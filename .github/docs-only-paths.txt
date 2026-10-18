@@ -44,7 +44,6 @@ docs/migrations/calls-import.md
 docs/migrations/calls-python313.md
 docs/migrations/messaging-layout.md
 docs/migrations/platform-baseline.md
-docs/operations/claude-code-tiden.md
 docs/operations/parallel-development.md
 docs/operations/platform-cutover.md
 docs/operations/seamless-release.md

@@ -368,3 +368,44 @@ merging. Each suite's actual main child-ID set was checked and remains unchanged
 no test hierarchy was renamed or rewritten to match an aggregate counter.
 These observed metadata differences are separately enumerated in the private
 exact before/after digest allowlist, not silently ignored by the comparator.
+
+## Maintenance procedures
+
+Moved here from docs/operations/tiden-product-workflow.md (process v2, 2026-10-19). They matter
+only for bulk Tiden maintenance.
+
+**Snapshots and preservation.** Before a bulk change, export complete specs, sources, test
+identities and links with `scripts/tiden_snapshot.py`; keep private snapshots outside Git. Its two
+complete reads must agree; a network or pagination failure is an incomplete export, not
+permission to claim preservation from equal counts. Afterwards compare exact object and link
+identities and historical anchors against a reviewed allowlist of intended changes with
+`scripts/verify_tiden_preservation.py`. Report source coverage, assertion review and live
+acceptance as distinct audit depths. Leave experiments with open code PRs on their own branches;
+an old recovery branch may duplicate the baseline: record its disposition instead of merging
+duplicates or deleting requirements.
+
+**Provenance.** The CLI 0.33.0 source update and merge path regenerates source-record IDs and
+does not round-trip nested `reverse_pr` metadata. Keep each affected original ID in
+`metadata.historical_source_id` and its complete original metadata as serialized JSON in
+`metadata.historical_metadata_json`, alongside the original fields; read them back before a bulk
+update and verify them after merge. Never overwrite an existing provenance receipt.
+
+**Drift watermark.** The drift workflow advances the watermark after every merge with
+`--reason empty_sync` once every changed code file is anchored (TIDEN-CI.md). `empty_sync` is a
+compare-and-set on `--from`: on 2026-10-18 a stale `--from` returned `"advanced": false` and the
+current one advanced (receipts on ANYM-355); only the drift workflow uses it. A manual advance
+follows an audit that checked every spec anchored to the files changed since the previous audit,
+anchored or explained every unanchored changed file and merged its edits on Tiden main; it merges
+an empty drift-sync branch (`tiden branch create --sync-base <W> --sync-target <SHA> --sync-repo
+github.com/GoSync-Inc/deedkit`, recorded as `sync_merge`). `baseline` only sets a first watermark
+and `bootstrap` is never used. A commit after the audited target is fresh drift.
+
+**History.** The gate observed on 2026-10-16 counts queued `Backlog`/`Review` specs and the
+General index in coverage, so a branch reads `NOT VERIFIED` and main `BLOCKED` for those gaps even
+when implementation evidence passes; do not add placeholder tests, link unrelated tests or change
+statuses to suppress it. The initial import placed future requirements on main; in CLI 0.33.0 no
+main-to-proposal relocation preserves the spec identity (`spec update --branch` makes a
+copy-on-write proposal and leaves the original), so those records stay and the scope debt is
+reported. The release spec sync's first semantic baseline was
+69486f43b7140632c5eeed6a27690683e3a82c68 (the ANYM-314 catch-up audit); the daily delta audit
+replaced that sync on 2026-10-19. An old `Active` baseline is not evidence of a running task.
