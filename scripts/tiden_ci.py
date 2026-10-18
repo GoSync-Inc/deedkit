@@ -439,6 +439,13 @@ def tiden(cli: str, arguments: list[str], product: str, directory: Path, label: 
     return completed.returncode, output
 
 
+def evidence_failures(manifest: dict) -> str:
+    """The failed tests and the failed or blocked checks prepared evidence records; empty when all passed."""
+    tests, checks = manifest["test_counts"], manifest["check_counts"]
+    failures = [f"{tests['failed']} failed test(s)"] if tests.get("failed") else []
+    return ", ".join(failures + [f"{checks[status]} {status} check(s)" for status in ("failed", "blocked") if checks.get(status)])
+
+
 def publish(directory: Path, manifest: dict, branch: str | None, product: str, cli: str = "tiden",
             routed: bool = False, workspace: str = "") -> dict:
     if manifest.get("schema") != 1 or not re.fullmatch(r"[a-f0-9]{40}", manifest.get("sha", "")):
@@ -540,10 +547,7 @@ def publish(directory: Path, manifest: dict, branch: str | None, product: str, c
         expected_attempts = sum(manifest["test_counts"].values()) + check_count
         if int(result["stats"]["attempts"]) != expected_attempts:
             raise RuntimeError("Tiden result count differs from the authentic CI evidence")
-        expected_failure = (manifest["test_counts"].get("failed", 0)
-                            or manifest["check_counts"].get("failed", 0)
-                            or manifest["check_counts"].get("blocked", 0))
-        if expected_failure and result["status"] != "failed":
+        if evidence_failures(manifest) and result["status"] != "failed":
             raise RuntimeError("Tiden verdict contradicts failed or incomplete CI evidence")
         return result
     finally:
@@ -646,7 +650,7 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["assemble", "prepare", "publish", "release"])
+    parser.add_argument("command", choices=["assemble", "prepare", "verdict", "publish", "release"])
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--fragments", type=Path)
     parser.add_argument("--producer", action="append", default=[], help="<job>:<job result>:<captured source SHA>")
@@ -674,6 +678,11 @@ def main() -> int:
         result = prepare(args.source_root.resolve(), directory, metadata)
         print(json.dumps({"test_counts": result["test_counts"], "check_counts": result["check_counts"]}))
         return 0
+    if args.command == "verdict":
+        # The evidence job's own verdict, so the gate never depends on the Tiden round trip.
+        failures = evidence_failures(json.loads((directory / "manifest.json").read_text()))
+        print(f"The evidence records {failures}; see ci-checks.json." if failures else "Every test and check passed.")
+        return 1 if failures else 0
     manifest = published_manifest(directory, json.loads((directory / "manifest.json").read_text()))
     if merge_queue_run(manifest):
         # publish() skips a queue run before any Tiden call: no credentials, map or route needed.
@@ -689,6 +698,10 @@ def main() -> int:
         result = publish(directory, manifest, branch, os.environ["TIDEN_PRODUCT_ID"], routed=routed,
                          workspace=os.environ.get("TIDEN_WORKSPACE_ID", ""))
     print(json.dumps({k: result[k] for k in ("seqNum", "status", "branchName", "branchId", "buildSha", "stats", "liveDocStatus")}))
+    if result["status"] == "passed" and os.environ.get("GITHUB_OUTPUT"):
+        # Only a verified passed run counts as published; a skip published nothing (ci.yml release record).
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write("verified=true\n")
     return 0 if result["status"] in {"passed", "skipped"} else 1
 
 
