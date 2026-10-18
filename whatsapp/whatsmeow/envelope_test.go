@@ -187,3 +187,56 @@ func TestNativeIdentityPairsOnlyForArchivablePersonalIDs(t *testing.T) {
 		}
 	}
 }
+
+func ptvMessage(id string) *events.Message {
+	m := fixtureMessage(id, 1700000000)
+	m.Message = &waE2E.Message{PtvMessage: &waE2E.VideoMessage{Caption: proto.String("round"), Mimetype: proto.String("video/mp4"), FileLength: proto.Uint64(4096), Seconds: proto.Uint32(17), ContextInfo: &waE2E.ContextInfo{StanzaID: proto.String("quoted1"), IsForwarded: proto.Bool(true)}}}
+	m.RawMessage = m.Message
+	return m
+}
+
+func TestNativeRoundVideoIsCapturedAsVideoAttachment(t *testing.T) {
+	v, err := NormalizeMessage(ptvMessage("round"), types.EmptyJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireArchivable(t, v)
+	for field, want := range map[string]any{"messageType": "ptv", "mediaKind": "video", "hasMedia": true, "mimetype": "video/mp4", "filesize": int64(4096), "durationSeconds": uint32(17), "body": "round", "replyToId": "quoted1", "forwarded": true, "filename": "false_111111@c.us_round.bin"} {
+		if v[field] != want {
+			t.Fatalf("%s = %#v, want %#v", field, v[field], want)
+		}
+	}
+}
+
+func TestNativeViewOnceRoundVideoIsNotRetained(t *testing.T) {
+	wrap := map[string]func(*waE2E.Message) *waE2E.Message{
+		"v1": func(m *waE2E.Message) *waE2E.Message {
+			return &waE2E.Message{ViewOnceMessage: &waE2E.FutureProofMessage{Message: m}}
+		},
+		"v2": func(m *waE2E.Message) *waE2E.Message {
+			return &waE2E.Message{ViewOnceMessageV2: &waE2E.FutureProofMessage{Message: m}}
+		},
+		"extension": func(m *waE2E.Message) *waE2E.Message {
+			return &waE2E.Message{ViewOnceMessageV2Extension: &waE2E.FutureProofMessage{Message: m}}
+		},
+		"flag": func(m *waE2E.Message) *waE2E.Message { return m },
+	}
+	for name, w := range wrap {
+		t.Run(name, func(t *testing.T) {
+			m := ptvMessage("once")
+			m.RawMessage = w(m.Message)
+			m.Message = m.RawMessage
+			m.IsViewOnce = name == "flag"
+			v, err := NormalizeMessage(m, types.EmptyJID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v["hasMedia"] != false || v["mediaKind"] != nil || v["filename"] != nil || v["mimetype"] != nil || v["filesize"] != nil {
+				t.Fatalf("view-once round video retained: %v", v)
+			}
+			if _, err = nativeMediaMetadata(unwrap(m)); err == nil || err.Error() != "unsupported_media_type" {
+				t.Fatalf("view-once round video has a descriptor: %v", err)
+			}
+		})
+	}
+}

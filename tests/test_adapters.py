@@ -109,3 +109,13 @@ def test_telegram_cross_peer_reply_does_not_resolve_in_local_id_namespace():
     assert telegram_message('tg-owner',message)['metadata']['reply_to_provider_id'] is None
     message.reply_to.reply_to_peer_id=PeerChat(123)
     assert telegram_message('tg-owner',message)['metadata']['reply_to_provider_id']=='10'
+
+
+def test_whatsapp_round_video_is_a_video_with_observed_duration():
+    event={'messageId':'false_123@c.us_ROUND','chatId':'123@c.us','senderId':'123@c.us',
+           'body':'','fromMe':False,'timestamp':1791000000,'hasMedia':True,'messageType':'ptv',
+           'mediaKind':'video','durationSeconds':9,'filename':'round.bin','mimetype':'video/mp4','filesize':4096}
+    e=whatsapp_message('wa-1',event)
+    assert e['metadata']['message_kind']=='video' and e['metadata']['provider_message_type']=='ptv'
+    assert e['metadata']['media_duration_seconds']==9
+    assert e['media']==[{'provider_id':'false_123@c.us_ROUND','filename':'round.bin','mime':'video/mp4','bytes':4096}]
