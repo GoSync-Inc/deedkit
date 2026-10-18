@@ -14,6 +14,7 @@ import argparse
 from collections import Counter
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -45,10 +46,13 @@ MIGRATION = re.compile(r"(^|/)migrations/[^/]+\.sql$")
 # "drop the cache" does not.
 DESTRUCTIVE_SQL = re.compile(r"\b(DROP|TRUNCATE|RENAME)\b|\bDELETE FROM\b|"
                              r"\bALTER TABLE\b.*\bALTER (COLUMN )?\S+ (SET DATA )?TYPE\b|\bSET NOT NULL\b", re.IGNORECASE)
-DESTRUCTIVE_SQL_IN_CODE = re.compile(r"\b(DROP [A-Z]+|TRUNCATE( TABLE)? \S|DELETE FROM|ALTER TABLE \S+ RENAME|"
-                                     r"ALTER (COLUMN )?\S+ (SET DATA )?TYPE|SET NOT NULL)\b")
-SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
-CODE_SUFFIXES = {".py", ".go", ".js", ".mjs", ".cjs", ".ts", ".sh"}
+DESTRUCTIVE_SQL_IN_CODE = re.compile(r"\b(DROP\s+[A-Z]+|TRUNCATE(\s+TABLE)?\s+\S|DELETE\s+FROM|ALTER\s+TABLE\s+\S+\s+RENAME|"
+                                     r"ALTER(\s+COLUMN)?\s+\S+\s+(SET\s+DATA\s+)?TYPE|SET\s+NOT\s+NULL)\b")
+DOLLAR_QUOTE = re.compile(r"\$([A-Za-z_]\w*)?\$")
+QUOTES = "\"'`"
+# A string literal joined to the previous one: `+`, a line continuation or nothing between, then a prefixed quote.
+JOINED_LITERAL = re.compile(r"\s*\+?\s*(\\\s*)?[A-Za-z]{0,2}([\"'`])")
+CODE_SUFFIXES = {".py", ".go", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".sh"}
 AGENT_SETTINGS = ".claude/settings.json"
 # An agent permission may be added to `allow` without the owner only when it is read-only by name.
 READ_ONLY_TOOL = re.compile(r"^mcp__\w+?__(?:(?:messages|calls|calendar)_)?(get|list|search|resolve|preview)(_\w+)?$"
@@ -81,20 +85,25 @@ class Change:
     after: str | None
 
 
-def git(root: Path, *arguments: str) -> str:
-    return subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True, text=True).stdout
+def git(root: Path, *arguments: str) -> bytes:
+    return subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True).stdout
 
 
-def show(root: Path, revision: str, path: str) -> str | None:
-    """The blob at a revision as text (undecodable bytes replaced), or None when it does not exist there."""
-    result = subprocess.run(["git", "-C", str(root), "cat-file", "blob", f"{revision}:{path}"], capture_output=True)
-    return result.stdout.decode("utf-8", "replace") if result.returncode == 0 else None
+def fields(root: Path, *arguments: str) -> list[str]:
+    """The NUL-delimited output of a git command, each field decoded byte for byte (no newline translation)."""
+    listing = git(root, *arguments)
+    return [os.fsdecode(field) for field in listing.rstrip(b"\0").split(b"\0")] if listing else []
+
+
+def show(root: Path, revision: str, path: str) -> str:
+    """The blob at a revision as text (undecodable bytes replaced). A blob that cannot be read is a git failure."""
+    return git(root, "cat-file", "blob", f"{revision}:{path}").decode("utf-8", "replace")
 
 
 def changes(root: Path, base: str, head: str) -> list[Change]:
-    listing = git(root, "diff", "--no-renames", "--no-ext-diff", "--name-status", "-z", base, head)
-    tokens = listing.rstrip("\0").split("\0") if listing else []
-    return [Change(path, status, show(root, base, path), show(root, head, path))
+    tokens = fields(root, "diff", "--no-renames", "--no-ext-diff", "--name-status", "-z", base, head)
+    return [Change(path, status, None if status == "A" else show(root, base, path),
+                   None if status == "D" else show(root, head, path))
             for status, path in zip(tokens[::2], tokens[1::2])]
 
 
@@ -109,14 +118,81 @@ def is_doc(path: str) -> bool:
     return pure.suffix.lower() in DOC_SUFFIXES or re.match(r"(LICENSE|NOTICE|COPYING)", pure.name) is not None
 
 
+def sql_statements(text: str) -> list[str]:
+    """The statements of a SQL file, whitespace collapsed: comments (nested block comments too) removed, split at
+    semicolons outside string literals, quoted identifiers and dollar quotes. An unterminated one runs to the end."""
+    statements, current, at, size = [], [], 0, len(text)
+    while at < size:
+        char = text[at]
+        if text.startswith("--", at):
+            end = text.find("\n", at)
+            at = size if end < 0 else end
+            current.append(" ")
+        elif text.startswith("/*", at):
+            depth, at = 1, at + 2
+            while at < size and depth:
+                pair = text[at:at + 2]
+                depth += {"/*": 1, "*/": -1}.get(pair, 0)
+                at += 2 if pair in ("/*", "*/") else 1
+            current.append(" ")
+        elif char in "'\"":
+            escapes = char == "'" and text[at - 1:at] in ("e", "E") and not re.match(r"\w", text[at - 2:at - 1] or " ")
+            end = at + 1
+            while end < size:
+                if escapes and text[end] == "\\" or text.startswith(char * 2, end):
+                    end += 2
+                elif text[end] == char:
+                    break
+                else:
+                    end += 1
+            current.append(text[at:end + 1])
+            at = end + 1
+        elif char == "$" and (tag := DOLLAR_QUOTE.match(text, at)):
+            end = text.find(tag.group(0), tag.end())
+            end = size if end < 0 else end + len(tag.group(0))
+            current.append(text[at:end])
+            at = end
+        elif char == ";":
+            statements.append("".join(current))
+            current, at = [], at + 1
+        else:
+            current.append(char)
+            at += 1
+    statements.append("".join(current))
+    return [" ".join(statement.split()) for statement in statements if statement.strip()]
+
+
+def code_statements(text: str) -> list[str]:
+    """Each upper-case destructive SQL match in code with the rest of its string literal (and of literals joined to
+    it) and of that source line, whitespace collapsed, so a changed target or predicate is a new statement."""
+    found = []
+    for match in DESTRUCTIVE_SQL_IN_CODE.finditer(text):
+        quote, end = text[:match.start()].rstrip()[-1:], match.end()
+        if quote and quote in QUOTES:
+            while (close := text.find(quote, end)) >= 0:
+                end = close + 1
+                joined = JOINED_LITERAL.match(text, end)
+                if not joined:
+                    break
+                quote, end = joined.group(2), joined.end()
+            else:
+                end = len(text)
+            stops = (text.find("\n", end),)
+        else:
+            stops = (text.find(";", end), text.find("\n", end))
+        end = min([stop for stop in stops if stop >= 0] or [len(text)])
+        found.append(" ".join(text[match.start():end].split()))
+    return found
+
+
 def destructive_statements(text: str | None, sql: bool) -> Counter:
-    """Destructive SQL statements of a file, comments removed and whitespace collapsed, counted."""
+    """Destructive SQL statements of a file, counted: whole statements in `.sql`, statements in string literals in
+    code."""
     if not text:
         return Counter()
     if sql:
-        statements = (" ".join(part.split()) for part in SQL_COMMENT.sub(" ", text).split(";"))
-        return Counter(statement for statement in statements if DESTRUCTIVE_SQL.search(statement))
-    return Counter(match.group(0) for match in DESTRUCTIVE_SQL_IN_CODE.finditer(" ".join(text.split())))
+        return Counter(statement for statement in sql_statements(text) if DESTRUCTIVE_SQL.search(statement))
+    return Counter(code_statements(text))
 
 
 def secret_bindings(text: str | None) -> Counter:
@@ -176,8 +252,9 @@ def widened(before: dict[str, int] | None, after: dict[str, int]) -> bool:
 
 def check_labels(root: Path, revision: str, required: set[str]) -> Counter:
     """How many jobs report each required check name. Only workflows with a trigger other than `workflow_call`
-    report checks; a local reusable workflow call reports `<caller> / <called job>` for each leaf job, recursively."""
-    paths = [path for path in git(root, "ls-tree", "-r", "--name-only", revision, ".github/workflows").splitlines()
+    report checks; a local reusable workflow call reports `<caller> / <called job>` for each leaf job, recursively.
+    A remote call is a doubt when a required check starts with its `<caller> / ` prefix."""
+    paths = [path for path in fields(root, "ls-tree", "-r", "-z", "--name-only", revision, "--", ".github/workflows")
              if path.endswith((".yml", ".yaml"))]
     documents = {path: load(show(root, revision, path)) or {} for path in paths}
 
@@ -192,6 +269,10 @@ def check_labels(root: Path, revision: str, required: set[str]) -> Counter:
                 if target in seen or target not in documents:
                     raise ValueError(f"unresolved reusable workflow {called}")
                 labels += leaves(documents[target], f"{label} / ", (*seen, target))
+            elif called:
+                # A remote reusable workflow reports `<label> / <its job>`, which cannot be resolved here.
+                if any(check.startswith(f"{label} / ") for check in required):
+                    raise ValueError(f"unresolved reusable workflow {called}")
             else:
                 labels.append(label)
         return labels
@@ -206,9 +287,9 @@ def check_labels(root: Path, revision: str, required: set[str]) -> Counter:
 
 
 def required_checks(root: Path, revision: str) -> set[str]:
-    text = show(root, revision, "deploy/main-ruleset.json")
-    if text is None:
+    if not fields(root, "ls-tree", "-z", "--name-only", revision, "--", "deploy/main-ruleset.json"):
         return set()
+    text = show(root, revision, "deploy/main-ruleset.json")
     contexts: set[str] = set()
 
     def walk(node):
@@ -281,7 +362,7 @@ def owner_rules(change: Change) -> list[tuple[str, str]]:
 
 
 def classify(root: Path, base: str = "origin/main", head: str = "HEAD") -> str:
-    merge_base = git(root, "merge-base", base, head).strip()
+    merge_base = git(root, "merge-base", base, head).decode().strip()
     found = changes(root, merge_base, head)
     owner: dict[str, list[str]] = {rule: [] for rule in RULES}
     review: list[str] = []
@@ -312,7 +393,11 @@ def classify(root: Path, base: str = "origin/main", head: str = "HEAD") -> str:
 
 def listed(paths: list[str]) -> str:
     """Every path once, with control characters escaped, so the result stays one line."""
-    return ", ".join("".join(c if c.isprintable() else repr(c)[1:-1] for c in path) for path in dict.fromkeys(paths))
+    return ", ".join(escaped(path) for path in dict.fromkeys(paths))
+
+
+def escaped(text: str) -> str:
+    return "".join(char if char.isprintable() else repr(char)[1:-1] for char in text)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -324,7 +409,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         print(classify(arguments.repo, arguments.base, arguments.head))
     except subprocess.CalledProcessError as error:
-        print(f"change_path: git failed: {' '.join(error.cmd[3:])}: {error.stderr.strip()}", file=sys.stderr)
+        command, reason = escaped(" ".join(error.cmd[3:])), escaped(os.fsdecode(error.stderr.strip()))
+        print(f"change_path: git failed: {command}: {reason}", file=sys.stderr)
         return 2
     return 0
 

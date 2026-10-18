@@ -55,7 +55,10 @@ BASE = {
     "app/migrations/001_base.sql": "-- base\nCREATE TABLE t (id int);\n", "app/reader_role.sql": "GRANT SELECT ON t;\n",
     ".gitleaks.toml": "[allowlist]\n", "scripts/change_path.py": "RULES = {}\n",
     "deploy/compose.yaml": COMPOSE, "app/schema.sql": "DROP VIEW IF EXISTS v;\nCREATE VIEW v AS SELECT 1;\n",
+    "app/purge.py": 'def purge(db):\n    db.execute("DELETE FROM users WHERE expired = TRUE")\n'
+                    '    db.execute("DROP TABLE scratch_cache")\n',
 }
+GATE_JOB = "    name: CI gate\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo gate\n"
 
 
 def git(root, *arguments):
@@ -120,9 +123,13 @@ def test_documentation_and_tests_only_take_the_auto_path(tmp_path, change, expec
      ".github/workflows/ci.yml"),
     ({"deploy/compose.yaml": COMPOSE.replace("image: app", "image: app:2")}, "deploy/compose.yaml"),
     ({f"app/m{n}.py": "X = 1\n" for n in range(5)}, "app/m0.py, app/m1.py, app/m2.py, app/m3.py, app/m4.py"),
+    ({"app/purge.py": BASE["app/purge.py"] + "\n\nLIMIT = 10\n"}, "app/purge.py"),
+    ({".github/workflows/remote.yml": "on: push\npermissions: {}\njobs:\n  lint:\n"
+                                      "    uses: example/ci/.github/workflows/lint.yml@main\n"},
+     ".github/workflows/remote.yml"),
 ], ids=["code", "deleted-test", "expand-migration", "python-secrets-module", "prose-drop", "read-only-tool",
         "inside-a-required-job", "narrowed-permissions", "existing-drop-reformatted", "step-added-before-a-step",
-        "tagged-compose-edit", "every-path-listed"])
+        "tagged-compose-edit", "every-path-listed", "unchanged-sql-in-edited-code", "unrelated-remote-workflow"])
 def test_any_other_file_takes_auto_with_review_and_names_it(tmp_path, change, named):
     assert path_of(tmp_path, change) == f"AUTO+review — code: {named}"
 
@@ -184,13 +191,28 @@ def test_any_other_file_takes_auto_with_review_and_names_it(tmp_path, change, na
       ".github/workflows/leaf.yml": CHECKS},
      "ruleset: .github/workflows (renames, removes or duplicates a required check)"),
     ({"deploy/main-ruleset.json": "{not json"}, "ruleset: deploy/main-ruleset.json, required checks (cannot be read"),
+    ({"app/new\rdata.sql": "DROP TABLE t;\n"}, "destructive-sql: app/new\\rdata.sql"),
+    ({"app/purge.py": BASE["app/purge.py"].replace(" WHERE expired = TRUE", "")}, "destructive-sql: app/purge.py"),
+    ({"app/purge.py": BASE["app/purge.py"].replace("scratch_cache", "users")}, "destructive-sql: app/purge.py"),
+    ({"app/migrations/002_x.sql": "SELECT '-- marker'; DELETE FROM users;\n"},
+     "destructive-sql: app/migrations/002_x.sql"),
+    ({"app/migrations/002_x.sql": "SELECT '/*'; DELETE FROM users; SELECT '*/';\n"},
+     "destructive-sql: app/migrations/002_x.sql"),
+    ({".github/workflows/ci.yml": CI.replace(GATE_JOB, "    name: CI gate\n"
+                                                       "    uses: example/ci/.github/workflows/gate.yml@main\n")},
+     "ruleset: .github/workflows (renames, removes or duplicates a required check)"),
+    ({".github/workflows/ci.yml": CI.replace("./.github/workflows/checks.yml",
+                                            "example/ci/.github/workflows/checks.yml@main")},
+     "ruleset: required checks (cannot be read: ValueError)"),
 ], ids=["ruleset", "renamed-gate", "renamed-verify", "duplicated-gate", "secret-reference", "gitleaks",
         "write-permission", "dropped-permissions", "new-workflow-default-token", "role-sql", "send-tool-allowed",
         "deny-dropped", "drop-column", "rename-lowercase", "edited-migration", "delete-in-code", "own-rules",
         "owner-list", "unparsable-workflow", "space-in-name", "quote-in-name", "tab-in-name", "binary-diff-attribute",
         "delete-over-lines", "alter-type-over-lines", "alter-without-column", "comment-between-keywords",
         "drop-sequence-in-code", "quoted-secrets-key", "compose-secret-list-item", "secret-expression-over-lines",
-        "gitleaksignore", "required-check-renamed-by-name", "required-job-became-a-caller", "malformed-ruleset"])
+        "gitleaksignore", "required-check-renamed-by-name", "required-job-became-a-caller", "malformed-ruleset",
+        "carriage-return-in-name", "predicate-removed-in-code", "target-changed-in-code", "line-comment-in-literal",
+        "block-comment-in-literals", "required-job-became-a-remote-call", "required-caller-became-remote"])
 def test_what_the_owner_keeps_takes_the_owner_path_and_names_the_rule(tmp_path, change, rule):
     line = path_of(tmp_path, change)
     assert line.startswith("OWNER — ") and rule in line
@@ -221,3 +243,14 @@ def test_the_command_prints_one_line_and_a_git_failure_exits_2(tmp_path, capsys)
     assert capsys.readouterr().out == "AUTO — no changes\n"
     assert change_path.main(["--repo", str(root), "--base", "missing"]) == 2
     assert "git failed" in capsys.readouterr().err
+
+
+# spec: ANYM-404
+def test_a_changed_blob_that_cannot_be_read_is_a_git_failure_not_a_lower_path(tmp_path, capsys):
+    path_of(tmp_path, {"app/new.sql": "DROP TABLE users;\n"})
+    root = tmp_path / "repo"
+    blob = git(root, "rev-parse", "HEAD:app/new.sql")
+    (root / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    assert change_path.main(["--repo", str(root), "--base", "main"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and "git failed: cat-file blob HEAD:app/new.sql" in captured.err
