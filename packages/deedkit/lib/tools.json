@@ -21,6 +21,7 @@
   {"name": "calls_prepare_call", "read_only": false},
   {"name": "calls_prepare_external_call", "read_only": false},
   {"name": "calls_prepare_followup", "read_only": false},
+  {"name": "calls_raise_call_cap", "read_only": false},
   {"name": "calls_start_call", "read_only": false},
   {"name": "calls_stop_call", "read_only": false},
   {"name": "messages_ack_subscription_events", "read_only": false},

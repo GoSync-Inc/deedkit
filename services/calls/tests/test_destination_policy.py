@@ -338,9 +338,12 @@ def test_defaults_need_no_configuration_and_no_agent_tool_changes_policy(tmp_pat
         assert brief.status_code == 200
         ready = client.post('/v1/preflight_call', json={'brief_id': brief.json()['id']}, headers=auth)
         assert ready.status_code == 200 and ready.json()['daily_calls_remaining'] == policy.DAILY_UNITS
-    # No agent operation can change the cap, the switch or any list.
+    # No agent operation changes the switch or any list; only raise_call_cap changes the cap,
+    # and only on the owner's quoted words (ANYM-353).
     writes = {name for name, (_, scope) in METHODS.items() if scope not in {'', 'calls:read'}}
-    assert writes == {'prepare_call', 'prepare_external_call', 'start_call', 'dial_call', 'prepare_followup', 'stop_call'}
+    assert writes == {'prepare_call', 'prepare_external_call', 'start_call', 'dial_call', 'prepare_followup', 'stop_call',
+                      'raise_call_cap'}
+    assert set(METHODS['raise_call_cap'][0].model_json_schema()['required']) == {'owner_instruction', 'extra_units'}
     assert not any(field in json.dumps(model.model_json_schema()) for model, _ in METHODS.values()
                    for field in ('daily_call_units', '"allowed"', '"enabled"', 'calling_settings'))
     app.state.service.close()

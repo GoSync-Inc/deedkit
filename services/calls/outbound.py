@@ -17,6 +17,7 @@ from core import ACTIVE, BriefInput, ServiceError, now
 import destination_policy as policy
 
 E164=re.compile(r'\+[1-9][0-9]{7,14}')
+RAISE_FIELDS=('id','created_at','expires_at','principal','owner_instruction','extra_units')
 SIP=re.compile(r'sips?:[A-Za-z0-9_.+-]{1,80}@[A-Za-z0-9.-]{1,200}(?::[0-9]{1,5})?(?:;transport=(?:tcp|tls|udp))?(?:;secure=true)?')
 
 
@@ -148,6 +149,8 @@ class Outbound:
         self.model_key=model_key
         self.lock=asyncio.Lock(); self.tasks={};self.runtime_stop=None
         service.db.execute('CREATE TABLE IF NOT EXISTS outbound_attempts (call_id TEXT PRIMARY KEY, token TEXT NOT NULL)')
+        service.db.execute('CREATE TABLE IF NOT EXISTS cap_raises (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, '
+                           'principal TEXT NOT NULL, owner_instruction TEXT NOT NULL, extra_units INTEGER NOT NULL)')
         service.db.commit()
 
     def units_used(self):
@@ -165,8 +168,44 @@ class Outbound:
             total+=units
         return total
 
+    def active_raises(self):
+        """Unexpired owner raises of the daily cap (ANYM-353), oldest first, from durable rows."""
+        rows=self.service.db.execute('SELECT id,created_at,expires_at,principal,owner_instruction,extra_units FROM cap_raises '
+                                     'WHERE expires_at>? ORDER BY created_at',(now(),))
+        return [dict(zip(RAISE_FIELDS,row)) for row in rows]
+
+    def daily_call_units(self):
+        return min(policy.CAP_CEILING,policy.DAILY_UNITS+sum(r['extra_units'] for r in self.active_raises()))
+
     def daily_calls_remaining(self):
-        return max(0,policy.DAILY_UNITS-self.units_used())
+        return max(0,self.daily_call_units()-self.units_used())
+
+    def cap_status(self,principal=None):
+        """Effective cap with its raises. Given a principal, other principals' raises omit the owner's words."""
+        raises=[r if principal is None or r['principal']==principal else
+                {k:r[k] for k in ('id','created_at','expires_at','extra_units')} for r in self.active_raises()]
+        return {'base_units':policy.DAILY_UNITS,'daily_call_units':self.daily_call_units(),'call_cap_ceiling':policy.CAP_CEILING,
+                'daily_calls_remaining':self.daily_calls_remaining(),'raises':raises}
+
+    async def raise_cap(self,owner_instruction,extra_units,principal):
+        """Raise the daily cap for 24 hours on the owner's quoted reply, which must state the unit count.
+        The same words and count while that raise is active return it instead of adding another."""
+        instruction=owner_instruction.strip() if isinstance(owner_instruction,str) else ''
+        if not 3<=len(instruction)<=1500: raise ServiceError('owner_instruction_reference_required',422)
+        if not isinstance(extra_units,int) or isinstance(extra_units,bool) or not 1<=extra_units<=policy.MAX_RAISE_UNITS:
+            raise ServiceError('invalid_arguments',422)
+        if not policy.units_named(instruction,extra_units): raise ServiceError('units_not_in_owner_instruction',422)
+        async with self.lock:
+            active=self.active_raises()
+            same=next((r for r in active if (r['principal'],r['owner_instruction'],r['extra_units'])==(principal,instruction,extra_units)),None)
+            if same is None:
+                room=policy.CAP_CEILING-self.daily_call_units()
+                if extra_units>room: raise ServiceError('call_cap_ceiling',422,{'raisable_units':room,'call_cap_ceiling':policy.CAP_CEILING})
+                created=datetime.now(timezone.utc)
+                same=dict(zip(RAISE_FIELDS,(secrets.token_hex(8),created.isoformat(),
+                    (created+timedelta(hours=policy.RAISE_HOURS)).isoformat(),principal,instruction,extra_units)))
+                self.service.db.execute('INSERT INTO cap_raises VALUES (?,?,?,?,?,?)',tuple(same.values())); self.service.db.commit()
+            return {'raise':same,'call_cap':self.cap_status(principal)}
 
     async def preflight(self,brief_id):
         b=self.service.get_brief(brief_id)
@@ -179,7 +218,7 @@ class Outbound:
         if not provider: raise ServiceError('provider_not_configured')
         result=await provider.preflight(b)
         return {**result,'recipient_policy':policy.recipient_policy(b['channel']),'dial_units':units,
-                'daily_calls_remaining':self.daily_calls_remaining()}
+                'daily_call_units':self.daily_call_units(),'daily_calls_remaining':self.daily_calls_remaining()}
 
     async def dial(self,brief_id,authorization_reference,*,admission=None,origin=None):
         """Internal entry point. Agent-facing surfaces always pass `origin` (destination_source/evidence)."""

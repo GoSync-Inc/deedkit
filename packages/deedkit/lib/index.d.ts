@@ -21,6 +21,7 @@ export type ToolName =
   | 'calls_prepare_call'
   | 'calls_prepare_external_call'
   | 'calls_prepare_followup'
+  | 'calls_raise_call_cap'
   | 'calls_start_call'
   | 'calls_stop_call'
   | 'messages_ack_subscription_events'

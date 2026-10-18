@@ -70,6 +70,7 @@ With `calls:read`, `list_briefs` and `list_calls` page only the principal's own 
 newest first as short summaries without notes, facts, prompts or destinations.
 Capabilities report each granted channel's configured state (from settings only, no
 provider contact), the recipient policy (SIP: allowlisted recipient counts),
+the daily call cap with the owner's active raises (`raise_call_cap`, ANYM-353),
 `daily_calls_remaining` and the enforced request limits.
 
 ## Outcomes and verification

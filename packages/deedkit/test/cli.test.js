@@ -150,7 +150,7 @@ test('usage errors exit 2 before any request', async () => {
 
 test('tools, help and version need no network or token', async () => {
   const listed = JSON.parse((await run(['tools'])).stdout);
-  assert.equal(listed.length, 66);
+  assert.equal(listed.length, 67);
   assert.deepEqual(listed.find(row => row.name === 'messages_send_message'), {name: 'messages_send_message', read_only: false});
   assert.match((await run(['--help'])).stdout, /outcome unknown/);
   const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
