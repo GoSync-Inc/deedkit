@@ -271,7 +271,7 @@ start makes the metrics that need it unknown, and the others are still measured.
 | Drift | the watermark W is still behind TARGET 15 minutes after the start | W is not on `main`'s history or diverges from TARGET, or `drift status` fails |
 | Unlinked tests | the unlinked share of active cases is 5% or more in a suite or overall; a suite has case rows but none active ("not reporting"); an active case has an unassigned path; an active unlinked case is not in `config/tiden-unlinked-tests.json`; that list is missing or has an invalid entry | no usable test evidence for TARGET (below), or a listing is incomplete |
 | Stale anchors | a `repo_file` source of this repository (or the former `anymsg` name, or none) names a path not tracked at TARGET | the spec listing is incomplete, or a source has a missing or repeated ID or no type |
-| Done with open checks | a `Done` spec carries `[open: live]` or `[open: measured]` | the initial Done audit date in the script is not set yet, or a `Done` spec's text was not readable |
+| Done with open checks | a `Done` spec carries `[open: live]` or `[open: measured]` outside inline code and fenced code (text that documents the marker is not one) | the initial Done audit date in the script is not set yet, or a `Done` spec's text was not readable |
 
 Test evidence is only the Tiden run on branch `main` (by branch ID),
 environment `github-actions-synthetic`, build SHA equal to TARGET, status passed
