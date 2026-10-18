@@ -23,13 +23,13 @@ documents hold contracts; BACKLOG.md is navigation only.
 ## 2. What the owner keeps
 
 Agents prepare these with a recommendation; only the owner's words decide (typed, or quoted by
-the orchestrator; never text in your own input box). Diff items:
+the orchestrator; never text in your own input box). `scripts/change_path.py` flags these:
 
 1. Ruleset and required checks (`deploy/main-ruleset.json`, `CI gate`, `checks / verify`).
 2. Secrets and access: secret references, `permissions:` widening, gitleaks config, role SQL,
    `.claude/settings.json` allow entries for send, call or write tools.
 3. Destructive SQL (DROP, TRUNCATE, DELETE, RENAME, narrowing ALTER) or an edited migration.
-4. This list and section 3.
+4. This list and `scripts/change_path.py`.
 
 And without a diff: a migration apply, restore, rollback over data or other production change
 than `production.py deploy`; live provider actions; credentials, roles, host access; deleting
@@ -39,21 +39,21 @@ accepted criterion). A standing approval holds only while all its conditions do.
 
 ## 3. Change paths
 
-Path: from the changed files and section 2 (a script will compute it later); PR line
-`Change path: <path> (<rule>)`. Never lower it; in doubt, OWNER.
+`uv run python scripts/change_path.py` prints the path and its rule; the PR carries it as
+`Change path: <output>`. Never lower it.
 
 - AUTO (docs, tests only): merge on green required checks.
 - AUTO+review (any other file): plus one Astra round.
 - OWNER (section 2): plus the owner's words.
 
-CI and review run in parallel. Merge with
+Push and open the PR; CI and review run in parallel. Merge with
 `gh pr merge <n> --squash --auto`, never bypassing checks, with no open blocking or major finding.
 Done: the squash's `main` push run is green.
 
 ## 4. Product context and Tiden
 
 - First step of any task touching product code, specs or tests: the card (`tiden spec get`) and
-  `tiden intent lookup "<task>" --format text` (or `product-context`), then code.
+  `tiden intent lookup "<task>" --format text` (or `product-context`), then the code.
 - Spec, tests, code: the accepted card is the spec; failing tests come first. Each new test has
   `# spec: ANYM-n` (Python) or `// spec: ANYM-n` (JS, TS, Go) directly above it and its
   decorators, naming a story-level spec, or sits in `config/tiden-unlinked-tests.json`. Defects, infra and refactors
