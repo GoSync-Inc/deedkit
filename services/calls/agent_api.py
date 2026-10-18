@@ -457,14 +457,15 @@ class AgentAPI:
         except ValidationError:
             raise ServiceError("invalid_arguments", 422) from None
         if name == "capabilities":
+            # One snapshot of the effective cap, raises included (ANYM-353).
+            cap = self.outbound.cap_status(principal.id) if self.outbound else None
             return {
                 "service": "deedkit-calls",
                 "principal": principal.id,
                 "permissions": principal.scopes,
                 "channels": principal.channels,
-                # The enforced daily bound is the effective cap, raises included (ANYM-353).
-                "limits": {**LIMITS, "daily_call_units": self.outbound.daily_call_units()}
-                if self.outbound
+                "limits": {**LIMITS, "daily_call_units": cap["daily_call_units"]}
+                if cap
                 else LIMITS,
                 "scope": "owned_briefs_and_calls",
                 "archive_configured": bool(principal.archive_config),
@@ -472,7 +473,7 @@ class AgentAPI:
                 "owner_decision_write": False,
                 "live_call_verification": "not_claimed",
                 **({'calling_readiness':self.readiness(principal)} if self.readiness else {}),
-                **({'call_cap':self.outbound.cap_status(principal.id)} if self.outbound else {}),
+                **({'call_cap':cap} if cap else {}),
             }
         if name == "raise_call_cap":
             return await self.outbound.raise_cap(
