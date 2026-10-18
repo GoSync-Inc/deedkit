@@ -1,0 +1,239 @@
+{
+  "format": 1,
+  "cases": [
+    {
+      "caseId": "1ffee5a8-5f6c-46c6-9a76-a1bb20887a97",
+      "externalId": "s:tests.platform.test_legacy_contracts::test_locked_backend_contract_matches_snapshot",
+      "category": "missing-spec",
+      "reason": "Backend MCP/REST schema discovery must equal the reviewed messaging/calendar contract snapshot (drift guard); no spec states this; transport 404/405 asserts overlap ANYM-23/ANYM-25 only for messaging"
+    },
+    {
+      "caseId": "3c5393dc-38ee-4bc9-927a-fb4e116b64c9",
+      "externalId": "s:tests.platform.test_legacy_contracts::test_snapshot_has_no_provider_credentials_or_runtime_data",
+      "category": "helper",
+      "reason": "Fixture hygiene check: contract snapshot files are synthetic, have unique tool names and contain no synthetic key"
+    },
+    {
+      "caseId": "4f0b981b-a682-4942-b6ef-d28703352830",
+      "externalId": "s:tests.test_audio_native::test_faster_whisper_decoder_compatibility_without_model",
+      "category": "missing-spec",
+      "reason": "faster-whisper/PyAV native decoder compatibility in the enricher-test image (decodes wav/ogg to float32 of right length); no spec covers dependency compatibility"
+    },
+    {
+      "caseId": "8ebdcdbe-2248-479d-a5b7-f44797fb44e8",
+      "externalId": "s:tests.test_audio_native::test_invalid_native_audio_does_not_reach_provider",
+      "category": "missing-spec",
+      "reason": "Invalid audio fails invalid_audio before any provider call; no spec describes native audio probing/validation"
+    },
+    {
+      "caseId": "b3085d80-bfca-4b03-83ce-d4fa9cd51b5f",
+      "externalId": "s:tests.test_audio_native::test_native_duration_and_complete_provider_upload_preserve_original",
+      "category": "missing-spec",
+      "reason": "Native duration probing, OGG/Opus-to-MP3 transcoding and the exact OpenAI transcription upload with transcode/truncation metadata, original unchanged; no spec describes the audio provider contract"
+    },
+    {
+      "caseId": "c0682025-49b6-436a-91f3-05cf580c5aef",
+      "externalId": "s:tests.test_audio_native::test_native_duration_limit_rejects_before_any_provider_call",
+      "category": "missing-spec",
+      "reason": "Recording over max_audio_seconds fails audio_duration_limit before any provider call; ANYM-70 only configures the limit, enforcement is unspecified"
+    },
+    {
+      "caseId": "59f48aa1-3136-49e0-93aa-dabee80054af",
+      "externalId": "s:tests.test_audio_native::test_native_ogg_transcode_size_limit_never_submits_partial_audio",
+      "category": "missing-spec",
+      "reason": "OGG transcode exceeding max_input_bytes fails audio_transcode_size_limit and never submits partial audio; no spec describes transcoding limits"
+    },
+    {
+      "caseId": "edc31460-6c95-4482-9eab-f36338beae0b",
+      "externalId": "s:tests.test_audio_native::test_optional_cpu_package_loads_without_gpu_or_model_download",
+      "category": "missing-spec",
+      "reason": "Optional faster-whisper CPU package imports with int8 CPU compute support (image dependency smoke); no spec asserts it"
+    },
+    {
+      "caseId": "5425005b-4bc4-4382-bcd0-70b918893466",
+      "externalId": "s:tests.test_backup_restore_worker::test_worker_has_no_provider_or_store_initialization",
+      "category": "trivial",
+      "reason": "Asserts only that worker.run is callable and DATABASE ends with _restore_test; the claimed absence of provider/store initialization is not asserted"
+    },
+    {
+      "caseId": "d58633fb-f8c1-4a63-85b4-5d41c6e1bd7b",
+      "externalId": "s:tests.test_collector_resilience::test_discard_removes_only_strict_spool_names",
+      "category": "missing-spec",
+      "reason": "spool discard accepts only strict <time_ns>-<sha256>.json names (rejects traversal, lock file) and is idempotent; no spec states it"
+    },
+    {
+      "caseId": "ed541510-29bc-4a09-be0f-d9b163a967f4",
+      "externalId": "s:tests.test_collector_resilience::test_large_original_gets_a_deadline_that_matches_paced_transfer",
+      "category": "missing-spec",
+      "reason": "Telegram original download deadline scales with size (1 h minimum, paced-rate bound, 6 h cap); no spec states it"
+    },
+    {
+      "caseId": "df21da66-b8c2-4438-a1e2-5ac5fc055035",
+      "externalId": "s:tests.test_collector_resilience::test_reconcile_loop_survives_database_errors",
+      "category": "missing-spec",
+      "reason": "Telegram reconcile loop backs off (2 s, 4 s) and continues after transient database errors; no spec states it"
+    },
+    {
+      "caseId": "b10b03c6-96de-460a-826f-9d59511d239c",
+      "externalId": "s:tests.test_collector_resilience::test_sweep_removes_only_old_abandoned_temporary_files",
+      "category": "missing-spec",
+      "reason": "blob writer sweep removes only old strictly named abandoned .pending files, never fresh, nested or symlinked ones; no spec states it"
+    },
+    {
+      "caseId": "75c97136-d787-47ee-b961-8f31c55a57a3",
+      "externalId": "s:tests.test_collectors::test_expired_telegram_media_is_retried_without_stopping_other_jobs",
+      "category": "missing-spec",
+      "reason": "Telegram FileReferenceExpired/FilerefUpgradeNeeded becomes a delayed network_error retry while other jobs publish and partial bytes are removed"
+    },
+    {
+      "caseId": "7a75b659-7c3d-4cde-a68b-123808e51ecf",
+      "externalId": "s:tests.test_collectors::test_telegram_link_preview_downloads_concrete_media",
+      "category": "missing-spec",
+      "reason": "Telegram media in a link preview downloads the concrete document/photo location with its original size; no spec states download location rules"
+    },
+    {
+      "caseId": "9198824d-b86c-4711-828a-f63b9283765e",
+      "externalId": "s:tests.test_collectors::test_telegram_photo_does_not_replace_original_with_cached_preview",
+      "category": "missing-spec",
+      "reason": "a Telegram photo with only a cached preview size is unavailable rather than archived as the original"
+    },
+    {
+      "caseId": "d23b1f2c-1a3b-4694-8972-009ee8f0d079",
+      "externalId": "s:tests.test_collectors::test_telegram_photo_download_matches_largest_byte_size_not_list_order",
+      "category": "missing-spec",
+      "reason": "Telegram photo descriptor and download use the largest byte size (progressive included), not list order"
+    },
+    {
+      "caseId": "ebebd529-b88b-463e-bd76-6009a104a9bb",
+      "externalId": "s:tests.test_coverage_deployment::test_api_healthcheck_passes_the_real_host_boundary_and_fails_closed",
+      "category": "missing-spec",
+      "reason": "API container liveness healthcheck (exec-form python probe through PROBE_ALLOWED_HOSTS, fails on wrong Host or stopped server); no spec describes compose healthchecks"
+    },
+    {
+      "caseId": "fa8f4481-0399-4d88-81df-905e46064702",
+      "externalId": "s:tests.test_coverage_deployment::test_calendar_healthcheck_uses_the_service_port_bind_and_allowed_hosts",
+      "category": "missing-spec",
+      "reason": "calendar-api container liveness healthcheck reading gateway.json port/bind/allowed_hosts and failing closed; no spec describes compose healthchecks"
+    },
+    {
+      "caseId": "f9068c55-18c7-4940-8e9a-a0faefe9077a",
+      "externalId": "s:tests.test_coverage_deployment::test_gateway_healthcheck_uses_the_public_host_and_configured_port",
+      "category": "missing-spec",
+      "reason": "gateway container liveness healthcheck using the --public-url host and --port, failing on wrong Host; no spec describes compose healthchecks"
+    },
+    {
+      "caseId": "f188e219-e2de-44aa-a403-945bde3bc890",
+      "externalId": "s:tests.test_file_content::test_missing_workbook_names_and_provenance_cap_are_explicit",
+      "category": "missing-spec",
+      "reason": "workbook sheet/cell provenance spans with null sheet_name and an explicit provenance_truncated cap; no spec describes extraction provenance spans"
+    },
+    {
+      "caseId": "b9472a86-969b-4279-a9db-e913596502cd",
+      "externalId": "s:tests.test_file_understanding::test_empty_or_whitespace_model_summary_is_not_ready",
+      "category": "missing-spec",
+      "reason": "rejection of empty or whitespace model title/summary as understanding_description_empty is not in any spec criterion"
+    },
+    {
+      "caseId": "30262cd0-5c2d-41e5-bec1-b9903805beac",
+      "externalId": "s:tests.test_file_understanding::test_waiting_for_asr_does_not_hide_ready_source_behind_candidate_limit",
+      "category": "missing-spec",
+      "reason": "claim candidate window skipping sources still waiting for ASR is not described by any spec"
+    },
+    {
+      "caseId": "dc6c0676-6823-4a2e-8222-4aee796f3ca9",
+      "externalId": "s:tests.test_formatting::test_formatting_module_is_available",
+      "category": "trivial",
+      "reason": "only checks that the formatting module is importable"
+    },
+    {
+      "caseId": "91419263-3044-4895-8612-925745080473",
+      "externalId": "s:tests.test_index_api::test_whatsapp_capture_accepts_only_bounded_reported_identity",
+      "category": "missing-spec",
+      "reason": "only asserts a WhatsApp capture's senderName becomes sender_profile.display_name; no spec states this mapping (nearest ANYM-99/ANYM-92)"
+    },
+    {
+      "caseId": "733c4877-54aa-4476-af02-3ad0fbad2896",
+      "externalId": "s:tests.test_people::test_people_invalid_parameters",
+      "category": "missing-spec",
+      "reason": "Store.search_people rejects null/NUL query, non-list accounts and boolean chats/after/limit; ANYM-44 states no input-validation criterion"
+    },
+    {
+      "caseId": "9ed13fb8-14d5-4d08-9279-ead3ed00ecf9",
+      "externalId": "s:tests.test_publisher_trust::test_redirect_and_insecure_transport_are_rejected",
+      "category": "missing-spec",
+      "reason": "publisher-trust verifier refuses HTTP redirects and non-HTTPS URLs; ANYM-142 states no transport rule for the verify_only OIDC check"
+    },
+    {
+      "caseId": "51267869-450d-40a3-a6fc-420164950f09",
+      "externalId": "s:tests.test_search_performance::test_absent_file_query_reads_bounded_file_candidates",
+      "category": "missing-spec",
+      "reason": "search_files for an absent term reads fewer than 100 indexed candidate rows; no spec states a bounded file-search candidate budget"
+    },
+    {
+      "caseId": "ff5b2554-d544-4fa4-95c2-d31e69779149",
+      "externalId": "s:tests.test_search_performance::test_absent_lexical_query_reads_bounded_message_candidates",
+      "category": "missing-spec",
+      "reason": "Message search for an absent term reads fewer than 100 indexed candidate rows; no spec states a bounded lexical candidate budget"
+    },
+    {
+      "caseId": "45ea4f27-1d08-4dc0-aeca-93d13a2a4c65",
+      "externalId": "s:tests.test_search_v2::test_decorations_same_chat_and_live_profile_source_only",
+      "category": "missing-spec",
+      "reason": "Search rows decorated with same-chat sender profile name only while its source message is visible, plus reply_to/forwarded/media_kind; no search spec states these decorations"
+    },
+    {
+      "caseId": "eee572df-e897-42fb-a906-6e0d29f42142",
+      "externalId": "s:tests.test_storage_admission::test_alias_paths_share_filesystem_key",
+      "category": "helper",
+      "reason": "volume_key helper returns the same filesystem key for two directories on one volume"
+    },
+    {
+      "caseId": "69b3d16d-4c95-4a70-a388-3408fde97447",
+      "externalId": "s:tests.test_storage_admission::test_media_config_default_preserves_larger_capture_floor",
+      "category": "missing-spec",
+      "reason": "media_disk_reserve_bytes defaults to 10 GiB or the larger capture disk_reserve and is rejected below it; no spec states this default"
+    },
+    {
+      "caseId": "f701438e-c879-4422-b6e6-bf5ed0d053f6",
+      "externalId": "s:tests.test_telegram_receipts::test_fake_state_without_receipt_publisher_remains_compatible",
+      "category": "helper",
+      "reason": "only checks a test-double state without publish_receipts does not crash the drain"
+    },
+    {
+      "caseId": "8f135384-6c50-4206-be8c-b7df7aebe3eb",
+      "externalId": "s:tests.test_telegram_receipts::test_publication_failure_is_not_swallowed",
+      "category": "missing-spec",
+      "reason": "receipt publication errors propagate from the drain loop; no spec states this"
+    },
+    {
+      "caseId": "92d914b9-e930-4b96-9fa6-2ebd82f57cc2",
+      "externalId": "s:tests.test_telegram_receipts::test_receipt_callback_is_subscribed_before_connect_with_explicit_capability",
+      "category": "missing-spec",
+      "reason": "receipt callback is subscribed before connect only when the provider reports supports_receipts is True; no spec describes the subscription order"
+    },
+    {
+      "caseId": "9e077545-4d26-4c59-897e-b2e534b5543e",
+      "externalId": "s:tests.test_telegram_receipts::test_receipt_does_not_write_after_shutdown_or_failure",
+      "category": "missing-spec",
+      "reason": "receipt callback writes nothing after the collector is stopping or failed; no spec states this"
+    },
+    {
+      "caseId": "4288a863-8265-400a-bacc-da1157b8b1ae",
+      "externalId": "s:tests.test_telegram_receipts::test_subscription_type_error_is_not_misinterpreted_as_old_provider_signature",
+      "category": "missing-spec",
+      "reason": "a TypeError inside provider subscribe propagates instead of falling back to the two-callback signature; internal behaviour without a spec"
+    },
+    {
+      "caseId": "b0969b5f-2a5b-4734-aaea-f1e3e9a58c9e",
+      "externalId": "s:tests.test_whatsapp::test_cold_whatsapp_profile_drops_only_old_browser_singletons",
+      "category": "missing-spec",
+      "reason": "collector start removes stale Chromium Singleton* symlinks and keeps auth files, failing on an unexpected regular lock file; no spec describes it"
+    },
+    {
+      "caseId": "b511a57a-ddfd-4b19-8353-c67a6dca5280",
+      "externalId": "s:tests.test_whatsmeow_contract::test_actual_history_capture_uses_archive_backfill_origin",
+      "category": "missing-spec",
+      "reason": "native history capture maps to archive origin backfill; no spec states the native origin mapping"
+    }
+  ]
+}

@@ -222,6 +222,67 @@ The agent that merged a pull request checks that the `Tiden drift` run on its
 squash commit, or a later one, is green before it reports the merge as checked
 (docs/operations/parallel-development.md); a red run names the files to anchor.
 
+## Tiden health
+
+`.github/workflows/tiden-health.yml` reports after every merge whether Tiden
+still matches the code (ANYM-360). It runs when a `CI` run of a `main` push
+completes, whatever its conclusion, and on dispatch from `main`; the job's `if:`
+and a shell guard refuse any other upstream event or branch. Runs never overlap
+(one concurrency group, no cancelling). Each run checks out `main` as it is when
+it starts and freezes that HEAD as TARGET. It has `contents: read`, no persisted
+Git credential, the pinned CLI 0.33.0 called by its path, and the token only in
+its report step. It is not a required check: a red run blocks no merge, release
+or promotion, and `CI`, `CI gate`, `checks / verify`, the seven `anymsg-ci::*`
+checks, `deploy/main-ruleset.json` and `production.py verify` do not read it.
+
+`scripts/tiden_health.py` computes four metrics for TARGET, each `pass`, `fail`
+or `unknown` with its reason, and exits 0 when all pass, 1 when any fails (after
+printing every finding) and 2 when none fails and any is unknown. The run summary
+and the `tiden-health` artifact (`tiden-health.json`, uploaded even after a
+failure) hold every state, the numbers, TARGET and the evidence: the Tiden run's
+sequence, SHA, environment and completion time, the observation time and the
+upstream CI run. It writes nothing to Tiden.
+
+| Metric | Fails when | Unknown when |
+| --- | --- | --- |
+| Drift | the watermark W is still behind TARGET 15 minutes after the start | W is not on `main`'s history or diverges from TARGET, or `drift status` fails |
+| Unlinked tests | the unlinked share of active cases is 5% or more in a suite or overall; a suite has case rows but none active ("not reporting"); an active case has an unassigned path; an active unlinked case is not in `config/tiden-unlinked-tests.json`; that list is missing or has an invalid entry | no usable test evidence for TARGET (below), or a listing is incomplete |
+| Stale anchors | a `repo_file` source of this repository (or the former `anymsg` name, or none) names a path not tracked at TARGET | the spec listing is incomplete |
+| Done with open checks | a `Done` spec carries `[open: live]` or `[open: measured]` | the initial Done audit date in the script is not set yet |
+
+Test evidence is only the Tiden run on branch `main` (by branch ID),
+environment `github-actions-synthetic`, build SHA equal to TARGET, status passed
+or failed and live-doc sync `succeeded`; when several match, the newest by
+sequence. The report waits up to 30 minutes from its start for it. A live-doc
+sync that failed or was skipped, a result whose case is not on Tiden main, or no
+such run by the deadline makes the metric unknown; the newest older main run is
+then shown only with its own SHA. A case is active when it has a result in that
+run (`run results --latest-only`) and linked when its `linkedRequirementCount`
+is above zero. Other case rows are stale: counted and listed in the artifact,
+never deleted. The suites are fixed in the script, one path rule each: root
+`tests/`, calendar, calls frontend, calls, gateway, whatsmeow Go (also a bare
+`*_test.go` path), WhatsApp Node, npm and CI verifications (`.github/`). Every
+listing counts only when it ends with an empty `nextPageToken`, its integer
+`totalCount` equals its rows, its IDs are unique and, per spec, `sourceCount`
+equals its sources. CLI errors name the command only, never the response.
+
+`config/tiden-unlinked-tests.json` is the reviewed no-spec list: per case its
+`caseId`, `externalId`, a `category` (`missing-spec`, `helper`, `trivial`,
+`duplicate` or `dead-code`) and a one-line `reason`. It changes only through a
+reviewed pull request. A listed case is exempt only from the "not in the list"
+rule and still counts as unlinked in the share. The rule does not depend on when
+a case was created: a case first published on an intent branch fails when it
+becomes active on `main`, on every run until it is linked or listed.
+
+After the `main` push run of a squash publishes its evidence, the agent that
+merged it links each new test case of the change on Tiden main and reruns a
+failed `Tiden health` run (`AGENTS.md`). The measuring command gives the same
+report locally, read-only, without fetching:
+
+```sh
+uv run python scripts/tiden_health.py --product-id <pid> --workspace-id <wid> [--target <sha>]
+```
+
 ## Environments
 
 The 2026-10-16 cleanup left four Tiden run environments. CI publishes with

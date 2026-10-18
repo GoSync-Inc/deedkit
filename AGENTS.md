@@ -102,7 +102,13 @@ A skipped pull request builds the list from the anchors alone, anchors its new
 code files on the specs they implement before or in the same step as its merge
 (the drift workflow fails without them, TIDEN-CI.md) and ends with a `Spec sync:`
 line naming its new tests and the card it delivers, if any, for the release spec
-sync.
+sync. New tests get their links at merge, not at that sync: after the `main` push
+run of the squash publishes its evidence, the agent that merged any pull request
+links each new test case of that change to the spec it verifies on Tiden main
+(`tiden test link-spec`, after reading the test) and reruns a failed `Tiden health`
+run (TIDEN-CI.md). A case that no spec describes goes into
+`config/tiden-unlinked-tests.json` with its category and reason through a pull
+request, and a `missing-spec` entry goes to the orchestrator as a card candidate.
 The reviewers of its level (for a normal PR, the release review) receive the
 current text of the promised and the flagged specs and the IDs and dispositions
 of the rest, and check each disposition; "no behavior change" on a spec whose

@@ -293,8 +293,13 @@ merge the worker checks it and reports.
 
 Checked after the merge means a successful `main` push run on the squash commit
 or a later one, a green `Tiden drift` run on it or a later one (a red run names
-the files to anchor, TIDEN-CI.md) and, for a change with a Tiden branch, Tiden
-main and drift read back as in [tiden-product-workflow.md](tiden-product-workflow.md).
+the files to anchor, TIDEN-CI.md), each new test case of the change linked to
+the spec it verifies on Tiden main or listed in `config/tiden-unlinked-tests.json`
+(`AGENTS.md`, skipped pull requests), a failed `Tiden health` run rerun after
+those links, and, for a change with a Tiden branch, Tiden main and drift read
+back as in [tiden-product-workflow.md](tiden-product-workflow.md). The `Tiden
+health` run need not be green: it also fails on debt other changes left, and a
+finding of this change's own new cases is the one the merging agent fixes.
 
 A worker that merged its own pull request reaches its final result already
 merged and checked; a worker whose pull request the owner keeps stays open after

@@ -1,0 +1,91 @@
+name: Tiden health
+on:
+  # After every CI run of a main push, whatever its conclusion, and on dispatch from main (ANYM-360, TIDEN-CI.md).
+  # It reads the Tiden data the push run published; it is not a required check and blocks no merge or release.
+  workflow_run:  # zizmor: ignore[dangerous-triggers] only main pushes pass the guards; it checks out main, not the upstream head
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  # Runs never overlap. GitHub may replace a pending run with a newer one; each run measures the head of main when it
+  # starts, so whichever run executes last covers every merge.
+  group: tiden-health
+  cancel-in-progress: false
+jobs:
+  report:
+    name: Tiden health report
+    # Only the reviewed workflow and tools on main may use the Tiden credential, and only after a main push run.
+    if: >-
+      github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'))
+    runs-on: ubuntu-latest
+    # The report waits up to 15 minutes for the watermark and 30 minutes from its start for the test evidence.
+    timeout-minutes: 45
+    steps:
+      # Expression comparisons ignore case; these do not, and run before any repository code.
+      - name: Require the main branch exactly
+        env:
+          REF: ${{ github.ref }}
+          EVENT: ${{ github.event_name }}
+          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+          UPSTREAM_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          test "$REF" = refs/heads/main
+          if [ "$EVENT" = workflow_run ]; then
+            test "$UPSTREAM_EVENT" = push
+            test "$UPSTREAM_BRANCH" = main
+          else
+            test "$EVENT" = workflow_dispatch
+          fi
+      - name: Check optional Tiden configuration
+        id: config
+        # Only whether the secret exists; the token itself reaches the report step alone.
+        env:
+          HAS_TOKEN: ${{ secrets.TIDEN_API_TOKEN != '' }}
+          TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
+          TIDEN_WORKSPACE_ID: ${{ vars.TIDEN_WORKSPACE_ID }}
+        run: |
+          if [ "$HAS_TOKEN" != true ]; then
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'Tiden reporting is not configured; see TIDEN-CI.md.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            test -n "$TIDEN_PRODUCT_ID"
+            test -n "$TIDEN_WORKSPACE_ID"
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          fi
+      # main as it is when the run starts; its HEAD is TARGET, recorded in the summary.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: steps.config.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+          ref: main
+          fetch-depth: 0
+      # The report calls the CLI by its path; a workflow_run job writes nothing to GITHUB_PATH or GITHUB_ENV.
+      - name: Install pinned Tiden CLI with integrity check
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.33.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
+          echo "3f6b650c4cabd58ce4149d9106325cbd36d1472cccc9c63ca03137668b80e4a6  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
+          mkdir "$RUNNER_TEMP/tiden-bin"
+          tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
+      - name: Measure drift, unlinked tests, stale anchors and Done specs with open checks
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
+          TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
+          TIDEN_WORKSPACE_ID: ${{ vars.TIDEN_WORKSPACE_ID }}
+          TIDEN_BASE_URL: https://app.tiden.ai
+          UPSTREAM_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          UPSTREAM_SHA: ${{ github.event.workflow_run.head_sha }}
+        # Exit 1: a metric failed; exit 2: none failed and one is unknown.
+        run: python3 scripts/tiden_health.py --cli "$RUNNER_TEMP/tiden-bin/tiden" --fetch --output "$RUNNER_TEMP/tiden-health.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && steps.config.outputs.enabled == 'true'
+        with:
+          name: tiden-health
+          path: ${{ runner.temp }}/tiden-health.json
+          if-no-files-found: warn
+          overwrite: true
