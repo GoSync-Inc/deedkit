@@ -14,6 +14,7 @@ import threading
 import time
 
 from . import __version__
+from .operational import TELEMETRY_STOP_CODES as STOP_CODES
 
 COMPONENTS = {'gateway', 'telegram', 'whatsapp', 'indexer', 'enricher', 'subscriptions'}
 CODES = {'request_failed', 'tool_failed', 'collector_failed', 'indexer_failed',
@@ -41,7 +42,11 @@ def release():
 
 def safe_event(error, component, code):
     """Never stringify exceptions, inspect locals, read source lines or retain a traceback."""
-    if component not in COMPONENTS or code not in CODES:
+    # A collector stop also reports its fixed stop code, so Tiden groups each cause (ANYM-292).
+    # Only built-in strings: a str subclass can fake equality with an allowlisted value.
+    if type(component) is not str or type(code) is not str:
+        return None
+    if component not in COMPONENTS or (code not in CODES and code not in STOP_CODES.get(component, ())):
         return None
     frames = []
     tb = error.__traceback__ if isinstance(error, BaseException) else None
@@ -69,10 +74,12 @@ def before_send(event):
         tags = event['tags']
         component, code = tags['component'], tags['error_code']
         clean = safe_event(None, component, code)
-        if clean is None or event.get('environment') not in ENVIRONMENTS:
+        environment = event.get('environment')
+        if clean is None or type(environment) is not str or environment not in ENVIRONMENTS:
             return None
         value = event['exception']['values'][0]
-        clean['exception']['values'][0]['type'] = value['type'] if value['type'] in EXCEPTION_TYPES else 'UnexpectedError'
+        kind = value['type']
+        clean['exception']['values'][0]['type'] = kind if type(kind) is str and kind in EXCEPTION_TYPES else 'UnexpectedError'
         frames = []
         for frame in value.get('stacktrace', {}).get('frames', [])[-16:]:
             filename, lineno = frame.get('filename'), frame.get('lineno')

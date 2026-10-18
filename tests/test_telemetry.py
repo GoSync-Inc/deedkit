@@ -276,3 +276,185 @@ def test_gateway_reports_unexpected_errors_only(channel, unexpected, monkeypatch
         worker.close()
     assert bool(transport.envelopes) == unexpected
     assert SECRET not in repr(transport.envelopes)
+
+
+def stopped(component, monkeypatch, text, detail=None, stop=None):
+    """Run a collector's main against a synthetic stop (or a prepared exception)."""
+    import sys
+    from pathlib import Path
+    from messaging_service import telegram_collector, whatsapp_collector
+    collector = {'telegram': telegram_collector, 'whatsapp': whatsapp_collector}[component]
+    monkeypatch.setattr(telemetry, 'configure', lambda component: None)
+    async def failed(config):
+        assert config == Path('/synthetic/config.json')
+        try:
+            raise OSError(SECRET)
+        except OSError as cause:
+            error = stop
+            if error is None:
+                error = RuntimeError(text)
+                error.detail = detail
+            raise error from cause
+    monkeypatch.setattr(collector, 'run_config', failed)
+    monkeypatch.setattr(collector.os, 'umask', lambda mode: None)
+    monkeypatch.setattr(sys, 'argv', ['anymsg', '--config', '/synthetic/config.json'])
+    with pytest.raises(SystemExit) as result:
+        collector.main()
+    assert result.value.code == 1
+
+
+@pytest.mark.parametrize('component,text,detail,code,line', [
+    ('telegram', 'capture_overload', None, 'capture_overload', {'code': 'capture_overload'}),
+    ('telegram', 'provider_disconnected', SECRET, 'provider_disconnected', {'code': 'provider_disconnected'}),
+    ('telegram', 'durable_capture_failed', 'spool_io_error', 'durable_capture_failed.spool_io_error',
+     {'code': 'durable_capture_failed', 'detail': 'spool_io_error'}),
+    ('telegram', 'durable_capture_failed', 'disk_reserve', 'durable_capture_failed.disk_reserve',
+     {'code': 'durable_capture_failed', 'detail': 'disk_reserve'}),
+    ('telegram', 'durable_capture_failed', SECRET, 'durable_capture_failed', {'code': 'durable_capture_failed'}),
+    ('telegram', 'durable_capture_failed', None, 'durable_capture_failed', {'code': 'durable_capture_failed'}),
+    ('telegram', 'durable_capture_failed', ['spool_full'], 'durable_capture_failed', {'code': 'durable_capture_failed'}),
+    # A connection code reaches Tiden; the supervisor line keeps its own smaller vocabulary.
+    ('telegram', 'spool_corrupt', None, 'spool_corrupt', {'code': 'collector_failed'}),
+    ('telegram', 'durable_capture_failed.spool_full', None, 'collector_failed', {'code': 'collector_failed'}),
+    ('telegram', SECRET, 'spool_full', 'collector_failed', {'code': 'collector_failed'}),
+    ('whatsapp', 'provider_disconnected', None, 'provider_disconnected', {'code': 'provider_disconnected'}),
+    ('whatsapp', 'whatsapp_logged_out', None, 'whatsapp_logged_out', {'code': 'collector_failed'}),
+    ('whatsapp', 'durable_capture_failed', None, 'durable_capture_failed', {'code': 'collector_failed'}),
+    # Only Telegram records a fixed capture detail; WhatsApp never qualifies its code.
+    ('whatsapp', 'durable_capture_failed', 'spool_full', 'durable_capture_failed', {'code': 'collector_failed'}),
+    ('whatsapp', SECRET, None, 'collector_failed', {'code': 'collector_failed'}),
+])
+def test_collector_stop_reports_the_fixed_stop_code(component, text, detail, code, line, monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr(telemetry, 'capture', lambda error, code: seen.append(code))
+    stopped(component, monkeypatch, text, detail)
+    assert seen == [code]
+    assert json.loads(capsys.readouterr().out) == {'status': 'stopped', **line}
+
+
+class LooksSafe(str):
+    """Private text whose hash and equality pretend to be an allowlisted code."""
+    def __new__(cls, text, target):
+        value = super().__new__(cls, text)
+        value.target = target
+        return value
+    def __hash__(self):
+        return hash(self.target)
+    def __eq__(self, other):
+        return other == self.target
+    def __add__(self, other):
+        return LooksSafe(str.__add__(self, other), self.target + other)
+
+
+class Unhashable(str):
+    __hash__ = None
+
+
+def odd_stop(kind):
+    class TextRaises(Exception):
+        def __str__(self):
+            raise AssertionError(SECRET)
+    class TextLooksSafe(Exception):
+        def __str__(self):
+            return LooksSafe(SECRET, 'capture_overload')
+    class DetailRaises(RuntimeError):
+        @property
+        def detail(self):
+            raise ValueError(SECRET)
+    if kind == 'text_raises':
+        return TextRaises(SECRET)
+    if kind == 'text_looks_safe':
+        return TextLooksSafe(SECRET)
+    if kind == 'detail_raises':
+        return DetailRaises('durable_capture_failed')
+    stop = RuntimeError('durable_capture_failed')
+    stop.detail = {'detail_looks_safe': LooksSafe(SECRET, 'spool_full'), 'detail_unhashable': Unhashable('spool_full')}[kind]
+    return stop
+
+
+@pytest.mark.parametrize('kind,code', [('text_raises', 'collector_failed'), ('text_looks_safe', 'collector_failed'),
+    ('detail_raises', 'durable_capture_failed'), ('detail_looks_safe', 'durable_capture_failed'),
+    ('detail_unhashable', 'durable_capture_failed')])
+def test_collector_stop_with_odd_text_or_detail_still_reports_a_fixed_code(kind, code, monkeypatch, capsys):
+    transport = Transport()
+    worker = reporter(transport, 'telegram')
+    monkeypatch.setattr(telemetry, '_reporter', worker)
+    try:
+        stopped('telegram', monkeypatch, None, stop=odd_stop(kind))
+        assert transport.ready.wait(1)
+    finally:
+        worker.close()
+    raw = transport.envelopes[0].decode()
+    event = json.loads(raw.splitlines()[2])
+    assert SECRET not in raw and 'synthetic-private-token' not in raw
+    assert event['tags'] == {'component': 'telegram', 'error_code': code}
+    assert event['exception']['values'][0]['value'] == code
+    line = capsys.readouterr().out
+    assert SECRET not in line and json.loads(line) == {'status': 'stopped', 'code': code}
+
+
+@pytest.mark.parametrize('component,text,detail,code', [
+    ('telegram', 'durable_capture_failed', 'spool_full', 'durable_capture_failed.spool_full'),
+    ('telegram', 'durable_capture_failed', SECRET, 'durable_capture_failed'),
+    ('telegram', 'capture_overload', SECRET, 'capture_overload'),
+    ('telegram', SECRET, SECRET, 'collector_failed'),
+    ('whatsapp', 'whatsapp_logged_out', SECRET, 'whatsapp_logged_out'),
+    ('whatsapp', 'durable_capture_failed', 'spool_full', 'durable_capture_failed'),
+    ('whatsapp', SECRET, SECRET, 'collector_failed'),
+])
+def test_collector_stop_event_on_the_wire_has_no_exception_text(component, text, detail, code, monkeypatch):
+    transport = Transport()
+    worker = reporter(transport, component)
+    monkeypatch.setattr(telemetry, '_reporter', worker)
+    try:
+        stopped(component, monkeypatch, text, detail)
+        assert transport.ready.wait(1)
+    finally:
+        worker.close()
+    raw = transport.envelopes[0].decode()
+    event = json.loads(raw.splitlines()[2])
+    assert SECRET not in raw and 'synthetic-private-token' not in raw
+    assert event['tags'] == {'component': component, 'error_code': code}
+    value = event['exception']['values'][0]
+    assert value['type'] == 'RuntimeError' and value['value'] == code
+    assert {frame['filename'] for frame in value['stacktrace']['frames']} <= {
+        telemetry.FRAME_PREFIX + component + '_collector.py'}
+
+
+def test_stop_codes_are_allowlisted_for_collectors_only():
+    from messaging_service.collector_state import CAPTURE_STOP_DETAILS
+    from messaging_service.operational import CONNECTION_ERRORS, SUPERVISOR_STOP_CODES
+    durable = {'durable_capture_failed.' + detail for detail in CAPTURE_STOP_DETAILS}
+    assert telemetry.STOP_CODES['telegram'] == SUPERVISOR_STOP_CODES['telegram'] | CONNECTION_ERRORS | durable
+    assert telemetry.STOP_CODES['whatsapp'] == SUPERVISOR_STOP_CODES['whatsapp'] | CONNECTION_ERRORS
+    assert telemetry.safe_event(error(), 'telegram', 'durable_capture_failed.spool_io_error')
+    assert telemetry.safe_event(error(), 'whatsapp', 'durable_capture_failed.spool_io_error') is None
+    for component in ('telegram', 'whatsapp'):
+        assert telemetry.safe_event(error(), component, 'durable_capture_failed.' + SECRET) is None
+        assert telemetry.safe_event(error(), component, SECRET) is None
+        assert telemetry.safe_event(error(), component, LooksSafe(SECRET, 'capture_overload')) is None
+    for component in telemetry.COMPONENTS - {'telegram', 'whatsapp'}:
+        assert telemetry.safe_event(error(), component, 'capture_overload') is None
+    event = telemetry.safe_event(error(), 'telegram', 'capture_overload')
+    event.update(event_id='c'*32, timestamp=1, environment='local-synthetic')
+    assert telemetry.before_send(event)['tags']['error_code'] == 'capture_overload'
+    for component, code in [('telegram', 'durable_capture_failed.' + SECRET), ('gateway', 'capture_overload'),
+                            ('whatsapp', 'durable_capture_failed.spool_full'),
+                            ('telegram', LooksSafe(SECRET, 'capture_overload'))]:
+        event['tags'].update(component=component, error_code=code)
+        assert telemetry.before_send(event) is None
+    event['tags'].update(component='telegram', error_code='capture_overload')
+    event['environment'] = LooksSafe(SECRET, 'local-synthetic')
+    assert telemetry.before_send(event) is None
+
+
+def test_telemetry_document_lists_the_stop_vocabulary():
+    import re
+    from pathlib import Path
+    text = (Path(__file__).resolve().parents[1]/'TELEMETRY.md').read_text()
+    def listed(title):
+        section = re.search(rf'^{title}: (.+?)\.$', text, re.M | re.S)
+        return set(re.findall(r'`([a-z_.]+)`', section.group(1)))
+    # Both collectors share the stop codes; a split must be documented.
+    assert listed('Collector stop codes') == telemetry.STOP_CODES['whatsapp']
+    assert listed('Collector stop codes') | listed('Telegram only') == telemetry.STOP_CODES['telegram']

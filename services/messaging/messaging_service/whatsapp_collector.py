@@ -19,7 +19,7 @@ from .blobs import BlobWriter
 from .collector_state import CaptureSpool,CollectorState,session_lock,validate_capture
 from .store import Store
 from .telegram_collector import TelegramCollector,ProviderUnavailable,private_json
-from .operational import CONNECTION_ERRORS,MEDIA_ERRORS
+from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy
 
 
@@ -575,11 +575,9 @@ def main():
     args=parser.parse_args();os.umask(0o077)
     try:asyncio.run(run_config(args.config))
     except Exception as exc:
-        capture(exc, 'collector_failed')
-        safe={'collector_disabled','session_handover_not_confirmed','whatsapp_pairing_required','whatsapp_identity_mismatch',
-            'private_session_required','live_account_required','collector_already_owned','session_already_owned',
-            'collector_lease_lost','collection_disabled','provider_disconnected'}
-        print(json.dumps({'status':'stopped','code':str(exc) if str(exc) in safe else 'collector_failed'}),flush=True)
+        code,_,event=collector_stop(exc,'whatsapp')
+        capture(exc, event)
+        print(json.dumps({'status':'stopped','code':code}),flush=True)
         raise SystemExit(1) from None
 
 

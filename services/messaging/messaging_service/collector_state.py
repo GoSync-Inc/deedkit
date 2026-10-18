@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from psycopg.types.json import Jsonb
 
-from .operational import CONNECTION_ERRORS,TERMINAL,PHASE_STATES,PHASE_REASONS
+from .operational import CAPTURE_STOP_DETAILS,CONNECTION_ERRORS,TERMINAL,PHASE_STATES,PHASE_REASONS
 
 from .envelope import canonical,utc,validate,stable_id,MAX_ENVELOPE
 from .spool import DurableSpool
@@ -78,9 +78,8 @@ LIVE_REJECT_CODES=frozenset({'invalid_capture','invalid_capture_kind','invalid_c
     'invalid_receipt','invalid_receipt_account','invalid_receipt_chat','invalid_receipt_platform',
     'invalid_receipt_reference','unsupported_receipt_provider_time','invalid_whatsapp_event',
     'invalid_provider_message','receipt_parse_failed','read_parse_failed'})
-# Stop codes of live capture itself, and the fixed causes of a fail-closed write.
+# Stop codes of live capture itself; the fixed causes of a fail-closed write are CAPTURE_STOP_DETAILS.
 CAPTURE_STOPS={'durable_capture_failed','capture_overload'}
-CAPTURE_STOP_DETAILS={'spool_full','disk_reserve','spool_io_error','capture_error'}
 
 
 def validate_rejected_message(value):

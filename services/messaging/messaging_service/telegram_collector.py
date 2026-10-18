@@ -16,11 +16,11 @@ import time
 from .adapters import telegram_message
 from .archive import Archive
 from .blobs import BlobWriter
-from .collector_state import CAPTURE_STOP_DETAILS,LIVE_REJECT_CODES,CaptureSpool,CollectorState,session_lock
+from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,session_lock
 from .spool import InvalidCapture
 from .store import Store
 from .telegram_governor import ProviderRateLimited,RequestGovernor
-from .operational import CONNECTION_ERRORS,MEDIA_ERRORS
+from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .storage_admission import MEDIA_RESERVE_BYTES
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy,validate_prefetch_days
 
@@ -857,17 +857,11 @@ def main():
     os.umask(0o077)
     try: asyncio.run(run_config(args.config))
     except Exception as exc:
-        capture(exc, 'collector_failed')
         # Exception strings from providers can contain private requests. Emit
-        # only this service's fixed error vocabulary to the supervisor.
-        safe={'collector_disabled','session_handover_not_confirmed','telegram_pairing_required',
-              'telegram_identity_mismatch','private_session_required','live_account_required',
-              'collector_already_owned','session_already_owned','collector_lease_lost',
-              'durable_capture_failed','capture_overload','collection_disabled','provider_disconnected'}
-        code=str(exc) if str(exc) in safe else 'collector_failed'
-        detail=getattr(exc,'detail',None)
-        print(json.dumps({'status':'stopped','code':code,
-            **({'detail':detail} if code=='durable_capture_failed' and detail in CAPTURE_STOP_DETAILS else {})}),flush=True)
+        # only this service's fixed error vocabulary to Tiden and the supervisor.
+        code,detail,event=collector_stop(exc,'telegram')
+        capture(exc, event)
+        print(json.dumps({'status':'stopped','code':code,**({'detail':detail} if detail else {})}),flush=True)
         raise SystemExit(1) from None
 
 
