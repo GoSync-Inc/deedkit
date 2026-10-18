@@ -57,8 +57,9 @@ DESTRUCTIVE_SQL_IN_CODE = re.compile(
     r"alter\s+column\s+\S+\s+(set\s+data\s+)?type|set\s+not\s+null))\b")
 DOLLAR_QUOTE = re.compile(r"\$([A-Za-z_]\w*)?\$")
 QUOTES = "\"'`"
-# A string literal joined to the previous one: `+`, a line continuation or nothing between, then a prefixed quote.
-JOINED_LITERAL = re.compile(r"\s*\+?\s*(\\\s*)?[A-Za-z]{0,2}([\"'`])")
+# A string literal joined to the previous one: `+`, a line continuation, comments or nothing between, then a prefixed
+# quote.
+JOINED_LITERAL = re.compile(r"(\s|#[^\n]*|//[^\n]*)*\+?(\s|#[^\n]*|//[^\n]*)*(\\\s*)?[A-Za-z]{0,2}(?P<quote>[\"'`])")
 CODE_SUFFIXES = {".py", ".go", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".sh"}
 AGENT_SETTINGS = ".claude/settings.json"
 # An agent permission may be added to `allow` without the owner only when it is read-only by name.
@@ -148,6 +149,8 @@ def sql_statements(text: str) -> list[str]:
                 pair = text[at:at + 2]
                 depth += {"/*": 1, "*/": -1}.get(pair, 0)
                 at += 2 if pair in ("/*", "*/") else 1
+            if depth:
+                raise ValueError("unterminated block comment")
             current.append(" ")
         elif char in "'\"":
             escapes = char == "'" and text[at - 1:at] in ("e", "E") and not re.match(r"\w", text[at - 2:at - 1] or " ")
@@ -159,11 +162,15 @@ def sql_statements(text: str) -> list[str]:
                     break
                 else:
                     end += 1
+            if end >= size:
+                raise ValueError("unterminated quote")
             current.append(text[at:end + 1])
             at = end + 1
         elif char == "$" and (tag := DOLLAR_QUOTE.match(text, at)):
             end = text.find(tag.group(0), tag.end())
-            end = size if end < 0 else end + len(tag.group(0))
+            if end < 0:
+                raise ValueError("unterminated dollar quote")
+            end += len(tag.group(0))
             current.append(text[at:end])
             at = end
         elif char == ";":
@@ -177,25 +184,25 @@ def sql_statements(text: str) -> list[str]:
 
 
 def code_statements(text: str) -> list[str]:
-    """Each upper-case destructive SQL match in code with the rest of its string literal (and of literals joined to
-    it) and of that source line, whitespace collapsed, so a changed target or predicate is a new statement."""
+    """Each destructive SQL match in code with the rest of its string literal (and of literals joined to it) and of
+    that source line, whitespace collapsed, so a changed target or predicate is a new statement. A match that does not
+    open its string literal (after a comment or a CTE inside the literal, or outside any literal) cannot be bounded:
+    a doubt."""
     found = []
     for match in DESTRUCTIVE_SQL_IN_CODE.finditer(text):
         quote, end = text[:match.start()].rstrip()[-1:], match.end()
-        if quote and quote in QUOTES:
-            while (close := text.find(quote, end)) >= 0:
-                end = close + 1
-                joined = JOINED_LITERAL.match(text, end)
-                if not joined:
-                    break
-                quote, end = joined.group(2), joined.end()
-            else:
-                end = len(text)
-            stops = (text.find("\n", end),)
+        if not quote or quote not in QUOTES:
+            raise ValueError("destructive SQL whose statement cannot be bounded")
+        while (close := text.find(quote, end)) >= 0:
+            end = close + 1
+            joined = JOINED_LITERAL.match(text, end)
+            if not joined:
+                break
+            quote, end = joined.group("quote"), joined.end()
         else:
-            stops = (text.find(";", end), text.find("\n", end))
-        end = min([stop for stop in stops if stop >= 0] or [len(text)])
-        found.append(" ".join(text[match.start():end].split()))
+            end = len(text)
+        newline = text.find("\n", end)
+        found.append(" ".join(text[match.start():len(text) if newline < 0 else newline].split()))
     return found
 
 
@@ -338,8 +345,10 @@ def required_checks(root: Path, revision: str) -> set[str]:
 def allow_widening(before: str | None, after: str | None) -> list[str]:
     """Added `allow` entries that are not read-only, removed `deny` or `ask` entries and a changed default mode."""
     def lists(text):
-        block = (json.loads(text) if text else {}).get("permissions") or {}
-        entries = {key: block.get(key) or [] for key in ("allow", "deny", "ask")}
+        block = (json.loads(text) if text else {}).get("permissions", {})
+        if not isinstance(block, dict):
+            raise ValueError("permissions is not an object")
+        entries = {key: block.get(key, []) for key in ("allow", "deny", "ask")}
         if not all(isinstance(value, list) and all(isinstance(entry, str) for entry in value)
                    for value in entries.values()):
             raise ValueError("permission entries are not lists of strings")

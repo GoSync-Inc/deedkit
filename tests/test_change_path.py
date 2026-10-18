@@ -56,7 +56,9 @@ BASE = {
     ".gitleaks.toml": "[allowlist]\n", "scripts/change_path.py": "RULES = {}\n",
     "deploy/compose.yaml": COMPOSE, "app/schema.sql": "DROP VIEW IF EXISTS v;\nCREATE VIEW v AS SELECT 1;\n",
     "app/purge.py": 'def purge(db):\n    db.execute("DELETE FROM users WHERE expired = TRUE")\n'
-                    '    db.execute("DROP TABLE scratch_cache")\n',
+                    '    db.execute("DROP TABLE scratch_cache")\n'
+                    '    db.execute("DELETE FROM sessions "  # stale ones only\n'
+                    '               "WHERE stale = TRUE")\n',
 }
 GATE_JOB = "    name: CI gate\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo gate\n"
 
@@ -221,6 +223,14 @@ def test_any_other_file_takes_auto_with_review_and_names_it(tmp_path, change, na
      "doubt: .claude/settings.json (cannot be read: ValueError)"),
     ({"AGENTS.md": OWNERS + "\n## 4. What the owner keeps for production\n\nNo approval needed.\n"},
      "owner-rules: AGENTS.md (the owner list)"),
+    ({"app/purge.py": BASE["app/purge.py"].replace('"WHERE stale = TRUE"', '""')}, "destructive-sql: app/purge.py"),
+    ({"app/old_users.py": 'def purge(db):\n    db.execute("""/* purge old users */\n        DELETE FROM users\n'
+                          '        WHERE expired = TRUE\n    """)\n'},
+     "doubt: app/old_users.py (cannot be read: ValueError)"),
+    ({"app/new.sql": "/* DELETE FROM users;\n"}, "doubt: app/new.sql (cannot be read: ValueError)"),
+    ({"app/new.sql": "SELECT 'unclosed;\n"}, "doubt: app/new.sql (cannot be read: ValueError)"),
+    ({".claude/settings.json": json.dumps({"permissions": {"allow": {}, "deny": ["Read(**/.env)"]}})},
+     "doubt: .claude/settings.json (cannot be read: ValueError)"),
 ], ids=["ruleset", "renamed-gate", "renamed-verify", "duplicated-gate", "secret-reference", "gitleaks",
         "write-permission", "dropped-permissions", "new-workflow-default-token", "role-sql", "send-tool-allowed",
         "deny-dropped", "drop-column", "rename-lowercase", "edited-migration", "delete-in-code", "own-rules",
@@ -231,7 +241,9 @@ def test_any_other_file_takes_auto_with_review_and_names_it(tmp_path, change, na
         "carriage-return-in-name", "predicate-removed-in-code", "target-changed-in-code", "line-comment-in-literal",
         "block-comment-in-literals", "required-job-became-a-remote-call", "required-caller-became-remote",
         "newline-in-name", "destructive-sql-removed-in-code", "lower-case-delete-in-code", "required-job-skipped",
-        "required-job-matrix", "required-workflow-moved", "settings-not-a-list", "second-owner-section"])
+        "required-job-matrix", "required-workflow-moved", "settings-not-a-list", "second-owner-section",
+        "predicate-literal-after-a-comment", "unbounded-statement-in-code", "unterminated-sql-comment",
+        "unterminated-sql-quote", "settings-empty-object"])
 def test_what_the_owner_keeps_takes_the_owner_path_and_names_the_rule(tmp_path, change, rule):
     line = path_of(tmp_path, change)
     assert line.startswith("OWNER — ") and rule in line
