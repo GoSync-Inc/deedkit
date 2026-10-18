@@ -29,6 +29,34 @@ def utc(value):
     except ValueError: raise ValueError('invalid_timestamp') from None
 
 
+FORWARD_KINDS = ('user','chat','channel','hidden_user','status','newsletter','unknown')
+FORWARD_BASES = ('telegram_fwd_from','whatsmeow_context_info','whatsapp_web_js_message')
+WHATSAPP_FORWARD_ORIGINS = ('UNKNOWN','CHAT','STATUS','CHANNELS','META_AI','UGC')
+FORWARD_TEXT = {'sender_id':160,'sender_name':256,'chat_id':160,'provider_message_id':256,'post_author':256}
+
+
+def forward_origin(value):
+    """Provider-stated origin of a forwarded message: bounded strings, closed enums, no inference."""
+    if not isinstance(value,dict) or set(value)-{*FORWARD_TEXT,'kind','sent_at','forwarding_score','provider_origin_type','basis'} \
+            or value.get('kind') not in FORWARD_KINDS or value.get('basis') not in FORWARD_BASES:
+        raise ValueError('invalid_metadata')
+    result={}
+    for key,item in value.items():
+        if item is None:continue
+        if key in FORWARD_TEXT:
+            if not isinstance(item,str) or not item or '\x00' in item or len(item)>FORWARD_TEXT[key]:raise ValueError('invalid_metadata')
+        elif key=='sent_at':
+            # Provider time: NUL never reaches the parser and an out-of-range offset is invalid, not a crash.
+            if not isinstance(item,str) or '\x00' in item:raise ValueError('invalid_metadata')
+            try:item=utc(item)
+            except (ValueError,OverflowError):raise ValueError('invalid_metadata') from None
+        elif key=='forwarding_score':
+            if type(item) is not int or not 0<=item<2**32:raise ValueError('invalid_metadata')
+        elif key=='provider_origin_type' and item not in WHATSAPP_FORWARD_ORIGINS:raise ValueError('invalid_metadata')
+        result[key]=item
+    return result
+
+
 def text(value, maximum, name, empty=False):
     if not isinstance(value, str) or '\x00' in value or len(value)>maximum or (not empty and not value):
         raise ValueError('invalid_'+name)
@@ -65,12 +93,17 @@ def validate(data):
     if 'metadata' in data:
         metadata=data['metadata']
         if not isinstance(metadata,dict) or set(metadata)-{'reply_to_provider_id','forwarded','media_kind','mentions_owner','reply_to_owner','sender_is_bot','chat_type','sender_identity_basis','is_service','is_self_chat','sender_is_contact',
-                'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds'}:
+                'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin'}:
             raise ValueError('invalid_metadata')
         result['metadata']={}
         for key,value in metadata.items():
             if key in ('forwarded','mentions_owner','reply_to_owner','sender_is_bot','is_service','is_self_chat','sender_is_contact'):
                 if value is not None and type(value) is not bool:raise ValueError('invalid_metadata')
+            elif key=='forward_origin':
+                # Only a forwarded message has an origin; it is never the sender's own authorship.
+                if value is not None:
+                    if metadata.get('forwarded') is not True:raise ValueError('invalid_metadata')
+                    value=forward_origin(value)
             elif key=='media_duration_seconds':
                 if value is not None and (type(value) not in (int,float) or not 0<=value<=86400 or not math.isfinite(value)):
                     raise ValueError('invalid_metadata')

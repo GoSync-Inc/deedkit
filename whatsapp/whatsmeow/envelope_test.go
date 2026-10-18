@@ -333,3 +333,63 @@ func TestNativeRoundVideoInPreUpgradeCacheRecordStaysAttachmentFree(t *testing.T
 		})
 	}
 }
+
+func forwardedText(id string, ctx *waE2E.ContextInfo) *events.Message {
+	m := fixtureMessage(id, 1700000000)
+	ctx.IsForwarded = proto.Bool(true)
+	m.Message = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String("forwarded words"), ContextInfo: ctx}}
+	m.RawMessage = m.Message
+	return m
+}
+
+func TestNativeForwardOriginStatesNewsletterOrUnknown(t *testing.T) {
+	t.Setenv("ANYMSG_CAPTURE_FORWARD_ORIGIN", "1")
+	newsletter := forwardedText("news", &waE2E.ContextInfo{ForwardingScore: proto.Uint32(3), ForwardOrigin: waE2E.ContextInfo_CHANNELS.Enum(),
+		ForwardedNewsletterMessageInfo: &waE2E.ContextInfo_ForwardedNewsletterMessageInfo{NewsletterJID: proto.String("120363000000000001@newsletter"),
+			NewsletterName: proto.String("Synthetic Channel"), ServerMessageID: proto.Int32(77)}})
+	v, err := NormalizeMessage(newsletter, types.EmptyJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireArchivable(t, v)
+	want := map[string]any{"kind": "newsletter", "basis": "whatsmeow_context_info", "chat_id": "120363000000000001@newsletter",
+		"sender_name": "Synthetic Channel", "provider_message_id": "77", "forwarding_score": uint32(3), "provider_origin_type": "CHANNELS"}
+	origin, _ := v["forwardOrigin"].(map[string]any)
+	if v["forwarded"] != true || len(origin) != len(want) {
+		t.Fatalf("forwardOrigin = %#v", v["forwardOrigin"])
+	}
+	for field, value := range want {
+		if origin[field] != value {
+			t.Fatalf("%s = %#v, want %#v", field, origin[field], value)
+		}
+	}
+	// An ordinary chat forward does not carry its author: kind unknown, with the score.
+	plain, err := NormalizeMessage(forwardedText("plain", &waE2E.ContextInfo{ForwardingScore: proto.Uint32(5)}), types.EmptyJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, _ = plain["forwardOrigin"].(map[string]any)
+	if len(origin) != 3 || origin["kind"] != "unknown" || origin["forwarding_score"] != uint32(5) || origin["basis"] != "whatsmeow_context_info" {
+		t.Fatalf("plain forwardOrigin = %#v", plain["forwardOrigin"])
+	}
+}
+
+func TestNativeForwardOriginIsOmittedUnlessEnabledAndForwarded(t *testing.T) {
+	t.Setenv("ANYMSG_CAPTURE_FORWARD_ORIGIN", "")
+	v, err := NormalizeMessage(forwardedText("off", &waE2E.ContextInfo{ForwardingScore: proto.Uint32(5)}), types.EmptyJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v["forwardOrigin"]; ok || v["forwarded"] != true {
+		t.Fatalf("disabled capture emitted forwardOrigin: %#v", v)
+	}
+	t.Setenv("ANYMSG_CAPTURE_FORWARD_ORIGIN", "1")
+	m := forwardedText("not-forwarded", &waE2E.ContextInfo{ForwardingScore: proto.Uint32(5)})
+	m.Message.ExtendedTextMessage.ContextInfo.IsForwarded = proto.Bool(false)
+	if v, err = NormalizeMessage(m, types.EmptyJID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v["forwardOrigin"]; ok {
+		t.Fatalf("non-forwarded message has forwardOrigin: %#v", v)
+	}
+}

@@ -169,6 +169,16 @@ Use the same asset override for pairing and the collector. Native Windows server
 and Docker ARM support are not claimed. See the source Dockerfiles for pinned
 system dependencies; the Python package alone is not a one-command VPS installer.
 
+### Forwarded message origin
+
+Collectors record where a forwarded message came from (`forward_origin`,
+[SEARCH.md](SEARCH.md#forwarded-messages)) only when their environment sets
+`ANYMSG_CAPTURE_FORWARD_ORIGIN=1`; it is off by default. The server always
+accepts and returns a captured origin. Set it on the Telegram and WhatsApp
+collector services only once the release a rollback would return to already
+contains forward origin support: an older server rejects such a capture and the
+collector skips that message.
+
 ### Reply queue upgrade (0.9.17)
 
 Apply migration 027 as owner and reapply `gateway_role.sql` and

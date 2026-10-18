@@ -186,6 +186,30 @@ def test_list_chats_awaiting_reply_25_rows_within_30000_chars(recent_queue):
     assert len(json.dumps(result,ensure_ascii=False))<=30000
 
 
+def test_list_chats_25_forwarded_hints_within_39000_chars(recent_queue):
+    # ANYM-274: every incoming message forwarded with a worst-case origin; queue rows keep the kind and a
+    # 64-character name of quotes, the widest name character once control characters become U+FFFD
+    # (test_compact_origin_names_never_serialize_as_control_escapes). The 30,000 guard above keeps its fixture
+    # without forwards (decision 2026-10-18, option A). Measured 37,294 characters.
+    from psycopg.types.json import Jsonb
+    s,key=recent_queue
+    origin={'kind':'hidden_user','sender_id':'9'*160,'sender_name':'"'*256,'chat_id':'-'*160,
+        'provider_message_id':'1'*256,'post_author':'"'*256,'sent_at':'2026-09-01T00:00:00+00:00',
+        'forwarding_score':2**32-1,'provider_origin_type':'META_AI','basis':'whatsapp_web_js_message'}
+    with s.pool.connection() as c:
+        incoming=[r['id'] for r in c.execute("SELECT id FROM messages WHERE direction='incoming'").fetchall()]
+        c.execute('UPDATE message_metadata SET metadata=metadata||%s WHERE message=ANY(%s)',
+            (Jsonb({'forwarded':True,'forward_origin':origin}),incoming))
+    result=compact_queue(s,key)
+    hints=[row['awaiting_reply'] for row in result['items'] if 'awaiting_reply' in row]
+    assert len(result['items'])==25 and len(hints)==25
+    assert all(h['authorship']=='forwarded_by_sender' and h['forward_origin']=={'kind':'hidden_user','sender_name':'"'*64}
+        for h in hints)
+    for row in result['items']:assert_each_fact_once(row)
+    size=len(json.dumps(result,ensure_ascii=False))
+    assert size<=39000
+
+
 def test_list_chats_defaults_to_25_rows_with_a_cursor_on_every_surface(seeded):
     s,_,_=seeded
     key=build_queue(s,datetime.now(timezone.utc).replace(microsecond=0)-timedelta(hours=3),scanned=lambda n:None,chats=30)

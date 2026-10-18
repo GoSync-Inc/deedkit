@@ -266,7 +266,11 @@ class Store:
                     'file_search_sources':['extracted','enriched','understanding','message_context'],
                     'file_caption_provenance':'current_parent_message_revision_only',
                     'chat_coverage':True,'provider_id_lookup':'resolve_reference',
-                    'empty_result_diagnostics':True,'message_conflicts':'scoped_active_and_historical'},
+                    'empty_result_diagnostics':True,'message_conflicts':'scoped_active_and_historical',
+                    'forwarded_messages':{'origin_field':'forward_origin','authorship':'forwarded_by_sender',
+                        'rule':'sender_is_the_forwarder_never_quote_forwarded_words_as_written_by_sender',
+                        'origin_kinds':['user','chat','channel','hidden_user','status','newsletter','unknown','not_captured'],
+                        'origin_grants_chat_access':False}},
                 'available':available,
                 'file_uploads':{'implemented':True,'permission':'upload','required_permissions':['read','send','upload'],
                     'new_permission_inherited':False,'ownership':'originating_key_account_destination_chat',
@@ -406,12 +410,15 @@ class Store:
                    include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
                    only_questions=False,only_unread=False,view='archive'):
         from .chat_queries import list_chats
+        from .message_queries import hint_forward_origin
         with self.authorized(token,'list_chats') as (c,p):
-            return list_chats(self,c,p,after,limit,accounts=accounts,query=query,chat_types=chat_types,
+            result=list_chats(self,c,p,after,limit,accounts=accounts,query=query,chat_types=chat_types,
                 order=order,exclude_channels=exclude_channels,awaiting_reply=awaiting_reply,
                 from_time=from_time,to_time=to_time,include_coverage=include_coverage,
                 awaiting_reply_days=awaiting_reply_days,exclude_chats=exclude_chats,exclude_senders=exclude_senders,
                 only_questions=only_questions,only_unread=only_unread,view=view)
+            hint_forward_origin(c,result['items'])
+            return result
 
     def dismiss_reply(self,token,chat_id,message_id,expected_revision):
         from .reply_state import dismiss

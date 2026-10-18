@@ -5,6 +5,7 @@ provider catch-up and single-session handover are separate deployment gates.
 """
 from datetime import datetime,timezone
 import math
+import os
 import re
 
 from .envelope import validate
@@ -69,6 +70,37 @@ def telegram_kind(message,media_kind):
     return ('text' if getattr(message,'message',None) else 'unknown'),token
 
 
+def forward_origin_capture():
+    # Off until the release a rollback would return to accepts forward_origin (ANYM-274).
+    return os.environ.get('ANYMSG_CAPTURE_FORWARD_ORIGIN')=='1'
+
+
+def telegram_forward_origin(message):
+    """Origin stated by fwd_from and the entities Telethon cached from this update; never a lookup."""
+    from telethon import types,utils
+    header=getattr(message,'fwd_from',None)
+    if not isinstance(header,types.MessageFwdHeader):return None
+    # Message.forward is built from the update's entities; its get_sender()/get_chat() may call the network.
+    cached=getattr(message,'forward',None)
+    peer=header.from_id
+    origin={'kind':'unknown','basis':'telegram_fwd_from','sent_at':timestamp(header.date) if header.date else None,
+        'provider_message_id':str(header.channel_post) if header.channel_post else None,
+        'post_author':display_text(header.post_author,256) or None}
+    if isinstance(peer,types.PeerUser):
+        entity=getattr(cached,'sender',None)
+        name=' '.join(x for x in (entity.first_name,entity.last_name) if isinstance(x,str)) if isinstance(entity,types.User) else ''
+        origin.update(kind='user',sender_id=str(peer.user_id),sender_name=display_text(name or header.from_name,256) or None)
+    elif isinstance(peer,(types.PeerChat,types.PeerChannel)):
+        entity=getattr(cached,'chat',None)
+        group=isinstance(peer,types.PeerChat) or getattr(entity,'megagroup',False) is True
+        title=getattr(entity,'title','') if isinstance(entity,(types.Chat,types.ChatForbidden,types.Channel,types.ChannelForbidden)) else ''
+        origin.update(kind='chat' if group else 'channel',chat_id=str(utils.get_peer_id(peer)),sender_name=display_text(title,256) or None)
+    elif header.from_name:
+        # The original sender hid the link to their account: only the name is stated.
+        origin.update(kind='hidden_user',sender_name=display_text(header.from_name,256) or None)
+    return origin
+
+
 def telegram_message(account,message,*,chat_title='',origin='live',verified_self=None):
     """Telethon Message-shaped object. No entity/network lookups during capture."""
     media=[]
@@ -126,6 +158,8 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
         ('gif','animation'),('video','video'),('audio','audio'),('photo','photo'),('document','document')]
         if getattr(message,attr,None)),None)
     kind,provider_type=telegram_kind(message,media_kind)
+    forwarded=getattr(message,'fwd_from',None) is not None
+    forward=telegram_forward_origin(message) if forwarded and forward_origin_capture() else None
     return validate({'account':account,'platform':'telegram','chat':str(message.chat_id),
         'chat_title':(chat_title if chat_title and chat_title!=str(message.chat_id) else observed_title) or str(message.chat_id),
         'provider_id':str(message.id),
@@ -146,7 +180,8 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
             'sender_is_bot':getattr(entity,'bot',None) if isinstance(entity,types.User) else None,
             'reply_to_provider_id':reply_id,
             'mentions_owner':getattr(message,'mentioned',None),
-            'forwarded':getattr(message,'fwd_from',None) is not None,
+            'forwarded':forwarded,
+            **({'forward_origin':forward} if forward else {}),
             'media_kind':media_kind}})
 
 
@@ -180,6 +215,9 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
         body,formatting=display_text(body,65536),unknown_formatting()
     reply=event.get('replyToId')
     reply=reply if isinstance(reply,str) and 0<len(reply)<=256 and '\x00' not in reply else None
+    forward=event.get('forwardOrigin') if event.get('forwarded') is True else None
+    if isinstance(forward,dict) and 'sender_name' in forward:
+        forward={**forward,'sender_name':display_text(forward['sender_name'],256) or None}
     return validate({'account':account,'platform':'whatsapp','chat':event['chatId'],
         'chat_title':display_text(event.get('chatName'),512) or event['chatId'],'provider_id':event['messageId'],
         'sender':event.get('senderId') or '','body':body,
@@ -198,4 +236,5 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
                     'mentions_owner':event.get('mentionsOwner'),
                     'reply_to_owner':event.get('replyToOwner'),
                     'forwarded':event.get('forwarded'),
+                    **({'forward_origin':forward} if forward is not None else {}),
                     'media_kind':event.get('mediaKind')}})

@@ -1,4 +1,6 @@
 """Bounded agent summaries; full evidence remains available by explicit opt-in."""
+import re
+
 MESSAGE_FIELDS = ('id','message','account','chat','sender','sent_at','revision','direction',
     'provider_message_id','kind','origin','historical','is_backfill','event_sequence','sender_name','sender_name_basis','username',
     'chat_title','chat_type','reply_to_provider_id','mentions_owner','reply_to_owner','forwarded','media_kind','body_truncated',
@@ -49,6 +51,19 @@ def file_summary(row):
     return result
 
 
+def forward_fields(row, *, brief=False):
+    """A forwarded message's sender is the forwarder; the origin names the stated author.
+
+    Queue rows and chat heads (brief) keep the kind and the name; message rows keep every stated field.
+    """
+    if row.get('forwarded') is not True or not row.get('forward_origin'):return {}
+    origin={k:v for k,v in row['forward_origin'].items() if not brief or k in ('kind','sender_name')}
+    for key in ('sender_name','post_author'):
+        # Control characters would serialize as six-character escapes; names are display text only.
+        if key in origin:origin[key]=re.sub(r'[\x00-\x1f]','\ufffd',origin[key][:64])
+    return {'forward_origin':origin,'authorship':row.get('authorship') or 'forwarded_by_sender'}
+
+
 def message_summary(row):
     result={k:row[k] for k in MESSAGE_FIELDS if k in row and row[k] is not None}
     if row.get('conversation_view_version')==1:
@@ -58,6 +73,7 @@ def message_summary(row):
         result['formatting']=summary(result['formatting'])
     for key,maximum in [('sender_name',64),('username',64),('chat_title',72)]:
         if key in result:result[key]=result[key][:maximum]
+    result.update(forward_fields(row))
     snippet=row.get('snippet') or row.get('body') or ''
     files=row.get('attachments') or []
     if not snippet and (files or row.get('media_kind')):
@@ -111,6 +127,7 @@ def lean_message(row, *, search=False, files=True):
         result['snippet']=snippet[start:start+160]
     for flag in ('mentions_owner','reply_to_owner','forwarded'):
         if row.get(flag) is True:result[flag]=True
+    result.update(forward_fields(row))
     if row.get('reply_to_provider_id'):result['reply_to_provider_id']=row['reply_to_provider_id']
     if row.get('agent_send'):
         result['agent_send']={k:row['agent_send'][k] for k in ('send_id','basis') if k in row['agent_send']}
@@ -151,7 +168,8 @@ def lean_conversation(state, *, shown=()):
         if latest['id'] not in shown:
             result['latest_message']={'direction':latest.get('direction'),'sender_name':latest.get('sender_name'),
                 'sender_name_basis':_fallback_basis(latest),
-                'sent_at':latest.get('sent_at'),'display_text':(latest.get('display_text') or '')[:160]}
+                'sent_at':latest.get('sent_at'),'display_text':(latest.get('display_text') or '')[:160],
+                **forward_fields(latest,brief=True)}
             result['latest_message']={k:v for k,v in result['latest_message'].items() if v is not None}
     attention=state.get('owner_attention')
     if attention:
@@ -173,7 +191,7 @@ def lean_chat(row):
     if latest:
         last={'id':latest['id'],'direction':latest.get('direction'),'sender_name':latest.get('sender_name'),
             'sender_name_basis':_fallback_basis(latest),
-            'display_text':latest.get('display_text') or ''}
+            'display_text':latest.get('display_text') or '',**forward_fields(latest,brief=True)}
     elif row.get('last_message_id'):
         last={'id':row['last_message_id'],'direction':row.get('last_message_direction'),
             'display_text':row.get('last_message_snippet') or ''}
@@ -203,6 +221,8 @@ def lean_chat(row):
             hint['display_text']=result.pop('last_message')['display_text']
             if last.get('truncated'):hint['truncated']=True
         else:hint['display_text']=(row.get('awaiting_reply_snippet') or '')[:160]
+        hint.update(forward_fields({'forwarded':True,'forward_origin':row.get('awaiting_reply_forward_origin'),
+            'authorship':row.get('awaiting_reply_authorship')},brief=True))
         if hint['sent_at']==result.get('last_activity'):hint.pop('sent_at')
         result['awaiting_reply']={k:v for k,v in hint.items() if v is not None}
     for key in ('last_message','awaiting_reply'):
@@ -358,6 +378,9 @@ def render(method, result, detail):
             else:row.pop('last_message_snippet',None)
             if row.get('awaiting_reply_snippet'):
                 row['awaiting_reply_snippet']=row['awaiting_reply_snippet'][:80]
+            if row.get('awaiting_reply_forward_origin'):
+                row['awaiting_reply_forward_origin']=forward_fields({'forwarded':True,
+                    'forward_origin':row['awaiting_reply_forward_origin']},brief=True)['forward_origin']
         if result.get('awaiting_reply_scope'):result['awaiting_reply_notice']='heuristic_not_obligation'
         if result.get('awaiting_reply_scope') is None:
             result.pop('awaiting_reply_scope',None)
