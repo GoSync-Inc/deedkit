@@ -234,6 +234,8 @@ def test_conversation_group_attention_is_not_closed_by_unrelated_owner_post(dial
 def test_conversation_explicit_group_reply_closes_only_its_thread(dialogue_archive):
     s,key,add,query,catalog=dialogue_archive
     chat=add('thread-a','incoming',chat_type='group',metadata={'mentions_owner':True})
+    # thread-b arrives after answer-a, so it is open by the owner-message time
+    # rule (ANYM-277); answer-b, a later owner message, then closes it.
     add('answer-a','outgoing',second=1,chat_type='group',metadata={'reply_to_provider_id':'thread-a'})
     add('thread-b','incoming',second=2,chat_type='group',metadata={'mentions_owner':True})
     result=query('dialogue-wa',chat)
@@ -329,7 +331,7 @@ def test_conversation_group_chatter_still_does_not_clear(dialogue_archive):
 def test_conversation_group_service_empty_or_deleted_owner_message_does_not_clear(dialogue_archive):
     s,key,add,query,catalog=dialogue_archive
     chat=add('mention','incoming',chat_type='group',metadata={'mentions_owner':True})
-    add('timer','outgoing',second=1,chat_type='group',body='',metadata={'is_service':True})
+    add('timer','outgoing',second=1,chat_type='group',body='Synthetic service notice',metadata={'is_service':True})
     add('empty','outgoing',second=2,chat_type='group',body='')
     add('removed','outgoing',second=3,chat_type='group')
     with s.pool.connection() as c:
