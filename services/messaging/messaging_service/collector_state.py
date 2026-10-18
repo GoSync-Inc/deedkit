@@ -101,23 +101,24 @@ def trusted(info):
     return info.st_uid in {0,os.geteuid()}
 
 
-def private_session_directory(directory):
+def private_session_directory(session):
     """Open the directory that holds a session, its SQLite side files and its lock.
 
     A file's own 0600 mode does not stop another user from replacing it, so the
     directory must be private. As with OpenSSH StrictModes, no other non-root user
-    may rename any ancestor either, or the checked directory could be swapped for
-    another after the check. Never repaired here."""
+    may rename any directory on the path either, and the path holds no symlink, so
+    the provider's later access by name reaches the checked directory. Never repaired."""
+    session=Path(os.path.abspath(session))
     try:
-        if not os.path.lexists(directory): Path(directory).mkdir(mode=0o700,parents=True,exist_ok=True)
-        for path in {Path(os.path.abspath(directory)),Path(os.path.realpath(directory))}:
-            for parent in path.parents:
-                info=os.lstat(parent)
-                # Symlink modes mean nothing; a sticky directory protects entries it does not own.
-                if not trusted(info) or (not stat.S_ISLNK(info.st_mode) and info.st_mode&0o022
-                        and not info.st_mode&stat.S_ISVTX):
-                    raise RuntimeError('private_session_required')
-        fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        for path in [*reversed(session.parents),session]:
+            try: info=os.lstat(path)
+            except FileNotFoundError: break  # Below here, only this process creates entries.
+            if stat.S_ISLNK(info.st_mode): raise ValueError('session_symlink')
+            # A sticky directory protects the entries it does not own.
+            if path!=session and (not trusted(info) or info.st_mode&0o022 and not info.st_mode&stat.S_ISVTX):
+                raise RuntimeError('private_session_required')
+        session.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        fd=os.open(session.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
     except OSError: raise RuntimeError('private_session_required') from None
     info=os.fstat(fd)
     if info.st_mode&0o077 or not trusted(info):
@@ -129,8 +130,7 @@ def private_session_directory(directory):
 def session_lock(session):
     """Hold for the whole provider lifetime, including authorization. Never unlink lock."""
     session=Path(session)
-    if session.is_symlink() or session.parent.is_symlink(): raise ValueError('session_symlink')
-    directory=private_session_directory(session.parent)
+    directory=private_session_directory(session)
     try: fd=os.open(session.name+'.owner.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600,dir_fd=directory)
     finally: os.close(directory)
     try:

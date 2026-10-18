@@ -440,6 +440,39 @@ def test_session_lock_keeps_the_lock_in_the_checked_directory_after_a_swap(tmp_p
     assert [p.name for p in moved.iterdir()]==['telegram.session.owner.lock'] and list(public.iterdir())==[]
 
 
+def test_session_path_through_a_symlinked_ancestor_is_rejected(tmp_path):
+    # An indirect link: a trusted link whose target link sits in a renamable directory.
+    good=tmp_path/'good'; (good/'sessions').mkdir(parents=True,mode=0o700)
+    shared=tmp_path/'shared'; shared.mkdir(); shared.chmod(0o777); (shared/'redirect').symlink_to(good)
+    trusted_dir=tmp_path/'trusted'; trusted_dir.mkdir(); (trusted_dir/'route').symlink_to(shared/'redirect')
+    for session in [trusted_dir/'route'/'sessions'/'telegram.session',(tmp_path/'direct')/'sessions'/'telegram.session']:
+        if not session.parent.parent.exists(): session.parent.parent.symlink_to(good)
+        with pytest.raises(ValueError,match='session_symlink'):
+            with session_lock(session): pytest.fail('symlinked ancestor accepted')
+    assert list((good/'sessions').iterdir())==[]
+
+
+@pytest.mark.skipif(hasattr(os,'geteuid') and os.geteuid()==0,reason='root ignores directory modes')
+def test_session_under_an_inaccessible_ancestor_fails_with_the_privacy_code(tmp_path,monkeypatch,capsys):
+    from messaging_service import telegram_pair as pairing
+    denied=tmp_path/'denied'; (denied/'sessions').mkdir(parents=True,mode=0o700); denied.chmod(0)
+    session=denied/'sessions'/'telegram.session'
+    try:
+        with pytest.raises(RuntimeError,match='private_session_required'):
+            with session_lock(session): pytest.fail('uninspectable ancestor accepted')
+        monkeypatch.setattr(pairing,'require_owner_terminal',lambda: None)
+        monkeypatch.setattr(pairing,'configuration',lambda _: ({'session_file':str(session)},{}))
+        monkeypatch.setattr(pairing,'Store',lambda *_: pytest.fail('database opened'))
+        monkeypatch.setattr(pairing.sys,'argv',['telegram-pair','--config','/unused/synthetic.json'])
+        old_mask=os.umask(0o077)
+        try:
+            with pytest.raises(SystemExit): pairing.main()
+        finally: os.umask(old_mask)
+        assert json.loads(capsys.readouterr().out)=={'status':'not_paired','code':'private_session_required'}
+    finally: denied.chmod(0o700)
+    assert list((denied/'sessions').iterdir())==[]
+
+
 def test_session_whose_parent_is_a_file_fails_with_the_privacy_code(tmp_path,monkeypatch,capsys):
     from messaging_service import telegram_pair as pairing
     parent=tmp_path/'not-a-directory'; parent.write_bytes(b'FAKE'); parent.chmod(0o600)
