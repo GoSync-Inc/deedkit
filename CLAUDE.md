@@ -14,7 +14,7 @@ and API names stay compatible. A display rename does not authorize changing thes
 identities. Every service keeps its own lockfile, environment, process and state.
 
 ## Layout
-- `services/messaging`: AnyMsg server (Python 3.13, PostgreSQL 18, schema 34)
+- `services/messaging`: AnyMsg server (Python 3.13, PostgreSQL 18, schema 35)
 - `services/gateway`: common MCP gateway (HTTP only, imports no provider code)
 - `services/calendar`: family calendar (Google API/CalDAV), has its own AGENTS.md
 - `services/calls`: voice calls; `services/calls/frontend`: Vite UI

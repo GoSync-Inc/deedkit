@@ -5,8 +5,8 @@ paths:
 <!-- Sources: AGENTS.md, CONTRIBUTING.md, FILE_INDEX.md, MEDIA_STORAGE.md, messaging_service/store.py -->
 # Messaging SQL migrations
 - Applied migrations are immutable: `Store.migrate()` compares each file's sha256 with `archive_migrations` and raises `migration_checksum_mismatch`. Never edit, rename, reorder or reformat an existing file.
-- Schema changes get a new next-numbered file (current head: `034_file_understanding.sql`, schema 34).
-- In the same change: register it in the `migrate()` list, raise the `version>34` runtime ceiling, update backup `TABLES`/`V*_TABLES` and the restore range in `backup.py`, and update role grants (`*_role.sql`).
+- Schema changes get a new next-numbered file (current head: `035_cold_archive.sql`, schema 35).
+- In the same change: register it in the `migrate()` list, raise the `version>35` runtime ceiling, update backup `TABLES`/`V*_TABLES` and the restore range in `backup.py`, and update role grants (`*_role.sql`).
 - Check roles/ACL and a repeated `migrate()` (CONTRIBUTING.md). Update the documented schema version (README, RELEASING).
 - Keep source revisions, original provider IDs, archive IDs and acknowledgement semantics stable. Older runtimes deliberately reject a newer database.
 - Production deploys do not run migrations. A schema change needs its own procedure and a compatible backup (docs/operations/production.md).
