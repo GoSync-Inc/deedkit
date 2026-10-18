@@ -432,3 +432,44 @@ def test_an_existing_receipt_keeps_new_nested_metadata_and_a_changed_source_fail
     code, out = run(root, server)
     assert code == 1
     assert "read-back of ANYM-12: 1 sent source(s) missing or changed, 1 unexpected" in out
+
+
+# spec: ANYM-405
+def test_a_surrogate_pair_title_links_to_the_case_ci_imported(root, server):
+    full_server(server)
+    server.set(tests=[case("node:web/s.test.mjs::smile", "web/s.test.mjs", "\U0001F600 smile")])
+    merged(root, server, {"web/s.test.mjs": "// spec: ANYM-12\ntest('\\uD83D\\uDE00 smile', () => {});\n"},
+           "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert server.state()["links"] == {"t-node:web/s.test.mjs::smile": ["m-0012-0000-0000-0000-000000000000"]}
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("change", [
+    {"seqNum": 50, "branch": {"seqNum": 50.0}},
+    {"seqNum": 50, "branch": {"seqNum": True}},
+    {"seqNum": []},
+    {"seqNum": 50, "branch": {"seqNum": {"n": 50}}},
+])
+def test_a_spec_number_of_another_type_is_never_merged_and_fails_the_merge_step(root, server, change):
+    full_server(server)
+    server.set(previews={"proposal/x": {"modifications": [change]}})
+    merged(root, server, {"app/new.py": "y\n"}, "Delivers: ANYM-50\nTiden branch: proposal/x")
+    code, out = run(root, server)
+    assert code == 1 and "Failed at step merge: the merge preview has a change without exactly one spec number" in out
+    assert not server.writes()
+
+
+# spec: ANYM-405
+def test_an_unexpected_error_in_the_merge_step_is_named_and_stops_the_sync(root, server, monkeypatch):
+    full_server(server)
+
+    def broken(*_):
+        raise TypeError("a value from the data")
+
+    monkeypatch.setattr(tiden_sync, "preview_numbers", broken)
+    merged(root, server, {"app/new.py": "y\n"}, "Delivers: ANYM-50\nTiden branch: proposal/x")
+    code, out = run(root, server)
+    assert code == 1 and "Failed at step merge: unexpected TypeError" in out and "a value from the data" not in out
+    assert not server.writes()

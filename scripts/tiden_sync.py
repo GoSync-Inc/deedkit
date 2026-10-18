@@ -121,8 +121,11 @@ def preview_number(item: object) -> int:
     if not isinstance(item, dict):
         raise StepFailed("merge", "the merge preview has a change that is not an object")
     numbers = [item.get("seqNum")] + [value.get("seqNum") for value in item.values() if isinstance(value, dict)]
-    found = {number for number in numbers if number is not None}
-    if len(found) != 1 or not all(type(number) is int for number in found):
+    numbers = [number for number in numbers if number is not None]
+    if not all(type(number) is int for number in numbers):  # before the set: 50.0 and True would equal an int
+        raise StepFailed("merge", "the merge preview has a change without exactly one spec number")
+    found = set(numbers)
+    if len(found) != 1:
         raise StepFailed("merge", "the merge preview has a change without exactly one spec number")
     return found.pop()
 
@@ -381,7 +384,12 @@ def sync(root: Path, sha: str, number: int, body: str, cli: str, product: str, r
     report(f"Pull request #{number}, commit {sha}: {len(code)} code file(s), {len(tests)} added test(s); named "
            + (", ".join(f"ANYM-{n}" for n in lines.named) or "no spec")
            + (f"; branch {lines.branch}" if lines.branch else "") + ".")
-    pending = bool(lines.branch) and merge(cli, product, lines.branch or "", lines.named, report, dry)
+    try:
+        pending = bool(lines.branch) and merge(cli, product, lines.branch or "", lines.named, report, dry)
+    except (StepFailed, Refused):
+        raise
+    except Exception as error:  # noqa: BLE001 - named like the other steps, and the later steps still stop
+        raise StepFailed("merge", f"unexpected {type(error).__name__}") from None
     failures = []
     try:
         # A dry run before the merge reads the branch view, which is main with the branch's specs on top.

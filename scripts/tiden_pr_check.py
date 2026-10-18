@@ -41,6 +41,9 @@ MARKER_LIKE = re.compile(r"^[ \t]*(#|//)[ \t]*spec\b", re.IGNORECASE)
 # never a test; the name is then read from the original source at the literal's offset.
 NODE_TEST = re.compile(r"(?<![\w.$])(?:test|it)(?:\.(?:only|skip|todo))?\s*\(\s*")
 GO_TEST = re.compile(r"^func\s+(Test(?:[A-Z0-9_]\w*)?)\s*\(\s*\w+\s+\*testing\.T\s*,?\s*\)", re.MULTILINE)
+# Words after which a `/` starts a regex literal rather than a division.
+REGEX_KEYWORDS = {"return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "instanceof",
+                  "yield", "await"}
 JS_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
 # Story-level means a leaf that holds criteria: not an Epic and without child specs.
 CONTAINER_TYPES = {"Epic"}
@@ -149,9 +152,27 @@ def python_tests(source: str) -> list[tuple[str, int, str]]:
     return found
 
 
+def regex_allowed(out: list[str], index: int) -> bool:
+    """Whether a `/` at `index` starts a JS regex literal rather than a division, judged by the code before it."""
+    position = index - 1
+    while position >= 0 and out[position].isspace():
+        position -= 1
+    if position < 0 or out[position] in "(,=:[!&|?{};+-*%<>~^}":
+        return True
+    end = position + 1
+    while position >= 0 and (out[position].isalnum() or out[position] in "_$"):
+        position -= 1
+    return "".join(out[position + 1:end]) in REGEX_KEYWORDS
+
+
+def unterminated(what: str, source: str, index: int) -> SyntaxError:
+    return SyntaxError(f"unterminated {what}", (None, source.count("\n", 0, index) + 1, 0, ""))
+
+
 def blank(source: str, go: bool) -> str:
-    """The source with comments replaced by spaces and string contents by `x`, newlines and offsets kept. JS template
-    literals return to code inside `${...}`; Go raw strings and runes are strings. Regex literals are not recognized."""
+    """The source with comments replaced by spaces and string and JS regex contents by `x`, newlines and offsets kept.
+    JS template literals return to code inside `${...}`; Go raw strings and runes are strings. A comment, string or
+    template still open at the end is a syntax error, so the file refuses rather than hiding the tests after it."""
     out, length = list(source), len(source)
     stack: list[int] = []  # the brace depth inside each open `${` of the enclosing templates
 
@@ -178,8 +199,22 @@ def blank(source: str, go: bool) -> str:
             if char == "\n" and quote != "`":
                 break
             position += 1
-        fill(index + 1, position, "x")
-        return position
+        raise unterminated("string", source, index)
+
+    def regex(index: int) -> int:
+        """Blank one regex literal from its `/`; the index after its closing `/`, or -1 when it is none."""
+        position, klass = index + 1, False
+        while position < length and source[position] != "\n":
+            char = source[position]
+            if char == "\\":
+                position += 2
+                continue
+            if char == "/" and not klass:
+                fill(index + 1, position, "x")
+                return position + 1
+            klass = (klass and char != "]") or char == "["
+            position += 1
+        return -1
 
     index = 0
     while index < length:
@@ -191,8 +226,11 @@ def blank(source: str, go: bool) -> str:
             index = end
         elif source.startswith("/*", index):
             end = source.find("*/", index + 2)
-            end = length if end < 0 else end + 2
-            fill(index, end, " ")
+            if end < 0:
+                raise unterminated("comment", source, index)
+            fill(index, end + 2, " ")
+            index = end + 2
+        elif char == "/" and not go and regex_allowed(out, index) and (end := regex(index)) > 0:
             index = end
         elif char in "'\"`":
             index = string(index, char)
@@ -208,11 +246,14 @@ def blank(source: str, go: bool) -> str:
                 index = string(index, "`")  # the template continues after its `}`
         else:
             index += 1
+    if stack:
+        raise unterminated("template", source, length)
     return "".join(out)
 
 
-def js_literal(source: str, index: int) -> str | None:
-    """The runtime value of the JS string literal at `index`, or None when the name is not a plain literal."""
+def js_literal(source: str, code: str, index: int) -> str | None:
+    """The runtime value of the JS string literal at `index` when it is the whole first argument (`code` is the
+    blanked source), or None when the name is not a plain literal."""
     quote = source[index] if index < len(source) else ""
     if quote not in ("'", '"', "`"):
         return None
@@ -220,7 +261,12 @@ def js_literal(source: str, index: int) -> str | None:
     while position < len(source):
         char = source[position]
         if char == quote:
-            return "".join(value)
+            if code[position + 1:].lstrip()[:1] not in (",", ")"):
+                return None  # a computed name, such as a concatenation, that starts with a literal
+            try:  # paired surrogate escapes form one character, as in the runtime title
+                return "".join(value).encode("utf-16", "surrogatepass").decode("utf-16")
+            except UnicodeDecodeError:
+                return None
         if (quote == "`" and source.startswith("${", position)) or (char == "\n" and quote != "`"):
             return None
         if char != "\\":
@@ -253,7 +299,7 @@ def tests_in(path: str, source: str) -> list[tuple[str, int, str]]:
     found = []
     for match in NODE_TEST.finditer(code):
         line = code.count("\n", 0, match.start())
-        name = js_literal(source, match.end())
+        name = js_literal(source, code, match.end())
         if name is not None:
             found.append((name, line, ""))
             continue

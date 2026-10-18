@@ -259,3 +259,31 @@ def test_nested_test_classes_and_parenthesized_decorators_take_their_markers(rep
     assert "test tests/test_n.py:7 TestOuter::TestInner::test_deep -> ANYM-12" in out
     assert "test tests/test_n.py:11 TestOuter::test_wrapped -> ANYM-12" in out
     assert "helper" not in out and "test_ignored" not in out
+
+
+# spec: ANYM-405
+def test_regex_literals_neither_hide_nor_make_tests_and_an_unterminated_comment_refuses(repo, server):
+    server.set(main=[spec(12)])
+    code, out = run(repo, server, {"web/r.test.mjs": "import test from 'node:test';\nconst rx = /[/*]/;\n"
+                                                     "test('after class', () => {});\nconst tick = /`/, ratio = a / b / c;\n"
+                                                     "test('after tick', () => {});\nconst fake = /test('fake')/;\n"
+                                                     "if (ok) { done(); } /x/.test(value);\n"}, "Spec: ANYM-12")
+    assert code == 1
+    assert "web/r.test.mjs:3 after class: no marker" in out and "web/r.test.mjs:5 after tick: no marker" in out
+    assert "fake" not in out
+    with pytest.raises(pr_check.Refused, match="does not parse"):
+        run(repo, server, {"web/u.test.mjs": "/* open\ntest('hidden', () => {});\n"}, "Spec: ANYM-12")
+
+
+# spec: ANYM-405
+def test_a_literal_that_starts_a_computed_name_is_not_its_name_and_surrogate_pairs_join(repo, server):
+    server.set(main=[spec(12)])
+    root, _ = repo
+    commit(root, {"web/p.test.mjs": "test('prefix', () => {});\n"}, "node")
+    code, out = run(repo, server, {"web/p.test.mjs": "test('prefix', () => {});\ntest('prefix' + 'new', () => {});\n"
+                                                     "// spec: ANYM-12\ntest('\\uD83D\\uDE00', () => {});\n"},
+                    "Spec: ANYM-12")
+    assert code == 1
+    assert "web/p.test.mjs:2 <'prefix' + 'new'>: the test name is not a plain string literal" in out
+    assert pr_check.tests_in("web/p.test.mjs", "test('\\uD83D\\uDE00', () => {});\n") == [("\U0001F600", 0, "")]
+    assert "web/p.test.mjs:4 \\U0001f600 -> ANYM-12" in out
