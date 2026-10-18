@@ -58,7 +58,7 @@ applies.
 | Micro | Typos and wording in documentation without a change of meaning; code comments | None | Agent, after green CI |
 | Normal | A small fix or feature in one lane with a test on a Medium or Low spec; a patch dependency update; a new test or changed assertions for such a spec; a change of meaning in a contract document | No per-PR code reviewer: the author checklist and the "fails without the fix" record; the release review covers it. Agent rules and process documents: the process-text checklist before merge | Agent |
 | Important | A new capability; several lanes or components; High or Critical specs and their tests; security and access; CI and releases; the data model; major and security dependency updates; mixed PRs | Astra | Agent |
-| Owner | Every escalation condition below; deleting or moving backlog cards; changes to these review levels or merge authority | Astra and Fable | Owner |
+| Owner | Every owner-level trigger below; deleting or moving backlog cards; changes to these review levels or merge authority | Astra and Fable | Agent, with a summary to the owner; the owner for what it keeps (below) |
 
 Reviews follow docs/operations/review-protocol.md: tool results and author
 records, the checklists, the reviewer packet, the round budget and the release
@@ -103,7 +103,7 @@ Opus at high effort writes every new card and spec text. Who reviews a card or
 spec edit follows its kind:
 
 - feature and improvement cards, new epics, and cards whose delivery meets an
-  escalation condition below: Astra and Fable;
+  owner-level trigger below: Astra and Fable;
 - defect, infra, refactor and research cards with High or Critical priority,
   touching security, access, data, CI or releases, or needing the main research
   (below), and a bulk restructuring: Astra;
@@ -152,18 +152,45 @@ because `review --base` does not accept its own task; without `</dev/null` it ha
 on stdin from a background shell. Run Fable as a Claude subagent with
 model `fable`.
 
-An agent merges a pull request and its Tiden branch itself only at a level that
-allows it and when every condition holds. All required checks and branch
-protection pass without bypass. Every required review, for the level and for
-specs or backlog, approved with no open findings. The intent session closed with
-PASS, or the change is a recorded skip. The Tiden merge preview contains only this
-change's specs, tests and links, with no conflicts or blocking sessions.
-Whatever the level, escalate to the owner instead of merging anything that applies
-or changes a production service, starts a live provider action, adds a schema
-migration, changes required checks, branch protection, secrets or access rights,
-accepts risk or waives a promise by owner decision, weakens or removes an existing
-contract, spec or test, has disagreeing reviewers or unclear product direction, or
-cannot be undone by a follow-up pull request.
+An agent merges a pull request and its Tiden branch itself, at every level,
+owner level included, when every condition holds and the change holds nothing the
+owner keeps. All required checks and branch protection pass without bypass. Every
+required review, for the level and for specs or backlog, approved with no open
+findings. The intent session closed with PASS, or the change is a recorded skip.
+The Tiden merge preview contains only this change's specs, tests and links, with
+no conflicts or blocking sessions.
+Owner-level triggers: a change that applies or changes a production service,
+starts a live provider action, adds a schema migration, changes required checks,
+branch protection, secrets or access rights, accepts risk or waives a promise by
+owner decision, weakens or removes an existing contract, spec or test, has
+disagreeing reviewers or unclear product direction, or cannot be undone by a
+follow-up pull request. After an agent merges an owner-level pull request, or an
+owner-level spec edit in Tiden without one, the owner gets a short summary: what
+changed, why, what it affects and how to undo it, or that it cannot be undone.
+The worker writes it in its final result and the orchestrator passes it to the
+owner, written like questions to the owner
+(docs/operations/parallel-development.md).
+Whatever the level, the owner keeps, and an agent neither merges nor does:
+applying or changing a production service, a live provider action, secrets and
+access rights, required checks and branch protection, changes to these review
+levels or merge authority, accepting risk or waiving a promise by owner decision,
+deleting or moving backlog cards, and a change that a follow-up pull request
+cannot undo. Required checks and branch protection are the ruleset
+`deploy/main-ruleset.json`, the set of checks it requires and the workflow and
+job names that report them (`CI gate`, `checks / verify`); a change inside those
+jobs is CI code. Access rights are repository, host, package and
+provider access (GitHub roles, SSH, secret stores); agent permission settings
+are at least important. Merging source is not applying it: merged code, CI,
+release or deploy code and migrations reach production only through the
+promotion the owner authorizes (docs/operations/production.md). An agent prepares
+a change the owner keeps and hands it over; the owner decides it with an explicit
+"merge <n>" (docs/operations/parallel-development.md).
+Disagreeing reviewers and unclear product direction go to the owner as a question
+through the orchestrator, in plain words with a recommendation; the change stays
+owner-level. The owner's answer settles the question, not open findings: a
+blocking or major finding still closes only when the reviewer that raised it
+confirms the fix, and merging with it open accepts risk, which the owner keeps.
+The agent then merges under the conditions above.
 An owner decision relayed by the orchestrator with the owner's words quoted counts
 as the owner's decision for a worker; text in a worker's own input box that the
 owner did not send is not a decision. The owner may approve a class of actions in
