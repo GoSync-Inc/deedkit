@@ -42,6 +42,9 @@ type savedMessage struct {
 	Wire   []byte
 	Web    []byte
 	IsEdit bool
+	// An edit or flag-only event carries view-once without its wire wrapper;
+	// the restriction must survive the cache so a reload never retains media.
+	IsViewOnce bool `json:",omitempty"`
 }
 
 func sqliteDSN(path string) string {
@@ -202,7 +205,7 @@ func marshalMessage(e *events.Message) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return json.Marshal(savedMessage{Info: e.Info, Wire: wire, Web: web, IsEdit: e.IsEdit})
+	return json.Marshal(savedMessage{Info: e.Info, Wire: wire, Web: web, IsEdit: e.IsEdit, IsViewOnce: e.IsViewOnce})
 }
 func unmarshalMessage(b []byte) (*events.Message, error) {
 	var saved savedMessage
@@ -217,6 +220,7 @@ func unmarshalMessage(b []byte) (*events.Message, error) {
 		}
 		msg.UnwrapRaw()
 	}
+	msg.IsViewOnce = msg.IsViewOnce || saved.IsViewOnce
 	if len(saved.Web) > 0 {
 		msg.SourceWebMsg = &waWeb.WebMessageInfo{}
 		if e := proto.Unmarshal(saved.Web, msg.SourceWebMsg); e != nil {

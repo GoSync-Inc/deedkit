@@ -240,3 +240,39 @@ func TestNativeViewOnceRoundVideoIsNotRetained(t *testing.T) {
 		})
 	}
 }
+
+// The native cache keeps only the wire message, so the view-once restriction of
+// a flag-only event or a wrapped edit must be persisted on its own.
+func TestNativeViewOnceRoundVideoStaysUnretainedAfterCacheReload(t *testing.T) {
+	for _, name := range []string{"flag", "wrapped_edit", "wrapper"} {
+		t.Run(name, func(t *testing.T) {
+			s := openTestStore(t)
+			m := ptvMessage("stored-once")
+			switch name {
+			case "flag":
+				m.IsViewOnce = true
+			case "wrapped_edit":
+				edit := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: &waCommon.MessageKey{ID: proto.String("stored-once"), FromMe: proto.Bool(false)}, EditedMessage: m.Message, TimestampMS: proto.Int64(1700000100123)}}
+				m.RawMessage = &waE2E.Message{ViewOnceMessageV2: &waE2E.FutureProofMessage{Message: edit}}
+				m.Message = m.RawMessage
+			case "wrapper":
+				m.RawMessage = &waE2E.Message{ViewOnceMessageV2: &waE2E.FutureProofMessage{Message: m.Message}}
+				m.Message = m.RawMessage
+			}
+			if err := s.Put(m, "live"); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := s.Get(LegacyChatID(m.Info.Chat), "false_111111@c.us_stored-once")
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, err := NormalizeMessage(loaded, types.EmptyJID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = nativeMediaMetadata(loaded); v["hasMedia"] != false || err == nil || err.Error() != "unsupported_media_type" {
+				t.Fatalf("view-once round video retained after reload: hasMedia=%v descriptor=%v", v["hasMedia"], err)
+			}
+		})
+	}
+}

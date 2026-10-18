@@ -32,8 +32,8 @@ No send is retried after an uncertain result. Passive reads do not mark read.
 Native captures are journaled before ACK and replayed into the ordinary spool.
 Both providers capture a round video (PTV, native type `ptv`) as a video
 attachment with its duration and a media job; its original downloads with the
-WhatsApp Video keys. A view-once round video, like other view-once media, is
-not retained.
+WhatsApp Video keys. On the native adapter a view-once round video, like other
+view-once media, is not retained, also after a reload from its capture cache.
 An exhausted local cache is not a complete WhatsApp history.
 
 The account-specific operation manifest reflects the selected provider after
