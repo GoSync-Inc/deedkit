@@ -70,12 +70,16 @@ class Unreachable(Refused):
     """GitHub's git endpoint did not answer: `deploy` retries on its next run."""
 
 
-# The stderr of a git command talking to GitHub that names a transport failure; any other git failure is this
-# host's (a broken mirror, permissions, disk space) and is refused.
+# The stderr of a git command talking to GitHub that names the cause of a transport failure (curl's resolve,
+# connect, timeout, send/receive and HTTP 5xx errors); generic labels such as "RPC failed" or "early EOF" are no
+# evidence. Any other git failure, and any that also names a cause on this host or an access or trust problem
+# (HTTP 4xx, a local write, a certificate), is refused.
 TRANSPORT = re.compile(r"Could not resolve host|Failed to connect to|Connection (?:timed out|reset by peer|refused)|"
-                       r"Operation timed out|early EOF|RPC failed|remote end hung up unexpectedly|"
-                       r"The requested URL returned error: 5\d\d|gnutls_handshake\(\) failed|GnuTLS recv error|"
-                       r"SSL_read|SSL_ERROR_SYSCALL|Empty reply from server|was not closed cleanly")
+                       r"Operation timed out|Empty reply from server|returned error: 5\d\d|HTTP 5\d\d|"
+                       r"\bcurl (?:6|7|18|28|52|55|56|92)\b|GnuTLS recv error")
+NOT_TRANSPORT = re.compile(r"returned error: 4\d\d|HTTP 4\d\d|\bcurl (?:23|35|51|58|60|77)\b|certificate|"
+                           r"Permission denied|No space left|Failed writing|Read-only file system|could not lock|"
+                           r"not a git repository|corrupt", re.I)
 
 
 def run(argv, *, cwd=None, umask=-1, env=None, reason=False, remote=False):
@@ -84,7 +88,7 @@ def run(argv, *, cwd=None, umask=-1, env=None, reason=False, remote=False):
     # with `reason`. `remote` marks a git command talking to GitHub: only a transport failure is Unreachable.
     result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=1800, umask=umask, env=env)
     if result.returncode:
-        if remote and TRANSPORT.search(result.stderr):
+        if remote and TRANSPORT.search(result.stderr) and not NOT_TRANSPORT.search(result.stderr):
             raise Unreachable(f"{Path(argv[0]).name} could not reach GitHub (exit {result.returncode})")
         detail = (result.stderr.strip().splitlines() or [""])[-1][:300] if reason else ""
         raise Refused(f"{Path(argv[0]).name} failed (exit {result.returncode}){': ' + detail if detail else ''}; "
@@ -1024,7 +1028,7 @@ def main_history(state):
     if mirror.exists():
         # Only the mirror itself, a bare repository, is fetched into; anything else there is refused (a pause).
         if run(["git", "-C", str(mirror), "rev-parse", "--is-bare-repository", "--absolute-git-dir"],
-               reason=True).split() != ["true", str(mirror.resolve())]:
+               reason=True).splitlines() != ["true", str(mirror.resolve())]:
             raise Refused(f"{mirror} is not the bare source mirror; remove or repair it")
         run(["git", "-C", str(mirror), "fetch", "--quiet", "--filter=blob:none", "origin",
              "+refs/heads/main:refs/heads/main"], reason=True, remote=True)

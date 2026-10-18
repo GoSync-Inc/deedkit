@@ -1937,7 +1937,11 @@ class Deployer:
         self.git.append(argv)
         if "--is-bare-repository" in argv:
             return self.real_run(argv, **kwargs)
-        if failure := self.git_failures.get(argv[1]):
+        if isinstance(failure := self.git_failures.get(argv[1]), str):
+            # git's stderr, through the real run(): a synthetic process prints it and exits 128.
+            return self.real_run([sys.executable, "-c", f"import sys; sys.stderr.write({failure!r}); sys.exit(128)"],
+                                 **kwargs)
+        if failure:
             raise failure
         head = self.history[-1]
         if argv[1] == "ls-remote":
@@ -2283,6 +2287,39 @@ def test_only_a_transport_failure_of_git_talking_to_github_is_retried(tmp_path, 
         else:
             assert outcome["status"] == "halted" and "synthetic local failure" in outcome["reason"] and host.paused()
         assert host.steps == []
+
+
+RETRIED_GIT = ("fatal: unable to access 'https://github.com/GoSync-Inc/deedkit.git/': Failed to connect to github.com "
+               "port 443 after 130000 ms: Couldn't connect to server\n",
+               "error: RPC failed; curl 56 Recv failure: Connection reset by peer\nfatal: early EOF\n",
+               "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503\n")
+PAUSED_GIT = ("error: RPC failed; HTTP 403 curl 22 The requested URL returned error: 403\n",
+              "error: RPC failed; curl 23 Failed writing received data to disk/application\nfatal: early EOF\n",
+              "error: RPC failed; curl 60 SSL certificate problem: unable to get local issuer certificate\n",
+              "error: RPC failed; curl 56 Recv failure: Connection reset by peer\n"
+              "fatal: could not lock config file deploy-source.git/config: No space left on device\n",
+              "error: RPC failed; result=18, HTTP 200\nfatal: early EOF\nfatal: the remote end hung up unexpectedly\n")
+
+
+@pytest.mark.parametrize("stderr", RETRIED_GIT + PAUSED_GIT,
+                         ids=[f"retried{i}" for i in range(len(RETRIED_GIT))] + [f"paused{i}" for i in range(len(PAUSED_GIT))])
+def test_a_git_failure_is_retried_only_when_git_names_a_transport_cause(tmp_path, monkeypatch, stderr):
+    host = Deployer(tmp_path, monkeypatch)
+    host.git_failures["clone"] = stderr
+    outcome = host.deploy()
+    if stderr in RETRIED_GIT:
+        assert outcome["status"] == "error" and "could not reach GitHub" in outcome["reason"] and host.paused() is None
+    else:
+        assert outcome["status"] == "halted" and "refused before any change" in outcome["reason"]
+        assert host.paused() == outcome["reason"]
+    assert host.steps == []
+
+
+def test_a_bare_mirror_under_a_path_with_spaces_is_fetched(tmp_path, monkeypatch):
+    (tmp_path / "with spaces").mkdir()
+    host = Deployer(tmp_path / "with spaces", monkeypatch)
+    subprocess.run(["git", "init", "--quiet", "--bare", str(host.state / "deploy-source.git")], check=True)
+    assert host.deploy()["status"] == "deployed" and [argv for argv in host.git if "fetch" in argv]
 
 
 def test_a_dry_run_reports_the_plan_or_the_pause_reason_and_changes_nothing(tmp_path, monkeypatch):
