@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import math
 import struct
 import threading
@@ -169,3 +170,59 @@ def test_probe_sample_rate_follows_observed_input():
     probe.input(tone(320,16000),rate=16000)
     probe.input(tone(160,8000),rate=8000)
     assert probe.snapshot()['sample_rate'] is None
+
+
+async def test_a_failing_inbound_probe_never_drops_audio_or_raises_a_pipeline_error():
+    class BrokenProbe:
+        def input(self,*args,**kwargs):raise RuntimeError('synthetic probe failure')
+    received=[];errors=[];done=asyncio.Event()
+    class Sink(FrameProcessor):
+        async def process_frame(self,frame,direction):
+            await super().process_frame(frame,direction)
+            if isinstance(frame,InputAudioRawFrame):
+                received.append(frame);done.set()
+            await self.push_frame(frame,direction)
+    audio=(np.sin(np.arange(320)*2*np.pi*440/16000)*4000).astype(np.int16).tobytes()
+    probe=InboundAudioProbe(BrokenProbe())
+    worker=PipelineWorker(Pipeline([probe,Sink()]),idle_timeout_secs=None)
+    runner=WorkerRunner(handle_sigint=False)
+    await runner.add_workers(worker)
+    @worker.event_handler('on_pipeline_started')
+    async def start(worker,frame):
+        await worker.queue_frames([InputAudioRawFrame(audio,16000,1)])
+    @worker.event_handler('on_pipeline_error')
+    async def error(worker,frame):errors.append(frame)
+    task=asyncio.create_task(runner.run())
+    try:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(done.wait(),2)
+    finally:
+        await runner.cancel();await asyncio.wait_for(task,5)
+    # The model still gets the identical frame, and the call sees no pipeline (model) error.
+    assert [frame.audio for frame in received]==[audio]
+    assert errors==[] and probe.failures==1
+
+
+async def test_external_analysis_never_receives_inbound_audio_diagnostics(monkeypatch):
+    import json
+    from google import genai
+    import learning
+    sent=[]
+    class Models:
+        async def generate_content(self,model,contents,config):
+            sent.append(contents);raise RuntimeError('stop after capturing the request')
+    class Client:
+        def __init__(self,**kwargs):self.aio=SimpleNamespace(models=Models())
+    monkeypatch.setattr(genai,'Client',Client)
+    call={'id':'synthetic','events':[{'kind':'transcript','role':'user','text':'Hello'},
+                                     {'kind':'inbound_audio','audio':{'input_frames':5,'input_max_rms':10.0}}],
+          'metrics':{'telegram_audio':{'measurement':'worker_pcm_energy_gap','input_pcm_ms':20,'input_frames':5,
+                                       'input_zero_frames':0,'input_max_rms':10.0,'first_active_input_ms':0,
+                                       'input_sample_rates':[48000],'media':{'events':[]}}}}
+    with pytest.raises(RuntimeError):
+        await learning.GeminiReviewer().review(call,'synthetic-key')
+    request=json.loads(sent[0])
+    assert [event['kind'] for event in request['events']]==['transcript']
+    assert request['metrics']['telegram_audio']=={'measurement':'worker_pcm_energy_gap','input_pcm_ms':20}
+    # The server copy keeps every diagnostic.
+    assert call['events'][1]['kind']=='inbound_audio' and 'media' in call['metrics']['telegram_audio']
