@@ -44,7 +44,7 @@ def test_router_main_movement_prevents_build_and_enrollment_receipt(tmp_path, mo
     command = p.run
     monkeypatch.setattr(p, "run", lambda argv, **kw: "c" * 40 if "FETCH_HEAD" in argv else command(argv, **kw))
     monkeypatch.setattr(p, "build_image", lambda *args: pytest.fail("main moved; must not build"))
-    with pytest.raises(p.Refused, match="main moved"):
+    with pytest.raises(p.Refused, match="not the verified candidate commit"):
         p.prepare_router(settings, SHA)
     assert not (state / ("router-" + SHA) / "router-build.json").exists()
 

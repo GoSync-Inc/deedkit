@@ -518,8 +518,9 @@ else is a removal candidate. It removes nothing: deleting an image stays a
 manual owner step by image ID, after checking that no container uses it. Never
 use `docker image prune`, `docker system prune` or volume removal for this.
 
-There is deliberately no unattended restart timer. Only `apply` changes runtime
-processes, after review of the candidate and any required live-session authority.
+Only `apply`, `rollback` and `deploy` (below) change runtime processes; `apply`
+and `rollback` after review of the candidate and any required live-session
+authority. No unattended timer runs `deploy` yet.
 
 ## Continuous deployment
 
@@ -538,8 +539,12 @@ or, with `--auto` (the timer), the last deploy started less than 20 minutes ago.
 Otherwise it:
 
 1. reads the current plan A release (`current.json`, status `applied`) and the
-   serving HTTP release (`http-current.json`, status `serving`; a pending
-   predecessor retirement is retried first);
+   serving HTTP release (`http-current.json`, status `serving`, or
+   `serving-retirement-pending` with no managed predecessor: the first managed
+   generation keeps the legacy instances; a pending managed predecessor
+   retirement is retried first), and pauses while any plan A attempt is
+   unfinished or any HTTP attempt (`http-attempted.json`) is neither `serving`
+   nor `startup-failed`;
 2. fetches a blobless mirror of `main` into `<state>/deploy-source.git` and
    picks the newest first-parent commit after the current release whose latest
    push run succeeded; a commit whose deployment was attempted is never
@@ -558,19 +563,25 @@ Otherwise it:
    prints one JSON line for the journal.
 
 Within one run `verify()` reads the run and job listings once per SHA and
-afterwards re-reads only the runs (a completed attempt keeps its jobs), so a
-deploy needs about 35 of the host's 60 anonymous requests an hour. A GitHub
-rate-limit response is refused as "GitHub rate limit exhausted, resets at <time>".
+afterwards re-reads only the runs (a completed attempt keeps its jobs; the push
+run is read again after the merge queue run), so a deploy of plans A and B makes
+at most about 44 of the host's 60 anonymous requests an hour and starts only with
+48 left (plan B alone: 27, starts with 31); in practice at most one deploy an
+hour. A GitHub rate-limit response is refused as "GitHub rate limit exhausted,
+resets at <time>".
 
 On a failure it writes `/etc/deedkit/autodeploy.pause` (JSON with the reason)
 and exits 1; nothing deploys until a human removes it. A refusal before any
-change pauses; a network or quota error before any change is retried by the
-next run. When plan A failed its health wait (`unhealthy`, above), it runs
+change pauses, and so does any other error (a malformed receipt, a failed
+retirement of the previous HTTP generation); only a network error, a GitHub
+server error (5xx) or an exhausted quota before any change is retried by the
+next run. An error after a release step started pauses as an unknown state. When plan A failed its health wait (`unhealthy`, above), it runs
 `rollback` once (automatic deploys never change the SQL inventory) and pauses
 with status `rolled-back`; a failed rollback, or an apply that stopped in any
 other state, pauses with no further action. A failed plan B pauses and leaves
 plan A applied (the serving HTTP pair is unchanged or awaits recovery
-inspection). `status` shows `deploy.json` and the pause reason. To resume after
+inspection). `--dry-run` changes no release or runtime state (it may update
+the source mirror and take the locks). `status` shows `deploy.json` and the pause reason. To resume after
 a pause, fix the cause (migrate, install the tools, inspect the state), then
 remove the pause file.
 

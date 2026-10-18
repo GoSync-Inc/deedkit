@@ -14,8 +14,8 @@ def test_backup_image_verification_is_required_even_with_a_green_summary():
             for name in promotion.REQUIRED_JOBS if name != "images / build (backup)"]
 
     def get(path):
-        if path == "git/ref/heads/main":
-            return {"object": {"sha": sha}}
+        if path == "compare/main..." + sha:
+            return {"status": "identical", "ahead_by": 0, "merge_base_commit": {"sha": sha}}
         if "/runs?" in path:
             return {"workflow_runs": [{"id": 12, "run_attempt": 1, "head_sha": sha,
                     "head_branch": "main", "event": "push", "status": "completed",

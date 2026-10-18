@@ -66,6 +66,10 @@ class RateLimited(Refused):
     """GitHub's API quota ran out: nothing is wrong with the candidate, and `deploy` retries after the reset."""
 
 
+class Unreachable(Refused):
+    """GitHub's git endpoint did not answer: `deploy` retries on its next run."""
+
+
 def run(argv, *, cwd=None, umask=-1, env=None, reason=False):
     # Never include command output in an exception: Compose can contain secrets. Only a tool that prints
     # nothing secret (the attestation verifier) may pass its last stderr line on, with `reason`.
@@ -189,10 +193,12 @@ def verify(sha, get=api):
             or latest.get("head_repository", {}).get("full_name") != REPOSITORY):
         raise Refused("latest main CI run is not a completed success for this repository and commit")
     known = _verified.get(sha) if _verified is not None else None
-    if known and unchanged(known["push"], latest) and (
-            known["queue"] is None or unchanged(known["queue"], latest_run(sha, "merge_group", get))):
+    if known and unchanged(known["push"], latest) and (known["queue"] is None or (
+            unchanged(known["queue"], latest_run(sha, "merge_group", get))
+            and unchanged(latest, latest_run(sha, "push", get)))):
         # Within one deploy run: the same completed attempts have the same jobs, so the runs are read again
-        # but not their jobs (the host's anonymous GitHub quota is 60 requests an hour).
+        # but not their jobs (the host's anonymous GitHub quota is 60 requests an hour). After the queue read
+        # the push run is read once more, as the full path does, so a rerun between the reads is not missed.
         return known["result"]
     jobs = attempt_jobs(latest, get)
     verified_by = latest
@@ -975,9 +981,11 @@ DEPLOY_INTERVAL = 20 * 60
 # Changes a human applies or installs by hand, so the deployer pauses for them.
 SQL_INVENTORY = re.compile(r"\.sql$|^services/.+/migrations/")
 DEPLOY_TOOLS = ("scripts/production.py", "scripts/seamless_release.py", "tools/attest-verify/", "services/release-router/")
-# GitHub requests that plan A and plan B use at most within one deploy run (verify() reads ~7 the first time and
-# 3 after, verification_reuse), against the anonymous quota of 60 an hour; below it the deploy waits for the reset.
-QUOTA = {"plan A and B": 40, "plan B": 20}
+# GitHub requests one deploy run needs, against the anonymous quota of 60 an hour; below it the deploy waits for the
+# reset. Plan A verifies 4 times (prepare 2, apply 2) and plan B 6 times (prepare 3, promote 3); with the merge
+# queue's verification the first verify() reads 7 and each later one 4 (verification_reuse): 43 and 27, plus the
+# deploy's own run listing and a margin for a listing that needs a second page.
+QUOTA = {"plan A and B": 48, "plan B": 31}
 
 
 def quota():
@@ -991,7 +999,10 @@ def quota():
 
 def remote_main():
     """main's head from `git ls-remote`, which the API quota does not meter."""
-    line = run(["git", "ls-remote", "https://github.com/" + REPOSITORY + ".git", "refs/heads/main"]).split()
+    try:
+        line = run(["git", "ls-remote", "https://github.com/" + REPOSITORY + ".git", "refs/heads/main"]).split()
+    except Refused as exc:
+        raise Unreachable(str(exc)) from None
     if len(line) != 2 or line[1] != "refs/heads/main" or not re.fullmatch(r"[0-9a-f]{40}", line[0]):
         raise Refused("git ls-remote returned no main commit")
     return line[0]
@@ -1000,11 +1011,15 @@ def remote_main():
 def main_history(state):
     """A blobless mirror of main in the state directory: commits and trees, enough to classify a range."""
     mirror = state / "deploy-source.git"
-    if mirror.exists():
-        run(["git", "-C", str(mirror), "fetch", "--quiet", "--filter=blob:none", "origin", "+refs/heads/main:refs/heads/main"])
-    else:
-        run(["git", "clone", "--quiet", "--bare", "--filter=blob:none", "--single-branch", "--branch", "main",
-             "https://github.com/" + REPOSITORY + ".git", str(mirror)])
+    try:
+        if mirror.exists():
+            run(["git", "-C", str(mirror), "fetch", "--quiet", "--filter=blob:none", "origin",
+                 "+refs/heads/main:refs/heads/main"])
+        else:
+            run(["git", "clone", "--quiet", "--bare", "--filter=blob:none", "--single-branch", "--branch", "main",
+                 "https://github.com/" + REPOSITORY + ".git", str(mirror)])
+    except Refused as exc:
+        raise Unreachable(str(exc)) from None
     return mirror
 
 
@@ -1077,7 +1092,7 @@ def deploy(settings, http, *, auto=False, dry_run=False, get=None):
 
 
 def deploy_locked(settings, http, s, *, dry_run, get):
-    state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
+    state = Path(settings["state_directory"])
     def halt(reason, status="halted", **fields):
         # The pause stops every later run until a human removes it; nothing is retried.
         outcome = {"status": status, "reason": reason, "at": now(), **fields}
@@ -1086,22 +1101,58 @@ def deploy_locked(settings, http, s, *, dry_run, get):
         PAUSE.write_text(json.dumps(outcome) + "\n")
         PAUSE.chmod(0o600)
         return outcome
+    record = {}
+    try:
+        return deploy_steps(settings, http, s, dry_run=dry_run, get=get, halt=halt, record=record)
+    except Exception as exc:
+        # Every failure the steps do not classify themselves ends here: a pause, unless nothing changed yet
+        # and it was the network or the API quota.
+        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        if record:
+            outcome = halt(f"deploy of {record['sha']} stopped in an unknown state: {message}; inspect it")
+            record.update(outcome, finished_at=now())
+            write(state / "deploy.json", record)
+            return record
+        if transient(exc):
+            return {"status": "error", "reason": message + "; nothing changed, the next run retries"}
+        return halt("deploy was refused before any change: " + message)
+
+
+def serving_settled(receipt):
+    """The serving HTTP release has no predecessor left to retire: retired, or legacy instances that stay retained."""
+    return receipt.get("status") == "serving" or (receipt.get("status") == "serving-retirement-pending"
+                                                 and receipt.get("previous") is None)
+
+
+def deploy_steps(settings, http, s, *, dry_run, get, halt, record):
+    state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
     if blocked := unfinished(state):
         return halt("an apply or rollback is unfinished: " + ", ".join(blocked) + "; inspect it before any recovery")
+    # An HTTP attempt that neither serves nor failed before admission has an unknown router or retirement outcome.
+    if unresolved := sorted(path.parent.name for path in http_state.glob("*/http-attempted.json")
+                            if read(path).get("status") not in ("serving", "startup-failed")):
+        return halt("an HTTP release attempt is unresolved: " + ", ".join(unresolved)
+                    + "; inspect seamless_release.py status --sha <sha>")
     current = read(state / "current.json") if (state / "current.json").exists() else {}
     serving = read(http_state / "http-current.json") if (http_state / "http-current.json").exists() else {}
     if current.get("status") != "applied" or not re.fullmatch(r"[0-9a-f]{40}", current.get("sha", "")):
         return halt(f"the current release is {current.get('status', 'missing')}, not applied; apply one by hand first")
     base = current["sha"]
-    if serving.get("status") == "serving-retirement-pending":
-        # Retiring the predecessor HTTP pair is promote's last step, safe to repeat; it never cuts a request short.
+    if serving.get("status") == "serving-retirement-pending" and not serving_settled(serving):
+        # Retiring the managed predecessor HTTP pair is promote's last step, safe to repeat; it never cuts a request
+        # short. It changes the router (the admission fence), so its failure pauses.
         if dry_run:
             return {"status": "plan", "sha": serving.get("sha"), "steps": ["retire the previous HTTP generation"]}
-        s.retire(http, serving["sha"])
+        try:
+            s.retire(http, serving["sha"])
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+            return halt(f"retiring the HTTP generation before {serving['sha']} failed: {message}; "
+                        "inspect seamless_release.py status --sha " + serving["sha"])
         serving = read(http_state / "http-current.json")
-        if serving.get("status") != "serving":
+        if not serving_settled(serving):
             return {"status": "waiting", "reason": "the previous HTTP generation is still draining"}
-    if serving.get("status") != "serving" or not re.fullmatch(r"[0-9a-f]{40}", serving.get("sha", "")):
+    if not serving_settled(serving) or not re.fullmatch(r"[0-9a-f]{40}", serving.get("sha", "")):
         return halt(f"the HTTP release is {serving.get('status', 'missing')}; inspect seamless_release.py status")
     head = remote_main()
     if head == base == serving["sha"]:
@@ -1145,7 +1196,7 @@ def deploy_locked(settings, http, s, *, dry_run, get):
     if dry_run:
         return {"status": "plan", "sha": candidate, "base": base, "run": run_url,
                 "steps": (["plan A"] if candidate != base else []) + ["plan B"]}
-    record = {"sha": candidate, "base": base, "run": run_url, "started_at": now(), "status": "deploying"}
+    record.update(sha=candidate, base=base, run=run_url, started_at=now(), status="deploying")
     write(state / "deploy.json", record)
     def finish(status, **fields):
         record.update(status=status, finished_at=now(), **fields)
@@ -1196,8 +1247,11 @@ def deploy_locked(settings, http, s, *, dry_run, get):
 
 
 def transient(exc):
-    """A network error or an exhausted API quota says nothing about the candidate: the next run retries it."""
-    return isinstance(exc, RateLimited) or not isinstance(exc, Refused)
+    """A network error, a GitHub server error or an exhausted API quota says nothing about the candidate: the next run
+    retries it. Anything else (a refusal, a malformed receipt, a program error) pauses."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500
+    return isinstance(exc, (RateLimited, Unreachable, urllib.error.URLError, TimeoutError, ConnectionError))
 
 
 def http_release_tool():

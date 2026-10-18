@@ -1667,16 +1667,14 @@ def test_an_apply_or_rollback_record_from_the_order_dependent_digest_is_refused_
 
 def test_a_commit_main_has_moved_past_is_still_promotable_and_one_outside_main_is_not():
     get, _, _ = github()
+    def answering(answer):
+        return lambda path: answer if path.startswith("compare/main...") else get(path)
     for behind in (1, 25):
-        moved = lambda path, behind=behind: (comparison(SHA, behind=behind) if path.startswith("compare/main...")
-                                             else get(path))
-        assert p.verify(SHA, moved)["run_id"] == 12
+        assert p.verify(SHA, answering(comparison(SHA, behind=behind)))["run_id"] == 12
     for status in ({"status": "ahead", "ahead_by": 1}, {"status": "diverged", "ahead_by": 2},
                    {"status": "behind", "ahead_by": 0, "merge_base_commit": {"sha": "f" * 40}}):
-        answer = {**comparison(SHA, behind=3), **status}
-        outside = lambda path, answer=answer: answer if path.startswith("compare/main...") else get(path)
         with pytest.raises(p.Refused, match="not a commit on main"):
-            p.verify(SHA, outside)
+            p.verify(SHA, answering({**comparison(SHA, behind=3), **status}))
 
 
 def test_within_one_deploy_a_later_verification_rereads_the_runs_but_not_their_jobs():
@@ -1690,8 +1688,11 @@ def test_within_one_deploy_a_later_verification_rereads_the_runs_but_not_their_j
         full = len(paths)
         paths.clear()
         assert p.verify(SHA, counted) == first
-        # compare, the push run listing and the queue run listing; no job listing.
-        assert len(paths) == 3 and not any("/jobs?" in path for path in paths)
+        # compare, the push run listing, the queue run listing and the push run listing again; no job listing.
+        assert [path.split("?")[0] + ("" if "?" not in path else "?" + re.search(r"event=\w+", path).group(0))
+                for path in paths] == ["compare/main..." + SHA, "actions/workflows/ci.yml/runs?event=push",
+                                       "actions/workflows/ci.yml/runs?event=merge_group",
+                                       "actions/workflows/ci.yml/runs?event=push"]
     paths.clear()
     p.verify(SHA, counted)
     assert len(paths) == full  # outside a deploy run every verification is complete
@@ -1699,11 +1700,60 @@ def test_within_one_deploy_a_later_verification_rereads_the_runs_but_not_their_j
 
 @pytest.mark.parametrize("changed", ["push", "merge_group"])
 def test_a_rerun_after_the_first_verification_of_a_deploy_is_verified_again_in_full(changed):
-    get, _, _ = queue_github(changes={changed: {"run_attempt": 3, "conclusion": "failure"}})
+    get, push, group = queue_github()
+    paths = []
+    def counted(path):
+        paths.append(path)
+        # The rerun's jobs are the same synthetic jobs as its first attempt's.
+        return get(path.replace("/attempts/3/", "/attempts/1/" if "runs/40/" in path else "/attempts/2/"))
     with p.verification_reuse():
-        with pytest.raises(p.Refused):
-            p.verify(SHA, get)
-            p.verify(SHA, get)
+        assert p.verify(SHA, counted)["run_attempt"] == 1
+        (push if changed == "push" else group)["run_attempt"] = 3  # a successful rerun of the same run
+        paths.clear()
+        again = p.verify(SHA, counted)
+        rerun = "runs/40/attempts/3/jobs?" if changed == "push" else "runs/30/attempts/3/jobs?"
+        assert any(rerun in path for path in paths)  # the new attempt's jobs are read: a full verification
+        assert (again["run_attempt"], again["verify_run_attempt"]) == ((3, 2) if changed == "push" else (1, 3))
+        (push if changed == "push" else group)["conclusion"] = "failure"
+        (push if changed == "push" else group)["run_attempt"] = 4
+        with pytest.raises(p.Refused, match="not a completed success"):
+            p.verify(SHA, counted)
+
+
+@pytest.mark.parametrize("change", [{"run_attempt": 2, "status": "in_progress", "conclusion": None}, {"id": 41}])
+def test_a_push_run_change_during_the_queue_read_of_a_reused_verification_is_refused(change):
+    get, push, _ = queue_github()
+    with p.verification_reuse():
+        p.verify(SHA, get)
+        def racing(path):
+            answer = get(path)
+            if "event=merge_group" in path:
+                push.update(change)  # a rerun or a newer run starts while the queue run is read
+            return answer
+        with pytest.raises(p.Refused, match="push run changed while it was being verified"):
+            p.verify(SHA, racing)
+
+
+def test_the_quota_a_deploy_waits_for_covers_every_verification_of_plans_a_and_b():
+    import ast
+    import inspect
+    import textwrap
+    from scripts import seamless_release as s
+    def verifications(function):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        return sum(isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) == "verify"
+                   for node in ast.walk(tree))
+    # seamless prepare runs production.py prepare first.
+    plan_a = verifications(p.prepare) + verifications(p.apply)
+    plan_b = verifications(p.prepare) + verifications(s.prepare) + verifications(s.promote)
+    assert (plan_a, plan_b) == (4, 6)
+    get, _, _ = queue_github()  # the costliest path: the push run reused the queue's verification
+    for steps, count, listing in (("plan A and B", plan_a + plan_b, 1), ("plan B", plan_b, 0)):
+        paths = []
+        with p.verification_reuse():
+            for _ in range(count):
+                p.verify(SHA, lambda path: paths.append(path) or get(path))
+        assert len(paths) + listing <= p.QUOTA[steps] - 4, (steps, len(paths))  # 4 spare for a second page
 
 
 def test_an_exhausted_github_quota_is_refused_with_its_reset_time(monkeypatch):
@@ -1951,8 +2001,8 @@ def test_deploy_pauses_for_an_sql_inventory_or_deploy_tool_change_before_any_ste
 
 
 def test_documentation_about_migrations_is_not_an_sql_inventory_change(tmp_path, monkeypatch):
-    host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["docs/migrations/messaging-layout.md",
-                                                            ".claude/rules/migrations.md"]})
+    host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["guide/migrations/synthetic-layout.md",
+                                                            "services/messaging/migration-notes.md"]})
     assert host.deploy()["status"] == "deployed"
 
 
@@ -2061,6 +2111,66 @@ def test_a_failed_http_release_pauses_and_leaves_plan_a_applied(tmp_path, monkey
     outcome = host.deploy()
     assert outcome["status"] == "halted" and "HTTP release stopped" in outcome["reason"]
     assert p.read(host.state / "current.json")["sha"] == NEWEST and ("rollback", NEWEST) not in host.steps
+
+
+def test_a_first_http_generation_that_keeps_its_legacy_instances_does_not_hold_deploy_back(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    # seamless_release.py leaves the first managed generation pending for good: legacy instances stay retained.
+    p.write(host.http_state / "http-current.json", {"sha": BASE, "status": "serving-retirement-pending",
+                                                    "previous": None, "config_digest": p.digest(host.http)})
+    assert host.deploy()["status"] == "deployed" and ("seamless retire", BASE) not in host.steps
+
+
+def test_a_failed_retirement_of_the_previous_http_generation_pauses(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    p.write(host.http_state / "http-current.json", {"sha": BASE, "status": "serving-retirement-pending",
+                                                    "previous": {"generation": "g1"}, "config_digest": p.digest(host.http)})
+    assert host.deploy() == {"status": "waiting", "reason": "the previous HTTP generation is still draining"}
+    host.fail_seamless_retire = lambda sha: (_ for _ in ()).throw(p.Refused("router admission fence needs recovery inspection"))
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "router admission fence" in outcome["reason"] and host.paused()
+    assert host.steps == [("seamless retire", BASE)] * 2
+
+
+def test_a_missing_or_malformed_receipt_before_any_step_pauses_with_its_reason(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    (host.state / BASE / "prepared.json").unlink()
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and outcome["reason"].startswith("deploy was refused before any change")
+    assert host.paused() and host.steps == [] and not (host.state / "deploy.json").exists()
+
+
+def test_an_unresolved_http_attempt_pauses_before_plan_a_changes_anything(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    (host.http_state / NEWER).mkdir()
+    p.write(host.http_state / NEWER / "http-attempted.json", {"status": "recovery-required", "sha": NEWER})
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "HTTP release attempt is unresolved: " + NEWER in outcome["reason"]
+    assert host.steps == [] and host.requests == []
+    # A startup that failed before traffic admission left the serving release unchanged: it no longer blocks.
+    p.write(host.http_state / NEWER / "http-attempted.json", {"status": "startup-failed", "sha": NEWER})
+    p.PAUSE.unlink()
+    assert host.deploy()["sha"] == NEWEST
+
+
+def test_a_program_or_state_error_before_any_change_pauses_and_only_network_errors_are_retried(tmp_path, monkeypatch):
+    retried = (urllib.error.URLError("synthetic resolver failure"),
+               urllib.error.HTTPError("https://api.github.com", 502, "Bad Gateway", {}, None))
+    paused = (ValueError("malformed receipt"), KeyError("sha"),
+              urllib.error.HTTPError("https://api.github.com", 404, "Not Found", {}, None))
+    for index, error in enumerate(retried + paused):
+        (tmp_path / str(index)).mkdir()
+        host = Deployer(tmp_path / str(index), monkeypatch)
+        def early(sha, host=host, error=error):
+            (host.state / sha / "attempted.json").unlink()  # it failed before its attempt began
+            raise error
+        host.fail_apply = early
+        outcome = host.deploy()
+        if error in retried:
+            assert outcome["status"] == "error" and host.paused() is None, error
+        else:
+            assert outcome["status"] == "halted" and "refused before any change" in outcome["reason"], error
+            assert host.paused() is not None
 
 
 def test_a_dry_run_reports_the_plan_or_the_pause_reason_and_changes_nothing(tmp_path, monkeypatch):
