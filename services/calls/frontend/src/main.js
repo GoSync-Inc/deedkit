@@ -158,6 +158,10 @@ function renderRecord(record, force=false) {
   const phase=record.events.filter(e=>e.kind==='flow').at(-1)?.flow;
   const phases={discussion:'Беседа',review:'Подведение итогов',confirmation:'Ожидание ответа на предложение завершить',ending:'Прощание с проверкой новой речи'};
   $('flow-stage').textContent=phase ? `Flows: ${phases[phase.node] || phase.node} · переход ${phase.revision}` : 'Прежний режим Gemini Live';
+  // Who was called, on which owner words, and where the number came from (ANYM-288).
+  const source=record.destination_source==='owner_named' ? 'номер назвал владелец' : record.destination_source==='agent_found' ? `номер нашёл агент: ${record.destination_evidence}` : 'источник номера не указан';
+  const origin=record.owner_instruction ? `Звонок на ${record.brief.destination} · ${source} · слова владельца: «${record.owner_instruction}»` : '';
+  $('call-origin').textContent=origin; $('call-origin').hidden=!origin;
   const utterances=record.events.filter(e=>e.kind==='transcript');
   $('transcript').replaceChildren(...utterances.map(e=>{
     const p=node('p',undefined,`utterance ${e.role}`); p.append(node('small',e.role==='user' ? 'Ты играешь собеседника' : `Ассистент${e.interrupted ? ' / прерванная реплика' : ''}`),document.createTextNode(typeof e.text==='string' ? e.text : JSON.stringify(e.text))); return p;

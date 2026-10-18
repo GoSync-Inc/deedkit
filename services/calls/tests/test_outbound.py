@@ -30,9 +30,10 @@ async def test_dial_requires_explicit_route_recipient_key_and_reference(tmp_path
         await manager.dial(saved['id'],'Owner asked in this conversation')
     assert service.list_calls()==[]
     manager.settings=CallingSettings(enabled=True)
+    # ANYM-288: only SIP keeps a recipient list; an unlisted phone number reaches the key check.
+    sip=service.prepare(brief('sip','sip:alice@pbx.example.test'),[])
     with pytest.raises(ServiceError,match='recipient_not_allowed'):
-        await manager.dial(saved['id'],'Owner asked in this conversation')
-    manager.settings=CallingSettings(enabled=True,allowed={'phone':['+628123456789']})
+        await manager.dial(sip['id'],'Owner asked in this conversation')
     with pytest.raises(ServiceError,match='model_key_required'):
         await manager.dial(saved['id'],'Owner asked in this conversation')
     assert service.list_calls()==[]

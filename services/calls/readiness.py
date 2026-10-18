@@ -1,6 +1,7 @@
 """Principal-scoped configuration diagnostics. No probes, calls or archive reads."""
 from core import ServiceError
 from outbound import TwilioCalls
+import destination_policy as policy
 
 
 def calling_readiness(principal, outbound, credentials, browser_enabled):
@@ -21,9 +22,12 @@ def calling_readiness(principal, outbound, credentials, browser_enabled):
             blockers.append('calls:dial_required')
         if not outbound.settings.enabled:
             blockers.append('calling_disabled')
+        # Only SIP keeps a recipient list (ANYM-288).
         recipients = set(principal.destinations.get(channel, [])) & set(outbound.settings.allowed.get(channel, []))
-        if not recipients:
+        if channel == 'sip' and not recipients:
             blockers.append('recipient_not_allowed')
+        # An exhausted cap is not a configuration fault: preflight and dial report daily_call_limit.
+        remaining = outbound.daily_calls_remaining()
         supported = ['gemini', 'xai'] if channel in {'phone','sip'} else ['gemini']
         if not any(credentials.get(name) for name in supported):
             blockers.append('model_key_required')
@@ -36,7 +40,8 @@ def calling_readiness(principal, outbound, credentials, browser_enabled):
             except ServiceError as error:
                 blockers.append(error.code)
         channels[channel] = {'configuration_ready':not blockers, 'blockers':blockers,
-            'allowed_recipient_count':len(recipients), 'model_providers':supported,
+            'recipient_policy':policy.recipient_policy(channel), 'daily_calls_remaining':remaining,
+            **({'allowed_recipient_count':len(recipients)} if channel == 'sip' else {}), 'model_providers':supported,
             'provider_connection':'not_probed', 'preflight_required':True, 'live_call_verified':False}
     return {'model_credentials':dict(credentials), 'channels':channels,
             'external_action_authorized':False}

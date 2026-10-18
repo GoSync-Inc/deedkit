@@ -52,7 +52,15 @@ directory. Old browser/owner tasks retain their legacy boundary.
 Calls agent API credentials are separate from the owner control token. An atomic
 private `VOICE_AGENT_REGISTRY` JSON file contains version 1, a monotonically
 increasing revision and principals with ID, SHA-256 key digest, enabled flag,
-timezone-aware expiry, scopes, channels and exact destination allowlists. Brief
+timezone-aware expiry, scopes, channels and, for SIP only, exact destination
+allowlists. Phone, WhatsApp and Telegram have no recipient list (ANYM-288): an agent
+may call a destination the owner named or one it found for the owner's task.
+`dial_call` carries the owner's own words (`owner_instruction`) and the destination's
+origin (`owner_named`, which the words must contain, or `agent_found` with evidence);
+messages, files, web pages and model output never authorize a call. Emergency numbers
+and short codes fail fast with a call-it-yourself message, invalid numbers are refused,
+and every dial spends units of a durable cap of 10 per rolling 24 hours (premium-rate,
+shared-cost and UAN numbers cost 3). Country limits stay in Twilio Geo Permissions. Brief
 ownership is assigned from the authenticated principal before snapshot hashing.
 Calls, results, decisions and followups inherit it. No agent tool can submit an
 owner decision or read/activate global learned prompts. Optional archive context
@@ -61,7 +69,8 @@ to the owner archive credential. Phone preparation works without an archive.
 With `calls:read`, `list_briefs` and `list_calls` page only the principal's own items
 newest first as short summaries without notes, facts, prompts or destinations.
 Capabilities report each granted channel's configured state (from settings only, no
-provider contact), allowlisted recipient counts and the enforced request limits.
+provider contact), the recipient policy (SIP: allowlisted recipient counts),
+`daily_calls_remaining` and the enforced request limits.
 
 ## Outcomes and verification
 
