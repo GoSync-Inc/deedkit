@@ -293,3 +293,24 @@ def test_a_plain_title_is_non_empty_without_control_characters_and_may_hold_a_do
     assert "web/d.test.mjs:2 cost $5 -> ANYM-12" in out
     assert "web/d.test.mjs:4 <" in out and "web/d.test.mjs:6 <" in out
     assert out.count("the test name is not a plain string literal") == 2
+
+
+# spec: ANYM-405
+def test_a_go_name_after_a_line_break_and_a_call_after_an_open_comment_are_not_hidden(repo, server):
+    server.set(main=[spec(12)])
+    code, out = run(repo, server, {"pkg/s_test.go": "package pkg\n\nfunc\nTestSplit(t *testing.T) {}\n",
+                                   "web/o.test.mjs": "test /* label\n*/ ('open comment', () => {});\n"},
+                    "Spec: ANYM-12")
+    assert code == 1
+    assert "pkg/s_test.go:3 TestSplit: no marker" in out
+    assert "web/o.test.mjs:1 <test /* label>: the test call is split" in out
+
+
+# spec: ANYM-405
+def test_many_block_comments_without_a_call_scan_in_linear_time():
+    source = 'const description = "test ' + "/*x*/" * 40 + ' trailer";\nfunc Test' + "/*x*/" * 40 + "\n"
+    completed = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, 'scripts'); import tiden_pr_check"
+                                " as p; print(p.tests_in('p.test.mjs', sys.argv[1]), p.tests_in('p_test.go', sys.argv[1]))",
+                                source], capture_output=True, text=True, timeout=20,
+                               cwd=Path(ROOT_SCRIPT).parents[1])
+    assert completed.stdout.strip() == "[] []", completed.stderr

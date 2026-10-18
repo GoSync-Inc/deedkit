@@ -41,12 +41,15 @@ MARKER_LIKE = re.compile(r"^[ \t]*(#|//)[ \t]*spec\b", re.IGNORECASE)
 # definition counts, even inside a comment or a string, so a test is never hidden (fail closed). A Node name must be a
 # plain string literal, the whole first argument on the call's line, so it equals the title CI reports: non-empty, with
 # no escape, `${` or control character (the report rewrites those). A block comment may sit before the `(`; a `test`
-# or `it` alone on its line, its `(` on a later one, is a call this check cannot read, so it fails (NODE_SPLIT).
-NODE_TEST = re.compile(r"(?<![\w.$])(?:test|it)(?:\.(?:only|skip|todo))?\s*(?:/\*.*?\*/\s*)*\(")
-NODE_SPLIT = re.compile(r"^\s*(?:await\s+)?(?:test|it)(?:\.(?:only|skip|todo))?\s*(?:/\*.*?\*/\s*)*(?://.*)?$")
+# or `it` alone on its line, its `(` on a later one or after a comment left open, is a call this check cannot read,
+# so it fails (NODE_SPLIT). COMMENT is one block comment, written so no text matches it two ways (no backtracking).
+COMMENT = r"/\*(?:[^*]|\*+[^*/])*\*+/"
+NODE_TEST = re.compile(rf"(?<![\w.$])(?:test|it)(?:\.(?:only|skip|todo))?\s*(?:{COMMENT}\s*)*\(")
+NODE_SPLIT = re.compile(rf"^\s*(?:await\s+)?(?:test|it)(?:\.(?:only|skip|todo))?\s*(?:{COMMENT}\s*)*"
+                        r"(?://.*|/\*(?:[^*]|\*+[^*/])*\**)?$")
 NODE_NAME = re.compile(r"\s*(?:'([^'\\\x00-\x1f\x7f]+)'|\"([^\"\\\x00-\x1f\x7f]+)\""
                        r"|`((?:[^`\\$\x00-\x1f\x7f]|\$(?!\{))+)`)\s*,")
-GO_TEST = re.compile(r"^[ \t]*func[ \t]+(Test(?![a-z])\w*)[ \t]*(?:/\*.*?\*/[ \t]*)*\(", re.MULTILINE)
+GO_TEST = re.compile(rf"^[ \t]*func\s+(Test(?![a-z])\w*)\s*(?:{COMMENT}\s*)*\(", re.MULTILINE)
 # Story-level means a leaf that holds criteria: not an Epic and without child specs.
 CONTAINER_TYPES = {"Epic"}
 # Tests that verify no spec, as `<path>::<test>` patterns with the reason; widening it is a reviewed code change.
