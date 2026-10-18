@@ -13,8 +13,13 @@ The existing operator handles explicitly scheduled singleton updates.
    so the host needs the installed attestation verifier and GHCR access;
    [production.md](production.md#attestation-verifier)) and saves private
    configuration snapshots without starting application containers.
-2. `promote` rechecks image, configuration, container and router identities. Old
-   and new messaging images must have identical SQL inventories. It starts a
+2. `promote` rechecks image, configuration, container and router identities.
+   `prepare` and `promote` require the candidate and the API image that the
+   `production.py` deployment runs ([production.md](production.md), "plan A")
+   to have identical SQL inventories. A previously promoted serving generation's
+   image may lack only later migrations that this API image already carries: its
+   inventory is a prefix of the candidate's, the added migrations continue its
+   numbering without a gap and each number names one file. It starts a
    uniquely named gateway/API pair beside the serving generation, without
    inherited host ports or provider-owner dependencies.
 3. Candidates remain `warming`: ordinary HTTP fails closed and upload maintenance
@@ -56,7 +61,11 @@ identities and all other module targets.
 
 Updating singleton code still needs its own deployment and applicable session or
 call authority. Schema changes require a separate reviewed compatibility and
-backup plan; this operator refuses differing SQL inventories before overlap.
+backup plan; this operator refuses differing SQL inventories before overlap,
+except a serving generation that predates migrations the `production.py` API
+image already carries (step 2), which that deployment applied under its own
+plan. The candidate API's read-only readiness then requires the database
+version and checksums to equal the candidate inventory exactly.
 Never use a migration or provider command as readiness.
 
 ## Internal router and first enrollment

@@ -401,13 +401,38 @@ def schema_inventory(image):
     return value
 
 
+def migration_version(name):
+    match = re.fullmatch(r'migrations/([0-9]{3})_[^/]+\.sql', name)
+    return int(match.group(1)) if match else None
+
+
+def applied_prefix(old, candidate):
+    """An older generation's inventory followed only by later migrations, which plan A has already applied."""
+    versions = [migration_version(name) for name in old if name != 'schema.sql']
+    added = [migration_version(name) for name in candidate if name not in old]
+    if not added or None in versions + added or any(candidate.get(name) != sha for name, sha in old.items()):
+        return False
+    # Readiness keys the applied ledger by number, so every number must name one file;
+    # the added migrations continue the old numbering without gaps.
+    newest = max((v for v in versions if v is not None), default=0)
+    if len(set(versions)) != len(versions):
+        return False
+    return sorted(v for v in added if v is not None) == list(range(newest + 1, newest + 1 + len(added)))
+
+
 def check_schema(settings, receipt):
-    old_images = {item['running'][settings['http_release']['api']['service']]['image'] for item in receipt['baseline'] if item['name'] == settings['http_release']['api']['project']}
-    if receipt.get('previous'):
-        old_images.add(receipt['previous']['images']['runtime'])
+    baseline = {item['running'][settings['http_release']['api']['service']]['image'] for item in receipt['baseline'] if item['name'] == settings['http_release']['api']['project']}
     candidate = schema_inventory(receipt['images']['runtime'])
-    if candidate != receipt['schema'] or any(schema_inventory(image) != candidate for image in old_images):
+    if candidate != receipt['schema'] or any(schema_inventory(image) != candidate for image in baseline):
         raise Refused('messaging schema inventory mismatch; seamless promotion cannot run migrations')
+    # The plan A API already runs the candidate inventory against the database. A serving
+    # generation from before plan A's migrations may differ only by those later migrations;
+    # the candidate's passive readiness still compares the database inventory exactly.
+    previous = receipt['previous']['images']['runtime'] if receipt.get('previous') else None
+    if previous and previous not in baseline:
+        old = schema_inventory(previous)
+        if old != candidate and not applied_prefix(old, candidate):
+            raise Refused('messaging schema inventory mismatch; seamless promotion cannot run migrations')
 
 
 def prepare(settings, sha):
