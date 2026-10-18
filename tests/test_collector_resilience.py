@@ -518,18 +518,82 @@ def test_capture_stop_detail_is_kept_in_live_capture_status(worker):
     assert live['last_capture_stop']['detail'] is None and live['last_capture_stop']['code']=='durable_capture_failed'
 
 
-def test_rejected_counts_are_bounded_and_validated(worker):
+def test_rejected_reasons_are_a_fixed_vocabulary_and_validated(worker):
     w,s,_=worker
-    w.state.capture_progress(None,0,0,rejected={f'code_{n}':1 for n in range(40)})
-    w.state.capture_progress(None,0,0,rejected={'code_1':2})
-    with s.pool.connection() as c:
-        live=c.execute('SELECT operations FROM collector_health WHERE account=%s',(w.account,)).fetchone()['operations']['live_capture']
-    counts=live['rejected_live_captures']
-    assert len(counts)==33 and counts['code_1']==3 and counts['invalid_capture']==8
-    for bad in [{'Private text':1},{'ok':0}]:
+    # Code-shaped exception text from a validator is not trusted as a reason.
+    w.spool.validator=lambda item:(_ for _ in ()).throw(ValueError('synthetic_private_message'))
+    asyncio.run(w.capture(NS(message=message(7))))
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=[4])))
+    assert not w.failed.is_set()
+    live=live_status(w,s)
+    assert live['rejected_live_captures']=={'invalid_capture':2}
+    assert live['rejected_live_messages'][0]['reason_code']=='invalid_capture'
+    assert 'synthetic_private' not in str(live)
+    for bad in [{'synthetic_private_message':1},{'invalid_capture':0}]:
         with pytest.raises(ValueError,match='invalid_capture_progress'):w.state.capture_progress(None,0,0,rejected=bad)
-    with pytest.raises(ValueError,match='invalid_capture_progress'):
-        w.state.capture_progress(None,0,0,rejected_messages=[{'chat':'100','message_id':1,'reason_code':'x','observed_at':'2026-10-18T00:00:00+00:00','body':'private'}])
+    for bad in [{'chat':'100','message_id':1,'reason_code':'invalid_capture','observed_at':'2026-10-18T00:00:00+00:00','body':'private'},
+                {'chat':'100','message_id':1,'reason_code':'synthetic_private','observed_at':'2026-10-18T00:00:00+00:00'}]:
+        with pytest.raises(ValueError,match='invalid_capture_progress'):w.state.capture_progress(None,0,0,rejected_messages=[bad])
+
+
+@pytest.mark.parametrize('callback',['receipt','owner_read'])
+@pytest.mark.parametrize('error,detail',[(OSError(5,'synthetic-private'),'spool_io_error'),
+    (MemoryError(),'capture_error'),(RuntimeError('synthetic-private'),'capture_error')])
+def test_parser_resource_or_unexpected_error_still_fails_closed(worker,monkeypatch,callback,error,detail):
+    w,_,_=worker
+    import messaging_service.reply_state as reply_state
+    import messaging_service.telegram_receipts as receipts
+    event=receipt_ready(w)
+    def boom(*a,**k):raise error
+    monkeypatch.setattr(receipts if callback=='receipt' else reply_state,
+        'telegram_receipt' if callback=='receipt' else 'telegram_read_capture',boom)
+    asyncio.run(getattr(w,callback)(event))
+    assert w.failed.is_set() and w.failure_code=='durable_capture_failed' and w.failure_detail==detail
+    assert w.rejected=={} and names(w.spool.path)==[]
+
+
+def test_an_io_error_that_is_also_a_value_error_is_never_a_rejection(worker):
+    import io
+    w,_,_=worker
+    def unsupported(item):raise io.UnsupportedOperation('synthetic-private')
+    w.spool.validator=unsupported
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=[4])))
+    assert w.failed.is_set() and w.failure_detail=='spool_io_error' and w.rejected=={}
+
+
+class Raising:
+    @property
+    def chat_id(self):raise RuntimeError('synthetic-private')
+
+
+@pytest.mark.parametrize('event',[NS(),NS(message=Raising())])
+def test_malformed_live_event_fails_closed_and_releases_its_slot(worker,event):
+    w,_,_=worker
+    asyncio.run(w.capture(event))
+    assert w.failed.is_set() and w.failure_code=='durable_capture_failed' and w.failure_detail=='capture_error'
+    assert w.capture_count==0 and w.rejected=={}
+
+
+def test_rejection_evidence_survives_a_failed_status_write(worker):
+    w,s,_=worker
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=[0])))
+    odd=message(7);odd.peer_id=NS()
+    asyncio.run(w.capture(NS(message=odd)))
+    real=w.state.capture_progress;calls=[]
+    def flaky(*args,**kwargs):
+        calls.append(kwargs)
+        if len(calls)==1:
+            # A rejection that arrives while the first write is failing.
+            w.reject('invalid_deleted_ids')
+            raise psycopg.OperationalError('synthetic outage')
+        return real(*args,**kwargs)
+    w.state.capture_progress=flaky
+    with pytest.raises(psycopg.OperationalError):asyncio.run(w.drain_captures([w.spool]))
+    w._next_capture_status=0
+    asyncio.run(w.drain_captures([w.spool]))
+    assert calls[1]['rejected']=={'invalid_deleted_ids':2,'invalid_provider_message':1} and calls[1]['invalid']==1
+    assert [m['message_id'] for m in calls[1]['rejected_messages']]==[7]
+    assert w.rejected=={} and w.rejected_messages==[] and w.invalid_messages==0
 
 
 def test_run_reports_the_capture_stop_detail_to_state(tmp_path):

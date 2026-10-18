@@ -60,6 +60,7 @@ class DurableSpool:
 
     def put(self,data):
         try:payload=canonical(self.validator(data))
+        except OSError:raise  # Also a ValueError for io.UnsupportedOperation; never a rejection.
         except (ValueError,TypeError,KeyError,RecursionError) as exc:raise InvalidCapture(reason_code(exc)) from None
         digest=hashlib.sha256(payload).hexdigest()
         with self.locked():

@@ -16,7 +16,7 @@ import time
 from .adapters import telegram_message
 from .archive import Archive
 from .blobs import BlobWriter
-from .collector_state import CAPTURE_STOP_DETAILS,CaptureSpool,CollectorState,session_lock
+from .collector_state import CAPTURE_STOP_DETAILS,LIVE_REJECT_CODES,CaptureSpool,CollectorState,session_lock
 from .spool import InvalidCapture
 from .store import Store
 from .telegram_governor import ProviderRateLimited,RequestGovernor
@@ -281,6 +281,11 @@ def media_deadline(size):
     return max(3600,min(6*3600,int(expected*1.5)+600))
 
 
+# Deterministic failures of a pure parser on malformed provider input. Resource,
+# I/O and unexpected errors are not among them and still fail capture closed.
+PARSE_ERRORS=(ValueError,TypeError,KeyError,AttributeError,IndexError,RecursionError)
+
+
 class TelegramCollector:
     state_class=CollectorState
     coverage_code='telegram_history_partial'
@@ -326,6 +331,8 @@ class TelegramCollector:
 
     def reject(self,code,chat=None,message_id=None):
         """Count one deterministically unstorable live item; a restart cannot fix it."""
+        # Only fixed codes reach status, never text that merely looks like one.
+        if code not in LIVE_REJECT_CODES:code='invalid_capture'
         self.rejected[code]=self.rejected.get(code,0)+1
         if (chat is not None and type(message_id) is int and 0<message_id<2**63
                 and re.fullmatch(r'-?[0-9]{1,20}',chat) and self.policy and self.state.allows(self.policy,chat)):
@@ -339,12 +346,14 @@ class TelegramCollector:
         if self.stopping.is_set() or self.failed.is_set(): return
         if self.capture_count>=16: self.fail('capture_overload'); return
         self.capture_count+=1
-        message=event.message; chat=str(getattr(message,'chat_id',None))
+        message=chat=None
         try:
+            message=event.message; chat=str(getattr(message,'chat_id',None))
             try:
                 e=telegram_message(self.account,message,verified_self=getattr(self.provider,'verified_self',None))
                 kind=peer_kind(message)
-            except ValueError:
+            except ValueError as exc:
+                if isinstance(exc,OSError):raise
                 # Deterministically unstorable; reconciliation skips it the same way.
                 self.invalid_messages+=1; self.reject('invalid_provider_message',chat,getattr(message,'id',None)); return
             if not self.state.allows(self.policy,e['chat']): return
@@ -379,7 +388,9 @@ class TelegramCollector:
             try:
                 capture=telegram_read_capture(self.account,event,verified_self=getattr(self.provider,'verified_self',None),
                     expected_user_id=getattr(self.provider,'expected_user_id',None))
-            except Exception:self.reject('read_parse_failed');return
+            except PARSE_ERRORS as exc:
+                if isinstance(exc,OSError):raise
+                self.reject('read_parse_failed');return
             if capture is None or not self.policy or self.policy.get('account')!=self.account:return
             if not self.state.allows(self.policy,capture['chat']):return
             if self.capture_count>=16:self.fail('capture_overload');return
@@ -399,7 +410,9 @@ class TelegramCollector:
                 capture=telegram_receipt(self.account,event,
                     verified_self=getattr(self.provider,'verified_self',None),
                     expected_user_id=getattr(self.provider,'expected_user_id',None))
-            except Exception: self.reject('receipt_parse_failed'); return
+            except PARSE_ERRORS as exc:
+                if isinstance(exc,OSError): raise
+                self.reject('receipt_parse_failed'); return
             if capture is None: return
             if not self.policy or self.policy.get('account')!=self.account: return
             if getattr(self.state,'account',self.account)!=self.account: return
@@ -567,8 +580,15 @@ class TelegramCollector:
             if rejected:extra['rejected']=rejected
             skipped,self.rejected_messages=getattr(self,'rejected_messages',[]),[]
             if skipped:extra['rejected_messages']=skipped
-            await asyncio.to_thread(self.state.capture_progress,last,count,await asyncio.to_thread(pending,spools),
-                quarantined=min(20000,quarantined),invalid=invalid,**extra)
+            try:
+                await asyncio.to_thread(self.state.capture_progress,last,count,await asyncio.to_thread(pending,spools),
+                    quarantined=min(20000,quarantined),invalid=invalid,**extra)
+            except BaseException:
+                # Skipped items have no spool record to replay; keep their counts for the retry.
+                self.invalid_messages+=invalid
+                for code,number in rejected.items():self.rejected[code]=self.rejected.get(code,0)+number
+                self.rejected_messages=[*skipped,*self.rejected_messages][-20:]
+                raise
             self._next_capture_status=time.monotonic()+15
 
     async def renew_lease(self):

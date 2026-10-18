@@ -67,9 +67,17 @@ def validate_capture(value):
     raise ValueError('invalid_capture_kind')
 
 
-REASON=re.compile(r'[a-z][a-z0-9_]{0,63}')
-MAX_REJECTED_CODES=32
 MAX_REJECTED_MESSAGES=20
+# Reason codes a skipped live capture may report: the capture validators' own
+# codes plus the collector's parser codes. Anything else is `invalid_capture`.
+LIVE_REJECT_CODES=frozenset({'invalid_capture','invalid_capture_kind','invalid_capture_account','invalid_capture_chat',
+    'invalid_deleted','invalid_deleted_ids','invalid_envelope','envelope_too_large','unknown_envelope_fields',
+    'invalid_account','invalid_chat_type','invalid_peer_kind','invalid_timestamp','invalid_metadata','invalid_media',
+    'invalid_media_size','invalid_mime','duplicate_media_id','invalid_sender_profile','invalid_identity_observation',
+    'invalid_identity_observations','identity_source_mismatch','invalid_read_capture','invalid_read_observation',
+    'invalid_receipt','invalid_receipt_account','invalid_receipt_chat','invalid_receipt_platform',
+    'invalid_receipt_reference','unsupported_receipt_provider_time','invalid_whatsapp_event',
+    'invalid_provider_message','receipt_parse_failed','read_parse_failed'})
 # Stop codes of live capture itself, and the fixed causes of a fail-closed write.
 CAPTURE_STOPS={'durable_capture_failed','capture_overload'}
 CAPTURE_STOP_DETAILS={'spool_full','disk_reserve','spool_io_error','capture_error'}
@@ -80,7 +88,7 @@ def validate_rejected_message(value):
     if (not isinstance(value,dict) or set(value)!={'chat','message_id','reason_code','observed_at'}
             or not isinstance(value['chat'],str) or not re.fullmatch(r'-?[0-9]{1,20}',value['chat'])
             or type(value['message_id']) is not int or not 0<value['message_id']<2**63
-            or not isinstance(value['reason_code'],str) or not REASON.fullmatch(value['reason_code'])):
+            or value['reason_code'] not in LIVE_REJECT_CODES):
         raise ValueError('invalid_capture_progress')
     return {**value,'observed_at':utc(value['observed_at'])}
 
@@ -165,8 +173,8 @@ class CollectorState:
                 or history_pending is not None and (type(history_pending) is not int or not 0<=history_pending<=20000)):
             raise ValueError('invalid_capture_progress')
         rejected=rejected or {}
-        if not isinstance(rejected,dict) or any(not isinstance(k,str) or not REASON.fullmatch(k)
-                or type(n) is not int or n<1 for k,n in rejected.items()):
+        if not isinstance(rejected,dict) or any(k not in LIVE_REJECT_CODES or type(n) is not int or n<1
+                for k,n in rejected.items()):
             raise ValueError('invalid_capture_progress')
         rejected_messages=[validate_rejected_message(m) for m in rejected_messages]
         capture=validate_capture(last) if last is not None else None
@@ -179,10 +187,7 @@ class CollectorState:
                 extra['invalid_provider_messages']=previous.get('invalid_provider_messages',0)+invalid
             if rejected:
                 counts=dict(previous.get('rejected_live_captures',{}))
-                for code,number in rejected.items():
-                    # Bounded vocabulary: later unseen codes share the generic one.
-                    if code not in counts and len(counts)>=MAX_REJECTED_CODES:code='invalid_capture'
-                    counts[code]=counts.get(code,0)+number
+                for code,number in rejected.items():counts[code]=counts.get(code,0)+number
                 extra['rejected_live_captures']=counts
             if rejected_messages:
                 extra['rejected_live_messages']=[*previous.get('rejected_live_messages',[]),*rejected_messages][-MAX_REJECTED_MESSAGES:]

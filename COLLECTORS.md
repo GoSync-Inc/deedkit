@@ -61,29 +61,46 @@ a size over 8 GiB, an overlong `replyToId`) instead of rejecting them. A message
 that still fails validation is skipped during history reconciliation and
 counted in `invalid_provider_messages` of the `live_capture` status.
 
-Telegram live capture follows the same rule. A live message, deletion, read
-receipt or owner read that the spool validator rejects, or whose receipt or
-read parser fails, is not written and does not stop the collector: a restart
-would meet the same input again. `live_capture.rejected_live_captures` counts
-these items by content-free reason code (for example `invalid_deleted_ids`,
-`invalid_provider_message`, `receipt_parse_failed`, `read_parse_failed`; at most
-32 codes, later ones count as `invalid_capture`). For a skipped message,
-`rejected_live_messages` keeps the chat, message ID, reason and time of the last
-20, never content. Reconciliation already re-reads new messages above the chat
-checkpoint and the newest page of each chat; a message that is still invalid
-there is skipped and counted again, never stopping the collector. An older
-message is not re-read automatically; its recorded ID lets an operator fetch it
-again once a fix accepts it. A deletion with more than 1,000 IDs is written as
-several `telegram_delete` records of at most 1,000 IDs.
+Telegram live capture follows the same rule. Exactly three rejections of a
+live message, deletion, read receipt or owner read are skipped, because a
+restart would meet the same input again: the message adapter's `ValueError`
+(an unsupported peer kind included), a malformed-input error from the receipt
+or read parser, and a rejection by the spool validator or canonical
+serialisation. A skipped item is not written, not quarantined and not retried,
+and it does not stop the collector. `live_capture.rejected_live_captures`
+counts skipped items, cumulatively, by a code from a fixed vocabulary: the
+validators' own codes (for example `invalid_deleted_ids`),
+`invalid_provider_message`, `receipt_parse_failed` and `read_parse_failed`.
+Any other text becomes the generic `invalid_capture`. `invalid_provider_message`
+is the live counterpart of `invalid_provider_messages`: the same message counts
+once in each. For a skipped message, `rejected_live_messages` keeps the chat,
+message ID, reason and time of the last 20, never content. Counts and IDs are
+written with the next capture-progress record, at most about 15 s later; a
+failed write keeps them for the retry, but a stop before the write loses them.
+
+Reconciliation re-reads new messages above each chat checkpoint and the newest
+page of each chat. A message that is still invalid there is skipped and counted
+in `invalid_provider_messages` again, never stopping the collector. Reconciliation
+does not read `rejected_live_messages` and does not re-read older messages; the
+recorded ID is evidence for a later fix. A skipped deletion, receipt or owner
+read keeps only its count: reconciliation does not infer deletions or read
+state. A deletion with more than 1,000 IDs is written as several
+`telegram_delete` records of at most 1,000 IDs each, with one observed time.
 
 Capacity and I/O still fail closed. `spool_full`, `disk_reserve`, an I/O error
-while writing, or any unexpected error stops the collector with
-`durable_capture_failed`; nothing is acknowledged before it is durable, and
-reconciliation after the restart covers the gap. The cause is kept as a fixed
-detail (`spool_full`, `disk_reserve`, `spool_io_error` or `capture_error`) in
-`live_capture.last_capture_stop` and in the supervisor line
+(also one that is a `ValueError`), a resource error or any other unexpected
+error in a live callback, including one raised while normalising a message,
+stops the collector with `durable_capture_failed`. Nothing is acknowledged
+before it is durable. After the restart, reconciliation re-reads messages as
+above; a deletion, receipt or owner read not written before the stop is lost,
+as is any part of a multi-record deletion not yet written. The cause is kept
+as a fixed detail (`spool_full`, `disk_reserve`, `spool_io_error` or
+`capture_error`) in `live_capture.last_capture_stop` (`code`, `detail`, `at`)
+and in the supervisor line
 `{"status":"stopped","code":"durable_capture_failed","detail":"disk_reserve"}`.
-Exception text never leaves the process.
+A `durable_capture_failed` stop without a detail did not come from a live
+callback (for example a capture after a confirmed send) and is read as
+`capture_error`. Exception text never leaves the process.
 
 If a spool record fails validation or its send receipt permanently
 disagrees with the DB (for example, after restoring an old backup), `drain`
