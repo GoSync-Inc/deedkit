@@ -787,7 +787,7 @@ def rollback(settings, sha):
             raise Refused("the before-release snapshot is missing or was modified")
         if legacy_identities(item["running"]):
             raise Refused("rollback data was written by an older production.py with order-dependent container settings; "
-                          "use the manual procedure (platform-cutover.md)")
+                          "use the manual procedure")
         document, running = snapshot(project)
         if digest(document) != item["after_digest"] or running != item["running"]:
             raise Refused("production changed since this release was applied")
