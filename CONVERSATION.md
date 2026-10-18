@@ -34,6 +34,13 @@ In the conversation view each message tool returns every message text once.
   the `context` neighbours. `list_chats` groups the reply hint into one
   `awaiting_reply` object and shows the latest message once in `last_message`.
   Each fact appears once per `list_chats` row (compact queue rows below).
+  A forwarded message, and an `awaiting_reply` hint on one, carries
+  `authorship: "forwarded_by_sender"` and `forward_origin` in every detail level:
+  its `sender` and `sender_name` are the forwarder, never the author of the
+  forwarded words. `forward_origin.kind` is `user`, `chat`, `channel`,
+  `hidden_user`, `status`, `newsletter`, `unknown` or `not_captured` (archived
+  before origin capture); fields, enums and the access rule are in
+  [SEARCH.md](SEARCH.md#forwarded-messages).
 - `detail="transcript"`: only the numbered transcript with message IDs, its
   warnings, cursors and file references (`files`). Message text defaults to
   2000 characters; `body_chars` changes it. Requires `view="conversation"`.
@@ -69,7 +76,8 @@ The remaining hint fields keep their names and meanings: `message_id`,
 `revision`, `sender_id`, `sender_name`, `sender_name_basis`, `priority`,
 `reasons`, `waiting_hours`, `incoming_count`, `basis`, `has_question`,
 `dismissed`, `confidence` when it is not the default, and `display_text` with
-`truncated` (the hint's own text, or the head's when the hint is the head). The
+`truncated` (the hint's own text, or the head's when the hint is the head), and
+`forward_origin` with `authorship` for a forwarded hint message. The
 row's `read_state` is unchanged. `detail="full"` keeps every field.
 
 ## Ordering and windows
