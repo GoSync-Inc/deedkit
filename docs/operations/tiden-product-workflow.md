@@ -87,22 +87,23 @@ starting it.
    `tiden spec list`). A match, merged or not, is updated rather than duplicated.
    Decide whether the work is worth doing; a declined candidate gets its reason at
    its source and no card.
-2. **Write.** Opus or Fable at high effort writes the card from the template
+2. **Write.** Opus at high effort writes the card from the template
    below, never directly on main: on a proposal branch for a future-only
    requirement, which stays open until implemented, or on a review branch for a
    current defect, which merges to main after review and acceptance (Current
    truth and future proposals).
-3. **Review.** Astra and Fable review every new card and every spec edit
-   (`AGENTS.md`); the card text goes to them as a file. They first judge whether
-   the card should exist: a real need and value, no duplicate of an existing card
-   or built-in capability, no over-engineering (a smaller or existing solution),
-   and whether it must be built now. They may reject or shrink it; a rejected
-   card gets its reason at its source.
+3. **Review.** The card's kind sets its reviewers (`AGENTS.md`: Astra and
+   Fable, Astra, or the card checklist subagent of
+   [review-protocol.md](review-protocol.md)); the card text goes to them as a
+   file. They first judge whether the card should exist: a real need and value,
+   no duplicate of an existing card or built-in capability, no over-engineering
+   (a smaller or existing solution), and whether it must be built now. They may
+   reject or shrink it; a rejected card gets its reason at its source.
 4. **Accept.** Cards in the categories feature and improvement (owner-visible
    product behavior) are accepted by the owner, presented in plain words, or by
    the orchestrator relaying the owner's quoted words. Cards in defect, infra,
-   refactor and research are accepted by the orchestrator once Astra and Fable
-   both approve with no open findings, necessity check included. The orchestrator
+   refactor and research are accepted by the orchestrator once their reviewers
+   approve with no open findings, necessity check included. The orchestrator
    brings such a card to the owner when the reviewers disagree, when it changes
    product behavior beyond restoring the contract, or when an escalation
    condition in `AGENTS.md` applies. Record who accepted on the card.
@@ -209,11 +210,15 @@ Record these independently, with timestamp, branch/release ID and exact Git SHA:
    acceptance requirements. A main `prod_issues: PASS` does not supersede this
    review: the vendor documents production-issue gating for attributed release
    scopes. Unattributed errors and absent release snapshots require investigation.
+4. The release review of the delta's normal-level pull requests
+   ([review-protocol.md](review-protocol.md)), or that the delta has none: the
+   reviewed range, verdict lines and open blocking or major findings.
 
 Readiness remains blocked while a relevant current defect, unresolved production
-incident or required acceptance lacks evidence. This is the project's release
-decision; do not present it as a newly computed native Tiden verdict. Classifying
-future proposals alone does not repair runtime incidents or establish readiness.
+incident or required acceptance lacks evidence, or a blocking or major release
+review finding is open. This is the project's release decision; do not present
+it as a newly computed native Tiden verdict. Classifying future proposals alone
+does not repair runtime incidents or establish readiness.
 
 For issue triage, read `issue fix-context`, every suspect source path and the
 relevant historical revision. `verified` on a suspect spec is not proof that its

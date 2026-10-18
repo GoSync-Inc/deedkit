@@ -3,8 +3,9 @@
 This document covers how several agent sessions work at once and how their work
 reaches production. Tiden usage is defined in
 [tiden-product-workflow.md](tiden-product-workflow.md), promotion in
-[production.md](production.md), and review levels, reviews and merge authority
-under Review levels in [AGENTS.md](../../AGENTS.md). Do not restate those rules here.
+[production.md](production.md), review levels, reviews and merge authority
+under Review levels in [AGENTS.md](../../AGENTS.md), and the review procedure in
+[review-protocol.md](review-protocol.md). Do not restate those rules here.
 
 ## Roles
 
@@ -140,6 +141,10 @@ at least important (`AGENTS.md`). Prefer splitting it.
   records the release; without a valid queue run it verifies in full
   ([TIDEN-CI.md](../../TIDEN-CI.md), ANYM-322). `production.py verify` accepts the
   queue's verification only in place of `checks / verify` (ANYM-321).
+- Before prepare, the release owner runs the release review
+  ([review-protocol.md](review-protocol.md)) when the delta holds a normal-level
+  pull request it has not covered; its open blocking or major findings hold the
+  release.
 - The release owner keeps one release in flight, from prepare to acceptance. The
   host deployment lock only stops two deployment commands from running at once.
 - Release often; the target is several times a day. Once automatic deployment
@@ -197,17 +202,23 @@ work; the orchestrator picks them for each worker:
 
 | Work | Model and effort |
 | --- | --- |
-| Orchestrator | Opus, high |
-| Code and CI | Opus, high; xhigh only for an autonomous task longer than about 30 minutes |
-| Security, unclear root cause | Opus, xhigh, or Fable, high |
-| Tiden specs and backlog | Opus, high, or Fable, high |
-| Documents and settings | Sonnet, medium |
+| Orchestrator | Opus, high; medium for routine sweeps |
+| Product code, CI and release code, permission settings | Opus, high; xhigh only for an autonomous task longer than about 30 minutes |
+| A normal-level code fix of Effort 1 or 2 in one lane with tests | Sonnet, high, as a trial (below) |
+| Security, unclear root cause | Opus, xhigh |
+| Tiden card and spec text, production operation plans | Opus, high |
+| Research reports | Opus, medium |
+| Process and wording documents, translations, receipts, gathering data from logs and transcripts | Sonnet, medium |
+| Card checklist subagent ([review-protocol.md](review-protocol.md)) | Sonnet, medium |
 | Code exploration | Haiku or Sonnet, low |
 
-Reviewers follow Review levels in `AGENTS.md` whatever the worker's model. The
-orchestrator measures usage-limit spend by role, review findings per pull request
-and the share of pull requests with green CI from the first push; the weekly
-review reads these measurements.
+Fable is a reviewer only, under Review levels in `AGENTS.md`; reviewers follow
+those levels whatever the worker's model. The Sonnet code trial records, for each
+such unit, green CI from the first push and its release review findings, next to
+comparable Opus units; the weekly review keeps or ends it after eight units. The
+orchestrator measures usage-limit spend by role, review findings and rounds per
+pull request and the share of pull requests with green CI from the first push;
+the weekly review reads these measurements.
 
 The worker writes and waits for the answer:
 
@@ -259,3 +270,16 @@ timed reports.
   use bare `git stash`; the stash stack is shared across worktrees.
 - Codex and Claude Code follow the same rules. Tool-specific setup lives in
   `CLAUDE.md` and the [Claude Code Tiden guide](claude-code-tiden.md).
+- **Context budget.** Every call re-reads the whole context, so cost grows with
+  session length. One story is one worker session. At about 250k tokens of
+  context, or at a story boundary, a worker writes a handoff file (task, state,
+  open items, next step) into its scratchpad and tells the orchestrator, which
+  starts a fresh session from that file. The orchestrator restarts from its own
+  handoff file at about 300k.
+- **Large output.** Tiden commands use `--format json` with a `jq` field
+  projection; files over about 20k characters are read by range or `grep`.
+  Whole exports never go into a session or a reviewer packet.
+- **Messages.** A worker writes once per state change (the start, a question,
+  the pull request opened, ready to merge, blocked, the final result), not
+  progress reports. The orchestrator asks for an idle notice only when it
+  expects an answer.
