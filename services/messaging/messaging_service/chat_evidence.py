@@ -140,8 +140,8 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
     if account and accounts is not None:accts=[account] if account in accounts else []
     lower=normalized.get('from_time');upper=normalized.get('to_time')
     # Named chats keep their own evidence; otherwise totals count only chats of the searched types.
-    types=normalized.get('chat_types') if ids is None else None
-    records=rows(c,p,ids,accts,types)
+    types=normalized.get('chat_types')
+    records=rows(c,p,ids,accts,types if ids is None else None)
     histories=[history(r,lower,upper) for r in records]
     missing=ids is not None and bool(set(ids)-{r['chat_id'] for r in records})
     traversed=(ids is not None or p['chat_ids'] is not None) and bool(histories) and all(h['requested_range_traversed'] for h in histories) and not missing

@@ -513,6 +513,8 @@ class Store:
                query_mode='all', order='asc', before='', direction='', search_language='auto',
                fuzzy=False, compact=False, body_chars=None, include_coverage=True,view='archive',include_system=False,exclude_channels=False,
                chat_types=None,include_channels=False):
+        # None is the internal no-default sentinel of message_queries.search, never a public value.
+        if type(include_channels) is not bool:raise APIError('invalid_filter')
         with self.authorized(token,'search') as (c,p):
             return self._search(c,p,query,account,chat,sender,from_time,to_time,after,limit,
                 accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,

@@ -51,6 +51,26 @@ def test_absent_lexical_query_reads_bounded_message_candidates(seeded):
     assert measured.plans and sum(ordered_visits(plan) for plan in measured.plans)<100, [scans(plan) for plan in measured.plans]
 
 
+# spec: ANYM-272
+def test_default_channel_exclusion_keeps_absent_query_candidates_bounded(seeded):
+    s,a,b=seeded
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='60s'")
+        c.execute('''INSERT INTO chats(id,account,provider_chat,title,chat_type)
+            SELECT 'news-'||n,'telegram-demo','news-'||n,'Synthetic news','channel' FROM generate_series(1,40) n''')
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
+            SELECT 'news-post-'||n,'telegram-demo','news-'||(n%40+1),n::text,'fixture',
+                repeat('ordinary channel content ',5),now()+n*interval '1 second'
+            FROM generate_series(1,4000) n''')
+        c.execute('ANALYZE messages');c.execute('ANALYZE chats')
+    with s.authorized(b,'search') as (c,p):
+        c.execute('SET LOCAL enable_seqscan=off')
+        measured=Measured(c)
+        result=search(s,measured,p,query='absentlexicalneedleqxz',include_channels=False)
+    assert result['items']==[]
+    assert measured.plans and sum(ordered_visits(plan) for plan in measured.plans)<100, [scans(plan) for plan in measured.plans]
+
+
 def test_absent_file_query_reads_bounded_file_candidates(seeded):
     s,a,b=seeded
     with s.pool.connection() as c:

@@ -468,7 +468,7 @@ def test_search_chat_types_unknown_and_invalid(seeded):
     assert hits(s.search(b,'typedneedle',chat_types=['unknown']))==['typed-null-hit']
     for value in (['dm'],'private',[1],['private']*101):
         with pytest.raises(APIError,match='invalid_filter'):s.search(b,'typedneedle',chat_types=value)
-    for options in ({'include_channels':1},{'include_channels':True,'exclude_channels':True},
+    for options in ({'include_channels':1},{'include_channels':None},{'include_channels':True,'exclude_channels':True},
             {'include_channels':True,'chat_types':['private']}):
         with pytest.raises(APIError,match='invalid_filter'):s.search(b,'typedneedle',**options)
 
@@ -507,6 +507,16 @@ def test_search_chat_types_respect_chat_scope(seeded):
     assert hits(result)==[] and result['result_evidence']['chats_considered']==0
     assert 'typed-hidden' not in str(result)
     assert hits(s.search(b,'typedneedle',include_channels=True))==['typed-private-hit']
+
+
+# spec: ANYM-272
+@pytest.mark.parametrize('options',[{'chat':'typed-channel','chat_types':[]},{'chats':['typed-channel'],'chat_types':[]},
+    {'chats':['typed-channel'],'chat_types':['channel'],'exclude_channels':True}],ids=['chat','chats','excluded-channel'])
+def test_search_named_chat_with_empty_type_filter_reports_empty_filter(seeded,options):
+    s,a,b=seeded
+    typed_chats(s)
+    evidence=s.search(b,'typedneedle',**options)['result_evidence']
+    assert evidence['empty_reason']=='empty_filter' and evidence['next_action']=='inspect_chat_coverage'
 
 
 # spec: ANYM-272

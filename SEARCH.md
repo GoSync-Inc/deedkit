@@ -18,10 +18,15 @@ and `get_context` read a channel as before. `chat_types` takes `private`, `group
 as `list_chats`: "or" inside the list, "and" with the other filters and with
 `exclude_channels`; `[]` returns an empty result and another value returns
 `invalid_filter`. `include_channels: true` together with `exclude_channels: true` or
-a `chat_types` list without `channel` is also `invalid_filter`. An explicit
-`chat_types`, `include_channels` or `exclude_channels` binds `next_cursor`; changing
-it with that cursor returns `invalid_cursor`. Without named chats,
-`result_evidence` counts only chats of the searched types.
+a `chat_types` list without `channel` is also `invalid_filter`. A `chat_types` list,
+`include_channels: true` or `exclude_channels: true` turns a chronological archive
+`next_cursor` from a bare message ID into an opaque cursor bound to the effective set of
+types; continuing with another set returns `invalid_cursor`, an equivalent one (for example
+dropping `exclude_channels: true` under the default) continues. Relevance, fuzzy and
+conversation cursors are always bound, and those issued before this filter existed
+return `invalid_cursor` once: restart the search. Without named chats,
+`result_evidence` counts only chats of the searched types; an empty effective set is
+`empty_filter`.
 `capabilities.search_options.search_channels_default` states the default.
 
 `query_mode`:
