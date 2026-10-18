@@ -65,7 +65,7 @@ def test_compact_messages_and_chats_omit_duplicate_text_and_routine_qualifiers(s
         assert 'provider_chat_id' not in chat
         if 'last_message' in chat:
             assert occurrences(chat,chat['last_message']['display_text'])==1
-            assert chat['conversation']['latest_message_id']==chat['last_message']['id']
+            assert 'latest_message_id' not in chat['conversation']
 
 
 def test_transcript_needs_the_conversation_view_and_says_so(seeded):

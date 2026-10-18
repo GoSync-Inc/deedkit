@@ -585,7 +585,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
         return call(ctx, 'get_messenger_operation', operation_id=operation_id)
 
     @mcp.tool(structured_output=True, annotations=read)
-    def list_chats(ctx: Context, after: str='', limit: int=100, accounts: list[StrictStr] | None=None,
+    def list_chats(ctx: Context, after: str='', limit: int=25, accounts: list[StrictStr] | None=None,
                    query: str='', chat_types: list[Literal['private','group','channel','unknown']] | None=None, order: Literal['id','activity','last_activity_desc','priority']='activity',
                    exclude_channels: bool=False, awaiting_reply: bool=False,
                    from_time: str='', to_time: str='', include_coverage: bool | None=None, detail: Detail='compact',
@@ -601,6 +601,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
         exclude_chats takes archive IDs, exclude_senders account-scoped provider sender IDs.
         only_questions uses question punctuation; private-only uses chat_types=['private'].
         only_unread includes fresh known chat read observations only; unknown/stale count is explicit.
+        limit defaults to 25 (maximum 100); continue with next_cursor.
         """
         return call(ctx,'list_chats',detail=detail,after=after,limit=limit,accounts=accounts,query=query,chat_types=chat_types,
                     order=order,exclude_channels=exclude_channels,awaiting_reply=awaiting_reply,

@@ -81,6 +81,10 @@ MCP/REST `list_chats` defaults to recent activity order. `order: activity` and
 `order: last_activity_desc` are aliases; `order: id` retains stable catalogue
 traversal. Direct Store calls retain the legacy ID default. Restart pagination
 when changing orders; activity pages use an opaque cursor, not a bare chat ID.
+`limit` defaults to 25 rows in MCP, REST, the Store and the gateway
+`messages_list_chats` tool, and accepts 1–100; larger values return
+`invalid_limit`. Continue with `next_cursor`, including for a full catalogue
+traversal.
 Account/type/date filters and
 `exclude_channels` are supported. `awaiting_reply` is only a heuristic from the
 last known incoming message in a private chat, plus explicit attention in groups:
