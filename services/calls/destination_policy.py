@@ -14,6 +14,11 @@ from core import ServiceError
 
 DAILY_UNITS=10
 PREMIUM_UNITS=3
+# The owner raises the cap from chat (ANYM-353): each raise lasts 24 hours, and the
+# base plus unexpired raises never exceeds the ceiling.
+CAP_CEILING=50
+MAX_RAISE_UNITS=CAP_CEILING-DAILY_UNITS
+RAISE_HOURS=24
 TELEPHONE={'phone','whatsapp'}
 PREMIUM={PhoneNumberType.PREMIUM_RATE,PhoneNumberType.SHARED_COST,PhoneNumberType.UAN}
 SEPARATORS=re.compile(r'[\s().-]')
@@ -109,3 +114,9 @@ def bind_origin(brief,instruction,source,evidence):
     else:
         raise ServiceError('destination_source_required',422)
     return {'destination_source':source,'destination_evidence':evidence or None}
+
+
+def units_named(instruction,units):
+    """True when the owner's words state this count as a standalone number: "ещё 20 звонков"
+    names 20; "120", "20.5", "2,0" or "20-30" do not."""
+    return bool(re.search(r'(?<![0-9])(?<![0-9][.,-])'+str(units)+r'(?![0-9]|[.,-][0-9])',instruction))

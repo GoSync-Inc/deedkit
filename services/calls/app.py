@@ -25,7 +25,7 @@ from agent_api import AgentAPI, AgentRegistry
 from learning import LearningWorker, ANALYZER_MODEL
 from supervisor import Supervisor, SUPERVISOR_MODEL
 from outbound import Outbound,CallingSettings,TwilioCalls,ExternalBrief
-from destination_policy import DAILY_UNITS,PREMIUM_UNITS,recipient_policy
+from destination_policy import PREMIUM_UNITS,recipient_policy
 from settings import Setup,read_private,write_private
 from call_errors import record_model_error
 from security import OwnerCredential, VoiceBoundary
@@ -265,7 +265,7 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
                               'owner_approval_authority':False,'scope':'selected_task_and_conversation'},
                 'owner_workflow':{'attention':'asynchronous','notification_channel':'not_connected','followup':'fresh_authorized_brief'},
                 'archive':await archive_status(), 'active_call_id':next((v['id'] for v in service.list_calls() if v['status'] in ACTIVE),None),
-                'channels':channels}
+                'channels':channels,'call_cap':outbound.cap_status()}
 
     @app.get('/api/calling')
     async def calling_status():
@@ -502,7 +502,8 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
         value=await config()
         value['calling']=await calling_status()
         value['calling']['recipient_policy']={channel:recipient_policy(channel) for channel in ('telegram','whatsapp','phone','sip')}
-        value['calling'].update(daily_calls_remaining=outbound.daily_calls_remaining(),daily_call_units=DAILY_UNITS,premium_call_units=PREMIUM_UNITS)
+        value['calling'].update(daily_calls_remaining=outbound.daily_calls_remaining(),daily_call_units=outbound.daily_call_units(),
+                                premium_call_units=PREMIUM_UNITS,call_cap=outbound.cap_status())
         value['calling']['credential_storage']='private_server_file' if persist else 'memory_only'
         for channel in ('telegram','whatsapp','phone','sip'):
             value['channels'][channel]=('configured_needs_pilot' if channel!='telegram' and value['calling']['twilio']['configured'] else 'not_connected' if channel!='telegram' else

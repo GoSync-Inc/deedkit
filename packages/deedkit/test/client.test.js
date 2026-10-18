@@ -20,7 +20,7 @@ test('every catalog tool is a bearer POST to /v1/{tool} on the gateway prefix', 
   }});
   for (const tool of tools) assert.deepEqual(await client.call(tool, {probe: 'synthetic'}), {ok: true});
   assert.deepEqual(seen, tools.map(tool => `https://gateway.example/deedkit/v1/${tool}`));
-  assert.equal(tools.length, 66);
+  assert.equal(tools.length, 67);
 });
 
 test('platform_capabilities helper sends an empty object', async () => {

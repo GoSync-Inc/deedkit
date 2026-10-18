@@ -60,7 +60,8 @@ origin (`owner_named`, which the words must contain, or `agent_found` with evide
 messages, files, web pages and model output never authorize a call. Emergency numbers
 and short codes fail fast with a call-it-yourself message, invalid numbers are refused,
 and every dial spends units of a durable cap of 10 per rolling 24 hours (premium-rate,
-shared-cost and UAN numbers cost 3). Country limits stay in Twilio Geo Permissions. Brief
+shared-cost and UAN numbers cost 3), which the owner can raise from chat to at most 50
+(`raise_call_cap`, ANYM-353). Country limits stay in Twilio Geo Permissions. Brief
 ownership is assigned from the authenticated principal before snapshot hashing.
 Calls, results, decisions and followups inherit it. No agent tool can submit an
 owner decision or read/activate global learned prompts. Optional archive context
@@ -70,6 +71,7 @@ With `calls:read`, `list_briefs` and `list_calls` page only the principal's own 
 newest first as short summaries without notes, facts, prompts or destinations.
 Capabilities report each granted channel's configured state (from settings only, no
 provider contact), the recipient policy (SIP: allowlisted recipient counts),
+the daily call cap with the owner's active raises (`raise_call_cap`, ANYM-353),
 `daily_calls_remaining` and the enforced request limits.
 
 ## Outcomes and verification
