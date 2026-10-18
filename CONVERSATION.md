@@ -54,8 +54,9 @@ two fields would carry the same fact, compact keeps the first and omits the othe
   or `awaiting_reply.message_id`;
 - compact omits `conversation.basis` when it equals `awaiting_reply.confidence`
   or `awaiting_reply.basis`;
-- `conversation.candidate_message_ids` omits `awaiting_reply.message_id`; with
-  `order_status="ambiguous"` it lists the other tied messages;
+- `conversation.candidate_message_ids` omits `awaiting_reply.message_id` and
+  `owner_attention.target_message_id`; with `order_status="ambiguous"` it lists
+  the other tied messages, and it is omitted when none remain;
 - compact omits `conversation.owner_attention.target_message_id` when it equals
   `awaiting_reply.message_id` or, in a row without `awaiting_reply` (expired or
   dismissed attention), `last_message.id`;
