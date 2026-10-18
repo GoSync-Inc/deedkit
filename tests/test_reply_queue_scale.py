@@ -71,8 +71,9 @@ def test_reply_priority_reasons_match_the_actual_waiting_time(seeded):
     rows={row['id']:row for row in s.list_chats(b,awaiting_reply=True,awaiting_reply_days=0,
         order='priority',include_coverage=False)['items']}
     recent,old=rows['active-1'],rows['quiet-0001']
-    assert recent['awaiting_reply_waiting_hours']==1 and recent['awaiting_reply_priority']==126
-    assert recent['awaiting_reply_priority_reasons']==['private_chat','question_mark','waiting_age']
+    # ANYM-276: the active chats have no owner message, so the one-way demotion (-60) applies; the old chat has one.
+    assert recent['awaiting_reply_waiting_hours']==1 and recent['awaiting_reply_priority']==66
+    assert recent['awaiting_reply_priority_reasons']==['private_chat','question_mark','waiting_age','one_way_chat']
     assert old['awaiting_reply_waiting_hours']>=700 and old['awaiting_reply_priority']==145
     assert old['awaiting_reply_priority_reasons']==['private_chat','question_mark','waiting_age_capped']
 

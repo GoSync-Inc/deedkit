@@ -368,6 +368,7 @@ def render(method, result, detail):
         for row in result['items']:
             row.pop('sync',None)
             row.pop('awaiting_reply_confidence',None)
+            row.pop('awaiting_reply_priority_components',None)  # ANYM-276: itemized score on request (detail=full) only
             if not result.get('awaiting_reply_scope'):
                 for key in tuple(row):
                     if key.startswith('awaiting_reply_'):row.pop(key,None)

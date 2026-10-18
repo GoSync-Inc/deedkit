@@ -76,6 +76,9 @@ def test_same_second_telegram_owner_reply_clears_group_hint(inbox):
 
 def test_priority_and_exclusion_filters_are_scoped_and_cursor_bound(inbox):
     s, ar, key, add, queue = inbox
+    # ANYM-276: a private chat the owner never wrote in is demoted, so these two have owner history.
+    add('100', 0, 0, direction='outgoing')
+    add('200', 0, 0, direction='outgoing')
     add('100', 1, 1, body='A question?')
     add('200', 1, 2, body='A statement', sender='99')
     add('300', 1, 3, body='Group question?', metadata={'chat_type':'group','mentions_owner':True})

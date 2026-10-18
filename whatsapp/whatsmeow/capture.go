@@ -68,6 +68,12 @@ func forwardOriginCapture() bool {
 	return os.Getenv("ANYMSG_CAPTURE_FORWARD_ORIGIN") == "1"
 }
 
+// providerFlagsCapture stays off until the release a rollback would return to
+// accepts senderIsBusiness (ANYM-276, ANYMSG_CAPTURE_PROVIDER_FLAGS).
+func providerFlagsCapture() bool {
+	return os.Getenv("ANYMSG_CAPTURE_PROVIDER_FLAGS") == "1"
+}
+
 // nativeForwardOrigin reports only what ContextInfo states. WhatsApp does not
 // carry the author of an ordinary chat forward, so that origin stays unknown.
 func nativeForwardOrigin(ctx *waE2E.ContextInfo) map[string]any {
@@ -462,6 +468,10 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 	if forwardOrigin != nil {
 		// Present only when captured, so an older reader never meets the field (rollback).
 		value["forwardOrigin"] = forwardOrigin
+	}
+	// Only a stated certificate is captured; no VerifiedName is unknown, never "not a business".
+	if providerFlagsCapture() && !e.Info.IsFromMe && e.Info.VerifiedName != nil {
+		value["senderIsBusiness"] = true
 	}
 	return value, nil
 }

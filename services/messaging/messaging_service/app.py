@@ -591,7 +591,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
                    from_time: str='', to_time: str='', include_coverage: bool | None=None, detail: Detail='compact',
                    awaiting_reply_days: StrictInt=14,exclude_chats: list[StrictStr] | None=None,
                    exclude_senders: list[StrictStr] | None=None,only_questions: bool=False,only_unread: bool=False,
-                   view: ConversationView='conversation') -> dict[str, Any]:
+                   view: ConversationView='conversation',exclude_likely_broadcasts: bool=False) -> dict[str, Any]:
         """List permitted chats. order: activity (default) or last_activity_desc = recent first;
         id = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,
         or explicit group owner mention/reply; heuristic, not obligation. Attention expires after
@@ -601,13 +601,16 @@ def create_app(store: Store, allowed_hosts: list[str]):
         exclude_chats takes archive IDs, exclude_senders account-scoped provider sender IDs.
         only_questions uses question punctuation; private-only uses chat_types=['private'].
         only_unread includes fresh known chat read observations only; unknown/stale count is explicit.
+        exclude_likely_broadcasts (queue only, default false) drops one-way chats and provider business/verified senders
+        and reports excluded_likely_broadcasts_total within scope. detail=full adds priority_components (points per reason).
         limit defaults to 25 (maximum 100); continue with next_cursor.
         """
         return call(ctx,'list_chats',detail=detail,after=after,limit=limit,accounts=accounts,query=query,chat_types=chat_types,
                     order=order,exclude_channels=exclude_channels,awaiting_reply=awaiting_reply,
                     from_time=from_time,to_time=to_time,include_coverage=include_coverage,
                     awaiting_reply_days=awaiting_reply_days,exclude_chats=exclude_chats,exclude_senders=exclude_senders,
-                    only_questions=only_questions,only_unread=only_unread,view=view)
+                    only_questions=only_questions,only_unread=only_unread,view=view,
+                    exclude_likely_broadcasts=exclude_likely_broadcasts)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=False, idempotentHint=True, openWorldHint=False))
