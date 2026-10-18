@@ -316,3 +316,67 @@ async def test_agents_never_receive_the_custom_voice_id(tmp_path,monkeypatch):
                         await tool(name,{'call_id':started['id']})
                     await tool('get_call_result',{'call_id':cid})
     assert len(seen)==17 and not any(secret in text for text in seen)
+
+
+# spec: ANYM-359
+async def test_agents_never_receive_a_historical_custom_voice_id_after_a_switch(tmp_path,monkeypatch):
+    # Astra r2 F1: status and owner requests omit the brief, and the current setting no longer names the ID.
+    monkeypatch.setenv('VOICE_EXTERNAL_MCP','1')
+    data=tmp_path/'data'
+    secret='voice_owner_fixture'
+    app=create_app(data,Archive(),agent_registry=every_channel(tmp_path),control_token='control-fixture-token')
+    service=app.state.service
+    service.set_call_voice(service.call_voice().model_copy(update={'gemini_custom_voice_id':secret}))
+    seen=[]
+    async with app.router.lifespan_context(app):
+        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app),base_url='http://testserver') as http:
+            async def agent(operation,body):
+                response=await http.post(f'/v1/{operation}',json=body,headers=AGENT)
+                assert response.status_code==200, (operation,response.text)
+                seen.append(response.text)
+                return response.json()
+            body={**BRIEF,'source_message_ids':[],'approval_fields':['delivery_window'],**ROUTES['telegram']}
+            brief=await agent('prepare_external_call',{'brief':body})
+            call=service.start(brief['id']);cid=call['id'];service.connected(cid)
+            spoken=f'12–13, {secret}'
+            service.transcript(cid,'user',spoken)
+            service.tool(cid,'record_answer',{'field':'delivery_window','value':spoken,'evidence':spoken},'t1')
+            service.stop(cid,'awaiting_owner')
+            assert secret in json.dumps(service.get_call(cid))
+            for voice in ({'provider':'grok_realtime','grok_voice':'eve'},None):
+                if voice:
+                    service.set_call_voice(service.call_voice().model_copy(update={**voice,'gemini_custom_voice_id':None}))
+                else:
+                    (data/'call-voice.json').write_text('{damaged')
+                status=await agent('get_call_status',{'call_id':cid})
+                assert status['id']==cid and 'redacted' in json.dumps(status)
+                requests=await agent('get_owner_requests',{})
+                assert requests['items'] and 'redacted' in json.dumps(requests)
+                await agent('get_call_result',{'call_id':cid});await agent('list_calls',{})
+        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app),headers={'Authorization':'Bearer control-fixture-token'}) as http:
+            async with streamable_http_client('http://testserver/control/mcp',http_client=http) as (read,write):
+                async with ClientSession(read,write) as client:
+                    await client.initialize()
+                    for name,arguments in (('get_call_status',{'call_id':cid}),('get_owner_requests',{})):
+                        result=await client.call_tool(name,arguments)
+                        assert not result.is_error, (name,result)
+                        seen.append(json.dumps(result.model_dump(mode='json')))
+    assert len(seen)==11 and not any(secret in text for text in seen)
+
+
+# spec: ANYM-359
+def test_voice_redaction_keeps_ordinary_task_data_and_response_keys(tmp_path):
+    # Astra r2 F5: a task field named custom_voice_id is task data, never a voice ID to redact.
+    data=tmp_path/'data'
+    with TestClient(create_app(data,Archive(),agent_registry=every_channel(tmp_path))) as client:
+        body={**BRIEF,'source_message_ids':[],'success_fields':['custom_voice_id'],'approval_fields':['custom_voice_id']}
+        brief=client.post('/v1/prepare_call',json={'brief':body},headers=AGENT).json()
+        service=client.app.state.service
+        call=service.start(brief['id']);cid=call['id'];service.connected(cid)
+        service.transcript(cid,'user','id')
+        service.tool(cid,'record_answer',{'field':'custom_voice_id','value':'id','evidence':'id'},'t1')
+        status=client.post('/v1/get_call_status',json={'call_id':cid},headers=AGENT).json()
+        assert status['id']==cid and status['answers']['custom_voice_id']['value']=='id', status
+        assert 'redacted' not in json.dumps(status)
+        result=client.post('/v1/get_call_result',json={'call_id':cid},headers=AGENT).json()
+        assert result['id']==cid and result['brief']['id']==brief['id'] and 'redacted' not in json.dumps(result)

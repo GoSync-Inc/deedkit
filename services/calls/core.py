@@ -76,22 +76,12 @@ class CallVoice(BaseModel):
                 'voice':self.grok_voice if grok else 'replicated' if custom else self.gemini_voice,'custom_voice':custom}
 
 
-def voice_ids(value,found=None):
-    """Every custom voice ID stored anywhere in a response: briefs, call records, followups."""
-    found=set() if found is None else found
-    if isinstance(value,dict):
-        for key,item in value.items():
-            if key in {'custom_voice_id','gemini_custom_voice_id'} and isinstance(item,str) and item:
-                found.add(item)
-            voice_ids(item,found)
-    elif isinstance(value,(list,tuple)):
-        for item in value:
-            voice_ids(item,found)
-    return found
+VOICE_ID=re.compile(r'voice_[A-Za-z0-9_]{4,100}')
 
 
 def redact_voice_ids(value,ids):
-    """Agents never see the owner's custom voice ID, nested or inside text (ANYM-359); stored data keeps it."""
+    """Agents never see the owner's custom voice ID in a value, nested or inside text (ANYM-359).
+    Keys are protocol structure and stay as they are; stored data keeps the ID."""
     if not ids:
         return value
     if isinstance(value,str):
@@ -99,7 +89,7 @@ def redact_voice_ids(value,ids):
             value=value.replace(identity,'redacted')
         return value
     if isinstance(value,dict):
-        return {redact_voice_ids(key,ids):redact_voice_ids(item,ids) for key,item in value.items()}
+        return {key:redact_voice_ids(item,ids) for key,item in value.items()}
     if isinstance(value,(list,tuple)):
         return [redact_voice_ids(item,ids) for item in value]
     return value
@@ -358,14 +348,22 @@ class VoiceService:
             # A damaged setting refuses agent preparation instead of silently changing the voice.
             raise ServiceError('call_voice_invalid',503) from None
 
-    def agent_view(self,value):
-        """What an agent may read of a response: custom voice IDs, stored or current, become "redacted"."""
-        ids=voice_ids(value)
+    def voice_ids(self):
+        """Trusted custom voice IDs only: every one frozen into a brief, plus the current setting's.
+        Task data never adds to the set, so an ordinary answer cannot be mistaken for an ID."""
+        with self.lock:
+            rows=self.db.execute("SELECT DISTINCT json_extract(body,'$.custom_voice_id') FROM briefs "
+                                 "WHERE json_extract(body,'$.custom_voice_id') IS NOT NULL").fetchall()
+        ids={row[0] for row in rows}
         try:
-            current=self.call_voice().gemini_custom_voice_id
+            ids.add(self.call_voice().gemini_custom_voice_id)
         except ServiceError:
-            current=None
-        return redact_voice_ids(value,ids|{current} if current else ids)
+            pass
+        return {identity for identity in ids if isinstance(identity,str) and VOICE_ID.fullmatch(identity)}
+
+    def agent_view(self,value):
+        """What an agent may read of a response: every custom voice ID, historical or current, becomes "redacted"."""
+        return redact_voice_ids(value,self.voice_ids())
 
     def set_call_voice(self,value):
         from settings import write_private
