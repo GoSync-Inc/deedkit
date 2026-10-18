@@ -173,3 +173,29 @@ def test_gateway_dial_carries_owner_instruction_and_destination_origin(tmp_path)
         assert status["owner_instruction"] == "Find a clinic and ask for tomorrow"
         assert named["destination_source"] == "owner_named" and dialed == ["+12025550199"] * 2
     app.state.service.close()
+
+
+def test_gateway_raises_call_cap_with_owner_words(tmp_path):
+    path, _, _ = registry(tmp_path)
+    selected_port = port()
+    base = f"http://127.0.0.1:{selected_port}"
+    app = create_app(tmp_path / "data", Archive(), agent_registry=path)
+    profile = (ROOT / "config/profiles/calls-phone-operator.toml").read_text()
+    assert '"calls_raise_call_cap"' in profile
+    with (
+        server(app, selected_port),
+        gateway(
+            tmp_path,
+            {"calls": (base, "alice")},
+            {"calls": ["calls:read", "calls:dial"]},
+            ["platform_capabilities", "calls_capabilities", "calls_raise_call_cap"],
+        ) as (c, _, _),
+    ):
+        refused = c.post("/v1/calls_raise_call_cap",
+                         json={"owner_instruction": "Add more calls", "extra_units": 4})
+        assert refused.status_code == 422 and refused.json()["error"] == "units_not_in_owner_instruction"
+        raised = call(c, "calls_raise_call_cap", {"owner_instruction": "Yes, 4 more calls today", "extra_units": 4})
+        assert raised["call_cap"]["daily_call_units"] == 14
+        caps = call(c, "calls_capabilities", {})
+        assert caps["call_cap"]["raises"][0]["owner_instruction"] == "Yes, 4 more calls today"
+    app.state.service.close()

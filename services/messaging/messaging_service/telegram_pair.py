@@ -70,7 +70,7 @@ def main():
     args=parser.parse_args(); os.umask(0o077)
     try: asyncio.run(pair_config(args.config))
     except Exception as exc:
-        safe={'owner_terminal_required','collector_disabled','session_handover_not_confirmed',
+        safe={'owner_terminal_required','collector_disabled','session_handover_not_confirmed','private_session_required',
               'telegram_identity_mismatch','live_account_required','collector_already_owned',
               'session_already_owned','collector_lease_lost'}
         print(json.dumps({'status':'not_paired','code':str(exc) if str(exc) in safe else 'pairing_failed'}),flush=True)

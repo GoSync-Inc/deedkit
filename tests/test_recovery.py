@@ -21,7 +21,7 @@ DUMP=[sys.executable,'-c','print("UNIT_DUMP_NOT_A_DATABASE")']
 
 def recovery_fixture(store,path):
     Archive(store).register('recovery-fixture','telegram','Synthetic session fixture',synthetic=False,include_chats=['1'])
-    session=path/'session';session.mkdir();(session/'example.session').write_bytes(b'FAKE_SESSION_BYTES')
+    session=path/'session';session.mkdir(mode=0o700);(session/'example.session').write_bytes(b'FAKE_SESSION_BYTES')
     with session_lock(session/'example.session'):pass
     spool=path/'spool';spool.mkdir();(spool/'pending.json').write_text('{"test":"pending"}')
     (spool/'empty').mkdir()

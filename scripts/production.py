@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack, contextmanager
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -13,6 +14,7 @@ import posixpath
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -20,7 +22,8 @@ import urllib.parse
 import urllib.request
 
 REPOSITORY = "GoSync-Inc/deedkit"
-REQUIRED_JOBS = {"checks / verify", "native / synthetic", "images / build (backup)", "CI gate"}
+# `publish` pushed and attested this commit's images; preparation pulls nothing from a run without it (ANYM-301).
+REQUIRED_JOBS = {"checks / verify", "native / synthetic", "images / build (backup)", "CI gate", "publish"}
 # A main push run may skip only this job, and only when the merge queue verified the exact commit (ANYM-321).
 QUEUE_VERIFIED_JOB = "checks / verify"
 QUEUE_BRANCH_PREFIX = "gh-readonly-queue/main/"
@@ -39,17 +42,29 @@ BUILDS = {
                "[subprocess.run([tool, '--version'], check=True) for tool in ('age', 'pg_dump', 'pg_restore')]"),
     "http-router": (".", "services/release-router/Dockerfile", "", ""),
 }
+# The images the main push run publishes (scripts/publish_images.py TARGETS): preparation pulls these by verified
+# digest instead of building them; `http-router` and `check-image` still build locally (ANYM-301 B1).
+PUBLISHED = ("runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "calls", "backup")
+REGISTRY = "ghcr.io/gosync-inc/deedkit-"
+# The tokenless attestation verifier, built reproducibly from tools/attest-verify and installed by the owner;
+# tests keep this hash equal to tools/attest-verify/attest-verify.linux-amd64.sha256.
+VERIFIER = Path("/usr/local/libexec/deedkit/attest-verify")
+VERIFIER_SHA256 = "af405433c424fe20580cc86e2d96221670b0a75d6af9068ab06d309ec49344db"
+IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class Refused(RuntimeError):
     pass
 
 
-def run(argv, *, cwd=None, umask=-1):
-    # Never include command output in an exception: Compose can contain secrets.
-    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=1800, umask=umask)
+def run(argv, *, cwd=None, umask=-1, env=None, reason=False):
+    # Never include command output in an exception: Compose can contain secrets. Only a tool that prints
+    # nothing secret (the attestation verifier) may pass its last stderr line on, with `reason`.
+    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=1800, umask=umask, env=env)
     if result.returncode:
-        raise Refused(f"{argv[0]} failed (exit {result.returncode}); production was not accepted")
+        detail = (result.stderr.strip().splitlines() or [""])[-1][:300] if reason else ""
+        raise Refused(f"{Path(argv[0]).name} failed (exit {result.returncode}){': ' + detail if detail else ''}; "
+                      "production was not accepted")
     return result.stdout
 
 
@@ -247,8 +262,14 @@ def snapshot(project):
         actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", actual["Image"]):
             raise Refused("running container has no immutable image identity")
-        running[service] = {"container": ids[0], "image": actual["Image"]}
+        running[service] = {"container": ids[0], "image": actual["Image"], "settings": container_settings(actual)}
     return document, running
+
+
+def container_settings(inspected):
+    """A digest of a container's configuration, including what `docker update` changes in place (resources,
+    restart policy), so drift without a new container or image is visible. Receipts keep the digest only."""
+    return digest({key: inspected.get(key) for key in ("Config", "HostConfig", "Mounts")})
 
 
 # The runtime's data/config mount roots, never executable roots.
@@ -404,7 +425,7 @@ def escaped(value):
 
 def check_space(directory):
     if shutil.disk_usage(directory).free < MIN_FREE_BYTES:
-        raise Refused("at least 15 GiB free is required before building production images")
+        raise Refused("at least 15 GiB free is required before obtaining production images")
 
 
 IMAGE_LOCK = Path("/var/lib/deedkit-production/image-build.lock")
@@ -445,15 +466,53 @@ def names_revision(image, sha, dockerfile, recipe=None):
                  or "DEEDKIT_SOURCE_SHA=" + sha in (config.get("Env") or [])))
 
 
-def build_image(source, sha, target, *, check=False):
+def published(target, sha):
+    """Resolve `ghcr.io/gosync-inc/deedkit-<target>:<sha>` to one digest and verify its attestation, tokenless.
+
+    The pinned verifier (tools/attest-verify) runs with an empty environment, so no GitHub or registry
+    credential can reach it; any refusal stops the target before a pull (ANYM-301 B2).
+    """
+    try:
+        info = VERIFIER.lstat()
+        content = VERIFIER.read_bytes() if stat.S_ISREG(info.st_mode) else b""
+    except OSError:
+        info, content = None, b""
+    if (info is None or not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid())
+            or info.st_mode & 0o022 or hashlib.sha256(content).hexdigest() != VERIFIER_SHA256):
+        raise Refused(f"the attestation verifier {VERIFIER} is missing, writable by others or not the pinned build")
+    try:
+        output = run([str(VERIFIER), "--image", REGISTRY + target, "--sha", sha], env={"PATH": "/usr/bin:/bin"},
+                     reason=True)
+    except OSError as exc:  # for example a pinned file without the execute bit
+        raise Refused(f"the attestation verifier {VERIFIER} could not be run") from exc
+    try:
+        value = json.loads(output)
+    except ValueError:
+        value = None
+    if (not isinstance(value, dict) or value.get("sha") != sha
+            or not all(isinstance(value.get(key), str) and IMAGE_DIGEST.fullmatch(value[key])
+                       for key in ("digest", "config_digest"))
+            or value.get("reference") != f"{REGISTRY}{target}@{value['digest']}"):
+        raise Refused("the attestation verifier returned no verified reference for this target and revision")
+    return {key: value[key] for key in ("reference", "digest", "config_digest")}
+
+
+def build_image(source, sha, target, *, check=False, verified=None):
+    """The image of `target` at `sha`: pulled by verified digest when CI publishes it, otherwise built."""
     context, dockerfile, stage, smoke = BUILDS[target]
     # A reused tag must carry this exact recipe, not only the revision.
     arguments, recipe = build_recipe(target, sha)
     # A container check builds the working tree; it never shares or reuses production tags.
     tag = f"deedkit-{'check' if check else 'production'}-{target}:{sha}"
+    pull = not check and target in PUBLISHED
+    reference, matches = "", set()
+    if pull:
+        verified = verified or published(target, sha)
+        # The image store reports the config digest (classic store) or the manifest digest (containerd store).
+        reference, matches = verified["reference"], {verified["digest"], verified["config_digest"]}
     with image_lock():
         # Builds are not reproducible, and retagging can drop the image running containers use
-        # (containerd image store), so an existing production tag is reused, never rebuilt.
+        # (containerd image store), so an existing production tag is reused, never rebuilt or retagged.
         existing = [] if check else run(["docker", "image", "ls", "--quiet", "--no-trunc", tag]).split()
         if existing:
             image = existing[0]
@@ -462,6 +521,20 @@ def build_image(source, sha, target, *, check=False):
             if not names_revision(image, sha, dockerfile, recipe):
                 raise Refused("existing image tag does not name the candidate source revision and build; "
                               "remove it only after checking that no container uses it")
+            # Matching labels are not enough: a host-built image of the same revision has other content.
+            if pull and image not in matches:
+                raise Refused("existing image tag is not the verified CI image of this revision; "
+                              "remove it only after checking that no container uses it")
+        elif pull:
+            run(["docker", "pull", "--quiet", reference])
+            image = run(["docker", "image", "inspect", "--format", "{{.Id}}", reference]).strip()
+            if image not in matches:
+                raise Refused("pulled image is not the verified digest")
+            if not names_revision(image, sha, dockerfile, recipe):
+                raise Refused("pulled image does not name the candidate source revision and build")
+            run(["docker", "tag", reference, tag])
+            if run(["docker", "image", "ls", "--quiet", "--no-trunc", tag]).split() != [image]:
+                raise Refused("the production tag does not name the pulled image")
         else:
             command = ["docker", "build", "--label", "org.opencontainers.image.revision=" + sha,
                        "--label", "org.opencontainers.image.source=https://github.com/" + REPOSITORY,
@@ -549,8 +622,10 @@ def prepare(settings, sha):
         snapshots.append({"project": project, "before": document, "running": running})
     images = {}
     targets = sorted({target for project in settings["projects"] for target in project["services"].values()})
+    # Every CI-published target is resolved and attested before the first pull.
+    verified = {target: published(target, sha) for target in targets if target in PUBLISHED}
     for target in targets:
-        images[target] = build_image(source, sha, target)
+        images[target] = build_image(source, sha, target, verified=verified.get(target))
     # Recheck after potentially long image builds. No production command ran yet.
     evidence = verify(sha)
     projects = []
@@ -569,18 +644,26 @@ def prepare(settings, sha):
         reread = json.loads(run(["docker", "compose", "--profile", "*", "-f", str(path), "config", "--format", "json"]))
         if reread != candidate:
             raise Refused("resolved Compose snapshot did not round-trip exactly")
-        projects.append({"name": project["name"], "file": str(path), "digest": digest(read(path)),
-                         "before_digest": digest(before), "running": item["running"]})
         rollback = json.loads(json.dumps(before))
         for unit in rollback["services"].values():
             unit.pop("build", None)
         for service, identity in item["running"].items():
             rollback["services"][service]["image"] = identity["image"]
-        write(release / (project["name"] + ".before.json"), escaped(rollback))
+        previous = release / (project["name"] + ".before.json")
+        write(previous, escaped(rollback))
+        # Bound here, so a snapshot changed before apply can never become the rollback baseline.
+        projects.append({"name": project["name"], "file": str(path), "digest": digest(read(path)),
+                         "before_digest": digest(before), "running": item["running"],
+                         "before_file_digest": digest(read(previous))})
     receipt = {"version": 1, "sha": sha, "ci": evidence, "images": images,
+               "references": {target: value["reference"] for target, value in verified.items()},
                "config_digest": digest(settings), "projects": projects}
     write(release / "prepared.json", receipt)
     return receipt
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def apply(settings, sha):
@@ -601,9 +684,15 @@ def apply(settings, sha):
         if (item["name"] != project["name"] or digest(document) != item["before_digest"]
                 or running != item["running"] or digest(read(item["file"])) != item["digest"]):
             raise Refused("production or prepared configuration changed since preparation")
+        previous = release / (project["name"] + ".before.json")
+        if "before_file_digest" not in item:
+            raise Refused("this release was prepared without a bound rollback snapshot; prepare it again")
+        if not previous.exists() or digest(read(previous)) != item["before_file_digest"]:
+            raise Refused("the before-release snapshot is missing or changed since preparation")
     # Last remote gate immediately before the first mutation, under the host lock.
     evidence = verify(sha)
     write(release / "attempted.json", {"sha": sha, "ci": evidence, "status": "applying"})
+    started = {}
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
         command = ["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f", item["file"]]
         services = list(project["services"])
@@ -618,15 +707,153 @@ def apply(settings, sha):
             actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
             if actual["Image"] != receipt["images"][target] or not actual["State"]["Running"]:
                 raise Refused("replacement did not start the prepared image")
-    result = {"sha": sha, "ci": evidence, "images": receipt["images"], "status": "applied"}
+            started[project["name"], service] = ids[0], container_settings(actual)
+    # What rollback must find unchanged before it stops anything, captured the way prepare captures the baseline.
+    # It must still be what this apply started: a change meanwhile leaves the attempt unresolved.
+    restore = []
+    for project, item in zip(settings["projects"], receipt["projects"], strict=True):
+        document, running = snapshot(project)
+        if digest(document) != item["before_digest"] or any(
+                running[service]["image"] != receipt["images"][target]
+                or not started[project["name"], service][0].startswith(running[service]["container"])
+                or started[project["name"], service][1] != running[service]["settings"]
+                for service, target in project["services"].items()):
+            raise Refused("production changed while this release was applied; inspect it before any recovery")
+        restore.append({"name": project["name"], "services": sorted(project["services"]),
+                        "before_file_digest": item["before_file_digest"],
+                        "after_digest": digest(document), "running": running})
+    result = {"sha": sha, "ci": evidence, "images": receipt["images"], "references": receipt.get("references", {}),
+              "status": "applied", "applied_at": now(), "rollback": {"version": 1, "projects": restore}}
     write(release / "result.json", result)
     write(state / "current.json", result)
     return result
 
 
+def unfinished(state):
+    """Releases whose apply or rollback started but never recorded its result."""
+    return sorted(path.parent.name for marker, outcome in (("attempted.json", "result.json"),
+                                                           ("rollback-attempted.json", "rollback.json"))
+                  for path in state.glob("*/" + marker) if not (path.parent / outcome).exists())
+
+
+def rollback(settings, sha):
+    """Return the current release's selected services to the images and configuration that ran before it.
+
+    Owner-confirmed like apply. It never calls verify(): the previous revision is no longer current main.
+    The caller holds the host lock, as main() does for every state-changing action.
+    """
+    state = Path(settings["state_directory"])
+    release = state / sha
+    current = read(state / "current.json") if (state / "current.json").exists() else {}
+    if current.get("sha") != sha or current.get("status") != "applied" or not (release / "result.json").exists():
+        raise Refused("only the current applied release can be rolled back")
+    if (release / "rollback-attempted.json").exists():
+        raise Refused("this release was already rolled back or attempted; inspect it before any recovery")
+    if blocked := unfinished(state):
+        raise Refused("an apply or rollback is unfinished: " + ", ".join(blocked) + "; inspect it first")
+    result = read(release / "result.json")
+    data = result.get("rollback") if isinstance(result.get("rollback"), dict) else {}
+    if data.get("version") != 1 or result.get("sha") != sha:
+        raise Refused("this release has no rollback data; follow the manual rollback procedure (production.md)")
+    if read(release / "prepared.json")["config_digest"] != digest(settings):
+        raise Refused("production configuration changed since this release")
+    plan = []
+    for project, item in zip(settings["projects"], data["projects"], strict=True):
+        before = release / (project["name"] + ".before.json")
+        if item["name"] != project["name"] or item["services"] != sorted(project["services"]):
+            raise Refused("rollback data does not match the selected production configuration")
+        if not before.exists() or digest(read(before)) != item["before_file_digest"]:
+            raise Refused("the before-release snapshot is missing or was modified")
+        document, running = snapshot(project)
+        if digest(document) != item["after_digest"] or running != item["running"]:
+            raise Refused("production changed since this release was applied")
+        previous = {service: read(before)["services"][service]["image"] for service in project["services"]}
+        for image in sorted(set(previous.values())):
+            # It never pulls: the exact previous image must still be on this host.
+            try:
+                present = bool(IMAGE_DIGEST.fullmatch(image)) and json.loads(
+                    run(["docker", "image", "inspect", image]))[0]["Id"] == image
+            except Refused:
+                present = False
+            if not present:
+                raise Refused("a previous image is no longer present on this host")
+        plan.append((project, before, previous))
+    write(release / "rollback-attempted.json", {"sha": sha, "status": "rolling-back", "started_at": now()})
+    for project, before, previous in plan:
+        command = ["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f", str(before)]
+        services = list(project["services"])
+        # Stop the release's owners before the previous ones can connect to their sessions.
+        run(command + ["stop", *services])
+        run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps",
+                       "--wait", "--wait-timeout", "180", *services])
+        for service, image in previous.items():
+            ids = run(command + ["ps", "-q", service]).split()
+            if len(ids) != 1:
+                raise Refused("restored service is missing")
+            actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
+            if actual["Image"] != image or not actual["State"]["Running"]:
+                raise Refused("restored service does not run its previous image")
+    outcome = {"sha": sha, "status": "rolled-back", "rolled_back_at": now(),
+               "previous_images": {project["name"]: previous for project, _, previous in plan}}
+    write(release / "rollback.json", outcome)
+    write(state / "current.json", {**outcome, "images": result["images"]})
+    return outcome
+
+
+def images_report(settings):
+    """Which `deedkit-production-<target>` images the retention rules keep, and why. It removes nothing."""
+    state = Path(settings["state_directory"])
+    reasons = {}
+    def keep(image, why):
+        if isinstance(image, str) and IMAGE_DIGEST.fullmatch(image):
+            reasons.setdefault(image, []).append(why)
+    current = read(state / "current.json") if (state / "current.json").exists() else {}
+    for image in current.get("images", {}).values():
+        keep(image, ("rolled-back release " if current.get("status") == "rolled-back" else "current release ")
+             + current["sha"])
+    for services in current.get("previous_images", {}).values():
+        for image in services.values():
+            keep(image, "restored by the rollback of " + current["sha"])
+    if current.get("sha"):
+        for before in (state / current["sha"]).glob("*.before.json"):
+            for unit in read(before)["services"].values():
+                keep(unit.get("image"), "rollback target of the current release")
+    others = [read(path) for path in state.glob("*/result.json") if path.parent.name != current.get("sha")]
+    for result in others:
+        if not result.get("applied_at"):
+            for image in result["images"].values():
+                keep(image, f"release {result['sha']} without applied_at, order unknown")
+    dated = sorted((result for result in others if result.get("applied_at")), key=lambda value: value["applied_at"])
+    for result in dated[-2:]:
+        for image in result["images"].values():
+            keep(image, f"one of the two newest other releases ({result['sha']})")
+    for path in state.glob("*/prepared.json"):
+        if not (path.parent / "result.json").exists():
+            for image in read(path)["images"].values():
+                keep(image, f"prepared release {path.parent.name} is not applied")
+    containers = run(["docker", "ps", "--all", "--quiet", "--no-trunc"]).split()
+    for value in json.loads(run(["docker", "inspect", *containers])) if containers else []:
+        keep(value["Image"], "used by container " + value["Id"][:12])
+    tags = {}
+    names = {"deedkit-production-" + target for target in PUBLISHED}
+    for line in run(["docker", "image", "ls", "--no-trunc", "--format", "{{.Repository}}:{{.Tag}} {{.ID}}"]).splitlines():
+        name, _, image = line.rpartition(" ")
+        if name.rpartition(":")[0] in names:
+            tags.setdefault(image, []).append(name)
+    report = {"keep": [], "candidates": []}
+    for image, tagged in sorted(tags.items()):
+        if image in reasons:
+            report["keep"].append({"image": image, "tags": sorted(tagged), "reasons": reasons[image]})
+        else:
+            report["candidates"].append({"image": image, "tags": sorted(tagged),
+                                         "reason": "no current, rollback, recent, prepared or container use"})
+    return report
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["verify", "prepare", "prepare-router", "apply", "status", "check-image"])
+    parser.add_argument("action", choices=["verify", "prepare", "prepare-router", "apply", "rollback", "status",
+                                           "images", "check-image"])
     parser.add_argument("--sha")
     parser.add_argument("--target", choices=sorted(BUILDS))
     parser.add_argument("--config", default="/etc/deedkit/production.json")
@@ -656,13 +883,16 @@ def main(argv=None):
                     locks.enter_context(lock(state))
                 if args.action == "status":
                     result = read(state / "current.json") if (state / "current.json").exists() else {"status": "not promoted by this tool"}
+                elif args.action == "images":
+                    result = images_report(settings)
                 else:
                     if not re.fullmatch(r"[0-9a-f]{40}", args.sha or ""):
                         raise Refused("an exact lowercase 40-character commit SHA is required")
-                    result = {"prepare": prepare, "prepare-router": prepare_router, "apply": apply}[args.action](settings, args.sha)
+                    result = {"prepare": prepare, "prepare-router": prepare_router, "apply": apply,
+                              "rollback": rollback}[args.action](settings, args.sha)
         # Receipts contain revisions/image IDs, never resolved Compose environments.
         if args.action == "prepare":
-            result = {key: result[key] for key in ("sha", "ci", "images")}
+            result = {key: result[key] for key in ("sha", "ci", "images", "references")}
         print(json.dumps(result, indent=2))
     except Exception as exc:
         message = str(exc) if isinstance(exc, Refused) else type(exc).__name__

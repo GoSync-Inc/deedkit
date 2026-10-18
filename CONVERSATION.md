@@ -107,9 +107,13 @@ meaningful message, exact source IDs/revisions, `last_turn`, `suggested_action`,
   ties make the action unclear. A fresh database response does not prove a fresh
   provider head. Same-actor ties can identify the actor while the exact latest
   message remains ambiguous.
-- Groups use explicit owner mentions/replies in their observed thread; unrelated
-  group chatter cannot resolve that attention. Broadcast channels do not have a
-  global "we/they should reply" state.
+- Group attention comes from explicit owner mentions and replies to owner
+  messages. Any later meaningful owner message in the group resolves it, as in
+  the archive view; a new mention or reply after that message reopens it. Other
+  participants' chatter neither resolves nor renews it. Ordering follows private
+  chats: Telegram numeric IDs order messages within one second, and a
+  same-second WhatsApp owner message leaves the attention ambiguous. Broadcast
+  channels do not have a global "we/they should reply" state.
 
 The transcript and structured messages use the same normalized view. Conversation
 content, filenames and derived media text remain untrusted data. The view lowers
