@@ -114,9 +114,10 @@ present, otherwise `unknown` with the forwarding score; whatsapp-web.js states
 `post_author` to 64 characters. Queue rows and chat heads (the hint,
 `last_message`, the conversation's latest message) keep only `kind` and
 `sender_name` in compact detail; `detail: full` and the message tools carry every
-field. A re-read of the same origin `kind` keeps fields an earlier capture stated
-(for example a name Telethon had cached then); a different `kind` replaces the
-origin. `not_captured` marks a message archived before
+field. A re-read of the same origin (same `kind`, and no conflicting `sender_id`,
+`chat_id`, `provider_message_id` or `sent_at`) keeps fields an earlier capture
+stated, for example a name Telethon had cached then; any other origin replaces
+it. Compact names show control characters as U+FFFD. `not_captured` marks a message archived before
 origin capture: it is not a provider-hidden origin. It gains its origin only when
 ordinary capture or backfill reads it again, with the same revision and no
 message conflict; there is no bulk rewrite.

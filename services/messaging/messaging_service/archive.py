@@ -203,8 +203,13 @@ class Archive:
                     revision=excluded.revision,
                     metadata=CASE WHEN message_metadata.revision=excluded.revision
                         THEN message_metadata.metadata || jsonb_strip_nulls(excluded.metadata) ||
-                            -- A sparser re-read of the same stated origin keeps the fields it already named.
+                            -- A sparser re-read of the same stated origin keeps the fields it already named;
+                            -- a conflicting ID or time is another origin and replaces it.
                             CASE WHEN message_metadata.metadata->'forward_origin'->'kind'=excluded.metadata->'forward_origin'->'kind'
+                                AND NOT EXISTS(SELECT 1 FROM jsonb_each(excluded.metadata->'forward_origin') o
+                                    WHERE o.key IN ('sender_id','chat_id','provider_message_id','sent_at')
+                                    AND message_metadata.metadata->'forward_origin'->o.key IS DISTINCT FROM o.value
+                                    AND message_metadata.metadata->'forward_origin' ? o.key)
                                 THEN jsonb_build_object('forward_origin',message_metadata.metadata->'forward_origin' ||
                                     jsonb_strip_nulls(excluded.metadata->'forward_origin'))
                                 ELSE '{}'::jsonb END

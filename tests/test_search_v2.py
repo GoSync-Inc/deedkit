@@ -387,3 +387,37 @@ def test_archive_compact_hint_bounds_the_origin(forwards):
     row=render('list_chats',s.list_chats(key,awaiting_reply=True,include_coverage=False),'compact')['items'][0]
     assert row['awaiting_reply_forward_origin']=={'kind':'channel','sender_name':'N'*64}
     assert row['awaiting_reply_authorship']=='forwarded_by_sender'
+
+
+def test_a_conflicting_origin_id_replaces_the_stored_origin(forwards):
+    s,ar,add,event=forwards
+    add('1','synthetic forwarded words',forwarded=True,
+        forward_origin={'kind':'user','sender_id':'111','sender_name':'Synthetic Alice','basis':'telegram_fwd_from'})
+    other={'kind':'user','sender_id':'222','basis':'telegram_fwd_from'}
+    assert ar.ingest(event(account='forward-tg',chat='300',provider_id='1',body='synthetic forwarded words',
+        metadata={'forwarded':True,'forward_origin':other}))['outcome']=='unchanged'
+    key=s.issue_key('forward-reader',['forward-tg'])
+    assert s.search(key,'synthetic forwarded')['items'][0]['forward_origin']==other
+
+
+def test_forwarded_group_attention_target_keeps_attribution(forwards):
+    from datetime import timedelta
+    s,ar,_,event=forwards
+    at=(datetime.now(timezone.utc)-timedelta(hours=1)).replace(microsecond=0).isoformat()
+    mid=ar.ingest(event(account='forward-tg',chat='-500',provider_id='1',body='synthetic forwarded mention',sent_at=at,
+        updated_at=at,metadata={'chat_type':'group','mentions_owner':True,'forwarded':True,'forward_origin':ORIGIN}))['message']
+    key=s.issue_key('forward-reader',['forward-tg'])
+    target=s.get_context(key,mid,view='conversation')['conversation']['owner_attention']['target_message']
+    assert target['id']==mid and target['authorship']=='forwarded_by_sender' and target['forward_origin']==ORIGIN
+
+
+def test_compact_origin_names_never_serialize_as_control_escapes():
+    import json
+    from messaging_service.presentation import forward_fields
+    row={'forwarded':True,'forward_origin':{**ORIGIN,'sender_name':'\x01'*256,'post_author':'\x1f'*256}}
+    for brief in (False,True):
+        origin=forward_fields(row,brief=brief)['forward_origin']
+        assert origin['sender_name']=='�'*64
+        # A quote or backslash (two serialized characters) is the widest name character left.
+        assert len(json.dumps(origin['sender_name'],ensure_ascii=False))==66
+    assert forward_fields(row)['forward_origin']['post_author']=='�'*64

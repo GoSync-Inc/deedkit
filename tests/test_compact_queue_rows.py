@@ -188,7 +188,8 @@ def test_list_chats_awaiting_reply_25_rows_within_30000_chars(recent_queue):
 
 def test_list_chats_25_forwarded_hints_within_39000_chars(recent_queue):
     # ANYM-274: every incoming message forwarded with a worst-case origin; queue rows keep the kind and a
-    # 64-character name whose characters all need JSON escaping. The 30,000 guard above keeps its fixture
+    # 64-character name of quotes, the widest name character once control characters become U+FFFD
+    # (test_compact_origin_names_never_serialize_as_control_escapes). The 30,000 guard above keeps its fixture
     # without forwards (decision 2026-10-18, option A). Measured 37,294 characters.
     from psycopg.types.json import Jsonb
     s,key=recent_queue

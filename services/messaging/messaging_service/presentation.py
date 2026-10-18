@@ -1,4 +1,6 @@
 """Bounded agent summaries; full evidence remains available by explicit opt-in."""
+import re
+
 MESSAGE_FIELDS = ('id','message','account','chat','sender','sent_at','revision','direction',
     'provider_message_id','kind','origin','historical','is_backfill','event_sequence','sender_name','sender_name_basis','username',
     'chat_title','chat_type','reply_to_provider_id','mentions_owner','reply_to_owner','forwarded','media_kind','body_truncated',
@@ -57,7 +59,8 @@ def forward_fields(row, *, brief=False):
     if row.get('forwarded') is not True or not row.get('forward_origin'):return {}
     origin={k:v for k,v in row['forward_origin'].items() if not brief or k in ('kind','sender_name')}
     for key in ('sender_name','post_author'):
-        if key in origin:origin[key]=origin[key][:64]
+        # Control characters would serialize as six-character escapes; names are display text only.
+        if key in origin:origin[key]=re.sub(r'[\x00-\x1f]','\ufffd',origin[key][:64])
     return {'forward_origin':origin,'authorship':row.get('authorship') or 'forwarded_by_sender'}
 
 
