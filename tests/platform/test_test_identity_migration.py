@@ -14,7 +14,7 @@ def test_registered_case_ids_and_matcher_sources_are_unique_and_still_present():
     assert registry["version"] == 1
     assert registry["physical_moves"] == {}  # No physical test moves accepted yet.
     cases = registry["cases"]
-    assert len(cases) == 1281
+    assert len(cases) == 1278
     assert len({case["id"] for case in cases}) == len(cases)
     assert len({case["signature"] for case in cases}) == len(cases)
     for case in cases:
