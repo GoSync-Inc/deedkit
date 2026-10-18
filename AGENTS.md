@@ -48,7 +48,7 @@ accepted criterion). A standing approval holds only while all its conditions do.
 
 Push and open the PR; CI and review run in parallel. Merge with
 `gh pr merge <n> --squash --auto`, never bypassing checks, with no open blocking or major finding.
-Done means the squash's `main` push run is green.
+Done: the squash's `main` push run is green.
 
 ## 4. Product context and Tiden
 
