@@ -15,6 +15,7 @@
       "mcp__claude_ai_Deedkit__calls_get_owner_requests",
       "mcp__claude_ai_Deedkit__calls_list_briefs",
       "mcp__claude_ai_Deedkit__calls_list_calls",
+      "mcp__claude_ai_Deedkit__calls_raise_call_cap",
       "mcp__claude_ai_Deedkit__messages_capabilities",
       "mcp__claude_ai_Deedkit__messages_get_context",
       "mcp__claude_ai_Deedkit__messages_get_file_occurrences",
