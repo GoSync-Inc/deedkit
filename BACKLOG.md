@@ -11,7 +11,6 @@ checklists here. Module documents describe contracts and acceptance procedures,
 not another work queue.
 
 - [Agent workflow and standard Tiden skills](docs/operations/tiden-product-workflow.md)
-- [Claude Code instructions and readiness boundaries](docs/operations/claude-code-tiden.md)
 - [CI and evidence rules](TIDEN-CI.md)
 - [Dated reconciliation audit](docs/quality/tiden-reconciliation-2026-10-16.md)
 - [Pre-migration backlog](https://github.com/GoSync-Inc/deedkit/blob/e513e3890dacadd5386d7c6924aa6d2b18b20069/BACKLOG.md)
