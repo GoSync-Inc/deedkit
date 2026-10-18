@@ -26,6 +26,13 @@ test('capture does not invent a duration or precise creation time',()=>{
   assert.equal(event(message('document',12)).durationSeconds,null);
 });
 
+test('capture keeps a round video (ptv) as a video with its duration',()=>{
+  const result=event(message('ptv',9));
+  assert.equal(result.mediaKind,'video');
+  assert.equal(result.durationSeconds,9);
+  assert.equal(result.messageType,'ptv');
+});
+
 test('provider snapshot ties do not have a verified phone order contract',async()=>{
   // Cached order, lexical IDs and times disagree; the history transport must not
   // smuggle a guessed orderId/seq/verified order into normalized source metadata.

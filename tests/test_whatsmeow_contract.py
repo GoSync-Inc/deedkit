@@ -290,3 +290,22 @@ def test_actual_native_capture_replay_does_not_invent_a_revision(native_fixture_
 def test_actual_history_capture_uses_archive_backfill_origin(native_fixture_binary, tmp_path):
     _, normalized = _normalize_fixture(native_fixture_binary, tmp_path, {'origin': 'history'})
     assert normalized['envelope']['origin'] == 'backfill'
+
+
+def test_actual_go_round_video_is_archived_as_video_with_one_media_job(native_fixture_binary, tmp_path, seeded):
+    from messaging_service.archive import Archive
+    store = seeded[0]
+    archive = Archive(store)
+    archive.register('wa-native-test', 'whatsapp', 'Synthetic native', include_chats=['123@c.us'])
+    _, normalized = _normalize_fixture(native_fixture_binary, tmp_path, {
+        'kind': 'ptv', 'text': '', 'mime': 'video/mp4', 'bytes': 4096, 'duration_seconds': 9})
+    envelope = normalized['envelope']
+    assert envelope['metadata']['message_kind'] == 'video'
+    assert envelope['metadata']['provider_message_type'] == 'ptv'
+    assert envelope['metadata']['media_duration_seconds'] == 9
+    assert envelope['media'] == [{'provider_id': 'false_123@c.us_fixture123',
+        'filename': 'false_123@c.us_fixture123.bin', 'mime': 'video/mp4', 'bytes': 4096}]
+    message = archive.ingest(envelope)['message']
+    with store.pool.connection() as c:
+        jobs = c.execute('SELECT id FROM media_jobs WHERE message=%s', (message,)).fetchall()
+    assert len(jobs) == 1

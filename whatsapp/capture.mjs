@@ -84,7 +84,7 @@ export function event(message, body=undefined, ownerIds=[]) {
   const duration=message.duration;
   const numericDuration=typeof duration==='number'?duration:
     typeof duration==='string' && /^\d+(?:\.\d+)?$/.test(duration)?Number(duration):null;
-  const durationSeconds=['ptt','audio','video','gif'].includes(type) &&
+  const durationSeconds=['ptt','audio','video','gif','ptv'].includes(type) &&
     Number.isFinite(numericDuration) && numericDuration>=0 && numericDuration<=86400?numericDuration:null;
   const value={chatId:chat,messageId:asId(message.id),
     messageType:type,
@@ -100,7 +100,7 @@ export function event(message, body=undefined, ownerIds=[]) {
     replyToId:envelopeReference(raw.quotedStanzaID)?raw.quotedStanzaID:null,
     ...ownerAttention(message,ownerIds),
     forwarded:typeof message.isForwarded==='boolean'?message.isForwarded:null,
-    mediaKind:({image:'photo',video:'video',audio:'audio',ptt:'voice',document:'document',sticker:'sticker',gif:'animation'})[message.type] || (message.hasMedia?'other':null),
+    mediaKind:({image:'photo',video:'video',ptv:'video',audio:'audio',ptt:'voice',document:'document',sticker:'sticker',gif:'animation'})[message.type] || (message.hasMedia?'other':null),
     filesize:Number.isSafeInteger(raw.size) && raw.size>=0 && raw.size<=MAX_MEDIA_BYTES?raw.size:null,
     editedTimestampMs:message.latestEditSenderTimestampMs || raw.latestEditSenderTimestampMs || null};
   if (!Number.isSafeInteger(value.timestamp) || value.timestamp<=0 || value.timestamp>MAX_UNIX)

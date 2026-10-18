@@ -83,7 +83,7 @@ def title_sql(chat='c'):
         THEN '{SELF_CHAT_TITLE}' END,{peer_name_sql(chat)},{chat}.title) ELSE {chat}.title END"""
 
 
-def list_chats(store,c,p,after='',limit=100,*,accounts=None,query='',chat_types=None,
+def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=None,
         order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
         include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
         only_questions=False,only_unread=False,selected_chat=None,include_dismissed=False,

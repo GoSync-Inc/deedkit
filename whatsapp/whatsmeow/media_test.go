@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,8 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types/events"
+	"go.mau.fi/whatsmeow/util/cbcutil"
+	"go.mau.fi/whatsmeow/util/hkdfutil"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -417,4 +420,69 @@ func TestNativeMediaUnwritableStorageIsNotANetworkError(t *testing.T) {
 	if safeError(err) != "media_storage_unavailable" {
 		t.Fatal("storage error not in the safe vocabulary")
 	}
+}
+
+// whatsmeowDecrypt mirrors whatsmeow's downloadAndDecrypt offline: the HKDF
+// info comes from the payload's own media type, as in Client.DownloadToFile.
+func whatsmeowDecrypt(msg whatsmeow.DownloadableMessage, mediaType whatsmeow.MediaType, blob []byte) ([]byte, error) {
+	expanded := hkdfutil.SHA256(msg.GetMediaKey(), nil, []byte(mediaType), 112)
+	iv, cipherKey, macKey := expanded[:16], expanded[16:48], expanded[48:80]
+	ciphertext, mac := blob[:len(blob)-10], blob[len(blob)-10:]
+	h := hmac.New(sha256.New, macKey)
+	h.Write(iv)
+	h.Write(ciphertext)
+	if !hmac.Equal(h.Sum(nil)[:10], mac) {
+		return nil, whatsmeow.ErrInvalidMediaHMAC
+	}
+	return cbcutil.Decrypt(cipherKey, iv, ciphertext)
+}
+
+func TestNativeRoundVideoDownloadsAndVerifiesWithVideoKeys(t *testing.T) {
+	plain := bytes.Repeat([]byte("synthetic round video "), 500)
+	mediaKey := bytes.Repeat([]byte{7}, 32)
+	expanded := hkdfutil.SHA256(mediaKey, nil, []byte("WhatsApp Video Keys"), 112)
+	iv, cipherKey, macKey := expanded[:16], expanded[16:48], expanded[48:80]
+	ciphertext, err := cbcutil.Encrypt(cipherKey, iv, plain[:len(plain):len(plain)])
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := hmac.New(sha256.New, macKey)
+	h.Write(iv)
+	h.Write(ciphertext)
+	blob := append(ciphertext, h.Sum(nil)[:10]...)
+	plainHash, encHash := sha256.Sum256(plain), sha256.Sum256(blob)
+	_, cfg, m := mediaFixture(t, plain)
+	m.Message = &waE2E.Message{PtvMessage: &waE2E.VideoMessage{Mimetype: proto.String("video/mp4"), FileLength: proto.Uint64(uint64(len(plain))), Seconds: proto.Uint32(9), MediaKey: mediaKey, FileSHA256: plainHash[:], FileEncSHA256: encHash[:], DirectPath: proto.String("/synthetic")}}
+	m.RawMessage = m.Message
+	meta, err := nativeMediaMetadata(m)
+	if err != nil || meta.Payload != m.Message.GetPtvMessage() {
+		t.Fatal("round video has no media descriptor", err)
+	}
+	req := mediaRequest{Chat: operationsChat, Message: LegacyMessageID(m)}
+	req.Descriptor.ProviderID, req.Descriptor.Bytes, req.Descriptor.Filename, req.Descriptor.Mime = req.Message, meta.Bytes, meta.Filename, meta.Mime
+	var output bytes.Buffer
+	err = downloadMedia(context.Background(), req, cfg, mediaPolicy, mediaGet(m), func(_ context.Context, msg whatsmeow.DownloadableMessage, file whatsmeow.File) error {
+		if whatsmeow.GetMediaType(msg) != whatsmeow.MediaVideo {
+			t.Fatalf("round video downloads as %q", whatsmeow.GetMediaType(msg))
+		}
+		if _, e := whatsmeowDecrypt(msg, whatsmeow.MediaImage, blob); !errors.Is(e, whatsmeow.ErrInvalidMediaHMAC) {
+			t.Fatal("payload verified with keys other than Video", e)
+		}
+		data, e := whatsmeowDecrypt(msg, whatsmeow.GetMediaType(msg), blob)
+		if e != nil {
+			return e
+		}
+		_, e = file.Write(data)
+		return e
+	}, func(chunk []byte) error {
+		_, e := output.Write(chunk)
+		return e
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Bytes(), plain) || req.Descriptor.Mime != "video/mp4" {
+		t.Fatal("round video original not verified and emitted")
+	}
+	requireNoNativeTemp(t, cfg.PagesDirectory)
 }

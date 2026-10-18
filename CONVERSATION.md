@@ -33,12 +33,44 @@ In the conversation view each message tool returns every message text once.
   anchor once, in `message`; `context_window.anchor_index` is its position among
   the `context` neighbours. `list_chats` groups the reply hint into one
   `awaiting_reply` object and shows the latest message once in `last_message`.
+  Each fact appears once per `list_chats` row (compact queue rows below).
 - `detail="transcript"`: only the numbered transcript with message IDs, its
   warnings, cursors and file references (`files`). Message text defaults to
   2000 characters; `body_chars` changes it. Requires `view="conversation"`.
 - `detail="full"`: every field documented below, including `body`, ordering,
   timestamp precision and the complete conversation state. Unchanged by the
   compact and transcript levels, as is `view="archive"` compact output.
+
+### Compact queue rows
+
+A compact `list_chats` row in the conversation view states each fact once. When
+two fields would carry the same fact, compact keeps the first and omits the other:
+
+- compact omits `last_message` when it equals the `awaiting_reply` message (the
+  hint is the chat head); the hint then carries its `display_text` and
+  `truncated`, and the message is incoming by definition;
+- compact omits `awaiting_reply.sent_at` when it equals `last_activity`;
+- compact omits `conversation.latest_message_id` when it equals `last_message.id`
+  or `awaiting_reply.message_id`;
+- compact omits `conversation.basis` when it equals `awaiting_reply.confidence`
+  or `awaiting_reply.basis`;
+- `conversation.candidate_message_ids` omits `awaiting_reply.message_id` and
+  `owner_attention.target_message_id`; with `order_status="ambiguous"` it lists
+  the other tied messages, and it is omitted when none remain;
+- compact omits `conversation.owner_attention.target_message_id` when it equals
+  `awaiting_reply.message_id` or, in a row without `awaiting_reply` (expired or
+  dismissed attention), `last_message.id`;
+- compact omits `owner_attention.suggested_action` when it equals
+  `conversation.suggested_action`;
+- `sender_name` in `last_message` and `awaiting_reply` is cut to 64 characters,
+  as in compact messages.
+
+The remaining hint fields keep their names and meanings: `message_id`,
+`revision`, `sender_id`, `sender_name`, `sender_name_basis`, `priority`,
+`reasons`, `waiting_hours`, `incoming_count`, `basis`, `has_question`,
+`dismissed`, `confidence` when it is not the default, and `display_text` with
+`truncated` (the hint's own text, or the head's when the hint is the head). The
+row's `read_state` is unchanged. `detail="full"` keeps every field.
 
 ## Ordering and windows
 
