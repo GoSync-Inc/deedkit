@@ -287,20 +287,20 @@ def checkout_tree(sha: str) -> str:
     return git("rev-parse", "--verify", "HEAD^{tree}")
 
 
-def same_tree(sha: str, tested: str, head_sha: str, get, local_tree=checkout_tree) -> str:
+def same_tree(sha: str, tested: str, head_sha: str, get, local_tree=None) -> str:
     """The git tree hash `tested` and `sha` share; `tested` must be GitHub's merge of the pull request head."""
     commit, pushed = get(f"git/commits/{tested}"), get(f"git/commits/{sha}")
     if commit.get("sha") != tested or [parent.get("sha") for parent in commit.get("parents") or []][1:] != [head_sha]:
         raise Refused("the tested commit is not GitHub's merge of the pull request head")
     tree = str((commit.get("tree") or {}).get("sha", ""))
     if not SHA.fullmatch(tree) or pushed.get("sha") != sha or (pushed.get("tree") or {}).get("sha") != tree \
-            or local_tree(sha) != tree:
+            or (local_tree or checkout_tree)(sha) != tree:
         raise Refused("the tree the pull request run tested is not exactly this commit's tree")
     return tree
 
 
 def adopt_chain(pin: dict, sha: str, repository: str, run_id: str, run_attempt: str, directory: Path,
-                get=production.api, fetch=download, local_tree=checkout_tree) -> dict:
+                get=production.api, fetch=download, local_tree=None) -> dict:
     """Validate the pinned evidence of the pull request run the merge queue reused for `sha` (the PR→queue chain)
     into `directory`, require its tested tree to be exactly this commit's, and record this push run as publisher."""
     def current_chain() -> tuple[dict, dict, str]:
