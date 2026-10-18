@@ -62,29 +62,37 @@ def dial_units(channel,destination):
 
 
 def _named_forms(channel,destination):
+    """(international form, national forms) in which the owner may write this destination."""
     if channel not in TELEPHONE:
-        return {destination}
-    forms={destination.lstrip('+')}
+        return destination,set()
     try:
         number=phonenumbers.parse(destination,None)
         national=phonenumbers.format_number(number,phonenumbers.PhoneNumberFormat.NATIONAL)
-        forms.add(SEPARATORS.sub('',national))
+        return destination.lstrip('+'),{SEPARATORS.sub('',national)}
     except phonenumbers.NumberParseException:
-        pass
-    return forms
+        return destination.lstrip('+'),set()
+
+
+def _written(form,instruction,national):
+    # Separators may sit between the digits, but the form must not be part of a longer
+    # digit sequence: "+1 (202) 555-0199 (2 min)" names it, "...01992" does not.
+    digits=r'[\s().-]*'.join(map(re.escape,form))
+    for match in re.finditer(r'(?<![0-9])\+?'+digits+r'(?![0-9])',instruction):
+        before=instruction[:match.start()].rstrip(' \t\n().-')
+        # A national form right after an explicit country code belongs to another number:
+        # "+91 202 555 0199" does not name +1 202 555 0199.
+        if national and re.search(r'\+[0-9]{1,3}$',before):
+            continue
+        return True
+    return False
 
 
 def owner_named(instruction,channel,destination):
     """True when the owner's own words literally contain this destination."""
     if channel=='sip':
         return destination.casefold() in instruction.casefold()
-    # Each form may be written with separators between its digits, but must not be part of
-    # a longer digit sequence: "+1 (202) 555-0199 (2 min)" names it, "...01992" does not.
-    for form in _named_forms(channel,destination):
-        digits=r'[\s().-]*'.join(map(re.escape,form))
-        if re.search(r'(?<![0-9])\+?'+digits+r'(?![0-9])',instruction):
-            return True
-    return False
+    international,nationals=_named_forms(channel,destination)
+    return _written(international,instruction,False) or any(_written(form,instruction,True) for form in nationals)
 
 
 def bind_origin(brief,instruction,source,evidence):
