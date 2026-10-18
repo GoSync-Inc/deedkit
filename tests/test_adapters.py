@@ -218,3 +218,11 @@ def test_envelope_rejects_invalid_forward_origin(origin):
     # An origin without the forwarded flag would present the sender as someone else.
     with pytest.raises(ValueError,match='^invalid_metadata$'):
         validate(event(metadata={'forwarded':False,'forward_origin':valid}))
+
+
+@pytest.mark.parametrize('sent_at',['2026-09-01\x0012:00:00+00:00','0001-01-01T00:00:00+01:00',20260901])
+def test_envelope_rejects_unusable_forward_origin_time(sent_at):
+    from messaging_service.envelope import validate
+    from test_archive import event
+    with pytest.raises(ValueError,match='^invalid_metadata$'):
+        validate(event(metadata={'forwarded':True,'forward_origin':{'kind':'user','basis':'telegram_fwd_from','sent_at':sent_at}}))

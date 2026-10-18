@@ -146,6 +146,10 @@ def presentation(rows,*,order='asc',include_system=False):
         stamp=row.get('sent_at');stamp=stamp.isoformat() if hasattr(stamp,'isoformat') else str(stamp or '')
         scope_label=(f" · аккаунт {row.get('account','')} · чат {row.get('chat_title') or row.get('chat','')} ({row.get('chat','')})" if mixed_scope else '')
         text=row['display_text']+(' […]' if row.get('display_text_truncated') else '')
+        if row.get('authorship')=='forwarded_by_sender':
+            # Forwarded words are never the sender's own; name the stated origin or say it is unknown.
+            author=((row.get('forward_origin') or {}).get('sender_name') or '')[:64]
+            scope_label+=f' · переслано, автор: {author}' if author else ' · переслано, автор неизвестен'
         lines.append(f"{row['position']}. {actor}"+(f' ({sender})' if sender else '')+scope_label+f" · {stamp} · {row['id']}\n{text}")
     if warnings:lines.extend('⚠ '+warning['message'] for warning in warnings)
     return {'view':'conversation','contract_version':1,'order':order,

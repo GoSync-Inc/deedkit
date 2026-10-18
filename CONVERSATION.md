@@ -34,16 +34,19 @@ In the conversation view each message tool returns every message text once.
   the `context` neighbours. `list_chats` groups the reply hint into one
   `awaiting_reply` object and shows the latest message once in `last_message`.
   Each fact appears once per `list_chats` row (compact queue rows below).
-  A forwarded message, and an `awaiting_reply` hint on one, carries
-  `authorship: "forwarded_by_sender"` and `forward_origin` in every detail level:
-  its `sender` and `sender_name` are the forwarder, never the author of the
-  forwarded words. `forward_origin.kind` is `user`, `chat`, `channel`,
-  `hidden_user`, `status`, `newsletter`, `unknown` or `not_captured` (archived
-  before origin capture); fields, enums and the access rule are in
-  [SEARCH.md](SEARCH.md#forwarded-messages).
+  A forwarded message carries `authorship: "forwarded_by_sender"` and
+  `forward_origin`: its `sender` and `sender_name` are the forwarder, never the
+  author of the forwarded words. Message rows carry every stated origin field;
+  the `awaiting_reply` hint, `last_message` and the conversation's latest message
+  carry `forward_origin` with `kind` and `sender_name` only. `forward_origin.kind`
+  is `user`, `chat`, `channel`, `hidden_user`, `newsletter`, `unknown` or
+  `not_captured` (archived before origin capture; `status` is reserved); fields, enums and the access
+  rule are in [SEARCH.md](SEARCH.md#forwarded-messages).
 - `detail="transcript"`: only the numbered transcript with message IDs, its
   warnings, cursors and file references (`files`). Message text defaults to
   2000 characters; `body_chars` changes it. Requires `view="conversation"`.
+  A forwarded line adds `· переслано, автор: <name>` with the stated origin name,
+  or `· переслано, автор неизвестен` when the origin is unknown or not captured.
 - `detail="full"`: every field documented below, including `body`, ordering,
   timestamp precision and the complete conversation state. Unchanged by the
   compact and transcript levels, as is `view="archive"` compact output.
@@ -77,7 +80,8 @@ The remaining hint fields keep their names and meanings: `message_id`,
 `reasons`, `waiting_hours`, `incoming_count`, `basis`, `has_question`,
 `dismissed`, `confidence` when it is not the default, and `display_text` with
 `truncated` (the hint's own text, or the head's when the hint is the head), and
-`forward_origin` with `authorship` for a forwarded hint message. The
+`forward_origin` (`kind`, `sender_name`) with `authorship` for a forwarded hint
+message; `last_message` carries the same pair for a forwarded head. The
 row's `read_state` is unchanged. `detail="full"` keeps every field.
 
 ## Ordering and windows

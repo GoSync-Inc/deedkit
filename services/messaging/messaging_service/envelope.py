@@ -46,8 +46,10 @@ def forward_origin(value):
         if key in FORWARD_TEXT:
             if not isinstance(item,str) or not item or '\x00' in item or len(item)>FORWARD_TEXT[key]:raise ValueError('invalid_metadata')
         elif key=='sent_at':
+            # Provider time: NUL never reaches the parser and an out-of-range offset is invalid, not a crash.
+            if not isinstance(item,str) or '\x00' in item:raise ValueError('invalid_metadata')
             try:item=utc(item)
-            except ValueError:raise ValueError('invalid_metadata') from None
+            except (ValueError,OverflowError):raise ValueError('invalid_metadata') from None
         elif key=='forwarding_score':
             if type(item) is not int or not 0<=item<2**32:raise ValueError('invalid_metadata')
         elif key=='provider_origin_type' and item not in WHATSAPP_FORWARD_ORIGINS:raise ValueError('invalid_metadata')

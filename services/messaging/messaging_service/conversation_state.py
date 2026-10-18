@@ -29,6 +29,9 @@ def _snapshot(message):
         'sender_name', 'sender_name_basis', 'username', 'sent_at', 'body', 'kind', 'display_text',
         'order_basis', 'order_status', 'timestamp_precision')} | {
             'provider_message_id':message.get('provider_id')}
+    # A forwarded head keeps its attribution: the sender is the forwarder, not the author.
+    if message.get('authorship'):
+        snapshot.update(forwarded=True,forward_origin=message.get('forward_origin'),authorship=message['authorship'])
     for key,limit in (('body',1000),('display_text',1200)):
         value=snapshot.get(key)
         snapshot[key+'_truncated']=isinstance(value,str) and len(value)>limit

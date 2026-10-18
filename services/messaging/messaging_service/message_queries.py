@@ -54,13 +54,19 @@ def forward_presence(rows):
 
 
 def hint_forward_origin(c, rows):
-    """The reply-queue hint states the origin of its forwarded message (rows already authorized)."""
-    ids=[r['awaiting_reply_message_id'] for r in rows if r.get('awaiting_reply_message_id')]
-    found={r['id']:r for r in c.execute('SELECT m.id,'+FORWARD+' FROM messages m '
-        'LEFT JOIN message_revisions mr ON mr.message=m.id AND mr.revision=m.revision '
-        'LEFT JOIN message_metadata mm ON mm.message=m.id AND mm.revision=m.revision WHERE m.id=ANY(%s)',(ids,))} if ids else {}
+    """The reply-queue hint states the origin of its forwarded message (rows already authorized).
+
+    The origin is read for the hint's own revision, so a concurrent edit never relabels a shown snippet.
+    """
+    hints=[(r['awaiting_reply_message_id'],r['awaiting_reply_revision']) for r in rows
+        if r.get('awaiting_reply_message_id') and r.get('awaiting_reply_revision') is not None]
+    found={(r['id'],r['revision']):r for r in c.execute('SELECT h.id,h.revision,'+FORWARD+
+        ' FROM unnest(%s::text[],%s::integer[]) AS h(id,revision) '
+        'JOIN message_revisions mr ON mr.message=h.id AND mr.revision=h.revision '
+        'LEFT JOIN message_metadata mm ON mm.message=h.id AND mm.revision=h.revision',
+        ([h[0] for h in hints],[h[1] for h in hints]))} if hints else {}
     for row in rows:
-        origin=found.get(row.get('awaiting_reply_message_id')) or {}
+        origin=found.get((row.get('awaiting_reply_message_id'),row.get('awaiting_reply_revision'))) or {}
         if origin.get('forward_origin'):
             row['awaiting_reply_forward_origin']=origin['forward_origin']
             row['awaiting_reply_authorship']=origin['authorship']

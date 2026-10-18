@@ -283,5 +283,107 @@ def test_reply_queue_hint_states_forward_origin(forwards):
     with TestClient(create_app(s,['testserver'])) as client:
         items=structured(rpc(client,key,'list_chats',{'awaiting_reply':True,'view':'conversation','include_coverage':False}))['items']
     hints={r['awaiting_reply']['message_id']:r['awaiting_reply'] for r in items}
-    assert hints[forwarded]['forward_origin']==ORIGIN and hints[forwarded]['authorship']=='forwarded_by_sender'
+    # Queue rows keep who wrote it (kind and name); detail=full and the message tools carry the rest.
+    assert hints[forwarded]['forward_origin']=={'kind':'channel','sender_name':'Synthetic News'}
+    assert hints[forwarded]['authorship']=='forwarded_by_sender'
     assert 'forward_origin' not in hints[plain] and 'authorship' not in hints[plain]
+
+
+def test_forwarded_head_outside_the_context_window_keeps_attribution(forwards):
+    from starlette.testclient import TestClient
+    from messaging_service.app import create_app
+    from test_client_contract import rpc
+    from test_compact_queue_rows import structured
+    s,ar,_,event=forwards
+    def add(mid,day,body,**metadata):
+        at=f'2026-10-{day:02d}T12:00:00+00:00'
+        return ar.ingest(event(account='forward-tg',chat='300',provider_id=mid,body=body,sent_at=at,updated_at=at,
+            metadata={'chat_type':'private',**metadata}))['message']
+    anchor=add('1',1,'synthetic old question?')
+    for n in range(2,6):add(str(n),n,f'synthetic chatter {n}')
+    head=add('9',9,'synthetic forwarded head',forwarded=True,forward_origin=ORIGIN)
+    key=s.issue_key('forward-reader',['forward-tg'])
+    with TestClient(create_app(s,['testserver'])) as client:
+        for detail in ('compact','full'):
+            result=structured(rpc(client,key,'get_context',{'message_id':anchor,'view':'conversation','detail':detail,
+                'before_count':0,'after_count':1,'include_coverage':False}))
+            assert head not in [r['id'] for r in result['context']]
+            latest=result['conversation'].get('latest_message') or result['conversation']['latest_known_meaningful_message']
+            assert latest['authorship']=='forwarded_by_sender',detail
+            assert latest['forward_origin']['sender_name']=='Synthetic News',detail
+        transcript=structured(rpc(client,key,'get_messages',{'chat_id':result['message']['chat'],'view':'conversation',
+            'detail':'transcript','include_coverage':False}))['transcript']
+    assert 'synthetic forwarded head' in transcript and 'переслано, автор: Synthetic News' in transcript
+    assert transcript.count('переслано')==1
+
+
+def test_transcript_says_the_author_of_a_forward_is_unknown(forwards):
+    from starlette.testclient import TestClient
+    from messaging_service.app import create_app
+    from messaging_service.envelope import stable_id
+    from test_client_contract import rpc
+    from test_compact_queue_rows import structured
+    s,_,add,_=forwards
+    add('1','synthetic forwarded words',forwarded=True,
+        forward_origin={'kind':'unknown','forwarding_score':4,'basis':'whatsapp_web_js_message'})
+    add('2','synthetic old forward',forwarded=True)
+    key=s.issue_key('forward-reader',['forward-tg'])
+    with TestClient(create_app(s,['testserver'])) as client:
+        transcript=structured(rpc(client,key,'get_messages',{'chat_id':stable_id('chat','forward-tg','300'),
+            'view':'conversation','detail':'transcript','include_coverage':False}))['transcript']
+    assert transcript.count('переслано, автор неизвестен')==2
+
+
+def test_sparser_recapture_keeps_the_origin_fields_already_stated(forwards):
+    s,ar,add,event=forwards
+    add('1','synthetic forwarded words',forwarded=True,forward_origin=ORIGIN)
+    sparse={k:v for k,v in ORIGIN.items() if k not in ('sender_name','post_author')}
+    again=ar.ingest(event(account='forward-tg',chat='300',provider_id='1',body='synthetic forwarded words',
+        metadata={'forwarded':True,'forward_origin':sparse}))
+    assert again['outcome']=='unchanged'
+    key=s.issue_key('forward-reader',['forward-tg'])
+    assert s.search(key,'synthetic forwarded')['items'][0]['forward_origin']==ORIGIN
+    # A different stated origin replaces the old one instead of mixing two origins.
+    other={'kind':'hidden_user','sender_name':'X','basis':'telegram_fwd_from'}
+    ar.ingest(event(account='forward-tg',chat='300',provider_id='1',body='synthetic forwarded words',
+        metadata={'forwarded':True,'forward_origin':other}))
+    assert s.search(key,'synthetic forwarded')['items'][0]['forward_origin']==other
+
+
+def test_reply_queue_hint_origin_is_read_for_the_hint_revision(forwards):
+    from messaging_service.message_queries import hint_forward_origin
+    s,ar,_,event=forwards
+    at='2026-10-01T12:00:00+00:00'
+    mid=ar.ingest(event(account='forward-tg',chat='301',provider_id='1',body='synthetic question?',sent_at=at,
+        updated_at=at,metadata={'forwarded':True,'forward_origin':ORIGIN}))['message']
+    # An edit lands between the queue read (revision 1) and the annotation: revision 2 is not forwarded.
+    edited='2026-10-01T13:00:00+00:00'
+    assert ar.ingest(event(account='forward-tg',chat='301',provider_id='1',body='synthetic question, edited?',
+        sent_at=at,updated_at=edited,metadata={'forwarded':False}))['outcome']=='edited'
+    with s.pool.connection() as c:
+        stale,current=hint_forward_origin(c,[{'awaiting_reply_message_id':mid,'awaiting_reply_revision':1},
+            {'awaiting_reply_message_id':mid,'awaiting_reply_revision':2}])
+    assert stale['awaiting_reply_forward_origin']==ORIGIN and stale['awaiting_reply_authorship']=='forwarded_by_sender'
+    assert 'awaiting_reply_forward_origin' not in current
+
+
+def test_capabilities_state_the_forwarded_authorship_rule(forwards):
+    s,_,_,_=forwards
+    rule=s.capabilities(s.issue_key('forward-reader',['forward-tg']))['search_options']['forwarded_messages']
+    assert rule['authorship']=='forwarded_by_sender' and rule['origin_field']=='forward_origin'
+    assert rule['origin_grants_chat_access'] is False and 'not_captured' in rule['origin_kinds']
+    assert rule['rule']=='sender_is_the_forwarder_never_quote_forwarded_words_as_written_by_sender'
+
+
+def test_archive_compact_hint_bounds_the_origin(forwards):
+    from datetime import timedelta
+    from messaging_service.presentation import render
+    s,ar,_,event=forwards
+    at=(datetime.now(timezone.utc)-timedelta(hours=1)).replace(microsecond=0).isoformat()
+    long={**ORIGIN,'sender_name':'N'*256,'post_author':'P'*256}
+    ar.ingest(event(account='forward-tg',chat='301',provider_id='1',body='synthetic question?',sent_at=at,updated_at=at,
+        metadata={'chat_type':'private','forwarded':True,'forward_origin':long}))
+    key=s.issue_key('forward-queue',['forward-tg'])
+    row=render('list_chats',s.list_chats(key,awaiting_reply=True,include_coverage=False),'compact')['items'][0]
+    assert row['awaiting_reply_forward_origin']=={'kind':'channel','sender_name':'N'*64}
+    assert row['awaiting_reply_authorship']=='forwarded_by_sender'
