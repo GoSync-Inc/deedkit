@@ -19,7 +19,8 @@ physical test move until a Tiden identity/source mapping has real CI readback.
 The reviewed registry `config/tiden-test-identities.json` recorded 1,281 original
 case IDs and matcher signatures; it does not normalize renamed parameters or
 replace test identities. On 2026-10-18 three entries whose tests had been renamed
-and whose Tiden records were deleted left it, so it holds 1,278. Existing eleven messaging component IDs are retained.
+and whose Tiden records were deleted left it, so it holds 1,278.
+Existing eleven messaging component IDs are retained.
 The gateway/calendar/calls tests have distinct qualified identities.
 
 Run `uv run pytest tests` with an isolated `messaging_probe_test` DSN file, the
