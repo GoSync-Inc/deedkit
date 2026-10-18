@@ -95,7 +95,7 @@ COURTESY_EMOJI=r'\U0001F300-\U0001FAFF☀-➿⭐️‍'
 
 
 def courtesy_pattern():
-    """A whole short message of closing words and emoji, never a question: documented in CONVERSATION.md."""
+    """A whole short message of closing words and emoji, never a question (the word list is documented with the queue weights)."""
     word='(?:'+'|'.join(sorted(COURTESY_WORDS,key=len,reverse=True))+')'
     filler='(?:'+'|'.join(sorted(COURTESY_FILLER,key=len,reverse=True))+')'
     tail=r'[\s,.!)\-'+COURTESY_EMOJI+']'
