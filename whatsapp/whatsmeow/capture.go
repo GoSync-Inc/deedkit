@@ -63,7 +63,7 @@ func envelopeIdentifier(s string, limit int) bool {
 }
 
 // forwardOriginCapture stays off until the release a rollback would return to
-// accepts forwardOrigin (SEARCH.md, ANYMSG_CAPTURE_FORWARD_ORIGIN).
+// accepts forwardOrigin (ANYM-274, ANYMSG_CAPTURE_FORWARD_ORIGIN).
 func forwardOriginCapture() bool {
 	return os.Getenv("ANYMSG_CAPTURE_FORWARD_ORIGIN") == "1"
 }

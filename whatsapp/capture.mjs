@@ -103,7 +103,7 @@ export function event(message, body=undefined, ownerIds=[]) {
     mediaKind:({image:'photo',video:'video',ptv:'video',audio:'audio',ptt:'voice',document:'document',sticker:'sticker',gif:'animation'})[message.type] || (message.hasMedia?'other':null),
     filesize:Number.isSafeInteger(raw.size) && raw.size>=0 && raw.size<=MAX_MEDIA_BYTES?raw.size:null,
     editedTimestampMs:message.latestEditSenderTimestampMs || raw.latestEditSenderTimestampMs || null};
-  // Off until the release a rollback would return to accepts forwardOrigin (SEARCH.md).
+  // Off until the release a rollback would return to accepts forwardOrigin (ANYM-274).
   if (value.forwarded===true && process.env.ANYMSG_CAPTURE_FORWARD_ORIGIN==='1') {
     // WhatsApp does not state who wrote an ordinary forward; only the cached score is known.
     const score=message.forwardingScore;

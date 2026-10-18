@@ -71,7 +71,7 @@ def telegram_kind(message,media_kind):
 
 
 def forward_origin_capture():
-    # Off until the release a rollback would return to accepts forward_origin (SEARCH.md).
+    # Off until the release a rollback would return to accepts forward_origin (ANYM-274).
     return os.environ.get('ANYMSG_CAPTURE_FORWARD_ORIGIN')=='1'
 
 
