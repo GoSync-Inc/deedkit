@@ -119,6 +119,17 @@ def pcm_transport(send,ready_callback):
     return Transport()
 
 
+class NoDiagnostics:
+    # Stands in when a diagnostics constructor fails: every method is a no-op and every snapshot is empty.
+    def __getattr__(self,name): return lambda *args,**kwargs:{}
+
+
+def diagnostics(factory):
+    # Diagnostics are best effort: a constructor failure must never break call setup.
+    try: return factory()
+    except Exception: return NoDiagnostics()
+
+
 class TelegramCalls:
     def __init__(self,config,service,key,supervisor):
         self.config,self.service,self.key,self.supervisor=config,service,key,supervisor
@@ -150,7 +161,7 @@ class TelegramCalls:
         py=PyTgCalls(client,workers=2)
         state={'service':self.service,'call_id':cid,'brief':call['brief'],'supervisor':self.supervisor,
                'client':client,'py':py,'user':user,'input':None,'dial_task':asyncio.current_task(),
-               'audio_probe':PCMProbe(),'media':MediaDiagnostics()}
+               'audio_probe':diagnostics(PCMProbe),'media':diagnostics(MediaDiagnostics)}
         self.active[cid]=state
         @py.on_update()
         async def updates(py,update):
@@ -200,9 +211,11 @@ class TelegramCalls:
         except Exception: reason='model_error'
         finally:
             await self._release(cid)
-            value=self.service.get_call(cid)
-            self.service.result(cid,metrics={**value['metrics'],
-                'telegram_audio':{**state['audio_probe'].snapshot(),'media':state['media'].snapshot()}})
+            # Diagnostics are best effort: a failure here must not skip service.stop.
+            with contextlib.suppress(Exception):
+                value=self.service.get_call(cid)
+                self.service.result(cid,metrics={**value['metrics'],
+                    'telegram_audio':{**state['audio_probe'].snapshot(),'media':state['media'].snapshot()}})
             self.service.stop(cid,reason)
 
     async def _release(self,cid):

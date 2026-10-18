@@ -316,5 +316,7 @@ async def run_transport(transport,brief,key,state,browser=False):
         if ending_tasks:
             await asyncio.gather(*ending_tasks,return_exceptions=True)
         if 'tts_metrics' in state:
-            value=service.get_call(identity)
-            service.result(identity,metrics={**value['metrics'],'replicated_tts':state['tts_metrics']})
+            # Best effort too: a failure here must not mask the runner's own exception.
+            with contextlib.suppress(Exception):
+                value=service.get_call(identity)
+                service.result(identity,metrics={**value['metrics'],'replicated_tts':state['tts_metrics']})
