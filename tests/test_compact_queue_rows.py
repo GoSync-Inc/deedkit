@@ -147,15 +147,15 @@ def test_list_chats_defaults_to_25_rows_with_a_cursor_on_every_surface(seeded):
         mcp=structured(rpc(client,key,'list_chats',{}))
         rest=client.post('/v1/list_chats',headers=headers,json={}).json()
         queue=structured(rpc(client,key,'list_chats',{'awaiting_reply':True}))
+        store=s.list_chats(key,include_coverage=False)
+        for page in (mcp,rest,queue,store):
+            assert len(page['items'])==25 and page['next_cursor'],(len(page['items']),page.get('next_cursor'))
         more=structured(rpc(client,key,'list_chats',{'after':mcp['next_cursor']}))
         widest=structured(rpc(client,key,'list_chats',{'limit':100}))
         too_many=rpc(client,key,'list_chats',{'limit':101}).json()
         rest_too_many=client.post('/v1/list_chats',headers=headers,json={'limit':101})
         tools={t['name']:t for t in client.post('/mcp',headers={**headers,'Accept':'application/json, text/event-stream'},
             json={'jsonrpc':'2.0','id':1,'method':'tools/list'}).json()['result']['tools']}
-    store=s.list_chats(key,include_coverage=False)
-    for page in (mcp,rest,queue,store):
-        assert len(page['items'])==25 and page['next_cursor'],page.get('next_cursor')
     assert len(more['items'])==5 and not more['next_cursor']
     assert len(widest['items'])==30 and not widest['next_cursor']
     assert too_many['result']['isError'] and 'invalid_limit' in json.dumps(too_many)
