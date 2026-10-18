@@ -410,3 +410,33 @@ def test_dry_run_is_limited_to_a_localhost_registry_and_an_exact_sha(capsys):
     with pytest.raises(SystemExit):
         pi.main(["publish", "--sha", "main", "--directory", "x"])
     assert "40-character" in capsys.readouterr().err
+
+
+# spec: ANYM-300
+def test_publication_and_confirmation_check_every_target_in_parallel_and_finish_all_before_a_refusal(tmp_path):
+    import threading
+    registry = FakeRegistry()
+    for target in pi.TARGETS:
+        published(registry, target)
+    # Every target's attestation check waits until all of them are running: serial checks would break the barrier.
+    barrier = threading.Barrier(len(pi.TARGETS), timeout=10)
+
+    def verify(name, *_):
+        barrier.wait()
+        return "none" if name.endswith("deedkit-calls") else "complete"
+    for target in pi.TARGETS:
+        if target != "calls":
+            exported(tmp_path, target)
+    # The calls tag exists unattested and no tested archive is here.
+    with pytest.raises(pi.Refused, match="without a valid attestation"):
+        pi.publish(registry, SHA, tmp_path, str(tmp_path / "outputs"), verify)
+    assert not (tmp_path / "outputs").exists()  # no step outputs, so no attest step runs after a refusal
+    barrier.reset()
+    with pytest.raises(pi.Refused, match="calls is not published"):
+        pi.confirm(registry, SHA, verify)
+    barrier.reset()
+
+    def complete(*_):
+        barrier.wait()
+        return "complete"
+    assert list(pi.confirm(registry, SHA, complete)) == list(pi.TARGETS)

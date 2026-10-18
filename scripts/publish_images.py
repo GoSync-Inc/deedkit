@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -183,8 +184,16 @@ def output_key(target):
     return target.replace("-", "_")
 
 
+def each(function, targets):
+    """`function` of every target in parallel threads, results in target order. Every target finishes, as its own
+    write-once decision, before the first refusal (in target order) is raised."""
+    with ThreadPoolExecutor(max_workers=max(1, len(targets))) as pool:
+        futures = [pool.submit(function, target) for target in targets]
+    return [future.result() for future in futures]
+
+
 def publish(registry, sha, images, outputs, verify=attested, targets=TARGETS):
-    results = [publish_one(registry, target, sha, images, verify) for target in targets]
+    results = each(lambda target: publish_one(registry, target, sha, images, verify), targets)
     lines = []
     for result in results:
         key = output_key(result["target"])
@@ -197,13 +206,12 @@ def publish(registry, sha, images, outputs, verify=attested, targets=TARGETS):
 
 def confirm(registry, sha, verify=attested):
     """After attestation: every tag names an image of this commit attested in GitHub and in the registry."""
-    published = {}
-    for target in TARGETS:
+    def confirm_one(target):
         found = registry.manifest(f"{registry.name(target)}:{sha}")
         if not found or verify(registry.name(target), found[0], sha) != "complete":
             raise Refused(f"{target} is not published with a valid attestation")
-        published[target] = f"{registry.name(target)}@{found[0]}"
-    return published
+        return f"{registry.name(target)}@{found[0]}"
+    return dict(zip(TARGETS, each(confirm_one, TARGETS)))
 
 
 def main(argv=None):
