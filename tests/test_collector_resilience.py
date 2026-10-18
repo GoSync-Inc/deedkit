@@ -518,7 +518,7 @@ def test_capture_stop_detail_is_kept_in_live_capture_status(worker):
     assert live['last_capture_stop']['detail'] is None and live['last_capture_stop']['code']=='durable_capture_failed'
 
 
-def test_rejected_reasons_are_a_fixed_vocabulary_and_validated(worker):
+def test_rejected_counts_are_bounded_and_validated(worker):
     w,s,_=worker
     # Code-shaped exception text from a validator is not trusted as a reason.
     w.spool.validator=lambda item:(_ for _ in ()).throw(ValueError('synthetic_private_message'))
