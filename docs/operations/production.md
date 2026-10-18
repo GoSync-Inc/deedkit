@@ -397,9 +397,12 @@ python3 /usr/local/lib/deedkit/production.py status
 ```
 
 Apply locks the host, checks current main/CI again and validates the prepared
-image labels, configuration hashes and existing container identities. If another
-operator changed a runtime or config after preparation, prepare a fresh reviewed
-candidate. The selected services stop before their replacements start; `up` uses
+image labels, configuration hashes and existing container identities, and that
+each `<project>.before.json` still has the digest `prepared.json` recorded when
+preparation wrote it. A container identity is its ID, image and a digest of its
+inspected `Config`, `HostConfig` and `Mounts`, so a `docker update` of resources
+or restart policy counts as a change. If another operator changed a runtime or
+config after preparation, prepare a fresh reviewed candidate. The selected services stop before their replacements start; `up` uses
 `--no-build --pull never --no-deps --wait`. Databases and other Compose projects
 are not restarted. Routine promotion may briefly interrupt selected services.
 The messaging API, gateway and calendar API define Compose liveness healthchecks
@@ -413,9 +416,13 @@ restart an unhealthy container; monitor `docker ps`/`health_status` events.
 image. It records image/start verification; it is not a claim that every upstream
 provider or client is healthy. `result.json` and `current.json` also record the
 verified registry references, `applied_at` (UTC) and the rollback data (version
-1): per project the selected services, the digest of its `<project>.before.json`,
-and the Compose snapshot digest and running container identities right after
-apply, captured the way preparation captures its baseline. Use each module's approved health/readback procedure.
+1): per project the selected services, the digest of its `<project>.before.json`
+bound at preparation, and the Compose snapshot digest and running container
+identities right after apply, captured the way preparation captures its
+baseline. That final capture must still show the containers this apply started,
+on the prepared images, with the Compose configuration unchanged; otherwise apply
+refuses and leaves `attempted.json` without a result. Use each module's approved
+health/readback procedure.
 No test send, ACK, call, invitation or new provider session is a health probe.
 
 An interrupted/failed apply leaves `attempted.json`, retains previous image IDs
@@ -448,7 +455,8 @@ production configuration is the one the release was prepared with; each
 `<project>.before.json` exists and matches its recorded digest; the live Compose
 snapshot digest and the running container identities equal those recorded right
 after apply (so a container recreated since, even with the same image but other
-mounts, environment or configuration, is refused); and every previous image ID
+mounts, environment or configuration, or one reconfigured in place with
+`docker update`, is refused); and every previous image ID
 is still on the host (it never pulls). It then writes `rollback-attempted.json`,
 stops the selected services, starts them from the before-snapshot with
 `up -d --no-build --pull never --no-deps --wait`, checks that each runs its

@@ -262,8 +262,14 @@ def snapshot(project):
         actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", actual["Image"]):
             raise Refused("running container has no immutable image identity")
-        running[service] = {"container": ids[0], "image": actual["Image"]}
+        running[service] = {"container": ids[0], "image": actual["Image"], "settings": container_settings(actual)}
     return document, running
+
+
+def container_settings(inspected):
+    """A digest of a container's configuration, including what `docker update` changes in place (resources,
+    restart policy), so drift without a new container or image is visible. Receipts keep the digest only."""
+    return digest({key: inspected.get(key) for key in ("Config", "HostConfig", "Mounts")})
 
 
 # The runtime's data/config mount roots, never executable roots.
@@ -635,14 +641,17 @@ def prepare(settings, sha):
         reread = json.loads(run(["docker", "compose", "--profile", "*", "-f", str(path), "config", "--format", "json"]))
         if reread != candidate:
             raise Refused("resolved Compose snapshot did not round-trip exactly")
-        projects.append({"name": project["name"], "file": str(path), "digest": digest(read(path)),
-                         "before_digest": digest(before), "running": item["running"]})
         rollback = json.loads(json.dumps(before))
         for unit in rollback["services"].values():
             unit.pop("build", None)
         for service, identity in item["running"].items():
             rollback["services"][service]["image"] = identity["image"]
-        write(release / (project["name"] + ".before.json"), escaped(rollback))
+        previous = release / (project["name"] + ".before.json")
+        write(previous, escaped(rollback))
+        # Bound here, so a snapshot changed before apply can never become the rollback baseline.
+        projects.append({"name": project["name"], "file": str(path), "digest": digest(read(path)),
+                         "before_digest": digest(before), "running": item["running"],
+                         "before_file_digest": digest(read(previous))})
     receipt = {"version": 1, "sha": sha, "ci": evidence, "images": images,
                "references": {target: value["reference"] for target, value in verified.items()},
                "config_digest": digest(settings), "projects": projects}
@@ -672,9 +681,15 @@ def apply(settings, sha):
         if (item["name"] != project["name"] or digest(document) != item["before_digest"]
                 or running != item["running"] or digest(read(item["file"])) != item["digest"]):
             raise Refused("production or prepared configuration changed since preparation")
+        previous = release / (project["name"] + ".before.json")
+        if "before_file_digest" not in item:
+            raise Refused("this release was prepared without a bound rollback snapshot; prepare it again")
+        if not previous.exists() or digest(read(previous)) != item["before_file_digest"]:
+            raise Refused("the before-release snapshot is missing or changed since preparation")
     # Last remote gate immediately before the first mutation, under the host lock.
     evidence = verify(sha)
     write(release / "attempted.json", {"sha": sha, "ci": evidence, "status": "applying"})
+    started = {}
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
         command = ["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f", item["file"]]
         services = list(project["services"])
@@ -689,12 +704,19 @@ def apply(settings, sha):
             actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
             if actual["Image"] != receipt["images"][target] or not actual["State"]["Running"]:
                 raise Refused("replacement did not start the prepared image")
+            started[project["name"], service] = ids[0]
     # What rollback must find unchanged before it stops anything, captured the way prepare captures the baseline.
+    # It must still be what this apply started: a change meanwhile leaves the attempt unresolved.
     restore = []
-    for project in settings["projects"]:
+    for project, item in zip(settings["projects"], receipt["projects"], strict=True):
         document, running = snapshot(project)
+        if digest(document) != item["before_digest"] or any(
+                running[service]["image"] != receipt["images"][target]
+                or not started[project["name"], service].startswith(running[service]["container"])
+                for service, target in project["services"].items()):
+            raise Refused("production changed while this release was applied; inspect it before any recovery")
         restore.append({"name": project["name"], "services": sorted(project["services"]),
-                        "before_file_digest": digest(read(release / (project["name"] + ".before.json"))),
+                        "before_file_digest": item["before_file_digest"],
                         "after_digest": digest(document), "running": running})
     result = {"sha": sha, "ci": evidence, "images": receipt["images"], "references": receipt.get("references", {}),
               "status": "applied", "applied_at": now(), "rollback": {"version": 1, "projects": restore}}

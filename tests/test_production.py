@@ -129,7 +129,8 @@ def fixture(tmp_path, monkeypatch):
             # Compose unescapes $$ without consulting a real environment.
             return json.dumps(value).replace("$$", "$")
         if argv[:2] == ["docker", "ps"]:
-            return "existing123\n"
+            # After apply started the replacement, the service runs on it.
+            return "replacement123\n" if any("up" in call for call in calls) else "existing123\n"
         if argv[:2] == ["docker", "inspect"]:
             return json.dumps([{"Image": OLD_IMAGE if argv[2] == "existing123" else IMAGE, "State": {"Running": True}}])
         if "ps" in argv and "-q" in argv:
@@ -157,7 +158,8 @@ def test_preparation_builds_only_exact_main_source_and_does_not_restart_services
     previous = p.read(Path(settings["state_directory"]) / SHA / "synthetic.before.json")
     assert previous["services"]["api"]["image"] == OLD_IMAGE
     assert "build" not in previous["services"]["api"]
-    assert receipt["projects"][0]["running"]["api"] == {"container": "existing123", "image": OLD_IMAGE}
+    assert receipt["projects"][0]["running"]["api"] == {"container": "existing123", "image": OLD_IMAGE,
+                                                        "settings": p.container_settings({})}
     assert any("refs/heads/main" in call for call in calls)
     assert not any("stop" in call or "up" in call for call in calls)
     smoke = next(call for call in calls if call[:2] == ["docker", "run"])
@@ -1250,7 +1252,8 @@ def test_receipts_record_the_verified_reference_applied_at_and_rollback_data(tmp
     [project] = result["rollback"]["projects"]
     assert result["rollback"]["version"] == 1 and project["services"] == ["api"]
     assert project["before_file_digest"] == p.digest(p.read(host.state / sha / "synthetic.before.json"))
-    assert project["running"] == {"api": {"container": "container1", "image": host.image(sha)}}
+    assert project["running"] == {"api": {"container": "container1", "image": host.image(sha),
+                                          "settings": p.container_settings(host.container)}}
     assert project["after_digest"] == p.digest(json.loads(host.original.read_text()))
 
 
@@ -1452,3 +1455,69 @@ def test_retention_report_after_a_rollback_keeps_the_restored_images(tmp_path, m
     assert "restored by the rollback of " + RELEASES[2] in kept[host.image(RELEASES[1])]
     assert kept[host.image(RELEASES[2])][0] == "rolled-back release " + RELEASES[2]
     assert set(kept) == {host.image(sha) for sha in RELEASES}
+
+
+@pytest.mark.parametrize("case", ["modified", "missing"])
+def test_a_before_snapshot_changed_between_prepare_and_apply_is_refused_before_any_stop(tmp_path, monkeypatch, case):
+    host = Host(tmp_path, monkeypatch)
+    host.release(RELEASES[0])
+    host.main = RELEASES[1]
+    p.prepare(host.settings, RELEASES[1])
+    before = host.state / RELEASES[1] / "synthetic.before.json"
+    if case == "missing":
+        before.unlink()
+    else:
+        # Point the rollback at an older image that is still on the host, with other configuration.
+        document = p.read(before)
+        document["services"]["api"].update(image=OLD_IMAGE, environment={"SYNTHETIC": "changed"})
+        p.write(before, document)
+    host.calls.clear()
+    with pytest.raises(p.Refused, match="before-release snapshot is missing or changed since preparation"):
+        p.apply(host.settings, RELEASES[1])
+    assert host.mutations() == [] and not (host.state / RELEASES[1] / "attempted.json").exists()
+
+
+@pytest.mark.parametrize("change", ["other-container", "other-image", "compose-configuration"])
+def test_apply_never_certifies_a_runtime_that_changed_while_it_applied(tmp_path, monkeypatch, change):
+    host = Host(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    original = host.run
+    def run(argv, **kwargs):
+        result = original(argv, **kwargs)
+        if (argv[:2] == ["docker", "inspect"] and change != "compose-configuration"
+                and any("up" in call for call in host.calls)):
+            # Right after the replacement check, something else restarts or replaces the service.
+            host.container = {**host.container, **({"Id": "unexpected"} if change == "other-container" else {"Image": OLD_IMAGE})}
+        if argv[:2] == ["docker", "compose"] and "up" in argv and change == "compose-configuration":
+            document = json.loads(host.original.read_text())
+            document["services"]["api"]["environment"]["SYNTHETIC"] = "changed"
+            host.original.write_text(json.dumps(document))
+        return result
+    monkeypatch.setattr(p, "run", run)
+    with pytest.raises(p.Refused, match="changed while this release was applied"):
+        p.apply(host.settings, RELEASES[0])
+    # The attempt stays unresolved: no result, no current release, and rollback cannot adopt the drift.
+    assert (host.state / RELEASES[0] / "attempted.json").exists()
+    assert not (host.state / RELEASES[0] / "result.json").exists() and not (host.state / "current.json").exists()
+
+
+def test_rollback_is_refused_when_the_container_was_reconfigured_in_place(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    # `docker update` changes resources and restart policy without a new container or image.
+    host.container = {**host.container, "HostConfig": {"Memory": 268435456, "RestartPolicy": {"Name": "always"}}}
+    rolled_back_refusal(host, "changed since this release was applied")
+    assert not (host.state / RELEASES[1] / "rollback-attempted.json").exists()
+
+
+def test_apply_is_refused_when_the_container_was_reconfigured_in_place_after_preparation(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    host.container = {**host.container, "HostConfig": {"RestartPolicy": {"Name": "no"}}}
+    host.calls.clear()
+    with pytest.raises(p.Refused, match="changed since preparation"):
+        p.apply(host.settings, RELEASES[0])
+    assert host.mutations() == []
