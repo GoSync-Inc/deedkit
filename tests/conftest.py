@@ -6,22 +6,6 @@ import pytest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from messaging_service.store import Store
-from scripts import python_shards
-
-
-def pytest_configure(config):
-    try:
-        config.stash[SHARD]=python_shards.selected(os.environ.get('DEEDKIT_TEST_SHARD'))
-    except ValueError as error:
-        raise pytest.UsageError(str(error)) from None
-
-
-def pytest_ignore_collect(collection_path, config):
-    # CI runs the suite in file-level shards (scripts/python_shards.py); None leaves the decision to pytest.
-    return True if python_shards.ignored(collection_path,config.stash.get(SHARD,None)) else None
-
-
-SHARD=pytest.StashKey()
 
 
 @pytest.fixture(autouse=True)

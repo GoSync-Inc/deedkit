@@ -1238,7 +1238,8 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     step = next(s for s in evidence["steps"] if s.get("name") == "Merge the fragments of the tested commit and record every check outcome")
     assert step["env"] == {"VERIFY": "verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}",
                            "LOAD": "load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}",
-                           "PYTHON": "python:${{ needs.python.result }}:${{ needs.python.outputs.source_sha }}"}
+                           **{f"PYTHON_{index}": f"python-{index}:${{{{ needs.python.result }}}}:${{{{ needs.python.outputs.source_sha_{index} }}}}"
+                              for index in range(2, 5)}}
     work = tmp_path / "work"
     work.mkdir()
     (work / "ci-tools").symlink_to(root, target_is_directory=True)
@@ -1247,7 +1248,7 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     evidence_fragments(temp, load=False)  # both jobs report success, the load artifact is gone, Tiden is unconfigured
     env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin", "RUNNER_TEMP": str(temp), "GITHUB_REPOSITORY": "example/repo",
            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "VERIFY": "verify:success:" + "a" * 40,
-           "LOAD": "load:success:" + "a" * 40, "PYTHON": "python:success:" + "a" * 40}
+           "LOAD": "load:success:" + "a" * 40, **{f"PYTHON_{index}": f"python-{index}:success:" + "a" * 40 for index in range(2, 5)}}
     result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, capture_output=True, text=True, env=env)
     assert result.returncode != 0, result.stderr
     rows = json.loads((temp / "ci-evidence" / "ci-checks.json").read_text())  # the evidence still exists for upload

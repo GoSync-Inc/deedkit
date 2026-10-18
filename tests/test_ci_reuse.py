@@ -24,7 +24,7 @@ CASE = '<testsuite><testcase name="{name}" file="tests/{name}.py"/><testcase nam
 
 
 def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, event="merge_group", tiden_branch="",
-                   producer_url=PRODUCER_URL, shard_outcomes=None):
+                   producer_url=PRODUCER_URL, shard_outcomes=None, shard_reports=None):
     """The `ci-evidence` directory a passing merge queue run uploads, built by the real assemble and prepare."""
     fragments = tmp_path / "fragments"
     verify, load = fragments / "ci-evidence-verify", fragments / "ci-evidence-load"
@@ -48,7 +48,7 @@ def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, even
         shard.mkdir()
         (shard / "source-sha").write_text(sha + "\n")
         (shard / "attempt").write_text(attempt + "\n")
-        (shard / f"{job}.xml").write_text(CASE.format(name=job.replace("-", "_")))
+        (shard / f"{job}.xml").write_text((shard_reports or {}).get(job) or CASE.format(name=job.replace("-", "_")))
         (shard / "outcomes.json").write_text(json.dumps({"checks": {"python": outcome}}))
     evidence = tmp_path / "queue-evidence"
     producers = {job: ("success", sha) for job in tiden_ci.FRAGMENTS}
@@ -313,6 +313,19 @@ def test_queue_evidence_without_every_passing_python_shard_is_refused(tmp_path, 
     assert json.loads((evidence / "manifest.json").read_text())["checks"]["python"] != "success"
     data = archive(evidence)
     with pytest.raises(ci_reuse.Refused, match="not every check of the queue run passed|exactly the queue run's evidence files"):
+        adopt(tmp_path, GitHub(artifacts=[artifact(data=data)]), data)
+
+
+@pytest.mark.parametrize("report", [
+    '<testsuite><testcase name="t" file="tests/t.py"><skipped/></testcase></testsuite>', "<testsuite/>",
+    '<testsuites><testcase name="lost" file="tests/lost.py"><failure/></testcase></testsuites>',
+], ids=["only-skipped-cases", "empty-report", "case-outside-a-suite"])
+def test_queue_evidence_with_a_shard_report_without_executed_tests_is_refused(tmp_path, report):
+    # Each shard's report is judged on its own; the other shards' passing cases never make it reusable.
+    evidence = queue_evidence(tmp_path, shard_reports={"python-3": report})
+    assert json.loads((evidence / "manifest.json").read_text())["checks"]["python"] != "success"
+    data = archive(evidence)
+    with pytest.raises(ci_reuse.Refused, match="not every check of the queue run passed"):
         adopt(tmp_path, GitHub(artifacts=[artifact(data=data)]), data)
 
 

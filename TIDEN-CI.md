@@ -15,10 +15,19 @@ Python/PostgreSQL suite. The root suite runs in four file-level shards
 PostgreSQL. Every test module belongs to exactly one shard, chosen by committed
 per-file timings (`scripts/python_shards.json`, refreshed with
 `python scripts/python_shards.py weights <python.xml>`); a module without a
-timing still runs in exactly one shard. The `checks / evidence` job merges the
-fragments into `ci-evidence` and the four shard reports into one `python.xml`,
-so test identities do not change; `anymsg-ci::python` passes only when every
-shard passed with its report.
+timing still runs in exactly one shard, and a module pytest would collect that
+the plan cannot name (outside `tests/`, through a directory symlink) is a
+collection error. Each job runs pytest through the selector of the workflow's
+own commit (`ci-tools`), so a baseline of a revision without the selector is
+sharded the same way. The `checks / evidence` job merges the fragments into
+`ci-evidence` and the four shard reports into one `python.xml`, so test
+identities do not change. `anymsg-ci::python` passes only when every shard
+passed with its own valid report of executed tests and no failed one, and every
+shard job succeeded; in a baseline of another source, where every test job
+fails its receiving-commit check by design, the shards keep their step
+outcomes, as verify's checks do. Each shard job names its captured SHA in an
+output of its own (`source_sha_<n>`), because a matrix job's outputs are one
+set its jobs overwrite; its result is the matrix result.
 A fragment counts only when it holds just the files and checks its own job
 produces and names the tested source SHA that both its job output and verify
 captured; a job that did not succeed in this run attempt never contributes an

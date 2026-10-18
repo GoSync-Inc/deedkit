@@ -245,7 +245,11 @@ jobs:
           p.write_text('postgresql://probe_owner:synthetic-ci-password@127.0.0.1:5432/messaging_probe_test')
           p.chmod(0o600)
           PY
-          uv run pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py tests
+          # The shard selector is the workflow commit's (ci-tools), not the tested source's, and only its own
+          # directory joins pytest's import path; a baseline of an older revision is sharded the same way.
+          mkdir -p "$RUNNER_TEMP/shard-plugin"
+          cp ci-tools/scripts/python_shards.py ci-tools/scripts/python_shards.json "$RUNNER_TEMP/shard-plugin/"
+          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py tests
       - name: Isolated server backup restore with real age and PostgreSQL
         id: backup_restore
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -409,7 +413,11 @@ jobs:
     env:
       DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
     outputs:
-      source_sha: ${{ steps.source.outputs.sha }}
+      # A matrix job has one set of outputs that its jobs overwrite, so each shard job names its captured SHA
+      # under an output of its own (an empty value overwrites nothing) and evidence compares each one.
+      source_sha_2: ${{ steps.shard.outputs.sha_2 }}
+      source_sha_3: ${{ steps.shard.outputs.sha_3 }}
+      source_sha_4: ${{ steps.shard.outputs.sha_4 }}
     services:
       postgres:
         image: postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
@@ -424,6 +432,11 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.source_ref }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ci-tools
       - name: Start evidence record
         id: source
         run: |
@@ -431,6 +444,12 @@ jobs:
           git rev-parse HEAD > "$RUNNER_TEMP/ci-evidence/source-sha"
           echo "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/ci-evidence/attempt"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Name the captured source for this shard
+        id: shard
+        env:
+          SHARD: ${{ matrix.shard }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: echo "sha_$SHARD=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
       - name: Start the release router image build and the Python image pull in the background
         run: |
           mkdir -p "$RUNNER_TEMP/background"
@@ -514,7 +533,11 @@ jobs:
           p.write_text('postgresql://probe_owner:synthetic-ci-password@127.0.0.1:5432/messaging_probe_test')
           p.chmod(0o600)
           PY
-          uv run pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py tests
+          # The shard selector is the workflow commit's (ci-tools), not the tested source's, and only its own
+          # directory joins pytest's import path; a baseline of an older revision is sharded the same way.
+          mkdir -p "$RUNNER_TEMP/shard-plugin"
+          cp ci-tools/scripts/python_shards.py ci-tools/scripts/python_shards.json "$RUNNER_TEMP/shard-plugin/"
+          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py tests
       - name: Record the shard outcome
         if: ${{ always() }}
         env:
@@ -566,11 +589,14 @@ jobs:
         env:
           VERIFY: verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}
           LOAD: load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}
-          PYTHON: python:${{ needs.python.result }}:${{ needs.python.outputs.source_sha }}
+          # A matrix job has one result for all its jobs, so each shard job takes the matrix result.
+          PYTHON_2: python-2:${{ needs.python.result }}:${{ needs.python.outputs.source_sha_2 }}
+          PYTHON_3: python-3:${{ needs.python.result }}:${{ needs.python.outputs.source_sha_3 }}
+          PYTHON_4: python-4:${{ needs.python.result }}:${{ needs.python.outputs.source_sha_4 }}
         run: |
           assembled=0
           python ci-tools/scripts/tiden_ci.py assemble --directory "$RUNNER_TEMP/ci-evidence" --fragments "$RUNNER_TEMP/fragments" \
-            --producer "$VERIFY" --producer "$LOAD" --producer "$PYTHON" || assembled=$?
+            --producer "$VERIFY" --producer "$LOAD" --producer "$PYTHON_2" --producer "$PYTHON_3" --producer "$PYTHON_4" || assembled=$?
           python ci-tools/scripts/tiden_ci.py prepare --directory "$RUNNER_TEMP/ci-evidence"
           exit "$assembled"
       - name: Retain test evidence even when a check fails

@@ -1,8 +1,10 @@
 """The root Python suite runs in four file-level shards on parallel runners; synthetic workflows and reports only."""
+import fnmatch
 import json
 import os
 from pathlib import Path
 import random
+import shutil
 import subprocess
 import sys
 
@@ -23,7 +25,8 @@ def jobs():
 def test_every_test_module_runs_in_exactly_one_of_the_four_shards():
     modules = python_shards.modules(ROOT)
     assert "tests/test_python_shards.py" in modules and "tests/platform/test_stack.py" in modules
-    assert all(name.startswith("tests/") and Path(name).name.startswith("test_") for name in modules)
+    assert all(name.startswith("tests/") and any(fnmatch.fnmatch(Path(name).name, pattern) for pattern in ("test_*.py", "*_test.py"))
+               for name in modules)
     owners = {name: [index for index in range(1, 5) if not python_shards.ignored(ROOT / name, (index, 4))] for name in modules}
     assert all(len(shards) == 1 for shards in owners.values()), {k: v for k, v in owners.items() if len(v) != 1}
     assert {shards[0] for shards in owners.values()} == {1, 2, 3, 4}
@@ -80,28 +83,83 @@ def test_a_malformed_shard_is_an_error_never_the_whole_suite_or_nothing(value):
     assert python_shards.selected("3/4") == (3, 4)
 
 
-def collected(directory, shard=None):
+def shard_plugin(tmp_path):
+    """The selector as CI runs it: the workflow commit's two files, copied to a directory of their own."""
+    plugin = tmp_path / "shard-plugin"
+    plugin.mkdir()
+    for name in ("python_shards.py", "python_shards.json"):
+        shutil.copy(ROOT / "scripts" / name, plugin / name)
+    return plugin / "python_shards.py"
+
+
+def collected(directory, shard=None, *, plugin, cwd=ROOT):
     env = {key: value for key, value in os.environ.items() if key != "DEEDKIT_TEST_SHARD"}
     if shard:
         env["DEEDKIT_TEST_SHARD"] = shard
-    result = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", directory],
-                            cwd=ROOT, env=env, capture_output=True, text=True, timeout=300)
+    result = subprocess.run([sys.executable, str(plugin), "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", directory],
+                            cwd=cwd, env=env, capture_output=True, text=True, timeout=300)
     return result.returncode, sorted(line for line in result.stdout.splitlines() if line.startswith("tests/"))
 
 
-def test_pytest_collects_each_module_in_exactly_the_shard_the_plan_names():
-    # tests/conftest.py applies the shard while pytest collects; the four shards together are the full collection.
-    code, full = collected("tests/platform")
+def test_pytest_collects_each_module_in_exactly_the_shard_the_plan_names(tmp_path):
+    # The workflow commit's selector applies the shard while pytest collects; the four shards are the full collection.
+    plugin = shard_plugin(tmp_path)
+    code, full = collected("tests/platform", plugin=plugin)
     assert code == 0 and len(full) >= 5
-    shards = [collected("tests/platform", f"{index}/4") for index in range(1, 5)]
+    shards = [collected("tests/platform", f"{index}/4", plugin=plugin) for index in range(1, 5)]
     union = [line for code, lines in shards for line in lines]
     assert sorted(union) == full and len(set(union)) == len(union)
     plan = python_shards.plan(python_shards.modules(ROOT), 4, WEIGHTS)
     for index, (code, lines) in enumerate(shards, 1):
         assert code in (0, 5)  # 5: this shard owns no module of the directory
         assert all(plan[line.split(":")[0]] == index for line in lines)
-    code, _ = collected("tests/platform", "5/4")
+    code, _ = collected("tests/platform", "5/4", plugin=plugin)
     assert code == 4  # a usage error, so CI never silently runs another shard's modules
+
+
+def synthetic_checkout(root, *, hook=False):
+    """A checkout with ordinary modules, a module of pytest's `*_test.py` pattern and a symlinked module."""
+    (root / "tests").mkdir(parents=True)
+    (root / "elsewhere").mkdir()
+    (root / "pytest.ini").write_text("[pytest]\n")
+    for index in range(8):
+        (root / "tests" / f"test_{index}.py").write_text(f"def test_{index}():\n    pass\n")
+    (root / "tests" / "suffix_test.py").write_text("def test_suffix():\n    pass\n")
+    (root / "elsewhere" / "test_target.py").write_text("def test_link():\n    pass\n")
+    (root / "tests" / "test_link.py").symlink_to(Path("..") / "elsewhere" / "test_target.py")
+    if hook:  # an older revision's own hook, which the workflow commit's selector does not need
+        (root / "tests" / "conftest.py").write_text("def pytest_ignore_collect(collection_path, config):\n    return None\n")
+    return root
+
+
+@pytest.mark.parametrize("hook", [False, True], ids=["baseline-without-a-hook", "own-hook"])
+def test_every_collected_module_of_any_checkout_runs_in_exactly_one_shard(tmp_path, hook):
+    # Neither pytest's second default pattern, a symlinked module nor a baseline source without a shard hook of
+    # its own lets a module run in every shard: the selector comes from the workflow commit, not the checkout.
+    checkout = synthetic_checkout(tmp_path / "checkout", hook=hook)
+    plugin = shard_plugin(tmp_path)
+    code, full = collected("tests", plugin=plugin, cwd=checkout)
+    assert code == 0 and "tests/suffix_test.py::test_suffix" in full and "tests/test_link.py::test_link" in full
+    assert len(full) == 10
+    shards = [collected("tests", f"{index}/4", plugin=plugin, cwd=checkout) for index in range(1, 5)]
+    union = [line for code, lines in shards for line in lines]
+    assert all(code in (0, 5) for code, _ in shards)
+    assert sorted(union) == full and len(set(union)) == len(union)
+
+
+def test_a_collected_module_outside_the_plan_is_a_collection_error(tmp_path):
+    # A directory symlink takes pytest to modules the plan cannot name: an error, never a module run everywhere.
+    checkout = synthetic_checkout(tmp_path / "checkout")
+    (checkout / "outside").mkdir()
+    (checkout / "outside" / "test_far.py").write_text("def test_far():\n    pass\n")
+    (checkout / "tests" / "linked").symlink_to(Path("..") / "outside", target_is_directory=True)
+    plugin = shard_plugin(tmp_path)
+    code, full = collected("tests", plugin=plugin, cwd=checkout)
+    assert code == 0 and "tests/linked/test_far.py::test_far" in full
+    env = {**os.environ, "DEEDKIT_TEST_SHARD": "2/4"}
+    result = subprocess.run([sys.executable, str(plugin), "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "tests"],
+                            cwd=checkout, env=env, capture_output=True, text=True, timeout=300)
+    assert result.returncode != 0 and "outside the shard plan" in result.stdout + result.stderr
 
 
 def test_python_shard_jobs_run_verifys_suite_step_on_runners_of_their_own():
@@ -112,7 +170,9 @@ def test_python_shard_jobs_run_verifys_suite_step_on_runners_of_their_own():
     # Skipped exactly when verify is, never after it, and with verify's PostgreSQL, images and pins.
     assert python["needs"] == verify["needs"] == "documentation" and python["if"] == verify["if"]
     assert python["services"] == verify["services"] and python["env"] == verify["env"]
-    assert python["outputs"] == verify["outputs"] == {"source_sha": "${{ steps.source.outputs.sha }}"}
+    assert verify["outputs"] == {"source_sha": "${{ steps.source.outputs.sha }}"}
+    assert python["outputs"] == {f"source_sha_{index}": f"${{{{ steps.shard.outputs.sha_{index} }}}}"
+                                 for index in range(2, tiden_ci.PYTHON_SHARDS + 1)}
     assert python["timeout-minutes"] <= verify["timeout-minutes"]
     named = {step.get("name") or step["uses"]: step for step in python["steps"]}
     ours = {step.get("name") or step["uses"]: step for step in verify["steps"]}
@@ -138,7 +198,12 @@ def test_python_shard_jobs_run_verifys_suite_step_on_runners_of_their_own():
     assert "(cd services/gateway && uv sync --locked --group dev)" in venvs and "(cd services/calendar && uv sync --locked --group dev)" in venvs
     # A shard's only check is `python`; its fragment carries its outcome and report under its own name.
     ids = {step.get("id") for step in python["steps"]} - {None}
-    assert ids == {"source", "package", "python"} and not ids & (set(tiden_ci.CHECKS) - {"python"})
+    assert ids == {"source", "shard", "package", "python"} and not ids & (set(tiden_ci.CHECKS) - {"python"})
+    # Both run the suite through the workflow commit's selector, checked out as ci-tools beside the tested source.
+    for job in (verify, python):
+        assert {"persist-credentials": False, "ref": "${{ github.sha }}", "path": "ci-tools"} in [step.get("with") for step in job["steps"]]
+    assert 'cp ci-tools/scripts/python_shards.py ci-tools/scripts/python_shards.json "$RUNNER_TEMP/shard-plugin/"' in suite["run"]
+    assert 'uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest ' in suite["run"] and "uv run pytest" not in suite["run"]
     upload = named["Retain shard evidence even when its tests fail"]
     assert upload["if"] == "${{ always() }}" and upload["with"]["name"] == "ci-evidence-python-${{ matrix.shard }}"
     assert upload["with"]["overwrite"] is True and upload["with"]["if-no-files-found"] == "error"
@@ -175,8 +240,17 @@ def shard_fragment(fragments, job, **files):
     ({"python-3_xml": "<!DOCTYPE x><testsuite/>"}, None, "blocked"),
     ({"python-3_xml": "<testsuite"}, None, "blocked"),
     ({"attempt": "1\n"}, ("failure", "a" * 40), "failed"),
+    # Each shard's report is judged on its own, so the other shards' passing cases never hide it.
+    ({"python-3_xml": '<testsuite><testcase name="t" file="tests/t.py"><skipped/></testcase></testsuite>'}, None, "blocked"),
+    ({"python-3_xml": "<testsuite/>"}, None, "blocked"),
+    ({"python-3_xml": '<testsuites><testcase name="lost" file="tests/lost.py"><failure/></testcase></testsuites>'}, None, "blocked"),
+    # A shard job that failed or was cancelled after uploading a passing fragment of this attempt never passes.
+    ({}, ("failure", "a" * 40), "failed"),
+    ({}, ("cancelled", "a" * 40), "blocked"),
+    ({}, ("skipped", "a" * 40), "blocked"),
 ], ids=["all-passed", "failed-shard", "cancelled-shard", "no-report", "failing-case", "unsafe-report", "malformed-report",
-        "stale-fragment-of-a-failed-rerun"])
+        "stale-fragment-of-a-failed-rerun", "only-skipped-cases", "empty-report", "case-outside-a-suite",
+        "job-failed-after-upload", "job-cancelled-after-upload", "job-skipped"])
 def test_the_python_check_passes_only_when_every_shard_passed_with_its_report(tmp_path, change, producer, python):
     fragments = evidence_fragments(tmp_path)
     shard_fragment(fragments, "python-3", **change)
@@ -224,9 +298,42 @@ def test_the_python_producer_names_every_shard_job_of_the_matrix(tmp_path):
     env = {"PATH": os.environ["PATH"], "GITHUB_REPOSITORY": "example/repo", "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2"}
     base = [sys.executable, str(ROOT / "scripts/tiden_ci.py"), "assemble", "--fragments", str(tmp_path / "fragments"),
             "--producer", "verify:success:" + "a" * 40, "--producer", "load:success:" + "a" * 40]
-    passed = subprocess.run([*base, "--directory", str(tmp_path / "ok"), "--producer", "python:success:" + "a" * 40],
-                            env=env, capture_output=True, text=True)
+    shards = [argument for job in tiden_ci.SHARD_JOBS for argument in ("--producer", f"{job}:success:" + "a" * 40)]
+    passed = subprocess.run([*base, "--directory", str(tmp_path / "ok"), *shards], env=env, capture_output=True, text=True)
     assert passed.returncode == 0, passed.stderr
     assert json.loads((tmp_path / "ok" / "metadata.json").read_text())["producers"].keys() == tiden_ci.FRAGMENTS.keys()
-    # Without the matrix job's result the assembly refuses, rather than counting the shards as passed.
+    # Without every shard job's own producer the assembly refuses, rather than counting the shards as passed.
     assert subprocess.run([*base, "--directory", str(tmp_path / "none")], env=env, capture_output=True).returncode != 0
+    assert subprocess.run([*base, "--directory", str(tmp_path / "some"), *shards[:4]], env=env, capture_output=True).returncode != 0
+
+
+def test_each_shard_job_reports_its_own_captured_source_to_the_assembly(tmp_path):
+    # A matrix job's outputs are one set its jobs overwrite, so each shard job writes its SHA under its own name.
+    all_jobs = jobs()
+    step = next(step for step in all_jobs["python"]["steps"] if step.get("id") == "shard")
+    assert step["env"] == {"SHARD": "${{ matrix.shard }}", "SOURCE_SHA": "${{ steps.source.outputs.sha }}"}
+    for index in range(2, tiden_ci.PYTHON_SHARDS + 1):
+        output = tmp_path / f"output-{index}"
+        subprocess.run(["bash", "-e", "-c", step["run"]], check=True, env={"PATH": os.environ["PATH"], "GITHUB_OUTPUT": str(output),
+                                                                        "SHARD": str(index), "SOURCE_SHA": str(index) * 40})
+        assert output.read_text() == f"sha_{index}={str(index) * 40}\n"
+    merge = next(step for step in all_jobs["evidence"]["steps"]
+                 if step.get("name") == "Merge the fragments of the tested commit and record every check outcome")
+    for job in tiden_ci.SHARD_JOBS:
+        index = job.split("-")[1]
+        assert merge["env"][f"PYTHON_{index}"] == f"{job}:${{{{ needs.python.result }}}}:${{{{ needs.python.outputs.source_sha_{index} }}}}"
+        assert f'--producer "$PYTHON_{index}"' in merge["run"]
+    # One shard job's checkout differing from verify's is refused, whatever the other shard jobs captured.
+    with pytest.raises(ValueError, match="captured another source"):
+        tiden_ci.assemble(tmp_path / "other" / "ci-evidence", evidence_fragments(tmp_path / "other"), ATTEMPT_URL,
+                          {**PASSED, "python-3": ("success", "b" * 40)})
+
+
+def test_a_baseline_of_another_source_keeps_its_shard_step_outcomes(tmp_path):
+    # Every test job of a baseline dispatch fails its receiving-commit check by design; the shards' tests still count.
+    fragments = evidence_fragments(tmp_path)
+    failed = {**PASSED, **dict.fromkeys(tiden_ci.SHARD_JOBS, ("failure", "a" * 40))}
+    baseline = tiden_ci.assemble(tmp_path / "ci-evidence", fragments, ATTEMPT_URL, failed, commit="b" * 40)
+    assert baseline["checks"]["python"] == "success"
+    tested = tiden_ci.assemble(tmp_path / "same" / "ci-evidence", fragments, ATTEMPT_URL, failed, commit="a" * 40)
+    assert tested["checks"]["python"] == "failure"

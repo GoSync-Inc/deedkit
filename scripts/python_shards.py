@@ -4,14 +4,19 @@
 `checks / verify` runs shard 1 and the `checks / python` matrix jobs run the others (checks.yml). Every test
 module under tests/ belongs to exactly one shard: the plan is a pure function of the checkout and the committed
 per-file timings (`python_shards.json`), computed the same way on every runner. A module without a timing gets
-the default weight, and a file outside the plan is never left out: no shard skips it, so it runs everywhere.
-tests/conftest.py applies the shard named by DEEDKIT_TEST_SHARD (`<index>/<count>`) when pytest collects.
+the default weight; a module pytest would collect that the plan does not name is a collection error, never a
+module that runs everywhere or nowhere. CI runs pytest through this file (`python_shards.py pytest <args>`) as
+it is in the workflow's commit, applying the shard named by DEEDKIT_TEST_SHARD (`<index>/<count>`) to the
+checkout pytest tests; the tested source needs no hook of its own, so a baseline of an older revision is
+sharded the same way.
 """
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import functools
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -22,9 +27,24 @@ WEIGHTS = Path(__file__).resolve().with_name("python_shards.json")
 SHARD = re.compile(r"([1-9][0-9]*)/([1-9][0-9]*)")
 
 
-def modules(root: Path) -> list[str]:
-    """Every file pytest's default `test_*.py` pattern collects under tests/, as sorted checkout paths."""
-    return sorted(path.relative_to(root).as_posix() for path in (root / "tests").rglob("test_*.py") if path.is_file())
+# pytest's default `python_files`; the plugin uses the collecting run's own setting.
+PATTERNS = ("test_*.py", "*_test.py")
+
+
+def checkout_name(path: Path, root: Path) -> str | None:
+    """`path` relative to the checkout, its directories resolved and its own name kept, so a symlinked module
+    keeps the name it is collected under; None outside the checkout."""
+    try:
+        return (path.absolute().parent.resolve() / path.name).relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def modules(root: Path, patterns: tuple[str, ...] = PATTERNS) -> list[str]:
+    """Every file under tests/ that pytest's `python_files` patterns collect, as sorted checkout paths."""
+    names = (checkout_name(path, root) for path in (root / "tests").rglob("*")
+             if path.is_file() and any(fnmatch.fnmatch(path.name, pattern) for pattern in patterns))
+    return sorted(name for name in names if name)
 
 
 def plan(files: list[str], count: int, weights: dict) -> dict[str, int]:
@@ -42,8 +62,8 @@ def plan(files: list[str], count: int, weights: dict) -> dict[str, int]:
 
 
 @functools.cache
-def _plan(root: Path, count: int) -> dict[str, int]:
-    return plan(modules(root), count, json.loads(WEIGHTS.read_text()))
+def _plan(root: Path, count: int, patterns: tuple[str, ...] = PATTERNS) -> dict[str, int]:
+    return plan(modules(root, patterns), count, json.loads(WEIGHTS.read_text()))
 
 
 def selected(value: str | None) -> tuple[int, int] | None:
@@ -56,17 +76,38 @@ def selected(value: str | None) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
-def ignored(path: Path, shard: tuple[int, int] | None, root: Path = ROOT) -> bool:
-    """Whether this shard leaves `path` to another one; directories and files outside the plan are never left."""
-    if shard is None or not path.is_file():
-        return False
-    try:
-        name = path.resolve().relative_to(root).as_posix()
-    except ValueError:
+def ignored(path: Path, shard: tuple[int, int] | None, root: Path = ROOT, patterns: tuple[str, ...] = PATTERNS) -> bool:
+    """Whether this shard leaves `path` to another one. Directories and files pytest does not collect as
+    modules are never left; a collected module outside the plan is an error, as it would run in every shard."""
+    if shard is None or not path.is_file() or not any(fnmatch.fnmatch(path.name, pattern) for pattern in patterns):
         return False
     index, count = shard
-    owner = _plan(root, count).get(name)
-    return owner is not None and owner != index
+    owner = _plan(root, count, patterns).get(checkout_name(path, root) or "")
+    if owner is None:
+        raise ValueError(f"{path} is a test module outside the shard plan of {root}/tests; it would run in every shard")
+    return owner != index
+
+
+# The shard of this pytest run, set when the plugin configures it.
+_SHARD: tuple[int, int] | None = None
+
+
+def pytest_configure(config) -> None:
+    import pytest
+    global _SHARD
+    try:
+        _SHARD = selected(os.environ.get("DEEDKIT_TEST_SHARD"))
+    except ValueError as error:
+        raise pytest.UsageError(str(error)) from None
+
+
+def pytest_ignore_collect(collection_path: Path, config) -> bool | None:
+    # None leaves the decision to pytest and the other plugins.
+    import pytest
+    try:
+        return True if ignored(collection_path, _SHARD, config.rootpath, tuple(config.getini("python_files"))) else None
+    except ValueError as error:
+        raise pytest.UsageError(str(error)) from None
 
 
 def junit_seconds(paths: list[Path]) -> dict[str, float]:
@@ -81,7 +122,12 @@ def junit_seconds(paths: list[Path]) -> dict[str, float]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Plan or reweigh the root Python suite's CI shards.")
+    if sys.argv[1:2] == ["pytest"]:
+        # pytest with this module as a plugin; only this file's directory joins the import path, in this process.
+        import pytest
+        return int(pytest.main(sys.argv[2:], plugins=[sys.modules[__name__]]))
+    parser = argparse.ArgumentParser(description="Plan or reweigh the root Python suite's CI shards, or run "
+                                                 "`pytest <args>` in the shard DEEDKIT_TEST_SHARD names.")
     actions = parser.add_subparsers(dest="action", required=True)
     show = actions.add_parser("plan", help="print each shard's modules and expected seconds")
     show.add_argument("--count", type=int, default=4)

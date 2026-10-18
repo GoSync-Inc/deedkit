@@ -190,18 +190,29 @@ def fresh_fragment(fragment: Path, root: Path, job: str, result: str, attempt: s
     return result == "success" or control_file(fragment, "attempt") == attempt
 
 
-def merge_shard_reports(reports: list[Path]) -> bytes:
-    """One pytest report of the shards' test suites, refused on the same unsafe input as `normalize_junit`."""
-    merged = ET.Element("testsuites", {"name": "pytest tests"})
-    for path in reports:
-        data = path.read_bytes()
-        if len(data) > MAX_BYTES or b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
-            raise ValueError("unsafe or oversized JUnit report")
-        document = ET.fromstring(data)
-        if document.tag not in {"testsuites", "testsuite"}:
-            raise ValueError("not a JUnit report")
-        merged.extend([document] if document.tag == "testsuite" else document.findall("testsuite"))
-    return ET.tostring(merged, encoding="utf-8", xml_declaration=True)
+def shard_suites(path: Path, root: Path) -> tuple[list[ET.Element], Counter]:
+    """A shard's pytest report, validated on its own as `prepare` validates a report: its test suites, which
+    must hold every one of its cases, and the counts of its passed, failed and skipped cases."""
+    _, counts = normalize_junit(path, root, "python")
+    document = ET.fromstring(path.read_bytes())
+    suites = [document] if document.tag == "testsuite" else list(document)
+    if any(suite.tag != "testsuite" for suite in suites) or sum(len(suite.findall("testcase")) for suite in suites) != sum(counts.values()):
+        raise ValueError("a test case lies outside the report's test suites")
+    return suites, counts
+
+
+def shard_outcome(state: str, report: Path, root: Path, suites: list) -> str:
+    """One shard's `python` outcome from its reported step outcome and its report, whose suites join `suites`.
+    A shard passes only with a valid report of executed tests and no failed one; without such a report it
+    failed, or its verification is incomplete."""
+    try:
+        found, counts = shard_suites(report, root)
+    except (OSError, ValueError, ET.ParseError):
+        return state if state in {"failure", "cancelled"} else "skipped"
+    suites.extend(found)
+    if state == "success" and counts["failed"]:
+        return "failure"
+    return "skipped" if state == "success" and not counts["passed"] and not counts["failed"] else state
 
 
 def combined_outcome(outcomes: list[str]) -> str:
@@ -211,7 +222,8 @@ def combined_outcome(outcomes: list[str]) -> str:
     return next((state for state in ("failure", "cancelled") if state in outcomes), "skipped")
 
 
-def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict) -> dict:
+def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, source_root: Path | None = None,
+             commit: str | None = None) -> dict:
     """Merge the evidence fragments that the parallel test jobs uploaded into the directory `prepare` reads.
 
     `producers` maps each job of FRAGMENTS to its job result and the checkout SHA its job output captured. A
@@ -220,7 +232,11 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict) -> 
     (`skipped` when it succeeded), so it never reads as passed; such jobs are returned in `missing`. A stale
     verify fragment still supplies the run's routing metadata (SHA, Git and Tiden branch), never its outcomes.
     The `python` check passes only when every shard (verify's and each shard job's) passed with a fresh fragment
-    and a valid report; the shard reports merge into one python.xml, so test identities do not change.
+    and its own valid report of executed tests (`source_root`, the tested checkout, places their paths), and
+    each shard job succeeded: a shard job that failed or was cancelled after its tests never reads as passed. A
+    baseline of another source than `commit`, the commit receiving the checks, is the exception: every test
+    job then fails by design on that difference, and its checks keep their step outcomes, as verify's always do.
+    The valid shard reports merge into one python.xml, so test identities do not change.
     `ci_url` names this assembly's run attempt, which reruns with every producer; `producers` in the metadata
     keeps each job's own result, captured SHA and the attempt its merged fragment came from. `directory` must
     be new or empty, so no earlier assembly's report survives.
@@ -243,7 +259,8 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict) -> 
         raise ValueError("the evidence directory must be new or empty")
     checks, module_checks, provenance = dict(metadata["checks"]), {}, {}
     directory.mkdir(parents=True, exist_ok=True)
-    present, missing, shards, reports = [], [], [], []
+    present, missing, shards, suites = [], [], [], []
+    source_root = source_root or Path.cwd()
     for job, (names, files) in FRAGMENTS.items():
         result, captured = producers[job]
         # A job's own captured checkout always has to agree with verify's, whatever its fragment.
@@ -275,28 +292,23 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict) -> 
         if not isinstance(reported, dict) or set(reported) != ({"python"} if job in SHARD_JOBS else set(names)):
             raise ValueError(f"the {job} fragment may report only its own checks")
         if job in SHARD_JOBS:
-            state, report = reported["python"], fragment / files[1]
+            state = shard_outcome(reported["python"], fragment / files[1], source_root, suites)
+            if state == "success" and result != "success" and commit in {None, sha}:
+                state = result if result in {"failure", "cancelled"} else "skipped"
+            shards.append(state)
         else:
             module_checks.update(reported)
-            state, report = (checks["python"], fragment / SHARD_REPORTS[0]) if job == "verify" else (None, None)
-        if report is not None:
-            # A shard without its report never passes: it failed, or its verification is incomplete.
-            if report.is_file():
-                reports.append(report)
-            elif state not in {"failure", "cancelled"}:
-                state = "skipped"
-            shards.append(state)
+            if job == "verify":
+                shards.append(shard_outcome(checks["python"], fragment / SHARD_REPORTS[0], source_root, suites))
         for path in fragment.iterdir():
             if path.name not in CONTROL_FILES and path.name not in SHARD_REPORTS:
                 (directory / path.name).write_bytes(path.read_bytes())
         present.append(job)
     checks["python"] = combined_outcome(shards)
-    if reports:
-        try:
-            (directory / REPORTS["python"]).write_bytes(merge_shard_reports(reports))
-        except (OSError, ValueError, ET.ParseError):
-            # An unsafe or malformed shard report records the suite as incomplete, never as passed.
-            checks["python"] = checks["python"] if checks["python"] in {"failure", "cancelled"} else "skipped"
+    if suites:
+        merged = ET.Element("testsuites", {"name": "pytest tests"})
+        merged.extend(suites)
+        (directory / REPORTS["python"]).write_bytes(ET.tostring(merged, encoding="utf-8", xml_declaration=True))
     (directory / "source-sha").write_text(sha + "\n")
     metadata.update({"ci_url": ci_url, "checks": checks, "module_checks": module_checks, "fragments": present,
                      "producers": provenance})
@@ -651,10 +663,9 @@ def main() -> int:
     if args.command == "assemble":
         ci_url = "https://github.com/{}/actions/runs/{}/attempts/{}".format(*(
             os.environ.get(name, "") for name in ("GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")))
-        # `python` names the shard matrix job: its result is success only when every shard job succeeded.
-        producers = {name: (result, sha) for job, result, sha in (value.split(":", 2) for value in args.producer)
-                     for name in (SHARD_JOBS if job == "python" else (job,))}
-        merged = assemble(directory, args.fragments, ci_url, producers)
+        producers = {job: (result, sha) for job, result, sha in (value.split(":", 2) for value in args.producer)}
+        merged = assemble(directory, args.fragments, ci_url, producers, source_root=args.source_root,
+                          commit=os.environ.get("GITHUB_SHA") or None)
         print(json.dumps({"fragments": merged["fragments"], "missing": merged["missing"]}))
         # The evidence is written either way, so a run without every fresh fragment is recorded and still fails.
         return 1 if merged["missing"] else 0
