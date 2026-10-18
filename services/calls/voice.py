@@ -296,9 +296,10 @@ async def run_transport(transport,brief,key,state,browser=False):
     finally:
         health_task.cancel()
         await asyncio.gather(health_task,return_exceptions=True)
-        service.runtime_event(identity,{'kind':'provider_audio_health','audio':llm.audio_health.snapshot(),
-                                        'runtime':runtime_health.snapshot()})
         # Diagnostics are best effort: a failure here must not skip cleanup or change the end reason.
+        with contextlib.suppress(Exception):
+            service.runtime_event(identity,{'kind':'provider_audio_health','audio':llm.audio_health.snapshot(),
+                                            'runtime':runtime_health.snapshot()})
         with contextlib.suppress(Exception):
             service.runtime_event(identity,{'kind':'inbound_audio','audio':inbound_audio.snapshot()})
         for task in ending_tasks:

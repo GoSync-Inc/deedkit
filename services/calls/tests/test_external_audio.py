@@ -96,3 +96,56 @@ async def test_twilio_pcm_ulaw_roundtrip_and_interrupt_clear():
     assert isinstance(decoded,InputAudioRawFrame) and decoded.sample_rate==16000
     assert max(np.abs(np.frombuffer(decoded.audio,dtype=np.int16)))>1000
     assert json.loads(await serializer.serialize(InterruptionFrame()))['event']=='clear'
+
+
+async def test_a_failing_telegram_audio_probe_never_drops_or_skips_audio(monkeypatch):
+    import pytgcalls
+    import telegram_audio
+    from pytgcalls.types import StreamFrames,Direction,Device,Frame
+
+    callbacks=[];sent=[];received=[]
+    class Client:
+        def __init__(self,*args):pass
+        async def connect(self):pass
+        async def close(self):pass
+    class Native:
+        def __init__(self,*args,**kwargs):
+            self._app=self;self._binding=self
+        def on_update(self):
+            def register(fn):callbacks.append(fn);return fn
+            return register
+        async def start(self):pass
+        async def play(self,*args,**kwargs):pass
+        async def record(self,*args,**kwargs):pass
+        async def get_input_call(self,*args):return SimpleNamespace(id=101)
+        async def send_frame(self,user,device,audio):sent.append(audio)
+        async def leave_call(self,*args):pass
+        async def stop(self,*args):pass
+    class BrokenProbe:
+        def input(self,*args,**kwargs):raise RuntimeError('synthetic probe failure')
+        def output(self,*args,**kwargs):raise RuntimeError('synthetic probe failure')
+    async def waiting(self,*args):await asyncio.Event().wait()
+    class Input:
+        async def push_audio_frame(self,frame):received.append(frame)
+    outputs=[]
+    def capture(send,set_input):
+        outputs.append(send);return SimpleNamespace()
+    monkeypatch.setattr(telegram_audio,'BrokerClient',Client)
+    monkeypatch.setattr(pytgcalls,'PyTgCalls',Native)
+    monkeypatch.setattr(telegram_audio,'dispose_native',lambda py:None)
+    monkeypatch.setattr(telegram_audio,'PCMProbe',BrokenProbe)
+    monkeypatch.setattr(telegram_audio,'pcm_transport',capture)
+    monkeypatch.setattr(telegram_audio.TelegramCalls,'_run',waiting)
+    calls=telegram_audio.TelegramCalls({'socket':'/fixture'},None,None,None)
+    monkeypatch.setattr(calls,'token',lambda:'fixture-token')
+    await calls.dial({'id':'fixture','brief':{'destination':'123'}})
+    calls.active['fixture']['input']=Input()
+    try:
+        audio=(np.sin(np.arange(960)*2*np.pi*440/48000)*4000).astype(np.int16).tobytes()
+        packet=StreamFrames(123,Direction.INCOMING,Device.MICROPHONE,[Frame(1,audio,Frame.Info()),Frame(2,audio,Frame.Info())])
+        await callbacks[0](None,packet)
+        # Both frames reach the model although every probe call raises.
+        assert [frame.audio for frame in received]==[audio,audio]
+        await outputs[0](audio)
+        assert sent==[audio]
+    finally:await calls.close()
