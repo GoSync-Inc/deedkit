@@ -241,14 +241,17 @@ printing every finding) and 2 when none fails and any is unknown. The run summar
 and the `tiden-health` artifact (`tiden-health.json`, uploaded even after a
 failure) hold every state, the numbers, TARGET and the evidence: the Tiden run's
 sequence, SHA, environment and completion time, the observation time and the
-upstream CI run. It writes nothing to Tiden.
+upstream CI run. It writes nothing to Tiden. Missing configuration (the token
+or either ID) still produces that full report with every metric unknown, so the
+run is never green without one; a Git or CLI command that times out or cannot
+start makes the metrics that need it unknown, and the others are still measured.
 
 | Metric | Fails when | Unknown when |
 | --- | --- | --- |
 | Drift | the watermark W is still behind TARGET 15 minutes after the start | W is not on `main`'s history or diverges from TARGET, or `drift status` fails |
 | Unlinked tests | the unlinked share of active cases is 5% or more in a suite or overall; a suite has case rows but none active ("not reporting"); an active case has an unassigned path; an active unlinked case is not in `config/tiden-unlinked-tests.json`; that list is missing or has an invalid entry | no usable test evidence for TARGET (below), or a listing is incomplete |
-| Stale anchors | a `repo_file` source of this repository (or the former `anymsg` name, or none) names a path not tracked at TARGET | the spec listing is incomplete |
-| Done with open checks | a `Done` spec carries `[open: live]` or `[open: measured]` | the initial Done audit date in the script is not set yet |
+| Stale anchors | a `repo_file` source of this repository (or the former `anymsg` name, or none) names a path not tracked at TARGET | the spec listing is incomplete, or a source has a missing or repeated ID or no type |
+| Done with open checks | a `Done` spec carries `[open: live]` or `[open: measured]` | the initial Done audit date in the script is not set yet, or a `Done` spec's text was not readable |
 
 Test evidence is only the Tiden run on branch `main` (by branch ID),
 environment `github-actions-synthetic`, build SHA equal to TARGET, status passed
@@ -264,7 +267,9 @@ never deleted. The suites are fixed in the script, one path rule each: root
 `*_test.go` path), WhatsApp Node, npm and CI verifications (`.github/`). Every
 listing counts only when it ends with an empty `nextPageToken`, its integer
 `totalCount` equals its rows, its IDs are unique and, per spec, `sourceCount`
-equals its sources. CLI errors name the command only, never the response.
+equals its sources, each with a unique ID and a type. The artifact keeps every
+stale anchor path in full; the summary shortens and escapes it. CLI errors name
+the command only, never the response.
 
 `config/tiden-unlinked-tests.json` is the reviewed no-spec list: per case its
 `caseId`, `externalId`, a `category` (`missing-spec`, `helper`, `trivial`,

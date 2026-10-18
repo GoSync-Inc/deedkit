@@ -80,28 +80,43 @@ def shown(text: str, limit: int = 300) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def run_git(root: Path, *arguments: str) -> subprocess.CompletedProcess:
+    """One Git command; a timeout or a launch failure is unknown, named by its subcommand only."""
+    try:
+        return subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise Unknown(f"git {arguments[0]} timed out") from None
+    except OSError:
+        raise Unknown(f"git {arguments[0]} could not run") from None
+
+
 def git(root: Path, *arguments: str) -> bytes:
-    completed = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, timeout=TIMEOUT)
+    completed = run_git(root, *arguments)
     if completed.returncode:
         raise Unknown(f"git {arguments[0]} exited {completed.returncode}")
     return completed.stdout
 
 
+def count(root: Path, span: str) -> int:
+    value = git(root, "rev-list", "--count", span).strip()
+    if not value.isdigit():
+        raise Unknown("git rev-list returned no count")
+    return int(value)
+
+
 def commit(root: Path, ref: str) -> str:
-    value = git(root, "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}").decode().strip()
+    value = git(root, "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}").decode("ascii", "replace").strip()
     if not SHA.fullmatch(value):
         raise Unknown(f"{shown(ref)} does not resolve to a commit")
     return value
 
 
 def present(root: Path, sha: str) -> bool:
-    return not subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{sha}^{{commit}}"],
-                              capture_output=True, timeout=TIMEOUT).returncode
+    return not run_git(root, "cat-file", "-e", f"{sha}^{{commit}}").returncode
 
 
 def ancestor(root: Path, older: str, newer: str) -> bool:
-    completed = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", older, newer],
-                               capture_output=True, timeout=TIMEOUT)
+    completed = run_git(root, "merge-base", "--is-ancestor", older, newer)
     if completed.returncode not in (0, 1):
         raise Unknown(f"git merge-base exited {completed.returncode}")
     return completed.returncode == 0
@@ -127,6 +142,8 @@ class Tiden:
                                        timeout=TIMEOUT)
         except subprocess.TimeoutExpired:
             raise Unknown(f"tiden {label} timed out") from None
+        except (OSError, UnicodeDecodeError):
+            raise Unknown(f"tiden {label} could not run or returned undecodable output") from None
         if completed.returncode:
             raise Unknown(f"tiden {label} exited {completed.returncode}")
         try:
@@ -190,6 +207,13 @@ class Tiden:
             if (not isinstance(sources, list) or not all(isinstance(source, dict) for source in sources)
                     or type(count) is not int or count != len(sources)):
                 raise Unknown("tiden spec list has malformed or incomplete sources")
+            # A repeated or missing source ID could stand in for an omitted source, and an untyped one could hide a
+            # repo_file anchor: either makes the inventory unprovable.
+            source_ids = [source.get("id") for source in sources]
+            if (not all(isinstance(value, str) and value for value in source_ids)
+                    or len(set(source_ids)) != len(source_ids)
+                    or not all(isinstance(source.get("sourceType"), str) and source["sourceType"] for source in sources)):
+                raise Unknown("tiden spec list has a source with a missing or duplicate id or no type")
         return specs
 
     def cases(self) -> list[dict]:
@@ -235,7 +259,7 @@ def drift_metric(root: Path, tiden: Tiden, target: str, main_ref: str, fetch: bo
         if not ancestor(root, watermark, target):
             raise Unknown(f"the watermark {watermark} and TARGET have diverged")
         if clock() >= deadline:
-            behind = int(git(root, "rev-list", "--count", f"{watermark}..{target}").decode())
+            behind = count(root, f"{watermark}..{target}")
             result = metric(FAIL, f"the watermark {watermark} is {behind} commit(s) behind TARGET at the deadline",
                             numbers=numbers | {"behind": behind})
             result["findings"].append(f"watermark {watermark} does not cover TARGET {target}; the Tiden drift run "
@@ -245,14 +269,14 @@ def drift_metric(root: Path, tiden: Tiden, target: str, main_ref: str, fetch: bo
     head = commit(root, main_ref)
     if head != target and ancestor(root, target, head):
         # Merges after TARGET are shown for context only; they never decide this report.
-        after = int(git(root, "rev-list", "--count", f"{target}..{head}").decode())
+        after = count(root, f"{target}..{head}")
         result["numbers"]["after_target"] = {"head": head, "commits": after,
                                              "covered": ancestor(root, head, result["numbers"]["watermark"])}
     return result
 
 
 def anchors_metric(specs: list[dict], paths: set[str]) -> dict:
-    stale, count = [], 0
+    stale, stale_paths, anchors = [], set(), 0
     for spec in specs:
         for source in spec.get("sources", []):
             repository = source.get("repository")
@@ -262,22 +286,26 @@ def anchors_metric(specs: list[dict], paths: set[str]) -> dict:
                 continue
             if not isinstance(source.get("repoPath"), str) or not source["repoPath"]:
                 raise Unknown("tiden spec list has a repo_file source without a path")
-            count += 1
+            anchors += 1
             if source["repoPath"] not in paths:
                 stale.append(f"ANYM-{spec.get('seqNum')} source {source.get('id')}: {shown(source['repoPath'])}")
-    result = metric(FAIL if stale else PASS, f"{len(stale)} of {count} repo_file anchors name a path not tracked at "
-                    "TARGET", numbers={"anchors": count, "stale": len(stale),
-                                       "stale_paths": len({line.split(': ', 1)[1] for line in stale})})
-    result["findings"] = stale
+                stale_paths.add(source["repoPath"])
+    result = metric(FAIL if stale else PASS, f"{len(stale)} of {anchors} repo_file anchors name a path not tracked "
+                    "at TARGET", numbers={"anchors": anchors, "stale": len(stale), "stale_paths": len(stale_paths)})
+    # Findings are escaped and shortened for display; the JSON keeps every stale path in full.
+    result["findings"], result["paths"] = stale, sorted(stale_paths)
     return result
 
 
 def done_metric(specs: list[dict]) -> dict:
     marked, phrased = [], []
     for spec in specs:
-        content = spec.get("content")
-        if spec.get("status") != "Done" or not isinstance(content, str):
+        if spec.get("status") != "Done":
             continue
+        content = spec.get("content")
+        if not isinstance(content, str):
+            # A Done card whose text was not read cannot count as one without an open check.
+            raise Unknown(f"tiden spec list has no readable text for Done spec ANYM-{spec.get('seqNum')}")
         label = f"ANYM-{spec.get('seqNum')} {shown(spec.get('title') or '', 120)}"
         lines = [line for line in content.splitlines() if MARKER.search(line)]
         if lines:
@@ -297,8 +325,7 @@ def done_metric(specs: list[dict]) -> dict:
 
 def no_spec_list(root: Path, target: str) -> tuple[dict[str, dict], list[str]]:
     """The reviewed no-spec list at TARGET: valid entries by case ID, and an error for each defect."""
-    completed = subprocess.run(["git", "-C", str(root), "show", f"{target}:{NO_SPEC_LIST}"], capture_output=True,
-                               timeout=TIMEOUT)
+    completed = run_git(root, "show", f"{target}:{NO_SPEC_LIST}")
     if completed.returncode:
         return {}, [f"{NO_SPEC_LIST} is missing at TARGET"]
     return parse_no_spec_list(completed.stdout)
@@ -398,7 +425,8 @@ def unlinked_metric(cases: list[dict], results: list[dict], seq: int, listed: di
 
 
 def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool, clock=time.monotonic,
-           sleep=time.sleep) -> dict:
+           sleep=time.sleep, unconfigured: str | None = None) -> dict:
+    """The four metrics at TARGET; `unconfigured` names missing Tiden configuration, which makes every one unknown."""
     start = clock()
     data = {"target": None, "observedAt": datetime.now(timezone.utc).isoformat(), "evidence": {}, "metrics": {}}
     upstream = {key.lower(): os.environ[key] for key in ("UPSTREAM_RUN_URL", "UPSTREAM_CONCLUSION", "UPSTREAM_SHA")
@@ -410,6 +438,8 @@ def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool
         target = data["target"] = commit(root, target_ref)
         if not ancestor(root, target, main_ref):
             raise Unknown("TARGET is not on main's history")
+        if unconfigured:
+            raise Unknown(unconfigured)
     except Unknown as error:
         data["metrics"] = {name: metric(UNKNOWN, str(error)) for name in names}
         return data
@@ -421,12 +451,16 @@ def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool
             data["metrics"][name] = metric(UNKNOWN, str(error))
             if error.evidence:
                 data["evidence"]["older_run"] = error.evidence
+        except Exception as error:  # noqa: BLE001 - any other defect leaves this metric unknown; the report is still written
+            data["metrics"][name] = metric(UNKNOWN, f"unexpected {type(error).__name__} while measuring")
 
     measure("drift", lambda: drift_metric(root, tiden, target, main_ref, fetch, start + DRIFT_WAIT, clock, sleep))
     try:
         specs: list[dict] | Unknown = tiden.specs()
     except Unknown as error:
         specs = error  # both spec metrics are unknown for the same reason
+    except Exception as error:  # noqa: BLE001 - as in measure
+        specs = Unknown(f"unexpected {type(error).__name__} while reading the spec list")
 
     def with_specs(compute):
         if isinstance(specs, Unknown):
@@ -503,11 +537,17 @@ def main() -> int:
     parser.add_argument("--cli", default="tiden")
     parser.add_argument("--fetch", action="store_true", help="fetch main when the watermark is newer than the clone")
     parser.add_argument("--output", type=Path, help="write the full report as JSON")
+    parser.add_argument("--require-token", action="store_true",
+                        help="treat an unset TIDEN_API_TOKEN as missing configuration (the workflow passes it)")
     args = parser.parse_args()
+    # Missing configuration still writes a full report, every metric unknown, never a green run without one.
+    unconfigured = None
     if not args.product_id or not args.workspace_id:
-        parser.error("--product-id and --workspace-id are required")
-    data = report(args.root.resolve(), Tiden(args.cli, args.product_id, args.workspace_id), args.target,
-                  args.main_ref, args.fetch)
+        unconfigured = "Tiden is not configured: no product or workspace ID (TIDEN-CI.md)"
+    elif args.require_token and not os.environ.get("TIDEN_API_TOKEN"):
+        unconfigured = "Tiden is not configured: TIDEN_API_TOKEN is not set (TIDEN-CI.md)"
+    data = report(args.root.resolve(), Tiden(args.cli, args.product_id or "", args.workspace_id or ""), args.target,
+                  args.main_ref, args.fetch, unconfigured=unconfigured)
     code = outcome(data)
     lines = render(data, code)
     print("\n".join(lines))
@@ -519,7 +559,8 @@ def main() -> int:
         with open(summary, "a", encoding="utf-8") as stream:
             stream.write("\n".join(lines) + "\n")
     if args.output:
-        args.output.write_text(json.dumps(data | {"exit": code}, indent=2, ensure_ascii=False) + "\n")
+        args.output.write_text(json.dumps(data | {"exit": code}, indent=2, ensure_ascii=False) + "\n",
+                               encoding="utf-8", errors="backslashreplace")
     return code
 
 

@@ -124,7 +124,7 @@ def results(*case_ids):
     return [{"id": f"result-{index}", "testId": case_id} for index, case_id in enumerate(case_ids)]
 
 
-def spec(seq, status="Active", content="Acceptance criteria:\n- it works", paths=(),
+def spec(seq, status="Active", content: str | None = "Acceptance criteria:\n- it works", paths=(),
          repository: str | None = "github.com/GoSync-Inc/deedkit"):
     sources = [{"id": f"source-{seq}-{index}", "sourceType": "repo_file", "repoPath": path, "repository": repository}
                for index, path in enumerate(paths)]
@@ -583,6 +583,34 @@ def test_a_repo_file_source_without_a_path_is_unknown(repo, server):
     assert states(measure(repo, server, b)[1])["stale_anchors"] == UNKNOWN
 
 
+TRACKED = {"id": "s1", "sourceType": "repo_file", "repoPath": "services/app.py"}
+
+
+@pytest.mark.parametrize("sources", [
+    [TRACKED, dict(TRACKED)],  # a repeated tracked source standing in for an omitted stale one
+    [TRACKED, {"sourceType": "repo_file", "repoPath": "gone.py"}],
+    [TRACKED, {"id": "", "sourceType": "repo_file", "repoPath": "gone.py"}],
+    [TRACKED, {"id": "s2", "repoPath": "gone.py"}],
+    [TRACKED, {"id": "s2", "sourceType": None, "repoPath": "gone.py"}],
+    [TRACKED, {"id": "s2", "sourceType": "", "repoPath": "gone.py"}],
+], ids=["duplicate", "missing-id", "empty-id", "missing-type", "null-type", "empty-type"])
+def test_a_source_with_a_duplicate_or_missing_id_or_type_makes_both_spec_metrics_unknown(repo, server, sources):
+    _, b = history(repo)
+    server.world(b, specs=[dict(spec(1), sources=sources, sourceCount=len(sources))])
+    data = measure(repo, server, b)[1]
+    assert states(data)["stale_anchors"] == UNKNOWN and states(data)["done_open_checks"] == UNKNOWN
+
+
+def test_long_stale_paths_sharing_a_display_prefix_count_separately_and_stay_whole_in_the_json(repo, server):
+    _, b = history(repo)
+    prefix = "services/" + "nested/" * 50
+    long_paths = [prefix + "one.py", prefix + "two.py"]
+    server.world(b, specs=[spec(1, paths=["services/app.py", *long_paths])])
+    metric = measure(repo, server, b)[1]["metrics"]["stale_anchors"]
+    assert metric["numbers"] == {"anchors": 3, "stale": 2, "stale_paths": 2}
+    assert metric["paths"] == long_paths and all(item.endswith("...") for item in metric["findings"])
+
+
 # Drift.
 
 def test_a_slow_drift_run_passes_once_the_watermark_reaches_target(repo, server):
@@ -673,6 +701,20 @@ def test_done_specs_with_open_check_markers(repo, server, specs, state, findings
     assert (metric["state"], len(metric["findings"]), len(metric["warnings"])) == (state, findings, warnings)
 
 
+@pytest.mark.parametrize("content", [None, 5, ["- [open: live]"], "absent"])
+def test_a_done_spec_without_readable_text_is_unknown_never_pass(repo, server, content):
+    _, b = history(repo)
+    done = spec(2, "Done")
+    if content == "absent":
+        del done["content"]
+    else:
+        done["content"] = content
+    server.world(b, specs=[spec(1, paths=["services/app.py"]), done, spec(3, "Active", None)])
+    code, data = measure(repo, server, b)
+    assert code == 2 and states(data)["done_open_checks"] == UNKNOWN
+    assert data["metrics"]["done_open_checks"]["reason"] == "tiden spec list has no readable text for Done spec ANYM-2"
+
+
 def test_before_the_audit_date_is_set_the_done_metric_is_unknown(repo, server, monkeypatch):
     _, b = history(repo)
     server.world(b, specs=[spec(1, paths=["services/app.py"]), spec(2, "Done", "- [open: live]")])
@@ -700,6 +742,76 @@ def test_the_command_reports_locally_read_only_with_the_same_result(repo, server
     reads = {" ".join(call[:2]) for call in server.state()["calls"]}
     assert reads == {"drift status", "spec list", "branch list", "run list", "test list", "run results"}
     assert git(repo, "for-each-ref") == refs
+
+
+def command(repo, tmp_path, cli, *extra, env=None) -> tuple[subprocess.CompletedProcess, dict]:
+    """The measuring command as the workflow runs it; it must always leave its JSON report behind."""
+    output = tmp_path / "health.json"
+    completed = subprocess.run([sys.executable, str(ROOT / "scripts/tiden_health.py"), "--root", str(repo), "--cli",
+                                cli, "--output", str(output), *extra], capture_output=True, text=True,
+                               env={"PATH": "/usr/bin:/bin", "FAKE_TIDEN_STATE": str(tmp_path / "state.json"),
+                                    "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"), **(env or {})})
+    assert output.exists(), completed.stderr
+    return completed, json.loads(output.read_text())
+
+
+@pytest.mark.parametrize(("extra", "env", "reason"), [
+    (("--product-id", "product", "--workspace-id", "workspace", "--require-token"), {}, "TIDEN_API_TOKEN is not set"),
+    (("--workspace-id", "workspace", "--require-token"), {"TIDEN_API_TOKEN": SECRET}, "no product or workspace ID"),
+    (("--product-id", "product", "--require-token"), {"TIDEN_API_TOKEN": SECRET}, "no product or workspace ID"),
+])
+def test_missing_configuration_still_writes_a_full_report_with_every_metric_unknown(repo, server, tmp_path, extra,
+                                                                                    env, reason):
+    _, b = history(repo)
+    server.world(b)
+    completed, data = command(repo, tmp_path, server.cli, "--target", b, *extra, env=env)
+    assert completed.returncode == 2, completed.stderr
+    assert data["exit"] == 2 and data["target"] == b and set(states(data).values()) == {UNKNOWN}
+    assert all(reason in entry["reason"] for entry in data["metrics"].values())
+    assert "## Tiden health: UNKNOWN" in (tmp_path / "summary.md").read_text()
+    assert server.state()["calls"] == []  # nothing is asked of Tiden without configuration
+
+
+def test_an_unavailable_cli_leaves_every_metric_unknown_and_the_report_is_written(repo, tmp_path):
+    _, b = history(repo)
+    completed, data = command(repo, tmp_path, str(tmp_path / "missing-cli"), "--product-id", "product",
+                              "--workspace-id", "workspace", "--target", b, "--require-token",
+                              env={"TIDEN_API_TOKEN": SECRET})
+    assert completed.returncode == 2 and "Traceback" not in completed.stderr
+    assert data["target"] == b and set(states(data).values()) == {UNKNOWN}
+    assert all("could not run" in entry["reason"] for entry in data["metrics"].values())
+    assert SECRET not in completed.stdout + completed.stderr + json.dumps(data)
+
+
+def test_a_git_fetch_timeout_leaves_drift_unknown_and_the_other_metrics_measured(repo, server, monkeypatch):
+    _, b = history(repo)
+    server.world(b, watermarks=["f" * 40])  # not in the clone, so the report fetches main
+    real = subprocess.run
+
+    def stalled(arguments, **options):
+        if arguments[:1] == ["git"] and "fetch" in arguments:
+            raise subprocess.TimeoutExpired(arguments, health.TIMEOUT, output=SECRET.encode())
+        return real(arguments, **options)
+
+    monkeypatch.setattr(health.subprocess, "run", stalled)
+    code, data = measure(repo, server, b, fetch=True)
+    assert code == 2
+    assert states(data) == {"drift": UNKNOWN, "unlinked_tests": PASS, "stale_anchors": PASS, "done_open_checks": PASS}
+    assert data["metrics"]["drift"]["reason"] == "git fetch timed out" and SECRET not in json.dumps(data)
+
+
+def test_an_unexpected_defect_in_one_metric_leaves_only_it_unknown(repo, server, monkeypatch):
+    _, b = history(repo)
+    server.world(b)
+
+    def broken(specs):
+        raise KeyError(SECRET)
+
+    monkeypatch.setattr(health, "done_metric", broken)
+    code, data = measure(repo, server, b)
+    assert code == 2 and states(data)["done_open_checks"] == UNKNOWN and states(data)["stale_anchors"] == PASS
+    assert data["metrics"]["done_open_checks"]["reason"] == "unexpected KeyError while measuring"
+    assert SECRET not in json.dumps(data)
 
 
 def test_the_reviewed_no_spec_list_in_the_repository_is_valid():
@@ -738,13 +850,17 @@ def test_the_workflow_checks_out_main_without_credentials_and_pins_the_cli_as_ci
         assert line.strip() in ci
     assert "v0.33.0" in install["run"]
     assert not any(name in step.get("run", "") for step in steps for name in ("GITHUB_PATH", "GITHUB_ENV"))
-    # The config step sees only whether the secret exists; the token value reaches the report step alone.
+    # The token reaches the report step alone; no step reads the secret otherwise.
     holders = [step["name"] for step in steps
                if "${{ secrets.TIDEN_API_TOKEN }}" in step.get("env", {}).values()]
     assert holders == ["Measure drift, unlinked tests, stale anchors and Done specs with open checks"]
+    assert sum("secrets." in json.dumps(step) for step in steps) == 1
     report_step = next(step for step in steps if step.get("name") == holders[0])
     assert report_step["env"]["TIDEN_API_TOKEN"] == "${{ secrets.TIDEN_API_TOKEN }}"
-    assert report_step["run"].startswith("python3 scripts/tiden_health.py --cli \"$RUNNER_TEMP/tiden-bin/tiden\" --fetch")
+    assert report_step["run"].startswith("python3 scripts/tiden_health.py --cli \"$RUNNER_TEMP/tiden-bin/tiden\" "
+                                         "--require-token --fetch")
+    # Missing configuration must not skip the report: every step after the guard runs, the upload even after a failure.
+    assert all("if" not in step for step in steps[1:-1])
     upload = steps[-1]
     assert upload["uses"].startswith("actions/upload-artifact@") and upload["if"].startswith("always()")
     assert upload["with"]["name"] == "tiden-health" and upload["with"]["overwrite"] is True
