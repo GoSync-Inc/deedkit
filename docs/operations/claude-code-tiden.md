@@ -23,8 +23,10 @@ workspace `1dc18e09-4a09-4d74-8300-cd4302622357` and product
 
 1. Answer the per-prompt start directive yourself: continue a listed candidate,
    start a new intent, look up, or skip. Agent rules, process documents, wording
-   and read-only work use skip; a change of meaning in a product contract document
-   runs the full loop (`AGENTS.md`).
+   and read-only work use skip, and so does normal-level code that changes no
+   acceptance criterion; a change to a criterion, important- or owner-level code
+   and a change of meaning in a product contract document run the full loop
+   (`AGENTS.md`).
 2. Before `tiden intent start`, run `product-context` for each independent part and
    read the code its results point to. Promises are frozen at start and cannot be
    edited; a promise written before reading the code may later need a waiver.

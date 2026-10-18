@@ -48,7 +48,10 @@ for a normal-level pull request instead of a per-PR reviewer:
 - Every new or changed acceptance criterion has a test that exercises it or is
   marked pending (a claim without a test, PR #88).
 - Each `no behavior change` disposition was checked against the criteria the
-  diff touches.
+  diff touches, and each spec whose criteria the diff changes, may change,
+  restores or newly tests is `(flagged)` (`AGENTS.md`).
+- A skipped code pull request is normal level, changes no acceptance criterion
+  and has its `Spec sync:` line (`AGENTS.md`).
 - Every changed term, ID, path and test name was searched for (`git grep`) and
   each reference to it re-read.
 - A rerunnable job that uploads an artifact sets `overwrite: true`; a suite that
@@ -94,8 +97,10 @@ whole exports.
   its own open findings;
 - `diff.patch`: `git diff <base>..<head>` of the reviewed range; for a recheck,
   only the fix range;
-- `specs.md`: the current text with acceptance criteria of the promised specs
-  and every spec under `Spec impact:`, and the `Spec impact:` inventory;
+- `specs.md`: the current text with acceptance criteria of the promised and the
+  flagged specs, and the `Spec impact:` list with its inventory, which gives the
+  rest by ID and disposition. A reviewer that needs the text of an unflagged
+  spec names it as a missing input;
 - `pr.md`: the pull request description.
 
 A card or spec edit has no diff; its packet holds instead the previous and the
@@ -131,10 +136,11 @@ review and one recheck.
    the clauses that refer to it. The PR records `Consistency pass: <terms>`.
 3. **Recheck** by each reviewer that raised blocking or major findings, on the
    fix range only, with its own open findings: it verifies each item and scans
-   the fix diff. It is never a fresh full review. A fix that materially changes
-   what another reviewer approved goes to that reviewer too, on that part only.
-   On an owner-level PR, a fix range that touches a migration, data or security
-   path goes to both reviewers.
+   the fix diff. It is never a fresh full review. For a card or spec edit the
+   fix range is the diff between the reviewed and the fixed text. A fix that
+   materially changes what another reviewer approved goes to that reviewer too,
+   on that part only. On an owner-level PR, a fix range that touches a
+   migration, data or security path goes to both reviewers.
 4. **Minors and nits** are fixed without review or recorded in the PR as a
    follow-up with its card. A recheck's minor never opens another round.
 5. **Closure.** A blocking or major finding stays open until the reviewer that
@@ -162,7 +168,9 @@ production: a CI change to how `main` push runs verify, which the host's older
   or verifier consumes. Otherwise the release owner records `Release review:
   none — <reason>`.
 - **Part A, normal PRs.** Astra reviews their code, Fable their spec,
-  contract-document and process text, each only when that part is not empty.
+  contract-document and process text and the release spec sync's spec edits
+  ([tiden-product-workflow.md](tiden-product-workflow.md)), each only when that
+  part is not empty.
   `diff.patch` holds those PRs' squash commits (`git show <sha>...`); `specs.md`
   and `pr.md` hold their specs and descriptions.
 - **Part B, compatibility.** Astra reviews `delta.md` (title, level and changed
