@@ -103,13 +103,15 @@ async def test_owner_named_destination_must_appear_in_instruction(tmp_path):
                   'Call +1 (202) 555-0199 (2 minutes maximum).', 'позвони в 10 (202) 555-0199', '18.10 +1 202 555 0199'):
         assert policy.owner_named(words, 'phone', UNLISTED), words
     for words in ('Call +1 202 555 01992', 'Call 512025550199', 'Call +1 202 555 0198', 'Call +91 202 555 0199',
-                  'Call +91 (202) 555-0199'):
+                  'Call +91 (202) 555-0199', 'Call +91\u00a0202 555 0199', 'Call +9 1 202 555 0199', 'Call +7 12025550199'):
         assert not policy.owner_named(words, 'phone', UNLISTED), words
     assert policy.owner_named('Набери Telegram 987654321', 'telegram', '987654321')
     assert policy.owner_named('Набери Telegram 987654321 (5 минут)', 'telegram', '987654321')
     assert not policy.owner_named('Набери Telegram 9876543210', 'telegram', '987654321')
     with pytest.raises(ServiceError, match='destination_not_in_owner_instruction'):
         await outbound.dial(saved['id'], 'Позвони на +91 202 555 0199', origin={'destination_source': 'owner_named'})
+    with pytest.raises(ServiceError, match='destination_not_in_owner_instruction'):
+        await outbound.dial(saved['id'], 'Позвони на +91\u00a0202 555 0199', origin={'destination_source': 'owner_named'})
     assert service.list_calls() == [] and provider.dialed == []
     call = await outbound.dial(saved['id'], 'Позвони на +1 202-555-0199 и узнай цену',
                                origin={'destination_source': 'owner_named'})

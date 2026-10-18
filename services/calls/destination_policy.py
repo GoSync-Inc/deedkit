@@ -17,6 +17,8 @@ PREMIUM_UNITS=3
 TELEPHONE={'phone','whatsapp'}
 PREMIUM={PhoneNumberType.PREMIUM_RATE,PhoneNumberType.SHARED_COST,PhoneNumberType.UAN}
 SEPARATORS=re.compile(r'[\s().-]')
+SEPARATOR=r'[\s().-]*'
+COUNTRY_CODE_BEFORE=re.compile(r'\+(?:[0-9]'+SEPARATOR+r'){1,3}$')
 CALL_YOURSELF='Emergency and short-code calls are not supported. Tell the owner to call {} themselves right now.'
 
 
@@ -73,15 +75,14 @@ def _named_forms(channel,destination):
         return destination.lstrip('+'),set()
 
 
-def _written(form,instruction,national):
+def _written(form,instruction):
     # Separators may sit between the digits, but the form must not be part of a longer
     # digit sequence: "+1 (202) 555-0199 (2 min)" names it, "...01992" does not.
-    digits=r'[\s().-]*'.join(map(re.escape,form))
+    digits=SEPARATOR.join(map(re.escape,form))
     for match in re.finditer(r'(?<![0-9])\+?'+digits+r'(?![0-9])',instruction):
-        before=instruction[:match.start()].rstrip(' \t\n().-')
-        # A national form right after an explicit country code belongs to another number:
-        # "+91 202 555 0199" does not name +1 202 555 0199.
-        if national and re.search(r'\+[0-9]{1,3}$',before):
+        # Digits right after an explicit country code belong to another number, whatever
+        # separators follow it: "+91 202 555 0199" does not name +1 202 555 0199.
+        if not match.group().startswith('+') and COUNTRY_CODE_BEFORE.search(instruction[:match.start()]):
             continue
         return True
     return False
@@ -92,7 +93,7 @@ def owner_named(instruction,channel,destination):
     if channel=='sip':
         return destination.casefold() in instruction.casefold()
     international,nationals=_named_forms(channel,destination)
-    return _written(international,instruction,False) or any(_written(form,instruction,True) for form in nationals)
+    return any(_written(form,instruction) for form in {international,*nationals})
 
 
 def bind_origin(brief,instruction,source,evidence):
