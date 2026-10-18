@@ -25,8 +25,9 @@ ANCHOR_REPOSITORIES = {"", REPOSITORY, "github.com/GoSync-Inc/anymsg"}
 ENVIRONMENT = "github-actions-synthetic"
 SHARE_PERCENT = 5  # an unlinked share of active cases at or above this fails, per suite and overall
 DRIFT_WAIT, TESTS_WAIT, POLL = 15 * 60, 30 * 60, 30  # deadlines in seconds from the start of the report
-# Date of the initial Done audit whose record is on ANYM-360; until it is set the Done metric is unknown.
-DONE_AUDIT: str | None = None
+# Date of the initial Done audit whose record is on ANYM-360 (22 Done specs read; 8 moved to Review with markers, by
+# the tiden-hygiene worker on review/2026-10-18-tiden-hygiene-done-audit). While unset the Done metric is unknown.
+DONE_AUDIT: str | None = "2026-10-18"
 MARKER = re.compile(r"\[open: (?:live|measured)\]")
 PHRASE = re.compile(r"live recheck pending|remains open|Not run:")
 NO_SPEC_LIST = "config/tiden-unlinked-tests.json"
