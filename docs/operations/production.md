@@ -610,16 +610,18 @@ the optional `/etc/deedkit/autodeploy.env` (root-owned, mode `0600`) sets
 A deploy and the daily backup never overlap; the backup stops the collectors
 (`personal-os-backup.timer`, 18:00 UTC) and an apply would recreate them.
 Admission: the unit starts no deploy while `personal-os-backup.service` runs or
-waits to retry (any state but `inactive` or `failed`) and none from 16:00 to
-18:59 UTC; a failed or unexpected read of either skips the run. Exclusion: the
-deploy holds the backup runner's own lock
+waits to retry (any state but `inactive` or `failed`) and none from 13:00 to
+18:59 UTC; a failed or unexpected read of either skips the run. A run admitted
+before 13:00 ends by 17:03 at the latest (the 4-hour start timeout plus the
+3-minute stop timeout), so it is over before the scheduled backup starts.
+Exclusion: the deploy holds the backup runner's own lock
 (`/opt/personal-os-probe/backups/.runner.lock`, `DEEDKIT_BACKUP_LOCK`) for its
-whole run. A backup that starts meanwhile refuses before it stops anything
-(`backup_job_already_running`) and systemd retries it after its 30-minute
-restart delay (at most three starts in 8 hours); while a backup holds the lock,
-the deploy exits 75 and the run counts as a skip. A deploy started before 16:00
-that is still running at 18:00 thus delays the backup instead of overlapping it.
-A skipped run (condition or lock) prints no JSON line.
+whole run, so a backup started by hand during a deploy refuses before it stops
+anything (`backup_job_already_running`) and systemd retries it every 30 minutes,
+at most three starts in 8 hours: pause the timer and let a running deploy finish
+before starting a backup by hand. While a backup holds the lock, the deploy
+exits 75 and the run counts as a skip. A skipped run (condition or lock) prints
+no JSON line.
 
 The unit adds no destination: `deploy` reads `main` from GitHub over HTTPS,
 GitHub's REST API (runs, jobs, comparisons, `/rate_limit`) and GHCR (manifests,

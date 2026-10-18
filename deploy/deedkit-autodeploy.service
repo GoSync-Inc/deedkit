@@ -17,9 +17,10 @@ Environment=DEEDKIT_BACKUP_LOCK=/opt/personal-os-probe/backups/.runner.lock
 # Optional host overrides: the plan A configuration path (DEEDKIT_DEPLOY_CONFIG), GH_TOKEN.
 EnvironmentFile=-/etc/deedkit/autodeploy.env
 # The daily backup (personal-os-backup.timer, 18:00 UTC) stops the collectors; a deploy and a backup never overlap.
-# Admission: no start while the backup unit runs or waits to retry, none from 16:00 to 18:59 UTC; a failed or
+# Admission: no start while the backup unit runs or waits to retry, none from 13:00 to 18:59 UTC (a run admitted
+# before 13:00 ends by 17:03 at the latest: TimeoutStartSec plus TimeoutStopSec); a failed or
 # unexpected read skips the run (fail closed).
-ExecCondition=/bin/sh -c 's=$$(systemctl show -P ActiveState personal-os-backup.service) || exit 1; case "$$s" in inactive|failed) ;; *) exit 1;; esac; h=$$(date -u +%%H) || exit 1; case "$$h" in 16|17|18) exit 1;; [01][0-9]|2[0-3]) exit 0;; *) exit 1;; esac'
+ExecCondition=/bin/sh -c 's=$$(systemctl show -P ActiveState personal-os-backup.service) || exit 1; case "$$s" in inactive|failed) ;; *) exit 1;; esac; h=$$(date -u +%%H) || exit 1; case "$$h" in 13|14|15|16|17|18) exit 1;; [01][0-9]|2[0-3]) exit 0;; *) exit 1;; esac'
 # Exclusion: the deploy holds the backup runner's own lock for its whole run, so a backup that starts meanwhile
 # refuses before it stops anything (backup_job_already_running) and systemd retries it; a held lock skips the deploy (75).
 ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 75 ${DEEDKIT_BACKUP_LOCK} /usr/bin/python3 /usr/local/lib/deedkit/production.py deploy --auto --config ${DEEDKIT_DEPLOY_CONFIG} --http-config ${DEEDKIT_HTTP_CONFIG}
