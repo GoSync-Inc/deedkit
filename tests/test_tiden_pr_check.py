@@ -343,12 +343,27 @@ def test_only_a_verdict_fails_the_pr_check_job_and_anything_else_warns(repo, ser
     job = pr_check_job()
     steps = {step.get("id"): step for step in job["steps"]}
     assert [step.get("id") for step in job["steps"] if "TIDEN_API_TOKEN" in str(step.get("env"))] == ["check"]
-    assert steps["check"]["continue-on-error"] is True and steps["install"]["continue-on-error"] is True
+    assert [step.get("name") for step in job["steps"] if step.get("continue-on-error") is not True] == \
+        ["Fail on the verdict"]
     assert steps["check"]["if"] == "steps.install.outcome == 'success'"
     assert next(step for step in job["steps"] if step.get("name") == "Fail on the verdict")["if"] == \
         "steps.check.outputs.outcome == 'failed'"
     assert "outcome != 'passed' && steps.check.outputs.outcome != 'failed'" in steps["warn"]["if"]
     assert sum(step["timeout-minutes"] for step in job["steps"]) < job["timeout-minutes"]
+    receipt = next(step for step in job["steps"] if step.get("name") == "Retain the Tiden PR check receipt")
+    assert receipt["if"] == steps["warn"]["if"]
+    for printed in (None, "## Tiden PR check\nRefused: tiden spec list exited 3\n"):  # killed before any output, or not
+        work = tmp_path / f"warn-{printed is None}"
+        work.mkdir()
+        if printed:
+            (work / "tiden-pr-check.txt").write_text(printed)
+        completed = subprocess.run(["bash", "-e", "-c", steps["warn"]["run"]], capture_output=True, text=True, env={
+            "RUNNER_TEMP": str(work), "GITHUB_STEP_SUMMARY": str(work / "summary"), "PATH": "/usr/bin:/bin",
+            "PREPARE": "checkout success, Python success", "INSTALL": "success", "CHECK": "failure"})
+        assert completed.returncode == 0 and "::warning title=Tiden PR check not run::" in completed.stdout
+        assert json.loads((work / "tiden-pr-check/tiden-pr-check.json").read_text()) == {
+            "checked": False, "prepare": "checkout success, Python success", "install": "success", "check": "failure",
+            "reason": "Refused: tiden spec list exited 3" if printed else None}
 
     root, base = repo
     commit(root, {"tests/test_new.py": "def test_new():\n    pass\n"}, "change")
@@ -374,10 +389,14 @@ def test_only_a_verdict_fails_the_pr_check_job_and_anything_else_warns(repo, ser
     lines, status = real(fault={})
     assert lines[-1].startswith("Refused: tests/test_bad.py does not parse")
     assert outcome(tmp_path, lines, status) == "outcome=failed"
+    commit(root, {"tests/test_bad.py": "def test_bad():\n    pass\n", "tests/test_nul.py": "x = 1\0\n"}, "nul")
+    lines, status = real(fault={})
+    assert lines[-1].startswith("Refused: tests/test_nul.py does not parse") and lines[-1].endswith("line None)")
+    assert outcome(tmp_path, lines, status) == "outcome=failed"
     assert outcome(tmp_path, ["Refused: a changed path is not valid UTF-8"], 1) == "outcome=failed"
     for line in ("Refused: unexpected UnicodeDecodeError", "Refused: unexpected FileNotFoundError",
                  "Refused: the spec listing of main is incomplete", "Refused: git diff exited 128",
-                 "Refused: tiden spec list timed out", "Refused: tests/x.py does not parse (y)"):
+                 "Refused: tiden spec list timed out", "Refused: tests/x.py does not parse"):
         assert outcome(tmp_path, ["## Tiden PR check", line], 1) == "outcome=unchecked", line
     verdict = "Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun."
     assert outcome(tmp_path, [verdict, "Refused: tiden spec list exited 3"], 1) == "outcome=unchecked"

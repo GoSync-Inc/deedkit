@@ -258,10 +258,11 @@ comes from the event that started the run, and a rerun replays the same event:
 after you edit the body, push a commit to check again. Fork pull requests and
 runs without `TIDEN_API_TOKEN` skip with a summary line. Any other outcome
 fails nothing: a Tiden CLI failure (unreachable, timeout, an error status or a
-malformed reply), another refusal, an unexpected error, a failed CLI install or
-a check killed at its step timeout. The job warns and keeps a
-`tiden-pr-check-receipt` artifact with the last line the check printed; the sync
-and `Tiden drift` still check after the merge, and a rerun of the job checks now.
+malformed reply), another refusal, an unexpected error, a failed checkout, Python
+setup or CLI install, or a check killed at its step timeout. The job warns and
+keeps a `tiden-pr-check-receipt` artifact with the last line the check printed,
+when the artifact service accepts it; the sync and `Tiden drift` still check
+after the merge, and a rerun of the job checks now.
 
 ## Drift watermark
 
