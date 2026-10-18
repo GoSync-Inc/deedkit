@@ -219,8 +219,11 @@ Record these independently, with timestamp, branch/release ID and exact Git SHA:
    SHA it leaves (unchanged by a partial sync or `none`).
 
 Readiness remains blocked while a relevant current defect, unresolved production
-incident or required acceptance lacks evidence, or a release review finding
-that holds the release ([review-protocol.md](review-protocol.md)) is open. This
+incident or required acceptance lacks evidence, a release review finding
+that holds the release ([review-protocol.md](review-protocol.md)) is open, or a
+merged change's required review that the orchestrator's post-merge audit found
+missing has not approved ([parallel-development.md](parallel-development.md),
+Worker protocol). This
 is the project's release decision; do not present it as a newly computed native
 Tiden verdict. Classifying future proposals alone
 does not repair runtime incidents or establish readiness.
@@ -313,8 +316,10 @@ display text can use DeedKit immediately.
 3. Implement in the appropriate Git branch. Update the existing requirement when
    its behavior changes; create a child only for an independent increment.
    Preserve preimages, historical source anchors and accepted test links.
-4. Run the appropriate synthetic checks and publish authentic results through
-   the existing reporter with exact checkout SHA and branch. Open the pull request
+4. Run the local tests `AGENTS.md` names (the touched code's tests and the new
+   tests); the full synthetic suites run in CI, which publishes authentic
+   results through the existing reporter with exact checkout SHA and branch.
+   Open the pull request
    with the `Tiden intent branch:` line the contract prints; CI routing uses it
    (TIDEN-CI.md). Never rename old
    tests or the seven `anymsg-ci::*` checks. Review assertions before proposing

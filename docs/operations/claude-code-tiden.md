@@ -43,7 +43,8 @@ workspace `1dc18e09-4a09-4d74-8300-cd4302622357` and product
    run that bypasses the reporter does not change the gate.
 6. After CI and the reviews, in the order in `AGENTS.md`, run
    `tiden intent progress`, link reviewed tests, then use `capture-intent`
-   (candidates, settle, waive) and `tiden intent close`. Defer a connected item
+   (candidates, settle with the spec text the review round covered, waive) and
+   `tiden intent close`. Defer a connected item
    that has no test yet with `--propose-tests`; never accept risk to clear an
    unrelated Backlog card.
 7. After merging `main` into the branch, pass the session's own commit range to

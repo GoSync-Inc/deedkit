@@ -14,11 +14,10 @@ under Review levels in [AGENTS.md](../../AGENTS.md), and the review procedure in
   every live provider action) and receives the summary of every owner-level pull
   request an agent merged. Nothing below delegates that authority implicitly.
 - **Orchestrator** (one at a time) selects ready stories, checks lanes, dispatches
-  worker sessions and checks their pull requests before they merge. It writes no
-  product code.
+  worker sessions and audits their merge reports. It writes no product code.
 - **Worker session** (Claude Code) implements exactly one story in its own
   worktree, branch, pull request and Tiden intent session or recorded skip.
-- **Codex** reviews as Astra and gives a second opinion when planning;
+- **Codex** reviews as Astra and gives a second opinion on request;
   development goes to Claude Code workers.
 - **Release owner** (one at a time) prepares and applies promotions of `main`.
 
@@ -103,12 +102,13 @@ at least important (`AGENTS.md`). Prefer splitting it.
   failed group check drops the pull request from the queue; fix it and enqueue
   again. Update a branch only for a real conflict or when a review asks for it,
   never just to stay current. A worker closes the intent session on its own commit
-  range before "ready to merge" ([Claude Code guide](claude-code-tiden.md)); a
-  conflict after the "ok" goes back to the orchestrator.
+  range before it merges ([Claude Code guide](claude-code-tiden.md)); a conflict
+  in another task's files goes back to the orchestrator.
 - Merge method: **squash** only; merge commits and rebase merges are disabled in
   the repository settings (2026-10-16). One story becomes one commit on `main`.
-- Who merges follows the review level in `AGENTS.md`; a worker also waits for the
-  orchestrator's "ok" (Worker protocol). Enqueueing a pull request is merging it.
+- Who merges follows the review level in `AGENTS.md`. A worker merges without an
+  "ok" from the orchestrator, except during a merge freeze (Releases).
+  Enqueueing a pull request is merging it.
   Never bypass required checks or use administrator merges.
 - Merging the Git pull request never merges its Tiden branch. Merge both in the
   same step, under the same review level and conditions: check the Tiden merge
@@ -133,9 +133,9 @@ at least important (`AGENTS.md`). Prefer splitting it.
   never implies a deploy. A release in flight holds merges from prepare to apply,
   because apply checks again that its SHA is the current `main`
   ([production.md](production.md)). The release owner tells the orchestrator
-  before prepare and after apply, and the orchestrator gives no "ok" in between;
-  it lets already enqueued pull requests merge or dequeues them before the release
-  SHA is chosen.
+  before prepare and after apply, and the orchestrator announces a merge freeze
+  to the workers in between, during which no worker enqueues; it lets already
+  enqueued pull requests merge or dequeues them before the release SHA is chosen.
 - The release owner promotes the exact current `main` SHA by
   [production.md](production.md), after that SHA's own push run succeeds; never
   an earlier SHA. The readiness decision in the Tiden workflow is recorded for
@@ -168,8 +168,9 @@ at least important (`AGENTS.md`). Prefer splitting it.
 2. List open pull requests and intent branches; compute busy lanes.
 3. Select the wave by the Queue rule in the card intake
    ([tiden-product-workflow.md](tiden-product-workflow.md)) and dispatch every
-   selected story whose paths fit a free lane; there is no fixed number of
-   workers. The real limits are file overlap (lanes), the GitHub CI queue and the
+   selected story whose paths fit a free lane; there is no fixed cap on
+   workers, and the owner's target is at least seven at once (10–15 later). The
+   real limits are file overlap (lanes), the GitHub CI queue and the
    owner's attention for what it keeps and for questions; the orchestrator
    watches them.
 4. Each brief names the story and adds only what the story and the Tiden
@@ -181,11 +182,11 @@ at least important (`AGENTS.md`). Prefer splitting it.
    the worker sets the level from the working contract (`AGENTS.md`). The brief
    does not restate them. A skip without a story has a brief that carries the
    goal, expected paths, acceptance and checks.
-5. Answer workers' questions and check each pull request before its "ok" (Worker
-   protocol). Read a waiting worker's terminal with `superset terminals read` and
-   give the owner exactly what it asks, so the owner need not open worker terminals.
-6. After merge: confirm the worker's post-merge check, update the story (for a
-   skip, the release spec sync updates it), free the lane.
+5. Answer workers' questions and audit each merge report (Worker protocol). Read
+   a waiting worker's terminal with `superset terminals read` and give the owner
+   exactly what it asks, so the owner need not open worker terminals.
+6. After merge: read the worker's post-merge check in its final result, update
+   the story (for a skip, the release spec sync updates it), free the lane.
 7. Escalate to the owner: priority conflicts, the pull requests and actions the
    owner keeps under Review levels in `AGENTS.md`, disagreeing reviewers and
    unclear product direction as questions, any feature or improvement story that
@@ -244,26 +245,35 @@ orchestrator measures usage-limit spend by role, review findings and rounds per
 pull request and the share of pull requests with green CI from the first push;
 the weekly review reads these measurements.
 
-The worker writes and waits for the answer:
+The card is the plan: there is no plan approval round. The worker writes and
+waits for the answer only before going out of scope: another task's file, an
+action the owner keeps, a change to the card's criteria, or a fork without an
+obvious answer.
 
-- before `tiden intent start`: its objective and promises, which cannot be edited
-  after the start;
-- before going out of scope: another task's file, an action the owner keeps, or a fork
-  without an obvious answer;
-- before merging: "ready to merge" with the pull request, CI, review results and
-  the Tiden verdict or recorded skip. The orchestrator checks CI, the diff and the
-  Tiden merge preview (the recorded skip when there is no Tiden branch) itself and
-  only then answers "ok"; it hands a pull request the owner keeps to the owner.
-  It also confirms that the level follows the signals in `AGENTS.md` and, for a
-  normal-level pull request, that the author checklist, the "fails without the
-  fix" record and any process-text checklist review are in the description. It
-  sends back a pull request with a record missing and raises the level when the
-  signals require it.
+The worker writes without waiting:
 
-The worker writes without waiting: at the start, when it opens the pull request,
-and its final result. The result ends with a `SUPERSET_WORKER_DONE` or
-`SUPERSET_WORKER_BLOCKED` block. Both list `task`, `summary`, `files` and `checks`;
-DONE adds `handoff`, BLOCKED adds `reason` and `needs`.
+- at the start: its objective and promises, for information; it starts the
+  intent at once, and the promises cannot be edited after the start;
+- when it opens the pull request;
+- when it merges: the pull request, CI, review results, the Tiden verdict or
+  recorded skip and the squash SHA. It merges itself when the conditions under
+  Review levels in `AGENTS.md` hold and no merge freeze is announced, and hands
+  a pull request the owner keeps to the orchestrator for the owner (Orchestrator
+  loop 7). The orchestrator audits the report after the merge: that the level
+  follows the signals in `AGENTS.md`, that spec text written at settle matches
+  the `Settle text:` the review round covered, and, for a normal-level pull
+  request, that the author checklist, the "fails without the fix" record and any
+  process-text checklist review are in the description. A missing record is
+  added to the pull request description. A level the signals raise gets that
+  level's missing reviews on the squash commit, and the change is held from
+  release and package publication from the moment the gap is found: the
+  orchestrator records the hold and tells the release owner, and the hold clears
+  when those reviews approve with no open blocking or major finding, the change
+  is reverted, or the owner accepts the risk (`AGENTS.md`). A merged pull request
+  the owner keeps goes to the owner at once, with a revert pull request ready;
+- its final result. It ends with a `SUPERSET_WORKER_DONE` or
+  `SUPERSET_WORKER_BLOCKED` block. Both list `task`, `summary`, `files` and
+  `checks`; DONE adds `handoff`, BLOCKED adds `reason` and `needs`.
 
 The final result depends on the level:
 
@@ -286,8 +296,10 @@ or a later one, a green `Tiden drift` run on it or a later one (a red run names
 the files to anchor, TIDEN-CI.md) and, for a change with a Tiden branch, Tiden
 main and drift read back as in [tiden-product-workflow.md](tiden-product-workflow.md).
 
-After its final result the worker stays open until its pull request is merged and
-checked after the merge. The orchestrator then closes its terminal and archives
+A worker that merged its own pull request reaches its final result already
+merged and checked; a worker whose pull request the owner keeps stays open after
+its final result until the pull request is merged and checked after the merge.
+The orchestrator then closes its terminal and archives
 the workspace without asking again, after checking that the worktree has no
 uncommitted changes: archiving deletes the folder, the branch stays.
 
@@ -303,15 +315,17 @@ timed reports.
 - Codex and Claude Code follow the same rules. Tool-specific setup lives in
   `CLAUDE.md` and the [Claude Code Tiden guide](claude-code-tiden.md).
 - **Context budget.** Every call re-reads the whole context, so cost grows with
-  session length. One story is one worker session. At about 250k tokens of
-  context, or at a story boundary, a worker writes a handoff file (task, state,
-  open items, next step) into its scratchpad and tells the orchestrator, which
-  starts a fresh session from that file. The orchestrator restarts from its own
+  session length. One story is one worker session. About 250k tokens of context
+  is a soft signal, not a stop: the worker finishes its current step and hands
+  off only at the next natural boundary (between cards, or before a long new
+  phase). It then writes a handoff file (task, state, open items, next step) into
+  its scratchpad and tells the orchestrator, which starts a fresh session from
+  that file with the context it needs. The orchestrator restarts from its own
   handoff file at about 300k.
 - **Large output.** Tiden commands use `--format json` with a `jq` field
   projection; files over about 20k characters are read by range or `grep`.
   Whole exports never go into a session or a reviewer packet.
 - **Messages.** A worker writes once per state change (the start, a question,
-  the pull request opened, ready to merge, blocked, the final result), not
+  the pull request opened, merged, blocked, the final result), not
   progress reports. The orchestrator asks for an idle notice only when it
   expects an answer.
