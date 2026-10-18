@@ -45,7 +45,7 @@ story (or the goal for a skip), the lane and the review level (`Lane: <lane>`,
 `Tiden: skip — <reason>`. The draft pull request is the claim. Before dispatching,
 the orchestrator lists open pull requests and open intent branches; an item with a
 claim is taken. A card named on the `Spec sync:` line of a pull request merged
-since the last release spec sync is delivered and waits for that sync; it is not
+since the last completed release spec sync is delivered and waits for that sync; it is not
 dispatched again. When a claimed pull request has no activity for two days, the
 orchestrator hands it to a new worker on the same branch and pull request and
 tells the owner. Git allows one worktree per branch, so the orchestrator first
