@@ -1,5 +1,6 @@
 """The drift watermark job against temporary Git repositories and a fake Tiden CLI; it never calls Tiden."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -52,7 +53,7 @@ FAKE = textwrap.dedent(f"""\
         # As CLI 0.33.0 does: a stale --from is refused with exit 0 and "advanced": false.
         advanced = options["--from"] == state["watermark"]
         if advanced:
-            state["watermark"] = options["--to"]
+            state["watermark"] = state.get("lands_on") or options["--to"]  # lands_on: another writer moved it on
         save()
         fault("advance")
         print(json.dumps({{"advanced": advanced, "watermark": {{"lastReconciledSha": state["watermark"]}}}}))
@@ -199,6 +200,55 @@ def test_paths_stay_literal_renames_need_their_destination_and_deletions_need_no
     assert run(repo, server)[0] == 0 and server.state()["watermark"] == c
 
 
+@pytest.mark.parametrize("name", ["scripts/carriage\rreturn.py", "scripts/crlf\r\nname.py"])
+def test_a_carriage_return_name_is_not_aliased_to_a_newline_name(repo, server, name):
+    a = commit(repo, {"base.py": "x"}, "A")
+    c = commit(repo, {name: "z"}, "B")
+    git(repo, "push", "-q", "origin", "main")
+    server.set(watermark=a, anchors=[name.replace("\r\n", "\n").replace("\r", "\n")])
+    assert run(repo, server)[0] == 1 and server.state()["advances"] == []
+    server.set(anchors=[name])
+    assert run(repo, server)[0] == 0 and server.state()["watermark"] == c
+
+
+def test_a_path_that_is_not_utf8_fails_closed(repo, server):
+    a = commit(repo, {"base.py": "x"}, "A")
+    try:
+        (repo / os.fsdecode(b"bad\xff.py")).write_text("z")
+    except OSError:
+        pytest.skip("this filesystem refuses non-UTF-8 names")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "B")
+    git(repo, "push", "-q", "origin", "main")
+    server.set(watermark=a, anchors=[])
+    with pytest.raises(Refused, match="UTF-8"):
+        run(repo, server)
+    assert server.state()["advances"] == []
+
+
+def test_a_read_back_on_a_commit_off_main_fails(repo, server):
+    a, b, c = history(repo)
+    git(repo, "checkout", "-q", "-b", "side")
+    off = commit(repo, {"services/messaging/side.py": "s"}, "off main")
+    git(repo, "checkout", "-q", "main")
+    server.set(watermark=a, anchors=["services/messaging/app.py", "services/messaging/new.py"], lands_on=off)
+    with pytest.raises(Refused, match="later merge on main"):
+        run(repo, server)
+    assert len(server.state()["advances"]) == 1
+
+
+def test_a_read_back_on_a_later_merge_this_checkout_lacks_passes(repo, server, tmp_path):
+    a, b, c = history(repo)
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(tmp_path / "origin.git"), str(other)], check=True)
+    for key, value in (("user.name", "Test"), ("user.email", "test@example.invalid"), ("commit.gpgsign", "false")):
+        git(other, "config", key, value)
+    d = commit(other, {"services/messaging/later.py": "d"}, "D")
+    git(other, "push", "-q", "origin", "main")
+    server.set(watermark=a, anchors=["services/messaging/app.py", "services/messaging/new.py"], lands_on=d)
+    assert run(repo, server)[0] == 0 and len(server.state()["advances"]) == 1
+
+
 def test_unanchored_odd_names_are_escaped_in_the_report(repo, server):
     a = commit(repo, {"base.py": "x"}, "A")
     commit(repo, {"scripts/new\nforged line.py": "z"}, "B")
@@ -274,11 +324,29 @@ def test_failures_before_the_advance_send_nothing(repo, server, monkeypatch, sta
     {"pagination": {"nextPageToken": "", "totalCount": 1},
      "requirements": [{"id": "s", "sourceCount": 2, "sources": [{"sourceType": "repo_file", "repoPath": "a.py"}]}]},
     {"pagination": {"nextPageToken": "", "totalCount": 1}, "requirements": [{"id": "s", "sourceCount": 1}]},
+    {"pagination": {"nextPageToken": "", "totalCount": 1}, "requirements": [{"id": "", "sources": []}]},
+    {"pagination": {"nextPageToken": "", "totalCount": 1},
+     "requirements": [{"id": "s", "sourceCount": True, "sources": [{"sourceType": "repo_file", "repoPath": "a.py"}]}]},
+    {"pagination": {"nextPageToken": "", "totalCount": 1},
+     "requirements": [{"id": "s", "sourceCount": 1, "sources": [{"sourceType": "repo_file"}]}]},
 ])
 def test_an_incomplete_or_malformed_listing_fails_closed(repo, server, listing):
     a, *_ = history(repo)
     server.set(watermark=a, anchors=[], listing=listing)
     with pytest.raises(Refused):
+        run(repo, server)
+    assert server.state()["advances"] == []
+
+
+@pytest.mark.parametrize("repository", [False, [], {}, 0])
+def test_a_malformed_source_repository_fails_closed_instead_of_counting_as_legacy(repo, server, repository):
+    a, *_ = history(repo)
+    paths = ["services/messaging/app.py", "services/messaging/new.py"]
+    server.set(watermark=a, anchors=[], listing={
+        "pagination": {"nextPageToken": "", "totalCount": 1},
+        "requirements": [{"id": "s", "sourceCount": 2, "sources": [
+            {"sourceType": "repo_file", "repoPath": path, "repository": repository} for path in paths]}]})
+    with pytest.raises(Refused, match="repository"):
         run(repo, server)
     assert server.state()["advances"] == []
 
@@ -391,9 +459,10 @@ def test_the_workflow_runs_after_every_merge_serialized_and_read_only():
     assert steps[0]["run"] == 'test "$REF" = refs/heads/main'
     checkout = next(step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@"))
     assert checkout["with"] == {"persist-credentials": False, "ref": "main", "fetch-depth": 0}
-    holders = [step["name"] for step in steps if "TIDEN_API_TOKEN" in json.dumps(step.get("env", {}))]
-    assert holders == ["Check optional Tiden configuration",
-                       "Require an anchor for every changed code file, then advance the watermark"]
+    holders = [step["name"] for step in steps if "${{ secrets.TIDEN_API_TOKEN }}" in step.get("env", {}).values()]
+    assert holders == ["Require an anchor for every changed code file, then advance the watermark"]
+    config = next(step for step in steps if step.get("id") == "config")
+    assert config["env"]["HAS_TOKEN"] == "${{ secrets.TIDEN_API_TOKEN != '' }}"
     assert all("secrets." not in step.get("run", "") for step in steps)
 
 

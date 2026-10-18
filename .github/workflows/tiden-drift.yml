@@ -26,12 +26,13 @@ jobs:
         run: test "$REF" = refs/heads/main
       - name: Check optional Tiden configuration
         id: config
+        # Only whether the secret exists; the token itself reaches the checker step alone.
         env:
-          TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
+          HAS_TOKEN: ${{ secrets.TIDEN_API_TOKEN != '' }}
           TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
           TIDEN_WORKSPACE_ID: ${{ vars.TIDEN_WORKSPACE_ID }}
         run: |
-          if [ -z "$TIDEN_API_TOKEN" ]; then
+          if [ "$HAS_TOKEN" != true ]; then
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             echo 'Tiden reporting is not configured; see TIDEN-CI.md.' >> "$GITHUB_STEP_SUMMARY"
           else

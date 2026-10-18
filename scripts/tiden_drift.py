@@ -85,9 +85,16 @@ def excluded(path: str) -> bool:
 
 
 def changed(root: Path, base: str, target: str) -> list[str]:
-    """Paths added or modified from base to target, NUL-delimited so any file name stays literal."""
-    output = git(root, "diff", "-z", "--name-only", "--no-renames", "--diff-filter=d", base, target)
-    return [path for path in output.split("\0") if path]
+    """Paths added or modified from base to target, read as NUL-delimited bytes so no file name is rewritten
+    (text mode would turn a carriage return into a newline and alias two distinct names)."""
+    completed = subprocess.run(["git", "-C", str(root), "diff", "-z", "--name-only", "--no-renames",
+                                "--diff-filter=d", base, target], capture_output=True, timeout=TIMEOUT)
+    if completed.returncode:
+        raise Refused(f"git diff exited {completed.returncode}")
+    try:
+        return [path.decode("utf-8") for path in completed.stdout.split(b"\0") if path]
+    except UnicodeDecodeError:
+        raise Refused("a changed path is not valid UTF-8, so it cannot be matched to an anchor") from None
 
 
 def shown(path: str) -> str:
@@ -130,17 +137,25 @@ def anchors(cli: str, product: str) -> set[str]:
         raise Refused("the spec listing is incomplete")
     paths, ids = set(), set()
     for spec in specs:
-        if not isinstance(spec, dict) or not isinstance(spec.get("id"), str) or spec["id"] in ids:
+        if not isinstance(spec, dict) or not isinstance(spec.get("id"), str) or not spec["id"] or spec["id"] in ids:
             raise Refused("the spec listing has a missing or duplicate spec id")
         ids.add(spec["id"])
         # The JSON API omits zero counts and empty arrays; a nonempty array still needs its exact count.
-        sources = spec.get("sources", [])
+        sources, count = spec.get("sources", []), spec.get("sourceCount", 0)
         if (not isinstance(sources, list) or not all(isinstance(source, dict) for source in sources)
-                or spec.get("sourceCount", 0) != len(sources)):
+                or type(count) is not int or count != len(sources)):
             raise Refused("the spec listing has malformed or incomplete sources")
-        paths.update(source["repoPath"] for source in sources
-                     if source.get("sourceType") == "repo_file" and isinstance(source.get("repoPath"), str)
-                     and (source.get("repository") or "") in ANCHOR_REPOSITORIES)
+        for source in sources:
+            # Only an absent or null repository means a legacy anchor; any other non-string value is malformed.
+            repository = source.get("repository")
+            if repository is not None and not isinstance(repository, str):
+                raise Refused("the spec listing has a malformed source repository")
+            if source.get("sourceType") != "repo_file":
+                continue
+            if not isinstance(source.get("repoPath"), str) or not source["repoPath"]:
+                raise Refused("the spec listing has a repo_file source without a path")
+            if (repository or "") in ANCHOR_REPOSITORIES:
+                paths.add(source["repoPath"])
     return paths
 
 
@@ -184,8 +199,11 @@ def check(root: Path, cli: str, product: str, report) -> int:
     if answer.get("advanced") is not True:
         # CLI 0.33.0 answers a stale --from with exit 0 and "advanced": false (verified 2026-10-18).
         raise Refused(f"the server did not advance from {base} (now {after}); rerun to read the watermark again")
-    if after != target and not ancestor(root, target, after):
-        raise Refused(f"after the advance the watermark is {after}, not {target}")
+    if after != target:
+        # Only another writer's advance to a later merge on main is acceptable; fetch main, which may hold it.
+        head = main_now(root)
+        if not (present(root, after) and ancestor(root, target, after) and ancestor(root, after, head)):
+            raise Refused(f"after the advance the watermark is {after}, not {target} or a later merge on main")
     report(f"Watermark advanced to {target}.")
     return 0
 
