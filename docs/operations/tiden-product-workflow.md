@@ -237,8 +237,8 @@ A normal-level pull request that changes no acceptance criterion skips the
 intent loop (`AGENTS.md`), so its spec writes wait for this release step: links
 for its new tests, spec text outside the criteria that it made stale (Boundary,
 evidence notes) and the delivered status of the card it names. Anchors for its
-new code files cannot wait: it adds them when it merges, or the drift workflow
-fails. The same step audits spec text against the code since the semantic
+new code files cannot wait: it adds them before or in the same step as its merge,
+or the drift workflow fails. The same step audits spec text against the code since the semantic
 baseline: the candidate SHA of the last completed full sync, recorded in the
 readiness record (item 5 above). The drift workflow advances the watermark after
 every merge once changed code is anchored (Reconciliation and maintenance), so
@@ -246,7 +246,9 @@ the watermark never stands in for that baseline. The release owner runs the sync
 before the release review whenever the delta from the semantic baseline to the
 candidate changes a product file or a skipped pull request merged since the last
 completed spec sync waits for its spec writes, and otherwise records
-`Spec sync: none — <reason>`. Example: the last full sync was at A, the drift
+`Spec sync: none — <reason>`. The first semantic baseline is
+69486f43b7140632c5eeed6a27690683e3a82c68, the target of the ANYM-314 catch-up
+audit. Example: the last full sync was at A, the drift
 workflow has moved the watermark to C, and the candidate is C; the sync audits
 A..C, not the empty watermark range.
 
@@ -375,7 +377,7 @@ spec text current. The drift workflow (`.github/workflows/tiden-drift.yml`,
 merge, with `--reason empty_sync`, and only when every code file changed since
 the watermark has an anchor on some spec; otherwise it fails, names the files and
 leaves the watermark. Every pull request therefore anchors its new code files on
-the specs they implement when it merges. The watermark means "changed code is
+the specs they implement before or in the same step as its merge. The watermark means "changed code is
 anchored", not "spec text audited": the audit of spec text is the release spec
 sync, tracked by its own semantic baseline. `empty_sync` is a compare-and-set on
 `--from`: on 2026-10-18 a stale `--from` returned `"advanced": false` and the

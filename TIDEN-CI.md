@@ -168,7 +168,13 @@ it is when the run starts, not its event commit, and runs
    links, not anchors.
 2. Every remaining path needs a `repo_file` anchor on some spec on Tiden main.
    If one lacks it, the run fails, lists the paths in its summary and leaves the
-   watermark. Anchor each on the spec it implements, then rerun the failed run.
+   watermark. Add each path as a `repo_file` source of the spec it implements:
+   at settle on the pull request's Tiden branch, which merges with the pull
+   request, or for a skipped pull request directly on Tiden main as bookkeeping
+   with `tiden spec update --id <spec> --sources-file <file>`, which replaces the
+   whole list, so resend every existing source with its fields
+   (docs/operations/tiden-product-workflow.md, Reconciliation and maintenance).
+   Do it before or in the same step as the Git merge, then rerun the failed run.
 3. Otherwise it runs `tiden drift advance --from W --to <checkout> --reason
    empty_sync` once, requires `"advanced": true` and reads the watermark back.
    The server compares `--from` with the current watermark and answers a stale
@@ -184,6 +190,10 @@ was sent leaves its result unknown: the run is not retried in place, and a rerun
 reads the server watermark again before it acts. Without `TIDEN_API_TOKEN` the
 workflow records that reporting is not configured and passes. Widening `EXCLUDED`
 is a reviewed code change to the checker and its test, never a data edit.
+
+The agent that merged a pull request checks that the `Tiden drift` run on its
+squash commit is green before it reports the merge as checked; a red run names
+the files to anchor.
 
 ## Environments
 

@@ -43,6 +43,7 @@ EXCLUDED = (
     ("*/go.mod", "dependency pins"),
     ("*/requirements*.in", "dependency pins"),
     ("*/requirements*.txt", "dependency pins"),
+    ("*/requirements*.lock", "exported lockfiles"),
 )
 SHA = re.compile(r"[0-9a-f]{40}")
 TIMEOUT = 120

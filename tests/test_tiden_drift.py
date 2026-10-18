@@ -418,7 +418,7 @@ def test_the_exclusion_categories_are_exactly_the_reviewed_set():
     assert [pattern for pattern, _ in EXCLUDED] == [
         "*.md", "docs/*", ".claude/*", "tests/*", "*/tests/*", "*_test.go", "*.test.mjs", "*.test.js", "*.test.ts",
         "*/fixtures/*", "*/testdata/*", "uv.lock", "*/uv.lock", "package-lock.json", "*/package-lock.json",
-        "*/go.sum", "*/go.mod", "*/requirements*.in", "*/requirements*.txt"]
+        "*/go.sum", "*/go.mod", "*/requirements*.in", "*/requirements*.txt", "*/requirements*.lock"]
     assert all(reason for _, reason in EXCLUDED)
 
 

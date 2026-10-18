@@ -99,9 +99,10 @@ in doubt, flag it. The author flags by hand until a script does (planned:
 `scripts/spec_impact.py`). A skip is invalid when it changes code beyond comments
 and either the level is above normal or the diff changes an acceptance criterion.
 A skipped pull request builds the list from the anchors alone, anchors its new
-code files on the specs they implement (the drift workflow fails without them,
-TIDEN-CI.md) and ends with a `Spec sync:` line naming its new tests and the card
-it delivers, if any, for the release spec sync.
+code files on the specs they implement before or in the same step as its merge
+(the drift workflow fails without them, TIDEN-CI.md) and ends with a `Spec sync:`
+line naming its new tests and the card it delivers, if any, for the release spec
+sync.
 The reviewers of its level (for a normal PR, the release review) receive the
 current text of the promised and the flagged specs and the IDs and dispositions
 of the rest, and check each disposition; "no behavior change" on a spec whose
