@@ -10,8 +10,10 @@ The existing operator handles explicitly scheduled singleton updates.
 1. `prepare` requires the exact current `main` SHA and its latest successful push
    CI attempt. It fetches clean source, builds immutable images and saves private
    configuration snapshots without starting application containers.
-2. `promote` rechecks image, configuration, container and router identities. Old
-   and new messaging images must have identical SQL inventories. It starts a
+2. `promote` rechecks image, configuration, container and router identities. The
+   candidate and the plan A API image must have identical SQL inventories; the
+   serving HTTP generation's image may lack only later migrations that plan A
+   already applied (its inventory is a prefix of the candidate's). It starts a
    uniquely named gateway/API pair beside the serving generation, without
    inherited host ports or provider-owner dependencies.
 3. Candidates remain `warming`: ordinary HTTP fails closed and upload maintenance
@@ -53,7 +55,10 @@ identities and all other module targets.
 
 Updating singleton code still needs its own deployment and applicable session or
 call authority. Schema changes require a separate reviewed compatibility and
-backup plan; this operator refuses differing SQL inventories before overlap.
+backup plan; this operator refuses differing SQL inventories before overlap,
+except a serving generation that predates migrations plan A has already applied
+under that plan. The candidate API's read-only readiness then requires the
+database version and checksums to equal the candidate inventory exactly.
 Never use a migration or provider command as readiness.
 
 ## Internal router and first enrollment

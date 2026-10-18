@@ -780,6 +780,41 @@ def test_promotion_preserves_every_fenced_issuer_tombstone(tmp_path, monkeypatch
 
 
 
+def test_serving_generation_may_lack_only_migrations_plan_a_already_runs(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    base = {'schema.sql': '1'*64, 'migrations/002_archive.sql': '2'*64, 'migrations/003_more.sql': '3'*64}
+    candidate = {**base, 'migrations/004_expand.sql': '4'*64}
+    serving = 'sha256:' + 'd' * 64
+    def check(old):
+        inventories = {IMAGE: candidate, OLD: candidate, serving: old}
+        monkeypatch.setattr(s.p, 'run', lambda command: json.dumps(inventories[command[-3]]))
+        s.check_schema(cfg, {'images': {'runtime': IMAGE}, 'schema': candidate,
+            'baseline': [{'name': 'messages', 'running': {'api': {'image': OLD}}}], 'previous': {'images': {'runtime': serving}}})
+    check(base)
+    check(candidate)
+    refused = [
+        {**base, 'migrations/003_more.sql': 'f'*64},  # an applied migration changed
+        {**base, 'schema.sql': 'f'*64},
+        {**candidate, 'migrations/005_newer.sql': '5'*64},  # the serving generation is newer
+        {'schema.sql': '1'*64, 'migrations/002_archive.sql': '2'*64, 'migrations/004_expand.sql': '4'*64},  # gap below its newest
+        {**base, 'notes.sql': '9'*64}]
+    for old in refused:
+        with pytest.raises(s.Refused, match='schema inventory mismatch'):
+            check(old)
+
+
+def test_plan_a_api_must_run_the_candidate_inventory_even_with_a_prefix_generation(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    base = {'schema.sql': '1'*64, 'migrations/002_archive.sql': '2'*64}
+    candidate = {**base, 'migrations/003_expand.sql': '3'*64}
+    serving = 'sha256:' + 'd' * 64
+    inventories = {IMAGE: candidate, OLD: base, serving: base}
+    monkeypatch.setattr(s.p, 'run', lambda command: json.dumps(inventories[command[-3]]))
+    with pytest.raises(s.Refused, match='schema inventory mismatch'):
+        s.check_schema(cfg, {'images': {'runtime': IMAGE}, 'schema': candidate,
+            'baseline': [{'name': 'messages', 'running': {'api': {'image': OLD}}}], 'previous': {'images': {'runtime': serving}}})
+
+
 def test_prepare_after_plan_a_reuses_its_images_for_the_schema_probe(tmp_path, monkeypatch):
     from tests.test_production import ImageStore
     monkeypatch.setattr(s.p, 'IMAGE_LOCK', tmp_path / 'absent' / 'image-build.lock')
