@@ -797,7 +797,8 @@ def test_prepare_after_plan_a_reuses_its_images_for_the_schema_probe(tmp_path, m
             return json.dumps({'schema.sql': '1'*64, 'migrations/002_archive.sql': '2'*64})
         return result
     monkeypatch.setattr(s.p, 'run', run)
-    # Plan A (production.py prepare and apply) builds both HTTP images; its containers run on them.
+    monkeypatch.setattr(s.p, 'published', store.published)
+    # Plan A (production.py prepare and apply) pulls both HTTP images; its containers run on them.
     plan_a = {target: s.p.build_image(tmp_path, SHA, target) for target in ('runtime', 'gateway')}
     docs = documents(cfg)
     baseline = []
@@ -807,7 +808,7 @@ def test_prepare_after_plan_a_reuses_its_images_for_the_schema_probe(tmp_path, m
         s.p.write(release / (name+'.json'), s.p.escaped(docs[name]))
         baseline.append({'name': name, 'before_digest': s.p.digest(docs[name]),
                          'running': {service: {'container': 'plan-a-'+name, 'image': plan_a[target]}}})
-    # Seamless preparation then builds the same targets through production.py.
+    # Seamless preparation then obtains the same targets through production.py.
     monkeypatch.setattr(s.p, 'prepare', lambda *a: {'images': {target: s.p.build_image(tmp_path, SHA, target) for target in ('runtime', 'gateway')},
                                                      'projects': baseline, 'ci': {'sha': SHA}})
     live = s.route_document(cfg)
@@ -816,7 +817,7 @@ def test_prepare_after_plan_a_reuses_its_images_for_the_schema_probe(tmp_path, m
     monkeypatch.setattr(s, 'router_get', lambda *a: (live, '"etag"'))
     monkeypatch.setattr(s.p, 'verify', lambda *a: {'sha': SHA})
     assert s.prepare(cfg, SHA)['images'] == plan_a
-    assert len(store.built()) == 2 and set(plan_a.values()) <= set(store.images)
+    assert len(store.pulls()) == 2 and store.built() == [] and set(plan_a.values()) <= set(store.images)
     # The receipt schema, the candidate and the running plan A API image are all probed, on plan A's image.
     assert probed == [plan_a['runtime']] * 3
     assert s.p.read(release / 'http-prepared.json')['images'] == plan_a

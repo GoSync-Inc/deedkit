@@ -1,0 +1,2 @@
+# Local builds; the recorded SHA-256 is in attest-verify.linux-amd64.sha256.
+/attest-verify
