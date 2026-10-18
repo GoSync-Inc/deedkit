@@ -16,7 +16,7 @@ _TRIMMED = r"regexp_replace(sp.display_name,'^\s+|\s+$','','g')"
 _DIGITS = "split_part(split_part(sp.sender,'@',1),':',1)"
 NORMALIZED_SQL = _DIGITS+"||'@'||split_part(sp.sender,'@',2)"
 RAW_NAME_SQL = ('('+_TRIMMED+"='' OR "+_TRIMMED+" IN (sp.sender,split_part(sp.sender,'@',1)) OR "+
-    'substring('+_TRIMMED+" from '^"+_ID_DIGITS+"$')="+_DIGITS+')')
+    'coalesce(substring('+_TRIMMED+" from '^"+_ID_DIGITS+"$')="+_DIGITS+',false))')
 
 
 def raw_name(name, sender):
