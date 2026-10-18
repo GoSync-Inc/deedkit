@@ -782,7 +782,8 @@ def images_report(settings):
             reasons.setdefault(image, []).append(why)
     current = read(state / "current.json") if (state / "current.json").exists() else {}
     for image in current.get("images", {}).values():
-        keep(image, "current release " + current["sha"])
+        keep(image, ("rolled-back release " if current.get("status") == "rolled-back" else "current release ")
+             + current["sha"])
     for services in current.get("previous_images", {}).values():
         for image in services.values():
             keep(image, "restored by the rollback of " + current["sha"])

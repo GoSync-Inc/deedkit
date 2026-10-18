@@ -1450,4 +1450,5 @@ def test_retention_report_after_a_rollback_keeps_the_restored_images(tmp_path, m
     monkeypatch.setattr(p, "run", run)
     kept = {item["image"]: item["reasons"] for item in p.images_report(host.settings)["keep"]}
     assert "restored by the rollback of " + RELEASES[2] in kept[host.image(RELEASES[1])]
+    assert kept[host.image(RELEASES[2])][0] == "rolled-back release " + RELEASES[2]
     assert set(kept) == {host.image(sha) for sha in RELEASES}
