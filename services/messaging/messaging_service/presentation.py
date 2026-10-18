@@ -216,14 +216,16 @@ def lean_queue_conversation(state, last, hint):
     shown=[m for m in (last and last['id'],hint and hint.get('message_id')) if m]
     result=lean_conversation(state,shown=shown)
     if result.get('latest_message_id') in shown:result.pop('latest_message_id')
+    attention=result.get('owner_attention')
+    if attention:
+        # The target is the hint's message, or the shown head in a row without a hint.
+        target=hint['message_id'] if hint else last and last['id']
+        if target and attention.get('target_message_id')==target:attention.pop('target_message_id')
+        if attention['suggested_action']==result['suggested_action']:attention.pop('suggested_action')
     if not hint:return result
     if result['basis'] in (hint.get('confidence'),hint.get('basis')):result.pop('basis')
     if 'candidate_message_ids' in result:
         result['candidate_message_ids']=[m for m in result['candidate_message_ids'] if m!=hint['message_id']]
-    attention=result.get('owner_attention')
-    if attention:
-        if attention.get('target_message_id')==hint['message_id']:attention.pop('target_message_id')
-        if attention['suggested_action']==result['suggested_action']:attention.pop('suggested_action')
     return result
 
 

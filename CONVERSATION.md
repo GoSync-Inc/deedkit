@@ -34,6 +34,12 @@ In the conversation view each message tool returns every message text once.
   the `context` neighbours. `list_chats` groups the reply hint into one
   `awaiting_reply` object and shows the latest message once in `last_message`.
   Each fact appears once per `list_chats` row (compact queue rows below).
+- `detail="transcript"`: only the numbered transcript with message IDs, its
+  warnings, cursors and file references (`files`). Message text defaults to
+  2000 characters; `body_chars` changes it. Requires `view="conversation"`.
+- `detail="full"`: every field documented below, including `body`, ordering,
+  timestamp precision and the complete conversation state. Unchanged by the
+  compact and transcript levels, as is `view="archive"` compact output.
 
 ### Compact queue rows
 
@@ -51,22 +57,19 @@ two fields would carry the same fact, compact keeps the first and omits the othe
 - `conversation.candidate_message_ids` omits `awaiting_reply.message_id`; with
   `order_status="ambiguous"` it lists the other tied messages;
 - compact omits `conversation.owner_attention.target_message_id` when it equals
-  `awaiting_reply.message_id`, and `owner_attention.suggested_action` when it
-  equals `conversation.suggested_action`;
+  `awaiting_reply.message_id` or, in a row without `awaiting_reply` (expired or
+  dismissed attention), `last_message.id`;
+- compact omits `owner_attention.suggested_action` when it equals
+  `conversation.suggested_action`;
 - `sender_name` in `last_message` and `awaiting_reply` is cut to 64 characters,
   as in compact messages.
 
 The remaining hint fields keep their names and meanings: `message_id`,
-`revision`, `sender_id`, `sender_name`, `priority`, `reasons`, `waiting_hours`,
-`incoming_count`, `basis`, `has_question`, `dismissed` and `confidence` when it
-is not the default, as does the row's `read_state`. `detail="full"` keeps every
-field.
-- `detail="transcript"`: only the numbered transcript with message IDs, its
-  warnings, cursors and file references (`files`). Message text defaults to
-  2000 characters; `body_chars` changes it. Requires `view="conversation"`.
-- `detail="full"`: every field documented below, including `body`, ordering,
-  timestamp precision and the complete conversation state. Unchanged by the
-  compact and transcript levels, as is `view="archive"` compact output.
+`revision`, `sender_id`, `sender_name`, `sender_name_basis`, `priority`,
+`reasons`, `waiting_hours`, `incoming_count`, `basis`, `has_question`,
+`dismissed`, `confidence` when it is not the default, and `display_text` with
+`truncated` (the hint's own text, or the head's when the hint is the head). The
+row's `read_state` is unchanged. `detail="full"` keeps every field.
 
 ## Ordering and windows
 

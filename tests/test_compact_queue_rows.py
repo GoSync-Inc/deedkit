@@ -91,6 +91,11 @@ def assert_each_fact_once(row):
     shown={v for key in ('awaiting_reply','last_message') for v in scalars(row.get(key,{})) if isinstance(v,str)}
     repeated={v for v in scalars(row.get('conversation',{})) if isinstance(v,str)}&shown
     assert not repeated,(repeated,row)
+    hint=row.get('awaiting_reply',{})
+    assert 'sent_at' not in hint or hint['sent_at']!=row.get('last_activity'),row
+    conversation=row.get('conversation',{})
+    attention=conversation.get('owner_attention',{})
+    assert 'suggested_action' not in attention or attention['suggested_action']!=conversation['suggested_action'],row
 
 
 def test_compact_queue_row_states_each_fact_once(recent_queue):
@@ -127,6 +132,37 @@ def test_compact_queue_row_states_each_fact_once(recent_queue):
     hint=private[0]['awaiting_reply']
     assert hint['priority']>=100 and 'private_chat' in hint['reasons'] and hint['has_question'] is True
     assert isinstance(hint['waiting_hours'],int) and hint['incoming_count']==1 and hint['revision']==1
+
+
+def test_compact_rows_without_a_hint_state_owner_attention_once(seeded):
+    s,_,_=seeded
+    ar=Archive(s)
+    ar.register('attention-tg','telegram','Synthetic attention',discover=True)
+    key=s.issue_key('attention-agent',['attention-tg'])
+    now=datetime.now(timezone.utc).replace(microsecond=0)
+    def add(chat, mid, at, **metadata):
+        return ar.ingest(event(account='attention-tg',chat=chat,provider_id=mid,sent_at=at.isoformat(),
+            updated_at=at.isoformat(),body=f'Synthetic group message {mid}',metadata={'chat_type':'group',**metadata}))['message']
+    # Expired attention (older than awaiting_reply_days) that is also the head.
+    expired=add('501','1',now-timedelta(days=20),mentions_owner=True)
+    # Dismissed attention that is the head.
+    dismissed=add('502','1',now-timedelta(hours=1),mentions_owner=True)
+    # Expired attention followed by unrelated chatter: the target differs from the head.
+    older=add('503','1',now-timedelta(days=21),mentions_owner=True)
+    add('503','2',now-timedelta(days=20))
+    hint=next(r for r in s.list_chats(key,awaiting_reply=True,view='conversation',include_coverage=False)['items']
+        if r['awaiting_reply_message_id']==dismissed)
+    s.dismiss_reply(key,hint['id'],dismissed,hint['awaiting_reply_revision'])
+    with TestClient(create_app(s,['testserver'])) as client:
+        rows={r['last_message']['id']:r for r in structured(rpc(client,key,'list_chats',{}))['items']}
+    for row in rows.values():
+        assert 'awaiting_reply' not in row
+        assert_each_fact_once(row)
+    for head in (expired,dismissed):
+        attention=rows[head]['conversation']['owner_attention']
+        assert 'target_message_id' not in attention and 'suggested_action' not in attention and attention['last_turn']
+    chatter=next(r for r in rows.values() if r['last_message']['id'] not in (expired,dismissed))
+    assert chatter['conversation']['owner_attention']['target_message_id']==older
 
 
 def test_list_chats_awaiting_reply_25_rows_within_30000_chars(recent_queue):
