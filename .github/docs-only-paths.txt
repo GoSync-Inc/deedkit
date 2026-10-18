@@ -67,6 +67,8 @@ docs/whatsapp-native.md
 .github/workflows/production-release.yml | a comment names docs/operations/production.md, which is not listed; it lists no documents
 services/calendar/pyproject.toml | its sdist include list is relative to services/calendar and names that service's own docs
 scripts/docs_only.py | the guard's own pattern literals
+scripts/tiden_drift.py | the drift job's exclusion patterns and its spec listing flag; it reads no document
 tests/test_docs_only.py | the guard's tests: synthetic repositories under tmp_path and the guard's pattern literals
+tests/test_tiden_drift.py | synthetic repositories under tmp_path and the drift job's exclusion patterns; it reads no document
 tests/test_seamless_release.py | docs is a local variable holding parsed Compose documents; it lists release state, not Markdown
 tests/test_tiden_ci.py | synthetic repositories under tmp_path for the image change detection and evidence tests

@@ -278,8 +278,9 @@ that explicit word neither the worker nor the orchestrator merges them. After th
 merge the worker checks it and reports.
 
 Checked after the merge means a successful `main` push run on the squash commit
-or a later one and, for a change with a Tiden branch, Tiden main and drift read
-back as in [tiden-product-workflow.md](tiden-product-workflow.md).
+or a later one, a green `Tiden drift` run on it or a later one (a red run names
+the files to anchor, TIDEN-CI.md) and, for a change with a Tiden branch, Tiden
+main and drift read back as in [tiden-product-workflow.md](tiden-product-workflow.md).
 
 After its final result the worker stays open until its pull request is merged and
 checked after the merge. The orchestrator then closes its terminal and archives

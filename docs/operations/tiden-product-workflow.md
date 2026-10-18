@@ -215,7 +215,8 @@ Record these independently, with timestamp, branch/release ID and exact Git SHA:
    report path, and its open blocking or major findings.
 5. The release spec sync (below) or its recorded `none` reason: the review
    branch, the specs edited, the tests linked, the anchors added, the cards set
-   to delivered and the watermark range when it advanced.
+   to delivered, the audited range and its artifact, and the semantic baseline
+   SHA it leaves (unchanged by a partial sync or `none`).
 
 Readiness remains blocked while a relevant current defect, unresolved production
 incident or required acceptance lacks evidence, or a release review finding
@@ -234,23 +235,32 @@ Deployment acceptance remains separate, and old `lastSeen` alone proves nothing.
 
 A normal-level pull request that changes no acceptance criterion skips the
 intent loop (`AGENTS.md`), so its spec writes wait for this release step: links
-for its new tests, anchors for its new files, spec text outside the criteria that
-it made stale (Boundary, evidence notes) and the delivered status of the card it
-names. The same step audits the drift since the watermark, so the watermark
-advances once per release. The release owner runs it before the release review
-whenever the delta from the watermark to the candidate changes a product file or
-a skipped pull request merged since the last completed spec sync waits for its
-spec writes, and otherwise records `Spec sync: none — <reason>`.
+for its new tests, spec text outside the criteria that it made stale (Boundary,
+evidence notes) and the delivered status of the card it names. Anchors for its
+new code files cannot wait: it adds them before or in the same step as its merge,
+or the drift workflow fails. The same step audits spec text against the code since the semantic
+baseline: the candidate SHA of the last completed full sync, recorded in the
+readiness record (item 5 above). The drift workflow advances the watermark after
+every merge once changed code is anchored (Reconciliation and maintenance), so
+the watermark never stands in for that baseline. The release owner runs the sync
+before the release review whenever the delta from the semantic baseline to the
+candidate changes a product file or a skipped pull request merged since the last
+completed spec sync waits for its spec writes, and otherwise records
+`Spec sync: none — <reason>`. The first semantic baseline is
+69486f43b7140632c5eeed6a27690683e3a82c68, the target of the ANYM-314 catch-up
+audit. Example: the last full sync was at A, the drift
+workflow has moved the watermark to C, and the candidate is C; the sync audits
+A..C, not the empty watermark range.
 
 1. One worker session (Tiden card and spec text,
    [parallel-development.md](parallel-development.md)) with `tiden intent skip`
    works on one review branch, `review/<date>-spec-sync`.
-2. Its inputs are every file changed from the watermark (`tiden drift status`)
-   to the candidate, matched against the anchors as in Implementation sequence
-   step 4, and the `Spec impact:` and `Spec sync:` lines of every skipped pull
-   request merged since the last completed spec sync, whether or not the
-   watermark has since moved past it (an advance by another audit does not
-   complete these writes).
+2. Its inputs are every file changed from the semantic baseline to the
+   candidate (`git diff --name-only <baseline> <candidate>`), matched against the
+   anchors as in Implementation sequence step 4, and the `Spec impact:` and
+   `Spec sync:` lines of every skipped pull request merged since the last
+   completed spec sync, whether or not the watermark has since moved past it (an
+   automated or other advance does not complete these writes).
 3. On the review branch it checks each matched spec's text against the code and
    corrects stale text; it anchors each changed file that no anchor matches to
    the spec it implements or records why none applies; it links each named new
@@ -265,11 +275,12 @@ spec writes, and otherwise records `Spec sync: none — <reason>`.
    the branch merges under the review levels in `AGENTS.md`, and Tiden main is
    read back.
 5. A sync that covered the whole range is the delta audit under Reconciliation
-   and maintenance, and the watermark advances to the audited candidate SHA
-   under the rules there. Until the drift audit card (ANYM-314) has advanced the
-   watermark once, the sync is partial: it covers only the skipped pull requests
-   since the last completed spec sync, completes no drift audit and leaves the
-   watermark unchanged.
+   and maintenance: its candidate SHA becomes the new semantic baseline, and when
+   the watermark is still behind it, it advances by a drift-sync branch merge
+   under the rules there. Until the drift audit card (ANYM-314) has completed once, the sync is
+   partial: it covers only the skipped pull requests since the last completed
+   spec sync, completes no drift audit and moves neither the semantic baseline
+   nor the watermark.
 
 ### Names and release identity
 
@@ -359,18 +370,27 @@ merge. This is explicit provenance preservation, not permission to drop metadata
 or to change specification, test or accepted-link identities. Do not overwrite
 an existing provenance receipt during later updates.
 
-Drift compares Git main with a reviewed spec-sync watermark. Re-anchoring, PR
+Drift compares Git main with the spec-sync watermark. Re-anchoring, PR
 links and component changes are bookkeeping, not verification: they do not make
-spec text current. Advance the watermark (`tiden drift advance`) only after a
-delta audit has checked every spec anchored to files changed since the previous
-watermark against the code, every changed file without a matching anchor has an
-anchor on the spec it implements or a recorded reason why none applies, and the
-audit's edits are merged on Tiden main. Pass `--from`, `--to` and `--reason`
-explicitly; never use `empty_sync` (the default) or `bootstrap` to clear a delta
-that was not audited. The vendor documents none of the reasons (CLI 0.33.0
-accepts `empty_sync`, `bootstrap` and `baseline`): confirm which one records an
-audited advance before the first use and note it here. Record the audited SHA,
-the spec count and the findings in the audit artifact, outside Git.
+spec text current. The drift workflow (`.github/workflows/tiden-drift.yml`,
+[TIDEN-CI.md](../../TIDEN-CI.md)) advances the watermark by itself after every
+merge, with `--reason empty_sync`, and only when every code file changed since
+the watermark has an anchor on some spec; otherwise it fails, names the files and
+leaves the watermark. Every pull request therefore anchors its new code files on
+the specs they implement before or in the same step as its merge. The watermark means "changed code is
+anchored", not "spec text audited": the audit of spec text is the release spec
+sync, tracked by its own semantic baseline. `empty_sync` is a compare-and-set on
+`--from`: on 2026-10-18 a stale `--from` returned `"advanced": false` and the
+current one advanced (receipts on ANYM-355); only the drift workflow uses it.
+A manual advance follows a delta audit that has checked every spec anchored to
+files changed since the previous audit against the code, anchored every changed
+file without a matching anchor or recorded why none applies, and merged its edits
+on Tiden main. It merges an empty drift-sync branch
+(`tiden branch create --sync-base <W> --sync-target <SHA> --sync-repo
+github.com/GoSync-Inc/deedkit`, recorded as `sync_merge`); `baseline` only sets
+a first watermark (it returned `"advanced": false` on an existing one) and
+`bootstrap` is never used. Record the audited SHA, the spec count and the
+findings in the audit artifact, outside Git.
 A new commit after the audited target is fresh drift, not a reason to claim the
 old review covered it.
 
