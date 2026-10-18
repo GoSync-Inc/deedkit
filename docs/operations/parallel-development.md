@@ -45,8 +45,6 @@ per provider, and migration numbers are sequential with immutable checksums. `ci
 - `main` push runs are never cancelled (`ci.yml` concurrency), so every merged SHA keeps a
   complete result; production promotes only a SHA whose own push run succeeded
   ([production.md](production.md)).
-- Until the host runs `production.py deploy` (PR #124), `apply` requires its SHA to be the current
-  `main`: from prepare to apply the orchestrator announces a merge freeze, and nobody enqueues.
 
 ## Sessions
 
