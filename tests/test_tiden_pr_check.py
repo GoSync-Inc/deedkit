@@ -402,3 +402,32 @@ def test_only_a_verdict_fails_the_pr_check_job_and_anything_else_warns(repo, ser
     assert outcome(tmp_path, [verdict, "Refused: tiden spec list exited 3"], 1) == "outcome=unchecked"
     assert outcome(tmp_path, [verdict], 2) == "outcome=unchecked"
     assert outcome(tmp_path, [verdict], 137) == "outcome=unchecked"
+
+
+# spec: ANYM-405
+def test_a_test_merge_checkout_diffs_from_the_merged_base_tip_not_the_stale_event_base(repo, server, tmp_path):
+    root, base = repo
+    server.set(main=[spec(12)])
+    git(root, "checkout", "-q", "-b", "feature")
+    tip = commit(root, {"tests/test_new.py": "# spec: ANYM-12\ndef test_new():\n    pass\n"}, "change")
+    git(root, "checkout", "-q", "main")
+    commit(root, {"tests/test_later.py": "def test_later():\n    pass\n"}, "a later base commit")
+    # GitHub's test merge: the base tip is the first parent, the pull request head the second.
+    git(root, "merge", "-q", "--no-ff", "--no-edit", "feature")
+    event = tmp_path / "event.json"
+    payload = {"repository": {"full_name": "o/r"}, "pull_request": {
+        "body": "Spec: ANYM-12", "base": {"sha": base}, "head": {"sha": tip, "repo": {"full_name": "o/r"}}}}
+    env = {"GITHUB_EVENT_PATH": str(event), "TIDEN_PRODUCT_ID": "product", "TIDEN_API_TOKEN": SECRET,
+           "FAKE_TIDEN_STATE": str(server.path), "PATH": "/usr/bin:/bin"}
+
+    def real():
+        event.write_text(json.dumps(payload))
+        return subprocess.run([sys.executable, ROOT_SCRIPT, "--root", str(root), "--cli", str(server.cli)],
+                              capture_output=True, text=True, env=env)
+
+    completed = real()
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "Changed files 1," in completed.stdout and "test_later" not in completed.stdout
+    payload["pull_request"]["head"]["sha"] = base  # HEAD is no test merge of this pull request: the event's base
+    completed = real()
+    assert completed.returncode == 1 and "test tests/test_later.py:1 test_later" in completed.stdout

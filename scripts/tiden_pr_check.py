@@ -398,10 +398,19 @@ def skip_reason(payload: dict) -> str | None:
     return None
 
 
+def merged_base(root: Path, head: str, pull: dict) -> str | None:
+    """The base tip of GitHub's test merge when `head` is that merge of the pull request (first parent the base tip,
+    second the pull request head). The event's base.sha is the base when the pull request was last pushed; once
+    the base moves on, a diff from it would also hold every later base commit."""
+    tip = (pull.get("head") or {}).get("sha")
+    parents = git(root, "rev-list", "--parents", "-n", "1", head, "--").decode().split()
+    return parents[1] if tip and len(parents) == 3 and parents[2] == tip else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check a pull request's Tiden lines, markers and anchors.")
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--base", help="the base commit (default: the event's pull_request.base.sha)")
+    parser.add_argument("--base", help="the base commit (default: a test merge's base tip, else the event's base.sha)")
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--body-file", type=Path, help="read the body from a file instead of the event")
     parser.add_argument("--cli", default="tiden")
@@ -423,7 +432,7 @@ def main() -> int:
                 return 0
         pull = payload.get("pull_request") or {}
         body = args.body_file.read_text(encoding="utf-8") if args.body_file else (pull.get("body") or "")
-        base = args.base or (pull.get("base") or {}).get("sha")
+        base = args.base or merged_base(args.root.resolve(), args.head, pull) or (pull.get("base") or {}).get("sha")
         if not base:
             raise Refused("no base commit: pass --base")
         return check(args.root.resolve(), base, args.head, body, args.cli, os.environ["TIDEN_PRODUCT_ID"], report)
