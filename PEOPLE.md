@@ -31,8 +31,10 @@ Messages (`search`, `get_messages`, `get_context`, `get_updates`), the conversat
 view, people rows and the reply-queue hint name a sender in `sender_name` and say
 where the name came from in `sender_name_basis`. The raw provider ID is always in
 `sender` (messages) or `sender_id` (people rows and the queue hint), never in
-`sender_name`. A stored name equal to the sender ID, its bare digits or `+digits`
-counts as no name on every platform. For WhatsApp the first match wins:
+`sender_name`. A stored name that, without surrounding whitespace, equals the
+sender ID or spells its digits as an ID (bare, `+digits`, with any device suffix or
+`@` domain) counts as no name on every platform. For a WhatsApp account the first
+match wins:
 
 1. `message`: the name observed for this sender in the message's own chat;
 2. `seen_elsewhere`: the newest name of the same sender (device suffix ignored) in
