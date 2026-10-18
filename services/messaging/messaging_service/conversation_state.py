@@ -169,62 +169,51 @@ def group_attention_sql(alias='m', metadata='md', chat_alias='c', *, provider_ch
             {provider_reply_matches(metadata, 'quoted', provider_chat)} OFFSET 0)))'''
 
 
-def group_answer_sql(platform='a.platform', *, same_time=False):
-    """Compare the three exact reply heads joined by group_thread_query."""
+def group_after_owner_sql(platform='a.platform', *, same_time=False):
+    """Order an attention message against the chat's latest owner message.
+
+    This is the private-chat rule: a later time, or the same second with a
+    higher Telegram numeric ID. A WhatsApp same-second tie stays a candidate.
+    """
     from .chat_queries import number
-    matches=[]
-    for alias in ('direct_reply','native_reply','root_reply'):
-        after=f'{alias}.sent_at=m.sent_at' if same_time else f'''({alias}.sent_at>m.sent_at OR
-            ({platform}='telegram' AND {alias}.sent_at=m.sent_at AND
-              {alias}.numeric_id>{number('m')}))'''
-        matches.append(after)
-    return 'coalesce(('+' OR '.join(matches)+'),false)'
+    if same_time:
+        return f"coalesce({platform}='whatsapp' AND owner_last.sent_at=m.sent_at,false)"
+    return f'''(owner_last.sent_at IS NULL OR m.sent_at>owner_last.sent_at OR
+        ({platform}='telegram' AND m.sent_at=owner_last.sent_at AND {number('m')}>owner_last.numeric_id)
+        OR ({platform}='whatsapp' AND m.sent_at=owner_last.sent_at))'''
 
 
 def group_thread_query(projection, *, account='c.account',chat='c.id',
         provider_chat='c.provider_chat',platform='a.platform',enabled='true',
         criteria='true',limit=None,count=False):
-    """Read observed owner threads from exact account/chat message scope.
+    """Read explicit owner attention after the latest owner message in one chat.
 
-    Scoped messages drive current metadata PK reads before materialization, so
-    other accounts and chats cannot enlarge the candidate pools. Replies are
-    collected once, reduced to the newest source position per reference, then
-    joined by the incoming ID, scoped WhatsApp stanza alias, or observed root.
-    Work remains linear in this chat's retained messages even when every
-    incoming message mentions the owner, without per-candidate outgoing scans.
+    Any later meaningful owner message in the group answers earlier attention,
+    as in the archive view; others' chatter neither answers nor renews it. The
+    owner head is one bounded indexed tail read, and scoped messages drive
+    current metadata PK reads before materialization, so other accounts and
+    chats cannot enlarge the candidate pool.
     """
     from .conversation import meaningful_sql
-    from .chat_queries import number
-    numeric=f"CASE WHEN {platform}='telegram' THEN {number('answer')} ELSE 0::bigint END"
-    native=f'''CASE WHEN right({provider_chat},5)='@g.us' AND
-        (left(m.provider_id,length('true_'||{provider_chat}||'_'))='true_'||{provider_chat}||'_'
-         OR left(m.provider_id,length('false_'||{provider_chat}||'_'))='false_'||{provider_chat}||'_')
-        THEN split_part(substr(m.provider_id,length((CASE WHEN left(m.provider_id,5)='true_'
-          THEN 'true_' ELSE 'false_' END)||{provider_chat}||'_')+1),'_',1) END'''
-    sql=f'''WITH owner_replies AS MATERIALIZED (
-        SELECT amd.metadata->>'reply_to_provider_id' AS reference,answer.sent_at,{numeric} AS numeric_id
-        FROM messages answer JOIN LATERAL (SELECT amd.metadata FROM message_metadata amd
-          WHERE amd.message=answer.id AND amd.revision=answer.revision
-            AND amd.metadata->>'reply_to_provider_id' IS NOT NULL OFFSET 0) amd ON true
-        WHERE {enabled} AND answer.account={account} AND answer.chat={chat}
-          AND answer.direction='outgoing' AND {meaningful_sql('answer','amd')}),
-      reply_heads AS MATERIALIZED (
-        SELECT DISTINCT ON (reference) reference,sent_at,numeric_id FROM owner_replies
-        ORDER BY reference,sent_at DESC,numeric_id DESC),
+    from .chat_queries import latest_sql,number
+    owner=f'''SELECT m.sent_at,m.id,{number('m')} AS numeric_id FROM messages m
+        LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
+        WHERE {enabled} AND m.account={account} AND m.chat={chat} AND m.direction='outgoing'
+          AND {meaningful_sql()}'''
+    sql=f'''WITH owner_last AS MATERIALIZED ({latest_sql(owner,platform=platform)}),
       thread_messages AS MATERIALIZED (
         SELECT m.id,m.account,m.chat,m.provider_id,m.revision,m.sender,m.body,m.sent_at,m.direction,
           md.metadata AS thread_metadata FROM messages m JOIN LATERAL (
           SELECT md.metadata FROM message_metadata md WHERE md.message=m.id AND md.revision=m.revision
             AND (md.metadata->'mentions_owner'='true'::jsonb OR md.metadata->'reply_to_owner'='true'::jsonb
               OR md.metadata->>'reply_to_provider_id' IS NOT NULL) OFFSET 0) md ON true
+        LEFT JOIN owner_last ON true
         WHERE {enabled} AND m.account={account} AND m.chat={chat} AND m.direction='incoming'
+          AND m.sent_at>=coalesce(owner_last.sent_at,'-infinity'::timestamptz) AND {group_after_owner_sql(platform)}
           AND {meaningful_sql()} AND {criteria} AND {group_attention_sql(provider_chat=provider_chat)})
       SELECT {projection} FROM thread_messages m
       CROSS JOIN LATERAL (SELECT m.thread_metadata AS metadata) md
-      LEFT JOIN reply_heads direct_reply ON direct_reply.reference=m.provider_id
-      LEFT JOIN reply_heads native_reply ON native_reply.reference=({native})
-      LEFT JOIN reply_heads root_reply ON root_reply.reference=md.metadata->>'reply_to_provider_id'
-      WHERE NOT {group_answer_sql(platform)}'''
+      LEFT JOIN owner_last ON true'''
     if not count:
         sql+=f" ORDER BY m.sent_at DESC,CASE WHEN {platform}='telegram' THEN {number('m')} ELSE 0::bigint END DESC,m.id DESC"
         if limit is not None:sql+=' LIMIT '+str(limit)
@@ -251,6 +240,9 @@ def conversation_state(c,p,account,chat):
     # Only the newest timestamp is needed before resolving its actor/order.
     # The per-direction provider index then bounds that timestamp's candidates.
     # Never sort the entire conversation to choose a 64-message head.
+    # The newest read binds account/chat directly so the chat date index bounds
+    # it; a joined scope lets the planner walk the global date index past every
+    # newer message of other accounts.
     platform="'telegram'" if info['platform']=='telegram' else "'whatsapp'"
     numeric=number('m') if info['platform']=='telegram' else '0::bigint'
     scoped_head=head_query.replace('FROM messages m','FROM messages m CROSS JOIN scope').replace(
@@ -258,10 +250,10 @@ def conversation_state(c,p,account,chat):
     head_sql=('SELECT '+BASE+','+numeric+' AS numeric_id'+scoped_head+
         ' AND m.sent_at=(SELECT sent_at FROM newest)')
     observed=c.execute('WITH scope AS (SELECT %s::text AS account,%s::text AS chat),newest AS (SELECT m.sent_at'+
-        scoped_head+
+        head_query+
         ' ORDER BY m.sent_at DESC,m.id DESC LIMIT 1) '+
         latest_sql(head_sql,both_directions=True,platform=platform,limit=HEAD_LIMIT+1),
-        [account,chat]).fetchall()
+        [account,chat,account,chat]).fetchall()
     truncated=len(observed)>HEAD_LIMIT and observed[0]['sent_at']==observed[-1]['sent_at']
     observed=observed[:HEAD_LIMIT]
     enrich(c,observed,p);decorate_messages(c,p,observed)
@@ -276,7 +268,7 @@ def conversation_state(c,p,account,chat):
             enrich(c,[fallback],p);decorate_messages(c,p,[fallback])
     attention=[]
     if info['chat_type']=='group':
-        projection=(BASE+", CASE WHEN gs.platform='whatsapp' AND "+group_answer_sql('gs.platform',same_time=True)+
+        projection=(BASE+", CASE WHEN gs.platform='whatsapp' AND "+group_after_owner_sql('gs.platform',same_time=True)+
             " THEN 'ambiguous' ELSE 'open' END AS attention_status")
         attention=c.execute('''WITH group_scope AS (SELECT %s::text AS account,%s::text AS chat,
             %s::text AS provider_chat,%s::text AS platform)

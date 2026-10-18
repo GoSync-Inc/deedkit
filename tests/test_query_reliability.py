@@ -207,7 +207,8 @@ def test_group_attention_uses_explicit_candidates_without_rescanning_broadcasts(
         c.execute("UPDATE chats SET chat_type='group' WHERE id='telegram-demo-chat'")
         c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
             SELECT 'group-load-'||n,'telegram-demo','telegram-demo-chat',n::text,'fixture',
-                'Synthetic ordinary group broadcast',now()-interval '3 hours'+n*interval '1 second',
+                'Synthetic ordinary group broadcast',
+                CASE WHEN n%2=0 THEN now()-interval '6 hours' ELSE now()-interval '3 hours' END+n*interval '1 second',
                 CASE WHEN n%2=0 THEN 'outgoing' ELSE 'incoming' END
             FROM generate_series(1,10000) n''')
         c.execute('''INSERT INTO message_metadata(message,revision,metadata)
@@ -283,6 +284,39 @@ def test_group_attention_uses_explicit_candidates_without_rescanning_broadcasts(
         # Compact states the attention target once: in the hint when it is the hint's message.
         attention=row['conversation']['owner_attention']
         assert attention.get('target_message_id',row.get('awaiting_reply',{}).get('message_id'))==expected
+
+
+def test_conversation_head_read_ignores_newer_messages_of_other_accounts(seeded,record_property):
+    from messaging_service.conversation_state import conversation_state
+    s,a,b=seeded
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='60s'")
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            SELECT 'head-own-'||n,'telegram-demo','telegram-demo-chat',(1000+n)::text,'fixture',
+                'Synthetic ordinary content',now()-interval '3 hours'+n*interval '1 second',
+                CASE WHEN n%2=0 THEN 'outgoing' ELSE 'incoming' END
+            FROM generate_series(1,2000) n''')
+        c.execute('ANALYZE messages')
+    def head():
+        with s.authorized(b,'list_chats') as (c,p):
+            measured=GroupMeasured(c)
+            state=conversation_state(measured,p,'telegram-demo','telegram-demo-chat')
+        return state,sum(visited(plan['Plan'],{'messages'}) for plan in measured.plans)
+    before,baseline=head()
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='60s'")
+        # Hidden-account messages newer than the whole permitted chat.
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            SELECT 'head-foreign-'||n,'whatsapp-demo-1','whatsapp-demo-1-chat',n::text,'other-fixture',
+                'Synthetic hidden account message',now(),
+                CASE WHEN n%2=0 THEN 'outgoing' ELSE 'incoming' END
+            FROM generate_series(1,20000) n''')
+        c.execute('ANALYZE messages')
+    after,visits=head()
+    record_property('head_rows_visited',str((baseline,visits)))
+    assert after['latest_known_meaningful_message']['provider_message_id']=='3000'
+    assert after['latest_known_meaningful_message']==before['latest_known_meaningful_message']
+    assert visits<=baseline+100,(baseline,visits)
 
 
 def test_group_reply_heads_keep_telegram_order_and_whatsapp_same_second_uncertainty(seeded):

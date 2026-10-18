@@ -222,7 +222,10 @@ def test_conversation_catalog_ignores_newer_known_service_as_last_message(dialog
 def test_conversation_group_attention_is_not_closed_by_unrelated_owner_post(dialogue_archive):
     s,key,add,query,catalog=dialogue_archive
     chat=add('mention','incoming',chat_type='group',metadata={'mentions_owner':True})
-    add('noise','outgoing',second=1,chat_type='group')
+    # Owner posts in another chat of this account and in the same provider chat
+    # of another account are not messages in this group.
+    add('noise','outgoing',second=1,chat='456@g.us',chat_type='group')
+    add('7','outgoing',second=1,account='dialogue-tg',chat_type='group')
     result=query('dialogue-wa',chat)
     assert result['owner_attention']['target_message']['provider_message_id']=='mention'
     assert catalog(awaiting_reply=True)['items'][0]['conversation']['suggested_action']=='review_incoming'
@@ -231,8 +234,8 @@ def test_conversation_group_attention_is_not_closed_by_unrelated_owner_post(dial
 def test_conversation_explicit_group_reply_closes_only_its_thread(dialogue_archive):
     s,key,add,query,catalog=dialogue_archive
     chat=add('thread-a','incoming',chat_type='group',metadata={'mentions_owner':True})
-    add('thread-b','incoming',second=1,chat_type='group',metadata={'mentions_owner':True})
-    add('answer-a','outgoing',second=2,chat_type='group',metadata={'reply_to_provider_id':'thread-a'})
+    add('answer-a','outgoing',second=1,chat_type='group',metadata={'reply_to_provider_id':'thread-a'})
+    add('thread-b','incoming',second=2,chat_type='group',metadata={'mentions_owner':True})
     result=query('dialogue-wa',chat)
     assert result['owner_attention']['target_message']['provider_message_id']=='thread-b'
     add('answer-b','outgoing',second=3,chat_type='group',metadata={'reply_to_provider_id':'thread-b'})
@@ -254,11 +257,85 @@ def test_group_dismissal_is_not_reopened_by_unrelated_incoming_chatter(dialogue_
 def test_group_attention_can_be_dismissed_after_unrelated_owner_post(dialogue_archive):
     s,key,add,query,catalog=dialogue_archive
     chat=add('mention','incoming',chat_type='group',metadata={'mentions_owner':True})
-    add('unrelated-owner-post','outgoing',second=1,chat_type='group')
+    add('unrelated-owner-post','outgoing',second=1,chat='456@g.us',chat_type='group')
     row=catalog(awaiting_reply=True)['items'][0]
     result=s.dismiss_reply(key,chat,row['awaiting_reply_message_id'],row['awaiting_reply_revision'])
     assert result['dismissed'] is True
     assert catalog(awaiting_reply=True)['items']==[]
+
+
+def test_conversation_group_attention_clears_after_any_owner_message(dialogue_archive):
+    from messaging_service.store import APIError
+    s,key,add,query,catalog=dialogue_archive
+    chat=add('mention','incoming',chat_type='group',metadata={'mentions_owner':True})
+    row=catalog(awaiting_reply=True)['items'][0]
+    add('ok-will-take-it','outgoing',second=1,chat_type='group',body='ок, заберу')
+    assert catalog(awaiting_reply=True)['items']==[]
+    assert query('dialogue-wa',chat)['owner_attention']['target_message'] is None
+    with pytest.raises(APIError,match='reply_target_changed'):
+        s.dismiss_reply(key,chat,row['awaiting_reply_message_id'],row['awaiting_reply_revision'])
+
+
+def test_conversation_group_new_mention_after_owner_message_reopens(dialogue_archive):
+    s,key,add,query,catalog=dialogue_archive
+    chat=add('mention-1','incoming',chat_type='group',metadata={'mentions_owner':True})
+    add('owner','outgoing',second=1,chat_type='group')
+    add('mention-3','incoming',second=3,chat_type='group',metadata={'reply_to_owner':True})
+    row=catalog(awaiting_reply=True)['items'][0]
+    assert row['awaiting_reply_provider_message_id']=='mention-3'
+    # Only attention after the owner message is counted.
+    assert row['awaiting_reply_incoming_count']==1
+    assert query('dialogue-wa',chat)['owner_attention']['target_message']['provider_message_id']=='mention-3'
+
+
+def test_conversation_group_owner_message_same_second_ordering(dialogue_archive):
+    s,key,add,query,catalog=dialogue_archive
+    # Telegram orders one second by numeric provider ID.
+    answered=add('10','incoming',account='dialogue-tg',chat='-1001',chat_type='group',metadata={'mentions_owner':True})
+    add('11','outgoing',account='dialogue-tg',chat='-1001',chat_type='group')
+    open_tg=add('21','incoming',account='dialogue-tg',chat='-1002',chat_type='group',metadata={'mentions_owner':True})
+    add('20','outgoing',account='dialogue-tg',chat='-1002',chat_type='group')
+    # WhatsApp has no order within a second: the mention stays a candidate.
+    tied=add('mention','incoming',chat_type='group',metadata={'mentions_owner':True})
+    add('owner','outgoing',chat_type='group')
+    rows={r['id']:r for r in catalog(awaiting_reply=True)['items']}
+    assert set(rows)=={open_tg,tied}
+    assert query('dialogue-tg',answered)['owner_attention']['target_message'] is None
+    assert rows[open_tg]['awaiting_reply_provider_message_id']=='21'
+    assert rows[open_tg]['awaiting_reply_confidence']=='heuristic_not_obligation'
+    assert rows[tied]['awaiting_reply_provider_message_id']=='mention'
+    # The archive row states the tie; conversation state qualifies it further.
+    archive_row=next(r for r in s.list_chats(key,awaiting_reply=True,include_coverage=False)['items'] if r['id']==tied)
+    assert archive_row['awaiting_reply_confidence']=='ambiguous_message_order'
+    assert rows[tied]['awaiting_reply_confidence']=='ambiguous_attention_reply_order'
+    state=query('dialogue-wa',tied)
+    assert state['owner_attention']['target_message']['provider_message_id']=='mention'
+    assert state['basis']['code']=='ambiguous_attention_reply_order'
+
+
+def test_conversation_group_chatter_still_does_not_clear(dialogue_archive):
+    s,key,add,query,catalog=dialogue_archive
+    chat=add('mention','incoming',chat_type='group',metadata={'mentions_owner':True})
+    first=catalog(awaiting_reply=True)['items'][0]
+    add('chatter-1','incoming',second=1,chat_type='group')
+    add('chatter-2','incoming',second=2,chat_type='group',metadata={'reply_to_provider_id':'chatter-1'})
+    row=catalog(awaiting_reply=True)['items'][0]
+    assert row['awaiting_reply_provider_message_id']=='mention'
+    assert row['awaiting_reply_sent_at']==first['awaiting_reply_sent_at']
+    assert row['awaiting_reply_incoming_count']==1
+    assert query('dialogue-wa',chat)['owner_attention']['target_message']['provider_message_id']=='mention'
+
+
+def test_conversation_group_service_empty_or_deleted_owner_message_does_not_clear(dialogue_archive):
+    s,key,add,query,catalog=dialogue_archive
+    chat=add('mention','incoming',chat_type='group',metadata={'mentions_owner':True})
+    add('timer','outgoing',second=1,chat_type='group',body='',metadata={'is_service':True})
+    add('empty','outgoing',second=2,chat_type='group',body='')
+    add('removed','outgoing',second=3,chat_type='group')
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET deleted=true WHERE account='dialogue-wa' AND provider_id='removed'")
+    assert catalog(awaiting_reply=True)['items'][0]['awaiting_reply_provider_message_id']=='mention'
+    assert query('dialogue-wa',chat)['owner_attention']['target_message']['provider_message_id']=='mention'
 
 
 def test_whatsapp_answer_matches_incoming_serialized_id_using_bare_quoted_stanza(dialogue_archive):
