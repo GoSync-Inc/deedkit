@@ -125,7 +125,7 @@ def test_only_a_main_push_runs_the_publish_job_and_only_it_can_write():
     assert upload["if"] == "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.source_ref == '' }}"
     assert upload["with"]["name"] == "image-${{ matrix.target }}" and upload["with"]["retention-days"] == 1
     # The Tiden release record waits for the publication; the required checks are untouched.
-    assert ci["jobs"]["release"]["needs"] == ["gate", "publish"]
+    assert ci["jobs"]["release"]["needs"] == ["gate", "publish", "checks"]
     assert ci["jobs"]["gate"]["name"] == "CI gate" and set(ci["jobs"]["gate"]["needs"]) == {"reuse", "pr_reuse", "checks", "native", "images"}
     # Preparation pulls these images, so a promotable main run must show this exact job passed (ANYM-301 B3).
     assert "publish" in production.REQUIRED_JOBS

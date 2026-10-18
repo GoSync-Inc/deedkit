@@ -589,7 +589,7 @@ def test_a_reusing_push_skips_only_the_test_jobs_and_still_builds_publishes_and_
     assert "reuse_queue_evidence" not in json.dumps(tiden)
     for name in ("native", "images"):
         assert "if" not in ci["jobs"][name] and "needs" not in ci["jobs"][name]
-    assert ci["jobs"]["publish"]["needs"] == ["gate"] and ci["jobs"]["release"]["needs"] == ["gate", "publish"]
+    assert ci["jobs"]["publish"]["needs"] == ["gate"] and ci["jobs"]["release"]["needs"] == ["gate", "publish", "checks"]
     # The queue still gets no Tiden credential.
     assert ci["jobs"]["checks"]["secrets"]["TIDEN_API_TOKEN"] == (
         "${{ github.event_name != 'merge_group' && secrets.TIDEN_API_TOKEN || '' }}")

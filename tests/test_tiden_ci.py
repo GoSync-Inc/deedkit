@@ -1043,9 +1043,9 @@ def test_release_workflows_record_only_verified_main_commits(tmp_path):
     assert "tiden_ci.py release" not in json.dumps(checks)
     ci = yaml.safe_load((root / ".github/workflows/ci.yml").read_text())
     job = ci["jobs"]["release"]
-    # Only after the CI gate and the image publication, so every verification job, the Tiden
-    # publication and the GHCR publication passed.
-    assert job["needs"] == ["gate", "publish"]
+    # Only after the CI gate and the image publication, so every verification job and the GHCR
+    # publication passed; checks tells it whether the Tiden publication was verified.
+    assert job["needs"] == ["gate", "publish", "checks"]
     assert job["if"] == ("${{ !cancelled() && needs.gate.result == 'success' && needs.publish.result == 'success' "
                          "&& github.event_name == 'push' && github.ref == 'refs/heads/main' }}")
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in job["steps"]}
@@ -1397,11 +1397,14 @@ def test_the_evidence_job_fails_on_a_failed_test_or_a_failed_or_blocked_check(tm
     assert completed.stdout.startswith("Every test and check passed." if passes else "The evidence records ")
     import yaml
     root = Path(__file__).resolve().parents[1]
-    names = [step.get("name") for step in yaml.safe_load((root / ".github/workflows/checks.yml").read_text())[
-        "jobs"]["evidence"]["steps"]]
+    jobs = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]
+    names = [step.get("name") for step in jobs["evidence"]["steps"]]
     verdict = names.index("Require every recorded test and check to have passed")
-    # Evaluated after the evidence is retained, also when an earlier step failed.
+    # Evaluated after the evidence is retained, also when an earlier step failed, and its failure fails the job.
     assert names.index("Retain test evidence even when a check fails") < verdict
+    assert jobs["evidence"]["steps"][verdict]["if"] == "${{ always() }}"
+    assert "continue-on-error" not in jobs["evidence"]["steps"][verdict]
+    assert "continue-on-error" not in jobs["evidence"] and "continue-on-error" not in jobs["tiden"]
 
 
 def test_a_failed_tiden_publication_warns_and_never_fails_the_reporting_job(tmp_path):
@@ -1414,11 +1417,17 @@ def test_a_failed_tiden_publication_warns_and_never_fails_the_reporting_job(tmp_
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in job["steps"]}
     install, publication = "Install pinned Tiden CLI with integrity check", "Publish and verify branch association"
     warn = "Warn that the evidence was not published to Tiden"
-    # Only the CLI install and the publication may fail without failing the job, each within a timeout of its own
-    # below the job's, so a hung Tiden call ends as a step failure. Queue, docs-only and reuse receipts still fail it.
+    # Only the CLI install and the publication may fail without failing the job. Queue, docs-only and reuse
+    # receipts still fail it, and so does the job itself: no job-level failure suppression.
     assert [name for name, step in steps.items() if step.get("continue-on-error")] == [install, publication]
+    assert "continue-on-error" not in job
     assert (steps[install]["id"], steps[publication]["id"]) == ("install", "publish")
-    assert steps[install]["timeout-minutes"] + steps[publication]["timeout-minutes"] < job["timeout-minutes"]
+    # Every step has its own timeout and all of them together leave the job two minutes for setup and cleanup, so
+    # slow but successful prerequisites never let the job deadline cancel a hung Tiden call before its step's.
+    assert all("timeout-minutes" in step for step in steps.values())
+    assert sum(step["timeout-minutes"] for step in steps.values()) + 2 <= job["timeout-minutes"]
+    # The release record learns from this output whether the publication was verified.
+    assert job["outputs"]["published"] == "${{ steps.publish.outcome == 'success' }}"
     assert list(steps).index(warn) == list(steps).index(publication) + 1
     assert steps[warn]["if"] == ("${{ always() && steps.config.outputs.enabled == 'true' && "
                                  "(steps.install.outcome != 'success' || steps.publish.outcome != 'success') }}")
@@ -1446,3 +1455,39 @@ def test_a_failed_tiden_publication_warns_and_never_fails_the_reporting_job(tmp_
         assert f"CLI install: {install_outcome}; publication: {publish_outcome}" in completed.stdout
         assert receipt == {"published": False, "install": install_outcome, "publish": publish_outcome}
         assert summary.startswith("Tiden evidence not published.")
+
+
+def test_a_main_commit_whose_publication_was_not_verified_records_no_release(tmp_path):
+    import os
+    import subprocess
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    ci = yaml.safe_load((root / ".github/workflows/ci.yml").read_text())
+    checks = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())
+    output = checks.get("on", checks.get(True))["workflow_call"]["outputs"]["tiden_published"]
+    assert output["value"] == "${{ jobs.tiden.outputs.published }}"
+    release = ci["jobs"]["release"]
+    assert "checks" in release["needs"]
+    config = release["steps"][0]
+    assert config["id"] == "config" and config["env"]["TIDEN_PUBLISHED"] == "${{ needs.checks.outputs.tiden_published }}"
+    # Every later step, Tiden calls included, runs only when the configuration step enabled the record.
+    assert all(step["if"] in ("steps.config.outputs.enabled == 'true'",
+                              "${{ always() && steps.config.outputs.enabled == 'true' }}") for step in release["steps"][1:])
+
+    def configured(published, token="synthetic-token"):
+        temp = tmp_path / f"{published or 'unset'}-{bool(token)}"
+        temp.mkdir()
+        completed = subprocess.run(["bash", "-e", "-c", config["run"]], capture_output=True, text=True, env={
+            "PATH": os.environ["PATH"], "GITHUB_OUTPUT": str(temp / "output"), "GITHUB_STEP_SUMMARY": str(temp / "summary"),
+            "TIDEN_API_TOKEN": token, "TIDEN_PRODUCT_ID": "product", "TIDEN_WORKSPACE_ID": "workspace",
+            "TIDEN_PUBLISHED": published})
+        return completed, (temp / "output").read_text()
+
+    completed, written = configured("true")
+    assert completed.returncode == 0 and written == "enabled=true\n" and not completed.stdout
+    for published in ("false", ""):
+        completed, written = configured(published)
+        assert completed.returncode == 0 and written == "enabled=false\n"
+        assert completed.stdout.startswith("::warning title=Tiden release not recorded::")
+    completed, written = configured("false", token="")
+    assert completed.returncode == 0 and written == "enabled=false\n" and not completed.stdout

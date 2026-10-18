@@ -39,6 +39,9 @@ on:
       docs_sha:
         description: The pull request merge commit the docs-only decision classified
         value: ${{ jobs.documentation.outputs.docs_sha }}
+      tiden_published:
+        description: Whether the Tiden publication of this run's evidence was verified
+        value: ${{ jobs.tiden.outputs.published }}
     secrets:
       TIDEN_API_TOKEN:
         required: false
@@ -648,11 +651,15 @@ jobs:
     # tested merge SHA, not the head SHA or the last successful main revision.
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
-    # Above the step timeouts below, so a hung Tiden call ends as a warning, never as a failed job.
-    timeout-minutes: 8
+    # Every step has a timeout and together they stay below the job's, so a hung Tiden call ends as a step
+    # failure, which only warns, and never as a cancelled job.
+    timeout-minutes: 20
+    outputs:
+      published: ${{ steps.publish.outcome == 'success' }}
     steps:
       - name: Check optional Tiden configuration
         id: config
+        timeout-minutes: 1
         env:
           TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
           TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
@@ -684,11 +691,13 @@ jobs:
           fi
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         if: steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true'
+        timeout-minutes: 2
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true'
+        timeout-minutes: 3
         with:
           name: ci-evidence
           path: ${{ runner.temp }}/ci-evidence
@@ -718,6 +727,7 @@ jobs:
         run: python scripts/tiden_ci.py publish --directory "$RUNNER_TEMP/ci-evidence"
       - name: Warn that the evidence was not published to Tiden
         if: ${{ always() && steps.config.outputs.enabled == 'true' && (steps.install.outcome != 'success' || steps.publish.outcome != 'success') }}
+        timeout-minutes: 1
         env:
           INSTALL: ${{ steps.install.outcome }}
           PUBLISH: ${{ steps.publish.outcome }}
@@ -728,9 +738,11 @@ jobs:
           echo "Tiden evidence not published. $message" >> "$GITHUB_STEP_SUMMARY"
       - name: Record that a merge queue run publishes nothing
         if: steps.config.outputs.queue == 'true'
+        timeout-minutes: 1
         run: python scripts/tiden_ci.py publish --directory "$RUNNER_TEMP/ci-evidence"
       - name: Record that a docs-only pull request run publishes nothing
         if: steps.config.outputs.docs_only == 'true'
+        timeout-minutes: 1
         env:
           REASON: docs-only pull request run of reviewed documentation; no tests ran, and main CI publishes the merged code
         run: |
@@ -738,6 +750,7 @@ jobs:
           echo "::notice title=Tiden evidence not published::$REASON"
       - name: Record that a merge queue run reusing the pull request verification publishes nothing
         if: steps.config.outputs.pr_reused == 'true'
+        timeout-minutes: 1
         env:
           REASON: merge queue run reused the verification of a pull request run that tested this exact tree; no tests ran, and main CI verifies and publishes the merged code
           TESTED_IN: ${{ inputs.reused_pr_run }}
@@ -762,6 +775,7 @@ jobs:
           echo "::notice title=Tiden evidence not published::$REASON ($TESTED_IN)"
       - name: Retain Tiden association and verdict receipt
         if: ${{ always() && ((steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true') || steps.config.outputs.docs_only == 'true' || steps.config.outputs.pr_reused == 'true') }}
+        timeout-minutes: 3
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tiden-receipt
