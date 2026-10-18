@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
@@ -283,3 +284,12 @@ def test_a_changed_blob_that_cannot_be_read_takes_the_owner_path(tmp_path):
     blob = git(root, "rev-parse", "HEAD:app/new.py")
     (root / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
     assert change_path.classify(root, "main", "HEAD") == "OWNER — doubt: app/new.py (a blob cannot be read)"
+
+
+# spec: ANYM-404
+def test_a_comment_after_a_statement_in_code_is_scanned_in_linear_time():
+    comment = "# " + "#" * 5000
+    text = f'sql = "DELETE FROM users WHERE expired = TRUE"  {comment}\nX = 1\n'
+    started = time.monotonic()
+    assert change_path.code_statements(text) == [f'DELETE FROM users WHERE expired = TRUE" {comment}']
+    assert time.monotonic() - started < 1

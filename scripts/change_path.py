@@ -58,8 +58,10 @@ DESTRUCTIVE_SQL_IN_CODE = re.compile(
 DOLLAR_QUOTE = re.compile(r"\$([A-Za-z_]\w*)?\$")
 QUOTES = "\"'`"
 # A string literal joined to the previous one: `+`, a line continuation, comments or nothing between, then a prefixed
-# quote.
-JOINED_LITERAL = re.compile(r"(\s|#[^\n]*|//[^\n]*)*\+?(\s|#[^\n]*|//[^\n]*)*(\\\s*)?[A-Za-z]{0,2}(?P<quote>[\"'`])")
+# quote. A comment runs to its newline and every repetition is possessive, so a failed match is linear (no
+# backtracking over a run of `#`).
+GAP = r"(?:\s|#[^\n]*\n|//[^\n]*\n)*+"
+JOINED_LITERAL = re.compile(rf"{GAP}(?:\+{GAP})?+(?:\\\s*+)?+[A-Za-z]{{0,2}}(?P<quote>[\"'`])")
 CODE_SUFFIXES = {".py", ".go", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".sh"}
 AGENT_SETTINGS = ".claude/settings.json"
 # An agent permission may be added to `allow` without the owner only when it is read-only by name.
