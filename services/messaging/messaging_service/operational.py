@@ -40,19 +40,24 @@ PHASE_REASONS = CONNECTION_ERRORS | {'provider_ready','capture_ready','capture_d
     'collector_shutdown','history_scan','history_scan_finished','provider_temporarily_unavailable',
     'collector_starting','operator_resumed'}
 # Stop codes a collector's telemetry event may carry (ANYM-292): never exception text.
-TELEMETRY_STOP_CODES = {component:codes|CONNECTION_ERRORS|{'durable_capture_failed.'+detail
-    for detail in CAPTURE_STOP_DETAILS} for component,codes in SUPERVISOR_STOP_CODES.items()}
+# Only Telegram records a fixed capture detail, so only it has qualified codes.
+TELEMETRY_STOP_CODES = {component:frozenset(codes|CONNECTION_ERRORS) for component,codes in SUPERVISOR_STOP_CODES.items()}
+TELEMETRY_STOP_CODES['telegram'] |= {'durable_capture_failed.'+detail for detail in CAPTURE_STOP_DETAILS}
 
 
 def collector_stop(exc, component):
-    """Supervisor code, fixed capture detail and telemetry code of a collector stop."""
-    # Exception strings from providers can contain private requests; only exact
-    # fixed codes pass, anything else becomes collector_failed.
+    """Supervisor code, fixed capture detail and telemetry code of a collector stop; never raises."""
+    # Exception strings from providers can contain private requests; only an exact
+    # built-in str equal to a fixed code passes (a str subclass could fake equality).
     try:text=str(exc)
     except Exception:text=''
+    if type(text) is not str:text=''
     code=text if text in SUPERVISOR_STOP_CODES[component] else 'collector_failed'
-    detail=getattr(exc,'detail',None) if text=='durable_capture_failed' else None
-    detail=detail if isinstance(detail,str) and detail in CAPTURE_STOP_DETAILS else None
+    detail=None
+    if component=='telegram' and text=='durable_capture_failed':
+        try:detail=getattr(exc,'detail',None)
+        except Exception:detail=None
+        if type(detail) is not str or detail not in CAPTURE_STOP_DETAILS:detail=None
     # A qualified code comes only from the fixed detail, never from exception text.
     event=(text+'.'+detail if detail else text if text in SUPERVISOR_STOP_CODES[component] or text in CONNECTION_ERRORS
         else 'collector_failed')
