@@ -2239,80 +2239,78 @@ def test_a_serving_http_attempt_that_http_current_does_not_name_pauses_before_pl
 
 
 def test_an_invalid_source_mirror_pauses_and_is_never_fetched_into(tmp_path, monkeypatch):
-    host = Deployer(tmp_path, monkeypatch)
-    (host.state / "deploy-source.git").mkdir()  # empty: git refuses it locally, before any network access
-    outcome = host.deploy()
-    assert outcome["status"] == "halted" and outcome["reason"].startswith("deploy was refused before any change: git")
-    assert host.paused() == outcome["reason"] and host.steps == []
-    assert not [argv for argv in host.git if "fetch" in argv]
-    # So does a repository there that is not the bare mirror itself; a real bare mirror is fetched.
-    for bare in (False, True):
+    for kind in ("empty", "not bare"):
         p.PAUSE.unlink(missing_ok=True)
-        (tmp_path / str(bare)).mkdir()
-        host = Deployer(tmp_path / str(bare), monkeypatch)
-        subprocess.run(["git", "init", "--quiet", *(["--bare"] if bare else []), str(host.state / "deploy-source.git")],
-                       check=True)
-        outcome = host.deploy()
-        if bare:
-            assert outcome["status"] == "deployed" and [argv for argv in host.git if "fetch" in argv]
+        (tmp_path / kind).mkdir()
+        host = Deployer(tmp_path / kind, monkeypatch)
+        if kind == "empty":
+            (host.state / "deploy-source.git").mkdir()  # git refuses it locally, before any network access
         else:
-            assert outcome["status"] == "halted" and "is not the bare source mirror" in outcome["reason"]
-            assert not [argv for argv in host.git if "fetch" in argv]
+            subprocess.run(["git", "init", "--quiet", str(host.state / "deploy-source.git")], check=True)
+        outcomes = [host.deploy() for _ in range(3)]
+        assert [outcome["status"] for outcome in outcomes] == ["fetch_failed", "fetch_failed", "halted"]
+        detail = "not a git repository" if kind == "empty" else "is not the bare source mirror"
+        assert all(detail in outcome["reason"] for outcome in outcomes), outcomes
+        assert host.paused() == outcomes[-1]["reason"] and "3 times in a row" in host.paused()
+        assert host.steps == [] and not [argv for argv in host.git if "fetch" in argv]
+    # A real bare mirror is fetched.
+    p.PAUSE.unlink()
+    (tmp_path / "bare").mkdir()
+    host = Deployer(tmp_path / "bare", monkeypatch)
+    subprocess.run(["git", "init", "--quiet", "--bare", str(host.state / "deploy-source.git")], check=True)
+    assert host.deploy()["status"] == "deployed" and [argv for argv in host.git if "fetch" in argv]
 
 
-def test_only_a_transport_failure_of_git_talking_to_github_is_retried(tmp_path, monkeypatch):
-    def failing(stderr):
-        return [sys.executable, "-c", f"import sys; sys.stderr.write({stderr!r}); sys.exit(128)"]
-    transport = "fatal: unable to access 'https://github.com/GoSync-Inc/deedkit.git/': Could not resolve host: github.com\n"
-    local = "fatal: could not lock config file deploy-source.git/config: Permission denied\n"
-    with pytest.raises(p.Unreachable):
-        p.run(failing(transport), reason=True, remote=True)
-    with pytest.raises(p.Refused, match="could not lock config file") as refused:
-        p.run(failing(local), reason=True, remote=True)
-    assert not isinstance(refused.value, p.Unreachable)
-    with pytest.raises(p.Refused) as refused:
-        p.run(failing(transport))  # not marked as a command talking to GitHub
-    assert not isinstance(refused.value, p.Unreachable)
-    for command, error in (("ls-remote", p.Unreachable("git could not reach GitHub (exit 128)")),
-                           ("clone", p.Unreachable("git could not reach GitHub (exit 128)")),
-                           ("ls-remote", p.Refused("git failed (exit 128): fatal: synthetic local failure")),
-                           ("clone", p.Refused("git failed (exit 128): fatal: synthetic local failure"))):
-        directory = tmp_path / f"{command}-{type(error).__name__}"
-        directory.mkdir()
-        host = Deployer(directory, monkeypatch)
-        host.git_failures[command] = error
+@pytest.mark.parametrize("command, stderr", [
+    ("ls-remote", "fatal: unable to access 'https://github.com/GoSync-Inc/deedkit.git/': Could not resolve host: "
+                  "github.com\n"),
+    ("clone", "error: RPC failed; HTTP 403 curl 22 The requested URL returned error: 403\nfatal: early EOF\n")],
+    ids=["ls-remote", "clone"])
+def test_a_failed_fetch_changes_nothing_and_only_the_third_in_a_row_pauses(tmp_path, monkeypatch, capsys, command,
+                                                                         stderr):
+    host = Deployer(tmp_path, monkeypatch, green=())
+    tail = stderr.strip().splitlines()[-1]
+    def failed(count):
         outcome = host.deploy()
-        if isinstance(error, p.Unreachable):
-            assert outcome["status"] == "error" and "the next run retries" in outcome["reason"] and host.paused() is None
-        else:
-            assert outcome["status"] == "halted" and "synthetic local failure" in outcome["reason"] and host.paused()
-        assert host.steps == []
-
-
-RETRIED_GIT = ("fatal: unable to access 'https://github.com/GoSync-Inc/deedkit.git/': Failed to connect to github.com "
-               "port 443 after 130000 ms: Couldn't connect to server\n",
-               "error: RPC failed; curl 56 Recv failure: Connection reset by peer\nfatal: early EOF\n",
-               "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503\n")
-PAUSED_GIT = ("error: RPC failed; HTTP 403 curl 22 The requested URL returned error: 403\n",
-              "error: RPC failed; curl 23 Failed writing received data to disk/application\nfatal: early EOF\n",
-              "error: RPC failed; curl 60 SSL certificate problem: unable to get local issuer certificate\n",
-              "error: RPC failed; curl 56 Recv failure: Connection reset by peer\n"
-              "fatal: could not lock config file deploy-source.git/config: No space left on device\n",
-              "error: RPC failed; result=18, HTTP 200\nfatal: early EOF\nfatal: the remote end hung up unexpectedly\n")
-
-
-@pytest.mark.parametrize("stderr", RETRIED_GIT + PAUSED_GIT,
-                         ids=[f"retried{i}" for i in range(len(RETRIED_GIT))] + [f"paused{i}" for i in range(len(PAUSED_GIT))])
-def test_a_git_failure_is_retried_only_when_git_names_a_transport_cause(tmp_path, monkeypatch, stderr):
-    host = Deployer(tmp_path, monkeypatch)
-    host.git_failures["clone"] = stderr
+        assert outcome == {"status": "fetch_failed", "reason": outcome["reason"], "failures": count}
+        assert tail in outcome["reason"] and host.paused() is None and host.steps == []
+        receipt = p.read(host.state / "deploy.json")["fetch_failures"]
+        assert receipt["count"] == count and receipt["reason"] == outcome["reason"]
+    host.git_failures[command] = stderr
+    failed(1)
+    failed(2)
+    # A dry run reports the failure but records nothing.
+    assert "3 times in a row" in host.deploy(dry_run=True)["would_pause"] and host.paused() is None
+    assert p.read(host.state / "deploy.json")["fetch_failures"]["count"] == 2
+    # A successful fetch resets the count.
+    del host.git_failures[command]
+    assert host.deploy()["status"] == "waiting" and "fetch_failures" not in p.read(host.state / "deploy.json")
+    host.git_failures[command] = stderr
+    failed(1)
+    failed(2)
     outcome = host.deploy()
-    if stderr in RETRIED_GIT:
-        assert outcome["status"] == "error" and "could not reach GitHub" in outcome["reason"] and host.paused() is None
-    else:
-        assert outcome["status"] == "halted" and "refused before any change" in outcome["reason"]
-        assert host.paused() == outcome["reason"]
-    assert host.steps == []
+    assert outcome["status"] == "halted" and outcome["reason"].startswith("git could not read main 3 times in a row")
+    assert tail in outcome["reason"] and host.paused() == outcome["reason"] and host.steps == []
+    assert "fetch_failures" not in p.read(host.state / "deploy.json")
+    # The command line exits 1 on a failed fetch, so the timer unit shows it.
+    p.PAUSE.unlink()
+    monkeypatch.setattr(p.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(p, "lock", lambda state: contextlib.nullcontext())
+    monkeypatch.setattr(host.s, "locks", lambda settings: contextlib.nullcontext())
+    monkeypatch.setattr(p, "config", lambda name: host.settings if name == "plan-a.json" else host.http)
+    monkeypatch.setattr(host.s, "validate_settings", lambda value: value)
+    with pytest.raises(SystemExit) as stopped:
+        p.main(["deploy", "--config", "plan-a.json", "--http-config", "plan-b.json"])
+    assert stopped.value.code == 1 and json.loads(capsys.readouterr().out)["status"] == "fetch_failed"
+
+
+def test_an_unchanged_main_after_failed_fetches_resets_the_count(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, history=())
+    host.git_failures["ls-remote"] = p.Refused("git failed (exit 128): fatal: synthetic; production was not accepted")
+    assert host.deploy()["failures"] == 1 and host.deploy()["failures"] == 2
+    del host.git_failures["ls-remote"]
+    assert host.deploy() == {"status": "current", "sha": BASE}
+    assert "fetch_failures" not in p.read(host.state / "deploy.json")
 
 
 def test_a_bare_mirror_under_a_path_with_spaces_is_fetched(tmp_path, monkeypatch):

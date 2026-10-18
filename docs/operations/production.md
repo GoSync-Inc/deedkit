@@ -547,7 +547,7 @@ Otherwise it:
    nor `startup-failed`, or a `serving` attempt is not the serving release or
    an ancestor of it (`promote` stopped before it published `http-current.json`);
 2. fetches a blobless mirror of `main` into `<state>/deploy-source.git` (an
-   existing path there that is not that bare repository pauses) and
+   existing path there must be that bare repository) and
    picks the newest first-parent commit after the current release whose latest
    push run succeeded; a commit whose deployment was attempted is never
    retried, and no older commit follows it;
@@ -578,10 +578,13 @@ On a failure it writes `/etc/deedkit/autodeploy.pause` (JSON with the reason)
 and exits 1; nothing deploys until a human removes it. A refusal before any
 change pauses, and so does any other error or state it cannot classify (a
 malformed receipt, `deploy.json` included, a failed retirement of the previous
-HTTP generation, a local git or source mirror failure, a lock it cannot take);
-only a network error (a GitHub API connection error, a git transport failure
-named in git's error output), a GitHub server error (5xx) or an exhausted quota
-before any change is retried by the next run. An error after a release step started pauses as an unknown state. When plan A failed its health wait (`unhealthy`, above), it runs
+HTTP generation, a lock it cannot take); only a GitHub API connection error,
+a GitHub server error (5xx) or an exhausted quota before any change is retried
+by the next run. A failed `git ls-remote` or mirror fetch (any cause, the
+mirror check included) changes nothing: the run prints `fetch_failed` with
+git's last error line, exits 1 and counts it in `deploy.json`
+(`fetch_failures`); a successful fetch resets the count, and the third failure
+in a row (about 15 minutes on the timer) pauses. An error after a release step started pauses as an unknown state. When plan A failed its health wait (`unhealthy`, above), it runs
 `rollback` once (automatic deploys never change the SQL inventory) and pauses
 with status `rolled-back`; a failed rollback, or an apply that stopped in any
 other state, pauses with no further action. A failed plan B pauses and leaves

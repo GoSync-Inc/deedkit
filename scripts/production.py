@@ -66,30 +66,12 @@ class RateLimited(Refused):
     """GitHub's API quota ran out: nothing is wrong with the candidate, and `deploy` retries after the reset."""
 
 
-class Unreachable(Refused):
-    """GitHub's git endpoint did not answer: `deploy` retries on its next run."""
-
-
-# The stderr of a git command talking to GitHub that names the cause of a transport failure (curl's resolve,
-# connect, timeout, send/receive and HTTP 5xx errors); generic labels such as "RPC failed" or "early EOF" are no
-# evidence. Any other git failure, and any that also names a cause on this host or an access or trust problem
-# (HTTP 4xx, a local write, a certificate), is refused.
-TRANSPORT = re.compile(r"Could not resolve host|Failed to connect to|Connection (?:timed out|reset by peer|refused)|"
-                       r"Operation timed out|Empty reply from server|returned error: 5\d\d|HTTP 5\d\d|"
-                       r"\bcurl (?:6|7|18|28|52|55|56|92)\b|GnuTLS recv error")
-NOT_TRANSPORT = re.compile(r"returned error: 4\d\d|HTTP 4\d\d|\bcurl (?:23|35|51|58|60|77)\b|certificate|"
-                           r"Permission denied|No space left|Failed writing|Read-only file system|could not lock|"
-                           r"not a git repository|corrupt", re.I)
-
-
-def run(argv, *, cwd=None, umask=-1, env=None, reason=False, remote=False):
+def run(argv, *, cwd=None, umask=-1, env=None, reason=False):
     # Never include command output in an exception: Compose can contain secrets. Only a tool that prints
     # nothing secret (the attestation verifier, git on the public source mirror) may pass its last stderr line on,
-    # with `reason`. `remote` marks a git command talking to GitHub: only a transport failure is Unreachable.
+    # with `reason`.
     result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=1800, umask=umask, env=env)
     if result.returncode:
-        if remote and TRANSPORT.search(result.stderr) and not NOT_TRANSPORT.search(result.stderr):
-            raise Unreachable(f"{Path(argv[0]).name} could not reach GitHub (exit {result.returncode})")
         detail = (result.stderr.strip().splitlines() or [""])[-1][:300] if reason else ""
         raise Refused(f"{Path(argv[0]).name} failed (exit {result.returncode}){': ' + detail if detail else ''}; "
                       "production was not accepted")
@@ -993,6 +975,9 @@ def images_report(settings):
 # commit, or pauses for a human. A human creates or removes the pause file; `deploy` only creates it.
 PAUSE = Path("/etc/deedkit/autodeploy.pause")
 DEPLOY_INTERVAL = 20 * 60
+# Consecutive runs whose `git ls-remote` or mirror fetch failed before the deployer pauses (about 15 minutes on the
+# timer): a network blip heals by itself, a broken mirror or a refused access does not.
+FETCH_FAILURES = 3
 # Changes a human applies or installs by hand, so the deployer pauses for them.
 SQL_INVENTORY = re.compile(r"\.sql$|^services/.+/migrations/")
 DEPLOY_TOOLS = ("scripts/production.py", "scripts/seamless_release.py", "tools/attest-verify/", "services/release-router/")
@@ -1015,8 +1000,8 @@ def quota():
 
 def remote_main():
     """main's head from `git ls-remote`, which the API quota does not meter."""
-    line = run(["git", "ls-remote", "https://github.com/" + REPOSITORY + ".git", "refs/heads/main"], reason=True,
-               remote=True).split()
+    line = run(["git", "ls-remote", "https://github.com/" + REPOSITORY + ".git", "refs/heads/main"],
+               reason=True).split()
     if len(line) != 2 or line[1] != "refs/heads/main" or not re.fullmatch(r"[0-9a-f]{40}", line[0]):
         raise Refused("git ls-remote returned no main commit")
     return line[0]
@@ -1031,10 +1016,10 @@ def main_history(state):
                reason=True).splitlines() != ["true", str(mirror.resolve())]:
             raise Refused(f"{mirror} is not the bare source mirror; remove or repair it")
         run(["git", "-C", str(mirror), "fetch", "--quiet", "--filter=blob:none", "origin",
-             "+refs/heads/main:refs/heads/main"], reason=True, remote=True)
+             "+refs/heads/main:refs/heads/main"], reason=True)
     else:
         run(["git", "clone", "--quiet", "--bare", "--filter=blob:none", "--single-branch", "--branch", "main",
-             "https://github.com/" + REPOSITORY + ".git", str(mirror)], reason=True, remote=True)
+             "https://github.com/" + REPOSITORY + ".git", str(mirror)], reason=True)
     return mirror
 
 
@@ -1144,7 +1129,10 @@ def deploy_steps(settings, http, s, *, auto, dry_run, get, halt, record):
         last = read(state / "deploy.json") if (state / "deploy.json").exists() else {}
         started = last.get("started_at") and datetime.strptime(last["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
             tzinfo=timezone.utc)
-    except (ValueError, TypeError, AttributeError):
+        failures = last.get("fetch_failures", {"count": 0})["count"]
+        if type(failures) is not int or failures < 0:
+            raise ValueError("fetch failure count")
+    except (ValueError, TypeError, AttributeError, KeyError):
         return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it")
     if auto and started and (datetime.now(timezone.utc) - started).total_seconds() < DEPLOY_INTERVAL:
         return {"status": "waiting", "reason": "less than 20 minutes since the last deploy started"}
@@ -1176,10 +1164,25 @@ def deploy_steps(settings, http, s, *, auto, dry_run, get, halt, record):
             return {"status": "waiting", "reason": "the previous HTTP generation is still draining"}
     if not serving_settled(serving) or not re.fullmatch(r"[0-9a-f]{40}", serving.get("sha", "")):
         return halt(f"the HTTP release is {serving.get('status', 'missing')}; inspect seamless_release.py status")
-    head = remote_main()
-    if head == base == serving["sha"]:
+    try:
+        # Every failure here precedes any change: this run does nothing, and the third in a row pauses.
+        head = remote_main()
+        mirror = None if head == base == serving["sha"] else main_history(state)
+    except Exception as exc:
+        message, failures = (str(exc) if isinstance(exc, Refused) else type(exc).__name__), failures + 1
+        rest = {key: value for key, value in last.items() if key != "fetch_failures"}
+        if failures >= FETCH_FAILURES:
+            if not dry_run:
+                write(state / "deploy.json", rest)
+            return halt(f"git could not read main {failures} times in a row, last: {message}; "
+                        f"inspect the network and {state / 'deploy-source.git'}")
+        if not dry_run:
+            write(state / "deploy.json", {**rest, "fetch_failures": {"count": failures, "at": now(), "reason": message}})
+        return {"status": "fetch_failed", "reason": message, "failures": failures}
+    if "fetch_failures" in last and not dry_run:
+        write(state / "deploy.json", {key: value for key, value in last.items() if key != "fetch_failures"})
+    if mirror is None:
         return {"status": "current", "sha": base}
-    mirror = main_history(state)
     head = run(["git", "-C", str(mirror), "rev-parse", "refs/heads/main"]).strip()
     if not on_main(mirror, base, head) or not on_main(mirror, serving["sha"], base):
         return halt("the current release is not on main, or the serving HTTP release is not an ancestor of it")
@@ -1281,7 +1284,7 @@ def transient(exc):
     retries it. Anything else (a refusal, a malformed receipt, a program error) pauses."""
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code >= 500
-    return isinstance(exc, (RateLimited, Unreachable, urllib.error.URLError, TimeoutError, ConnectionError))
+    return isinstance(exc, (RateLimited, urllib.error.URLError, TimeoutError, ConnectionError))
 
 
 def http_release_tool():
@@ -1321,9 +1324,9 @@ def main(argv=None):
                 raise Refused("deploy requires the production host operator")
             result = deploy(config(args.config), http_release_tool().validate_settings(config(args.http_config)),
                             auto=args.auto, dry_run=args.dry_run)
-            # One line per run for the journal; a new pause or an error exits 1, so the timer unit shows failed.
+            # One line per run for the journal; a new pause, an error or a failed fetch exits 1, so the timer unit shows failed.
             print(json.dumps(result, sort_keys=True))
-            if result["status"] in ("halted", "rolled-back", "error"):
+            if result["status"] in ("halted", "rolled-back", "error", "fetch_failed"):
                 parser.exit(1)
             return
         else:
