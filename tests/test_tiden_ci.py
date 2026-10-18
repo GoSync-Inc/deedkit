@@ -1374,7 +1374,8 @@ def evidence_verdict(tmp_path, meta, **reports):
     prepare(tmp_path, directory, meta)
     (tmp_path / "ci-tools").symlink_to(root)  # the workflow commit's checkout in CI
     return subprocess.run(["bash", "-e", "-c", step["run"]], cwd=tmp_path, capture_output=True, text=True,
-                          env={"PATH": os.environ["PATH"], "RUNNER_TEMP": str(tmp_path)})
+                          env={"PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+                               "RUNNER_TEMP": str(tmp_path)})
 
 
 @pytest.mark.parametrize("change, reports, passes", [
@@ -1392,7 +1393,8 @@ def test_the_evidence_job_fails_on_a_failed_test_or_a_failed_or_blocked_check(tm
     meta = metadata()
     meta["checks"].update(change)
     completed = evidence_verdict(tmp_path, meta, **reports)
-    assert (completed.returncode == 0) is passes, completed.stdout + completed.stderr
+    assert completed.returncode == (0 if passes else 1), completed.stdout + completed.stderr
+    assert completed.stdout.startswith("Every test and check passed." if passes else "The evidence records ")
     import yaml
     root = Path(__file__).resolve().parents[1]
     names = [step.get("name") for step in yaml.safe_load((root / ".github/workflows/checks.yml").read_text())[
