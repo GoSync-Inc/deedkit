@@ -24,6 +24,15 @@ class PoisonItem(ValueError):
     """A durably queued item that can never be applied; quarantine it instead of retrying."""
 
 
+class InvalidCapture(ValueError):
+    """The validator deterministically rejected an item; nothing was written.
+
+    Its message is a content-free reason code. Capacity and I/O failures are
+    never raised as this class, so callers can skip one bad item and still fail
+    closed on everything else.
+    """
+
+
 def reason_code(exc):
     # Codes only: exception text from parsers could carry source content.
     code=str(exc)
@@ -50,7 +59,10 @@ class DurableSpool:
         finally: os.close(fd)
 
     def put(self,data):
-        payload=canonical(self.validator(data)); digest=hashlib.sha256(payload).hexdigest()
+        try:payload=canonical(self.validator(data))
+        except OSError:raise  # Also a ValueError for io.UnsupportedOperation; never a rejection.
+        except (ValueError,TypeError,KeyError,RecursionError) as exc:raise InvalidCapture(reason_code(exc)) from None
+        digest=hashlib.sha256(payload).hexdigest()
         with self.locked():
             # One directory pass: dedupe, quota and abandoned temp files.
             pending=occupied=0

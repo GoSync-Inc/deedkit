@@ -12,9 +12,9 @@ from messaging_service.adapters import telegram_message,whatsapp_message
 from messaging_service.blobs import Blob,BlobWriter
 from messaging_service.commands import CommandWorker
 from messaging_service.outgoing import DispatchNotStarted,OutgoingWorker,dispatch,finish_durably
-from messaging_service.spool import DurableSpool,PoisonItem
+from messaging_service.spool import DurableSpool,InvalidCapture,PoisonItem
 from messaging_service.telegram_collector import TelegramCollector,media_deadline
-from test_collectors import worker  # noqa: F401  (fixture)
+from test_collectors import message,worker  # noqa: F401  (fixture)
 
 
 def strict(item):
@@ -362,3 +362,280 @@ def test_sweep_removes_only_old_abandoned_temporary_files(tmp_path):
     assert writer.sweep_abandoned()==1
     assert not old.exists() and fresh.exists() and other.exists() and nested.exists()
     assert link.is_symlink() and target.exists()
+
+
+# Live callbacks: one deterministically unstorable item is skipped and counted;
+# capacity, I/O and unexpected errors still fail the collector closed.
+
+def live_status(w,store):
+    asyncio.run(w.drain_captures([w.spool]))
+    with store.pool.connection() as c:
+        return c.execute('SELECT operations FROM collector_health WHERE account=%s',(w.account,)).fetchone()['operations']['live_capture']
+
+
+def spooled(w):
+    items=[];w.spool.drain(items.append);return items
+
+
+def test_spool_rejection_is_invalid_capture_and_writes_nothing(tmp_path):
+    queue=spool(tmp_path)
+    with pytest.raises(InvalidCapture,match='^invalid_body$'):queue.put({'bad':True})
+    with pytest.raises(InvalidCapture,match='^invalid_capture$'):queue.put({'bad':False,'x':{1,2}})
+    assert names(queue.path)==[] and not list(queue.path.glob('.pending-*'))
+
+
+def test_rejected_live_message_is_counted_with_its_identity_and_capture_continues(worker,monkeypatch):
+    w,s,_=worker
+    import messaging_service.telegram_collector as collector
+    original=collector.telegram_message
+    def broken(account,item,**options):
+        e=original(account,item,**options)
+        return {**e,'sent_at':'not-a-time'} if item.id==7 else e
+    monkeypatch.setattr(collector,'telegram_message',broken)
+    asyncio.run(w.capture(NS(message=message(7))))
+    asyncio.run(w.capture(NS(message=message(8))))
+    assert not w.failed.is_set() and w.capture_count==0
+    assert [i['envelope']['provider_id'] for i in spooled(w)]==['8']
+    live=live_status(w,s)
+    assert sum(live['rejected_live_captures'].values())==1
+    [skipped]=live['rejected_live_messages']
+    assert skipped['chat']=='100' and skipped['message_id']==7 and skipped['reason_code'] in live['rejected_live_captures']
+    assert set(skipped)=={'chat','message_id','reason_code','observed_at'}
+
+
+def test_unsupported_live_peer_is_an_invalid_message_not_a_stop(worker):
+    w,s,_=worker
+    odd=message(7);odd.peer_id=NS()
+    asyncio.run(w.capture(NS(message=odd)))
+    assert not w.failed.is_set() and w.invalid_messages==1
+    live=live_status(w,s)
+    assert live['invalid_provider_messages']==1 and live['rejected_live_captures']=={'invalid_provider_message':1}
+    assert live['rejected_live_messages'][0]['message_id']==7
+
+
+def test_invalid_live_delete_is_counted_and_next_delete_is_spooled(worker):
+    w,s,_=worker
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=[0])))
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=[])))
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=[4])))
+    assert not w.failed.is_set() and w.capture_count==0
+    assert [i['ids'] for i in spooled(w)]==[[4]]
+    assert live_status(w,s)['rejected_live_captures']=={'invalid_deleted_ids':2}
+
+
+def test_large_live_delete_is_spooled_in_parts_and_drains_every_tombstone(worker):
+    w,s,key=worker
+    asyncio.run(w.sync_once())
+    ids=list(range(2500,0,-1))
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=ids)))
+    assert not w.failed.is_set()
+    items=[]
+    def apply(item):items.append(item);w.state.apply(item)
+    w.spool.drain(apply)
+    assert sorted(len(i['ids']) for i in items)==[500,1000,1000]
+    assert sorted(x for i in items for x in i['ids'])==list(range(1,2501))
+    assert len({i['observed_at'] for i in items})==1
+    asyncio.run(w.sync_once())
+    from messaging_service.envelope import stable_id
+    # The first page archived messages 4 and 5; their tombstones applied from the split records.
+    assert all(s.get_context(key,stable_id('msg',w.account,'100',str(n)))['message']['deleted'] for n in (4,5))
+
+
+def receipt_ready(w):
+    from telethon import types
+    w.provider.verified_self=types.User(id=42,is_self=True);w.provider.expected_user_id=42
+    return types.UpdateReadHistoryOutbox(types.PeerUser(100),23,10,1)
+
+
+def test_invalid_or_unparsable_live_receipt_is_counted_not_a_stop(worker,monkeypatch):
+    w,s,_=worker
+    import messaging_service.telegram_receipts as receipts
+    event=receipt_ready(w);original=receipts.telegram_receipt
+    monkeypatch.setattr(receipts,'telegram_receipt',lambda *a,**k:{**original(*a,**k),'max_id':0})
+    asyncio.run(w.receipt(event))
+    def boom(*a,**k):raise AttributeError('synthetic-private-parser-detail')
+    monkeypatch.setattr(receipts,'telegram_receipt',boom)
+    asyncio.run(w.receipt(event))
+    monkeypatch.setattr(receipts,'telegram_receipt',original)
+    asyncio.run(w.receipt(event))
+    assert not w.failed.is_set() and w.capture_count==0
+    assert [i['kind'] for i in spooled(w)]==['message_receipt']
+    live=live_status(w,s)
+    assert live['rejected_live_captures']=={'invalid_receipt_reference':1,'receipt_parse_failed':1}
+    assert 'synthetic-private' not in str(live)
+
+
+def test_invalid_or_unparsable_live_owner_read_is_counted_not_a_stop(worker,monkeypatch):
+    w,s,_=worker
+    import messaging_service.reply_state as reply_state
+    from telethon import types
+    receipt_ready(w)
+    event=types.UpdateReadHistoryInbox(types.PeerUser(100),23,2,10,1)
+    original=reply_state.telegram_read_capture
+    monkeypatch.setattr(reply_state,'telegram_read_capture',lambda *a,**k:{**original(*a,**k),'extra':1})
+    asyncio.run(w.owner_read(event))
+    def boom(*a,**k):raise TypeError('synthetic-private-parser-detail')
+    monkeypatch.setattr(reply_state,'telegram_read_capture',boom)
+    asyncio.run(w.owner_read(event))
+    monkeypatch.setattr(reply_state,'telegram_read_capture',original)
+    asyncio.run(w.owner_read(event))
+    assert not w.failed.is_set() and w.capture_count==0
+    assert [i['kind'] for i in spooled(w)]==['owner_read_state']
+    assert live_status(w,s)['rejected_live_captures']=={'invalid_read_capture':1,'read_parse_failed':1}
+
+
+@pytest.mark.parametrize('cause,detail',[('disk_reserve','disk_reserve'),('spool_full','spool_full'),
+    ('io','spool_io_error'),('other','capture_error')])
+def test_capacity_io_and_unexpected_errors_still_fail_closed_with_a_fixed_detail(worker,cause,detail):
+    w,_,_=worker
+    if cause=='disk_reserve':w.spool.reserve_bytes=2**62
+    elif cause=='spool_full':w.spool.max_entries=0
+    else:
+        def failing(_):raise OSError(5,'synthetic-private-path') if cause=='io' else LookupError('synthetic-private')
+        w.spool.put=failing
+    asyncio.run(w.capture(NS(message=message(7))))
+    assert w.failed.is_set() and w.failure_code=='durable_capture_failed' and w.failure_detail==detail
+    assert names(w.spool.path)==[] and w.capture_count==0
+    # The first failure wins; later callbacks write nothing.
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=[4])))
+    assert names(w.spool.path)==[]
+
+
+def test_capture_stop_detail_is_kept_in_live_capture_status(worker):
+    w,s,_=worker
+    w.state.connection_failed('durable_capture_failed','disk_reserve')
+    w.state.capture_progress(None,0,0)
+    with s.pool.connection() as c:
+        operations=c.execute('SELECT operations FROM collector_health WHERE account=%s',(w.account,)).fetchone()['operations']
+    stop=operations['live_capture']['last_capture_stop']
+    assert stop['code']=='durable_capture_failed' and stop['detail']=='disk_reserve' and stop['at']
+    assert operations['connection']['reason_code']=='durable_capture_failed'
+    # Unknown details and non-capture stops record no capture detail.
+    w.state.connection_failed('durable_capture_failed','synthetic-private')
+    w.state.connection_failed('provider_disconnected','disk_reserve')
+    with s.pool.connection() as c:
+        live=c.execute('SELECT operations FROM collector_health WHERE account=%s',(w.account,)).fetchone()['operations']['live_capture']
+    assert live['last_capture_stop']['detail'] is None and live['last_capture_stop']['code']=='durable_capture_failed'
+
+
+def test_rejected_counts_are_bounded_and_validated(worker):
+    w,s,_=worker
+    # Code-shaped exception text from a validator is not trusted as a reason.
+    w.spool.validator=lambda item:(_ for _ in ()).throw(ValueError('synthetic_private_message'))
+    asyncio.run(w.capture(NS(message=message(7))))
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=[4])))
+    assert not w.failed.is_set()
+    live=live_status(w,s)
+    assert live['rejected_live_captures']=={'invalid_capture':2}
+    assert live['rejected_live_messages'][0]['reason_code']=='invalid_capture'
+    assert 'synthetic_private' not in str(live)
+    for bad in [{'synthetic_private_message':1},{'invalid_capture':0}]:
+        with pytest.raises(ValueError,match='invalid_capture_progress'):w.state.capture_progress(None,0,0,rejected=bad)
+    for bad in [{'chat':'100','message_id':1,'reason_code':'invalid_capture','observed_at':'2026-10-18T00:00:00+00:00','body':'private'},
+                {'chat':'100','message_id':1,'reason_code':'synthetic_private','observed_at':'2026-10-18T00:00:00+00:00'}]:
+        with pytest.raises(ValueError,match='invalid_capture_progress'):w.state.capture_progress(None,0,0,rejected_messages=[bad])
+
+
+@pytest.mark.parametrize('callback',['receipt','owner_read'])
+@pytest.mark.parametrize('error,detail',[(OSError(5,'synthetic-private'),'spool_io_error'),
+    (MemoryError(),'capture_error'),(RuntimeError('synthetic-private'),'capture_error')])
+def test_parser_resource_or_unexpected_error_still_fails_closed(worker,monkeypatch,callback,error,detail):
+    w,_,_=worker
+    import messaging_service.reply_state as reply_state
+    import messaging_service.telegram_receipts as receipts
+    event=receipt_ready(w)
+    def boom(*a,**k):raise error
+    monkeypatch.setattr(receipts if callback=='receipt' else reply_state,
+        'telegram_receipt' if callback=='receipt' else 'telegram_read_capture',boom)
+    asyncio.run(getattr(w,callback)(event))
+    assert w.failed.is_set() and w.failure_code=='durable_capture_failed' and w.failure_detail==detail
+    assert w.rejected=={} and names(w.spool.path)==[]
+
+
+def test_an_io_error_that_is_also_a_value_error_is_never_a_rejection(worker):
+    import io
+    w,_,_=worker
+    def unsupported(item):raise io.UnsupportedOperation('synthetic-private')
+    w.spool.validator=unsupported
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=[4])))
+    assert w.failed.is_set() and w.failure_detail=='spool_io_error' and w.rejected=={}
+
+
+class Raising:
+    @property
+    def chat_id(self):raise RuntimeError('synthetic-private')
+
+
+@pytest.mark.parametrize('event',[NS(),NS(message=Raising())])
+def test_malformed_live_event_fails_closed_and_releases_its_slot(worker,event):
+    w,_,_=worker
+    asyncio.run(w.capture(event))
+    assert w.failed.is_set() and w.failure_code=='durable_capture_failed' and w.failure_detail=='capture_error'
+    assert w.capture_count==0 and w.rejected=={}
+
+
+def test_rejection_evidence_survives_a_failed_status_write(worker):
+    w,s,_=worker
+    asyncio.run(w.deleted(NS(chat_id=None,deleted_ids=[0])))
+    odd=message(7);odd.peer_id=NS()
+    asyncio.run(w.capture(NS(message=odd)))
+    real=w.state.capture_progress;calls=[]
+    def flaky(*args,**kwargs):
+        calls.append(kwargs)
+        if len(calls)==1:
+            # A rejection that arrives while the first write is failing.
+            w.reject('invalid_deleted_ids')
+            raise psycopg.OperationalError('synthetic outage')
+        return real(*args,**kwargs)
+    w.state.capture_progress=flaky
+    with pytest.raises(psycopg.OperationalError):asyncio.run(w.drain_captures([w.spool]))
+    w._next_capture_status=0
+    asyncio.run(w.drain_captures([w.spool]))
+    assert calls[1]['rejected']=={'invalid_deleted_ids':2,'invalid_provider_message':1} and calls[1]['invalid']==1
+    assert [m['message_id'] for m in calls[1]['rejected_messages']]==[7]
+    assert w.rejected=={} and w.rejected_messages==[] and w.invalid_messages==0
+
+
+def test_run_reports_the_capture_stop_detail_to_state(tmp_path):
+    from messaging_service.collector_state import CaptureSpool
+    calls=[]
+    worker=TelegramCollector(None,'tg-fixture',None,CaptureSpool(tmp_path/'captures',reserve_bytes=0),writer=object())
+    async def connect():worker.fail('durable_capture_failed','disk_reserve')
+    async def idle():await asyncio.Event().wait()
+    async def disconnect():pass
+    worker.provider=NS(subscribe=lambda *a:None,connect=connect,disconnect=disconnect,wait_disconnected=idle)
+    state=NS(policy=lambda:{'account':'tg-fixture'},status=lambda *a:None,phase=lambda *a:None,
+        connection_gate=lambda:{'blocked':False,'remaining_seconds':0},connection_failed=lambda *a:calls.append(a))
+    worker.state_class=lambda *a:state
+    worker.archive=NS(acquire=lambda *a:1,release=lambda *a:None)
+    for name in ('heartbeat','drain_loop','reconcile_loop','media_loop','outgoing_loop'):setattr(worker,name,idle)
+    with pytest.raises(RuntimeError,match='^durable_capture_failed$') as stop:asyncio.run(worker.run())
+    assert stop.value.detail=='disk_reserve' and calls==[('durable_capture_failed','disk_reserve')]
+
+
+@pytest.mark.parametrize('detail,expected',[('disk_reserve',{'detail':'disk_reserve'}),('synthetic-private',{}),(None,{})])
+def test_supervisor_stop_line_names_the_fixed_capture_detail_only(monkeypatch,capsys,detail,expected):
+    import json,sys
+    from messaging_service import telegram_collector,telemetry
+    monkeypatch.setattr(telemetry,'configure',lambda component:None)
+    monkeypatch.setattr(telemetry,'capture',lambda error,code:None)
+    async def failed(config):
+        stop=RuntimeError('durable_capture_failed');stop.detail=detail;raise stop
+    monkeypatch.setattr(telegram_collector,'run_config',failed)
+    monkeypatch.setattr(telegram_collector.os,'umask',lambda mode:None)
+    monkeypatch.setattr(sys,'argv',['anymsg','--config','/synthetic/config.json'])
+    with pytest.raises(SystemExit):telegram_collector.main()
+    assert json.loads(capsys.readouterr().out)=={'status':'stopped','code':'durable_capture_failed',**expected}
+
+
+def test_history_page_skips_an_item_the_spool_validator_rejects(worker,monkeypatch):
+    w,s,key=worker
+    import messaging_service.telegram_collector as collector
+    original=collector.telegram_message
+    def broken(account,item,**options):
+        e=original(account,item,**options)
+        return {**e,'sent_at':'not-a-time'} if item.id==3 else e
+    monkeypatch.setattr(collector,'telegram_message',broken)
+    for _ in range(3):asyncio.run(w.sync_once())
+    assert len(s.search(key)['items'])==4 and w.invalid_messages==1
+    assert w.state.chat('100','user')['high_water']==5
