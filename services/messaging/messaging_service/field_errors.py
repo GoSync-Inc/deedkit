@@ -38,19 +38,6 @@ _TYPES = {'string': 'string', 'int': 'integer', 'float': 'number', 'bool': 'bool
     'dict': 'object', 'model': 'object', 'mapping': 'object'}
 
 
-def _names(node, found):
-    """Every property and literal-key name the reviewed schema declares; the only names a path may carry."""
-    if isinstance(node, dict):
-        found.update(node.get('properties', {}))
-        found.update(v for v in node.get('propertyNames', {}).get('enum', ()) if isinstance(v, str))
-        for value in node.values():
-            _names(value, found)
-    elif isinstance(node, list):
-        for value in node:
-            _names(value, found)
-    return found
-
-
 def _resolve(schema, node):
     """Follow a local $ref and, for a nullable union, the non-null branch."""
     for _ in range(8):
@@ -64,18 +51,32 @@ def _resolve(schema, node):
     return {}
 
 
-def _node(schema, path):
-    """The reviewed schema node at a path, or {} when the path leaves the schema."""
+def _walk(schema, loc):
+    """Follow an error location through the reviewed schema.
+
+    Returns (path, rank, node, complete): the longest prefix of the location the schema declares (property names,
+    literal map keys and array indexes only), the schema order of that path, its schema node, and whether the
+    whole location was declared. A segment the schema does not declare is input and is never kept.
+    """
     node = _resolve(schema, schema)
-    for part in path:
-        node = node.get('items', {}) if part.isdigit() else node.get('properties', {}).get(part, node.get('additionalProperties', {}))
-        node = _resolve(schema, node)
-    return node
+    path, rank = [], []
+    for part in loc:
+        if isinstance(part, bool): break
+        if isinstance(part, int) and 'items' in node:
+            path.append(str(part)); rank.append(part); node = _resolve(schema, node['items'])
+        elif isinstance(part, str) and part in node.get('properties', {}):
+            path.append(part); rank.append(list(node['properties']).index(part))
+            node = _resolve(schema, node['properties'][part])
+        elif isinstance(part, str) and part in node.get('propertyNames', {}).get('enum', ()):
+            path.append(part); rank.append(node['propertyNames']['enum'].index(part))
+            node = _resolve(schema, node.get('additionalProperties', {}))
+        else: break
+    return path, rank, node, len(path) == len(loc)
 
 
 def _expected(reason, kind, node, ctx):
     if reason == 'type': return _TYPES.get(kind.split('_')[0])
-    if reason == 'pattern' and len(node.get('pattern', '')) <= 80: return 'matching ' + node['pattern']
+    if reason == 'pattern' and isinstance(node.get('pattern'), str) and len(node['pattern']) <= 80: return 'matching ' + node['pattern']
     if reason in ('min_length', 'max_length'):
         low = node.get('minLength', ctx.get('min_length')); high = node.get('maxLength', ctx.get('max_length'))
         if low is not None and high is not None: return f'{low}–{high} characters'
@@ -90,33 +91,27 @@ def _expected(reason, kind, node, ctx):
 def pydantic_field_errors(model, errors):
     """Map `ValidationError.errors(include_input=False)` to field_errors in schema order, one per field."""
     schema = model.model_json_schema()
-    names = _names(schema, set())
-    order = {name: index for index, name in enumerate(schema.get('properties', {}))}
     found = []
     for error in errors:
-        path = []
-        for part in error.get('loc', ()):
-            if isinstance(part, int) and not isinstance(part, bool): path.append(str(part))
-            elif isinstance(part, str) and part in names: path.append(part)
-            else: break
-        # A rejected unknown key is named only when it is a short identifier.
-        if error['type'] == 'extra_forbidden' and len(error.get('loc', ())) == len(path) + 1:
-            part = error['loc'][-1]
-            if isinstance(part, str) and FIELD_NAME.fullmatch(part): path.append(part)
-        kind = error['type']
+        loc, kind = tuple(error.get('loc', ())), error['type']
+        key_error = loc[-1:] == ('[key]',)
+        path, rank, node, complete = _walk(schema, loc[:-1] if key_error else loc)
         reason = _REASONS.get(kind) or ('type' if kind.rsplit('_', 1)[-1] in ('type', 'parsing') else 'format')
-        node = _node(schema, path)
         allowed = None
-        if error.get('loc', ())[-1:] == ('[key]',):  # A map key outside the reviewed literal keys.
+        if key_error:  # A map key outside the reviewed literal keys.
             reason, allowed = 'unknown_field', node.get('propertyNames', {}).get('enum')
+        elif kind == 'extra_forbidden' and len(path) == len(loc) - 1:
+            # A rejected unknown key is named only when it is a short identifier.
+            if isinstance(loc[-1], str) and FIELD_NAME.fullmatch(loc[-1]): path.append(loc[-1]); rank.append(10**6)
+        elif not complete:
+            if 'propertyNames' in node: continue  # Under an unknown map key, which has its own entry.
+            reason, kind = 'format', ''
         elif reason == 'enum':
             allowed = node.get('enum') or ([node['const']] if 'const' in node else None)
         allowed = [v for v in allowed or () if isinstance(v, (str, int, bool)) and len(str(v)) <= 64]
         text = '/'.join(path)
-        if not text or len(text) > MAX_FIELD_PATH: text = None
-        found.append((order.get(path[0], len(order)) if path else len(order), text,
+        if len(text) > MAX_FIELD_PATH: text, rank = '/'.join(path[:1]), rank[:1]
+        found.append((rank or [10**6], text or 'arguments', None if not complete and not key_error else
             _expected(reason, kind, node, error.get('ctx') or {}), reason, allowed))
-    result = []
-    for _, text, expected, reason, allowed in sorted(found, key=lambda f: f[0]):
-        result.append(field_error(text or 'arguments', reason, expected, allowed))
-    return one_per_field(result)
+    return one_per_field(field_error(text, reason, expected, allowed)
+        for _, text, expected, reason, allowed in sorted(found, key=lambda f: f[0]))

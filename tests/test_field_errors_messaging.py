@@ -14,6 +14,7 @@ from tests.test_subscription_api import rpc
 CANARY = 'synthetic-canary-do-not-echo'
 HEADERS = {'Authorization': 'Bearer synthetic-token'}
 CATEGORIES = ['bug', 'feature', 'quality', 'other']
+REF_KINDS = ['message_ids', 'chat_ids', 'subscription_ids']
 GOOD = dict(request_id='synthetic-request', category='bug', description='ok')
 
 
@@ -83,13 +84,20 @@ def test_feedback_backend_errors_never_echo_input(seeded):
         {'field': 'request_id', 'reason': 'min_length', 'expected': '8–128 characters'},
         {'field': 'description', 'reason': 'min_length', 'expected': '1–4000 characters'}]),
     (dict(GOOD, operation='Bad Name'), [{'field': 'operation', 'reason': 'pattern', 'expected': 'matching ^[a-z][a-z0-9_]*$'}]),
-    (dict(GOOD, refs={'other_ids': ['x']}), [{'field': 'refs', 'reason': 'unknown_field',
-        'allowed': ['message_ids', 'chat_ids', 'subscription_ids']}]),
+    (dict(GOOD, refs={'other_ids': ['x']}), [{'field': 'refs', 'reason': 'unknown_field', 'allowed': REF_KINDS}]),
     (dict(GOOD, refs={'chat_ids': ['x'] * 33}), [{'field': 'refs/chat_ids', 'reason': 'max_items', 'expected': 'at most 32 items'}]),
     (dict(GOOD, refs={'chat_ids': [3]}), [{'field': 'refs/chat_ids/0', 'reason': 'type', 'expected': 'string'}]),
     (dict(GOOD, description='  '), [{'field': 'description', 'reason': 'blank', 'expected': 'text with a non-space character'}]),
     (dict(GOOD, refs={'chat_ids': ['x' * 130] * 32, 'message_ids': ['y' * 130] * 32}),
         [{'field': 'refs', 'reason': 'size', 'expected': 'at most 8 KiB'}]),
+    (dict(GOOD, refs={'synthetic-canary': ['\n']}), [{'field': 'refs', 'reason': 'unknown_field', 'allowed': REF_KINDS}]),
+    (dict(GOOD, refs={'request_id': ['x']}), [{'field': 'refs', 'reason': 'unknown_field', 'allowed': REF_KINDS}]),
+    (dict(GOOD, refs={'subscription_ids': [3], 'message_ids': [4]}), [
+        {'field': 'refs/message_ids/0', 'reason': 'type', 'expected': 'string'},
+        {'field': 'refs/subscription_ids/0', 'reason': 'type', 'expected': 'string'}]),
+    (dict(GOOD, refs={'message_ids': [3], 'subscription_ids': [4]}), [
+        {'field': 'refs/message_ids/0', 'reason': 'type', 'expected': 'string'},
+        {'field': 'refs/subscription_ids/0', 'reason': 'type', 'expected': 'string'}]),
     ({'category': 'bug'}, [{'field': 'request_id', 'reason': 'required'}, {'field': 'description', 'reason': 'required'}]),
     (dict(GOOD, unexpected=1), [{'field': 'unexpected', 'reason': 'unknown_field'}]),
 ])
@@ -118,3 +126,18 @@ def test_boundary_field_errors_never_echo_input():
     assert rest.json()['field_errors'] == mcp.json()['error']['data']['field_errors']
     assert {e['field'] for e in rest.json()['field_errors']} >= {'category', 'refs', 'arguments'}
     assert store.calls == []
+
+
+# spec: ANYM-295
+def test_integer_map_keys_are_never_named_and_never_raise():
+    from messaging_service.field_errors import pydantic_field_errors
+    from pydantic import BaseModel, ValidationError
+
+    class Model(BaseModel):
+        refs: dict[str, list[str]]
+        others: dict[str, int]
+
+    with pytest.raises(ValidationError) as failure:
+        Model.model_validate({'refs': {12345: [4]}, 'others': 1}, strict=True)
+    assert pydantic_field_errors(Model, failure.value.errors(include_input=False)) == [
+        {'field': 'refs', 'reason': 'unknown_field'}, {'field': 'others', 'reason': 'type', 'expected': 'object'}]
