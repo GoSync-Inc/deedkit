@@ -4,7 +4,9 @@ from outbound import TwilioCalls
 import destination_policy as policy
 
 
-def calling_readiness(principal, outbound, credentials, browser_enabled):
+def calling_readiness(principal, outbound, credentials, browser_enabled, provider='gemini_live'):
+    # The owner's call_voice provider speaks on every agent call (ANYM-359); None: the setting is unreadable.
+    key = {'gemini_live':'gemini', 'grok_realtime':'xai'}.get(provider)
     channels = {}
     for channel in principal.channels:
         blockers = []
@@ -13,7 +15,9 @@ def calling_readiness(principal, outbound, credentials, browser_enabled):
                 blockers.append('use_local_browser_rehearsal')
             if 'calls:start' not in principal.scopes:
                 blockers.append('calls:start_required')
-            if not any(credentials.values()):
+            if key is None:
+                blockers.append('call_voice_invalid')
+            elif not credentials.get(key):
                 blockers.append('model_key_required')
             channels[channel] = {'configuration_ready':not blockers, 'blockers':blockers,
                                  'live_call_verified':False}
@@ -28,8 +32,10 @@ def calling_readiness(principal, outbound, credentials, browser_enabled):
             blockers.append('recipient_not_allowed')
         # An exhausted cap is not a configuration fault: preflight and dial report daily_call_limit.
         remaining = outbound.daily_calls_remaining()
-        supported = ['gemini', 'xai'] if channel in {'phone','sip'} else ['gemini']
-        if not any(credentials.get(name) for name in supported):
+        supported = ['gemini', 'xai']
+        if key is None:
+            blockers.append('call_voice_invalid')
+        elif not credentials.get(key):
             blockers.append('model_key_required')
         provider = outbound.providers.get('telegram' if channel == 'telegram' else 'twilio')
         if provider is None:

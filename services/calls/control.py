@@ -13,8 +13,8 @@ from pydantic import Field, ValidationError
 
 from agent_api import OWNER_NOTICE, Dial, RaiseCap, call_origin
 import destination_policy as policy
-from core import BriefInput, ServiceError
-from outbound import ExternalBrief
+from core import AgentBrief, ServiceError
+from outbound import AgentExternalBrief
 from learning import SemanticReview
 
 
@@ -62,10 +62,10 @@ def create_control(service,prepare,start,stop,capabilities,outbound=None,browser
         return await capabilities()
 
     @mcp.tool(structured_output=True,annotations=write)
-    async def prepare_call(brief:BriefInput)->dict[str,Any]:
-        """Save a browser task with explicitly selected message IDs. No audio or external call starts."""
+    async def prepare_call(brief:AgentBrief)->dict[str,Any]:
+        """Save a browser task with explicitly selected message IDs, in the owner's call voice. No audio or external call starts."""
         try:
-            return await prepare(brief)
+            return await prepare(service.with_call_voice(brief))
         except Exception:
             raise ToolError('Cannot prepare the selected task or archive context.') from None
 
@@ -147,11 +147,11 @@ def create_control(service,prepare,start,stop,capabilities,outbound=None,browser
 
     if outbound is not None:
         @mcp.tool(structured_output=True,annotations=write)
-        async def prepare_external_call(brief:ExternalBrief)->dict[str,Any]:
-            """Freeze an outbound Telegram, WhatsApp, phone or SIP task with exact account/destination and selected AnyMsg facts. No dialing occurs."""
+        async def prepare_external_call(brief:AgentExternalBrief)->dict[str,Any]:
+            """Freeze an outbound Telegram, WhatsApp, phone or SIP task with exact account/destination and selected AnyMsg facts, in the owner's call voice. No dialing occurs."""
             try:
                 policy.dial_units(brief.channel,brief.destination)
-                return await prepare(brief)
+                return await prepare(service.with_call_voice(brief))
             except ServiceError as exc:raise ToolError(exc.detail.get('message',exc.code)) from None
             except Exception:raise ToolError('Cannot prepare selected external task.') from None
 

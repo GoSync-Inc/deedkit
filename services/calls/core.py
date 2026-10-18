@@ -8,19 +8,25 @@ import threading
 import uuid
 from datetime import datetime,timezone
 from pathlib import Path
-from typing import Literal
+from typing import Annotated,Literal,get_args
 
-from pydantic import BaseModel,ConfigDict,Field
+from pydantic import BaseModel,ConfigDict,Field,model_validator
 
 PROMPT_VERSION="2026-10-14.task-v7"
 MODEL="gemini-3.8-live"
 GROK_MODEL="grok-voice-3.0"
-GROK_VOICES=["eve","ara","rex","sal","leo"]
-VOICES=["Kore","Puck","Charon","Fenrir","Aoede","Leda","Orus","Zephyr"]
 ACTIVE={"waiting_for_browser","dialing","ringing","connecting","active"}
 
 
-class BriefInput(BaseModel):
+GeminiVoice=Literal["Kore","Puck","Charon","Fenrir","Aoede","Leda","Orus","Zephyr"]
+GrokVoice=Literal['eve','ara','rex','sal','leo']
+VOICES,GROK_VOICES=list(get_args(GeminiVoice)),list(get_args(GrokVoice))
+CustomVoiceId=Annotated[str|None,Field(pattern=r'^voice_[A-Za-z0-9_]{4,100}$')]
+VoiceStyle=Literal['neutral','friendly']
+
+
+# What an agent may set; the voice is the owner's call_voice (ANYM-359). No docstrings: they enter the schema.
+class AgentBrief(BaseModel):
     model_config=ConfigDict(extra="forbid")
     goal:str=Field(min_length=3,max_length=1500)
     counterparty:str=Field(min_length=1,max_length=200)
@@ -30,14 +36,44 @@ class BriefInput(BaseModel):
     source_message_ids:list[str]=Field(default_factory=list,max_length=8)
     success_fields:list[str]=Field(min_length=1,max_length=8)
     approval_fields:list[str]=Field(default_factory=list,max_length=8)
-    voice:Literal["Kore","Puck","Charon","Fenrir","Aoede","Leda","Orus","Zephyr"]="Puck"
-    custom_voice_id:str|None=Field(default=None,pattern=r'^voice_[A-Za-z0-9_]{4,100}$')
-    voice_style:Literal['neutral','friendly']='neutral'
     conversation_mode:Literal['task','social']='task'
-    dialog_engine:Literal['gemini_live','gemini_live_flows','grok_realtime']='gemini_live'
-    grok_voice:Literal['eve','ara','rex','sal','leo']='rex'
     self_reference:Literal["feminine","masculine","neutral"]="masculine"
     max_duration_secs:int=Field(default=600,ge=30,le=600)
+
+
+# Owner rehearsals choose their own engine and voice.
+class BriefInput(AgentBrief):
+    voice:GeminiVoice="Puck"
+    custom_voice_id:CustomVoiceId=None
+    voice_style:VoiceStyle='neutral'
+    dialog_engine:Literal['gemini_live','gemini_live_flows','grok_realtime']='gemini_live'
+    grok_voice:GrokVoice='rex'
+
+
+# The owner's one voice for every agent-prepared call. Unset means today's Gemini defaults.
+class CallVoice(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    provider:Literal['gemini_live','grok_realtime']='gemini_live'
+    gemini_voice:GeminiVoice='Puck'
+    grok_voice:GrokVoice='rex'
+    gemini_custom_voice_id:CustomVoiceId=None
+    voice_style:VoiceStyle='neutral'
+
+    @model_validator(mode='after')
+    def native_grok(self):
+        if self.provider=='grok_realtime' and self.gemini_custom_voice_id:
+            raise ValueError('grok_native_voice_required')
+        return self
+
+    def brief_fields(self):
+        return {'dialog_engine':self.provider,'voice':self.gemini_voice,'grok_voice':self.grok_voice,
+                'custom_voice_id':self.gemini_custom_voice_id,'voice_style':self.voice_style}
+
+    def summary(self):
+        """For agents: no custom voice ID."""
+        grok=self.provider=='grok_realtime'
+        return {'provider':self.provider,'model':GROK_MODEL if grok else MODEL,
+                'voice':self.grok_voice if grok else self.gemini_voice,'custom_voice':bool(self.gemini_custom_voice_id)}
 
 
 class ToolInput(BaseModel):
@@ -189,6 +225,7 @@ TASK SNAPSHOT:\n{json.dumps(spec,ensure_ascii=False)}"""
 class VoiceService:
     def __init__(self,directory):
         directory=Path(directory)
+        self.directory=directory
         directory.mkdir(parents=True,exist_ok=True,mode=0o700)
         os.chmod(directory,0o700)
         self.lock=threading.RLock()
@@ -258,8 +295,6 @@ class VoiceService:
         b.update(id=str(uuid.uuid4()),created_at=now(),version=1,channel=b.get('channel','browser'),facts=facts,
                  prompt_version=PROMPT_VERSION,model=MODEL)
         if b.get('dialog_engine')=='grok_realtime':
-            if b['channel'] not in {'browser','phone','sip'}:
-                raise ServiceError('grok_browser_phone_sip_only',422)
             if b.get('custom_voice_id'):
                 raise ServiceError('grok_native_voice_required',422)
             b['model']=GROK_MODEL
@@ -285,6 +320,28 @@ class VoiceService:
             self.db.execute("INSERT INTO briefs VALUES (?,?)",(b["id"],json.dumps(b,ensure_ascii=False)))
             self.db.commit()
         return b
+
+    def call_voice(self):
+        from settings import read_private
+        try:
+            return CallVoice.model_validate(read_private(self.directory/'call-voice.json'))
+        except Exception:
+            # A damaged setting refuses agent preparation instead of silently changing the voice.
+            raise ServiceError('call_voice_invalid',503) from None
+
+    def set_call_voice(self,value):
+        from settings import write_private
+        with self.lock:
+            write_private(self.directory/'call-voice.json',value.model_dump())
+        return value
+
+    def with_call_voice(self,selected):
+        """Freeze the owner's current call_voice into an agent brief (ANYM-359)."""
+        fields={**selected.model_dump(),**self.call_voice().brief_fields()}
+        if hasattr(selected,'channel'):
+            from outbound import ExternalBrief
+            return ExternalBrief(**fields)
+        return BriefInput(**fields)
 
     def get_brief(self,identity):
         with self.lock:

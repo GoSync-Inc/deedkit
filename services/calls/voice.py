@@ -147,10 +147,15 @@ class AuditedGemini(GeminiLiveLLMService):
             await self._handle_send_error(error)
 
 
-def create_model(brief,key,recorder=None):
+def input_sample_rate(transport):
+    # The rate of the frames this transport delivers: its own setting, else the pipeline's (it resamples to it).
+    return transport.input()._params.audio_in_sample_rate or PipelineParams().audio_in_sample_rate
+
+
+def create_model(brief,key,recorder=None,input_rate=None):
     if brief.get('dialog_engine')=='grok_realtime':
         from grok_voice import AuditedGrok
-        return AuditedGrok(brief,key,recorder)
+        return AuditedGrok(brief,key,recorder,input_rate=input_rate or PipelineParams().audio_in_sample_rate)
     return AuditedGemini(api_key=key,recorder=recorder,external_tts=bool(brief.get('custom_voice_id')),
         live_flows=brief.get('dialog_engine')=='gemini_live_flows',settings=GeminiLiveLLMService.Settings(
         model=brief['model'],system_instruction=brief['prompt'],voice=brief['voice']),
@@ -174,15 +179,19 @@ async def report_error(state,rtvi,frame=None):
     await rtvi.send_server_message(record_model_error(state,frame))
 
 
+def webrtc_transport(connection):
+    return SmallWebRTCTransport(connection,TransportParams(audio_in_enabled=True,audio_out_enabled=True))
+
+
 async def run_voice(connection,brief,key,state):
-    transport=SmallWebRTCTransport(connection,TransportParams(audio_in_enabled=True,audio_out_enabled=True))
-    await run_transport(transport,brief,key,state,browser=True)
+    await run_transport(webrtc_transport(connection),brief,key,state,browser=True)
 
 
 async def run_transport(transport,brief,key,state,browser=False):
     service,identity=state['service'],state['call_id']
     context=LLMContext()
-    llm=create_model(brief,key,recorder=lambda role,text:service.transcript_chunk(identity,role,text))
+    llm=create_model(brief,key,recorder=lambda role,text:service.transcript_chunk(identity,role,text),
+                     input_rate=input_sample_rate(transport))
     live_flows=brief.get('dialog_engine')=='gemini_live_flows'
     ending_tasks=[]
     runtime_health=RuntimeAudioHealth()

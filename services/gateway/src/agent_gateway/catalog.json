@@ -2961,10 +2961,10 @@
     "scopes": [
       "calls:prepare"
     ],
-    "description": "Local write; places no call. Saves a new browser-rehearsal brief (goal, counterparty, success_fields, voice) owned by this principal and returns its id as brief_id. Optional source_message_ids (max 8) are read from this principal's own message archive. Every request creates a new brief. Next: start_call.",
+    "description": "Local write; places no call. Saves a new browser-rehearsal brief (goal, counterparty, success_fields) owned by this principal and returns its id as brief_id. Optional source_message_ids (max 8) are read from this principal's own message archive. The owner sets the voice for all calls (capabilities call_voice). Every request creates a new brief. Next: start_call.",
     "inputSchema": {
       "$defs": {
-        "BriefInput": {
+        "AgentBrief": {
           "additionalProperties": false,
           "properties": {
             "goal": {
@@ -3026,43 +3026,6 @@
               "title": "Approval Fields",
               "type": "array"
             },
-            "voice": {
-              "default": "Puck",
-              "enum": [
-                "Kore",
-                "Puck",
-                "Charon",
-                "Fenrir",
-                "Aoede",
-                "Leda",
-                "Orus",
-                "Zephyr"
-              ],
-              "title": "Voice",
-              "type": "string"
-            },
-            "custom_voice_id": {
-              "anyOf": [
-                {
-                  "pattern": "^voice_[A-Za-z0-9_]{4,100}$",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Custom Voice Id"
-            },
-            "voice_style": {
-              "default": "neutral",
-              "enum": [
-                "neutral",
-                "friendly"
-              ],
-              "title": "Voice Style",
-              "type": "string"
-            },
             "conversation_mode": {
               "default": "task",
               "enum": [
@@ -3070,16 +3033,6 @@
                 "social"
               ],
               "title": "Conversation Mode",
-              "type": "string"
-            },
-            "dialog_engine": {
-              "default": "gemini_live",
-              "enum": [
-                "gemini_live",
-                "gemini_live_flows",
-                "grok_realtime"
-              ],
-              "title": "Dialog Engine",
               "type": "string"
             },
             "self_reference": {
@@ -3098,18 +3051,6 @@
               "minimum": 30,
               "title": "Max Duration Secs",
               "type": "integer"
-            },
-            "grok_voice": {
-              "default": "rex",
-              "enum": [
-                "eve",
-                "ara",
-                "rex",
-                "sal",
-                "leo"
-              ],
-              "title": "Grok Voice",
-              "type": "string"
             }
           },
           "required": [
@@ -3117,14 +3058,14 @@
             "counterparty",
             "success_fields"
           ],
-          "title": "BriefInput",
+          "title": "AgentBrief",
           "type": "object"
         }
       },
       "additionalProperties": false,
       "properties": {
         "brief": {
-          "$ref": "#/$defs/BriefInput"
+          "$ref": "#/$defs/AgentBrief"
         }
       },
       "required": [
@@ -3147,10 +3088,10 @@
     "scopes": [
       "calls:prepare"
     ],
-    "description": "Local write; places no call. Saves a new outbound brief for one exact channel (phone, sip, whatsapp or telegram), account and destination and returns its id as brief_id. The destination may be one the owner named or one you found for the owner's task; no recipient list applies (SIP: exact allowlist). Emergency numbers and short codes are refused: tell the owner to call them directly. Next: preflight_call, then dial_call.",
+    "description": "Local write; places no call. Saves a new outbound brief for one exact channel (phone, sip, whatsapp or telegram), account and destination and returns its id as brief_id. The destination may be one the owner named or one you found for the owner's task; no recipient list applies (SIP: exact allowlist). Emergency numbers and short codes are refused: tell the owner to call them directly. The owner sets the voice for all calls (capabilities call_voice). Next: preflight_call, then dial_call.",
     "inputSchema": {
       "$defs": {
-        "ExternalBrief": {
+        "AgentExternalBrief": {
           "additionalProperties": false,
           "properties": {
             "goal": {
@@ -3212,43 +3153,6 @@
               "title": "Approval Fields",
               "type": "array"
             },
-            "voice": {
-              "default": "Puck",
-              "enum": [
-                "Kore",
-                "Puck",
-                "Charon",
-                "Fenrir",
-                "Aoede",
-                "Leda",
-                "Orus",
-                "Zephyr"
-              ],
-              "title": "Voice",
-              "type": "string"
-            },
-            "custom_voice_id": {
-              "anyOf": [
-                {
-                  "pattern": "^voice_[A-Za-z0-9_]{4,100}$",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Custom Voice Id"
-            },
-            "voice_style": {
-              "default": "neutral",
-              "enum": [
-                "neutral",
-                "friendly"
-              ],
-              "title": "Voice Style",
-              "type": "string"
-            },
             "conversation_mode": {
               "default": "task",
               "enum": [
@@ -3256,16 +3160,6 @@
                 "social"
               ],
               "title": "Conversation Mode",
-              "type": "string"
-            },
-            "dialog_engine": {
-              "default": "gemini_live",
-              "enum": [
-                "gemini_live",
-                "gemini_live_flows",
-                "grok_realtime"
-              ],
-              "title": "Dialog Engine",
               "type": "string"
             },
             "self_reference": {
@@ -3300,18 +3194,6 @@
               "minLength": 1,
               "title": "Destination",
               "type": "string"
-            },
-            "grok_voice": {
-              "default": "rex",
-              "enum": [
-                "eve",
-                "ara",
-                "rex",
-                "sal",
-                "leo"
-              ],
-              "title": "Grok Voice",
-              "type": "string"
             }
           },
           "required": [
@@ -3322,14 +3204,14 @@
             "account",
             "destination"
           ],
-          "title": "ExternalBrief",
+          "title": "AgentExternalBrief",
           "type": "object"
         }
       },
       "additionalProperties": false,
       "properties": {
         "brief": {
-          "$ref": "#/$defs/ExternalBrief"
+          "$ref": "#/$defs/AgentExternalBrief"
         }
       },
       "required": [

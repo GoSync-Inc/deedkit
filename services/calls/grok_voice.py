@@ -8,14 +8,17 @@ from audio_health import ProviderAudioHealth
 
 
 class AuditedGrok(GrokRealtimeLLMService):
-    def __init__(self, brief, key, recorder=None):
+    def __init__(self, brief, key, recorder=None, *, input_rate=16000):
         self.recorder = recorder
         self.audio_health = ProviderAudioHealth()
+        # xAI takes the frame bytes as they are, so the declared rate must equal the
+        # transport's frames; undeclared, it assumes 24 kHz (ANYM-359).
         super().__init__(api_key=key, settings=self.Settings(
             model=brief['model'], system_instruction=brief['prompt'],
             session_properties=events.SessionProperties(
                 voice=brief['grok_voice'],
                 audio=events.AudioConfiguration(input=events.AudioInput(
+                    format=events.PCMAudioFormat(rate=input_rate),
                     transcription=events.InputAudioTranscription(
                         language_hint=brief['language']))))))
 
