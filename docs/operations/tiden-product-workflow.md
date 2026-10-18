@@ -28,8 +28,8 @@ contract, hides a failing test or removes it from verification.
 An open live or measured check is written in the spec as `[open: live]` or `[open: measured]` on
 its criterion or evidence line. Whoever records its evidence (version, environment, run or
 measurement, date) removes the marker in the same edit, and only then. A card with an open check
-stays in `Review`; the `Tiden health` report fails on a `Done` spec that carries one
-(TIDEN-CI.md).
+stays in `Review`; the `Tiden health` report fails on a `Done` spec that carries one (text inside
+inline code or a fenced block is ignored, so a spec may document the marker; TIDEN-CI.md).
 
 Main holds maintained behaviour and its known defects. New future-only requirements go on a
 proposal branch per deliverable increment, which stays open until implemented; a current defect
