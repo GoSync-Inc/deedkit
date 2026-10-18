@@ -71,5 +71,3 @@ tests/test_docs_only.py | the guard's tests: synthetic repositories under tmp_pa
 tests/test_tiden_drift.py | synthetic repositories under tmp_path and the drift job's exclusion patterns; it reads no document
 tests/test_seamless_release.py | docs is a local variable holding parsed Compose documents; it lists release state, not Markdown
 tests/test_tiden_ci.py | synthetic repositories under tmp_path for the image change detection and evidence tests
-scripts/change_path.py | classifies changed paths by name and reads only AGENTS.md, .claude/settings.json, the ruleset and workflows at two revisions; no listed document
-tests/test_change_path.py | synthetic repositories under tmp_path and the classifier's path literals; it reads no listed document
