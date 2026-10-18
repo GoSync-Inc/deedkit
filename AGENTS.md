@@ -160,15 +160,19 @@ freshness (10–15 min) before starting.
 Order: code and local tests; push and open the PR, which starts CI; reviews in
 parallel with CI, one round per reviewer on the ready PR; fixes, rechecked by the
 same reviewer on the fix diff only, and only after a blocking or major finding;
-settle; `tiden intent progress`, `tiden intent close`; merge. The card is the
-plan: the worker starts the intent from it, with no plan approval round. Local
-tests are the tests of the code the PR touches, its new tests and their "fails
-without the fix" run; the full suites run in CI and the merge queue, never as a
-local precondition for a PR (CLAUDE.md lists the commands as reference). The
-author drafts the spec text that settle will write before the review, and the
-round covers it together with the diff; settle writes the reviewed text, and a
-change of its meaning after the round goes to the same reviewer on that text
-only.
+settle; `tiden intent progress`, `tiden intent close`; merge.
+
+- The card is the plan: the worker starts the intent from it, with no plan
+  approval round.
+- Local tests are the test modules that exercise the changed files, the new
+  tests and their "fails without the fix" run. The full suites run in CI and the
+  merge queue, never as a local precondition for a PR (CLAUDE.md lists the
+  commands as reference).
+- The author drafts the spec text that settle will write before the review, as
+  `Settle text:` in the PR description, and the round covers it together with
+  the diff. Settle writes the reviewed text; a change of its meaning after the
+  round goes to the same reviewer on that text only.
+
 Reviewers get the packet in the review protocol: the intent goal and promises
 (the task goal for a skip), the current text with acceptance criteria of the
 promised and the flagged specs, the `Spec impact:` list, the diff and the PR

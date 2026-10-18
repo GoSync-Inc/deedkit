@@ -17,7 +17,7 @@ under Review levels in [AGENTS.md](../../AGENTS.md), and the review procedure in
   worker sessions and audits their merge reports. It writes no product code.
 - **Worker session** (Claude Code) implements exactly one story in its own
   worktree, branch, pull request and Tiden intent session or recorded skip.
-- **Codex** reviews as Astra and gives a second opinion when planning;
+- **Codex** reviews as Astra and gives a second opinion on request;
   development goes to Claude Code workers.
 - **Release owner** (one at a time) prepares and applies promotions of `main`.
 
@@ -254,16 +254,19 @@ The worker writes without waiting:
 - when it merges: the pull request, CI, review results, the Tiden verdict or
   recorded skip and the squash SHA. It merges itself when the conditions under
   Review levels in `AGENTS.md` hold and no merge freeze is announced, and hands
-  a pull request the owner keeps to the owner. The orchestrator audits the
-  report after the merge: that the level follows the signals in `AGENTS.md`
-  and, for a normal-level pull request, that the author checklist, the "fails
-  without the fix" record and any process-text checklist review are in the
-  description. A missing record is added to the pull request description; a
-  level the signals raise gets that level's missing reviews on the squash
-  commit, and their blocking or major findings hold the release as in the
-  release review ([review-protocol.md](review-protocol.md)); a merged pull
-  request the owner keeps goes to the owner at once, with a revert pull request
-  ready;
+  a pull request the owner keeps to the orchestrator for the owner (Orchestrator
+  loop 7). The orchestrator audits the report after the merge: that the level
+  follows the signals in `AGENTS.md`, that spec text written at settle matches
+  the `Settle text:` the review round covered, and, for a normal-level pull
+  request, that the author checklist, the "fails without the fix" record and any
+  process-text checklist review are in the description. A missing record is
+  added to the pull request description. A level the signals raise gets that
+  level's missing reviews on the squash commit, and the change is held from
+  release and package publication from the moment the gap is found: the
+  orchestrator records the hold and tells the release owner, and the hold clears
+  when those reviews approve with no open blocking or major finding, the change
+  is reverted, or the owner accepts the risk (`AGENTS.md`). A merged pull request
+  the owner keeps goes to the owner at once, with a revert pull request ready;
 - its final result. It ends with a `SUPERSET_WORKER_DONE` or
   `SUPERSET_WORKER_BLOCKED` block. Both list `task`, `summary`, `files` and
   `checks`; DONE adds `handoff`, BLOCKED adds `reason` and `needs`.
@@ -289,8 +292,10 @@ or a later one, a green `Tiden drift` run on it or a later one (a red run names
 the files to anchor, TIDEN-CI.md) and, for a change with a Tiden branch, Tiden
 main and drift read back as in [tiden-product-workflow.md](tiden-product-workflow.md).
 
-After its final result the worker stays open until its pull request is merged and
-checked after the merge. The orchestrator then closes its terminal and archives
+A worker that merged its own pull request reaches its final result already
+merged and checked; a worker whose pull request the owner keeps stays open after
+its final result until the pull request is merged and checked after the merge.
+The orchestrator then closes its terminal and archives
 the workspace without asking again, after checking that the worktree has no
 uncommitted changes: archiving deletes the folder, the branch stays.
 

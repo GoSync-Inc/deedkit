@@ -100,8 +100,10 @@ whole exports.
 - `specs.md`: the current text with acceptance criteria of the promised and the
   flagged specs, and the `Spec impact:` list with its inventory, which gives the
   rest by ID and disposition, and the spec text the author will write at
-  settle, as previous and proposed text. A reviewer that needs the text of an
-  unflagged spec names it as a missing input;
+  settle, as previous and proposed text. The PR description carries the same
+  proposed text under `Settle text:`, so the text written at settle can be
+  checked against it after the packet is gone. A reviewer that needs the text of
+  an unflagged spec names it as a missing input;
 - `pr.md`: the pull request description.
 
 A card or spec edit has no diff; its packet holds instead the previous and the
