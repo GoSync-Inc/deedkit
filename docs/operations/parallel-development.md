@@ -28,10 +28,13 @@ A story is **ready** when its Tiden card was accepted through the card intake in
 the Tiden workflow and has the template's fields, including its Score, **lane**
 and expected paths. A story that is not ready goes back to card intake (the owner for feature
 and improvement). A
-change that takes `tiden intent skip` has no story; its brief names the goal,
-expected paths, acceptance and checks instead.
+change that takes `tiden intent skip` without a story (agent rules, process
+documents, wording) has a brief that names the goal, expected paths, acceptance
+and checks instead.
 
-One story maps to one Git branch, one pull request and one intent session. Split
+One story maps to one Git branch, one pull request and one intent session, or a
+recorded skip for a normal-level story that changes no acceptance criterion
+(`AGENTS.md`). Split
 larger work into stories that merge independently. A pull request should merge
 within about a day; the older a branch, the more it conflicts.
 
@@ -170,8 +173,8 @@ at least important (`AGENTS.md`). Prefer splitting it.
    criteria, lane, expected paths and checks come from the story and the working
    contract; the evidence and final result follow the level (Worker protocol);
    the worker sets the level from the working contract (`AGENTS.md`). The brief
-   does not restate them. A skip has no story, so its brief carries the goal,
-   expected paths, acceptance and checks.
+   does not restate them. A skip without a story has a brief that carries the
+   goal, expected paths, acceptance and checks.
 5. Answer workers' questions and check each pull request before its "ok" (Worker
    protocol). Read a waiting worker's terminal with `superset terminals read` and
    give the owner exactly what it asks, so the owner need not open worker terminals.

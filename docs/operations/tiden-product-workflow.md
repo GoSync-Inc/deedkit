@@ -213,6 +213,9 @@ Record these independently, with timestamp, branch/release ID and exact Git SHA:
 4. The release review ([review-protocol.md](review-protocol.md)) or its
    recorded `none` reason: the reviewed range, each part's verdict line and
    report path, and its open blocking or major findings.
+5. The release spec sync (below) or its recorded `none` reason: the review
+   branch, the specs edited, the tests linked, the anchors added, the cards set
+   to delivered and the watermark range when it advanced.
 
 Readiness remains blocked while a relevant current defect, unresolved production
 incident or required acceptance lacks evidence, or a release review finding
@@ -226,6 +229,40 @@ relevant historical revision. `verified` on a suspect spec is not proof that its
 tests cover the incident. Report truncation. Preserve redaction and issue history;
 resolve only after a matching regression is demonstrated and the repair verified.
 Deployment acceptance remains separate, and old `lastSeen` alone proves nothing.
+
+### Release spec sync
+
+A normal-level pull request that changes no acceptance criterion skips the
+intent loop (`AGENTS.md`), so its spec writes wait for this release step: links
+for its new tests, anchors for its new files, spec text outside the criteria that
+it made stale (Boundary, evidence notes) and the delivered status of the card it
+names. The release owner runs the sync before the release review when the delta
+from the last released SHA to the candidate holds a skipped code pull request,
+and otherwise records `Spec sync: none — <reason>`.
+
+1. One worker session (Tiden card and spec text,
+   [parallel-development.md](parallel-development.md)) with `tiden intent skip`
+   works on one review branch, `review/<date>-spec-sync`.
+2. Its inputs are the `Spec impact:` and `Spec sync:` lines of every skipped pull
+   request in the delta, and the files those pull requests changed, matched
+   against the anchors as in Implementation sequence step 4.
+3. On the review branch it checks each matched spec's text against the code and
+   corrects stale text; it links each named new test with `tiden test link-spec`
+   after reviewing its assertion; it anchors each new file to the spec it
+   implements or records why none applies; and it sets each named card to its
+   delivered status. It changes no acceptance criterion: a skipped pull request
+   that needed one was mis-leveled, and that is a release review finding
+   ([review-protocol.md](review-protocol.md)).
+4. Its edits enter the release review's Part A packet as previous and proposed
+   text; a High or Critical spec or a weakened criterion is never checklist-only
+   (`AGENTS.md`). After that review the branch merges under the review levels in
+   `AGENTS.md`, and Tiden main is read back.
+5. When the sync covered every spec anchored to the files changed since the
+   watermark (`tiden drift status`), it is the delta audit under Reconciliation
+   and maintenance, and the watermark advances to the audited candidate SHA under
+   the rules there. Until the drift audit card (ANYM-314) has advanced the
+   watermark once, the sync covers only the skipped pull requests of the delta
+   and leaves the watermark unchanged.
 
 ### Names and release identity
 
@@ -272,6 +309,8 @@ display text can use DeedKit immediately.
    leave out the `BACKLOG.md` hub, and add the session delta from
    `tiden intent progress`. A delta spec cannot be dropped from the session;
    `tiden intent radius drop` with a reason is for radius specs outside the delta.
+   A recorded skip has no session delta; its list ends with the `Spec sync:`
+   line for the release spec sync.
 5. Review the Tiden merge preview, conflicts and link proposals. Record a Git PR
    and Tiden branch together. A closed intent session or merged Git PR does not
    merge its Tiden branch: merge both in the same step. Merge reviewed spec

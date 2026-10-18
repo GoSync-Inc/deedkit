@@ -35,8 +35,8 @@ or the seven `anymsg-ci::*` checks. For product changes run the intent loop:
 `tiden intent start "<objective>" --promise ...` before editing, then push,
 open the PR with the printed Tiden branch link in its body, run
 `tiden intent link-pr <url>`, and close the session in the order under Review
-levels. Use `tiden intent skip` for questions, read-only work and the non-product
-changes listed under Review levels, and `--format json` when parsing CLI output.
+levels. Use `tiden intent skip` for questions, read-only work and the changes
+listed under Review levels, and `--format json` when parsing CLI output.
 Without a local CLI, run `scripts/tiden_agent_setup.sh` when `TIDEN_API_TOKEN` is
 set; otherwise say in the PR that its specs were not updated.
 
@@ -73,11 +73,18 @@ Fable takes Astra's place; at owner level both review it.
 The Tiden loop follows the kind of change. Use `tiden intent skip` only for
 changes without code beyond comments that leave observable product behavior
 unchanged (agent rules, process documents, wording), for questions and read-only
-work, and for spec maintenance only in Tiden (review and proposal branches without
-code). Run the full intent loop for every pull request that changes code beyond
-comments, including that code's documentation, and when a product contract
-document (SENDING.md, ACCESS.md, SEARCH.md and the like) changes meaning, because
-its spec changes with it.
+work, for spec maintenance only in Tiden (review and proposal branches without
+code), and for a normal-level pull request that changes no acceptance criterion:
+every criterion on Tiden main stays true as written, as for a defect fix that
+restores a criterion, a test for an existing criterion, a refactor or a patch
+dependency update. Its spec work waits for the release spec sync
+(docs/operations/tiden-product-workflow.md). Run the full intent loop for every
+important- or owner-level pull request that changes code beyond comments,
+including that code's documentation, for every pull request that adds, changes or
+removes an acceptance criterion (delivering a proposal card's criteria included),
+and when a product contract document (SENDING.md, ACCESS.md, SEARCH.md and the
+like) changes meaning, because its spec changes with it. In doubt, run the full
+loop.
 
 Spec impact. Every pull request that changes code or a contract document lists
 under `Spec impact:` in its description every spec anchored to its changed files
@@ -85,28 +92,36 @@ and every spec in the session delta of `tiden intent progress`, built as the Tid
 workflow describes: one line per spec, `ANYM-n: updated` or
 `ANYM-n: no behavior change — <reason>`. The list is a floor: also name a spec
 whose behavior changed without an anchor match, and add anchors for new files to
-the specs they implement; without a local CLI, say so under `Spec impact:`. A skip
-is invalid when it changes code beyond comments in a file anchored to a spec.
+the specs they implement; without a local CLI, say so under `Spec impact:`. The
+author ends the line of a spec with `(flagged)` when the diff changes its
+acceptance criteria or may change them, or restores or newly tests one of them;
+in doubt, flag it. The author flags by hand until a script does (planned:
+`scripts/spec_impact.py`). A skip is invalid when it changes code beyond comments
+and either the level is above normal or the diff changes an acceptance criterion.
+A skipped pull request builds the list from the anchors alone, adds no anchors
+itself and ends with a `Spec sync:` line naming its new tests, its new files that
+no anchor matches and the card it delivers, if any, for the release spec sync.
 The reviewers of its level (for a normal PR, the release review) receive the
-current text of every listed spec, not only the promised ones, and check each
-disposition; "no behavior change" on a spec whose
-criteria the diff changes is a finding. Before `tiden intent close`, every
+current text of the promised and the flagged specs and the IDs and dispositions
+of the rest, and check each disposition; "no behavior change" on a spec whose
+criteria the diff changes is a finding, and so is a missing flag. Before `tiden intent close`, every
 session-delta spec has a disposition in that list; a passing linked test does not
 make spec text current. Merge the Tiden branch in the same step as the Git PR:
 check `tiden branch merge-preview` before merging and read back Tiden main after
 it, so nothing of the change is left unmerged, and set a card to its delivered
-status when its code merges.
+status when its code merges (for a skip, the release spec sync sets it).
 
 Backlog and specs are reviewed too, on top of the level's reviews. Cards enter
 Tiden through the card intake in docs/operations/tiden-product-workflow.md.
 Opus at high effort writes every new card and spec text. Who reviews a card or
 spec edit follows its kind:
 
-- feature and improvement cards, new epics, and cards whose delivery meets an
-  owner-level trigger below: Astra and Fable;
-- defect, infra, refactor and research cards with High or Critical priority,
-  touching security, access, data, CI or releases, or needing the main research
-  (below), and a bulk restructuring: Astra;
+- product cards (feature and improvement cards, new epics): Fable, one judgment
+  round;
+- every card, of any category, that sets a contract in code, CI, releases, data
+  or security, has High or Critical priority, meets an owner-level trigger below
+  in its delivery or needs the main research (below), and a bulk restructuring:
+  Astra;
 - other cards and spec edits (status, evidence notes, facts): the card
   checklist subagent;
 - spec text written at settle: the reviewers of its pull request's level, and
@@ -115,10 +130,12 @@ spec edit follows its kind:
 A spec edit on a High or Critical spec, or one that weakens a criterion, is
 never checklist-only.
 
-Fable checks necessity and value, clear and testable acceptance criteria, scope,
-duplicates, priority, dependencies and score, and whether a quoted approval is
-one; Astra whether the problem and criteria match the code, edge cases,
-security and the research note.
+Fable's judgment round on a card checks necessity and value (priority
+included), scope, duplicates and whether a quoted approval is one; it makes no
+correctness pass. Astra checks correctness: whether the problem and criteria
+match the code, testable criteria, dependencies, edge cases, security and the
+research note. A recheck follows only a blocking or major finding, on the
+changed text only (review-protocol.md).
 Acceptance into the ready queue follows Card intake step 4 (owner for feature and
 improvement; the orchestrator for the other categories after their review).
 Without a code PR, a spec edit in Tiden takes the reviewers above; for merge
@@ -141,15 +158,18 @@ the fix diff only; settle, with its spec text reviewed as above;
 `tiden intent progress`, `tiden intent close`; merge.
 Reviewers get the packet in the review protocol: the intent goal and promises
 (the task goal for a skip), the current text with acceptance criteria of the
-promised specs and of every spec under `Spec impact:`, the diff and the PR
+promised and the flagged specs, the `Spec impact:` list, the diff and the PR
 description, as files, because they have no Tiden access. They write their report
 to a file and return one verdict line. Astra checks correctness, security, edge
 cases and the code's conformance to specs and promises; Fable checks necessity,
 scope, scenarios, data integrity and the conformance and consistency of text.
 Run Astra as
-`codex exec -m gpt-6-astra "<task with the spec file and commit range>" </dev/null`,
+`codex exec --disable hooks -m gpt-6-astra "<task with the spec file and commit range>" </dev/null`,
 because `review --base` does not accept its own task; without `</dev/null` it hangs
-on stdin from a background shell. Run Fable as a Claude subagent with
+on stdin from a background shell, and without `--disable hooks` it inherits the
+worker's Tiden session through the Codex hooks (`-c features.codex_hooks=false`
+does not turn them off in codex-cli 0.163.0; leave `~/.codex/config.toml`
+unchanged, other Codex work needs the hooks). Run Fable as a Claude subagent with
 model `fable`.
 
 An agent merges a pull request and its Tiden branch itself, at every level,
