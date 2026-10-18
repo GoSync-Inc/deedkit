@@ -520,7 +520,7 @@ use `docker image prune`, `docker system prune` or volume removal for this.
 
 Only `apply`, `rollback` and `deploy` (below) change runtime processes; `apply`
 and `rollback` after review of the candidate and any required live-session
-authority. No unattended timer runs `deploy` yet.
+authority. The `deedkit-autodeploy` timer (below) runs `deploy` unattended.
 
 ## Continuous deployment
 
@@ -593,6 +593,62 @@ inspection). `--dry-run` changes no release or runtime state (it may update
 the source mirror and take the locks). `status` shows `deploy.json` and the pause reason. To resume after
 a pause, fix the cause (migrate, install the tools, inspect the state), then
 remove the pause file.
+
+### Timer
+
+[`deploy/deedkit-autodeploy.service`](../../deploy/deedkit-autodeploy.service)
+runs `deploy --auto` and
+[`deploy/deedkit-autodeploy.timer`](../../deploy/deedkit-autodeploy.timer)
+starts it about 5 minutes after the previous run ended (plus up to 30 seconds
+of jitter and systemd's default one-minute accuracy) and 10 minutes after boot;
+enabled later than that, the first run starts at once. `--auto` keeps at least
+20 minutes between two deploy starts. The unit reads
+`/etc/deedkit/production.json` and `/etc/deedkit/http-production.json` unless
+the optional `/etc/deedkit/autodeploy.env` (root-owned, mode `0600`) sets
+`DEEDKIT_DEPLOY_CONFIG`; an owner-added `GH_TOKEN` goes into the same file.
+
+A deploy and the daily backup never overlap; the backup stops the collectors
+(`personal-os-backup.timer`, 18:00 UTC) and an apply would recreate them.
+Admission: the unit starts no deploy while `personal-os-backup.service` runs or
+waits to retry (any state but `inactive` or `failed`) and none from 13:00 to
+18:59 UTC; a failed or unexpected read of either skips the run. A run admitted
+before 13:00 ends by 17:03 at the latest (the 4-hour start timeout plus the
+3-minute stop timeout), so it is over before the scheduled backup starts.
+Exclusion: the deploy holds the backup runner's own lock
+(`/opt/personal-os-probe/backups/.runner.lock`, `DEEDKIT_BACKUP_LOCK`) for its
+whole run, so a backup started by hand during a deploy refuses before it stops
+anything (`backup_job_already_running`) and systemd retries it every 30 minutes,
+at most three starts in 8 hours: pause the timer and let a running deploy finish
+before starting a backup by hand. While a backup holds the lock, the deploy
+exits 75 and the run counts as a skip. A skipped run (condition or lock) prints
+no JSON line.
+
+The unit adds no destination: `deploy` reads `main` from GitHub over HTTPS,
+GitHub's REST API (runs, jobs, comparisons, `/rate_limit`) and GHCR (manifests,
+attestations, images). `GH_TOKEN`, when set, is sent only as the
+`Authorization` header of the GitHub API requests; the attestation verifier
+runs with an empty environment. The journal gets one JSON line per run (SHAs,
+the CI run URL, times, the outcome and its reason, at most git's last error
+line), never resolved Compose settings.
+
+Install it once, after a clean manual `deploy`, from the same reviewed `main`
+commit as the tools:
+
+```sh
+sudo install -o root -g root -m 0644 deploy/deedkit-autodeploy.service deploy/deedkit-autodeploy.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now deedkit-autodeploy.timer
+journalctl -u deedkit-autodeploy.service     # one JSON line per run that was not skipped
+```
+
+Pause with `sudo touch /etc/deedkit/autodeploy.pause`: each run then exits 0
+with `paused`. A run that creates a new pause, rolls back, fails or cannot fetch
+exits 1, so the unit shows as failed until the next clean run. Stop the timer
+with `sudo systemctl disable --now deedkit-autodeploy.timer`; that lets a
+running deploy finish. Never stop `deedkit-autodeploy.service` itself during a
+run: the stop (or the 4-hour start timeout) kills `production.py` and its
+children, which can leave the selected services stopped mid-apply; the next
+run then finds the unfinished attempt and pauses for a human.
 
 ## Record the production release
 
