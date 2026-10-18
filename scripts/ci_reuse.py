@@ -42,8 +42,7 @@ MAX_ARCHIVE_BYTES, MAX_ENTRIES, MAX_TOTAL_BYTES = 64 * 1024**2, 64, 128 * 1024**
 REPORT_CHECKS = (*tiden_ci.REPORTS, *tiden_ci.MODULE_REPORTS)
 # Exactly what the queue run's evidence job uploads: the assembled fragments and what `prepare` adds to them.
 EVIDENCE_FILES = frozenset({
-    "source-sha", "metadata.json", "manifest.json", "ci-checks.json",
-    *(name for _, files in tiden_ci.FRAGMENTS.values() for name in files if name not in tiden_ci.CONTROL_FILES),
+    "source-sha", "metadata.json", "manifest.json", "ci-checks.json", *tiden_ci.ASSEMBLED_FILES,
     *(f"normalized-{check}.xml" for check in REPORT_CHECKS)})
 SHA = re.compile(r"[0-9a-f]{40}")
 # The merge queue names a group of main after the pull request it tests last: pr-<number>-<group base SHA>.
