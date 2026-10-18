@@ -236,6 +236,34 @@ For an explicit baseline rerun, dispatch `CI` on the reporting-code branch with
 existing spec branch. The checkout SHA, rather than the workflow SHA, is recorded.
 Normal pull requests record their actual tested merge SHA.
 
+## Pull request check
+
+The `checks / Tiden PR check` job runs `scripts/tiden_pr_check.py` (check A,
+ANYM-405) on every pull request run. It reads only from Tiden and checks the
+bookkeeping a merge needs (AGENTS.md section 4):
+
+- the body lines `Spec:`, `Delivers:` and `Tiden branch:` are well formed, name
+  story-level specs that exist on Tiden main or on the named branch, and the
+  named branch is open;
+- every test the pull request adds has a `# spec: ANYM-n` or `// spec: ANYM-n`
+  marker directly above it and its decorators, or is in the reviewed `NO_SPEC`
+  list; existing tests need none;
+- every changed code file outside drift's `EXCLUDED` list has a `repo_file`
+  anchor on Tiden main, or the body names a spec for the sync to anchor it to.
+
+Only a verdict fails the run, and so `CI gate`. A verdict is the check's list
+of problems in the job summary, or a refusal of the pull request's own content:
+a test file that does not parse, or a changed path that is not UTF-8. The body
+comes from the event that started the run, and a rerun replays the same event:
+after you edit the body, push a commit to check again. Fork pull requests and
+runs without `TIDEN_API_TOKEN` skip with a summary line. Any other outcome
+fails nothing: a Tiden CLI failure (unreachable, timeout, an error status or a
+malformed reply), another refusal, an unexpected error, a failed checkout, Python
+setup or CLI install, or a check killed at its step timeout. The job warns and
+keeps a `tiden-pr-check-receipt` artifact with the last line the check printed,
+when the artifact service accepts it; the sync and `Tiden drift` still check
+after the merge, and a rerun of the job checks now.
+
 ## Drift watermark
 
 `.github/workflows/tiden-drift.yml` keeps the drift watermark current after every

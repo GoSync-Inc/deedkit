@@ -314,3 +314,120 @@ def test_many_block_comments_without_a_call_scan_in_linear_time():
                                 source], capture_output=True, text=True, timeout=20,
                                cwd=Path(ROOT_SCRIPT).parents[1])
     assert completed.stdout.strip() == "[] []", completed.stderr
+
+
+
+def pr_check_job():
+    import yaml
+    return yaml.safe_load((Path(ROOT_SCRIPT).parents[1] / ".github/workflows/checks.yml").read_text())["jobs"]["tiden_pr"]
+
+
+def outcome(tmp_path, lines, status):
+    """Run the workflow's check step with the script replaced by one that prints `lines` and exits `status`."""
+    step = next(step for step in pr_check_job()["steps"] if step.get("id") == "check")
+    work = tmp_path / f"step-{len(list(tmp_path.glob('step-*')))}"
+    (work / "scripts").mkdir(parents=True)
+    (work / "bin").mkdir()
+    (work / "bin/python").symlink_to(sys.executable)
+    (work / "scripts/tiden_pr_check.py").write_text(
+        f"import sys\nprint({json.dumps(chr(10).join(lines))})\nsys.exit({status})\n")
+    output = work / "output"
+    completed = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, capture_output=True, text=True, env={
+        "RUNNER_TEMP": str(work), "GITHUB_OUTPUT": str(output), "PATH": f"{work / 'bin'}:/usr/bin:/bin"})
+    assert completed.returncode == 0, completed.stderr
+    return output.read_text().strip()
+
+
+# spec: ANYM-405
+def test_only_a_verdict_fails_the_pr_check_job_and_anything_else_warns(repo, server, tmp_path):
+    job = pr_check_job()
+    steps = {step.get("id"): step for step in job["steps"]}
+    assert [step.get("id") for step in job["steps"] if "TIDEN_API_TOKEN" in str(step.get("env"))] == ["check"]
+    assert [step.get("name") for step in job["steps"] if step.get("continue-on-error") is not True] == \
+        ["Fail on the verdict"]
+    assert steps["check"]["if"] == "steps.install.outcome == 'success'"
+    assert next(step for step in job["steps"] if step.get("name") == "Fail on the verdict")["if"] == \
+        "steps.check.outputs.outcome == 'failed'"
+    assert "outcome != 'passed' && steps.check.outputs.outcome != 'failed'" in steps["warn"]["if"]
+    assert sum(step["timeout-minutes"] for step in job["steps"]) < job["timeout-minutes"]
+    receipt = next(step for step in job["steps"] if step.get("name") == "Retain the Tiden PR check receipt")
+    assert receipt["if"] == steps["warn"]["if"]
+    for printed in (None, "## Tiden PR check\nRefused: tiden spec list exited 3\n"):  # killed before any output, or not
+        work = tmp_path / f"warn-{printed is None}"
+        work.mkdir()
+        if printed:
+            (work / "tiden-pr-check.txt").write_text(printed)
+        completed = subprocess.run(["bash", "-e", "-c", steps["warn"]["run"]], capture_output=True, text=True, env={
+            "RUNNER_TEMP": str(work), "GITHUB_STEP_SUMMARY": str(work / "summary"), "PATH": "/usr/bin:/bin",
+            "PREPARE": "checkout success, Python success", "INSTALL": "success", "CHECK": "failure"})
+        assert completed.returncode == 0 and "::warning title=Tiden PR check not run::" in completed.stdout
+        assert json.loads((work / "tiden-pr-check/tiden-pr-check.json").read_text()) == {
+            "checked": False, "prepare": "checkout success, Python success", "install": "success", "check": "failure",
+            "reason": "Refused: tiden spec list exited 3" if printed else None}
+
+    root, base = repo
+    commit(root, {"tests/test_new.py": "def test_new():\n    pass\n"}, "change")
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"repository": {"full_name": "o/r"}, "pull_request": {
+        "body": "Spec: ANYM-12", "base": {"sha": base}, "head": {"repo": {"full_name": "o/r"}}}}))
+    env = {"GITHUB_EVENT_PATH": str(event), "TIDEN_PRODUCT_ID": "product", "TIDEN_API_TOKEN": SECRET,
+           "FAKE_TIDEN_STATE": str(server.path), "PATH": "/usr/bin:/bin"}
+
+    def real(cli=str(server.cli), **state):
+        server.set(main=[spec(12)], **state)
+        completed = subprocess.run([sys.executable, ROOT_SCRIPT, "--root", str(root), "--cli", cli],
+                                   capture_output=True, text=True, env=env)
+        return completed.stdout.splitlines(), completed.returncode
+
+    assert outcome(tmp_path, *real(fault={})) == "outcome=failed"
+    assert outcome(tmp_path, *real(fault={"spec list": "exit"})) == "outcome=unchecked"
+    assert outcome(tmp_path, *real(fault={"spec list": "garbage"})) == "outcome=unchecked"
+    assert outcome(tmp_path, *real(cli=str(tmp_path / "missing-cli"), fault={})) == "outcome=unchecked"
+    commit(root, {"tests/test_new.py": "# spec: ANYM-12\ndef test_new():\n    pass\n"}, "marked")
+    assert outcome(tmp_path, *real(fault={})) == "outcome=passed"
+    commit(root, {"tests/test_bad.py": "def test_bad(:\n    pass\n"}, "unparseable")
+    lines, status = real(fault={})
+    assert lines[-1].startswith("Refused: tests/test_bad.py does not parse")
+    assert outcome(tmp_path, lines, status) == "outcome=failed"
+    commit(root, {"tests/test_bad.py": "def test_bad():\n    pass\n", "tests/test_nul.py": "x = 1\0\n"}, "nul")
+    lines, status = real(fault={})
+    assert lines[-1].startswith("Refused: tests/test_nul.py does not parse") and lines[-1].endswith("line None)")
+    assert outcome(tmp_path, lines, status) == "outcome=failed"
+    assert outcome(tmp_path, ["Refused: a changed path is not valid UTF-8"], 1) == "outcome=failed"
+    for line in ("Refused: unexpected UnicodeDecodeError", "Refused: unexpected FileNotFoundError",
+                 "Refused: the spec listing of main is incomplete", "Refused: git diff exited 128",
+                 "Refused: tiden spec list timed out", "Refused: tests/x.py does not parse"):
+        assert outcome(tmp_path, ["## Tiden PR check", line], 1) == "outcome=unchecked", line
+    verdict = "Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun."
+    assert outcome(tmp_path, [verdict, "Refused: tiden spec list exited 3"], 1) == "outcome=unchecked"
+    assert outcome(tmp_path, [verdict], 2) == "outcome=unchecked"
+    assert outcome(tmp_path, [verdict], 137) == "outcome=unchecked"
+
+
+# spec: ANYM-405
+def test_a_test_merge_checkout_diffs_from_the_merged_base_tip_not_the_stale_event_base(repo, server, tmp_path):
+    root, base = repo
+    server.set(main=[spec(12)])
+    git(root, "checkout", "-q", "-b", "feature")
+    tip = commit(root, {"tests/test_new.py": "# spec: ANYM-12\ndef test_new():\n    pass\n"}, "change")
+    git(root, "checkout", "-q", "main")
+    commit(root, {"tests/test_later.py": "def test_later():\n    pass\n"}, "a later base commit")
+    # GitHub's test merge: the base tip is the first parent, the pull request head the second.
+    git(root, "merge", "-q", "--no-ff", "--no-edit", "feature")
+    event = tmp_path / "event.json"
+    payload = {"repository": {"full_name": "o/r"}, "pull_request": {
+        "body": "Spec: ANYM-12", "base": {"sha": base}, "head": {"sha": tip, "repo": {"full_name": "o/r"}}}}
+    env = {"GITHUB_EVENT_PATH": str(event), "TIDEN_PRODUCT_ID": "product", "TIDEN_API_TOKEN": SECRET,
+           "FAKE_TIDEN_STATE": str(server.path), "PATH": "/usr/bin:/bin"}
+
+    def real():
+        event.write_text(json.dumps(payload))
+        return subprocess.run([sys.executable, ROOT_SCRIPT, "--root", str(root), "--cli", str(server.cli)],
+                              capture_output=True, text=True, env=env)
+
+    completed = real()
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "Changed files 1," in completed.stdout and "test_later" not in completed.stdout
+    payload["pull_request"]["head"]["sha"] = base  # HEAD is no test merge of this pull request: the event's base
+    completed = real()
+    assert completed.returncode == 1 and "test tests/test_later.py:1 test_later" in completed.stdout
