@@ -76,10 +76,11 @@ def _named_forms(channel,destination):
 
 
 def _written(form,instruction):
-    # Separators may sit between the digits, but the form must not be part of a longer
-    # digit sequence: "+1 (202) 555-0199 (2 min)" names it, "...01992" does not.
+    # Separators may sit between the digits, but the form must not continue into more
+    # digits directly or through a dash or dot: "+1 (202) 555-0199 (2 min)" names it,
+    # "...01992" and "...0199-2" do not.
     digits=SEPARATOR.join(map(re.escape,form))
-    for match in re.finditer(r'(?<![0-9])\+?'+digits+r'(?![0-9])',instruction):
+    for match in re.finditer(r'(?<![0-9])(?<![0-9][.-])\+?'+digits+r'(?![0-9]|[.-][0-9])',instruction):
         # Digits right after an explicit country code belong to another number, whatever
         # separators follow it: "+91 202 555 0199" does not name +1 202 555 0199.
         if not match.group().startswith('+') and COUNTRY_CODE_BEFORE.search(instruction[:match.start()]):

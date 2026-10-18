@@ -103,7 +103,8 @@ async def test_owner_named_destination_must_appear_in_instruction(tmp_path):
                   'Call +1 (202) 555-0199 (2 minutes maximum).', 'позвони в 10 (202) 555-0199', '18.10 +1 202 555 0199'):
         assert policy.owner_named(words, 'phone', UNLISTED), words
     for words in ('Call +1 202 555 01992', 'Call 512025550199', 'Call +1 202 555 0198', 'Call +91 202 555 0199',
-                  'Call +91 (202) 555-0199', 'Call +91\u00a0202 555 0199', 'Call +9 1 202 555 0199', 'Call +7 12025550199'):
+                  'Call +91 (202) 555-0199', 'Call +91\u00a0202 555 0199', 'Call +9 1 202 555 0199', 'Call +7 12025550199',
+                  'Call +91 1 202 555 0199', 'Call +1 202 555 0199-2'):
         assert not policy.owner_named(words, 'phone', UNLISTED), words
     assert policy.owner_named('Набери Telegram 987654321', 'telegram', '987654321')
     assert policy.owner_named('Набери Telegram 987654321 (5 минут)', 'telegram', '987654321')
