@@ -10,6 +10,8 @@ import math
 from jsonschema import Draft202012Validator
 from jsonschema.validators import extend
 
+from .field_errors import field_errors
+
 
 def load_catalog(rows):
     result = {}
@@ -59,13 +61,22 @@ def finite_numbers(value):
             pending.extend(item)
 
 
+class InvalidArguments(ValueError):
+    """`invalid_arguments` for arguments that fail the tool's schema, with bounded field_errors."""
+
+    def __init__(self, field_errors):
+        super().__init__("invalid_arguments")
+        self.field_errors = field_errors
+
+
 def arguments(tool, value):
     if not isinstance(value, dict):
         raise ValueError("invalid_arguments")
     finite_numbers(value)
     schema = tool["inputSchema"]
-    if next(StrictValidator(schema).iter_errors(value), None) is not None:
-        raise ValueError("invalid_arguments")
+    errors = list(StrictValidator(schema).iter_errors(value))
+    if errors:
+        raise InvalidArguments(field_errors(schema, errors))
     if tool["operation"] == "upload_file_chunk":
         try:
             raw = base64.b64decode(value["data_base64"], validate=True)

@@ -5,7 +5,7 @@ import logging
 from platform_contracts import Capability, safe_error
 from .adapters.calls import receipt_reference
 
-from .catalog import arguments, CATALOG
+from .catalog import arguments, CATALOG, InvalidArguments
 from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, unavailable
 from .policy import Denied, key_from_file
 
@@ -217,6 +217,12 @@ class Dispatch:
         snapshot, agent, tool = self.admit(key, name)
         try:
             args = arguments(tool, values)
+        except InvalidArguments as error:
+            denied = Denied("invalid_arguments", 422)
+            if error.field_errors:
+                denied.detail = {"error": "invalid_arguments", "field_errors": error.field_errors,
+                                 "next_action": "check_parameters"}
+            raise denied from None
         except ValueError:
             raise Denied("invalid_arguments", 422) from None
         if tool["module"] == "gateway":

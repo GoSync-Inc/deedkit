@@ -347,7 +347,7 @@ def test_rest_error_header_follows_latest_authentication(tmp_path, frozen, befor
     held.authenticate = authenticate
     with TestClient(app) as client:
         rest = client.post("/v1/messages_search", json={"limit": "x"}, headers=HEADERS)
-    assert rest.status_code == 422 and rest.json() == {"error": "invalid_arguments"}
+    assert rest.status_code == 422 and rest.json()["error"] == "invalid_arguments"
     assert rest.headers.get("X-DeedKit-Key-Expires") == (stamp(NOW + timedelta(days=after)) if after < 7 else None)
 
 

@@ -54,6 +54,17 @@ and argument schema. There is no generic arbitrary backend executor. Unknown wri
 are not retried. Capability discovery intersects profile, local grants and current
 backend permissions. An unavailable module leaves platform introspection available.
 
+Arguments that fail a tool's input schema are rejected with 422 `invalid_arguments` on REST and
+`isError` on MCP, with the same body: `error`, `next_action: "check_parameters"` and
+`field_errors`, a list of at most 20 entries, one per field, in schema order:
+`{field, reason, expected?, allowed?}`. `field` is a slash path from the reviewed schema
+(`destination_source`, `rows/0/version`), or `$` for the arguments object itself. `reason` is one of
+`required`, `unknown_field`, `type`, `enum`, `min_length`, `max_length`, `pattern`, `minimum`,
+`maximum`, `min_items`, `max_items`, `unique`, `format`, `blank`, `size`. `expected` and `allowed` come
+from the schema, never from the submitted value, and an unknown key is named only when it is a short
+identifier. Other rejections (non-finite numbers, a non-object body) keep the bare
+`{"error": "invalid_arguments"}`.
+
 `platform_capabilities.tools` and a fresh MCP `tools/list` use the same effective
 catalog. Both expose `discovery` metadata (under `_meta["deedkit.discovery"]` for
 `tools/list`): selected tool count, a SHA-256 of the effective public schemas,
