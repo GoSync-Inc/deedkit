@@ -1,0 +1,95 @@
+name: Tiden sync
+on:
+  # Sync B (ANYM-405, TIDEN-CI.md): after the CI run of every main push, write the merged pull request's Tiden
+  # bookkeeping to Tiden main. A workflow of its own, so a red or dropped sync never touches the `CI` push run that
+  # production promotion requires; it is not a required check and blocks no merge or release.
+  workflow_run:  # zizmor: ignore[dangerous-triggers] only main pushes pass the guards; it checks out main, not the upstream head
+    workflows: [CI]
+    types: [completed]
+  # A hand rerun for one main commit, for example a waiting run that GitHub dropped.
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'The exact main commit to sync'
+        type: string
+        required: true
+permissions:
+  contents: read
+concurrency:
+  # The sync is the only automated writer of anchors and replaces whole source lists, so runs never overlap and a
+  # run in progress is never cancelled. GitHub keeps one waiting run and drops an older waiting one; a later run does
+  # not cover an earlier commit, so a dropped run is dispatched again with its own SHA (TIDEN-CI.md).
+  group: tiden-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    name: Tiden sync
+    # Only the reviewed workflow and tools on main may use the Tiden credential, and only for a main push whose CI
+    # run passed, so the push run's evidence is published before its tests are linked.
+    if: >-
+      github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success'))
+    runs-on: ubuntu-latest
+    # The sync's CLI and gh calls time out after 120 seconds each; a long merge with many tests stays well inside.
+    timeout-minutes: 30
+    permissions:
+      contents: read  # checkout of main and its history
+      pull-requests: read  # the merged pull request's body, base and merge commit (gh api repos/<repo>/pulls/<n>)
+    steps:
+      # Expression comparisons ignore case; these do not, and run before any repository code.
+      - name: Require the main branch and an exact commit
+        env:
+          REF: ${{ github.ref }}
+          EVENT: ${{ github.event_name }}
+          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+          UPSTREAM_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          UPSTREAM_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          REPOSITORY: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          test "$REF" = refs/heads/main
+          if [ "$EVENT" = workflow_run ]; then
+            test "$UPSTREAM_EVENT" = push
+            test "$UPSTREAM_BRANCH" = main
+            test "$UPSTREAM_REPOSITORY" = "$REPOSITORY"
+            sha=$UPSTREAM_SHA
+          else
+            test "$EVENT" = workflow_dispatch
+            sha=$INPUT_SHA
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        id: guard
+      # main as it is when the run starts, never the commit's own tree: the tools that hold the credential are
+      # main's. The commit must be on that history.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: main
+          fetch-depth: 0
+      - name: Require the commit on main
+        env:
+          SHA: ${{ steps.guard.outputs.sha }}
+        run: git merge-base --is-ancestor "$SHA" HEAD
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with: {python-version: '3.13'}
+      # The sync calls the CLI by its path; a workflow_run job writes nothing to GITHUB_PATH or GITHUB_ENV.
+      - name: Install pinned Tiden CLI with integrity check
+        run: |
+          curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.33.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
+          echo "3f6b650c4cabd58ce4149d9106325cbd36d1472cccc9c63ca03137668b80e4a6  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
+          mkdir "$RUNNER_TEMP/tiden-bin"
+          tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
+      # --dry-run until check A has run green on three pull requests (ANYM-405); then the flag is removed by a
+      # reviewed pull request. Without TIDEN_API_TOKEN the sync fails, so a missing credential is never green.
+      - name: Merge the named branch, link the marked tests, anchor the files and set the status
+        env:
+          TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
+          TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
+          TIDEN_WORKSPACE_ID: ${{ vars.TIDEN_WORKSPACE_ID }}
+          TIDEN_BASE_URL: https://app.tiden.ai
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.guard.outputs.sha }}
+        run: python scripts/tiden_sync.py --sha "$SHA" --cli "$RUNNER_TEMP/tiden-bin/tiden" --dry-run

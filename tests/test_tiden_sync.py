@@ -465,3 +465,61 @@ def test_a_null_spec_number_in_any_copy_is_never_merged(root, server, change):
     code, out = run(root, server)
     assert code == 1 and "Failed at step merge: the merge preview has a change without exactly one spec number" in out
     assert not server.writes()
+
+
+def sync_workflow():
+    import yaml
+    return yaml.safe_load((Path(SCRIPT).parents[1] / ".github/workflows/tiden-sync.yml").read_text())
+
+
+# spec: ANYM-405
+def test_the_sync_workflow_runs_after_main_ci_serialized_with_main_tools_and_a_dry_run():
+    value = sync_workflow()
+    triggers = value[True]  # yaml reads the `on` key as a boolean
+    assert set(triggers) == {"workflow_run", "workflow_dispatch"}
+    assert triggers["workflow_run"] == {"workflows": ["CI"], "types": ["completed"]}
+    assert triggers["workflow_dispatch"]["inputs"]["sha"]["required"] is True
+    assert value["permissions"] == {"contents": "read"}
+    assert value["concurrency"] == {"group": "tiden-sync", "cancel-in-progress": False}
+    (job,) = value["jobs"].values()
+    assert "concurrency" not in job and job["permissions"] == {"contents": "read", "pull-requests": "read"}
+    assert "github.event.workflow_run.conclusion == 'success'" in job["if"]
+    steps = job["steps"]
+    checkout = next(step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@"))
+    assert checkout["with"] == {"persist-credentials": False, "ref": "main", "fetch-depth": 0}
+    assert steps.index(checkout) == 1 and steps[2]["run"] == 'git merge-base --is-ancestor "$SHA" HEAD'
+    holders = [step["name"] for step in steps if any("secrets." in str(v) or "github.token" in str(v)
+                                                     for v in step.get("env", {}).values())]
+    assert holders == [steps[-1]["name"]] and "--dry-run" in steps[-1]["run"].split()
+    assert all("secrets." not in step.get("run", "") and "GITHUB_PATH" not in step.get("run", "") for step in steps)
+
+    def pinned(text):
+        return next(line.strip() for line in text.splitlines() if "sha256sum --check" in line)
+    install = next(step for step in steps if step.get("name") == "Install pinned Tiden CLI with integrity check")
+    assert pinned(install["run"]) == pinned((Path(SCRIPT).parents[1] / ".github/workflows/ci.yml").read_text())
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize(("env", "passes"), [
+    ({"EVENT": "workflow_run", "UPSTREAM_EVENT": "push", "UPSTREAM_BRANCH": "main", "UPSTREAM_REPOSITORY": "o/r"}, True),
+    ({"EVENT": "workflow_dispatch", "INPUT_SHA": "a" * 40}, True),
+    ({"EVENT": "workflow_run", "UPSTREAM_EVENT": "pull_request", "UPSTREAM_BRANCH": "main",
+      "UPSTREAM_REPOSITORY": "o/r"}, False),
+    ({"EVENT": "workflow_run", "UPSTREAM_EVENT": "push", "UPSTREAM_BRANCH": "MAIN", "UPSTREAM_REPOSITORY": "o/r"}, False),
+    ({"EVENT": "workflow_run", "UPSTREAM_EVENT": "push", "UPSTREAM_BRANCH": "main", "UPSTREAM_REPOSITORY": "fork/r"},
+     False),
+    ({"EVENT": "workflow_dispatch", "INPUT_SHA": "main"}, False),
+    ({"EVENT": "workflow_dispatch", "INPUT_SHA": "A" * 40}, False),
+    ({"EVENT": "workflow_dispatch", "INPUT_SHA": "a" * 40, "REF": "refs/heads/feature"}, False),
+])
+def test_the_sync_guard_admits_only_an_exact_main_commit(env, passes, tmp_path):
+    guard = sync_workflow()["jobs"]["sync"]["steps"][0]
+    assert guard["id"] == "guard"
+    output = tmp_path / "output"
+    base = {"REF": "refs/heads/main", "REPOSITORY": "o/r", "UPSTREAM_SHA": "b" * 40, "GITHUB_OUTPUT": str(output),
+            "PATH": "/usr/bin:/bin"}
+    completed = subprocess.run(["bash", "-e", "-c", guard["run"]], env={**base, **env})
+    assert (completed.returncode == 0) == passes
+    if passes:
+        expected = "b" * 40 if env["EVENT"] == "workflow_run" else env["INPUT_SHA"]
+        assert output.read_text() == f"sha={expected}\n"

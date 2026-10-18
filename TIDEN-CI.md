@@ -264,6 +264,40 @@ keeps a `tiden-pr-check-receipt` artifact with the last line the check printed,
 when the artifact service accepts it; the sync and `Tiden drift` still check
 after the merge, and a rerun of the job checks now.
 
+## Main sync
+
+`.github/workflows/tiden-sync.yml` runs `scripts/tiden_sync.py` (sync B,
+ANYM-405) after the CI run of every main push passes, so that run's evidence is
+already published. It is a workflow of its own, so a red or dropped sync never
+touches the `CI` push run that production promotion requires. For the merged
+pull request named by `(#n)` in the commit subject, it:
+
+1. merges the body's `Tiden branch:` when its preview holds only the named
+   specs;
+2. links each marked test the commit adds to its specs;
+3. anchors each unanchored changed code file to the primary spec;
+4. sets each `Delivers:` spec to Done, or to Review while it has an open live or
+   measured check;
+5. reads everything back.
+
+Each failure prints `Failed at step <name>: <reason>` and fails the run. A rerun
+finishes what an earlier run left.
+
+The workflow runs main's tools with main checked out, never the commit's tree,
+and needs `pull-requests: read` to read the merged pull request. Runs never
+overlap and a run in progress is never cancelled (one concurrency group), because
+the sync is the only automated writer of anchors and replaces whole source lists.
+GitHub keeps one waiting run and drops an older waiting one. A later run does not
+cover an earlier commit, so dispatch a dropped run again from main with its SHA
+(`gh workflow run tiden-sync.yml --ref main -f sha=<sha>`). Never repair sources
+by hand while a sync runs.
+
+Until check A has run green on three pull requests, the sync runs `--dry-run`
+and writes nothing. The agent that merged runs it after the CI push run
+completes, first with `--dry-run`, then without
+(`TIDEN_PRODUCT_ID=<id> uv run python scripts/tiden_sync.py --sha <sha>` from a
+main checkout), and reads back the result (AGENTS.md section 4).
+
 ## Drift watermark
 
 `.github/workflows/tiden-drift.yml` keeps the drift watermark current after every
