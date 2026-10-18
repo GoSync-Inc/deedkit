@@ -76,6 +76,35 @@ class CallVoice(BaseModel):
                 'voice':self.grok_voice if grok else 'replicated' if custom else self.gemini_voice,'custom_voice':custom}
 
 
+def voice_ids(value,found=None):
+    """Every custom voice ID stored anywhere in a response: briefs, call records, followups."""
+    found=set() if found is None else found
+    if isinstance(value,dict):
+        for key,item in value.items():
+            if key in {'custom_voice_id','gemini_custom_voice_id'} and isinstance(item,str) and item:
+                found.add(item)
+            voice_ids(item,found)
+    elif isinstance(value,(list,tuple)):
+        for item in value:
+            voice_ids(item,found)
+    return found
+
+
+def redact_voice_ids(value,ids):
+    """Agents never see the owner's custom voice ID, nested or inside text (ANYM-359); stored data keeps it."""
+    if not ids:
+        return value
+    if isinstance(value,str):
+        for identity in ids:
+            value=value.replace(identity,'redacted')
+        return value
+    if isinstance(value,dict):
+        return {redact_voice_ids(key,ids):redact_voice_ids(item,ids) for key,item in value.items()}
+    if isinstance(value,(list,tuple)):
+        return [redact_voice_ids(item,ids) for item in value]
+    return value
+
+
 class ToolInput(BaseModel):
     model_config=ConfigDict(extra="forbid")
 
@@ -328,6 +357,15 @@ class VoiceService:
         except Exception:
             # A damaged setting refuses agent preparation instead of silently changing the voice.
             raise ServiceError('call_voice_invalid',503) from None
+
+    def agent_view(self,value):
+        """What an agent may read of a response: custom voice IDs, stored or current, become "redacted"."""
+        ids=voice_ids(value)
+        try:
+            current=self.call_voice().gemini_custom_voice_id
+        except ServiceError:
+            current=None
+        return redact_voice_ids(value,ids|{current} if current else ids)
 
     def set_call_voice(self,value):
         from settings import write_private

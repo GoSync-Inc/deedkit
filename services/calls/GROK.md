@@ -42,10 +42,11 @@ returns its frozen `dialog_engine`, `voice` and `grok_voice`. The owner's browse
 (Flows included) and never changes `call_voice`.
 
 Voices offered: Gemini `Kore, Puck, Charon, Fenrir, Aoede, Leda, Orus, Zephyr`;
-Grok `eve, ara, rex, sal, leo`. On 2026-10-18 the providers listed 30 Gemini
-Live voices (https://ai.google.dev/gemini-api/docs/live-guide) and 26 xAI
-voices (https://docs.x.ai/developers/model-capabilities/audio/voice). Only the
-voice the owner picks after listening is added.
+Grok `eve, ara, rex, sal, leo`. On 2026-10-18 Google listed 30 Gemini Live
+voices (https://ai.google.dev/gemini-api/docs/live-guide); on 2026-10-19 xAI
+listed 28 voices with audio samples, page updated 2026-10-14
+(https://docs.x.ai/developers/model-capabilities/audio/voice). Only the voice
+the owner picks after listening to those samples is added.
 
 Owner test path: set `call_voice`, ask the agent for a new call to you
 (`destination_source: owner_named`), listen, switch and repeat. After a switch

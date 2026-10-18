@@ -451,6 +451,10 @@ class AgentAPI:
         }
 
     async def call(self, token, name, arguments):
+        # One projection for every agent response: no custom voice ID (ANYM-359).
+        return self.service.agent_view(await self._call(token, name, arguments))
+
+    async def _call(self, token, name, arguments):
         principal = self.registry.authenticate(token)
         if name not in METHODS:
             raise ServiceError("not_found_or_forbidden", 403)

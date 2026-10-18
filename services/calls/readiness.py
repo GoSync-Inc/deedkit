@@ -20,7 +20,7 @@ def calling_readiness(principal, outbound, credentials, browser_enabled, provide
             elif not credentials.get(key):
                 blockers.append('model_key_required')
             channels[channel] = {'configuration_ready':not blockers, 'blockers':blockers,
-                                 'live_call_verified':False}
+                                 'model_providers':['gemini', 'xai'], 'live_call_verified':False}
             continue
         if 'calls:dial' not in principal.scopes:
             blockers.append('calls:dial_required')

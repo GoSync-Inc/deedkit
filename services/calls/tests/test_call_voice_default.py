@@ -240,7 +240,7 @@ def test_readiness_requires_the_call_voice_provider_key_on_every_channel(tmp_pat
         client.post('/api/credentials',json={present:'synthetic-model-key'},headers=HEADERS)
         ready=client.post('/v1/capabilities',json={},headers=AGENT).json()['calling_readiness']['channels']
         assert all('model_key_required' in ready[channel]['blockers'] for channel in ROUTES), ready
-        assert all(ready[channel]['model_providers']==['gemini','xai'] for channel in ROUTES if channel!='browser')
+        assert all(ready[channel]['model_providers']==['gemini','xai'] for channel in ROUTES)
         client.post('/api/credentials',json={missing:'synthetic-model-key'},headers=HEADERS)
         ready=client.post('/v1/capabilities',json={},headers=AGENT).json()['calling_readiness']['channels']
         assert not any('model_key_required' in ready[channel]['blockers'] for channel in ROUTES), ready
@@ -265,3 +265,54 @@ def test_call_voice_command_shows_and_sets_the_owner_setting(tmp_path,monkeypatc
         with pytest.raises(HTTPError) as refused:
             call_voice({'provider':'grok_realtime','grok_voice':'unknown'})
         assert refused.value.code==422 and call_voice()['grok_voice']=='rex'
+
+
+# spec: ANYM-359
+async def test_agents_never_receive_the_custom_voice_id(tmp_path,monkeypatch):
+    monkeypatch.setenv('VOICE_EXTERNAL_MCP','1')
+    data=tmp_path/'data'
+    secret='voice_owner_fixture'
+    app=create_app(data,Archive(),agent_registry=every_channel(tmp_path),control_token='control-fixture-token')
+    service=app.state.service
+    service.set_call_voice(service.call_voice().model_copy(update={'gemini_custom_voice_id':secret}))
+    seen=[]
+    async with app.router.lifespan_context(app):
+        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app),base_url='http://testserver') as http:
+            async def agent(operation,body):
+                response=await http.post(f'/v1/{operation}',json=body,headers=AGENT)
+                assert response.status_code==200, (operation,response.text)
+                seen.append(response.text)
+                return response.json()
+            body={**BRIEF,'source_message_ids':[],'approval_fields':['delivery_window'],**ROUTES['telegram']}
+            parent=await agent('prepare_external_call',{'brief':body})
+            assert parent['custom_voice_id']=='redacted' and secret in json.dumps(service.get_brief(parent['id']))
+            call=service.start(parent['id']);cid=call['id'];service.connected(cid)
+            service.transcript(cid,'user',f'12–13, {secret}')
+            decision=service.tool(cid,'record_answer',{'field':'delivery_window','value':'12–13','evidence':'12–13'},'t1')['owner_decision']
+            service.stop(cid,'awaiting_owner');service.decide(cid,decision['decision_id'],'No')
+            for operation in ('get_call_result','get_call_status'):
+                await agent(operation,{'call_id':cid})
+            await agent('prepare_followup',{'call_id':cid,'decision_id':decision['decision_id']})
+            await agent('list_briefs',{});await agent('list_calls',{});await agent('get_owner_requests',{})
+            browser=await agent('prepare_call',{'brief':{**BRIEF,'source_message_ids':[]}})
+            started=await agent('start_call',{'brief_id':browser['id']})
+            await agent('stop_call',{'call_id':started['id']})
+            owner=await http.get(f'/api/briefs/{browser["id"]}',headers=owner_headers(data))
+            assert owner.json()['custom_voice_id']==secret
+        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app),headers={'Authorization':'Bearer control-fixture-token'}) as http:
+            async with streamable_http_client('http://testserver/control/mcp',http_client=http) as (read,write):
+                async with ClientSession(read,write) as client:
+                    await client.initialize()
+                    async def tool(name,arguments):
+                        result=await client.call_tool(name,arguments)
+                        assert not result.is_error, (name,result)
+                        seen.append(json.dumps(result.model_dump(mode='json')))
+                        return result.structured_content
+                    prepared=await tool('prepare_call',{'brief':BRIEF})
+                    assert prepared['custom_voice_id']=='redacted'
+                    await tool('prepare_external_call',{'brief':{**BRIEF,**ROUTES['whatsapp']}})
+                    started=await tool('start_call',{'brief_id':prepared['id']})
+                    for name in ('get_call_status','get_call_result','stop_call'):
+                        await tool(name,{'call_id':started['id']})
+                    await tool('get_call_result',{'call_id':cid})
+    assert len(seen)==17 and not any(secret in text for text in seen)
