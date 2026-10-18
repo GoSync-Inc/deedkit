@@ -5,6 +5,8 @@ from datetime import datetime,timezone
 import json
 import os
 from pathlib import Path
+import shutil
+import tempfile
 from threading import Event
 from types import SimpleNamespace as NS
 
@@ -445,11 +447,23 @@ def test_session_path_through_a_symlinked_ancestor_is_rejected(tmp_path):
     good=tmp_path/'good'; (good/'sessions').mkdir(parents=True,mode=0o700)
     shared=tmp_path/'shared'; shared.mkdir(); shared.chmod(0o777); (shared/'redirect').symlink_to(good)
     trusted_dir=tmp_path/'trusted'; trusted_dir.mkdir(); (trusted_dir/'route').symlink_to(shared/'redirect')
-    for session in [trusted_dir/'route'/'sessions'/'telegram.session',(tmp_path/'direct')/'sessions'/'telegram.session']:
-        if not session.parent.parent.exists(): session.parent.parent.symlink_to(good)
-        with pytest.raises(ValueError,match='session_symlink'):
-            with session_lock(session): pytest.fail('symlinked ancestor accepted')
+    with pytest.raises(RuntimeError,match='private_session_required'):
+        with session_lock(trusted_dir/'route'/'sessions'/'telegram.session'): pytest.fail('renamable link accepted')
     assert list((good/'sessions').iterdir())==[]
+
+
+def test_session_lock_follows_only_links_and_directories_other_users_cannot_change(tmp_path):
+    good=tmp_path/'good'; (good/'sessions').mkdir(parents=True,mode=0o700)
+    (tmp_path/'direct').symlink_to(good); (tmp_path/'relative').symlink_to('good/../good')
+    for name in ['direct','relative']:
+        with session_lock(tmp_path/name/'sessions'/'telegram.session'): pass
+    assert [p.name for p in (good/'sessions').iterdir()]==['telegram.session.owner.lock']
+    # The system temporary directory: a root-owned link on macOS (/tmp -> private/tmp), sticky everywhere.
+    system=Path(tempfile.mkdtemp(dir='/tmp'))
+    try:
+        with session_lock(system/'sessions'/'telegram.session'): pass
+        assert (system/'sessions').stat().st_mode&0o777==0o700
+    finally: shutil.rmtree(system)
 
 
 @pytest.mark.skipif(hasattr(os,'geteuid') and os.geteuid()==0,reason='root ignores directory modes')

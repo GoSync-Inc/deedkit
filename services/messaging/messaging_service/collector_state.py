@@ -101,24 +101,54 @@ def trusted(info):
     return info.st_uid in {0,os.geteuid()}
 
 
+def trusted_real_path(path):
+    """Resolve path, refusing any component another non-root user could change.
+
+    As OpenSSH StrictModes: each directory used, including those that resolve a
+    symlink (like macOS /tmp), is owned by root or this uid and not group/other
+    writable unless sticky; each symlink is owned by root or this uid. Returns the
+    real path and the missing tail."""
+    real=Path('/'); pending=list(Path(os.getcwd(),path).parts[1:]); links=0
+    info=os.lstat(real)
+    if not trusted(info) or info.st_mode&0o022: raise RuntimeError('private_session_required')
+    while pending:
+        name=pending.pop(0)
+        if name=='..': real=real.parent; continue  # real holds no symlink, so this is the kernel's parent.
+        candidate=real/name
+        try: info=os.lstat(candidate)
+        except FileNotFoundError: return real,[name,*pending]
+        if not trusted(info): raise RuntimeError('private_session_required')
+        if stat.S_ISLNK(info.st_mode):
+            links+=1
+            if links>32: raise RuntimeError('private_session_required')
+            target=Path(os.readlink(candidate))
+            if target.is_absolute(): real=Path('/')
+            pending=[*target.parts[1 if target.is_absolute() else 0:],*pending]; continue
+        # A sticky directory protects the entries it does not own.
+        if not stat.S_ISDIR(info.st_mode) or info.st_mode&0o022 and not info.st_mode&stat.S_ISVTX:
+            raise RuntimeError('private_session_required')
+        real=candidate
+    return real,[]
+
+
 def private_session_directory(session):
     """Open the directory that holds a session, its SQLite side files and its lock.
 
     A file's own 0600 mode does not stop another user from replacing it, so the
-    directory must be private. As with OpenSSH StrictModes, no other non-root user
-    may rename any directory on the path either, and the path holds no symlink, so
-    the provider's later access by name reaches the checked directory. Never repaired."""
-    session=Path(os.path.abspath(session))
+    directory must be private, and no other non-root user may change the path to
+    it, so the provider's later access by name reaches the checked directory.
+    Never repaired."""
+    session=Path(session)
     try:
-        for path in [*reversed(session.parents),session]:
-            try: info=os.lstat(path)
-            except FileNotFoundError: break  # Below here, only this process creates entries.
-            if stat.S_ISLNK(info.st_mode): raise ValueError('session_symlink')
-            # A sticky directory protects the entries it does not own.
-            if path!=session and (not trusted(info) or info.st_mode&0o022 and not info.st_mode&stat.S_ISVTX):
-                raise RuntimeError('private_session_required')
-        session.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
-        fd=os.open(session.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        if session.is_symlink() or session.parent.is_symlink(): raise ValueError('session_symlink')
+        real,missing=trusted_real_path(session.parent)
+        if '..' in missing: raise RuntimeError('private_session_required')
+        if missing:
+            real.joinpath(*missing).mkdir(mode=0o700,parents=True,exist_ok=True)
+            # Another user may create a missing name first in a sticky directory.
+            real,missing=trusted_real_path(session.parent)
+            if missing: raise RuntimeError('private_session_required')
+        fd=os.open(real,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
     except OSError: raise RuntimeError('private_session_required') from None
     info=os.fstat(fd)
     if info.st_mode&0o077 or not trusted(info):
