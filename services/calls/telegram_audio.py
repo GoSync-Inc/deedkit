@@ -1,6 +1,8 @@
 """Experimental private Telegram calls; native audio lives outside AnyMsg's collector."""
 import asyncio
 import contextlib
+import threading
+import time
 from pathlib import Path
 
 from core import ACTIVE, ServiceError
@@ -17,6 +19,64 @@ def dispose_native(py):
     py._is_running=False
     py.executor.shutdown(wait=False,cancel_futures=True)
     py._binding=None
+
+
+class MediaDiagnostics:
+    """Bounded Telegram media facts for owner diagnosis: no audio, ids or key material."""
+    def __init__(self,limit=24):
+        self.limit,self.origin=limit,time.monotonic()
+        self.events=[]
+        self.dropped=0
+        self.lock=threading.Lock()
+        self.library_versions=self.p2p_allowed=None
+
+    def _add(self,kind,**value):
+        with self.lock:
+            if len(self.events)<self.limit:
+                self.events.append({'kind':kind,'at_ms':round((time.monotonic()-self.origin)*1000),**value})
+            else:self.dropped+=1
+
+    # Native callbacks run off the loop thread, so the capacity check is locked; failures stay silent.
+    def remote_source(self,source):
+        name=lambda value:getattr(value,'name',str(value))
+        with contextlib.suppress(Exception):
+            self._add('remote_source',device=name(source.device),state=name(source.state))
+
+    def connection(self,info):
+        name=lambda value:getattr(value,'name',str(value))
+        with contextlib.suppress(Exception):
+            self._add('connection',state=name(info.state),connection_kind=name(info.kind))
+
+    def protocol(self,protocol):
+        with contextlib.suppress(Exception):
+            self.library_versions=[str(value) for value in protocol.library_versions][:8]
+            self.p2p_allowed=protocol.p2p_allowed
+
+    def snapshot(self):
+        with self.lock:
+            return {'library_versions':self.library_versions,'p2p_allowed':self.p2p_allowed,
+                    'events':[dict(event) for event in self.events],'events_dropped':self.dropped}
+
+
+def observe_media(py,media):
+    # PyTgCalls never registers on_remote_source_change; connection changes and the confirmed call
+    # protocol are observed by wrapping its own methods, which are looked up at call time.
+    # Diagnostics are best effort and must never stop a call from being placed.
+    with contextlib.suppress(Exception):
+        py._binding.on_remote_source_change(lambda chat_id,source:media.remote_source(source))
+    with contextlib.suppress(Exception):
+        connection=py._handle_connection_changed
+        async def connection_changed(chat_id,net_state):
+            media.connection(net_state)
+            await connection(chat_id,net_state)
+        py._handle_connection_changed=connection_changed
+    with contextlib.suppress(Exception):
+        confirm=py._app.confirm_call
+        async def confirm_call(*args,**kwargs):
+            protocol=await confirm(*args,**kwargs)
+            media.protocol(protocol)
+            return protocol
+        py._app.confirm_call=confirm_call
 
 
 async def broker_status(socket,token):
@@ -90,7 +150,7 @@ class TelegramCalls:
         py=PyTgCalls(client,workers=2)
         state={'service':self.service,'call_id':cid,'brief':call['brief'],'supervisor':self.supervisor,
                'client':client,'py':py,'user':user,'input':None,'dial_task':asyncio.current_task(),
-               'audio_probe':PCMProbe()}
+               'audio_probe':PCMProbe(),'media':MediaDiagnostics()}
         self.active[cid]=state
         @py.on_update()
         async def updates(py,update):
@@ -112,6 +172,7 @@ class TelegramCalls:
             # Version is pinned in uv.lock; do not fetch GitHub during call setup.
             PyTgCallsSession.notice_displayed=True
             await py.start()
+            observe_media(py,state['media'])
             await asyncio.wait_for(py.play(user,MediaStream(ExternalMedia.AUDIO,AudioParameters(48000,1)),
                                            config=CallConfig(timeout=30)),45)
             await py.record(user,RecordStream(audio=True,audio_parameters=AudioParameters(48000,1)))
@@ -139,7 +200,8 @@ class TelegramCalls:
         finally:
             await self._release(cid)
             value=self.service.get_call(cid)
-            self.service.result(cid,metrics={**value['metrics'],'telegram_audio':state['audio_probe'].snapshot()})
+            self.service.result(cid,metrics={**value['metrics'],
+                'telegram_audio':{**state['audio_probe'].snapshot(),'media':state['media'].snapshot()}})
             self.service.stop(cid,reason)
 
     async def _release(self,cid):

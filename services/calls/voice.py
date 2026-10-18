@@ -4,7 +4,7 @@ import json
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.frames.frames import EndFrame, InputTextRawFrame, LLMRunFrame, LLMTextFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, OutputAudioRawFrame, BotStoppedSpeakingFrame, InterruptionFrame
+from pipecat.frames.frames import EndFrame, InputAudioRawFrame, InputTextRawFrame, LLMRunFrame, LLMTextFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, OutputAudioRawFrame, BotStoppedSpeakingFrame, InterruptionFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
@@ -17,6 +17,7 @@ from pipecat.workers.runner import WorkerRunner
 
 from core import TOOL_MODELS
 from audio_health import RuntimeAudioHealth
+from audio_probe import PCMProbe
 from call_errors import record_model_error
 
 
@@ -34,6 +35,20 @@ class AudioDeliveryProbe(FrameProcessor):
             elif isinstance(frame,OutputAudioRawFrame):
                 self.health.audio(len(frame.audio),frame.sample_rate,frame.num_channels)
         await self.push_frame(frame,direction)
+
+
+class InboundAudioProbe(FrameProcessor):
+    """Counters only: observe inbound transport audio on every channel without changing frames."""
+    def __init__(self,probe):
+        super().__init__()
+        self.probe=probe
+
+    async def process_frame(self,frame,direction):
+        await super().process_frame(frame,direction)
+        if direction==FrameDirection.DOWNSTREAM and isinstance(frame,InputAudioRawFrame):
+            self.probe.input(frame.audio,rate=frame.sample_rate,channels=frame.num_channels)
+        await self.push_frame(frame,direction)
+
 
 DESCRIPTIONS={
     'lookup_context':'Read only selected task facts. Empty query lists all facts. Sources may be partial or outdated.',
@@ -168,6 +183,7 @@ async def run_transport(transport,brief,key,state,browser=False):
     live_flows=brief.get('dialog_engine')=='gemini_live_flows'
     ending_tasks=[]
     runtime_health=RuntimeAudioHealth()
+    inbound_audio=PCMProbe()
 
     async def handle(name,params):
         if name=='consult_supervisor' and state.get('supervisor'):
@@ -185,7 +201,7 @@ async def run_transport(transport,brief,key,state,browser=False):
         context.set_tools(tool_schemas(handle))
     aggregators=LLMContextAggregatorPair(context)
     user,assistant=aggregators
-    processors=[transport.input()]
+    processors=[transport.input(),InboundAudioProbe(inbound_audio)]
     if live_flows:
         from live_flows import SpeechSafety
         async def activity(speaking):
@@ -279,6 +295,7 @@ async def run_transport(transport,brief,key,state,browser=False):
         await asyncio.gather(health_task,return_exceptions=True)
         service.runtime_event(identity,{'kind':'provider_audio_health','audio':llm.audio_health.snapshot(),
                                         'runtime':runtime_health.snapshot()})
+        service.runtime_event(identity,{'kind':'inbound_audio','audio':inbound_audio.snapshot()})
         for task in ending_tasks:
             task.cancel()
         if ending_tasks:
