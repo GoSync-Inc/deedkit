@@ -65,7 +65,13 @@ class Refused(RuntimeError):
 
 
 class QueueSkipped(Refused):
-    """The merge queue run passed with `checks / verify` skipped: a pull request reuse or a docs-only decision."""
+    """The merge queue run passed with `checks / verify` skipped: a pull request reuse or a docs-only decision.
+
+    It carries the queue run and its latest attempt's jobs as read, so `queue_chain` does not read them again."""
+
+    def __init__(self, message, queue, jobs):
+        super().__init__(message)
+        self.queue, self.jobs = queue, jobs
 
 
 class Busy(Refused):
@@ -175,7 +181,7 @@ def queue_verification(sha, get):
         raise Refused("latest merge queue run is not a completed success of this repository's main queue for this commit")
     jobs = attempt_jobs(queue, get)
     if job_concluded(jobs, QUEUE_VERIFIED_JOB, "skipped") and job_concluded(jobs, "CI gate"):
-        raise QueueSkipped(f"merge queue job did not pass: {QUEUE_VERIFIED_JOB}")
+        raise QueueSkipped(f"merge queue job did not pass: {QUEUE_VERIFIED_JOB}", queue, jobs)
     for required in (QUEUE_VERIFIED_JOB, "CI gate"):
         if not job_concluded(jobs, required):
             raise Refused(f"merge queue job did not pass: {required}")
@@ -184,22 +190,24 @@ def queue_verification(sha, get):
     return queue
 
 
-def queue_chain(sha, get):
+def queue_chain(sha, get, queue=None, jobs=None):
     """The merge queue run that reused a full pull request run for this commit, and that pull request run.
 
     Returns (queue run, pull request run, pull request number, head branch). The queue run must have passed `CI gate`
     with `checks / verify` skipped after its pull request reuse job, and not by its docs-only decision; the pull
     request must have merged as exactly this commit, and the latest run of its head must have passed every
     `PULL_REQUEST_JOBS` job. The exact tree equality is the queue gate's (ANYM-358), checked again by the push run.
+    `queue` and `jobs`, when given, are the latest queue run and its attempt's jobs as just read (QueueSkipped).
     """
-    queue = latest_run(sha, "merge_group", get)
+    if queue is None:
+        queue = latest_run(sha, "merge_group", get)
     branch = str((queue or {}).get("head_branch", ""))
     match = QUEUE_GROUP_BRANCH.fullmatch(branch)
     if queue is None or not match or queue.get("head_sha") != sha or queue.get("event") != "merge_group" \
             or queue.get("status") != "completed" or queue.get("conclusion") != "success" \
             or queue.get("head_repository", {}).get("full_name") != REPOSITORY:
         raise Refused("latest merge queue run is not a completed success of one pull request's group for this commit")
-    jobs = attempt_jobs(queue, get)
+    jobs = attempt_jobs(queue, get) if jobs is None else jobs
     if not (job_concluded(jobs, "CI gate") and job_concluded(jobs, QUEUE_VERIFIED_JOB, "skipped")
             and job_concluded(jobs, QUEUE_PR_REUSE_JOB)) or job_concluded(jobs, "checks / documentation"):
         raise Refused("the merge queue run did not pass by reusing a pull request verification")
@@ -245,13 +253,12 @@ def verify(sha, get=api):
     known = _verified.get(sha) if _verified is not None else None
     if known and unchanged(known["push"], latest) and (known["queue"] is None or (
             unchanged(known["queue"], latest_run(sha, "merge_group", get))
-            and (known.get("pull") is None
-                 or unchanged(known["pull"], latest_run(known["pull"]["head_sha"], "pull_request", get)))
             and unchanged(latest, latest_run(sha, "push", get)))):
         # Within one deploy run: the same completed attempts have the same jobs, so the runs are read again
-        # but not their jobs (the host's anonymous GitHub quota is 60 requests an hour). After the queue read (and,
-        # for the PR→queue chain, the pull request run read) the push run is read once more, as the full path does,
-        # so a rerun between the reads is not missed.
+        # but not their jobs (the host's anonymous GitHub quota is 60 requests an hour). After the queue read
+        # the push run is read once more, as the full path does, so a rerun between the reads is not missed. For the
+        # PR→queue chain the queue run that reused the pull request run is re-read, not the pull request run: its
+        # listing would make plans A and B exceed the quota, and the deploy's first verification read it in full.
         return known["result"]
     jobs = attempt_jobs(latest, get)
     verified_by, queue = latest, None
@@ -263,7 +270,7 @@ def verify(sha, get=api):
                 verified_by = queue = queue_verification(sha, get)
             except QueueSkipped as refused:
                 try:
-                    queue, verified_by, _, _ = queue_chain(sha, get)
+                    queue, verified_by, _, _ = queue_chain(sha, get, refused.queue, refused.jobs)
                 except Refused as exc:
                     raise Refused(f"{refused}; {exc}") from None
         elif not job_concluded(jobs, required):
@@ -274,8 +281,7 @@ def verify(sha, get=api):
               "verify_run_id": verified_by["id"], "verify_run_attempt": verified_by["run_attempt"],
               "verify_run_url": verified_by["html_url"]}
     if _verified is not None:
-        _verified[sha] = {"push": latest, "queue": None if verified_by is latest else queue,
-                          "pull": verified_by if queue is not None and verified_by is not queue else None, "result": result}
+        _verified[sha] = {"push": latest, "queue": None if verified_by is latest else queue, "result": result}
     return result
 
 
@@ -1046,11 +1052,12 @@ FETCH_FAILURES = 3
 SQL_INVENTORY = re.compile(r"\.sql$|^services/.+/migrations/")
 DEPLOY_TOOLS = ("scripts/production.py", "scripts/seamless_release.py", "tools/attest-verify/", "services/release-router/")
 # GitHub requests one deploy run needs, against the anonymous quota of 60 an hour; below it the deploy waits for the
-# reset. Plan A verifies 4 times (prepare 2, apply 2) and plan B 6 times (prepare 3, promote 3); with the merge
-# queue's verification the first verify() reads 7 and each later one 4 (verification_reuse): 43 and 27, plus the
-# deploy's own run listing and a small margin. These hold for unchanged attempts and one-page listings; more pages
-# or a rerun can need more, and the rate limit then stops the run (retried before any change, otherwise a pause).
-QUOTA = {"plan A and B": 48, "plan B": 31}
+# reset. Plan A verifies 4 times (prepare 2, apply 2) and plan B 6 times (prepare 3, promote 3); through the PR→queue
+# chain the first verify() reads 11 (7 through the queue's own verification) and each later one 4 (verification_reuse):
+# 47 and 31, plus the deploy's own run listing and a small margin. These hold for unchanged attempts and one-page
+# listings; more pages or a rerun can need more, and the rate limit then stops the run (retried before any change,
+# otherwise a pause).
+QUOTA = {"plan A and B": 52, "plan B": 35}
 
 
 def quota():

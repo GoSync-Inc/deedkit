@@ -1245,7 +1245,7 @@ def test_the_reuse_job_passes_the_chained_pull_request_from_its_decision_to_its_
 
 
 # spec: ANYM-322
-def test_within_one_deploy_a_chained_verification_rereads_the_pull_request_run_and_a_rerun_is_verified_again(tmp_path):
+def test_within_one_deploy_chained_verifications_fit_the_anonymous_quota_and_a_queue_rerun_is_verified_again(tmp_path):
     github = ChainGitHub(b"")
     get = chain_push(github)
     paths = []
@@ -1253,13 +1253,19 @@ def test_within_one_deploy_a_chained_verification_rereads_the_pull_request_run_a
     def counted(path):
         paths.append(path)
         return get(path)
+    # Plans A and B verify 10 times and plan B 6 times; the first verification reads the queue run once, not twice.
+    for steps, count, listing in (("plan A and B", 10, 1), ("plan B", 6, 0)):
+        paths.clear()
+        with production.verification_reuse():
+            first = production.verify(SHA, counted)
+            assert len(paths) == 11
+            for _ in range(count - 1):
+                assert production.verify(SHA, counted) == first
+        assert len(paths) + listing <= production.QUOTA[steps] - 4, (steps, len(paths))  # 4 spare for a second page
+    # A later verification re-reads the queue run that reused the pull request run, and a rerun of it is read in full.
     with production.verification_reuse():
-        first = production.verify(SHA, counted)
+        production.verify(SHA, counted)
+        github.queue.runs[0] = {**github.queue.runs[0], "run_attempt": 3}
         paths.clear()
-        assert production.verify(SHA, counted) == first
-        assert not any("/jobs?" in path for path in paths)
-        assert [path for path in paths if "event=pull_request" in path and f"head_sha={HEAD_SHA}" in path]
-        github.pr.runs[0] = {**github.pr.runs[0], "run_attempt": 2}  # a successful rerun after the first read
-        paths.clear()
-        assert production.verify(SHA, counted)["verify_run_attempt"] == 2
-        assert f"actions/runs/{PR_RUN_ID}/attempts/2/jobs?per_page=100&page=1" in paths
+        assert production.verify(SHA, counted)["verify_run_id"] == PR_RUN_ID
+        assert f"actions/runs/{QUEUE_ID}/attempts/3/jobs?per_page=100&page=1" in paths

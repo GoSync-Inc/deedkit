@@ -318,7 +318,17 @@ queue, completed successfully with one successful `checks / verify` and
 required job must still pass in the push run itself. Both runs are read again after their jobs, so a rerun that
 starts in between is refused, and run listings are followed across pages. The
 result names the queue run that supplied the test verification next to the
-promoted push run.
+promoted push run. When that queue run itself skipped `checks / verify` because
+it reused a full pull request run of the identical tree (ANYM-358), the push run
+qualifies only through that chain: the queue run's latest attempt passed
+`CI gate` and `Reuse the pull request verification` with `checks / verify`
+skipped and no docs-only decision; the pull request named by its
+`gh-readonly-queue/main/pr-<N>-<sha>` branch merged into `main` as exactly this
+SHA from this repository; and the latest `pull_request` run of its head, on its
+head branch, completed successfully with `checks / verify`, `checks / load`,
+`checks / evidence` and `CI gate` passed in its latest attempt. Both runs are
+read again, and the result names the pull request run. The tree equality is
+the queue decision's, checked again by the main push run before it publishes.
 The public repository supports anonymous API reads; optional `GH_TOKEN` may be
 provided by the operator's secret mechanism to increase API limits. Never copy a
 maintainer's broad token onto the host for routine deployment.
@@ -566,9 +576,11 @@ Otherwise it:
 
 Within one run `verify()` reads the run and job listings once per SHA and
 afterwards re-reads only the runs (a completed attempt keeps its jobs; the push
-run is read again after the merge queue run), so a deploy of plans A and B makes
-about 44 of the host's 60 anonymous requests an hour and starts only with 48 left
-(plan B alone: 27, starts with 31); in practice at most one deploy an hour. These
+run is read again after the merge queue run; through the pull request chain the
+queue run is re-read, not the pull request run), so a deploy of plans A and B
+makes about 48 of the host's 60 anonymous requests an hour and starts only with
+52 left (plan B alone: 31, starts with 35); in practice at most one deploy an
+hour. These
 numbers hold for unchanged run attempts and one-page listings: a listing with a
 second page or a rerun during the deploy can need more. A GitHub rate-limit
 response is refused as "GitHub rate limit exhausted, resets at <time>"; before
