@@ -7,6 +7,7 @@ from .sender_names import resolve
 from .search_query import (compile_query, coverage, cursor_binding, decode_cursor,
     encode_cursor, filter_values, fingerprint, output_options, shape_messages, valid_text)
 
+CHAT_TYPES = ('private','group','channel','unknown')
 
 JOINS = '''JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
     LEFT JOIN sender_profiles sp ON sp.account=m.account AND sp.chat=m.chat AND sp.sender=m.sender
@@ -92,18 +93,29 @@ def enrich(c, rows, p):
 
 
 def filters(p, *, account='',chat='',sender='',accounts=None,chats=None,senders=None,
-            from_time='',to_time='',direction='',exclude_channels=False):
+            from_time='',to_time='',direction='',exclude_channels=False,chat_types=None,include_channels=None):
+    """include_channels=None (internal reads) applies no chat type default; False is
+    the public search default: channels excluded unless chat or chats names a chat."""
     from .store import APIError,date_bound
-    if not isinstance(direction,str) or direction not in ('','incoming','outgoing') or type(exclude_channels) is not bool:
+    if (not isinstance(direction,str) or direction not in ('','incoming','outgoing') or type(exclude_channels) is not bool
+            or include_channels is not None and type(include_channels) is not bool):
         raise APIError('invalid_filter')
+    types=filter_values(chat_types)
+    if types is not None and any(t not in CHAT_TYPES for t in types):raise APIError('invalid_filter')
+    if include_channels and (exclude_channels or types is not None and 'channel' not in types):raise APIError('invalid_filter')
+    if (types is None and include_channels is False and not chat and chats is None) or exclude_channels:
+        types=[t for t in (CHAT_TYPES if types is None else types) if t!='channel']
     lower,upper=date_bound(from_time),date_bound(to_time)
     if lower and upper and lower>=upper:
         raise APIError('invalid_date_range')
     scope,args=scope_filter(p,'m'); clauses=[scope,'NOT m.deleted']
     normalized={'direction':direction,'from_time':lower,'to_time':upper}
-    if exclude_channels:
-        normalized['exclude_channels']=True
-        clauses.append("EXISTS(SELECT 1 FROM chats ch WHERE ch.id=m.chat AND ch.account=m.account AND ch.chat_type IS DISTINCT FROM 'channel')")
+    if include_channels:normalized['include_channels']=True
+    if types is not None:
+        normalized['chat_types']=sorted(types)
+        if set(types)!=set(CHAT_TYPES):
+            clauses.append("EXISTS(SELECT 1 FROM chats ch WHERE ch.id=m.chat AND ch.account=m.account AND coalesce(ch.chat_type,'unknown')=ANY(%s))")
+            args.append(sorted(types))
     for column,value in [('account',account),('chat',chat),('sender',sender)]:
         valid_text(value)
         normalized[column]=value
@@ -121,7 +133,7 @@ def filters(p, *, account='',chat='',sender='',accounts=None,chats=None,senders=
 def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time='',after='',limit=20,
            *,accounts=None,chats=None,senders=None,query_mode='all',order='asc',before='',direction='',
            search_language='auto',fuzzy=False,compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False,
-           exclude_channels=False):
+           exclude_channels=False,chat_types=None,include_channels=None):
     from .store import APIError,bounded,date_bound,serial
     import re
     from .conversation import options,numeric_order_sql,visible_sql,decorate_messages,presentation
@@ -137,7 +149,10 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     if fuzzy and (query_mode!='all' or not re.fullmatch(r'\w{3,64}',query,flags=re.UNICODE)):
         raise APIError('invalid_fuzzy_query')
     clauses,args,normalized=filters(p,account=account,chat=chat,sender=sender,accounts=accounts,
-        chats=chats,senders=senders,from_time=from_time,to_time=to_time,direction=direction,exclude_channels=exclude_channels)
+        chats=chats,senders=senders,from_time=from_time,to_time=to_time,direction=direction,exclude_channels=exclude_channels,
+        chat_types=chat_types,include_channels=include_channels)
+    # An explicit type filter binds the cursor; the default exclusion keeps bare ID cursors.
+    typed=exclude_channels or chat_types is not None or include_channels is True
     binding=cursor_binding(p,'messages',{**normalized,'query':query,'query_mode':query_mode,
         'language':search_language,'order':order,'fuzzy':fuzzy,
         **({'view':view,'include_system':include_system,'conversation_version':1} if conversation else {})})
@@ -208,7 +223,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
                     cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
                     cursor_args=[at,mid]
         else:
-            if order=='relevance' or conversation or exclude_channels:raise APIError('invalid_cursor')
+            if order=='relevance' or conversation or typed:raise APIError('invalid_cursor')
             anchor=store.message(c,p,cursor)
             cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
             cursor_args=[anchor['sent_at'],anchor['id']]
@@ -237,7 +252,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
             next_cursor=encode_cursor(binding,{'id':last['id'],'at':last['sent_at'],'score':last['score'],
                 'revision':last['revision'],'fuzzy':fuzzy_used,'source_order':last['source_order'],'snapshot':snapshot})
         else:next_cursor=encode_cursor(binding,{'id':last['id'],'at':last['sent_at'],'score':last['score'],
-            'revision':last['revision'],'fuzzy':fuzzy_used}) if order=='relevance' or fuzzy or exclude_channels else last['id']
+            'revision':last['revision'],'fuzzy':fuzzy_used}) if order=='relevance' or fuzzy or typed else last['id']
     shape_messages(items,compact=False if conversation else compact)
     from .result_evidence import decorate
     from .chat_evidence import query_evidence

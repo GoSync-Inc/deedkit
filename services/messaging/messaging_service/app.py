@@ -645,7 +645,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                senders: list[StrictStr] | None=None, query_mode: QueryMode='all', order: Literal['asc','desc','relevance']='asc',
                before: str='', direction: Literal['','incoming','outgoing']='', search_language: SearchLanguage='auto', fuzzy: bool=False,
                compact: bool | None=None, body_chars: StrictInt | None=None, include_coverage: bool | None=None, detail: MessageDetail='compact',
-                    view: ConversationView='conversation',include_system: StrictBool=False,exclude_channels: StrictBool=False) -> dict[str, Any]:
+                    view: ConversationView='conversation',include_system: StrictBool=False,exclude_channels: StrictBool=False,
+               chat_types: list[Literal['private','group','channel','unknown']] | None=None,include_channels: StrictBool=False) -> dict[str, Any]:
         """Search archived text across chosen accounts/chats/sender IDs. Lists use OR within each
         dimension, AND between dimensions; [] matches nothing. Exact account-scoped sender IDs,
         not a merged person directory. query_mode: all words (all), phrase, or web (quotes/OR/-word).
@@ -654,13 +655,16 @@ def create_app(store: Store, allowed_hosts: list[str]):
         Conversation view hides known system events unless include_system=true.
         order=relevance ranks hits, not dialogue turns. Preserve supplied order, inspect ambiguity.
         direction: incoming/outgoing or empty. detail=transcript returns only the numbered transcript.
+        Channels are excluded unless include_channels=true, chat_types lists channel, or chat/chats is set.
+        chat_types: private/group/channel/unknown (null type = unknown), ANDed with exclude_channels.
         No provider calls, ACK or semantic task extraction.
         """
         return call(ctx,'search',detail=detail,query=query,account=account,chat=chat,sender=sender,
                     from_time=from_time,to_time=to_time,after=after,limit=limit,
                     accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,
                     order=order,before=before,direction=direction,search_language=search_language,fuzzy=fuzzy,
-                    compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels)
+                    compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
+                    chat_types=chat_types,include_channels=include_channels)
 
     @mcp.tool(structured_output=True, annotations=read)
     def search_files(ctx: Context, query: str='', account: str='', chat: str='', sender: str='',

@@ -10,6 +10,20 @@ Inside a list "or" applies; between lists and the earlier single filters —
 the dimension, `[]` returns an empty result. A foreign ID in a list does not widen permissions.
 A sender ID belongs to the source/account; a match of strings does not merge people.
 
+Channels are excluded from `search` by default, so news posts do not crowd out
+conversations. Pass `include_channels: true`, a `chat_types` list containing
+`channel`, or name the chat with `chat`/`chats` to search channels; `get_messages`
+and `get_context` read a channel as before. `chat_types` takes `private`, `group`,
+`channel` and `unknown` (a chat without a stored type is `unknown`), the same values
+as `list_chats`: "or" inside the list, "and" with the other filters and with
+`exclude_channels`; `[]` returns an empty result and another value returns
+`invalid_filter`. `include_channels: true` together with `exclude_channels: true` or
+a `chat_types` list without `channel` is also `invalid_filter`. An explicit
+`chat_types`, `include_channels` or `exclude_channels` binds `next_cursor`; changing
+it with that cursor returns `invalid_cursor`. Without named chats,
+`result_evidence` counts only chats of the searched types.
+`capabilities.search_options.search_channels_default` states the default.
+
 `query_mode`:
 
 - `all` by default: all words in any order;

@@ -800,7 +800,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Search archived text across chosen accounts/chats/sender IDs. Lists use OR within each\ndimension, AND between dimensions; [] matches nothing. Exact account-scoped sender IDs,\nnot a merged person directory. query_mode: all words (all), phrase, or web (quotes/OR/-word).\nUTC range [from_time,to_time). order asc/desc; use next_cursor as after with unchanged\nfilters/order. before is an exclusive chronological boundary, incompatible with after.\nConversation view hides known system events unless include_system=true.\norder=relevance ranks hits, not dialogue turns. Preserve supplied order, inspect ambiguity.\ndirection: incoming/outgoing or empty. detail=transcript returns only the numbered transcript.\nNo provider calls, ACK or semantic task extraction.\n",
+      "description": "Search archived text across chosen accounts/chats/sender IDs. Lists use OR within each\ndimension, AND between dimensions; [] matches nothing. Exact account-scoped sender IDs,\nnot a merged person directory. query_mode: all words (all), phrase, or web (quotes/OR/-word).\nUTC range [from_time,to_time). order asc/desc; use next_cursor as after with unchanged\nfilters/order. before is an exclusive chronological boundary, incompatible with after.\nConversation view hides known system events unless include_system=true.\norder=relevance ranks hits, not dialogue turns. Preserve supplied order, inspect ambiguity.\ndirection: incoming/outgoing or empty. detail=transcript returns only the numbered transcript.\nChannels are excluded unless include_channels=true, chat_types lists channel, or chat/chats is set.\nchat_types: private/group/channel/unknown (null type = unknown), ANDed with exclude_channels.\nNo provider calls, ACK or semantic task extraction.\n",
       "inputSchema": {
         "properties": {
           "query": {
@@ -1004,6 +1004,32 @@
           "exclude_channels": {
             "default": false,
             "title": "Exclude Channels",
+            "type": "boolean"
+          },
+          "chat_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "private",
+                    "group",
+                    "channel",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Chat Types"
+          },
+          "include_channels": {
+            "default": false,
+            "title": "Include Channels",
             "type": "boolean"
           }
         },

@@ -49,10 +49,11 @@ def resolve_chat(c,p,account,provider_chat_id):
     targets(p,[row['id']]);return row
 
 
-def rows(c,p,chat_ids=None,accounts=None):
+def rows(c,p,chat_ids=None,accounts=None,chat_types=None):
     where,args=scope_filter(p,'c',chat_column='id')
     if chat_ids is not None:where+=' AND c.id=ANY(%s)';args.append(chat_ids)
     if accounts is not None:where+=' AND c.account=ANY(%s)';args.append(accounts)
+    if chat_types is not None:where+=" AND coalesce(c.chat_type,'unknown')=ANY(%s)";args.append(chat_types)
     return c.execute('''SELECT c.id AS chat_id,c.account,c.provider_chat,a.platform,a.synthetic,
         cc.initialized,cc.history_since,cc.window_complete,cc.history_exhausted,
         cc.high_water,cc.history_before,cc.last_scan_at,cc.last_attempt_at,cc.last_head_scan_at,
@@ -138,7 +139,9 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
     accts=[account] if account else accounts
     if account and accounts is not None:accts=[account] if account in accounts else []
     lower=normalized.get('from_time');upper=normalized.get('to_time')
-    records=rows(c,p,ids,accts)
+    # Named chats keep their own evidence; otherwise totals count only chats of the searched types.
+    types=normalized.get('chat_types') if ids is None else None
+    records=rows(c,p,ids,accts,types)
     histories=[history(r,lower,upper) for r in records]
     missing=ids is not None and bool(set(ids)-{r['chat_id'] for r in records})
     traversed=(ids is not None or p['chat_ids'] is not None) and bool(histories) and all(h['requested_range_traversed'] for h in histories) and not missing
@@ -152,7 +155,7 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
     reason=None
     if not items:
         if paged:reason='end_of_archived_page'
-        elif ids==[] or accts==[]:reason='empty_filter'
+        elif ids==[] or accts==[] or types==[]:reason='empty_filter'
         elif missing or not records:reason='not_found_or_not_permitted'
         elif any(h['state']=='provider_unavailable' for h in histories):reason='provider_unavailable'
         elif any(h['state']=='rate_limited' for h in histories):reason='provider_rate_limited'
