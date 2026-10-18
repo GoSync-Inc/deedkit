@@ -32,6 +32,18 @@ jobs:
     steps:
       - run: pytest
 """
+COMPOSE = """services:
+  app:
+    image: app
+    security_opt: !override [no-new-privileges:true]
+    secrets:
+      - dsn
+secrets:
+  dsn:
+    external: true
+  sensitive:
+    external: true
+"""
 SETTINGS = json.dumps({"permissions": {"allow": ["mcp__claude_ai_Deedkit__messages_get_messages"],
                                        "ask": ["mcp__claude_ai_Deedkit__messages_send_message"],
                                        "deny": ["Read(**/.env)"]}}, indent=2)
@@ -42,6 +54,7 @@ BASE = {
     "app/store.py": "def read():\n    return 'SELECT 1'\n", "tests/test_store.py": "def test_read():\n    pass\n",
     "app/migrations/001_base.sql": "-- base\nCREATE TABLE t (id int);\n", "app/reader_role.sql": "GRANT SELECT ON t;\n",
     ".gitleaks.toml": "[allowlist]\n", "scripts/change_path.py": "RULES = {}\n",
+    "deploy/compose.yaml": COMPOSE, "app/schema.sql": "DROP VIEW IF EXISTS v;\nCREATE VIEW v AS SELECT 1;\n",
 }
 
 
@@ -102,8 +115,14 @@ def test_documentation_and_tests_only_take_the_auto_path(tmp_path, change, expec
                                                 '"mcp__claude_ai_Deedkit__calls_list_calls"')}, ".claude/settings.json"),
     ({".github/workflows/checks.yml": CHECKS.replace("pytest", "pytest -q")}, ".github/workflows/checks.yml"),
     ({".github/workflows/ci.yml": CI.replace("contents: read", "contents: none")}, ".github/workflows/ci.yml"),
+    ({"app/schema.sql": "DROP  VIEW IF EXISTS v;\nCREATE VIEW v AS SELECT 2;\n"}, "app/schema.sql"),
+    ({".github/workflows/ci.yml": CI.replace("      - run: echo gate", "      - run: echo first\n      - run: echo gate")},
+     ".github/workflows/ci.yml"),
+    ({"deploy/compose.yaml": COMPOSE.replace("image: app", "image: app:2")}, "deploy/compose.yaml"),
+    ({f"app/m{n}.py": "X = 1\n" for n in range(5)}, "app/m0.py, app/m1.py, app/m2.py, app/m3.py, app/m4.py"),
 ], ids=["code", "deleted-test", "expand-migration", "python-secrets-module", "prose-drop", "read-only-tool",
-        "inside-a-required-job", "narrowed-permissions"])
+        "inside-a-required-job", "narrowed-permissions", "existing-drop-reformatted", "step-added-before-a-step",
+        "tagged-compose-edit", "every-path-listed"])
 def test_any_other_file_takes_auto_with_review_and_names_it(tmp_path, change, named):
     assert path_of(tmp_path, change) == f"AUTO+review — code: {named}"
 
@@ -140,10 +159,38 @@ def test_any_other_file_takes_auto_with_review_and_names_it(tmp_path, change, na
     ({"scripts/change_path.py": "RULES = {'x': 1}\n"}, "owner-rules: scripts/change_path.py"),
     ({"AGENTS.md": OWNERS.replace("1. Ruleset.", "1. Ruleset only.")}, "owner-rules: AGENTS.md (the owner list)"),
     ({".github/workflows/ci.yml": "jobs: [unclosed\n"}, "cannot be read"),
+    ({"app/new data.sql": "DROP TABLE t;\n"}, "destructive-sql: app/new data.sql"),
+    ({'app/new"data.sql': "DROP TABLE t;\n"}, 'destructive-sql: app/new"data.sql'),
+    ({"app/new\tdata.sql": "DROP TABLE t;\n"}, "destructive-sql: app/new\\tdata.sql"),
+    ({".gitattributes": "*.sql -diff\n", "app/migrations/002_x.sql": "DROP TABLE t;\n"},
+     "destructive-sql: app/migrations/002_x.sql"),
+    ({"app/migrations/002_x.sql": "DELETE\nFROM t;\n"}, "destructive-sql: app/migrations/002_x.sql"),
+    ({"app/migrations/002_x.sql": "ALTER TABLE t ALTER COLUMN id\nTYPE smallint;\n"},
+     "destructive-sql: app/migrations/002_x.sql"),
+    ({"app/migrations/002_x.sql": "ALTER TABLE t ALTER id TYPE smallint;\n"}, "destructive-sql: app/migrations/002_x.sql"),
+    ({"app/migrations/002_x.sql": "DELETE /* archived rows */ FROM t;\n"}, "destructive-sql: app/migrations/002_x.sql"),
+    ({"app/store.py": 'def reset(db):\n    db.execute("DROP SEQUENCE order_ids")\n'}, "destructive-sql: app/store.py"),
+    ({".github/workflows/ci.yml": CI.replace("    uses: ./.github/workflows/checks.yml",
+                                            '    uses: ./.github/workflows/checks.yml\n    "secrets": inherit')},
+     "secrets: .github/workflows/ci.yml"),
+    ({"deploy/compose.yaml": COMPOSE.replace("      - dsn\n", "      - dsn\n      - sensitive\n")},
+     "secrets: deploy/compose.yaml"),
+    ({".github/workflows/ci.yml": CI.replace("echo gate", "|\n          echo ${{ secrets\n          .TOKEN }}")},
+     "secrets: .github/workflows/ci.yml"),
+    ({".gitleaksignore": "abc:app/x.py:generic-api-key:1\n"}, "secrets: .gitleaksignore"),
+    ({".github/workflows/checks.yml": CHECKS.replace("  verify:\n", "  verify:\n    name: checks / verify\n")},
+     "ruleset: .github/workflows (renames, removes or duplicates a required check)"),
+    ({".github/workflows/checks.yml": "on: workflow_call\njobs:\n  verify:\n    uses: ./.github/workflows/leaf.yml\n",
+      ".github/workflows/leaf.yml": CHECKS},
+     "ruleset: .github/workflows (renames, removes or duplicates a required check)"),
+    ({"deploy/main-ruleset.json": "{not json"}, "ruleset: deploy/main-ruleset.json, required checks (cannot be read"),
 ], ids=["ruleset", "renamed-gate", "renamed-verify", "duplicated-gate", "secret-reference", "gitleaks",
         "write-permission", "dropped-permissions", "new-workflow-default-token", "role-sql", "send-tool-allowed",
         "deny-dropped", "drop-column", "rename-lowercase", "edited-migration", "delete-in-code", "own-rules",
-        "owner-list", "unparsable-workflow"])
+        "owner-list", "unparsable-workflow", "space-in-name", "quote-in-name", "tab-in-name", "binary-diff-attribute",
+        "delete-over-lines", "alter-type-over-lines", "alter-without-column", "comment-between-keywords",
+        "drop-sequence-in-code", "quoted-secrets-key", "compose-secret-list-item", "secret-expression-over-lines",
+        "gitleaksignore", "required-check-renamed-by-name", "required-job-became-a-caller", "malformed-ruleset"])
 def test_what_the_owner_keeps_takes_the_owner_path_and_names_the_rule(tmp_path, change, rule):
     line = path_of(tmp_path, change)
     assert line.startswith("OWNER — ") and rule in line

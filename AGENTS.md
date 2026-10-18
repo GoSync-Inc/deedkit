@@ -56,15 +56,14 @@ Done means the squash's `main` push run is green.
   `tiden intent lookup "<task>" --format text` (or `product-context`), then the code.
 - Spec, tests, code: the accepted card is the spec; failing tests come first. Each new test has
   `# spec: ANYM-n` (Python) or `// spec: ANYM-n` (JS, TS, Go) directly above it and its
-  decorators, naming a story-level spec, or sits in a reviewed no-spec list (`NO_SPEC` in
-  `scripts/tiden_pr_check.py`, `config/tiden-unlinked-tests.json`). Defects, infra and refactors
+  decorators, naming a story-level spec, or sits in the reviewed no-spec list. Defects, infra and refactors
   need no card: a marked regression test and a `Spec:` line.
 - PR lines: `Spec: ANYM-n[, …]` (implements or keeps), `Delivers: ANYM-n` (completes), optional
   `Tiden branch: proposal/<name>` or `review/<name>`, the only place to edit criteria. The first
   ID is primary; new files are anchored to it.
-- Check A (PR) and sync B (main push) enforce and record this (TIDEN-CI.md). Until B is live, do
-  B by hand after the push run: merge the named branch, anchor new code files, link marked tests,
-  set the card status.
+- Check A (PR) and sync B (main push) will enforce this. Until they run, check markers
+  and IDs yourself; after the push run, merge the named branch when its preview holds only the
+  named cards, anchor new files, link marked tests, set the card status, read back.
 - Cards, markers and the daily delta audit: docs/operations/tiden-product-workflow.md.
 
 ## 5. Reviews

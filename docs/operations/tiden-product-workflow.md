@@ -49,7 +49,8 @@ audits. A worker that finds work outside its task reports it to the orchestrator
    round with the product-manager prompt; cards that set a contract in code, CI, data or security
    Astra; small cards none. Reviewers first judge whether the card should exist and may shrink or
    reject it.
-4. **Accept.** The owner accepts feature and improvement cards; the orchestrator the others.
+4. **Accept.** The owner accepts product cards (feature, improvement, product epics); the
+   orchestrator the others.
    Record who accepted.
 5. **Queue.** Current breakages and deadlines first; then about 70% product and 30% engineering
    by Effort, at least one refactor when one is ready, each share by Score.
