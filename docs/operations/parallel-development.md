@@ -161,9 +161,13 @@ at least important (`AGENTS.md`). Prefer splitting it.
    selected story whose paths fit a free lane; there is no fixed number of
    workers. The real limits are file overlap (lanes), the GitHub CI queue and the
    owner's attention for owner-level decisions; the orchestrator watches them.
-4. Each brief names: story link or goal, lane, expected paths, review level,
-   acceptance criteria, checks to run, the evidence to return and the final result
-   its level requires.
+4. Each brief names the story (or the goal for a skip) and adds only what the
+   story and the Tiden working contract do not hold: the files that other
+   workers' open pull requests and briefs are changing (Tiden does not show
+   concurrent work), the review level when the story does not state it, and
+   limits beyond the story, such as read-only production. Acceptance criteria,
+   expected paths and checks come from the story and the working contract; the
+   brief does not restate them.
 5. Answer workers' questions and check each pull request before its "ok" (Worker
    protocol). Read a waiting worker's terminal with `superset terminals read` and
    give the owner exactly what it asks, so the owner need not open worker terminals.
@@ -176,9 +180,12 @@ at least important (`AGENTS.md`). Prefer splitting it.
 The orchestrator starts no new worker when its context is above about 60%, at the
 end of the working day or when the current wave of tasks is done. Running workers
 still reach their final result: merge, post-merge check, archive. The orchestrator
-keeps all its state in a handoff file and updates it after every decision, so a
-compaction or a new session loses nothing. A new orchestrator session first reads
-the handoff file and the list of live sessions.
+keeps its rules and its current state in a short handoff file and updates the
+state after every decision, so a compaction or a new session loses nothing.
+Finished history, the decision log and session notes live in a separate log that
+a new session does not read on start. A new orchestrator session first reads the
+handoff file and the list of live sessions, and reads documents already loaded
+into its context (`AGENTS.md`, `CLAUDE.md`) no second time.
 
 Questions to the owner use plain names, never internal codes alone. Each states
 what it is, why it matters to the owner, what it costs, the options with their
@@ -188,8 +195,8 @@ an explicit "merge <n>".
 
 The orchestrator keeps a log of the owner's decisions: its recommendation, the
 owner's choice and whether they matched, so autonomy grows on facts. At the end
-of each session it writes two or three lines to the handoff file: what got in the
-way and what to change. Once a week it reviews the decision log, these notes and
+of each session it writes two or three lines to the log: what got in the way and
+what to change. Once a week it reviews the decision log, these notes and
 the measurements under Worker protocol, and proposes rule changes as separate
 pull requests.
 
