@@ -9,11 +9,10 @@ under Review levels in [AGENTS.md](../../AGENTS.md), and the review procedure in
 
 ## Roles
 
-- **Owner** sets priorities, answers the questions escalated to it and decides
-  what it keeps under Review levels in `AGENTS.md`: production apply, every live
-  provider action, secrets and access rights, required checks and branch
-  protection, review levels and merge authority, accepting risk. Nothing below
-  delegates that authority implicitly.
+- **Owner** sets priorities, answers the questions escalated to it, decides what
+  it keeps under Review levels in `AGENTS.md` (among them production apply and
+  every live provider action) and receives the summary of every owner-level pull
+  request an agent merged. Nothing below delegates that authority implicitly.
 - **Orchestrator** (one at a time) selects ready stories, checks lanes, dispatches
   worker sessions and checks their pull requests before they merge. It writes no
   product code.
@@ -116,8 +115,7 @@ at least important (`AGENTS.md`). Prefer splitting it.
   depend on this.
 - Never edit a merged migration. Reserve the next migration number in the pull
   request title while the `schema` lane is held.
-- A schema migration is owner-level (`AGENTS.md`): Astra and Fable review it, an
-  agent merges it and the owner gets the summary. Its pull request states its
+- A schema migration is owner-level (`AGENTS.md`). Its pull request states its
   backup prerequisite, and its release waits for the backup gate in
   [production.md](production.md).
 
@@ -163,7 +161,8 @@ at least important (`AGENTS.md`). Prefer splitting it.
    ([tiden-product-workflow.md](tiden-product-workflow.md)) and dispatch every
    selected story whose paths fit a free lane; there is no fixed number of
    workers. The real limits are file overlap (lanes), the GitHub CI queue and the
-   owner's attention for owner-level decisions; the orchestrator watches them.
+   owner's attention for what it keeps and for questions; the orchestrator
+   watches them.
 4. Each brief names the story and adds only what the story and the Tiden
    working contract do not hold: the files that other active workers' stories
    and open pull requests are changing (Tiden does not show concurrent work),
@@ -180,8 +179,9 @@ at least important (`AGENTS.md`). Prefer splitting it.
    lane.
 7. Escalate to the owner: priority conflicts, the pull requests and actions the
    owner keeps under Review levels in `AGENTS.md`, disagreeing reviewers and
-   unclear product direction as questions, the summary of every owner-level pull
-   request an agent merged, any feature or improvement story that is not ready.
+   unclear product direction as questions, any feature or improvement story that
+   is not ready. Relay to the owner the summary of every owner-level pull request
+   an agent merged.
 
 The orchestrator starts no new worker when its context is above about 60%, at the
 end of the working day or when the current wave of tasks is done. Running workers
@@ -197,9 +197,9 @@ time.
 
 Questions to the owner use plain names, never internal codes alone. Each states
 what it is, why it matters to the owner, what it costs, the options with their
-consequences and a recommendation. There is no limit on how many are asked; "да на
-всё" ("yes to all") accepts every recommendation except a merge the owner keeps, which still
-needs an explicit "merge <n>".
+consequences and a recommendation. There is no limit on how many are asked;
+"да на всё" ("yes to all") accepts every recommendation except a merge the owner
+keeps, which still needs an explicit "merge <n>".
 
 The orchestrator log holds the owner's decisions: its recommendation, the
 owner's choice and whether they matched, so autonomy grows on facts. At the end

@@ -105,8 +105,8 @@ starting it.
    refactor and research are accepted by the orchestrator once their reviewers
    approve with no open findings, necessity check included. The orchestrator
    brings such a card to the owner when the reviewers disagree, when it changes
-   product behavior beyond restoring the contract, or when its delivery needs
-   something the owner keeps under Review levels in `AGENTS.md`. Record who accepted on the card.
+   product behavior beyond restoring the contract, or when an owner-level
+   trigger in `AGENTS.md` applies. Record who accepted on the card.
 5. **Queue.** Accepted cards with a lane and expected paths form the ready queue.
    A wave takes current breakages (defects, unresolved production incidents) and
    hard deadlines first. The rest of the wave is about 70% product (feature,

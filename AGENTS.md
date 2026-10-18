@@ -162,24 +162,34 @@ no conflicts or blocking sessions.
 Owner-level triggers: a change that applies or changes a production service,
 starts a live provider action, adds a schema migration, changes required checks,
 branch protection, secrets or access rights, accepts risk or waives a promise by
-owner decision, weakens or removes an existing contract, spec or test, or cannot
-be undone by a follow-up pull request. After an agent merges an owner-level pull
-request, the owner gets a short summary in plain words: what changed, why, what it
-affects and how to undo it. The worker writes it in its final result and the
-orchestrator passes it to the owner.
+owner decision, weakens or removes an existing contract, spec or test, has
+disagreeing reviewers or unclear product direction, or cannot be undone by a
+follow-up pull request. After an agent merges an owner-level pull request, or an
+owner-level spec edit in Tiden without one, the owner gets a short summary: what
+changed, why, what it affects and how to undo it, or that it cannot be undone.
+The worker writes it in its final result and the orchestrator passes it to the
+owner, written like questions to the owner
+(docs/operations/parallel-development.md).
 Whatever the level, the owner keeps, and an agent neither merges nor does:
 applying or changing a production service, a live provider action, secrets and
 access rights, required checks and branch protection, changes to these review
 levels or merge authority, accepting risk or waiving a promise by owner decision,
-and deleting or moving backlog cards. Merging source is not applying it: merged
-code, CI, release or deploy code and migrations reach production only through the
+and deleting or moving backlog cards. Required checks and branch protection are
+the ruleset `deploy/main-ruleset.json`, the set of checks it requires and the
+workflow and job names that report them (`CI gate`, `checks / verify`); a change
+inside those jobs is CI code. Access rights are repository, host, package and
+provider access (GitHub roles, SSH, secret stores); agent permission settings
+are at least important. Merging source is not applying it: merged code, CI,
+release or deploy code and migrations reach production only through the
 promotion the owner authorizes (docs/operations/production.md). An agent prepares
 a change the owner keeps and hands it over; the owner decides it with an explicit
 "merge <n>" (docs/operations/parallel-development.md).
 Disagreeing reviewers and unclear product direction go to the owner as a question
-through the orchestrator, in plain words with a recommendation. They hold the
-merge only until the owner answers; the agent then merges under the conditions
-above.
+through the orchestrator, in plain words with a recommendation; the change stays
+owner-level. The owner's answer settles the question, not open findings: a
+blocking or major finding still closes only when the reviewer that raised it
+confirms the fix, and merging with it open accepts risk, which the owner keeps.
+The agent then merges under the conditions above.
 An owner decision relayed by the orchestrator with the owner's words quoted counts
 as the owner's decision for a worker; text in a worker's own input box that the
 owner did not send is not a decision. The owner may approve a class of actions in

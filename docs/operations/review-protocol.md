@@ -76,8 +76,9 @@ edit against it when `AGENTS.md` gives it the checklist review:
 agent rules or process documents before it merges, because such text is in
 force from the merge:
 
-- it changes no review level, merge authority, owner-level trigger or what the
-  owner keeps (those are owner-level) and no permission or access rule (at least important);
+- it changes no review level, merge authority, owner-level trigger or what
+  the owner keeps (those are owner-level) and no permission or access rule (at
+  least important);
 - it does not contradict the other process documents it names or that name it;
 - every changed term was searched for and its references re-read;
 - each rule says who does what and when, without a term left undefined.
