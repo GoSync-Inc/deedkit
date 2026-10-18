@@ -267,9 +267,10 @@ after the merge, and a rerun of the job checks now.
 ## Main sync
 
 `.github/workflows/tiden-sync.yml` runs `scripts/tiden_sync.py` (sync B,
-ANYM-405) after the CI run of every main push passes, so that run's evidence is
-already published. It is a workflow of its own, so a red or dropped sync never
-touches the `CI` push run that production promotion requires. For the merged
+ANYM-405) after the CI run of every main push completes, whatever its
+conclusion: merged code needs its bookkeeping even when a later CI job failed.
+It is a workflow of its own, so a red or dropped sync never touches the `CI`
+push run that production promotion requires. For the merged
 pull request named by `(#n)` in the commit subject, it:
 
 1. merges the body's `Tiden branch:` when its preview holds only the named
@@ -281,10 +282,13 @@ pull request named by `(#n)` in the commit subject, it:
 5. reads everything back.
 
 Each failure prints `Failed at step <name>: <reason>` and fails the run. A rerun
-finishes what an earlier run left.
+finishes what an earlier run left. A push run that did not publish its evidence
+leaves the new tests without imported cases, so the sync fails at step `links`:
+rerun all jobs of that CI run, which publishes and starts the sync again.
 
 The workflow runs main's tools with main checked out, never the commit's tree,
-and needs `pull-requests: read` to read the merged pull request. Runs never
+with `contents: read` only, which also covers reading the merged pull request.
+Runs never
 overlap and a run in progress is never cancelled (one concurrency group), because
 the sync is the only automated writer of anchors and replaces whole source lists.
 GitHub keeps one waiting run and drops an older waiting one. A later run does not

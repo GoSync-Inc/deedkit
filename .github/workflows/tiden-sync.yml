@@ -24,18 +24,16 @@ concurrency:
 jobs:
   sync:
     name: Tiden sync
-    # Only the reviewed workflow and tools on main may use the Tiden credential, and only for a main push whose CI
-    # run passed, so the push run's evidence is published before its tests are linked.
+    # Only the reviewed workflow and tools on main may use the Tiden credential, and only after a main push run,
+    # whatever its conclusion: the merged code needs its bookkeeping even when a later CI job failed. A run whose
+    # evidence was not published fails at step `links`; rerun the publication, then dispatch this SHA.
+    # `contents: read` covers the pull request read (gh api repos/<repo>/pulls/<n>), so the job needs nothing more.
     if: >-
       github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.conclusion == 'success'))
+      (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'))
     runs-on: ubuntu-latest
     # The sync's CLI and gh calls time out after 120 seconds each; a long merge with many tests stays well inside.
     timeout-minutes: 30
-    permissions:
-      contents: read  # checkout of main and its history
-      pull-requests: read  # the merged pull request's body, base and merge commit (gh api repos/<repo>/pulls/<n>)
     steps:
       # Expression comparisons ignore case; these do not, and run before any repository code.
       - name: Require the main branch and an exact commit

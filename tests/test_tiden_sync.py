@@ -482,8 +482,7 @@ def test_the_sync_workflow_runs_after_main_ci_serialized_with_main_tools_and_a_d
     assert value["permissions"] == {"contents": "read"}
     assert value["concurrency"] == {"group": "tiden-sync", "cancel-in-progress": False}
     (job,) = value["jobs"].values()
-    assert "concurrency" not in job and job["permissions"] == {"contents": "read", "pull-requests": "read"}
-    assert "github.event.workflow_run.conclusion == 'success'" in job["if"]
+    assert "concurrency" not in job and "permissions" not in job and "conclusion" not in job["if"]
     steps = job["steps"]
     checkout = next(step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@"))
     assert checkout["with"] == {"persist-credentials": False, "ref": "main", "fetch-depth": 0}
