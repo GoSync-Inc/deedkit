@@ -1668,7 +1668,11 @@ def test_an_apply_or_rollback_record_from_the_order_dependent_digest_is_refused_
 def test_a_commit_main_has_moved_past_is_still_promotable_and_one_outside_main_is_not():
     get, _, _ = github()
     def answering(answer):
-        return lambda path: answer if path.startswith("compare/main...") else get(path)
+        def moved(path):
+            if path == "git/ref/heads/main":
+                return {"object": {"sha": "f" * 40}}  # main's head is a later commit
+            return answer if path.startswith("compare/main...") else get(path)
+        return moved
     for behind in (1, 25):
         assert p.verify(SHA, answering(comparison(SHA, behind=behind)))["run_id"] == 12
     for status in ({"status": "ahead", "ahead_by": 1}, {"status": "diverged", "ahead_by": 2},
@@ -1689,7 +1693,7 @@ def test_within_one_deploy_a_later_verification_rereads_the_runs_but_not_their_j
         paths.clear()
         assert p.verify(SHA, counted) == first
         # compare, the push run listing, the queue run listing and the push run listing again; no job listing.
-        assert [path.split("?")[0] + ("" if "?" not in path else "?" + re.search(r"event=\w+", path).group(0))
+        assert [re.sub(r"\?.*?(event=\w+)?(&.*)?$", lambda match: "?" + (match.group(1) or ""), path)
                 for path in paths] == ["compare/main..." + SHA, "actions/workflows/ci.yml/runs?event=push",
                                        "actions/workflows/ci.yml/runs?event=merge_group",
                                        "actions/workflows/ci.yml/runs?event=push"]

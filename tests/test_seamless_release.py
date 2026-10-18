@@ -877,6 +877,8 @@ def test_promotion_accepts_a_verified_commit_that_main_has_moved_past(tmp_path, 
         if path.startswith('compare/main...'):
             compared.append(path)
             return comparison(SHA, behind=2)  # two commits merged after SHA
+        if path == 'git/ref/heads/main':
+            return {'object': {'sha': 'f' * 40}}  # main's head is one of them
         return get(path)
     monkeypatch.setattr(s.p, 'verify', lambda sha: calls.append('verify') or verify(sha, moved))
     s.promote(cfg, SHA)
