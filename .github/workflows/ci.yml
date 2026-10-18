@@ -74,16 +74,49 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           overwrite: true
+  pr_reuse:
+    # A merge queue group whose commit has exactly the tree a passing, full pull request run tested reuses that
+    # run's verification instead of testing the same code again (owner decision 2026-10-18). The decision downloads
+    # and validates that run's evidence as data; any doubt runs the full suite and never fails the run. The main
+    # push of such a group finds no queue run whose checks / verify passed, so it verifies in full (ANYM-321).
+    name: Reuse the pull request verification
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read  # checkout of this commit's decision script
+      actions: read  # read the pull request's runs and download its evidence artifact
+    outputs:
+      decision: ${{ steps.decide.outcome == 'success' && steps.decide.outputs.decision || 'full' }}
+      validated_sha: ${{ steps.decide.outcome == 'success' && steps.decide.outputs.validated_sha || '' }}
+      producer_url: ${{ steps.decide.outcome == 'success' && steps.decide.outputs.producer_url || '' }}
+      tested_sha: ${{ steps.decide.outcome == 'success' && steps.decide.outputs.tested_sha || '' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Choose reuse only for a passed full pull request run of exactly this tree
+        id: decide
+        # A hung lookup ends here as a full verification, well inside the job timeout.
+        continue-on-error: true
+        timeout-minutes: 6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_reuse.py group
   checks:
-    # After the decision: a validated reuse skips the test jobs and publishes the queue's evidence; every other
-    # run verifies in full. A reuse that failed validation leaves checks skipped, so the gate fails.
-    needs: reuse
+    # After the decisions: a validated reuse skips the test jobs (on a main push it publishes the queue's evidence);
+    # every other run verifies in full. A reuse that failed validation leaves checks skipped, so the gate fails.
+    needs: [reuse, pr_reuse]
     if: ${{ !cancelled() && (needs.reuse.outputs.decision != 'reuse' || needs.reuse.result == 'success') }}
     uses: ./.github/workflows/checks.yml
     with:
       source_ref: ${{ inputs.source_ref || '' }}
       tiden_branch: ${{ inputs.tiden_branch || '' }}
       reuse_queue_evidence: ${{ needs.reuse.outputs.decision == 'reuse' }}
+      reuse_pr_verification: ${{ needs.pr_reuse.outputs.decision == 'reuse' }}
+      reused_pr_run: ${{ needs.pr_reuse.outputs.producer_url }}
+      reused_pr_tested_sha: ${{ needs.pr_reuse.outputs.tested_sha }}
     secrets:
       # A queued group can hold a fork's unmerged code, so it never gets the credential.
       TIDEN_API_TOKEN: ${{ github.event_name != 'merge_group' && secrets.TIDEN_API_TOKEN || '' }}
@@ -97,7 +130,7 @@ jobs:
       source_ref: ${{ inputs.source_ref || '' }}
   gate:
     name: CI gate
-    needs: [reuse, checks, native, images]
+    needs: [reuse, pr_reuse, checks, native, images]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -115,11 +148,14 @@ jobs:
           test "$IMAGES_RESULT" = success
           # A manual baseline of another revision must never turn this commit green.
           test -z "$SOURCE_REF" || test "$SOURCE_REF" = "$EXPECTED_SHA"
-      - name: Require this commit's own verification, its validated merge queue verification or a docs-only decision
+      - name: Require this commit's own verification, a validated reuse of an earlier one or a docs-only decision
         env:
           DECISION: ${{ needs.reuse.outputs.decision }}
           REUSE_RESULT: ${{ needs.reuse.result }}
           REUSED_SHA: ${{ needs.reuse.outputs.validated_sha }}
+          PR_DECISION: ${{ needs.pr_reuse.outputs.decision }}
+          PR_REUSE_RESULT: ${{ needs.pr_reuse.result }}
+          PR_REUSED_SHA: ${{ needs.pr_reuse.outputs.validated_sha }}
           VERIFIED_SHA: ${{ needs.checks.outputs.source_sha }}
           DOCS_ONLY: ${{ needs.checks.outputs.docs_only }}
           DOCS_SHA: ${{ needs.checks.outputs.docs_sha }}
@@ -133,6 +169,12 @@ jobs:
             test "$REF" = refs/heads/main
             test "$REUSE_RESULT" = success
             test "$REUSED_SHA" = "$EXPECTED_SHA"
+            test -z "$VERIFIED_SHA"
+          elif [ "$PR_DECISION" = reuse ]; then
+            # checks / verify was skipped by the decision that a passing pull request run tested this group's tree.
+            test "$EVENT_NAME" = merge_group
+            test "$PR_REUSE_RESULT" = success
+            test "$PR_REUSED_SHA" = "$EXPECTED_SHA"
             test -z "$VERIFIED_SHA"
           elif [ "$DOCS_ONLY" = true ]; then
             # checks / verify was skipped by the docs-only decision on this pull request's merge commit (ANYM-323).

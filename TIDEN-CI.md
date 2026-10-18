@@ -82,7 +82,8 @@ always build them.
 
 A merge queue run (`merge_group`, Git branch `gh-readonly-queue/...`) verifies
 the temporary group commit with the same required checks, `CI gate` and
-`checks / verify`, but publishes nothing to Tiden and creates no Tiden branch.
+`checks / verify` (or reuses a full pull request run of its identical tree,
+below), but publishes nothing to Tiden and creates no Tiden branch.
 This takes precedence over every target above, including an override, a map
 entry or a pull request link. A queued group can contain a fork's unmerged code,
 so a `merge_group` run never receives `TIDEN_API_TOKEN`. A queue run checks no
@@ -92,10 +93,34 @@ through the main push run. Each queue run has its own concurrency group and
 cancels no other run. Queue runs take their workflow files from the group commit,
 so review workflow changes in a fork's pull request before queuing it.
 
-The queue run is the authoritative test run of a merged SHA; the main push run
-of that SHA validates and publishes it instead of testing the commit again
-(ANYM-322). Its first job, `Reuse the merge queue verification`, the only CI job
-with `actions: read`, finds the latest merge queue run of the exact commit by the
+A queue run whose group commit has exactly the Git tree a passing, full pull
+request run tested reuses that run's verification instead of testing the same
+code again (ANYM-358). On `merge_group` only, the job `Reuse the pull request
+verification` (`contents: read`, `actions: read`, no secret) reads the pull
+request named by the group's `gh-readonly-queue/main/pr-<N>-<sha>` ref; it must
+be open, into `main` and from this repository. The latest `pull_request` run of
+its head must have succeeded with `checks / verify`, `checks / load`,
+`checks / evidence` and `CI gate` passed in its latest attempt, so a docs-only
+run never qualifies. Its one current `ci-evidence` artifact is pinned by digest,
+downloaded and validated as data by the push-reuse rules below. The tested
+merge commit must be GitHub's merge of that head, and its tree must equal the
+group commit's tree. A re-read must show the same run. Anything else, including
+any error, means full verification, never a failed run. On a reuse
+`checks / verify`, `checks / load` and `checks / evidence` are skipped;
+`native / synthetic` and the image builds run. `checks / tiden` runs no Tiden
+command: its receipt records `skipped` with the reused run attempt's URL
+(`tested_in`), the merge commit it tested and the group commit, and the job fails
+without them. `CI gate` accepts that skip only for this decision on this group
+commit. The decision script runs from the group commit's tree like every queue
+workflow, so the fork exclusion selects evidence and is no sandbox; queued
+workflow changes are still reviewed. Such a queue run has a skipped
+`checks / verify`, so its main push verifies in full (below).
+
+A queue run that ran the suite is the authoritative test run of a merged SHA; the
+main push run of that SHA validates and publishes it instead of testing the
+commit again (ANYM-322); after a queue run that reused a pull request run, the
+push run verifies in full. Its first job, `Reuse the merge queue verification`,
+one of the two CI jobs with `actions: read`, finds the latest merge queue run of the exact commit by the
 rules `production.py verify` applies (ANYM-321), waits up to five minutes for it
 to complete, and pins its latest attempt and the one `ci-evidence` artifact
 created during that attempt. Without them, or on any lookup error, the push run
@@ -141,8 +166,10 @@ request description. On a docs-only run `checks / verify`, `checks / load` and
 satisfies the required check. `CI gate` accepts the skip only for the docs-only
 decision on this merge commit, `native / synthetic` and the image builds keep
 their rules, and `checks / tiden` records a skipped route with the reason. Merge
-queue runs, main pushes, dispatch runs and package releases always verify in
-full, so the queue run still tests every merged commit. Editing a pull request
+queue runs, main pushes, dispatch runs and package releases never take this
+path: a queue run verifies in full or reuses a full pull request run of its
+identical tree, which a docs-only run never is, so every merged commit's tree is
+tested in full before it reaches `main`. Editing a pull request
 description does not rerun CI, and a rerun reuses the captured event, so adding
 a `Tiden intent branch:` line later needs a new push. Add a document to the list
 only after a review finds that no test, script, packaging file, Dockerfile or
