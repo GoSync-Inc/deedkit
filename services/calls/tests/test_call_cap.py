@@ -63,7 +63,7 @@ async def test_cap_raise_binds_owner_words_and_units(tmp_path):
     assert expires == timedelta(hours=24)
     # A repeated request with the same words is the same raise, never a second one.
     again = await api.call('alice', 'raise_call_cap', {'owner_instruction': words, 'extra_units': 5})
-    assert again['raise'] == raised['raise'] and raises(service) == 1
+    assert again['raise'] == raised['raise'] and again['repeated'] and not raised['repeated'] and raises(service) == 1
     await outbound.dial(saved['id'], 'Owner words', origin=AGENT_FOUND)
     assert len(provider.dialed) == 1
     service.close()
@@ -101,6 +101,30 @@ async def test_cap_raise_is_durable_bounded_and_expires(tmp_path):
     service.db.commit()
     assert outbound.daily_call_units() == policy.CAP_CEILING - 20
     assert len(outbound.active_raises()) == 2
+    # One status reads one snapshot: a raise expiring between reads cannot split its fields.
+    snapshots = iter([outbound.active_raises(), []])
+    outbound.active_raises = lambda: next(snapshots)
+    status = outbound.cap_status()
+    assert status['daily_call_units'] == policy.DAILY_UNITS + sum(r['extra_units'] for r in status['raises'])
+    service.close()
+
+
+async def test_cap_raise_rechecks_authority_after_waiting(tmp_path):
+    path, doc, save = registry(tmp_path)
+    service = VoiceService(tmp_path / 'data')
+    outbound = manager(service)
+    api = surface(service, path, outbound)
+    # A raise queued behind a dial must not commit once the principal lost calls:dial.
+    await outbound.lock.acquire()
+    queued = asyncio.create_task(api.call('alice', 'raise_call_cap', {'owner_instruction': 'Добавь 5 звонков', 'extra_units': 5}))
+    await asyncio.sleep(0.05)
+    doc['principals'][0]['scopes'] = ['calls:read']
+    doc['revision'] += 1
+    save()
+    outbound.lock.release()
+    with pytest.raises(ServiceError, match='policy_changed'):
+        await queued
+    assert raises(service) == 0 and outbound.daily_call_units() == policy.DAILY_UNITS
     service.close()
 
 
@@ -128,6 +152,7 @@ def test_cap_raise_is_visible_to_owner(tmp_path):
         assert own['call_cap']['raises'][0]['owner_instruction'] == words
         assert own['calling_readiness']['channels']['phone']['daily_calls_remaining'] == policy.DAILY_UNITS + 7
         assert own['call_cap']['call_cap_ceiling'] == policy.CAP_CEILING
+        assert own['limits']['daily_call_units'] == policy.DAILY_UNITS + 7
         other = client.post('/v1/capabilities', json={}, headers=bob).json()['call_cap']
         assert other['daily_call_units'] == policy.DAILY_UNITS + 7
         assert other['raises'][0]['extra_units'] == 7 and 'owner_instruction' not in other['raises'][0]
@@ -154,6 +179,11 @@ async def test_control_mcp_raises_cap_with_owner_words(tmp_path, monkeypatch):
                     assert 'never raises the cap' in tools['raise_call_cap'].description
                     unbound = await client.call_tool('raise_call_cap', {'owner_instruction': 'Добавь звонков', 'extra_units': 3})
                     assert unbound.is_error and 'units_not_in_owner_instruction' in unbound.content[0].text
+                    # The MCP boundary is as strict as the scoped API: no coercion into a count.
+                    for units in (True, '5', 2.0, 0, policy.MAX_RAISE_UNITS + 1):
+                        malformed = await client.call_tool('raise_call_cap', {'owner_instruction': 'Добавь 1, 2 или 5', 'extra_units': units})
+                        assert malformed.is_error, units
+                    assert app.state.outbound.active_raises() == []
                     raised = await client.call_tool('raise_call_cap', {'owner_instruction': 'Добавь 3 звонка', 'extra_units': 3})
                     assert not raised.is_error and raised.structured_content['raise']['principal'] == 'control_mcp'
                     caps = (await client.call_tool('get_voice_capabilities', {})).structured_content['calling']

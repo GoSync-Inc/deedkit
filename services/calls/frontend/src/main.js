@@ -6,6 +6,7 @@ import { AudioHealth, audioHealthText } from './audio-health.mjs';
 import { settleDisconnectedCall } from './call-cleanup.mjs';
 import { MicrophoneControl, bindTalkButton } from './microphone.mjs';
 import { createLearningUI } from './learning.mjs';
+import { capText } from './call-cap.mjs';
 import './style.css';
 
 const $ = id => document.getElementById(id);
@@ -75,10 +76,9 @@ async function refreshConfig() {
   providerUI();
   $('archive-label').textContent=config.archive.connected ? 'AnyMsg подключён' : 'AnyMsg недоступен';
   if (!config.archive.connected) $('archive-label').title='Можно проверить поручение с собственными фактами. Поиск сообщений пока недоступен.';
-  // The daily call cap and every owner raise with the owner's quoted words (ANYM-353).
-  const cap=config.call_cap;
-  $('call-cap-label').textContent=cap ? `Звонков на сутки: осталось ${cap.daily_calls_remaining} из ${cap.daily_call_units}` : 'Лимит звонков недоступен';
-  $('cap-raises').replaceChildren(...(cap?.raises || []).map(r=>node('small',`+${r.extra_units} до ${new Date(r.expires_at).toLocaleString('ru-RU')} · слова владельца: «${r.owner_instruction}»`)));
+  const cap=capText(config.call_cap);
+  $('call-cap-label').textContent=cap.label;
+  $('cap-raises').replaceChildren(...cap.raises.map(text=>node('small',text)));
   const previous=$('account').value;
   $('account').replaceChildren(new Option('Все доступные аккаунты',''),...(config.archive.accounts || []).map(a=>new Option(a.label || a.id,a.id)));
   $('account').value=previous;

@@ -174,38 +174,45 @@ class Outbound:
                                      'WHERE expires_at>? ORDER BY created_at',(now(),))
         return [dict(zip(RAISE_FIELDS,row)) for row in rows]
 
-    def daily_call_units(self):
-        return min(policy.CAP_CEILING,policy.DAILY_UNITS+sum(r['extra_units'] for r in self.active_raises()))
+    def daily_call_units(self,raises=None):
+        """Effective cap; pass one active_raises() snapshot so related fields agree across an expiry."""
+        raises=self.active_raises() if raises is None else raises
+        return min(policy.CAP_CEILING,policy.DAILY_UNITS+sum(r['extra_units'] for r in raises))
 
-    def daily_calls_remaining(self):
-        return max(0,self.daily_call_units()-self.units_used())
+    def daily_calls_remaining(self,raises=None):
+        return max(0,self.daily_call_units(raises)-self.units_used())
 
     def cap_status(self,principal=None):
         """Effective cap with its raises. Given a principal, other principals' raises omit the owner's words."""
+        active=self.active_raises()
         raises=[r if principal is None or r['principal']==principal else
-                {k:r[k] for k in ('id','created_at','expires_at','extra_units')} for r in self.active_raises()]
-        return {'base_units':policy.DAILY_UNITS,'daily_call_units':self.daily_call_units(),'call_cap_ceiling':policy.CAP_CEILING,
-                'daily_calls_remaining':self.daily_calls_remaining(),'raises':raises}
+                {k:r[k] for k in ('id','created_at','expires_at','extra_units')} for r in active]
+        return {'base_units':policy.DAILY_UNITS,'daily_call_units':self.daily_call_units(active),'call_cap_ceiling':policy.CAP_CEILING,
+                'daily_calls_remaining':self.daily_calls_remaining(active),'raises':raises}
 
-    async def raise_cap(self,owner_instruction,extra_units,principal):
+    async def raise_cap(self,owner_instruction,extra_units,principal,*,admission=None):
         """Raise the daily cap for 24 hours on the owner's quoted reply, which must state the unit count.
-        The same words and count while that raise is active return it instead of adding another."""
+        The same words and count while that raise is active return it instead of adding another.
+        `admission` rechecks the caller's authority after the lock, as for dial."""
         instruction=owner_instruction.strip() if isinstance(owner_instruction,str) else ''
         if not 3<=len(instruction)<=1500: raise ServiceError('owner_instruction_reference_required',422)
         if not isinstance(extra_units,int) or isinstance(extra_units,bool) or not 1<=extra_units<=policy.MAX_RAISE_UNITS:
             raise ServiceError('invalid_arguments',422)
         if not policy.units_named(instruction,extra_units): raise ServiceError('units_not_in_owner_instruction',422)
         async with self.lock:
+            if admission is not None:
+                admission()
             active=self.active_raises()
             same=next((r for r in active if (r['principal'],r['owner_instruction'],r['extra_units'])==(principal,instruction,extra_units)),None)
-            if same is None:
-                room=policy.CAP_CEILING-self.daily_call_units()
+            repeated=same is not None
+            if not repeated:
+                room=policy.CAP_CEILING-self.daily_call_units(active)
                 if extra_units>room: raise ServiceError('call_cap_ceiling',422,{'raisable_units':room,'call_cap_ceiling':policy.CAP_CEILING})
                 created=datetime.now(timezone.utc)
                 same=dict(zip(RAISE_FIELDS,(secrets.token_hex(8),created.isoformat(),
                     (created+timedelta(hours=policy.RAISE_HOURS)).isoformat(),principal,instruction,extra_units)))
                 self.service.db.execute('INSERT INTO cap_raises VALUES (?,?,?,?,?,?)',tuple(same.values())); self.service.db.commit()
-            return {'raise':same,'call_cap':self.cap_status(principal)}
+            return {'raise':same,'repeated':repeated,'call_cap':self.cap_status(principal)}
 
     async def preflight(self,brief_id):
         b=self.service.get_brief(brief_id)
@@ -217,8 +224,9 @@ class Outbound:
         provider=self.providers.get(b['account'])
         if not provider: raise ServiceError('provider_not_configured')
         result=await provider.preflight(b)
+        active=self.active_raises()
         return {**result,'recipient_policy':policy.recipient_policy(b['channel']),'dial_units':units,
-                'daily_call_units':self.daily_call_units(),'daily_calls_remaining':self.daily_calls_remaining()}
+                'daily_call_units':self.daily_call_units(active),'daily_calls_remaining':self.daily_calls_remaining(active)}
 
     async def dial(self,brief_id,authorization_reference,*,admission=None,origin=None):
         """Internal entry point. Agent-facing surfaces always pass `origin` (destination_source/evidence)."""
