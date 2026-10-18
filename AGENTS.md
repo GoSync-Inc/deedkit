@@ -56,17 +56,19 @@ applies.
 | Level | Covers | Review | Merge |
 | --- | --- | --- | --- |
 | Micro | Typos and wording in documentation without a change of meaning; code comments | None | Agent, after green CI |
-| Normal | A small fix or feature in one lane with a test on a Medium or Low spec; a patch dependency update; a new test or changed assertions for such a spec; a change of meaning in a contract document | No per-PR reviewer: the author checklist and the "fails without the fix" record; the release review covers it | Agent |
+| Normal | A small fix or feature in one lane with a test on a Medium or Low spec; a patch dependency update; a new test or changed assertions for such a spec; a change of meaning in a contract document | No per-PR code reviewer: the author checklist and the "fails without the fix" record; the release review covers it. Agent rules and process documents: the process-text checklist before merge | Agent |
 | Important | A new capability; several lanes or components; High or Critical specs and their tests; security and access; CI and releases; the data model; major and security dependency updates; mixed PRs | Astra | Agent |
 | Owner | Every escalation condition below; deleting or moving backlog cards; changes to these review levels or merge authority | Astra and Fable | Owner |
 
-Reviews follow docs/operations/review-protocol.md: what CI and Tiden already
-prove, the author checklist, the reviewer packet, at most two rounds per
-reviewer, and the release review. The release review covers every normal-level
-PR once, before the release that would ship it: Astra on its code and on how the
-release's PRs interact, Fable on its spec, contract and process text. Important
-and owner-level PRs are reviewed before they merge and never wait for it. A
-production operation plan gets Astra before the owner authorizes it.
+Reviews follow docs/operations/review-protocol.md: tool results and author
+records, the checklists, the reviewer packet, the round budget and the release
+review. The release review runs before a release or package publication: Astra
+and Fable on the normal-level PRs it would ship, once each, and Astra on how
+the candidate fits what is deployed when it changes CI, release or deploy code,
+the schema or a consumed interface. Important and owner-level PRs are reviewed
+before they merge and never wait for it. A production operation plan gets Astra
+before the owner authorizes it. When Codex wrote the code, Fable takes Astra's
+place on it.
 
 The Tiden loop follows the kind of change. Use `tiden intent skip` only for
 changes without code beyond comments that leave observable product behavior
@@ -85,8 +87,9 @@ workflow describes: one line per spec, `ANYM-n: updated` or
 whose behavior changed without an anchor match, and add anchors for new files to
 the specs they implement; without a local CLI, say so under `Spec impact:`. A skip
 is invalid when it changes code beyond comments in a file anchored to a spec.
-Reviewers receive the current text of every listed spec, not only the
-promised ones, and check each disposition; "no behavior change" on a spec whose
+The reviewers of its level (for a normal PR, the release review) receive the
+current text of every listed spec, not only the promised ones, and check each
+disposition; "no behavior change" on a spec whose
 criteria the diff changes is a finding. Before `tiden intent close`, every
 session-delta spec has a disposition in that list; a passing linked test does not
 make spec text current. Merge the Tiden branch in the same step as the Git PR:
@@ -99,25 +102,29 @@ Tiden through the card intake in docs/operations/tiden-product-workflow.md.
 Opus at high effort writes every new card and spec text. Who reviews a card or
 spec edit follows its kind:
 
-- feature and improvement cards, new epics and owner-level cards: Astra and
-  Fable;
-- defect, infra, refactor and research cards with High or Critical priority or
-  touching security, access, data, CI or releases, and a bulk restructuring:
-  Astra;
+- feature and improvement cards, new epics, and cards whose delivery meets an
+  escalation condition below: Astra and Fable;
+- defect, infra, refactor and research cards with High or Critical priority,
+  touching security, access, data, CI or releases, or needing the main research
+  (below), and a bulk restructuring: Astra;
 - other cards and spec edits (status, evidence notes, facts): the card
   checklist subagent;
 - spec text written at settle: the reviewers of its pull request's level, and
   the card checklist for a normal-level PR.
 
+A spec edit on a High or Critical spec, or one that weakens a criterion, is
+never checklist-only.
+
 Fable checks necessity and value, clear and testable acceptance criteria, scope,
 duplicates, priority, dependencies and score, and whether a quoted approval is
-one; Astra whether the problem and
-criteria match the code, edge cases, security and the research note.
+one; Astra whether the problem and criteria match the code, edge cases,
+security and the research note.
 Acceptance into the ready queue follows Card intake step 4 (owner for feature and
 improvement; the orchestrator for the other categories after their review).
-Without a code PR, a spec edit in Tiden is normal and a bulk restructuring is
-important. Signals and the owner row raise either, as for a PR, and the agent
-merges under the conditions below. A proposal branch for future requirements
+Without a code PR, a spec edit in Tiden takes the reviewers above; for merge
+authority it is normal and a bulk restructuring important, signals and the
+owner row raise either as for a PR, and the agent merges under the conditions
+below. A proposal branch for future requirements
 stays open until implemented instead of merging to register it
 (docs/operations/tiden-product-workflow.md).
 Deleting or moving cards is the owner's. Research before building: every new card

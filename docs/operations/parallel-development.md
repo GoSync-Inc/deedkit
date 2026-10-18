@@ -141,10 +141,9 @@ at least important (`AGENTS.md`). Prefer splitting it.
   records the release; without a valid queue run it verifies in full
   ([TIDEN-CI.md](../../TIDEN-CI.md), ANYM-322). `production.py verify` accepts the
   queue's verification only in place of `checks / verify` (ANYM-321).
-- Before prepare, the release owner runs the release review
-  ([review-protocol.md](review-protocol.md)) when the delta holds a normal-level
-  pull request it has not covered; its open blocking or major findings hold the
-  release.
+- Before prepare or a package publication, the release owner runs the release
+  review ([review-protocol.md](review-protocol.md)) or records why none is due;
+  its open blocking or major findings hold the release.
 - The release owner keeps one release in flight, from prepare to acceptance. The
   host deployment lock only stops two deployment commands from running at once.
 - Release often; the target is several times a day. Once automatic deployment
@@ -209,7 +208,7 @@ work; the orchestrator picks them for each worker:
 | Tiden card and spec text, production operation plans | Opus, high |
 | Research reports | Opus, medium |
 | Process and wording documents, translations, receipts, gathering data from logs and transcripts | Sonnet, medium |
-| Card checklist subagent ([review-protocol.md](review-protocol.md)) | Sonnet, medium |
+| Checklist subagent: card and process-text checklists ([review-protocol.md](review-protocol.md)) | Sonnet, medium |
 | Code exploration | Haiku or Sonnet, low |
 
 Fable is a reviewer only, under Review levels in `AGENTS.md`; reviewers follow
@@ -230,6 +229,11 @@ The worker writes and waits for the answer:
   the Tiden verdict or recorded skip. The orchestrator checks CI, the diff and the
   Tiden merge preview (the recorded skip when there is no Tiden branch) itself and
   only then answers "ok"; it hands an owner-level pull request to the owner.
+  It also confirms that the level follows the signals in `AGENTS.md` and, for a
+  normal-level pull request, that the author checklist, the "fails without the
+  fix" record and any process-text checklist review are in the description. It
+  sends back a pull request with a record missing and raises the level when the
+  signals require it.
 
 The worker writes without waiting: at the start, when it opens the pull request,
 and its final result. The result ends with a `SUPERSET_WORKER_DONE` or

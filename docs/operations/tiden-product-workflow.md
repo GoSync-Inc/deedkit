@@ -210,14 +210,14 @@ Record these independently, with timestamp, branch/release ID and exact Git SHA:
    acceptance requirements. A main `prod_issues: PASS` does not supersede this
    review: the vendor documents production-issue gating for attributed release
    scopes. Unattributed errors and absent release snapshots require investigation.
-4. The release review of the delta's normal-level pull requests
-   ([review-protocol.md](review-protocol.md)), or that the delta has none: the
-   reviewed range, verdict lines and open blocking or major findings.
+4. The release review ([review-protocol.md](review-protocol.md)) or its
+   recorded `none` reason: the reviewed range, each part's verdict line and
+   report path, and its open blocking or major findings.
 
 Readiness remains blocked while a relevant current defect, unresolved production
 incident or required acceptance lacks evidence, or a blocking or major release
-review finding is open. This is the project's release decision; do not present
-it as a newly computed native Tiden verdict. Classifying future proposals alone
+review finding on code, contract or spec text is open. This is the project's
+release decision; do not present it as a newly computed native Tiden verdict. Classifying future proposals alone
 does not repair runtime incidents or establish readiness.
 
 For issue triage, read `issue fix-context`, every suspect source path and the
