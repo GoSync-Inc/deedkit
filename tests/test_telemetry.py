@@ -276,3 +276,129 @@ def test_gateway_reports_unexpected_errors_only(channel, unexpected, monkeypatch
         worker.close()
     assert bool(transport.envelopes) == unexpected
     assert SECRET not in repr(transport.envelopes)
+
+
+def stopped(component, monkeypatch, text, detail=None):
+    """Run a collector's main against a synthetic stop; return its stop line."""
+    import sys
+    from pathlib import Path
+    from messaging_service import telegram_collector, whatsapp_collector
+    collector = {'telegram': telegram_collector, 'whatsapp': whatsapp_collector}[component]
+    monkeypatch.setattr(telemetry, 'configure', lambda component: None)
+    async def failed(config):
+        assert config == Path('/synthetic/config.json')
+        try:
+            raise OSError(SECRET)
+        except OSError as cause:
+            stop = RuntimeError(text)
+            stop.detail = detail
+            raise stop from cause
+    monkeypatch.setattr(collector, 'run_config', failed)
+    monkeypatch.setattr(collector.os, 'umask', lambda mode: None)
+    monkeypatch.setattr(sys, 'argv', ['anymsg', '--config', '/synthetic/config.json'])
+    with pytest.raises(SystemExit) as result:
+        collector.main()
+    assert result.value.code == 1
+
+
+@pytest.mark.parametrize('component,text,detail,code,line', [
+    ('telegram', 'capture_overload', None, 'capture_overload', {'code': 'capture_overload'}),
+    ('telegram', 'provider_disconnected', SECRET, 'provider_disconnected', {'code': 'provider_disconnected'}),
+    ('telegram', 'durable_capture_failed', 'spool_io_error', 'durable_capture_failed.spool_io_error',
+     {'code': 'durable_capture_failed', 'detail': 'spool_io_error'}),
+    ('telegram', 'durable_capture_failed', 'disk_reserve', 'durable_capture_failed.disk_reserve',
+     {'code': 'durable_capture_failed', 'detail': 'disk_reserve'}),
+    ('telegram', 'durable_capture_failed', SECRET, 'durable_capture_failed', {'code': 'durable_capture_failed'}),
+    ('telegram', 'durable_capture_failed', None, 'durable_capture_failed', {'code': 'durable_capture_failed'}),
+    ('telegram', 'durable_capture_failed', ['spool_full'], 'durable_capture_failed', {'code': 'durable_capture_failed'}),
+    # A connection code reaches Tiden; the supervisor line keeps its own smaller vocabulary.
+    ('telegram', 'spool_corrupt', None, 'spool_corrupt', {'code': 'collector_failed'}),
+    ('telegram', 'durable_capture_failed.spool_full', None, 'collector_failed', {'code': 'collector_failed'}),
+    ('telegram', SECRET, 'spool_full', 'collector_failed', {'code': 'collector_failed'}),
+    ('whatsapp', 'provider_disconnected', None, 'provider_disconnected', {'code': 'provider_disconnected'}),
+    ('whatsapp', 'whatsapp_logged_out', None, 'whatsapp_logged_out', {'code': 'collector_failed'}),
+    ('whatsapp', 'durable_capture_failed', None, 'durable_capture_failed', {'code': 'collector_failed'}),
+    ('whatsapp', SECRET, None, 'collector_failed', {'code': 'collector_failed'}),
+])
+def test_collector_stop_reports_the_fixed_stop_code(component, text, detail, code, line, monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr(telemetry, 'capture', lambda error, code: seen.append(code))
+    stopped(component, monkeypatch, text, detail)
+    assert seen == [code]
+    assert json.loads(capsys.readouterr().out) == {'status': 'stopped', **line}
+
+
+def test_collector_stop_whose_text_cannot_be_read_reports_collector_failed(monkeypatch, capsys):
+    from messaging_service import telegram_collector
+    class DangerousError(Exception):
+        def __str__(self):
+            raise AssertionError('must not stringify')
+    async def failed(config):
+        raise DangerousError(SECRET)
+    seen = []
+    monkeypatch.setattr(telemetry, 'configure', lambda component: None)
+    monkeypatch.setattr(telemetry, 'capture', lambda error, code: seen.append(code))
+    monkeypatch.setattr(telegram_collector, 'run_config', failed)
+    monkeypatch.setattr(telegram_collector.os, 'umask', lambda mode: None)
+    monkeypatch.setattr('sys.argv', ['anymsg', '--config', '/synthetic/config.json'])
+    with pytest.raises(SystemExit):
+        telegram_collector.main()
+    assert seen == ['collector_failed']
+    assert json.loads(capsys.readouterr().out) == {'status': 'stopped', 'code': 'collector_failed'}
+
+
+@pytest.mark.parametrize('component,text,detail,code', [
+    ('telegram', 'durable_capture_failed', 'spool_full', 'durable_capture_failed.spool_full'),
+    ('telegram', 'durable_capture_failed', SECRET, 'durable_capture_failed'),
+    ('telegram', 'capture_overload', SECRET, 'capture_overload'),
+    ('telegram', SECRET, SECRET, 'collector_failed'),
+    ('whatsapp', 'whatsapp_logged_out', SECRET, 'whatsapp_logged_out'),
+    ('whatsapp', SECRET, SECRET, 'collector_failed'),
+])
+def test_collector_stop_event_on_the_wire_has_no_exception_text(component, text, detail, code, monkeypatch):
+    transport = Transport()
+    worker = reporter(transport, component)
+    monkeypatch.setattr(telemetry, '_reporter', worker)
+    try:
+        stopped(component, monkeypatch, text, detail)
+        assert transport.ready.wait(1)
+    finally:
+        worker.close()
+    raw = transport.envelopes[0].decode()
+    event = json.loads(raw.splitlines()[2])
+    assert SECRET not in raw and 'synthetic-private-token' not in raw
+    assert event['tags'] == {'component': component, 'error_code': code}
+    value = event['exception']['values'][0]
+    assert value['type'] == 'RuntimeError' and value['value'] == code
+    assert {frame['filename'] for frame in value['stacktrace']['frames']} <= {
+        telemetry.FRAME_PREFIX + component + '_collector.py'}
+
+
+def test_stop_codes_are_allowlisted_for_collectors_only():
+    from messaging_service.collector_state import CAPTURE_STOP_DETAILS
+    from messaging_service.operational import CONNECTION_ERRORS, SUPERVISOR_STOP_CODES
+    durable = {'durable_capture_failed.' + detail for detail in CAPTURE_STOP_DETAILS}
+    for component in ('telegram', 'whatsapp'):
+        assert telemetry.STOP_CODES[component] == SUPERVISOR_STOP_CODES[component] | CONNECTION_ERRORS | durable
+        assert telemetry.safe_event(error(), component, 'durable_capture_failed.spool_io_error')
+        assert telemetry.safe_event(error(), component, 'durable_capture_failed.' + SECRET) is None
+        assert telemetry.safe_event(error(), component, SECRET) is None
+    for component in telemetry.COMPONENTS - {'telegram', 'whatsapp'}:
+        assert telemetry.safe_event(error(), component, 'capture_overload') is None
+    event = telemetry.safe_event(error(), 'telegram', 'capture_overload')
+    event.update(event_id='c'*32, timestamp=1, environment='local-synthetic')
+    assert telemetry.before_send(event)['tags']['error_code'] == 'capture_overload'
+    event['tags']['error_code'] = 'durable_capture_failed.' + SECRET
+    assert telemetry.before_send(event) is None
+    event['tags'].update(component='gateway', error_code='capture_overload')
+    assert telemetry.before_send(event) is None
+
+
+def test_telemetry_document_lists_the_stop_vocabulary():
+    import re
+    from pathlib import Path
+    text = (Path(__file__).resolve().parents[1]/'TELEMETRY.md').read_text()
+    section = re.search(r'^Collector stop codes: (.+?)\.$', text, re.M | re.S)
+    listed = set(re.findall(r'`([a-z_.]+)`', section.group(1)))
+    # Both collectors currently share one vocabulary; a split must be documented.
+    assert listed == telemetry.STOP_CODES['telegram'] == telemetry.STOP_CODES['whatsapp']

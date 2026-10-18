@@ -18,6 +18,19 @@ MEDIA_ERRORS = {'media_unavailable','media_reference_changed','unsupported_media
     'media_hash_mismatch','media_size_mismatch','media_size_limit','media_metadata_unavailable',
     'invalid_media_path','media_timeout','media_network_error','media_storage_unavailable'}
 LOCAL_STORAGE_ERRORS = {'storage_unavailable','media_storage_unavailable'}
+# The fixed causes of a fail-closed live capture write (ANYM-352).
+CAPTURE_STOP_DETAILS = {'spool_full','disk_reserve','spool_io_error','capture_error'}
+# Fixed codes each collector prints to its supervisor when it stops.
+SUPERVISOR_STOP_CODES = {
+    'telegram':frozenset({'collector_disabled','session_handover_not_confirmed','telegram_pairing_required',
+        'telegram_identity_mismatch','private_session_required','live_account_required',
+        'collector_already_owned','session_already_owned','collector_lease_lost',
+        'durable_capture_failed','capture_overload','collection_disabled','provider_disconnected'}),
+    'whatsapp':frozenset({'collector_disabled','session_handover_not_confirmed','whatsapp_pairing_required',
+        'whatsapp_identity_mismatch','private_session_required','live_account_required',
+        'collector_already_owned','session_already_owned','collector_lease_lost',
+        'collection_disabled','provider_disconnected'}),
+}
 PHASE_STATES = {
     'connection':{'connecting','connected','retry_wait','blocked','stopped'},
     'live_capture':{'starting','receiving','backlogged','paused','stopped'},
@@ -26,6 +39,24 @@ PHASE_STATES = {
 PHASE_REASONS = CONNECTION_ERRORS | {'provider_ready','capture_ready','capture_draining','capture_quarantined',
     'collector_shutdown','history_scan','history_scan_finished','provider_temporarily_unavailable',
     'collector_starting','operator_resumed'}
+# Stop codes a collector's telemetry event may carry (ANYM-292): never exception text.
+TELEMETRY_STOP_CODES = {component:codes|CONNECTION_ERRORS|{'durable_capture_failed.'+detail
+    for detail in CAPTURE_STOP_DETAILS} for component,codes in SUPERVISOR_STOP_CODES.items()}
+
+
+def collector_stop(exc, component):
+    """Supervisor code, fixed capture detail and telemetry code of a collector stop."""
+    # Exception strings from providers can contain private requests; only exact
+    # fixed codes pass, anything else becomes collector_failed.
+    try:text=str(exc)
+    except Exception:text=''
+    code=text if text in SUPERVISOR_STOP_CODES[component] else 'collector_failed'
+    detail=getattr(exc,'detail',None) if text=='durable_capture_failed' else None
+    detail=detail if isinstance(detail,str) and detail in CAPTURE_STOP_DETAILS else None
+    # A qualified code comes only from the fixed detail, never from exception text.
+    event=(text+'.'+detail if detail else text if text in SUPERVISOR_STOP_CODES[component] or text in CONNECTION_ERRORS
+        else 'collector_failed')
+    return code,detail,event
 
 
 def operations(row, history, files, now=None):

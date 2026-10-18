@@ -14,6 +14,7 @@ import threading
 import time
 
 from . import __version__
+from .operational import TELEMETRY_STOP_CODES as STOP_CODES
 
 COMPONENTS = {'gateway', 'telegram', 'whatsapp', 'indexer', 'enricher', 'subscriptions'}
 CODES = {'request_failed', 'tool_failed', 'collector_failed', 'indexer_failed',
@@ -41,7 +42,8 @@ def release():
 
 def safe_event(error, component, code):
     """Never stringify exceptions, inspect locals, read source lines or retain a traceback."""
-    if component not in COMPONENTS or code not in CODES:
+    # A collector stop also reports its fixed stop code, so Tiden groups each cause (ANYM-292).
+    if component not in COMPONENTS or (code not in CODES and code not in STOP_CODES.get(component, ())):
         return None
     frames = []
     tb = error.__traceback__ if isinstance(error, BaseException) else None

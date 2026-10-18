@@ -37,6 +37,29 @@ retries are not automatically reported. The AI inference child is not connected.
 Node/Chromium crashes are reported through the existing Python collector owner;
 there is no second WhatsApp client and no browser session instrumentation.
 
+When a Telegram or WhatsApp collector stops, its event's error code is the stop
+code, so Tiden groups issues per cause, for example
+`RuntimeError: capture_overload`. A stop code is reported only when the exception
+text is exactly one of the codes below; any other stop reports `collector_failed`.
+A Telegram `durable_capture_failed` stop with one of the fixed capture details of
+`live_capture.last_capture_stop` reports `durable_capture_failed.<detail>`; without
+a detail, or with any other value, it reports `durable_capture_failed`. The
+supervisor stop line keeps its own smaller vocabulary; exception text, cause
+chains and an exception's detail value never enter the event. Other components
+keep their generic codes.
+
+Collector stop codes: `capture_overload`, `collection_disabled`,
+`collector_already_owned`, `collector_disabled`, `collector_lease_lost`,
+`disk_reserve`, `durable_capture_failed`, `durable_capture_failed.capture_error`,
+`durable_capture_failed.disk_reserve`, `durable_capture_failed.spool_full`,
+`durable_capture_failed.spool_io_error`, `live_account_required`,
+`private_session_required`, `provider_auth_failed`, `provider_connect_timeout`,
+`provider_disconnected`, `provider_initialization_failed`, `provider_not_ready`,
+`provider_page_stalled`, `provider_protocol_error`, `session_already_owned`,
+`session_handover_not_confirmed`, `spool_corrupt`, `spool_full`,
+`telegram_identity_mismatch`, `telegram_pairing_required`,
+`whatsapp_identity_mismatch`, `whatsapp_logged_out`, `whatsapp_pairing_required`.
+
 The payload contains the release, environment, fixed component/error code,
 allowlisted exception type and public Python filenames/line numbers. Filenames are
 relative to the repository root (`services/messaging/messaging_service/<file>.py`),
