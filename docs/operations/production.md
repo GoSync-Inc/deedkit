@@ -477,7 +477,17 @@ refuses with "each selected service must already have exactly one running
 container". The settings digest covers Docker's whole inspected `Config`,
 `HostConfig` and `Mounts`, so a Docker Engine upgrade that changes their shape
 between apply and rollback also reads as drift: rollback refuses, and the manual
-procedure applies.
+procedure applies. `Mounts`, `HostConfig.Links` and inherited `HostConfig.Ulimits`
+are compared as sets, because Docker returns them in no stable order; the digest
+is versioned (`v2:`). Records written by the earlier tool, which hashed those
+lists in the order returned (installed 2026-10-18 from e0ce9f6; it completed no
+apply), carry an unversioned digest: their tool rollback is not supported, and
+apply and rollback refuse them with "prepare again" or "use the manual
+procedure" (owner decision 2026-10-18). Upgrade: install the fixed
+`production.py`, then prepare afresh against the current verified main. An
+unattempted candidate directory for the same SHA is renamed (for example to
+`prepared-older-tool-<sha>`), never deleted or edited, because preparation
+refuses an existing directory; receipts and their digests are never rewritten.
 
 ## Image retention report
 
