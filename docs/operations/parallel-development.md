@@ -27,8 +27,8 @@ A story is **ready** when its Tiden card was accepted through the card intake in
 the Tiden workflow and has the template's fields, including its Score, **lane**
 and expected paths. A story that is not ready goes back to card intake (the owner for feature
 and improvement). A
-change that takes `tiden intent skip` has no story; its brief names the goal and
-paths instead.
+change that takes `tiden intent skip` has no story; its brief names the goal,
+expected paths, acceptance and checks instead.
 
 One story maps to one Git branch, one pull request and one intent session. Split
 larger work into stories that merge independently. A pull request should merge
@@ -54,8 +54,8 @@ its task is cancelled.
 A lane never has more concurrent pull requests than its limit in the table; where
 two are allowed, their files must not overlap. The lane is recorded in the story
 and in the pull request description. Before dispatch the orchestrator compares the
-planned paths with the expected paths in active workers' briefs and with the
-changed paths of open pull requests (`gh pr diff <n> --name-only`).
+planned paths with the expected paths in active workers' stories (for a skip,
+its brief) and with the changed paths of open pull requests (`gh pr diff <n> --name-only`).
 
 | Lane | Paths | Concurrent PRs |
 | --- | --- | --- |
@@ -161,13 +161,15 @@ at least important (`AGENTS.md`). Prefer splitting it.
    selected story whose paths fit a free lane; there is no fixed number of
    workers. The real limits are file overlap (lanes), the GitHub CI queue and the
    owner's attention for owner-level decisions; the orchestrator watches them.
-4. Each brief names the story (or the goal for a skip) and adds only what the
-   story and the Tiden working contract do not hold: the files that other
-   workers' open pull requests and briefs are changing (Tiden does not show
-   concurrent work), the review level when the story does not state it, and
-   limits beyond the story, such as read-only production. Acceptance criteria,
-   expected paths and checks come from the story and the working contract; the
-   brief does not restate them.
+4. Each brief names the story and adds only what the story and the Tiden
+   working contract do not hold: the files that other active workers' stories
+   and open pull requests are changing (Tiden does not show concurrent work),
+   and limits beyond the story, such as read-only production. Acceptance
+   criteria, lane, expected paths and checks come from the story and the working
+   contract; the evidence and final result follow the level (Worker protocol);
+   the worker sets the level from the working contract (`AGENTS.md`). The brief
+   does not restate them. A skip has no story, so its brief carries the goal,
+   expected paths, acceptance and checks.
 5. Answer workers' questions and check each pull request before its "ok" (Worker
    protocol). Read a waiting worker's terminal with `superset terminals read` and
    give the owner exactly what it asks, so the owner need not open worker terminals.
@@ -180,12 +182,14 @@ at least important (`AGENTS.md`). Prefer splitting it.
 The orchestrator starts no new worker when its context is above about 60%, at the
 end of the working day or when the current wave of tasks is done. Running workers
 still reach their final result: merge, post-merge check, archive. The orchestrator
-keeps its rules and its current state in a short handoff file and updates the
-state after every decision, so a compaction or a new session loses nothing.
-Finished history, the decision log and session notes live in a separate log that
-a new session does not read on start. A new orchestrator session first reads the
-handoff file and the list of live sessions, and reads documents already loaded
-into its context (`AGENTS.md`, `CLAUDE.md`) no second time.
+keeps its rules and its current state in a handoff file and updates the state
+after every decision, so a compaction or a new session loses nothing; the file
+holds no finished history. Finished history, the decision log and the session
+notes live in the orchestrator log, a separate file next to the handoff file
+that a new session does not read on start. A new orchestrator session first
+reads the handoff file and the list of live sessions, and does not read
+documents already loaded into its context (`AGENTS.md`, `CLAUDE.md`) a second
+time.
 
 Questions to the owner use plain names, never internal codes alone. Each states
 what it is, why it matters to the owner, what it costs, the options with their
@@ -193,10 +197,10 @@ consequences and a recommendation. There is no limit on how many are asked; "д�
 всё" ("yes to all") accepts every recommendation except an owner-level merge, which still needs
 an explicit "merge <n>".
 
-The orchestrator keeps a log of the owner's decisions: its recommendation, the
+The orchestrator log holds the owner's decisions: its recommendation, the
 owner's choice and whether they matched, so autonomy grows on facts. At the end
-of each session it writes two or three lines to the log: what got in the way and
-what to change. Once a week it reviews the decision log, these notes and
+of each session it writes two or three lines to the orchestrator log: what got
+in the way and what to change. Once a week it reviews the decision log, these notes and
 the measurements under Worker protocol, and proposes rule changes as separate
 pull requests.
 
