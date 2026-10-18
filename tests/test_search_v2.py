@@ -421,3 +421,12 @@ def test_compact_origin_names_never_serialize_as_control_escapes():
         # A quote or backslash (two serialized characters) is the widest name character left.
         assert len(json.dumps(origin['sender_name'],ensure_ascii=False))==66
     assert forward_fields(row)['forward_origin']['post_author']=='�'*64
+
+
+def test_a_null_origin_re_read_keeps_the_stored_origin(forwards):
+    s,ar,add,event=forwards
+    add('1','synthetic forwarded words',forwarded=True,forward_origin=ORIGIN)
+    assert ar.ingest(event(account='forward-tg',chat='300',provider_id='1',body='synthetic forwarded words',
+        metadata={'forwarded':True,'forward_origin':None}))['outcome']=='unchanged'
+    key=s.issue_key('forward-reader',['forward-tg'])
+    assert s.search(key,'synthetic forwarded')['items'][0]['forward_origin']==ORIGIN
