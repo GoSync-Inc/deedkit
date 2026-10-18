@@ -20,14 +20,43 @@ on:
       source_sha:
         description: Exact commit these checks tested
         value: ${{ jobs.verify.outputs.source_sha }}
+      docs_only:
+        description: Whether the documentation job classified this pull request run as documentation-only
+        value: ${{ jobs.documentation.outputs.docs_only }}
+      docs_sha:
+        description: The pull request merge commit the docs-only decision classified
+        value: ${{ jobs.documentation.outputs.docs_sha }}
     secrets:
       TIDEN_API_TOKEN:
         required: false
 permissions:
   contents: read
 jobs:
+  documentation:
+    # A pull request run that changes only reviewed documentation nothing reads skips the test jobs (ANYM-323,
+    # scripts/docs_only.py, .github/docs-only-paths.txt). Every other event, and any doubt, verifies in full.
+    if: ${{ github.event_name == 'pull_request' && inputs.source_ref == '' && !inputs.reuse_queue_evidence }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.decide.outcome == 'success' && steps.decide.outputs.docs_only || 'false' }}
+      docs_sha: ${{ steps.decide.outcome == 'success' && steps.decide.outputs.docs_sha || '' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Decide whether this pull request changes only reviewed documentation
+        id: decide
+        # A failed decision runs the full suite, never a failed run.
+        continue-on-error: true
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/docs_only.py
   verify:
-    if: ${{ !inputs.reuse_queue_evidence }}
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -305,7 +334,8 @@ jobs:
   load:
     # The paired gateway load gate measures its latency and isolation budgets on a runner of its own,
     # in parallel with verify, instead of after the whole suite on the verify runner.
-    if: ${{ !inputs.reuse_queue_evidence }}
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -352,8 +382,8 @@ jobs:
     # One `ci-evidence` artifact from every test job's fragment, attempted even after a failure so the
     # failure itself is recorded (TIDEN-CI.md). A missing, failed, cancelled or skipped test job fails
     # this job whether or not Tiden reporting is configured.
-    needs: [verify, load]
-    if: ${{ always() && !inputs.reuse_queue_evidence }}
+    needs: [documentation, verify, load]
+    if: ${{ always() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -401,7 +431,7 @@ jobs:
           test "$VERIFY_RESULT" = success
           test "$LOAD_RESULT" = success
   tiden:
-    needs: evidence
+    needs: [documentation, evidence]
     # PRs from forks never receive credentials. Internal PRs retain their actual
     # tested merge SHA, not the head SHA or the last successful main revision.
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
@@ -416,12 +446,17 @@ jobs:
           TIDEN_WORKSPACE_ID: ${{ vars.TIDEN_WORKSPACE_ID }}
           EVENT_NAME: ${{ github.event_name }}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
+          DOCS_ONLY: ${{ needs.documentation.outputs.docs_only }}
         run: |
           # A merge queue run publishes nothing, so it needs no Tiden configuration or CLI.
           # Matched with case, like scripts/tiden_ci.py; expression startsWith() ignores case.
           if [ "$EVENT_NAME" = merge_group ] || [[ "$SOURCE_BRANCH" == gh-readonly-queue/* ]]; then
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             echo 'queue=true' >> "$GITHUB_OUTPUT"
+          elif [ "$DOCS_ONLY" = true ]; then
+            # A docs-only pull request run ran no tests, so it has no evidence to publish.
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'docs_only=true' >> "$GITHUB_OUTPUT"
           elif [ -z "$TIDEN_API_TOKEN" ]; then
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             echo 'Tiden reporting is not configured; see TIDEN-CI.md.' >> "$GITHUB_STEP_SUMMARY"
@@ -459,8 +494,15 @@ jobs:
       - name: Record that a merge queue run publishes nothing
         if: steps.config.outputs.queue == 'true'
         run: python scripts/tiden_ci.py publish --directory "$RUNNER_TEMP/ci-evidence"
+      - name: Record that a docs-only pull request run publishes nothing
+        if: steps.config.outputs.docs_only == 'true'
+        env:
+          REASON: docs-only pull request run of reviewed documentation; no tests ran, and main CI publishes the merged code
+        run: |
+          python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-route.json").write_text(json.dumps({"branch": None, "source": "skipped", "reason": os.environ["REASON"]}))'
+          echo "::notice title=Tiden evidence not published::$REASON"
       - name: Retain Tiden association and verdict receipt
-        if: ${{ always() && (steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true') }}
+        if: ${{ always() && ((steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true') || steps.config.outputs.docs_only == 'true') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tiden-receipt

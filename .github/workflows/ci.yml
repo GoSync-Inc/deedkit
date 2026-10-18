@@ -115,12 +115,14 @@ jobs:
           test "$IMAGES_RESULT" = success
           # A manual baseline of another revision must never turn this commit green.
           test -z "$SOURCE_REF" || test "$SOURCE_REF" = "$EXPECTED_SHA"
-      - name: Require this commit's own verification or its validated merge queue verification
+      - name: Require this commit's own verification, its validated merge queue verification or a docs-only decision
         env:
           DECISION: ${{ needs.reuse.outputs.decision }}
           REUSE_RESULT: ${{ needs.reuse.result }}
           REUSED_SHA: ${{ needs.reuse.outputs.validated_sha }}
           VERIFIED_SHA: ${{ needs.checks.outputs.source_sha }}
+          DOCS_ONLY: ${{ needs.checks.outputs.docs_only }}
+          DOCS_SHA: ${{ needs.checks.outputs.docs_sha }}
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           EXPECTED_SHA: ${{ github.sha }}
@@ -131,6 +133,11 @@ jobs:
             test "$REF" = refs/heads/main
             test "$REUSE_RESULT" = success
             test "$REUSED_SHA" = "$EXPECTED_SHA"
+            test -z "$VERIFIED_SHA"
+          elif [ "$DOCS_ONLY" = true ]; then
+            # checks / verify was skipped by the docs-only decision on this pull request's merge commit (ANYM-323).
+            test "$EVENT_NAME" = pull_request
+            test "$DOCS_SHA" = "$EXPECTED_SHA"
             test -z "$VERIFIED_SHA"
           else
             # Otherwise checks / verify tested this commit; one skipped for any other reason fails the gate.

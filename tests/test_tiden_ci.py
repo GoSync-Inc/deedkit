@@ -544,7 +544,9 @@ def test_ci_reports_required_checks_for_merge_queue_runs_without_cancelling_them
                                           "|| needs.reuse.result == 'success') }}")
     assert ci["jobs"]["checks"]["with"]["reuse_queue_evidence"] == "${{ needs.reuse.outputs.decision == 'reuse' }}"
     assert checks.get("on", checks.get(True))["workflow_call"]["inputs"]["reuse_queue_evidence"]["default"] is False
-    assert checks["jobs"]["verify"]["if"] == "${{ !inputs.reuse_queue_evidence }}"
+    # It is skipped too on a pull request run of reviewed documentation only (ANYM-323).
+    assert checks["jobs"]["verify"]["needs"] == "documentation"
+    assert checks["jobs"]["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}"
     step_ids = {step.get("id") for step in checks["jobs"]["verify"]["steps"]}
     assert set(CHECKS) <= step_ids
     # A queue run gets its own group and cancels nothing; so does a main push run.
@@ -1247,8 +1249,10 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     jobs = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]
     load = jobs["load"]
     # Its own runner, in parallel with verify, bounded, with the unchanged command and budgets.
-    # Skipped, like verify, only on a main push that reuses the merge queue's verification (ANYM-322).
-    assert "needs" not in load and load["if"] == jobs["verify"]["if"] == "${{ !inputs.reuse_queue_evidence }}"
+    # Skipped, like verify, only on a main push that reuses the merge queue's verification (ANYM-322) or on a
+    # docs-only pull request run (ANYM-323); it needs only that decision, never verify.
+    assert load["needs"] == jobs["verify"]["needs"] == "documentation"
+    assert load["if"] == jobs["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}"
     assert load["timeout-minutes"] == 10
     gate = next(step for step in load["steps"] if step.get("id") == "load")
     assert gate["name"] == "Paired gateway load and isolation budgets" and "if" not in gate
@@ -1261,8 +1265,8 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         assert upload["with"]["name"] == f"ci-evidence-{job}" and upload["if"] == "${{ always() }}"
         assert upload["with"]["overwrite"] is True
     evidence = jobs["evidence"]
-    assert evidence["needs"] == ["verify", "load"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence }}"
-    assert jobs["tiden"]["needs"] == "evidence"
+    assert evidence["needs"] == ["documentation", "verify", "load"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}"
+    assert jobs["tiden"]["needs"] == ["documentation", "evidence"]
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in evidence["steps"]}
     assert steps["actions/download-artifact"]["with"]["pattern"] == "ci-evidence-*"
     assert "tiden_ci.py assemble" in steps["Merge the fragments of the tested commit and record every check outcome"]["run"]

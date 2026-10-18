@@ -122,6 +122,32 @@ record` with **Re-run all jobs**: a partial rerun has an attempt the record does
 not name. Validating the artifact does not replace reviewing a fork's workflow
 changes before queuing.
 
+A pull request run that changes only reviewed documentation nothing reads
+skips the test jobs (ANYM-323). On pull request runs only, the `checks / documentation`
+job classifies the run as docs-only when every change in GitHub's two-parent
+merge of exactly this head is a plain edit or deletion of a path named in
+`.github/docs-only-paths.txt`. A scan of every other tracked file of the merge
+commit that is not Markdown (the tests, scripts, packaging files, Dockerfiles
+and workflows of every module, and anything else) must also find, in each
+whole file outside Python comments, neither a changed path, nor its file name,
+nor a directory or glob read of Markdown, however its parts are spread. The
+files whose directory or glob matches a review found harmless are listed, each
+with a reason, in the list's `## scan exclusions` section; no file may name a
+changed document. Any of these means full verification: a
+new file, a mode or type change, an empty or uncertain diff, an unlisted file, a
+scan hit, a failed decision, or a `Tiden intent branch:` line in the pull
+request description. On a docs-only run `checks / verify`, `checks / load` and
+`checks / evidence` are skipped, and the skipped `checks / verify` still
+satisfies the required check. `CI gate` accepts the skip only for the docs-only
+decision on this merge commit, `native / synthetic` and the image builds keep
+their rules, and `checks / tiden` records a skipped route with the reason. Merge
+queue runs, main pushes, dispatch runs and package releases always verify in
+full, so the queue run still tests every merged commit. Editing a pull request
+description does not rerun CI, and a rerun reuses the captured event, so adding
+a `Tiden intent branch:` line later needs a new push. Add a document to the list
+only after a review finds that no test, script, packaging file, Dockerfile or
+workflow reads it, including through a composed path.
+
 For an explicit baseline rerun, dispatch `CI` on the reporting-code branch with
 `source_ref` set to the exact source revision and `tiden_branch` to the matching
 existing spec branch. The checkout SHA, rather than the workflow SHA, is recorded.

@@ -543,11 +543,11 @@ def test_only_a_main_push_decides_and_only_the_reuse_job_reads_actions():
 
 def test_a_reusing_push_skips_only_the_test_jobs_and_still_builds_publishes_and_records():
     ci, checks = workflows()
-    skip = "${{ !inputs.reuse_queue_evidence }}"
+    skip = "${{ !cancelled() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}"
     assert checks["jobs"]["verify"]["if"] == checks["jobs"]["load"]["if"] == skip
-    assert checks["jobs"]["evidence"]["if"] == "${{ always() && !inputs.reuse_queue_evidence }}"
+    assert checks["jobs"]["evidence"]["if"] == "${{ always() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}"
     tiden = checks["jobs"]["tiden"]
-    assert tiden["needs"] == "evidence" and tiden["if"].startswith("${{ always() && !cancelled()")
+    assert tiden["needs"] == ["documentation", "evidence"] and tiden["if"].startswith("${{ always() && !cancelled()")
     assert "reuse_queue_evidence" not in json.dumps(tiden)
     for name in ("native", "images"):
         assert "if" not in ci["jobs"][name] and "needs" not in ci["jobs"][name]
@@ -558,9 +558,9 @@ def test_a_reusing_push_skips_only_the_test_jobs_and_still_builds_publishes_and_
 
 
 GREEN = {"DECISION": "full", "REUSE_RESULT": "skipped", "REUSED_SHA": "", "VERIFIED_SHA": SHA, "EVENT_NAME": "pull_request",
-         "REF": "refs/pull/7/merge", "EXPECTED_SHA": SHA}
+         "REF": "refs/pull/7/merge", "EXPECTED_SHA": SHA, "DOCS_ONLY": "false", "DOCS_SHA": ""}
 REUSED = {"DECISION": "reuse", "REUSE_RESULT": "success", "REUSED_SHA": SHA, "VERIFIED_SHA": "", "EVENT_NAME": "push",
-          "REF": "refs/heads/main", "EXPECTED_SHA": SHA}
+          "REF": "refs/heads/main", "EXPECTED_SHA": SHA, "DOCS_ONLY": "", "DOCS_SHA": ""}
 
 
 @pytest.mark.parametrize("environment, passes", [
