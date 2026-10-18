@@ -282,9 +282,11 @@ pull request named by `(#n)` in the commit subject, it:
 5. reads everything back.
 
 Each failure prints `Failed at step <name>: <reason>` and fails the run. A rerun
-finishes what an earlier run left. A push run that did not publish its evidence
-leaves the new tests without imported cases, so the sync fails at step `links`:
-rerun all jobs of that CI run, which publishes and starts the sync again.
+finishes what an earlier run left. If the push run's publication left a newly
+added marked test without an imported case, the sync fails at step `links`.
+A green sync does not verify that publication: read the push run's own Tiden
+receipt, and rerun all jobs of that CI run to publish again, which also starts
+the sync again; dispatch the sync by SHA if that run is dropped.
 
 The workflow runs main's tools with main checked out, never the commit's tree,
 with `contents: read` only, which also covers reading the merged pull request.

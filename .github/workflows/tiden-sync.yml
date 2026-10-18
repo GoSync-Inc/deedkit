@@ -25,8 +25,9 @@ jobs:
   sync:
     name: Tiden sync
     # Only the reviewed workflow and tools on main may use the Tiden credential, and only after a main push run,
-    # whatever its conclusion: the merged code needs its bookkeeping even when a later CI job failed. A run whose
-    # evidence was not published fails at step `links`; rerun the publication, then dispatch this SHA.
+    # whatever its conclusion: the merged code needs its bookkeeping even when a later CI job failed. If the
+    # publication left a newly added marked test without an imported case, the sync fails at step `links`; its
+    # success does not verify the push run's publication, which its own receipt records (TIDEN-CI.md).
     # `contents: read` covers the pull request read (gh api repos/<repo>/pulls/<n>), so the job needs nothing more.
     if: >-
       github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' ||
