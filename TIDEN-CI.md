@@ -192,8 +192,8 @@ workflow records that reporting is not configured and passes. Widening `EXCLUDED
 is a reviewed code change to the checker and its test, never a data edit.
 
 The agent that merged a pull request checks that the `Tiden drift` run on its
-squash commit is green before it reports the merge as checked; a red run names
-the files to anchor.
+squash commit, or a later one, is green before it reports the merge as checked
+(docs/operations/parallel-development.md); a red run names the files to anchor.
 
 ## Environments
 
