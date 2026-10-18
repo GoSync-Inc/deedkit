@@ -77,7 +77,8 @@ def digest(data):
 def queue_run(run_id=QUEUE_ID, attempt=2, **change):
     return {"id": run_id, "run_attempt": attempt, "head_sha": SHA, "event": "merge_group", "head_branch": QUEUE_BRANCH,
             "status": "completed", "conclusion": "success", "head_repository": {"full_name": REPOSITORY},
-            "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{run_id}", **change}
+            "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{run_id}", "run_started_at": "2026-10-17T08:20:00Z",
+            **change}
 
 
 def artifact(artifact_id=77, created="2026-10-17T08:30:00Z", data=b"", **change):
@@ -716,7 +717,8 @@ PR_JOBS = ("checks / verify", "checks / load", "checks / evidence", "CI gate")
 
 def pr_run(run_id=PR_RUN_ID, attempt=1, **change):
     return {"id": run_id, "run_attempt": attempt, "head_sha": HEAD_SHA, "event": "pull_request", "head_branch": PR_BRANCH,
-            "status": "completed", "conclusion": "success", "head_repository": {"full_name": REPOSITORY}, **change}
+            "status": "completed", "conclusion": "success", "head_repository": {"full_name": REPOSITORY},
+            "created_at": "2026-10-17T08:00:00Z", **change}
 
 
 class PullGitHub:
@@ -1165,6 +1167,7 @@ def chain_published(tmp_path, monkeypatch, tree=TREE):
     data = archive(pr_evidence(tmp_path))
     adopt_chain(tmp_path, ChainGitHub(data), data)
     monkeypatch.setattr(tiden_ci, "checkout_tree", lambda sha: tree if sha == SHA else "")
+    monkeypatch.setattr(tiden_ci, "commit_tree", lambda repository, sha: TREE if (repository, sha) == (REPOSITORY, TESTED_SHA) else "")
     return tmp_path / "published"
 
 
@@ -1269,3 +1272,101 @@ def test_within_one_deploy_chained_verifications_fit_the_anonymous_quota_and_a_q
         paths.clear()
         assert production.verify(SHA, counted)["verify_run_id"] == PR_RUN_ID
         assert f"actions/runs/{QUEUE_ID}/attempts/3/jobs?per_page=100&page=1" in paths
+
+
+def git(root, *arguments):
+    return subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True, text=True,
+                          env={"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "HOME": str(root),
+                               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}).stdout.strip()
+
+
+# spec: ANYM-322
+def test_the_checkout_tree_ignores_git_replacements_and_inherited_git_settings(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    git(repository, "init", "-q")
+    (repository / "file").write_text("pushed")
+    git(repository, "add", "file")
+    git(repository, "commit", "-q", "-m", "pushed")
+    pushed, pushed_tree = git(repository, "rev-parse", "HEAD"), git(repository, "rev-parse", "HEAD^{tree}")
+    (repository / "file").write_text("other")
+    git(repository, "commit", "-q", "-am", "other")
+    other, other_tree = git(repository, "rev-parse", "HEAD"), git(repository, "rev-parse", "HEAD^{tree}")
+    git(repository, "checkout", "-q", pushed)
+    # A replacement object makes plain git show the other commit's tree for the pushed commit.
+    git(repository, "replace", pushed, other)
+    assert git(repository, "rev-parse", "HEAD^{tree}") == other_tree
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("GIT_DIR", str(elsewhere))
+    monkeypatch.setenv("GIT_REPLACE_REF_BASE", "refs/replace/")
+    assert tiden_ci.checkout_tree(pushed, repository) == ci_reuse.checkout_tree(pushed, repository) == pushed_tree
+    assert tiden_ci.checkout_tree(other, repository) == "" and tiden_ci.checkout_tree(pushed, elsewhere) == ""
+    with pytest.raises(ci_reuse.Refused, match="not this commit"):
+        ci_reuse.checkout_tree(other, repository)
+
+
+# spec: ANYM-322
+def test_chained_evidence_publishes_nothing_when_github_records_another_tree_for_the_tested_commit(tmp_path, monkeypatch):
+    published = chain_published(tmp_path, monkeypatch)
+    # A record and manifest that agree with each other and with the checkout, for a tested commit of another tree.
+    for recorded in ("0" * 40, ""):
+        monkeypatch.setattr(tiden_ci, "commit_tree", lambda repository, sha, recorded=recorded: recorded)
+        with pytest.raises(ValueError, match="publication record"):
+            tiden_main(monkeypatch, published, {}, "publish")
+    asked = []
+    monkeypatch.setattr(tiden_ci, "commit_tree", lambda repository, sha: asked.append((repository, sha)) or TREE)
+    assert tiden_main(monkeypatch, published, {}, "publish")[0] == 0 and asked == [(REPOSITORY, TESTED_SHA)]
+
+
+# spec: ANYM-322
+def test_github_commit_tree_reads_only_an_exact_commit_anonymously_and_fails_closed(monkeypatch):
+    requests = []
+
+    def answer(body):
+        def urlopen(request, timeout):
+            requests.append((request.full_url, dict(request.header_items()), timeout))
+            if isinstance(body, Exception):
+                raise body
+            return Response(json.dumps(body).encode())
+        return urlopen
+    monkeypatch.setattr(tiden_ci.urllib.request, "urlopen", answer({"sha": TESTED_SHA, "tree": {"sha": TREE}}))
+    assert tiden_ci.commit_tree(REPOSITORY, TESTED_SHA) == TREE
+    url, headers, _ = requests[0]
+    assert url == f"https://api.github.com/repos/{REPOSITORY}/git/commits/{TESTED_SHA}"
+    assert not any(name.lower() == "authorization" for name in headers)
+    for body in ({"sha": "b" * 40, "tree": {"sha": TREE}}, {"sha": TESTED_SHA, "tree": {"sha": "short"}}, [],
+                 OSError("down")):
+        monkeypatch.setattr(tiden_ci.urllib.request, "urlopen", answer(body))
+        assert tiden_ci.commit_tree(REPOSITORY, TESTED_SHA) == ""
+    requests.clear()
+    assert tiden_ci.commit_tree("fork/deedkit/../x", TESTED_SHA) == tiden_ci.commit_tree(REPOSITORY, "HEAD") == ""
+    assert requests == []
+
+
+# spec: ANYM-322
+def test_promotion_refuses_a_pull_request_run_newer_than_the_queue_decision(tmp_path):
+    # Two successful runs of the same head: the queue decided on 640; 641, created after the queue attempt started,
+    # may test another merge base and tree, so promotion and the push reuse refuse it rather than name it.
+    newer = pr_run(run_id=PR_RUN_ID + 1, created_at="2026-10-17T08:30:00Z")
+    with pytest.raises(production.Refused, match="not the one the merge queue decision evaluated"):
+        production.verify(SHA, get=chain_push(ChainGitHub(b"", runs=[pr_run(), newer])))
+    with pytest.raises(ci_reuse.Refused, match="not the one the merge queue decision evaluated"):
+        ci_reuse.decide(SHA, REPOSITORY, get=ChainGitHub(b"", runs=[pr_run(), newer]), sleep=lambda seconds: None)
+    for broken in ({"created_at": None}, {"created_at": "2026-10-17T08:00:00"}):
+        with pytest.raises(production.Refused, match="not the one the merge queue decision evaluated"):
+            production.verify(SHA, get=chain_push(ChainGitHub(b"", runs=[pr_run(**broken)])))
+
+
+# spec: ANYM-322
+def test_within_one_deploy_a_failed_or_pending_pull_request_rerun_is_never_taken_from_the_cache(tmp_path):
+    for change, reason in (({"run_attempt": 2, "conclusion": "failure"}, "not a completed success"),
+                           ({"run_attempt": 2, "status": "in_progress", "conclusion": None}, "not a completed success")):
+        github = ChainGitHub(b"")
+        get = chain_push(github)
+        with production.verification_reuse():
+            production.verify(SHA, get)
+            github.pr.runs[0] = {**github.pr.runs[0], **change}  # between preparation and application
+            with pytest.raises(production.Refused, match=reason):
+                production.verify(SHA, get)

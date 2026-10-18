@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import time
+import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -76,15 +77,37 @@ PRODUCER_FIELDS = ("repository", "workflow", "run_id", "run_attempt", "url", "ar
 CHAIN_FIELDS = ("pull_request", "head_branch", "queue_run_id", "queue_run_attempt", "tree")
 
 
-def checkout_tree(sha: str) -> str:
-    """The git tree hash of this checkout's commit, which must be exactly `sha`; empty when it cannot be read."""
+def checkout_tree(sha: str, root: Path | None = None) -> str:
+    """The git tree hash of this checkout's commit, which must be exactly `sha`; empty when it cannot be read.
+
+    Git runs without replacement objects and without any inherited `GIT_*` setting, so neither can redirect it to
+    another repository or show another commit's tree."""
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+
     def git(*arguments: str) -> str:
-        return subprocess.run(["git", "-C", str(Path(__file__).resolve().parents[1]), *arguments], check=True,
-                              capture_output=True, text=True, timeout=60).stdout.strip()
+        return subprocess.run(["git", "-C", str(root or Path(__file__).resolve().parents[1]), *arguments], check=True,
+                              capture_output=True, text=True, timeout=60, env=environment).stdout.strip()
     try:
         return git("rev-parse", "--verify", "HEAD^{tree}") if git("rev-parse", "--verify", "HEAD") == sha else ""
     except (OSError, subprocess.SubprocessError):
         return ""
+
+
+def commit_tree(repository: str, sha: str) -> str:
+    """The git tree hash GitHub records for commit `sha` of `repository`, read anonymously from the public API (the
+    tested merge commit of a pull request is in no local history); empty when it cannot be read."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or not re.fullmatch(r"[a-f0-9]{40}", sha):
+        return ""
+    request = urllib.request.Request(f"https://api.github.com/repos/{repository}/git/commits/{sha}",
+                                     headers={"Accept": "application/vnd.github+json", "User-Agent": "deedkit-tiden-ci"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            commit = json.loads(response.read(1_000_000))
+        tree = str((commit.get("tree") or {}).get("sha", "")) if commit.get("sha") == sha else ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return tree if re.fullmatch(r"[a-f0-9]{40}", tree) else ""
 
 
 def source_path(value: str, root: Path) -> str:
@@ -338,9 +361,9 @@ def published_manifest(directory: Path, manifest: dict) -> dict:
     Git branch, CI URL and check row IDs become this push run's, and `tested_in` names the queue run attempt.
 
     A record with a `chain` instead names the pull request run the queue reused: its evidence is of the merge commit
-    that run tested, of the record's head branch, and is accepted only when the record's git tree hash is exactly
-    the tree of this checkout's commit, which must be the push commit. The published manifest then names the push
-    commit, and `tested_sha` the tested merge commit.
+    that run tested, of the record's head branch, and is accepted only when the git tree hash GitHub records for that
+    tested commit, the record's tree and the tree of this checkout's commit, which must be the push commit, are one
+    tree. The published manifest then names the push commit, and `tested_sha` the tested merge commit.
     """
     if not (directory / PUBLICATION).exists() and not (directory / PUBLICATION).is_symlink():
         return manifest
@@ -368,7 +391,7 @@ def published_manifest(directory: Path, manifest: dict) -> dict:
                       and tested == manifest.get("sha") != sha and manifest.get("event") == "pull_request"
                       and manifest.get("git_branch") == chain["head_branch"] and not merge_queue_run(manifest)
                       and re.fullmatch(r"[a-f0-9]{40}", chain["tree"]) is not None
-                      and checkout_tree(sha) == chain["tree"])
+                      and checkout_tree(sha) == chain["tree"] == commit_tree(repository, tested))
         valid = ((event, ref) == ("push", "refs/heads/main") and bool(RUN_ATTEMPT_URL.fullmatch(ci_url))
                  and re.fullmatch(r"[a-f0-9]{40}", sha) is not None
                  and {key: record.get(key) for key in ("schema", "event", "git_branch", "repository", "run_id",

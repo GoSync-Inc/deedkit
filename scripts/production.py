@@ -190,14 +190,24 @@ def queue_verification(sha, get):
     return queue
 
 
+def timestamp(value):
+    """An ISO 8601 GitHub timestamp ("...Z") as an aware datetime."""
+    moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if moment.tzinfo is None:
+        raise ValueError("a GitHub timestamp names its time zone")
+    return moment
+
+
 def queue_chain(sha, get, queue=None, jobs=None):
     """The merge queue run that reused a full pull request run for this commit, and that pull request run.
 
     Returns (queue run, pull request run, pull request number, head branch). The queue run must have passed `CI gate`
     with `checks / verify` skipped after its pull request reuse job, and not by its docs-only decision; the pull
     request must have merged as exactly this commit, and the latest run of its head must have passed every
-    `PULL_REQUEST_JOBS` job. The exact tree equality is the queue gate's (ANYM-358), checked again by the push run.
-    `queue` and `jobs`, when given, are the latest queue run and its attempt's jobs as just read (QueueSkipped).
+    `PULL_REQUEST_JOBS` job. That run must have been created before the queue run's latest attempt started: the queue
+    decision reuses only the latest pull request run of the head, so it is the run the decision evaluated (a rerun
+    attempt tests the same merge commit). The exact tree equality is the queue gate's (ANYM-358), checked again by the
+    push run. `queue` and `jobs`, when given, are the latest queue run and its attempt's jobs as just read.
     """
     if queue is None:
         queue = latest_run(sha, "merge_group", get)
@@ -224,6 +234,12 @@ def queue_chain(sha, get, queue=None, jobs=None):
     if run is None or (run.get("head_sha"), run.get("event"), run.get("head_branch"), run.get("status"),
                        run.get("conclusion"), (run.get("head_repository") or {}).get("full_name")) != expected:
         raise Refused("the latest pull request run of the merged head is not a completed success of this repository")
+    try:
+        decided = timestamp(run["created_at"]) <= timestamp(queue["run_started_at"])
+    except (KeyError, TypeError, ValueError):
+        decided = False
+    if not decided:
+        raise Refused("the latest pull request run of the merged head is not the one the merge queue decision evaluated")
     pull_jobs = attempt_jobs(run, get)
     for name in PULL_REQUEST_JOBS:
         if not job_concluded(pull_jobs, name):
@@ -242,6 +258,17 @@ def verify(sha, get=api):
     if (comparison.get("status") not in ("identical", "behind") or comparison.get("ahead_by") != 0
             or comparison.get("merge_base_commit", {}).get("sha") != sha):
         raise Refused("candidate is not a commit on main")
+    known = _verified.get(sha) if _verified is not None else None
+    if known and known.get("pull") is not None:
+        # Within one deploy run, a verification through the PR→queue chain re-reads the queue run, the pull request
+        # run and then the push run, each once and none of their jobs: a rerun or newer run of any of them, or a push
+        # run that changed at any time since it was verified, means a full verification. Reading the push run only
+        # last keeps plans A and B inside the host's anonymous quota.
+        if (unchanged(known["queue"], latest_run(sha, "merge_group", get))
+                and unchanged(known["pull"], latest_run(known["pull"]["head_sha"], "pull_request", get))
+                and unchanged(known["push"], latest_run(sha, "push", get))):
+            return known["result"]
+        known = None
     latest = latest_run(sha, "push", get)
     if latest is None:
         raise Refused("main has no CI push run for this exact commit")
@@ -250,15 +277,12 @@ def verify(sha, get=api):
             or latest.get("conclusion") != "success"
             or latest.get("head_repository", {}).get("full_name") != REPOSITORY):
         raise Refused("latest main CI run is not a completed success for this repository and commit")
-    known = _verified.get(sha) if _verified is not None else None
     if known and unchanged(known["push"], latest) and (known["queue"] is None or (
             unchanged(known["queue"], latest_run(sha, "merge_group", get))
             and unchanged(latest, latest_run(sha, "push", get)))):
         # Within one deploy run: the same completed attempts have the same jobs, so the runs are read again
         # but not their jobs (the host's anonymous GitHub quota is 60 requests an hour). After the queue read
-        # the push run is read once more, as the full path does, so a rerun between the reads is not missed. For the
-        # PR→queue chain the queue run that reused the pull request run is re-read, not the pull request run: its
-        # listing would make plans A and B exceed the quota, and the deploy's first verification read it in full.
+        # the push run is read once more, as the full path does, so a rerun between the reads is not missed.
         return known["result"]
     jobs = attempt_jobs(latest, get)
     verified_by, queue = latest, None
@@ -281,7 +305,8 @@ def verify(sha, get=api):
               "verify_run_id": verified_by["id"], "verify_run_attempt": verified_by["run_attempt"],
               "verify_run_url": verified_by["html_url"]}
     if _verified is not None:
-        _verified[sha] = {"push": latest, "queue": None if verified_by is latest else queue, "result": result}
+        _verified[sha] = {"push": latest, "queue": None if verified_by is latest else queue,
+                          "pull": verified_by if queue is not None and verified_by is not queue else None, "result": result}
     return result
 
 

@@ -204,18 +204,22 @@ latest attempt must have passed `CI gate` and `Reuse the pull request
 verification` with `checks / verify` skipped, never by a docs-only decision;
 the pull request named by its group ref must have merged into `main` as exactly
 this commit, and the latest run of its head must have passed every job a full
-pull request run needs. The job pins that run's latest attempt and its one
+pull request run needs and have been created before the queue run's latest
+attempt started, so it is the run the queue decision evaluated. The job pins that run's latest attempt and its one
 current artifact, validates the evidence by the rules above for the merge
 commit it tested and the pull request's head branch, and then requires that
 merge commit to be GitHub's merge of that head and its Git tree hash to equal
-this commit's tree in the API and in the job's own checkout. A changed queue or
+this commit's tree in the API and in the job's own checkout, read by Git
+without replacement objects or inherited `GIT_*` settings. A changed queue or
 pull request run, a rerun or any mismatch fails the push run. The record also
 names the pull request, its head branch, the queue run attempt and the tree;
-`tiden_ci.py publish` and `release` accept it only when their own checkout of
-this commit has exactly that tree. The Tiden run then names this commit, with
+`tiden_ci.py publish` and `release` accept it only when the tree GitHub records
+for the tested commit (one anonymous read of the public API), the record's tree
+and their own checkout's tree of this commit are one tree. The Tiden run then names this commit, with
 `tested_sha` the tested merge commit and `tested_in` the pull request run
 attempt. `production.py verify` follows the same chain to the pull request run
-when the push run skipped `checks / verify` after such a queue run.
+when the push run skipped `checks / verify` after such a queue run; within one
+deploy it re-reads the queue run, the pull request run and the push run.
 `tiden_ci.py publish` and `release` accept the record only when it names their
 own job's repository, run, attempt and commit. The Tiden run on `main`, its
 thirteen check row IDs and the release then carry this push run's attempt URL,

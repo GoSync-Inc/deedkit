@@ -278,10 +278,15 @@ def pinned_artifact(get, pin: dict, head_sha: str, kind: str):
     return current
 
 
-def checkout_tree(sha: str) -> str:
-    """The git tree hash of the checked-out commit, which must be exactly `sha`."""
+def checkout_tree(sha: str, root: Path | None = None) -> str:
+    """The git tree hash of the checked-out commit, which must be exactly `sha`. Git runs without replacement objects
+    and without any inherited `GIT_*` setting, so neither can redirect it or show another commit's tree."""
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+
     def git(*arguments: str) -> str:
-        return subprocess.run(["git", *arguments], check=True, capture_output=True, text=True, timeout=60).stdout.strip()
+        return subprocess.run(["git", "-C", str(root or Path.cwd()), *arguments], check=True, capture_output=True,
+                              text=True, timeout=60, env=environment).stdout.strip()
     if git("rev-parse", "--verify", "HEAD") != sha:
         raise Refused("the checkout is not this commit")
     return git("rev-parse", "--verify", "HEAD^{tree}")

@@ -326,7 +326,9 @@ skipped and no docs-only decision; the pull request named by its
 `gh-readonly-queue/main/pr-<N>-<sha>` branch merged into `main` as exactly this
 SHA from this repository; and the latest `pull_request` run of its head, on its
 head branch, completed successfully with `checks / verify`, `checks / load`,
-`checks / evidence` and `CI gate` passed in its latest attempt. Both runs are
+`checks / evidence` and `CI gate` passed in its latest attempt, and was created
+before the queue run's latest attempt started (the queue decision reuses only
+the latest run of the head, so this is the run it evaluated). Both runs are
 read again, and the result names the pull request run. The tree equality is
 the queue decision's, checked again by the main push run before it publishes.
 The public repository supports anonymous API reads; optional `GH_TOKEN` may be
@@ -577,7 +579,8 @@ Otherwise it:
 Within one run `verify()` reads the run and job listings once per SHA and
 afterwards re-reads only the runs (a completed attempt keeps its jobs; the push
 run is read again after the merge queue run; through the pull request chain the
-queue run is re-read, not the pull request run), so a deploy of plans A and B
+queue run, the pull request run and then the push run are each read once), so a
+deploy of plans A and B
 makes about 48 of the host's 60 anonymous requests an hour and starts only with
 52 left (plan B alone: 31, starts with 35); in practice at most one deploy an
 hour. These
