@@ -3287,12 +3287,6 @@
       "externalPath": "node:packages/npm/test/format-client.test.js"
     },
     {
-      "id": "212e3e49-5fdf-4310-a69e-9eb0e84463f0",
-      "signature": "node:packages/npm/test/operations-client.test.js::all_operation_sdk_methods_preserve_exact_payload_and_expose_29_tools",
-      "filePath": "packages/npm/test/operations-client.test.js",
-      "externalPath": "node:packages/npm/test/operations-client.test.js"
-    },
-    {
       "id": "d8638e87-4ec0-4bcb-af3c-b73a471b0fa1",
       "signature": "node:packages/npm/test/operations-client.test.js::executemessengeroperation_rejects_unknown_outer_arguments_before_transport",
       "filePath": "packages/npm/test/operations-client.test.js",
@@ -4835,12 +4829,6 @@
       "externalPath": "tests.test_operations_api"
     },
     {
-      "id": "77175b58-a707-4cdc-a812-16bdf684da85",
-      "signature": "tests.test_operations_api::test_operation_manifest_has_29_actual_tools_and_truthful_annotations",
-      "filePath": "tests/test_operations_api.py",
-      "externalPath": "tests.test_operations_api"
-    },
-    {
       "id": "1a9939c1-418b-4d8d-b08c-10a261f26dd4",
       "signature": "tests.test_operations_api::test_operation_required_fields_rejected_before_backend",
       "filePath": "tests/test_operations_api.py",
@@ -5919,12 +5907,6 @@
       "signature": "tests.test_whatsapp_lanes::test_send_receipt_arrives_while_background_media_is_unfinished",
       "filePath": "tests/test_whatsapp_lanes.py",
       "externalPath": "tests.test_whatsapp_lanes"
-    },
-    {
-      "id": "968bf626-5e8f-4f6d-a2ce-30ad990883cc",
-      "signature": "node:packages/npm/test/operations-client.test.js::all_operation_sdk_methods_preserve_exact_payload_and_expose_30_tools",
-      "filePath": "packages/npm/test/operations-client.test.js",
-      "externalPath": "node:packages/npm/test/operations-client.test.js"
     },
     {
       "id": "555539f9-fa5a-4cac-9ba0-8753237f3329",
