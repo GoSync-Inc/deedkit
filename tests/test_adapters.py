@@ -119,3 +119,102 @@ def test_whatsapp_round_video_is_a_video_with_observed_duration():
     assert e['metadata']['message_kind']=='video' and e['metadata']['provider_message_type']=='ptv'
     assert e['metadata']['media_duration_seconds']==9
     assert e['media']==[{'provider_id':'false_123@c.us_ROUND','filename':'round.bin','mime':'video/mp4','bytes':4096}]
+
+
+class NoRequestClient:
+    """Synthetic Telethon client: any request or lookup fails the test."""
+    _self_id=1
+
+    def __init__(self):
+        from telethon._updates import EntityCache
+        self._mb_entity_cache=EntityCache()
+
+    def __call__(self,*args,**kwargs):raise AssertionError('telegram_request')
+
+    def __getattr__(self,name):raise AssertionError('telegram_lookup:'+name)
+
+
+def forwarded_message(header,entities=()):
+    from telethon import types,utils
+    message=types.Message(id=19,peer_id=types.PeerUser(100),message='forwarded words',fwd_from=header,
+        from_id=types.PeerUser(100),date=datetime(2026,10,2,tzinfo=timezone.utc))
+    message._finish_init(NoRequestClient(),{utils.get_peer_id(e):e for e in entities},None)
+    return message
+
+
+@pytest.fixture()
+def forward_capture(monkeypatch):
+    monkeypatch.setenv('ANYMSG_CAPTURE_FORWARD_ORIGIN','1')
+
+
+def test_telegram_forward_from_user_keeps_original_sender_and_date(forward_capture):
+    from telethon import types
+    original=datetime(2026,9,1,8,30,tzinfo=timezone.utc)
+    header=types.MessageFwdHeader(date=original,from_id=types.PeerUser(555),from_name=None)
+    e=telegram_message('tg-owner',forwarded_message(header,[types.User(id=555,first_name='Synthetic',last_name='Author')]))
+    assert e['sender']=='100' and e['metadata']['forwarded'] is True
+    assert e['metadata']['forward_origin']=={'kind':'user','sender_id':'555','sender_name':'Synthetic Author',
+        'sent_at':original.isoformat(),'basis':'telegram_fwd_from'}
+
+
+def test_telegram_hidden_and_channel_forward_origin_invent_nothing(forward_capture):
+    from telethon import types
+    hidden=types.MessageFwdHeader(date=datetime(2026,9,1,tzinfo=timezone.utc),from_id=None,from_name='X')
+    origin=telegram_message('tg-owner',forwarded_message(hidden))['metadata']['forward_origin']
+    assert origin=={'kind':'hidden_user','sender_name':'X','sent_at':'2026-09-01T00:00:00+00:00','basis':'telegram_fwd_from'}
+    channel=types.MessageFwdHeader(date=datetime(2026,9,1,tzinfo=timezone.utc),from_id=types.PeerChannel(777),
+        channel_post=41,post_author='Synthetic Editor')
+    entity=types.Channel(id=777,title='Synthetic News',photo=types.ChatPhotoEmpty(),date=None,broadcast=True)
+    origin=telegram_message('tg-owner',forwarded_message(channel,[entity]))['metadata']['forward_origin']
+    assert origin=={'kind':'channel','chat_id':'-1000000000777','sender_name':'Synthetic News','provider_message_id':'41',
+        'post_author':'Synthetic Editor','sent_at':'2026-09-01T00:00:00+00:00','basis':'telegram_fwd_from'}
+    # Without a cached entity the channel is still named by its ID only.
+    origin=telegram_message('tg-owner',forwarded_message(channel))['metadata']['forward_origin']
+    assert origin['kind']=='channel' and origin['chat_id']=='-1000000000777' and 'sender_name' not in origin
+
+
+def test_telegram_forward_origin_makes_no_provider_request(forward_capture):
+    from telethon import types
+    header=types.MessageFwdHeader(date=datetime(2026,9,1,tzinfo=timezone.utc),from_id=types.PeerUser(555))
+    message=forwarded_message(header)
+    # The entity is not cached: the origin keeps the ID and never asks Telegram for the name.
+    origin=telegram_message('tg-owner',message)['metadata']['forward_origin']
+    assert origin['kind']=='user' and origin['sender_id']=='555' and 'sender_name' not in origin
+    with pytest.raises(AssertionError,match='telegram_request'):message._client(object())
+
+
+def test_forward_origin_capture_is_off_until_enabled(monkeypatch):
+    from telethon import types
+    monkeypatch.delenv('ANYMSG_CAPTURE_FORWARD_ORIGIN',raising=False)
+    header=types.MessageFwdHeader(date=datetime(2026,9,1,tzinfo=timezone.utc),from_id=types.PeerUser(555))
+    e=telegram_message('tg-owner',forwarded_message(header))
+    assert e['metadata']['forwarded'] is True and 'forward_origin' not in e['metadata']
+    event={'chatId':'1@c.us','messageId':'F','senderId':'1@c.us','body':'x','timestamp':1800000000,'forwarded':True,
+        'forwardOrigin':{'kind':'unknown','forwarding_score':4,'basis':'whatsapp_web_js_message'}}
+    # The server side always accepts an origin a collector captured.
+    assert whatsapp_message('wa-owner',event)['metadata']['forward_origin']=={'kind':'unknown','forwarding_score':4,
+        'basis':'whatsapp_web_js_message'}
+    assert 'forward_origin' not in whatsapp_message('wa-owner',{**event,'forwarded':False})['metadata']
+
+
+@pytest.mark.parametrize('origin',[
+    {'kind':'user','basis':'telegram_fwd_from','sender_avatar':'x'},
+    {'kind':'not_captured','basis':'telegram_fwd_from'},
+    {'kind':'user','basis':'guess'},
+    {'kind':'unknown','basis':'whatsmeow_context_info','provider_origin_type':'FRIEND'},
+    {'kind':'user','basis':'telegram_fwd_from','sender_name':'x'*257},
+    {'kind':'channel','basis':'telegram_fwd_from','chat_id':'1'*161},
+    {'kind':'unknown','basis':'whatsmeow_context_info','forwarding_score':-1},
+    {'kind':'unknown','basis':'whatsmeow_context_info','forwarding_score':True},
+    {'kind':'user','basis':'telegram_fwd_from','sent_at':'yesterday'},
+    'user'])
+def test_envelope_rejects_invalid_forward_origin(origin):
+    from messaging_service.envelope import validate
+    from test_archive import event
+    with pytest.raises(ValueError,match='^invalid_metadata$'):
+        validate(event(metadata={'forwarded':True,'forward_origin':origin}))
+    valid={'kind':'user','sender_id':'555','basis':'telegram_fwd_from'}
+    assert validate(event(metadata={'forwarded':True,'forward_origin':valid}))['metadata']['forward_origin']==valid
+    # An origin without the forwarded flag would present the sender as someone else.
+    with pytest.raises(ValueError,match='^invalid_metadata$'):
+        validate(event(metadata={'forwarded':False,'forward_origin':valid}))

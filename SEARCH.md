@@ -77,6 +77,53 @@ direction, and known reply/forward/media fields. Unknown metadata remains null.
 Older messages acquire provider metadata as they are observed again; this does
 not invent a new content revision.
 
+### Forwarded messages
+
+A forwarded message's `sender`, `sender_name` and `direction` describe the
+forwarder, not the author. Search, history, context and the reply-queue hint
+(`awaiting_reply.forward_origin` in the compact conversation view,
+`awaiting_reply_forward_origin` in full rows) mark every forwarded message with
+`authorship: forwarded_by_sender` and a `forward_origin` object, in compact and
+full detail. A message that is not forwarded has neither. An agent must not quote
+forwarded words as written by the sender; it names the origin, or says the
+author is unknown. `capabilities.search_options.forwarded_messages` states this
+rule.
+
+`forward_origin` holds only what the provider stated in the captured message:
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | `user`, `chat`, `channel`, `hidden_user`, `status`, `newsletter`, `unknown`, or `not_captured` |
+| `sender_id`, `sender_name` | Original sender ID and name (a channel or newsletter title for those kinds), from the message and the provider's cached entities only |
+| `chat_id`, `provider_message_id`, `post_author` | Origin chat or channel, the original post ID and the signed post author |
+| `sent_at` | Original send time, when the provider states it |
+| `forwarding_score`, `provider_origin_type` | WhatsApp forward count and the raw `ForwardOrigin` enum name (`UNKNOWN`, `CHAT`, `STATUS`, `CHANNELS`, `META_AI`, `UGC`) |
+| `basis` | `telegram_fwd_from`, `whatsmeow_context_info` or `whatsapp_web_js_message` |
+
+Telegram fills it from the update's `fwd_from` without a provider request:
+`hidden_user` when the original sender hid the link to their account (only the
+name is stated), `channel` or `chat` with the origin chat ID. WhatsApp does not
+carry the author of an ordinary chat forward: the native adapter states a
+`newsletter` origin with the newsletter JID, name and server message ID when
+present, otherwise `unknown` with the forwarding score; whatsapp-web.js states
+`unknown` with its cached score. Compact detail cuts `sender_name` and
+`post_author` to 64 characters. `not_captured` marks a message archived before
+origin capture: it is not a provider-hidden origin. It gains its origin only when
+ordinary capture or backfill reads it again, with the same revision and no
+message conflict; there is no bulk rewrite.
+
+`forward_origin.chat_id` and `sender_name` are provider data carried by the
+visible forwarded message. They are returned with it even when they name a chat
+the key cannot read, and never let the caller resolve, list or open that chat:
+`resolve_reference` and `get_context` keep their access checks and answer such a
+chat like one that does not exist.
+
+Collectors capture the origin only with `ANYMSG_CAPTURE_FORWARD_ORIGIN=1` in
+their environment; it is off by default. The server always accepts and returns a
+captured origin. Enable the flag only when the release a rollback would return to
+already contains this change: an older server rejects a capture that carries the
+origin, so the message would be skipped.
+
 MCP/REST `list_chats` defaults to recent activity order. `order: activity` and
 `order: last_activity_desc` are aliases; `order: id` retains stable catalogue
 traversal. Direct Store calls retain the legacy ID default. Restart pagination

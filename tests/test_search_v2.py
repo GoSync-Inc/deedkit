@@ -175,3 +175,113 @@ def test_people_transliteration_is_candidate_and_grouping_never_crosses_accounts
     s.set_access('candidate-reader',chats=[visible])
     limited=s.search_people(key,'Yuliya',transliterate=True,group_by_sender=True)
     assert len(limited['items'])==1 and len(limited['items'][0]['observations'])==1
+
+
+ORIGIN={'kind':'channel','chat_id':'-1000000000777','sender_name':'Synthetic News','provider_message_id':'41',
+    'post_author':'Synthetic Editor','sent_at':'2026-09-01T00:00:00+00:00','basis':'telegram_fwd_from'}
+
+
+@pytest.fixture()
+def forwards(seeded):
+    from messaging_service.archive import Archive
+    from test_archive import event
+    s,_,_=seeded
+    ar=Archive(s);ar.register('forward-tg','telegram','Synthetic forwards',discover=True)
+    def add(mid,body,chat='300',**metadata):
+        return ar.ingest(event(account='forward-tg',chat=chat,provider_id=mid,body=body,metadata=metadata))
+    return s,ar,add,event
+
+
+def forward_rows(s,key,message_id,chat):
+    from starlette.testclient import TestClient
+    from messaging_service.app import create_app
+    from test_client_contract import rpc
+    from test_compact_queue_rows import structured
+    with TestClient(create_app(s,['testserver'])) as client:
+        for detail in ('compact','full'):
+            for view in ('archive','conversation'):
+                common={'detail':detail,'view':view,'include_coverage':False}
+                result=structured(rpc(client,key,'search',{'query':'synthetic forwarded',**common}))
+                yield f'search/{detail}/{view}',result['items']
+                result=structured(rpc(client,key,'get_messages',{'chat_id':chat,**common}))
+                yield f'get_messages/{detail}/{view}',result['items']
+                result=structured(rpc(client,key,'get_context',{'message_id':message_id,**common}))
+                yield f'get_context/{detail}/{view}',[result['message'],*result['context']]
+
+
+def test_forwarded_message_states_origin_and_authorship_in_every_detail(forwards):
+    from messaging_service.envelope import stable_id
+    s,_,add,_=forwards
+    forwarded=add('1','synthetic forwarded words',forwarded=True,forward_origin=ORIGIN)['message']
+    plain=add('2','synthetic forwarded reply',forwarded=False)['message']
+    key=s.issue_key('forward-reader',['forward-tg'])
+    seen=set()
+    for name,rows in forward_rows(s,key,forwarded,stable_id('chat','forward-tg','300')):
+        by_id={row['id']:row for row in rows}
+        assert {forwarded,plain}<=set(by_id),name
+        assert by_id[forwarded]['authorship']=='forwarded_by_sender',name
+        assert by_id[forwarded]['forward_origin']==ORIGIN,name
+        assert 'forward_origin' not in by_id[plain] and 'authorship' not in by_id[plain],name
+        seen.add(name)
+    assert len(seen)==12
+
+
+def test_forwarded_message_stored_before_origin_capture_reports_not_captured(forwards):
+    s,ar,add,event=forwards
+    old=add('1','synthetic forwarded words',forwarded=True)
+    key=s.issue_key('forward-reader',['forward-tg'])
+    row=s.search(key,'synthetic forwarded')['items'][0]
+    assert row['forward_origin']=={'kind':'not_captured'} and row['authorship']=='forwarded_by_sender'
+    # Ordinary capture re-reads the unchanged message: same revision, no conflict, origin added.
+    again=ar.ingest(event(account='forward-tg',chat='300',provider_id='1',body='synthetic forwarded words',
+        metadata={'forwarded':True,'forward_origin':ORIGIN}))
+    assert again['outcome']=='unchanged'
+    row=s.search(key,'synthetic forwarded')['items'][0]
+    assert row['forward_origin']==ORIGIN and row['revision']==1
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM message_conflicts WHERE message=%s',(old['message'],)).fetchone()['n']==0
+        assert c.execute('SELECT count(*) AS n FROM message_revisions WHERE message=%s',(old['message'],)).fetchone()['n']==1
+
+
+def test_forward_origin_chat_grants_no_access(forwards):
+    from messaging_service.envelope import stable_id
+    s,_,add,_=forwards
+    forwarded=add('1','synthetic forwarded words',forwarded=True,forward_origin=ORIGIN)['message']
+    hidden=add('41','synthetic origin post',chat='-1000000000777')['message']
+    key=s.issue_key('forward-scoped',['forward-tg'],chats=[stable_id('chat','forward-tg','300')])
+    row=s.get_context(key,forwarded)['message']
+    assert row['forward_origin']['chat_id']=='-1000000000777' and row['forward_origin']['sender_name']=='Synthetic News'
+    def refusal(call):
+        with pytest.raises(APIError) as error:call()
+        return error.value.code,error.value.status
+    absent=refusal(lambda:s.resolve_reference(key,'forward-tg','-1000000000999'))
+    assert absent==('not_found',404)
+    assert refusal(lambda:s.resolve_reference(key,'forward-tg','-1000000000777'))==absent
+    assert refusal(lambda:s.resolve_reference(key,'forward-tg','-1000000000777','41'))==absent
+    assert refusal(lambda:s.get_context(key,hidden))==absent
+    assert [r['id'] for r in s.search(key,'synthetic')['items']]==[forwarded]
+
+
+def test_reply_queue_hint_states_forward_origin(forwards):
+    from starlette.testclient import TestClient
+    from messaging_service.app import create_app
+    from test_client_contract import rpc
+    from test_compact_queue_rows import structured
+    from datetime import timedelta
+    s,ar,_,event=forwards
+    at=(datetime.now(timezone.utc)-timedelta(hours=1)).replace(microsecond=0).isoformat()
+    def add(chat,mid,**metadata):
+        return ar.ingest(event(account='forward-tg',chat=chat,provider_id=mid,body='synthetic question?',
+            sent_at=at,updated_at=at,metadata={'chat_type':'private',**metadata}))['message']
+    forwarded=add('301','1',forwarded=True,forward_origin=ORIGIN)
+    plain=add('302','1')
+    key=s.issue_key('forward-queue',['forward-tg'])
+    full={r['awaiting_reply_message_id']:r for r in s.list_chats(key,awaiting_reply=True,include_coverage=False)['items']}
+    assert full[forwarded]['awaiting_reply_forward_origin']==ORIGIN
+    assert full[forwarded]['awaiting_reply_authorship']=='forwarded_by_sender'
+    assert 'awaiting_reply_forward_origin' not in full[plain]
+    with TestClient(create_app(s,['testserver'])) as client:
+        items=structured(rpc(client,key,'list_chats',{'awaiting_reply':True,'view':'conversation','include_coverage':False}))['items']
+    hints={r['awaiting_reply']['message_id']:r['awaiting_reply'] for r in items}
+    assert hints[forwarded]['forward_origin']==ORIGIN and hints[forwarded]['authorship']=='forwarded_by_sender'
+    assert 'forward_origin' not in hints[plain] and 'authorship' not in hints[plain]

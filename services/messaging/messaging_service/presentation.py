@@ -49,6 +49,15 @@ def file_summary(row):
     return result
 
 
+def forward_fields(row):
+    """A forwarded message's sender is the forwarder; the origin names the stated author."""
+    if row.get('forwarded') is not True or not row.get('forward_origin'):return {}
+    origin=dict(row['forward_origin'])
+    for key in ('sender_name','post_author'):
+        if key in origin:origin[key]=origin[key][:64]
+    return {'forward_origin':origin,'authorship':row.get('authorship') or 'forwarded_by_sender'}
+
+
 def message_summary(row):
     result={k:row[k] for k in MESSAGE_FIELDS if k in row and row[k] is not None}
     if row.get('conversation_view_version')==1:
@@ -58,6 +67,7 @@ def message_summary(row):
         result['formatting']=summary(result['formatting'])
     for key,maximum in [('sender_name',64),('username',64),('chat_title',72)]:
         if key in result:result[key]=result[key][:maximum]
+    result.update(forward_fields(row))
     snippet=row.get('snippet') or row.get('body') or ''
     files=row.get('attachments') or []
     if not snippet and (files or row.get('media_kind')):
@@ -111,6 +121,7 @@ def lean_message(row, *, search=False, files=True):
         result['snippet']=snippet[start:start+160]
     for flag in ('mentions_owner','reply_to_owner','forwarded'):
         if row.get(flag) is True:result[flag]=True
+    result.update(forward_fields(row))
     if row.get('reply_to_provider_id'):result['reply_to_provider_id']=row['reply_to_provider_id']
     if row.get('agent_send'):
         result['agent_send']={k:row['agent_send'][k] for k in ('send_id','basis') if k in row['agent_send']}
@@ -203,6 +214,8 @@ def lean_chat(row):
             hint['display_text']=result.pop('last_message')['display_text']
             if last.get('truncated'):hint['truncated']=True
         else:hint['display_text']=(row.get('awaiting_reply_snippet') or '')[:160]
+        hint.update(forward_fields({'forwarded':True,'forward_origin':row.get('awaiting_reply_forward_origin'),
+            'authorship':row.get('awaiting_reply_authorship')}))
         if hint['sent_at']==result.get('last_activity'):hint.pop('sent_at')
         result['awaiting_reply']={k:v for k,v in hint.items() if v is not None}
     for key in ('last_message','awaiting_reply'):

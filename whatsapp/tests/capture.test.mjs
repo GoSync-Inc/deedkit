@@ -154,3 +154,19 @@ test('owner cache lookup reads only authenticated account identities',async()=>{
     assert.deepEqual(cachedOwnerIds(),[]);
   }finally{delete globalThis.window;}
 });
+
+test('a forwarded message states an unknown origin with its cached score only when capture is enabled',()=>{
+  const msg={id:{fromMe:false,remote:'42@c.us',id:'F'},from:'42@c.us',fromMe:false,body:'forwarded words',
+    timestamp:1800000000,type:'chat',hasMedia:false,isForwarded:true,forwardingScore:4};
+  const saved=process.env.ANYMSG_CAPTURE_FORWARD_ORIGIN;
+  try {
+    delete process.env.ANYMSG_CAPTURE_FORWARD_ORIGIN;
+    assert.equal('forwardOrigin' in event(msg),false);
+    process.env.ANYMSG_CAPTURE_FORWARD_ORIGIN='1';
+    assert.deepEqual(event(msg).forwardOrigin,{kind:'unknown',basis:'whatsapp_web_js_message',forwarding_score:4});
+    assert.deepEqual(event({...msg,forwardingScore:undefined}).forwardOrigin,{kind:'unknown',basis:'whatsapp_web_js_message'});
+    assert.equal('forwardOrigin' in event({...msg,isForwarded:false}),false);
+  } finally {
+    if(saved===undefined)delete process.env.ANYMSG_CAPTURE_FORWARD_ORIGIN;else process.env.ANYMSG_CAPTURE_FORWARD_ORIGIN=saved;
+  }
+});

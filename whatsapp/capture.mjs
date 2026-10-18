@@ -103,6 +103,13 @@ export function event(message, body=undefined, ownerIds=[]) {
     mediaKind:({image:'photo',video:'video',ptv:'video',audio:'audio',ptt:'voice',document:'document',sticker:'sticker',gif:'animation'})[message.type] || (message.hasMedia?'other':null),
     filesize:Number.isSafeInteger(raw.size) && raw.size>=0 && raw.size<=MAX_MEDIA_BYTES?raw.size:null,
     editedTimestampMs:message.latestEditSenderTimestampMs || raw.latestEditSenderTimestampMs || null};
+  // Off until the release a rollback would return to accepts forwardOrigin (SEARCH.md).
+  if (value.forwarded===true && process.env.ANYMSG_CAPTURE_FORWARD_ORIGIN==='1') {
+    // WhatsApp does not state who wrote an ordinary forward; only the cached score is known.
+    const score=message.forwardingScore;
+    value.forwardOrigin={kind:'unknown',basis:'whatsapp_web_js_message',
+      ...(Number.isSafeInteger(score) && score>=0 && score<2**32?{forwarding_score:score}:{})};
+  }
   if (!Number.isSafeInteger(value.timestamp) || value.timestamp<=0 || value.timestamp>MAX_UNIX)
     throw new Error('invalid_provider_time');
   if (!envelopeReference(value.messageId) || (value.senderId!=='' && !envelopeReference(value.senderId,MAX_SENDER)) ||

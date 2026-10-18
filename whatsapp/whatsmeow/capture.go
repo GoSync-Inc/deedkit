@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -28,6 +29,7 @@ const (
 	maxEnvelopeMime       = 127
 	maxEnvelopeProviderID = 256
 	maxEnvelopeSender     = 160
+	maxForwardName        = 256
 	maxEnvelopeMediaBytes = 8 << 30
 	maxEnvelopeUnix       = 253402300799 // 9999-12-31T23:59:59Z, Python datetime bound
 )
@@ -58,6 +60,39 @@ func envelopeText(s string, limit int) string {
 // unchanged. References are never truncated: a shortened ID names another message.
 func envelopeIdentifier(s string, limit int) bool {
 	return s != "" && utf8.ValidString(s) && !strings.ContainsRune(s, 0) && utf8.RuneCountInString(s) <= limit
+}
+
+// forwardOriginCapture stays off until the release a rollback would return to
+// accepts forwardOrigin (SEARCH.md, ANYMSG_CAPTURE_FORWARD_ORIGIN).
+func forwardOriginCapture() bool {
+	return os.Getenv("ANYMSG_CAPTURE_FORWARD_ORIGIN") == "1"
+}
+
+// nativeForwardOrigin reports only what ContextInfo states. WhatsApp does not
+// carry the author of an ordinary chat forward, so that origin stays unknown.
+func nativeForwardOrigin(ctx *waE2E.ContextInfo) map[string]any {
+	origin := map[string]any{"kind": "unknown", "basis": "whatsmeow_context_info"}
+	if ctx.ForwardingScore != nil {
+		origin["forwarding_score"] = ctx.GetForwardingScore()
+	}
+	if ctx.ForwardOrigin != nil {
+		// A value outside the archive's closed enum is omitted, never renamed.
+		switch v := ctx.GetForwardOrigin(); v {
+		case waE2E.ContextInfo_UNKNOWN, waE2E.ContextInfo_CHAT, waE2E.ContextInfo_STATUS, waE2E.ContextInfo_CHANNELS, waE2E.ContextInfo_META_AI, waE2E.ContextInfo_UGC:
+			origin["provider_origin_type"] = v.String()
+		}
+	}
+	if n := ctx.GetForwardedNewsletterMessageInfo(); n != nil && envelopeIdentifier(n.GetNewsletterJID(), maxEnvelopeSender) {
+		origin["kind"] = "newsletter"
+		origin["chat_id"] = n.GetNewsletterJID()
+		if name := envelopeText(n.GetNewsletterName(), maxForwardName); name != "" {
+			origin["sender_name"] = name
+		}
+		if n.ServerMessageID != nil {
+			origin["provider_message_id"] = strconv.Itoa(int(n.GetServerMessageID()))
+		}
+	}
+	return origin
 }
 
 // envelopeMime keeps only the media type and falls back to the generic type when
@@ -251,6 +286,7 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 	m := e.Message
 	body, kind, media := "", "unknown", ""
 	var filename, mime, size, duration, reply, mentions, replyOwner, forwarded, edited any
+	var forwardOrigin map[string]any
 	if e.IsEdit && e.Info.MsgBotInfo.EditSenderTimestampMS.UnixMilli() > 0 {
 		edited = envelopeEditStamp(e.Info.MsgBotInfo.EditSenderTimestampMS.UnixMilli(), e.Info.Timestamp.Unix())
 	}
@@ -349,6 +385,9 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 		}
 		if ctx := messageContext(m); ctx != nil {
 			forwarded = ctx.GetIsForwarded()
+			if ctx.GetIsForwarded() && forwardOriginCapture() {
+				forwardOrigin = nativeForwardOrigin(ctx)
+			}
 			// An unarchivable reference is omitted, never shortened into another ID.
 			if envelopeIdentifier(ctx.GetStanzaID(), maxEnvelopeProviderID) {
 				reply = ctx.GetStanzaID()
@@ -419,7 +458,12 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 	if pair := observedPair(e.Info.Chat, e.Info.RecipientAlt, at); pair != nil && LegacyChatID(e.Info.Chat) != LegacyChatID(e.Info.Sender) {
 		observations = append(observations, pair)
 	}
-	return map[string]any{"chatId": chat, "chatName": chat, "messageId": messageID, "messageType": kind, "timestampResolution": "second", "durationSeconds": duration, "isService": service, "isSelfChat": self, "senderId": sender, "senderName": envelopeText(e.Info.PushName, maxEnvelopeSenderName), "body": body, "timestamp": e.Info.Timestamp.Unix(), "fromMe": e.Info.IsFromMe, "hasMedia": media != "", "filename": filename, "mimetype": mime, "filesize": size, "replyToId": reply, "mentionsOwner": mentions, "replyToOwner": replyOwner, "forwarded": forwarded, "mediaKind": nilString(media), "editedTimestampMs": edited, "identityObservations": observations, "formatting": formatting}, nil
+	value := map[string]any{"chatId": chat, "chatName": chat, "messageId": messageID, "messageType": kind, "timestampResolution": "second", "durationSeconds": duration, "isService": service, "isSelfChat": self, "senderId": sender, "senderName": envelopeText(e.Info.PushName, maxEnvelopeSenderName), "body": body, "timestamp": e.Info.Timestamp.Unix(), "fromMe": e.Info.IsFromMe, "hasMedia": media != "", "filename": filename, "mimetype": mime, "filesize": size, "replyToId": reply, "mentionsOwner": mentions, "replyToOwner": replyOwner, "forwarded": forwarded, "mediaKind": nilString(media), "editedTimestampMs": edited, "identityObservations": observations, "formatting": formatting}
+	if forwardOrigin != nil {
+		// Present only when captured, so an older reader never meets the field (rollback).
+		value["forwardOrigin"] = forwardOrigin
+	}
+	return value, nil
 }
 func lidEmpty(ids []types.JID) bool {
 	for _, id := range ids {

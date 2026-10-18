@@ -14,11 +14,19 @@ JOINS = '''JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
         AND source.account=m.account AND source.chat=m.chat AND source.sender=m.sender AND NOT source.deleted)
     LEFT JOIN message_revisions mr ON mr.message=m.id AND mr.revision=m.revision
     LEFT JOIN message_metadata mm ON mm.message=m.id AND mm.revision=m.revision'''
+# A forwarded message stored before origin capture reports not_captured, never a guess.
+FORWARD = '''CASE WHEN coalesce(mm.metadata,mr.snapshot->'metadata')->'forwarded'='true'::jsonb
+      THEN CASE WHEN jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'forward_origin')='object'
+        THEN coalesce(mm.metadata,mr.snapshot->'metadata')->'forward_origin'
+        ELSE '{"kind":"not_captured"}'::jsonb END END AS forward_origin,
+    CASE WHEN coalesce(mm.metadata,mr.snapshot->'metadata')->'forwarded'='true'::jsonb
+      THEN 'forwarded_by_sender'::text END AS authorship'''
 META = '''nullif(sp.display_name,'') AS sender_name,nullif(sp.username,'') AS username,
     '''+title_sql('ch')+''' AS chat_title,ch.chat_type,ch.provider_chat AS provider_chat_id,m.provider_id,
     coalesce(mm.metadata,mr.snapshot->'metadata')->>'reply_to_provider_id' AS reply_to_provider_id,
     CASE WHEN jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'forwarded')='boolean'
       THEN (coalesce(mm.metadata,mr.snapshot->'metadata')->>'forwarded')::boolean END AS forwarded,
+    '''+FORWARD+''',
     CASE WHEN jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'mentions_owner')='boolean'
       THEN (coalesce(mm.metadata,mr.snapshot->'metadata')->>'mentions_owner')::boolean END AS mentions_owner,
     CASE WHEN jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'reply_to_owner')='boolean'
@@ -37,6 +45,28 @@ META = '''nullif(sp.display_name,'') AS sender_name,nullif(sp.username,'') AS us
 BASE = 'm.id,m.account,m.chat,m.sender,m.body,m.sent_at,m.revision,m.direction'
 
 
+def forward_presence(rows):
+    # Only a forwarded message carries an origin and the authorship marker, in every detail level.
+    for row in rows:
+        for key in ('forward_origin','authorship'):
+            if row.get(key) is None:row.pop(key,None)
+    return rows
+
+
+def hint_forward_origin(c, rows):
+    """The reply-queue hint states the origin of its forwarded message (rows already authorized)."""
+    ids=[r['awaiting_reply_message_id'] for r in rows if r.get('awaiting_reply_message_id')]
+    found={r['id']:r for r in c.execute('SELECT m.id,'+FORWARD+' FROM messages m '
+        'LEFT JOIN message_revisions mr ON mr.message=m.id AND mr.revision=m.revision '
+        'LEFT JOIN message_metadata mm ON mm.message=m.id AND mm.revision=m.revision WHERE m.id=ANY(%s)',(ids,))} if ids else {}
+    for row in rows:
+        origin=found.get(row.get('awaiting_reply_message_id')) or {}
+        if origin.get('forward_origin'):
+            row['awaiting_reply_forward_origin']=origin['forward_origin']
+            row['awaiting_reply_authorship']=origin['authorship']
+    return rows
+
+
 def enrich(c, rows, p):
     """Rows were individually authorized; metadata comes from the same chat.
 
@@ -46,7 +76,7 @@ def enrich(c, rows, p):
         return rows
     metadata=c.execute('SELECT m.id,m.account,m.chat,m.sender,'+META+' FROM messages m '+JOINS+' WHERE m.id=ANY(%s)',
         ([r['id'] for r in rows],)).fetchall()
-    resolve(c,p,metadata)
+    resolve(c,p,forward_presence(metadata))
     by_id={r['id']:r for r in metadata}
     for row in rows:
         row.update(by_id.get(row['id'],{}))
@@ -192,7 +222,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         current_snapshot=fingerprint({'n':rows[0]['snapshot_count'],'checksum':rows[0]['snapshot_checksum']})
         if snapshot is not None and snapshot!=current_snapshot:raise APIError('cursor_changed',409)
         snapshot=current_snapshot
-    items=resolve(c,p,rows[:limit])
+    items=resolve(c,p,forward_presence(rows[:limit]))
     next_cursor=None
     if len(rows)>limit:
         last=items[-1]
