@@ -111,7 +111,8 @@ def test_only_a_main_push_runs_the_publish_job_and_only_it_can_write():
     job = ci["jobs"]["publish"]
     # A single job whose exact name production.py can require, after every verification passed.
     assert job["name"] == "publish" and "strategy" not in job and job["needs"] == ["gate"]
-    assert job["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    assert job["if"] == ("${{ !cancelled() && needs.gate.result == 'success' "
+                         "&& github.event_name == 'push' && github.ref == 'refs/heads/main' }}")
     assert job["permissions"] == {"contents": "read", "packages": "write", "id-token": "write", "attestations": "write"}
     writable = {"packages", "id-token", "attestations", "artifact-metadata", "contents", "actions"}
     for workflow in (ci, images):
