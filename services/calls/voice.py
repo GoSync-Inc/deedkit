@@ -18,7 +18,7 @@ from pipecat.workers.runner import WorkerRunner
 
 from core import TOOL_MODELS
 from audio_health import RuntimeAudioHealth
-from audio_probe import PCMProbe
+from audio_probe import PCMProbe, diagnostics
 from call_errors import record_model_error
 
 
@@ -195,7 +195,7 @@ async def run_transport(transport,brief,key,state,browser=False):
     live_flows=brief.get('dialog_engine')=='gemini_live_flows'
     ending_tasks=[]
     runtime_health=RuntimeAudioHealth()
-    inbound_audio=PCMProbe()
+    inbound_audio=diagnostics(PCMProbe)
 
     async def handle(name,params):
         if name=='consult_supervisor' and state.get('supervisor'):

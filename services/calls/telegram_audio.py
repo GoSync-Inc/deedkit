@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from core import ACTIVE, ServiceError
-from audio_probe import PCMProbe
+from audio_probe import PCMProbe, diagnostics
 from telegram_broker import BrokerClient
 
 
@@ -117,17 +117,6 @@ def pcm_transport(send,ready_callback):
         def input(self): return self.i
         def output(self): return self.o
     return Transport()
-
-
-class NoDiagnostics:
-    # Stands in when a diagnostics constructor fails: every method is a no-op and every snapshot is empty.
-    def __getattr__(self,name): return lambda *args,**kwargs:{}
-
-
-def diagnostics(factory):
-    # Diagnostics are best effort: a constructor failure must never break call setup.
-    try: return factory()
-    except Exception: return NoDiagnostics()
 
 
 class TelegramCalls:

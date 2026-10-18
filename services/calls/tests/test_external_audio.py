@@ -215,3 +215,28 @@ async def test_a_failing_final_telegram_audio_metrics_write_never_skips_stop(mon
     calls=telegram_audio.TelegramCalls({},Reading(),lambda:'synthetic-key',None)
     await calls._run('fixture',SimpleNamespace(),{'brief':{'max_duration_secs':5},'audio_probe':BrokenSnapshot(),'media':BrokenSnapshot()})
     assert stops==[('fixture','disconnected')]
+
+
+async def test_a_failing_final_telegram_audio_result_write_or_media_snapshot_never_skips_stop(monkeypatch):
+    import telegram_audio
+    import voice
+
+    stops=[];called=[]
+    class Service:
+        def get_call(self,cid):return {'metrics':{}}
+        def result(self,cid,**kwargs):
+            called.append('result');raise RuntimeError('synthetic result write failure')
+        def stop(self,cid,reason):stops.append((cid,reason))
+    class Probe:
+        def snapshot(self):return {}
+    class BrokenMedia:
+        def snapshot(self):
+            called.append('media');raise RuntimeError('synthetic media snapshot failure')
+    async def finished(*args,**kwargs):pass
+    monkeypatch.setattr(voice,'run_transport',finished)
+    calls=telegram_audio.TelegramCalls({},Service(),lambda:'synthetic-key',None)
+    await calls._run('fixture',SimpleNamespace(),{'brief':{'max_duration_secs':5},'audio_probe':Probe(),'media':Probe()})
+    assert called==['result'] and stops==[('fixture','disconnected')]
+    called.clear();stops.clear()
+    await calls._run('fixture',SimpleNamespace(),{'brief':{'max_duration_secs':5},'audio_probe':Probe(),'media':BrokenMedia()})
+    assert called==['media'] and stops==[('fixture','disconnected')]
