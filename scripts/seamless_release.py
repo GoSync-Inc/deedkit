@@ -484,6 +484,8 @@ def validate_prepared(settings, receipt):
         if actual['Id'] != image or labels.get('org.opencontainers.image.revision') != receipt['sha'] or labels.get('org.opencontainers.image.source') != 'https://github.com/' + p.REPOSITORY:
             raise Refused('prepared HTTP image identity changed')
     for project, item in zip(settings['projects'], receipt['baseline'], strict=True):
+        if p.legacy_identities(item['running']):
+            raise Refused('HTTP baseline was prepared by an older production.py with order-dependent container settings; prepare again')
         document, running = p.snapshot(project)
         if item['name'] != project['name'] or p.digest(document) != item['before_digest'] or running != item['running']:
             raise Refused('existing HTTP runtime/configuration changed')

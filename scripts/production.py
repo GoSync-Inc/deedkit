@@ -266,14 +266,29 @@ def snapshot(project):
     return document, running
 
 
+# Version of the container settings digest. Unversioned digests came from a tool that hashed Mounts, Links and
+# Ulimits in the order docker happened to return them; they cannot be compared and are refused explicitly.
+SETTINGS_VERSION = "v2:"
+
+
+def canonical_list(value):
+    return sorted(value, key=lambda item: json.dumps(item, sort_keys=True)) if isinstance(value, list) else value
+
+
 def container_settings(inspected):
     """A digest of a container's configuration, including what `docker update` changes in place (resources,
     restart policy), so drift without a new container or image is visible. Receipts keep the digest only.
-    Docker returns Mounts in no stable order, so they are compared as a set."""
+    Docker returns Mounts, HostConfig.Links and inherited HostConfig.Ulimits in no stable order: they are sets."""
     value = {key: inspected.get(key) for key in ("Config", "HostConfig", "Mounts")}
-    if isinstance(value["Mounts"], list):
-        value["Mounts"] = sorted(value["Mounts"], key=lambda mount: json.dumps(mount, sort_keys=True))
-    return digest(value)
+    value["Mounts"] = canonical_list(value["Mounts"])
+    if isinstance(value["HostConfig"], dict):
+        value["HostConfig"] = {**value["HostConfig"], **{key: canonical_list(value["HostConfig"][key])
+                                                          for key in ("Links", "Ulimits") if key in value["HostConfig"]}}
+    return SETTINGS_VERSION + digest(value)
+
+
+def legacy_identities(running):
+    return any(not str(identity.get("settings", "")).startswith(SETTINGS_VERSION) for identity in running.values())
 
 
 # The runtime's data/config mount roots, never executable roots.
@@ -684,6 +699,8 @@ def apply(settings, sha):
         if (actual["Id"] != image or actual["Config"].get("Labels", {}).get("org.opencontainers.image.revision") != sha):
             raise Refused("prepared image is missing or has the wrong source revision")
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
+        if legacy_identities(item["running"]):
+            raise Refused("prepared by an older production.py with order-dependent container settings; prepare again")
         document, running = snapshot(project)
         if (item["name"] != project["name"] or digest(document) != item["before_digest"]
                 or running != item["running"] or digest(read(item["file"])) != item["digest"]):
@@ -768,6 +785,9 @@ def rollback(settings, sha):
             raise Refused("rollback data does not match the selected production configuration")
         if not before.exists() or digest(read(before)) != item["before_file_digest"]:
             raise Refused("the before-release snapshot is missing or was modified")
+        if legacy_identities(item["running"]):
+            raise Refused("rollback data was written by an older production.py with order-dependent container settings; "
+                          "use the manual procedure (platform-cutover.md)")
         document, running = snapshot(project)
         if digest(document) != item["after_digest"] or running != item["running"]:
             raise Refused("production changed since this release was applied")

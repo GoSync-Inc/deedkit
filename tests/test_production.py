@@ -1615,3 +1615,35 @@ def test_container_settings_ignore_the_order_docker_returns_mounts_in():
     assert p.container_settings({**inspected, "Mounts": mounts[:3]}) != digest
     assert p.container_settings({**inspected, "Mounts": [*mounts[:3], {**mounts[3], "RW": True}]}) != digest
     assert p.container_settings({**inspected, "Config": {"Env": ["A=2"]}}) != digest
+    # Legacy links and inherited ulimits come from map iteration too.
+    host = {"RestartPolicy": {"Name": "no"}, "Links": ["/x:/y/x", "/z:/y/z"],
+            "Ulimits": [{"Name": "nofile", "Soft": 1, "Hard": 2}, {"Name": "nproc", "Soft": 3, "Hard": 4}]}
+    reordered = {**host, "Links": host["Links"][::-1], "Ulimits": host["Ulimits"][::-1]}
+    assert p.container_settings({**inspected, "HostConfig": host}) == p.container_settings({**inspected, "HostConfig": reordered})
+
+
+def test_an_apply_or_rollback_record_from_the_order_dependent_digest_is_refused_with_its_remedy(tmp_path, monkeypatch):
+    # A record written by the earlier tool (unversioned digest) is never compared with today's digest.
+    host = Host(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    receipt = p.read(host.state / RELEASES[0] / "prepared.json")
+    for identity in receipt["projects"][0]["running"].values():
+        identity["settings"] = identity["settings"].removeprefix(p.SETTINGS_VERSION)
+    p.write(host.state / RELEASES[0] / "prepared.json", receipt)
+    host.calls.clear()
+    with pytest.raises(p.Refused, match="older production.py .* prepare again"):
+        p.apply(host.settings, RELEASES[0])
+    assert host.mutations() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
+    (tmp_path / "rollback").mkdir()
+    host = Host(tmp_path / "rollback", monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    result = p.read(host.state / RELEASES[1] / "result.json")
+    for identity in result["rollback"]["projects"][0]["running"].values():
+        identity["settings"] = identity["settings"].removeprefix(p.SETTINGS_VERSION)
+    p.write(host.state / RELEASES[1] / "result.json", result)
+    host.calls.clear()
+    with pytest.raises(p.Refused, match="older production.py .* manual procedure"):
+        p.rollback(host.settings, RELEASES[1])
+    assert host.mutations() == []
