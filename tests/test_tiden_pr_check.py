@@ -317,18 +317,38 @@ def test_many_block_comments_without_a_call_scan_in_linear_time():
 
 
 
-# spec: ANYM-405
-def test_only_a_tiden_cli_failure_matches_the_workflow_warning_pattern(repo, server, tmp_path):
+def pr_check_job():
     import yaml
-    steps = yaml.safe_load((Path(ROOT_SCRIPT).parents[1] / ".github/workflows/checks.yml").read_text()
-                           )["jobs"]["tiden_pr"]["steps"]
-    step = next(step for step in steps if step.get("id") == "check")
-    assert [other.get("id") for other in steps if "TIDEN_API_TOKEN" in str(other.get("env"))] == ["check"]
-    pattern = next(line.strip()[len("pattern='"):-1] for line in step["run"].splitlines()
-                   if line.strip().startswith("pattern='"))
+    return yaml.safe_load((Path(ROOT_SCRIPT).parents[1] / ".github/workflows/checks.yml").read_text())["jobs"]["tiden_pr"]
 
-    def warns(line):  # the step's own test: bash ERE, the whole last line
-        return subprocess.run(["bash", "-c", 'pattern=$1; [[ $2 =~ $pattern ]]', "-", pattern, line]).returncode == 0
+
+def outcome(tmp_path, lines, status):
+    """Run the workflow's check step with the script replaced by one that prints `lines` and exits `status`."""
+    step = next(step for step in pr_check_job()["steps"] if step.get("id") == "check")
+    work = tmp_path / f"step-{len(list(tmp_path.glob('step-*')))}"
+    (work / "scripts").mkdir(parents=True)
+    (work / "bin").mkdir()
+    (work / "bin/python").symlink_to(sys.executable)
+    (work / "scripts/tiden_pr_check.py").write_text(
+        f"import sys\nprint({json.dumps(chr(10).join(lines))})\nsys.exit({status})\n")
+    output = work / "output"
+    completed = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, capture_output=True, text=True, env={
+        "RUNNER_TEMP": str(work), "GITHUB_OUTPUT": str(output), "PATH": f"{work / 'bin'}:/usr/bin:/bin"})
+    assert completed.returncode == 0, completed.stderr
+    return output.read_text().strip()
+
+
+# spec: ANYM-405
+def test_only_a_verdict_fails_the_pr_check_job_and_anything_else_warns(repo, server, tmp_path):
+    job = pr_check_job()
+    steps = {step.get("id"): step for step in job["steps"]}
+    assert [step.get("id") for step in job["steps"] if "TIDEN_API_TOKEN" in str(step.get("env"))] == ["check"]
+    assert steps["check"]["continue-on-error"] is True and steps["install"]["continue-on-error"] is True
+    assert steps["check"]["if"] == "steps.install.outcome == 'success'"
+    assert next(step for step in job["steps"] if step.get("name") == "Fail on the verdict")["if"] == \
+        "steps.check.outputs.outcome == 'failed'"
+    assert "outcome != 'passed' && steps.check.outputs.outcome != 'failed'" in steps["warn"]["if"]
+    assert sum(step["timeout-minutes"] for step in job["steps"]) < job["timeout-minutes"]
 
     root, base = repo
     commit(root, {"tests/test_new.py": "def test_new():\n    pass\n"}, "change")
@@ -338,17 +358,28 @@ def test_only_a_tiden_cli_failure_matches_the_workflow_warning_pattern(repo, ser
     env = {"GITHUB_EVENT_PATH": str(event), "TIDEN_PRODUCT_ID": "product", "TIDEN_API_TOKEN": SECRET,
            "FAKE_TIDEN_STATE": str(server.path), "PATH": "/usr/bin:/bin"}
 
-    def last_line(**state):
+    def real(cli=str(server.cli), **state):
         server.set(main=[spec(12)], **state)
-        completed = subprocess.run([sys.executable, ROOT_SCRIPT, "--root", str(root), "--cli", str(server.cli)],
+        completed = subprocess.run([sys.executable, ROOT_SCRIPT, "--root", str(root), "--cli", cli],
                                    capture_output=True, text=True, env=env)
-        assert completed.returncode == 1, completed.stdout + completed.stderr
-        return completed.stdout.splitlines()[-1]
+        return completed.stdout.splitlines(), completed.returncode
 
-    assert warns(last_line(fault={"spec list": "exit"}))
-    assert warns(last_line(fault={"spec list": "garbage"}))
-    verdict = last_line(fault={})
-    assert verdict.startswith("Fix the pull request body") and not warns(verdict)
-    for refusal in ("Refused: tiden spec list exited 1 (x)", "Refused: tiden spec/list exited 1.py does not parse",
-                    "Refused: the spec listing of tiden spec list exited 1 is incomplete", "tiden spec list timed out"):
-        assert not warns(refusal)
+    assert outcome(tmp_path, *real(fault={})) == "outcome=failed"
+    assert outcome(tmp_path, *real(fault={"spec list": "exit"})) == "outcome=unchecked"
+    assert outcome(tmp_path, *real(fault={"spec list": "garbage"})) == "outcome=unchecked"
+    assert outcome(tmp_path, *real(cli=str(tmp_path / "missing-cli"), fault={})) == "outcome=unchecked"
+    commit(root, {"tests/test_new.py": "# spec: ANYM-12\ndef test_new():\n    pass\n"}, "marked")
+    assert outcome(tmp_path, *real(fault={})) == "outcome=passed"
+    commit(root, {"tests/test_bad.py": "def test_bad(:\n    pass\n"}, "unparseable")
+    lines, status = real(fault={})
+    assert lines[-1].startswith("Refused: tests/test_bad.py does not parse")
+    assert outcome(tmp_path, lines, status) == "outcome=failed"
+    assert outcome(tmp_path, ["Refused: a changed path is not valid UTF-8"], 1) == "outcome=failed"
+    for line in ("Refused: unexpected UnicodeDecodeError", "Refused: unexpected FileNotFoundError",
+                 "Refused: the spec listing of main is incomplete", "Refused: git diff exited 128",
+                 "Refused: tiden spec list timed out", "Refused: tests/x.py does not parse (y)"):
+        assert outcome(tmp_path, ["## Tiden PR check", line], 1) == "outcome=unchecked", line
+    verdict = "Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun."
+    assert outcome(tmp_path, [verdict, "Refused: tiden spec list exited 3"], 1) == "outcome=unchecked"
+    assert outcome(tmp_path, [verdict], 2) == "outcome=unchecked"
+    assert outcome(tmp_path, [verdict], 137) == "outcome=unchecked"

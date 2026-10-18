@@ -647,15 +647,15 @@ jobs:
           test "$PYTHON_4_RESULT" = success
   tiden_pr:
     # Check A (ANYM-405, TIDEN-CI.md): the pull request's `Spec:`/`Delivers:`/`Tiden branch:` lines, the markers
-    # of its new tests and the anchors of its changed code files, read-only against Tiden. A verdict fails the run,
-    # and so CI gate, before the merge; a Tiden CLI failure (unreachable, timeout, error status, malformed reply)
-    # only warns with a receipt, as the evidence publication does. The script skips a fork and a run without the
-    # token; the merge queue and main pushes have no pull request body to check.
+    # of its new tests and the anchors of its changed code files, read-only against Tiden. Only a verdict fails the
+    # run, and so CI gate, before the merge. Any other outcome (a Tiden CLI failure, an unexpected error, a failed
+    # CLI install, a check killed at its timeout) warns with a receipt, as the evidence publication does. The script
+    # skips a fork and a run without the token; the merge queue and main pushes have no pull request body to check.
     name: Tiden PR check
     if: ${{ github.event_name == 'pull_request' && inputs.source_ref == '' }}
     runs-on: ubuntu-latest
-    # The three CLI reads time out after 120 seconds each, inside the check step's timeout.
-    timeout-minutes: 15
+    # Above the sum of the step timeouts, so the verdict, the warning and the receipt always have their time.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         timeout-minutes: 3
@@ -676,9 +676,11 @@ jobs:
           mkdir "$RUNNER_TEMP/tiden-bin"
           tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
           echo "$RUNNER_TEMP/tiden-bin" >> "$GITHUB_PATH"
+      # The step never fails the job itself: it records `outcome`, and a step killed at its timeout records none.
       - name: Check the spec lines, test markers and anchors
         id: check
         if: steps.install.outcome == 'success'
+        continue-on-error: true
         timeout-minutes: 8
         env:
           TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
@@ -692,28 +694,46 @@ jobs:
           set -e
           cat "$RUNNER_TEMP/tiden-pr-check.txt"
           last=$(tail -n 1 "$RUNNER_TEMP/tiden-pr-check.txt")
-          # Only a Tiden CLI failure ends with this whole line (tiden_drift.tiden); a verdict or any other refusal
-          # never matches it (tests/test_tiden_pr_check.py).
-          pattern='^Refused: tiden [a-z]+ [a-z-]+ (timed out|exited -?[0-9]+|returned malformed JSON|returned no object)$'
-          if [ "$status" -ne 0 ] && [[ "$last" =~ $pattern ]]; then
-            echo 'unchecked=true' >> "$GITHUB_OUTPUT"
-            echo "reason=${last#Refused: }" >> "$GITHUB_OUTPUT"
-            exit 0
+          # A verdict is the script's closing line after its problem list, or a refusal of the pull request's own
+          # content; every other line the script or a crash can end with is no verdict (tests/test_tiden_pr_check.py).
+          verdict='Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun.'
+          content='^Refused: (.+ does not parse \(.+, line [0-9]+\)|a changed path is not valid UTF-8)$'
+          if [ "$status" -eq 0 ]; then
+            echo 'outcome=passed' >> "$GITHUB_OUTPUT"
+          elif [ "$status" -eq 1 ] && { [ "$last" = "$verdict" ] || [[ "$last" =~ $content ]]; }; then
+            echo 'outcome=failed' >> "$GITHUB_OUTPUT"
+          else
+            echo 'outcome=unchecked' >> "$GITHUB_OUTPUT"
           fi
-          exit "$status"
+      - name: Fail on the verdict
+        if: steps.check.outputs.outcome == 'failed'
+        timeout-minutes: 1
+        run: |
+          echo '::error title=Tiden PR check failed::see the problems listed above and in the job summary (TIDEN-CI.md)'
+          exit 1
       - name: Warn that Tiden could not check this pull request
-        if: ${{ always() && (steps.install.outcome != 'success' || steps.check.outputs.unchecked == 'true') }}
+        id: warn
+        if: ${{ !cancelled() && steps.check.outputs.outcome != 'passed' && steps.check.outputs.outcome != 'failed' }}
         timeout-minutes: 1
         env:
           INSTALL: ${{ steps.install.outcome }}
-          REASON: ${{ steps.check.outputs.reason }}
+          CHECK: ${{ steps.check.outcome }}
         run: |
-          python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "tiden-pr-check"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-pr-check.json").write_text(json.dumps({"checked": False, "install": os.environ["INSTALL"], "reason": os.environ["REASON"] or None}))'
-          message="CLI install: ${INSTALL}; check: ${REASON:-not run}. The sync and Tiden drift still check after the merge; rerun this job to check now (TIDEN-CI.md)"
+          python3 - <<'PY'
+          import json, os, pathlib
+          output = pathlib.Path(os.environ["RUNNER_TEMP"], "tiden-pr-check.txt")
+          lines = output.read_text(errors="replace").splitlines() if output.exists() else []
+          directory = pathlib.Path(os.environ["RUNNER_TEMP"], "tiden-pr-check")
+          directory.mkdir(parents=True, exist_ok=True)
+          (directory / "tiden-pr-check.json").write_text(json.dumps({
+              "checked": False, "install": os.environ["INSTALL"], "check": os.environ["CHECK"] or "not run",
+              "reason": lines[-1] if lines else None}))
+          PY
+          message="CLI install: ${INSTALL}; check: ${CHECK:-not run}. The sync and Tiden drift still check after the merge; rerun this job to check now (TIDEN-CI.md)"
           echo "::warning title=Tiden PR check not run::$message"
           echo "Tiden PR check not run. $message" >> "$GITHUB_STEP_SUMMARY"
       - name: Retain the Tiden PR check receipt
-        if: ${{ always() && (steps.install.outcome != 'success' || steps.check.outputs.unchecked == 'true') }}
+        if: ${{ !cancelled() && steps.warn.outcome == 'success' }}
         timeout-minutes: 3
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

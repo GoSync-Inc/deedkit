@@ -251,16 +251,17 @@ bookkeeping a merge needs (AGENTS.md section 4):
 - every changed code file outside drift's `EXCLUDED` list has a `repo_file`
   anchor on Tiden main, or the body names a spec for the sync to anchor it to.
 
-A failed check lists every problem in the job summary and fails the run, and so
-`CI gate`. The body comes from the event that started the run, and a rerun
-replays the same event: after you edit the body, push a commit to check again.
-Fork pull requests and runs without `TIDEN_API_TOKEN` skip with a summary line.
-A Tiden CLI failure (unreachable, timeout, an error status or a malformed reply)
-or a failed CLI install fails nothing. The job warns and keeps a
-`tiden-pr-check-receipt` artifact naming the reason; the sync and `Tiden drift`
-still check after the merge, and a rerun of the job checks now. Only a whole last
-line `Refused: tiden <command> timed out|exited <n>|returned ...` counts as such
-a failure; any other refusal fails the run.
+Only a verdict fails the run, and so `CI gate`. A verdict is the check's list
+of problems in the job summary, or a refusal of the pull request's own content:
+a test file that does not parse, or a changed path that is not UTF-8. The body
+comes from the event that started the run, and a rerun replays the same event:
+after you edit the body, push a commit to check again. Fork pull requests and
+runs without `TIDEN_API_TOKEN` skip with a summary line. Any other outcome
+fails nothing: a Tiden CLI failure (unreachable, timeout, an error status or a
+malformed reply), another refusal, an unexpected error, a failed CLI install or
+a check killed at its step timeout. The job warns and keeps a
+`tiden-pr-check-receipt` artifact with the last line the check printed; the sync
+and `Tiden drift` still check after the merge, and a rerun of the job checks now.
 
 ## Drift watermark
 
