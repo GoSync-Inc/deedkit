@@ -61,6 +61,14 @@ only for the stated delivered scope. A broad maintained capability may remain
 not weaken a contract, hide a failing test or remove it from verification scope.
 Record the exact evidence and the unresolved boundary in the spec body.
 
+An open live or measured check is written in the spec text as `[open: live]` or
+`[open: measured]` on its criterion or evidence line. Whoever records the check's
+evidence on the card (version, environment, run or measurement, and date) removes
+the marker in the same spec edit, and only then. A card with an open check stays
+in `Review`, never `Done`. The `Tiden health` report fails on a `Done` spec that
+carries a marker and warns on a `Done` spec that mentions a pending live recheck,
+an open item or a check not run without one (TIDEN-CI.md).
+
 The gate observed on 2026-10-16 includes queued `Backlog`/`Review` specs and the
 General navigation index in its coverage calculation. These produce `no_test`
 and a branch `NOT VERIFIED` verdict; main reports `BLOCKED` for the same coverage
@@ -237,11 +245,14 @@ Deployment acceptance remains separate, and old `lastSeen` alone proves nothing.
 ### Release spec sync
 
 A normal-level pull request that changes no acceptance criterion skips the
-intent loop (`AGENTS.md`), so its spec writes wait for this release step: links
-for its new tests, spec text outside the criteria that it made stale (Boundary,
-evidence notes) and the delivered status of the card it names. Anchors for its
-new code files cannot wait: it adds them before or in the same step as its merge,
-or the drift workflow fails. The same step audits spec text against the code since the semantic
+intent loop (`AGENTS.md`), so its spec writes wait for this release step: spec
+text outside the criteria that it made stale (Boundary, evidence notes) and the
+delivered status of the card it names. Anchors for its new code files cannot
+wait: it adds them before or in the same step as its merge, or the drift
+workflow fails. Links for its new tests do not wait either: the agent that
+merged it makes them after the `main` push run publishes the cases (`AGENTS.md`),
+and the `Tiden health` report fails on an active unlinked case that is neither
+linked nor in `config/tiden-unlinked-tests.json` (TIDEN-CI.md). The same step audits spec text against the code since the semantic
 baseline: the candidate SHA of the last completed full sync, recorded in the
 readiness record (item 5 above). The drift workflow advances the watermark after
 every merge once changed code is anchored (Reconciliation and maintenance), so
@@ -266,8 +277,10 @@ A..C, not the empty watermark range.
    automated or other advance does not complete these writes).
 3. On the review branch it checks each matched spec's text against the code and
    corrects stale text; it anchors each changed file that no anchor matches to
-   the spec it implements or records why none applies; it links each named new
-   test with `tiden test link-spec` after reviewing its assertion; and it sets
+   the spec it implements or records why none applies; it checks that each named
+   new test is linked on Tiden main or listed in `config/tiden-unlinked-tests.json`
+   and links one that is not with `tiden test link-spec` after reviewing its
+   assertion; and it sets
    each named card to its delivered status. It changes no acceptance criterion:
    a skipped pull request that needed one should have run the full intent loop,
    and that is a release review finding ([review-protocol.md](review-protocol.md)).
