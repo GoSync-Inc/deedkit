@@ -177,8 +177,9 @@ jobs:
             test "$PR_REUSED_SHA" = "$EXPECTED_SHA"
             test -z "$VERIFIED_SHA"
           elif [ "$DOCS_ONLY" = true ]; then
-            # checks / verify was skipped by the docs-only decision on this pull request's merge commit (ANYM-323).
-            test "$EVENT_NAME" = pull_request
+            # checks / verify was skipped by the docs-only decision on this pull request's merge commit or this
+            # merge queue group commit (ANYM-323); a main push never takes it.
+            [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = merge_group ]
             test "$DOCS_SHA" = "$EXPECTED_SHA"
             test -z "$VERIFIED_SHA"
           else
