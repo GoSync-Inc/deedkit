@@ -386,6 +386,7 @@ def test_telegram_symlinked_session_file_is_rejected_without_following(tmp_path,
     assert sorted(p.name for p in target.parent.iterdir())==['link.session','telegram.session']
 
 
+@pytest.mark.skipif(hasattr(os,'geteuid') and os.geteuid()==0,reason='root-owned fixtures stay trusted; the chown test covers root')
 def test_session_lock_rejects_directory_of_another_user(tmp_path,monkeypatch):
     from messaging_service import collector_state
     directory=tmp_path/'sessions'; directory.mkdir(mode=0o700)
@@ -412,6 +413,53 @@ def test_session_lock_creates_missing_parent_private_and_keeps_symlink_code(tmp_
         with session_lock(tmp_path/'linked'/'telegram.session'): pytest.fail('symlinked parent accepted')
 
 
+@pytest.mark.parametrize('mode,accepted',[(0o777,False),(0o770,False),(0o1777,True)],ids=['world','group','sticky'])
+def test_session_lock_requires_ancestors_that_other_users_cannot_rename(tmp_path,mode,accepted):
+    shared=tmp_path/'shared'; shared.mkdir(); shared.chmod(mode)
+    directory=shared/'sessions'; directory.mkdir(mode=0o700)
+    if accepted:
+        with session_lock(directory/'telegram.session'): pass
+    else:
+        with pytest.raises(RuntimeError,match='private_session_required'):
+            with session_lock(directory/'telegram.session'): pytest.fail('renamable ancestor accepted')
+        assert list(directory.iterdir())==[]
+
+
+def test_session_lock_keeps_the_lock_in_the_checked_directory_after_a_swap(tmp_path,monkeypatch):
+    from messaging_service import collector_state
+    directory=tmp_path/'sessions'; directory.mkdir(mode=0o700)
+    moved=tmp_path/'moved'; public=tmp_path/'public'; public.mkdir(); public.chmod(0o777)
+    real_open=os.open
+    def swap_before_lock(path,*args,**kwargs):
+        # Swap after every directory check, just before the lock file opens.
+        if str(path).endswith('.owner.lock'):
+            directory.rename(moved); directory.symlink_to(public,target_is_directory=True)
+        return real_open(path,*args,**kwargs)
+    monkeypatch.setattr(collector_state.os,'open',swap_before_lock)
+    with session_lock(directory/'telegram.session'): pass
+    assert [p.name for p in moved.iterdir()]==['telegram.session.owner.lock'] and list(public.iterdir())==[]
+
+
+def test_session_whose_parent_is_a_file_fails_with_the_privacy_code(tmp_path,monkeypatch,capsys):
+    from messaging_service import telegram_pair as pairing
+    parent=tmp_path/'not-a-directory'; parent.write_bytes(b'FAKE'); parent.chmod(0o600)
+    session=parent/'telegram.session'
+    with pytest.raises(RuntimeError,match='private_session_required'):
+        with session_lock(session): pytest.fail('file parent accepted')
+    with pytest.raises(RuntimeError,match='private_session_required'):
+        run_telegram(monkeypatch,session,lambda *_: pytest.fail('database opened'))
+    monkeypatch.setattr(pairing,'require_owner_terminal',lambda: None)
+    monkeypatch.setattr(pairing,'configuration',lambda _: ({'session_file':str(session)},{}))
+    monkeypatch.setattr(pairing,'Store',lambda *_: pytest.fail('database opened'))
+    monkeypatch.setattr(pairing.sys,'argv',['telegram-pair','--config','/unused/synthetic.json'])
+    old_mask=os.umask(0o077)
+    try:
+        with pytest.raises(SystemExit): pairing.main()
+    finally: os.umask(old_mask)
+    assert json.loads(capsys.readouterr().out)=={'status':'not_paired','code':'private_session_required'}
+    assert parent.read_bytes()==b'FAKE'
+
+
 def test_whatsapp_session_directory_with_shared_parent_is_rejected(tmp_path,monkeypatch):
     from messaging_service import whatsapp_collector as wa
     parent=tmp_path/'sessions'; parent.mkdir(mode=0o700)
@@ -420,6 +468,8 @@ def test_whatsapp_session_directory_with_shared_parent_is_rejected(tmp_path,monk
     parent.chmod(0o755)
     monkeypatch.setattr(wa,'configuration',lambda _: {'session_directory':str(session),'provider':'whatsmeow'})
     monkeypatch.setattr(wa,'Store',lambda *_: pytest.fail('database opened'))
+    dsn=tmp_path/'synthetic.dsn'; dsn.write_text('synthetic-not-a-connection')
+    monkeypatch.setenv('DATABASE_URL_FILE',str(dsn)); monkeypatch.setenv('PROBE_FILES','/unused')
     with pytest.raises(RuntimeError,match='private_session_required'): asyncio.run(wa.run_config('/unused/synthetic.json'))
     assert sorted(p.name for p in parent.iterdir())==['whatsapp']
 
