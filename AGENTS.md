@@ -124,6 +124,9 @@ spec edit follows its kind:
   restructuring: Astra;
 - other cards and spec edits (status, evidence notes, facts): the card
   checklist subagent;
+- every new card, besides the reviewers above: the card checklist's template,
+  Score and fact items, until card lint does them (planned:
+  `scripts/card_lint.py`);
 - spec text written at settle: the reviewers of its pull request's level, and
   the card checklist for a normal-level PR.
 

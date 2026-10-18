@@ -44,7 +44,9 @@ story (or the goal for a skip), the lane and the review level (`Lane: <lane>`,
 `Review level: <level> — <reason>`) and carries the `Tiden intent branch:` line or
 `Tiden: skip — <reason>`. The draft pull request is the claim. Before dispatching,
 the orchestrator lists open pull requests and open intent branches; an item with a
-claim is taken. When a claimed pull request has no activity for two days, the
+claim is taken. A card named on the `Spec sync:` line of a pull request merged
+since the last release spec sync is delivered and waits for that sync; it is not
+dispatched again. When a claimed pull request has no activity for two days, the
 orchestrator hands it to a new worker on the same branch and pull request and
 tells the owner. Git allows one worktree per branch, so the orchestrator first
 saves uncommitted work in the old worktree (a pushed work-in-progress commit or a
@@ -178,8 +180,8 @@ at least important (`AGENTS.md`). Prefer splitting it.
 5. Answer workers' questions and check each pull request before its "ok" (Worker
    protocol). Read a waiting worker's terminal with `superset terminals read` and
    give the owner exactly what it asks, so the owner need not open worker terminals.
-6. After merge: confirm the worker's post-merge check, update the story, free the
-   lane.
+6. After merge: confirm the worker's post-merge check, update the story (for a
+   skip, the release spec sync updates it), free the lane.
 7. Escalate to the owner: priority conflicts, the pull requests and actions the
    owner keeps under Review levels in `AGENTS.md`, disagreeing reviewers and
    unclear product direction as questions, any feature or improvement story that

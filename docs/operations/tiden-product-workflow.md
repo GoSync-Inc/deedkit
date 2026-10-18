@@ -92,8 +92,8 @@ starting it.
    requirement, which stays open until implemented, or on a review branch for a
    current defect, which merges to main after review and acceptance (Current
    truth and future proposals).
-3. **Review.** The card's kind sets its reviewers (`AGENTS.md`: Astra and
-   Fable, Astra, or the card checklist subagent of
+3. **Review.** The card's kind sets its reviewers (`AGENTS.md`: Fable, Astra,
+   both, or the card checklist subagent of
    [review-protocol.md](review-protocol.md)); the card text goes to them as a
    file. They first judge whether the card should exist: a real need and value,
    no duplicate of an existing card or built-in capability, no over-engineering
@@ -236,33 +236,38 @@ A normal-level pull request that changes no acceptance criterion skips the
 intent loop (`AGENTS.md`), so its spec writes wait for this release step: links
 for its new tests, anchors for its new files, spec text outside the criteria that
 it made stale (Boundary, evidence notes) and the delivered status of the card it
-names. The release owner runs the sync before the release review when the delta
-from the last released SHA to the candidate holds a skipped code pull request,
-and otherwise records `Spec sync: none — <reason>`.
+names. The same step audits the drift since the watermark, so the watermark
+advances once per release. The release owner runs it before the release review
+whenever the delta from the watermark to the candidate changes a product file or
+a skipped pull request in it still waits for its spec writes, and otherwise
+records `Spec sync: none — <reason>`.
 
 1. One worker session (Tiden card and spec text,
    [parallel-development.md](parallel-development.md)) with `tiden intent skip`
    works on one review branch, `review/<date>-spec-sync`.
-2. Its inputs are the `Spec impact:` and `Spec sync:` lines of every skipped pull
-   request in the delta, and the files those pull requests changed, matched
-   against the anchors as in Implementation sequence step 4.
+2. Its inputs are every file changed from the watermark (`tiden drift status`)
+   to the candidate, matched against the anchors as in Implementation sequence
+   step 4, and the `Spec impact:` and `Spec sync:` lines of the skipped pull
+   requests in that range.
 3. On the review branch it checks each matched spec's text against the code and
-   corrects stale text; it links each named new test with `tiden test link-spec`
-   after reviewing its assertion; it anchors each new file to the spec it
-   implements or records why none applies; and it sets each named card to its
-   delivered status. It changes no acceptance criterion: a skipped pull request
-   that needed one was mis-leveled, and that is a release review finding
-   ([review-protocol.md](review-protocol.md)).
-4. Its edits enter the release review's Part A packet as previous and proposed
-   text; a High or Critical spec or a weakened criterion is never checklist-only
-   (`AGENTS.md`). After that review the branch merges under the review levels in
-   `AGENTS.md`, and Tiden main is read back.
-5. When the sync covered every spec anchored to the files changed since the
-   watermark (`tiden drift status`), it is the delta audit under Reconciliation
-   and maintenance, and the watermark advances to the audited candidate SHA under
-   the rules there. Until the drift audit card (ANYM-314) has advanced the
-   watermark once, the sync covers only the skipped pull requests of the delta
-   and leaves the watermark unchanged.
+   corrects stale text; it anchors each changed file that no anchor matches to
+   the spec it implements or records why none applies; it links each named new
+   test with `tiden test link-spec` after reviewing its assertion; and it sets
+   each named card to its delivered status. It changes no acceptance criterion:
+   a skipped pull request that needed one should have run the full intent loop,
+   and that is a release review finding ([review-protocol.md](review-protocol.md)).
+4. Its edits are spec edits and take the reviewers `AGENTS.md` assigns them by
+   kind; a High or Critical spec or a weakened criterion is never
+   checklist-only. When the release review's Part A runs, they enter its packet
+   as previous and proposed text instead of a separate review. After that review
+   the branch merges under the review levels in `AGENTS.md`, and Tiden main is
+   read back.
+5. A sync that covered the whole range is the delta audit under Reconciliation
+   and maintenance, and the watermark advances to the audited candidate SHA
+   under the rules there. Until the drift audit card (ANYM-314) has advanced the
+   watermark once, the sync is partial: it covers only the skipped pull requests
+   since the last release, completes no drift audit and leaves the watermark
+   unchanged.
 
 ### Names and release identity
 
