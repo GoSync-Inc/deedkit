@@ -102,6 +102,10 @@ def test_self_chat_with_a_phone_number_title_is_labelled_saved_messages(seeded):
             assert c.execute('SELECT title FROM chats WHERE id=%s',(row['id'],)).fetchone()['title']==PHONE_TITLE
         # Title matching still uses the stored title.
         assert [r['id'] for r in s.list_chats(key,query='000 003',include_coverage=False)['items']]==[row['id']]
+        # A provider reference names the chat like list_chats does.
+        resolved=s.resolve_reference(key,account,'48000000000003@lid','true_48000000000003@lid_TITLED1')
+        assert resolved['chat']['title']=='Saved messages' and resolved['chat']['title_basis']=='self_chat'
+        assert resolved['message']['chat_title']=='Saved messages'
 
 
 # spec: ANYM-361
@@ -110,6 +114,27 @@ def test_private_chat_with_a_phone_number_title_and_no_self_evidence_keeps_it(se
     row,messages,found,context=chat_titles(s,key,mid)
     assert row['title']==PHONE_TITLE and 'title_basis' not in row
     assert messages==found=={PHONE_TITLE} and context==PHONE_TITLE
+    resolved=s.resolve_reference(key,'title-plain','48000000000004@lid')['chat']
+    assert resolved['title']==PHONE_TITLE and 'title_basis' not in resolved
+
+
+# spec: ANYM-361
+def test_self_chat_title_query_matching_is_unchanged(seeded):
+    s,_,_=seeded
+    ar=Archive(s);ar.register('title-self-query','whatsapp','Synthetic self query',discover=True)
+    key=s.issue_key('title-self-query-agent',['title-self-query'])
+    own='48000000000005@lid'
+    at=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+    ar.ingest(event(account='title-self-query',platform='whatsapp',chat=own,chat_title=own,
+        provider_id='false_'+own+'_SELF1',sender=own,body='Synthetic note',sent_at=at,updated_at=at,
+        direction='incoming',sender_profile={'display_name':'Synthetic Owner','username':''},
+        metadata={'chat_type':'private','is_self_chat':True}))
+    chat=s.list_chats(key,include_coverage=False)['items'][0]
+    assert chat['title']=='Saved messages'
+    # The stored title and the raw-title sender-name fallback still match; the label is no search alias.
+    for query in ('000005@lid','synthetic owner'):
+        assert [r['id'] for r in s.list_chats(key,query=query,include_coverage=False)['items']]==[chat['id']]
+    assert s.list_chats(key,query='saved messages',include_coverage=False)['items']==[]
 
 
 # spec: ANYM-361

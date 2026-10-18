@@ -46,6 +46,10 @@ def resolve_chat(c,p,account,provider_chat_id):
         if row:row={**row,'reference_resolution':{'method':'verified_whatsapp_alias',
             'requested_provider_chat_id':provider_chat_id,'original_provider_chat_id':row['provider_chat']}}
     if not row:raise APIError('not_found',404)
+    # ANYM-361: the same self-chat label as list_chats; the stored title is not returned for it.
+    from .chat_queries import SELF_CHAT_TITLE,self_chat_sql
+    if c.execute("SELECT c.chat_type='private' AND "+self_chat_sql()+' AS self FROM chats c WHERE c.id=%s',
+            (row['id'],)).fetchone()['self']:row={**row,'title':SELF_CHAT_TITLE,'title_basis':'self_chat'}
     targets(p,[row['id']]);return row
 
 
