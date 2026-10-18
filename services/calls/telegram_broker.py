@@ -34,8 +34,9 @@ def unpack(value):
 
 
 class SessionBroker:
-    def __init__(self,provider,socket,token,policy):
-        self.provider,self.socket,self.token,self.policy=provider,Path(socket),token,Path(policy)
+    def __init__(self,provider,socket,token,policy=None):
+        # `policy` (the former Telegram recipient list file) is accepted and ignored since ANYM-288.
+        self.provider,self.socket,self.token=provider,Path(socket),token
         self.server=None;self.current=None;self.handlers=set()
 
     async def start(self):
@@ -46,12 +47,6 @@ class SessionBroker:
         self.socket.unlink(missing_ok=True)
         self.server=await asyncio.start_unix_server(self._accept,path=self.socket,limit=65536)
         os.chmod(self.socket,0o600)
-
-    def _allowed(self,user):
-        try:
-            policy=json.loads(self.policy.read_text())
-            return str(user) in policy.get('telegram',[])
-        except (OSError,ValueError): return False
 
     async def _send(self,state,value):
         async with state['write_lock']:
@@ -95,7 +90,7 @@ class SessionBroker:
         if isinstance(request,GetDhConfigRequest):
             if request.random_length!=256 or request.version!=0: raise BrokerError('invalid_dh_request')
         elif isinstance(request,RequestCallRequest):
-            if state.get('requested') or not self._allowed(state['user']): raise BrokerError('dial_not_allowed')
+            if state.get('requested'): raise BrokerError('dial_not_allowed')
             if not isinstance(request.user_id,(InputUser,InputPeerUser)) or request.user_id.user_id!=state['user'] or request.video:
                 raise BrokerError('dial_not_allowed')
             peer=await self.provider.rpc(lambda:self.provider.client.get_input_entity(state['user']),'provider_call')
@@ -127,7 +122,8 @@ class SessionBroker:
                 writer.write(json.dumps({'ready':True,'account_id':self.provider.expected_user_id,'protocol':1,'cooldown_secs':remaining}).encode()+b'\n')
                 await writer.drain();return
             if self.current: raise BrokerError('another_call_active')
-            if type(user) is not int or user<=0 or not self._allowed(user): raise BrokerError('recipient_not_allowed')
+            # No recipient list (ANYM-288): the authenticated calls service owns the destination policy.
+            if type(user) is not int or user<=0: raise BrokerError('recipient_not_allowed')
             state={'writer':writer,'write_lock':asyncio.Lock(),'user':user,'call':None}
             self.current=state
             await self._send(state,{'ready':True,'account_id':self.provider.expected_user_id,'protocol':1})

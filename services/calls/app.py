@@ -292,8 +292,6 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
             else:outbound.providers.pop('twilio',None)
             outbound.settings=CallingSettings(enabled=body.enabled,allowed=body.allowed)
             write_private(settings_path,{**outbound.settings.model_dump(),'twilio':cfg})
-            if os.environ.get('VOICE_TELEGRAM_POLICY_FILE'):
-                write_private(os.environ['VOICE_TELEGRAM_POLICY_FILE'],body.allowed)
         return await calling_status()
 
     @app.post('/api/calling/twilio/probe')

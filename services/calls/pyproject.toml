@@ -13,6 +13,7 @@ dependencies = [
   "ntgcalls==3.0.3",
   "telethon==1.45.0",
   "python-multipart>=0.0.20,<0.1",
+  "phonenumbers==9.0.40",
 ]
 
 [dependency-groups]

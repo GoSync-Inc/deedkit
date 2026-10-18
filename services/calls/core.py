@@ -79,8 +79,9 @@ FLOW_TOOL_MODELS={**TOOL_MODELS,'propose_closing':Finish}
 
 
 class ServiceError(Exception):
-    def __init__(self,code,status=409):
-        self.code,self.status=code,status
+    def __init__(self,code,status=409,detail=None):
+        # detail: a fixed explanation for the caller (never provider text or secrets).
+        self.code,self.status,self.detail=code,status,detail or {}
 
 
 def now():
@@ -347,7 +348,8 @@ class VoiceService:
             self._save_call(v)
 
     def provider_update(self,identity,**values):
-        allowed={'dial_state','provider_call_id','authorization_reference','provider_status','transport'}
+        allowed={'dial_state','provider_call_id','authorization_reference','provider_status','transport',
+                 'owner_instruction','destination_source','destination_evidence','dial_units'}
         if set(values)-allowed:
             raise ValueError('invalid_provider_update')
         with self.lock:

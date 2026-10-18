@@ -1,6 +1,7 @@
 """One durable outbound attempt per frozen brief. Provider media never receives archive credentials."""
 import asyncio
 import contextlib
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -13,6 +14,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core import ACTIVE, BriefInput, ServiceError, now
+import destination_policy as policy
 
 E164=re.compile(r'\+[1-9][0-9]{7,14}')
 SIP=re.compile(r'sips?:[A-Za-z0-9_.+-]{1,80}@[A-Za-z0-9.-]{1,200}(?::[0-9]{1,5})?(?:;transport=(?:tcp|tls|udp))?(?:;secure=true)?')
@@ -25,6 +27,8 @@ class ExternalBrief(BriefInput):
 
     @model_validator(mode='after')
     def route(self):
+        try: policy.unsupported(self.channel,self.destination)
+        except ServiceError as error: raise ValueError(error.code+': '+error.detail['message']) from None
         if self.channel=='telegram':
             valid=self.account=='telegram' and bool(re.fullmatch(r'[1-9][0-9]{0,17}',self.destination))
         else:
@@ -35,6 +39,7 @@ class ExternalBrief(BriefInput):
 
 
 class CallingSettings(BaseModel):
+    """Operator switch. `allowed` restricts SIP only; other channels have no recipient list (ANYM-288)."""
     model_config=ConfigDict(extra='forbid')
     enabled: bool=False
     allowed: dict[str,list[str]]=Field(default_factory=dict)
@@ -144,30 +149,51 @@ class Outbound:
         service.db.execute('CREATE TABLE IF NOT EXISTS outbound_attempts (call_id TEXT PRIMARY KEY, token TEXT NOT NULL)')
         service.db.commit()
 
+    def units_used(self):
+        """Dial units of external attempts started in the last 24 hours, from durable call rows."""
+        cutoff=(datetime.now(timezone.utc)-timedelta(hours=24)).isoformat()
+        rows=self.service.db.execute("SELECT json_extract(body,'$.dial_units') FROM calls WHERE "
+            "json_extract(body,'$.channel')!='browser' AND json_extract(body,'$.started_at')>=?",(cutoff,))
+        return sum(units or 1 for (units,) in rows)
+
+    def daily_calls_remaining(self):
+        return max(0,policy.DAILY_UNITS-self.units_used())
+
     async def preflight(self,brief_id):
         b=self.service.get_brief(brief_id)
         if b['channel']=='browser': raise ServiceError('external_brief_required')
         if not self.settings.enabled: raise ServiceError('calling_disabled')
-        if b['destination'] not in self.settings.allowed.get(b['channel'],[]): raise ServiceError('recipient_not_allowed')
+        if b['channel']=='sip' and b['destination'] not in self.settings.allowed.get('sip',[]): raise ServiceError('recipient_not_allowed')
+        units=policy.dial_units(b['channel'],b['destination'])
         if not (self.model_key(b) if self.model_key else self.key()): raise ServiceError('model_key_required')
         provider=self.providers.get(b['account'])
         if not provider: raise ServiceError('provider_not_configured')
-        return await provider.preflight(b)
+        result=await provider.preflight(b)
+        return {**result,'recipient_policy':policy.recipient_policy(b['channel']),'dial_units':units,
+                'daily_calls_remaining':self.daily_calls_remaining()}
 
-    async def dial(self,brief_id,authorization_reference,*,admission=None):
+    async def dial(self,brief_id,authorization_reference,*,admission=None,origin=None):
+        """Internal entry point. Agent-facing surfaces always pass `origin` (destination_source/evidence)."""
         if not isinstance(authorization_reference,str) or not 3<=len(authorization_reference.strip())<=1500:
             raise ServiceError('owner_instruction_reference_required',422)
+        instruction=authorization_reference.strip()
         async with self.lock:
             # Check the durable record BEFORE readiness: retries cannot become another call,
             # including after restarts, changed settings, or missing credentials.
             row=self.service.db.execute('SELECT id FROM calls WHERE brief_id=?',(brief_id,)).fetchone()
             if row: return self.service.get_call(row[0])
-            await self.preflight(brief_id)
+            ready=await self.preflight(brief_id)
+            bound={}
+            if origin is not None:
+                bound=policy.bind_origin(self.service.get_brief(brief_id),instruction,
+                                         origin.get('destination_source'),origin.get('destination_evidence'))
+            if ready['dial_units']>ready['daily_calls_remaining']: raise ServiceError('daily_call_limit',429)
             if admission is not None:
                 admission()
             call=self.service.start(brief_id); cid=call['id']; token=secrets.token_urlsafe(32)
             self.service.db.execute('INSERT INTO outbound_attempts VALUES (?,?)',(cid,token)); self.service.db.commit()
-            self.service.provider_update(cid,dial_state='requesting',authorization_reference=authorization_reference.strip())
+            self.service.provider_update(cid,dial_state='requesting',authorization_reference=instruction,
+                                         owner_instruction=instruction,dial_units=ready['dial_units'],**bound)
             try:
                 receipt=await self.providers[call['brief']['account']].dial({**call,'stream_token':token})
                 bound=self.service.get_call(cid).get('provider_call_id')

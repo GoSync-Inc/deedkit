@@ -72,6 +72,8 @@ async def test_ownership_cannot_be_spoofed_and_survives_restart(tmp_path):
         arguments = {"brief_id": brief["id"]}
         if operation == "dial_call":
             arguments["authorization_reference"] = "synthetic instruction"
+            arguments["destination_source"] = "agent_found"
+            arguments["destination_evidence"] = "synthetic directory"
         with pytest.raises(ServiceError, match="not_found_or_forbidden"):
             await surface.call("bob", operation, arguments)
     call = await surface.call("alice", "start_call", {"brief_id": brief["id"]})
@@ -181,11 +183,12 @@ async def test_scope_route_revocation_and_admission_after_provider_preflight(tmp
         "account": "twilio",
         "destination": "+12025550123",
     }
+    # No destination list since ANYM-288; an ungranted channel is still refused.
     with pytest.raises(ServiceError, match="not_found_or_forbidden"):
         await surface.call(
             "alice",
             "prepare_external_call",
-            {"brief": {**body, "destination": "+12025550124"}},
+            {"brief": {**body, "channel": "whatsapp"}},
         )
     brief = await surface.call("alice", "prepare_external_call", {"brief": body})
     doc["principals"][0]["scopes"].remove("calls:dial")
@@ -195,7 +198,12 @@ async def test_scope_route_revocation_and_admission_after_provider_preflight(tmp
         await surface.call(
             "alice",
             "dial_call",
-            {"brief_id": brief["id"], "authorization_reference": "synthetic"},
+            {
+                "brief_id": brief["id"],
+                "authorization_reference": "synthetic",
+                "destination_source": "agent_found",
+                "destination_evidence": "synthetic directory",
+            },
         )
     doc["principals"][0]["scopes"].append("calls:dial")
     doc["revision"] += 1
@@ -204,7 +212,12 @@ async def test_scope_route_revocation_and_admission_after_provider_preflight(tmp
         await surface.call(
             "alice",
             "dial_call",
-            {"brief_id": brief["id"], "authorization_reference": "synthetic"},
+            {
+                "brief_id": brief["id"],
+                "authorization_reference": "synthetic",
+                "destination_source": "agent_found",
+                "destination_evidence": "synthetic directory",
+            },
         )
     assert seen == [] and service.list_calls() == []
     service.close()
@@ -349,6 +362,7 @@ async def test_lists_are_owned_newest_first_paged_and_summarized(tmp_path):
                 "status": "waiting_for_browser",
                 "outcome": "unresolved",
                 "channel": "browser",
+                "destination_source": None,
                 "started_at": call["started_at"],
                 "ended_at": None,
                 "end_reason": None,
@@ -382,6 +396,8 @@ async def test_capabilities_report_enforced_limits(tmp_path):
     caps = await surface.call("alice", "capabilities", {})
     assert caps["limits"] == {
         "active_calls_per_service": 1,
+        "daily_call_units": 10,
+        "premium_call_units": 3,
         "max_duration_secs": {"minimum": 30, "maximum": 600, "default": 600},
         "source_message_ids": 8,
         "success_fields": 8,

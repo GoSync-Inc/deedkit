@@ -17,8 +17,7 @@ class VoiceProvider(collector.TelethonProvider):
         await super().connect()
         if not self.broker:
             self.broker=SessionBroker(self,os.environ['VOICE_TELEGRAM_SOCKET'],
-                Path(os.environ['VOICE_TELEGRAM_TOKEN_FILE']).read_text().strip(),
-                os.environ['VOICE_TELEGRAM_POLICY_FILE'])
+                Path(os.environ['VOICE_TELEGRAM_TOKEN_FILE']).read_text().strip())
             await self.broker.start()
 
     async def disconnect(self):

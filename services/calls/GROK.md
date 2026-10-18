@@ -57,9 +57,10 @@ than silently using xAI for another purpose.
 
 `calls_capabilities.calling_readiness` is a local, principal-scoped configuration
 check. It reports model-key presence and channel blockers, without calling a
-provider, reading archives or creating a call. Allowed-recipient counts include
-only the intersection of this principal's destinations and operator settings;
-other principals' destinations and all secrets remain hidden. `configuration_ready`
+provider, reading archives or creating a call. Phone, WhatsApp and Telegram have
+no recipient list (`recipient_policy: any_valid_destination`); SIP reports an
+allowed-recipient count of only the intersection of this principal's destinations
+and operator settings. Other principals' destinations and all secrets remain hidden. `configuration_ready`
 does not prove provider connectivity: `provider_connection` stays `not_probed`,
 and `live_call_verified` stays false.
 
@@ -69,9 +70,10 @@ For phone or SIP, check these layers:
    existing `calls-phone` profile permits preparation and inspection only.
    Profile selection alone grants nothing: the private gateway principal and
    calls registry must separately grant `calls:prepare`, `calls:read`,
-   `calls:dial`, `calls:stop` for the exact channel and destination.
-2. In private setup, set calling enabled and allow the exact E.164 number or SIP
-   URI. Keep the gateway, registry and operator allowlists consistent.
+   `calls:dial`, `calls:stop` for the channel (and, for SIP, the exact destination).
+2. In private setup, set calling enabled. Phone numbers need no list; for SIP,
+   allow the exact URI and keep the registry and operator SIP lists consistent.
+   Country limits are Twilio Voice Geo Permissions in the Twilio Console.
 3. Configure Twilio Account SID and Auth Token, a callable phone sender or SIP
    caller ID, an optional complete SIP auth pair, and a public HTTPS URL whose
    `/provider/twilio/` callbacks and WSS media route reach this service. Keep the
@@ -79,11 +81,14 @@ For phone or SIP, check these layers:
    permissions still apply; local validation cannot establish them.
 4. Save the selected model's key. Prepare the task without archive source IDs
    if no messenger context is needed. Run `calls_preflight_call` for that brief.
-5. Only after a concrete owner instruction names recipient and task, invoke
-   `calls_dial_call` once with its authorization reference. An unknown provider
-   outcome requires reconciliation; never create a replacement attempt.
+5. Only for a task the owner gave, invoke `calls_dial_call` once with the owner's
+   own words as `owner_instruction` and the destination's origin: `owner_named`
+   when those words contain the number, otherwise `agent_found` with evidence.
+   Each dial spends daily call units (10 per 24 hours; premium numbers 3). An
+   unknown provider outcome requires reconciliation; never create a replacement
+   attempt.
 
-No setup path automatically enables an agent or adds a destination.
+No setup path automatically enables an agent or adds a SIP destination.
 
 ## Comparison after the key is available
 
