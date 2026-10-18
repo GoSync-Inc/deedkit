@@ -9,9 +9,11 @@ under Review levels in [AGENTS.md](../../AGENTS.md), and the review procedure in
 
 ## Roles
 
-- **Owner** sets priorities, decides owner-level pull requests, authorizes
-  production apply and every live provider action. Nothing below delegates that
-  authority implicitly.
+- **Owner** sets priorities, answers the questions escalated to it and decides
+  what it keeps under Review levels in `AGENTS.md`: production apply, every live
+  provider action, secrets and access rights, required checks and branch
+  protection, review levels and merge authority, accepting risk. Nothing below
+  delegates that authority implicitly.
 - **Orchestrator** (one at a time) selects ready stories, checks lanes, dispatches
   worker sessions and checks their pull requests before they merge. It writes no
   product code.
@@ -114,7 +116,8 @@ at least important (`AGENTS.md`). Prefer splitting it.
   depend on this.
 - Never edit a merged migration. Reserve the next migration number in the pull
   request title while the `schema` lane is held.
-- A schema migration is owner-level (`AGENTS.md`). Its pull request states its
+- A schema migration is owner-level (`AGENTS.md`): Astra and Fable review it, an
+  agent merges it and the owner gets the summary. Its pull request states its
   backup prerequisite, and its release waits for the backup gate in
   [production.md](production.md).
 
@@ -175,9 +178,10 @@ at least important (`AGENTS.md`). Prefer splitting it.
    give the owner exactly what it asks, so the owner need not open worker terminals.
 6. After merge: confirm the worker's post-merge check, update the story, free the
    lane.
-7. Escalate to the owner: priority conflicts, owner-level pull requests, every
-   escalation condition under Review levels in `AGENTS.md`, any feature or improvement story that is not
-   ready.
+7. Escalate to the owner: priority conflicts, the pull requests and actions the
+   owner keeps under Review levels in `AGENTS.md`, disagreeing reviewers and
+   unclear product direction as questions, the summary of every owner-level pull
+   request an agent merged, any feature or improvement story that is not ready.
 
 The orchestrator starts no new worker when its context is above about 60%, at the
 end of the working day or when the current wave of tasks is done. Running workers
@@ -194,8 +198,8 @@ time.
 Questions to the owner use plain names, never internal codes alone. Each states
 what it is, why it matters to the owner, what it costs, the options with their
 consequences and a recommendation. There is no limit on how many are asked; "да на
-всё" ("yes to all") accepts every recommendation except an owner-level merge, which still needs
-an explicit "merge <n>".
+всё" ("yes to all") accepts every recommendation except a merge the owner keeps, which still
+needs an explicit "merge <n>".
 
 The orchestrator log holds the owner's decisions: its recommendation, the
 owner's choice and whether they matched, so autonomy grows on facts. At the end
@@ -235,12 +239,12 @@ The worker writes and waits for the answer:
 
 - before `tiden intent start`: its objective and promises, which cannot be edited
   after the start;
-- before going out of scope: another task's file, an owner-level action, or a fork
+- before going out of scope: another task's file, an action the owner keeps, or a fork
   without an obvious answer;
 - before merging: "ready to merge" with the pull request, CI, review results and
   the Tiden verdict or recorded skip. The orchestrator checks CI, the diff and the
   Tiden merge preview (the recorded skip when there is no Tiden branch) itself and
-  only then answers "ok"; it hands an owner-level pull request to the owner.
+  only then answers "ok"; it hands a pull request the owner keeps to the owner.
   It also confirms that the level follows the signals in `AGENTS.md` and, for a
   normal-level pull request, that the author checklist, the "fails without the
   fix" record and any process-text checklist review are in the description. It
@@ -255,13 +259,15 @@ DONE adds `handoff`, BLOCKED adds `reason` and `needs`.
 The final result depends on the level:
 
 - micro: merged after green CI;
-- normal and important: the pull request and its Tiden branch, if any, merged and
-  checked after the merge, the intent session closed with PASS or a recorded skip;
-- owner: the pull request ready (not draft, green CI, reviews with no open
-  findings, Tiden closed or skipped) and a summary for the owner in its
-  description.
+- normal, important and owner: the pull request and its Tiden branch, if any,
+  merged and checked after the merge, the intent session closed with PASS or a
+  recorded skip; at owner level, also the plain-language summary for the owner
+  (`AGENTS.md`);
+- a pull request the owner keeps: the pull request ready (not draft, green CI,
+  reviews with no open findings, Tiden closed or skipped) and a summary for the
+  owner in its description.
 
-The owner decides an owner-level pull request and its Tiden branch together: an
+The owner decides a pull request it keeps and its Tiden branch together: an
 explicit "merge <n>" covers both, and the orchestrator may carry it out. Without
 that explicit word neither the worker nor the orchestrator merges them. After the
 merge the worker checks it and reports.
