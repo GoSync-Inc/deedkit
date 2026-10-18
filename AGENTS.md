@@ -129,8 +129,8 @@ spec edit follows its kind:
 - every new card, besides the reviewers above: the card checklist's template,
   Score and fact items, until card lint does them (planned:
   `scripts/card_lint.py`);
-- spec text written at settle: the reviewers of its pull request's level, and
-  the card checklist for a normal-level PR.
+- spec text written at settle: the reviewers of its pull request's level, in
+  the same round as the diff, and the card checklist for a normal-level PR.
 
 A spec edit on a High or Critical spec, or one that weakens a criterion, is
 never checklist-only.
@@ -158,9 +158,17 @@ adapt or build), reviewed with the card, and the executor re-checks it for
 freshness (10–15 min) before starting.
 
 Order: code and local tests; push and open the PR, which starts CI; reviews in
-parallel with CI, once on the ready PR; fixes, rechecked by the same reviewer on
-the fix diff only; settle, with its spec text reviewed as above;
-`tiden intent progress`, `tiden intent close`; merge.
+parallel with CI, one round per reviewer on the ready PR; fixes, rechecked by the
+same reviewer on the fix diff only, and only after a blocking or major finding;
+settle; `tiden intent progress`, `tiden intent close`; merge. The card is the
+plan: the worker starts the intent from it, with no plan approval round. Local
+tests are the tests of the code the PR touches, its new tests and their "fails
+without the fix" run; the full suites run in CI and the merge queue, never as a
+local precondition for a PR (CLAUDE.md lists the commands as reference). The
+author drafts the spec text that settle will write before the review, and the
+round covers it together with the diff; settle writes the reviewed text, and a
+change of its meaning after the round goes to the same reviewer on that text
+only.
 Reviewers get the packet in the review protocol: the intent goal and promises
 (the task goal for a skip), the current text with acceptance criteria of the
 promised and the flagged specs, the `Spec impact:` list, the diff and the PR

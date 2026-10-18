@@ -313,8 +313,9 @@ display text can use DeedKit immediately.
 3. Implement in the appropriate Git branch. Update the existing requirement when
    its behavior changes; create a child only for an independent increment.
    Preserve preimages, historical source anchors and accepted test links.
-4. Run the appropriate synthetic checks and publish authentic results through
-   the existing reporter with exact checkout SHA and branch. Open the pull request
+4. Run the local tests `AGENTS.md` names (the touched code's tests and the new
+   tests); the full synthetic suites run in CI, which publishes authentic results
+   through the existing reporter with exact checkout SHA and branch. Open the pull request
    with the `Tiden intent branch:` line the contract prints; CI routing uses it
    (TIDEN-CI.md). Never rename old
    tests or the seven `anymsg-ci::*` checks. Review assertions before proposing

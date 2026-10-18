@@ -99,8 +99,9 @@ whole exports.
   only the fix range;
 - `specs.md`: the current text with acceptance criteria of the promised and the
   flagged specs, and the `Spec impact:` list with its inventory, which gives the
-  rest by ID and disposition. A reviewer that needs the text of an unflagged
-  spec names it as a missing input;
+  rest by ID and disposition, and the spec text the author will write at
+  settle, as previous and proposed text. A reviewer that needs the text of an
+  unflagged spec names it as a missing input;
 - `pr.md`: the pull request description.
 
 A card or spec edit has no diff; its packet holds instead the previous and the
@@ -122,8 +123,10 @@ VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <
 
 ## Rounds
 
-A round is one review by one reviewer. The budget is two per reviewer: the
-review and one recheck.
+A round is one review by one reviewer of the whole packet: the diff and the
+proposed settle text together, never a separate round for either. The budget is
+two per reviewer: the review and one recheck, which only a blocking or major
+finding opens.
 
 1. **Scope freezes** when the first review starts: an optional addition, the
    owner's included, goes to a follow-up card or the next package, and the
@@ -148,8 +151,9 @@ review and one recheck.
    the orchestrator either asks that reviewer for one more fix-range recheck of
    the open items only, or the scope is reduced or the change reverted;
    merging with it open accepts risk and is the owner's (`AGENTS.md`).
-6. A reviewer is never re-run for wording-only edits or for a relayed owner
-   decision that changes no rule the review covered.
+6. A reviewer is never re-run for wording-only edits, for settle writing the
+   text the round reviewed, or for a relayed owner decision that changes no
+   rule the review covered.
 
 ## Release review
 
