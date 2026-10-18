@@ -5,6 +5,7 @@ from .policy import scope_filter,targets
 from .search_query import cursor_binding,decode_cursor,encode_cursor,filter_values,valid_text
 from .name_variants import patterns
 from .whatsapp_identity import visible_cte,people_join
+from .sender_names import resolve
 
 
 def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=20,
@@ -103,7 +104,11 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
         row.pop('match_rank',None)
         if group_by_sender:
             for observation in row['observations']:observation.pop('match_rank',None)
-    refs=[r['source_message'] for row in items for r in (row['observations'] if group_by_sender else [row])]
+    observations=[r for row in items for r in (row['observations'] if group_by_sender else [row])]
+    # display_name stays this chat's observation; sender_name is the readable label.
+    for row in observations:row['sender_name']=row['display_name']
+    resolve(c,p,observations,sender='sender_id')
+    refs=[r['source_message'] for r in observations]
     targets(p,refs)
     return serial({'items':items,'next_cursor':cursor,'identity_model':'provider_sender_per_account_and_chat',
         'names_are_verified_identity':False,'directory_coverage':'observed_provider_names_only',

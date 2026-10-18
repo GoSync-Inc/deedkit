@@ -495,7 +495,7 @@ class Store:
                 row=c.execute('SELECT id FROM messages WHERE account=%s AND chat=%s AND provider_id=%s',
                     (account,chat['id'],provider_message_id)).fetchone()
                 if not row:raise APIError('not_found',404)
-                message=self.message(c,p,row['id']);enrich(c,[message]);result['message']=message
+                message=self.message(c,p,row['id']);enrich(c,[message],p);result['message']=message
             return serial(result)
 
     def search(self, token, query='', account='', chat='', sender='', from_time='',
@@ -544,7 +544,7 @@ class Store:
                 # Authorization remains READ COMMITTED. Re-read source evidence
                 # after pinning the view, then reject changes around all scans.
                 anchor=self.message(c,p,message_id)
-                enrich(c,[anchor])
+                enrich(c,[anchor],p)
             provider=str(anchor['provider_id'])
             numeric=int(provider) if anchor.get('platform')=='telegram' and provider.isascii() and provider.isdigit() and len(provider)<=18 else 0
             scans=[]
@@ -573,7 +573,7 @@ class Store:
                 rows=sorted(rows,key=lambda r:(r['id']!=anchor['id'],
                     abs((r['sent_at']-anchor['sent_at']).total_seconds())))[:limit]
             if conversation:
-                enrich(c,rows);rows.sort(key=sort_key)
+                enrich(c,rows,p);rows.sort(key=sort_key)
                 shape_messages(rows,compact=False,body_chars=cap)
                 shape_messages([anchor],compact=False,body_chars=cap)
                 decorate_messages(c,p,rows,include_system=include_system);decorate_messages(c,p,[anchor],include_system=include_system)
@@ -583,7 +583,7 @@ class Store:
                             row['display_text']=row['display_text'][:cap];row['display_text_truncated']=True
             else:
                 rows.sort(key=lambda r:(r['sent_at'],r['id']))
-                enrich(c,rows);enrich(c,[anchor])
+                enrich(c,rows,p);enrich(c,[anchor],p)
                 shape_messages(rows,compact=compact,body_chars=cap)
                 shape_messages([anchor],compact=compact,body_chars=cap)
             files=[f for f in anchor['attachments'] if f['download_status']=='ready']

@@ -309,6 +309,10 @@ def list_chats(store,c,p,after='',limit=100,*,accounts=None,query='',chat_types=
             if state['last_turn']=='unknown':row['last_message_direction']=None
             if row['awaiting_reply'] and state['suggested_action']=='unclear':
                 row['awaiting_reply_confidence']=state['basis']['code']
+    # The queue hint names its sender like a message; the raw ID stays in awaiting_reply_sender.
+    from .sender_names import resolve
+    resolve(c,p,items,chat='id',sender='awaiting_reply_sender',name='awaiting_reply_sender_name',
+        basis='awaiting_reply_sender_name_basis')
     raw=[row['id'] for row in items if row.pop('_raw_title')]
     if raw:
         labels={r['id']:r for r in c.execute('SELECT c.id,'+peer_name_sql()+' AS name,'+self_chat_sql()+

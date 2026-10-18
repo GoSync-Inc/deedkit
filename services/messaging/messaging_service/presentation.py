@@ -1,6 +1,6 @@
 """Bounded agent summaries; full evidence remains available by explicit opt-in."""
 MESSAGE_FIELDS = ('id','message','account','chat','sender','sent_at','revision','direction',
-    'provider_message_id','kind','origin','historical','is_backfill','event_sequence','sender_name','username',
+    'provider_message_id','kind','origin','historical','is_backfill','event_sequence','sender_name','sender_name_basis','username',
     'chat_title','chat_type','reply_to_provider_id','mentions_owner','reply_to_owner','forwarded','media_kind','body_truncated',
     'sender_identity_basis','agent_send','delivery_receipt','formatting')
 CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','order_basis',
@@ -88,6 +88,9 @@ def lean_message(row, *, search=False, files=True):
     result={k:row[k] for k in ('id','account','chat','sender','sender_name','sent_at','direction','kind','revision')
         if row.get(k) is not None}
     if 'sender_name' not in result and row.get('username'):result['username']=row['username']
+    # Compact rows state the basis only when the name is not this chat's own observation.
+    if result.get('sender_name') and row.get('sender_name_basis') not in (None,'message'):
+        result['sender_name_basis']=row['sender_name_basis']
     for key,maximum in [('sender_name',64),('username',64)]:
         if key in result:result[key]=result[key][:maximum]
     if search:
@@ -180,7 +183,9 @@ def lean_chat(row):
     if row.get('awaiting_reply'):
         hint={'message_id':row.get('awaiting_reply_message_id'),'revision':row.get('awaiting_reply_revision'),
             'sent_at':row.get('awaiting_reply_sent_at'),
-            'sender_name':row.get('awaiting_reply_sender_name') or row.get('awaiting_reply_username') or row.get('awaiting_reply_sender'),
+            'sender_id':row.get('awaiting_reply_sender'),
+            'sender_name':row.get('awaiting_reply_sender_name') or row.get('awaiting_reply_username'),
+            'sender_name_basis':row.get('awaiting_reply_sender_name_basis') if row.get('awaiting_reply_sender_name_basis')!='message' else None,
             'priority':row.get('awaiting_reply_priority'),'reasons':row.get('awaiting_reply_priority_reasons'),
             'waiting_hours':row.get('awaiting_reply_waiting_hours'),'incoming_count':row.get('awaiting_reply_incoming_count'),
             'basis':row.get('awaiting_reply_basis')}

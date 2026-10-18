@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from .chat_queries import title_sql
 from .policy import scope_filter, targets
+from .sender_names import resolve
 from .search_query import (compile_query, coverage, cursor_binding, decode_cursor,
     encode_cursor, filter_values, fingerprint, output_options, shape_messages, valid_text)
 
@@ -36,12 +37,16 @@ META = '''nullif(sp.display_name,'') AS sender_name,nullif(sp.username,'') AS us
 BASE = 'm.id,m.account,m.chat,m.sender,m.body,m.sent_at,m.revision,m.direction'
 
 
-def enrich(c, rows):
-    """Rows were individually authorized; metadata comes from the same chat."""
+def enrich(c, rows, p):
+    """Rows were individually authorized; metadata comes from the same chat.
+
+    A missing sender name falls back only to names the caller can read (sender_names).
+    """
     if not rows:
         return rows
-    metadata=c.execute('SELECT m.id,'+META+' FROM messages m '+JOINS+' WHERE m.id=ANY(%s)',
+    metadata=c.execute('SELECT m.id,m.account,m.chat,m.sender,'+META+' FROM messages m '+JOINS+' WHERE m.id=ANY(%s)',
         ([r['id'] for r in rows],)).fetchall()
+    resolve(c,p,metadata)
     by_id={r['id']:r for r in metadata}
     for row in rows:
         row.update(by_id.get(row['id'],{}))
@@ -187,7 +192,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         current_snapshot=fingerprint({'n':rows[0]['snapshot_count'],'checksum':rows[0]['snapshot_checksum']})
         if snapshot is not None and snapshot!=current_snapshot:raise APIError('cursor_changed',409)
         snapshot=current_snapshot
-    items=rows[:limit]
+    items=resolve(c,p,rows[:limit])
     next_cursor=None
     if len(rows)>limit:
         last=items[-1]
