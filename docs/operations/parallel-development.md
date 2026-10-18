@@ -94,7 +94,10 @@ at least important (`AGENTS.md`). Prefer splitting it.
   need to be up to date with `main`. The queue tests it against the latest `main`
   plus the pull requests ahead of it, and CI runs the required checks on
   `merge_group`; a queue run publishes nothing to Tiden
-  ([TIDEN-CI.md](../../TIDEN-CI.md)).
+  ([TIDEN-CI.md](../../TIDEN-CI.md)). When the group commit has exactly the tree
+  a passing, full pull request run tested (`main` has not moved since that run
+  and the group holds only that pull request), the queue run reuses that run's
+  verification and takes a minute or two instead of the full suite (ANYM-358).
 - Enqueue with `gh pr merge <n> --squash --auto` (repository auto-merge is on).
   The merge is asynchronous: confirm it landed, not that the command returned. A
   failed group check drops the pull request from the queue; fix it and enqueue
@@ -141,11 +144,12 @@ at least important (`AGENTS.md`). Prefer splitting it.
 - `main` push runs are never cancelled (`ci.yml` concurrency, since PR #60), so
   every merged SHA keeps a complete result. Promote only a SHA whose own push run
   succeeded.
-- The merge queue run is the authoritative test run of a merged SHA. Its `main`
-  push run validates that run's evidence and publishes it to Tiden instead of
-  running the test suite again, and still builds and publishes the images and
-  records the release; without a valid queue run it verifies in full
-  ([TIDEN-CI.md](../../TIDEN-CI.md), ANYM-322). `production.py verify` accepts the
+- A merge queue run that ran the suite is the authoritative test run of a merged
+  SHA. Its `main` push run validates that run's evidence and publishes it to
+  Tiden instead of running the test suite again, and still builds and publishes
+  the images and records the release; without a valid queue run, including after
+  a queue run that reused a pull request run, it verifies in full
+  ([TIDEN-CI.md](../../TIDEN-CI.md), ANYM-322, ANYM-358). `production.py verify` accepts the
   queue's verification only in place of `checks / verify` (ANYM-321).
 - Before prepare or a package publication, the release owner runs the release
   review ([review-protocol.md](review-protocol.md)) or records why none is due;
