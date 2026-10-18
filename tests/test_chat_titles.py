@@ -61,3 +61,60 @@ def test_self_chat_titled_by_its_lid_is_labelled_saved_messages(seeded):
     row=s.list_chats(key,include_coverage=False)['items'][0]
     assert row['title']=='Saved messages' and row['title_basis']=='self_chat'
     assert {m['chat_title'] for m in s.get_messages(key,row['id'])['items']}=={'Saved messages'}
+
+
+PHONE_TITLE = '+48 000 000 003'
+
+
+def titled_chat(seeded,account,chat,*,chat_type='private',self_metadata=False,self_observation=False):
+    s,_,_=seeded
+    ar=Archive(s);ar.register(account,'whatsapp','Synthetic '+account,discover=True)
+    key=s.issue_key(account+'-agent',[account])
+    at=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+    metadata={'chat_type':chat_type,**({'is_self_chat':True} if self_metadata else {})}
+    mid=ar.ingest(event(account=account,platform='whatsapp',chat=chat,chat_title=PHONE_TITLE,
+        provider_id='true_'+chat+'_TITLED1',sender='48000000000003@lid',body='Synthetic titled note',
+        sent_at=at,updated_at=at,direction='outgoing',sender_profile={'display_name':'Synthetic Owner','username':''},
+        metadata=metadata))['message']
+    if self_observation:
+        from messaging_service.reply_state import observe
+        with s.pool.connection() as c:
+            observe(c,account,chat,{'observed_at':at,'basis':'whatsapp_cached_chat','is_self_chat':True})
+    return s,key,mid
+
+
+def chat_titles(s,key,mid):
+    row=s.list_chats(key,include_coverage=False)['items'][0]
+    return (row,{m['chat_title'] for m in s.get_messages(key,row['id'])['items']},
+        {m['chat_title'] for m in s.search(key)['items']},s.get_context(key,mid)['message']['chat_title'])
+
+
+# spec: ANYM-361
+def test_self_chat_with_a_phone_number_title_is_labelled_saved_messages(seeded):
+    for account,evidence in (('title-self-md',{'self_metadata':True}),('title-self-ro',{'self_observation':True})):
+        s,key,mid=titled_chat(seeded,account,'48000000000003@lid',**evidence)
+        row,messages,found,context=chat_titles(s,key,mid)
+        assert row['title']=='Saved messages' and row['title_basis']=='self_chat'
+        assert messages==found=={'Saved messages'} and context=='Saved messages'
+        # Presentation only: the stored title and the provider ID are unchanged.
+        assert row['provider_chat_id']=='48000000000003@lid'
+        with s.pool.connection() as c:
+            assert c.execute('SELECT title FROM chats WHERE id=%s',(row['id'],)).fetchone()['title']==PHONE_TITLE
+        # Title matching still uses the stored title.
+        assert [r['id'] for r in s.list_chats(key,query='000 003',include_coverage=False)['items']]==[row['id']]
+
+
+# spec: ANYM-361
+def test_private_chat_with_a_phone_number_title_and_no_self_evidence_keeps_it(seeded):
+    s,key,mid=titled_chat(seeded,'title-plain','48000000000004@lid')
+    row,messages,found,context=chat_titles(s,key,mid)
+    assert row['title']==PHONE_TITLE and 'title_basis' not in row
+    assert messages==found=={PHONE_TITLE} and context==PHONE_TITLE
+
+
+# spec: ANYM-361
+def test_group_chat_with_stray_self_chat_metadata_keeps_its_title(seeded):
+    s,key,mid=titled_chat(seeded,'title-group','120000000000000001@g.us',chat_type='group',self_metadata=True)
+    row,messages,found,context=chat_titles(s,key,mid)
+    assert row['title']==PHONE_TITLE and 'title_basis' not in row
+    assert messages==found=={PHONE_TITLE} and context==PHONE_TITLE
