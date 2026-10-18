@@ -1242,3 +1242,24 @@ def test_the_reuse_job_passes_the_chained_pull_request_from_its_decision_to_its_
     monkeypatch.setattr(sys, "argv", ["ci_reuse.py", "adopt", "--directory", str(tmp_path / "other")])
     with pytest.raises(ci_reuse.Refused, match="not exactly this commit's tree"):
         ci_reuse.main()
+
+
+# spec: ANYM-322
+def test_within_one_deploy_a_chained_verification_rereads_the_pull_request_run_and_a_rerun_is_verified_again(tmp_path):
+    github = ChainGitHub(b"")
+    get = chain_push(github)
+    paths = []
+
+    def counted(path):
+        paths.append(path)
+        return get(path)
+    with production.verification_reuse():
+        first = production.verify(SHA, counted)
+        paths.clear()
+        assert production.verify(SHA, counted) == first
+        assert not any("/jobs?" in path for path in paths)
+        assert [path for path in paths if "event=pull_request" in path and f"head_sha={HEAD_SHA}" in path]
+        github.pr.runs[0] = {**github.pr.runs[0], "run_attempt": 2}  # a successful rerun after the first read
+        paths.clear()
+        assert production.verify(SHA, counted)["verify_run_attempt"] == 2
+        assert f"actions/runs/{PR_RUN_ID}/attempts/2/jobs?per_page=100&page=1" in paths

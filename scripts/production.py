@@ -245,10 +245,13 @@ def verify(sha, get=api):
     known = _verified.get(sha) if _verified is not None else None
     if known and unchanged(known["push"], latest) and (known["queue"] is None or (
             unchanged(known["queue"], latest_run(sha, "merge_group", get))
+            and (known.get("pull") is None
+                 or unchanged(known["pull"], latest_run(known["pull"]["head_sha"], "pull_request", get)))
             and unchanged(latest, latest_run(sha, "push", get)))):
         # Within one deploy run: the same completed attempts have the same jobs, so the runs are read again
-        # but not their jobs (the host's anonymous GitHub quota is 60 requests an hour). After the queue read
-        # the push run is read once more, as the full path does, so a rerun between the reads is not missed.
+        # but not their jobs (the host's anonymous GitHub quota is 60 requests an hour). After the queue read (and,
+        # for the PR→queue chain, the pull request run read) the push run is read once more, as the full path does,
+        # so a rerun between the reads is not missed.
         return known["result"]
     jobs = attempt_jobs(latest, get)
     verified_by, queue = latest, None
@@ -271,7 +274,8 @@ def verify(sha, get=api):
               "verify_run_id": verified_by["id"], "verify_run_attempt": verified_by["run_attempt"],
               "verify_run_url": verified_by["html_url"]}
     if _verified is not None:
-        _verified[sha] = {"push": latest, "queue": None if verified_by is latest else queue, "result": result}
+        _verified[sha] = {"push": latest, "queue": None if verified_by is latest else queue,
+                          "pull": verified_by if queue is not None and verified_by is not queue else None, "result": result}
     return result
 
 
