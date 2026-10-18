@@ -81,8 +81,10 @@ def self_chat_sql(chat='c'):
 
 
 def title_sql(chat='c'):
-    return f"""CASE WHEN {raw_title_sql(chat)} THEN coalesce(CASE WHEN {self_chat_sql(chat)}
-        THEN '{SELF_CHAT_TITLE}' END,{peer_name_sql(chat)},{chat}.title) ELSE {chat}.title END"""
+    # ANYM-361: self-chat evidence labels a private chat whatever its stored title;
+    # a group or channel is never relabelled by stray message metadata.
+    return f"""CASE WHEN {chat}.chat_type='private' AND {self_chat_sql(chat)} THEN '{SELF_CHAT_TITLE}'
+        WHEN {raw_title_sql(chat)} THEN coalesce({peer_name_sql(chat)},{chat}.title) ELSE {chat}.title END"""
 
 
 # ANYM-276: one fixed integer per component; a row's priority is the sum of its non-zero components.
@@ -308,7 +310,6 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         base=base.replace(' FROM chats c JOIN accounts a',' FROM chat_page c JOIN accounts a',1)
         query_args=[*args,limit+1,*base_args,limit+1];where='true'
     rows=c.execute(prefix+'''SELECT c.id,c.account,c.title,c.provider_chat AS provider_chat_id,c.chat_type AS type,
-        '''+raw_title_sql()+''' AS _raw_title,
         last.sent_at AS last_activity,last.id AS last_message_id,last.direction AS last_message_direction,
         last.snippet AS last_message_snippet,ro.unread_count AS provider_unread_count,ro.unread_count AS unread_count,
         '''+unread+''' AS provider_unread,ro.observed_at AS read_state_observed_at,ro.basis AS read_state_basis,
@@ -378,10 +379,10 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     from .sender_names import resolve
     resolve(c,p,items,chat='id',sender='awaiting_reply_sender',name='awaiting_reply_sender_name',
         basis='awaiting_reply_sender_name_basis')
-    raw=[row['id'] for row in items if row.pop('_raw_title')]
-    if raw:
-        labels={r['id']:r for r in c.execute('SELECT c.id,'+peer_name_sql()+' AS name,'+self_chat_sql()+
-            ' AS self FROM chats c WHERE c.id=ANY(%s)',(raw,))}
+    private=[row['id'] for row in items if row['type']=='private']
+    if private:
+        labels={r['id']:r for r in c.execute('SELECT c.id,CASE WHEN '+raw_title_sql()+' THEN '+peer_name_sql()+
+            ' END AS name,'+self_chat_sql()+' AS self FROM chats c WHERE c.id=ANY(%s)',(private,))}
         for row in items:
             label=labels.get(row['id'])
             if label and label['self']:row.update(title=SELF_CHAT_TITLE,title_basis='self_chat')
