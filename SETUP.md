@@ -179,6 +179,16 @@ collector services only once the release a rollback would return to already
 contains forward origin support: an older server rejects such a capture and the
 collector skips that message.
 
+### Provider business and verified flags
+
+Collectors record that a sender is a WhatsApp business (`VerifiedName`) or a
+Telegram verified/support account (`sender_is_business_or_verified`, used by the
+reply queue demotion in [CONVERSATION.md](CONVERSATION.md#queue-priority-components))
+only when their environment sets `ANYMSG_CAPTURE_PROVIDER_FLAGS=1`; it is off by
+default. Only a stated flag is captured. Set it on the Telegram and WhatsApp
+collector services once the release a rollback would return to accepts the field:
+an older server rejects the capture and the collector skips that message.
+
 ### Reply queue upgrade (0.9.17)
 
 Apply migration 027 as owner and reapply `gateway_role.sql` and

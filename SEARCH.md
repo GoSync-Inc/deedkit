@@ -221,15 +221,23 @@ request was answered.
 `order='priority'` requires `awaiting_reply=true`. The score is 100 for private
 chats or 25 for explicit group attention, +25 for question punctuation, +10 for
 an observed provider contact, plus waiting points: the square root of waiting hours
-(1 hour = 1, 1 day = 4, 4 days = 9), capped at 20 after about 17 days. Each row
+(1 hour = 1, 1 day = 4, 4 days = 9), capped at 20 after about 17 days, minus
+demotions for chats the owner never wrote in, provider business/verified
+senders, the owner's other accounts, closing courtesies and group bots
+(weights and rules in [CONVERSATION.md](CONVERSATION.md#queue-priority-components)).
+Every private hint without a demotion outranks a group hint; a demoted private
+hint may rank below one. Each row
 includes the score, `awaiting_reply_waiting_hours` and reasons; `waiting_age` or
-`waiting_age_capped` appear only when waiting points were added. This does not infer identity from names or decide whether
+`waiting_age_capped` appear only when waiting points were added, and
+`detail=full` adds `awaiting_reply_priority_components` with the points per reason.
+This does not infer identity from names or decide whether
 a statement semantically requires an answer. Contact flags can be unknown.
 Priority cursors retain a scoring timestamp and bind all filters.
 
 Additional query filters: `exclude_chats` (archive chat IDs), `exclude_senders`
 (provider sender IDs within selected accounts), `only_questions`, `only_unread`,
-and `chat_types=['private']`. Exclusions are per request, not a stored global
+`exclude_likely_broadcasts` (opt-in: one-way chats and provider business/verified
+senders; `excluded_likely_broadcasts_total`) and `chat_types=['private']`. Exclusions are per request, not a stored global
 mute policy. Select accounts when the same provider sender ID is ambiguous.
 
 `unread_count`/`provider_unread_count` is a timestamped chat observation, separate
