@@ -302,9 +302,10 @@ jobs:
         if: ${{ always() }}
         run: docker logout ghcr.io
   release:
-    # After every verification job, the Tiden publication and the image publication have
-    # passed, so no release is recorded for a SHA whose images were not published. Tiden captures
-    # a release gate from the main gate when the release is first created (TIDEN-CI.md).
+    # After every verification job and the image publication have passed, so no release is
+    # recorded for a SHA whose images were not published. Tiden captures a release gate from the
+    # main gate when the release is first created (TIDEN-CI.md); when this commit's evidence
+    # publication only warned, its run is not the latest main run and the record warns.
     name: Tiden release record
     needs: [gate, publish]
     if: ${{ !cancelled() && needs.gate.result == 'success' && needs.publish.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}

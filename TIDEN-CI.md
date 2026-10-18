@@ -36,7 +36,10 @@ earlier attempt's fragment. A job without such a fragment contributes no
 reports, and its checks take its job result, so they never read as passed. The
 evidence is named by the assembling run attempt and is retained either way;
 the job then fails when a fragment is missing or a test job failed, was
-cancelled or was skipped, whether or not Tiden reporting is configured.
+cancelled or was skipped, and when the prepared evidence records a failed test
+or a failed or blocked check (a missing, invalid or only-skipped report),
+whether or not Tiden reporting is configured. So `CI gate` never depends on the
+Tiden publication.
 
 The separate reporting job receives no database or messenger credentials. It
 uses Tiden CLI 0.33.0 from the official release with a pinned SHA-256 checksum.
@@ -81,8 +84,20 @@ The publisher reads the result back and accepts only that same-named branch or a
 (uppercase, dots) still need a mapping. The `tiden-route.json` receipt records the
 chosen branch and why.
 Do not label a feature run as `main` just to make the main gate green. Failed
-evidence association fails the reporting job. Without a token the job clearly
+evidence association fails the publication step. Without a token the job clearly
 states that reporting is not configured. No workspace credentials belong in Git.
+
+A publication failure is a warning, not a red gate. When installing the CLI or
+publishing fails, including a Tiden error, a refused route or association, a
+contradicting verdict or a hang past the step timeout, the reporting job still
+succeeds: it logs a `Tiden evidence not published` warning naming the failed
+step, writes `tiden-publication.json` and retains it with any Tiden response in
+the `tiden-receipt` artifact. The merge queue, docs-only and pull request reuse
+receipts are not publications and still fail the job when unproven. The
+run's evidence is then missing in Tiden: its intent branch shows no run for the
+commit, a main commit's release record warns instead of recording, and the drift,
+health and release spec sync checks still see the code; `production.py verify`
+does not require the publication. Rerun all jobs to publish it.
 
 CI runs on `push` only for `main`. A feature branch is verified by its pull
 request run, so a push does not repeat CI or publish a second copy of the
@@ -322,9 +337,10 @@ when the release is recorded again. So the job records only while this commit's
 passed run is the latest completed `main` run, at least a minute after it
 completed, and then checks that the run completed last before the release's
 creation time is this commit's. Otherwise it warns, and its
-`tiden-release-receipt` artifact records `gateFromThisCommit: false`. A Tiden
-error fails the job and with it the main run, as a failed evidence publication
-does, and `production.py verify` then refuses that commit. The
+`tiden-release-receipt` artifact records `gateFromThisCommit: false`; this is
+also the case when the commit's evidence publication only warned. A Tiden
+error in the release record fails the job and with it the main run, and
+`production.py verify` then refuses that commit. The
 `production` release is recorded by the dispatch in
 [production.md](docs/operations/production.md). `synthetic` is
 historical: release 0.9.16 is attached to it, so keep it, but send no new runs

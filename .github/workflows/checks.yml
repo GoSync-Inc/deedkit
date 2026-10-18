@@ -623,6 +623,11 @@ jobs:
           retention-days: 14
           # Artifact names are unique per run, so a rerun attempt replaces its earlier evidence.
           overwrite: true
+      - name: Require every recorded test and check to have passed
+        # Failed tests and failed or blocked checks (a missing, invalid or only-skipped report) fail here, so the
+        # gate never depends on the Tiden publication, which only warns (TIDEN-CI.md).
+        if: ${{ always() }}
+        run: python ci-tools/scripts/tiden_ci.py verdict --directory "$RUNNER_TEMP/ci-evidence"
       - name: Require every test job to have succeeded
         if: ${{ always() }}
         env:
@@ -643,7 +648,8 @@ jobs:
     # tested merge SHA, not the head SHA or the last successful main revision.
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    # Above the step timeouts below, so a hung Tiden call ends as a warning, never as a failed job.
+    timeout-minutes: 8
     steps:
       - name: Check optional Tiden configuration
         id: config
@@ -686,8 +692,12 @@ jobs:
         with:
           name: ci-evidence
           path: ${{ runner.temp }}/ci-evidence
+      # The publication reports the verdict that checks / evidence already enforced; its failure only warns.
       - name: Install pinned Tiden CLI with integrity check
+        id: install
         if: steps.config.outputs.enabled == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
         run: |
           curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.33.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
           echo "3f6b650c4cabd58ce4149d9106325cbd36d1472cccc9c63ca03137668b80e4a6  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
@@ -695,7 +705,10 @@ jobs:
           tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
           echo "$RUNNER_TEMP/tiden-bin" >> "$GITHUB_PATH"
       - name: Publish and verify branch association
+        id: publish
         if: steps.config.outputs.enabled == 'true'
+        continue-on-error: true
+        timeout-minutes: 3
         env:
           TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
           TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
@@ -703,6 +716,16 @@ jobs:
           TIDEN_BASE_URL: https://app.tiden.ai
           TIDEN_BRANCH_MAP: ${{ vars.TIDEN_BRANCH_MAP }}
         run: python scripts/tiden_ci.py publish --directory "$RUNNER_TEMP/ci-evidence"
+      - name: Warn that the evidence was not published to Tiden
+        if: ${{ always() && steps.config.outputs.enabled == 'true' && (steps.install.outcome != 'success' || steps.publish.outcome != 'success') }}
+        env:
+          INSTALL: ${{ steps.install.outcome }}
+          PUBLISH: ${{ steps.publish.outcome }}
+        run: |
+          python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-publication.json").write_text(json.dumps({"published": False, "install": os.environ["INSTALL"], "publish": os.environ["PUBLISH"]}))'
+          message="CLI install: ${INSTALL:-not run}; publication: ${PUBLISH:-not run}. CI gate does not wait for Tiden; rerun all jobs to publish (TIDEN-CI.md)"
+          echo "::warning title=Tiden evidence not published::$message"
+          echo "Tiden evidence not published. $message" >> "$GITHUB_STEP_SUMMARY"
       - name: Record that a merge queue run publishes nothing
         if: steps.config.outputs.queue == 'true'
         run: python scripts/tiden_ci.py publish --directory "$RUNNER_TEMP/ci-evidence"
