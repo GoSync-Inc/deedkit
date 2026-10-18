@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT / "tests/platform"))
 from runtime_helpers import call, gateway, port, server
 from agent_api import ANNOTATIONS, DESCRIPTIONS, METHODS
 from app import create_app
+from core import CallVoice
 from test_agent_api import registry
 from test_tasks import Archive, BRIEF
 
@@ -83,8 +84,9 @@ def test_gateway_scoped_phone_preparation_needs_no_messaging(tmp_path):
         assert [row["id"] for row in listed["items"]] == [brief["id"]]
         assert listed["next_offset"] is None
         assert "+12025550123" not in json.dumps(listed)
-        grok = call(c, "calls_prepare_external_call", {"brief": {**body,
-            "dialog_engine":"grok_realtime", "grok_voice":"rex"}})
+        # ANYM-359: Grok comes from the owner's call voice, not the agent's brief.
+        app.state.service.set_call_voice(CallVoice(provider="grok_realtime", grok_voice="rex"))
+        grok = call(c, "calls_prepare_external_call", {"brief": body})
         assert grok["model"] == "grok-voice-3.0" and grok["grok_voice"] == "rex"
         readiness = call(c, "calls_capabilities", {})["calling_readiness"]
         assert readiness["channels"]["phone"]["provider_connection"] == "not_probed"
@@ -198,4 +200,32 @@ def test_gateway_raises_call_cap_with_owner_words(tmp_path):
         assert raised["call_cap"]["daily_call_units"] == 14
         caps = call(c, "calls_capabilities", {})
         assert caps["call_cap"]["raises"][0]["owner_instruction"] == "Yes, 4 more calls today"
+    app.state.service.close()
+
+
+# spec: ANYM-359
+def test_gateway_refuses_agent_call_voice_fields(tmp_path):
+    path, _, _ = registry(tmp_path)
+    selected_port = port()
+    base = f"http://127.0.0.1:{selected_port}"
+    app = create_app(tmp_path / "data", Archive(), agent_registry=path)
+    with (
+        server(app, selected_port),
+        gateway(
+            tmp_path,
+            {"calls": (base, "alice")},
+            {"calls": ["calls:prepare", "calls:read"]},
+            ["platform_capabilities", "calls_prepare_call", "calls_prepare_external_call"],
+        ) as (c, _, _),
+    ):
+        body = {**BRIEF, "source_message_ids": []}
+        external = {**body, "channel": "phone", "account": "twilio", "destination": "+12025550123"}
+        for field, value in (("dialog_engine", "grok_realtime"), ("voice", "Puck"), ("grok_voice", None),
+                             ("custom_voice_id", "voice_owner_fixture"), ("voice_style", "neutral")):
+            for tool, brief in (("calls_prepare_call", body), ("calls_prepare_external_call", external)):
+                response = c.post(f"/v1/{tool}", json={"brief": {**brief, field: value}})
+                # The gateway's own validation payload: the agent learns the field is unknown.
+                assert response.status_code == 422 and response.json()["error"] == "invalid_arguments", (tool, field)
+                assert response.json()["field_errors"] == [{"field": f"brief/{field}", "reason": "unknown_field"}]
+        assert app.state.service.db.execute("SELECT count(*) FROM briefs").fetchone()[0] == 0
     app.state.service.close()

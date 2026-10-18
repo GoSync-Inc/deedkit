@@ -13,7 +13,7 @@ from xml.sax.saxutils import escape
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from core import ACTIVE, BriefInput, ServiceError, now
+from core import ACTIVE, AgentBrief, BriefInput, ServiceError, now
 import destination_policy as policy
 
 E164=re.compile(r'\+[1-9][0-9]{7,14}')
@@ -21,7 +21,7 @@ RAISE_FIELDS=('id','created_at','expires_at','principal','owner_instruction','ex
 SIP=re.compile(r'sips?:[A-Za-z0-9_.+-]{1,80}@[A-Za-z0-9.-]{1,200}(?::[0-9]{1,5})?(?:;transport=(?:tcp|tls|udp))?(?:;secure=true)?')
 
 
-class ExternalBrief(BriefInput):
+class AgentExternalBrief(AgentBrief):
     channel: str = Field(pattern=r'^(telegram|whatsapp|phone|sip)$')
     account: str = Field(pattern=r'^(telegram|twilio)$')
     destination: str = Field(min_length=1,max_length=300)
@@ -37,6 +37,11 @@ class ExternalBrief(BriefInput):
         if not valid:
             raise ValueError('invalid_call_destination_or_account')
         return self
+
+
+# Owner route plus the owner's engine and voice; agents use AgentExternalBrief.
+class ExternalBrief(BriefInput,AgentExternalBrief):
+    pass
 
 
 class CallingSettings(BaseModel):

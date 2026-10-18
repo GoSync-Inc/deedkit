@@ -192,7 +192,7 @@ class TelegramCalls:
         from voice import run_transport
         reason='disconnected'
         try:
-            await asyncio.wait_for(run_transport(transport,state['brief'],self.key(),state),state['brief']['max_duration_secs'])
+            await asyncio.wait_for(run_transport(transport,state['brief'],self.key(state['brief']),state),state['brief']['max_duration_secs'])
             reason=state.get('end_reason',reason)
         except asyncio.CancelledError:
             reason=state.get('end_reason','owner_stop');raise

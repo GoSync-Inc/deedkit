@@ -1,11 +1,69 @@
 # Grok Voice and phone/SIP readiness
 
-Grok Voice 3.0 is an experimental alternative to Gemini Live in the browser and
-on the existing Twilio phone/SIP transport. Select `dialog_engine: grok_realtime`
-and `grok_voice: rex` (also `eve`, `ara`, `sal`, `leo`). The frozen snapshot pins
-`grok-voice-3.0`; the server connects to `wss://api.x.ai/v1/realtime`. Audio goes
-directly to xAI and comes back as audio, without a separate STT/TTS pipeline.
+Grok Voice 3.0 is an alternative to Gemini Live on every channel: browser,
+phone, SIP, WhatsApp and Telegram. The frozen snapshot pins `grok-voice-3.0`;
+the server connects to `wss://api.x.ai/v1/realtime`. Audio goes directly to xAI
+and comes back as audio, without a separate STT/TTS pipeline.
 [xAI speech-to-speech API](https://docs.x.ai/developers/model-capabilities/audio/speech-to-speech).
+
+## One voice for all calls (ANYM-359)
+
+The owner sets one `call_voice` for every agent-prepared call; agents can
+neither choose nor change it. It is a private server file,
+`VOICE_DATA_DIR/call-voice.json` (0600), read and written only through the
+owner API `GET`/`POST /api/call-voice`, with no panel UI. After a deploy every
+call stays on Gemini `Puck` until it is set. On the server, the owner (or a
+worker on the owner's explicit word: a production change) runs, inside the
+calls container, which reads the owner credential itself and never prints it:
+
+```sh
+docker compose <deployment files> exec calls python call_voice.py              # show
+docker compose <deployment files> exec calls python call_voice.py '{"provider":"grok_realtime","grok_voice":"rex"}'
+```
+
+Direct API use needs the owner credential, a loopback host, and for the write
+`Origin: http://127.0.0.1:13842` and `X-Voice-Service: 1`.
+
+Fields: `provider` (`gemini_live` or `grok_realtime`), `gemini_voice`,
+`grok_voice`, optional `gemini_custom_voice_id` (the replicated Gemini voice;
+refused with Grok) and `voice_style`. Unset means `gemini_live`, `Puck`,
+neutral, no custom voice. A voice outside the lists below is refused. Saving the
+calling settings does not touch it.
+
+Preparation copies the current `call_voice` into the frozen brief. Changing it
+later does not alter a prepared or running brief; followups keep the parent's
+provider and voice. Agent briefs (scoped `/v1`, the gateway and the control
+MCP) carry no `dialog_engine`, `voice`, `grok_voice`, `custom_voice_id` or
+`voice_style`; a request with any of them, even a default or null, fails
+validation with `invalid_arguments` and saves nothing. `calls_capabilities`
+shows `call_voice: {provider, model, voice, custom_voice}` without the custom
+voice ID (`voice: replicated` for the replicated voice). Every prepared brief
+returns its frozen `dialog_engine`, `voice` and `grok_voice`. The owner's browser rehearsal keeps its own engine and voice pickers
+(Flows included) and never changes `call_voice`.
+
+Voices offered: Gemini `Kore, Puck, Charon, Fenrir, Aoede, Leda, Orus, Zephyr`;
+Grok `eve, ara, rex, sal, leo`. On 2026-10-18 Google listed 30 Gemini Live
+voices (https://ai.google.dev/gemini-api/docs/live-guide); on 2026-10-19 xAI
+listed 28 voices with audio samples, page updated 2026-10-14
+(https://docs.x.ai/developers/model-capabilities/audio/voice). Only the voice
+the owner picks after listening to those samples is added.
+
+Owner test path: set `call_voice`, ask the agent for a new call to you
+(`destination_source: owner_named`), listen, switch and repeat. After a switch
+ask for a new call: a followup or a brief prepared before the switch keeps the
+old voice. To audition voices first, use the owner's browser rehearsal, whose
+engine and voice pickers are independent of `call_voice`. Synthetic tests
+are not live acceptance (ANYM-239 stage B).
+
+## Input audio format
+
+xAI takes the frame bytes as they arrive and assumes 24 kHz PCM unless told
+otherwise. Each transport therefore declares its own rate in `session.update`:
+16 kHz PCM for the browser and Twilio (phone, SIP and WhatsApp; Twilio's 8 kHz
+mulaw is decoded to 16 kHz) and 48 kHz PCM for Telegram. No resampler is added.
+The Telegram route uses the xAI key for Grok briefs.
+
+## Tools and audio
 
 The installed Pipecat 1.12 xAI realtime service carries the same six scoped task
 tools as the legacy Gemini executor. No remote MCP, web search, messenger access
@@ -34,7 +92,7 @@ This executor does not implement the browser-only Gemini Flows closing graph.
 Farewell playback, interruption, network disconnects and ru/en/id task quality
 still require audio acceptance. Grok's inclusion is not evidence that it is
 better than Gemini or that a real phone call has succeeded. Google custom voices
-and Telegram/WhatsApp Grok routes are rejected before a brief is saved.
+are rejected for Grok before a brief is saved.
 Followups retain the provider and chosen voice, require a new owner instruction
 for dialing, and do not import a Gemini learned prompt.
 
@@ -79,7 +137,8 @@ For phone or SIP, check these layers:
    `/provider/twilio/` callbacks and WSS media route reach this service. Keep the
    owner UI and MCP private. Twilio account, number, trial and destination
    permissions still apply; local validation cannot establish them.
-4. Save the selected model's key. Prepare the task without archive source IDs
+4. Save the key of the `call_voice` provider (readiness reports
+   `model_key_required` without it). Prepare the task without archive source IDs
    if no messenger context is needed. Run `calls_preflight_call` for that brief.
 5. Only for a task the owner gave, invoke `calls_dial_call` once with the owner's
    own words as `owner_instruction` and the destination's origin: `owner_named`

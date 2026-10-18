@@ -14,8 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from fastapi.responses import JSONResponse
 
 from anymsg import AnyMsg
-from core import BriefInput, ServiceError
-from outbound import ExternalBrief
+from core import AgentBrief, ServiceError
+from outbound import AgentExternalBrief
 import destination_policy as policy
 
 
@@ -28,11 +28,11 @@ class Empty(Strict):
 
 
 class Prepare(Strict):
-    brief: BriefInput
+    brief: AgentBrief
 
 
 class PrepareExternal(Strict):
-    brief: ExternalBrief
+    brief: AgentExternalBrief
 
 
 class Brief(Strict):
@@ -115,16 +115,18 @@ DESCRIPTIONS = {
     "raises, daily_calls_remaining and brief/call limits. Contacts no provider; "
     "preflight_call checks one external brief.",
     "prepare_call": "Local write; places no call. Saves a new browser-rehearsal brief "
-    "(goal, counterparty, success_fields, voice) owned by this principal and returns "
+    "(goal, counterparty, success_fields) owned by this principal and returns "
     "its id as brief_id. Optional source_message_ids (max 8) are read from this "
-    "principal's own message archive. Every request creates a new brief. "
+    "principal's own message archive. The owner sets the voice for all calls "
+    "(capabilities call_voice). Every request creates a new brief. "
     "Next: start_call.",
     "prepare_external_call": "Local write; places no call. Saves a new outbound brief "
     "for one exact channel (phone, sip, whatsapp or telegram), account and "
     "destination and returns its id as brief_id. The destination may be one the owner "
     "named or one you found for the owner's task; no recipient list applies (SIP: "
     "exact allowlist). Emergency numbers and short codes are refused: tell the owner "
-    "to call them directly. Next: preflight_call, then dial_call.",
+    "to call them directly. The owner sets the voice for all calls (capabilities "
+    "call_voice). Next: preflight_call, then dial_call.",
     "start_call": "Local write; places no phone call. Opens a browser rehearsal for a "
     "prepared browser brief: the call waits as waiting_for_browser until a human opens "
     "the local voice UI and joins with a microphone. Repeating with the same brief_id "
@@ -206,7 +208,7 @@ ANNOTATIONS = {
         "openWorldHint": True,
     },
 }
-_BRIEF = BriefInput.model_json_schema()["properties"]
+_BRIEF = AgentBrief.model_json_schema()["properties"]
 LIMITS = {
     # Enforced bounds only, read from the request models where they are declared.
     "active_calls_per_service": 1,
@@ -397,6 +399,13 @@ class AgentAPI:
         if self.registry.authenticate(token) != principal:
             raise ServiceError("policy_changed", 409)
 
+    def call_voice_summary(self):
+        """Read-only: which voice will speak; never the custom voice ID (ANYM-359)."""
+        try:
+            return self.service.call_voice().summary()
+        except ServiceError as error:
+            return {"error": error.code}
+
     @staticmethod
     def route(principal, brief):
         if brief["channel"] not in principal.channels:
@@ -442,6 +451,10 @@ class AgentAPI:
         }
 
     async def call(self, token, name, arguments):
+        # One projection for every agent response: no custom voice ID (ANYM-359).
+        return self.service.agent_view(await self._call(token, name, arguments))
+
+    async def _call(self, token, name, arguments):
         principal = self.registry.authenticate(token)
         if name not in METHODS:
             raise ServiceError("not_found_or_forbidden", 403)
@@ -472,6 +485,7 @@ class AgentAPI:
                 "shared_learning": False,
                 "owner_decision_write": False,
                 "live_call_verification": "not_claimed",
+                "call_voice": self.call_voice_summary(),
                 **({'calling_readiness':self.readiness(principal)} if self.readiness else {}),
                 **({'call_cap':cap} if cap else {}),
             }
@@ -483,7 +497,7 @@ class AgentAPI:
                 admission=lambda: self.admit(token, principal),
             )
         if name in {"prepare_call", "prepare_external_call"}:
-            selected = args.brief
+            selected = self.service.with_call_voice(args.brief)
             self.route(principal, {"channel": "browser", **selected.model_dump()})
             if name == "prepare_external_call":
                 policy.dial_units(selected.channel, selected.destination)

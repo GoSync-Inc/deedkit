@@ -19,7 +19,7 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from anymsg import AnyMsg, UnconfiguredArchive
-from core import ACTIVE, MODEL, GROK_MODEL, GROK_VOICES, PROMPT_VERSION, VOICES, BriefInput, ServiceError, VoiceService
+from core import ACTIVE, MODEL, GROK_MODEL, GROK_VOICES, PROMPT_VERSION, VOICES, BriefInput, CallVoice, ServiceError, VoiceService
 from control import control_key, create_control
 from agent_api import AgentAPI, AgentRegistry
 from learning import LearningWorker, ANALYZER_MODEL
@@ -156,12 +156,16 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
     if os.environ.get('VOICE_TELEGRAM_SOCKET'):
         from telegram_audio import TelegramCalls
         providers['telegram']=TelegramCalls({'socket':os.environ['VOICE_TELEGRAM_SOCKET'],
-            'token_file':os.environ['VOICE_TELEGRAM_TOKEN_FILE']},service,lambda:keys.get('gemini'),supervisor)
+            'token_file':os.environ['VOICE_TELEGRAM_TOKEN_FILE']},service,model_key,supervisor)
     outbound=Outbound(service,lambda:keys.get('gemini'),policy,providers,model_key=model_key)
     persist=os.environ.get('VOICE_PERSIST_CREDENTIALS')=='1'
     browser_enabled=os.environ.get('VOICE_BROWSER_ENABLED','1')=='1'
     if persist:
         keys.update(read_private(directory/'model-key.json'))
+
+    def voice_provider():
+        try:return service.call_voice().provider
+        except ServiceError:return None
 
     async def cancel_learning():
         task=getattr(app.state,'learning_task',None)
@@ -255,7 +259,8 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
             channels[channel]=('experimental_ready' if connected['telegram']['connected'] else 'not_connected') if channel=='telegram' else ('configured_needs_pilot' if connected['twilio']['configured'] else 'not_connected')
         return {'credentials':credential_status(),'model':MODEL,'voices':VOICES,
                 'voice_providers':{'gemini':{'model':MODEL,'voices':VOICES},
-                                   'xai':{'model':GROK_MODEL,'voices':GROK_VOICES,'scope':['browser','phone','sip']}},
+                                   'xai':{'model':GROK_MODEL,'voices':GROK_VOICES,'scope':['browser','telegram','whatsapp','phone','sip']}},
+                'call_voice':app.state.agent_api.call_voice_summary(),
                 'prompt_version':learned['prompt_version'] if learned else PROMPT_VERSION,'framework':'Pipecat 1.12.0', 'transport':'SmallWebRTC',
                 'dialog_engines':['gemini_live','gemini_live_flows','grok_realtime'],
                 'live_flows':{'scope':'browser_prototype','context_strategy':'APPEND','fixed_tools':True,
@@ -299,6 +304,15 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
     async def twilio_probe():
         provider=outbound.providers.get('twilio')
         return await provider.probe() if provider else {'connected':False,'error':'twilio_credentials_required'}
+
+    @app.get('/api/call-voice')
+    async def call_voice():
+        return service.call_voice().model_dump()
+
+    @app.post('/api/call-voice')
+    async def set_call_voice(body:CallVoice):
+        # Agent briefs already prepared keep the voice frozen in them.
+        return service.set_call_voice(body).model_dump()
 
     @app.post('/api/external/briefs')
     async def prepare_external(body:ExternalBrief):
@@ -516,7 +530,7 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
     from readiness import calling_readiness
     app.state.agent_api=AgentAPI(service,AgentRegistry(agent_registry or os.environ.get('VOICE_AGENT_REGISTRY')),
         control_start,control_stop,outbound,
-        readiness=lambda principal:calling_readiness(principal,outbound,credential_status(),browser_enabled))
+        readiness=lambda principal:calling_readiness(principal,outbound,credential_status(),browser_enabled,voice_provider()))
 
     @app.post('/v1/{operation}')
     async def agent_operation(operation:str,request:Request):

@@ -42,6 +42,8 @@ def test_ready_twilio_configuration_requires_scoped_recipient_and_selected_model
     with TestClient(app) as client:
         client.headers.update(owner_headers(tmp_path/'data'))
         client.post('/api/credentials',json={'xai':'synthetic-xai-key'},headers=HEADERS)
+        # ANYM-359: the selected model key is the owner's call voice provider.
+        client.post('/api/call-voice',json={'provider':'grok_realtime'},headers=HEADERS)
         setup={'enabled':True,'allowed':{'sip':['sip:alice@pbx.example.test']},'twilio':{
             'account_sid':'AC'+'1'*32,'auth_token':'synthetic-token','phone_from':'+12025550125',
             'public_url':'https://voice.example.test'}}
@@ -74,7 +76,9 @@ def test_twilio_preflight_requires_the_briefs_own_model_credential(tmp_path,cred
         client.post('/api/calling',json=setup,headers=HEADERS)
         auth={'Authorization':'Bearer alice'}
         for engine,expected in [(unavailable,'model_key_required'),(available,None)]:
-            body={**BRIEF,'source_message_ids':[],'dialog_engine':engine,'channel':'phone',
+            # ANYM-359: the engine is the owner's call voice, never an agent field.
+            client.post('/api/call-voice',json={'provider':engine},headers=HEADERS)
+            body={**BRIEF,'source_message_ids':[],'channel':'phone',
                   'account':'twilio','destination':'+12025550123'}
             brief=client.post('/v1/prepare_external_call',json={'brief':body},headers=auth)
             assert brief.status_code==200
