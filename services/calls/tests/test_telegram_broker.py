@@ -89,3 +89,18 @@ async def test_pinned_native_adapter_starts_over_broker_without_telegram_client(
     finally:
         from telegram_audio import dispose_native
         await client.close();await broker.close();dispose_native(native)
+
+
+async def test_broker_accepts_unlisted_user_without_policy_file(socket_path):
+    # ANYM-288: the calls service owns the destination policy; the broker keeps no list.
+    provider=Provider();broker=SessionBroker(provider,socket_path,'fixture')
+    await broker.start()
+    client=BrokerClient(socket_path,'fixture',987654321);await client.connect()
+    assert (await client.get_input_entity(987654321)).user_id==987654321
+    from telethon.tl.functions.phone import RequestCallRequest
+    from telethon.tl.types import InputUser,PhoneCallProtocol
+    request=RequestCallRequest(InputUser(987654321,123),b'a'*32,PhoneCallProtocol(65,92,['synthetic']),random_id=7)
+    # The fake provider returns no call object, so the reply fails after the request passed the broker.
+    with pytest.raises(BrokerError): await client._call(None,request)
+    assert [type(r).__name__ for r in provider.requests]==['RequestCallRequest']
+    await client.close();await broker.close()

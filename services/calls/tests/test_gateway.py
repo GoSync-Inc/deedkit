@@ -95,7 +95,12 @@ def test_gateway_scoped_phone_preparation_needs_no_messaging(tmp_path):
         assert (
             c.post(
                 "/v1/calls_dial_call",
-                json={"brief_id": brief["id"], "authorization_reference": "synthetic"},
+                json={
+                    "brief_id": brief["id"],
+                    "authorization_reference": "synthetic",
+                    "destination_source": "agent_found",
+                    "destination_evidence": "synthetic directory",
+                },
             ).status_code
             == 403
         )
@@ -108,3 +113,63 @@ def test_gateway_scoped_phone_preparation_needs_no_messaging(tmp_path):
             and requested.json()["error"] == "scoped_archive_not_configured"
         )
         assert app.state.service.list_calls() == []
+
+
+def test_gateway_dial_carries_owner_instruction_and_destination_origin(tmp_path):
+    from core import ServiceError
+    from outbound import CallingSettings
+
+    path, _, _ = registry(tmp_path)
+    selected_port = port()
+    base = f"http://127.0.0.1:{selected_port}"
+    app = create_app(tmp_path / "data", Archive(), agent_registry=path)
+    dialed = []
+
+    class Provider:
+        async def preflight(self, b):
+            return {"configured": True}
+
+        async def dial(self, call):
+            dialed.append(call["brief"]["destination"])
+            raise ServiceError("synthetic_provider_rejected")
+
+    app.state.outbound.settings = CallingSettings(enabled=True)
+    app.state.outbound.providers["twilio"] = Provider()
+    app.state.outbound.model_key = lambda brief: "synthetic"
+    tools = ["calls_" + name for name in ["prepare_external_call", "dial_call", "get_call_status"]]
+    with (
+        server(app, selected_port),
+        gateway(
+            tmp_path,
+            {"calls": (base, "alice")},
+            {"calls": ["calls:prepare", "calls:read", "calls:dial"]},
+            ["platform_capabilities", *tools],
+        ) as (c, _, _),
+    ):
+        body = {**BRIEF, "source_message_ids": [], "channel": "phone", "account": "twilio",
+                "destination": "+12025550199"}
+        owner_named = call(c, "calls_prepare_external_call", {"brief": body})
+        agent_found = call(c, "calls_prepare_external_call", {"brief": body})
+        refused = [
+            {"brief_id": owner_named["id"], "owner_instruction": "Owner words"},
+            {"brief_id": owner_named["id"], "owner_instruction": "Owner words",
+             "authorization_reference": "Owner words", "destination_source": "owner_named"},
+            {"brief_id": owner_named["id"], "owner_instruction": "Call the clinic",
+             "destination_source": "owner_named"},
+            {"brief_id": agent_found["id"], "owner_instruction": "Find a clinic",
+             "destination_source": "agent_found"},
+        ]
+        for arguments in refused:
+            response = c.post("/v1/calls_dial_call", json=arguments)
+            assert 400 <= response.status_code < 500, response.text
+        assert app.state.service.list_calls() == [] and dialed == []
+        named = call(c, "calls_dial_call", {"brief_id": owner_named["id"],
+            "owner_instruction": "Позвони на +1 202 555 0199", "destination_source": "owner_named"})
+        found = call(c, "calls_dial_call", {"brief_id": agent_found["id"],
+            "authorization_reference": "Find a clinic and ask for tomorrow",
+            "destination_source": "agent_found", "destination_evidence": "https://clinic.example.test"})
+        status = call(c, "calls_get_call_status", {"call_id": found["id"]})
+        assert status["destination_source"] == "agent_found"
+        assert status["owner_instruction"] == "Find a clinic and ask for tomorrow"
+        assert named["destination_source"] == "owner_named" and dialed == ["+12025550199"] * 2
+    app.state.service.close()

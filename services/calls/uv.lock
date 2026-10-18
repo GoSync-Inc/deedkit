@@ -1048,6 +1048,7 @@ dependencies = [
     { name = "httpx" },
     { name = "mcp" },
     { name = "ntgcalls" },
+    { name = "phonenumbers" },
     { name = "pipecat-ai", extra = ["google", "webrtc"] },
     { name = "py-tgcalls" },
     { name = "python-multipart" },
@@ -1067,6 +1068,7 @@ requires-dist = [
     { name = "httpx", specifier = "==0.28.1" },
     { name = "mcp", specifier = "==2.3.0" },
     { name = "ntgcalls", specifier = "==3.0.3" },
+    { name = "phonenumbers", specifier = "==9.0.40" },
     { name = "pipecat-ai", extras = ["google", "webrtc", "silero"], specifier = "==1.12.0" },
     { name = "py-tgcalls", specifier = "==3.0.0" },
     { name = "python-multipart", specifier = ">=0.0.20,<0.1" },
@@ -1078,6 +1080,15 @@ requires-dist = [
 dev = [
     { name = "pytest", specifier = ">=8,<10" },
     { name = "pytest-asyncio", specifier = ">=1,<2" },
+]
+
+[[package]]
+name = "phonenumbers"
+version = "9.0.40"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b4/39/66db12a16eec873aa12411fc6da0fe052a86413fe117e208b51836b41740/phonenumbers-9.0.40.tar.gz", hash = "sha256:a0dd1bc98efa0b6f5839c7b1fface2ebdf0a811645dd8211ae3f037a17ec07ac", size = 2311069, upload-time = "2026-09-24T06:59:03.882Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/74/da/c266478ebea2b8d3176484e06756960d94d27cce2d7dc5ca3be6151cb9e3/phonenumbers-9.0.40-py2.py3-none-any.whl", hash = "sha256:189c028c4acd41ee80782e50f74a91260bd76d9115c83be94302509e1cdb5e84", size = 2594747, upload-time = "2026-09-24T06:59:00.564Z" },
 ]
 
 [[package]]

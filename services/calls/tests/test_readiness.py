@@ -21,8 +21,11 @@ def test_capabilities_report_scoped_blockers_without_provider_io(tmp_path):
     result=asyncio.run(app.state.agent_api.call('alice','capabilities',{}))
     ready=result['calling_readiness']
     assert set(ready['channels'])=={'browser','phone'}
+    # No recipient list for phone since ANYM-288; only SIP can report recipient_not_allowed.
     assert ready['channels']['phone']['blockers']==[
-        'calls:dial_required','calling_disabled','recipient_not_allowed','model_key_required']
+        'calls:dial_required','calling_disabled','model_key_required']
+    assert ready['channels']['phone']['recipient_policy']=='any_valid_destination'
+    assert ready['channels']['phone']['daily_calls_remaining']==10
     assert ready['channels']['phone']['provider_connection']=='not_probed'
     assert ready['channels']['phone']['live_call_verified'] is False
     assert app.state.service.list_calls()==[]
@@ -31,21 +34,26 @@ def test_capabilities_report_scoped_blockers_without_provider_io(tmp_path):
 
 def test_ready_twilio_configuration_requires_scoped_recipient_and_selected_model_key(tmp_path):
     path,doc,save=registry(tmp_path)
-    doc['principals'][1]['destinations']['phone']=['+12025550124'];save()
+    # Since ANYM-288 only SIP keeps scoped recipients; phone needs no list.
+    for principal,uri in zip(doc['principals'],['sip:alice@pbx.example.test','sip:bob@pbx.example.test']):
+        principal['channels'].append('sip');principal['destinations']={'sip':[uri]}
+    save()
     app=create_app(tmp_path/'data',Archive(),agent_registry=path)
     with TestClient(app) as client:
         client.headers.update(owner_headers(tmp_path/'data'))
         client.post('/api/credentials',json={'xai':'synthetic-xai-key'},headers=HEADERS)
-        setup={'enabled':True,'allowed':{'phone':['+12025550123']},'twilio':{
+        setup={'enabled':True,'allowed':{'sip':['sip:alice@pbx.example.test']},'twilio':{
             'account_sid':'AC'+'1'*32,'auth_token':'synthetic-token','phone_from':'+12025550125',
             'public_url':'https://voice.example.test'}}
         assert client.post('/api/calling',json=setup,headers=HEADERS).status_code==200
         alice=client.post('/v1/capabilities',json={},headers={'Authorization':'Bearer alice'}).json()['calling_readiness']
         bob=client.post('/v1/capabilities',json={},headers={'Authorization':'Bearer bob'}).json()['calling_readiness']
-        assert alice['channels']['phone']['configuration_ready']
-        assert alice['channels']['phone']['allowed_recipient_count']==1
-        assert bob['channels']['phone']['blockers']==['recipient_not_allowed']
-        assert '+12025550123' not in json.dumps(bob)
+        assert alice['channels']['phone']['configuration_ready'] and bob['channels']['phone']['configuration_ready']
+        assert 'allowed_recipient_count' not in alice['channels']['phone']
+        assert alice['channels']['sip']['configuration_ready']
+        assert alice['channels']['sip']['allowed_recipient_count']==1
+        assert bob['channels']['sip']['blockers']==['recipient_not_allowed']
+        assert 'sip:alice@pbx.example.test' not in json.dumps(bob)
         assert 'synthetic' not in json.dumps(alice)
         assert alice['external_action_authorized'] is False
         assert app.state.service.list_calls()==[]
