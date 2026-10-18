@@ -474,7 +474,10 @@ inspect the state by hand then. A release applied before rollback data existed
 has no tool rollback and keeps the manual procedure above, and so does a release
 whose selected container is no longer running (exited or stopped): rollback then
 refuses with "each selected service must already have exactly one running
-container".
+container". The settings digest covers Docker's whole inspected `Config`,
+`HostConfig` and `Mounts`, so a Docker Engine upgrade that changes their shape
+between apply and rollback also reads as drift: rollback refuses, and the manual
+procedure applies.
 
 ## Image retention report
 
