@@ -67,6 +67,24 @@ def validate_capture(value):
     raise ValueError('invalid_capture_kind')
 
 
+REASON=re.compile(r'[a-z][a-z0-9_]{0,63}')
+MAX_REJECTED_CODES=32
+MAX_REJECTED_MESSAGES=20
+# Stop codes of live capture itself, and the fixed causes of a fail-closed write.
+CAPTURE_STOPS={'durable_capture_failed','capture_overload'}
+CAPTURE_STOP_DETAILS={'spool_full','disk_reserve','spool_io_error','capture_error'}
+
+
+def validate_rejected_message(value):
+    """Identity of a skipped live message, never its content, for a later re-fetch."""
+    if (not isinstance(value,dict) or set(value)!={'chat','message_id','reason_code','observed_at'}
+            or not isinstance(value['chat'],str) or not re.fullmatch(r'-?[0-9]{1,20}',value['chat'])
+            or type(value['message_id']) is not int or not 0<value['message_id']<2**63
+            or not isinstance(value['reason_code'],str) or not REASON.fullmatch(value['reason_code'])):
+        raise ValueError('invalid_capture_progress')
+    return {**value,'observed_at':utc(value['observed_at'])}
+
+
 class CaptureSpool(DurableSpool):
     def __init__(self,path,**kwargs): super().__init__(path,validator=validate_capture,**kwargs)
 
@@ -115,8 +133,9 @@ class CollectorState:
             self._phase(value,name,state,code,row['observed'],**extra)
             self._save_operations(c,value)
 
-    def connection_failed(self,code):
+    def connection_failed(self,code,detail=None):
         if code not in CONNECTION_ERRORS:code='provider_disconnected'
+        if detail not in CAPTURE_STOP_DETAILS or code!='durable_capture_failed':detail=None
         with self.archive.store.pool.connection() as c:
             row=self._operations(c);value=row['operations'];now=row['observed']
             attempts=min(1024,value.get('connection',{}).get('retry_attempts',0)+1)
@@ -125,7 +144,9 @@ class CollectorState:
             self._phase(value,'connection','blocked' if code in TERMINAL else 'retry_wait',code,now,
                 TERMINAL.get(code,'wait_for_retry'),retry_attempts=attempts,
                 retry_at=None if code in TERMINAL else (now+timedelta(seconds=delay)).isoformat())
-            self._phase(value,'live_capture','paused',code,now,TERMINAL.get(code,'wait_for_retry'))
+            # A capture stop keeps its content-free cause after the next run resets the phase.
+            stop={'last_capture_stop':{'code':code,'detail':detail,'at':now.isoformat()}} if code in CAPTURE_STOPS else {}
+            self._phase(value,'live_capture','paused',code,now,TERMINAL.get(code,'wait_for_retry'),**stop)
             self._save_operations(c,value)
 
     def connection_gate(self):
@@ -135,13 +156,19 @@ class CollectorState:
             remaining=max(0,(datetime.fromisoformat(deadline)-row['observed']).total_seconds()) if deadline else 0
             return {'blocked':phase.get('state')=='blocked','remaining_seconds':remaining}
 
-    def capture_progress(self,last,count,pending,*,quarantined=None,invalid=0,history_pending=None):
+    def capture_progress(self,last,count,pending,*,quarantined=None,invalid=0,history_pending=None,
+                         rejected=None,rejected_messages=()):
         if type(count) is not int or count<0 or type(pending) is not int or not 0<=pending<=20000:
             raise ValueError('invalid_capture_progress')
         if (quarantined is not None and (type(quarantined) is not int or not 0<=quarantined<=20000)
                 or type(invalid) is not int or invalid<0
                 or history_pending is not None and (type(history_pending) is not int or not 0<=history_pending<=20000)):
             raise ValueError('invalid_capture_progress')
+        rejected=rejected or {}
+        if not isinstance(rejected,dict) or any(not isinstance(k,str) or not REASON.fullmatch(k)
+                or type(n) is not int or n<1 for k,n in rejected.items()):
+            raise ValueError('invalid_capture_progress')
+        rejected_messages=[validate_rejected_message(m) for m in rejected_messages]
         capture=validate_capture(last) if last is not None else None
         with self.archive.store.pool.connection() as c:
             row=self._operations(c);value=row['operations'];now=row['observed']
@@ -150,6 +177,15 @@ class CollectorState:
             if quarantined is not None:extra['quarantined_captures']=quarantined
             if invalid or 'invalid_provider_messages' in previous:
                 extra['invalid_provider_messages']=previous.get('invalid_provider_messages',0)+invalid
+            if rejected:
+                counts=dict(previous.get('rejected_live_captures',{}))
+                for code,number in rejected.items():
+                    # Bounded vocabulary: later unseen codes share the generic one.
+                    if code not in counts and len(counts)>=MAX_REJECTED_CODES:code='invalid_capture'
+                    counts[code]=counts.get(code,0)+number
+                extra['rejected_live_captures']=counts
+            if rejected_messages:
+                extra['rejected_live_messages']=[*previous.get('rejected_live_messages',[]),*rejected_messages][-MAX_REJECTED_MESSAGES:]
             if capture is not None:
                 envelope=capture.get('envelope')
                 captured=capture.get('captured_at') if envelope else capture['observed_at']

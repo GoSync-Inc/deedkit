@@ -14,7 +14,10 @@ account queues, processing profile summaries or lease observations.
 - `live_capture`: independent durable-spool drain state, pending capture count,
   cumulative committed observations and latest commit timing. A quiet account is
   not marked stale because no new message arrived. A healthy empty drain also
-  does not prove the provider delivered every callback.
+  does not prove the provider delivered every callback. Skipped live items and the
+  cause of the last capture stop are reported here too (`rejected_live_captures`,
+  `rejected_live_messages`, `last_capture_stop`; COLLECTORS.md, Queue quarantine
+  and resilience).
 - `history`: traversal evidence, partial history and gaps; it never claims full
   history. A WhatsApp gap can coexist with connected/receiving live capture: the
   legacy account `status` stays `receiving` with `detail_code=whatsapp_catchup_gap`,

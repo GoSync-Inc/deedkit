@@ -61,6 +61,30 @@ a size over 8 GiB, an overlong `replyToId`) instead of rejecting them. A message
 that still fails validation is skipped during history reconciliation and
 counted in `invalid_provider_messages` of the `live_capture` status.
 
+Telegram live capture follows the same rule. A live message, deletion, read
+receipt or owner read that the spool validator rejects, or whose receipt or
+read parser fails, is not written and does not stop the collector: a restart
+would meet the same input again. `live_capture.rejected_live_captures` counts
+these items by content-free reason code (for example `invalid_deleted_ids`,
+`invalid_provider_message`, `receipt_parse_failed`, `read_parse_failed`; at most
+32 codes, later ones count as `invalid_capture`). For a skipped message,
+`rejected_live_messages` keeps the chat, message ID, reason and time of the last
+20, never content. Reconciliation already re-reads new messages above the chat
+checkpoint and the newest page of each chat; a message that is still invalid
+there is skipped and counted again, never stopping the collector. An older
+message is not re-read automatically; its recorded ID lets an operator fetch it
+again once a fix accepts it. A deletion with more than 1,000 IDs is written as
+several `telegram_delete` records of at most 1,000 IDs.
+
+Capacity and I/O still fail closed. `spool_full`, `disk_reserve`, an I/O error
+while writing, or any unexpected error stops the collector with
+`durable_capture_failed`; nothing is acknowledged before it is durable, and
+reconciliation after the restart covers the gap. The cause is kept as a fixed
+detail (`spool_full`, `disk_reserve`, `spool_io_error` or `capture_error`) in
+`live_capture.last_capture_stop` and in the supervisor line
+`{"status":"stopped","code":"durable_capture_failed","detail":"disk_reserve"}`.
+Exception text never leaves the process.
+
 If a spool record fails validation or its send receipt permanently
 disagrees with the DB (for example, after restoring an old backup), `drain`
 moves the file to `quarantine/` inside the same spool
