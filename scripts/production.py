@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import uuid
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -57,9 +58,18 @@ class Refused(RuntimeError):
     pass
 
 
+class Busy(Refused):
+    """Another production operation holds the host lock."""
+
+
+class RateLimited(Refused):
+    """GitHub's API quota ran out: nothing is wrong with the candidate, and `deploy` retries after the reset."""
+
+
 def run(argv, *, cwd=None, umask=-1, env=None, reason=False):
     # Never include command output in an exception: Compose can contain secrets. Only a tool that prints
-    # nothing secret (the attestation verifier) may pass its last stderr line on, with `reason`.
+    # nothing secret (the attestation verifier, git on the public source mirror) may pass its last stderr line on,
+    # with `reason`.
     result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=1800, umask=umask, env=env)
     if result.returncode:
         detail = (result.stderr.strip().splitlines() or [""])[-1][:300] if reason else ""
@@ -73,8 +83,15 @@ def api(path):
     if token := os.environ.get("GH_TOKEN"):
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request("https://api.github.com/repos/" + REPOSITORY + "/" + path, headers=headers)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        payload = response.read(4 * 1024 * 1024 + 1)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read(4 * 1024 * 1024 + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 429) and exc.headers.get("x-ratelimit-remaining") == "0":
+            reset = str(exc.headers.get("x-ratelimit-reset", ""))
+            when = datetime.fromtimestamp(int(reset), timezone.utc).strftime("%H:%M:%SZ") if reset.isdigit() else "unknown"
+            raise RateLimited(f"GitHub rate limit exhausted, resets at {when}") from None
+        raise
     if len(payload) > 4 * 1024 * 1024:
         raise Refused("GitHub response exceeded the safety limit")
     return json.loads(payload)
@@ -158,8 +175,12 @@ def queue_verification(sha, get):
 def verify(sha, get=api):
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise Refused("an exact lowercase 40-character commit SHA is required")
-    if get("git/ref/heads/main")["object"]["sha"] != sha:
-        raise Refused("candidate is not the current main commit")
+    # Any commit main contains is promotable, not only its head, so merging never waits for a release.
+    # `main...<sha>` lists what the candidate has beyond main: nothing, and so a tiny response, when main contains it.
+    comparison = get("compare/main..." + sha)
+    if (comparison.get("status") not in ("identical", "behind") or comparison.get("ahead_by") != 0
+            or comparison.get("merge_base_commit", {}).get("sha") != sha):
+        raise Refused("candidate is not a commit on main")
     latest = latest_run(sha, "push", get)
     if latest is None:
         raise Refused("main has no CI push run for this exact commit")
@@ -168,6 +189,14 @@ def verify(sha, get=api):
             or latest.get("conclusion") != "success"
             or latest.get("head_repository", {}).get("full_name") != REPOSITORY):
         raise Refused("latest main CI run is not a completed success for this repository and commit")
+    known = _verified.get(sha) if _verified is not None else None
+    if known and unchanged(known["push"], latest) and (known["queue"] is None or (
+            unchanged(known["queue"], latest_run(sha, "merge_group", get))
+            and unchanged(latest, latest_run(sha, "push", get)))):
+        # Within one deploy run: the same completed attempts have the same jobs, so the runs are read again
+        # but not their jobs (the host's anonymous GitHub quota is 60 requests an hour). After the queue read
+        # the push run is read once more, as the full path does, so a rerun between the reads is not missed.
+        return known["result"]
     jobs = attempt_jobs(latest, get)
     verified_by = latest
     for required in sorted(REQUIRED_JOBS):
@@ -178,9 +207,26 @@ def verify(sha, get=api):
             raise Refused(f"required job did not pass: {required}")
     if not unchanged(latest, latest_run(sha, "push", get)):
         raise Refused("the main CI push run changed while it was being verified")
-    return {"sha": sha, "run_id": latest["id"], "run_attempt": latest["run_attempt"], "url": latest["html_url"],
-            "verify_run_id": verified_by["id"], "verify_run_attempt": verified_by["run_attempt"],
-            "verify_run_url": verified_by["html_url"]}
+    result = {"sha": sha, "run_id": latest["id"], "run_attempt": latest["run_attempt"], "url": latest["html_url"],
+              "verify_run_id": verified_by["id"], "verify_run_attempt": verified_by["run_attempt"],
+              "verify_run_url": verified_by["html_url"]}
+    if _verified is not None:
+        _verified[sha] = {"push": latest, "queue": None if verified_by is latest else verified_by, "result": result}
+    return result
+
+
+# Full verifications of this process, set only while `deploy` runs (verification_reuse).
+_verified = None
+
+
+@contextmanager
+def verification_reuse():
+    global _verified
+    _verified = {}
+    try:
+        yield
+    finally:
+        _verified = None
 
 
 def read(path):
@@ -235,7 +281,7 @@ def lock(state):
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise Refused("another production operation holds the deployment lock") from exc
+            raise Busy("another production operation holds the deployment lock") from exc
         yield
 
 
@@ -250,16 +296,23 @@ def compose(project):
     return result
 
 
-def snapshot(project):
+def snapshot(project, *, stopped=False):
+    """The project's Compose document and the identity of each selected service's container. Only rollback and a
+    failed health wait (`stopped`) accept a container that exited or keeps restarting: that is when they run."""
     document = json.loads(run(compose(project) + ["config", "--format", "json"]))
     running = {}
     for service in project["services"]:
-        ids = run(["docker", "ps", "--filter", "label=com.docker.compose.project=" + project["name"],
+        ids = run(["docker", "ps", *(["--all", "--filter", "label=com.docker.compose.oneoff=False"] if stopped else []),
+                   "--filter", "label=com.docker.compose.project=" + project["name"],
                    "--filter", "label=com.docker.compose.service=" + service, "--format", "{{.ID}}"]).split()
         if len(ids) != 1 or service not in document["services"]:
             raise Refused("each selected service must already have exactly one running container")
         validate_runtime(document["services"][service])
         actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
+        condition = actual.get("State", {})
+        if stopped and not (condition.get("Running") and not condition.get("Paused")
+                            or condition.get("Status") in ("restarting", "exited")):
+            raise Refused("a selected container is neither running, restarting nor exited")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", actual["Image"]):
             raise Refused("running container has no immutable image identity")
         running[service] = {"container": ids[0], "image": actual["Image"], "settings": container_settings(actual)}
@@ -601,9 +654,10 @@ def prepare_router(settings, sha):
     source = release / "source"
     run(["git", "init", "--quiet", str(source)])
     run(["git", "-C", str(source), "remote", "add", "origin", "https://github.com/" + REPOSITORY + ".git"])
-    run(["git", "-C", str(source), "fetch", "--depth=1", "origin", "refs/heads/main"])
+    # The verified commit itself, which main contains (verify), whether or not main moved on since.
+    run(["git", "-C", str(source), "fetch", "--depth=1", "origin", sha])
     if run(["git", "-C", str(source), "rev-parse", "FETCH_HEAD"]).strip() != sha:
-        raise Refused("main moved while retrieving source; prepare the new verified commit")
+        raise Refused("fetched source is not the verified candidate commit")
     run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha], umask=0o022)
     image = build_image(source, sha, "http-router")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
@@ -629,9 +683,10 @@ def prepare(settings, sha):
     source = release / "source"
     run(["git", "init", "--quiet", str(source)])
     run(["git", "-C", str(source), "remote", "add", "origin", "https://github.com/" + REPOSITORY + ".git"])
-    run(["git", "-C", str(source), "fetch", "--depth=1", "origin", "refs/heads/main"])
+    # The verified commit itself, which main contains (verify), whether or not main moved on since.
+    run(["git", "-C", str(source), "fetch", "--depth=1", "origin", sha])
     if run(["git", "-C", str(source), "rev-parse", "FETCH_HEAD"]).strip() != sha:
-        raise Refused("main moved while retrieving source; prepare the new verified commit")
+        raise Refused("fetched source is not the verified candidate commit")
     # Docker COPY preserves checkout modes. Public code must be readable by
     # image UID 10001; private release parents and snapshots retain 0700/0600.
     run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha], umask=0o022)
@@ -674,9 +729,11 @@ def prepare(settings, sha):
         projects.append({"name": project["name"], "file": str(path), "digest": digest(read(path)),
                          "before_digest": digest(before), "running": item["running"],
                          "before_file_digest": digest(read(previous))})
+    # What current.json said at preparation: rollback of a release that failed its health wait requires it unchanged.
+    current = read(state / "current.json") if (state / "current.json").exists() else None
     receipt = {"version": 1, "sha": sha, "ci": evidence, "images": images,
                "references": {target: value["reference"] for target, value in verified.items()},
-               "config_digest": digest(settings), "projects": projects}
+               "config_digest": digest(settings), "current_digest": digest(current), "projects": projects}
     write(release / "prepared.json", receipt)
     return receipt
 
@@ -713,14 +770,18 @@ def apply(settings, sha):
     # Last remote gate immediately before the first mutation, under the host lock.
     evidence = verify(sha)
     write(release / "attempted.json", {"sha": sha, "ci": evidence, "status": "applying"})
-    started = {}
+    started, touched = {}, []
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
         command = ["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f", item["file"]]
         services = list(project["services"])
         # Stop the existing owners before replacements can connect to their sessions.
         run(command + ["stop", *services])
-        run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps",
-                       "--wait", "--wait-timeout", "180", *services])
+        touched.append((project, item))
+        try:
+            run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps",
+                           "--wait", "--wait-timeout", "180", *services])
+        except Refused as exc:
+            unhealthy(release, sha, receipt, evidence, touched, exc)
         for service, target in project["services"].items():
             ids = run(command + ["ps", "-q", service]).split()
             if len(ids) != 1:
@@ -750,6 +811,29 @@ def apply(settings, sha):
     return result
 
 
+def unhealthy(release, sha, receipt, evidence, touched, failure):
+    """After `up --wait` failed: when every replacement started so far runs the prepared image, in any state, record
+    the release as `unhealthy` with rollback data for the projects it touched; otherwise the attempt stays unresolved.
+    Either way current.json keeps naming the previous release, and the apply is refused."""
+    restore = []
+    try:
+        for project, item in touched:
+            document, running = snapshot(project, stopped=True)
+            if digest(document) != item["before_digest"] or any(running[service]["image"] != receipt["images"][target]
+                                                               for service, target in project["services"].items()):
+                raise Refused("a replacement does not run the prepared image")
+            restore.append({"name": project["name"], "services": sorted(project["services"]),
+                            "before_file_digest": item["before_file_digest"],
+                            "after_digest": digest(document), "running": running})
+    except Exception:
+        raise Refused("apply stopped before every replacement ran the prepared image; "
+                      "inspect it before any recovery") from failure
+    write(release / "result.json", {"sha": sha, "ci": evidence, "images": receipt["images"],
+                                    "references": receipt.get("references", {}), "status": "unhealthy",
+                                    "failed_at": now(), "rollback": {"version": 1, "projects": restore}})
+    raise Refused(f"a replacement failed its health wait; `rollback --sha {sha}` returns the previous release") from failure
+
+
 def unfinished(state):
     """Releases whose apply or rollback started but never recorded its result."""
     return sorted(path.parent.name for marker, outcome in (("attempted.json", "result.json"),
@@ -758,37 +842,49 @@ def unfinished(state):
 
 
 def rollback(settings, sha):
-    """Return the current release's selected services to the images and configuration that ran before it.
+    """Return the current release's selected services to the images and configuration that ran before it, or
+    those of a release whose apply failed its health wait (`unhealthy`), which never became current.
 
-    Owner-confirmed like apply. It never calls verify(): the previous revision is no longer current main.
-    The caller holds the host lock, as main() does for every state-changing action.
+    Owner-confirmed like apply, except as `deploy`'s one automatic rollback. It never calls verify(): the previous
+    revision is no longer current main. The caller holds the host lock, as main() does for every state-changing action.
     """
     state = Path(settings["state_directory"])
     release = state / sha
-    current = read(state / "current.json") if (state / "current.json").exists() else {}
-    if current.get("sha") != sha or current.get("status") != "applied" or not (release / "result.json").exists():
+    current = read(state / "current.json") if (state / "current.json").exists() else None
+    result = read(release / "result.json") if (release / "result.json").exists() else {}
+    failed, named = result.get("status") == "unhealthy", current or {}
+    if not result or not failed and (named.get("sha") != sha or named.get("status") != "applied"):
         raise Refused("only the current applied release can be rolled back")
     if (release / "rollback-attempted.json").exists():
         raise Refused("this release was already rolled back or attempted; inspect it before any recovery")
     if blocked := unfinished(state):
         raise Refused("an apply or rollback is unfinished: " + ", ".join(blocked) + "; inspect it first")
-    result = read(release / "result.json")
-    data = result.get("rollback") if isinstance(result.get("rollback"), dict) else {}
-    if data.get("version") != 1 or result.get("sha") != sha:
+    data = result.get("rollback")
+    if not isinstance(data, dict) or data.get("version") != 1 or result.get("sha") != sha:
         raise Refused("this release has no rollback data; follow the manual rollback procedure (production.md)")
-    if read(release / "prepared.json")["config_digest"] != digest(settings):
+    prepared = read(release / "prepared.json")
+    if prepared["config_digest"] != digest(settings):
         raise Refused("production configuration changed since this release")
+    # current.json still names the release that ran before the failed one, unless another one was applied since.
+    if failed and prepared.get("current_digest") != digest(current):
+        raise Refused("another release was applied or rolled back after this one was prepared")
+    names = [project["name"] for project in settings["projects"]]
+    touched = [item.get("name") for item in data["projects"]]
+    # An applied release replaced every project; a failed health wait, those up to the one that failed.
+    if not touched or touched != (names[:len(touched)] if failed else names):
+        raise Refused("rollback data does not match the selected production configuration")
     plan = []
-    for project, item in zip(settings["projects"], data["projects"], strict=True):
+    for project, item in zip(settings["projects"], data["projects"]):
         before = release / (project["name"] + ".before.json")
-        if item["name"] != project["name"] or item["services"] != sorted(project["services"]):
+        if item["services"] != sorted(project["services"]):
             raise Refused("rollback data does not match the selected production configuration")
         if not before.exists() or digest(read(before)) != item["before_file_digest"]:
             raise Refused("the before-release snapshot is missing or was modified")
         if legacy_identities(item["running"]):
             raise Refused("rollback data was written by an older production.py with order-dependent container settings; "
                           "use the manual procedure")
-        document, running = snapshot(project)
+        # A crashed replacement exits or keeps restarting: that is when rollback is needed.
+        document, running = snapshot(project, stopped=True)
         if digest(document) != item["after_digest"] or running != item["running"]:
             raise Refused("production changed since this release was applied")
         previous = {service: read(before)["services"][service]["image"] for service in project["services"]}
@@ -820,7 +916,8 @@ def rollback(settings, sha):
     outcome = {"sha": sha, "status": "rolled-back", "rolled_back_at": now(),
                "previous_images": {project["name"]: previous for project, _, previous in plan}}
     write(release / "rollback.json", outcome)
-    write(state / "current.json", {**outcome, "images": result["images"]})
+    if not failed:  # current.json already names the release that runs again
+        write(state / "current.json", {**outcome, "images": result["images"]})
     return outcome
 
 
@@ -874,13 +971,343 @@ def images_report(settings):
     return report
 
 
+# Continuous deployment (production.md "Continuous deployment"): one command that deploys the newest green main
+# commit, or pauses for a human. A human creates or removes the pause file; `deploy` only creates it.
+PAUSE = Path("/etc/deedkit/autodeploy.pause")
+DEPLOY_INTERVAL = 20 * 60
+# Consecutive runs whose `git ls-remote` or mirror fetch failed before the deployer pauses (about 15 minutes on the
+# timer): a network blip heals by itself, a broken mirror or a refused access does not.
+FETCH_FAILURES = 3
+# Changes a human applies or installs by hand, so the deployer pauses for them.
+SQL_INVENTORY = re.compile(r"\.sql$|^services/.+/migrations/")
+DEPLOY_TOOLS = ("scripts/production.py", "scripts/seamless_release.py", "tools/attest-verify/", "services/release-router/")
+# GitHub requests one deploy run needs, against the anonymous quota of 60 an hour; below it the deploy waits for the
+# reset. Plan A verifies 4 times (prepare 2, apply 2) and plan B 6 times (prepare 3, promote 3); with the merge
+# queue's verification the first verify() reads 7 and each later one 4 (verification_reuse): 43 and 27, plus the
+# deploy's own run listing and a small margin. These hold for unchanged attempts and one-page listings; more pages
+# or a rerun can need more, and the rate limit then stops the run (retried before any change, otherwise a pause).
+QUOTA = {"plan A and B": 48, "plan B": 31}
+
+
+def quota():
+    """Remaining core GitHub API requests and their reset time; reading them costs no request."""
+    request = urllib.request.Request("https://api.github.com/rate_limit", headers={"User-Agent": "deedkit-production",
+        **({"Authorization": "Bearer " + os.environ["GH_TOKEN"]} if os.environ.get("GH_TOKEN") else {})})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        core = json.loads(response.read(1024 * 1024))["resources"]["core"]
+    return core["remaining"], datetime.fromtimestamp(core["reset"], timezone.utc).strftime("%H:%M:%SZ")
+
+
+def remote_main():
+    """main's head from `git ls-remote`, which the API quota does not meter."""
+    line = run(["git", "ls-remote", "https://github.com/" + REPOSITORY + ".git", "refs/heads/main"],
+               reason=True).split()
+    if len(line) != 2 or line[1] != "refs/heads/main" or not re.fullmatch(r"[0-9a-f]{40}", line[0]):
+        raise Refused("git ls-remote returned no main commit")
+    return line[0]
+
+
+def main_history(state):
+    """A blobless mirror of main in the state directory: commits and trees, enough to classify a range."""
+    mirror = state / "deploy-source.git"
+    if mirror.exists():
+        # Only the mirror itself, a bare repository, is fetched into; anything else there is refused (a pause).
+        if run(["git", "-C", str(mirror), "rev-parse", "--is-bare-repository", "--absolute-git-dir"],
+               reason=True).splitlines() != ["true", str(mirror.resolve())]:
+            raise Refused(f"{mirror} is not the bare source mirror; remove or repair it")
+        run(["git", "-C", str(mirror), "fetch", "--quiet", "--filter=blob:none", "origin",
+             "+refs/heads/main:refs/heads/main"], reason=True)
+    else:
+        run(["git", "clone", "--quiet", "--bare", "--filter=blob:none", "--single-branch", "--branch", "main",
+             "https://github.com/" + REPOSITORY + ".git", str(mirror)], reason=True)
+    return mirror
+
+
+def on_main(mirror, ancestor, sha):
+    try:
+        run(["git", "-C", str(mirror), "merge-base", "--is-ancestor", ancestor, sha])
+        return True
+    except Refused:
+        return False
+
+
+def blob(path):
+    content = Path(path).read_bytes()
+    return hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest()
+
+
+def pause_reasons(mirror, base, candidate, installed):
+    """Why `base..candidate` needs a human: SQL inventory changes, and deploy tools that are not installed yet."""
+    paths = [path for path in run(["git", "-C", str(mirror), "diff", "--name-only", "--no-renames", "-z", base,
+                                   candidate]).split("\0") if path]
+    reasons = []
+    if sql := [path for path in paths if SQL_INVENTORY.search(path)]:
+        reasons.append("the SQL inventory changed (" + ", ".join(sql[:5]) + "); migrate by hand (production.md)")
+    tools = [path for path in paths if path in DEPLOY_TOOLS or path.startswith(tuple(t for t in DEPLOY_TOOLS if t[-1] == "/"))]
+    def current_tool(path):
+        # The running tool is the candidate's when its installed file has the candidate's content.
+        if path in installed:
+            return run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{path}"]).strip() == blob(installed[path])
+        # The verifier is the candidate's when it matches the pin of the installed (the candidate's) production.py.
+        return (path.startswith("tools/attest-verify/") and current_tool("scripts/production.py") and VERIFIER.exists()
+                and hashlib.sha256(VERIFIER.read_bytes()).hexdigest() == VERIFIER_SHA256)
+    if pending := [path for path in tools if not current_tool(path)]:
+        reasons.append("deploy tools changed (" + ", ".join(pending[:5]) + "); install them by hand (production.md)")
+    return reasons
+
+
+def configuration_drift(settings, http, current, serving):
+    """Why the configuration differs from the one the current releases were applied with, or None."""
+    state = Path(settings["state_directory"])
+    if read(state / current["sha"] / "prepared.json").get("config_digest") != digest(settings):
+        return "the production configuration changed since the current release was prepared"
+    after = {item["name"]: item["after_digest"] for item in current.get("rollback", {}).get("projects", [])}
+    for project in settings["projects"]:
+        if after.get(project["name"]) != digest(json.loads(run(compose(project) + ["config", "--format", "json"]))):
+            return f"the Compose configuration of {project['name']} changed since the current release was applied"
+    if serving.get("config_digest") != digest(http):
+        return "the HTTP release configuration changed since the serving HTTP release was prepared"
+    return None
+
+
+def deploy(settings, http, *, auto=False, dry_run=False, get=None):
+    """Deploy the newest green main commit with plan A and then plan B, or pause with a reason (production.md)."""
+    if PAUSE.exists():
+        return {"status": "paused", "reason": PAUSE.read_text()[:1000].strip()}
+    state = Path(settings["state_directory"])
+    def halt(reason, status="halted", **fields):
+        # The pause stops every later run until a human removes it; nothing is retried.
+        outcome = {"status": status, "reason": reason, "at": now(), **fields}
+        if dry_run:
+            return {"status": "plan", "would_pause": reason, **fields}
+        PAUSE.write_text(json.dumps(outcome) + "\n")
+        PAUSE.chmod(0o600)
+        return outcome
+    s = http_release_tool()
+    with ExitStack() as held:
+        try:
+            held.enter_context(s.locks(http))
+            if state.resolve() not in (s.GLOBAL_LOCK.resolve(), Path(http["state_directory"]).resolve()):
+                held.enter_context(lock(state))
+        except Busy as exc:
+            return {"status": "busy", "reason": str(exc)}
+        except Exception as exc:
+            return halt("deploy could not take the host locks: " + (str(exc) if isinstance(exc, Refused)
+                                                                     else type(exc).__name__))
+        held.enter_context(verification_reuse())
+        return deploy_locked(settings, http, s, auto=auto, dry_run=dry_run, get=get or api, halt=halt)
+
+
+def deploy_locked(settings, http, s, *, auto, dry_run, get, halt):
+    state = Path(settings["state_directory"])
+    record = {}
+    try:
+        return deploy_steps(settings, http, s, auto=auto, dry_run=dry_run, get=get, halt=halt, record=record)
+    except Exception as exc:
+        # Every failure the steps do not classify themselves ends here: a pause, unless nothing changed yet
+        # and it was the network or the API quota.
+        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        if record:
+            outcome = halt(f"deploy of {record['sha']} stopped in an unknown state: {message}; inspect it")
+            record.update(outcome, finished_at=now())
+            write(state / "deploy.json", record)
+            return record
+        if transient(exc):
+            return {"status": "error", "reason": message + "; nothing changed, the next run retries"}
+        return halt("deploy was refused before any change: " + message)
+
+
+def serving_settled(receipt):
+    """The serving HTTP release has no predecessor left to retire: retired, or legacy instances that stay retained."""
+    return receipt.get("status") == "serving" or (receipt.get("status") == "serving-retirement-pending"
+                                                 and receipt.get("previous") is None)
+
+
+def deploy_steps(settings, http, s, *, auto, dry_run, get, halt, record):
+    state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
+    try:
+        last = read(state / "deploy.json") if (state / "deploy.json").exists() else {}
+        started = last.get("started_at") and datetime.strptime(last["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+        failures = last.get("fetch_failures", {"count": 0})["count"]
+        if type(failures) is not int or failures < 0:
+            raise ValueError("fetch failure count")
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it")
+    if auto and started and (datetime.now(timezone.utc) - started).total_seconds() < DEPLOY_INTERVAL:
+        return {"status": "waiting", "reason": "less than 20 minutes since the last deploy started"}
+    if blocked := unfinished(state):
+        return halt("an apply or rollback is unfinished: " + ", ".join(blocked) + "; inspect it before any recovery")
+    # An HTTP attempt that neither serves nor failed before admission has an unknown router or retirement outcome.
+    if unresolved := sorted(path.parent.name for path in http_state.glob("*/http-attempted.json")
+                            if read(path).get("status") not in ("serving", "startup-failed")):
+        return halt("an HTTP release attempt is unresolved: " + ", ".join(unresolved)
+                    + "; inspect seamless_release.py status --sha <sha>")
+    current = read(state / "current.json") if (state / "current.json").exists() else {}
+    serving = read(http_state / "http-current.json") if (http_state / "http-current.json").exists() else {}
+    if current.get("status") != "applied" or not re.fullmatch(r"[0-9a-f]{40}", current.get("sha", "")):
+        return halt(f"the current release is {current.get('status', 'missing')}, not applied; apply one by hand first")
+    base = current["sha"]
+    if serving.get("status") == "serving-retirement-pending" and not serving_settled(serving):
+        # Retiring the managed predecessor HTTP pair is promote's last step, safe to repeat; it never cuts a request
+        # short. It changes the router (the admission fence), so its failure pauses.
+        if dry_run:
+            return {"status": "plan", "sha": serving.get("sha"), "steps": ["retire the previous HTTP generation"]}
+        try:
+            s.retire(http, serving["sha"])
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+            return halt(f"retiring the HTTP generation before {serving['sha']} failed: {message}; "
+                        "inspect seamless_release.py status --sha " + serving["sha"])
+        serving = read(http_state / "http-current.json")
+        if not serving_settled(serving):
+            return {"status": "waiting", "reason": "the previous HTTP generation is still draining"}
+    if not serving_settled(serving) or not re.fullmatch(r"[0-9a-f]{40}", serving.get("sha", "")):
+        return halt(f"the HTTP release is {serving.get('status', 'missing')}; inspect seamless_release.py status")
+    try:
+        # Every failure here precedes any change: this run does nothing, and the third in a row pauses.
+        head = remote_main()
+        mirror = None if head == base == serving["sha"] else main_history(state)
+    except Exception as exc:
+        message, failures = (str(exc) if isinstance(exc, Refused) else type(exc).__name__), failures + 1
+        rest = {key: value for key, value in last.items() if key != "fetch_failures"}
+        if failures >= FETCH_FAILURES:
+            if not dry_run:
+                write(state / "deploy.json", rest)
+            return halt(f"git could not read main {failures} times in a row, last: {message}; "
+                        f"inspect the network and {state / 'deploy-source.git'}")
+        if not dry_run:
+            write(state / "deploy.json", {**rest, "fetch_failures": {"count": failures, "at": now(), "reason": message}})
+        return {"status": "fetch_failed", "reason": message, "failures": failures}
+    if "fetch_failures" in last and not dry_run:
+        write(state / "deploy.json", {key: value for key, value in last.items() if key != "fetch_failures"})
+    if mirror is None:
+        return {"status": "current", "sha": base}
+    head = run(["git", "-C", str(mirror), "rev-parse", "refs/heads/main"]).strip()
+    if not on_main(mirror, base, head) or not on_main(mirror, serving["sha"], base):
+        return halt("the current release is not on main, or the serving HTTP release is not an ancestor of it")
+    # promote marks an attempt `serving` before it publishes http-current.json: a serving attempt the serving release
+    # does not contain is an interrupted publication, and the router may already admit that generation.
+    if unpublished := sorted(path.parent.name for path in http_state.glob("*/http-attempted.json")
+                             if read(path).get("status") == "serving" and not (
+                                 re.fullmatch(r"[0-9a-f]{40}", path.parent.name)
+                                 and on_main(mirror, path.parent.name, serving["sha"]))):
+        return halt("an HTTP release attempt serves, but http-current.json does not name it: " + ", ".join(unpublished)
+                    + "; inspect seamless_release.py status --sha <sha>")
+    if drift := configuration_drift(settings, http, current, serving):
+        return halt(drift + "; apply the next release by hand")
+    installed = {"scripts/production.py": __file__, "scripts/seamless_release.py": s.__file__}
+    steps = "plan B" if serving["sha"] != base else "plan A and B"
+    remaining, reset = quota()
+    if remaining < QUOTA[steps]:
+        return {"status": "waiting", "reason": f"{remaining} GitHub API requests left until {reset}"}
+    if serving["sha"] != base:
+        # Plan A is ahead of the HTTP pair: a deploy that waited for API quota, or plan A applied by hand.
+        candidate, run_url = base, current.get("ci", {}).get("url")
+        reasons = pause_reasons(mirror, serving["sha"], base, installed)
+    else:
+        listing = get("actions/workflows/ci.yml/runs?" + urllib.parse.urlencode(
+            {"branch": "main", "event": "push", "per_page": 100}))["workflow_runs"]
+        newest = {}
+        for value in listing:
+            if value.get("id", 0) > newest.get(value.get("head_sha"), {}).get("id", 0):
+                newest[value.get("head_sha")] = value
+        candidate = run_url = None
+        for sha in run(["git", "-C", str(mirror), "rev-list", "--first-parent", f"{base}..{head}"]).split():
+            # A commit whose deployment was attempted is never retried, and older ones never follow it.
+            if (state / sha / "attempted.json").exists() or (http_state / sha / "http-attempted.json").exists():
+                break
+            value = newest.get(sha, {})
+            if (value.get("status"), value.get("conclusion"), value.get("head_branch")) == ("completed", "success", "main"):
+                candidate, run_url = sha, value.get("html_url")
+                break
+        if candidate is None:
+            return {"status": "waiting", "reason": "no newer main commit has a green push run yet", "sha": base}
+        reasons = pause_reasons(mirror, base, candidate, installed)
+    if reasons:
+        return halt("; ".join(reasons), sha=candidate)
+    if dry_run:
+        return {"status": "plan", "sha": candidate, "base": base, "run": run_url,
+                "steps": (["plan A"] if candidate != base else []) + ["plan B"]}
+    record.update(sha=candidate, base=base, run=run_url, started_at=now(), status="deploying")
+    write(state / "deploy.json", record)
+    def finish(status, **fields):
+        record.update(status=status, finished_at=now(), **fields)
+        write(state / "deploy.json", record)
+        return record
+    release = state / candidate
+    if candidate != base:
+        try:
+            if not (release / "prepared.json").exists():
+                if release.exists():
+                    return finish(**halt(f"an earlier preparation of {candidate} did not finish; inspect {release}"))
+                prepare(settings, candidate)
+            apply(settings, candidate)
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+            if not (release / "attempted.json").exists():
+                # A network or quota error before preparation started or after it finished changed nothing.
+                if transient(exc) and ((release / "prepared.json").exists() or not release.exists()):
+                    return finish("error", reason=message + "; nothing changed, the next run retries")
+                return finish(**halt(f"plan A of {candidate} was refused before any change: {message}"))
+            result = read(release / "result.json") if (release / "result.json").exists() else {}
+            if result.get("status") != "unhealthy":
+                return finish(**halt(f"plan A of {candidate} stopped in an unknown state: {message}; inspect it"))
+            # Automatic deploys never change the SQL inventory (pause_reasons), so the previous release still fits.
+            try:
+                rollback(settings, candidate)
+            except Exception as again:
+                detail = str(again) if isinstance(again, Refused) else type(again).__name__
+                return finish(**halt(f"plan A of {candidate} failed its health wait and its rollback failed: {detail}; "
+                                     "production state is unknown, inspect it"))
+            return finish(**halt(f"plan A of {candidate} failed its health wait; rolled back to {base}",
+                                 status="rolled-back"))
+    try:
+        if not (http_state / candidate / "http-prepared.json").exists():
+            if (http_state / candidate).exists():
+                return finish(**halt(f"an earlier HTTP preparation of {candidate} did not finish; inspect it"))
+            s.prepare(http, candidate)
+        served = s.promote(http, candidate)
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        directory = http_state / candidate
+        if transient(exc) and not (directory / "http-attempted.json").exists() and (
+                (directory / "http-prepared.json").exists() or not directory.exists()):
+            return finish("error", reason=message + "; nothing changed, the next run retries")
+        return finish(**halt(f"plan A of {candidate} is applied, but its HTTP release stopped: {message}; "
+                             "inspect seamless_release.py status --sha " + candidate))
+    return finish("deployed", http=served.get("status"))
+
+
+def transient(exc):
+    """A network error, a GitHub server error or an exhausted API quota says nothing about the candidate: the next run
+    retries it. Anything else (a refusal, a malformed receipt, a program error) pauses."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500
+    return isinstance(exc, (RateLimited, urllib.error.URLError, TimeoutError, ConnectionError))
+
+
+def http_release_tool():
+    """seamless_release.py next to this file, sharing this module (it imports `production`)."""
+    if __name__ == "__main__":
+        sys.modules.setdefault("production", sys.modules[__name__])
+    try:
+        from scripts import seamless_release
+    except ImportError:
+        import seamless_release
+    return seamless_release
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["verify", "prepare", "prepare-router", "apply", "rollback", "status",
-                                           "images", "check-image"])
+                                           "images", "check-image", "deploy"])
     parser.add_argument("--sha")
     parser.add_argument("--target", choices=sorted(BUILDS))
     parser.add_argument("--config", default="/etc/deedkit/production.json")
+    parser.add_argument("--http-config", default="/etc/deedkit/http-production.json", help="deploy: seamless_release.py's")
+    parser.add_argument("--auto", action="store_true", help="deploy: at most one deploy start per 20 minutes (timer)")
+    parser.add_argument("--dry-run", action="store_true", help="deploy: print the plan or pause reason, change nothing")
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
@@ -892,6 +1319,16 @@ def main(argv=None):
             result = {"sha": sha, "image": build_image(source, sha, args.target, check=True)}
         elif args.action == "verify":
             result = verify(args.sha or "")
+        elif args.action == "deploy":
+            if os.geteuid() != 0:
+                raise Refused("deploy requires the production host operator")
+            result = deploy(config(args.config), http_release_tool().validate_settings(config(args.http_config)),
+                            auto=args.auto, dry_run=args.dry_run)
+            # One line per run for the journal; a new pause, an error or a failed fetch exits 1, so the timer unit shows failed.
+            print(json.dumps(result, sort_keys=True))
+            if result["status"] in ("halted", "rolled-back", "error", "fetch_failed"):
+                parser.exit(1)
+            return
         else:
             settings = config(args.config)
             state = Path(settings["state_directory"])
@@ -907,6 +1344,10 @@ def main(argv=None):
                     locks.enter_context(lock(state))
                 if args.action == "status":
                     result = read(state / "current.json") if (state / "current.json").exists() else {"status": "not promoted by this tool"}
+                    if (state / "deploy.json").exists():
+                        result["deploy"] = read(state / "deploy.json")
+                    if PAUSE.exists():
+                        result["autodeploy_pause"] = PAUSE.read_text()[:1000].strip()
                 elif args.action == "images":
                     result = images_report(settings)
                 else:

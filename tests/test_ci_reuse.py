@@ -967,8 +967,8 @@ def test_the_push_after_a_reusing_queue_run_verifies_in_full_and_promotion_takes
     jobs = [{"name": name, "status": "completed", "conclusion": "success"} for name in production.REQUIRED_JOBS]
 
     def github(path):
-        if path == "git/ref/heads/main":
-            return {"object": {"sha": SHA}}
+        if path == "compare/main..." + SHA:
+            return {"status": "identical", "ahead_by": 0, "merge_base_commit": {"sha": SHA}}
         if path.startswith("actions/workflows/ci.yml/runs?"):
             assert "event=push" in path  # a push run whose own verify passed never consults the queue
             return {"total_count": 1, "workflow_runs": [push]}

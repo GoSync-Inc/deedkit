@@ -865,3 +865,28 @@ def test_prepare_after_plan_a_reuses_its_images_for_the_schema_probe(tmp_path, m
     # The receipt schema, the candidate and the running plan A API image are all probed, on plan A's image.
     assert probed == [plan_a['runtime']] * 3
     assert s.p.read(release / 'http-prepared.json')['images'] == plan_a
+
+
+def test_promotion_accepts_a_verified_commit_that_main_has_moved_past(tmp_path, monkeypatch):
+    from tests.test_production import comparison, github
+    verify = s.p.verify
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
+    get, _, _ = github()
+    compared = []
+    def moved(path):
+        if path.startswith('compare/main...'):
+            compared.append(path)
+            return comparison(SHA, behind=2)  # two commits merged after SHA
+        if path == 'git/ref/heads/main':
+            return {'object': {'sha': 'f' * 40}}  # main's head is one of them
+        return get(path)
+    monkeypatch.setattr(s.p, 'verify', lambda sha: calls.append('verify') or verify(sha, moved))
+    s.promote(cfg, SHA)
+    assert 'switch' in calls and len(compared) == calls.count('verify') >= 3
+    diverged = lambda path: {**comparison(SHA), 'status': 'diverged', 'ahead_by': 1} if path.startswith('compare/') else get(path)
+    (tmp_path / 'other').mkdir()
+    cfg, release, calls, receipt = fixture(tmp_path / 'other', monkeypatch)
+    monkeypatch.setattr(s.p, 'verify', lambda sha: verify(sha, diverged))
+    with pytest.raises(s.Refused, match='not a commit on main'):
+        s.promote(cfg, SHA)
+    assert 'switch' not in calls and not (release / 'http-attempted.json').exists()

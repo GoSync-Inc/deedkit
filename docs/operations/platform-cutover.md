@@ -3,7 +3,7 @@
 The repository contains one platform, while module processes, locks and state remain independent. See [runtime policy](../platform-runtime.md), [verification](../quality/platform-acceptance.md) and module READMEs. The existing `anymsg` package/import/CLI and npm name remain compatible.
 
 Production upgrades use the [verified promotion procedure](production.md): only
-the exact current `main` SHA with successful required CI may be prepared/applied.
+a `main` commit with successful required CI may be prepared/applied.
 The launcher below is for explicit module setup and local operation; it does not
 provide the production revision/CI gate.
 
