@@ -186,6 +186,25 @@ def test_list_chats_awaiting_reply_25_rows_within_30000_chars(recent_queue):
     assert len(json.dumps(result,ensure_ascii=False))<=30000
 
 
+def test_list_chats_25_forwarded_hints_within_39000_chars(recent_queue):
+    # ANYM-274: every hint forwarded with a worst-case origin measured 38,874 characters;
+    # the 30,000 guard above keeps its fixture without forwards (decision 2026-10-18, option A).
+    from psycopg.types.json import Jsonb
+    s,key=recent_queue
+    origin={'kind':'channel','chat_id':'-1001234567890123','sender_name':'Я'*256,'provider_message_id':'2147483647',
+        'post_author':'Ж'*256,'sent_at':'2026-09-01T00:00:00+00:00','basis':'telegram_fwd_from'}
+    with s.pool.connection() as c:
+        incoming=[r['id'] for r in c.execute("SELECT id FROM messages WHERE direction='incoming'").fetchall()]
+        c.execute('UPDATE message_metadata SET metadata=metadata||%s WHERE message=ANY(%s)',
+            (Jsonb({'forwarded':True,'forward_origin':origin}),incoming))
+    result=compact_queue(s,key)
+    hints=[row['awaiting_reply'] for row in result['items'] if 'awaiting_reply' in row]
+    assert len(result['items'])==25 and len(hints)==25
+    assert all(h['authorship']=='forwarded_by_sender' and h['forward_origin']['sender_name']=='Я'*64 for h in hints)
+    for row in result['items']:assert_each_fact_once(row)
+    assert len(json.dumps(result,ensure_ascii=False))<=39000
+
+
 def test_list_chats_defaults_to_25_rows_with_a_cursor_on_every_surface(seeded):
     s,_,_=seeded
     key=build_queue(s,datetime.now(timezone.utc).replace(microsecond=0)-timedelta(hours=3),scanned=lambda n:None,chats=30)
