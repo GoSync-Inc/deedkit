@@ -1023,13 +1023,13 @@ def test_published_targets_are_the_publication_matrix_and_the_verifier_is_the_re
 @pytest.mark.parametrize("outcome", ["failure", "skipped", "cancelled", None, "missing", "duplicate"])
 def test_main_run_without_a_passed_publish_job_is_refused(outcome):
     get, _, jobs = github()
-    publish = next(job for job in jobs if job["name"] == "publish")
-    if outcome == "missing":
-        jobs.remove(publish)
-    elif outcome == "duplicate":
-        jobs.append(copy.deepcopy(publish))
-    else:
-        publish["conclusion"] = outcome
+    # The run's jobs are listed explicitly, so the case does not depend on REQUIRED_JOBS naming `publish`.
+    jobs[:] = [job for job in jobs if job["name"] != "publish"]
+    publish = {"name": "publish", "status": "completed", "conclusion": "success"}
+    if outcome == "duplicate":
+        jobs += [publish, copy.deepcopy(publish)]
+    elif outcome != "missing":
+        jobs.append({**publish, "conclusion": outcome})
     with pytest.raises(p.Refused, match="required job did not pass: publish"):
         p.verify(SHA, get)
 
