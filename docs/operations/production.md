@@ -543,9 +543,11 @@ Otherwise it:
    `serving-retirement-pending` with no managed predecessor: the first managed
    generation keeps the legacy instances; a pending managed predecessor
    retirement is retried first), and pauses while any plan A attempt is
-   unfinished or any HTTP attempt (`http-attempted.json`) is neither `serving`
-   nor `startup-failed`;
-2. fetches a blobless mirror of `main` into `<state>/deploy-source.git` and
+   unfinished, any HTTP attempt (`http-attempted.json`) is neither `serving`
+   nor `startup-failed`, or a `serving` attempt is not the serving release or
+   an ancestor of it (`promote` stopped before it published `http-current.json`);
+2. fetches a blobless mirror of `main` into `<state>/deploy-source.git` (an
+   existing path there that is not that bare repository pauses) and
    picks the newest first-parent commit after the current release whose latest
    push run succeeded; a commit whose deployment was attempted is never
    retried, and no older commit follows it;
@@ -565,17 +567,21 @@ Otherwise it:
 Within one run `verify()` reads the run and job listings once per SHA and
 afterwards re-reads only the runs (a completed attempt keeps its jobs; the push
 run is read again after the merge queue run), so a deploy of plans A and B makes
-at most about 44 of the host's 60 anonymous requests an hour and starts only with
-48 left (plan B alone: 27, starts with 31); in practice at most one deploy an
-hour. A GitHub rate-limit response is refused as "GitHub rate limit exhausted,
-resets at <time>".
+about 44 of the host's 60 anonymous requests an hour and starts only with 48 left
+(plan B alone: 27, starts with 31); in practice at most one deploy an hour. These
+numbers hold for unchanged run attempts and one-page listings: a listing with a
+second page or a rerun during the deploy can need more. A GitHub rate-limit
+response is refused as "GitHub rate limit exhausted, resets at <time>"; before
+any change the next run retries it, after a release step started it pauses.
 
 On a failure it writes `/etc/deedkit/autodeploy.pause` (JSON with the reason)
 and exits 1; nothing deploys until a human removes it. A refusal before any
-change pauses, and so does any other error (a malformed receipt, a failed
-retirement of the previous HTTP generation); only a network error, a GitHub
-server error (5xx) or an exhausted quota before any change is retried by the
-next run. An error after a release step started pauses as an unknown state. When plan A failed its health wait (`unhealthy`, above), it runs
+change pauses, and so does any other error or state it cannot classify (a
+malformed receipt, `deploy.json` included, a failed retirement of the previous
+HTTP generation, a local git or source mirror failure, a lock it cannot take);
+only a network error (a GitHub API connection error, a git transport failure
+named in git's error output), a GitHub server error (5xx) or an exhausted quota
+before any change is retried by the next run. An error after a release step started pauses as an unknown state. When plan A failed its health wait (`unhealthy`, above), it runs
 `rollback` once (automatic deploys never change the SQL inventory) and pauses
 with status `rolled-back`; a failed rollback, or an apply that stopped in any
 other state, pauses with no further action. A failed plan B pauses and leaves

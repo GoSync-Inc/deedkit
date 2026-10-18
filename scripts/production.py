@@ -70,11 +70,22 @@ class Unreachable(Refused):
     """GitHub's git endpoint did not answer: `deploy` retries on its next run."""
 
 
-def run(argv, *, cwd=None, umask=-1, env=None, reason=False):
+# The stderr of a git command talking to GitHub that names a transport failure; any other git failure is this
+# host's (a broken mirror, permissions, disk space) and is refused.
+TRANSPORT = re.compile(r"Could not resolve host|Failed to connect to|Connection (?:timed out|reset by peer|refused)|"
+                       r"Operation timed out|early EOF|RPC failed|remote end hung up unexpectedly|"
+                       r"The requested URL returned error: 5\d\d|gnutls_handshake\(\) failed|GnuTLS recv error|"
+                       r"SSL_read|SSL_ERROR_SYSCALL|Empty reply from server|was not closed cleanly")
+
+
+def run(argv, *, cwd=None, umask=-1, env=None, reason=False, remote=False):
     # Never include command output in an exception: Compose can contain secrets. Only a tool that prints
-    # nothing secret (the attestation verifier) may pass its last stderr line on, with `reason`.
+    # nothing secret (the attestation verifier, git on the public source mirror) may pass its last stderr line on,
+    # with `reason`. `remote` marks a git command talking to GitHub: only a transport failure is Unreachable.
     result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=1800, umask=umask, env=env)
     if result.returncode:
+        if remote and TRANSPORT.search(result.stderr):
+            raise Unreachable(f"{Path(argv[0]).name} could not reach GitHub (exit {result.returncode})")
         detail = (result.stderr.strip().splitlines() or [""])[-1][:300] if reason else ""
         raise Refused(f"{Path(argv[0]).name} failed (exit {result.returncode}){': ' + detail if detail else ''}; "
                       "production was not accepted")
@@ -984,7 +995,8 @@ DEPLOY_TOOLS = ("scripts/production.py", "scripts/seamless_release.py", "tools/a
 # GitHub requests one deploy run needs, against the anonymous quota of 60 an hour; below it the deploy waits for the
 # reset. Plan A verifies 4 times (prepare 2, apply 2) and plan B 6 times (prepare 3, promote 3); with the merge
 # queue's verification the first verify() reads 7 and each later one 4 (verification_reuse): 43 and 27, plus the
-# deploy's own run listing and a margin for a listing that needs a second page.
+# deploy's own run listing and a small margin. These hold for unchanged attempts and one-page listings; more pages
+# or a rerun can need more, and the rate limit then stops the run (retried before any change, otherwise a pause).
 QUOTA = {"plan A and B": 48, "plan B": 31}
 
 
@@ -999,10 +1011,8 @@ def quota():
 
 def remote_main():
     """main's head from `git ls-remote`, which the API quota does not meter."""
-    try:
-        line = run(["git", "ls-remote", "https://github.com/" + REPOSITORY + ".git", "refs/heads/main"]).split()
-    except Refused as exc:
-        raise Unreachable(str(exc)) from None
+    line = run(["git", "ls-remote", "https://github.com/" + REPOSITORY + ".git", "refs/heads/main"], reason=True,
+               remote=True).split()
     if len(line) != 2 or line[1] != "refs/heads/main" or not re.fullmatch(r"[0-9a-f]{40}", line[0]):
         raise Refused("git ls-remote returned no main commit")
     return line[0]
@@ -1011,15 +1021,16 @@ def remote_main():
 def main_history(state):
     """A blobless mirror of main in the state directory: commits and trees, enough to classify a range."""
     mirror = state / "deploy-source.git"
-    try:
-        if mirror.exists():
-            run(["git", "-C", str(mirror), "fetch", "--quiet", "--filter=blob:none", "origin",
-                 "+refs/heads/main:refs/heads/main"])
-        else:
-            run(["git", "clone", "--quiet", "--bare", "--filter=blob:none", "--single-branch", "--branch", "main",
-                 "https://github.com/" + REPOSITORY + ".git", str(mirror)])
-    except Refused as exc:
-        raise Unreachable(str(exc)) from None
+    if mirror.exists():
+        # Only the mirror itself, a bare repository, is fetched into; anything else there is refused (a pause).
+        if run(["git", "-C", str(mirror), "rev-parse", "--is-bare-repository", "--absolute-git-dir"],
+               reason=True).split() != ["true", str(mirror.resolve())]:
+            raise Refused(f"{mirror} is not the bare source mirror; remove or repair it")
+        run(["git", "-C", str(mirror), "fetch", "--quiet", "--filter=blob:none", "origin",
+             "+refs/heads/main:refs/heads/main"], reason=True, remote=True)
+    else:
+        run(["git", "clone", "--quiet", "--bare", "--filter=blob:none", "--single-branch", "--branch", "main",
+             "https://github.com/" + REPOSITORY + ".git", str(mirror)], reason=True, remote=True)
     return mirror
 
 
@@ -1075,24 +1086,6 @@ def deploy(settings, http, *, auto=False, dry_run=False, get=None):
     if PAUSE.exists():
         return {"status": "paused", "reason": PAUSE.read_text()[:1000].strip()}
     state = Path(settings["state_directory"])
-    last = read(state / "deploy.json") if (state / "deploy.json").exists() else {}
-    if auto and last.get("started_at") and (datetime.now(timezone.utc) - datetime.strptime(
-            last["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds() < DEPLOY_INTERVAL:
-        return {"status": "waiting", "reason": "less than 20 minutes since the last deploy started"}
-    s = http_release_tool()
-    with ExitStack() as held:
-        try:
-            held.enter_context(s.locks(http))
-            if state.resolve() not in (s.GLOBAL_LOCK.resolve(), Path(http["state_directory"]).resolve()):
-                held.enter_context(lock(state))
-        except Busy as exc:
-            return {"status": "busy", "reason": str(exc)}
-        held.enter_context(verification_reuse())
-        return deploy_locked(settings, http, s, dry_run=dry_run, get=get or api)
-
-
-def deploy_locked(settings, http, s, *, dry_run, get):
-    state = Path(settings["state_directory"])
     def halt(reason, status="halted", **fields):
         # The pause stops every later run until a human removes it; nothing is retried.
         outcome = {"status": status, "reason": reason, "at": now(), **fields}
@@ -1101,9 +1094,26 @@ def deploy_locked(settings, http, s, *, dry_run, get):
         PAUSE.write_text(json.dumps(outcome) + "\n")
         PAUSE.chmod(0o600)
         return outcome
+    s = http_release_tool()
+    with ExitStack() as held:
+        try:
+            held.enter_context(s.locks(http))
+            if state.resolve() not in (s.GLOBAL_LOCK.resolve(), Path(http["state_directory"]).resolve()):
+                held.enter_context(lock(state))
+        except Busy as exc:
+            return {"status": "busy", "reason": str(exc)}
+        except Exception as exc:
+            return halt("deploy could not take the host locks: " + (str(exc) if isinstance(exc, Refused)
+                                                                     else type(exc).__name__))
+        held.enter_context(verification_reuse())
+        return deploy_locked(settings, http, s, auto=auto, dry_run=dry_run, get=get or api, halt=halt)
+
+
+def deploy_locked(settings, http, s, *, auto, dry_run, get, halt):
+    state = Path(settings["state_directory"])
     record = {}
     try:
-        return deploy_steps(settings, http, s, dry_run=dry_run, get=get, halt=halt, record=record)
+        return deploy_steps(settings, http, s, auto=auto, dry_run=dry_run, get=get, halt=halt, record=record)
     except Exception as exc:
         # Every failure the steps do not classify themselves ends here: a pause, unless nothing changed yet
         # and it was the network or the API quota.
@@ -1124,8 +1134,16 @@ def serving_settled(receipt):
                                                  and receipt.get("previous") is None)
 
 
-def deploy_steps(settings, http, s, *, dry_run, get, halt, record):
+def deploy_steps(settings, http, s, *, auto, dry_run, get, halt, record):
     state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
+    try:
+        last = read(state / "deploy.json") if (state / "deploy.json").exists() else {}
+        started = last.get("started_at") and datetime.strptime(last["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it")
+    if auto and started and (datetime.now(timezone.utc) - started).total_seconds() < DEPLOY_INTERVAL:
+        return {"status": "waiting", "reason": "less than 20 minutes since the last deploy started"}
     if blocked := unfinished(state):
         return halt("an apply or rollback is unfinished: " + ", ".join(blocked) + "; inspect it before any recovery")
     # An HTTP attempt that neither serves nor failed before admission has an unknown router or retirement outcome.
@@ -1161,6 +1179,14 @@ def deploy_steps(settings, http, s, *, dry_run, get, halt, record):
     head = run(["git", "-C", str(mirror), "rev-parse", "refs/heads/main"]).strip()
     if not on_main(mirror, base, head) or not on_main(mirror, serving["sha"], base):
         return halt("the current release is not on main, or the serving HTTP release is not an ancestor of it")
+    # promote marks an attempt `serving` before it publishes http-current.json: a serving attempt the serving release
+    # does not contain is an interrupted publication, and the router may already admit that generation.
+    if unpublished := sorted(path.parent.name for path in http_state.glob("*/http-attempted.json")
+                             if read(path).get("status") == "serving" and not (
+                                 re.fullmatch(r"[0-9a-f]{40}", path.parent.name)
+                                 and on_main(mirror, path.parent.name, serving["sha"]))):
+        return halt("an HTTP release attempt serves, but http-current.json does not name it: " + ", ".join(unpublished)
+                    + "; inspect seamless_release.py status --sha <sha>")
     if drift := configuration_drift(settings, http, current, serving):
         return halt(drift + "; apply the next release by hand")
     installed = {"scripts/production.py": __file__, "scripts/seamless_release.py": s.__file__}

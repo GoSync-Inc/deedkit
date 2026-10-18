@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 from types import SimpleNamespace
 import urllib.error
 
@@ -1857,7 +1858,9 @@ BASE, NEWER, NEWEST = "0" * 40, "1" * 40, "2" * 40
 
 class Deployer:
     """A synthetic host for `deploy`: plan A and HTTP state at BASE, a main history BASE..NEWEST, a CI listing,
-    and the release steps recorded instead of run. No git, GitHub or Docker access."""
+    and the release steps recorded instead of run. No git (but the check of an existing source mirror), GitHub or
+    Docker access."""
+    real_run = staticmethod(p.run)
 
     def __init__(self, tmp_path, monkeypatch, *, history=(NEWER, NEWEST), green=(NEWER, NEWEST), changes=None):
         from scripts import seamless_release as s
@@ -1876,7 +1879,7 @@ class Deployer:
                       "conclusion": "success" if sha in green else None, "html_url": f"https://example.invalid/{index}"}
                      for index, sha in enumerate(self.history)]
         self.steps, self.requests, self.git, self.remaining = [], [], [], 60
-        self.blobs = {}
+        self.blobs, self.git_failures = {}, {}
         self.current(BASE)
         p.write(self.http_state / "http-current.json",
                 {"sha": BASE, "status": "serving", "config_digest": p.digest(self.http)})
@@ -1932,6 +1935,10 @@ class Deployer:
             return json.dumps(self.document)
         assert argv[0] == "git", argv
         self.git.append(argv)
+        if "--is-bare-repository" in argv:
+            return self.real_run(argv, **kwargs)
+        if failure := self.git_failures.get(argv[1]):
+            raise failure
         head = self.history[-1]
         if argv[1] == "ls-remote":
             return f"{head}\trefs/heads/main\n"
@@ -1989,6 +1996,15 @@ def test_deploy_exits_quietly_while_paused_or_while_another_operation_holds_the_
     with p.lock(host.state):
         assert host.deploy()["status"] == "busy"
     assert host.steps == [] and host.git == [] and host.paused() is None
+
+
+def test_a_host_lock_refused_for_another_reason_than_a_concurrent_operation_pauses(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.state.chmod(0o750)  # lock() refuses a state directory that is not private
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "could not take the host locks: production state directory must be private" \
+        in outcome["reason"]
+    assert host.paused() == outcome["reason"] and host.steps == [] and host.git == []
 
 
 @pytest.mark.parametrize("path", ["services/messaging/messaging_service/migrations/036_synthetic.sql",
@@ -2175,6 +2191,98 @@ def test_a_program_or_state_error_before_any_change_pauses_and_only_network_erro
         else:
             assert outcome["status"] == "halted" and "refused before any change" in outcome["reason"], error
             assert host.paused() is not None
+
+
+@pytest.mark.parametrize("receipt", ["{", '{"started_at": "yesterday"}', "[]"])
+def test_a_malformed_previous_deploy_receipt_pauses_with_its_reason(tmp_path, monkeypatch, capsys, receipt):
+    host = Deployer(tmp_path, monkeypatch)
+    (host.state / "deploy.json").write_text(receipt)
+    outcome = host.deploy(auto=True)
+    assert outcome["status"] == "halted" and "deploy.json is malformed" in outcome["reason"]
+    assert host.paused() == outcome["reason"] and host.steps == [] and host.git == []
+    # The command line prints the same outcome as its one JSON line and exits 1.
+    p.PAUSE.unlink()
+    monkeypatch.setattr(p.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(p, "lock", lambda state: contextlib.nullcontext())
+    monkeypatch.setattr(host.s, "locks", lambda settings: contextlib.nullcontext())
+    monkeypatch.setattr(p, "config", lambda name: host.settings if name == "plan-a.json" else host.http)
+    monkeypatch.setattr(host.s, "validate_settings", lambda value: value)
+    with pytest.raises(SystemExit) as stopped:
+        p.main(["deploy", "--config", "plan-a.json", "--http-config", "plan-b.json", "--auto"])
+    printed = json.loads(capsys.readouterr().out)
+    assert stopped.value.code == 1 and printed["status"] == "halted" and "malformed" in printed["reason"]
+    assert host.paused() == printed["reason"] and host.steps == []
+
+
+def test_a_serving_http_attempt_that_http_current_does_not_name_pauses_before_plan_a(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    # promote marked NEWER serving and wrote its result, then stopped before it published http-current.json.
+    for sha in (BASE, NEWER):
+        (host.http_state / sha).mkdir()
+        p.write(host.http_state / sha / "http-attempted.json", {"status": "serving", "sha": sha})
+        p.write(host.http_state / sha / "http-result.json", {"sha": sha, "status": "serving-retirement-pending"})
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and outcome["reason"].startswith(
+        "an HTTP release attempt serves, but http-current.json does not name it: " + NEWER + ";")
+    assert host.steps == [] and host.requests == [] and host.paused() == outcome["reason"]
+    # The same when plan A had already applied NEWER: plan B is not started either.
+    (tmp_path / "ahead").mkdir()
+    host = Deployer(tmp_path / "ahead", monkeypatch)
+    host.current(NEWER)
+    (host.http_state / NEWER).mkdir()
+    p.write(host.http_state / NEWER / "http-attempted.json", {"status": "serving", "sha": NEWER})
+    assert host.deploy()["status"] == "halted" and host.steps == []
+
+
+def test_an_invalid_source_mirror_pauses_and_is_never_fetched_into(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    (host.state / "deploy-source.git").mkdir()  # empty: git refuses it locally, before any network access
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and outcome["reason"].startswith("deploy was refused before any change: git")
+    assert host.paused() == outcome["reason"] and host.steps == []
+    assert not [argv for argv in host.git if "fetch" in argv]
+    # So does a repository there that is not the bare mirror itself; a real bare mirror is fetched.
+    for bare in (False, True):
+        p.PAUSE.unlink(missing_ok=True)
+        (tmp_path / str(bare)).mkdir()
+        host = Deployer(tmp_path / str(bare), monkeypatch)
+        subprocess.run(["git", "init", "--quiet", *(["--bare"] if bare else []), str(host.state / "deploy-source.git")],
+                       check=True)
+        outcome = host.deploy()
+        if bare:
+            assert outcome["status"] == "deployed" and [argv for argv in host.git if "fetch" in argv]
+        else:
+            assert outcome["status"] == "halted" and "is not the bare source mirror" in outcome["reason"]
+            assert not [argv for argv in host.git if "fetch" in argv]
+
+
+def test_only_a_transport_failure_of_git_talking_to_github_is_retried(tmp_path, monkeypatch):
+    def failing(stderr):
+        return [sys.executable, "-c", f"import sys; sys.stderr.write({stderr!r}); sys.exit(128)"]
+    transport = "fatal: unable to access 'https://github.com/GoSync-Inc/deedkit.git/': Could not resolve host: github.com\n"
+    local = "fatal: could not lock config file deploy-source.git/config: Permission denied\n"
+    with pytest.raises(p.Unreachable):
+        p.run(failing(transport), reason=True, remote=True)
+    with pytest.raises(p.Refused, match="could not lock config file") as refused:
+        p.run(failing(local), reason=True, remote=True)
+    assert not isinstance(refused.value, p.Unreachable)
+    with pytest.raises(p.Refused) as refused:
+        p.run(failing(transport))  # not marked as a command talking to GitHub
+    assert not isinstance(refused.value, p.Unreachable)
+    for command, error in (("ls-remote", p.Unreachable("git could not reach GitHub (exit 128)")),
+                           ("clone", p.Unreachable("git could not reach GitHub (exit 128)")),
+                           ("ls-remote", p.Refused("git failed (exit 128): fatal: synthetic local failure")),
+                           ("clone", p.Refused("git failed (exit 128): fatal: synthetic local failure"))):
+        directory = tmp_path / f"{command}-{type(error).__name__}"
+        directory.mkdir()
+        host = Deployer(directory, monkeypatch)
+        host.git_failures[command] = error
+        outcome = host.deploy()
+        if isinstance(error, p.Unreachable):
+            assert outcome["status"] == "error" and "the next run retries" in outcome["reason"] and host.paused() is None
+        else:
+            assert outcome["status"] == "halted" and "synthetic local failure" in outcome["reason"] and host.paused()
+        assert host.steps == []
 
 
 def test_a_dry_run_reports_the_plan_or_the_pause_reason_and_changes_nothing(tmp_path, monkeypatch):
