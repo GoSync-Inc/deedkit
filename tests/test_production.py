@@ -1,4 +1,5 @@
 """Promotion guards use synthetic GitHub/Compose responses; no live runtime access."""
+import contextlib
 import copy
 import hashlib
 import json
@@ -8,6 +9,7 @@ import re
 import stat
 import subprocess
 from types import SimpleNamespace
+import urllib.error
 
 import pytest
 import yaml
@@ -20,14 +22,22 @@ OLD_IMAGE = "sha256:" + "d" * 64
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def comparison(sha, *, behind=0):
+    """GitHub's `compare/main...<sha>` when main contains SHA (`behind` commits ahead of it), or diverged."""
+    if sha != SHA:
+        return {"status": "diverged", "ahead_by": 1, "behind_by": 1, "merge_base_commit": {"sha": "f" * 40}}
+    return {"status": "behind" if behind else "identical", "ahead_by": 0, "behind_by": behind,
+            "merge_base_commit": {"sha": SHA}}
+
+
 def github(*, conclusion="success", event="push", branch="main", sha=SHA, jobs=None):
     run = {"id": 12, "run_attempt": 2, "head_sha": sha, "head_branch": branch,
            "event": event, "status": "completed", "conclusion": conclusion,
            "head_repository": {"full_name": p.REPOSITORY}, "html_url": "https://example.invalid/run/12"}
     required = [{"name": name, "status": "completed", "conclusion": "success"} for name in p.REQUIRED_JOBS]
     def get(path):
-        if path == "git/ref/heads/main":
-            return {"object": {"sha": SHA}}
+        if path.startswith("compare/main..."):
+            return comparison(path.removeprefix("compare/main..."))
         if "/runs?" in path:
             return {"workflow_runs": [run]}
         assert "runs/12/attempts/2/jobs?" in path
@@ -160,7 +170,8 @@ def test_preparation_builds_only_exact_main_source_and_does_not_restart_services
     assert "build" not in previous["services"]["api"]
     assert receipt["projects"][0]["running"]["api"] == {"container": "existing123", "image": OLD_IMAGE,
                                                         "settings": p.container_settings({})}
-    assert any("refs/heads/main" in call for call in calls)
+    # The verified commit itself is fetched, not whatever main's head is by now.
+    assert ["git", "-C", str(Path(settings["state_directory"]) / SHA / "source"), "fetch", "--depth=1", "origin", SHA] in calls
     assert not any("stop" in call or "up" in call for call in calls)
     smoke = next(call for call in calls if call[:2] == ["docker", "run"])
     assert smoke[smoke.index("--network") + 1] == "none"
@@ -236,7 +247,7 @@ def test_main_moving_during_source_fetch_prevents_any_build(tmp_path, monkeypatc
     settings, calls, _ = fixture(tmp_path, monkeypatch)
     original = p.run
     monkeypatch.setattr(p, "run", lambda argv, **kw: "c" * 40 if "FETCH_HEAD" in argv else original(argv, **kw))
-    with pytest.raises(p.Refused, match="main moved"):
+    with pytest.raises(p.Refused, match="not the verified candidate commit"):
         p.prepare(settings, SHA)
     assert not any(call[:2] == ["docker", "build"] for call in calls)
 
@@ -843,8 +854,8 @@ def queue_github(*, push_verify="skipped", queue=None, queue_jobs=None, extra_qu
     reads = {"push": 0, "merge_group": 0}
 
     def get(path):
-        if path == "git/ref/heads/main":
-            return {"object": {"sha": SHA}}
+        if path.startswith("compare/main..."):
+            return comparison(path.removeprefix("compare/main..."))
         if "/runs?" in path:
             event = "merge_group" if "event=merge_group" in path else "push"
             reads[event] += 1
@@ -1225,7 +1236,8 @@ class Host:
                 return self.container["Id"] + "\n"
             return ""
         if argv[:2] == ["docker", "ps"]:
-            return self.container["Id"] + "\n"
+            # Like Docker: without --all only running (or restarting) containers are listed.
+            return self.container["Id"] + "\n" if "--all" in argv or self.container["State"].get("Running") else ""
         if argv[:2] == ["docker", "inspect"]:
             assert argv[2:] == [self.container["Id"]]
             return json.dumps([self.container])
@@ -1647,3 +1659,437 @@ def test_an_apply_or_rollback_record_from_the_order_dependent_digest_is_refused_
     with pytest.raises(p.Refused, match="older production.py .* manual procedure"):
         p.rollback(host.settings, RELEASES[1])
     assert host.mutations() == []
+
+
+# Continuous deployment stage 1: verify on any commit main contains, rollback after a crash or a failed health
+# wait, and `deploy` (production.md "Continuous deployment"). Synthetic GitHub, git and Docker only.
+
+
+def test_a_commit_main_has_moved_past_is_still_promotable_and_one_outside_main_is_not():
+    get, _, _ = github()
+    for behind in (1, 25):
+        moved = lambda path, behind=behind: (comparison(SHA, behind=behind) if path.startswith("compare/main...")
+                                             else get(path))
+        assert p.verify(SHA, moved)["run_id"] == 12
+    for status in ({"status": "ahead", "ahead_by": 1}, {"status": "diverged", "ahead_by": 2},
+                   {"status": "behind", "ahead_by": 0, "merge_base_commit": {"sha": "f" * 40}}):
+        answer = {**comparison(SHA, behind=3), **status}
+        outside = lambda path, answer=answer: answer if path.startswith("compare/main...") else get(path)
+        with pytest.raises(p.Refused, match="not a commit on main"):
+            p.verify(SHA, outside)
+
+
+def test_within_one_deploy_a_later_verification_rereads_the_runs_but_not_their_jobs():
+    get, push, group = queue_github()
+    paths = []
+    def counted(path):
+        paths.append(path)
+        return get(path)
+    with p.verification_reuse():
+        first = p.verify(SHA, counted)
+        full = len(paths)
+        paths.clear()
+        assert p.verify(SHA, counted) == first
+        # compare, the push run listing and the queue run listing; no job listing.
+        assert len(paths) == 3 and not any("/jobs?" in path for path in paths)
+    paths.clear()
+    p.verify(SHA, counted)
+    assert len(paths) == full  # outside a deploy run every verification is complete
+
+
+@pytest.mark.parametrize("changed", ["push", "merge_group"])
+def test_a_rerun_after_the_first_verification_of_a_deploy_is_verified_again_in_full(changed):
+    get, _, _ = queue_github(changes={changed: {"run_attempt": 3, "conclusion": "failure"}})
+    with p.verification_reuse():
+        with pytest.raises(p.Refused):
+            p.verify(SHA, get)
+            p.verify(SHA, get)
+
+
+def test_an_exhausted_github_quota_is_refused_with_its_reset_time(monkeypatch):
+    def limited(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 403, "rate limit exceeded",
+                                     {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1792350189"}, None)
+    monkeypatch.setattr(p.urllib.request, "urlopen", limited)
+    monkeypatch.setenv("GH_TOKEN", "synthetic-secret")
+    with pytest.raises(p.RateLimited, match=r"GitHub rate limit exhausted, resets at \d\d:\d\d:\d\dZ") as refused:
+        p.api("compare/main..." + SHA)
+    assert "synthetic-secret" not in str(refused.value)
+
+
+@pytest.mark.parametrize("state", [{"Running": False, "Status": "exited", "ExitCode": 1},
+                                   {"Running": True, "Restarting": True, "Status": "restarting"}],
+                         ids=["exited", "restarting"])
+def test_rollback_restores_the_release_before_a_replacement_that_exited_or_keeps_restarting(tmp_path, monkeypatch,
+                                                                                             state):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    host.container["State"] = state
+    p.rollback(host.settings, RELEASES[1])
+    assert host.container["Image"] == host.image(RELEASES[0]) and host.container["State"]["Running"]
+
+
+def test_rollback_refuses_a_selected_container_that_was_only_created_or_is_paused(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    for state in ({"Running": False, "Status": "created"}, {"Running": True, "Paused": True, "Status": "paused"}):
+        host.container["State"] = state
+        rolled_back_refusal(host, "neither running, restarting nor exited")
+
+
+def unhealthy_apply(host, monkeypatch, *, image=None):
+    """Apply RELEASES[1] over RELEASES[0] while its replacement starts and then fails Compose's health wait."""
+    host.release(RELEASES[0])
+    host.main = RELEASES[1]
+    p.prepare(host.settings, RELEASES[1])
+    original = host.run
+    def run(argv, **kwargs):
+        result = original(argv, **kwargs)
+        if argv[:2] == ["docker", "compose"] and "up" in argv and "--wait" in argv:
+            host.container["State"] = {"Running": True, "Restarting": True, "Status": "restarting"}
+            if image:
+                host.container["Image"] = image
+            raise p.Refused("docker failed (exit 1); production was not accepted")
+        return result
+    monkeypatch.setattr(p, "run", run)
+    with pytest.raises(p.Refused) as refused:
+        p.apply(host.settings, RELEASES[1])
+    monkeypatch.setattr(p, "run", original)
+    return str(refused.value)
+
+
+def test_a_failed_health_wait_is_recorded_unhealthy_and_rolls_back_to_the_release_before_it(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    message = unhealthy_apply(host, monkeypatch)
+    assert "failed its health wait" in message and f"rollback --sha {RELEASES[1]}" in message
+    result = p.read(host.state / RELEASES[1] / "result.json")
+    assert result["status"] == "unhealthy" and "applied_at" not in result
+    assert [item["name"] for item in result["rollback"]["projects"]] == ["synthetic"]
+    # It never became current: current.json names the release that ran before it.
+    current = p.read(host.state / "current.json")
+    assert current["sha"] == RELEASES[0] and current["status"] == "applied"
+    with pytest.raises(p.Refused, match="already attempted"):
+        p.apply(host.settings, RELEASES[1])
+    p.rollback(host.settings, RELEASES[1])
+    assert host.container["Image"] == host.image(RELEASES[0]) and host.container["State"] == {"Running": True}
+    assert p.read(host.state / "current.json") == current
+    host.calls.clear()
+    with pytest.raises(p.Refused, match="already rolled back or attempted"):
+        p.rollback(host.settings, RELEASES[1])
+    assert host.mutations() == []
+
+
+def test_a_failed_health_wait_without_the_prepared_image_running_stays_unresolved(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    message = unhealthy_apply(host, monkeypatch, image=OLD_IMAGE)
+    assert "inspect it before any recovery" in message
+    assert not (host.state / RELEASES[1] / "result.json").exists()
+    assert p.unfinished(host.state) == [RELEASES[1]]
+    rolled_back_refusal(host, "only the current applied release")
+
+
+def test_an_unhealthy_release_is_not_rolled_back_after_another_release_became_current(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    unhealthy_apply(host, monkeypatch)
+    current = p.read(host.state / "current.json")
+    p.write(host.state / "current.json", {**current, "applied_at": "2026-10-19T00:00:00Z"})
+    rolled_back_refusal(host, "another release was applied or rolled back")
+
+
+BASE, NEWER, NEWEST = "0" * 40, "1" * 40, "2" * 40
+
+
+class Deployer:
+    """A synthetic host for `deploy`: plan A and HTTP state at BASE, a main history BASE..NEWEST, a CI listing,
+    and the release steps recorded instead of run. No git, GitHub or Docker access."""
+
+    def __init__(self, tmp_path, monkeypatch, *, history=(NEWER, NEWEST), green=(NEWER, NEWEST), changes=None):
+        from scripts import seamless_release as s
+        self.s, self.root = s, tmp_path
+        self.state, self.http_state = tmp_path / "state", tmp_path / "http-state"
+        for directory in (self.state, self.http_state, tmp_path / "global"):
+            directory.mkdir(mode=0o700)
+        self.document = {"name": "synthetic", "services": {"api": {"image": "old"}}}
+        project = {"name": "synthetic", "directory": str(tmp_path), "files": [str(tmp_path / "compose.json")],
+                   "services": {"api": "runtime"}}
+        self.settings = {"version": 1, "state_directory": str(self.state), "projects": [project]}
+        self.http = {"version": 1, "state_directory": str(self.http_state), "projects": [project], "http_release": {}}
+        self.history, self.changes = [BASE, *history], changes or {}
+        self.runs = [{"id": 100 + index, "head_sha": sha, "head_branch": "main", "event": "push",
+                      "status": "completed" if sha in green else "in_progress",
+                      "conclusion": "success" if sha in green else None, "html_url": f"https://example.invalid/{index}"}
+                     for index, sha in enumerate(self.history)]
+        self.steps, self.requests, self.git, self.remaining = [], [], [], 60
+        self.blobs = {}
+        self.current(BASE)
+        p.write(self.http_state / "http-current.json",
+                {"sha": BASE, "status": "serving", "config_digest": p.digest(self.http)})
+        monkeypatch.setattr(p, "PAUSE", tmp_path / "autodeploy.pause")
+        monkeypatch.setattr(s, "GLOBAL_LOCK", tmp_path / "global")
+        monkeypatch.setattr(p, "run", self.run)
+        monkeypatch.setattr(p, "quota", lambda: (self.remaining, "12:00:00Z"))
+        for module, name in ((p, "prepare"), (p, "apply"), (p, "rollback"), (s, "prepare"), (s, "promote"),
+                             (s, "retire")):
+            monkeypatch.setattr(module, name, self.step(module is s, name))
+
+    def current(self, sha):
+        p.write(self.state / "current.json", {"sha": sha, "status": "applied", "ci": {"url": "https://example.invalid"},
+                                              "rollback": {"version": 1, "projects": [
+                                                  {"name": "synthetic", "after_digest": p.digest(self.document)}]}})
+        (self.state / sha).mkdir(exist_ok=True)
+        p.write(self.state / sha / "prepared.json", {"sha": sha, "config_digest": p.digest(self.settings)})
+
+    def step(self, http, name):
+        label = ("seamless " if http else "") + name
+        def call(settings, sha):
+            self.steps.append((label, sha))
+            failure = getattr(self, "fail_" + label.replace(" ", "_"), None)
+            if label == "prepare":
+                (self.state / sha).mkdir()
+                p.write(self.state / sha / "prepared.json", {"sha": sha, "config_digest": p.digest(self.settings)})
+            if label == "apply":
+                p.write(self.state / sha / "attempted.json", {"sha": sha})
+            if label == "seamless prepare":
+                (self.http_state / sha).mkdir()
+            if failure:
+                failure(sha)
+            if label == "apply":
+                p.write(self.state / sha / "result.json", {"sha": sha, "status": "applied"})
+                self.current(sha)
+            if label == "seamless prepare":
+                p.write(self.http_state / sha / "http-prepared.json", {"sha": sha})
+            if label == "seamless promote":
+                p.write(self.http_state / sha / "http-attempted.json", {"status": "serving"})
+                p.write(self.http_state / "http-current.json",
+                        {"sha": sha, "status": "serving", "config_digest": p.digest(self.http)})
+                return {"sha": sha, "status": "serving"}
+            return {"sha": sha}
+        return call
+
+    def get(self, path):
+        self.requests.append(path)
+        assert path.startswith("actions/workflows/ci.yml/runs?") and "branch=main" in path and "event=push" in path
+        return {"workflow_runs": self.runs[::-1]}
+
+    def run(self, argv, **kwargs):
+        if argv[:2] == ["docker", "compose"] and "config" in argv:
+            return json.dumps(self.document)
+        assert argv[0] == "git", argv
+        self.git.append(argv)
+        head = self.history[-1]
+        if argv[1] == "ls-remote":
+            return f"{head}\trefs/heads/main\n"
+        command = argv[3:]
+        if command[:1] == ["rev-parse"]:
+            if command[1] == "refs/heads/main":
+                return head + "\n"
+            return self.blobs.get(command[1], "e" * 40) + "\n"
+        if command[:2] == ["merge-base", "--is-ancestor"]:
+            if self.history.index(command[2]) > self.history.index(command[3]):
+                raise p.Refused("git failed (exit 1); production was not accepted")
+            return ""
+        if command[:2] == ["rev-list", "--first-parent"]:
+            old, new = command[2].split("..")
+            return "\n".join(self.history[self.history.index(old) + 1:self.history.index(new) + 1][::-1])
+        if command[:1] == ["diff"]:
+            old, new = command[-2:]
+            commits = self.history[self.history.index(old) + 1:self.history.index(new) + 1]
+            return "\0".join(path for sha in commits for path in self.changes.get(sha, ())) + "\0"
+        return ""  # clone and fetch of the blobless mirror
+
+    def deploy(self, **options):
+        return p.deploy(self.settings, self.http, get=self.get, **options)
+
+    def paused(self):
+        return json.loads(p.PAUSE.read_text())["reason"] if p.PAUSE.exists() else None
+
+
+def test_deploy_applies_the_newest_green_main_commit_with_plan_a_then_plan_b(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, history=(NEWER, NEWEST, "3" * 40), green=(NEWER, NEWEST))
+    outcome = host.deploy()
+    # The newest commit's CI still runs: the newest green one is deployed, everything at one SHA.
+    assert host.steps == [("prepare", NEWEST), ("apply", NEWEST), ("seamless prepare", NEWEST),
+                          ("seamless promote", NEWEST)]
+    assert outcome["status"] == "deployed" and outcome["sha"] == NEWEST and outcome["base"] == BASE
+    assert outcome["run"] == "https://example.invalid/2" and outcome["http"] == "serving"
+    assert p.read(host.state / "deploy.json") == outcome and host.paused() is None
+    assert len(host.requests) == 1
+    # The next run waits for the newest commit's CI, with one listing.
+    host.requests.clear()
+    assert host.deploy()["status"] == "waiting" and len(host.requests) == 1 and len(host.steps) == 4
+
+
+def test_deploy_without_a_new_main_commit_reads_neither_the_api_nor_the_history(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, history=())
+    assert host.deploy() == {"status": "current", "sha": BASE}
+    assert host.requests == [] and [argv[1] for argv in host.git] == ["ls-remote"] and host.steps == []
+
+
+def test_deploy_exits_quietly_while_paused_or_while_another_operation_holds_the_lock(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    p.PAUSE.write_text("owner: synthetic maintenance\n")
+    assert host.deploy() == {"status": "paused", "reason": "owner: synthetic maintenance"}
+    p.PAUSE.unlink()
+    with p.lock(host.state):
+        assert host.deploy()["status"] == "busy"
+    assert host.steps == [] and host.git == [] and host.paused() is None
+
+
+@pytest.mark.parametrize("path", ["services/messaging/messaging_service/migrations/036_synthetic.sql",
+                                  "services/calendar/family_calendar/service/schema.sql",
+                                  "services/messaging/messaging_service/gateway_role.sql",
+                                  "scripts/production.py", "scripts/seamless_release.py",
+                                  "tools/attest-verify/main.go", "services/release-router/main.go"])
+def test_deploy_pauses_for_an_sql_inventory_or_deploy_tool_change_before_any_step(tmp_path, monkeypatch, path):
+    host = Deployer(tmp_path, monkeypatch, changes={NEWER: [path, "README.md"]})
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and path in outcome["reason"] and outcome["sha"] == NEWEST
+    assert host.steps == [] and host.paused() == outcome["reason"]
+    assert host.deploy()["status"] == "paused"
+
+
+def test_documentation_about_migrations_is_not_an_sql_inventory_change(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["docs/migrations/messaging-layout.md",
+                                                            ".claude/rules/migrations.md"]})
+    assert host.deploy()["status"] == "deployed"
+
+
+def test_deploy_continues_when_the_changed_deploy_tools_are_the_installed_ones(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["scripts/production.py", "scripts/seamless_release.py"]})
+    host.blobs = {f"{NEWEST}:scripts/production.py": p.blob(p.__file__),
+                  f"{NEWEST}:scripts/seamless_release.py": p.blob(host.s.__file__)}
+    assert host.deploy()["status"] == "deployed"
+
+
+@pytest.mark.parametrize("change", ["settings", "compose", "http"])
+def test_deploy_pauses_when_the_configuration_changed_since_the_current_release(tmp_path, monkeypatch, change):
+    host = Deployer(tmp_path, monkeypatch)
+    if change == "settings":
+        host.settings["projects"][0]["services"]["indexer"] = "indexer"
+    elif change == "compose":
+        host.document["services"]["api"]["environment"] = {"SYNTHETIC": "changed by hand"}
+    else:
+        host.http["http_release"]["drain_timeout"] = 1
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "changed since" in outcome["reason"] and host.steps == []
+
+
+def test_a_failed_health_wait_rolls_back_once_and_pauses(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    def unhealthy(sha):
+        p.write(host.state / sha / "result.json", {"sha": sha, "status": "unhealthy"})
+        raise p.Refused("a replacement failed its health wait")
+    host.fail_apply = unhealthy
+    outcome = host.deploy()
+    assert host.steps == [("prepare", NEWEST), ("apply", NEWEST), ("rollback", NEWEST)]
+    assert outcome["status"] == "rolled-back" and f"rolled back to {BASE}" in outcome["reason"]
+    assert p.read(host.state / "deploy.json")["status"] == "rolled-back" and host.paused() == outcome["reason"]
+    # After a human removes the pause, the failed commit is never retried and nothing older follows it.
+    p.PAUSE.unlink()
+    host.steps.clear()
+    assert host.deploy()["status"] == "waiting" and host.steps == []
+
+
+def test_a_failed_rollback_or_an_unknown_apply_state_pauses_without_any_further_step(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    def unhealthy(sha):
+        p.write(host.state / sha / "result.json", {"sha": sha, "status": "unhealthy"})
+        raise p.Refused("a replacement failed its health wait")
+    host.fail_apply = unhealthy
+    host.fail_rollback = lambda sha: (_ for _ in ()).throw(p.Refused("restored service is missing"))
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "rollback failed: restored service is missing" in outcome["reason"]
+    (tmp_path / "unknown").mkdir()
+    host = Deployer(tmp_path / "unknown", monkeypatch)
+    host.fail_apply = lambda sha: (_ for _ in ()).throw(p.Refused("replacement did not start the prepared image"))
+    outcome = host.deploy()
+    assert host.steps == [("prepare", NEWEST), ("apply", NEWEST)]
+    assert outcome["status"] == "halted" and "unknown state" in outcome["reason"]
+    # The unfinished attempt keeps every later run paused, even after the pause file is removed.
+    p.PAUSE.unlink()
+    assert host.deploy()["status"] == "halted" and "unfinished" in host.paused()
+
+
+def test_a_refusal_before_any_change_pauses_and_a_network_or_quota_error_is_retried(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.fail_prepare = lambda sha: (_ for _ in ()).throw(p.Refused("latest main CI run is not a completed success"))
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "refused before any change" in outcome["reason"]
+    for error in (TimeoutError(), p.RateLimited("GitHub rate limit exhausted, resets at 12:00:00Z")):
+        (tmp_path / type(error).__name__).mkdir()
+        host = Deployer(tmp_path / type(error).__name__, monkeypatch)
+        def early(sha, host=host, error=error):
+            (host.state / sha / "attempted.json").unlink()  # it failed in its first verification
+            raise error
+        host.fail_apply = early
+        outcome = host.deploy()
+        assert outcome["status"] == "error" and "the next run retries" in outcome["reason"] and host.paused() is None
+        host.fail_apply = None
+        host.steps.clear()
+        # The retry applies the prepared release without preparing it again.
+        assert host.deploy()["status"] == "deployed" and host.steps[0] == ("apply", NEWEST)
+
+
+def test_deploy_waits_for_the_api_quota_and_for_the_interval_between_automatic_deploys(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.remaining = p.QUOTA["plan A and B"] - 1
+    outcome = host.deploy()
+    assert outcome["status"] == "waiting" and "until 12:00:00Z" in outcome["reason"] and host.requests == []
+    host.remaining = 60
+    assert host.deploy()["status"] == "deployed"
+    host.runs.append({"id": 200, "head_sha": "3" * 40, "head_branch": "main", "status": "completed",
+                      "conclusion": "success", "html_url": "https://example.invalid/3"})
+    host.history.append("3" * 40)
+    host.steps.clear()
+    assert host.deploy(auto=True)["status"] == "waiting" and host.steps == []
+    assert host.deploy()["sha"] == "3" * 40  # a manual run is not held back by the interval
+
+
+def test_deploy_finishes_plan_b_when_plan_a_is_ahead_of_the_serving_http_release(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.current(NEWER)  # plan A applied NEWER; its HTTP release waited for the API quota
+    assert host.deploy()["status"] == "deployed"
+    assert host.steps == [("seamless prepare", NEWER), ("seamless promote", NEWER)] and host.requests == []
+
+
+def test_a_failed_http_release_pauses_and_leaves_plan_a_applied(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.fail_seamless_promote = lambda sha: (_ for _ in ()).throw(
+        p.Refused("candidate HTTP readiness did not pass; serving release is unchanged"))
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "HTTP release stopped" in outcome["reason"]
+    assert p.read(host.state / "current.json")["sha"] == NEWEST and ("rollback", NEWEST) not in host.steps
+
+
+def test_a_dry_run_reports_the_plan_or_the_pause_reason_and_changes_nothing(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    assert host.deploy(dry_run=True) == {"status": "plan", "sha": NEWEST, "base": BASE,
+                                         "run": "https://example.invalid/2", "steps": ["plan A", "plan B"]}
+    host.changes = {NEWEST: ["services/messaging/messaging_service/migrations/036_synthetic.sql"]}
+    assert "SQL inventory" in host.deploy(dry_run=True)["would_pause"]
+    assert host.steps == [] and host.paused() is None and not (host.state / "deploy.json").exists()
+
+
+def test_the_command_line_runs_deploy_only_as_the_host_operator_and_exits_1_on_a_new_pause(tmp_path, monkeypatch,
+                                                                                            capsys):
+    host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["scripts/production.py"]})
+    arguments = ["deploy", "--config", "plan-a.json", "--http-config", "plan-b.json"]
+    monkeypatch.setattr(p.os, "geteuid", lambda: 1000)
+    with pytest.raises(SystemExit):
+        p.main(arguments)
+    assert "host operator" in capsys.readouterr().err and host.git == []
+    monkeypatch.setattr(p.os, "geteuid", lambda: 0)
+    # The synthetic state directories belong to the test user, not to root.
+    monkeypatch.setattr(p, "lock", lambda state: contextlib.nullcontext())
+    monkeypatch.setattr(host.s, "locks", lambda settings: contextlib.nullcontext())
+    monkeypatch.setattr(p, "config", lambda name: host.settings if name == "plan-a.json" else host.http)
+    monkeypatch.setattr(host.s, "validate_settings", lambda value: value)
+    monkeypatch.setattr(p, "api", host.get)
+    with pytest.raises(SystemExit) as stopped:
+        p.main(arguments)
+    printed = json.loads(capsys.readouterr().out)
+    assert stopped.value.code == 1 and printed["status"] == "halted" and "scripts/production.py" in printed["reason"]
+    p.main(arguments)  # paused now: one quiet line, exit 0
+    assert json.loads(capsys.readouterr().out)["status"] == "paused"

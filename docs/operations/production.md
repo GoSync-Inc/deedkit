@@ -301,8 +301,11 @@ python3 /usr/local/lib/deedkit/production.py verify --sha <40-character-main-sha
 python3 /usr/local/lib/deedkit/production.py prepare --sha <40-character-main-sha>
 ```
 
-The guard queries GitHub directly. Only the latest successful **push** CI run
-for the exact current `main` SHA qualifies, with successful package, native and
+The guard queries GitHub directly. The SHA must be a commit `main` contains
+(`compare/main...<sha>` reports `identical` or `behind` with nothing ahead), not
+necessarily its head, so merges never wait for a release; preparation fetches
+that exact commit (`git fetch --depth=1 origin <sha>`). Only the latest
+successful **push** CI run for that SHA qualifies, with successful package, native and
 aggregate jobs from its current attempt, including exactly one passed `publish`
 job (preparation pulls what it published). A PR run, manual baseline run, earlier
 successful run followed by failure, missing job or skipped check is refused.
@@ -403,7 +406,7 @@ python3 /usr/local/lib/deedkit/production.py apply --sha <same-sha>
 python3 /usr/local/lib/deedkit/production.py status
 ```
 
-Apply locks the host, checks current main/CI again and validates the prepared
+Apply locks the host, checks main/CI again and validates the prepared
 image labels, configuration hashes and existing container identities, and that
 each `<project>.before.json` still has the digest `prepared.json` recorded when
 preparation wrote it. A container identity is its ID, image and a digest of its
@@ -443,11 +446,21 @@ images until acceptance.
 
 ## Roll back the current release
 
+A release whose `up --wait` failed while every replacement it started runs the
+prepared image (running, restarting or exited) is recorded as `unhealthy` in its
+`result.json`, with rollback data for the projects it touched; `current.json`
+keeps naming the release before it. `rollback --sha <that-sha>` restores those
+projects and leaves `current.json` unchanged; it refuses when `current.json`
+changed since the release was prepared. Any other apply failure leaves
+`attempted.json` without a result. Rollback accepts a selected container that
+exited or keeps restarting, not only a running one (`docker ps --all`).
+
 ```sh
 python3 /usr/local/lib/deedkit/production.py rollback --sha <current-applied-sha>
 ```
 
-Rollback is a production change: the owner confirms it like `apply`. It returns
+Rollback is a production change: the owner confirms it like `apply` (except
+the one automatic rollback of `deploy`, below). It returns
 the current release's selected services to the images and configuration that
 ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 `verify()` (the previous revision is no longer current `main`), does not run or
@@ -507,6 +520,59 @@ use `docker image prune`, `docker system prune` or volume removal for this.
 
 There is deliberately no unattended restart timer. Only `apply` changes runtime
 processes, after review of the candidate and any required live-session authority.
+
+## Continuous deployment
+
+```sh
+sudo python3 /usr/local/lib/deedkit/production.py deploy \
+  --config /etc/deedkit/<plan-a>.json --http-config /etc/deedkit/http-production.json [--dry-run]
+sudo touch /etc/deedkit/autodeploy.pause     # stop deploying; remove the file to resume
+```
+
+`deploy` runs as root and holds the global, plan A and HTTP host locks for the
+whole run. It exits quietly (`paused`, `busy`, `current`, `waiting`, exit 0)
+when the pause file exists, another operation holds a lock, `git ls-remote`
+shows no new `main` commit, no newer commit has a green push run yet, the API
+quota left (`/rate_limit`, which costs no request) is below what the run needs,
+or, with `--auto` (the timer), the last deploy started less than 20 minutes ago.
+Otherwise it:
+
+1. reads the current plan A release (`current.json`, status `applied`) and the
+   serving HTTP release (`http-current.json`, status `serving`; a pending
+   predecessor retirement is retried first);
+2. fetches a blobless mirror of `main` into `<state>/deploy-source.git` and
+   picks the newest first-parent commit after the current release whose latest
+   push run succeeded; a commit whose deployment was attempted is never
+   retried, and no older commit follows it;
+3. pauses with a reason when the range changes the SQL inventory (any `*.sql`,
+   `services/*/migrations/**`) or a deploy tool (`scripts/production.py`,
+   `scripts/seamless_release.py`, `tools/attest-verify/**`,
+   `services/release-router/**`) that is not installed yet (the installed tool
+   file equals the candidate's; the verifier matches the installed pin), or
+   when the configuration changed since the current release (the plan A
+   settings digest, each project's Compose document, the HTTP settings digest);
+4. runs `prepare` + `apply` (plan A), then `seamless_release.py prepare` +
+   `promote` (plan B), all at that one SHA with every guard of those steps;
+   when plan A is ahead of the HTTP release, it runs plan B only;
+5. writes `<state>/deploy.json` (SHA, base, run URL, start, end, outcome) and
+   prints one JSON line for the journal.
+
+Within one run `verify()` reads the run and job listings once per SHA and
+afterwards re-reads only the runs (a completed attempt keeps its jobs), so a
+deploy needs about 35 of the host's 60 anonymous requests an hour. A GitHub
+rate-limit response is refused as "GitHub rate limit exhausted, resets at <time>".
+
+On a failure it writes `/etc/deedkit/autodeploy.pause` (JSON with the reason)
+and exits 1; nothing deploys until a human removes it. A refusal before any
+change pauses; a network or quota error before any change is retried by the
+next run. When plan A failed its health wait (`unhealthy`, above), it runs
+`rollback` once (automatic deploys never change the SQL inventory) and pauses
+with status `rolled-back`; a failed rollback, or an apply that stopped in any
+other state, pauses with no further action. A failed plan B pauses and leaves
+plan A applied (the serving HTTP pair is unchanged or awaits recovery
+inspection). `status` shows `deploy.json` and the pause reason. To resume after
+a pause, fix the cause (migrate, install the tools, inspect the state), then
+remove the pause file.
 
 ## Record the production release
 
