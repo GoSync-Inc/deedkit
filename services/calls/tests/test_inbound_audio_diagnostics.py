@@ -212,7 +212,9 @@ async def test_external_analysis_never_receives_inbound_audio_diagnostics(monkey
         async def generate_content(self,model,contents,config):
             sent.append(contents);raise RuntimeError('stop after capturing the request')
     class Client:
-        def __init__(self,**kwargs):self.aio=SimpleNamespace(models=Models())
+        def __init__(self,**kwargs):
+            async def aclose():pass
+            self.aio=SimpleNamespace(models=Models(),aclose=aclose)
     monkeypatch.setattr(genai,'Client',Client)
     call={'id':'synthetic','events':[{'kind':'transcript','role':'user','text':'Hello'},
                                      {'kind':'inbound_audio','audio':{'input_frames':5,'input_max_rms':10.0}}],
