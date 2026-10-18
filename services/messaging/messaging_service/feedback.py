@@ -4,21 +4,56 @@ import hashlib
 import json
 import re
 from psycopg.types.json import Jsonb
+from .field_errors import field_error, one_per_field
 from .policy import OPERATION_PERMISSIONS, scope_filter, targets
+
+
+REF_KINDS = ('message_ids', 'chat_ids', 'subscription_ids')
+
+
+def _invalid(errors):
+    """invalid_feedback with bounded field_errors, never an input value."""
+    from .store import APIError
+    failure = APIError('invalid_feedback')
+    failure.field_errors = one_per_field(field_error(*e) for e in errors)
+    return failure
+
+
+def _ref_errors(refs):
+    if not isinstance(refs, dict):
+        return [('refs', 'type', 'object')]
+    errors = []
+    if set(refs) - set(REF_KINDS):
+        errors.append(('refs', 'unknown_field', 'only the listed reference types', REF_KINDS))
+    for kind in REF_KINDS:
+        values = refs.get(kind)
+        if kind not in refs:
+            continue
+        if not isinstance(values, list):
+            errors.append(('refs/' + kind, 'type', 'array'))
+        elif len(values) > 32:
+            errors.append(('refs/' + kind, 'max_items', 'at most 32 items'))
+        else:
+            for index, v in enumerate(values):
+                path = 'refs/%s/%d' % (kind, index)
+                if not isinstance(v, str):
+                    errors.append((path, 'type', 'string'))
+                elif not 1 <= len(v) <= 256:
+                    errors.append((path, 'min_length' if not v else 'max_length', '1–256 characters'))
+                elif any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
+                    errors.append((path, 'pattern', 'no control characters'))
+    return errors
 
 
 def _validate_refs(c, p, refs):
     from .store import APIError
     if refs is None:
         refs = {}
-    if not isinstance(refs, dict) or set(refs) - {'message_ids', 'chat_ids', 'subscription_ids'}:
-        raise APIError('invalid_feedback')
+    errors = _ref_errors(refs)
+    if errors:
+        raise _invalid(errors)
     normalized = {}
     for kind, values in refs.items():
-        if (not isinstance(values, list) or len(values) > 32 or
-                any(not isinstance(v, str) or not 1 <= len(v) <= 256 or
-                    any(ord(ch) < 32 or ord(ch) == 127 for ch in v) for v in values)):
-            raise APIError('invalid_feedback')
         normalized[kind] = sorted(set(values))
         if not values:
             continue
@@ -40,7 +75,7 @@ def _validate_refs(c, p, refs):
         if {row['id'] for row in found} != set(values):
             raise APIError('not_found', 404)
     if len(json.dumps(normalized).encode()) > 8192:
-        raise APIError('invalid_feedback')
+        raise _invalid([('refs', 'size', 'at most 8 KiB')])
     return normalized
 
 
@@ -48,12 +83,27 @@ def submit_feedback(store, c, p, request_id, category, description, *, operation
     from .store import APIError
     if 'read' not in p['permissions']:
         raise APIError('forbidden', 403)
-    if (not isinstance(request_id, str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}', request_id) or
-            category not in ('bug', 'feature', 'quality', 'other') or
-            not isinstance(description, str) or not 1 <= len(description) <= 4000 or not description.strip() or
-            any(ord(ch) < 32 and ch not in '\n\t' or ord(ch) == 127 for ch in description) or
-            operation is not None and (not isinstance(operation, str) or operation not in OPERATION_PERMISSIONS)):
-        raise APIError('invalid_feedback')
+    errors = []
+    if not isinstance(request_id, str):
+        errors.append(('request_id', 'type', 'string'))
+    elif not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}', request_id):
+        errors.append(('request_id', 'min_length' if len(request_id) < 8 else 'max_length' if len(request_id) > 128 else 'pattern',
+            '8–128 characters: letters, digits and _ . : -'))
+    if category not in ('bug', 'feature', 'quality', 'other'):
+        errors.append(('category', 'enum', None, ('bug', 'feature', 'quality', 'other')))
+    if not isinstance(description, str):
+        errors.append(('description', 'type', 'string'))
+    elif not 1 <= len(description) <= 4000:
+        errors.append(('description', 'min_length' if not description else 'max_length', '1–4000 characters'))
+    elif not description.strip():
+        errors.append(('description', 'blank', 'text with a non-space character'))
+    elif any(ord(ch) < 32 and ch not in '\n\t' or ord(ch) == 127 for ch in description):
+        errors.append(('description', 'pattern', 'no control characters except newline and tab'))
+    if operation is not None and (not isinstance(operation, str) or operation not in OPERATION_PERMISSIONS):
+        errors.append(('operation', 'type' if not isinstance(operation, str) else 'enum',
+            'string' if not isinstance(operation, str) else 'a documented operation name'))
+    if errors:
+        raise _invalid(errors)
     refs = _validate_refs(c, p, refs)
     value = dict(category=category, description=description, operation=operation, refs=refs)
     request_hash = hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()

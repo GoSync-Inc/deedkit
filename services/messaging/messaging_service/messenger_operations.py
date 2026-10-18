@@ -7,6 +7,8 @@ from copy import deepcopy
 import math
 import re
 
+from .field_errors import FIELD_NAME, field_error, one_per_field
+
 MAX_REGISTERED_FILE_BYTES = 32 * 1024**2
 CATALOG_VERSION = 1
 
@@ -184,29 +186,11 @@ def operation_manifest(platform, *, provider=None):
     return rows
 
 
-# Field error shape shared with FB-03 (ANYM-295), which moves it to platform_contracts.
-# Paths, reasons and hints come from this reviewed catalog, never from input values.
-FIELD_ERROR_REASONS = frozenset(('required', 'unknown_field', 'type', 'enum', 'min_length',
-    'max_length', 'pattern', 'minimum', 'maximum', 'min_items', 'max_items', 'unique',
-    'format', 'blank', 'size'))
-MAX_FIELD_ERRORS = 20
-FIELD_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,63}')
-FIELD_PATH = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,63}(/[0-9]{1,2})?')
-
-
-def field_error(field, reason, expected=None, allowed=None):
-    if reason not in FIELD_ERROR_REASONS or not FIELD_PATH.fullmatch(field):
-        raise ValueError('invalid_field_error')
-    return {'field': field, 'reason': reason, **({'expected': expected} if expected else {}),
-            **({'allowed': list(allowed)} if allowed else {})}
-
-
 class ParameterError(ValueError):
     """invalid_operation_parameters with bounded field_errors; never input values."""
     def __init__(self, *errors):
         super().__init__('invalid_operation_parameters')
-        seen = set()  # One entry per field path, so fallback paths never crowd out others.
-        self.field_errors = [e for e in errors if not (e['field'] in seen or seen.add(e['field']))][:MAX_FIELD_ERRORS]
+        self.field_errors = one_per_field(errors)  # One entry per field path, so fallback paths never crowd out others.
 
 
 def _modes(platform):
