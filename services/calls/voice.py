@@ -1,5 +1,6 @@
 """Gemini native audio through Pipecat, with scoped tools and bounded supervision."""
 import asyncio
+import contextlib
 import json
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -41,12 +42,14 @@ class InboundAudioProbe(FrameProcessor):
     """Counters only: observe inbound transport audio on every channel without changing frames."""
     def __init__(self,probe):
         super().__init__()
-        self.probe=probe
+        self.probe,self.failures=probe,0
 
     async def process_frame(self,frame,direction):
         await super().process_frame(frame,direction)
         if direction==FrameDirection.DOWNSTREAM and isinstance(frame,InputAudioRawFrame):
-            self.probe.input(frame.audio,rate=frame.sample_rate,channels=frame.num_channels)
+            # A diagnostic failure must never drop the frame or turn into a pipeline (model) error.
+            try:self.probe.input(frame.audio,rate=frame.sample_rate,channels=frame.num_channels)
+            except Exception:self.failures+=1
         await self.push_frame(frame,direction)
 
 
@@ -295,7 +298,9 @@ async def run_transport(transport,brief,key,state,browser=False):
         await asyncio.gather(health_task,return_exceptions=True)
         service.runtime_event(identity,{'kind':'provider_audio_health','audio':llm.audio_health.snapshot(),
                                         'runtime':runtime_health.snapshot()})
-        service.runtime_event(identity,{'kind':'inbound_audio','audio':inbound_audio.snapshot()})
+        # Diagnostics are best effort: a failure here must not skip cleanup or change the end reason.
+        with contextlib.suppress(Exception):
+            service.runtime_event(identity,{'kind':'inbound_audio','audio':inbound_audio.snapshot()})
         for task in ending_tasks:
             task.cancel()
         if ending_tasks:

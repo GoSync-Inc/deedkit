@@ -327,11 +327,23 @@ class Learning:
             self.db.commit()
 
 
+# Inbound audio diagnostics (#111) stay on the server: the external analyzer never receives them.
+SERVER_ONLY_AUDIO={'input_frames','input_zero_frames','input_max_rms','first_active_input_ms','input_sample_rates','media'}
+
+
+def analysis_view(snapshot):
+    view={**snapshot,'events':[e for e in snapshot.get('events',[]) if e.get('kind')!='inbound_audio']}
+    metrics=snapshot.get('metrics')
+    if isinstance(metrics,dict) and isinstance(metrics.get('telegram_audio'),dict):
+        view['metrics']={**metrics,'telegram_audio':{k:v for k,v in metrics['telegram_audio'].items() if k not in SERVER_ONLY_AUDIO}}
+    return view
+
+
 class GeminiReviewer:
     async def review(self,snapshot,key):
         from google import genai
         from google.genai import types
-        text=json.dumps(snapshot,ensure_ascii=False)
+        text=json.dumps(analysis_view(snapshot),ensure_ascii=False)
         if len(text)>180000:
             raise AnalysisInputTooLarge()
         client=genai.Client(api_key=key,http_options=types.HttpOptions(timeout=60000))
