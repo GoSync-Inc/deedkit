@@ -1,0 +1,24 @@
+[Unit]
+Description=Deploy the newest green DeedKit main commit (production.py deploy)
+Wants=network-online.target
+Requires=docker.service
+After=network-online.target docker.service personal-os-backup.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/production.json
+Environment=DEEDKIT_HTTP_CONFIG=/etc/deedkit/http-production.json
+# Optional host overrides: the plan A configuration path (DEEDKIT_DEPLOY_CONFIG), GH_TOKEN.
+EnvironmentFile=-/etc/deedkit/autodeploy.env
+# The daily backup (personal-os-backup.timer, 18:00 UTC) stops the collectors; a deploy never overlaps it:
+# skip while the backup unit runs or waits to retry, and start no deploy in the two hours before it.
+ExecCondition=/bin/sh -c 'case "$$(systemctl show -P ActiveState personal-os-backup.service)" in inactive|failed|"") ;; *) exit 1;; esac; case "$$(date -u +%%H)" in 16|17) exit 1;; esac'
+ExecStart=/usr/bin/python3 /usr/local/lib/deedkit/production.py deploy --auto --config ${DEEDKIT_DEPLOY_CONFIG} --http-config ${DEEDKIT_HTTP_CONFIG}
+TimeoutStartSec=4h
+TimeoutStopSec=180s
+KillMode=control-group

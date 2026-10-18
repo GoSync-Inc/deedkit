@@ -1,0 +1,11 @@
+[Unit]
+Description=Check DeedKit main for a new green commit to deploy
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+Unit=deedkit-autodeploy.service
+
+[Install]
+WantedBy=timers.target

@@ -520,7 +520,7 @@ use `docker image prune`, `docker system prune` or volume removal for this.
 
 Only `apply`, `rollback` and `deploy` (below) change runtime processes; `apply`
 and `rollback` after review of the candidate and any required live-session
-authority. No unattended timer runs `deploy` yet.
+authority. The `deedkit-autodeploy` timer (below) runs `deploy` unattended.
 
 ## Continuous deployment
 
@@ -593,6 +593,33 @@ inspection). `--dry-run` changes no release or runtime state (it may update
 the source mirror and take the locks). `status` shows `deploy.json` and the pause reason. To resume after
 a pause, fix the cause (migrate, install the tools, inspect the state), then
 remove the pause file.
+
+### Timer
+
+[`deploy/deedkit-autodeploy.service`](../../deploy/deedkit-autodeploy.service)
+runs `deploy --auto` and
+[`deploy/deedkit-autodeploy.timer`](../../deploy/deedkit-autodeploy.timer)
+starts it 5 minutes after the previous run ended (10 minutes after boot);
+`--auto` keeps at least 20 minutes between two deploy starts. The unit reads
+`/etc/deedkit/production.json` and `/etc/deedkit/http-production.json` unless
+the optional `/etc/deedkit/autodeploy.env` sets `DEEDKIT_DEPLOY_CONFIG` (and,
+when the owner adds one, `GH_TOKEN`). It never overlaps the daily backup,
+which stops the collectors (`personal-os-backup.timer`, 18:00 UTC): it waits
+for a running backup unit, skips while the backup runs or waits to retry,
+and starts no deploy between 16:00 and 18:00 UTC. Install it once, after a
+clean manual `deploy`, from the same reviewed `main` commit as the tools:
+
+```sh
+sudo install -o root -g root -m 0644 deploy/deedkit-autodeploy.service deploy/deedkit-autodeploy.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now deedkit-autodeploy.timer
+journalctl -u deedkit-autodeploy.service     # one JSON line per run
+```
+
+Pause with `sudo touch /etc/deedkit/autodeploy.pause` (each run then exits
+`paused`); stop the timer with `sudo systemctl disable --now
+deedkit-autodeploy.timer`. A run that pauses, rolls back, fails or cannot
+fetch exits 1, so the unit shows as failed until the next clean run.
 
 ## Record the production release
 
