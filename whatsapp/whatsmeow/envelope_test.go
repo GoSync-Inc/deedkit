@@ -393,3 +393,38 @@ func TestNativeForwardOriginIsOmittedUnlessEnabledAndForwarded(t *testing.T) {
 		t.Fatalf("non-forwarded message has forwardOrigin: %#v", v)
 	}
 }
+
+func TestNativeBusinessSenderFlagIsGatedAndStatedOnly(t *testing.T) {
+	business := func(id string, fromMe bool, name *types.VerifiedName) *events.Message {
+		m := forwardedText(id, &waE2E.ContextInfo{})
+		m.Info.IsFromMe = fromMe
+		m.Info.VerifiedName = name
+		return m
+	}
+	// Off by default: a rollback server that rejects the field never meets it.
+	t.Setenv("ANYMSG_CAPTURE_PROVIDER_FLAGS", "")
+	v, err := NormalizeMessage(business("off", false, &types.VerifiedName{VerifiedLevel: "high"}), types.EmptyJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v["senderIsBusiness"]; ok {
+		t.Fatalf("disabled capture emitted senderIsBusiness: %#v", v)
+	}
+	t.Setenv("ANYMSG_CAPTURE_PROVIDER_FLAGS", "1")
+	if v, err = NormalizeMessage(business("on", false, &types.VerifiedName{VerifiedLevel: "high"}), types.EmptyJID); err != nil {
+		t.Fatal(err)
+	}
+	requireArchivable(t, v)
+	if v["senderIsBusiness"] != true {
+		t.Fatalf("VerifiedName not captured: %#v", v)
+	}
+	// No VerifiedName is unknown, not "not a business"; the owner's own message states nothing.
+	for name, m := range map[string]*events.Message{"plain": business("plain", false, nil), "mine": business("mine", true, &types.VerifiedName{})} {
+		if v, err = NormalizeMessage(m, types.EmptyJID); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := v["senderIsBusiness"]; ok {
+			t.Fatalf("%s: unexpected senderIsBusiness: %#v", name, v)
+		}
+	}
+}

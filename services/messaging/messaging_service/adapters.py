@@ -75,6 +75,11 @@ def forward_origin_capture():
     return os.environ.get('ANYMSG_CAPTURE_FORWARD_ORIGIN')=='1'
 
 
+def provider_flags_capture():
+    # Off until the release a rollback would return to accepts sender_is_business_or_verified (ANYM-276).
+    return os.environ.get('ANYMSG_CAPTURE_PROVIDER_FLAGS')=='1'
+
+
 def telegram_forward_origin(message):
     """Origin stated by fwd_from and the entities Telethon cached from this update; never a lookup."""
     from telethon import types,utils
@@ -182,6 +187,9 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
             'mentions_owner':getattr(message,'mentioned',None),
             'forwarded':forwarded,
             **({'forward_origin':forward} if forward else {}),
+            # Only a stated flag is captured; an absent one is unknown, never "not verified".
+            **({'sender_is_business_or_verified':True} if provider_flags_capture() and isinstance(entity,types.User)
+                and (getattr(entity,'verified',None) is True or getattr(entity,'support',None) is True) else {}),
             'media_kind':media_kind}})
 
 
@@ -237,4 +245,5 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
                     'reply_to_owner':event.get('replyToOwner'),
                     'forwarded':event.get('forwarded'),
                     **({'forward_origin':forward} if forward is not None else {}),
+                    **({'sender_is_business_or_verified':True} if event.get('senderIsBusiness') is True else {}),
                     'media_kind':event.get('mediaKind')}})

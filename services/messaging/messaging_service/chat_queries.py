@@ -1,4 +1,6 @@
 """Scoped catalogue and evidence-backed, deliberately heuristic reply queue."""
+from psycopg.types.json import Jsonb
+
 from .policy import scope_filter,targets
 from .search_query import coverage,cursor_binding,decode_cursor,encode_cursor,filter_values,valid_text
 from .conversation import meaningful_sql,options
@@ -83,22 +85,60 @@ def title_sql(chat='c'):
         THEN '{SELF_CHAT_TITLE}' END,{peer_name_sql(chat)},{chat}.title) ELSE {chat}.title END"""
 
 
+# ANYM-276: one fixed integer per component; a row's priority is the sum of its non-zero components.
+DEMOTIONS={'one_way_chat':-60,'provider_business_or_verified':-40,'own_account':-80,'closing_courtesy':-30,'observed_bot':-20}
+COURTESY_WORDS=('спасибо','спс','благодарю','ок','окей','хорошо','ясно','понятно','понял','поняла','принято','отлично','супер',
+    'взаимно','пожалуйста','thanks','thank you','thx','ty','ok','okay','noted','got it','great','perfect','cool','appreciated',
+    'terima kasih','makasih','trims','oke','siap','baik','sip','mantap','ya','iya')
+COURTESY_FILLER=('большое','огромное','вам','тебе','you','so much','very much','banyak','sangat')
+COURTESY_EMOJI=r'\U0001F300-\U0001FAFF☀-➿⭐️‍'
+
+
+def courtesy_pattern():
+    """A whole short message of closing words and emoji, never a question (the word list is documented with the queue weights)."""
+    word='(?:'+'|'.join(sorted(COURTESY_WORDS,key=len,reverse=True))+')'
+    filler='(?:'+'|'.join(sorted(COURTESY_FILLER,key=len,reverse=True))+')'
+    tail=r'[\s,.!)\-'+COURTESY_EMOJI+']'
+    return (r'^\s*(?:'+filler+r'\s+)*'+word+'(?:'+tail+'+(?:'+word+'|'+filler+'))*'+tail+'*$|'+
+        r'^\s*['+COURTESY_EMOJI+']['+COURTESY_EMOJI+r'\s]*$')
+
+
+def sql_literal(value):
+    # Constants only (never request values); a quote is doubled and no percent sign is allowed by psycopg.
+    assert '%' not in value
+    return "'"+value.replace("'","''")+"'"
+
+
+def owner_senders(c,p):
+    """Sender IDs seen on recent outgoing messages the key may read: {platform|sender: [account, ...]}.
+
+    The key's account and chat scope applies before the 20-message limit, so a chat it cannot read never changes a score.
+    """
+    scope,args=scope_filter(p,'m')
+    owners={}
+    for r in c.execute(f'''SELECT DISTINCT a.platform||'|'||o.sender AS k,a.id AS account FROM accounts a
+        CROSS JOIN LATERAL (SELECT m.sender FROM messages m WHERE m.account=a.id AND {scope} AND m.direction='outgoing'
+          AND NOT m.deleted AND m.sender<>'' ORDER BY m.sent_at DESC,m.id DESC LIMIT 20) o WHERE a.id=ANY(%s)''',
+        (*args,p['accounts'])):owners.setdefault(r['k'],[]).append(r['account'])
+    return Jsonb(owners)
+
+
 def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=None,
         order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
         include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
         only_questions=False,only_unread=False,selected_chat=None,include_dismissed=False,
-        view='archive'):
+        view='archive',exclude_likely_broadcasts=False):
     from .store import APIError,bounded,date_bound,serial
     bounded(limit);valid_text(after,4096);valid_text(query,200)
     options(view)
     if order=='last_activity_desc':order='activity'
     if order not in ('id','activity','priority') or any(type(v) is not bool for v in
-            (exclude_channels,awaiting_reply,include_coverage,only_questions,only_unread)):
+            (exclude_channels,awaiting_reply,include_coverage,only_questions,only_unread,exclude_likely_broadcasts)):
         raise APIError('invalid_filter')
     if type(awaiting_reply_days) is not int or not 0<=awaiting_reply_days<=365:
         raise APIError('invalid_filter')
     if awaiting_reply and order=='id':order='activity'
-    if order=='priority' and not awaiting_reply:raise APIError('invalid_filter')
+    if (order=='priority' or exclude_likely_broadcasts) and not awaiting_reply:raise APIError('invalid_filter')
     c.execute('SET LOCAL jit=off')
     accounts=filter_values(accounts);chat_types=filter_values(chat_types)
     exclude_chats=filter_values(exclude_chats);exclude_senders=filter_values(exclude_senders)
@@ -121,7 +161,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     binding=cursor_binding(p,'chats',{'accounts':accounts,'query':query,'types':chat_types,'order':order,
         'exclude_channels':exclude_channels,'awaiting_reply':awaiting_reply,'awaiting_reply_days':awaiting_reply_days,
         'from':lower,'to':upper,'exclude_chats':exclude_chats,'exclude_senders':exclude_senders,
-        'only_questions':only_questions,'only_unread':only_unread})
+        'only_questions':only_questions,'only_unread':only_unread,
+        **({'exclude_likely_broadcasts':True} if exclude_likely_broadcasts else {})})
     if view=='conversation':
         binding=cursor_binding(p,'chats-conversation-v1',{'archive_binding':binding})
     pos=decode_cursor(after,binding) if after and order!='id' else None
@@ -145,7 +186,21 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     # 20 at about 17 days, so recent requests differ before a day has passed.
     waited="greatest(0,extract(epoch FROM (score_clock.at-attention.sent_at))/3600)"
     waiting="least(20,floor(sqrt("+waited+"))::integer)"
-    score="(CASE WHEN c.chat_type='private' THEN 100 ELSE 25 END + CASE WHEN attention.question THEN 25 ELSE 0 END + CASE WHEN attention.known_contact THEN 10 ELSE 0 END + "+waiting+")"
+    # Each component is a CASE yielding its points or NULL; the score is their sum and the reasons their keys.
+    def demotion(code,condition):return code,f'CASE WHEN {condition} THEN {DEMOTIONS[code]} END'
+    components=[('private_chat',"CASE WHEN c.chat_type='private' THEN 100 END"),
+        ('group_attention',"CASE WHEN c.chat_type IS DISTINCT FROM 'private' THEN 25 END"),
+        ('question_mark','CASE WHEN attention.question THEN 25 END'),
+        ('provider_contact','CASE WHEN attention.known_contact THEN 10 END'),
+        ('waiting_age_capped',f'CASE WHEN {waiting}>=20 THEN 20 END'),
+        ('waiting_age',f'CASE WHEN {waiting} BETWEEN 1 AND 19 THEN {waiting} END'),
+        demotion('one_way_chat',"c.chat_type='private' AND own_last.sent_at IS NULL"),
+        demotion('provider_business_or_verified','coalesce(attention.business,false)'),
+        demotion('observed_bot',"c.chat_type='group' AND coalesce(attention.bot,false)"),
+        demotion('own_account',"coalesce((score_clock.owners->(a.platform||'|'||attention.sender))-c.account<>'[]'::jsonb,false)"),
+        demotion('closing_courtesy','coalesce(attention.courtesy,false)')]
+    score='('+'+'.join(f'coalesce({sql},0)' for _,sql in components)+')'
+    broadcast="(c.chat_type='private' AND own_last.sent_at IS NULL OR coalesce(attention.business,false))"
     if awaiting_reply:clauses.append(pending)
     if only_questions:clauses.append('attention.question')
     if (awaiting_reply or only_questions) and awaiting_reply_days:
@@ -161,12 +216,18 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     after_owner=f'''(own_last.sent_at IS NULL OR m.sent_at>own_last.sent_at OR
         (a.platform='telegram' AND m.sent_at=own_last.sent_at AND {number('m')}>own_last.numeric_id)
         OR (a.platform='whatsapp' AND m.sent_at=own_last.sent_at))'''
+    # lower() folds Cyrillic only under a UTF-8 database collation (the postgres image default).
+    courtesy=sql_literal(courtesy_pattern())
     message_projection=f'''m.id,m.provider_id,m.revision,m.sender,m.sent_at,m.direction,
         CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END AS numeric_id,
         coalesce(nullif(left(m.body,160),''),'['||coalesce(md.metadata->>'media_kind','attachment')||']') AS snippet,
         md.metadata->'is_self_chat'='true'::jsonb AS is_self_chat,
         md.metadata->'sender_is_contact'='true'::jsonb AS known_contact,
         (position('?' in m.body)>0 OR position('？' in m.body)>0) AS question,
+        md.metadata->'sender_is_business_or_verified'='true'::jsonb AS business,
+        md.metadata->'sender_is_bot'='true'::jsonb AS bot,
+        (length(btrim(m.body)) BETWEEN 1 AND 40 AND position('?' in m.body)=0 AND position('？' in m.body)=0
+          AND lower(btrim(m.body)) ~ {courtesy}) AS courtesy,
         CASE WHEN c.chat_type='private' THEN 'last_archived_message_incoming'
           WHEN md.metadata->'mentions_owner'='true'::jsonb THEN 'owner_mention' ELSE 'reply_to_owner_message' END AS basis'''
     select_message='SELECT '+message_projection+f'''
@@ -202,7 +263,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         attention_lookup='SELECT * FROM (('+attention_lookup+') UNION ALL ('+group_thread_query(
             message_projection,enabled="c.chat_type='group'",criteria=attention_age,limit=1)+')) owner_attention'
     base=f''' FROM chats c JOIN accounts a ON a.id=c.account
-      CROSS JOIN (SELECT %s::timestamptz AS at) score_clock
+      CROSS JOIN (SELECT %s::timestamptz AS at,%s::jsonb AS owners) score_clock
       LEFT JOIN LATERAL ({latest_sql(last_sql,both_directions=True)}) last ON true
       LEFT JOIN LATERAL ({latest_sql(owner_sql)}) own_last ON true
       LEFT JOIN LATERAL ({latest_sql(select_message+" AND m.direction='incoming'")}) incoming ON true
@@ -210,9 +271,14 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
       LEFT JOIN sender_profiles sp ON sp.account=c.account AND sp.chat=c.id AND sp.sender=attention.sender
       LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
       LEFT JOIN reply_dismissals d ON d.key_id=%s AND d.chat=c.id WHERE '''
-    base_args=[score_at,p['key_id']]
+    base_args=[score_at,owner_senders(c,p),p['key_id']]
     # A first queue page counts the same filtered rows it sorts, in one pass.
     inline_totals=awaiting_reply and not only_unread and not after
+    excluded=None
+    if exclude_likely_broadcasts:
+        # Counted in the caller's scope and filters only, then removed from the rows, the totals and the cursor.
+        excluded=c.execute('SELECT count(*) AS n'+base+' AND '.join([*clauses,broadcast,*([unread+' IS TRUE'] if only_unread else [])]),[*base_args,*args]).fetchone()['n']
+        clauses.append('NOT '+broadcast)
     totals=c.execute('SELECT count(*) AS n,count(*) FILTER(WHERE '+unread+' IS NULL) AS unknown'+base+
         ' AND '.join(clauses),[*base_args,*args]).fetchone() if awaiting_reply and not inline_totals else None
     if only_unread:clauses.append(unread+' IS TRUE')
@@ -258,10 +324,9 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         attention.sender AS awaiting_reply_sender,sp.display_name AS awaiting_reply_sender_name,
         sp.username AS awaiting_reply_username,attention.question AS awaiting_reply_has_question,
         attention.known_contact AS awaiting_reply_known_contact,'''+score+''' AS awaiting_reply_priority,
-        array_remove(ARRAY[CASE WHEN c.chat_type='private' THEN 'private_chat' ELSE 'group_attention' END,
-          CASE WHEN attention.question THEN 'question_mark' END,CASE WHEN attention.known_contact THEN 'provider_contact' END,
-          CASE WHEN '''+waiting+'''>=20 THEN 'waiting_age_capped' WHEN '''+waiting+'''>0 THEN 'waiting_age' END],NULL)
-          AS awaiting_reply_priority_reasons,floor('''+waited+''')::integer AS awaiting_reply_waiting_hours,
+        array_remove(ARRAY['''+','.join(f"CASE WHEN {sql} IS NOT NULL THEN '{code}' END" for code,sql in components)+'''],NULL)
+          AS awaiting_reply_priority_reasons,jsonb_strip_nulls(jsonb_build_object('''+','.join(f"'{code}',{sql}" for code,sql in components)+'''))
+          AS awaiting_reply_priority_components,floor('''+waited+''')::integer AS awaiting_reply_waiting_hours,
         '''+incoming_head+''' AS _incoming_head,own_last.sent_at AS _own_sent_at,own_last.numeric_id AS _own_numeric_id,
         a.platform AS _platform,coalesce('''+dismissed+''',false) AS awaiting_reply_dismissed,
         CASE WHEN a.platform='whatsapp' AND attention.sent_at=own_last.sent_at THEN
@@ -329,6 +394,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     return serial({'items':items,'next_cursor':cursor,'order':order,'awaiting_reply_total':total,
         **({'view':view,'conversation_view_version':1} if view=='conversation' else {}),
         'awaiting_reply_days':awaiting_reply_days if awaiting_reply else None,
+        **({'excluded_likely_broadcasts_total':excluded} if exclude_likely_broadcasts else {}),
         'read_state_unknown_total':totals['unknown'] if totals else None,
         'only_unread_notice':'unknown_or_stale_read_state_excluded' if only_unread else None,
         'bot_filter_coverage':'observed_sender_flags_only' if awaiting_reply else None,

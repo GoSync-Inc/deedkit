@@ -84,6 +84,56 @@ The remaining hint fields keep their names and meanings: `message_id`,
 message; `last_message` carries the same pair for a forwarded head. The
 row's `read_state` is unchanged. `detail="full"` keeps every field.
 
+### Queue priority components
+
+The queue score is a sum of named components, each a fixed integer. `detail="full"`
+returns them as `awaiting_reply_priority_components` (an object keyed by the
+reason codes, summing to `awaiting_reply_priority`); compact rows omit it so
+the default output does not grow (owner decision 2026-10-18), and keep `reasons`,
+which lists exactly the keys of the components. Zero components are absent.
+Direct Store calls, which have no presentation level, always include it.
+
+| Code | Points | When |
+| --- | --- | --- |
+| `private_chat` / `group_attention` | 100 / 25 | private chat / explicit group attention |
+| `question_mark` | +25 | the attention message has question punctuation |
+| `provider_contact` | +10 | the sender is an observed provider contact |
+| `waiting_age`, `waiting_age_capped` | +1 to +19, +20 | square root of waiting hours; capped after about 17 days |
+| `one_way_chat` | -60 | private chat in which no meaningful owner message is archived |
+| `provider_business_or_verified` | -40 | the provider stated a business/verified (WhatsApp `VerifiedName`) or verified/support (Telegram) sender |
+| `own_account` | -80 | the sender ID is a recent outgoing sender of another account of the key |
+| `closing_courtesy` | -30 | the whole message (at most 40 characters, no question mark) is only closing words or common emoji |
+| `observed_bot` | -20 | a group message from a sender the provider marks as a bot |
+
+A demotion never excludes a row (private bots stay excluded as before); a
+demoted private hint may rank below a group hint. Weights were checked only
+against the synthetic labelled fixture in `tests/test_queue_demotion.py`. All
+signals are archive or provider facts: an unknown or absent flag never demotes,
+and a chat the owner wrote in before the archive began looks one-way. The
+provider flags exist only for messages captured with `ANYMSG_CAPTURE_PROVIDER_FLAGS=1`
+(SETUP.md). WhatsApp Web (`whatsapp-web.js`) states no such flag.
+
+Closing words (case-insensitive, repeated and mixed freely with emoji and
+`,.!)-`): ru `спасибо`, `спс`, `благодарю`, `ок`, `окей`, `хорошо`, `ясно`,
+`понятно`, `понял(а)`, `принято`, `отлично`, `супер`, `взаимно`, `пожалуйста`;
+en `thanks`, `thank you`, `thx`, `ty`, `ok`, `okay`, `noted`, `got it`, `great`,
+`perfect`, `cool`, `appreciated`; id `terima kasih`, `makasih`, `trims`, `oke`,
+`siap`, `baik`, `sip`, `mantap`, `ya`, `iya`. Fillers `большое`, `огромное`,
+`вам`, `тебе`, `you`, `so much`, `very much`, `banyak`, `sangat` may precede or
+follow a closing word but never stand alone. A message with other words
+("ок, завтра созвонимся") is not a courtesy.
+
+`list_chats(awaiting_reply=true, exclude_likely_broadcasts=true)` (default
+false) removes rows with `one_way_chat` or `provider_business_or_verified`
+before totals, paging and the cursor; the cursor binds the flag.
+`excluded_likely_broadcasts_total` counts the removed rows within the key's
+scope and the request's other filters, `only_unread` included. A one-way chat is
+also a person's first message until the owner replies: use the filter to shorten a
+long queue, not as the default view.
+
+`own_account` evidence is read only from chats the key may read, and the same
+score is returned whether or not `awaiting_reply` filters the listing.
+
 ## Ordering and windows
 
 `position` is local to the returned page/window, never a permanent chat sequence.

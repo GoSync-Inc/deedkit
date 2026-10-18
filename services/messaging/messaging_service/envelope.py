@@ -92,12 +92,12 @@ def validate(data):
         result['sender_profile']['username']=result['sender_profile']['username'].lstrip('@')
     if 'metadata' in data:
         metadata=data['metadata']
-        if not isinstance(metadata,dict) or set(metadata)-{'reply_to_provider_id','forwarded','media_kind','mentions_owner','reply_to_owner','sender_is_bot','chat_type','sender_identity_basis','is_service','is_self_chat','sender_is_contact',
+        if not isinstance(metadata,dict) or set(metadata)-{'reply_to_provider_id','forwarded','media_kind','mentions_owner','reply_to_owner','sender_is_bot','chat_type','sender_identity_basis','is_service','is_self_chat','sender_is_contact','sender_is_business_or_verified',
                 'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin'}:
             raise ValueError('invalid_metadata')
         result['metadata']={}
         for key,value in metadata.items():
-            if key in ('forwarded','mentions_owner','reply_to_owner','sender_is_bot','is_service','is_self_chat','sender_is_contact'):
+            if key in ('forwarded','mentions_owner','reply_to_owner','sender_is_bot','is_service','is_self_chat','sender_is_contact','sender_is_business_or_verified'):
                 if value is not None and type(value) is not bool:raise ValueError('invalid_metadata')
             elif key=='forward_origin':
                 # Only a forwarded message has an origin; it is never the sender's own authorship.
