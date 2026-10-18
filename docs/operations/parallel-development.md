@@ -164,8 +164,9 @@ at least important (`AGENTS.md`). Prefer splitting it.
 2. List open pull requests and intent branches; compute busy lanes.
 3. Select the wave by the Queue rule in the card intake
    ([tiden-product-workflow.md](tiden-product-workflow.md)) and dispatch every
-   selected story whose paths fit a free lane; there is no fixed number of
-   workers. The real limits are file overlap (lanes), the GitHub CI queue and the
+   selected story whose paths fit a free lane; there is no fixed cap on
+   workers, and the owner's target is at least seven at once (10–15 later). The
+   real limits are file overlap (lanes), the GitHub CI queue and the
    owner's attention for what it keeps and for questions; the orchestrator
    watches them.
 4. Each brief names the story and adds only what the story and the Tiden
@@ -305,10 +306,12 @@ timed reports.
 - Codex and Claude Code follow the same rules. Tool-specific setup lives in
   `CLAUDE.md` and the [Claude Code Tiden guide](claude-code-tiden.md).
 - **Context budget.** Every call re-reads the whole context, so cost grows with
-  session length. One story is one worker session. At about 250k tokens of
-  context, or at a story boundary, a worker writes a handoff file (task, state,
-  open items, next step) into its scratchpad and tells the orchestrator, which
-  starts a fresh session from that file. The orchestrator restarts from its own
+  session length. One story is one worker session. About 250k tokens of context
+  is a soft signal, not a stop: the worker finishes its current step and hands
+  off only at the next natural boundary (between cards, or before a long new
+  phase). It then writes a handoff file (task, state, open items, next step) into
+  its scratchpad and tells the orchestrator, which starts a fresh session from
+  that file with the context it needs. The orchestrator restarts from its own
   handoff file at about 300k.
 - **Large output.** Tiden commands use `--format json` with a `jq` field
   projection; files over about 20k characters are read by range or `grep`.
