@@ -866,9 +866,12 @@ def test_only_a_merge_queue_run_decides_on_a_pull_request_run_and_its_reuse_publ
             assert "pr_reused" not in step.get("if", ""), name
 
     def configure(**env):
+        output = tmp_path / "config-output"
+        output.write_text("")
         completed = subprocess.run(["bash", "-e", "-c", config["run"]], capture_output=True, text=True,
-                                   env={"PATH": "/usr/bin:/bin", "GITHUB_OUTPUT": "/dev/stdout", "GITHUB_STEP_SUMMARY": "/dev/null", **env})
-        return completed.returncode, completed.stdout.split()
+                                   env={"PATH": "/usr/bin:/bin", "GITHUB_OUTPUT": str(output),
+                                        "GITHUB_STEP_SUMMARY": str(tmp_path / "config-summary"), **env})
+        return completed.returncode, output.read_text().split()
     assert configure(EVENT_NAME="merge_group", SOURCE_BRANCH=QUEUE_BRANCH, PR_REUSED="true") == (0, ["enabled=false", "pr_reused=true"])
     assert configure(EVENT_NAME="merge_group", SOURCE_BRANCH=QUEUE_BRANCH, PR_REUSED="false") == (0, ["enabled=false", "queue=true"])
     # Only a queue run takes it: the input on any other event changes nothing.
