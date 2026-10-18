@@ -99,6 +99,9 @@ def pytest_configure(config) -> None:
         _SHARD = selected(os.environ.get("DEEDKIT_TEST_SHARD"))
     except ValueError as error:
         raise pytest.UsageError(str(error)) from None
+    # pytest matches a pattern with a directory against the whole path; the plan matches file names only.
+    if _SHARD and any("/" in pattern or os.sep in pattern for pattern in config.getini("python_files")):
+        raise pytest.UsageError("the shard plan supports python_files patterns of file names only, not of paths")
 
 
 def pytest_ignore_collect(collection_path: Path, config) -> bool | None:

@@ -418,6 +418,9 @@ jobs:
       source_sha_2: ${{ steps.shard.outputs.sha_2 }}
       source_sha_3: ${{ steps.shard.outputs.sha_3 }}
       source_sha_4: ${{ steps.shard.outputs.sha_4 }}
+      result_2: ${{ steps.result.outputs.result_2 }}
+      result_3: ${{ steps.result.outputs.result_3 }}
+      result_4: ${{ steps.result.outputs.result_4 }}
     services:
       postgres:
         image: postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
@@ -553,6 +556,15 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           overwrite: true
+      - name: Record this shard job's own result
+        # The matrix reports one result for all its jobs, so each shard job names its own, taken before the
+        # receiving-commit check that a baseline of another source fails by design (TIDEN-CI.md).
+        id: result
+        if: ${{ always() }}
+        env:
+          SHARD: ${{ matrix.shard }}
+          STATUS: ${{ job.status }}
+        run: echo "result_$SHARD=$STATUS" >> "$GITHUB_OUTPUT"
       - name: Require the tested source to be the commit receiving this check
         if: ${{ always() }}
         env:
@@ -589,10 +601,10 @@ jobs:
         env:
           VERIFY: verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}
           LOAD: load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}
-          # A matrix job has one result for all its jobs, so each shard job takes the matrix result.
-          PYTHON_2: python-2:${{ needs.python.result }}:${{ needs.python.outputs.source_sha_2 }}
-          PYTHON_3: python-3:${{ needs.python.result }}:${{ needs.python.outputs.source_sha_3 }}
-          PYTHON_4: python-4:${{ needs.python.result }}:${{ needs.python.outputs.source_sha_4 }}
+          # Each shard job's own result, or the matrix result when it recorded none; the matrix result stays the gate.
+          PYTHON_2: python-2:${{ needs.python.outputs.result_2 || needs.python.result }}:${{ needs.python.outputs.source_sha_2 }}
+          PYTHON_3: python-3:${{ needs.python.outputs.result_3 || needs.python.result }}:${{ needs.python.outputs.source_sha_3 }}
+          PYTHON_4: python-4:${{ needs.python.outputs.result_4 || needs.python.result }}:${{ needs.python.outputs.source_sha_4 }}
         run: |
           assembled=0
           python ci-tools/scripts/tiden_ci.py assemble --directory "$RUNNER_TEMP/ci-evidence" --fragments "$RUNNER_TEMP/fragments" \

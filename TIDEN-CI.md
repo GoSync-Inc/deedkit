@@ -23,11 +23,13 @@ sharded the same way. The `checks / evidence` job merges the fragments into
 `ci-evidence` and the four shard reports into one `python.xml`, so test
 identities do not change. `anymsg-ci::python` passes only when every shard
 passed with its own valid report of executed tests and no failed one, and every
-shard job succeeded; in a baseline of another source, where every test job
-fails its receiving-commit check by design, the shards keep their step
-outcomes, as verify's checks do. Each shard job names its captured SHA in an
-output of its own (`source_sha_<n>`), because a matrix job's outputs are one
-set its jobs overwrite; its result is the matrix result.
+shard job succeeded. A matrix job has one result and one set of outputs its
+jobs overwrite, so each shard job names its captured SHA (`source_sha_<n>`) and
+its own result (`result_<n>`) in outputs of its own; it records the result
+before its receiving-commit check, which a baseline of another source fails by
+design, and a shard job that recorded none takes the matrix result. The matrix
+result still has to be success for the evidence job to pass. A
+`python_files` pattern with a directory is a usage error in a sharded run.
 A fragment counts only when it holds just the files and checks its own job
 produces and names the tested source SHA that both its job output and verify
 captured; a job that did not succeed in this run attempt never contributes an

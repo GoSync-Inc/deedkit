@@ -1238,7 +1238,8 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     step = next(s for s in evidence["steps"] if s.get("name") == "Merge the fragments of the tested commit and record every check outcome")
     assert step["env"] == {"VERIFY": "verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}",
                            "LOAD": "load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}",
-                           **{f"PYTHON_{index}": f"python-{index}:${{{{ needs.python.result }}}}:${{{{ needs.python.outputs.source_sha_{index} }}}}"
+                           **{f"PYTHON_{index}": (f"python-{index}:${{{{ needs.python.outputs.result_{index} || needs.python.result }}}}"
+                                                     f":${{{{ needs.python.outputs.source_sha_{index} }}}}")
                               for index in range(2, 5)}}
     work = tmp_path / "work"
     work.mkdir()

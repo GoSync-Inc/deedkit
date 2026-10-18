@@ -222,8 +222,7 @@ def combined_outcome(outcomes: list[str]) -> str:
     return next((state for state in ("failure", "cancelled") if state in outcomes), "skipped")
 
 
-def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, source_root: Path | None = None,
-             commit: str | None = None) -> dict:
+def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, source_root: Path | None = None) -> dict:
     """Merge the evidence fragments that the parallel test jobs uploaded into the directory `prepare` reads.
 
     `producers` maps each job of FRAGMENTS to its job result and the checkout SHA its job output captured. A
@@ -234,9 +233,9 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, 
     The `python` check passes only when every shard (verify's and each shard job's) passed with a fresh fragment
     and its own valid report of executed tests (`source_root`, the tested checkout, places their paths), and
     each shard job succeeded: a shard job that failed or was cancelled after its tests never reads as passed. A
-    baseline of another source than `commit`, the commit receiving the checks, is the exception: every test
-    job then fails by design on that difference, and its checks keep their step outcomes, as verify's always do.
-    The valid shard reports merge into one python.xml, so test identities do not change.
+    shard job's result is the one it recorded before its receiving-commit check, which a baseline of another
+    source fails by design (checks.yml). The valid shard reports merge into one python.xml, so test identities
+    do not change.
     `ci_url` names this assembly's run attempt, which reruns with every producer; `producers` in the metadata
     keeps each job's own result, captured SHA and the attempt its merged fragment came from. `directory` must
     be new or empty, so no earlier assembly's report survives.
@@ -293,7 +292,7 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, 
             raise ValueError(f"the {job} fragment may report only its own checks")
         if job in SHARD_JOBS:
             state = shard_outcome(reported["python"], fragment / files[1], source_root, suites)
-            if state == "success" and result != "success" and commit in {None, sha}:
+            if state == "success" and result != "success":
                 state = result if result in {"failure", "cancelled"} else "skipped"
             shards.append(state)
         else:
@@ -664,8 +663,7 @@ def main() -> int:
         ci_url = "https://github.com/{}/actions/runs/{}/attempts/{}".format(*(
             os.environ.get(name, "") for name in ("GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")))
         producers = {job: (result, sha) for job, result, sha in (value.split(":", 2) for value in args.producer)}
-        merged = assemble(directory, args.fragments, ci_url, producers, source_root=args.source_root,
-                          commit=os.environ.get("GITHUB_SHA") or None)
+        merged = assemble(directory, args.fragments, ci_url, producers, source_root=args.source_root)
         print(json.dumps({"fragments": merged["fragments"], "missing": merged["missing"]}))
         # The evidence is written either way, so a run without every fresh fragment is recorded and still fails.
         return 1 if merged["missing"] else 0
