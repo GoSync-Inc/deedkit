@@ -107,3 +107,31 @@ async def test_model_failure_records_only_safe_category_and_status(tmp_path,stat
     import json
     assert secret not in json.dumps([messages,event])
     store.close()
+
+
+async def test_a_failing_provider_audio_health_write_never_skips_transport_cleanup(monkeypatch):
+    import voice
+    from telegram_audio import pcm_transport
+    writes=[];results=[]
+    class Service:
+        def runtime_event(self,identity,event):
+            writes.append(event['kind'])
+            if event['kind']=='provider_audio_health':raise RuntimeError('synthetic event store failure')
+        def get_call(self,identity):return {'metrics':{}}
+        def result(self,identity,**kwargs):results.append(kwargs)
+    class Runner:
+        def __init__(self,*args,**kwargs):pass
+        async def add_workers(self,*workers):pass
+        async def run(self):pass
+    class Model(voice.FrameProcessor):
+        audio_health=SimpleNamespace(snapshot=lambda:{})
+    monkeypatch.setattr(voice,'create_model',lambda *args,**kwargs:Model())
+    monkeypatch.setattr(voice,'WorkerRunner',Runner)
+    monkeypatch.setattr(voice,'LLMContextAggregatorPair',lambda context:(
+        voice.FrameProcessor(),voice.FrameProcessor()))
+    state={'service':Service(),'call_id':'synthetic','tts_metrics':[{'synthetic':True}]}
+    async def send(audio):pass
+    await voice.run_transport(pcm_transport(send,lambda value:None),{'dialog_engine':'gemini_live'},'synthetic-key',state)
+    # The health write failed, yet the inbound diagnostics, the TTS metrics and the rest of cleanup still ran.
+    assert writes==['provider_audio_health','inbound_audio']
+    assert results==[{'metrics':{'replicated_tts':[{'synthetic':True}]}}]

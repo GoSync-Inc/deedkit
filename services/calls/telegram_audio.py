@@ -163,7 +163,8 @@ class TelegramCalls:
                         # PyTgCalls wraps NTgCalls' raw `data` as public `frame`.
                         audio=frame.frame
                         if len(audio)<=48000:
-                            state['audio_probe'].input(audio)
+                            # A diagnostic failure must never skip the frame (same isolation as InboundAudioProbe).
+                            with contextlib.suppress(Exception): state['audio_probe'].input(audio)
                             await target.push_audio_frame(InputAudioRawFrame(audio=audio,sample_rate=48000,num_channels=1))
             elif isinstance(update,ChatUpdate) and update.status & ChatUpdate.Status.DISCARDED_CALL:
                 state['end_reason']='counterparty_hangup'
@@ -180,7 +181,7 @@ class TelegramCalls:
             state['provider_id']=str(peer.id)
             async def send(audio):
                 await py.send_frame(user,Device.MICROPHONE,audio)
-                state['audio_probe'].output(audio)
+                with contextlib.suppress(Exception): state['audio_probe'].output(audio)
             transport=pcm_transport(send,lambda value:state.update(input=value))
             state['task']=asyncio.create_task(self._run(cid,transport,state),name='telegram-audio-'+cid)
             return {'provider_call_id':str(peer.id),'provider_status':'connected'}
