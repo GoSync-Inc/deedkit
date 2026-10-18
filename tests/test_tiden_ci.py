@@ -534,7 +534,8 @@ def test_ci_reports_required_checks_for_merge_queue_runs_without_cancelling_them
     assert "merge_group" in trigger and trigger["push"] == {"branches": ["main"]}
     assert "pull_request" in trigger and "workflow_dispatch" in trigger
     # The required `CI gate` runs for every trigger, the queue included, and so does `checks / verify`, except
-    # on a main push whose reuse job validated the merge queue's verification of that commit (ANYM-322).
+    # on a main push whose reuse job validated the merge queue's verification of that commit (ANYM-322) and on a
+    # merge queue run that reused a full pull request run of its identical tree (ANYM-358).
     assert ci["jobs"]["gate"]["name"] == "CI gate" and ci["jobs"]["gate"]["if"] == "${{ always() }}"
     assert set(ci["jobs"]["gate"]["needs"]) == {"reuse", "pr_reuse", "checks", "native", "images"}
     assert ci["jobs"]["checks"]["uses"] == "./.github/workflows/checks.yml"
@@ -1249,8 +1250,9 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     jobs = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]
     load = jobs["load"]
     # Its own runner, in parallel with verify, bounded, with the unchanged command and budgets.
-    # Skipped, like verify, only on a main push that reuses the merge queue's verification (ANYM-322) or on a
-    # docs-only pull request run (ANYM-323); it needs only that decision, never verify.
+    # Skipped, like verify, only on a main push that reuses the merge queue's verification (ANYM-322), on a merge
+    # queue run that reuses a full pull request run of its tree (ANYM-358) or on a docs-only pull request run
+    # (ANYM-323); it needs only that decision, never verify.
     assert load["needs"] == jobs["verify"]["needs"] == "documentation"
     assert load["if"] == jobs["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     assert load["timeout-minutes"] == 10

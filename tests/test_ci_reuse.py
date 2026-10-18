@@ -704,7 +704,7 @@ def decide_group(github, event=GROUP_EVENT, event_name="merge_group", sha=GROUP_
 def test_a_queue_group_reuses_a_passed_full_pull_request_run_of_exactly_its_tree(tmp_path):
     github = PullGitHub(archive(pr_evidence(tmp_path)))
     assert decide_group(github) == {"pull_request": str(PR_NUMBER), "run_id": str(PR_RUN_ID), "run_attempt": "1",
-                                    "tested_sha": TESTED_SHA, "validated_sha": GROUP_SHA}
+                                    "tested_sha": TESTED_SHA, "validated_sha": GROUP_SHA, "producer_url": PR_URL}
     # The latest attempt's jobs, both commits' trees, and a re-read of the run after validation decided it.
     assert f"actions/runs/{PR_RUN_ID}/attempts/1/jobs?per_page=100&page=1" in github.calls
     assert {f"git/commits/{TESTED_SHA}", f"git/commits/{GROUP_SHA}"} <= set(github.calls)
@@ -810,10 +810,11 @@ def test_a_group_decision_error_at_any_point_means_full_verification_and_a_green
     output.write_text("")
     assert ci_reuse.main() == 0
     assert output.read_text().splitlines() == ["decision=reuse", f"pull_request={PR_NUMBER}", f"run_id={PR_RUN_ID}",
-                                               "run_attempt=1", f"tested_sha={TESTED_SHA}", f"validated_sha={GROUP_SHA}"]
+                                               "run_attempt=1", f"tested_sha={TESTED_SHA}", f"validated_sha={GROUP_SHA}",
+                                               f"producer_url={PR_URL}"]
 
 
-def test_only_a_merge_queue_run_decides_on_a_pull_request_run_and_its_reuse_publishes_nothing():
+def test_only_a_merge_queue_run_decides_on_a_pull_request_run_and_its_reuse_publishes_nothing(tmp_path):
     ci, checks = workflows()
     job = ci["jobs"]["pr_reuse"]
     assert job["name"] == "Reuse the pull request verification" and job["if"] == "github.event_name == 'merge_group'"
@@ -824,11 +825,13 @@ def test_only_a_merge_queue_run_decides_on_a_pull_request_run_and_its_reuse_publ
     assert decide["timeout-minutes"] < job["timeout-minutes"] and all("${{" not in step.get("run", "") for step in job["steps"])
     # No evidence is uploaded: nothing of the pull request run becomes this run's ci-evidence.
     assert not any(step.get("uses", "").startswith("actions/upload-artifact") for step in job["steps"])
-    assert job["outputs"] == {
-        "decision": "${{ steps.decide.outcome == 'success' && steps.decide.outputs.decision || 'full' }}",
-        "validated_sha": "${{ steps.decide.outcome == 'success' && steps.decide.outputs.validated_sha || '' }}"}
+    assert job["outputs"] == {name: f"${{{{ steps.decide.outcome == 'success' && steps.decide.outputs.{name} || '{default}' }}}}"
+                              for name, default in (("decision", "full"), ("validated_sha", ""), ("producer_url", ""),
+                                                    ("tested_sha", ""))}
     assert ci["jobs"]["checks"]["needs"] == ["reuse", "pr_reuse"]
     assert ci["jobs"]["checks"]["with"]["reuse_pr_verification"] == "${{ needs.pr_reuse.outputs.decision == 'reuse' }}"
+    assert ci["jobs"]["checks"]["with"]["reused_pr_run"] == "${{ needs.pr_reuse.outputs.producer_url }}"
+    assert ci["jobs"]["checks"]["with"]["reused_pr_tested_sha"] == "${{ needs.pr_reuse.outputs.tested_sha }}"
     assert checks.get("on", checks.get(True))["workflow_call"]["inputs"]["reuse_pr_verification"]["default"] is False
     for kind in ("pypi", "npm"):
         release = yaml.safe_load((ROOT / f".github/workflows/publish-{kind}.yml").read_text())
@@ -839,7 +842,25 @@ def test_only_a_merge_queue_run_decides_on_a_pull_request_run_and_its_reuse_publ
     assert config["env"]["PR_REUSED"] == "${{ inputs.reuse_pr_verification }}"
     record = steps["Record that a merge queue run reusing the pull request verification publishes nothing"]
     assert record["if"] == "steps.config.outputs.pr_reused == 'true'" and "tiden_ci.py" not in record["run"]
-    assert "steps.config.outputs.pr_reused == 'true'" in steps["Retain Tiden association and verdict receipt"]["if"]
+    retain = steps["Retain Tiden association and verdict receipt"]
+    assert "steps.config.outputs.pr_reused == 'true'" in retain["if"] and retain["with"]["overwrite"] is True
+    assert record["env"]["TESTED_IN"] == "${{ inputs.reused_pr_run }}" and record["env"]["GROUP_SHA"] == "${{ github.sha }}"
+
+    def receipt(directory, **env):
+        directory.mkdir()
+        values = {"REASON": record["env"]["REASON"], "TESTED_IN": PR_URL, "TESTED_SHA": TESTED_SHA, "GROUP_SHA": GROUP_SHA,
+                  "REPOSITORY": REPOSITORY, **env}
+        completed = subprocess.run(["bash", "-e", "-c", record["run"]], capture_output=True, text=True,
+                                   env={"PATH": "/usr/bin:/bin", "RUNNER_TEMP": str(directory), **values})
+        route = directory / "ci-evidence" / "tiden-route.json"
+        return completed.returncode, json.loads(route.read_text()) if route.exists() else None
+    # The receipt names the exact pull request run attempt, the merge commit it tested and this group commit.
+    assert receipt(tmp_path / "named") == (0, {"branch": None, "source": "skipped", "reason": record["env"]["REASON"],
+                                               "tested_in": PR_URL, "tested_sha": TESTED_SHA, "group_sha": GROUP_SHA})
+    # Without them the reuse is unproven and the reporting job fails, so the gate does.
+    for index, change in enumerate([{"TESTED_IN": ""}, {"TESTED_IN": PR_URL.replace(REPOSITORY, "fork/deedkit")},
+                                    {"TESTED_SHA": ""}, {"GROUP_SHA": "A" * 40}]):
+        assert receipt(tmp_path / f"unnamed-{index}", **change) == (1, None)
     for name, step in steps.items():
         if name not in ("config", record["name"], "Retain Tiden association and verdict receipt"):
             assert "pr_reused" not in step.get("if", ""), name
@@ -889,3 +910,20 @@ def test_the_push_after_a_reusing_queue_run_verifies_in_full_and_promotion_takes
     # Promotion then accepts only the push run's own passed checks / verify, never the skipped queue job.
     with pytest.raises(production.Refused, match="did not pass: checks / verify"):
         production.queue_verification(SHA, GitHub(jobs=skipped))
+    push = {"id": PUSH_ID, "run_attempt": 1, "head_sha": SHA, "head_branch": "main", "event": "push", "status": "completed",
+            "conclusion": "success", "head_repository": {"full_name": REPOSITORY},
+            "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{PUSH_ID}"}
+    jobs = [{"name": name, "status": "completed", "conclusion": "success"} for name in production.REQUIRED_JOBS]
+
+    def github(path):
+        if path == "git/ref/heads/main":
+            return {"object": {"sha": SHA}}
+        if path.startswith("actions/workflows/ci.yml/runs?"):
+            assert "event=push" in path  # a push run whose own verify passed never consults the queue
+            return {"total_count": 1, "workflow_runs": [push]}
+        if path.startswith(f"actions/runs/{PUSH_ID}/attempts/1/jobs?"):
+            return {"total_count": len(jobs), "jobs": jobs}
+        raise AssertionError(path)
+    assert production.verify(SHA, get=github) == {
+        "sha": SHA, "run_id": PUSH_ID, "run_attempt": 1, "url": push["html_url"], "verify_run_id": PUSH_ID,
+        "verify_run_attempt": 1, "verify_run_url": push["html_url"]}

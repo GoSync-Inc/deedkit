@@ -278,8 +278,9 @@ def decide_group(sha: str, repository: str, event_name: str, event: dict, get=pr
     """Pin the passing full pull request run that tested exactly this group commit's tree; Refused means verify in full.
 
     Tree identity is the whole claim: the queue builds the group commit from main and the pull request, so its tree
-    equals the merge commit a pull request run tested only when main has not moved since and the group holds that
-    pull request alone. The pull request's workflow files are part of that tree, as they are of the group commit.
+    usually equals the merge commit a pull request run tested only when main has not moved since and the group holds
+    that pull request alone; whenever the trees are equal, the same code was tested. The pull request's workflow
+    files are part of that tree, as they are of the group commit.
     """
     if event_name != "merge_group" or repository != production.REPOSITORY or not SHA.fullmatch(sha):
         raise Refused("only a merge queue run of an exact commit of this repository reuses a pull request run")
@@ -327,7 +328,7 @@ def decide_group(sha: str, repository: str, event_name: str, event: dict, get=pr
     if not production.unchanged(run, production.latest_run(head_sha, "pull_request", get)):
         raise Refused("the pull request run changed while it was being validated")
     return {"pull_request": str(number), "run_id": str(run["id"]), "run_attempt": str(attempt), "tested_sha": tested,
-            "validated_sha": sha}
+            "validated_sha": sha, "producer_url": run_url(repository, run["id"], attempt)}
 
 
 def outputs(values: dict) -> None:
@@ -350,7 +351,7 @@ def main() -> int:
             outputs({"decision": "full"})
             return 0
         print(f"::notice title=Reusing the pull request verification::pull request {pin['pull_request']}, "
-              f"{run_url(repository, pin['run_id'], pin['run_attempt'])} tested {pin['tested_sha']}, the tree of {sha}")
+              f"{pin['producer_url']} tested {pin['tested_sha']}, the tree of {sha}")
         outputs({"decision": "reuse", **pin})
         return 0
     if args.command == "decide":

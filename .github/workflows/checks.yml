@@ -21,6 +21,14 @@ on:
         # exactly this group commit's tree: the test jobs are skipped and `tiden` publishes nothing.
         type: boolean
         default: false
+      reused_pr_run:
+        # With reuse_pr_verification: the reused pull request run attempt's URL and the merge commit it tested,
+        # named in this run's skipped Tiden receipt.
+        type: string
+        default: ''
+      reused_pr_tested_sha:
+        type: string
+        default: ''
     outputs:
       source_sha:
         description: Exact commit these checks tested
@@ -515,9 +523,26 @@ jobs:
         if: steps.config.outputs.pr_reused == 'true'
         env:
           REASON: merge queue run reused the verification of a pull request run that tested this exact tree; no tests ran, and main CI verifies and publishes the merged code
+          TESTED_IN: ${{ inputs.reused_pr_run }}
+          TESTED_SHA: ${{ inputs.reused_pr_tested_sha }}
+          GROUP_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-route.json").write_text(json.dumps({"branch": None, "source": "skipped", "reason": os.environ["REASON"]}))'
-          echo "::notice title=Tiden evidence not published::$REASON"
+          # The receipt names the exact pull request run attempt and tested commit; without them the reuse is unproven.
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          env = os.environ
+          url = r"https://github\.com/" + re.escape(env["REPOSITORY"]) + r"/actions/runs/[0-9]+/attempts/[0-9]+"
+          if not (re.fullmatch(url, env["TESTED_IN"]) and re.fullmatch(r"[0-9a-f]{40}", env["TESTED_SHA"])
+                  and re.fullmatch(r"[0-9a-f]{40}", env["GROUP_SHA"])):
+              raise SystemExit("the reused pull request run or its tested commit is not named")
+          directory = pathlib.Path(env["RUNNER_TEMP"], "ci-evidence")
+          directory.mkdir(parents=True, exist_ok=True)
+          (directory / "tiden-route.json").write_text(json.dumps({
+              "branch": None, "source": "skipped", "reason": env["REASON"], "tested_in": env["TESTED_IN"],
+              "tested_sha": env["TESTED_SHA"], "group_sha": env["GROUP_SHA"]}))
+          PY
+          echo "::notice title=Tiden evidence not published::$REASON ($TESTED_IN)"
       - name: Retain Tiden association and verdict receipt
         if: ${{ always() && ((steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true') || steps.config.outputs.docs_only == 'true' || steps.config.outputs.pr_reused == 'true') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -526,3 +551,5 @@ jobs:
           path: ${{ runner.temp }}/ci-evidence/tiden-*.json
           if-no-files-found: warn
           retention-days: 14
+          # A rerun attempt replaces its earlier receipt instead of failing on the existing name.
+          overwrite: true
