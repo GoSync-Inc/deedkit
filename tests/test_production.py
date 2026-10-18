@@ -252,9 +252,13 @@ def test_host_mounted_code_prevents_preparation_before_any_build_or_restart(tmp_
     settings, calls, document = fixture(tmp_path, monkeypatch)
     document["services"]["api"]["volumes"].append(mount)
     Path(settings["projects"][0]["files"][0]).write_text(json.dumps(document))
+    verified = []
+    monkeypatch.setattr(p, "published", lambda target, sha: verified.append(target) or verified_image(target, IMAGE))
     with pytest.raises(p.Refused, match="host-mounted code"):
         p.prepare(settings, SHA)
     assert not any(call[:2] == ["docker", "build"] or "stop" in call or "up" in call for call in calls)
+    # Nothing is obtained either: no attestation lookup, pull or tag before the refusal.
+    assert verified == [] and not any(call[:2] in (["docker", "pull"], ["docker", "tag"]) for call in calls)
 
 
 @pytest.mark.parametrize("name", ["PYTHONPATH", "NODE_PATH", "LD_PRELOAD", "LD_LIBRARY_PATH"])
@@ -1566,3 +1570,34 @@ def test_a_release_prepared_without_a_bound_rollback_snapshot_must_be_prepared_a
     with pytest.raises(p.Refused, match="prepare it again"):
         p.apply(host.settings, RELEASES[0])
     assert host.mutations() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
+
+
+def test_apply_never_certifies_a_container_reconfigured_in_place_while_it_applied(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    original = host.run
+    def run(argv, **kwargs):
+        result = original(argv, **kwargs)
+        if argv[:2] == ["docker", "inspect"] and any("up" in call for call in host.calls):
+            # After the replacement check, `docker update` changes it in place: same container and image.
+            host.container = {**host.container, "HostConfig": {"Memory": 268435456, "RestartPolicy": {"Name": "always"}}}
+        return result
+    monkeypatch.setattr(p, "run", run)
+    with pytest.raises(p.Refused, match="changed while this release was applied"):
+        p.apply(host.settings, RELEASES[0])
+    assert (host.state / RELEASES[0] / "attempted.json").exists()
+    assert not (host.state / RELEASES[0] / "result.json").exists() and not (host.state / "current.json").exists()
+
+
+@pytest.mark.parametrize("target", p.PUBLISHED)
+def test_the_ci_check_build_of_a_published_target_receives_the_candidate_source_revision(tmp_path, monkeypatch,
+                                                                                         no_host_lock, target):
+    # CI's `check-image` builds what it publishes; the host's pull path relies on that build's revision.
+    store = ImageStore()
+    monkeypatch.setattr(p, "run", store.run)
+    monkeypatch.setattr(p, "published", lambda *args: pytest.fail("a check build never consults the registry"))
+    p.build_image(tmp_path, SHA, target, check=True)
+    [build] = store.built()
+    assert build[build.index("--build-arg") + 1] == "DEEDKIT_SOURCE_SHA=" + SHA
+    assert "org.opencontainers.image.revision=" + SHA in build and store.pulls() == []

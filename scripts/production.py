@@ -707,7 +707,7 @@ def apply(settings, sha):
             actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
             if actual["Image"] != receipt["images"][target] or not actual["State"]["Running"]:
                 raise Refused("replacement did not start the prepared image")
-            started[project["name"], service] = ids[0]
+            started[project["name"], service] = ids[0], container_settings(actual)
     # What rollback must find unchanged before it stops anything, captured the way prepare captures the baseline.
     # It must still be what this apply started: a change meanwhile leaves the attempt unresolved.
     restore = []
@@ -715,7 +715,8 @@ def apply(settings, sha):
         document, running = snapshot(project)
         if digest(document) != item["before_digest"] or any(
                 running[service]["image"] != receipt["images"][target]
-                or not started[project["name"], service].startswith(running[service]["container"])
+                or not started[project["name"], service][0].startswith(running[service]["container"])
+                or started[project["name"], service][1] != running[service]["settings"]
                 for service, target in project["services"].items()):
             raise Refused("production changed while this release was applied; inspect it before any recovery")
         restore.append({"name": project["name"], "services": sorted(project["services"]),
