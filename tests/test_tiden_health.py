@@ -701,6 +701,38 @@ def test_done_specs_with_open_check_markers(repo, server, specs, state, findings
     assert (metric["state"], len(metric["findings"]), len(metric["warnings"])) == (state, findings, warnings)
 
 
+def test_done_spec_text_in_code_documents_a_marker_without_being_one(repo, server):
+    _, b = history(repo)
+    documented = "\n".join([
+        "Convention: an open check is written `[open: live]` or ``[open: measured]``.",
+        "```",
+        "- [open: live] recheck on the installation",
+        "Not run: the live preview",
+        "```",
+        "~~~~text",
+        "```",
+        "- [open: measured] still inside the longer fence",
+        "~~~~",
+        "A span across lines: `see",
+        "[open: live]` for the syntax.",
+        "The recheck remains open `elsewhere`.",
+    ])
+    real = "Delivered.\nUse `code` first, then:\n- recheck on the installation [open: live]\n```\nfenced\n```"
+    server.world(b, specs=[spec(1, paths=["services/app.py"]), spec(2, "Done", documented), spec(3, "Done", real)])
+    metric = measure(repo, server, b)[1]["metrics"]["done_open_checks"]
+    assert metric["findings"] == ["ANYM-3 Spec 3: - recheck on the installation [open: live]"]
+    assert [item.split(":")[0] for item in metric["warnings"]] == ["ANYM-2 Spec 2"]
+    assert (metric["state"], metric["numbers"]["marked"]) == (FAIL, 1)
+
+
+def test_done_spec_text_only_in_code_passes(repo, server):
+    _, b = history(repo)
+    only_code = "Marker syntax: `[open: live]`, `[open: measured]`; phrases: `Not run:` and ``live recheck pending``."
+    server.world(b, specs=[spec(1, paths=["services/app.py"]), spec(2, "Done", only_code)])
+    metric = measure(repo, server, b)[1]["metrics"]["done_open_checks"]
+    assert (metric["state"], metric["findings"], metric["warnings"]) == (PASS, [], [])
+
+
 @pytest.mark.parametrize("content", [None, 5, ["- [open: live]"], "absent"])
 def test_a_done_spec_without_readable_text_is_unknown_never_pass(repo, server, content):
     _, b = history(repo)

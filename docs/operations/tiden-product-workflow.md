@@ -67,7 +67,8 @@ evidence on the card (version, environment, run or measurement, and date) remove
 the marker in the same spec edit, and only then. A card with an open check stays
 in `Review`, never `Done`. The `Tiden health` report fails on a `Done` spec that
 carries a marker and warns on a `Done` spec that mentions a pending live recheck,
-an open item or a check not run without one (TIDEN-CI.md).
+an open item or a check not run without one; text inside inline code or a fenced
+block is ignored, so a spec may document the marker (TIDEN-CI.md).
 
 The gate observed on 2026-10-16 includes queued `Backlog`/`Review` specs and the
 General navigation index in its coverage calculation. These produce `no_test`

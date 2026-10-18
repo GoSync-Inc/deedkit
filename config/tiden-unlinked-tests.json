@@ -2,6 +2,12 @@
   "format": 1,
   "cases": [
     {
+      "caseId": "c2c532fb-3617-4c31-a846-2ad60cac109e",
+      "externalId": "s:services.gateway.tests.test_shared_contracts::test_calls_reference_does_not_wrap_or_drop_domain_payload",
+      "category": "missing-spec",
+      "reason": "The gateway validates a calls result's receipt reference from id/call_id and leaves the domain payload unwrapped and unmodified; ANYM-204/205 state routing and admission, not this passthrough"
+    },
+    {
       "caseId": "1ffee5a8-5f6c-46c6-9a76-a1bb20887a97",
       "externalId": "s:tests.platform.test_legacy_contracts::test_locked_backend_contract_matches_snapshot",
       "category": "missing-spec",

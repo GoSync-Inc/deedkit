@@ -30,6 +30,8 @@ DRIFT_WAIT, TESTS_WAIT, POLL = 15 * 60, 30 * 60, 30  # deadlines in seconds from
 DONE_AUDIT: str | None = "2026-10-18"
 MARKER = re.compile(r"\[open: (?:live|measured)\]")
 PHRASE = re.compile(r"live recheck pending|remains open|Not run:")
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)", re.DOTALL)
 NO_SPEC_LIST = "config/tiden-unlinked-tests.json"
 CATEGORIES = ("missing-spec", "helper", "trivial", "duplicate", "dead-code")
 ENTRY_FIELDS = {"caseId", "externalId", "category", "reason"}
@@ -297,6 +299,22 @@ def anchors_metric(specs: list[dict], paths: set[str]) -> dict:
     return result
 
 
+def prose(content: str) -> list[tuple[str, str]]:
+    """(original line, line with fenced code and inline code spans blanked), so text that documents a marker is not one."""
+    lines, kept, fence = content.splitlines(), [], None
+    for line in lines:
+        mark = FENCE.match(line)
+        if fence is None:
+            fence = mark.group(1) if mark else None
+        elif mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence) and not line[mark.end():].strip():
+            fence = None
+            kept.append("")
+            continue
+        kept.append(line if fence is None else "")
+    blanked = CODE_SPAN.sub(lambda found: re.sub(r"[^\n]", " ", found.group(0)), "\n".join(kept))
+    return list(zip(lines, blanked.split("\n")))
+
+
 def done_metric(specs: list[dict]) -> dict:
     marked, phrased = [], []
     for spec in specs:
@@ -307,10 +325,11 @@ def done_metric(specs: list[dict]) -> dict:
             # A Done card whose text was not read cannot count as one without an open check.
             raise Unknown(f"tiden spec list has no readable text for Done spec ANYM-{spec.get('seqNum')}")
         label = f"ANYM-{spec.get('seqNum')} {shown(spec.get('title') or '', 120)}"
-        lines = [line for line in content.splitlines() if MARKER.search(line)]
+        text = prose(content)
+        lines = [line for line, plain in text if MARKER.search(plain)]
         if lines:
             marked.extend(f"{label}: {shown(line.strip(), 200)}" for line in lines)
-        elif PHRASE.search(content):
+        elif any(PHRASE.search(plain) for _, plain in text):
             phrased.append(f"{label}: mentions an open check without a marker")
     done = sum(spec.get("status") == "Done" for spec in specs)
     numbers = {"done": done, "marked": len(marked), "unmarked_phrases": len(phrased), "audit": DONE_AUDIT}
