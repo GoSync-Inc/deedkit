@@ -118,10 +118,10 @@ spec edit follows its kind:
 
 - product cards (feature and improvement cards, new epics): Fable, one judgment
   round;
-- every card, of any category, that sets a contract in code, CI, releases, data
-  or security, has High or Critical priority, meets an owner-level trigger below
-  in its delivery or needs the main research (below), and a bulk restructuring:
-  Astra;
+- every card, of any category, that sets a contract in code, CI, releases,
+  data, security or access, has High or Critical priority, meets an owner-level
+  trigger below in its delivery or needs the main research (below), and a bulk
+  restructuring: Astra;
 - other cards and spec edits (status, evidence notes, facts): the card
   checklist subagent;
 - spec text written at settle: the reviewers of its pull request's level, and
