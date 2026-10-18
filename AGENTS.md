@@ -166,7 +166,7 @@ owner decision, weakens or removes an existing contract, spec or test, has
 disagreeing reviewers or unclear product direction, or cannot be undone by a
 follow-up pull request. After an agent merges an owner-level pull request, or an
 owner-level spec edit in Tiden without one, the owner gets a short summary: what
-changed, why, what it affects and how to undo it, or that it cannot be undone.
+changed, why, what it affects and how to undo it.
 The worker writes it in its final result and the orchestrator passes it to the
 owner, written like questions to the owner
 (docs/operations/parallel-development.md).
@@ -174,10 +174,11 @@ Whatever the level, the owner keeps, and an agent neither merges nor does:
 applying or changing a production service, a live provider action, secrets and
 access rights, required checks and branch protection, changes to these review
 levels or merge authority, accepting risk or waiving a promise by owner decision,
-and deleting or moving backlog cards. Required checks and branch protection are
-the ruleset `deploy/main-ruleset.json`, the set of checks it requires and the
-workflow and job names that report them (`CI gate`, `checks / verify`); a change
-inside those jobs is CI code. Access rights are repository, host, package and
+deleting or moving backlog cards, and a change that a follow-up pull request
+cannot undo. Required checks and branch protection are the ruleset
+`deploy/main-ruleset.json`, the set of checks it requires and the workflow and
+job names that report them (`CI gate`, `checks / verify`); a change inside those
+jobs is CI code. Access rights are repository, host, package and
 provider access (GitHub roles, SSH, secret stores); agent permission settings
 are at least important. Merging source is not applying it: merged code, CI,
 release or deploy code and migrations reach production only through the
