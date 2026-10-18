@@ -1552,3 +1552,17 @@ def test_the_command_line_prints_prepare_references_and_reaches_rollback_and_ima
     p.main(["rollback", "--sha", sha])
     assert json.loads(capsys.readouterr().out)["previous_images"] == {"synthetic": {"api": OLD_IMAGE}}
     assert host.container["Image"] == OLD_IMAGE
+
+
+def test_a_release_prepared_without_a_bound_rollback_snapshot_must_be_prepared_again(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    # A prepared.json written before the before-snapshot digest was bound at preparation.
+    receipt = p.read(host.state / RELEASES[0] / "prepared.json")
+    del receipt["projects"][0]["before_file_digest"]
+    p.write(host.state / RELEASES[0] / "prepared.json", receipt)
+    host.calls.clear()
+    with pytest.raises(p.Refused, match="prepare it again"):
+        p.apply(host.settings, RELEASES[0])
+    assert host.mutations() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
