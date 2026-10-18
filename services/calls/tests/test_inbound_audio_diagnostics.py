@@ -1,6 +1,7 @@
 import asyncio
 import math
 import struct
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -83,7 +84,7 @@ async def test_inbound_probe_counts_pipeline_audio_without_changing_frames():
     result=probe.snapshot()
     assert result['input_pcm_ms']==pytest.approx(20)
     assert result['input_active_ms']==pytest.approx(20)
-    assert result['input_sample_rates']==[16000]
+    assert result['input_sample_rates']==[16000] and result['sample_rate']==16000
 
 
 class Source:
@@ -149,3 +150,22 @@ async def test_dispose_native_clears_the_remote_source_callback():
     dispose_native(py)
     registered['remote'](7,Source('MICROPHONE','ACTIVE'))  # Now the no-op replacement.
     assert media.snapshot()['events']==[]
+
+
+def test_media_diagnostics_capacity_holds_across_threads():
+    media=MediaDiagnostics(limit=50)
+    def push():
+        for _ in range(500):media.remote_source(Source('MICROPHONE','ACTIVE'))
+    threads=[threading.Thread(target=push) for _ in range(4)]
+    for thread in threads:thread.start()
+    for thread in threads:thread.join()
+    snapshot=media.snapshot()
+    assert len(snapshot['events'])==50 and snapshot['events_dropped']==1950
+
+
+def test_probe_sample_rate_follows_observed_input():
+    probe=PCMProbe()
+    assert probe.snapshot()['sample_rate']==48000
+    probe.input(tone(320,16000),rate=16000)
+    probe.input(tone(160,8000),rate=8000)
+    assert probe.snapshot()['sample_rate'] is None

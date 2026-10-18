@@ -1,6 +1,7 @@
 """Experimental private Telegram calls; native audio lives outside AnyMsg's collector."""
 import asyncio
 import contextlib
+import threading
 import time
 from pathlib import Path
 
@@ -26,14 +27,16 @@ class MediaDiagnostics:
         self.limit,self.origin=limit,time.monotonic()
         self.events=[]
         self.dropped=0
+        self.lock=threading.Lock()
         self.library_versions=self.p2p_allowed=None
 
     def _add(self,kind,**value):
-        if len(self.events)<self.limit:
-            self.events.append({'kind':kind,'at_ms':round((time.monotonic()-self.origin)*1000),**value})
-        else:self.dropped+=1
+        with self.lock:
+            if len(self.events)<self.limit:
+                self.events.append({'kind':kind,'at_ms':round((time.monotonic()-self.origin)*1000),**value})
+            else:self.dropped+=1
 
-    # Native callbacks may run off the loop thread; list.append is atomic and failures stay silent.
+    # Native callbacks run off the loop thread, so the capacity check is locked; failures stay silent.
     def remote_source(self,source):
         name=lambda value:getattr(value,'name',str(value))
         with contextlib.suppress(Exception):
@@ -50,8 +53,9 @@ class MediaDiagnostics:
             self.p2p_allowed=protocol.p2p_allowed
 
     def snapshot(self):
-        return {'library_versions':self.library_versions,'p2p_allowed':self.p2p_allowed,
-                'events':[dict(event) for event in self.events],'events_dropped':self.dropped}
+        with self.lock:
+            return {'library_versions':self.library_versions,'p2p_allowed':self.p2p_allowed,
+                    'events':[dict(event) for event in self.events],'events_dropped':self.dropped}
 
 
 def observe_media(py,media):

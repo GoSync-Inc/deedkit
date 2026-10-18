@@ -61,7 +61,7 @@ class PCMProbe:
         self.pending_ms=0
 
     def snapshot(self):
-        return {'measurement':'worker_pcm_energy_gap','sample_rate':48000,
+        return {'measurement':'worker_pcm_energy_gap','sample_rate':(None if len(self.input_rates)>1 else next(iter(self.input_rates),48000)),
                 'input_pcm_ms':round(self.input_ms,1),'output_pcm_ms':round(self.output_ms,1),
                 'input_active_ms':round(self.active_ms,1),'input_frames':self.input_frames,
                 'input_zero_frames':self.zero_frames,'input_max_rms':round(self.max_rms,1),
