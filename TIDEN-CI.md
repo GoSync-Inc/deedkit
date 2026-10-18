@@ -153,6 +153,38 @@ For an explicit baseline rerun, dispatch `CI` on the reporting-code branch with
 existing spec branch. The checkout SHA, rather than the workflow SHA, is recorded.
 Normal pull requests record their actual tested merge SHA.
 
+## Drift watermark
+
+`.github/workflows/tiden-drift.yml` keeps the drift watermark current after every
+merge (ANYM-355). It is a workflow of its own, so a red run never touches the
+`CI` push run that production promotion requires. Each run checks out `main` as
+it is when the run starts, not its event commit, and runs
+`scripts/tiden_drift.py`:
+
+1. It reads the watermark W (`tiden drift status`) and lists the files changed
+   from W to that checkout, leaving out deletions and the categories in the
+   checker's `EXCLUDED` list (Markdown and `docs/`, `.claude/`, tests and their
+   fixtures, lockfiles and dependency pins). Tests trace to specs through test
+   links, not anchors.
+2. Every remaining path needs a `repo_file` anchor on some spec on Tiden main.
+   If one lacks it, the run fails, lists the paths in its summary and leaves the
+   watermark. Anchor each on the spec it implements, then rerun the failed run.
+3. Otherwise it runs `tiden drift advance --from W --to <checkout> --reason
+   empty_sync` once, requires `"advanced": true` and reads the watermark back.
+   The server compares `--from` with the current watermark and answers a stale
+   one with `"advanced": false` (verified 2026-10-18). Manual audited advances
+   merge a drift-sync branch instead (docs/operations/tiden-product-workflow.md).
+
+Runs never overlap (one concurrency group, no cancelling). GitHub may replace a
+waiting run with a newer one; the run that executes covers the newest merge. A
+run whose checkout the watermark already reached passes without an advance.
+Diverged history, an unreadable or incomplete spec listing, or any CLI failure
+before the advance fails the run with nothing sent. A failure after the advance
+was sent leaves its result unknown: the run is not retried in place, and a rerun
+reads the server watermark again before it acts. Without `TIDEN_API_TOKEN` the
+workflow records that reporting is not configured and passes. Widening `EXCLUDED`
+is a reviewed code change to the checker and its test, never a data edit.
+
 ## Environments
 
 The 2026-10-16 cleanup left four Tiden run environments. CI publishes with

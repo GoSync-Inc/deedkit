@@ -1,0 +1,63 @@
+name: Tiden drift
+on:
+  # Every merge to main; a dispatch reconciles main again after anchors were added (TIDEN-CI.md).
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  # Runs never overlap. GitHub may replace a pending run with a newer one; each run checks the head of main when it
+  # starts, not its event commit, so whichever run executes last covers every merge.
+  group: tiden-drift
+  cancel-in-progress: false
+jobs:
+  anchors:
+    name: Anchors and watermark
+    # Only the reviewed workflow and tools on main may use the Tiden credential.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Expression comparisons ignore case; this one does not, and runs before any repository code.
+      - name: Require the main branch exactly
+        env:
+          REF: ${{ github.ref }}
+        run: test "$REF" = refs/heads/main
+      - name: Check optional Tiden configuration
+        id: config
+        env:
+          TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
+          TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
+          TIDEN_WORKSPACE_ID: ${{ vars.TIDEN_WORKSPACE_ID }}
+        run: |
+          if [ -z "$TIDEN_API_TOKEN" ]; then
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'Tiden reporting is not configured; see TIDEN-CI.md.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            test -n "$TIDEN_PRODUCT_ID"
+            test -n "$TIDEN_WORKSPACE_ID"
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: steps.config.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+          ref: main
+          fetch-depth: 0
+      - name: Install pinned Tiden CLI with integrity check
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.33.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
+          echo "3f6b650c4cabd58ce4149d9106325cbd36d1472cccc9c63ca03137668b80e4a6  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
+          mkdir "$RUNNER_TEMP/tiden-bin"
+          tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
+          echo "$RUNNER_TEMP/tiden-bin" >> "$GITHUB_PATH"
+      - name: Require an anchor for every changed code file, then advance the watermark
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
+          TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
+          TIDEN_WORKSPACE_ID: ${{ vars.TIDEN_WORKSPACE_ID }}
+          TIDEN_BASE_URL: https://app.tiden.ai
+        run: python3 scripts/tiden_drift.py
