@@ -561,6 +561,20 @@ def test_a_reusing_push_skips_only_the_test_jobs_and_still_builds_publishes_and_
         "${{ github.event_name != 'merge_group' && secrets.TIDEN_API_TOKEN || '' }}")
 
 
+def test_a_reused_main_push_still_publishes_and_records_after_a_green_gate():
+    ci, _ = workflows()
+    jobs = ci["jobs"]
+    # A main push always has a skipped ancestor of publish: pr_reuse runs only in the merge queue, and a reused
+    # push skips the test jobs. Without a status function, GitHub's implicit success() skips a job when any
+    # ancestor was skipped, so publish and the release record must test the results they depend on explicitly
+    # (1647024..2af17b6 published no images).
+    assert jobs["pr_reuse"]["if"] == "github.event_name == 'merge_group'" and "pr_reuse" in jobs["gate"]["needs"]
+    main_push = "github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+    assert jobs["publish"]["if"] == "${{ !cancelled() && needs.gate.result == 'success' && " + main_push
+    assert jobs["release"]["if"] == ("${{ !cancelled() && needs.gate.result == 'success' "
+                                     "&& needs.publish.result == 'success' && " + main_push)
+
+
 GREEN = {"DECISION": "full", "REUSE_RESULT": "skipped", "REUSED_SHA": "", "VERIFIED_SHA": SHA, "EVENT_NAME": "pull_request",
          "REF": "refs/pull/7/merge", "EXPECTED_SHA": SHA, "DOCS_ONLY": "false", "DOCS_SHA": "", "PR_DECISION": "",
          "PR_REUSE_RESULT": "skipped", "PR_REUSED_SHA": ""}

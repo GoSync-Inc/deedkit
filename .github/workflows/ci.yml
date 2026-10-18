@@ -192,7 +192,9 @@ jobs:
     # tag that already exists is never moved (scripts/publish_images.py, production.md).
     name: publish
     needs: [gate]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Explicit result checks: a push run has skipped ancestors (pr_reuse, reused test jobs), and
+    # the implicit success() would skip publish whenever any ancestor was skipped.
+    if: ${{ !cancelled() && needs.gate.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     # Two runs of one commit (a rerun, or main reset to an earlier commit while its run is
     # active) must not both find a tag absent and push; the lookup-to-confirm sequence is
     # serialized per commit. A running publication is never cancelled; GitHub keeps at most
@@ -305,7 +307,7 @@ jobs:
     # a release gate from the main gate when the release is first created (TIDEN-CI.md).
     name: Tiden release record
     needs: [gate, publish]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.publish.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
