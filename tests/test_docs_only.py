@@ -268,7 +268,8 @@ def test_a_docs_only_run_records_a_skipped_route_and_stays_green(tmp_path):
 
 SHA = "a" * 40
 DOCS = {"DECISION": "", "REUSE_RESULT": "skipped", "REUSED_SHA": "", "VERIFIED_SHA": "", "EVENT_NAME": "pull_request",
-        "REF": "refs/pull/7/merge", "EXPECTED_SHA": SHA, "DOCS_ONLY": "true", "DOCS_SHA": SHA}
+        "REF": "refs/pull/7/merge", "EXPECTED_SHA": SHA, "DOCS_ONLY": "true", "DOCS_SHA": SHA, "PR_DECISION": "",
+        "PR_REUSE_RESULT": "skipped", "PR_REUSED_SHA": ""}
 
 
 @pytest.mark.parametrize("environment, passes", [
@@ -295,7 +296,7 @@ def test_native_and_image_rules_are_untouched_by_the_docs_only_decision():
     ci, _ = workflows()
     for name in ("native", "images"):
         assert "if" not in ci["jobs"][name] and "needs" not in ci["jobs"][name]
-    assert ci["jobs"]["gate"]["needs"] == ["reuse", "checks", "native", "images"]
+    assert ci["jobs"]["gate"]["needs"] == ["reuse", "pr_reuse", "checks", "native", "images"]
     images = yaml.safe_load((ROOT / ".github/workflows/images.yml").read_text())
     assert "docs_only" not in json.dumps(images) and "docs_only" not in json.dumps(ci["jobs"]["publish"])
 

@@ -463,8 +463,8 @@ def test_host_lock_rejects_concurrent_promotion(tmp_path):
 def test_ci_gate_fails_for_failed_cancelled_or_skipped_dependencies():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     gate = workflow["jobs"]["gate"]
-    # The reuse decision gates only the second step (ANYM-322); this first step is unchanged.
-    assert gate["needs"] == ["reuse", "checks", "native", "images"] and gate["if"] == "${{ always() }}"
+    # The reuse decisions gate only the second step (ANYM-322, the queue's pull request reuse); this first step is unchanged.
+    assert gate["needs"] == ["reuse", "pr_reuse", "checks", "native", "images"] and gate["if"] == "${{ always() }}"
     assert workflow["jobs"]["native"]["uses"] == "./.github/workflows/whatsmeow.yml"
     script = gate["steps"][0]["run"]
     for checks, native, images in [("success", "success", "success"), ("failure", "success", "success"),

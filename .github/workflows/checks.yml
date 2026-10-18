@@ -16,6 +16,11 @@ on:
         # and uploaded it as `ci-evidence`: the test jobs are skipped and `tiden` publishes that evidence.
         type: boolean
         default: false
+      reuse_pr_verification:
+        # Set only by ci.yml on a merge queue run whose `pr_reuse` job validated a passing, full pull request run of
+        # exactly this group commit's tree: the test jobs are skipped and `tiden` publishes nothing.
+        type: boolean
+        default: false
     outputs:
       source_sha:
         description: Exact commit these checks tested
@@ -56,7 +61,7 @@ jobs:
         run: python3 scripts/docs_only.py
   verify:
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -335,7 +340,7 @@ jobs:
     # The paired gateway load gate measures its latency and isolation budgets on a runner of its own,
     # in parallel with verify, instead of after the whole suite on the verify runner.
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -383,7 +388,7 @@ jobs:
     # failure itself is recorded (TIDEN-CI.md). A missing, failed, cancelled or skipped test job fails
     # this job whether or not Tiden reporting is configured.
     needs: [documentation, verify, load]
-    if: ${{ always() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -447,10 +452,15 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
           DOCS_ONLY: ${{ needs.documentation.outputs.docs_only }}
+          PR_REUSED: ${{ inputs.reuse_pr_verification }}
         run: |
           # A merge queue run publishes nothing, so it needs no Tiden configuration or CLI.
           # Matched with case, like scripts/tiden_ci.py; expression startsWith() ignores case.
-          if [ "$EVENT_NAME" = merge_group ] || [[ "$SOURCE_BRANCH" == gh-readonly-queue/* ]]; then
+          if [ "$EVENT_NAME" = merge_group ] && [ "$PR_REUSED" = true ]; then
+            # A queue run that reused the pull request verification ran no tests and assembled no evidence.
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'pr_reused=true' >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = merge_group ] || [[ "$SOURCE_BRANCH" == gh-readonly-queue/* ]]; then
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             echo 'queue=true' >> "$GITHUB_OUTPUT"
           elif [ "$DOCS_ONLY" = true ]; then
@@ -501,8 +511,15 @@ jobs:
         run: |
           python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-route.json").write_text(json.dumps({"branch": None, "source": "skipped", "reason": os.environ["REASON"]}))'
           echo "::notice title=Tiden evidence not published::$REASON"
+      - name: Record that a merge queue run reusing the pull request verification publishes nothing
+        if: steps.config.outputs.pr_reused == 'true'
+        env:
+          REASON: merge queue run reused the verification of a pull request run that tested this exact tree; no tests ran, and main CI verifies and publishes the merged code
+        run: |
+          python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-route.json").write_text(json.dumps({"branch": None, "source": "skipped", "reason": os.environ["REASON"]}))'
+          echo "::notice title=Tiden evidence not published::$REASON"
       - name: Retain Tiden association and verdict receipt
-        if: ${{ always() && ((steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true') || steps.config.outputs.docs_only == 'true') }}
+        if: ${{ always() && ((steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true') || steps.config.outputs.docs_only == 'true' || steps.config.outputs.pr_reused == 'true') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tiden-receipt

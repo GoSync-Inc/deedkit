@@ -5,6 +5,10 @@
 artifact of its latest attempt, or on any error, the push run verifies in full. `adopt` runs only after the
 choice: it downloads that pinned artifact as data, validates it and adds this run's publication record, and
 any problem fails the push run. Nothing from the artifact is ever executed.
+
+`group` decides a merge queue run the same never-failing way: it reuses the verification of a passing, full pull
+request run only when the group commit's tree is exactly the tree that run tested (owner decision 2026-10-18),
+and otherwise the queue run verifies in full.
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -41,6 +46,10 @@ EVIDENCE_FILES = frozenset({
     *(name for _, files in tiden_ci.FRAGMENTS.values() for name in files if name not in tiden_ci.CONTROL_FILES),
     *(f"normalized-{check}.xml" for check in REPORT_CHECKS)})
 SHA = re.compile(r"[0-9a-f]{40}")
+# The merge queue names a group of main after the pull request it tests last: pr-<number>-<group base SHA>.
+GROUP_REF = re.compile("refs/heads/" + re.escape(production.QUEUE_BRANCH_PREFIX) + r"pr-([1-9][0-9]*)-[0-9a-f]{40}")
+# A full pull request run: a docs-only run skips `checks / verify` and never qualifies.
+PULL_REQUEST_JOBS = ("checks / verify", "checks / load", "checks / evidence", "CI gate")
 
 
 class Refused(RuntimeError):
@@ -81,22 +90,29 @@ def decide(sha: str, repository: str, get=production.api, sleep=time.sleep, cloc
         raise Refused("only an exact commit of this repository's main reuses its queue verification")
     queue = queue_run(sha, get, sleep, clock=clock)
     attempt = queue["run_attempt"]
-    started = get(f"actions/runs/{queue['id']}/attempts/{attempt}")
-    if started.get("id") != queue["id"] or started.get("run_attempt") != attempt or not started.get("run_started_at"):
-        raise Refused("the queue run's latest attempt could not be read")
-    artifacts = production.complete_listing(lambda page: get(f"actions/runs/{queue['id']}/artifacts?" + urllib.parse.urlencode(
+    artifact = evidence_artifact(queue, sha, get, "queue run")
+    return {"run_id": str(queue["id"]), "run_attempt": str(attempt), "artifact_id": str(artifact["id"]),
+            "artifact_digest": artifact["digest"]}
+
+
+def evidence_artifact(run: dict, head_sha: str, get, kind: str) -> dict:
+    """The one current `ci-evidence` artifact of the run's latest attempt, created by that run for `head_sha`."""
+    attempt = run["run_attempt"]
+    started = get(f"actions/runs/{run['id']}/attempts/{attempt}")
+    if started.get("id") != run["id"] or started.get("run_attempt") != attempt or not started.get("run_started_at"):
+        raise Refused(f"the {kind}'s latest attempt could not be read")
+    artifacts = production.complete_listing(lambda page: get(f"actions/runs/{run['id']}/artifacts?" + urllib.parse.urlencode(
         {"name": ARTIFACT, "per_page": 100, "page": page})), "artifacts")
     # A rerun can leave an earlier attempt's evidence behind; only the one created during the pinned attempt counts.
     current = [artifact for artifact in artifacts if artifact.get("name") == ARTIFACT and artifact.get("expired") is False
                and when(artifact["created_at"]) >= when(started["run_started_at"])]
     if len(current) != 1:
-        raise Refused(f"the queue run's latest attempt has {len(current)} current evidence artifacts, not exactly one")
+        raise Refused(f"the {kind}'s latest attempt has {len(current)} current evidence artifacts, not exactly one")
     artifact = current[0]
     workflow_run = artifact.get("workflow_run") or {}
-    if (workflow_run.get("id"), workflow_run.get("head_sha")) != (queue["id"], sha) or not str(artifact.get("digest", "")).startswith("sha256:"):
-        raise Refused("the evidence artifact does not belong to the queue run or has no digest")
-    return {"run_id": str(queue["id"]), "run_attempt": str(attempt), "artifact_id": str(artifact["id"]),
-            "artifact_digest": artifact["digest"]}
+    if (workflow_run.get("id"), workflow_run.get("head_sha")) != (run["id"], head_sha) or not str(artifact.get("digest", "")).startswith("sha256:"):
+        raise Refused(f"the evidence artifact does not belong to the {kind} or has no digest")
+    return artifact
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -162,8 +178,12 @@ def read_json(directory: Path, name: str):
         raise Refused(f"the evidence file {name} is not valid JSON") from None
 
 
-def validate(directory: Path, sha: str, producer_url: str, attempt: int) -> dict:
-    """Refuse evidence that is not the queue run's complete, passing verification of exactly `sha`."""
+def validate(directory: Path, sha: str, producer_url: str, attempt: int, pull_request_branch: str = "") -> dict:
+    """Refuse evidence that is not the queue run's complete, passing verification of exactly `sha`.
+
+    With `pull_request_branch`, the producer is instead a pull request run of that head branch, whose `sha` is the
+    merge commit it tested; every other rule is the same.
+    """
     metadata, manifest, load = (read_json(directory, name) for name in ("metadata.json", "manifest.json", "load.json"))
     if not all(isinstance(value, dict) for value in (metadata, manifest, load)):
         raise Refused("the evidence metadata, manifest or load report is malformed")
@@ -172,7 +192,11 @@ def validate(directory: Path, sha: str, producer_url: str, attempt: int) -> dict
         raise Refused("an evidence SHA field names another commit")
     if metadata.get("ci_url") != producer_url or any(manifest.get(key) != value for key, value in metadata.items()):
         raise Refused("the evidence was not assembled by the pinned queue run attempt")
-    if (manifest.get("schema"), manifest.get("event"), manifest.get("tiden_branch")) != (1, "merge_group", "") \
+    if pull_request_branch:
+        if (manifest.get("schema"), manifest.get("event"), manifest.get("git_branch")) != (1, "pull_request", pull_request_branch) \
+                or not isinstance(manifest.get("tiden_branch"), str):
+            raise Refused("the evidence is not this pull request run's evidence")
+    elif (manifest.get("schema"), manifest.get("event"), manifest.get("tiden_branch")) != (1, "merge_group", "") \
             or not str(manifest.get("git_branch", "")).startswith(production.QUEUE_BRANCH_PREFIX):
         raise Refused("the evidence is not a merge queue run's evidence of main")
     if manifest.get("checks") != dict.fromkeys(tiden_ci.CHECKS, "success") \
@@ -250,6 +274,62 @@ def adopt(pin: dict, sha: str, repository: str, run_id: str, run_attempt: str, d
     return record
 
 
+def decide_group(sha: str, repository: str, event_name: str, event: dict, get=production.api, fetch=download) -> dict:
+    """Pin the passing full pull request run that tested exactly this group commit's tree; Refused means verify in full.
+
+    Tree identity is the whole claim: the queue builds the group commit from main and the pull request, so its tree
+    equals the merge commit a pull request run tested only when main has not moved since and the group holds that
+    pull request alone. The pull request's workflow files are part of that tree, as they are of the group commit.
+    """
+    if event_name != "merge_group" or repository != production.REPOSITORY or not SHA.fullmatch(sha):
+        raise Refused("only a merge queue run of an exact commit of this repository reuses a pull request run")
+    group = event.get("merge_group") or {}
+    match = GROUP_REF.fullmatch(str(group.get("head_ref", "")))
+    if group.get("head_sha") != sha or not match:
+        raise Refused("the event is not a merge queue group of main for this commit")
+    number = int(match.group(1))
+    pull = get(f"pulls/{number}")
+    head = pull.get("head") or {}
+    head_sha, head_ref = str(head.get("sha", "")), str(head.get("ref", ""))
+    if pull.get("number") != number or pull.get("state") != "open" or (pull.get("base") or {}).get("ref") != "main" \
+            or (head.get("repo") or {}).get("full_name") != repository or not SHA.fullmatch(head_sha) or not head_ref:
+        raise Refused(f"pull request {number} is not an open pull request of this repository into main")
+    run = production.latest_run(head_sha, "pull_request", get)
+    expected = (head_sha, "pull_request", head_ref, "completed", "success", repository)
+    if run is None or (run.get("head_sha"), run.get("event"), run.get("head_branch"), run.get("status"), run.get("conclusion"),
+                       (run.get("head_repository") or {}).get("full_name")) != expected:
+        raise Refused("the latest pull request run of this head is not a completed success of this repository")
+    jobs = production.attempt_jobs(run, get)
+    for name in PULL_REQUEST_JOBS:
+        if not production.job_concluded(jobs, name):
+            raise Refused(f"pull request job did not pass: {name}")
+    attempt = run["run_attempt"]
+    artifact = evidence_artifact(run, head_sha, get, "pull request run")
+    if not 0 < int(artifact.get("size_in_bytes", 0)) <= MAX_ARCHIVE_BYTES:
+        raise Refused("the pull request run's evidence archive is empty or exceeds its size limit")
+    data = fetch(f"actions/artifacts/{artifact['id']}/zip")
+    if "sha256:" + hashlib.sha256(data).hexdigest() != artifact["digest"]:
+        raise Refused("the downloaded evidence differs from the pull request run's artifact")
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary) / ARTIFACT
+        extract(data, directory)
+        tested = (directory / "source-sha").read_text().strip()
+        if not SHA.fullmatch(tested):
+            raise Refused("the pull request run's evidence names no exact tested commit")
+        validate(directory, tested, run_url(repository, run["id"], attempt), int(attempt), pull_request_branch=head_ref)
+    commit, group_commit = get(f"git/commits/{tested}"), get(f"git/commits/{sha}")
+    if commit.get("sha") != tested or [parent.get("sha") for parent in commit.get("parents") or []][1:] != [head_sha]:
+        raise Refused("the tested commit is not GitHub's merge of this pull request head")
+    tree = (commit.get("tree") or {}).get("sha")
+    if group_commit.get("sha") != sha or not tree or (group_commit.get("tree") or {}).get("sha") != tree:
+        raise Refused("the group commit's tree differs from the tree the pull request run tested")
+    # A rerun of the pull request run during validation leaves nothing to reuse.
+    if not production.unchanged(run, production.latest_run(head_sha, "pull_request", get)):
+        raise Refused("the pull request run changed while it was being validated")
+    return {"pull_request": str(number), "run_id": str(run["id"]), "run_attempt": str(attempt), "tested_sha": tested,
+            "validated_sha": sha}
+
+
 def outputs(values: dict) -> None:
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.writelines(f"{key}={value}\n" for key, value in values.items())
@@ -257,10 +337,22 @@ def outputs(values: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["decide", "adopt"])
+    parser.add_argument("command", choices=["decide", "adopt", "group"])
     parser.add_argument("--directory", type=Path)
     args = parser.parse_args()
     sha, repository = os.environ.get("GITHUB_SHA", ""), os.environ.get("GITHUB_REPOSITORY", "")
+    if args.command == "group":
+        try:
+            event = json.loads(Path(os.environ.get("GITHUB_EVENT_PATH", "")).read_text())
+            pin = decide_group(sha, repository, os.environ.get("GITHUB_EVENT_NAME", ""), event)
+        except Exception as exc:  # any doubt means the queue run verifies in full, never a failed run
+            print(f"::notice title=Full verification::{type(exc).__name__}: {exc}")
+            outputs({"decision": "full"})
+            return 0
+        print(f"::notice title=Reusing the pull request verification::pull request {pin['pull_request']}, "
+              f"{run_url(repository, pin['run_id'], pin['run_attempt'])} tested {pin['tested_sha']}, the tree of {sha}")
+        outputs({"decision": "reuse", **pin})
+        return 0
     if args.command == "decide":
         try:
             pin = decide(sha, repository)

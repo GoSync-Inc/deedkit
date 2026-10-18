@@ -12,8 +12,11 @@ Reviewers spend their time on what no tool proves: logic, failure modes,
 security, concurrency, cross-file consistency and whether text matches code and
 specs. They do not re-run what a tool already proved:
 
-- the required checks, and the merge queue's full test run of every commit that
-  reaches `main` (a docs-only PR run may skip tests; the queue never does);
+- the required checks, and the full test run of every commit's tree before it
+  reaches `main`: in the merge queue, or on the pull request run whose tested
+  tree the queue group equals and reuses, after which the `main` push run tests
+  that commit in full again (a docs-only PR run may skip tests; its queue run
+  never does);
 - `ruff`, `actionlint`, `zizmor` and the other linters in CI;
 - an intent session closed with PASS: the promised specs' linked tests ran and
   passed on the session's commits.

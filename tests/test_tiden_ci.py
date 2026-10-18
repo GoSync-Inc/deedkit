@@ -536,7 +536,7 @@ def test_ci_reports_required_checks_for_merge_queue_runs_without_cancelling_them
     # The required `CI gate` runs for every trigger, the queue included, and so does `checks / verify`, except
     # on a main push whose reuse job validated the merge queue's verification of that commit (ANYM-322).
     assert ci["jobs"]["gate"]["name"] == "CI gate" and ci["jobs"]["gate"]["if"] == "${{ always() }}"
-    assert set(ci["jobs"]["gate"]["needs"]) == {"reuse", "checks", "native", "images"}
+    assert set(ci["jobs"]["gate"]["needs"]) == {"reuse", "pr_reuse", "checks", "native", "images"}
     assert ci["jobs"]["checks"]["uses"] == "./.github/workflows/checks.yml"
     assert not any("if" in ci["jobs"][job] for job in ("native", "images"))
     assert ci["jobs"]["reuse"]["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
@@ -546,7 +546,7 @@ def test_ci_reports_required_checks_for_merge_queue_runs_without_cancelling_them
     assert checks.get("on", checks.get(True))["workflow_call"]["inputs"]["reuse_queue_evidence"]["default"] is False
     # It is skipped too on a pull request run of reviewed documentation only (ANYM-323).
     assert checks["jobs"]["verify"]["needs"] == "documentation"
-    assert checks["jobs"]["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}"
+    assert checks["jobs"]["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     step_ids = {step.get("id") for step in checks["jobs"]["verify"]["steps"]}
     assert set(CHECKS) <= step_ids
     # A queue run gets its own group and cancels nothing; so does a main push run.
@@ -1252,7 +1252,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     # Skipped, like verify, only on a main push that reuses the merge queue's verification (ANYM-322) or on a
     # docs-only pull request run (ANYM-323); it needs only that decision, never verify.
     assert load["needs"] == jobs["verify"]["needs"] == "documentation"
-    assert load["if"] == jobs["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}"
+    assert load["if"] == jobs["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     assert load["timeout-minutes"] == 10
     gate = next(step for step in load["steps"] if step.get("id") == "load")
     assert gate["name"] == "Paired gateway load and isolation budgets" and "if" not in gate
@@ -1265,7 +1265,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         assert upload["with"]["name"] == f"ci-evidence-{job}" and upload["if"] == "${{ always() }}"
         assert upload["with"]["overwrite"] is True
     evidence = jobs["evidence"]
-    assert evidence["needs"] == ["documentation", "verify", "load"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && needs.documentation.outputs.docs_only != 'true' }}"
+    assert evidence["needs"] == ["documentation", "verify", "load"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     assert jobs["tiden"]["needs"] == ["documentation", "evidence"]
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in evidence["steps"]}
     assert steps["actions/download-artifact"]["with"]["pattern"] == "ci-evidence-*"
