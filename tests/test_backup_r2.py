@@ -677,6 +677,23 @@ def test_failed_cold_abort_keeps_the_journal_for_reconciliation(config):
     # Backup admission ignores cold journals.
     assert receive(config,cloud)['status']=='stored'
 
+# spec: ANYM-287 (receiver cold route state), ANYM-297 criterion 7 (cold copy crash safety)
+def test_cold_lock_fsyncs_state_directory_before_every_cold_use(config,monkeypatch):
+    state=Path(config['state_directory']);inode=state.stat().st_ino;real=os.fsync;synced=[];fail=[True]
+    def fsync(fd):
+        if fail and os.fstat(fd).st_ino==inode:fail.clear();raise OSError(5,'synthetic EIO')
+        synced.append(os.fstat(fd).st_ino);real(fd)
+    monkeypatch.setattr(os,'fsync',fsync)
+    # A failed parent sync after mkdir refuses the request before its lock is taken.
+    with pytest.raises(OSError):
+        with r2.cold_lock(config):pytest.fail('cold lock entered without a durable cold/ entry')
+    assert (state/'cold').is_dir() and not (state/'cold'/'.cold.lock').exists()
+    # Existence is no proof of a completed sync: the retry, or any concurrent
+    # caller, syncs the parent before its lock or any journal is used.
+    for _ in range(2):
+        synced.clear()
+        with r2.cold_lock(config):assert synced==[inode]
+
 @pytest.mark.parametrize('age_seconds',[60,30*86400])
 def test_sent_cold_completion_blocks_replacement_until_it_is_settled(config,age_seconds):
     cloud=Cloud();data=r2.AGE_HEADER+b'synthetic cold ciphertext'*8;key=config['prefix']+'/cold/'+COLD+'.age'
