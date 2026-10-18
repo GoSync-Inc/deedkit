@@ -64,7 +64,7 @@ def full_server(server):
 def test_a_merged_pull_request_merges_its_card_links_its_tests_anchors_its_files_and_delivers(root, server):
     full_server(server)
     merged(root, server, {"app/core.py": "x = 2\n", "app/new.py": "y\n", "tests/test_new.py": TEST_FILE,
-                          "docs/x.md": "doc\n"},
+                          "notes/x.md": "doc\n"},
            "Delivers: ANYM-50\nSpec: ANYM-12\nTiden branch: proposal/x\n")
     code, out = run(root, server)
     assert code == 0, out
@@ -136,7 +136,7 @@ def test_a_commit_without_a_pull_request_number_syncs_nothing_and_a_wrong_number
     ({"additions": [{"seqNum": 50}], "modifications": [], "deletions": [{"seqNum": 12}]}, "deletions"),
     ({"additions": [{"seqNum": 50}], "modifications": [], "stats": {"conflicts": 1}}, "conflicts"),
     ({"additions": [{"seqNum": 50}], "modifications": [], "blockingSessions": [{"sessionId": "s"}]}, "blocking"),
-    ({"additions": [{"title": "no number"}], "modifications": []}, "without a spec number"),
+    ({"additions": [{"title": "no number"}], "modifications": []}, "without exactly one spec number"),
     ({"additions": None, "modifications": []}, "malformed"),
 ])
 def test_a_mixed_or_unclear_preview_is_never_merged_and_stops_the_sync(root, server, preview, reason):
@@ -214,7 +214,7 @@ def test_anchoring_resends_every_source_with_provenance_and_never_overwrites_a_r
     assert sent[0] == {"sourceType": "repo_file", "repoPath": "app/core.py", "repository": "github.com/GoSync-Inc/deedkit",
                        "lineStart": 3, "lineEnd": 9,
                        "metadata": {"commit_sha": "abc", "historical_source_id": "src-app/core.py"}}
-    assert sent[1]["metadata"] == {"historical_source_id": "src-app/old.py",
+    assert sent[1]["metadata"] == {"reverse_pr": {"status": "modified"}, "historical_source_id": "src-app/old.py",
                                    "historical_metadata_json": '{"reverse_pr":{"status":"modified"}}'}
     assert sent[2]["metadata"] == {"historical_source_id": "original", "historical_metadata_json": "{}"}
     assert sent[3] == {"sourceType": "manual_input", "title": "Intent", "excerpt": "quote",
@@ -228,7 +228,7 @@ def test_a_lost_source_or_no_named_spec_fails_the_anchors_step(root, server):
     server.set(main=[spec(12, sources=[anchor("app/core.py")]), spec(20, kind="Epic")], fault={"spec update": "drop"})
     merged(root, server, {"app/new.py": "y\n"}, "Spec: ANYM-12")
     code, out = run(root, server)
-    assert code == 1 and "Failed at step anchors: read-back of ANYM-12: 1 source(s) lost" in out
+    assert code == 1 and "Failed at step anchors: read-back of ANYM-12: 1 sent source(s) missing or changed" in out
     server.set(fault={})
     merged(root, server, {"app/other.py": "z\n"}, "", number=8)
     code, out = run(root, server)
@@ -244,7 +244,7 @@ def test_an_open_live_or_measured_check_keeps_the_card_in_review_and_a_status_th
                      spec(13, status="Active", content="- Measured [open: measured]."),
                      spec(14, status="Review", content="Delivered; the check closed with evidence.")],
                fault={"spec update": "noop"})
-    merged(root, server, {"docs/x.md": "doc\n"}, "Delivers: ANYM-12, ANYM-13, ANYM-14")
+    merged(root, server, {"notes/x.md": "doc\n"}, "Delivers: ANYM-12, ANYM-13, ANYM-14")
     code, out = run(root, server)
     assert code == 1
     assert "read-back: ANYM-12 is Active, not Review" in out and "read-back: ANYM-14 is Review, not Done" in out
@@ -286,3 +286,149 @@ def test_the_command_line_hides_cli_output_and_writes_the_summary(root, server, 
                                 "--gh", str(server.gh)], capture_output=True, text=True, env=env)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert json.loads(server.path.read_text())["main"][0]["sources"][-1]["repoPath"] == "app/new.py"
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("preview, reason", [
+    ({"additions": [{"seqNum": 50}], "specMoves": [{"seqNum": 12}]}, "unknown fields (specMoves)"),
+    ({"additions": [{"seqNum": 50}], "componentAdditions": [{"name": "c"}]}, "componentAdditions"),
+    ({"additions": [{"seqNum": 50}], "componentModifications": [{"name": "c"}]}, "componentModifications"),
+    ({"additions": [{"seqNum": 50}], "testModifications": [{"id": "t"}]}, "testModifications"),
+    ({"additions": [{"seqNum": 50}], "testDeletions": [{"id": "t"}]}, "testDeletions"),
+    ({"additions": [{"seqNum": 50}], "stats": {"additions": 1, "conflicts": 2}}, "stats.conflicts"),
+    ({"additions": [{"seqNum": 50}], "stats": {"additions": 2}}, "stats.additions"),
+    ({"additions": [{"seqNum": 50}], "stats": {"conflicts": "0"}}, "malformed stats"),
+    ({"additions": [{"seqNum": 50}], "intentSession": {"id": "s"}}, "intentSession"),
+    ({"additions": [{"seqNum": 50}], "hasRequirementChanges": "yes"}, "hasRequirementChanges"),
+    ({"modifications": [{"seqNum": 50, "branch": {"seqNum": 99}}]}, "without exactly one spec number"),
+    ({"modifications": [{"seqNum": "50"}]}, "without exactly one spec number"),
+])
+def test_a_preview_outside_the_known_spec_only_shape_is_never_merged(root, server, preview, reason):
+    full_server(server)
+    server.set(previews={"proposal/x": preview})
+    merged(root, server, {"app/new.py": "y\n"}, "Delivers: ANYM-50\nTiden branch: proposal/x")
+    code, out = run(root, server)
+    assert code == 1 and "Failed at step merge" in out and reason in out
+    assert not server.writes()
+
+
+# spec: ANYM-405
+def test_a_merge_that_leaves_the_branch_open_fails_and_stops_before_other_writes(root, server):
+    full_server(server)
+    server.set(fault={"branch merge": "noop"})
+    merged(root, server, {"app/new.py": "y\n"}, "Delivers: ANYM-50\nTiden branch: proposal/x")
+    code, out = run(root, server)
+    assert code == 1 and "Failed at step merge: read-back: proposal/x is open, not merged" in out
+    assert [entry[:2] for entry in server.writes()] == [["branch", "merge"]]
+
+
+# spec: ANYM-405
+def test_an_escaped_node_title_links_to_the_case_ci_imported(root, server):
+    full_server(server)
+    server.set(tests=[case("node:web/q.test.mjs::adds_quoted", "web/q.test.mjs", "adds 'quoted' title")])
+    merged(root, server, {"web/q.test.mjs": "// spec: ANYM-12\ntest('adds \\'quoted\\' title', () => {});\n"},
+           "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert server.state()["links"] == {"t-node:web/q.test.mjs::adds_quoted": ["m-0012-0000-0000-0000-000000000000"]}
+
+
+# spec: ANYM-405
+def test_a_commented_out_copy_of_an_existing_test_links_nothing(root, server):
+    full_server(server)
+    server.set(tests=[case("node:web/e.test.mjs::existing", "web/e.test.mjs", "existing")])
+    commit(root, {"web/e.test.mjs": "await test('existing', () => {});\n"}, "existing test")
+    merged(root, server, {"web/e.test.mjs": "await test('existing', () => {});\n/*\n// spec: ANYM-12\n"
+                                            "test('existing', () => {});\n*/\n"}, "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert "0 added test(s)" in out and not server.writes()
+
+
+# spec: ANYM-405
+def test_nested_python_classes_match_their_dotted_junit_class():
+    rows = [case("tests.test_a.TestOuter.TestInner::test_x", "tests/test_a.py", "test_x"),
+            case("tests.test_a.TestOuter::test_x", "tests/test_a.py", "test_x")]
+    assert [row["id"] for row in tiden_sync.matches(rows, "tests/test_a.py", "TestOuter::TestInner::test_x")] == [
+        "t-tests.test_a.TestOuter.TestInner::test_x"]
+
+
+# spec: ANYM-405
+def test_a_malformed_link_read_or_an_unexpected_error_names_its_step_and_the_others_still_run(root, server,
+                                                                                          monkeypatch):
+    full_server(server)
+    server.set(fault={"test links": "malformed"})
+    merged(root, server, {"tests/test_new.py": "# spec: ANYM-12\ndef test_new():\n    pass\n", "app/new.py": "y\n"},
+           "Delivers: ANYM-12")
+    code, out = run(root, server)
+    assert code == 1 and "Failed at step links: tests.test_new::test_new -> ANYM-12: the test links are malformed" in out
+    assert "anchors: 1 file(s) anchored to ANYM-12" in out and "status: ANYM-12 Active -> Done" in out
+    server.set(fault={})
+
+    def broken(*_):
+        raise TypeError("a value from the data")
+
+    monkeypatch.setattr(tiden_sync, "matches", broken)
+    merged(root, server, {"tests/test_newer.py": "# spec: ANYM-12\ndef test_new():\n    pass\n", "app/other.py": "z\n"},
+           "Spec: ANYM-12", number=8)
+    code, out = run(root, server)
+    assert code == 1 and "Failed at step links: unexpected TypeError" in out and "a value from the data" not in out
+    assert "anchors: 1 file(s) anchored to ANYM-12: app/other.py" in out
+
+
+# spec: ANYM-405
+def test_a_malformed_source_fails_the_anchors_step_by_name(root, server):
+    server.set(main=[spec(12, status="Active", sources=[anchor("app/core.py", repository=7)])])
+    merged(root, server, {"app/new.py": "y\n"}, "Delivers: ANYM-12")
+    code, out = run(root, server)
+    assert code == 1 and "Failed at step anchors: ANYM-12 has a malformed source repository" in out
+    assert "status: ANYM-12 Active -> Done" in out
+
+
+# spec: ANYM-405
+def test_a_rerun_after_a_partial_failure_writes_only_what_is_left(root, server):
+    full_server(server)
+    server.set(fault={"spec update": "exit"})
+    merged(root, server, {"app/new.py": "y\n", "tests/test_new.py": TEST_FILE},
+           "Delivers: ANYM-50\nSpec: ANYM-12\nTiden branch: proposal/x\n")
+    code, out = run(root, server)
+    assert code == 1 and "Failed at step anchors" in out and "Failed at step status" in out
+    first = server.writes()
+    assert sorted({tuple(entry[:2]) for entry in first}) == [("branch", "merge"), ("spec", "update"),
+                                                             ("test", "link-spec")]
+    links = server.state()["links"]
+    server.set(fault={})
+    code, out = run(root, server)
+    assert code == 0, out
+    rest = server.writes()[len(first):]
+    assert [entry[:2] for entry in rest] == [["spec", "update"], ["spec", "update"]]
+    assert "--sources-file" in rest[0] and "--status" in rest[1]
+    assert server.state()["links"] == links and server.main(50)["status"] == "Done"
+    assert [source["repoPath"] for source in server.main(50)["sources"]] == ["app/new.py"]
+
+
+# spec: ANYM-405
+def test_two_anchor_runs_from_one_stale_listing_both_keep_their_anchors(root, server):
+    server.set(main=[spec(12, sources=[anchor("app/core.py", metadata={"reverse_pr": {"pr": 3}})])])
+    stale = tiden_sync.listing(str(server.cli), "product", "main")
+    for path in ("app/a.py", "app/b.py"):
+        tiden_sync.anchor(str(server.cli), "product", [path], 12, stale, "0" * 40, 7, lambda line: None)
+    sources = server.main(12)["sources"]
+    assert [source["repoPath"] for source in sources] == ["app/core.py", "app/a.py", "app/b.py"]
+    assert sources[0]["metadata"]["reverse_pr"] == {"pr": 3}
+
+
+# spec: ANYM-405
+def test_an_existing_receipt_keeps_new_nested_metadata_and_a_changed_source_fails_the_read_back(root, server):
+    kept = anchor("app/kept.py", metadata={"historical_source_id": "first", "historical_metadata_json": "{}",
+                                           "reverse_pr": {"new": "unrecorded"}})
+    server.set(main=[spec(12, sources=[kept])])
+    merged(root, server, {"app/new.py": "y\n"}, "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert server.main(12)["sources"][0]["metadata"] == kept["metadata"]
+    server.set(fault={"spec update": "corrupt"})
+    merged(root, server, {"app/other.py": "z\n"}, "Spec: ANYM-12", number=8)
+    code, out = run(root, server)
+    assert code == 1
+    assert "read-back of ANYM-12: 1 sent source(s) missing or changed, 1 unexpected" in out

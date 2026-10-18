@@ -37,8 +37,11 @@ BRANCH_NAME = re.compile(r"(?:proposal|review)/[a-z0-9]+(?:[/_-][a-z0-9]+)*")
 MARKER = re.compile(r"^[ \t]*(#|//)[ \t]*spec:[ \t]*(.*?)[ \t]*$")
 # A comment that tries to be a marker but is malformed (wrong case, missing colon) is reported, not ignored.
 MARKER_LIKE = re.compile(r"^[ \t]*(#|//)[ \t]*spec\b", re.IGNORECASE)
-NODE_TEST = re.compile(r"""^[ \t]*(?:test|it)(?:\.(?:only|skip|todo))?[ \t]*\([ \t]*(['"`])((?:\\.|(?!\1).)*)\1""")
-GO_TEST = re.compile(r"^func[ \t]+(Test(?:[A-Z0-9_][A-Za-z0-9_]*)?)[ \t]*\([ \t]*\w+[ \t]+\*testing\.T[ \t]*\)")
+# Matched on source whose comments and string contents are blanked (`blank`), so a commented-out or quoted call is
+# never a test; the name is then read from the original source at the literal's offset.
+NODE_TEST = re.compile(r"(?<![\w.$])(?:test|it)(?:\.(?:only|skip|todo))?\s*\(\s*")
+GO_TEST = re.compile(r"^func\s+(Test(?:[A-Z0-9_]\w*)?)\s*\(\s*\w+\s+\*testing\.T\s*,?\s*\)", re.MULTILINE)
+JS_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
 # Story-level means a leaf that holds criteria: not an Epic and without child specs.
 CONTAINER_TYPES = {"Epic"}
 # Tests that verify no spec, as `<path>::<test>` patterns with the reason; widening it is a reviewed code change.
@@ -120,41 +123,151 @@ def marker(lines: list[str], index: int, comment: str) -> tuple[tuple[int, ...],
     return tuple(found), ""
 
 
-def python_tests(source: str) -> list[tuple[str, int]]:
-    """(name, 0-based line of the marker's target) of each module-level test and each test method of a Test class."""
-    tree = ast.parse(source)
+def python_tests(source: str) -> list[tuple[str, int, str]]:
+    """(name, 0-based line of the marker's target, problem) of each module-level test and each test method of a
+    `Test*` class, nested classes included; the target is the `@` line of the first decorator, else the `def`."""
+    tree, lines = ast.parse(source), source.splitlines()
     found = []
 
-    def add(node, prefix: str = "") -> None:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-            first = min([node.lineno, *(decorator.lineno for decorator in node.decorator_list)])
-            found.append((prefix + node.name, first - 1))
+    def start(node) -> int:
+        first = node.lineno - 1
+        for decorator in node.decorator_list:
+            line = decorator.lineno - 1  # a parenthesized decorator reports its expression line, not the `@`
+            while line > 0 and not lines[line].lstrip().startswith("@"):
+                line -= 1
+            first = min(first, line)
+        return first
 
-    for node in tree.body:
-        add(node)
-        if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-            for child in node.body:
-                add(child, node.name + "::")
+    def walk(body, prefix: str) -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                found.append((prefix + node.name, start(node), ""))
+            elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+                walk(node.body, prefix + node.name + "::")
+
+    walk(tree.body, "")
     return found
 
 
-def tests_in(path: str, source: str) -> list[tuple[str, int]]:
+def blank(source: str, go: bool) -> str:
+    """The source with comments replaced by spaces and string contents by `x`, newlines and offsets kept. JS template
+    literals return to code inside `${...}`; Go raw strings and runes are strings. Regex literals are not recognized."""
+    out, length = list(source), len(source)
+    stack: list[int] = []  # the brace depth inside each open `${` of the enclosing templates
+
+    def fill(begin: int, end: int, char: str) -> None:
+        for position in range(begin, min(end, length)):
+            if out[position] != "\n":
+                out[position] = char
+
+    def string(index: int, quote: str) -> int:
+        """Blank one string from its opening quote; the index after it closes, or after a template's `${`."""
+        position = index + 1
+        while position < length:
+            char = source[position]
+            if char == "\\" and not (go and quote == "`"):
+                position += 2
+                continue
+            if char == quote:
+                fill(index + 1, position, "x")
+                return position + 1
+            if quote == "`" and not go and source.startswith("${", position):
+                fill(index + 1, position, "x")
+                stack.append(0)
+                return position + 2
+            if char == "\n" and quote != "`":
+                break
+            position += 1
+        fill(index + 1, position, "x")
+        return position
+
+    index = 0
+    while index < length:
+        char = source[index]
+        if source.startswith("//", index):
+            end = source.find("\n", index)
+            end = length if end < 0 else end
+            fill(index, end, " ")
+            index = end
+        elif source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            end = length if end < 0 else end + 2
+            fill(index, end, " ")
+            index = end
+        elif char in "'\"`":
+            index = string(index, char)
+        elif stack and char == "{":
+            stack[-1] += 1
+            index += 1
+        elif stack and char == "}":
+            if stack[-1]:
+                stack[-1] -= 1
+                index += 1
+            else:
+                stack.pop()
+                index = string(index, "`")  # the template continues after its `}`
+        else:
+            index += 1
+    return "".join(out)
+
+
+def js_literal(source: str, index: int) -> str | None:
+    """The runtime value of the JS string literal at `index`, or None when the name is not a plain literal."""
+    quote = source[index] if index < len(source) else ""
+    if quote not in ("'", '"', "`"):
+        return None
+    value, position = [], index + 1
+    while position < len(source):
+        char = source[position]
+        if char == quote:
+            return "".join(value)
+        if (quote == "`" and source.startswith("${", position)) or (char == "\n" and quote != "`"):
+            return None
+        if char != "\\":
+            value.append(char)
+            position += 1
+            continue
+        escape = source[position + 1:position + 2]
+        hexadecimal = re.match(r"x([0-9a-fA-F]{2})|u\{([0-9a-fA-F]{1,6})\}|u([0-9a-fA-F]{4})", source[position + 1:])
+        if hexadecimal:
+            value.append(chr(int(next(group for group in hexadecimal.groups() if group), 16)))
+            position += 1 + hexadecimal.end()
+        elif escape == "\n":
+            position += 2  # a line continuation adds nothing
+        elif escape and escape not in "xu":
+            value.append(JS_ESCAPES.get(escape, escape))
+            position += 2
+        else:
+            return None
+    return None
+
+
+def tests_in(path: str, source: str) -> list[tuple[str, int, str]]:
+    """(name, 0-based line of the marker's target, problem) of each test in one file."""
     kind = language(path)
     if kind == "python":
         return python_tests(source)
-    pattern = NODE_TEST if kind == "node" else GO_TEST
+    code = blank(source, go=kind == "go")
+    if kind == "go":
+        return [(match.group(1), code.count("\n", 0, match.start()), "") for match in GO_TEST.finditer(code)]
     found = []
-    for index, line in enumerate(source.splitlines()):
-        match = pattern.match(line)
-        if match:
-            found.append((match.group(2) if kind == "node" else match.group(1), index))
+    for match in NODE_TEST.finditer(code):
+        line = code.count("\n", 0, match.start())
+        name = js_literal(source, match.end())
+        if name is not None:
+            found.append((name, line, ""))
+            continue
+        # The expression's own text keys a non-literal name, so moving an existing test never makes it new.
+        expression = code[match.end():].split(",", 1)[0].split(")", 1)[0].strip()
+        found.append((f"<{source[match.end():match.end() + len(expression)]}>", line,
+                      "the test name is not a plain string literal, so it has no stable identity"))
     return found
 
 
 def added_tests(path: str, before: str | None, after: str) -> list[Test]:
     """Tests in `after` whose name the same file did not have in `before`; existing tests need no marker."""
     try:
-        old = {name for name, _ in tests_in(path, before)} if before is not None else set()
+        old = {name for name, _, _ in tests_in(path, before)} if before is not None else set()
     except SyntaxError:
         old = set()
     try:
@@ -164,12 +277,12 @@ def added_tests(path: str, before: str | None, after: str) -> list[Test]:
     comment = "#" if language(path) == "python" else "//"
     lines = after.splitlines()
     result, seen = [], set()
-    for name, index in new:
+    for name, index, problem in new:
         if name in old or name in seen:
             continue
         seen.add(name)
-        specs, problem = marker(lines, index, comment)
-        result.append(Test(path, name, index + 1, specs, problem))
+        specs, missing = marker(lines, index, comment)
+        result.append(Test(path, name, index + 1, () if problem else specs, problem or missing))
     return result
 
 
@@ -178,7 +291,10 @@ def no_spec(test: Test) -> bool:
 
 
 def git(root: Path, *arguments: str) -> bytes:
-    completed = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, timeout=TIMEOUT)
+    try:
+        completed = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, timeout=TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        raise Refused(f"git {arguments[0]} could not run") from None
     if completed.returncode:
         raise Refused(f"git {arguments[0]} exited {completed.returncode}")
     return completed.stdout
@@ -194,8 +310,11 @@ def changed(root: Path, base: str, head: str) -> list[str]:
 
 
 def blob(root: Path, commit: str, path: str) -> str | None:
-    completed = subprocess.run(["git", "-C", str(root), "cat-file", "blob", f"{commit}:{path}"],
-                               capture_output=True, timeout=TIMEOUT)
+    try:
+        completed = subprocess.run(["git", "-C", str(root), "cat-file", "blob", f"{commit}:{path}"],
+                                   capture_output=True, timeout=TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        raise Refused(f"git cat-file could not run for {shown(path)}") from None
     if completed.returncode:
         return None
     return completed.stdout.decode("utf-8", errors="replace")
@@ -392,6 +511,9 @@ def main() -> int:
         return check(args.root.resolve(), base, args.head, body, args.cli, os.environ["TIDEN_PRODUCT_ID"], report)
     except Refused as error:
         report(f"Refused: {error}")
+        return 1
+    except Exception as error:  # noqa: BLE001 - fail loudly without echoing data the error may hold
+        report(f"Refused: unexpected {type(error).__name__}")
         return 1
 
 

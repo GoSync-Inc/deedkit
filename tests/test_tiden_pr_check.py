@@ -54,7 +54,7 @@ def test_marked_tests_and_a_named_spec_pass_with_reads_only(repo, server):
 # spec: ANYM-405
 def test_unanchored_code_without_a_spec_line_fails_and_anchored_code_needs_none(repo, server):
     server.set(main=[spec(12, sources=[anchor("app/core.py")])])
-    code, out = run(repo, server, {"app/core.py": "x = 2\n", "docs/a.md": "text\n", "app/new.py": "y\n"})
+    code, out = run(repo, server, {"app/core.py": "x = 2\n", "notes/a.md": "text\n", "app/new.py": "y\n"})
     assert code == 1 and "1 changed code file(s) have no anchor" in out and "app/new.py" in out
     code, out = run(repo, server, {"app/core.py": "x = 3\n", "README.md": "text\n"})
     assert code == 0, out
@@ -95,7 +95,7 @@ def test_node_and_go_tests_are_found_and_a_renamed_file_counts_as_new(repo, serv
                                                       "\nfunc TestHelper(t *testing.T) {}\nfunc BenchmarkX(b *testing.B) {}\n",
     }, "Spec: ANYM-12")
     assert code == 1
-    assert "web/b.test.js:2 adds \\'quoted\\' title -> ANYM-12" in out
+    assert "web/b.test.js:2 adds 'quoted' title -> ANYM-12" in out
     assert "web/b.test.js:3 nested: no marker" in out
     assert "pkg/moved_test.go:4 TestOld -> ANYM-12" in out
     assert "TestHelper: no marker" in out and "BenchmarkX" not in out
@@ -207,3 +207,55 @@ def test_the_command_line_reads_the_event_and_writes_the_summary(repo, server, t
 # spec: ANYM-405
 def test_the_no_spec_list_is_the_reviewed_empty_set():
     assert pr_check.NO_SPEC == ()
+
+
+# spec: ANYM-405
+def test_commented_or_quoted_test_calls_are_not_tests_and_await_and_multiline_calls_are(repo, server):
+    server.set(main=[spec(12)])
+    root, _ = repo
+    commit(root, {"web/a.test.mjs": "import test from 'node:test';\nawait test('existing', () => {});\n"}, "node")
+    code, out = run(repo, server, {"web/a.test.mjs": "import test from 'node:test';\nawait test('existing', () => {});\n"
+                                                     "/*\n// spec: ANYM-12\ntest('existing', () => {});\n*/\n"
+                                                     "const text = \"test('quoted', () => {})\";\n"
+                                                     "// test('line comment', () => {});\n"})
+    assert code == 0, out
+    assert "added tests 0" in out
+    code, out = run(repo, server, {"web/b.test.mjs": "// spec: ANYM-12\nawait test('awaited', () => {});\n\n"
+                                                     "test(\n  'multiline',\n  () => {},\n);\n",
+                                   "pkg/m_test.go": "package pkg\n\n// spec: ANYM-12\nfunc TestMulti(\n\tt *testing.T,\n) {}\n"
+                                                    "\n/*\nfunc TestCommented(t *testing.T) {}\n*/\n"},
+                    "Spec: ANYM-12")
+    assert code == 1
+    assert "web/b.test.mjs:2 awaited -> ANYM-12" in out and "web/b.test.mjs:4 multiline: no marker" in out
+    assert "pkg/m_test.go:4 TestMulti -> ANYM-12" in out and "TestCommented" not in out
+
+
+# spec: ANYM-405
+def test_javascript_titles_are_decoded_and_a_non_literal_name_fails_unless_it_existed(repo, server):
+    server.set(main=[spec(12)])
+    root, _ = repo
+    commit(root, {"web/c.test.mjs": "const name = 'x';\ntest(name, () => {});\n"}, "node")
+    code, out = run(repo, server, {
+        "web/c.test.mjs": "const name = 'x';\n\n// spec: ANYM-12\ntest(\"tab\\there \\u00e9 \\x41\", () => {});\n"
+                          "test(name, () => {});\n// spec: ANYM-12\ntest(`made ${name}`, () => {});\n"}, "Spec: ANYM-12")
+    assert code == 1
+    assert "web/c.test.mjs:4 tab\\there \\xe9 A -> ANYM-12" in out  # shown escaped in the log
+    assert pr_check.tests_in("web/c.test.mjs", "test('it\\'s \\u{1F600}\\\n done', () => {});\n") == [
+        ("it's \U0001F600 done", 0, "")]
+    assert "web/c.test.mjs:7 <`made ${name}`>: the test name is not a plain string literal" in out
+    assert "<name>" not in out  # the moved existing call is not new
+
+
+# spec: ANYM-405
+def test_nested_test_classes_and_parenthesized_decorators_take_their_markers(repo, server):
+    server.set(main=[spec(12)])
+    code, out = run(repo, server, {
+        "tests/test_n.py": "import pytest\n\n\nclass TestOuter:\n    class TestInner:\n        # spec: ANYM-12\n"
+                           "        def test_deep(self):\n            pass\n\n    # spec: ANYM-12\n    @(\n"
+                           "        pytest.mark.slow\n    )\n    def test_wrapped(self):\n        pass\n\n"
+                           "    def helper(self):\n        pass\n\n\nclass Helper:\n    def test_ignored(self):\n"
+                           "        pass\n"}, "Spec: ANYM-12")
+    assert code == 0, out
+    assert "test tests/test_n.py:7 TestOuter::TestInner::test_deep -> ANYM-12" in out
+    assert "test tests/test_n.py:11 TestOuter::test_wrapped -> ANYM-12" in out
+    assert "helper" not in out and "test_ignored" not in out

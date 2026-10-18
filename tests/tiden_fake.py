@@ -81,6 +81,8 @@ FAKE = textwrap.dedent(f"""\
         print(json.dumps(state["previews"][options["--name"]]))
     elif command == ("branch", "merge"):
         name = options["--name"]
+        if fault == "noop":
+            save(); print(json.dumps({{"merged": True}})); sys.exit(0)
         merged = {{spec["seqNum"]: spec for spec in state.get("branch_specs", {{}}).get(name, [])}}
         state["main"] = [spec for spec in state["main"] if spec["seqNum"] not in merged] + list(merged.values())
         for branch in state["branches"]:
@@ -91,6 +93,8 @@ FAKE = textwrap.dedent(f"""\
         rows = state.get("tests", [])
         print(json.dumps({{"view": "identity", "identities": rows,
                           "pagination": {{"nextPageToken": "", "totalCount": len(rows)}}}}))
+    elif command == ("test", "links") and fault == "malformed":
+        print(json.dumps({{"links": [{{"requirementId": []}}]}}))
     elif command == ("test", "links"):
         print(json.dumps({{"links": [{{"id": str(uuid.uuid4()), "testId": positional[0], "requirementId": spec}}
                                     for spec in state.get("links", {{}}).get(positional[0], [])], "readOnly": False}}))
@@ -107,10 +111,11 @@ FAKE = textwrap.dedent(f"""\
             state.setdefault("sent_sources", []).append(sources)
             if fault == "drop":
                 sources = sources[1:]
-            # As the server does: new record IDs, nested metadata dropped.
-            spec["sources"] = [{{**source, "id": str(uuid.uuid4()), "metadata": {{
-                key: value for key, value in (source.get("metadata") or {{}}).items()
-                if not isinstance(value, (dict, list))}}}} for source in sources]
+            if fault == "corrupt":
+                sources = [{{**sources[0], "excerpt": "changed"}}, *sources[1:]]
+            # As the server does on a direct update (checked 2026-10-19): new record IDs, every field and the nested
+            # metadata kept.
+            spec["sources"] = [{{**source, "id": str(uuid.uuid4())}} for source in sources]
         save(); print(json.dumps({{"id": spec["id"], "seqNum": spec["seqNum"]}}))
 """)
 GH = textwrap.dedent(f"""\

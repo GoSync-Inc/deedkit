@@ -8,16 +8,19 @@ validated. In order, each step reading back what it wrote:
    test or component change, conflict or blocking session;
 2. links: link each test the commit adds to the specs its `spec:` marker names, add-only;
 3. anchors: anchor each changed code file that no spec anchors to the primary (first named) spec, resending every
-   existing source with its provenance;
+   existing source with its provenance and comparing every source on read-back;
 4. status: set each `Delivers:` spec Done, or Review while its text holds an `[open: live]` or `[open: measured]`
    check.
 
 Every step is idempotent, so a rerun finishes what an earlier run left. Any mismatch fails the run and names the step;
-the author then does that step by hand on Tiden main and reruns.
+the author then does that step by hand on Tiden main and reruns. Runs must not overlap: the anchors step reads the
+spec again right before it replaces the source list, but only one writer at a time makes that safe (the workflow job
+uses one concurrency group).
 """
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from fnmatch import fnmatchcase
 import json
 import os
@@ -29,7 +32,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import REPOSITORY, Refused, excluded, shown, tiden  # noqa: E402
-from tiden_pr_check import (anchor_map, anchor_paths, branch_status, changed, diff_tests, language,  # noqa: E402
+from tiden_pr_check import (anchor_map, branch_status, changed, diff_tests, language,  # noqa: E402
                             listing, parse_body, story)
 
 SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
@@ -38,8 +41,12 @@ OPEN_CHECK = re.compile(r"\[open: (?:live|measured)\]")
 # Test files whose suite CI does not publish to Tiden, so a marked test there has no identity to link yet.
 UNPUBLISHED = (("*_test.go", "CI publishes no Go report to Tiden (ANYM-360)"),)
 SOURCE_FIELDS = ("sourceType", "title", "locator", "url", "repoPath", "repository", "lineStart", "lineEnd", "excerpt")
+# The merge-preview shape of CLI 0.33.0 (read 2026-10-19 from 62 open branches); empty fields may be omitted. Any
+# other key is a change this job cannot judge, so it refuses.
+PREVIEW_CHANGES = ("additions", "modifications")
 PREVIEW_EMPTY = ("deletions", "testAdditions", "testModifications", "testDeletions", "componentAdditions",
                  "componentModifications", "componentDeletions")
+PREVIEW_OTHER = ("stats", "intentSession", "blockingSessions", "hasRequirementChanges")
 TIMEOUT = 120
 
 
@@ -49,8 +56,8 @@ def write(cli: str, arguments: list[str], product: str | None) -> None:
     command = [cli, *arguments, *(["--product-id", product] if product else []), "--format", "json"]
     try:
         completed = subprocess.run(command, capture_output=True, text=True, timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise Refused(f"tiden {' '.join(arguments[:2])} timed out") from None
+    except (OSError, subprocess.SubprocessError):
+        raise Refused(f"tiden {' '.join(arguments[:2])} timed out or could not run") from None
     if completed.returncode:
         raise Refused(f"tiden {' '.join(arguments[:2])} exited {completed.returncode}")
 
@@ -60,8 +67,8 @@ def read(cli: str, arguments: list[str]) -> dict:
     try:
         completed = subprocess.run([cli, *arguments, "--format", "json"], capture_output=True, text=True,
                                    timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise Refused(f"tiden {' '.join(arguments[:2])} timed out") from None
+    except (OSError, subprocess.SubprocessError):
+        raise Refused(f"tiden {' '.join(arguments[:2])} timed out or could not run") from None
     if completed.returncode:
         raise Refused(f"tiden {' '.join(arguments[:2])} exited {completed.returncode}")
     try:
@@ -80,7 +87,11 @@ class StepFailed(Exception):
 
 
 def git(root: Path, *arguments: str) -> str:
-    completed = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, text=True, timeout=TIMEOUT)
+    try:
+        completed = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, text=True,
+                                   timeout=TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        raise Refused(f"git {arguments[0]} could not run") from None
     if completed.returncode:
         raise Refused(f"git {arguments[0]} exited {completed.returncode}")
     return completed.stdout
@@ -91,8 +102,8 @@ def pull_request(gh: str, repository: str, number: int) -> dict:
     try:
         completed = subprocess.run([gh, "api", f"repos/{repository}/pulls/{number}"], capture_output=True, text=True,
                                    timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise StepFailed("pr", f"reading pull request #{number} timed out") from None
+    except (OSError, subprocess.SubprocessError):
+        raise StepFailed("pr", f"reading pull request #{number} timed out or could not run") from None
     if completed.returncode:
         raise StepFailed("pr", f"reading pull request #{number} exited {completed.returncode}")
     try:
@@ -104,16 +115,42 @@ def pull_request(gh: str, repository: str, number: int) -> dict:
     return value
 
 
-def preview_numbers(item: object) -> int:
-    """The spec number of one merge-preview addition or modification, which may nest the branch copy."""
-    if isinstance(item, dict):
-        if type(item.get("seqNum")) is int:
-            return item["seqNum"]
-        for key in ("branch", "after", "requirement", "source", "main", "before"):
-            nested = item.get(key)
-            if isinstance(nested, dict) and type(nested.get("seqNum")) is int:
-                return nested["seqNum"]
-    raise StepFailed("merge", "the merge preview has a change without a spec number")
+def preview_number(item: object) -> int:
+    """The one spec number of a merge-preview addition or modification: its own `seqNum` and that of every nested
+    object (a modification may carry the main and branch copies) must agree."""
+    if not isinstance(item, dict):
+        raise StepFailed("merge", "the merge preview has a change that is not an object")
+    numbers = [item.get("seqNum")] + [value.get("seqNum") for value in item.values() if isinstance(value, dict)]
+    found = {number for number in numbers if number is not None}
+    if len(found) != 1 or not all(type(number) is int for number in found):
+        raise StepFailed("merge", "the merge preview has a change without exactly one spec number")
+    return found.pop()
+
+
+def preview_numbers(preview: dict, name: str) -> set[int]:
+    """The specs a merge preview changes; anything but additions and modifications of specs refuses."""
+    unknown = sorted(set(preview) - {*PREVIEW_CHANGES, *PREVIEW_EMPTY, *PREVIEW_OTHER})
+    if unknown:
+        raise StepFailed("merge", f"the preview of {name} has unknown fields ({', '.join(map(shown, unknown))})")
+    lists = {key: preview.get(key, []) for key in (*PREVIEW_CHANGES, *PREVIEW_EMPTY)}
+    if not all(isinstance(value, list) for value in lists.values()):
+        raise StepFailed("merge", f"the merge preview of {name} is malformed")
+    other = [key for key in PREVIEW_EMPTY if lists[key]]
+    stats = preview.get("stats", {})
+    if not isinstance(stats, dict) or not all(type(value) is int for value in stats.values()):
+        raise StepFailed("merge", f"the merge preview of {name} has malformed stats")
+    other += [f"stats.{key}" for key, value in stats.items() if value and key not in PREVIEW_CHANGES]
+    other += [f"stats.{key}" for key in PREVIEW_CHANGES if stats.get(key, len(lists[key])) != len(lists[key])]
+    if preview.get("intentSession") is not None:
+        other.append("intentSession")
+    if preview.get("blockingSessions") not in (None, 0, []):
+        other.append("blockingSessions")
+    if not isinstance(preview.get("hasRequirementChanges", True), bool):
+        other.append("hasRequirementChanges")
+    if other:
+        raise StepFailed("merge", f"the preview of {name} holds more than spec changes ({', '.join(other)}); "
+                                  "merge it by hand")
+    return {preview_number(item) for key in PREVIEW_CHANGES for item in lists[key]}
 
 
 def merge(cli: str, product: str, name: str, named: list[int], report, dry: bool = False) -> bool:
@@ -131,16 +168,7 @@ def merge(cli: str, product: str, name: str, named: list[int], report, dry: bool
         preview = tiden(cli, ["branch", "merge-preview", "--name", name], product)
     except Refused as error:
         raise StepFailed("merge", str(error)) from None
-    additions, modifications = preview.get("additions"), preview.get("modifications")
-    if not isinstance(additions, list) or not isinstance(modifications, list):
-        raise StepFailed("merge", "the merge preview is malformed")
-    numbers = {preview_numbers(item) for item in additions + modifications}
-    other = [key for key in PREVIEW_EMPTY if preview.get(key) not in (None, [])]
-    conflicts = (preview.get("stats") or {}).get("conflicts", 0)
-    blocking = preview.get("blockingSessions")
-    if other or conflicts != 0 or blocking not in (None, 0, []):
-        raise StepFailed("merge", f"the preview of {name} holds more than spec changes "
-                                  f"({', '.join(other) or 'conflicts or blocking sessions'}); merge it by hand")
+    numbers = preview_numbers(preview, name)
     stray = sorted(numbers - set(named))
     if stray or not numbers:
         raise StepFailed("merge", f"the preview of {name} changes " + (
@@ -177,8 +205,9 @@ def matches(rows: list[dict], path: str, name: str) -> list[dict]:
     """The Tiden cases CI imported for one test: a Python identity is `<module>[.<Class>]::<name>[<params>]`, a Node
     one is its file path and title."""
     if language(path) == "python":
-        cls, _, leaf = name.rpartition("::")
-        prefix = str(PurePosixPath(path).with_suffix("")).replace("/", ".") + (f".{cls}" if cls else "") + "::" + leaf
+        cls, _, leaf = name.rpartition("::")  # nested classes are `Outer::Inner`, dotted in the JUnit class name
+        prefix = (str(PurePosixPath(path).with_suffix("")).replace("/", ".") + (f".{cls.replace('::', '.')}" if cls
+                                                                                 else "") + "::" + leaf)
         return [row for row in rows if row.get("signature") == prefix
                 or str(row.get("signature", "")).startswith(prefix + "[")]
     return [row for row in rows if row.get("filePath") == path and row.get("title") == name]
@@ -187,9 +216,10 @@ def matches(rows: list[dict], path: str, name: str) -> list[dict]:
 def linked(cli: str, test: str) -> set[str]:
     value = read(cli, ["test", "links", test])
     links = value.get("links", [])
-    if not isinstance(links, list) or not all(isinstance(link, dict) for link in links):
+    if not isinstance(links, list) or not all(isinstance(link, dict) and isinstance(link.get("requirementId"), str)
+                                              for link in links):
         raise Refused("the test links are malformed")
-    return {link.get("requirementId") for link in links}
+    return {link["requirementId"] for link in links}
 
 
 def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry: bool = False) -> None:
@@ -238,10 +268,11 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
         raise StepFailed("links", "; ".join(missing))
 
 
+# The source update regenerates record IDs, so each resent source keeps its original ID, and its complete original
+# metadata when that nests objects, in provenance receipts (docs/operations/tiden-product-workflow.md, Reconciliation
+# and maintenance). The metadata itself is resent whole: a direct update keeps nested values (checked 2026-10-19).
 def resent(source: dict) -> dict:
-    """An existing source as the update must resend it: its fields, and its record ID and any nested metadata kept in
-    provenance receipts, because the update regenerates source IDs and drops nested metadata
-    (docs/operations/tiden-product-workflow.md); an existing receipt is never overwritten."""
+    """An existing source as the update must resend it; an existing receipt is never overwritten."""
     value = {key: source[key] for key in SOURCE_FIELDS if source.get(key) is not None}
     original: dict = source["metadata"] if isinstance(source.get("metadata"), dict) else {}
     metadata = dict(original)
@@ -249,15 +280,17 @@ def resent(source: dict) -> dict:
         metadata["historical_source_id"] = source["id"]
     if any(isinstance(item, (dict, list)) for item in original.values()) and "historical_metadata_json" not in metadata:
         metadata["historical_metadata_json"] = json.dumps(original, separators=(",", ":"), sort_keys=True)
-        metadata = {key: item for key, item in metadata.items() if not isinstance(item, (dict, list))}
     if metadata:
         value["metadata"] = metadata
     return value
 
 
-def identity(source: dict) -> tuple:
-    return tuple(source.get(key) for key in ("sourceType", "repoPath", "repository", "locator", "lineStart", "lineEnd",
-                                             "title", "url"))
+def normalized(source: dict) -> str:
+    """A source as comparable text: every field, an empty string and an absent field alike, and the whole metadata;
+    record IDs and timestamps are left out because the update regenerates them."""
+    fields = {key: (None if source.get(key) in (None, "") else source[key]) for key in SOURCE_FIELDS}
+    metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+    return json.dumps([fields, metadata], sort_keys=True)
 
 
 def anchor(cli: str, product: str, paths: list[str], primary: int | None, main: dict[int, dict], sha: str, pr: int,
@@ -269,6 +302,13 @@ def anchor(cli: str, product: str, paths: list[str], primary: int | None, main: 
         return
     if primary is None:
         raise StepFailed("anchors", "the body names no spec for " + ", ".join(shown(path) for path in missing))
+    if not dry:
+        main = listing(cli, product, "main")  # fresh, right before the whole source list is replaced
+        anchors = anchor_map(main)
+        missing = [path for path in paths if path not in anchors]
+        if not missing:
+            report(f"anchors: all {len(paths)} changed code file(s) are anchored.")
+            return
     spec = main.get(primary)
     if spec is None or not story(spec):
         raise StepFailed("anchors", f"the primary spec ANYM-{primary} is not a story-level spec on Tiden main")
@@ -291,13 +331,12 @@ def anchor(cli: str, product: str, paths: list[str], primary: int | None, main: 
         os.unlink(stream.name)
     if after is None:
         raise StepFailed("anchors", f"read-back: ANYM-{primary} is gone from Tiden main")
-    kept = {identity(source) for source in after.get("sources", [])}
-    lost = [source for source in before if identity(source) not in kept]
-    absent = [path for path in missing if path not in anchor_paths(after)]
-    if lost or absent or len(after.get("sources", [])) != len(sources):
-        raise StepFailed("anchors", f"read-back of ANYM-{primary}: {len(lost)} source(s) lost, "
-                                    f"{len(absent)} anchor(s) absent, {len(after.get('sources', []))} of "
-                                    f"{len(sources)} sources")
+    expected, actual = Counter(map(normalized, sources)), Counter(map(normalized, after.get("sources", [])))
+    if expected != actual:
+        raise StepFailed("anchors", f"read-back of ANYM-{primary}: {sum((expected - actual).values())} sent source(s) "
+                                    f"missing or changed, {sum((actual - expected).values())} unexpected; "
+                                    f"check and repair "
+                                    f"the sources of ANYM-{primary} by hand")
     report(f"anchors: {len(missing)} file(s) anchored to ANYM-{primary}: " + ", ".join(shown(p) for p in missing))
 
 
@@ -352,16 +391,19 @@ def sync(root: Path, sha: str, number: int, body: str, cli: str, product: str, r
     unknown = [n for n in lines.named if n not in main]
     if unknown:
         failures.append(StepFailed("resolve", ", ".join(f"ANYM-{n}" for n in unknown) + " not on Tiden main"))
-    steps = (lambda: link(cli, product, tests, main, report, dry),
-             lambda: anchor(cli, product, code, lines.named[0] if lines.named else None, main, sha, number, report, dry),
-             lambda: settle_status(cli, product, lines.delivers, main, report, dry))
-    for step in steps:
+    steps = (("links", lambda: link(cli, product, tests, main, report, dry)),
+             ("anchors", lambda: anchor(cli, product, code, lines.named[0] if lines.named else None, main, sha, number,
+                                        report, dry)),
+             ("status", lambda: settle_status(cli, product, lines.delivers, main, report, dry)))
+    for name, step in steps:
         try:
             step()
         except StepFailed as error:
             failures.append(error)
         except Refused as error:
-            failures.append(StepFailed("tiden", str(error)))
+            failures.append(StepFailed(name, str(error)))
+        except Exception as error:  # noqa: BLE001 - one step's defect must not silence the others
+            failures.append(StepFailed(name, f"unexpected {type(error).__name__}"))
     if failures:
         for failure in failures:
             report(f"Failed at step {failure.step}: {failure}")
@@ -429,6 +471,9 @@ def main() -> int:
         return 1
     except Refused as error:
         report(f"Refused: {error}")
+        return 1
+    except Exception as error:  # noqa: BLE001 - fail loudly without echoing data the error may hold
+        report(f"Refused: unexpected {type(error).__name__}")
         return 1
 
 
