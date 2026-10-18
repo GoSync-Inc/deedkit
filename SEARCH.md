@@ -10,6 +10,26 @@ Inside a list "or" applies; between lists and the earlier single filters —
 the dimension, `[]` returns an empty result. A foreign ID in a list does not widen permissions.
 A sender ID belongs to the source/account; a match of strings does not merge people.
 
+Channels are excluded from `search` by default, so news posts do not crowd out
+conversations. Pass `include_channels: true`, a `chat_types` list containing
+`channel`, or name the chat with `chat`/`chats` to search channels; `get_messages`
+and `get_context` read a channel as before. `chat_types` takes `private`, `group`,
+`channel` and `unknown` (a chat without a stored type is `unknown`), the same values
+as `list_chats`: "or" inside the list, "and" with the other filters and with
+`exclude_channels`; `[]` returns an empty result and another value returns
+`invalid_filter`. `include_channels: true` together with `exclude_channels: true` or
+a `chat_types` list without `channel` is also `invalid_filter`. A `chat_types` list,
+`include_channels: true` or `exclude_channels: true` turns a chronological archive
+`next_cursor` from a bare message ID into an opaque cursor bound to the effective set of
+types and to `include_channels: true`; continuing with another set, or adding or dropping
+`include_channels: true` even with the same list, returns `invalid_cursor`. Only the same
+normalized filter continues, for example dropping `exclude_channels: true` under the default. Relevance, fuzzy and
+conversation cursors are always bound, and those issued before this filter existed
+return `invalid_cursor` once: restart the search. Without named chats,
+`result_evidence` counts only chats of the searched types; an empty effective set is
+`empty_filter`.
+`capabilities.search_options.search_channels_default` states the default.
+
 `query_mode`:
 
 - `all` by default: all words in any order;

@@ -240,7 +240,9 @@ class Store:
                 'key_permission_version':p['key_permission_version'],
                 'chat_scope':{'all_in_permitted_accounts':p['chat_ids'] is None,'chat_ids':p['chat_ids']},
                 'auth_mode': 'managed_bearer_keys',
-                'search_options':{'filters':['accounts','chats','senders','from_time','to_time','direction','exclude_channels'],
+                'search_options':{'filters':['accounts','chats','senders','from_time','to_time','direction','exclude_channels',
+                        'chat_types','include_channels'],
+                    'search_channels_default':'excluded_unless_include_channels_chat_types_or_named_chats',
                     'query_modes':['all','phrase','web','exact'],'orders':['asc','desc','relevance'],
                     'languages':['auto','simple','russian','english','indonesian'],
                     'fuzzy':'explicit_bounded_fallback','compact':True,'optional_coverage':True,
@@ -509,12 +511,16 @@ class Store:
     def search(self, token, query='', account='', chat='', sender='', from_time='',
                to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None,
                query_mode='all', order='asc', before='', direction='', search_language='auto',
-               fuzzy=False, compact=False, body_chars=None, include_coverage=True,view='archive',include_system=False,exclude_channels=False):
+               fuzzy=False, compact=False, body_chars=None, include_coverage=True,view='archive',include_system=False,exclude_channels=False,
+               chat_types=None,include_channels=False):
+        # None is the internal no-default sentinel of message_queries.search, never a public value.
+        if type(include_channels) is not bool:raise APIError('invalid_filter')
         with self.authorized(token,'search') as (c,p):
             return self._search(c,p,query,account,chat,sender,from_time,to_time,after,limit,
                 accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,
                 order=order,before=before,direction=direction,search_language=search_language,
-                fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels)
+                fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
+                chat_types=chat_types,include_channels=include_channels)
 
     def _search(self,c,p,*args,**kwargs):
         from .message_queries import search

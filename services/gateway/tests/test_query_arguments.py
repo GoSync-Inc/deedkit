@@ -22,6 +22,17 @@ def test_query_additions_validate_and_keep_legacy_defaults():
             arguments(tool, values)
 
 
+# spec: ANYM-272
+def test_search_chat_types_validate_and_include_channels_defaults_false():
+    search = CATALOG["messages_search"]
+    assert arguments(search, {})["include_channels"] is False
+    assert arguments(search, {})["chat_types"] is None
+    assert arguments(search, {"chat_types": ["private", "channel"]})["chat_types"] == ["private", "channel"]
+    for values in ({"chat_types": ["dm"]}, {"chat_types": "private"}, {"include_channels": 1}):
+        with pytest.raises(ValueError):
+            arguments(search, values)
+
+
 @pytest.mark.parametrize("tool,values", [
     ("messages_search", {"query": "synthetic", "exclude_channels": True}),
     ("messages_get_updates", {"consumer": "synthetic-new", "start_from": "now"}),

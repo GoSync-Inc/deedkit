@@ -430,3 +430,122 @@ def test_a_null_origin_re_read_keeps_the_stored_origin(forwards):
         metadata={'forwarded':True,'forward_origin':None}))['outcome']=='unchanged'
     key=s.issue_key('forward-reader',['forward-tg'])
     assert s.search(key,'synthetic forwarded')['items'][0]['forward_origin']==ORIGIN
+
+
+def typed_chats(s):
+    """One hit per chat type in agent-b's account, plus a channel hit outside its scope."""
+    rows=[('typed-private','telegram-demo','private'),('typed-group','telegram-demo','group'),
+        ('typed-channel','telegram-demo','channel'),('typed-null','telegram-demo',None),
+        ('typed-hidden','whatsapp-demo-2','channel')]
+    with s.pool.connection() as c:
+        for chat,account,kind in rows:
+            c.execute('INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,%s,%s,%s)',
+                (chat,account,'Synthetic '+chat,chat,kind))
+    for day,(chat,account,_) in enumerate(rows,start=10):
+        add(s,chat+'-hit','typedneedle synthetic report',account=account,chat=chat,day=day)
+
+
+def hits(result):
+    return [r['id'] for r in result['items']]
+
+
+# spec: ANYM-272
+def test_search_chat_types_private_only(seeded):
+    s,a,b=seeded
+    typed_chats(s)
+    assert hits(s.search(b,'typedneedle',chat_types=['private']))==['typed-private-hit']
+    assert hits(s.search(b,'typedneedle',chat_types=['group','channel']))==['typed-group-hit','typed-channel-hit']
+    assert hits(s.search(b,'typedneedle',chat_types=[]))==[]
+    assert hits(s.search(b,'typedneedle',chat_types=['private'],exclude_channels=True))==['typed-private-hit']
+    assert hits(s.search(b,'typedneedle',chat_types=['private','channel'],exclude_channels=True))==['typed-private-hit']
+    assert hits(s.search(b,'typedneedle',chat_types=['group'],chats=['typed-private']))==[]
+
+
+# spec: ANYM-272
+def test_search_chat_types_unknown_and_invalid(seeded):
+    s,a,b=seeded
+    typed_chats(s)
+    assert hits(s.search(b,'typedneedle',chat_types=['unknown']))==['typed-null-hit']
+    for value in (['dm'],'private',[1],['private']*101):
+        with pytest.raises(APIError,match='invalid_filter'):s.search(b,'typedneedle',chat_types=value)
+    for options in ({'include_channels':1},{'include_channels':None},{'include_channels':True,'exclude_channels':True},
+            {'include_channels':True,'chat_types':['private']}):
+        with pytest.raises(APIError,match='invalid_filter'):s.search(b,'typedneedle',**options)
+
+
+# spec: ANYM-272
+@pytest.mark.parametrize('order',['asc','desc','relevance'])
+def test_search_chat_types_cursor_binding(seeded,order):
+    s,a,b=seeded
+    typed_chats(s)
+    types=['private','group','channel','unknown']
+    page=s.search(b,'typedneedle',chat_types=types,order=order,limit=1)
+    assert page['next_cursor'].startswith('q1.')
+    seen=hits(page)
+    while page['next_cursor']:
+        cursor=page['next_cursor']
+        page=s.search(b,'typedneedle',chat_types=types,order=order,limit=1,after=cursor)
+        seen.extend(hits(page))
+    assert sorted(seen)==sorted(set(seen))==['typed-channel-hit','typed-group-hit','typed-null-hit','typed-private-hit']
+    if order!='relevance':
+        assert seen==['typed-private-hit','typed-group-hit','typed-channel-hit','typed-null-hit'][::1 if order=='asc' else -1]
+    first=s.search(b,'typedneedle',chat_types=types,order=order,limit=1)['next_cursor']
+    for options in ({'chat_types':['private']},{},{'include_channels':True},{'chat_types':types,'exclude_channels':True}):
+        with pytest.raises(APIError,match='invalid_cursor'):
+            s.search(b,'typedneedle',order=order,limit=1,after=first,**options)
+
+
+# spec: ANYM-272
+def test_search_chat_types_respect_chat_scope(seeded):
+    s,a,b=seeded
+    typed_chats(s)
+    result=s.search(b,'typedneedle',chat_types=['channel'])
+    assert hits(result)==['typed-channel-hit']
+    assert result['result_evidence']['chats_considered']==1
+    s.set_access('agent-b',chats=['typed-private'])
+    result=s.search(b,'typedneedle',chat_types=['channel'])
+    assert hits(result)==[] and result['result_evidence']['chats_considered']==0
+    assert 'typed-hidden' not in str(result)
+    assert hits(s.search(b,'typedneedle',include_channels=True))==['typed-private-hit']
+
+
+# spec: ANYM-272
+@pytest.mark.parametrize('options',[{'chat':'typed-channel','chat_types':[]},{'chats':['typed-channel'],'chat_types':[]},
+    {'chats':['typed-channel'],'chat_types':['channel'],'exclude_channels':True}],ids=['chat','chats','excluded-channel'])
+def test_search_named_chat_with_empty_type_filter_reports_empty_filter(seeded,options):
+    s,a,b=seeded
+    typed_chats(s)
+    evidence=s.search(b,'typedneedle',**options)['result_evidence']
+    assert evidence['empty_reason']=='empty_filter' and evidence['next_action']=='inspect_chat_coverage'
+
+
+# spec: ANYM-272
+def test_search_chat_types_in_capabilities_and_catalog(seeded):
+    import json
+    from pathlib import Path
+    s,a,b=seeded
+    options=s.capabilities(b)['search_options']
+    assert {'chat_types','include_channels','exclude_channels'}<=set(options['filters'])
+    assert options['search_channels_default']=='excluded_unless_include_channels_chat_types_or_named_chats'
+    catalog=json.loads((Path(__file__).resolve().parents[1]/'services/gateway/src/agent_gateway/catalog.json').read_text())
+    schema=next(t for t in catalog if t['name']=='messages_search')['inputSchema']['properties']
+    assert schema['include_channels']['default'] is False
+    assert schema['chat_types']['anyOf'][0]['items']['enum']==['private','group','channel','unknown']
+
+
+# spec: ANYM-272
+def test_search_excludes_channels_by_default(seeded):
+    s,a,b=seeded
+    typed_chats(s)
+    assert hits(s.search(b,'typedneedle'))==['typed-private-hit','typed-group-hit','typed-null-hit']
+    assert 'typed-channel-hit' in hits(s.search(b,'typedneedle',include_channels=True))
+    assert hits(s.search(b,'typedneedle',chat_types=['channel']))==['typed-channel-hit']
+    assert hits(s.search(b,'typedneedle',order='relevance'))==hits(s.search(b,'typedneedle',order='relevance',
+        chat_types=['private','group','unknown']))
+    # A named chat is an explicit choice; reading one chat is not a search.
+    assert hits(s.search(b,'typedneedle',chats=['typed-channel','typed-private']))==['typed-private-hit','typed-channel-hit']
+    assert hits(s.search(b,'typedneedle',chat='typed-channel'))==['typed-channel-hit']
+    assert hits(s.get_messages(b,'typed-channel'))==['typed-channel-hit']
+    page=s.search(b,'typedneedle',limit=1)
+    assert page['next_cursor']=='typed-private-hit'
+    assert hits(s.search(b,'typedneedle',limit=5,after=page['next_cursor']))==['typed-group-hit','typed-null-hit']
