@@ -276,3 +276,60 @@ func TestNativeViewOnceRoundVideoStaysUnretainedAfterCacheReload(t *testing.T) {
 		})
 	}
 }
+
+// Records written before the view-once flag was persisted lost the restriction
+// of flag-only and wrapped-edit events, so a cached round video in that format
+// keeps the attachment-free projection it was originally captured with.
+func TestNativeRoundVideoInPreUpgradeCacheRecordStaysAttachmentFree(t *testing.T) {
+	image := fixtureMessage("legacy-image", 1700000000)
+	image.Message = &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(64)}}
+	for name, c := range map[string]struct {
+		m      *events.Message
+		legacy bool
+		media  bool
+	}{
+		"legacy_round_video":  {ptvMessage("legacy-round"), true, false},
+		"legacy_image":        {image, true, true},
+		"current_round_video": {ptvMessage("current-round"), false, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := openTestStore(t)
+			c.m.RawMessage = c.m.Message
+			raw, err := marshalMessage(c.m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.legacy {
+				wire, _ := proto.Marshal(c.m.RawMessage)
+				raw, _ = json.Marshal(struct {
+					Info   types.MessageInfo
+					Wire   []byte
+					Web    []byte
+					IsEdit bool
+				}{Info: c.m.Info, Wire: wire})
+			}
+			envelope, err := captureEnvelope("test", c.m, types.EmptyJID, "live")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = s.append(LegacyChatID(c.m.Info.Chat), LegacyMessageID(c.m), c.m.Info.Timestamp.Unix(), raw, envelope, false); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := s.Get(LegacyChatID(c.m.Info.Chat), LegacyMessageID(c.m))
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, err := NormalizeMessage(loaded, types.EmptyJID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, descriptorErr := nativeMediaMetadata(loaded)
+			if v["hasMedia"] != c.media || (descriptorErr == nil) != c.media {
+				t.Fatalf("hasMedia=%v descriptor=%v, want media %v", v["hasMedia"], descriptorErr, c.media)
+			}
+			if c.legacy && !c.media && (v["messageType"] != "unknown" || v["durationSeconds"] != nil) {
+				t.Fatalf("legacy round video projection changed: %v", v)
+			}
+		})
+	}
+}

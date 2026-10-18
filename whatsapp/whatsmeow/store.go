@@ -44,7 +44,8 @@ type savedMessage struct {
 	IsEdit bool
 	// An edit or flag-only event carries view-once without its wire wrapper;
 	// the restriction must survive the cache so a reload never retains media.
-	IsViewOnce bool `json:",omitempty"`
+	// New records always set it; nil marks a record written before it existed.
+	IsViewOnce *bool `json:",omitempty"`
 }
 
 func sqliteDSN(path string) string {
@@ -205,7 +206,8 @@ func marshalMessage(e *events.Message) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return json.Marshal(savedMessage{Info: e.Info, Wire: wire, Web: web, IsEdit: e.IsEdit, IsViewOnce: e.IsViewOnce})
+	viewOnce := e.IsViewOnce
+	return json.Marshal(savedMessage{Info: e.Info, Wire: wire, Web: web, IsEdit: e.IsEdit, IsViewOnce: &viewOnce})
 }
 func unmarshalMessage(b []byte) (*events.Message, error) {
 	var saved savedMessage
@@ -220,7 +222,13 @@ func unmarshalMessage(b []byte) (*events.Message, error) {
 		}
 		msg.UnwrapRaw()
 	}
-	msg.IsViewOnce = msg.IsViewOnce || saved.IsViewOnce
+	if saved.IsViewOnce != nil {
+		msg.IsViewOnce = msg.IsViewOnce || *saved.IsViewOnce
+	} else if msg.Message.GetPtvMessage() != nil {
+		// An older record cannot tell a view-once round video from an ordinary
+		// one; it keeps the attachment-free projection it was captured with.
+		msg.Message.PtvMessage = nil
+	}
 	if len(saved.Web) > 0 {
 		msg.SourceWebMsg = &waWeb.WebMessageInfo{}
 		if e := proto.Unmarshal(saved.Web, msg.SourceWebMsg); e != nil {
