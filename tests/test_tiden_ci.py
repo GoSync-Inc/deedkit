@@ -1427,7 +1427,8 @@ def test_a_failed_tiden_publication_warns_and_never_fails_the_reporting_job(tmp_
     assert all("timeout-minutes" in step for step in steps.values())
     assert sum(step["timeout-minutes"] for step in steps.values()) + 2 <= job["timeout-minutes"]
     # The release record learns from this output whether the publication was verified.
-    assert job["outputs"]["published"] == "${{ steps.publish.outcome == 'success' }}"
+    assert job["outputs"]["published"] == ("${{ steps.publish.outcome == 'success' "
+                                           "&& steps.publish.outputs.verified == 'true' }}")
     assert list(steps).index(warn) == list(steps).index(publication) + 1
     assert steps[warn]["if"] == ("${{ always() && steps.config.outputs.enabled == 'true' && "
                                  "(steps.install.outcome != 'success' || steps.publish.outcome != 'success') }}")

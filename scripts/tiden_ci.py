@@ -698,6 +698,10 @@ def main() -> int:
         result = publish(directory, manifest, branch, os.environ["TIDEN_PRODUCT_ID"], routed=routed,
                          workspace=os.environ.get("TIDEN_WORKSPACE_ID", ""))
     print(json.dumps({k: result[k] for k in ("seqNum", "status", "branchName", "branchId", "buildSha", "stats", "liveDocStatus")}))
+    if result["status"] == "passed" and os.environ.get("GITHUB_OUTPUT"):
+        # Only a verified passed run counts as published; a skip published nothing (ci.yml release record).
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write("verified=true\n")
     return 0 if result["status"] in {"passed", "skipped"} else 1
 
 

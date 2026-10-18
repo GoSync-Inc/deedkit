@@ -487,6 +487,22 @@ def test_the_push_run_publishes_the_queue_evidence_to_main_under_its_own_run_url
     assert all((published / name).read_bytes() == (evidence / name).read_bytes() for name in ci_reuse.EVIDENCE_FILES)
 
 
+def test_only_a_verified_passed_publication_reports_itself_published(tmp_path, monkeypatch):
+    _, published = published_evidence(tmp_path)
+    output = tmp_path / "github-output"
+    output.touch()
+    code, _ = tiden_main(monkeypatch, published, {"GITHUB_OUTPUT": str(output)}, "publish")
+    assert code == 0 and output.read_text() == "verified=true\n"
+    # A skipped publication (an unlinked pull request) exits 0 but published nothing, and a failed verdict exits 1.
+    for status, exit_code in (("skipped", 0), ("failed", 1)):
+        output.write_text("")
+        monkeypatch.setattr(tiden_ci, "publish", lambda *args, status=status, **kwargs: {
+            "seqNum": None, "status": status, "branchName": None, "branchId": None, "buildSha": SHA, "stats": {},
+            "liveDocStatus": None})
+        code, _ = tiden_main(monkeypatch, published, {"GITHUB_OUTPUT": str(output)}, "publish")
+        assert code == exit_code and output.read_text() == ""
+
+
 def test_the_push_run_records_the_release_under_its_own_run_url(tmp_path, monkeypatch):
     _, published = published_evidence(tmp_path)
     monkeypatch.setattr(tiden_ci, "GATE_SETTLE", tiden_ci.timedelta(0))

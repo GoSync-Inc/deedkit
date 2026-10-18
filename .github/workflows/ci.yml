@@ -302,7 +302,7 @@ jobs:
         if: ${{ always() }}
         run: docker logout ghcr.io
   release:
-    # After every verification job and the image publication have passed, so no release is
+    # Runs after every verification job and the image publication passed, so no release is
     # recorded for a SHA whose images were not published. Tiden captures a release gate from the
     # main gate when the release is first created (TIDEN-CI.md), so a commit whose evidence
     # publication was not verified records nothing and warns.

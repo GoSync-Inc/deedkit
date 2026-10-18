@@ -40,7 +40,7 @@ on:
         description: The pull request merge commit the docs-only decision classified
         value: ${{ jobs.documentation.outputs.docs_sha }}
       tiden_published:
-        description: Whether the Tiden publication of this run's evidence was verified
+        description: Whether a passed Tiden run of this run's evidence was published and verified (not a skip)
         value: ${{ jobs.tiden.outputs.published }}
     secrets:
       TIDEN_API_TOKEN:
@@ -655,7 +655,7 @@ jobs:
     # failure, which only warns, and never as a cancelled job.
     timeout-minutes: 20
     outputs:
-      published: ${{ steps.publish.outcome == 'success' }}
+      published: ${{ steps.publish.outcome == 'success' && steps.publish.outputs.verified == 'true' }}
     steps:
       - name: Check optional Tiden configuration
         id: config

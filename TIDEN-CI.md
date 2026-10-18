@@ -105,10 +105,14 @@ The run's evidence in Tiden is then unverified. Tiden may hold no run for the
 commit, a partial one or a completed run whose association or counts were not
 confirmed. A main commit records no release (the release record warns), and
 `production.py verify` does not require the publication, so the commit stays
-promotable. Two checks catch it. On a pull request, the intent close finds no
-verified run for the commit. After a merge, the agent that merged it reads the
-`main` push run of the squash before reporting the merge as checked. When that
-run's reporting job warned, the agent reruns it with **Re-run all jobs**.
+promotable. The agent reads the run itself, because no Tiden check is sure to
+notice: a publication that failed after Tiden completed its run leaves a run
+that reads as passed, and the intent close reads the product's latest run,
+which may be another pull request's. On a pull request, the author reads its
+last run's reporting job before `tiden intent close`. After a merge, the agent
+that merged it reads the `main` push run of the squash before reporting the
+merge as checked. When the reporting job warned, the agent reruns that run with
+**Re-run all jobs**.
 `Tiden health` measures only the current `main` head, and drift reads only
 anchors, so neither replaces that read. Republishing always takes **Re-run all
 jobs**, the full suite: the reporting job no longer fails, so **Re-run failed
