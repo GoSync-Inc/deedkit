@@ -71,6 +71,20 @@ MAX_RUN_PAGES = 10
 PUBLICATION = "publication.json"
 PUBLISHED_CHECKS = "ci-checks-published.json"
 PRODUCER_FIELDS = ("repository", "workflow", "run_id", "run_attempt", "url", "artifact_id", "artifact_digest", "sha")
+# The PR→queue chain: the queue run reused a pull request run of exactly this tree, and the push run publishes that
+# pull request run's evidence; `tree` is the git tree hash both commits have (scripts/ci_reuse.py adopt_chain).
+CHAIN_FIELDS = ("pull_request", "head_branch", "queue_run_id", "queue_run_attempt", "tree")
+
+
+def checkout_tree(sha: str) -> str:
+    """The git tree hash of this checkout's commit, which must be exactly `sha`; empty when it cannot be read."""
+    def git(*arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(Path(__file__).resolve().parents[1]), *arguments], check=True,
+                              capture_output=True, text=True, timeout=60).stdout.strip()
+    try:
+        return git("rev-parse", "--verify", "HEAD^{tree}") if git("rev-parse", "--verify", "HEAD") == sha else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def source_path(value: str, root: Path) -> str:
@@ -322,6 +336,11 @@ def published_manifest(directory: Path, manifest: dict) -> dict:
     environment, and its producer must be a ci.yml run attempt of this repository whose evidence, of that commit,
     lies beside it. Test executions, outcomes and identities stay the queue run's; the event,
     Git branch, CI URL and check row IDs become this push run's, and `tested_in` names the queue run attempt.
+
+    A record with a `chain` instead names the pull request run the queue reused: its evidence is of the merge commit
+    that run tested, of the record's head branch, and is accepted only when the record's git tree hash is exactly
+    the tree of this checkout's commit, which must be the push commit. The published manifest then names the push
+    commit, and `tested_sha` the tested merge commit.
     """
     if not (directory / PUBLICATION).exists() and not (directory / PUBLICATION).is_symlink():
         return manifest
@@ -333,13 +352,30 @@ def published_manifest(directory: Path, manifest: dict) -> dict:
         producer = record["producer"]
         producer_url = "https://github.com/{}/actions/runs/{}/attempts/{}".format(
             repository, producer["run_id"], producer["run_attempt"])
+        chain = record.get("chain")
+        if chain is None:
+            tested = sha
+            source = producer["sha"] == manifest.get("sha") == sha and merge_queue_run(manifest)
+        else:
+            tested = producer["sha"]
+            source = (isinstance(chain, dict) and set(chain) == set(CHAIN_FIELDS) and set(record) == {
+                          "schema", "event", "git_branch", "repository", "run_id", "run_attempt", "sha", "ci_url",
+                          "producer", "chain"}
+                      and all(isinstance(chain[key], str) for key in CHAIN_FIELDS)
+                      and chain["pull_request"].isdigit() and chain["queue_run_id"].isdigit()
+                      and chain["queue_run_attempt"].isdigit() and chain["head_branch"] != ""
+                      and isinstance(tested, str) and re.fullmatch(r"[a-f0-9]{40}", tested) is not None
+                      and tested == manifest.get("sha") != sha and manifest.get("event") == "pull_request"
+                      and manifest.get("git_branch") == chain["head_branch"] and not merge_queue_run(manifest)
+                      and re.fullmatch(r"[a-f0-9]{40}", chain["tree"]) is not None
+                      and checkout_tree(sha) == chain["tree"])
         valid = ((event, ref) == ("push", "refs/heads/main") and bool(RUN_ATTEMPT_URL.fullmatch(ci_url))
                  and re.fullmatch(r"[a-f0-9]{40}", sha) is not None
                  and {key: record.get(key) for key in ("schema", "event", "git_branch", "repository", "run_id",
                                                        "run_attempt", "sha", "ci_url")}
                  == {"schema": 1, "event": "push", "git_branch": "main", "repository": repository, "run_id": run_id,
                      "run_attempt": attempt, "sha": sha, "ci_url": ci_url}
-                 and producer["sha"] == manifest.get("sha") == sha and merge_queue_run(manifest)
+                 and source
                  and set(producer) == set(PRODUCER_FIELDS) and producer["repository"] == repository
                  and producer["workflow"] == ".github/workflows/ci.yml"
                  and str(producer["run_id"]).isdigit() and str(producer["run_attempt"]).isdigit()
@@ -353,11 +389,13 @@ def published_manifest(directory: Path, manifest: dict) -> dict:
     except (ValueError, KeyError, TypeError, AttributeError, IndexError):
         valid = False
     if not valid:
-        raise ValueError("the publication record does not name this main push run and its merge queue evidence")
+        raise ValueError("the publication record does not name this main push run and its merge queue evidence, "
+                         "or the pull request evidence of exactly this commit's tree")
     (directory / PUBLISHED_CHECKS).write_text(json.dumps(published, indent=2))
     reports = [name for name in manifest["reports"] if name != "ci-checks.json"] + [PUBLISHED_CHECKS]
+    chained = {"sha": sha, "tested_sha": tested} if tested != sha else {}
     return {**manifest, "event": "push", "git_branch": "main", "tiden_branch": "", "pr_tiden_links": [],
-            "ci_url": ci_url, "tested_in": producer["url"], "reports": reports}
+            "ci_url": ci_url, "tested_in": producer["url"], "reports": reports, **chained}
 
 
 def resolve_branch(manifest: dict, mapping: dict) -> str:

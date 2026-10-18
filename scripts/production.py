@@ -28,6 +28,12 @@ REQUIRED_JOBS = {"checks / verify", "native / synthetic", "images / build (backu
 # A main push run may skip only this job, and only when the merge queue verified the exact commit (ANYM-321).
 QUEUE_VERIFIED_JOB = "checks / verify"
 QUEUE_BRANCH_PREFIX = "gh-readonly-queue/main/"
+# A merge queue run that skipped `checks / verify` because this job validated a full pull request run of exactly its
+# tree (ANYM-358): promotion follows that chain to the pull request run, whose jobs below must have passed.
+QUEUE_PR_REUSE_JOB = "Reuse the pull request verification"
+PULL_REQUEST_JOBS = ("checks / verify", "checks / load", "checks / evidence", "CI gate")
+# The merge queue names a group of main after the pull request it tests last: pr-<number>-<group base SHA>.
+QUEUE_GROUP_BRANCH = re.compile(re.escape(QUEUE_BRANCH_PREFIX) + r"pr-([1-9][0-9]*)-[0-9a-f]{40}")
 MAX_PAGES = 10
 MIN_FREE_BYTES = 15 * 1024**3
 BUILDS = {
@@ -56,6 +62,10 @@ IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 class Refused(RuntimeError):
     pass
+
+
+class QueueSkipped(Refused):
+    """The merge queue run passed with `checks / verify` skipped: a pull request reuse or a docs-only decision."""
 
 
 class Busy(Refused):
@@ -164,12 +174,55 @@ def queue_verification(sha, get):
             or queue.get("head_repository", {}).get("full_name") != REPOSITORY):
         raise Refused("latest merge queue run is not a completed success of this repository's main queue for this commit")
     jobs = attempt_jobs(queue, get)
+    if job_concluded(jobs, QUEUE_VERIFIED_JOB, "skipped") and job_concluded(jobs, "CI gate"):
+        raise QueueSkipped(f"merge queue job did not pass: {QUEUE_VERIFIED_JOB}")
     for required in (QUEUE_VERIFIED_JOB, "CI gate"):
         if not job_concluded(jobs, required):
             raise Refused(f"merge queue job did not pass: {required}")
     if not unchanged(queue, latest_run(sha, "merge_group", get)):
         raise Refused("the merge queue run changed while it was being verified")
     return queue
+
+
+def queue_chain(sha, get):
+    """The merge queue run that reused a full pull request run for this commit, and that pull request run.
+
+    Returns (queue run, pull request run, pull request number, head branch). The queue run must have passed `CI gate`
+    with `checks / verify` skipped after its pull request reuse job, and not by its docs-only decision; the pull
+    request must have merged as exactly this commit, and the latest run of its head must have passed every
+    `PULL_REQUEST_JOBS` job. The exact tree equality is the queue gate's (ANYM-358), checked again by the push run.
+    """
+    queue = latest_run(sha, "merge_group", get)
+    branch = str((queue or {}).get("head_branch", ""))
+    match = QUEUE_GROUP_BRANCH.fullmatch(branch)
+    if queue is None or not match or queue.get("head_sha") != sha or queue.get("event") != "merge_group" \
+            or queue.get("status") != "completed" or queue.get("conclusion") != "success" \
+            or queue.get("head_repository", {}).get("full_name") != REPOSITORY:
+        raise Refused("latest merge queue run is not a completed success of one pull request's group for this commit")
+    jobs = attempt_jobs(queue, get)
+    if not (job_concluded(jobs, "CI gate") and job_concluded(jobs, QUEUE_VERIFIED_JOB, "skipped")
+            and job_concluded(jobs, QUEUE_PR_REUSE_JOB)) or job_concluded(jobs, "checks / documentation"):
+        raise Refused("the merge queue run did not pass by reusing a pull request verification")
+    number = int(match.group(1))
+    pull = get(f"pulls/{number}")
+    head = pull.get("head") or {}
+    head_sha, head_ref = str(head.get("sha", "")), str(head.get("ref", ""))
+    if pull.get("number") != number or pull.get("merged") is not True or pull.get("merge_commit_sha") != sha \
+            or (pull.get("base") or {}).get("ref") != "main" or (head.get("repo") or {}).get("full_name") != REPOSITORY \
+            or not re.fullmatch(r"[0-9a-f]{40}", head_sha) or not head_ref:
+        raise Refused(f"pull request {number} did not merge into main as this commit from this repository")
+    run = latest_run(head_sha, "pull_request", get)
+    expected = (head_sha, "pull_request", head_ref, "completed", "success", REPOSITORY)
+    if run is None or (run.get("head_sha"), run.get("event"), run.get("head_branch"), run.get("status"),
+                       run.get("conclusion"), (run.get("head_repository") or {}).get("full_name")) != expected:
+        raise Refused("the latest pull request run of the merged head is not a completed success of this repository")
+    pull_jobs = attempt_jobs(run, get)
+    for name in PULL_REQUEST_JOBS:
+        if not job_concluded(pull_jobs, name):
+            raise Refused(f"pull request job did not pass: {name}")
+    if not (unchanged(queue, latest_run(sha, "merge_group", get)) and unchanged(run, latest_run(head_sha, "pull_request", get))):
+        raise Refused("the merge queue or pull request run changed while it was being verified")
+    return queue, run, number, head_ref
 
 
 def verify(sha, get=api):
@@ -198,11 +251,18 @@ def verify(sha, get=api):
         # the push run is read once more, as the full path does, so a rerun between the reads is not missed.
         return known["result"]
     jobs = attempt_jobs(latest, get)
-    verified_by = latest
+    verified_by, queue = latest, None
     for required in sorted(REQUIRED_JOBS):
         if required == QUEUE_VERIFIED_JOB and job_concluded(jobs, required, "skipped"):
-            # The push run reused the queue's verification; GitHub, not the push run, must show it passed.
-            verified_by = queue_verification(sha, get)
+            # The push run reused the queue's verification, or the pull request run the queue reused; GitHub, not
+            # the push run, must show it passed.
+            try:
+                verified_by = queue = queue_verification(sha, get)
+            except QueueSkipped as refused:
+                try:
+                    queue, verified_by, _, _ = queue_chain(sha, get)
+                except Refused as exc:
+                    raise Refused(f"{refused}; {exc}") from None
         elif not job_concluded(jobs, required):
             raise Refused(f"required job did not pass: {required}")
     if not unchanged(latest, latest_run(sha, "push", get)):
@@ -211,7 +271,7 @@ def verify(sha, get=api):
               "verify_run_id": verified_by["id"], "verify_run_attempt": verified_by["run_attempt"],
               "verify_run_url": verified_by["html_url"]}
     if _verified is not None:
-        _verified[sha] = {"push": latest, "queue": None if verified_by is latest else verified_by, "result": result}
+        _verified[sha] = {"push": latest, "queue": None if verified_by is latest else queue, "result": result}
     return result
 
 

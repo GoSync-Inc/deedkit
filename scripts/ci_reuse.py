@@ -6,6 +6,10 @@ artifact of its latest attempt, or on any error, the push run verifies in full. 
 choice: it downloads that pinned artifact as data, validates it and adds this run's publication record, and
 any problem fails the push run. Nothing from the artifact is ever executed.
 
+When the queue run passed by reusing a full pull request run of exactly this tree (`group`, ANYM-358), `decide`
+pins that pull request run's evidence instead (the PR→queue chain), and `adopt` validates it by the same rules
+and also requires the tree the pull request run tested to be exactly this commit's git tree.
+
 `group` decides a merge queue run the same never-failing way: it reuses the verification of a passing, full pull
 request run only when the group commit's tree is exactly the tree that run tested (owner decision 2026-10-18),
 and otherwise the queue run verifies in full.
@@ -21,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -48,11 +53,15 @@ SHA = re.compile(r"[0-9a-f]{40}")
 # The merge queue names a group of main after the pull request it tests last: pr-<number>-<group base SHA>.
 GROUP_REF = re.compile("refs/heads/" + re.escape(production.QUEUE_BRANCH_PREFIX) + r"pr-([1-9][0-9]*)-[0-9a-f]{40}")
 # A full pull request run: a docs-only run skips `checks / verify` and never qualifies.
-PULL_REQUEST_JOBS = ("checks / verify", "checks / load", "checks / evidence", "CI gate")
+PULL_REQUEST_JOBS = production.PULL_REQUEST_JOBS
 
 
 class Refused(RuntimeError):
     pass
+
+
+class QueueSkipped(Refused):
+    """The merge queue run passed with `checks / verify` skipped (production.QueueSkipped)."""
 
 
 def when(value: str) -> datetime:
@@ -79,15 +88,35 @@ def queue_run(sha: str, get, sleep=time.sleep, wait: int = QUEUE_WAIT_SECONDS, c
                 break
             sleep(QUEUE_POLL_SECONDS)
         return production.queue_verification(sha, get)
+    except production.QueueSkipped as exc:
+        raise QueueSkipped(str(exc)) from None
+    except production.Refused as exc:
+        raise Refused(str(exc)) from None
+
+
+def chain(sha: str, get) -> tuple[dict, dict, int, str]:
+    """The queue run that reused a pull request run for `sha`, that run, its pull request and head branch."""
+    try:
+        return production.queue_chain(sha, get)
     except production.Refused as exc:
         raise Refused(str(exc)) from None
 
 
 def decide(sha: str, repository: str, get=production.api, sleep=time.sleep, clock=time.monotonic) -> dict:
-    """Pin the queue run, its latest attempt and that attempt's one evidence artifact; Refused means verify in full."""
+    """Pin the queue run, its latest attempt and that attempt's one evidence artifact, or, when the queue run reused
+    a pull request run, that run, attempt and artifact and the pull request; Refused means verify in full."""
     if repository != production.REPOSITORY or not SHA.fullmatch(sha):
         raise Refused("only an exact commit of this repository's main reuses its queue verification")
-    queue = queue_run(sha, get, sleep, clock=clock)
+    try:
+        queue = queue_run(sha, get, sleep, clock=clock)
+    except QueueSkipped as refused:
+        try:
+            _, run, number, _ = chain(sha, get)
+        except Refused as exc:
+            raise Refused(f"{refused}; {exc}") from None
+        artifact = evidence_artifact(run, run["head_sha"], get, "pull request run")
+        return {"run_id": str(run["id"]), "run_attempt": str(run["run_attempt"]), "artifact_id": str(artifact["id"]),
+                "artifact_digest": artifact["digest"], "pull_request": str(number)}
     attempt = queue["run_attempt"]
     artifact = evidence_artifact(queue, sha, get, "queue run")
     return {"run_id": str(queue["id"]), "run_attempt": str(attempt), "artifact_id": str(artifact["id"]),
@@ -235,24 +264,94 @@ def validate(directory: Path, sha: str, producer_url: str, attempt: int, pull_re
     return manifest
 
 
-def adopt(pin: dict, sha: str, repository: str, run_id: str, run_attempt: str, directory: Path,
-          get=production.api, fetch=download) -> dict:
-    """Validate the pinned queue evidence of `sha` into `directory` and record this push run as its publisher."""
-    if repository != production.REPOSITORY or not SHA.fullmatch(sha) or not (run_id.isdigit() and run_attempt.isdigit()):
-        raise Refused("only this repository's main push run adopts queue evidence")
-    queue_id, attempt, artifact_id = pin["run_id"], int(pin["run_attempt"]), pin["artifact_id"]
-    producer_url = run_url(repository, queue_id, attempt)
-
+def pinned_artifact(get, pin: dict, head_sha: str, kind: str):
+    """A check that the pinned artifact is still the producer run's current, unexpired evidence of `head_sha`."""
     def current() -> dict:
-        artifact = get(f"actions/artifacts/{artifact_id}")
+        artifact = get(f"actions/artifacts/{pin['artifact_id']}")
         workflow_run = artifact.get("workflow_run") or {}
         if (artifact.get("name"), artifact.get("expired"), str(workflow_run.get("id")), workflow_run.get("head_sha"),
-                artifact.get("digest")) != (ARTIFACT, False, queue_id, sha, pin["artifact_digest"]) \
+                artifact.get("digest")) != (ARTIFACT, False, pin["run_id"], head_sha, pin["artifact_digest"]) \
                 or workflow_run.get("repository_id") != workflow_run.get("head_repository_id") \
                 or not 0 < int(artifact.get("size_in_bytes", 0)) <= MAX_ARCHIVE_BYTES:
-            raise Refused("the pinned evidence artifact is gone, expired, replaced or not this queue run's")
+            raise Refused(f"the pinned evidence artifact is gone, expired, replaced or not this {kind}'s")
         return artifact
+    return current
 
+
+def checkout_tree(sha: str) -> str:
+    """The git tree hash of the checked-out commit, which must be exactly `sha`."""
+    def git(*arguments: str) -> str:
+        return subprocess.run(["git", *arguments], check=True, capture_output=True, text=True, timeout=60).stdout.strip()
+    if git("rev-parse", "--verify", "HEAD") != sha:
+        raise Refused("the checkout is not this commit")
+    return git("rev-parse", "--verify", "HEAD^{tree}")
+
+
+def same_tree(sha: str, tested: str, head_sha: str, get, local_tree=checkout_tree) -> str:
+    """The git tree hash `tested` and `sha` share; `tested` must be GitHub's merge of the pull request head."""
+    commit, pushed = get(f"git/commits/{tested}"), get(f"git/commits/{sha}")
+    if commit.get("sha") != tested or [parent.get("sha") for parent in commit.get("parents") or []][1:] != [head_sha]:
+        raise Refused("the tested commit is not GitHub's merge of the pull request head")
+    tree = str((commit.get("tree") or {}).get("sha", ""))
+    if not SHA.fullmatch(tree) or pushed.get("sha") != sha or (pushed.get("tree") or {}).get("sha") != tree \
+            or local_tree(sha) != tree:
+        raise Refused("the tree the pull request run tested is not exactly this commit's tree")
+    return tree
+
+
+def adopt_chain(pin: dict, sha: str, repository: str, run_id: str, run_attempt: str, directory: Path,
+                get=production.api, fetch=download, local_tree=checkout_tree) -> dict:
+    """Validate the pinned evidence of the pull request run the merge queue reused for `sha` (the PR→queue chain)
+    into `directory`, require its tested tree to be exactly this commit's, and record this push run as publisher."""
+    def current_chain() -> tuple[dict, dict, str]:
+        queue, run, number, head_ref = chain(sha, get)
+        if (str(run["id"]), str(run["run_attempt"]), str(number)) != (pin["run_id"], pin["run_attempt"], pin["pull_request"]):
+            raise Refused("the pull request run the merge queue reused is not the pinned one")
+        return queue, run, head_ref
+
+    queue, run, head_ref = current_chain()
+    attempt, head_sha = int(pin["run_attempt"]), run["head_sha"]
+    producer_url = run_url(repository, pin["run_id"], attempt)
+    current = pinned_artifact(get, pin, head_sha, "pull request run")
+    current()
+    data = fetch(f"actions/artifacts/{pin['artifact_id']}/zip")
+    if "sha256:" + hashlib.sha256(data).hexdigest() != pin["artifact_digest"]:
+        raise Refused("the downloaded evidence differs from the pinned artifact")
+    extract(data, directory)
+    tested = (directory / "source-sha").read_text().strip()
+    if not SHA.fullmatch(tested):
+        raise Refused("the pull request run's evidence names no exact tested commit")
+    validate(directory, tested, producer_url, attempt, pull_request_branch=head_ref)
+    tree = same_tree(sha, tested, head_sha, get, local_tree)
+    # A newer queue or pull request run, a rerun or a deleted artifact during validation leaves nothing to reuse.
+    current()
+    again, _, _ = current_chain()
+    if (again["id"], again["run_attempt"]) != (queue["id"], queue["run_attempt"]):
+        raise Refused("a newer merge queue run or rerun of this commit appeared during validation")
+    record = {"schema": 1, "event": "push", "git_branch": "main", "repository": repository, "run_id": run_id,
+              "run_attempt": run_attempt, "sha": sha, "ci_url": run_url(repository, run_id, run_attempt),
+              "producer": {"repository": repository, "workflow": WORKFLOW, "run_id": pin["run_id"],
+                           "run_attempt": str(attempt), "url": producer_url, "artifact_id": pin["artifact_id"],
+                           "artifact_digest": pin["artifact_digest"], "sha": tested},
+              "chain": {"pull_request": pin["pull_request"], "head_branch": head_ref, "queue_run_id": str(queue["id"]),
+                        "queue_run_attempt": str(queue["run_attempt"]), "tree": tree}}
+    (directory / tiden_ci.PUBLICATION).write_text(json.dumps(record, indent=2))
+    return record
+
+
+def adopt(pin: dict, sha: str, repository: str, run_id: str, run_attempt: str, directory: Path,
+          get=production.api, fetch=download) -> dict:
+    """Validate the pinned queue evidence of `sha` into `directory` and record this push run as its publisher;
+    with a pinned pull request, the evidence of the pull request run the queue reused (`adopt_chain`)."""
+    if repository != production.REPOSITORY or not SHA.fullmatch(sha) or not (run_id.isdigit() and run_attempt.isdigit()):
+        raise Refused("only this repository's main push run adopts queue evidence")
+    if pin.get("pull_request"):
+        if not pin["pull_request"].isdigit():
+            raise Refused("the reuse decision pinned no exact pull request")
+        return adopt_chain(pin, sha, repository, run_id, run_attempt, directory, get, fetch)
+    queue_id, attempt, artifact_id = pin["run_id"], int(pin["run_attempt"]), pin["artifact_id"]
+    producer_url = run_url(repository, queue_id, attempt)
+    current = pinned_artifact(get, pin, sha, "queue run")
     current()
     data = fetch(f"actions/artifacts/{artifact_id}/zip")
     if "sha256:" + hashlib.sha256(data).hexdigest() != pin["artifact_digest"]:
@@ -363,7 +462,8 @@ def main() -> int:
         print(f"::notice title=Reusing the merge queue verification::{run_url(repository, pin['run_id'], pin['run_attempt'])}")
         outputs({"decision": "reuse", **pin})
         return 0
-    pin = {key: os.environ.get("QUEUE_" + key.upper(), "") for key in ("run_id", "run_attempt", "artifact_id", "artifact_digest")}
+    pin = {key: os.environ.get("QUEUE_" + key.upper(), "")
+           for key in ("run_id", "run_attempt", "artifact_id", "artifact_digest", "pull_request")}
     if not (pin["run_id"].isdigit() and pin["run_attempt"].isdigit() and pin["artifact_id"].isdigit() and args.directory):
         raise Refused("the reuse decision did not pin a queue run, attempt and artifact")
     record = adopt(pin, sha, repository, os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", ""),
