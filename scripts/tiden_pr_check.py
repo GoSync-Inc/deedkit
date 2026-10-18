@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""Check a pull request's Tiden bookkeeping before it merges; read-only on Tiden (TIDEN-CI.md, PR check).
+
+The pull request body names the specs the change implements or delivers, one kind per line:
+
+    Spec: ANYM-12, ANYM-34
+    Delivers: ANYM-56
+    Tiden branch: proposal/2026-10-19-example
+
+and every test the diff adds carries `# spec: ANYM-n` (Python) or `// spec: ANYM-n` (JS, TS, Go) on the line
+directly above its definition, above its decorators. The check fails when a changed code file has no source anchor on
+Tiden main and the body names no spec, when an added test has no marker and is not in NO_SPEC, when a named ID is not
+an existing story-level spec on Tiden main or the named branch, or when the named branch is not an open proposal or
+review branch. It prints the anchor matches for the job summary. The main-push sync (scripts/tiden_sync.py) later
+anchors, links and merges from the same lines and markers.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tiden_drift import ANCHOR_REPOSITORIES, Refused, excluded, shown, tiden  # noqa: E402
+
+SPEC_ID = re.compile(r"ANYM-([1-9][0-9]*)")
+ID_LIST = re.compile(r"ANYM-[1-9][0-9]*(?:[ \t]*,[ \t]*ANYM-[1-9][0-9]*)*")
+PR_LINE = re.compile(r"^[ \t]*(Spec|Delivers|Tiden branch):[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+BRANCH_NAME = re.compile(r"(?:proposal|review)/[a-z0-9]+(?:[/_-][a-z0-9]+)*")
+MARKER = re.compile(r"^[ \t]*(#|//)[ \t]*spec:[ \t]*(.*?)[ \t]*$")
+# A comment that tries to be a marker but is malformed (wrong case, missing colon) is reported, not ignored.
+MARKER_LIKE = re.compile(r"^[ \t]*(#|//)[ \t]*spec\b", re.IGNORECASE)
+NODE_TEST = re.compile(r"""^[ \t]*(?:test|it)(?:\.(?:only|skip|todo))?[ \t]*\([ \t]*(['"`])((?:\\.|(?!\1).)*)\1""")
+GO_TEST = re.compile(r"^func[ \t]+(Test(?:[A-Z0-9_][A-Za-z0-9_]*)?)[ \t]*\([ \t]*\w+[ \t]+\*testing\.T[ \t]*\)")
+# Story-level means a leaf that holds criteria: not an Epic and without child specs.
+CONTAINER_TYPES = {"Epic"}
+# Tests that verify no spec, as `<path>::<test>` patterns with the reason; widening it is a reviewed code change.
+NO_SPEC: tuple[tuple[str, str], ...] = ()
+TIMEOUT = 120
+
+
+@dataclass
+class Lines:
+    """The Tiden lines of a pull request body; IDs keep their order, the first named is the primary spec."""
+    spec: list[int] = field(default_factory=list)
+    delivers: list[int] = field(default_factory=list)
+    branch: str | None = None
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def named(self) -> list[int]:
+        return list(dict.fromkeys(self.delivers + self.spec))
+
+
+@dataclass(frozen=True)
+class Test:
+    path: str
+    name: str
+    line: int
+    specs: tuple[int, ...]
+    problem: str = ""  # why the marker is missing or malformed; empty when specs holds a valid marker
+
+
+def ids(text: str) -> list[int] | None:
+    if not ID_LIST.fullmatch(text):
+        return None
+    return list(dict.fromkeys(int(match) for match in SPEC_ID.findall(text)))
+
+
+def parse_body(body: str) -> Lines:
+    lines = Lines()
+    for key, value in PR_LINE.findall(body.replace("\r\n", "\n")):
+        if key == "Tiden branch":
+            value = value.strip("`")
+            if lines.branch is not None and lines.branch != value:
+                lines.errors.append("the body names more than one `Tiden branch:`")
+            elif not BRANCH_NAME.fullmatch(value):
+                lines.errors.append(f"`Tiden branch: {shown(value)}` is not a proposal/ or review/ branch name")
+            else:
+                lines.branch = value
+            continue
+        found = ids(value)
+        if found is None:
+            lines.errors.append(f"`{key}: {shown(value)}` is not a comma-separated list of ANYM-n IDs")
+            continue
+        target = lines.delivers if key == "Delivers" else lines.spec
+        target.extend(number for number in found if number not in target)
+    return lines
+
+
+def language(path: str) -> str | None:
+    name = PurePosixPath(path).name
+    if fnmatchcase(name, "test_*.py") or fnmatchcase(name, "*_test.py"):
+        return "python"
+    if any(fnmatchcase(name, pattern) for pattern in ("*.test.mjs", "*.test.js", "*.test.ts")):
+        return "node"
+    if fnmatchcase(name, "*_test.go"):
+        return "go"
+    return None
+
+
+def marker(lines: list[str], index: int, comment: str) -> tuple[tuple[int, ...], str]:
+    """The marker on the line above 0-based line `index`, as (spec numbers, problem)."""
+    above = lines[index - 1] if index > 0 else ""
+    match = MARKER.match(above)
+    if not match:
+        return (), "malformed marker" if MARKER_LIKE.match(above) else "no marker"
+    if match.group(1) != comment:
+        return (), f"marker must start with `{comment}`"
+    found = ids(match.group(2))
+    if not found:
+        return (), "malformed marker"
+    return tuple(found), ""
+
+
+def python_tests(source: str) -> list[tuple[str, int]]:
+    """(name, 0-based line of the marker's target) of each module-level test and each test method of a Test class."""
+    tree = ast.parse(source)
+    found = []
+
+    def add(node, prefix: str = "") -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+            first = min([node.lineno, *(decorator.lineno for decorator in node.decorator_list)])
+            found.append((prefix + node.name, first - 1))
+
+    for node in tree.body:
+        add(node)
+        if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            for child in node.body:
+                add(child, node.name + "::")
+    return found
+
+
+def tests_in(path: str, source: str) -> list[tuple[str, int]]:
+    kind = language(path)
+    if kind == "python":
+        return python_tests(source)
+    pattern = NODE_TEST if kind == "node" else GO_TEST
+    found = []
+    for index, line in enumerate(source.splitlines()):
+        match = pattern.match(line)
+        if match:
+            found.append((match.group(2) if kind == "node" else match.group(1), index))
+    return found
+
+
+def added_tests(path: str, before: str | None, after: str) -> list[Test]:
+    """Tests in `after` whose name the same file did not have in `before`; existing tests need no marker."""
+    try:
+        old = {name for name, _ in tests_in(path, before)} if before is not None else set()
+    except SyntaxError:
+        old = set()
+    try:
+        new = tests_in(path, after)
+    except SyntaxError as error:
+        raise Refused(f"{shown(path)} does not parse ({error.msg}, line {error.lineno})") from None
+    comment = "#" if language(path) == "python" else "//"
+    lines = after.splitlines()
+    result, seen = [], set()
+    for name, index in new:
+        if name in old or name in seen:
+            continue
+        seen.add(name)
+        specs, problem = marker(lines, index, comment)
+        result.append(Test(path, name, index + 1, specs, problem))
+    return result
+
+
+def no_spec(test: Test) -> bool:
+    return any(fnmatchcase(f"{test.path}::{test.name}", pattern) for pattern, _ in NO_SPEC)
+
+
+def git(root: Path, *arguments: str) -> bytes:
+    completed = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, timeout=TIMEOUT)
+    if completed.returncode:
+        raise Refused(f"git {arguments[0]} exited {completed.returncode}")
+    return completed.stdout
+
+
+def changed(root: Path, base: str, head: str) -> list[str]:
+    """Paths added or modified from base to head, NUL-delimited and exact, as the drift check reads them."""
+    output = git(root, "diff", "-z", "--name-only", "--no-renames", "--diff-filter=d", base, head, "--")
+    try:
+        return [path.decode("utf-8") for path in output.split(b"\0") if path]
+    except UnicodeDecodeError:
+        raise Refused("a changed path is not valid UTF-8") from None
+
+
+def blob(root: Path, commit: str, path: str) -> str | None:
+    completed = subprocess.run(["git", "-C", str(root), "cat-file", "blob", f"{commit}:{path}"],
+                               capture_output=True, timeout=TIMEOUT)
+    if completed.returncode:
+        return None
+    return completed.stdout.decode("utf-8", errors="replace")
+
+
+def diff_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Test]:
+    found = []
+    for path in paths:
+        if language(path) is None:
+            continue
+        after = blob(root, head, path)
+        if after is None:
+            raise Refused(f"{shown(path)} is missing at {head}")
+        found.extend(added_tests(path, blob(root, base, path), after))
+    return found
+
+
+def listing(cli: str, product: str, branch: str) -> dict[int, dict]:
+    """Specs of one Tiden branch by number, validated as complete; each keeps its sources."""
+    value = tiden(cli, ["spec", "list", "--branch", branch, "--include-sources"], product)
+    specs, pagination = value.get("requirements"), value.get("pagination")
+    if (not isinstance(specs, list) or not isinstance(pagination, dict) or pagination.get("nextPageToken") != ""
+            or type(pagination.get("totalCount")) is not int or pagination["totalCount"] != len(specs)):
+        raise Refused(f"the spec listing of {branch} is incomplete")
+    result, uuids = {}, set()
+    for spec in specs:
+        if (not isinstance(spec, dict) or not isinstance(spec.get("id"), str) or not spec["id"]
+                or spec["id"] in uuids or type(spec.get("seqNum")) is not int or spec["seqNum"] in result):
+            raise Refused(f"the spec listing of {branch} has a missing or duplicate spec id or number")
+        sources, count = spec.get("sources", []), spec.get("sourceCount", 0)
+        if (not isinstance(sources, list) or not all(isinstance(source, dict) for source in sources)
+                or type(count) is not int or count != len(sources)):
+            raise Refused(f"the spec listing of {branch} has malformed or incomplete sources")
+        if type(spec.get("childrenCount", 0)) is not int or not isinstance(spec.get("type"), str):
+            raise Refused(f"the spec listing of {branch} has a malformed spec type or child count")
+        uuids.add(spec["id"])
+        result[spec["seqNum"]] = spec
+    return result
+
+
+def anchor_paths(spec: dict) -> set[str]:
+    paths = set()
+    for source in spec.get("sources", []):
+        repository = source.get("repository")
+        if repository is not None and not isinstance(repository, str):
+            raise Refused(f"ANYM-{spec['seqNum']} has a malformed source repository")
+        if source.get("sourceType") == "repo_file" and (repository or "") in ANCHOR_REPOSITORIES:
+            if not isinstance(source.get("repoPath"), str) or not source["repoPath"]:
+                raise Refused(f"ANYM-{spec['seqNum']} has a repo_file source without a path")
+            paths.add(source["repoPath"])
+    return paths
+
+
+def anchor_map(specs: dict[int, dict]) -> dict[str, list[int]]:
+    result: dict[str, list[int]] = {}
+    for number in sorted(specs):
+        for path in anchor_paths(specs[number]):
+            result.setdefault(path, []).append(number)
+    return result
+
+
+def story(spec: dict) -> bool:
+    return spec["type"] not in CONTAINER_TYPES and spec.get("childrenCount", 0) == 0
+
+
+def branch_status(cli: str, product: str, name: str) -> str | None:
+    value = tiden(cli, ["branch", "list"], product)
+    branches = value.get("branches")
+    if not isinstance(branches, list) or not all(isinstance(branch, dict) for branch in branches):
+        raise Refused("the branch listing is malformed")
+    statuses = [branch.get("status") for branch in branches if branch.get("name") == name]
+    if len(statuses) > 1:
+        raise Refused(f"the branch listing names {name} more than once")
+    return statuses[0] if statuses else None
+
+
+def check(root: Path, base: str, head: str, body: str, cli: str, product: str, report) -> int:
+    failures: list[str] = []
+    lines = parse_body(body)
+    failures.extend(lines.errors)
+    # The merge base, so a pull request checkout (a merge commit) and a branch head both diff only the change.
+    base = git(root, "merge-base", base, head).decode().strip()
+    paths = changed(root, base, head)
+    code = [path for path in paths if not excluded(path)]
+    tests = diff_tests(root, base, head, paths)
+    main = listing(cli, product, "main")
+    anchors = anchor_map(main)
+    known = main
+    if lines.branch:
+        status = branch_status(cli, product, lines.branch)
+        if status != "open":
+            failures.append(f"`Tiden branch: {lines.branch}` is {'missing' if status is None else status}, not open")
+        else:
+            known = {**main, **listing(cli, product, lines.branch)}
+
+    report("## Tiden PR check")
+    report(f"Changed files {len(paths)}, code files {len(code)}, added tests {len(tests)}.")
+    if lines.named:
+        report("Named specs (the first is primary): " + ", ".join(
+            f"ANYM-{number}" + (f" {known[number]['title']}" if number in known else " (unknown)")
+            for number in lines.named))
+    if lines.branch:
+        report(f"Tiden branch: {lines.branch}")
+    unanchored = [path for path in code if path not in anchors]
+    for path in code:
+        found = anchors.get(path)
+        report(f"- {shown(path)}: " + (", ".join(f"ANYM-{number}" for number in found) if found else "no anchor"))
+    if unanchored and lines.named:
+        report(f"After the merge the sync anchors {len(unanchored)} unanchored file(s) to ANYM-{lines.named[0]}.")
+    if unanchored and not lines.named:
+        failures.append(f"{len(unanchored)} changed code file(s) have no anchor on Tiden main and the body names no "
+                        "`Spec:` or `Delivers:`: " + ", ".join(shown(path) for path in unanchored))
+
+    cited: dict[int, list[str]] = {}
+    for number in lines.named:
+        cited.setdefault(number, []).append("the body")
+    for test in tests:
+        where = f"{shown(test.path)}:{test.line} {shown(test.name)}"
+        if test.problem:
+            if not no_spec(test):
+                failures.append(f"added test {where}: {test.problem}")
+            continue
+        report(f"- test {where} -> " + ", ".join(f"ANYM-{number}" for number in test.specs))
+        for number in test.specs:
+            cited.setdefault(number, []).append(where)
+    for number, places in sorted(cited.items()):
+        spec = known.get(number)
+        if spec is None:
+            failures.append(f"ANYM-{number} (named by {places[0]}) is not a spec on Tiden main"
+                            + (f" or {lines.branch}" if lines.branch else ""))
+        elif not story(spec):
+            failures.append(f"ANYM-{number} (named by {places[0]}) is a {spec['type']} with child specs or an Epic; "
+                            "name the story that holds the criterion")
+
+    if failures:
+        report(f"{len(failures)} problem(s):")
+        report("\n".join(f"- {failure}" for failure in failures))
+        report("Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun.")
+        return 1
+    report("Passed.")
+    return 0
+
+
+def event(path: str | None) -> dict:
+    if not path:
+        return {}
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise Refused("the event file is unreadable") from None
+    return value if isinstance(value, dict) else {}
+
+
+def skip_reason(payload: dict) -> str | None:
+    pull = payload.get("pull_request")
+    if not isinstance(pull, dict):
+        return "not a pull request run"
+    head = ((pull.get("head") or {}).get("repo") or {}).get("full_name")
+    if not head or head != (payload.get("repository") or {}).get("full_name"):
+        return "a fork pull request receives no Tiden token"
+    if not os.environ.get("TIDEN_API_TOKEN"):
+        return "Tiden reporting is not configured (no TIDEN_API_TOKEN)"
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Check a pull request's Tiden lines, markers and anchors.")
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--base", help="the base commit (default: the event's pull_request.base.sha)")
+    parser.add_argument("--head", default="HEAD")
+    parser.add_argument("--body-file", type=Path, help="read the body from a file instead of the event")
+    parser.add_argument("--cli", default="tiden")
+    args = parser.parse_args()
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+
+    def report(line: str) -> None:
+        print(line)
+        if summary:
+            with open(summary, "a", encoding="utf-8") as stream:
+                stream.write(line + "\n")
+
+    try:
+        payload = event(os.environ.get("GITHUB_EVENT_PATH"))
+        if args.body_file is None:
+            reason = skip_reason(payload)
+            if reason:
+                report(f"Tiden PR check skipped: {reason}.")
+                return 0
+        pull = payload.get("pull_request") or {}
+        body = args.body_file.read_text(encoding="utf-8") if args.body_file else (pull.get("body") or "")
+        base = args.base or (pull.get("base") or {}).get("sha")
+        if not base:
+            raise Refused("no base commit: pass --base")
+        return check(args.root.resolve(), base, args.head, body, args.cli, os.environ["TIDEN_PRODUCT_ID"], report)
+    except Refused as error:
+        report(f"Refused: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
