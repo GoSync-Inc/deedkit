@@ -120,8 +120,8 @@ def preview_number(item: object) -> int:
     object (a modification may carry the main and branch copies) must agree."""
     if not isinstance(item, dict):
         raise StepFailed("merge", "the merge preview has a change that is not an object")
-    numbers = [item.get("seqNum")] + [value.get("seqNum") for value in item.values() if isinstance(value, dict)]
-    numbers = [number for number in numbers if number is not None]
+    copies = [item, *(value for value in item.values() if isinstance(value, dict))]
+    numbers = [copy["seqNum"] for copy in copies if "seqNum" in copy]  # a present null counts, an absent key not
     if not all(type(number) is int for number in numbers):  # before the set: 50.0 and True would equal an int
         raise StepFailed("merge", "the merge preview has a change without exactly one spec number")
     found = set(numbers)

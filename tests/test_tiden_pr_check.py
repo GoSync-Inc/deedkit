@@ -262,3 +262,34 @@ def test_a_node_name_must_be_a_plain_literal_on_the_call_line_unless_that_line_e
         assert f"web/c.test.mjs:{line} <" in out
     assert out.count("the test name is not a plain string literal") == 5
     assert "<test(name, () => {});>" not in out  # the existing call, moved and reindented, is not new
+
+
+# spec: ANYM-405
+def test_a_split_or_commented_call_is_never_hidden_and_an_unreadable_line_never_matches_a_title(repo, server):
+    server.set(main=[spec(12)])
+    root, _ = repo
+    commit(root, {"web/k.test.mjs": "test(\"<test('prefix' + 'new', () => {});>\", () => {});\n"}, "node")
+    code, out = run(repo, server, {
+        "web/k.test.mjs": "test(\"<test('prefix' + 'new', () => {});>\", () => {});\ntest('prefix' + 'new', () => {});\n"
+                          "test\n('newline', () => {});\nawait it // label\n('commented newline', () => {});\n"
+                          "test /* label */ ('block comment', () => {});\n",
+        "pkg/h_test.go": "package pkg\n\nfunc TestHidden /* label */(t *testing.T) {}\n",
+    }, "Spec: ANYM-12")
+    assert code == 1
+    assert "web/k.test.mjs:2 <test('prefix' + 'new', () => {});>: the test name is not a plain" in out
+    assert "web/k.test.mjs:3 <test>: the test call is split before its `(`" in out
+    assert "web/k.test.mjs:5 <await it // label>: the test call is split" in out
+    assert "web/k.test.mjs:7 block comment: no marker" in out and "pkg/h_test.go:3 TestHidden: no marker" in out
+
+
+# spec: ANYM-405
+def test_a_plain_title_is_non_empty_without_control_characters_and_may_hold_a_dollar(repo, server):
+    server.set(main=[spec(12)])
+    code, out = run(repo, server, {"web/d.test.mjs": "// spec: ANYM-12\ntest(`cost $5`, () => {});\n"
+                                                     "// spec: ANYM-12\ntest('', () => {});\n"
+                                                     "// spec: ANYM-12\ntest('tab\there', () => {});\n"},
+                    "Spec: ANYM-12")
+    assert code == 1
+    assert "web/d.test.mjs:2 cost $5 -> ANYM-12" in out
+    assert "web/d.test.mjs:4 <" in out and "web/d.test.mjs:6 <" in out
+    assert out.count("the test name is not a plain string literal") == 2

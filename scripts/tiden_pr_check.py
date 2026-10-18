@@ -39,10 +39,14 @@ MARKER = re.compile(r"^[ \t]*(#|//)[ \t]*spec:[ \t]*(.*?)[ \t]*$")
 MARKER_LIKE = re.compile(r"^[ \t]*(#|//)[ \t]*spec\b", re.IGNORECASE)
 # Node and Go tests are found by plain patterns, line by line, with no parsing: a line that looks like a test call or
 # definition counts, even inside a comment or a string, so a test is never hidden (fail closed). A Node name must be a
-# plain string literal, the whole first argument on the call's line, so it equals the title CI reports.
-NODE_TEST = re.compile(r"(?<![\w.$])(?:test|it)(?:\.(?:only|skip|todo))?\s*\(")
-NODE_NAME = re.compile(r"\s*(?:'([^'\\\n]*)'|\"([^\"\\\n]*)\"|`([^`\\$\n]*)`)\s*,")
-GO_TEST = re.compile(r"^\s*func\s+(Test(?![a-z])\w*)\s*\(", re.MULTILINE)
+# plain string literal, the whole first argument on the call's line, so it equals the title CI reports: non-empty, with
+# no escape, `${` or control character (the report rewrites those). A block comment may sit before the `(`; a `test`
+# or `it` alone on its line, its `(` on a later one, is a call this check cannot read, so it fails (NODE_SPLIT).
+NODE_TEST = re.compile(r"(?<![\w.$])(?:test|it)(?:\.(?:only|skip|todo))?\s*(?:/\*.*?\*/\s*)*\(")
+NODE_SPLIT = re.compile(r"^\s*(?:await\s+)?(?:test|it)(?:\.(?:only|skip|todo))?\s*(?:/\*.*?\*/\s*)*(?://.*)?$")
+NODE_NAME = re.compile(r"\s*(?:'([^'\\\x00-\x1f\x7f]+)'|\"([^\"\\\x00-\x1f\x7f]+)\""
+                       r"|`((?:[^`\\$\x00-\x1f\x7f]|\$(?!\{))+)`)\s*,")
+GO_TEST = re.compile(r"^[ \t]*func[ \t]+(Test(?![a-z])\w*)[ \t]*(?:/\*.*?\*/[ \t]*)*\(", re.MULTILINE)
 # Story-level means a leaf that holds criteria: not an Epic and without child specs.
 CONTAINER_TYPES = {"Epic"}
 # Tests that verify no spec, as `<path>::<test>` patterns with the reason; widening it is a reviewed code change.
@@ -161,6 +165,9 @@ def tests_in(path: str, source: str) -> list[tuple[str, int, str]]:
                 if match.group(1) != "TestMain"]
     found = []
     for line, text in enumerate(source.splitlines()):
+        if NODE_SPLIT.match(text):
+            found.append((f"<{text.strip()}>", line, "the test call is split before its `(`; write `test(` on one "
+                                                     "line"))
         for match in NODE_TEST.finditer(text):
             name = NODE_NAME.match(text, match.end())
             if name:
@@ -174,7 +181,8 @@ def tests_in(path: str, source: str) -> list[tuple[str, int, str]]:
 def added_tests(path: str, before: str | None, after: str) -> list[Test]:
     """Tests in `after` whose name the same file did not have in `before`; existing tests need no marker."""
     try:
-        old = {name for name, _, _ in tests_in(path, before)} if before is not None else set()
+        # A literal title and an unreadable call's line are different kinds of key, so they never collide.
+        old = {(bool(problem), name) for name, _, problem in tests_in(path, before)} if before is not None else set()
     except SyntaxError:
         old = set()
     try:
@@ -185,9 +193,9 @@ def added_tests(path: str, before: str | None, after: str) -> list[Test]:
     lines = after.splitlines()
     result, seen = [], set()
     for name, index, problem in new:
-        if name in old or name in seen:
+        if (bool(problem), name) in old or (bool(problem), name) in seen:
             continue
-        seen.add(name)
+        seen.add((bool(problem), name))
         specs, missing = marker(lines, index, comment)
         result.append(Test(path, name, index + 1, () if problem else specs, problem or missing))
     return result

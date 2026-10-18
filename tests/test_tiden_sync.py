@@ -451,3 +451,17 @@ def test_an_unexpected_error_in_the_merge_step_is_named_and_stops_the_sync(root,
     code, out = run(root, server)
     assert code == 1 and "Failed at step merge: unexpected TypeError" in out and "a value from the data" not in out
     assert not server.writes()
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("change", [
+    {"seqNum": 50, "branch": {"seqNum": None}},
+    {"seqNum": None, "branch": {"seqNum": 50}},
+])
+def test_a_null_spec_number_in_any_copy_is_never_merged(root, server, change):
+    full_server(server)
+    server.set(previews={"proposal/x": {"modifications": [change]}})
+    merged(root, server, {"app/new.py": "y\n"}, "Delivers: ANYM-50\nTiden branch: proposal/x")
+    code, out = run(root, server)
+    assert code == 1 and "Failed at step merge: the merge preview has a change without exactly one spec number" in out
+    assert not server.writes()
