@@ -265,8 +265,15 @@ host never builds it, and agents do not install it.
    which a CI test rebuilds and compares.
 2. Copy it to the host as `/usr/local/libexec/deedkit/attest-verify`, owned by
    root, mode `0755`, not a symlink. `production.py` refuses to run any other
-   file: it checks the owner, the mode and the SHA-256 against its own pinned
-   `VERIFIER_SHA256` before every call.
+   file: before every call it checks that the file is regular, owned by root or
+   the operator running `production.py`, not writable by group or others, and
+   that its SHA-256 equals its own pinned `VERIFIER_SHA256`.
+3. Install `production.py` from the same `main` commit as the release you
+   prepare. The pulled image's `io.deedkit.production.build` label is the recipe
+   CI computed for that commit, and the host compares it with the recipe its own
+   `production.py` computes: an older installed tool refuses a commit that
+   changed a build recipe ("pulled image does not name the candidate source
+   revision and build").
 
 For `ghcr.io/gosync-inc/deedkit-<target>:<sha40>` the verifier resolves the tag
 anonymously to exactly one single-image manifest (an index, an ambiguous or a
@@ -464,7 +471,10 @@ previous image, writes `rollback.json` and rewrites `current.json` with status
 `rolled-back` and the previous image IDs. A second rollback of the same release,
 a rollback of an older release and a failed rollback's retry are refused;
 inspect the state by hand then. A release applied before rollback data existed
-has no tool rollback and keeps the manual procedure above.
+has no tool rollback and keeps the manual procedure above, and so does a release
+whose selected container is no longer running (exited or stopped): rollback then
+refuses with "each selected service must already have exactly one running
+container".
 
 ## Image retention report
 

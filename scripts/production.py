@@ -425,7 +425,7 @@ def escaped(value):
 
 def check_space(directory):
     if shutil.disk_usage(directory).free < MIN_FREE_BYTES:
-        raise Refused("at least 15 GiB free is required before building production images")
+        raise Refused("at least 15 GiB free is required before obtaining production images")
 
 
 IMAGE_LOCK = Path("/var/lib/deedkit-production/image-build.lock")
@@ -480,8 +480,11 @@ def published(target, sha):
     if (info is None or not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid())
             or info.st_mode & 0o022 or hashlib.sha256(content).hexdigest() != VERIFIER_SHA256):
         raise Refused(f"the attestation verifier {VERIFIER} is missing, writable by others or not the pinned build")
-    output = run([str(VERIFIER), "--image", REGISTRY + target, "--sha", sha], env={"PATH": "/usr/bin:/bin"},
-                 reason=True)
+    try:
+        output = run([str(VERIFIER), "--image", REGISTRY + target, "--sha", sha], env={"PATH": "/usr/bin:/bin"},
+                     reason=True)
+    except OSError as exc:  # for example a pinned file without the execute bit
+        raise Refused(f"the attestation verifier {VERIFIER} could not be run") from exc
     try:
         value = json.loads(output)
     except ValueError:
@@ -736,6 +739,7 @@ def rollback(settings, sha):
     """Return the current release's selected services to the images and configuration that ran before it.
 
     Owner-confirmed like apply. It never calls verify(): the previous revision is no longer current main.
+    The caller holds the host lock, as main() does for every state-changing action.
     """
     state = Path(settings["state_directory"])
     release = state / sha

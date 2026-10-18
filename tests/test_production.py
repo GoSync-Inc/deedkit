@@ -1521,3 +1521,34 @@ def test_apply_is_refused_when_the_container_was_reconfigured_in_place_after_pre
     with pytest.raises(p.Refused, match="changed since preparation"):
         p.apply(host.settings, RELEASES[0])
     assert host.mutations() == []
+
+
+def test_an_older_release_is_refused_while_a_newer_one_is_current(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    host.calls.clear()
+    with pytest.raises(p.Refused, match="only the current applied release"):
+        p.rollback(host.settings, RELEASES[0])
+    assert host.mutations() == [] and p.read(host.state / "current.json")["sha"] == RELEASES[1]
+
+
+def test_the_command_line_prints_prepare_references_and_reaches_rollback_and_images(tmp_path, monkeypatch, capsys):
+    host = Host(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "config", lambda path: host.settings)
+    sha = RELEASES[0]
+    host.main = sha
+    p.main(["prepare", "--sha", sha])
+    printed = json.loads(capsys.readouterr().out)
+    assert set(printed) == {"sha", "ci", "images", "references"}
+    assert printed["references"] == {"runtime": host.published("runtime", sha)["reference"]}
+    p.main(["apply", "--sha", sha])
+    capsys.readouterr()
+    p.main(["images"])
+    assert set(json.loads(capsys.readouterr().out)) == {"keep", "candidates"}
+    with pytest.raises(SystemExit):
+        p.main(["rollback", "--sha", sha[:12]])
+    assert "40-character" in capsys.readouterr().err and host.container["Image"] == host.image(sha)
+    p.main(["rollback", "--sha", sha])
+    assert json.loads(capsys.readouterr().out)["previous_images"] == {"synthetic": {"api": OLD_IMAGE}}
+    assert host.container["Image"] == OLD_IMAGE

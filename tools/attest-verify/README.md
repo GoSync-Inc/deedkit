@@ -41,7 +41,10 @@ attest-verify --image ghcr.io/gosync-inc/deedkit-<name> --sha <40 lowercase hex>
    - `SourceRepositoryURI = https://github.com/GoSync-Inc/deedkit`,
      `SourceRepositoryRef = refs/heads/main`, `SourceRepositoryDigest = <sha>`,
      `RunnerEnvironment = github-hosted`, `BuildSignerURI` = the SAN (the real
-     bundle of a ci.yml main build carries exactly this value)
+     bundle of a ci.yml main build carries exactly this value). This is stricter
+     than B2's list on purpose: if publication ever moves into a reusable workflow
+     (`workflow_call`), the build signer changes and verification fails closed
+     until `verify.go`'s expected identity is updated in a reviewed PR.
 
    and the statement predicate type must be `https://slsa.dev/provenance/v1`.
    Predicate claims are never used in place of certificate extensions. A missing
@@ -59,7 +62,34 @@ committed, and parsed with `root.NewTrustedRootFromJSON`.
 trusted_root.json SHA-256: `6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66`
 
 `verify_test.go` asserts the embedded file matches this checksum. Refresh it the
-same way when Sigstore rotates keys, update the checksum here and rebuild.
+same way when Sigstore rotates keys, update the checksum here and rebuild. The
+fetch program, run from a scratch module that requires the same sigstore-go
+version (`go run .`), is:
+
+```go
+package main
+
+import (
+	"os"
+
+	"github.com/sigstore/sigstore-go/pkg/tuf"
+)
+
+func main() {
+	cache, _ := os.MkdirTemp("", "tuf")
+	client, err := tuf.New(tuf.DefaultOptions().WithCachePath(cache)) // verified against sigstore-go's embedded TUF root
+	if err != nil {
+		panic(err)
+	}
+	root, err := client.GetTarget("trusted_root.json")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile("trusted_root.json", root, 0o644); err != nil {
+		panic(err)
+	}
+}
+```
 
 ## Reproducible build
 

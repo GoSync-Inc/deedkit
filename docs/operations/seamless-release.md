@@ -8,7 +8,10 @@ The existing operator handles explicitly scheduled singleton updates.
 ## Release sequence
 
 1. `prepare` requires the exact current `main` SHA and its latest successful push
-   CI attempt. It fetches clean source, builds immutable images and saves private
+   CI attempt. It fetches clean source, obtains immutable images through
+   `production.py prepare` (the CI-published images are pulled by verified digest,
+   so the host needs the installed attestation verifier and GHCR access;
+   [production.md](production.md#attestation-verifier)) and saves private
    configuration snapshots without starting application containers.
 2. `promote` rechecks image, configuration, container and router identities. Old
    and new messaging images must have identical SQL inventories. It starts a
