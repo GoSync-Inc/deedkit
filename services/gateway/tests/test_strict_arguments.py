@@ -132,8 +132,8 @@ def test_field_errors_enumerate_all():
         arguments(tool, {"brief_id": "", "authorization_reference": "ab", "destination_source": "someone",
                          "destination_evidence": 5, "extra": 1})
     assert caught.value.field_errors == [
-        {"field": "brief_id", "reason": "blank", "expected": "length at least 1"},
-        {"field": "authorization_reference", "reason": "min_length", "expected": "length at least 3"},
+        {"field": "brief_id", "reason": "min_length", "expected": "1–100 characters"},
+        {"field": "authorization_reference", "reason": "min_length", "expected": "3–1500 characters"},
         {"field": "destination_source", "reason": "enum", "allowed": ["owner_named", "agent_found"]},
         {"field": "destination_evidence", "reason": "type", "expected": "string"},
         {"field": "extra", "reason": "unknown_field"},
@@ -175,3 +175,53 @@ def test_non_schema_rejections_and_valid_calls_keep_their_existing_shape():
         arguments(CATALOG["messages_send_message"], {**SEND, "wait_s": float("nan")})
     assert not isinstance(caught.value, InvalidArguments) and str(caught.value) == "invalid_arguments"
     assert arguments(CATALOG["calls_dial_call"], {**DIAL, "destination_source": "owner_named"})["destination_source"] == "owner_named"
+
+
+def messaging_app(tmp_path, name):
+    def backend(request):
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json={"permissions": ["read", "feedback-write"], "tool_manifest": {"names": [name.removeprefix("messages_")]}})
+        return httpx.Response(200, json={"synthetic": True})
+
+    return configured(tmp_path, backend, module="messaging", tools=[name], grants=["read", "feedback-write"])[0]
+
+
+def test_feedback_field_errors_match_the_card_example_over_both_transports(tmp_path):
+    values = {"request_id": "synthetic-request", "category": "bugs", "description": ""}
+    rest, mcp = post_both(messaging_app(tmp_path, "messages_submit_feedback"), "messages_submit_feedback", values)
+    expected = [{"field": "category", "reason": "enum", "allowed": ["bug", "feature", "quality", "other"]},
+                {"field": "description", "reason": "min_length", "expected": "1–4000 characters"}]
+    assert rest.status_code == 422 and rest.json()["field_errors"] == expected
+    assert mcp["isError"] and mcp["structuredContent"] == rest.json()
+
+
+def test_union_failures_keep_their_descendant_paths_over_both_transports(tmp_path):
+    allowed = ["private", "group", "channel", "unknown"]
+    rest, mcp = post_both(messaging_app(tmp_path, "messages_list_chats"), "messages_list_chats",
+                          {"chat_types": ["not-a-chat-type", "also-invalid"]})
+    assert rest.json()["field_errors"] == [{"field": f"chat_types/{i}", "reason": "enum", "allowed": allowed} for i in (0, 1)]
+    assert mcp["structuredContent"] == rest.json()
+
+
+def test_nested_union_object_reports_each_child_in_schema_order():
+    def fields(values):
+        with pytest.raises(InvalidArguments) as caught:
+            arguments(CATALOG["calendar_plan"], values)
+        return [(e["field"], e["reason"]) for e in caught.value.field_errors]
+
+    action = {"action": "create", "calendar_ref": "synthetic-cal"}
+    assert fields({"actions": [{**action, "event": {"start": 17, "end": False, "timezone": "UTC"}}]}) == [
+        ("actions/0/event/start", "type"), ("actions/0/event/end", "type")]
+    assert fields({"actions": [{**action, "event": {"start": 17}}]}) == [
+        ("actions/0/event/start", "type"), ("actions/0/event/end", "required"), ("actions/0/event/timezone", "required")]
+
+
+def test_nested_fields_follow_the_reviewed_schema_order():
+    with pytest.raises(InvalidArguments) as caught:
+        arguments(CATALOG["calls_prepare_call"], {"brief": {"language": "not-a-language", "voice_style": "not-a-style"}})
+    assert [e["field"] for e in caught.value.field_errors] == [
+        "brief/goal", "brief/counterparty", "brief/language", "brief/success_fields", "brief/voice_style"]
+    with pytest.raises(InvalidArguments) as caught:
+        arguments(CATALOG["messages_submit_feedback"], {"request_id": "synthetic-request", "category": "bug", "description": "x",
+                                                      "refs": {"message_ids": ["", 23], "chat_ids": [False]}})
+    assert [e["field"] for e in caught.value.field_errors] == ["refs/chat_ids/0", "refs/message_ids/0", "refs/message_ids/1"]
