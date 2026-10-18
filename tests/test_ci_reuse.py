@@ -24,7 +24,7 @@ CASE = '<testsuite><testcase name="{name}" file="tests/{name}.py"/><testcase nam
 
 
 def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, event="merge_group", tiden_branch="",
-                   producer_url=PRODUCER_URL):
+                   producer_url=PRODUCER_URL, shard_outcomes=None):
     """The `ci-evidence` directory a passing merge queue run uploads, built by the real assemble and prepare."""
     fragments = tmp_path / "fragments"
     verify, load = fragments / "ci-evidence-verify", fragments / "ci-evidence-load"
@@ -40,6 +40,16 @@ def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, even
     (load / "load.xml").write_text(CASE.format(name="load"))
     (load / "load.json").write_text(json.dumps({"version": 1, "status": "passed", "sha": sha}))
     (load / "outcomes.json").write_text(json.dumps({"module_checks": {"load": "success"}}))
+    for job in tiden_ci.SHARD_JOBS:  # the shard jobs of the root Python suite; a None outcome uploads nothing
+        outcome = (shard_outcomes or {}).get(job, "success")
+        if outcome is None:
+            continue
+        shard = fragments / f"ci-evidence-{job}"
+        shard.mkdir()
+        (shard / "source-sha").write_text(sha + "\n")
+        (shard / "attempt").write_text(attempt + "\n")
+        (shard / f"{job}.xml").write_text(CASE.format(name=job.replace("-", "_")))
+        (shard / "outcomes.json").write_text(json.dumps({"checks": {"python": outcome}}))
     evidence = tmp_path / "queue-evidence"
     producers = {job: ("success", sha) for job in tiden_ci.FRAGMENTS}
     metadata = tiden_ci.assemble(evidence, fragments, producer_url, producers)
@@ -292,6 +302,17 @@ def test_a_check_skipped_in_both_metadata_and_manifest_is_refused(tmp_path):
     data = archive(evidence, change={"metadata.json": rewrite(evidence, "metadata.json", checks=skipped),
                                      "manifest.json": rewrite(evidence, "manifest.json", checks=skipped)})
     with pytest.raises(ci_reuse.Refused, match="every check"):
+        adopt(tmp_path, GitHub(artifacts=[artifact(data=data)]), data)
+
+
+@pytest.mark.parametrize("outcomes", [{"python-3": None}, {"python-2": "failure"}, {"python-4": "cancelled"}],
+                         ids=["missing-shard", "failed-shard", "cancelled-shard"])
+def test_queue_evidence_without_every_passing_python_shard_is_refused(tmp_path, outcomes):
+    # The python check passes only when every shard of the root suite passed (scripts/python_shards.py).
+    evidence = queue_evidence(tmp_path, shard_outcomes=outcomes)
+    assert json.loads((evidence / "manifest.json").read_text())["checks"]["python"] != "success"
+    data = archive(evidence)
+    with pytest.raises(ci_reuse.Refused, match="not every check of the queue run passed|exactly the queue run's evidence files"):
         adopt(tmp_path, GitHub(artifacts=[artifact(data=data)]), data)
 
 

@@ -8,7 +8,17 @@ Parameterized Python executions retain their parameter names and status.
 
 Test jobs run in parallel and each uploads a `ci-evidence-<job>` fragment:
 `checks / verify` the seven checks and its module reports, `checks / load` the
-gateway load gate. The `checks / evidence` job merges them into `ci-evidence`.
+gateway load gate, and each `checks / python (<n>/4)` job its shard of the root
+Python/PostgreSQL suite. The root suite runs in four file-level shards
+(`scripts/python_shards.py`): `checks / verify` runs shard 1 and the three
+`checks / python` matrix jobs shards 2-4, each on its own runner with its own
+PostgreSQL. Every test module belongs to exactly one shard, chosen by committed
+per-file timings (`scripts/python_shards.json`, refreshed with
+`python scripts/python_shards.py weights <python.xml>`); a module without a
+timing still runs in exactly one shard. The `checks / evidence` job merges the
+fragments into `ci-evidence` and the four shard reports into one `python.xml`,
+so test identities do not change; `anymsg-ci::python` passes only when every
+shard passed with its report.
 A fragment counts only when it holds just the files and checks its own job
 produces and names the tested source SHA that both its job output and verify
 captured; a job that did not succeed in this run attempt never contributes an
@@ -106,7 +116,7 @@ downloaded and validated as data by the push-reuse rules below. The tested
 merge commit must be GitHub's merge of that head, and its tree must equal the
 group commit's tree. A re-read must show the same run. Anything else, including
 any error, means full verification, never a failed run. On a reuse
-`checks / verify`, `checks / load` and `checks / evidence` are skipped;
+`checks / verify`, `checks / python`, `checks / load` and `checks / evidence` are skipped;
 `native / synthetic` and the image builds run. `checks / tiden` runs no Tiden
 command: its receipt records `skipped` with the reused run attempt's URL
 (`tested_in`), the merge commit it tested and the group commit, and the job fails
@@ -133,7 +143,7 @@ and the artifact again, then uploads the evidence unchanged as this run's
 `ci-evidence` with a `publication.json` record that names this push run as
 publisher and the queue run attempt and artifact as producer. A failure there
 fails the push run: `checks` is skipped and `CI gate` turns red. On a validated
-reuse `checks / verify`, `checks / load` and `checks / evidence` are skipped;
+reuse `checks / verify`, `checks / python`, `checks / load` and `checks / evidence` are skipped;
 `native / synthetic`, the image builds, `publish` and the release record run as on
 every push. `CI gate` accepts a skipped `checks / verify` only for a validated
 reuse of this commit; otherwise `checks / verify` must have tested this commit.
@@ -161,7 +171,7 @@ with a reason, in the list's `## scan exclusions` section; no file may name a
 changed document. Any of these means full verification: a
 new file, a mode or type change, an empty or uncertain diff, an unlisted file, a
 scan hit, a failed decision, or a `Tiden intent branch:` line in the pull
-request description. On a docs-only run `checks / verify`, `checks / load` and
+request description. On a docs-only run `checks / verify`, `checks / python`, `checks / load` and
 `checks / evidence` are skipped, and the skipped `checks / verify` still
 satisfies the required check. `CI gate` accepts the skip only for the docs-only
 decision on this merge commit, `native / synthetic` and the image builds keep

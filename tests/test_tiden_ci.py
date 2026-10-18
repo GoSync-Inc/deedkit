@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from scripts.tiden_ci import (CHECKS, intent_links, linked_intent_branch, normalize_junit, prepare, publish,
+from scripts.tiden_ci import (CHECKS, SHARD_JOBS, intent_links, linked_intent_branch, normalize_junit, prepare, publish,
                               resolve_branch, route_branch)
 
 
@@ -1087,11 +1087,15 @@ def test_release_workflows_record_only_verified_main_commits(tmp_path):
 
 ATTEMPT_URL = "https://github.com/example/repo/actions/runs/1/attempts/2"
 LOAD_REPORT = '<testsuite><testcase name="budgets" file="tests/platform/benchmarks/gateway_read_load.py"/></testsuite>'
-PASSED = {"verify": ("success", "a" * 40), "load": ("success", "a" * 40)}
+PASSED = {"verify": ("success", "a" * 40), "load": ("success", "a" * 40), **dict.fromkeys(SHARD_JOBS, ("success", "a" * 40))}
+
+
+def shard_report(job):
+    return f'<testsuites name="pytest tests"><testsuite name="pytest"><testcase name="{job}" file="tests/{job}.py"/></testsuite></testsuites>'
 
 
 def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=True, load_attempt="2",
-                       verify_modules=None, verify_files=(), load_files=()):
+                       verify_modules=None, verify_files=(), load_files=(), shards=SHARD_JOBS):
     fragments = tmp_path / "fragments"
     verify = fragments / "ci-evidence-verify"
     verify.mkdir(parents=True)
@@ -1099,8 +1103,15 @@ def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=
     (verify / "attempt").write_text("2\n")
     modules = verify_modules or {name: "success" for name in ("gateway", "calendar", "calls", "calls_frontend", "backup_restore")}
     (verify / "metadata.json").write_text(json.dumps({**metadata(), "tiden_branch": "", "module_checks": modules}))
-    for name in ("python.xml", *verify_files):
+    for name in ("python-1.xml", *verify_files):
         (verify / name).write_text('<testsuite><testcase name="x" file="tests/x.py"/></testsuite>')
+    for job in shards:  # the `checks / python` matrix jobs, shards 2-4 of the root suite
+        fragment = fragments / f"ci-evidence-{job}"
+        fragment.mkdir()
+        (fragment / "source-sha").write_text("a" * 40 + "\n")
+        (fragment / "attempt").write_text("2\n")
+        (fragment / f"{job}.xml").write_text(shard_report(job))
+        (fragment / "outcomes.json").write_text(json.dumps({"checks": {"python": "success"}}))
     if load:
         fragment = fragments / "ci-evidence-load"
         fragment.mkdir()
@@ -1124,17 +1135,20 @@ def test_parallel_load_fragment_is_assembled_with_verify_evidence_of_the_same_co
     out = tmp_path / "ci-evidence"
     merged = assemble(out, evidence_fragments(tmp_path), ATTEMPT_URL, PASSED)
     # The assembling attempt names the evidence, so a rerun of one test job publishes under new row identities.
-    assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load"] and merged["missing"] == []
+    assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load", *SHARD_JOBS] and merged["missing"] == []
     assert merged["module_checks"]["load"] == "success" and set(merged["module_checks"]) == {
         "gateway", "calendar", "calls", "calls_frontend", "load", "backup_restore"}
     assert {path.name for path in out.iterdir()} == {"metadata.json", "source-sha", "python.xml", "load.xml", "load.json"}
+    # The four shard reports merge into the one python report, in shard order, so test identities do not change.
+    assert [case.get("name") for case in ET.parse(out / "python.xml").getroot().iter("testcase")] == ["x", *SHARD_JOBS]
     rows = assembled_rows(tmp_path, merged)
     assert rows["deedkit-ci::load"] == rows["anymsg-ci::python"] == "passed"
     # A job that succeeded and was not rerun keeps its earlier attempt's fragment, and the evidence says so.
     earlier = assemble(tmp_path / "earlier", evidence_fragments(tmp_path / "e", load_attempt="1"), ATTEMPT_URL, PASSED)
-    assert earlier["fragments"] == ["verify", "load"]
+    assert earlier["fragments"] == ["verify", "load", *SHARD_JOBS]
     assert earlier["producers"] == {"verify": {"result": "success", "sha": "a" * 40, "attempt": "2"},
-                                    "load": {"result": "success", "sha": "a" * 40, "attempt": "1"}}
+                                    "load": {"result": "success", "sha": "a" * 40, "attempt": "1"},
+                                    **{job: {"result": "success", "sha": "a" * 40, "attempt": "2"} for job in SHARD_JOBS}}
     # Assembling again into a used directory could keep a report the new fragments no longer supply.
     with pytest.raises(ValueError, match="new or empty"):
         assemble(out, evidence_fragments(tmp_path / "again", load=False), ATTEMPT_URL, PASSED)
@@ -1185,7 +1199,7 @@ def test_assembly_refuses_a_fragment_of_another_commit_or_of_foreign_checks(tmp_
 def test_missing_load_fragment_is_recorded_as_an_unrun_check(tmp_path):
     from scripts.tiden_ci import assemble
     merged = assemble(tmp_path / "ci-evidence", evidence_fragments(tmp_path, load=False), ATTEMPT_URL, PASSED)
-    assert merged["fragments"] == ["verify"] and merged["missing"] == ["load"] and merged["module_checks"]["load"] == "skipped"
+    assert merged["fragments"] == ["verify", *SHARD_JOBS] and merged["missing"] == ["load"] and merged["module_checks"]["load"] == "skipped"
     assert assembled_rows(tmp_path, merged)["deedkit-ci::load"] == "blocked"
 
 
@@ -1202,7 +1216,10 @@ def test_failed_rerun_never_publishes_an_earlier_attempts_passing_fragment(tmp_p
     stale_verify = evidence_fragments(tmp_path / "v")
     (stale_verify / "ci-evidence-verify" / "attempt").write_text("1\n")
     merged = assemble(tmp_path / "v" / "ci-evidence", stale_verify, ATTEMPT_URL, {**PASSED, "verify": ("cancelled", "")})
-    assert set(merged["checks"].values()) == {"cancelled"} and not (tmp_path / "v" / "ci-evidence" / "python.xml").exists()
+    assert set(merged["checks"].values()) == {"cancelled"}
+    # Its stale shard-1 report is never merged; the python report holds only the fresh shards' cases.
+    merged_report = ET.parse(tmp_path / "v" / "ci-evidence" / "python.xml").getroot()
+    assert [case.get("name") for case in merged_report.iter("testcase")] == list(SHARD_JOBS)
     # A stale verify fragment never hides that the failed verify job captured another checkout.
     with pytest.raises(ValueError, match="captured another source"):
         assemble(tmp_path / "v" / "other", stale_verify, ATTEMPT_URL, {**PASSED, "verify": ("failure", "b" * 40)})
@@ -1220,7 +1237,8 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     evidence = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]["evidence"]
     step = next(s for s in evidence["steps"] if s.get("name") == "Merge the fragments of the tested commit and record every check outcome")
     assert step["env"] == {"VERIFY": "verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}",
-                           "LOAD": "load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}"}
+                           "LOAD": "load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}",
+                           "PYTHON": "python:${{ needs.python.result }}:${{ needs.python.outputs.source_sha }}"}
     work = tmp_path / "work"
     work.mkdir()
     (work / "ci-tools").symlink_to(root, target_is_directory=True)
@@ -1229,7 +1247,7 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     evidence_fragments(temp, load=False)  # both jobs report success, the load artifact is gone, Tiden is unconfigured
     env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin", "RUNNER_TEMP": str(temp), "GITHUB_REPOSITORY": "example/repo",
            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "VERIFY": "verify:success:" + "a" * 40,
-           "LOAD": "load:success:" + "a" * 40}
+           "LOAD": "load:success:" + "a" * 40, "PYTHON": "python:success:" + "a" * 40}
     result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, capture_output=True, text=True, env=env)
     assert result.returncode != 0, result.stderr
     rows = json.loads((temp / "ci-evidence" / "ci-checks.json").read_text())  # the evidence still exists for upload
@@ -1268,7 +1286,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         assert upload["with"]["name"] == f"ci-evidence-{job}" and upload["if"] == "${{ always() }}"
         assert upload["with"]["overwrite"] is True
     evidence = jobs["evidence"]
-    assert evidence["needs"] == ["documentation", "verify", "load"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
+    assert evidence["needs"] == ["documentation", "verify", "load", "python"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     assert jobs["tiden"]["needs"] == ["documentation", "evidence"]
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in evidence["steps"]}
     assert steps["actions/download-artifact"]["with"]["pattern"] == "ci-evidence-*"
@@ -1277,12 +1295,15 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     assert retained["name"] == "ci-evidence" and retained["overwrite"] is True  # a rerun attempt replaces it
     require = steps["Require every test job to have succeeded"]
     assert require["if"] == "${{ always() }}"
-    assert require["env"] == {"VERIFY_RESULT": "${{ needs.verify.result }}", "LOAD_RESULT": "${{ needs.load.result }}"}
-    for verify, load_result in [("success", "success"), ("success", "failure"), ("success", "cancelled"),
-                                ("success", "skipped"), ("failure", "success"), ("skipped", "success")]:
+    assert require["env"] == {"VERIFY_RESULT": "${{ needs.verify.result }}", "LOAD_RESULT": "${{ needs.load.result }}",
+                              "PYTHON_RESULT": "${{ needs.python.result }}"}
+    for verify, load_result, shards in [("success", "success", "success"), ("success", "failure", "success"),
+                                        ("success", "cancelled", "success"), ("success", "skipped", "success"),
+                                        ("failure", "success", "success"), ("skipped", "success", "success"),
+                                        ("success", "success", "failure"), ("success", "success", "skipped")]:
         result = subprocess.run(["bash", "-e", "-c", require["run"]], capture_output=True,
-                                env={"VERIFY_RESULT": verify, "LOAD_RESULT": load_result})
-        assert (result.returncode == 0) == (verify == load_result == "success"), (verify, load_result)
+                                env={"VERIFY_RESULT": verify, "LOAD_RESULT": load_result, "PYTHON_RESULT": shards})
+        assert (result.returncode == 0) == (verify == load_result == shards == "success"), (verify, load_result, shards)
 
 
 def test_python_suite_reports_its_slowest_tests_and_waits_for_its_background_images(tmp_path):

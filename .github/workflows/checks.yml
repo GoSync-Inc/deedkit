@@ -227,12 +227,14 @@ jobs:
             fi
           done
       - name: Python/PostgreSQL tests
+        # Shard 1 of the root suite; the `python` jobs run the others in parallel (scripts/python_shards.py).
         id: python
         env:
           PROBE_TEST_DSN_FILE: ${{ runner.temp }}/anymsg-test.dsn
           ANYMSG_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           ANYMSG_TEST_WHEEL: ${{ github.workspace }}/dist/anymsg-${{ steps.build.outputs.version }}-py3-none-any.whl
           ANYMSG_TEST_SDIST: ${{ github.workspace }}/dist/anymsg-${{ steps.build.outputs.version }}.tar.gz
+          DEEDKIT_TEST_SHARD: 1/4
         run: |
           DEEDKIT_TEST_ROUTER_IMAGE="$(docker image inspect --format '{{.Id}}' deedkit-release-router:ci)"
           export DEEDKIT_TEST_ROUTER_IMAGE
@@ -243,7 +245,7 @@ jobs:
           p.write_text('postgresql://probe_owner:synthetic-ci-password@127.0.0.1:5432/messaging_probe_test')
           p.chmod(0o600)
           PY
-          uv run pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python.xml" --ignore=tests/test_backup_r2_verifier_native.py tests
+          uv run pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py tests
       - name: Isolated server backup restore with real age and PostgreSQL
         id: backup_restore
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -391,11 +393,156 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           overwrite: true
+  python:
+    # Shards 2-4 of the root Python/PostgreSQL suite, in parallel with verify, which runs shard 1. Each shard has
+    # its own runner and PostgreSQL and the same tools, images and environments as verify's suite step; every
+    # test module belongs to exactly one shard (scripts/python_shards.py), and evidence merges their reports.
+    name: python (${{ matrix.shard }}/4)
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [2, 3, 4]
+    env:
+      DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    services:
+      postgres:
+        image: postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
+        env:
+          POSTGRES_USER: probe_owner
+          POSTGRES_PASSWORD: synthetic-ci-password
+          POSTGRES_DB: messaging_probe_test
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U probe_owner -d messaging_probe_test" --health-interval 5s --health-timeout 3s --health-retries 12
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_ref }}
+      - name: Start evidence record
+        id: source
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/ci-evidence/source-sha"
+          echo "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/ci-evidence/attempt"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Start the release router image build and the Python image pull in the background
+        run: |
+          mkdir -p "$RUNNER_TEMP/background"
+          finish() { if "${@:2}" > "$RUNNER_TEMP/background/$1.log" 2>&1; then echo 0; else echo 1; fi > "$RUNNER_TEMP/background/$1.tmp"; mv "$RUNNER_TEMP/background/$1.tmp" "$RUNNER_TEMP/background/$1.exit"; }
+          revision="$(git rev-parse HEAD)"
+          finish router docker build --file services/release-router/Dockerfile --tag deedkit-release-router:ci \
+            --build-arg "VERSION_REF=$revision" --label "org.opencontainers.image.revision=$revision" \
+            --label org.opencontainers.image.source=https://github.com/GoSync-Inc/deedkit . </dev/null >/dev/null 2>&1 &
+          finish python-image docker pull "$DEEDKIT_TEST_PYTHON_IMAGE" </dev/null >/dev/null 2>&1 &
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with: {python-version: '3.13'}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with: {node-version: '24'}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: {version: '0.9.26'}
+      - name: Native extraction tools
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0
+      - name: Install pinned dependencies
+        run: uv sync --frozen --group dev
+      - name: Build the distributions the packaging tests inspect
+        id: package
+        run: |
+          python - <<'PYCODE'
+          import os,tomllib
+          from pathlib import Path
+          version=tomllib.loads(Path('services/messaging/pyproject.toml').read_text())['project']['version']
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:output.write(f'version={version}\n')
+          PYCODE
+          uv build --project services/messaging --out-dir dist
+      - name: Gateway and calendar environments the root suite starts
+        run: |
+          (cd services/gateway && uv sync --locked --group dev)
+          (cd services/calendar && uv sync --locked --group dev)
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.9'
+          cache-dependency-path: whatsapp/whatsmeow/go.sum
+      - name: Build native WhatsApp offline normalizer
+        run: |
+          cd whatsapp/whatsmeow
+          go build -trimpath -o "$RUNNER_TEMP/anymsg-whatsmeow" .
+          echo "ANYMSG_WHATSMEOW_TEST_BINARY=$RUNNER_TEMP/anymsg-whatsmeow" >> "$GITHUB_ENV"
+      - name: Install the pinned gitleaks for the image-scan tests
+        run: |
+          curl --fail --silent --show-error --location --retry 3 -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --strict
+          mkdir "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "GITLEAKS=$RUNNER_TEMP/gitleaks-bin/gitleaks" >> "$GITHUB_ENV"
+      - name: Wait for the background router image and Python image
+        env:
+          BACKGROUND_WAIT_SECONDS: 900
+        run: |
+          for name in router python-image; do
+            for _ in $(seq "$BACKGROUND_WAIT_SECONDS"); do
+              test -f "$RUNNER_TEMP/background/$name.exit" && break
+              sleep 1
+            done
+            if [ "$(cat "$RUNNER_TEMP/background/$name.exit" 2>/dev/null)" != 0 ]; then
+              cat "$RUNNER_TEMP/background/$name.log" 2>/dev/null || true
+              echo "::error::background $name preparation failed or did not finish"
+              exit 1
+            fi
+          done
+      - name: Python/PostgreSQL tests
+        id: python
+        env:
+          PROBE_TEST_DSN_FILE: ${{ runner.temp }}/anymsg-test.dsn
+          ANYMSG_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          ANYMSG_TEST_WHEEL: ${{ github.workspace }}/dist/anymsg-${{ steps.package.outputs.version }}-py3-none-any.whl
+          ANYMSG_TEST_SDIST: ${{ github.workspace }}/dist/anymsg-${{ steps.package.outputs.version }}.tar.gz
+          DEEDKIT_TEST_SHARD: ${{ matrix.shard }}/4
+        run: |
+          DEEDKIT_TEST_ROUTER_IMAGE="$(docker image inspect --format '{{.Id}}' deedkit-release-router:ci)"
+          export DEEDKIT_TEST_ROUTER_IMAGE
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          p=Path(os.environ['PROBE_TEST_DSN_FILE'])
+          p.write_text('postgresql://probe_owner:synthetic-ci-password@127.0.0.1:5432/messaging_probe_test')
+          p.chmod(0o600)
+          PY
+          uv run pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py tests
+      - name: Record the shard outcome
+        if: ${{ always() }}
+        env:
+          PYTHON_OUTCOME: ${{ steps.python.outcome }}
+        run: |
+          python3 -c 'import json, os, pathlib; pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence", "outcomes.json").write_text(json.dumps({"checks": {"python": os.environ["PYTHON_OUTCOME"]}}))'
+      - name: Retain shard evidence even when its tests fail
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-evidence-python-${{ matrix.shard }}
+          path: ${{ runner.temp }}/ci-evidence
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+      - name: Require the tested source to be the commit receiving this check
+        if: ${{ always() }}
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          test -n "$SOURCE_SHA"
+          test "$SOURCE_SHA" = "$EXPECTED_SHA"
   evidence:
     # One `ci-evidence` artifact from every test job's fragment, attempted even after a failure so the
     # failure itself is recorded (TIDEN-CI.md). A missing, failed, cancelled or skipped test job fails
     # this job whether or not Tiden reporting is configured.
-    needs: [documentation, verify, load]
+    needs: [documentation, verify, load, python]
     if: ${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -419,10 +566,11 @@ jobs:
         env:
           VERIFY: verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}
           LOAD: load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}
+          PYTHON: python:${{ needs.python.result }}:${{ needs.python.outputs.source_sha }}
         run: |
           assembled=0
           python ci-tools/scripts/tiden_ci.py assemble --directory "$RUNNER_TEMP/ci-evidence" --fragments "$RUNNER_TEMP/fragments" \
-            --producer "$VERIFY" --producer "$LOAD" || assembled=$?
+            --producer "$VERIFY" --producer "$LOAD" --producer "$PYTHON" || assembled=$?
           python ci-tools/scripts/tiden_ci.py prepare --directory "$RUNNER_TEMP/ci-evidence"
           exit "$assembled"
       - name: Retain test evidence even when a check fails
@@ -440,9 +588,11 @@ jobs:
         env:
           VERIFY_RESULT: ${{ needs.verify.result }}
           LOAD_RESULT: ${{ needs.load.result }}
+          PYTHON_RESULT: ${{ needs.python.result }}
         run: |
           test "$VERIFY_RESULT" = success
           test "$LOAD_RESULT" = success
+          test "$PYTHON_RESULT" = success
   tiden:
     needs: [documentation, evidence]
     # PRs from forks never receive credentials. Internal PRs retain their actual

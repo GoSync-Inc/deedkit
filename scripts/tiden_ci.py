@@ -28,13 +28,24 @@ MODULE_REPORTS = {
     "backup_restore": ("backup-restore.xml", "python", ""),
 }
 _VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load")
+# The root Python suite runs in file-level shards (scripts/python_shards.py): verify runs shard 1, each
+# `checks / python` matrix job one of the others, and assembly merges their reports into python.xml.
+PYTHON_SHARDS = 4
+SHARD_REPORTS = tuple(f"python-{index}.xml" for index in range(1, PYTHON_SHARDS + 1))
+SHARD_JOBS = tuple(f"python-{index}" for index in range(2, PYTHON_SHARDS + 1))
 # Each parallel test job uploads one `ci-evidence-<job>` fragment: the module checks it runs and the files it
-# produces (verify's seven checks travel in its metadata.json), besides the `source-sha` and `attempt` it ran.
+# produces (verify's seven checks travel in its metadata.json, a shard's `python` outcome in its outcomes.json),
+# besides the `source-sha` and `attempt` it ran.
 FRAGMENTS = {
-    "verify": (_VERIFY_MODULES, ("metadata.json", *REPORTS.values(), *(MODULE_REPORTS[name][0] for name in _VERIFY_MODULES))),
+    "verify": (_VERIFY_MODULES, ("metadata.json", SHARD_REPORTS[0], *(name for check, name in REPORTS.items() if check != "python"),
+                                 *(MODULE_REPORTS[name][0] for name in _VERIFY_MODULES))),
     "load": (("load",), ("outcomes.json", MODULE_REPORTS["load"][0], "load.json")),
+    **{job: ((), ("outcomes.json", report)) for job, report in zip(SHARD_JOBS, SHARD_REPORTS[1:])},
 }
 CONTROL_FILES = {"source-sha", "attempt", "metadata.json", "outcomes.json"}
+# Every file assembly writes besides `source-sha` and `metadata.json`.
+ASSEMBLED_FILES = frozenset({REPORTS["python"], *(name for _, files in FRAGMENTS.values() for name in files
+                                                  if name not in CONTROL_FILES and name not in SHARD_REPORTS)})
 MAX_BYTES = 20 * 1024 * 1024
 # Tiden branch names: lowercase letters, digits, slashes, underscores and hyphens.
 TIDEN_BRANCH_NAME = re.compile(r"[a-z0-9]+(?:[/_-][a-z0-9]+)*")
@@ -179,6 +190,27 @@ def fresh_fragment(fragment: Path, root: Path, job: str, result: str, attempt: s
     return result == "success" or control_file(fragment, "attempt") == attempt
 
 
+def merge_shard_reports(reports: list[Path]) -> bytes:
+    """One pytest report of the shards' test suites, refused on the same unsafe input as `normalize_junit`."""
+    merged = ET.Element("testsuites", {"name": "pytest tests"})
+    for path in reports:
+        data = path.read_bytes()
+        if len(data) > MAX_BYTES or b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
+            raise ValueError("unsafe or oversized JUnit report")
+        document = ET.fromstring(data)
+        if document.tag not in {"testsuites", "testsuite"}:
+            raise ValueError("not a JUnit report")
+        merged.extend([document] if document.tag == "testsuite" else document.findall("testsuite"))
+    return ET.tostring(merged, encoding="utf-8", xml_declaration=True)
+
+
+def combined_outcome(outcomes: list[str]) -> str:
+    """The `python` check over its shards: passed only when every shard passed."""
+    if all(outcome == "success" for outcome in outcomes):
+        return "success"
+    return next((state for state in ("failure", "cancelled") if state in outcomes), "skipped")
+
+
 def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict) -> dict:
     """Merge the evidence fragments that the parallel test jobs uploaded into the directory `prepare` reads.
 
@@ -187,6 +219,8 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict) -> 
     captured. A job without a fresh fragment contributes no reports, and its checks take its job result
     (`skipped` when it succeeded), so it never reads as passed; such jobs are returned in `missing`. A stale
     verify fragment still supplies the run's routing metadata (SHA, Git and Tiden branch), never its outcomes.
+    The `python` check passes only when every shard (verify's and each shard job's) passed with a fresh fragment
+    and a valid report; the shard reports merge into one python.xml, so test identities do not change.
     `ci_url` names this assembly's run attempt, which reruns with every producer; `producers` in the metadata
     keeps each job's own result, captured SHA and the attempt its merged fragment came from. `directory` must
     be new or empty, so no earlier assembly's report survives.
@@ -209,7 +243,7 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict) -> 
         raise ValueError("the evidence directory must be new or empty")
     checks, module_checks, provenance = dict(metadata["checks"]), {}, {}
     directory.mkdir(parents=True, exist_ok=True)
-    present, missing = [], []
+    present, missing, shards, reports = [], [], [], []
     for job, (names, files) in FRAGMENTS.items():
         result, captured = producers[job]
         # A job's own captured checkout always has to agree with verify's, whatever its fragment.
@@ -223,6 +257,8 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict) -> 
             module_checks.update(dict.fromkeys(names, state))
             if job == "verify":
                 checks = dict.fromkeys(CHECKS, state)
+            if job == "verify" or job in SHARD_JOBS:
+                shards.append(state)
             continue
         if control_file(fragment, "source-sha") != sha or captured != sha:
             raise ValueError(f"the {job} fragment tested another source than verify")
@@ -230,16 +266,37 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict) -> 
         if not provenance[job]["attempt"].isdigit():
             raise ValueError(f"the {job} fragment does not name its run attempt")
         try:
-            reported = (metadata if job == "verify" else json.loads(control_file(fragment, "outcomes.json")))["module_checks"]
+            outcomes = metadata if job == "verify" else json.loads(control_file(fragment, "outcomes.json"))
+            reported = outcomes["checks"] if job in SHARD_JOBS else outcomes["module_checks"]
+            if job in SHARD_JOBS and set(outcomes) != {"checks"}:
+                reported = None
         except (ValueError, KeyError, TypeError):
             reported = None
-        if not isinstance(reported, dict) or set(reported) != set(names):
+        if not isinstance(reported, dict) or set(reported) != ({"python"} if job in SHARD_JOBS else set(names)):
             raise ValueError(f"the {job} fragment may report only its own checks")
-        module_checks.update(reported)
+        if job in SHARD_JOBS:
+            state, report = reported["python"], fragment / files[1]
+        else:
+            module_checks.update(reported)
+            state, report = (checks["python"], fragment / SHARD_REPORTS[0]) if job == "verify" else (None, None)
+        if report is not None:
+            # A shard without its report never passes: it failed, or its verification is incomplete.
+            if report.is_file():
+                reports.append(report)
+            elif state not in {"failure", "cancelled"}:
+                state = "skipped"
+            shards.append(state)
         for path in fragment.iterdir():
-            if path.name not in CONTROL_FILES:
+            if path.name not in CONTROL_FILES and path.name not in SHARD_REPORTS:
                 (directory / path.name).write_bytes(path.read_bytes())
         present.append(job)
+    checks["python"] = combined_outcome(shards)
+    if reports:
+        try:
+            (directory / REPORTS["python"]).write_bytes(merge_shard_reports(reports))
+        except (OSError, ValueError, ET.ParseError):
+            # An unsafe or malformed shard report records the suite as incomplete, never as passed.
+            checks["python"] = checks["python"] if checks["python"] in {"failure", "cancelled"} else "skipped"
     (directory / "source-sha").write_text(sha + "\n")
     metadata.update({"ci_url": ci_url, "checks": checks, "module_checks": module_checks, "fragments": present,
                      "producers": provenance})
@@ -594,7 +651,9 @@ def main() -> int:
     if args.command == "assemble":
         ci_url = "https://github.com/{}/actions/runs/{}/attempts/{}".format(*(
             os.environ.get(name, "") for name in ("GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")))
-        producers = {job: (result, sha) for job, result, sha in (value.split(":", 2) for value in args.producer)}
+        # `python` names the shard matrix job: its result is success only when every shard job succeeded.
+        producers = {name: (result, sha) for job, result, sha in (value.split(":", 2) for value in args.producer)
+                     for name in (SHARD_JOBS if job == "python" else (job,))}
         merged = assemble(directory, args.fragments, ci_url, producers)
         print(json.dumps({"fragments": merged["fragments"], "missing": merged["missing"]}))
         # The evidence is written either way, so a run without every fresh fragment is recorded and still fails.
