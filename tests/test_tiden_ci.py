@@ -1238,8 +1238,7 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     step = next(s for s in evidence["steps"] if s.get("name") == "Merge the fragments of the tested commit and record every check outcome")
     assert step["env"] == {"VERIFY": "verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}",
                            "LOAD": "load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}",
-                           **{f"PYTHON_{index}": (f"python-{index}:${{{{ needs.python.outputs.result_{index} || needs.python.result }}}}"
-                                                     f":${{{{ needs.python.outputs.source_sha_{index} }}}}")
+                           **{f"PYTHON_{index}": f"python-{index}:${{{{ needs.python-{index}.result }}}}:${{{{ needs.python-{index}.outputs.source_sha }}}}"
                               for index in range(2, 5)}}
     work = tmp_path / "work"
     work.mkdir()
@@ -1288,7 +1287,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         assert upload["with"]["name"] == f"ci-evidence-{job}" and upload["if"] == "${{ always() }}"
         assert upload["with"]["overwrite"] is True
     evidence = jobs["evidence"]
-    assert evidence["needs"] == ["documentation", "verify", "load", "python"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
+    assert evidence["needs"] == ["documentation", "verify", "load", "python-2", "python-3", "python-4"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     assert jobs["tiden"]["needs"] == ["documentation", "evidence"]
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in evidence["steps"]}
     assert steps["actions/download-artifact"]["with"]["pattern"] == "ci-evidence-*"
@@ -1298,13 +1297,14 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     require = steps["Require every test job to have succeeded"]
     assert require["if"] == "${{ always() }}"
     assert require["env"] == {"VERIFY_RESULT": "${{ needs.verify.result }}", "LOAD_RESULT": "${{ needs.load.result }}",
-                              "PYTHON_RESULT": "${{ needs.python.result }}"}
+                              **{f"PYTHON_{index}_RESULT": f"${{{{ needs.python-{index}.result }}}}" for index in range(2, 5)}}
     for verify, load_result, shards in [("success", "success", "success"), ("success", "failure", "success"),
                                         ("success", "cancelled", "success"), ("success", "skipped", "success"),
                                         ("failure", "success", "success"), ("skipped", "success", "success"),
                                         ("success", "success", "failure"), ("success", "success", "skipped")]:
         result = subprocess.run(["bash", "-e", "-c", require["run"]], capture_output=True,
-                                env={"VERIFY_RESULT": verify, "LOAD_RESULT": load_result, "PYTHON_RESULT": shards})
+                                env={"VERIFY_RESULT": verify, "LOAD_RESULT": load_result, "PYTHON_2_RESULT": "success",
+                                     "PYTHON_3_RESULT": shards, "PYTHON_4_RESULT": "success"})
         assert (result.returncode == 0) == (verify == load_result == shards == "success"), (verify, load_result, shards)
 
 

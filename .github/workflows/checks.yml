@@ -397,31 +397,27 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           overwrite: true
-  python:
+  python-2:
     # Shards 2-4 of the root Python/PostgreSQL suite, in parallel with verify, which runs shard 1. Each shard has
     # its own runner and PostgreSQL and the same tools, images and environments as verify's suite step; every
     # test module belongs to exactly one shard (scripts/python_shards.py), and evidence merges their reports.
+    # Each shard is a job of its own, not one matrix, so evidence receives each shard job's completed result and
+    # captured SHA; python-3 and python-4 repeat this job's steps through the anchor. A shard job does not check
+    # the commit receiving the checks: evidence requires its captured SHA to be verify's, and verify checks it,
+    # so a shard job's result is its tests' and never a baseline's deliberate mismatch.
     name: python (${{ matrix.shard }}/4)
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
-      fail-fast: false
       matrix:
-        shard: [2, 3, 4]
+        shard: [2]
     env:
       DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
     outputs:
-      # A matrix job has one set of outputs that its jobs overwrite, so each shard job names its captured SHA
-      # under an output of its own (an empty value overwrites nothing) and evidence compares each one.
-      source_sha_2: ${{ steps.shard.outputs.sha_2 }}
-      source_sha_3: ${{ steps.shard.outputs.sha_3 }}
-      source_sha_4: ${{ steps.shard.outputs.sha_4 }}
-      result_2: ${{ steps.result.outputs.result_2 }}
-      result_3: ${{ steps.result.outputs.result_3 }}
-      result_4: ${{ steps.result.outputs.result_4 }}
-    services:
+      source_sha: ${{ steps.source.outputs.sha }}
+    services: &python-shard-services
       postgres:
         image: postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
         env:
@@ -430,7 +426,7 @@ jobs:
           POSTGRES_DB: messaging_probe_test
         ports: ['5432:5432']
         options: --health-cmd "pg_isready -U probe_owner -d messaging_probe_test" --health-interval 5s --health-timeout 3s --health-retries 12
-    steps:
+    steps: &python-shard-steps
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
@@ -447,12 +443,6 @@ jobs:
           git rev-parse HEAD > "$RUNNER_TEMP/ci-evidence/source-sha"
           echo "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/ci-evidence/attempt"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Name the captured source for this shard
-        id: shard
-        env:
-          SHARD: ${{ matrix.shard }}
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
-        run: echo "sha_$SHARD=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
       - name: Start the release router image build and the Python image pull in the background
         run: |
           mkdir -p "$RUNNER_TEMP/background"
@@ -556,28 +546,41 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           overwrite: true
-      - name: Record this shard job's own result
-        # The matrix reports one result for all its jobs, so each shard job names its own, taken before the
-        # receiving-commit check that a baseline of another source fails by design (TIDEN-CI.md).
-        id: result
-        if: ${{ always() }}
-        env:
-          SHARD: ${{ matrix.shard }}
-          STATUS: ${{ job.status }}
-        run: echo "result_$SHARD=$STATUS" >> "$GITHUB_OUTPUT"
-      - name: Require the tested source to be the commit receiving this check
-        if: ${{ always() }}
-        env:
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
-          EXPECTED_SHA: ${{ github.sha }}
-        run: |
-          test -n "$SOURCE_SHA"
-          test "$SOURCE_SHA" = "$EXPECTED_SHA"
+  python-3:
+    name: python (${{ matrix.shard }}/4)
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        shard: [3]
+    env:
+      DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    services: *python-shard-services
+    steps: *python-shard-steps
+  python-4:
+    name: python (${{ matrix.shard }}/4)
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        shard: [4]
+    env:
+      DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    services: *python-shard-services
+    steps: *python-shard-steps
   evidence:
     # One `ci-evidence` artifact from every test job's fragment, attempted even after a failure so the
     # failure itself is recorded (TIDEN-CI.md). A missing, failed, cancelled or skipped test job fails
     # this job whether or not Tiden reporting is configured.
-    needs: [documentation, verify, load, python]
+    needs: [documentation, verify, load, python-2, python-3, python-4]
     if: ${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -601,10 +604,9 @@ jobs:
         env:
           VERIFY: verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}
           LOAD: load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}
-          # Each shard job's own result, or the matrix result when it recorded none; the matrix result stays the gate.
-          PYTHON_2: python-2:${{ needs.python.outputs.result_2 || needs.python.result }}:${{ needs.python.outputs.source_sha_2 }}
-          PYTHON_3: python-3:${{ needs.python.outputs.result_3 || needs.python.result }}:${{ needs.python.outputs.source_sha_3 }}
-          PYTHON_4: python-4:${{ needs.python.outputs.result_4 || needs.python.result }}:${{ needs.python.outputs.source_sha_4 }}
+          PYTHON_2: python-2:${{ needs.python-2.result }}:${{ needs.python-2.outputs.source_sha }}
+          PYTHON_3: python-3:${{ needs.python-3.result }}:${{ needs.python-3.outputs.source_sha }}
+          PYTHON_4: python-4:${{ needs.python-4.result }}:${{ needs.python-4.outputs.source_sha }}
         run: |
           assembled=0
           python ci-tools/scripts/tiden_ci.py assemble --directory "$RUNNER_TEMP/ci-evidence" --fragments "$RUNNER_TEMP/fragments" \
@@ -626,11 +628,15 @@ jobs:
         env:
           VERIFY_RESULT: ${{ needs.verify.result }}
           LOAD_RESULT: ${{ needs.load.result }}
-          PYTHON_RESULT: ${{ needs.python.result }}
+          PYTHON_2_RESULT: ${{ needs.python-2.result }}
+          PYTHON_3_RESULT: ${{ needs.python-3.result }}
+          PYTHON_4_RESULT: ${{ needs.python-4.result }}
         run: |
           test "$VERIFY_RESULT" = success
           test "$LOAD_RESULT" = success
-          test "$PYTHON_RESULT" = success
+          test "$PYTHON_2_RESULT" = success
+          test "$PYTHON_3_RESULT" = success
+          test "$PYTHON_4_RESULT" = success
   tiden:
     needs: [documentation, evidence]
     # PRs from forks never receive credentials. Internal PRs retain their actual

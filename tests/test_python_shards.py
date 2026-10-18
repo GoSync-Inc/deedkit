@@ -178,24 +178,24 @@ def test_a_python_files_pattern_with_a_directory_is_a_usage_error_in_a_sharded_r
 
 def test_python_shard_jobs_run_verifys_suite_step_on_runners_of_their_own():
     all_jobs = jobs()
-    verify, python = all_jobs["verify"], all_jobs["python"]
-    assert python["strategy"] == {"fail-fast": False, "matrix": {"shard": list(range(2, tiden_ci.PYTHON_SHARDS + 1))}}
+    verify, python = all_jobs["verify"], all_jobs["python-2"]
+    # One job per shard, so each has its own completed result; the jobs differ only in their shard.
+    for job in tiden_ci.SHARD_JOBS:
+        assert all_jobs[job]["strategy"] == {"matrix": {"shard": [int(job.split("-")[1])]}}
+        assert {key: value for key, value in all_jobs[job].items() if key != "strategy"} == {
+            key: value for key, value in python.items() if key != "strategy"}
+    assert "python" not in all_jobs
     assert python["name"] == f"python (${{{{ matrix.shard }}}}/{tiden_ci.PYTHON_SHARDS})"
     # Skipped exactly when verify is, never after it, and with verify's PostgreSQL, images and pins.
     assert python["needs"] == verify["needs"] == "documentation" and python["if"] == verify["if"]
     assert python["services"] == verify["services"] and python["env"] == verify["env"]
-    assert verify["outputs"] == {"source_sha": "${{ steps.source.outputs.sha }}"}
-    assert python["outputs"] == {**{f"source_sha_{index}": f"${{{{ steps.shard.outputs.sha_{index} }}}}"
-                                    for index in range(2, tiden_ci.PYTHON_SHARDS + 1)},
-                                 **{f"result_{index}": f"${{{{ steps.result.outputs.result_{index} }}}}"
-                                    for index in range(2, tiden_ci.PYTHON_SHARDS + 1)}}
+    assert python["outputs"] == verify["outputs"] == {"source_sha": "${{ steps.source.outputs.sha }}"}
     assert python["timeout-minutes"] <= verify["timeout-minutes"]
     named = {step.get("name") or step["uses"]: step for step in python["steps"]}
     ours = {step.get("name") or step["uses"]: step for step in verify["steps"]}
     for name in ("Start evidence record", "Start the release router image build and the Python image pull in the background",
                  "Native extraction tools", "Install pinned dependencies", "Build native WhatsApp offline normalizer",
-                 "Install the pinned gitleaks for the image-scan tests", "Wait for the background router image and Python image",
-                 "Require the tested source to be the commit receiving this check"):
+                 "Install the pinned gitleaks for the image-scan tests", "Wait for the background router image and Python image"):
         assert named[name]["run"] == ours[name]["run"], name
     for uses in (step["uses"] for step in verify["steps"] if "uses" in step and "upload-artifact" not in step["uses"]):
         assert uses in named, uses
@@ -214,7 +214,7 @@ def test_python_shard_jobs_run_verifys_suite_step_on_runners_of_their_own():
     assert "(cd services/gateway && uv sync --locked --group dev)" in venvs and "(cd services/calendar && uv sync --locked --group dev)" in venvs
     # A shard's only check is `python`; its fragment carries its outcome and report under its own name.
     ids = {step.get("id") for step in python["steps"]} - {None}
-    assert ids == {"source", "shard", "package", "python", "result"} and not ids & (set(tiden_ci.CHECKS) - {"python"})
+    assert ids == {"source", "package", "python"} and not ids & (set(tiden_ci.CHECKS) - {"python"})
     # Both run the suite through the workflow commit's selector, checked out as ci-tools beside the tested source.
     for job in (verify, python):
         assert {"persist-credentials": False, "ref": "${{ github.sha }}", "path": "ci-tools"} in [step.get("with") for step in job["steps"]]
@@ -225,13 +225,15 @@ def test_python_shard_jobs_run_verifys_suite_step_on_runners_of_their_own():
     assert upload["with"]["overwrite"] is True and upload["with"]["if-no-files-found"] == "error"
     names = [step.get("name") for step in python["steps"]]
     assert names.index("Python/PostgreSQL tests") < names.index("Record the shard outcome") < names.index(
-        "Retain shard evidence even when its tests fail") < names.index("Record this shard job's own result") < names.index(
-        "Require the tested source to be the commit receiving this check") == len(names) - 1
+        "Retain shard evidence even when its tests fail") == len(names) - 1
+    # No receiving-commit check of its own: evidence requires its captured SHA to be verify's, which verify checks,
+    # so a shard job's result is its tests' result, never a baseline's deliberate mismatch.
+    assert not any("github.sha" in json.dumps(step) and step.get("with", {}).get("path") != "ci-tools" for step in python["steps"])
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancelled", "skipped"])
 def test_the_shard_outcome_step_records_only_its_python_check(tmp_path, outcome):
-    step = next(step for step in jobs()["python"]["steps"] if step.get("name") == "Record the shard outcome")
+    step = next(step for step in jobs()["python-2"]["steps"] if step.get("name") == "Record the shard outcome")
     assert step["if"] == "${{ always() }}" and step["env"] == {"PYTHON_OUTCOME": "${{ steps.python.outcome }}"}
     (tmp_path / "ci-evidence").mkdir()
     subprocess.run(["bash", "-e", "-c", step["run"]], check=True, env={"PATH": os.environ["PATH"], "RUNNER_TEMP": str(tmp_path),
@@ -325,21 +327,13 @@ def test_the_python_producer_names_every_shard_job_of_the_matrix(tmp_path):
 
 
 def test_each_shard_job_reports_its_own_captured_source_to_the_assembly(tmp_path):
-    # A matrix job's outputs are one set its jobs overwrite, so each shard job writes its SHA under its own name.
+    # Each shard is a job of its own, so evidence receives its own completed result and captured SHA.
     all_jobs = jobs()
-    step = next(step for step in all_jobs["python"]["steps"] if step.get("id") == "shard")
-    assert step["env"] == {"SHARD": "${{ matrix.shard }}", "SOURCE_SHA": "${{ steps.source.outputs.sha }}"}
-    for index in range(2, tiden_ci.PYTHON_SHARDS + 1):
-        output = tmp_path / f"output-{index}"
-        subprocess.run(["bash", "-e", "-c", step["run"]], check=True, env={"PATH": os.environ["PATH"], "GITHUB_OUTPUT": str(output),
-                                                                        "SHARD": str(index), "SOURCE_SHA": str(index) * 40})
-        assert output.read_text() == f"sha_{index}={str(index) * 40}\n"
     merge = next(step for step in all_jobs["evidence"]["steps"]
                  if step.get("name") == "Merge the fragments of the tested commit and record every check outcome")
     for job in tiden_ci.SHARD_JOBS:
         index = job.split("-")[1]
-        assert merge["env"][f"PYTHON_{index}"] == (f"{job}:${{{{ needs.python.outputs.result_{index} || needs.python.result }}}}"
-                                                   f":${{{{ needs.python.outputs.source_sha_{index} }}}}")
+        assert merge["env"][f"PYTHON_{index}"] == f"{job}:${{{{ needs.{job}.result }}}}:${{{{ needs.{job}.outputs.source_sha }}}}"
         assert f'--producer "$PYTHON_{index}"' in merge["run"]
     # One shard job's checkout differing from verify's is refused, whatever the other shard jobs captured.
     with pytest.raises(ValueError, match="captured another source"):
@@ -349,18 +343,48 @@ def test_each_shard_job_reports_its_own_captured_source_to_the_assembly(tmp_path
 
 @pytest.mark.parametrize("status", ["success", "failure", "cancelled"])
 def test_a_baseline_of_another_source_keeps_its_shard_step_outcomes(tmp_path, status):
-    # Every test job of a baseline dispatch fails its receiving-commit check by design. Each shard job records its
-    # own result before that check, so a baseline's passing shards still count, and a failure or cancellation of
-    # the job itself still never reads as passed.
-    step = next(step for step in jobs()["python"]["steps"] if step.get("id") == "result")
-    assert step["if"] == "${{ always() }}" and step["env"] == {"SHARD": "${{ matrix.shard }}", "STATUS": "${{ job.status }}"}
-    output = tmp_path / "output"
-    subprocess.run(["bash", "-e", "-c", step["run"]], check=True, env={"PATH": os.environ["PATH"], "GITHUB_OUTPUT": str(output),
-                                                                    "SHARD": "3", "STATUS": status})
-    assert output.read_text() == f"result_3={status}\n"
+    # A shard job has no receiving-commit check, which a baseline of another source fails by design, so a
+    # baseline's shard job result is its tests' result: passing shards count, and a failed or cancelled job never passes.
+    for job in tiden_ci.SHARD_JOBS:
+        names = [step.get("name") for step in jobs()[job]["steps"]]
+        assert "Require the tested source to be the commit receiving this check" not in names
     merged = tiden_ci.assemble(tmp_path / "ci-evidence", evidence_fragments(tmp_path), ATTEMPT_URL,
                                {**PASSED, "python-3": (status, "a" * 40)})
     assert merged["checks"]["python"] == status and merged["producers"]["python-3"]["result"] == status
+
+
+# The evidence step's needs context, as GitHub resolves it for these jobs; any other expression is unsupported here.
+def resolve(template, needs):
+    import re
+    resolved = re.sub(r"\$\{\{ needs\.([a-z0-9-]+)\.(result|outputs\.source_sha) \}\}",
+                      lambda match: needs[match.group(1)]["result" if match.group(2) == "result" else "sha"], template)
+    assert "${{" not in resolved, resolved
+    return resolved
+
+
+@pytest.mark.parametrize("late, row", [("success", "passed"), ("failure", "failed"), ("cancelled", "blocked")])
+def test_a_shard_job_that_fails_after_uploading_a_passing_fragment_never_reads_as_passed(tmp_path, late, row):
+    # The job passed its tests and uploaded a passing fragment, then failed or was cancelled in a later step or a
+    # post step. Evidence takes the job's completed result from `needs`, never a status sampled inside the job.
+    root = Path(__file__).resolve().parents[1]
+    merge = next(step for step in jobs()["evidence"]["steps"]
+                 if step.get("name") == "Merge the fragments of the tested commit and record every check outcome")
+    needs = {"verify": {"result": "success", "sha": "a" * 40}, "load": {"result": "success", "sha": "a" * 40},
+             **{job: {"result": "success", "sha": "a" * 40} for job in tiden_ci.SHARD_JOBS}}
+    needs["python-3"]["result"] = late
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "ci-tools").symlink_to(root, target_is_directory=True)
+    temp = tmp_path / "runner"
+    temp.mkdir()
+    evidence_fragments(temp)  # every fragment, python-3's included, reports passing tests of this attempt
+    env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin", "RUNNER_TEMP": str(temp), "GITHUB_REPOSITORY": "example/repo",
+           "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", **{name: resolve(value, needs) for name, value in merge["env"].items()}}
+    subprocess.run(["bash", "-e", "-c", merge["run"]], cwd=work, capture_output=True, text=True, env=env)
+    rows = json.loads((temp / "ci-evidence" / "ci-checks.json").read_text())
+    assert next(r for r in rows if r["signature"] == "anymsg-ci::python")["execution"]["status"] == row
+    producers = json.loads((temp / "ci-evidence" / "metadata.json").read_text())["producers"]
+    assert producers["python-3"]["result"] == late
 
 
 def test_a_partial_rerun_keeps_the_untouched_shard_jobs_fragments(tmp_path):

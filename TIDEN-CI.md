@@ -11,8 +11,8 @@ Test jobs run in parallel and each uploads a `ci-evidence-<job>` fragment:
 gateway load gate, and each `checks / python (<n>/4)` job its shard of the root
 Python/PostgreSQL suite. The root suite runs in four file-level shards
 (`scripts/python_shards.py`): `checks / verify` runs shard 1 and the three
-`checks / python` matrix jobs shards 2-4, each on its own runner with its own
-PostgreSQL. Every test module belongs to exactly one shard, chosen by committed
+`checks / python (<n>/4)` jobs (`python-2` to `python-4`) shards 2-4, each on its
+own runner with its own PostgreSQL. Every test module belongs to exactly one shard, chosen by committed
 per-file timings (`scripts/python_shards.json`, refreshed with
 `python scripts/python_shards.py weights <python.xml>`); a module without a
 timing still runs in exactly one shard, and a module pytest would collect that
@@ -23,13 +23,12 @@ sharded the same way. The `checks / evidence` job merges the fragments into
 `ci-evidence` and the four shard reports into one `python.xml`, so test
 identities do not change. `anymsg-ci::python` passes only when every shard
 passed with its own valid report of executed tests and no failed one, and every
-shard job succeeded. A matrix job has one result and one set of outputs its
-jobs overwrite, so each shard job names its captured SHA (`source_sha_<n>`) and
-its own result (`result_<n>`) in outputs of its own; it records the result
-before its receiving-commit check, which a baseline of another source fails by
-design, and a shard job that recorded none takes the matrix result. The matrix
-result still has to be success for the evidence job to pass. A
-`python_files` pattern with a directory is a usage error in a sharded run.
+shard job succeeded. Each shard is a job of its own rather than one matrix, so
+the evidence job receives each shard job's completed result and captured SHA. A
+shard job has no receiving-commit check of its own: its captured SHA must be
+verify's, which verify checks, so its result is that of its tests, also in a
+baseline of another source. A `python_files` pattern with a directory is a
+usage error in a sharded run.
 A fragment counts only when it holds just the files and checks its own job
 produces and names the tested source SHA that both its job output and verify
 captured; a job that did not succeed in this run attempt never contributes an
