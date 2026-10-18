@@ -25,6 +25,7 @@ from agent_api import AgentAPI, AgentRegistry
 from learning import LearningWorker, ANALYZER_MODEL
 from supervisor import Supervisor, SUPERVISOR_MODEL
 from outbound import Outbound,CallingSettings,TwilioCalls,ExternalBrief
+from destination_policy import DAILY_UNITS,PREMIUM_UNITS,recipient_policy
 from settings import Setup,read_private,write_private
 from call_errors import record_model_error
 from security import OwnerCredential, VoiceBoundary
@@ -500,6 +501,8 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
     async def control_capabilities():
         value=await config()
         value['calling']=await calling_status()
+        value['calling']['recipient_policy']={channel:recipient_policy(channel) for channel in ('telegram','whatsapp','phone','sip')}
+        value['calling'].update(daily_calls_remaining=outbound.daily_calls_remaining(),daily_call_units=DAILY_UNITS,premium_call_units=PREMIUM_UNITS)
         value['calling']['credential_storage']='private_server_file' if persist else 'memory_only'
         for channel in ('telegram','whatsapp','phone','sip'):
             value['channels'][channel]=('configured_needs_pilot' if channel!='telegram' and value['calling']['twilio']['configured'] else 'not_connected' if channel!='telegram' else

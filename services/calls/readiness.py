@@ -26,9 +26,8 @@ def calling_readiness(principal, outbound, credentials, browser_enabled):
         recipients = set(principal.destinations.get(channel, [])) & set(outbound.settings.allowed.get(channel, []))
         if channel == 'sip' and not recipients:
             blockers.append('recipient_not_allowed')
+        # An exhausted cap is not a configuration fault: preflight and dial report daily_call_limit.
         remaining = outbound.daily_calls_remaining()
-        if not remaining:
-            blockers.append('daily_call_limit')
         supported = ['gemini', 'xai'] if channel in {'phone','sip'} else ['gemini']
         if not any(credentials.get(name) for name in supported):
             blockers.append('model_key_required')

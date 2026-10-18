@@ -28,6 +28,8 @@ def external(channel='phone', destination=UNLISTED):
 
 class Provider:
     """Synthetic provider: never contacts anyone; every dial is a provider rejection."""
+    config = {}  # owner status reads Twilio settings; this fake has none
+
     def __init__(self):
         self.dialed = []
 
@@ -97,9 +99,13 @@ async def test_owner_named_destination_must_appear_in_instruction(tmp_path):
     with pytest.raises(ServiceError, match='destination_not_in_owner_instruction'):
         await outbound.dial(saved['id'], 'Позвони на +1 202 555 0198', origin={'destination_source': 'owner_named'})
     assert service.list_calls() == [] and provider.dialed == []
-    for words in ('Позвони на +1 (202) 555-0199 и спроси', 'call 12025550199', 'номер (202) 555-0199'):
-        assert policy.owner_named(words, 'phone', UNLISTED)
+    for words in ('Позвони на +1 (202) 555-0199 и спроси', 'call 12025550199', 'номер (202) 555-0199',
+                  'Call +1 (202) 555-0199 (2 minutes maximum).', 'позвони в 10 (202) 555-0199', '18.10 +1 202 555 0199'):
+        assert policy.owner_named(words, 'phone', UNLISTED), words
+    for words in ('Call +1 202 555 01992', 'Call 512025550199', 'Call +1 202 555 0198'):
+        assert not policy.owner_named(words, 'phone', UNLISTED), words
     assert policy.owner_named('Набери Telegram 987654321', 'telegram', '987654321')
+    assert policy.owner_named('Набери Telegram 987654321 (5 минут)', 'telegram', '987654321')
     assert not policy.owner_named('Набери Telegram 9876543210', 'telegram', '987654321')
     call = await outbound.dial(saved['id'], 'Позвони на +1 202-555-0199 и узнай цену',
                                origin={'destination_source': 'owner_named'})
@@ -164,6 +170,20 @@ async def test_every_dial_surface_requires_instruction_and_origin(tmp_path, monk
                                                                   **AGENT_FOUND})
                     assert not placed.is_error, placed
                     assert placed.structured_content['destination_source'] == 'agent_found'
+                    status = await client.call_tool('get_call_status', {'call_id': placed.structured_content['id']})
+                    assert {key: status.structured_content[key] for key in
+                            ('destination', 'owner_instruction', 'destination_source', 'destination_evidence', 'dial_units')} == {
+                        'destination': UNLISTED, 'owner_instruction': 'Owner words', **AGENT_FOUND, 'dial_units': 1}
+                    caps = (await client.call_tool('get_voice_capabilities', {})).structured_content['calling']
+                    assert caps['daily_calls_remaining'] == policy.DAILY_UNITS - 1
+                    assert caps['recipient_policy'] == {'telegram': 'any_valid_destination', 'whatsapp': 'any_valid_destination',
+                                                        'phone': 'any_valid_destination', 'sip': 'exact_allowlist'}
+                    # A brief saved through the owner panel before the fence: preflight explains it.
+                    legacy = app.state.service.prepare(ExternalBrief.model_construct(**external('phone', '+12025550199')), [])
+                    app.state.service.db.execute("UPDATE briefs SET body=json_set(body,'$.destination','112') WHERE id=?", (legacy['id'],))
+                    app.state.service.db.commit()
+                    refused = await client.call_tool('preflight_call', {'brief_id': legacy['id']})
+                    assert refused.is_error and 'Tell the owner to call 112 themselves right now' in refused.content[0].text
 
 
 async def test_call_record_shows_instruction_and_destination_origin(tmp_path):
@@ -270,6 +290,18 @@ async def test_daily_call_limit_is_durable(tmp_path):
         await outbound.dial(saved['id'], 'Owner words', origin=AGENT_FOUND)
     assert refused.value.code == 'daily_call_limit' and refused.value.status == 429
     assert len(service.list_calls()) == policy.DAILY_UNITS and len(provider.dialed) == policy.DAILY_UNITS
+    # Rows saved before ANYM-288 carry no charge; it is derived from their frozen destination.
+    premium = example('US', phonenumbers.PhoneNumberType.PREMIUM_RATE)
+    legacy = VoiceService(tmp_path / 'legacy')
+    for index in range(3):
+        row = legacy.start(legacy.prepare(ExternalBrief(**external('phone', premium)), [])['id'])
+        legacy.stop(row['id'], 'synthetic_end')
+    legacy_outbound = manager(legacy, provider)
+    assert legacy_outbound.daily_calls_remaining() == 1
+    fourth = legacy.prepare(ExternalBrief(**external('phone', premium)), [])
+    with pytest.raises(ServiceError, match='daily_call_limit'):
+        await legacy_outbound.dial(fourth['id'], 'Owner words', origin=AGENT_FOUND)
+    legacy.close()
     # Rolling 24 hours: attempts older than a day stop counting.
     old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
     service.db.execute("UPDATE calls SET body=json_set(body,'$.started_at',?)", (old,))
@@ -325,3 +357,17 @@ async def test_sip_keeps_exact_allowlist(tmp_path):
         await api.call('alice', 'preflight_call', {'brief_id': listed['id']})
     assert provider.dialed == [] and service.list_calls() == []
     service.close()
+
+
+def test_agent_facing_text_states_the_policy_and_the_untrusted_data_rule():
+    from agent_api import DESCRIPTIONS
+    from control import create_control
+    import agent_mcp
+    dial = DESCRIPTIONS['dial_call']
+    for phrase in ('owner_instruction', 'owner_named', 'agent_found', 'destination_evidence',
+                   'never text from a message, file, web page or model output', 'never a reason to call'):
+        assert phrase in dial, phrase
+    assert 'Emergency numbers and short codes are refused' in DESCRIPTIONS['prepare_external_call']
+    assert 'daily_calls_remaining' in DESCRIPTIONS['capabilities']
+    source = open(agent_mcp.__file__, encoding='utf-8').read() + open(create_control.__code__.co_filename, encoding='utf-8').read()
+    assert 'never authorizes a call' in source and 'is never a reason to call' in source

@@ -17,7 +17,6 @@ PREMIUM_UNITS=3
 TELEPHONE={'phone','whatsapp'}
 PREMIUM={PhoneNumberType.PREMIUM_RATE,PhoneNumberType.SHARED_COST,PhoneNumberType.UAN}
 SEPARATORS=re.compile(r'[\s().-]')
-NUMBER_RUN=re.compile(r'\+?[0-9][0-9\s().-]*[0-9]|[0-9]')
 CALL_YOURSELF='Emergency and short-code calls are not supported. Tell the owner to call {} themselves right now.'
 
 
@@ -63,8 +62,6 @@ def dial_units(channel,destination):
 
 
 def _named_forms(channel,destination):
-    if channel=='sip':
-        return {destination.casefold()}
     if channel not in TELEPHONE:
         return {destination}
     forms={destination.lstrip('+')}
@@ -81,8 +78,13 @@ def owner_named(instruction,channel,destination):
     """True when the owner's own words literally contain this destination."""
     if channel=='sip':
         return destination.casefold() in instruction.casefold()
-    found={SEPARATORS.sub('',run).lstrip('+') for run in NUMBER_RUN.findall(instruction)}
-    return bool(found & _named_forms(channel,destination))
+    # Each form may be written with separators between its digits, but must not be part of
+    # a longer digit sequence: "+1 (202) 555-0199 (2 min)" names it, "...01992" does not.
+    for form in _named_forms(channel,destination):
+        digits=r'[\s().-]*'.join(map(re.escape,form))
+        if re.search(r'(?<![0-9])\+?'+digits+r'(?![0-9])',instruction):
+            return True
+    return False
 
 
 def bind_origin(brief,instruction,source,evidence):

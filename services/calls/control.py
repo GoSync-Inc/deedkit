@@ -11,7 +11,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import ValidationError
 
-from agent_api import OWNER_NOTICE, Dial
+from agent_api import OWNER_NOTICE, Dial, call_origin
 import destination_policy as policy
 from core import BriefInput, ServiceError
 from outbound import ExternalBrief
@@ -82,7 +82,8 @@ def create_control(service,prepare,start,stop,capabilities,outbound=None,browser
         """Read lifecycle, collected answers, and pending owner decisions."""
         try:
             v=service.get_call(call_id)
-            return {k:v[k] for k in ('id','status','outcome','answers','decisions','started_at','channel','end_reason','dial_state','provider_call_id','provider_status') if k in v}
+            return {**{k:v[k] for k in ('id','status','outcome','answers','decisions','started_at','channel','end_reason','dial_state','provider_call_id','provider_status') if k in v},
+                    **call_origin(v)}
         except ServiceError as error:
             raise ToolError(error.code) from None
 
@@ -157,7 +158,7 @@ def create_control(service,prepare,start,stop,capabilities,outbound=None,browser
         async def preflight_call(brief_id:str)->dict[str,Any]:
             """Check enabled route, callable destination (SIP: allowlist), model key, provider configuration and daily call units. Does not dial. Configured is not live-call verification."""
             try:return await outbound.preflight(brief_id)
-            except ServiceError as exc:raise ToolError(exc.code) from None
+            except ServiceError as exc:raise ToolError(exc.detail.get('message',exc.code)) from None
 
         @mcp.tool(structured_output=True,annotations=ToolAnnotations(readOnlyHint=False,destructiveHint=True,idempotentHint=True,openWorldHint=True))
         async def dial_call(brief_id:str,destination_source:Literal['owner_named','agent_found'],owner_instruction:str|None=None,
@@ -169,7 +170,7 @@ def create_control(service,prepare,start,stop,capabilities,outbound=None,browser
             except ValidationError:raise ToolError('invalid_arguments') from None
             try:return await outbound.dial(args.brief_id,args.instruction,origin={'destination_source':args.destination_source,
                                                                                'destination_evidence':args.destination_evidence})
-            except ServiceError as exc:raise ToolError(exc.code) from None
+            except ServiceError as exc:raise ToolError(exc.detail.get('message',exc.code)) from None
 
     return mcp.streamable_http_app(stateless_http=True,json_response=True,max_request_body_size=16384,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,

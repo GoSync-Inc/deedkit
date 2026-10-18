@@ -39,7 +39,8 @@ class ExternalBrief(BriefInput):
 
 
 class CallingSettings(BaseModel):
-    """Operator switch. `allowed` restricts SIP only; other channels have no recipient list (ANYM-288)."""
+    """Operator switch. `allowed` restricts SIP only; other channels have no recipient list (ANYM-288),
+    so their keys may still be stored from older settings but are not read."""
     model_config=ConfigDict(extra='forbid')
     enabled: bool=False
     allowed: dict[str,list[str]]=Field(default_factory=dict)
@@ -152,9 +153,17 @@ class Outbound:
     def units_used(self):
         """Dial units of external attempts started in the last 24 hours, from durable call rows."""
         cutoff=(datetime.now(timezone.utc)-timedelta(hours=24)).isoformat()
-        rows=self.service.db.execute("SELECT json_extract(body,'$.dial_units') FROM calls WHERE "
+        rows=self.service.db.execute("SELECT json_extract(body,'$.dial_units'),json_extract(body,'$.brief.channel'),"
+            "json_extract(body,'$.brief.destination') FROM calls WHERE "
             "json_extract(body,'$.channel')!='browser' AND json_extract(body,'$.started_at')>=?",(cutoff,))
-        return sum(units or 1 for (units,) in rows)
+        total=0
+        for units,channel,destination in rows:
+            if units is None:
+                # Rows from before ANYM-288 carry no charge: derive it from the frozen destination.
+                try: units=policy.dial_units(channel,destination)
+                except ServiceError: units=1
+            total+=units
+        return total
 
     def daily_calls_remaining(self):
         return max(0,policy.DAILY_UNITS-self.units_used())
