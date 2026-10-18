@@ -38,6 +38,25 @@ and Telegram/WhatsApp Grok routes are rejected before a brief is saved.
 Followups retain the provider and chosen voice, require a new owner instruction
 for dialing, and do not import a Gemini learned prompt.
 
+## Minimal-prompt browser experiment
+
+For a Grok task rehearsal select **«Инструкции Grok → Короткое поручение»**
+(`prompt_mode: minimal`). The default remains `guided`. The short system prompt
+contains the task snapshot and authority boundaries, without the guided question
+and closing script. The same six tool schemas and server-side decision checks
+remain in place: this compares task coaching, not a model with zero instructions.
+The frozen snapshot records the mode, exact prompt, version and hash. Followups
+preserve the mode. Gemini, social conversations and external calls reject it
+before persistence.
+
+Example: “Book a lesson every Friday at 17:00; if unavailable, 16:00–18:00 works.”
+Use a synthetic studio and save `appointment_time, recurrence`. The human plays
+the studio freely; do not supply a scripted sequence of answers. In this browser
+experiment the arrangement is simulated: no calendar entry, real booking or
+recurring call is created. Compare the same task in both modes and inspect saved
+terms, tool outcomes and audible closing as well as conversational style. A
+shorter prompt alone is not evidence of improved quality.
+
 ## Credentials
 
 Create an API key in [xAI Console](https://console.x.ai/), with the required billing

@@ -44,7 +44,7 @@ function node(tag,text,cls) { const n=document.createElement(tag); if(text!==und
 function status(text,isActive=false) { $('status').textContent=text; $('status').classList.toggle('active',isActive); }
 function ms(value) { return Number.isFinite(value) ? `${Math.round(value)} мс` : '—'; }
 function locks() {
-  for (const id of ['goal','counterparty','language','voice','grok-voice','conversation-mode','dialog-engine','self-reference','owner-notes','supervisor-notes','fields','approval-fields','account','query','search','prepare','keys-toggle']) $(id).disabled=active || preparing;
+  for (const id of ['goal','counterparty','language','voice','grok-voice','prompt-mode','conversation-mode','dialog-engine','self-reference','owner-notes','supervisor-notes','fields','approval-fields','account','query','search','prepare','keys-toggle']) $(id).disabled=active || preparing;
   const joinWaiting=current?.id===config?.active_call_id && current?.status==='waiting_for_browser' && brief?.id===current?.brief_id;
   $('start').disabled=config?.channels?.browser==='local_rehearsal_only' || active || preparing || !brief || !config?.credentials[brief?.dialog_engine==='grok_realtime'?'xai':'gemini'] || (!!config?.active_call_id && !joinWaiting);
   $('stop').disabled=!active;
@@ -63,7 +63,7 @@ function invalidate() {
 }
 function formBody() {
   return {goal:$('goal').value.trim(),counterparty:$('counterparty').value.trim(),language:$('language').value,
-    voice:$('voice').value,grok_voice:$('grok-voice').value,conversation_mode:$('conversation-mode').value,dialog_engine:$('dialog-engine').value,self_reference:$('self-reference').value,owner_notes:$('owner-notes').value.trim(),supervisor_notes:$('supervisor-notes').value.trim(),
+    prompt_mode:$('prompt-mode').value,voice:$('voice').value,grok_voice:$('grok-voice').value,conversation_mode:$('conversation-mode').value,dialog_engine:$('dialog-engine').value,self_reference:$('self-reference').value,owner_notes:$('owner-notes').value.trim(),supervisor_notes:$('supervisor-notes').value.trim(),
     success_fields:$('fields').value.split(',').map(v=>v.trim()).filter(Boolean),
     approval_fields:$('approval-fields').value.split(',').map(v=>v.trim()).filter(Boolean),source_message_ids:[...selected.keys()]};
 }
@@ -95,6 +95,9 @@ async function refreshConfig() {
 function providerUI() {
   const grok=$('dialog-engine').value==='grok_realtime', provider=grok?'xai':'gemini', label=grok?'xAI':'Gemini';
   $('grok-voice-field').hidden=!grok;
+  const minimalAvailable=grok && $('conversation-mode').value==='task';
+  $('prompt-mode-field').hidden=!minimalAvailable;
+  if(!minimalAvailable)$('prompt-mode').value='guided';
   $('key-provider').value=provider;
   $('voice').parentElement.hidden=grok;
   $('model-label').textContent=grok?config?.voice_providers.xai.model:config?.model;
@@ -103,6 +106,8 @@ function providerUI() {
 function snapshot(b) {
   $('dialog-engine').value=b.dialog_engine || 'gemini_live';
   $('grok-voice').value=b.grok_voice || 'rex';
+  $('conversation-mode').value=b.conversation_mode || 'task';
+  $('prompt-mode').value=b.prompt_mode || 'guided';
   providerUI();
   $('prompt').textContent=b.prompt;
   $('prompt-version').textContent=`${b.prompt_version} / ${b.model} / ${b.snapshot_sha256.slice(0,12)}`;
@@ -388,7 +393,8 @@ $('keys-form').onsubmit=async e=>{
 };
 $('forget-key').onclick=async()=>{if(active)await stop();try{await api('/api/credentials','DELETE');$('gemini-key').value='';$('key-feedback').textContent='Ключи удалены.';await refreshConfig();}catch(e){error(e.message);}};
 $('brief-form').onsubmit=prepare;
-for(const id of ['goal','counterparty','language','voice','grok-voice','conversation-mode','dialog-engine','self-reference','owner-notes','supervisor-notes','fields','approval-fields'])$(id).addEventListener('input',invalidate);
+for(const id of ['goal','counterparty','language','voice','grok-voice','prompt-mode','conversation-mode','dialog-engine','self-reference','owner-notes','supervisor-notes','fields','approval-fields'])$(id).addEventListener('input',invalidate);
+$('conversation-mode').addEventListener('change',providerUI);
 $('dialog-engine').addEventListener('change',()=>{providerUI();$('key-provider').value=$('dialog-engine').value==='grok_realtime'?'xai':'gemini';});
 $('inbox-refresh').onclick=()=>loadInbox().catch(e=>error(e.message));
 $('search').onclick=search;
