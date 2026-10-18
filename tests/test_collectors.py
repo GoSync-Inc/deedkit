@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime,timezone
 import json
+import os
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace as NS
@@ -340,6 +341,102 @@ def test_session_lock_rejects_second_owner_and_releases(tmp_path):
         with pytest.raises(RuntimeError,match='session_already_owned'):
             with session_lock(session): pytest.fail('second owner')
     with session_lock(session): pass
+
+
+def telegram_session(tmp_path,mode):
+    directory=tmp_path/'sessions'; directory.mkdir(mode=0o700); directory.chmod(mode)
+    session=directory/'telegram.session'; session.write_bytes(b'FAKE_SESSION'); session.chmod(0o600)
+    return session
+
+
+def run_telegram(monkeypatch,session,store):
+    from messaging_service import telegram_collector as tc
+    monkeypatch.setattr(tc,'configuration',lambda _: ({'session_file':str(session)},{}))
+    monkeypatch.setattr(tc,'Store',store)
+    monkeypatch.setattr(tc,'TelethonProvider',lambda *_: pytest.fail('provider constructed'))
+    dsn=session.parent.parent/'synthetic.dsn'; dsn.write_text('synthetic-not-a-connection')
+    monkeypatch.setenv('DATABASE_URL_FILE',str(dsn)); monkeypatch.setenv('PROBE_FILES','/unused')
+    return asyncio.run(tc.run_config('/unused/synthetic.json'))
+
+
+@pytest.mark.parametrize('mode',[0o755,0o770],ids=['0755','0770'])
+def test_telegram_session_in_shared_directory_fails_before_lock_or_provider(tmp_path,monkeypatch,mode):
+    session=telegram_session(tmp_path,mode)
+    with pytest.raises(RuntimeError,match='private_session_required'):
+        run_telegram(monkeypatch,session,lambda *_: pytest.fail('database opened'))
+    assert sorted(p.name for p in session.parent.iterdir())==['telegram.session']
+    assert session.parent.stat().st_mode&0o777==mode  # Reported, never repaired.
+
+
+def test_telegram_session_in_private_directory_proceeds_to_session_lock(tmp_path,monkeypatch):
+    session=telegram_session(tmp_path,0o700)
+    def store(*_):
+        with pytest.raises(RuntimeError,match='session_already_owned'):
+            with session_lock(session): pytest.fail('collector did not own the session')
+        raise RuntimeError('synthetic_store_stop')
+    with pytest.raises(RuntimeError,match='synthetic_store_stop'): run_telegram(monkeypatch,session,store)
+    with session_lock(session): pass
+
+
+def test_telegram_symlinked_session_file_is_rejected_without_following(tmp_path,monkeypatch):
+    target=telegram_session(tmp_path,0o700)
+    link=target.parent/'link.session'; link.symlink_to(target)
+    with pytest.raises(RuntimeError,match='private_session_required'):
+        run_telegram(monkeypatch,link,lambda *_: pytest.fail('database opened'))
+    assert sorted(p.name for p in target.parent.iterdir())==['link.session','telegram.session']
+
+
+def test_session_lock_rejects_directory_of_another_user(tmp_path,monkeypatch):
+    from messaging_service import collector_state
+    directory=tmp_path/'sessions'; directory.mkdir(mode=0o700)
+    monkeypatch.setattr(collector_state.os,'geteuid',lambda: directory.stat().st_uid+1)
+    with pytest.raises(RuntimeError,match='private_session_required'):
+        with session_lock(directory/'telegram.session'): pytest.fail('foreign directory accepted')
+    assert list(directory.iterdir())==[]
+
+
+@pytest.mark.skipif(not hasattr(os,'geteuid') or os.geteuid()!=0,reason='chown to a foreign uid needs root')
+def test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root(tmp_path):
+    directory=tmp_path/'sessions'; directory.mkdir(mode=0o700); os.chown(directory,12345,12345)
+    with pytest.raises(RuntimeError,match='private_session_required'):
+        with session_lock(directory/'telegram.session'): pytest.fail('foreign directory accepted')
+    assert list(directory.iterdir())==[]
+
+
+def test_session_lock_creates_missing_parent_private_and_keeps_symlink_code(tmp_path):
+    session=tmp_path/'new'/'telegram.session'
+    with session_lock(session): pass
+    assert session.parent.stat().st_mode&0o777==0o700
+    elsewhere=tmp_path/'elsewhere'; elsewhere.mkdir(mode=0o700); (tmp_path/'linked').symlink_to(elsewhere)
+    with pytest.raises(ValueError,match='session_symlink'):
+        with session_lock(tmp_path/'linked'/'telegram.session'): pytest.fail('symlinked parent accepted')
+
+
+def test_whatsapp_session_directory_with_shared_parent_is_rejected(tmp_path,monkeypatch):
+    from messaging_service import whatsapp_collector as wa
+    parent=tmp_path/'sessions'; parent.mkdir(mode=0o700)
+    session=parent/'whatsapp'; session.mkdir(mode=0o700)
+    (session/'auth.sqlite').write_bytes(b'FAKE_AUTH'); (session/'auth.sqlite').chmod(0o600)
+    parent.chmod(0o755)
+    monkeypatch.setattr(wa,'configuration',lambda _: {'session_directory':str(session),'provider':'whatsmeow'})
+    monkeypatch.setattr(wa,'Store',lambda *_: pytest.fail('database opened'))
+    with pytest.raises(RuntimeError,match='private_session_required'): asyncio.run(wa.run_config('/unused/synthetic.json'))
+    assert sorted(p.name for p in parent.iterdir())==['whatsapp']
+
+
+def test_telegram_pairing_reports_shared_session_directory(tmp_path,monkeypatch,capsys):
+    from messaging_service import telegram_pair as pairing
+    session=telegram_session(tmp_path,0o755); session.unlink()
+    monkeypatch.setattr(pairing,'require_owner_terminal',lambda: None)
+    monkeypatch.setattr(pairing,'configuration',lambda _: ({'session_file':str(session)},{}))
+    monkeypatch.setattr(pairing,'Store',lambda *_: pytest.fail('database opened'))
+    monkeypatch.setattr(pairing.sys,'argv',['telegram-pair','--config','/unused/synthetic.json'])
+    old_mask=os.umask(0o077)
+    try:
+        with pytest.raises(SystemExit): pairing.main()
+    finally: os.umask(old_mask)
+    assert json.loads(capsys.readouterr().out)=={'status':'not_paired','code':'private_session_required'}
+    assert list(session.parent.iterdir())==[]
 
 
 def test_disabled_and_unconfirmed_configuration_never_constructs_provider(tmp_path):

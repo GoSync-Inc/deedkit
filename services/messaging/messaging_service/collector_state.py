@@ -5,6 +5,7 @@ import fcntl
 import os
 from pathlib import Path
 import re
+import stat
 from psycopg.types.json import Jsonb
 
 from .operational import CAPTURE_STOP_DETAILS,CONNECTION_ERRORS,TERMINAL,PHASE_STATES,PHASE_REASONS
@@ -102,6 +103,11 @@ def session_lock(session):
     session=Path(session)
     if session.is_symlink() or session.parent.is_symlink(): raise ValueError('session_symlink')
     session.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+    # The parent holds the session, its SQLite side files and the lock; a file's own
+    # 0600 mode does not stop another user from replacing them. Never repaired here.
+    info=os.lstat(session.parent)
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode&0o077 or info.st_uid not in {0,os.geteuid()}:
+        raise RuntimeError('private_session_required')
     fd=os.open(str(session)+'.owner.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
     try:
         try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
