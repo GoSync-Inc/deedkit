@@ -28,20 +28,30 @@ def test_backup_image_verification_is_required_even_with_a_green_summary():
 
 
 def test_backup_image_smoke_uses_native_tools_without_secrets_or_network(monkeypatch):
-    calls = []
+    calls, tagged = [], []
     image = "sha256:" + "b" * 64
+    manifest = "sha256:" + "9" * 64
 
     def run(args, **kwargs):
         calls.append(args)
+        if args[:2] == ["docker", "tag"]:
+            tagged.append(args[-1])
+        if args[:3] == ["docker", "image", "ls"]:
+            return image if tagged else ""
         if args[:3] != ["docker", "image", "inspect"]:
             return ""
         if "--format" in args:
             return image
-        # A fresh messaging build names its source revision (scripts/production.py).
-        return json.dumps([{"Id": image, "Config": {"Labels": {"org.opencontainers.image.revision": "a" * 40},
-                                                    "Env": ["DEEDKIT_SOURCE_SHA=" + "a" * 40]}}])
+        # The CI-published backup image names its source revision and build (scripts/production.py).
+        return json.dumps([{"Id": image, "Config": {"Labels": {
+            "org.opencontainers.image.revision": "a" * 40, "org.opencontainers.image.source": "https://github.com/" + promotion.REPOSITORY,
+            "io.deedkit.production.build": promotion.build_recipe("backup", "a" * 40)[1]},
+            "Env": ["DEEDKIT_SOURCE_SHA=" + "a" * 40]}}])
 
     monkeypatch.setattr(promotion, "run", run)
+    # A fake attestation verifier: preparation pulls the image CI published for this revision (ANYM-301).
+    monkeypatch.setattr(promotion, "published", lambda target, sha: {
+        "reference": promotion.REGISTRY + target + "@" + manifest, "digest": manifest, "config_digest": image})
     assert promotion.build_image(Path("/synthetic-source"), "a" * 40, "backup") == image
     smoke = next(args for args in calls if args[:2] == ["docker", "run"])
     assert smoke[smoke.index("--network") + 1] == "none"

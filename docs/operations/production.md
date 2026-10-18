@@ -152,9 +152,9 @@ or add storage before retrying.
 
 Every `main` push run publishes the eight images its `images / build (<target>)`
 jobs built and smoke-tested as `ghcr.io/gosync-inc/deedkit-<target>:<sha40>`,
-where `<sha40>` is the full source commit. Preparation does not use them yet: it
-still builds on the host as described below, until the pull path is reviewed and
-merged (proposal ANYM-301).
+where `<sha40>` is the full source commit. Preparation pulls them by verified
+digest instead of building them ([Prepare and inspect](#prepare-and-inspect),
+ANYM-301); only `http-router` and `check-image` still build on the host.
 
 - **Tested bytes, no rebuild.** On pull requests and `main` pushes, each build job
   saves the image `check-image` tested (`docker save`) and dry-runs the
@@ -250,6 +250,43 @@ referrers again. Keep Actions allowed to create repository-linked packages in th
 organization's package settings. Deleting a package version or changing its
 visibility is the owner's.
 
+## Attestation verifier
+
+Preparation verifies each image's provenance on the host without any GitHub
+token, with `tools/attest-verify`, a small Go program on sigstore-go. The owner
+installs it once (and again whenever its recorded hash changes on `main`); the
+host never builds it, and agents do not install it.
+
+1. On a development machine, at the `main` commit to deploy, build it with the
+   pinned toolchain exactly as `tools/attest-verify/README.md` states
+   (`GOTOOLCHAIN=go1.26.9 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath
+   -buildvcs=false -ldflags=-buildid= -o attest-verify .`). The build is
+   reproducible: its SHA-256 must equal `tools/attest-verify/attest-verify.linux-amd64.sha256`,
+   which a CI test rebuilds and compares.
+2. Copy it to the host as `/usr/local/libexec/deedkit/attest-verify`, owned by
+   root, mode `0755`, not a symlink. `production.py` refuses to run any other
+   file: it checks the owner, the mode and the SHA-256 against its own pinned
+   `VERIFIER_SHA256` before every call.
+
+For `ghcr.io/gosync-inc/deedkit-<target>:<sha40>` the verifier resolves the tag
+anonymously to exactly one single-image manifest (an index, an ambiguous or a
+missing tag is refused), finds the Sigstore bundle attached to that digest and
+verifies it offline against the public-good Sigstore trust root embedded in the
+binary: signature, certificate chain, signed certificate timestamp, Rekor
+inclusion and signing-time validity, and that the statement's subject is that
+exact digest. On the same bundle it then requires the certificate identity
+`https://github.com/GoSync-Inc/deedkit/.github/workflows/ci.yml@refs/heads/main`,
+issuer `https://token.actions.githubusercontent.com`, source repository
+`https://github.com/GoSync-Inc/deedkit`, source ref `refs/heads/main`, source
+commit `<sha40>`, a `github-hosted` runner and the predicate type
+`https://slsa.dev/provenance/v1`; predicate claims never stand in for these
+certificate checks. `production.py` runs it with an empty environment, so no
+credential reaches it, and passes its one-line refusal reason on. Any refusal
+stops preparation before the first pull. The trust root is fixed at build time:
+when Sigstore rotates its keys, verification of newer bundles fails closed until
+a reviewed pull request refreshes `trusted_root.json` and the owner installs the
+new build.
+
 ## Prepare and inspect
 
 ```sh
@@ -259,7 +296,8 @@ python3 /usr/local/lib/deedkit/production.py prepare --sha <40-character-main-sh
 
 The guard queries GitHub directly. Only the latest successful **push** CI run
 for the exact current `main` SHA qualifies, with successful package, native and
-aggregate jobs from its current attempt. A PR run, manual baseline run, earlier
+aggregate jobs from its current attempt, including exactly one passed `publish`
+job (preparation pulls what it published). A PR run, manual baseline run, earlier
 successful run followed by failure, missing job or skipped check is refused.
 One exception (ANYM-321): a push run whose `checks / verify` was skipped because
 it reused the merge queue's verification qualifies only when the latest merge
@@ -275,22 +313,27 @@ The public repository supports anonymous API reads; optional `GH_TOKEN` may be
 provided by the operator's secret mechanism to increase API limits. Never copy a
 maintainer's broad token onto the host for routine deployment.
 
-Preparation fetches only `main`, checks the fetched SHA again, builds the
-selected targets from that clean detached checkout and smoke-tests images with
-no network, sessions, mounts or database. Source downloads and image builds do
-not stop or replace running services. Images carry the exact source SHA in the
-`org.opencontainers.image.revision` label, and every build receives it as the
-`DEEDKIT_SOURCE_SHA` build argument. The messaging images (`runtime`, `indexer`,
+Preparation fetches only `main` and checks the fetched SHA again. It then
+obtains the selected targets: each CI-published target is first verified
+([Attestation verifier](#attestation-verifier)), all of them before the first
+pull, then pulled as `ghcr.io/gosync-inc/deedkit-<target>@sha256:<digest>` and
+tagged; `http-router` is built from the clean detached checkout. Every image is
+smoke-tested with no network, sessions, mounts or database. Source downloads,
+pulls and image builds do not stop or replace running services. Images carry
+the exact source SHA in the `org.opencontainers.image.revision` label, and every
+build (in CI or on the host) receives it as the `DEEDKIT_SOURCE_SHA` build
+argument. The messaging images (`runtime`, `indexer`,
 `enricher-local`, `whatsapp-native`, `backup`) also keep it in the
 `DEEDKIT_SOURCE_SHA` environment variable, so their telemetry reports
-`deedkit@<sha>` (TELEMETRY.md); preparation refuses a newly built messaging image
-whose variable or label differs from the candidate. Apply checks only the label,
+`deedkit@<sha>` (TELEMETRY.md); preparation refuses a newly obtained messaging
+image whose variable or label differs from the candidate. Apply checks only the label,
 so images built before this variable existed stay usable for rollback. The
 prepared Compose snapshots pin Docker image IDs. Inspect `prepared.json`, the
 image inventory and the private `*.before.json`/`*.json` Compose diff under
 `<state_directory>/<sha>/`. Full snapshots can contain secrets: keep them on the
 host with mode `0600`, outside Git, packages and CI artifacts. Public receipts
-contain only revision, CI URL and image IDs.
+contain only revision, CI URL, image IDs and, for each pulled target, the verified
+registry reference `ghcr.io/gosync-inc/deedkit-<target>@sha256:<digest>`.
 The checkout uses image-readable permissions for public source files so Docker
 COPY preserves access for unprivileged application users. Its enclosing release
 directory remains private (`0700`); resolved snapshots remain `0600`.
@@ -299,22 +342,27 @@ when the old configuration used a mutable tag; it does not depend on the tag
 continuing to reference the previous image.
 
 Each target is tagged `deedkit-production-<target>:<sha>`, and a tag is never
-rebuilt. Builds are not reproducible, and with the containerd image store a
-rebuild that moves the tag can remove the image that running containers use.
-Every build labels the image with its revision, the source repository and an
-`io.deedkit.production.build` digest of its Dockerfile, stage and build
-arguments. If the tag already exists and these labels (and, for a messaging
-image, its `DEEDKIT_SOURCE_SHA`) match the candidate, preparation reuses that
+rebuilt, re-pulled or moved. Builds are not reproducible, and with the containerd
+image store a retag can remove the image that running containers use. Every
+build, in CI or on the host, labels the image with its revision, the source
+repository and an `io.deedkit.production.build` digest of its Dockerfile, stage
+and build arguments. A pulled image must carry these labels too, and its image ID
+must be the verified config digest (classic image store) or manifest digest
+(containerd image store). If the tag already exists and these labels (and, for a
+messaging image, its `DEEDKIT_SOURCE_SHA`) match the candidate, and, for a
+CI-published target, the image is the verified CI image, preparation reuses that
 image and smoke-tests it again. So `seamless_release.py prepare` after
 `production.py prepare` of the same SHA gets the same image IDs. If the tag
 exists but does not match, for example another revision, an image built by an
-older tool without that digest, or a messaging image without
-`DEEDKIT_SOURCE_SHA`, preparation refuses and changes no tag. Removing such a
+older tool without that digest, a messaging image without `DEEDKIT_SOURCE_SHA`,
+or an image the old host-building tool built for this revision (right labels,
+other content), preparation refuses and changes no tag. Removing such a
 stale tag is a separate operator step, taken only after `docker ps --all` shows
 that no container uses its image. Lookups and builds take
 `/var/lib/deedkit-production/image-build.lock`, so two preparations on a host set
 up by this guide, from either tool or any state directory, never build the same
-tag at once; the second is refused. Without that directory, for example on a CI
+tag at once; the second is refused. The verification itself runs before the
+lock. Without that directory, for example on a CI
 runner, no image lock is taken. `check-image` builds the working tree under
 `deedkit-check-<target>:<sha>`, always fresh, and never reuses or touches a
 production tag.
@@ -363,7 +411,11 @@ restart an unhealthy container; monitor `docker ps`/`health_status` events.
 
 `current.json` is written only after every selected replacement runs its prepared
 image. It records image/start verification; it is not a claim that every upstream
-provider or client is healthy. Use each module's approved health/readback procedure.
+provider or client is healthy. `result.json` and `current.json` also record the
+verified registry references, `applied_at` (UTC) and the rollback data (version
+1): per project the selected services, the digest of its `<project>.before.json`,
+and the Compose snapshot digest and running container identities right after
+apply, captured the way preparation captures its baseline. Use each module's approved health/readback procedure.
 No test send, ACK, call, invitation or new provider session is a health probe.
 
 An interrupted/failed apply leaves `attempted.json`, retains previous image IDs
@@ -371,8 +423,56 @@ and refuses blind retries. A multi-project failure can leave some projects
 updated. Inspect actual container/image state before recovery. Never assume an
 automatic rollback is data-safe; restore compatibility/backup as the module
 runbook requires, stop the new session owner, then restore the recorded previous
-image/config. Do not use `down -v`, prune unrelated objects or restart a stale
-calendar writer. Keep the previous images until acceptance.
+image/config ([platform-cutover.md](platform-cutover.md)). Do not use `down -v`,
+prune unrelated objects or restart a stale calendar writer. Keep the previous
+images until acceptance.
+
+## Roll back the current release
+
+```sh
+python3 /usr/local/lib/deedkit/production.py rollback --sha <current-applied-sha>
+```
+
+Rollback is a production change: the owner confirms it like `apply`. It returns
+the current release's selected services to the images and configuration that
+ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
+`verify()` (the previous revision is no longer current `main`), does not run or
+reverse migrations and does not restore data: when the release changed the
+schema or data, follow the module's backup and migration runbook instead.
+
+Under the host lock it refuses before stopping anything unless all of these
+hold: `<sha>` is `current.json`'s release with status `applied` and has a
+`result.json` with rollback data; no release has an `attempted.json` without
+`result.json` or a `rollback-attempted.json` without `rollback.json`; the
+production configuration is the one the release was prepared with; each
+`<project>.before.json` exists and matches its recorded digest; the live Compose
+snapshot digest and the running container identities equal those recorded right
+after apply (so a container recreated since, even with the same image but other
+mounts, environment or configuration, is refused); and every previous image ID
+is still on the host (it never pulls). It then writes `rollback-attempted.json`,
+stops the selected services, starts them from the before-snapshot with
+`up -d --no-build --pull never --no-deps --wait`, checks that each runs its
+previous image, writes `rollback.json` and rewrites `current.json` with status
+`rolled-back` and the previous image IDs. A second rollback of the same release,
+a rollback of an older release and a failed rollback's retry are refused;
+inspect the state by hand then. A release applied before rollback data existed
+has no tool rollback and keeps the manual procedure above.
+
+## Image retention report
+
+```sh
+python3 /usr/local/lib/deedkit/production.py images
+```
+
+The report lists the image IDs behind the eight CI-published targets'
+`deedkit-production-<target>:*` tags in two groups, with reasons. Kept: the
+images of `current.json` (including those a rollback restored), of the current
+release's `*.before.json`, of the two newest other `result.json` by `applied_at`
+(a release without `applied_at` is kept, order unknown), of every `prepared.json`
+without `result.json`, and of every container, running or stopped. Everything
+else is a removal candidate. It removes nothing: deleting an image stays a
+manual owner step by image ID, after checking that no container uses it. Never
+use `docker image prune`, `docker system prune` or volume removal for this.
 
 There is deliberately no unattended restart timer. Only `apply` changes runtime
 processes, after review of the candidate and any required live-session authority.

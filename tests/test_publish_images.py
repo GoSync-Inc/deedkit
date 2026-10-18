@@ -126,7 +126,8 @@ def test_only_a_main_push_runs_the_publish_job_and_only_it_can_write():
     # The Tiden release record waits for the publication; the required checks are untouched.
     assert ci["jobs"]["release"]["needs"] == ["gate", "publish"]
     assert ci["jobs"]["gate"]["name"] == "CI gate" and set(ci["jobs"]["gate"]["needs"]) == {"reuse", "checks", "native", "images"}
-    assert "publish" not in production.REQUIRED_JOBS  # Story B adds it; this change only publishes
+    # Preparation pulls these images, so a promotable main run must show this exact job passed (ANYM-301 B3).
+    assert "publish" in production.REQUIRED_JOBS
 
 
 def test_build_jobs_export_the_tested_image_and_dry_run_its_publication():

@@ -1,5 +1,6 @@
 """Promotion guards use synthetic GitHub/Compose responses; no live runtime access."""
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -88,6 +89,14 @@ def test_no_ci_run_fails_closed():
         p.verify(SHA, response)
 
 
+MANIFEST = "sha256:" + "9" * 64
+
+
+def verified_image(target, config_digest, manifest=MANIFEST):
+    """What the attestation verifier reports for a CI-published image of SHA (a fake verifier, no network)."""
+    return {"reference": f"{p.REGISTRY}{target}@{manifest}", "digest": manifest, "config_digest": config_digest}
+
+
 def fixture(tmp_path, monkeypatch):
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
@@ -98,15 +107,20 @@ def fixture(tmp_path, monkeypatch):
         "environment": {"SYNTHETIC": "literal$password"}, "volumes": [{"source": "/existing", "target": "/data"}]},
         "db": {"image": "postgres:pinned"}}}
     (tmp_path / "original.json").write_text(json.dumps(document))
-    calls = []
+    calls, tagged = [], set()
     def command(argv, **kwargs):
         calls.append(argv)
         if "FETCH_HEAD" in argv:
             return SHA
+        if argv[:2] == ["docker", "tag"]:
+            tagged.add(argv[-1])
+        if argv[:3] == ["docker", "image", "ls"]:
+            return IMAGE if argv[-1] in tagged else ""
         if argv[:3] == ["docker", "image", "inspect"]:
             if "--format" in argv:
                 return IMAGE
-            return json.dumps([{"Id": IMAGE, "Config": {"Labels": {"org.opencontainers.image.revision": SHA},
+            # The CI-published runtime image carries the labels production.py gives its own builds.
+            return json.dumps([{"Id": IMAGE, "Config": {"Labels": ImageStore.image("b")["Config"]["Labels"],
                                                         "Env": ["PATH=/usr/local/bin", "DEEDKIT_SOURCE_SHA=" + SHA]}}])
         if argv[:2] == ["docker", "compose"] and "config" in argv:
             value = json.loads(Path(argv[argv.index("-f") + 1]).read_text())
@@ -123,6 +137,8 @@ def fixture(tmp_path, monkeypatch):
         return ""
     monkeypatch.setattr(p, "run", command)
     monkeypatch.setattr(p, "verify", lambda sha: {"sha": sha, "run_id": 12})
+    monkeypatch.setattr(p, "published", lambda target, sha: verified_image(target, IMAGE))
+    monkeypatch.setattr(p, "IMAGE_LOCK", tmp_path / "absent" / "image-build.lock")
     monkeypatch.setattr(p, "check_space", lambda directory: None)
     original = p.run
     monkeypatch.setattr(p, "run", lambda argv, **kw: str(tmp_path) if argv[:2] == ["docker", "info"] else original(argv, **kw))
@@ -171,7 +187,7 @@ def test_private_preparation_checks_out_source_readable_by_image_users(tmp_path,
             return real_run(argv, **kwargs)
         return simulated_runtime(argv, **kwargs)
 
-    def inspect_build_source(source, revision, target):
+    def inspect_build_source(source, revision, target, **kwargs):
         assert revision == sha
         # Docker COPY preserves these modes; root-owned 0600/0700 code is
         # unreadable to the production image's UID 10001.
@@ -536,22 +552,40 @@ def test_production_messaging_stages_end_with_the_source_revision():
 
 
 def image_builder(monkeypatch, *, labels=None, env=None):
-    calls = []
+    calls, tagged = [], set()
     def command(argv, **kwargs):
         calls.append(argv)
+        if argv[:2] == ["docker", "tag"]:
+            tagged.add(argv[-1])
+        if argv[:3] == ["docker", "image", "ls"]:
+            return IMAGE if argv[-1] in tagged else ""
         if argv[:3] == ["docker", "image", "inspect"]:
             if "--format" in argv:
                 return IMAGE
             return json.dumps([{"Id": IMAGE, "Config": {
-                "Labels": {"org.opencontainers.image.revision": SHA} if labels is None else labels,
+                "Labels": ImageStore.image("b")["Config"]["Labels"] if labels is None else labels,
                 "Env": ["PATH=/usr/local/bin", "DEEDKIT_SOURCE_SHA=" + SHA] if env is None else env}}])
         return ""
     monkeypatch.setattr(p, "run", command)
+    monkeypatch.setattr(p, "published", lambda target, sha: verified_image(target, IMAGE))
     return calls
 
 
 @pytest.mark.parametrize("target", sorted(p.BUILDS))
 def test_every_production_build_receives_the_candidate_source_revision(tmp_path, monkeypatch, target):
+    if target in p.PUBLISHED:
+        # CI built this target from the candidate revision; the host pulls that image by its verified digest.
+        store = ImageStore()
+        monkeypatch.setattr(p, "run", store.run)
+        monkeypatch.setattr(p, "published", store.published)
+        monkeypatch.setattr(p, "IMAGE_LOCK", tmp_path / "absent" / "image-build.lock")
+        image = p.build_image(tmp_path, SHA, target)
+        assert image == store.registry[target]["Id"] and store.built() == []
+        assert [call[-1] for call in store.pulls()] == [store.reference(target)]
+        assert store.images[image]["Config"]["Labels"]["org.opencontainers.image.revision"] == SHA
+        assert ["docker", "image", "inspect", image] in store.calls
+        assert any(call[:2] == ["docker", "run"] for call in store.calls)
+        return
     calls = image_builder(monkeypatch)
     assert p.build_image(tmp_path, SHA, target) == IMAGE
     build = next(call for call in calls if call[:2] == ["docker", "build"])
@@ -593,12 +627,35 @@ def test_apply_still_accepts_prepared_images_built_before_the_source_revision(tm
 
 
 class ImageStore:
-    """Synthetic Docker image store: a tag names one image; a rebuild moves the tag and drops the old image."""
+    """Synthetic Docker image store: a tag names one image; a rebuild moves the tag and drops the old image.
 
-    def __init__(self, tags=None):
+    `registry` is the synthetic GHCR: the image CI published for each target, which `published` reports as the
+    attestation verifier would (classic image store: the image ID is the config digest)."""
+
+    def __init__(self, tags=None, registry=None):
         self.tags = dict(tags or {})
         self.images = {value["Id"]: value for value in self.tags.values()}
+        self.registry = dict(registry or {})
         self.calls = []
+
+    @staticmethod
+    def manifest(target):
+        return "sha256:" + hashlib.sha256(("manifest " + target).encode()).hexdigest()
+
+    def reference(self, target):
+        return f"{p.REGISTRY}{target}@{self.manifest(target)}"
+
+    def published(self, target, sha):
+        if target not in self.registry:
+            image = ImageStore.image("c", target, revision=sha, source=sha)
+            self.registry[target] = {**image, "Id": "sha256:" + hashlib.sha256(("ci " + target).encode()).hexdigest()}
+        return verified_image(target, self.registry[target]["Id"], self.manifest(target))
+
+    def pulled(self, reference):
+        return next(value for target, value in self.registry.items() if self.reference(target) == reference)
+
+    def pulls(self):
+        return [call for call in self.calls if call[:2] == ["docker", "pull"]]
 
     @staticmethod
     def image(seed, target="runtime", *, revision=SHA, source=SHA, labels=None):
@@ -621,8 +678,15 @@ class ImageStore:
             self.images.pop(self.tags.get(tag, {}).get("Id"), None)
             self.tags[tag] = self.images[fresh["Id"]] = fresh
             return ""
+        if argv[:2] == ["docker", "pull"]:
+            value = self.pulled(argv[-1])
+            self.images[value["Id"]] = value
+            return ""
+        if argv[:2] == ["docker", "tag"]:
+            self.tags[argv[-1]] = self.pulled(argv[-2])
+            return ""
         if argv[:3] == ["docker", "image", "inspect"]:
-            value = self.tags.get(argv[-1]) or self.images[argv[-1]]
+            value = self.tags.get(argv[-1]) or (self.pulled(argv[-1]) if "@" in argv[-1] else self.images[argv[-1]])
             return value["Id"] if "--format" in argv else json.dumps([value])
         if argv[:2] == ["docker", "run"] and not any(image in argv for image in self.images):
             raise p.Refused("docker failed (exit 125)")  # No such image
@@ -640,10 +704,12 @@ def no_host_lock(tmp_path, monkeypatch):
 @pytest.mark.parametrize("target", sorted(p.BUILDS))
 def test_existing_tag_naming_the_revision_is_reused_without_a_rebuild(tmp_path, monkeypatch, no_host_lock, target):
     existing = ImageStore.image("e", target)
-    store = ImageStore({f"deedkit-production-{target}:{SHA}": existing})
+    # A CI-published target's tag is reused only because it names the verified CI image (an earlier pull).
+    store = ImageStore({f"deedkit-production-{target}:{SHA}": existing}, {target: existing})
     monkeypatch.setattr(p, "run", store.run)
+    monkeypatch.setattr(p, "published", store.published)
     assert p.build_image(tmp_path, SHA, target) == existing["Id"]
-    assert store.built() == []
+    assert store.built() == [] and store.pulls() == [] and not any(call[:2] == ["docker", "tag"] for call in store.calls)
     smoke = next(call for call in store.calls if call[:2] == ["docker", "run"])
     assert existing["Id"] in smoke and smoke[smoke.index("--network") + 1] == "none"
 
@@ -660,10 +726,12 @@ def test_existing_tag_that_does_not_name_the_revision_is_refused_without_a_rebui
     tag = f"deedkit-production-{target}:{SHA}"
     store = ImageStore({tag: existing})
     monkeypatch.setattr(p, "run", store.run)
+    monkeypatch.setattr(p, "published", store.published)
     with pytest.raises(p.Refused, match="does not name the candidate"):
         p.build_image(tmp_path, SHA, target)
     # The image keeps its tag, so a container that uses it still resolves it.
     assert store.built() == [] and store.tags[tag] is existing and existing["Id"] in store.images
+    assert store.pulls() == []
     assert not any(call[:2] == ["docker", "run"] for call in store.calls)
 
 
@@ -685,9 +753,10 @@ def test_existing_tag_from_another_build_recipe_is_refused_without_a_rebuild(tmp
     existing = ImageStore.image("e", target, labels=labels)
     store = ImageStore({tag: existing})
     monkeypatch.setattr(p, "run", store.run)
+    monkeypatch.setattr(p, "published", store.published)
     with pytest.raises(p.Refused, match="does not name the candidate"):
         p.build_image(tmp_path, SHA, target)
-    assert store.built() == [] and store.tags[tag] is existing
+    assert store.built() == [] and store.pulls() == [] and store.tags[tag] is existing
 
 
 def test_ambiguous_existing_tag_is_refused_without_a_rebuild(tmp_path, monkeypatch, no_host_lock):
@@ -697,18 +766,21 @@ def test_ambiguous_existing_tag_is_refused_without_a_rebuild(tmp_path, monkeypat
             return "sha256:" + "e" * 64 + "\nsha256:" + "d" * 64 + "\n"
         return store.run(argv, **kwargs)
     monkeypatch.setattr(p, "run", listing)
+    monkeypatch.setattr(p, "published", store.published)
     with pytest.raises(p.Refused, match="ambiguous"):
         p.build_image(tmp_path, SHA, "runtime")
-    assert store.built() == []
+    assert store.built() == [] and store.pulls() == []
 
 
 @pytest.mark.parametrize("target", sorted(p.BUILDS))
 def test_second_preparation_of_a_revision_keeps_the_image_the_first_one_built(tmp_path, monkeypatch, no_host_lock, target):
     store = ImageStore()
     monkeypatch.setattr(p, "run", store.run)
+    monkeypatch.setattr(p, "published", store.published)
     first = p.build_image(tmp_path, SHA, target)
     assert p.build_image(tmp_path, SHA, target) == first
-    assert len(store.built()) == 1 and first in store.images
+    # The first preparation pulled a CI-published target (or built http-router); the second reuses it.
+    assert len(store.built() + store.pulls()) == 1 and first in store.images
 
 
 def test_image_lookup_and_build_hold_the_host_image_lock(tmp_path, monkeypatch):
@@ -717,7 +789,7 @@ def test_image_lookup_and_build_hold_the_host_image_lock(tmp_path, monkeypatch):
     store = ImageStore()
     held = []
     def run(argv, **kwargs):
-        if argv[:2] == ["docker", "build"] or argv[:3] == ["docker", "image", "ls"]:
+        if argv[:2] in (["docker", "build"], ["docker", "pull"]) or argv[:3] == ["docker", "image", "ls"]:
             with (tmp_path / "image-build.lock").open("a") as probe:
                 try:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -726,8 +798,10 @@ def test_image_lookup_and_build_hold_the_host_image_lock(tmp_path, monkeypatch):
                     held.append(True)
         return store.run(argv, **kwargs)
     monkeypatch.setattr(p, "run", run)
+    monkeypatch.setattr(p, "published", store.published)
     p.build_image(tmp_path, SHA, "runtime")
-    assert held == [True, True]
+    # The lookup, the pull and the check that the new tag names the pulled image.
+    assert held == [True, True, True]
     # A concurrent preparation (another tool or state directory) is refused before its lookup.
     with (tmp_path / "image-build.lock").open("a") as other:
         fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -937,3 +1011,443 @@ def test_a_truncated_push_job_listing_never_hides_a_failed_required_job():
             return get(path)
         with pytest.raises(p.Refused):
             p.verify(SHA, response)
+
+
+def test_published_targets_are_the_publication_matrix_and_the_verifier_is_the_recorded_build():
+    from scripts import publish_images
+    assert p.PUBLISHED == publish_images.TARGETS and set(p.BUILDS) - set(p.PUBLISHED) == {"http-router"}
+    recorded = (ROOT / "tools/attest-verify/attest-verify.linux-amd64.sha256").read_text().split()
+    assert recorded == [p.VERIFIER_SHA256, "attest-verify"]
+
+
+@pytest.mark.parametrize("outcome", ["failure", "skipped", "cancelled", None, "missing", "duplicate"])
+def test_main_run_without_a_passed_publish_job_is_refused(outcome):
+    get, _, jobs = github()
+    publish = next(job for job in jobs if job["name"] == "publish")
+    if outcome == "missing":
+        jobs.remove(publish)
+    elif outcome == "duplicate":
+        jobs.append(copy.deepcopy(publish))
+    else:
+        publish["conclusion"] = outcome
+    with pytest.raises(p.Refused, match="required job did not pass: publish"):
+        p.verify(SHA, get)
+
+
+def test_host_built_image_with_matching_labels_is_refused_instead_of_the_ci_image(tmp_path, monkeypatch, no_host_lock):
+    # The old host-building tool left a tag with the right revision, source and recipe labels but other content.
+    tag = f"deedkit-production-runtime:{SHA}"
+    host_built = ImageStore.image("e")
+    store = ImageStore({tag: host_built})
+    monkeypatch.setattr(p, "run", store.run)
+    monkeypatch.setattr(p, "published", store.published)
+    with pytest.raises(p.Refused, match="not the verified CI image"):
+        p.build_image(tmp_path, SHA, "runtime")
+    assert store.tags[tag] is host_built and store.pulls() == [] and store.built() == []
+    assert not any(call[:2] in (["docker", "tag"], ["docker", "run"]) for call in store.calls)
+
+
+def test_existing_tag_of_the_pulled_manifest_is_reused_with_the_containerd_image_store(tmp_path, monkeypatch, no_host_lock):
+    # With the containerd image store the image ID is the manifest digest, not the config digest.
+    tag = f"deedkit-production-gateway:{SHA}"
+    pulled = {**ImageStore.image("e", "gateway"), "Id": ImageStore.manifest("gateway")}
+    store = ImageStore({tag: pulled}, {"gateway": ImageStore.image("c", "gateway")})
+    monkeypatch.setattr(p, "run", store.run)
+    monkeypatch.setattr(p, "published", store.published)
+    assert p.build_image(tmp_path, SHA, "gateway") == pulled["Id"]
+    assert store.pulls() == [] and store.built() == []
+
+
+@pytest.mark.parametrize("change", ["other-image", "other-revision"])
+def test_pulled_image_that_is_not_the_verified_ci_image_is_never_tagged(tmp_path, monkeypatch, no_host_lock, change):
+    store = ImageStore()
+    monkeypatch.setattr(p, "run", store.run)
+    verified = store.published("runtime", SHA)
+    if change == "other-image":
+        # The registry served other content than the verifier saw.
+        monkeypatch.setattr(p, "published", lambda target, sha: {**verified, "config_digest": "sha256:" + "0" * 64})
+        match = "not the verified digest"
+    else:
+        store.registry["runtime"]["Config"]["Labels"]["org.opencontainers.image.revision"] = "c" * 40
+        monkeypatch.setattr(p, "published", store.published)
+        match = "does not name the candidate"
+    with pytest.raises(p.Refused, match=match):
+        p.build_image(tmp_path, SHA, "runtime")
+    assert f"deedkit-production-runtime:{SHA}" not in store.tags
+    assert not any(call[:2] in (["docker", "tag"], ["docker", "run"]) for call in store.calls)
+
+
+def fake_verifier(tmp_path, monkeypatch, content=b"#!/bin/sh\n"):
+    path = tmp_path / "attest-verify"
+    path.write_bytes(content)
+    path.chmod(0o755)
+    monkeypatch.setattr(p, "VERIFIER", path)
+    monkeypatch.setattr(p, "VERIFIER_SHA256", hashlib.sha256(content).hexdigest())
+    return path
+
+
+def test_verifier_runs_without_any_credential_and_its_result_is_bound_to_target_and_revision(tmp_path, monkeypatch):
+    path = fake_verifier(tmp_path, monkeypatch)
+    monkeypatch.setenv("GH_TOKEN", "synthetic-token")
+    seen = []
+    def run(argv, **kwargs):
+        seen.append((argv, kwargs))
+        return json.dumps({**verified_image("calls", IMAGE), "sha": SHA}) + "\n"
+    monkeypatch.setattr(p, "run", run)
+    assert p.published("calls", SHA) == verified_image("calls", IMAGE)
+    argv, kwargs = seen[0]
+    assert argv == [str(path), "--image", "ghcr.io/gosync-inc/deedkit-calls", "--sha", SHA]
+    assert kwargs["env"] == {"PATH": "/usr/bin:/bin"} and kwargs["reason"] is True
+
+
+@pytest.mark.parametrize("output", [
+    "not json", "[]", json.dumps({**verified_image("calls", IMAGE), "sha": "c" * 40}),
+    json.dumps({**verified_image("gateway", IMAGE), "sha": SHA}),
+    json.dumps({**verified_image("calls", IMAGE), "reference": "ghcr.io/other/deedkit-calls@" + MANIFEST, "sha": SHA}),
+    json.dumps({**verified_image("calls", IMAGE), "digest": "sha256:" + "1" * 64, "sha": SHA}),
+    json.dumps({**verified_image("calls", "latest"), "sha": SHA}),
+], ids=["not-json", "not-object", "other-revision", "other-target", "other-registry", "other-digest", "no-config-digest"])
+def test_a_verifier_result_for_another_target_revision_or_digest_is_refused(tmp_path, monkeypatch, output):
+    fake_verifier(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "run", lambda argv, **kwargs: output)
+    with pytest.raises(p.Refused, match="no verified reference"):
+        p.published("calls", SHA)
+
+
+@pytest.mark.parametrize("case", ["missing", "other-build", "group-writable", "symlink"])
+def test_only_the_pinned_verifier_build_is_executed(tmp_path, monkeypatch, case):
+    path = fake_verifier(tmp_path, monkeypatch)
+    if case == "missing":
+        path.unlink()
+    elif case == "other-build":
+        path.write_bytes(b"#!/bin/sh\necho accepted\n")
+    elif case == "group-writable":
+        path.chmod(0o775)
+    else:
+        link = tmp_path / "link"
+        link.symlink_to(path)
+        monkeypatch.setattr(p, "VERIFIER", link)
+    monkeypatch.setattr(p, "run", lambda argv, **kwargs: pytest.fail("an unpinned verifier ran"))
+    with pytest.raises(p.Refused, match="attestation verifier"):
+        p.published("runtime", SHA)
+
+
+def test_a_verifier_refusal_passes_its_reason_on_and_stops_the_target(tmp_path, monkeypatch):
+    path = fake_verifier(tmp_path, monkeypatch, b"#!/bin/sh\necho 'attest-verify: refused: expected SourceRepositoryDigest' >&2\nexit 1\n")
+    monkeypatch.setattr(p, "VERIFIER_SHA256", hashlib.sha256(path.read_bytes()).hexdigest())
+    with pytest.raises(p.Refused, match="attest-verify failed \\(exit 1\\): attest-verify: refused: expected SourceRepositoryDigest"):
+        p.published("runtime", SHA)
+
+
+def test_every_published_target_is_verified_before_the_first_pull(tmp_path, monkeypatch):
+    settings, calls, document = fixture(tmp_path, monkeypatch)
+    settings["projects"][0]["services"]["worker"] = "indexer"
+    document["services"]["worker"] = copy.deepcopy(document["services"]["api"])
+    (tmp_path / "original.json").write_text(json.dumps(document))
+    def published(target, sha):
+        if target == "runtime":
+            raise p.Refused("attest-verify failed (exit 1): attest-verify: refused: self-hosted runner")
+        return verified_image(target, IMAGE)
+    monkeypatch.setattr(p, "published", published)
+    with pytest.raises(p.Refused, match="self-hosted"):
+        p.prepare(settings, SHA)
+    assert not any(call[:2] in (["docker", "pull"], ["docker", "build"], ["docker", "tag"]) for call in calls)
+    assert not (Path(settings["state_directory"]) / SHA / "prepared.json").exists()
+
+
+class Host:
+    """A synthetic production host: one Compose project whose `api` service runs on one container at a time,
+    and a synthetic GHCR that publishes one runtime image per revision. No Docker or network access."""
+
+    def __init__(self, tmp_path, monkeypatch):
+        self.root = tmp_path
+        self.state = tmp_path / "state"
+        self.state.mkdir(mode=0o700)
+        self.original = tmp_path / "original.json"
+        self.original.write_text(json.dumps({"name": "synthetic", "services": {
+            "api": {"image": "old", "build": {"context": "/unused"}, "environment": {"SYNTHETIC": "literal"},
+                    "volumes": [{"source": "/existing", "target": "/data"}]}, "db": {"image": "postgres:pinned"}}}))
+        self.project = {"name": "synthetic", "directory": str(tmp_path), "files": [str(self.original)],
+                        "services": {"api": "runtime"}}
+        self.settings = {"version": 1, "state_directory": str(self.state), "projects": [self.project]}
+        self.images = {OLD_IMAGE: {"Id": OLD_IMAGE, "Config": {"Labels": {}}}}
+        self.tags, self.calls, self.main, self.serial = {}, [], SHA, 0
+        self.container = {"Id": "container0", "Image": OLD_IMAGE, "State": {"Running": True}}
+        monkeypatch.setattr(p, "run", self.run)
+        monkeypatch.setattr(p, "verify", lambda sha: {"sha": sha, "run_id": 12})
+        monkeypatch.setattr(p, "published", self.published)
+        monkeypatch.setattr(p, "check_space", lambda directory: None)
+        monkeypatch.setattr(p, "IMAGE_LOCK", tmp_path / "absent" / "image-build.lock")
+
+    @staticmethod
+    def image(sha):
+        return "sha256:" + hashlib.sha256(("ci " + sha).encode()).hexdigest()
+
+    def published(self, target, sha):
+        return verified_image(target, self.image(sha), "sha256:" + hashlib.sha256(sha.encode()).hexdigest())
+
+    def run(self, argv, **kwargs):
+        self.calls.append(argv)
+        if argv[0] == "git":
+            return self.main if "FETCH_HEAD" in argv else ""
+        if argv[:2] == ["docker", "info"]:
+            return str(self.root)
+        if argv[:2] == ["docker", "pull"]:
+            sha = next(sha for sha in (self.main,) if argv[-1].endswith(hashlib.sha256(sha.encode()).hexdigest()))
+            self.images[self.image(sha)] = ImageStore.image("c", revision=sha, source=sha) | {"Id": self.image(sha)}
+            return ""
+        if argv[:2] == ["docker", "tag"]:
+            self.tags[argv[-1]] = self.image(self.main)
+            return ""
+        if argv[:3] == ["docker", "image", "ls"]:
+            return self.tags.get(argv[-1], "")
+        if argv[:3] == ["docker", "image", "inspect"]:
+            name = self.image(self.main) if "@" in argv[-1] else argv[-1]
+            if name not in self.images:
+                raise p.Refused("docker failed (exit 1)")  # No such image
+            return name if "--format" in argv else json.dumps([self.images[name]])
+        if argv[:2] == ["docker", "compose"]:
+            if "config" in argv:
+                return json.dumps(json.loads(Path(argv[argv.index("-f") + 1]).read_text())).replace("$$", "$")
+            if "stop" in argv:
+                self.container["State"] = {"Running": False}
+            if "up" in argv:
+                self.serial += 1
+                image = json.loads(Path(argv[argv.index("-f") + 1]).read_text())["services"]["api"]["image"]
+                self.container = {"Id": f"container{self.serial}", "Image": image, "State": {"Running": True}}
+            if "ps" in argv:
+                return self.container["Id"] + "\n"
+            return ""
+        if argv[:2] == ["docker", "ps"]:
+            return self.container["Id"] + "\n"
+        if argv[:2] == ["docker", "inspect"]:
+            assert argv[2:] == [self.container["Id"]]
+            return json.dumps([self.container])
+        return ""
+
+    def release(self, sha):
+        self.main = sha
+        p.prepare(self.settings, sha)
+        return p.apply(self.settings, sha)
+
+    def mutations(self):
+        return [call for call in self.calls if call[:2] == ["docker", "compose"] and ("stop" in call or "up" in call)]
+
+
+RELEASES = ("1" * 40, "2" * 40, "3" * 40)
+
+
+def test_receipts_record_the_verified_reference_applied_at_and_rollback_data(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    sha = RELEASES[0]
+    host.main = sha
+    prepared = p.prepare(host.settings, sha)
+    reference = host.published("runtime", sha)["reference"]
+    assert prepared["references"] == {"runtime": reference}
+    result = p.apply(host.settings, sha)
+    assert result["references"] == {"runtime": reference} and p.read(host.state / "current.json") == result
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", result["applied_at"])
+    [project] = result["rollback"]["projects"]
+    assert result["rollback"]["version"] == 1 and project["services"] == ["api"]
+    assert project["before_file_digest"] == p.digest(p.read(host.state / sha / "synthetic.before.json"))
+    assert project["running"] == {"api": {"container": "container1", "image": host.image(sha)}}
+    assert project["after_digest"] == p.digest(json.loads(host.original.read_text()))
+
+
+def test_three_successive_releases_roll_back_only_the_current_one_once(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES:
+        host.release(sha)
+    assert host.container["Image"] == host.image(RELEASES[2])
+    host.calls.clear()
+    outcome = p.rollback(host.settings, RELEASES[2])
+    stop = next(i for i, call in enumerate(host.calls) if "stop" in call)
+    up = next(i for i, call in enumerate(host.calls) if "up" in call)
+    assert stop < up and host.calls[up][-1] == "api" and "--no-deps" in host.calls[up] and "--no-build" in host.calls[up]
+    assert host.calls[up][host.calls[up].index("--pull") + 1] == "never"
+    assert host.calls[up][host.calls[up].index("-f") + 1] == str(host.state / RELEASES[2] / "synthetic.before.json")
+    assert not any(call[:2] == ["docker", "pull"] or "db" in call for call in host.calls)
+    # The release before it runs again, recorded as such.
+    assert host.container["Image"] == host.image(RELEASES[1]) and host.container["State"]["Running"]
+    assert outcome["previous_images"] == {"synthetic": {"api": host.image(RELEASES[1])}}
+    current = p.read(host.state / "current.json")
+    assert current["status"] == "rolled-back" and current["previous_images"] == outcome["previous_images"]
+    assert p.read(host.state / RELEASES[2] / "rollback-attempted.json")["status"] == "rolling-back"
+    assert p.read(host.state / RELEASES[2] / "rollback.json") == outcome
+    host.calls.clear()
+    for sha in (RELEASES[2], RELEASES[1]):
+        with pytest.raises(p.Refused, match="only the current applied release"):
+            p.rollback(host.settings, sha)
+    assert host.mutations() == []
+
+
+def rolled_back_refusal(host, match):
+    host.calls.clear()
+    with pytest.raises(p.Refused, match=match):
+        p.rollback(host.settings, RELEASES[1])
+    assert host.mutations() == [] and not (host.state / RELEASES[1] / "rollback.json").exists()
+
+
+@pytest.mark.parametrize("drift", ["recreated-same-image", "other-image", "compose-configuration"])
+def test_rollback_is_refused_when_production_changed_since_apply(tmp_path, monkeypatch, drift):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    if drift == "recreated-same-image":
+        # Same image, but recreated (for example with other mounts or environment): another container.
+        host.container = {**host.container, "Id": "recreated"}
+    elif drift == "other-image":
+        host.container = {**host.container, "Image": OLD_IMAGE}
+    else:
+        document = json.loads(host.original.read_text())
+        document["services"]["api"]["environment"]["SYNTHETIC"] = "changed"
+        host.original.write_text(json.dumps(document))
+    rolled_back_refusal(host, "changed since this release was applied")
+
+
+@pytest.mark.parametrize("case", ["modified", "missing"])
+def test_rollback_is_refused_when_the_before_release_snapshot_is_modified_or_missing(tmp_path, monkeypatch, case):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    before = host.state / RELEASES[1] / "synthetic.before.json"
+    if case == "missing":
+        before.unlink()
+    else:
+        document = p.read(before)
+        document["services"]["api"]["image"] = OLD_IMAGE
+        p.write(before, document)
+    rolled_back_refusal(host, "before-release snapshot")
+
+
+def test_rollback_never_pulls_a_previous_image_that_is_gone(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    del host.images[host.image(RELEASES[0])]
+    rolled_back_refusal(host, "no longer present on this host")
+    assert not any(call[:2] == ["docker", "pull"] for call in host.calls)
+    assert not (host.state / RELEASES[1] / "rollback-attempted.json").exists()
+
+
+@pytest.mark.parametrize("marker", ["attempted.json", "rollback-attempted.json"])
+def test_rollback_is_refused_while_an_apply_or_rollback_is_unfinished(tmp_path, monkeypatch, marker):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    unfinished = host.state / ("4" * 40)
+    unfinished.mkdir()
+    p.write(unfinished / marker, {"sha": "4" * 40})
+    rolled_back_refusal(host, "unfinished")
+
+
+def test_a_failed_rollback_is_not_retried(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    original = host.run
+    def failing(argv, **kwargs):
+        if "up" in argv:
+            raise p.Refused("synthetic start failure")
+        return original(argv, **kwargs)
+    monkeypatch.setattr(p, "run", failing)
+    with pytest.raises(p.Refused, match="synthetic start failure"):
+        p.rollback(host.settings, RELEASES[1])
+    assert p.read(host.state / "current.json")["status"] == "applied"
+    monkeypatch.setattr(p, "run", original)
+    rolled_back_refusal(host, "already rolled back or attempted")
+
+
+def test_a_release_without_rollback_data_keeps_the_manual_procedure(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    # A release applied before rollback data existed (ANYM-301 B5).
+    for path in (host.state / RELEASES[1] / "result.json", host.state / "current.json"):
+        result = p.read(path)
+        del result["rollback"]
+        p.write(path, result)
+    rolled_back_refusal(host, "no rollback data")
+
+
+def test_rollback_is_refused_after_the_production_configuration_changed(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    host.settings["new_setting"] = True
+    rolled_back_refusal(host, "configuration changed")
+
+
+def retention_state(tmp_path, monkeypatch, *, releases, current, prepared=(), containers=(), tags=()):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    for sha, applied_at, image in releases:
+        (state / sha).mkdir()
+        p.write(state / sha / "result.json", {"sha": sha, "images": {"runtime": image}, "status": "applied",
+                                               **({"applied_at": applied_at} if applied_at else {})})
+    for sha, image in prepared:
+        (state / sha).mkdir()
+        p.write(state / sha / "prepared.json", {"sha": sha, "images": {"runtime": image}})
+    sha, image, before = current
+    p.write(state / "current.json", p.read(state / sha / "result.json"))
+    p.write(state / sha / "synthetic.before.json", {"services": {"api": {"image": before}, "db": {"image": "postgres:pinned"}}})
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return "".join(f"{container}\n" for container, _ in containers)
+        if argv[:2] == ["docker", "inspect"]:
+            return json.dumps([{"Id": container, "Image": image} for container, image in containers])
+        if argv[:3] == ["docker", "image", "ls"]:
+            return "".join(f"{name} {image}\n" for name, image in tags)
+        raise AssertionError(argv)
+    monkeypatch.setattr(p, "run", run)
+    return {"version": 1, "state_directory": str(state), "projects": []}, calls
+
+
+def image_id(seed):
+    return "sha256:" + seed * 64
+
+
+def test_retention_report_keeps_current_rollback_recent_prepared_and_container_images(tmp_path, monkeypatch):
+    sha = [str(n) * 40 for n in range(1, 8)]
+    settings, calls = retention_state(tmp_path, monkeypatch, releases=[
+        (sha[0], "2026-10-01T00:00:00Z", image_id("1")), (sha[1], "2026-10-02T00:00:00Z", image_id("2")),
+        (sha[2], "2026-10-03T00:00:00Z", image_id("3")), (sha[3], "2026-10-04T00:00:00Z", image_id("4")),
+        (sha[4], None, image_id("5")), (sha[5], "2026-10-05T00:00:00Z", image_id("6"))],
+        current=(sha[5], image_id("6"), image_id("4")), prepared=[(sha[6], image_id("7"))],
+        containers=[("stopped0", image_id("1"))],
+        tags=[(f"deedkit-production-runtime:{sha[n]}", image_id(str(n + 1))) for n in range(7)]
+        + [("deedkit-production-runtime:extra", image_id("2")), ("deedkit-production-http-router:" + sha[0], image_id("8")),
+           ("postgres:pinned", image_id("9"))])
+    report = p.images_report(settings)
+    kept = {item["image"]: item["reasons"] for item in report["keep"]}
+    assert kept[image_id("6")] == ["current release " + sha[5]]
+    assert kept[image_id("4")] == ["rollback target of the current release", f"one of the two newest other releases ({sha[3]})"]
+    assert kept[image_id("3")] == [f"one of the two newest other releases ({sha[2]})"]
+    assert kept[image_id("5")] == [f"release {sha[4]} without applied_at, order unknown"]
+    assert kept[image_id("7")] == [f"prepared release {sha[6]} is not applied"]
+    assert kept[image_id("1")] == ["used by container stopped0"]
+    # Only the eight CI-published targets' production tags are reported; the second release is the one candidate.
+    assert report["candidates"] == [{"image": image_id("2"), "reason": "no current, rollback, recent, prepared or container use",
+                                     "tags": [f"deedkit-production-runtime:{sha[1]}", "deedkit-production-runtime:extra"]}]
+    assert set(kept) | {image_id("2")} == {image_id(str(n)) for n in range(1, 8)}
+    # It only reads: no removal, prune or tag change.
+    assert all(call[:2] in (["docker", "ps"], ["docker", "inspect"]) or call[:3] == ["docker", "image", "ls"] for call in calls)
+    assert "--all" in calls[0]
+
+
+def test_retention_report_after_a_rollback_keeps_the_restored_images(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES:
+        host.release(sha)
+    p.rollback(host.settings, RELEASES[2])
+    original = host.run
+    def run(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "ls"] and "--format" in argv:
+            return "".join(f"deedkit-production-runtime:{sha} {host.image(sha)}\n" for sha in RELEASES)
+        return original(argv, **kwargs)
+    monkeypatch.setattr(p, "run", run)
+    kept = {item["image"]: item["reasons"] for item in p.images_report(host.settings)["keep"]}
+    assert "restored by the rollback of " + RELEASES[2] in kept[host.image(RELEASES[1])]
+    assert set(kept) == {host.image(sha) for sha in RELEASES}
