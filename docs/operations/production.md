@@ -599,27 +599,54 @@ remove the pause file.
 [`deploy/deedkit-autodeploy.service`](../../deploy/deedkit-autodeploy.service)
 runs `deploy --auto` and
 [`deploy/deedkit-autodeploy.timer`](../../deploy/deedkit-autodeploy.timer)
-starts it 5 minutes after the previous run ended (10 minutes after boot);
-`--auto` keeps at least 20 minutes between two deploy starts. The unit reads
+starts it about 5 minutes after the previous run ended (plus up to 30 seconds
+of jitter and systemd's default one-minute accuracy) and 10 minutes after boot;
+enabled later than that, the first run starts at once. `--auto` keeps at least
+20 minutes between two deploy starts. The unit reads
 `/etc/deedkit/production.json` and `/etc/deedkit/http-production.json` unless
-the optional `/etc/deedkit/autodeploy.env` sets `DEEDKIT_DEPLOY_CONFIG` (and,
-when the owner adds one, `GH_TOKEN`). It never overlaps the daily backup,
-which stops the collectors (`personal-os-backup.timer`, 18:00 UTC): it waits
-for a running backup unit, skips while the backup runs or waits to retry,
-and starts no deploy between 16:00 and 18:00 UTC. Install it once, after a
-clean manual `deploy`, from the same reviewed `main` commit as the tools:
+the optional `/etc/deedkit/autodeploy.env` (root-owned, mode `0600`) sets
+`DEEDKIT_DEPLOY_CONFIG`; an owner-added `GH_TOKEN` goes into the same file.
+
+A deploy and the daily backup never overlap; the backup stops the collectors
+(`personal-os-backup.timer`, 18:00 UTC) and an apply would recreate them.
+Admission: the unit starts no deploy while `personal-os-backup.service` runs or
+waits to retry (any state but `inactive` or `failed`) and none from 16:00 to
+18:59 UTC; a failed or unexpected read of either skips the run. Exclusion: the
+deploy holds the backup runner's own lock
+(`/opt/personal-os-probe/backups/.runner.lock`, `DEEDKIT_BACKUP_LOCK`) for its
+whole run. A backup that starts meanwhile refuses before it stops anything
+(`backup_job_already_running`) and systemd retries it after its 30-minute
+restart delay (at most three starts in 8 hours); while a backup holds the lock,
+the deploy exits 75 and the run counts as a skip. A deploy started before 16:00
+that is still running at 18:00 thus delays the backup instead of overlapping it.
+A skipped run (condition or lock) prints no JSON line.
+
+The unit adds no destination: `deploy` reads `main` from GitHub over HTTPS,
+GitHub's REST API (runs, jobs, comparisons, `/rate_limit`) and GHCR (manifests,
+attestations, images). `GH_TOKEN`, when set, is sent only as the
+`Authorization` header of the GitHub API requests; the attestation verifier
+runs with an empty environment. The journal gets one JSON line per run (SHAs,
+the CI run URL, times, the outcome and its reason, at most git's last error
+line), never resolved Compose settings.
+
+Install it once, after a clean manual `deploy`, from the same reviewed `main`
+commit as the tools:
 
 ```sh
 sudo install -o root -g root -m 0644 deploy/deedkit-autodeploy.service deploy/deedkit-autodeploy.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now deedkit-autodeploy.timer
-journalctl -u deedkit-autodeploy.service     # one JSON line per run
+journalctl -u deedkit-autodeploy.service     # one JSON line per run that was not skipped
 ```
 
-Pause with `sudo touch /etc/deedkit/autodeploy.pause` (each run then exits
-`paused`); stop the timer with `sudo systemctl disable --now
-deedkit-autodeploy.timer`. A run that pauses, rolls back, fails or cannot
-fetch exits 1, so the unit shows as failed until the next clean run.
+Pause with `sudo touch /etc/deedkit/autodeploy.pause`: each run then exits 0
+with `paused`. A run that creates a new pause, rolls back, fails or cannot fetch
+exits 1, so the unit shows as failed until the next clean run. Stop the timer
+with `sudo systemctl disable --now deedkit-autodeploy.timer`; that lets a
+running deploy finish. Never stop `deedkit-autodeploy.service` itself during a
+run: the stop (or the 4-hour start timeout) kills `production.py` and its
+children, which can leave the selected services stopped mid-apply; the next
+run then finds the unfinished attempt and pauses for a human.
 
 ## Record the production release
 

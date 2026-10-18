@@ -2352,26 +2352,75 @@ def test_the_command_line_runs_deploy_only_as_the_host_operator_and_exits_1_on_a
     assert json.loads(capsys.readouterr().out)["status"] == "paused"
 
 
+def autodeploy_unit():
+    """The unit's `key=value` lines, the Environment= assignments as their own keys."""
+    unit = (ROOT / "deploy/deedkit-autodeploy.service").read_text()
+    lines = dict(line.split("=", 1) for line in unit.splitlines() if "=" in line and not line.startswith("#"))
+    lines.update(line.split("=", 1)[1].split("=", 1) for line in unit.splitlines() if line.startswith("Environment="))
+    return lines
+
+
+def systemd_shell(text):
+    """A unit command line as sh sees it: systemd turns $$ into $ and %% into %."""
+    return text.replace("$$", "$").replace("%%", "%")
+
+
 # spec: ANYM-407
 def test_the_autodeploy_unit_runs_deploy_auto_and_never_starts_during_or_just_before_the_backup(tmp_path):
-    unit = (ROOT / "deploy/deedkit-autodeploy.service").read_text()
+    lines = autodeploy_unit()
     timer = (ROOT / "deploy/deedkit-autodeploy.timer").read_text()
-    lines = dict(line.split("=", 1) for line in unit.splitlines() if "=" in line and not line.startswith("#"))
     assert "/usr/local/lib/deedkit/production.py deploy --auto " in lines["ExecStart"]
     assert "personal-os-backup.service" in lines["After"] and "OnUnitInactiveSec=5min" in timer
-    # systemd turns $$ into $ and %% into %; the condition then runs as a plain sh script.
-    script = re.fullmatch(r"/bin/sh -c '(.*)'", lines["ExecCondition"]).group(1).replace("$$", "$").replace("%%", "%")
+    script = systemd_shell(re.fullmatch(r"/bin/sh -c '(.*)'", lines["ExecCondition"]).group(1))
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
 
-    def skipped(backup, hour):
-        (bin_dir / "systemctl").write_text(f"#!/bin/sh\n[ \"$*\" = 'show -P ActiveState personal-os-backup.service' ] && echo {backup}\n")
-        (bin_dir / "date").write_text(f"#!/bin/sh\n[ \"$*\" = '-u +%H' ] && echo {hour}\n")
-        for name in ("systemctl", "date"):
+    def skipped(backup, hour, *, systemctl_fails=False, date_fails=False):
+        reads = {"systemctl": ("show -P ActiveState personal-os-backup.service", backup, systemctl_fails),
+                 "date": ("-u +%H", hour, date_fails)}
+        for name, (arguments, answer, fails) in reads.items():
+            (bin_dir / name).write_text(f"#!/bin/sh\n[ \"$*\" = '{arguments}' ] || exit 2\necho '{answer}'\n"
+                                        + ("exit 1\n" if fails else ""))
             (bin_dir / name).chmod(0o755)
-        environment = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
-        return subprocess.run(["/bin/sh", "-c", script], env=environment).returncode != 0
+        return subprocess.run(["/bin/sh", "-c", script], env={"PATH": f"{bin_dir}:/usr/bin:/bin"}).returncode != 0
 
-    assert not skipped("inactive", "12") and not skipped("failed", "19") and not skipped("inactive", "18")
+    assert not skipped("inactive", "12") and not skipped("failed", "19") and not skipped("inactive", "00")
     assert skipped("activating", "12") and skipped("active", "03") and skipped("deactivating", "12")
-    assert skipped("inactive", "16") and skipped("inactive", "17")
+    assert skipped("inactive", "16") and skipped("inactive", "17") and skipped("inactive", "18")
+    # A failed or unexpected read never admits a deploy.
+    assert skipped("inactive", "12", systemctl_fails=True) and skipped("inactive", "12", date_fails=True)
+    assert skipped("", "12") and skipped("inactive", "garbage") and skipped("inactive", "24")
+
+
+# spec: ANYM-407
+@pytest.mark.skipif(not Path("/usr/bin/flock").exists(), reason="needs util-linux flock, as on the host")
+def test_a_deploy_and_a_backup_never_hold_the_backup_runner_lock_at_once(tmp_path):
+    import fcntl
+    lines = autodeploy_unit()
+    assert lines["DEEDKIT_BACKUP_LOCK"] == "/opt/personal-os-probe/backups/.runner.lock"
+    assert lines["SuccessExitStatus"] == "75"
+    prefix, deploy = systemd_shell(lines["ExecStart"]).split(" /usr/bin/python3 ", 1)
+    assert deploy.startswith("/usr/local/lib/deedkit/production.py deploy --auto ")
+    lock_file, marker = tmp_path / ".runner.lock", tmp_path / "deploy-ran"
+    command = prefix.replace("${DEEDKIT_BACKUP_LOCK}", str(lock_file)).split()
+
+    # A running backup holds its lock (backup_runner.py: flock LOCK_EX|LOCK_NB): the deploy is skipped with 75.
+    backup = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(backup, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert subprocess.run([*command, "/bin/sh", "-c", f"touch {marker}"]).returncode == 75 and not marker.exists()
+    os.close(backup)
+
+    # A running deploy holds the lock: a backup starting meanwhile refuses before it stops anything.
+    running = subprocess.Popen([*command, "/bin/sh", "-c", f"touch {marker}; sleep 30"])
+    try:
+        for _ in range(200):
+            if marker.exists():
+                break
+            subprocess.run(["sleep", "0.05"], check=True)
+        backup = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(backup, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.close(backup)
+    finally:
+        running.terminate()
+        running.wait()
