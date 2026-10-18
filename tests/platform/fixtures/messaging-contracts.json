@@ -502,7 +502,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "List permitted chats. order: activity (default) or last_activity_desc = recent first;\nid = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,\nor explicit group owner mention/reply; heuristic, not obligation. Attention expires after\nawaiting_reply_days (default 14; 0 = no age limit), based on the attention message time.\nGroup evidence survives others' chatter and clears after owner writes. No provider read changes.\npriority requires awaiting_reply=true; score/reasons are transparent heuristics.\nexclude_chats takes archive IDs, exclude_senders account-scoped provider sender IDs.\nonly_questions uses question punctuation; private-only uses chat_types=['private'].\nonly_unread includes fresh known chat read observations only; unknown/stale count is explicit.\n",
+      "description": "List permitted chats. order: activity (default) or last_activity_desc = recent first;\nid = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,\nor explicit group owner mention/reply; heuristic, not obligation. Attention expires after\nawaiting_reply_days (default 14; 0 = no age limit), based on the attention message time.\nGroup evidence survives others' chatter and clears after owner writes. No provider read changes.\npriority requires awaiting_reply=true; score/reasons are transparent heuristics.\nexclude_chats takes archive IDs, exclude_senders account-scoped provider sender IDs.\nonly_questions uses question punctuation; private-only uses chat_types=['private'].\nonly_unread includes fresh known chat read observations only; unknown/stale count is explicit.\nlimit defaults to 25 (maximum 100); continue with next_cursor.\n",
       "inputSchema": {
         "properties": {
           "after": {
@@ -511,7 +511,7 @@
             "type": "string"
           },
           "limit": {
-            "default": 100,
+            "default": 25,
             "title": "Limit",
             "type": "integer"
           },

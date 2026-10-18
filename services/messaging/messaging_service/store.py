@@ -401,7 +401,7 @@ class Store:
             if not changed:raise ValueError('unknown_account')
             audit(c,None,'set_operations','ok')
 
-    def list_chats(self, token, after='', limit=100, *, accounts=None,query='',chat_types=None,
+    def list_chats(self, token, after='', limit=25, *, accounts=None,query='',chat_types=None,
                    order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
                    include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
                    only_questions=False,only_unread=False,view='archive'):

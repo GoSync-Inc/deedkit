@@ -198,10 +198,32 @@ def lean_chat(row):
         if row.get('awaiting_reply_dismissed'):hint['dismissed']=True
         if row.get('awaiting_reply_confidence') not in (None,'heuristic_not_obligation'):
             hint['confidence']=row['awaiting_reply_confidence']
-        if not last or last['id']!=hint['message_id']:
-            hint['display_text']=(row.get('awaiting_reply_snippet') or '')[:160]
+        if last and last['id']==hint['message_id']:
+            # The hint is the head: it carries the text once and last_message is omitted.
+            hint['display_text']=result.pop('last_message')['display_text']
+            if last.get('truncated'):hint['truncated']=True
+        else:hint['display_text']=(row.get('awaiting_reply_snippet') or '')[:160]
+        if hint['sent_at']==result.get('last_activity'):hint.pop('sent_at')
         result['awaiting_reply']={k:v for k,v in hint.items() if v is not None}
-    if state:result['conversation']=lean_conversation(state,shown=[last['id']] if last else [])
+    for key in ('last_message','awaiting_reply'):
+        if result.get(key,{}).get('sender_name'):result[key]['sender_name']=result[key]['sender_name'][:64]
+    if state:result['conversation']=lean_queue_conversation(state,last,result.get('awaiting_reply'))
+    return result
+
+
+def lean_queue_conversation(state, last, hint):
+    """Compact omits a conversation field when it equals a shown message or hint field."""
+    shown=[m for m in (last and last['id'],hint and hint.get('message_id')) if m]
+    result=lean_conversation(state,shown=shown)
+    if result.get('latest_message_id') in shown:result.pop('latest_message_id')
+    if not hint:return result
+    if result['basis'] in (hint.get('confidence'),hint.get('basis')):result.pop('basis')
+    if 'candidate_message_ids' in result:
+        result['candidate_message_ids']=[m for m in result['candidate_message_ids'] if m!=hint['message_id']]
+    attention=result.get('owner_attention')
+    if attention:
+        if attention.get('target_message_id')==hint['message_id']:attention.pop('target_message_id')
+        if attention['suggested_action']==result['suggested_action']:attention.pop('suggested_action')
     return result
 
 
