@@ -11,15 +11,18 @@ and comes back as audio, without a separate STT/TTS pipeline.
 The owner sets one `call_voice` for every agent-prepared call; agents can
 neither choose nor change it. It is a private server file,
 `VOICE_DATA_DIR/call-voice.json` (0600), read and written only through the
-owner API, with no panel UI:
+owner API `GET`/`POST /api/call-voice`, with no panel UI. After a deploy every
+call stays on Gemini `Puck` until it is set. On the server, the owner (or a
+worker on the owner's explicit word: a production change) runs, inside the
+calls container, which reads the owner credential itself and never prints it:
 
 ```sh
-# owner credential, loopback host; mutating requests need Origin + X-Voice-Service
-curl -s -H "Authorization: Bearer $OWNER_TOKEN" http://127.0.0.1:13842/api/call-voice
-curl -s -X POST -H "Authorization: Bearer $OWNER_TOKEN" -H 'Origin: http://127.0.0.1:13842' \
-  -H 'X-Voice-Service: 1' -H 'Content-Type: application/json' \
-  -d '{"provider":"grok_realtime","grok_voice":"rex"}' http://127.0.0.1:13842/api/call-voice
+docker compose <deployment files> exec calls python call_voice.py              # show
+docker compose <deployment files> exec calls python call_voice.py '{"provider":"grok_realtime","grok_voice":"rex"}'
 ```
+
+Direct API use needs the owner credential, a loopback host, and for the write
+`Origin: http://127.0.0.1:13842` and `X-Voice-Service: 1`.
 
 Fields: `provider` (`gemini_live` or `grok_realtime`), `gemini_voice`,
 `grok_voice`, optional `gemini_custom_voice_id` (the replicated Gemini voice;
@@ -34,7 +37,8 @@ MCP) carry no `dialog_engine`, `voice`, `grok_voice`, `custom_voice_id` or
 `voice_style`; a request with any of them, even a default or null, fails
 validation with `invalid_arguments` and saves nothing. `calls_capabilities`
 shows `call_voice: {provider, model, voice, custom_voice}` without the custom
-voice ID. The owner's browser rehearsal keeps its own engine and voice pickers
+voice ID (`voice: replicated` for the replicated voice). Every prepared brief
+returns its frozen `dialog_engine`, `voice` and `grok_voice`. The owner's browser rehearsal keeps its own engine and voice pickers
 (Flows included) and never changes `call_voice`.
 
 Voices offered: Gemini `Kore, Puck, Charon, Fenrir, Aoede, Leda, Orus, Zephyr`;
@@ -43,8 +47,11 @@ Live voices (https://ai.google.dev/gemini-api/docs/live-guide) and 26 xAI
 voices (https://docs.x.ai/developers/model-capabilities/audio/voice). Only the
 voice the owner picks after listening is added.
 
-Owner test path: set `call_voice`, ask the agent to call you
-(`destination_source: owner_named`), listen, switch and repeat. Synthetic tests
+Owner test path: set `call_voice`, ask the agent for a new call to you
+(`destination_source: owner_named`), listen, switch and repeat. After a switch
+ask for a new call: a followup or a brief prepared before the switch keeps the
+old voice. To audition voices first, use the owner's browser rehearsal, whose
+engine and voice pickers are independent of `call_voice`. Synthetic tests
 are not live acceptance (ANYM-239 stage B).
 
 ## Input audio format

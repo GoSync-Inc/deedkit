@@ -221,7 +221,7 @@ def test_capabilities_report_owner_call_voice(tmp_path):
         assert caps['call_voice']=={'provider':'gemini_live','model':MODEL,'voice':'Puck','custom_voice':False}
         set_voice(client,{'provider':'gemini_live','gemini_custom_voice_id':'voice_owner_fixture'})
         caps=client.post('/v1/capabilities',json={},headers=AGENT).json()
-        assert caps['call_voice']=={'provider':'gemini_live','model':MODEL,'voice':'Puck','custom_voice':True}
+        assert caps['call_voice']=={'provider':'gemini_live','model':MODEL,'voice':'replicated','custom_voice':True}
         assert 'voice_owner_fixture' not in json.dumps(caps)
         set_voice(client,GROK)
         caps=client.post('/v1/capabilities',json={},headers=AGENT).json()
@@ -244,3 +244,24 @@ def test_readiness_requires_the_call_voice_provider_key_on_every_channel(tmp_pat
         client.post('/api/credentials',json={missing:'synthetic-model-key'},headers=HEADERS)
         ready=client.post('/v1/capabilities',json={},headers=AGENT).json()['calling_readiness']['channels']
         assert not any('model_key_required' in ready[channel]['blockers'] for channel in ROUTES), ready
+
+
+# spec: ANYM-359
+def test_call_voice_command_shows_and_sets_the_owner_setting(tmp_path,monkeypatch):
+    import sys
+    sys.path.insert(0,str(Path(__file__).resolve().parents[3]/'tests/platform'))
+    from runtime_helpers import port, server
+    from call_voice import call_voice
+    from urllib.error import HTTPError
+    data=tmp_path/'data'
+    selected=port()
+    app=create_app(data,Archive())
+    monkeypatch.setenv('VOICE_DATA_DIR',str(data));monkeypatch.setenv('VOICE_PORT',str(selected))
+    with server(app,selected):
+        assert call_voice()['provider']=='gemini_live'
+        assert call_voice({'provider':'grok_realtime','grok_voice':'rex'})['grok_voice']=='rex'
+        assert call_voice()=={'provider':'grok_realtime','gemini_voice':'Puck','grok_voice':'rex',
+                              'gemini_custom_voice_id':None,'voice_style':'neutral'}
+        with pytest.raises(HTTPError) as refused:
+            call_voice({'provider':'grok_realtime','grok_voice':'unknown'})
+        assert refused.value.code==422 and call_voice()['grok_voice']=='rex'

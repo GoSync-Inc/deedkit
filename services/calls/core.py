@@ -70,10 +70,10 @@ class CallVoice(BaseModel):
                 'custom_voice_id':self.gemini_custom_voice_id,'voice_style':self.voice_style}
 
     def summary(self):
-        """For agents: no custom voice ID."""
-        grok=self.provider=='grok_realtime'
+        """For agents: no custom voice ID; a replicated voice is not reported as the prebuilt one."""
+        grok,custom=self.provider=='grok_realtime',bool(self.gemini_custom_voice_id)
         return {'provider':self.provider,'model':GROK_MODEL if grok else MODEL,
-                'voice':self.grok_voice if grok else self.gemini_voice,'custom_voice':bool(self.gemini_custom_voice_id)}
+                'voice':self.grok_voice if grok else 'replicated' if custom else self.gemini_voice,'custom_voice':custom}
 
 
 class ToolInput(BaseModel):
