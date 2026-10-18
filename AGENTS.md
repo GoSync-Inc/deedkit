@@ -166,7 +166,7 @@ owner decision, weakens or removes an existing contract, spec or test, has
 disagreeing reviewers or unclear product direction, or cannot be undone by a
 follow-up pull request. After an agent merges an owner-level pull request, or an
 owner-level spec edit in Tiden without one, the owner gets a short summary: what
-changed, why, what it affects and how to undo it.
+changed, why, what it affects and how to undo it, or that it cannot be undone.
 The worker writes it in its final result and the orchestrator passes it to the
 owner, written like questions to the owner
 (docs/operations/parallel-development.md).
