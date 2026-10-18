@@ -236,6 +236,32 @@ For an explicit baseline rerun, dispatch `CI` on the reporting-code branch with
 existing spec branch. The checkout SHA, rather than the workflow SHA, is recorded.
 Normal pull requests record their actual tested merge SHA.
 
+## Pull request check
+
+The `checks / Tiden PR check` job runs `scripts/tiden_pr_check.py` (check A,
+ANYM-405) on every pull request run. It reads only from Tiden and checks the
+bookkeeping a merge needs (AGENTS.md section 4):
+
+- the body lines `Spec:`, `Delivers:` and `Tiden branch:` are well formed, name
+  story-level specs that exist on Tiden main or on the named branch, and the
+  named branch is open;
+- every test the pull request adds has a `# spec: ANYM-n` or `// spec: ANYM-n`
+  marker directly above it and its decorators, or is in the reviewed `NO_SPEC`
+  list; existing tests need none;
+- every changed code file outside drift's `EXCLUDED` list has a `repo_file`
+  anchor on Tiden main, or the body names a spec for the sync to anchor it to.
+
+A failed check lists every problem in the job summary and fails the run, and so
+`CI gate`. The body comes from the event that started the run, and a rerun
+replays the same event: after you edit the body, push a commit to check again.
+Fork pull requests and runs without `TIDEN_API_TOKEN` skip with a summary line.
+A Tiden CLI failure (unreachable, timeout, an error status or a malformed reply)
+or a failed CLI install fails nothing. The job warns and keeps a
+`tiden-pr-check-receipt` artifact naming the reason; the sync and `Tiden drift`
+still check after the merge, and a rerun of the job checks now. Only a whole last
+line `Refused: tiden <command> timed out|exited <n>|returned ...` counts as such
+a failure; any other refusal fails the run.
+
 ## Drift watermark
 
 `.github/workflows/tiden-drift.yml` keeps the drift watermark current after every

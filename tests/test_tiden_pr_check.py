@@ -314,3 +314,41 @@ def test_many_block_comments_without_a_call_scan_in_linear_time():
                                 source], capture_output=True, text=True, timeout=20,
                                cwd=Path(ROOT_SCRIPT).parents[1])
     assert completed.stdout.strip() == "[] []", completed.stderr
+
+
+
+# spec: ANYM-405
+def test_only_a_tiden_cli_failure_matches_the_workflow_warning_pattern(repo, server, tmp_path):
+    import yaml
+    steps = yaml.safe_load((Path(ROOT_SCRIPT).parents[1] / ".github/workflows/checks.yml").read_text()
+                           )["jobs"]["tiden_pr"]["steps"]
+    step = next(step for step in steps if step.get("id") == "check")
+    assert [other.get("id") for other in steps if "TIDEN_API_TOKEN" in str(other.get("env"))] == ["check"]
+    pattern = next(line.strip()[len("pattern='"):-1] for line in step["run"].splitlines()
+                   if line.strip().startswith("pattern='"))
+
+    def warns(line):  # the step's own test: bash ERE, the whole last line
+        return subprocess.run(["bash", "-c", 'pattern=$1; [[ $2 =~ $pattern ]]', "-", pattern, line]).returncode == 0
+
+    root, base = repo
+    commit(root, {"tests/test_new.py": "def test_new():\n    pass\n"}, "change")
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"repository": {"full_name": "o/r"}, "pull_request": {
+        "body": "Spec: ANYM-12", "base": {"sha": base}, "head": {"repo": {"full_name": "o/r"}}}}))
+    env = {"GITHUB_EVENT_PATH": str(event), "TIDEN_PRODUCT_ID": "product", "TIDEN_API_TOKEN": SECRET,
+           "FAKE_TIDEN_STATE": str(server.path), "PATH": "/usr/bin:/bin"}
+
+    def last_line(**state):
+        server.set(main=[spec(12)], **state)
+        completed = subprocess.run([sys.executable, ROOT_SCRIPT, "--root", str(root), "--cli", str(server.cli)],
+                                   capture_output=True, text=True, env=env)
+        assert completed.returncode == 1, completed.stdout + completed.stderr
+        return completed.stdout.splitlines()[-1]
+
+    assert warns(last_line(fault={"spec list": "exit"}))
+    assert warns(last_line(fault={"spec list": "garbage"}))
+    verdict = last_line(fault={})
+    assert verdict.startswith("Fix the pull request body") and not warns(verdict)
+    for refusal in ("Refused: tiden spec list exited 1 (x)", "Refused: tiden spec/list exited 1.py does not parse",
+                    "Refused: the spec listing of tiden spec list exited 1 is incomplete", "tiden spec list timed out"):
+        assert not warns(refusal)

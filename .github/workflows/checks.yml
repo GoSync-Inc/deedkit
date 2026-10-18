@@ -645,6 +645,83 @@ jobs:
           test "$PYTHON_2_RESULT" = success
           test "$PYTHON_3_RESULT" = success
           test "$PYTHON_4_RESULT" = success
+  tiden_pr:
+    # Check A (ANYM-405, TIDEN-CI.md): the pull request's `Spec:`/`Delivers:`/`Tiden branch:` lines, the markers
+    # of its new tests and the anchors of its changed code files, read-only against Tiden. A verdict fails the run,
+    # and so CI gate, before the merge; a Tiden CLI failure (unreachable, timeout, error status, malformed reply)
+    # only warns with a receipt, as the evidence publication does. The script skips a fork and a run without the
+    # token; the merge queue and main pushes have no pull request body to check.
+    name: Tiden PR check
+    if: ${{ github.event_name == 'pull_request' && inputs.source_ref == '' }}
+    runs-on: ubuntu-latest
+    # The three CLI reads time out after 120 seconds each, inside the check step's timeout.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        timeout-minutes: 3
+        with:
+          persist-credentials: false
+          # The merge base with the base commit and the files before the change come from the history.
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        timeout-minutes: 2
+        with: {python-version: '3.13'}
+      - name: Install pinned Tiden CLI with integrity check
+        id: install
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.33.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
+          echo "3f6b650c4cabd58ce4149d9106325cbd36d1472cccc9c63ca03137668b80e4a6  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
+          mkdir "$RUNNER_TEMP/tiden-bin"
+          tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
+          echo "$RUNNER_TEMP/tiden-bin" >> "$GITHUB_PATH"
+      - name: Check the spec lines, test markers and anchors
+        id: check
+        if: steps.install.outcome == 'success'
+        timeout-minutes: 8
+        env:
+          TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
+          TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
+          TIDEN_WORKSPACE_ID: ${{ vars.TIDEN_WORKSPACE_ID }}
+          TIDEN_BASE_URL: https://app.tiden.ai
+        run: |
+          set +e
+          python scripts/tiden_pr_check.py > "$RUNNER_TEMP/tiden-pr-check.txt"
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/tiden-pr-check.txt"
+          last=$(tail -n 1 "$RUNNER_TEMP/tiden-pr-check.txt")
+          # Only a Tiden CLI failure ends with this whole line (tiden_drift.tiden); a verdict or any other refusal
+          # never matches it (tests/test_tiden_pr_check.py).
+          pattern='^Refused: tiden [a-z]+ [a-z-]+ (timed out|exited -?[0-9]+|returned malformed JSON|returned no object)$'
+          if [ "$status" -ne 0 ] && [[ "$last" =~ $pattern ]]; then
+            echo 'unchecked=true' >> "$GITHUB_OUTPUT"
+            echo "reason=${last#Refused: }" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$status"
+      - name: Warn that Tiden could not check this pull request
+        if: ${{ always() && (steps.install.outcome != 'success' || steps.check.outputs.unchecked == 'true') }}
+        timeout-minutes: 1
+        env:
+          INSTALL: ${{ steps.install.outcome }}
+          REASON: ${{ steps.check.outputs.reason }}
+        run: |
+          python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "tiden-pr-check"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-pr-check.json").write_text(json.dumps({"checked": False, "install": os.environ["INSTALL"], "reason": os.environ["REASON"] or None}))'
+          message="CLI install: ${INSTALL}; check: ${REASON:-not run}. The sync and Tiden drift still check after the merge; rerun this job to check now (TIDEN-CI.md)"
+          echo "::warning title=Tiden PR check not run::$message"
+          echo "Tiden PR check not run. $message" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain the Tiden PR check receipt
+        if: ${{ always() && (steps.install.outcome != 'success' || steps.check.outputs.unchecked == 'true') }}
+        timeout-minutes: 3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tiden-pr-check-receipt
+          path: ${{ runner.temp }}/tiden-pr-check/tiden-pr-check.json
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
   tiden:
     needs: [documentation, evidence]
     # PRs from forks never receive credentials. Internal PRs retain their actual
