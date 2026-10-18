@@ -21,8 +21,9 @@ as `list_chats`: "or" inside the list, "and" with the other filters and with
 a `chat_types` list without `channel` is also `invalid_filter`. A `chat_types` list,
 `include_channels: true` or `exclude_channels: true` turns a chronological archive
 `next_cursor` from a bare message ID into an opaque cursor bound to the effective set of
-types; continuing with another set returns `invalid_cursor`, an equivalent one (for example
-dropping `exclude_channels: true` under the default) continues. Relevance, fuzzy and
+types and to `include_channels: true`; continuing with another set, or adding or dropping
+`include_channels: true` even with the same list, returns `invalid_cursor`. Only the same
+normalized filter continues, for example dropping `exclude_channels: true` under the default. Relevance, fuzzy and
 conversation cursors are always bound, and those issued before this filter existed
 return `invalid_cursor` once: restart the search. Without named chats,
 `result_evidence` counts only chats of the searched types; an empty effective set is
