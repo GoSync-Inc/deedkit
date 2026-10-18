@@ -801,6 +801,15 @@ def test_serving_generation_may_lack_only_migrations_plan_a_already_runs(tmp_pat
     for old in refused:
         with pytest.raises(s.Refused, match='schema inventory mismatch'):
             check(old)
+    # A second file under an added number, or a gap after the old newest, could hide an unapplied
+    # migration from readiness, which keys the applied ledger by number.
+    for extra in ({**candidate, 'migrations/004_unapplied.sql': '5'*64},
+                  {**base, 'migrations/005_skips.sql': '5'*64}):
+        inventories = {IMAGE: extra, OLD: extra, 'sha256:' + 'd' * 64: base}
+        monkeypatch.setattr(s.p, 'run', lambda command: json.dumps(inventories[command[-3]]))
+        with pytest.raises(s.Refused, match='schema inventory mismatch'):
+            s.check_schema(cfg, {'images': {'runtime': IMAGE}, 'schema': extra,
+                'baseline': [{'name': 'messages', 'running': {'api': {'image': OLD}}}], 'previous': {'images': {'runtime': serving}}})
 
 
 def test_plan_a_api_must_run_the_candidate_inventory_even_with_a_prefix_generation(tmp_path, monkeypatch):

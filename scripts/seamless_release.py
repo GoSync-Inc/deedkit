@@ -412,7 +412,12 @@ def applied_prefix(old, candidate):
     added = [migration_version(name) for name in candidate if name not in old]
     if not added or None in versions + added or any(candidate.get(name) != sha for name, sha in old.items()):
         return False
-    return min(v for v in added if v is not None) > max((v for v in versions if v is not None), default=0)
+    # Readiness keys the applied ledger by number, so every number must name one file;
+    # the added migrations continue the old numbering without gaps.
+    newest = max((v for v in versions if v is not None), default=0)
+    if len(set(versions)) != len(versions):
+        return False
+    return sorted(v for v in added if v is not None) == list(range(newest + 1, newest + 1 + len(added)))
 
 
 def check_schema(settings, receipt):
