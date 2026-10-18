@@ -94,9 +94,9 @@ def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=N
     public_events=[{**e['snapshot'],'kind':e['kind'],'origin':e['origin'],'sender':e['sender'],
         'event_sequence':e['id'],'is_backfill':e['origin'] in ('backfill','reconcile'),
         'historical':e['origin'] in ('backfill','reconcile')} for e in events[:limit]]
-    names=enrich(c,[{'id':e['message']} for e in public_events])
+    names=enrich(c,[{'id':e['message']} for e in public_events],p)
     for event,named in zip(public_events,names):
-        for field in ('sender_name','username','chat_title','chat_type'):
+        for field in ('sender_name','sender_name_basis','username','chat_title','chat_type'):
             event[field]=named.get(field)
     from .result_evidence import send_provenance,delivery_evidence,formatting_evidence
     send_provenance(c,public_events)

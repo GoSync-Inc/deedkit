@@ -426,3 +426,22 @@ def test_gateway_can_dismiss_but_cannot_forge_provider_read_state(inbox):
         with s.pool.connection() as c:
             c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
             c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
+def test_whatsapp_queue_hint_never_names_a_sender_by_its_raw_id(seeded):
+    s, _, _ = seeded
+    ar = Archive(s)
+    ar.register('queue-wa', 'whatsapp', 'Synthetic WhatsApp queue', discover=True)
+    key = s.issue_key('queue-wa-agent', ['queue-wa'])
+    at = (datetime.now(timezone.utc)-timedelta(hours=2)).isoformat()
+    for chat in ('321@c.us', '903@lid'):
+        ar.ingest(event(account='queue-wa', platform='whatsapp', chat=chat, sender=chat, provider_id='false_'+chat,
+            sent_at=at, updated_at=at, metadata={'chat_type':'private'}))
+    full = {r['awaiting_reply_sender']: r for r in s.list_chats(key, awaiting_reply=True, include_coverage=False)['items']}
+    assert full['321@c.us']['awaiting_reply_sender_name'] == '+321'
+    assert full['321@c.us']['awaiting_reply_sender_name_basis'] == 'phone_number'
+    assert full['903@lid']['awaiting_reply_sender_name'] is None
+    lean = render('list_chats', s.list_chats(key, awaiting_reply=True, include_coverage=False, view='conversation'), 'compact')
+    hints = {r['awaiting_reply']['sender_id']: r['awaiting_reply'] for r in lean['items']}
+    assert (hints['321@c.us']['sender_name'], hints['321@c.us']['sender_name_basis']) == ('+321', 'phone_number')
+    assert 'sender_name' not in hints['903@lid']

@@ -71,7 +71,8 @@ verbose source coverage block without changing permissions. These options are
 also available for history/context. Context accepts separate `before_count`
 and `after_count`, always preserving the authorized anchor.
 
-Message metadata includes observed sender name/username, chat title/type,
+Message metadata includes the sender name with its `sender_name_basis` (fallback
+order in [PEOPLE.md](PEOPLE.md#sender-names)), username, chat title/type,
 direction, and known reply/forward/media fields. Unknown metadata remains null.
 Older messages acquire provider metadata as they are observed again; this does
 not invent a new content revision.
@@ -142,7 +143,9 @@ lists, compact output and optional coverage reduce the returned payload.
 ## Reply queue (0.9.17, schema 27)
 
 `list_chats(awaiting_reply=true)` returns the attention message's time, bounded
-snippet, exact archive/provider IDs, current revision, sender/name/username and
+snippet, exact archive/provider IDs, current revision, sender ID, name (with
+`awaiting_reply_sender_name_basis`; the compact hint carries `sender_id`,
+`sender_name` and `sender_name_basis`, never a raw ID as the name), username and
 `awaiting_reply_incoming_count` (meaningful incoming messages since the last
 meaningful owner message). Empty/service messages and observed self chats are
 excluded. Media without a caption remains meaningful. Telegram service account
