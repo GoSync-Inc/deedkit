@@ -268,8 +268,12 @@ def snapshot(project):
 
 def container_settings(inspected):
     """A digest of a container's configuration, including what `docker update` changes in place (resources,
-    restart policy), so drift without a new container or image is visible. Receipts keep the digest only."""
-    return digest({key: inspected.get(key) for key in ("Config", "HostConfig", "Mounts")})
+    restart policy), so drift without a new container or image is visible. Receipts keep the digest only.
+    Docker returns Mounts in no stable order, so they are compared as a set."""
+    value = {key: inspected.get(key) for key in ("Config", "HostConfig", "Mounts")}
+    if isinstance(value["Mounts"], list):
+        value["Mounts"] = sorted(value["Mounts"], key=lambda mount: json.dumps(mount, sort_keys=True))
+    return digest(value)
 
 
 # The runtime's data/config mount roots, never executable roots.

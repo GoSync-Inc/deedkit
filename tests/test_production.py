@@ -1601,3 +1601,17 @@ def test_the_ci_check_build_of_a_published_target_receives_the_candidate_source_
     [build] = store.built()
     assert build[build.index("--build-arg") + 1] == "DEEDKIT_SOURCE_SHA=" + SHA
     assert "org.opencontainers.image.revision=" + SHA in build and store.pulls() == []
+
+
+def test_container_settings_ignore_the_order_docker_returns_mounts_in():
+    # docker inspect lists the same mounts in a different order from call to call (release 7, 2026-10-18).
+    mounts = [{"Type": "bind", "Source": f"/opt/synthetic/{name}", "Destination": f"/run/secrets/{name}", "RW": False}
+              for name in ("a", "b", "c", "d")]
+    inspected = {"Config": {"Env": ["A=1"]}, "HostConfig": {"RestartPolicy": {"Name": "unless-stopped"}}, "Mounts": mounts}
+    digest = p.container_settings(inspected)
+    for order in ([3, 1, 0, 2], [1, 0, 3, 2], [2, 3, 1, 0]):
+        assert p.container_settings({**inspected, "Mounts": [mounts[i] for i in order]}) == digest
+    # A real change is still drift.
+    assert p.container_settings({**inspected, "Mounts": mounts[:3]}) != digest
+    assert p.container_settings({**inspected, "Mounts": [*mounts[:3], {**mounts[3], "RW": True}]}) != digest
+    assert p.container_settings({**inspected, "Config": {"Env": ["A=2"]}}) != digest
