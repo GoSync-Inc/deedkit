@@ -9,20 +9,22 @@ import re
 from .policy import scope_filter
 from .whatsapp_identity import personal_id
 
-# A stored name that only repeats the sender ID (any spelling below) carries no name.
+# A stored name that only repeats the sender ID carries no name: the ID itself, or
+# its digits in any ID spelling (+digits, a device suffix, any @domain).
+_ID_DIGITS = r'\+?([0-9]+)(?::[0-9]+)?(?:@[a-z.]+)?'
 _TRIMMED = r"regexp_replace(sp.display_name,'^\s+|\s+$','','g')"
 _DIGITS = "split_part(split_part(sp.sender,'@',1),':',1)"
 NORMALIZED_SQL = _DIGITS+"||'@'||split_part(sp.sender,'@',2)"
-RAW_NAME_SQL = ('('+_TRIMMED+"='' OR "+_TRIMMED+" IN (sp.sender,split_part(sp.sender,'@',1),"+
-    _DIGITS+",'+'||"+_DIGITS+','+NORMALIZED_SQL+'))')
+RAW_NAME_SQL = ('('+_TRIMMED+"='' OR "+_TRIMMED+" IN (sp.sender,split_part(sp.sender,'@',1)) OR "+
+    'substring('+_TRIMMED+" from '^"+_ID_DIGITS+"$')="+_DIGITS+')')
 
 
 def raw_name(name, sender):
     value=re.sub(r'^\s+|\s+$','',name) if isinstance(name,str) else ''
     if not value:return True
     if not isinstance(sender,str) or not sender:return False
-    local,_,domain=sender.partition('@');digits=local.split(':')[0]
-    return value in (sender,local,digits,'+'+digits,digits+'@'+domain)
+    local=sender.partition('@')[0];match=re.fullmatch(_ID_DIGITS,value)
+    return value in (sender,local) or bool(match and match[1]==local.split(':')[0])
 
 
 def _names(c,p,accounts,identities):

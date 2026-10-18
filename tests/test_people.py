@@ -200,6 +200,9 @@ def test_raw_name_rule_covers_device_suffix_whitespace_and_non_whatsapp_accounts
     s,key,say,named=wa_names
     assert named(say(1,'777@g.us','900:2@lid','900@lid'))==('900:2@lid',None,None)
     assert named(say(2,'777@g.us','445@c.us',' 445 '))==('445@c.us','+445','phone_number')
+    assert named(say(3,'777@g.us','903@lid','903:2@lid'))==('903@lid',None,None)
+    say(4,'446@c.us','446@c.us','446:1@c.us')
+    assert named(say(5,'777@g.us','446@c.us'))==('446@c.us','+446','phone_number')
     tg,ar,tg_key,_=directory(seeded)
     shaped=ar.ingest(event(account='people-test',provider_id='31',sender='123@c.us'))['message']
     message=tg.get_context(tg_key,shaped,limit=1)['message']
