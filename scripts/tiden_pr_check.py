@@ -37,14 +37,12 @@ BRANCH_NAME = re.compile(r"(?:proposal|review)/[a-z0-9]+(?:[/_-][a-z0-9]+)*")
 MARKER = re.compile(r"^[ \t]*(#|//)[ \t]*spec:[ \t]*(.*?)[ \t]*$")
 # A comment that tries to be a marker but is malformed (wrong case, missing colon) is reported, not ignored.
 MARKER_LIKE = re.compile(r"^[ \t]*(#|//)[ \t]*spec\b", re.IGNORECASE)
-# Matched on source whose comments and string contents are blanked (`blank`), so a commented-out or quoted call is
-# never a test; the name is then read from the original source at the literal's offset.
-NODE_TEST = re.compile(r"(?<![\w.$])(?:test|it)(?:\.(?:only|skip|todo))?\s*\(\s*")
-GO_TEST = re.compile(r"^func\s+(Test(?:[A-Z0-9_]\w*)?)\s*\(\s*\w+\s+\*testing\.T\s*,?\s*\)", re.MULTILINE)
-# Words after which a `/` starts a regex literal rather than a division.
-REGEX_KEYWORDS = {"return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "instanceof",
-                  "yield", "await"}
-JS_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+# Node and Go tests are found by plain patterns, line by line, with no parsing: a line that looks like a test call or
+# definition counts, even inside a comment or a string, so a test is never hidden (fail closed). A Node name must be a
+# plain string literal, the whole first argument on the call's line, so it equals the title CI reports.
+NODE_TEST = re.compile(r"(?<![\w.$])(?:test|it)(?:\.(?:only|skip|todo))?\s*\(")
+NODE_NAME = re.compile(r"\s*(?:'([^'\\\n]*)'|\"([^\"\\\n]*)\"|`([^`\\$\n]*)`)\s*,")
+GO_TEST = re.compile(r"^\s*func\s+(Test(?![a-z])\w*)\s*\(", re.MULTILINE)
 # Story-level means a leaf that holds criteria: not an Epic and without child specs.
 CONTAINER_TYPES = {"Epic"}
 # Tests that verify no spec, as `<path>::<test>` patterns with the reason; widening it is a reviewed code change.
@@ -152,161 +150,24 @@ def python_tests(source: str) -> list[tuple[str, int, str]]:
     return found
 
 
-def regex_allowed(out: list[str], index: int) -> bool:
-    """Whether a `/` at `index` starts a JS regex literal rather than a division, judged by the code before it."""
-    position = index - 1
-    while position >= 0 and out[position].isspace():
-        position -= 1
-    if position < 0 or out[position] in "(,=:[!&|?{};+-*%<>~^}":
-        return True
-    end = position + 1
-    while position >= 0 and (out[position].isalnum() or out[position] in "_$"):
-        position -= 1
-    return "".join(out[position + 1:end]) in REGEX_KEYWORDS
-
-
-def unterminated(what: str, source: str, index: int) -> SyntaxError:
-    return SyntaxError(f"unterminated {what}", (None, source.count("\n", 0, index) + 1, 0, ""))
-
-
-def blank(source: str, go: bool) -> str:
-    """The source with comments replaced by spaces and string and JS regex contents by `x`, newlines and offsets kept.
-    JS template literals return to code inside `${...}`; Go raw strings and runes are strings. A comment, string or
-    template still open at the end is a syntax error, so the file refuses rather than hiding the tests after it."""
-    out, length = list(source), len(source)
-    stack: list[int] = []  # the brace depth inside each open `${` of the enclosing templates
-
-    def fill(begin: int, end: int, char: str) -> None:
-        for position in range(begin, min(end, length)):
-            if out[position] != "\n":
-                out[position] = char
-
-    def string(index: int, quote: str) -> int:
-        """Blank one string from its opening quote; the index after it closes, or after a template's `${`."""
-        position = index + 1
-        while position < length:
-            char = source[position]
-            if char == "\\" and not (go and quote == "`"):
-                position += 2
-                continue
-            if char == quote:
-                fill(index + 1, position, "x")
-                return position + 1
-            if quote == "`" and not go and source.startswith("${", position):
-                fill(index + 1, position, "x")
-                stack.append(0)
-                return position + 2
-            if char == "\n" and quote != "`":
-                break
-            position += 1
-        raise unterminated("string", source, index)
-
-    def regex(index: int) -> int:
-        """Blank one regex literal from its `/`; the index after its closing `/`, or -1 when it is none."""
-        position, klass = index + 1, False
-        while position < length and source[position] != "\n":
-            char = source[position]
-            if char == "\\":
-                position += 2
-                continue
-            if char == "/" and not klass:
-                fill(index + 1, position, "x")
-                return position + 1
-            klass = (klass and char != "]") or char == "["
-            position += 1
-        return -1
-
-    index = 0
-    while index < length:
-        char = source[index]
-        if source.startswith("//", index):
-            end = source.find("\n", index)
-            end = length if end < 0 else end
-            fill(index, end, " ")
-            index = end
-        elif source.startswith("/*", index):
-            end = source.find("*/", index + 2)
-            if end < 0:
-                raise unterminated("comment", source, index)
-            fill(index, end + 2, " ")
-            index = end + 2
-        elif char == "/" and not go and regex_allowed(out, index) and (end := regex(index)) > 0:
-            index = end
-        elif char in "'\"`":
-            index = string(index, char)
-        elif stack and char == "{":
-            stack[-1] += 1
-            index += 1
-        elif stack and char == "}":
-            if stack[-1]:
-                stack[-1] -= 1
-                index += 1
-            else:
-                stack.pop()
-                index = string(index, "`")  # the template continues after its `}`
-        else:
-            index += 1
-    if stack:
-        raise unterminated("template", source, length)
-    return "".join(out)
-
-
-def js_literal(source: str, code: str, index: int) -> str | None:
-    """The runtime value of the JS string literal at `index` when it is the whole first argument (`code` is the
-    blanked source), or None when the name is not a plain literal."""
-    quote = source[index] if index < len(source) else ""
-    if quote not in ("'", '"', "`"):
-        return None
-    value, position = [], index + 1
-    while position < len(source):
-        char = source[position]
-        if char == quote:
-            if code[position + 1:].lstrip()[:1] not in (",", ")"):
-                return None  # a computed name, such as a concatenation, that starts with a literal
-            try:  # paired surrogate escapes form one character, as in the runtime title
-                return "".join(value).encode("utf-16", "surrogatepass").decode("utf-16")
-            except UnicodeDecodeError:
-                return None
-        if (quote == "`" and source.startswith("${", position)) or (char == "\n" and quote != "`"):
-            return None
-        if char != "\\":
-            value.append(char)
-            position += 1
-            continue
-        escape = source[position + 1:position + 2]
-        hexadecimal = re.match(r"x([0-9a-fA-F]{2})|u\{([0-9a-fA-F]{1,6})\}|u([0-9a-fA-F]{4})", source[position + 1:])
-        if hexadecimal:
-            value.append(chr(int(next(group for group in hexadecimal.groups() if group), 16)))
-            position += 1 + hexadecimal.end()
-        elif escape == "\n":
-            position += 2  # a line continuation adds nothing
-        elif escape and escape not in "xu":
-            value.append(JS_ESCAPES.get(escape, escape))
-            position += 2
-        else:
-            return None
-    return None
-
-
 def tests_in(path: str, source: str) -> list[tuple[str, int, str]]:
-    """(name, 0-based line of the marker's target, problem) of each test in one file."""
+    """(name, 0-based line of the marker's target, problem) of each test in one file. A Node call whose name is not a
+    plain literal is keyed by its stripped line, so an unchanged or moved one is not new."""
     kind = language(path)
     if kind == "python":
         return python_tests(source)
-    code = blank(source, go=kind == "go")
     if kind == "go":
-        return [(match.group(1), code.count("\n", 0, match.start()), "") for match in GO_TEST.finditer(code)]
+        return [(match.group(1), source.count("\n", 0, match.start()), "") for match in GO_TEST.finditer(source)
+                if match.group(1) != "TestMain"]
     found = []
-    for match in NODE_TEST.finditer(code):
-        line = code.count("\n", 0, match.start())
-        name = js_literal(source, code, match.end())
-        if name is not None:
-            found.append((name, line, ""))
-            continue
-        # The expression's own text keys a non-literal name, so moving an existing test never makes it new.
-        expression = code[match.end():].split(",", 1)[0].split(")", 1)[0].strip()
-        found.append((f"<{source[match.end():match.end() + len(expression)]}>", line,
-                      "the test name is not a plain string literal, so it has no stable identity"))
+    for line, text in enumerate(source.splitlines()):
+        for match in NODE_TEST.finditer(text):
+            name = NODE_NAME.match(text, match.end())
+            if name:
+                found.append((next(group for group in name.groups() if group is not None), line, ""))
+            else:
+                found.append((f"<{text.strip()}>", line, "the test name is not a plain string literal on the call's "
+                                                         "line (no escape, `${`, expression or line break)"))
     return found
 
 

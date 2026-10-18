@@ -323,17 +323,6 @@ def test_a_merge_that_leaves_the_branch_open_fails_and_stops_before_other_writes
 
 
 # spec: ANYM-405
-def test_an_escaped_node_title_links_to_the_case_ci_imported(root, server):
-    full_server(server)
-    server.set(tests=[case("node:web/q.test.mjs::adds_quoted", "web/q.test.mjs", "adds 'quoted' title")])
-    merged(root, server, {"web/q.test.mjs": "// spec: ANYM-12\ntest('adds \\'quoted\\' title', () => {});\n"},
-           "Spec: ANYM-12")
-    code, out = run(root, server)
-    assert code == 0, out
-    assert server.state()["links"] == {"t-node:web/q.test.mjs::adds_quoted": ["m-0012-0000-0000-0000-000000000000"]}
-
-
-# spec: ANYM-405
 def test_a_commented_out_copy_of_an_existing_test_links_nothing(root, server):
     full_server(server)
     server.set(tests=[case("node:web/e.test.mjs::existing", "web/e.test.mjs", "existing")])
@@ -432,17 +421,6 @@ def test_an_existing_receipt_keeps_new_nested_metadata_and_a_changed_source_fail
     code, out = run(root, server)
     assert code == 1
     assert "read-back of ANYM-12: 1 sent source(s) missing or changed, 1 unexpected" in out
-
-
-# spec: ANYM-405
-def test_a_surrogate_pair_title_links_to_the_case_ci_imported(root, server):
-    full_server(server)
-    server.set(tests=[case("node:web/s.test.mjs::smile", "web/s.test.mjs", "\U0001F600 smile")])
-    merged(root, server, {"web/s.test.mjs": "// spec: ANYM-12\ntest('\\uD83D\\uDE00 smile', () => {});\n"},
-           "Spec: ANYM-12")
-    code, out = run(root, server)
-    assert code == 0, out
-    assert server.state()["links"] == {"t-node:web/s.test.mjs::smile": ["m-0012-0000-0000-0000-000000000000"]}
 
 
 # spec: ANYM-405

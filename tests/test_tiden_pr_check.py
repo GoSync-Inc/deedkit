@@ -95,7 +95,7 @@ def test_node_and_go_tests_are_found_and_a_renamed_file_counts_as_new(repo, serv
                                                       "\nfunc TestHelper(t *testing.T) {}\nfunc BenchmarkX(b *testing.B) {}\n",
     }, "Spec: ANYM-12")
     assert code == 1
-    assert "web/b.test.js:2 adds 'quoted' title -> ANYM-12" in out
+    assert "web/b.test.js:2 <test('adds \\'quoted\\' title', () => {});>: the test name is not a plain" in out
     assert "web/b.test.js:3 nested: no marker" in out
     assert "pkg/moved_test.go:4 TestOld -> ANYM-12" in out
     assert "TestHelper: no marker" in out and "BenchmarkX" not in out
@@ -210,43 +210,6 @@ def test_the_no_spec_list_is_the_reviewed_empty_set():
 
 
 # spec: ANYM-405
-def test_commented_or_quoted_test_calls_are_not_tests_and_await_and_multiline_calls_are(repo, server):
-    server.set(main=[spec(12)])
-    root, _ = repo
-    commit(root, {"web/a.test.mjs": "import test from 'node:test';\nawait test('existing', () => {});\n"}, "node")
-    code, out = run(repo, server, {"web/a.test.mjs": "import test from 'node:test';\nawait test('existing', () => {});\n"
-                                                     "/*\n// spec: ANYM-12\ntest('existing', () => {});\n*/\n"
-                                                     "const text = \"test('quoted', () => {})\";\n"
-                                                     "// test('line comment', () => {});\n"})
-    assert code == 0, out
-    assert "added tests 0" in out
-    code, out = run(repo, server, {"web/b.test.mjs": "// spec: ANYM-12\nawait test('awaited', () => {});\n\n"
-                                                     "test(\n  'multiline',\n  () => {},\n);\n",
-                                   "pkg/m_test.go": "package pkg\n\n// spec: ANYM-12\nfunc TestMulti(\n\tt *testing.T,\n) {}\n"
-                                                    "\n/*\nfunc TestCommented(t *testing.T) {}\n*/\n"},
-                    "Spec: ANYM-12")
-    assert code == 1
-    assert "web/b.test.mjs:2 awaited -> ANYM-12" in out and "web/b.test.mjs:4 multiline: no marker" in out
-    assert "pkg/m_test.go:4 TestMulti -> ANYM-12" in out and "TestCommented" not in out
-
-
-# spec: ANYM-405
-def test_javascript_titles_are_decoded_and_a_non_literal_name_fails_unless_it_existed(repo, server):
-    server.set(main=[spec(12)])
-    root, _ = repo
-    commit(root, {"web/c.test.mjs": "const name = 'x';\ntest(name, () => {});\n"}, "node")
-    code, out = run(repo, server, {
-        "web/c.test.mjs": "const name = 'x';\n\n// spec: ANYM-12\ntest(\"tab\\there \\u00e9 \\x41\", () => {});\n"
-                          "test(name, () => {});\n// spec: ANYM-12\ntest(`made ${name}`, () => {});\n"}, "Spec: ANYM-12")
-    assert code == 1
-    assert "web/c.test.mjs:4 tab\\there \\xe9 A -> ANYM-12" in out  # shown escaped in the log
-    assert pr_check.tests_in("web/c.test.mjs", "test('it\\'s \\u{1F600}\\\n done', () => {});\n") == [
-        ("it's \U0001F600 done", 0, "")]
-    assert "web/c.test.mjs:7 <`made ${name}`>: the test name is not a plain string literal" in out
-    assert "<name>" not in out  # the moved existing call is not new
-
-
-# spec: ANYM-405
 def test_nested_test_classes_and_parenthesized_decorators_take_their_markers(repo, server):
     server.set(main=[spec(12)])
     code, out = run(repo, server, {
@@ -262,28 +225,40 @@ def test_nested_test_classes_and_parenthesized_decorators_take_their_markers(rep
 
 
 # spec: ANYM-405
-def test_regex_literals_neither_hide_nor_make_tests_and_an_unterminated_comment_refuses(repo, server):
+def test_node_and_go_tests_are_found_by_plain_line_patterns_even_in_comments_strings_and_regexes(repo, server):
     server.set(main=[spec(12)])
-    code, out = run(repo, server, {"web/r.test.mjs": "import test from 'node:test';\nconst rx = /[/*]/;\n"
-                                                     "test('after class', () => {});\nconst tick = /`/, ratio = a / b / c;\n"
-                                                     "test('after tick', () => {});\nconst fake = /test('fake')/;\n"
-                                                     "if (ok) { done(); } /x/.test(value);\n"}, "Spec: ANYM-12")
+    root, _ = repo
+    commit(root, {"web/a.test.mjs": "await test('existing', () => {});\n"}, "node")
+    code, out = run(repo, server, {
+        "web/a.test.mjs": "await test('existing', () => {});\nconst rx = /[/*]/;\ntest('after regex', () => {});\n"
+                          "/*\ntest('commented', () => {});\ntest('existing', () => {});\n*/\n"
+                          "const text = \"it('quoted', () => {})\";\n// spec: ANYM-12\nawait test('awaited', () => {});\n"
+                          "// test('line comment', () => {});\n",
+        "pkg/m_test.go": "package pkg\n\n// spec: ANYM-12\nfunc TestMulti(\n\tt *testing.T,\n) {}\n\n"
+                         "func TestMain(m *testing.M) {}\nfunc Testable() {}\n/*\nfunc TestCommented(t *testing.T) {}\n*/\n",
+    }, "Spec: ANYM-12")
     assert code == 1
-    assert "web/r.test.mjs:3 after class: no marker" in out and "web/r.test.mjs:5 after tick: no marker" in out
-    assert "fake" not in out
-    with pytest.raises(pr_check.Refused, match="does not parse"):
-        run(repo, server, {"web/u.test.mjs": "/* open\ntest('hidden', () => {});\n"}, "Spec: ANYM-12")
+    assert "web/a.test.mjs:3 after regex: no marker" in out and "web/a.test.mjs:5 commented: no marker" in out
+    assert "web/a.test.mjs:8 quoted: no marker" in out
+    assert "web/a.test.mjs:10 awaited -> ANYM-12" in out and "existing" not in out
+    assert "web/a.test.mjs:11 line comment: no marker" in out
+    assert "pkg/m_test.go:4 TestMulti -> ANYM-12" in out and "pkg/m_test.go:11 TestCommented: no marker" in out
+    assert "TestMain" not in out and "Testable" not in out
 
 
 # spec: ANYM-405
-def test_a_literal_that_starts_a_computed_name_is_not_its_name_and_surrogate_pairs_join(repo, server):
+def test_a_node_name_must_be_a_plain_literal_on_the_call_line_unless_that_line_existed(repo, server):
     server.set(main=[spec(12)])
     root, _ = repo
-    commit(root, {"web/p.test.mjs": "test('prefix', () => {});\n"}, "node")
-    code, out = run(repo, server, {"web/p.test.mjs": "test('prefix', () => {});\ntest('prefix' + 'new', () => {});\n"
-                                                     "// spec: ANYM-12\ntest('\\uD83D\\uDE00', () => {});\n"},
-                    "Spec: ANYM-12")
+    commit(root, {"web/c.test.mjs": "const name = 'x';\ntest(name, () => {});\n"}, "node")
+    code, out = run(repo, server, {"web/c.test.mjs": (
+        "const name = 'x';\n// spec: ANYM-12\ntest(`plain ok`, () => {});\n// spec: ANYM-12\ntest('it\\'s', () => {});\n"
+        "// spec: ANYM-12\ntest(`made ${name}`, () => {});\n// spec: ANYM-12\ntest('prefix' + 'new', () => {});\n"
+        "// spec: ANYM-12\ntest(\n  'split',\n  () => {},\n);\n\n  test(name, () => {});\n"
+        "// spec: ANYM-12\ntest('tab\\there', () => {});\n")}, "Spec: ANYM-12")
     assert code == 1
-    assert "web/p.test.mjs:2 <'prefix' + 'new'>: the test name is not a plain string literal" in out
-    assert pr_check.tests_in("web/p.test.mjs", "test('\\uD83D\\uDE00', () => {});\n") == [("\U0001F600", 0, "")]
-    assert "web/p.test.mjs:4 \\U0001f600 -> ANYM-12" in out
+    assert "web/c.test.mjs:3 plain ok -> ANYM-12" in out
+    for line in (5, 7, 9, 11, 18):
+        assert f"web/c.test.mjs:{line} <" in out
+    assert out.count("the test name is not a plain string literal") == 5
+    assert "<test(name, () => {});>" not in out  # the existing call, moved and reindented, is not new
