@@ -187,3 +187,149 @@ func TestNativeIdentityPairsOnlyForArchivablePersonalIDs(t *testing.T) {
 		}
 	}
 }
+
+func ptvMessage(id string) *events.Message {
+	m := fixtureMessage(id, 1700000000)
+	m.Message = &waE2E.Message{PtvMessage: &waE2E.VideoMessage{Caption: proto.String("round"), Mimetype: proto.String("video/mp4"), FileLength: proto.Uint64(4096), Seconds: proto.Uint32(17), ContextInfo: &waE2E.ContextInfo{StanzaID: proto.String("quoted1"), IsForwarded: proto.Bool(true)}}}
+	m.RawMessage = m.Message
+	return m
+}
+
+func TestNativeRoundVideoIsCapturedAsVideoAttachment(t *testing.T) {
+	v, err := NormalizeMessage(ptvMessage("round"), types.EmptyJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireArchivable(t, v)
+	for field, want := range map[string]any{"messageType": "ptv", "mediaKind": "video", "hasMedia": true, "mimetype": "video/mp4", "filesize": int64(4096), "durationSeconds": uint32(17), "body": "round", "replyToId": "quoted1", "forwarded": true, "filename": "false_111111@c.us_round.bin"} {
+		if v[field] != want {
+			t.Fatalf("%s = %#v, want %#v", field, v[field], want)
+		}
+	}
+}
+
+func TestNativeViewOnceRoundVideoIsNotRetained(t *testing.T) {
+	wrap := map[string]func(*waE2E.Message) *waE2E.Message{
+		"v1": func(m *waE2E.Message) *waE2E.Message {
+			return &waE2E.Message{ViewOnceMessage: &waE2E.FutureProofMessage{Message: m}}
+		},
+		"v2": func(m *waE2E.Message) *waE2E.Message {
+			return &waE2E.Message{ViewOnceMessageV2: &waE2E.FutureProofMessage{Message: m}}
+		},
+		"extension": func(m *waE2E.Message) *waE2E.Message {
+			return &waE2E.Message{ViewOnceMessageV2Extension: &waE2E.FutureProofMessage{Message: m}}
+		},
+		"flag": func(m *waE2E.Message) *waE2E.Message { return m },
+	}
+	for name, w := range wrap {
+		t.Run(name, func(t *testing.T) {
+			m := ptvMessage("once")
+			m.RawMessage = w(m.Message)
+			m.Message = m.RawMessage
+			m.IsViewOnce = name == "flag"
+			v, err := NormalizeMessage(m, types.EmptyJID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v["hasMedia"] != false || v["mediaKind"] != nil || v["filename"] != nil || v["mimetype"] != nil || v["filesize"] != nil {
+				t.Fatalf("view-once round video retained: %v", v)
+			}
+			if _, err = nativeMediaMetadata(unwrap(m)); err == nil || err.Error() != "unsupported_media_type" {
+				t.Fatalf("view-once round video has a descriptor: %v", err)
+			}
+		})
+	}
+}
+
+// The native cache keeps only the wire message, so the view-once restriction of
+// a flag-only event or a wrapped edit must be persisted on its own.
+func TestNativeViewOnceRoundVideoStaysUnretainedAfterCacheReload(t *testing.T) {
+	for _, name := range []string{"flag", "wrapped_edit", "wrapper"} {
+		t.Run(name, func(t *testing.T) {
+			s := openTestStore(t)
+			m := ptvMessage("stored-once")
+			switch name {
+			case "flag":
+				m.IsViewOnce = true
+			case "wrapped_edit":
+				edit := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: &waCommon.MessageKey{ID: proto.String("stored-once"), FromMe: proto.Bool(false)}, EditedMessage: m.Message, TimestampMS: proto.Int64(1700000100123)}}
+				m.RawMessage = &waE2E.Message{ViewOnceMessageV2: &waE2E.FutureProofMessage{Message: edit}}
+				m.Message = m.RawMessage
+			case "wrapper":
+				m.RawMessage = &waE2E.Message{ViewOnceMessageV2: &waE2E.FutureProofMessage{Message: m.Message}}
+				m.Message = m.RawMessage
+			}
+			if err := s.Put(m, "live"); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := s.Get(LegacyChatID(m.Info.Chat), "false_111111@c.us_stored-once")
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, err := NormalizeMessage(loaded, types.EmptyJID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = nativeMediaMetadata(loaded); v["hasMedia"] != false || err == nil || err.Error() != "unsupported_media_type" {
+				t.Fatalf("view-once round video retained after reload: hasMedia=%v descriptor=%v", v["hasMedia"], err)
+			}
+		})
+	}
+}
+
+// Records written before the view-once flag was persisted lost the restriction
+// of flag-only and wrapped-edit events, so a cached round video in that format
+// keeps the attachment-free projection it was originally captured with.
+func TestNativeRoundVideoInPreUpgradeCacheRecordStaysAttachmentFree(t *testing.T) {
+	image := fixtureMessage("legacy-image", 1700000000)
+	image.Message = &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(64)}}
+	for name, c := range map[string]struct {
+		m      *events.Message
+		legacy bool
+		media  bool
+	}{
+		"legacy_round_video":  {ptvMessage("legacy-round"), true, false},
+		"legacy_image":        {image, true, true},
+		"current_round_video": {ptvMessage("current-round"), false, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := openTestStore(t)
+			c.m.RawMessage = c.m.Message
+			raw, err := marshalMessage(c.m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.legacy {
+				wire, _ := proto.Marshal(c.m.RawMessage)
+				raw, _ = json.Marshal(struct {
+					Info   types.MessageInfo
+					Wire   []byte
+					Web    []byte
+					IsEdit bool
+				}{Info: c.m.Info, Wire: wire})
+			}
+			envelope, err := captureEnvelope("test", c.m, types.EmptyJID, "live")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = s.append(LegacyChatID(c.m.Info.Chat), LegacyMessageID(c.m), c.m.Info.Timestamp.Unix(), raw, envelope, false); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := s.Get(LegacyChatID(c.m.Info.Chat), LegacyMessageID(c.m))
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, err := NormalizeMessage(loaded, types.EmptyJID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, descriptorErr := nativeMediaMetadata(loaded)
+			if v["hasMedia"] != c.media || (descriptorErr == nil) != c.media {
+				t.Fatalf("hasMedia=%v descriptor=%v, want media %v", v["hasMedia"], descriptorErr, c.media)
+			}
+			if c.legacy && !c.media && (v["messageType"] != "unknown" || v["durationSeconds"] != nil) {
+				t.Fatalf("legacy round video projection changed: %v", v)
+			}
+		})
+	}
+}

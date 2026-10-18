@@ -55,6 +55,10 @@ func nativeMediaMetadata(m *events.Message) (nativeMediaInfo, error) {
 	case wire.GetVideoMessage() != nil:
 		out.Kind = "video"
 		out.Payload = wire.GetVideoMessage()
+	case wire.GetPtvMessage() != nil:
+		// *VideoMessage downloads with the WhatsApp Video keys.
+		out.Kind = "ptv"
+		out.Payload = wire.GetPtvMessage()
 	case wire.GetDocumentMessage() != nil:
 		out.Kind = "document"
 		out.Payload = wire.GetDocumentMessage()

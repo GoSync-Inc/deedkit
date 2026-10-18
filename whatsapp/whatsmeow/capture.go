@@ -143,6 +143,8 @@ func normalizeFixture(path string) error {
 		msg = &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Caption: proto.String(v.Text), Mimetype: proto.String(v.Mime), FileLength: proto.Uint64(v.Bytes), ContextInfo: ctx}}
 	case "ptt":
 		msg = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{PTT: proto.Bool(true), Seconds: proto.Uint32(v.Duration), Mimetype: proto.String(v.Mime), FileLength: proto.Uint64(v.Bytes), ContextInfo: ctx}}
+	case "ptv":
+		msg = &waE2E.Message{PtvMessage: &waE2E.VideoMessage{Caption: proto.String(v.Text), Seconds: proto.Uint32(v.Duration), Mimetype: proto.String(v.Mime), FileLength: proto.Uint64(v.Bytes), ContextInfo: ctx}}
 	case "document":
 		msg = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{FileName: proto.String(v.Filename), Caption: proto.String(v.Text), Mimetype: proto.String(v.Mime), FileLength: proto.Uint64(v.Bytes), ContextInfo: ctx}}
 	case "notification":
@@ -196,6 +198,8 @@ func messageContext(m *waE2E.Message) *waE2E.ContextInfo {
 		return m.GetImageMessage().GetContextInfo()
 	case m.GetVideoMessage() != nil:
 		return m.GetVideoMessage().GetContextInfo()
+	case m.GetPtvMessage() != nil:
+		return m.GetPtvMessage().GetContextInfo()
 	case m.GetAudioMessage() != nil:
 		return m.GetAudioMessage().GetContextInfo()
 	case m.GetDocumentMessage() != nil:
@@ -282,6 +286,15 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 				kind = "gif"
 				media = "animation"
 			}
+		case m.GetPtvMessage() != nil:
+			// A round video (PTV) is an ordinary VideoMessage in its own field.
+			v := m.GetPtvMessage()
+			kind = "ptv"
+			media = "video"
+			body = v.GetCaption()
+			mime = v.GetMimetype()
+			size = v.GetFileLength()
+			duration = v.GetSeconds()
 		case m.GetAudioMessage() != nil:
 			v := m.GetAudioMessage()
 			kind = "audio"

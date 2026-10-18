@@ -168,7 +168,7 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
     native_type=event.get('messageType')
     native_type=native_type if isinstance(native_type,str) and re.fullmatch(r'[a-z][a-z0-9_]{0,63}',native_type) else None
     service=event.get('isService') is True or native_type in ('notification','e2e_notification','call_log','gp2','protocol','ciphertext','revoked')
-    kind='system' if service else {'chat':'text','image':'photo','video':'video','gif':'video',
+    kind='system' if service else {'chat':'text','image':'photo','video':'video','gif':'video','ptv':'video',
         'ptt':'voice','audio':'audio','document':'document','sticker':'sticker','location':'location',
         'vcard':'contact','multi_vcard':'contact','poll_creation':'poll'}.get(native_type,'unknown')
     if native_type is None and event.get('mediaKind'):
