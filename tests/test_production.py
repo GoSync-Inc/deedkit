@@ -2409,7 +2409,7 @@ def test_a_deploy_admitted_before_the_backup_window_ends_before_the_daily_backup
 
     admitted = [hour for hour in range(18) if not admission_skips(tmp_path / "bin", "inactive", f"{hour:02d}")]
     latest_start = (admitted[-1] + 1) * 3600 - 1  # the last second of the last admitted hour before 18:00
-    # TimeoutStartSec counts from the condition check; after it systemd stops the run within TimeoutStopSec.
+    # The single ExecStart follows the hour read at once and gets TimeoutStartSec; then systemd stops it within TimeoutStopSec.
     latest_end = latest_start + duration(lines["TimeoutStartSec"]) + duration(lines["TimeoutStopSec"])
     assert latest_end < 18 * 3600 - 30 * 60  # half an hour before the backup, whatever the run's length
 
