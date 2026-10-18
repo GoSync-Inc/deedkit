@@ -239,16 +239,18 @@ it made stale (Boundary, evidence notes) and the delivered status of the card it
 names. The same step audits the drift since the watermark, so the watermark
 advances once per release. The release owner runs it before the release review
 whenever the delta from the watermark to the candidate changes a product file or
-a skipped pull request in it still waits for its spec writes, and otherwise
-records `Spec sync: none — <reason>`.
+a skipped pull request merged since the last completed spec sync waits for its
+spec writes, and otherwise records `Spec sync: none — <reason>`.
 
 1. One worker session (Tiden card and spec text,
    [parallel-development.md](parallel-development.md)) with `tiden intent skip`
    works on one review branch, `review/<date>-spec-sync`.
 2. Its inputs are every file changed from the watermark (`tiden drift status`)
    to the candidate, matched against the anchors as in Implementation sequence
-   step 4, and the `Spec impact:` and `Spec sync:` lines of the skipped pull
-   requests in that range.
+   step 4, and the `Spec impact:` and `Spec sync:` lines of every skipped pull
+   request merged since the last completed spec sync, whether or not the
+   watermark has since moved past it (an advance by another audit does not
+   complete these writes).
 3. On the review branch it checks each matched spec's text against the code and
    corrects stale text; it anchors each changed file that no anchor matches to
    the spec it implements or records why none applies; it links each named new
@@ -266,8 +268,8 @@ records `Spec sync: none — <reason>`.
    and maintenance, and the watermark advances to the audited candidate SHA
    under the rules there. Until the drift audit card (ANYM-314) has advanced the
    watermark once, the sync is partial: it covers only the skipped pull requests
-   since the last release, completes no drift audit and leaves the watermark
-   unchanged.
+   since the last completed spec sync, completes no drift audit and leaves the
+   watermark unchanged.
 
 ### Names and release identity
 
