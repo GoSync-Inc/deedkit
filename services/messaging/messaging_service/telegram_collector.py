@@ -822,7 +822,9 @@ class TelegramCollector:
 async def run_config(path):
     cfg,auth=configuration(path)
     session=Path(cfg['session_file'])
-    if not session.is_file() or session.stat().st_mode&0o077: raise RuntimeError('private_session_required')
+    try: info=session.lstat()  # A symlink is refused here, never followed.
+    except OSError: raise RuntimeError('private_session_required') from None
+    if not stat.S_ISREG(info.st_mode) or info.st_mode&0o077: raise RuntimeError('private_session_required')
     # File ownership spans client construction, which opens the SQLite session.
     with session_lock(session):
         store=Store(Path(os.environ['DATABASE_URL_FILE']).read_text().strip(),
