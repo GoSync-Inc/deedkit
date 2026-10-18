@@ -168,8 +168,8 @@ Telegram with `user_ids: ["person_abc"]`:
 
 `send_file` without a source names `attachment_id` with `required`; with both
 sources it names `upload_id` with `unique`. An empty `update_profile` names
-`parameters` with `required`. This shape follows the shared field error contract
-planned for gateway arguments and feedback (FB-03).
+`parameters` with `required`. The same shape (`messaging_service/field_errors.py`) reports rejected
+feedback and tool arguments; see SUBSCRIPTIONS.md.
 
 ## Registered files and forward evidence
 

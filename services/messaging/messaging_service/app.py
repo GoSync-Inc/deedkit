@@ -26,6 +26,7 @@ from .store import APIError, Store, digest
 from .security_logging import redact_library_logs
 from . import __version__
 from .error_details import payload,classified
+from .field_errors import field_error,pydantic_field_errors
 from .presentation import options, render
 from .telemetry import capture as capture_error
 from .uploads import UPLOAD_BODY_BYTES
@@ -83,21 +84,24 @@ def validate_arguments(models, method, arguments):
         values=models[method].model_validate(arguments,strict=True,extra='forbid').model_dump()
         invalid=[]
         if method=='create_subscription' and 'reply_to_confirmed_send' in (values.get('wake_rules') or []) and not values.get('reply_to_send'):
-            invalid=['reply_to_send']
+            invalid=[('reply_to_send','required','set when wake_rules has reply_to_confirmed_send')]
         if method=='submit_feedback':
-            if not values['description'].strip():invalid.append('description')
-            if len(json.dumps(values.get('refs') or {}).encode())>8192:invalid.append('refs')
+            if not values['description'].strip():invalid.append(('description','blank','text with a non-space character'))
+            if len(json.dumps(values.get('refs') or {}).encode())>8192:invalid.append(('refs','size','at most 8 KiB'))
         if invalid:
-            failure=APIError('invalid_parameters');failure.fields=invalid
+            failure=APIError('invalid_parameters');failure.fields=[name for name,*_ in invalid]
+            failure.field_errors=[field_error(*item) for item in invalid]
             raise failure
         return values
     except ValidationError as error:
         failure=APIError('invalid_parameters')
         # Return only bounded field names, never input values or Pydantic reprs.
         known=set(models[method].model_fields)
+        errors=error.errors(include_input=False)
         failure.fields=sorted({str(e['loc'][0]) if e['loc'] and str(e['loc'][0]) in known
             else str(e['loc'][0])[:64] if e['loc'] and str(e['loc'][0]).isidentifier()
-            else 'arguments' for e in error.errors(include_input=False)})[:20]
+            else 'arguments' for e in errors})[:20]
+        failure.field_errors=pydantic_field_errors(models[method],errors)
         raise failure from None
 
 log = logging.getLogger('anymsg')
@@ -288,7 +292,7 @@ class Boundary:
                                 await boundary_audit(error.code)
                                 return await JSONResponse({'jsonrpc':'2.0','id':envelope.get('id'),
                                     'error':{'code':-32602,'message':'Invalid tool arguments',
-                                        'data':{'fields':error.fields}}})(scope,receive,protected_send)
+                                        'data':{'fields':error.fields,'field_errors':error.field_errors}}})(scope,receive,protected_send)
                 used=False
                 original_receive=receive
                 async def replay():

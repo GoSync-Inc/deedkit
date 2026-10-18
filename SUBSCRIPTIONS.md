@@ -234,6 +234,19 @@ returns only this exact key's records; source reference IDs are omitted to avoid
 revealing a previously authorized scope after a policy change. Feedback does not
 send messages, create external issues or forward reports to a third party.
 
+A rejected `submit_feedback` names what to fix. Over REST and MCP the schema check
+returns `invalid_parameters` with the existing `fields` list plus `field_errors`; the
+backend checks return `invalid_feedback` with the same `field_errors`. Each entry is
+`{field, reason, expected?, allowed?}`: `field` is a path such as `category`,
+`description` or `refs/message_ids/0`; `reason` is one of `required`, `unknown_field`,
+`type`, `enum`, `min_length`, `max_length`, `pattern`, `blank`, `max_items`, `size`
+(and the other reasons of the shared vocabulary); `expected` is a short reviewed hint
+and `allowed` lists the permitted values, for example the four categories. There is
+one entry per field, in parameter order, at most 20, and no submitted value is ever
+returned: an unknown key is named only when it is a short identifier. A reference that
+is valid but not found or not permitted stays `not_found`. Through the common gateway,
+the gateway's own schema check returns `invalid_arguments` with `field_errors`.
+
 ## Remaining extensions and verification boundaries
 
 Quiet hours, silence timers, debounce/batch windows, coalescing across overlapping
