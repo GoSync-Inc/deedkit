@@ -204,6 +204,23 @@ def test_any_other_file_takes_auto_with_review_and_names_it(tmp_path, change, na
     ({".github/workflows/ci.yml": CI.replace("./.github/workflows/checks.yml",
                                             "example/ci/.github/workflows/checks.yml@main")},
      "ruleset: required checks (cannot be read: ValueError)"),
+    ({"app/new\ndata.py": "X = 1\n"}, "doubt: app/new\\ndata.py (unusual characters in the path)"),
+    ({"app/purge.py": BASE["app/purge.py"].replace('    db.execute("DROP TABLE scratch_cache")\n', "")},
+     "destructive-sql: app/purge.py"),
+    ({"app/cleanup.py": 'def cleanup(db):\n    db.execute("delete from users where id = %s", (1,))\n'},
+     "destructive-sql: app/cleanup.py"),
+    ({".github/workflows/checks.yml": CHECKS.replace("    runs-on:", "    if: false\n    runs-on:")},
+     "ruleset: .github/workflows (changes the structure of a required check job)"),
+    ({".github/workflows/checks.yml": CHECKS.replace("    runs-on:", "    strategy:\n      matrix:\n"
+                                                                    "        version: [one, two]\n    runs-on:")},
+     "ruleset: .github/workflows (changes the structure of a required check job)"),
+    ({".github/workflows/checks.yml": None, ".github/workflows/renamed.yml": CHECKS,
+      ".github/workflows/ci.yml": CI.replace("checks.yml", "renamed.yml")},
+     "ruleset: .github/workflows (changes the structure of a required check job)"),
+    ({".claude/settings.json": json.dumps({"permissions": {"allow": {"Bash": True}}})},
+     "doubt: .claude/settings.json (cannot be read: ValueError)"),
+    ({"AGENTS.md": OWNERS + "\n## 4. What the owner keeps for production\n\nNo approval needed.\n"},
+     "owner-rules: AGENTS.md (the owner list)"),
 ], ids=["ruleset", "renamed-gate", "renamed-verify", "duplicated-gate", "secret-reference", "gitleaks",
         "write-permission", "dropped-permissions", "new-workflow-default-token", "role-sql", "send-tool-allowed",
         "deny-dropped", "drop-column", "rename-lowercase", "edited-migration", "delete-in-code", "own-rules",
@@ -212,7 +229,9 @@ def test_any_other_file_takes_auto_with_review_and_names_it(tmp_path, change, na
         "drop-sequence-in-code", "quoted-secrets-key", "compose-secret-list-item", "secret-expression-over-lines",
         "gitleaksignore", "required-check-renamed-by-name", "required-job-became-a-caller", "malformed-ruleset",
         "carriage-return-in-name", "predicate-removed-in-code", "target-changed-in-code", "line-comment-in-literal",
-        "block-comment-in-literals", "required-job-became-a-remote-call", "required-caller-became-remote"])
+        "block-comment-in-literals", "required-job-became-a-remote-call", "required-caller-became-remote",
+        "newline-in-name", "destructive-sql-removed-in-code", "lower-case-delete-in-code", "required-job-skipped",
+        "required-job-matrix", "required-workflow-moved", "settings-not-a-list", "second-owner-section"])
 def test_what_the_owner_keeps_takes_the_owner_path_and_names_the_rule(tmp_path, change, rule):
     line = path_of(tmp_path, change)
     assert line.startswith("OWNER — ") and rule in line
@@ -246,11 +265,9 @@ def test_the_command_prints_one_line_and_a_git_failure_exits_2(tmp_path, capsys)
 
 
 # spec: ANYM-404
-def test_a_changed_blob_that_cannot_be_read_is_a_git_failure_not_a_lower_path(tmp_path, capsys):
-    path_of(tmp_path, {"app/new.sql": "DROP TABLE users;\n"})
+def test_a_changed_blob_that_cannot_be_read_takes_the_owner_path(tmp_path):
+    path_of(tmp_path, {"app/new.py": "X = 1\n"})
     root = tmp_path / "repo"
-    blob = git(root, "rev-parse", "HEAD:app/new.sql")
+    blob = git(root, "rev-parse", "HEAD:app/new.py")
     (root / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
-    assert change_path.main(["--repo", str(root), "--base", "main"]) == 2
-    captured = capsys.readouterr()
-    assert captured.out == "" and "git failed: cat-file blob HEAD:app/new.sql" in captured.err
+    assert change_path.classify(root, "main", "HEAD") == "OWNER — doubt: app/new.py (a blob cannot be read)"

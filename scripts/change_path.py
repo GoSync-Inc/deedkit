@@ -5,8 +5,10 @@ Lists the committed changes from the merge base of `--base` (default `origin/mai
 with `git diff --no-renames -z`, reads each changed file's blobs at both revisions with `git cat-file` (never a
 patch, a diff driver or a textconv filter) and prints one line: the path, then each matching rule with every path
 that matched it. The PR carries that line as `Change path: <line>`. AUTO is documentation and tests only;
-AUTO+review is any other file; OWNER is a diff that the owner keeps. A doubt (content that cannot be read or
-parsed) counts as OWNER. A change to this file is itself OWNER: it holds the rule table that decides merge authority.
+AUTO+review is any other file; OWNER is a diff that the owner keeps. It fails closed: a doubt (a blob or content
+that cannot be read or parsed, a path with unusual characters, any error while classifying) counts as OWNER, since a
+false OWNER costs one owner look. A change to this file is itself OWNER: it holds the rule table that decides merge
+authority.
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ RULES = {
     "agent-permissions": "agent permissions that allow a send, call or write tool",
     "destructive-sql": "destructive SQL or a changed migration",
     "owner-rules": "the owner list or the change path rules",
+    "doubt": "a change it cannot classify with certainty",
 }
 RULESET_FILES = {"deploy/main-ruleset.json", "deploy/main-protection.json"}
 WORKFLOWS = re.compile(r"^\.github/workflows/[^/]+\.ya?ml$")
@@ -42,12 +45,16 @@ SECRET_EXPRESSION = re.compile(r"\bsecrets(\.\w+|\[[^\]]*\])")
 ROLE_SQL = re.compile(r"(^|/)(\w+_role|roles)\.sql$")
 MIGRATION = re.compile(r"(^|/)migrations/[^/]+\.sql$")
 # Matched per statement after comments are removed and whitespace is collapsed, so a statement split over lines or
-# around a comment still matches. In `.sql` files any case counts; in code only upper-case SQL, so prose such as
-# "drop the cache" does not.
+# around a comment still matches. In `.sql` files any case counts; in code upper-case SQL and lower-case forms that
+# name an SQL object, so prose such as "drop the cache" does not. Any change to these statements, added, edited or
+# removed, is OWNER.
 DESTRUCTIVE_SQL = re.compile(r"\b(DROP|TRUNCATE|RENAME)\b|\bDELETE FROM\b|"
                              r"\bALTER TABLE\b.*\bALTER (COLUMN )?\S+ (SET DATA )?TYPE\b|\bSET NOT NULL\b", re.IGNORECASE)
-DESTRUCTIVE_SQL_IN_CODE = re.compile(r"\b(DROP\s+[A-Z]+|TRUNCATE(\s+TABLE)?\s+\S|DELETE\s+FROM|ALTER\s+TABLE\s+\S+\s+RENAME|"
-                                     r"ALTER(\s+COLUMN)?\s+\S+\s+(SET\s+DATA\s+)?TYPE|SET\s+NOT\s+NULL)\b")
+DESTRUCTIVE_SQL_IN_CODE = re.compile(
+    r"\b(DROP\s+[A-Z]+|TRUNCATE(\s+TABLE)?\s+\S|ALTER(\s+COLUMN)?\s+\S+\s+(SET\s+DATA\s+)?TYPE|(?i:delete\s+from|"
+    r"drop\s+(table|schema|database|index|view|materialized\s+view|sequence|column|constraint|function|procedure|"
+    r"trigger|domain|role|extension|policy|publication|subscription)|truncate\s+table|alter\s+table\s+\S+\s+rename|"
+    r"alter\s+column\s+\S+\s+(set\s+data\s+)?type|set\s+not\s+null))\b")
 DOLLAR_QUOTE = re.compile(r"\$([A-Za-z_]\w*)?\$")
 QUOTES = "\"'`"
 # A string literal joined to the previous one: `+`, a line continuation or nothing between, then a prefixed quote.
@@ -61,7 +68,8 @@ OWNER_FILES = {"scripts/change_path.py"}
 OWNER_LIST = ("AGENTS.md", re.compile(r"^## .*\bowner keeps\b", re.IGNORECASE | re.MULTILINE))
 DOC_SUFFIXES = {".md", ".mdx", ".rst"}
 LEVELS = {"none": 0, "read": 1, "write": 2}
-UNREADABLE = (ValueError, yaml.YAMLError, AttributeError, TypeError, RecursionError)
+# A required job's structure is everything but its steps, display name and permissions (other rules cover those).
+STRUCTURE_SKIP = {"steps", "name", "permissions", "jobs"}
 
 
 class Loader(yaml.SafeLoader):
@@ -83,6 +91,7 @@ class Change:
     status: str
     before: str | None
     after: str | None
+    doubt: str | None = None
 
 
 def git(root: Path, *arguments: str) -> bytes:
@@ -96,15 +105,20 @@ def fields(root: Path, *arguments: str) -> list[str]:
 
 
 def show(root: Path, revision: str, path: str) -> str:
-    """The blob at a revision as text (undecodable bytes replaced). A blob that cannot be read is a git failure."""
+    """The blob at a revision as text (undecodable bytes replaced); raises when git cannot read it."""
     return git(root, "cat-file", "blob", f"{revision}:{path}").decode("utf-8", "replace")
 
 
 def changes(root: Path, base: str, head: str) -> list[Change]:
-    tokens = fields(root, "diff", "--no-renames", "--no-ext-diff", "--name-status", "-z", base, head)
-    return [Change(path, status, None if status == "A" else show(root, base, path),
-                   None if status == "D" else show(root, head, path))
-            for status, path in zip(tokens[::2], tokens[1::2])]
+    """Every changed path with its blobs; a blob the diff status expects but git cannot read leaves a doubt."""
+    tokens, found = fields(root, "diff", "--no-renames", "--no-ext-diff", "--name-status", "-z", base, head), []
+    for status, path in zip(tokens[::2], tokens[1::2]):
+        try:
+            found.append(Change(path, status, None if status == "A" else show(root, base, path),
+                                None if status == "D" else show(root, head, path)))
+        except subprocess.CalledProcessError:
+            found.append(Change(path, status, None, None, "a blob cannot be read"))
+    return found
 
 
 def is_test(path: str) -> bool:
@@ -250,40 +264,56 @@ def widened(before: dict[str, int] | None, after: dict[str, int]) -> bool:
     return any(after.get(scope, after["*"]) > before.get(scope, before["*"]) for scope in scopes)
 
 
+def canonical(node):
+    """A parsed YAML node with string keys and JSON scalars, so it can be compared as sorted JSON."""
+    if isinstance(node, dict):
+        return {str(key): canonical(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [canonical(value) for value in node]
+    return node if isinstance(node, (str, int, float, bool, type(None))) else str(node)
+
+
+def structure(path: str, node: dict) -> list:
+    return [path, canonical({key: value for key, value in node.items() if str(key) not in STRUCTURE_SKIP})]
+
+
 def check_labels(root: Path, revision: str, required: set[str]) -> Counter:
-    """How many jobs report each required check name. Only workflows with a trigger other than `workflow_call`
-    report checks; a local reusable workflow call reports `<caller> / <called job>` for each leaf job, recursively.
-    A remote call is a doubt when a required check starts with its `<caller> / ` prefix."""
+    """Each job that reports a required check name, as (name, structure): the workflows and jobs on its way without
+    their steps, display names and permissions. Only workflows with a trigger other than `workflow_call` report
+    checks; a local reusable workflow call reports `<caller> / <called job>` for each leaf job, recursively. A remote
+    call is a doubt when a required check starts with its `<caller> / ` prefix."""
     paths = [path for path in fields(root, "ls-tree", "-r", "-z", "--name-only", revision, "--", ".github/workflows")
              if path.endswith((".yml", ".yaml"))]
     documents = {path: load(show(root, revision, path)) or {} for path in paths}
 
-    def leaves(document: dict, prefix: str, seen: tuple) -> list[str]:
-        labels = []
+    def leaves(path: str, prefix: str, seen: tuple, way: tuple) -> list[tuple[str, tuple]]:
+        document, labels = documents[path], []
         for name, job in (document.get("jobs") or {}).items():
-            job = job if isinstance(job, dict) else {}
-            label = f"{prefix}{job.get('name', name)}"
-            called = str(job.get("uses", ""))
+            if not isinstance(job, dict):
+                raise ValueError(f"job {name} is not a mapping")
+            label, called = f"{prefix}{job.get('name', name)}", str(job.get("uses", ""))
+            here = (*way, structure(path, document), structure(str(name), job))
             if called.startswith("./.github/workflows/"):
                 target = called[2:].split("@")[0]
                 if target in seen or target not in documents:
                     raise ValueError(f"unresolved reusable workflow {called}")
-                labels += leaves(documents[target], f"{label} / ", (*seen, target))
+                labels += leaves(target, f"{label} / ", (*seen, target), here)
             elif called:
                 # A remote reusable workflow reports `<label> / <its job>`, which cannot be resolved here.
                 if any(check.startswith(f"{label} / ") for check in required):
                     raise ValueError(f"unresolved reusable workflow {called}")
             else:
-                labels.append(label)
+                labels.append((label, here))
         return labels
 
-    labels: Counter = Counter()
+    found: Counter = Counter()
     for path, document in documents.items():
         triggers = document.get("on", document.get(True))
         names = set(triggers) if isinstance(triggers, (dict, list)) else {triggers}
         if names - {"workflow_call"}:
-            labels.update(leaves(document, "", (path,)))
-    return Counter({label: count for label, count in labels.items() if label in required})
+            found.update((label, json.dumps(way, sort_keys=True)) for label, way in leaves(path, "", (path,), ())
+                         if label in required)
+    return found
 
 
 def required_checks(root: Path, revision: str) -> set[str]:
@@ -309,7 +339,11 @@ def allow_widening(before: str | None, after: str | None) -> list[str]:
     """Added `allow` entries that are not read-only, removed `deny` or `ask` entries and a changed default mode."""
     def lists(text):
         block = (json.loads(text) if text else {}).get("permissions") or {}
-        return ({key: set(block.get(key) or []) for key in ("allow", "deny", "ask")}, block.get("defaultMode"))
+        entries = {key: block.get(key) or [] for key in ("allow", "deny", "ask")}
+        if not all(isinstance(value, list) and all(isinstance(entry, str) for entry in value)
+                   for value in entries.values()):
+            raise ValueError("permission entries are not lists of strings")
+        return ({key: set(value) for key, value in entries.items()}, block.get("defaultMode"))
     (old, old_mode), (new, new_mode) = lists(before), lists(after)
     found = [f"allow {entry}" for entry in sorted(new["allow"] - old["allow"]) if not READ_ONLY_TOOL.match(entry)]
     found += [f"drops {key} {entry}" for key in ("deny", "ask") for entry in sorted(old[key] - new[key])]
@@ -317,14 +351,15 @@ def allow_widening(before: str | None, after: str | None) -> list[str]:
 
 
 def owner_list(text: str | None) -> str | None:
+    """Every "owner keeps" section of AGENTS.md, joined, or None without one."""
     if text is None:
         return None
-    heading = OWNER_LIST[1].search(text)
-    if not heading:
-        return None
-    rest = text[heading.end():]
-    end = re.search(r"^## ", rest, re.MULTILINE)
-    return text[heading.start():heading.end() + (end.start() if end else len(rest))]
+    sections = []
+    for heading in OWNER_LIST[1].finditer(text):
+        rest = text[heading.end():]
+        end = re.search(r"^## ", rest, re.MULTILINE)
+        sections.append(text[heading.start():heading.end() + (end.start() if end else len(rest))])
+    return "\n".join(sections) or None
 
 
 def owner_rules(change: Change) -> list[tuple[str, str]]:
@@ -350,7 +385,7 @@ def owner_rules(change: Change) -> list[tuple[str, str]]:
     suffix = PurePosixPath(path).suffix.lower()
     if not is_test(path) and (suffix == ".sql" or suffix in CODE_SUFFIXES):
         sql = suffix == ".sql"
-        if destructive_statements(change.after, sql) - destructive_statements(change.before, sql):
+        if destructive_statements(change.after, sql) != destructive_statements(change.before, sql):
             found.append(("destructive-sql", path))
     if path in OWNER_FILES:
         found.append(("owner-rules", path))
@@ -367,11 +402,16 @@ def classify(root: Path, base: str = "origin/main", head: str = "HEAD") -> str:
     owner: dict[str, list[str]] = {rule: [] for rule in RULES}
     review: list[str] = []
     for change in found:
-        try:
-            for rule, detail in owner_rules(change):
-                owner[rule].append(detail)
-        except UNREADABLE as error:
-            owner["owner-rules"].append(f"{change.path} (cannot be read: {type(error).__name__})")
+        if not change.path.isprintable():
+            owner["doubt"].append(f"{change.path} (unusual characters in the path)")
+        if change.doubt:
+            owner["doubt"].append(f"{change.path} ({change.doubt})")
+        else:
+            try:
+                for rule, detail in owner_rules(change):
+                    owner[rule].append(detail)
+            except Exception as error:  # noqa: BLE001 - any failure to classify is a doubt, which is OWNER
+                owner["doubt"].append(f"{change.path} (cannot be read: {type(error).__name__})")
         if is_test(change.path) and change.after is None:
             review.append(f"{change.path} (removes or moves a test)")
         elif not is_test(change.path) and not is_doc(change.path):
@@ -379,9 +419,12 @@ def classify(root: Path, base: str = "origin/main", head: str = "HEAD") -> str:
     try:
         required = required_checks(root, merge_base) | required_checks(root, head)
         if required and any(change.path.startswith(".github/workflows/") for change in found):
-            if check_labels(root, merge_base, required) != check_labels(root, head, required):
+            before, after = check_labels(root, merge_base, required), check_labels(root, head, required)
+            if Counter(label for label, _ in before.elements()) != Counter(label for label, _ in after.elements()):
                 owner["ruleset"].append(".github/workflows (renames, removes or duplicates a required check)")
-    except UNREADABLE as error:
+            elif before != after:
+                owner["ruleset"].append(".github/workflows (changes the structure of a required check job)")
+    except Exception as error:  # noqa: BLE001 - any failure to classify is a doubt, which is OWNER
         owner["ruleset"].append(f"required checks (cannot be read: {type(error).__name__})")
     matched = {rule: paths for rule, paths in owner.items() if paths}
     if matched:
