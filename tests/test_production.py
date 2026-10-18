@@ -2350,3 +2350,28 @@ def test_the_command_line_runs_deploy_only_as_the_host_operator_and_exits_1_on_a
     assert stopped.value.code == 1 and printed["status"] == "halted" and "scripts/production.py" in printed["reason"]
     p.main(arguments)  # paused now: one quiet line, exit 0
     assert json.loads(capsys.readouterr().out)["status"] == "paused"
+
+
+# spec: ANYM-407
+def test_the_autodeploy_unit_runs_deploy_auto_and_never_starts_during_or_just_before_the_backup(tmp_path):
+    unit = (ROOT / "deploy/deedkit-autodeploy.service").read_text()
+    timer = (ROOT / "deploy/deedkit-autodeploy.timer").read_text()
+    lines = dict(line.split("=", 1) for line in unit.splitlines() if "=" in line and not line.startswith("#"))
+    assert "/usr/local/lib/deedkit/production.py deploy --auto " in lines["ExecStart"]
+    assert "personal-os-backup.service" in lines["After"] and "OnUnitInactiveSec=5min" in timer
+    # systemd turns $$ into $ and %% into %; the condition then runs as a plain sh script.
+    script = re.fullmatch(r"/bin/sh -c '(.*)'", lines["ExecCondition"]).group(1).replace("$$", "$").replace("%%", "%")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    def skipped(backup, hour):
+        (bin_dir / "systemctl").write_text(f"#!/bin/sh\n[ \"$*\" = 'show -P ActiveState personal-os-backup.service' ] && echo {backup}\n")
+        (bin_dir / "date").write_text(f"#!/bin/sh\n[ \"$*\" = '-u +%H' ] && echo {hour}\n")
+        for name in ("systemctl", "date"):
+            (bin_dir / name).chmod(0o755)
+        environment = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+        return subprocess.run(["/bin/sh", "-c", script], env=environment).returncode != 0
+
+    assert not skipped("inactive", "12") and not skipped("failed", "19") and not skipped("inactive", "18")
+    assert skipped("activating", "12") and skipped("active", "03") and skipped("deactivating", "12")
+    assert skipped("inactive", "16") and skipped("inactive", "17")
