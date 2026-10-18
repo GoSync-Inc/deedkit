@@ -601,8 +601,9 @@ def create_app(store: Store, allowed_hosts: list[str]):
         exclude_chats takes archive IDs, exclude_senders account-scoped provider sender IDs.
         only_questions uses question punctuation; private-only uses chat_types=['private'].
         only_unread includes fresh known chat read observations only; unknown/stale count is explicit.
-        exclude_likely_broadcasts (queue only, default false) drops one-way chats and provider business/verified senders
-        and reports excluded_likely_broadcasts_total within scope. detail=full adds priority_components (points per reason).
+        exclude_likely_broadcasts (queue only, default false) drops one-way chats, including a first contact the owner
+        has not answered, and provider business/verified senders; it reports excluded_likely_broadcasts_total within
+        scope. detail=full adds awaiting_reply_priority_components (points per reason).
         limit defaults to 25 (maximum 100); continue with next_cursor.
         """
         return call(ctx,'list_chats',detail=detail,after=after,limit=limit,accounts=accounts,query=query,chat_types=chat_types,

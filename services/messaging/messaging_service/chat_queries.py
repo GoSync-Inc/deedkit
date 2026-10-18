@@ -110,12 +110,16 @@ def sql_literal(value):
 
 
 def owner_senders(c,p):
-    """Sender IDs seen on recent outgoing messages of the key's accounts: {platform|sender: [account, ...]}."""
+    """Sender IDs seen on recent outgoing messages the key may read: {platform|sender: [account, ...]}.
+
+    The key's account and chat scope applies before the 20-message limit, so a chat it cannot read never changes a score.
+    """
+    scope,args=scope_filter(p,'m')
     owners={}
-    for r in c.execute('''SELECT DISTINCT a.platform||'|'||o.sender AS k,a.id AS account FROM accounts a
-        CROSS JOIN LATERAL (SELECT m.sender FROM messages m WHERE m.account=a.id AND m.direction='outgoing'
+    for r in c.execute(f'''SELECT DISTINCT a.platform||'|'||o.sender AS k,a.id AS account FROM accounts a
+        CROSS JOIN LATERAL (SELECT m.sender FROM messages m WHERE m.account=a.id AND {scope} AND m.direction='outgoing'
           AND NOT m.deleted AND m.sender<>'' ORDER BY m.sent_at DESC,m.id DESC LIMIT 20) o WHERE a.id=ANY(%s)''',
-        (p['accounts'],)):owners.setdefault(r['k'],[]).append(r['account'])
+        (*args,p['accounts'])):owners.setdefault(r['k'],[]).append(r['account'])
     return Jsonb(owners)
 
 
@@ -212,6 +216,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     after_owner=f'''(own_last.sent_at IS NULL OR m.sent_at>own_last.sent_at OR
         (a.platform='telegram' AND m.sent_at=own_last.sent_at AND {number('m')}>own_last.numeric_id)
         OR (a.platform='whatsapp' AND m.sent_at=own_last.sent_at))'''
+    # lower() folds Cyrillic only under a UTF-8 database collation (the postgres image default).
     courtesy=sql_literal(courtesy_pattern())
     message_projection=f'''m.id,m.provider_id,m.revision,m.sender,m.sent_at,m.direction,
         CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END AS numeric_id,
@@ -266,13 +271,13 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
       LEFT JOIN sender_profiles sp ON sp.account=c.account AND sp.chat=c.id AND sp.sender=attention.sender
       LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
       LEFT JOIN reply_dismissals d ON d.key_id=%s AND d.chat=c.id WHERE '''
-    base_args=[score_at,owner_senders(c,p) if awaiting_reply else Jsonb({}),p['key_id']]
+    base_args=[score_at,owner_senders(c,p),p['key_id']]
     # A first queue page counts the same filtered rows it sorts, in one pass.
     inline_totals=awaiting_reply and not only_unread and not after
     excluded=None
     if exclude_likely_broadcasts:
         # Counted in the caller's scope and filters only, then removed from the rows, the totals and the cursor.
-        excluded=c.execute('SELECT count(*) AS n'+base+' AND '.join([*clauses,broadcast]),[*base_args,*args]).fetchone()['n']
+        excluded=c.execute('SELECT count(*) AS n'+base+' AND '.join([*clauses,broadcast,*([unread+' IS TRUE'] if only_unread else [])]),[*base_args,*args]).fetchone()['n']
         clauses.append('NOT '+broadcast)
     totals=c.execute('SELECT count(*) AS n,count(*) FILTER(WHERE '+unread+' IS NULL) AS unknown'+base+
         ' AND '.join(clauses),[*base_args,*args]).fetchone() if awaiting_reply and not inline_totals else None

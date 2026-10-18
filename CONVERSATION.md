@@ -91,6 +91,7 @@ returns them as `awaiting_reply_priority_components` (an object keyed by the
 reason codes, summing to `awaiting_reply_priority`); compact rows omit it so
 the default output does not grow (owner decision 2026-10-18), and keep `reasons`,
 which lists exactly the keys of the components. Zero components are absent.
+Direct Store calls, which have no presentation level, always include it.
 
 | Code | Points | When |
 | --- | --- | --- |
@@ -101,7 +102,7 @@ which lists exactly the keys of the components. Zero components are absent.
 | `one_way_chat` | -60 | private chat in which no meaningful owner message is archived |
 | `provider_business_or_verified` | -40 | the provider stated a business/verified (WhatsApp `VerifiedName`) or verified/support (Telegram) sender |
 | `own_account` | -80 | the sender ID is a recent outgoing sender of another account of the key |
-| `closing_courtesy` | -30 | the whole message (at most 40 characters, no question mark) is only closing words or emoji |
+| `closing_courtesy` | -30 | the whole message (at most 40 characters, no question mark) is only closing words or common emoji |
 | `observed_bot` | -20 | a group message from a sender the provider marks as a bot |
 
 A demotion never excludes a row (private bots stay excluded as before); a
@@ -126,7 +127,12 @@ follow a closing word but never stand alone. A message with other words
 false) removes rows with `one_way_chat` or `provider_business_or_verified`
 before totals, paging and the cursor; the cursor binds the flag.
 `excluded_likely_broadcasts_total` counts the removed rows within the key's
-scope and the request's other filters only.
+scope and the request's other filters, `only_unread` included. A one-way chat is
+also a person's first message until the owner replies: use the filter to shorten a
+long queue, not as the default view.
+
+`own_account` evidence is read only from chats the key may read, and the same
+score is returned whether or not `awaiting_reply` filters the listing.
 
 ## Ordering and windows
 

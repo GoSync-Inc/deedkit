@@ -255,3 +255,54 @@ def test_provider_flag_is_validated_as_a_boolean_in_envelope_and_spool_event():
         'event':{'chatId':'1@c.us','messageId':'B1','senderId':'1@c.us','body':'Sale?','timestamp':1800000000,'fromMe':False,
             'senderIsBusiness':True}}
     assert validate_capture(spooled)['envelope']['metadata']['sender_is_business_or_verified'] is True
+
+
+def test_own_account_evidence_respects_the_keys_chat_scope(demote):
+    from messaging_service.envelope import stable_id
+    s,ar,key,add,history,queue,rows=demote
+    # The matching outgoing sender exists only in chat o2 of the second account.
+    add('o2','1',500,direction='outgoing',sender=OWNER_SENDER,account='demote-tg2',body='Synthetic owner message')
+    history('a');add('a','1',2,body='Hello from my other account',sender=OWNER_SENDER)
+    visible=[stable_id('chat','demote-tg','a')]
+    scoped=s.issue_key('demote-chat-scope',['demote-tg','demote-tg2'],chats=visible)
+    def component_of(token):
+        item=next(r for r in s.list_chats(token,awaiting_reply=True,include_coverage=False,order='priority')['items']
+            if r['provider_chat_id']=='a')
+        return components(item)
+    assert 'own_account' in component_of(key)
+    # Hidden history neither demotes nor changes the visible row; reading its chat enables the demotion.
+    assert 'own_account' not in component_of(scoped)
+    readable=s.issue_key('demote-chat-scope2',['demote-tg','demote-tg2'],chats=[*visible,stable_id('chat','demote-tg2','o2')])
+    assert 'own_account' in component_of(readable)
+
+
+def test_scored_hint_is_the_same_with_and_without_the_awaiting_reply_filter(demote):
+    s,ar,key,add,history,queue,rows=demote
+    add('o2','1',500,direction='outgoing',sender=OWNER_SENDER,account='demote-tg2',body='Synthetic owner message')
+    history('a');add('a','1',2,body='Hello from my other account',sender=OWNER_SENDER)
+    queued=rows()['a']
+    plain=next(r for r in s.list_chats(key,include_coverage=False,limit=100)['items'] if r['provider_chat_id']=='a')
+    assert plain['awaiting_reply_priority']==queued['awaiting_reply_priority']
+    assert components(plain)==components(queued) and 'own_account' in components(plain)
+    with TestClient(create_app(s,['testserver'])) as client:
+        compact=structured(rpc(client,key,'list_chats',{'limit':100}))['items']
+        awaiting=structured(rpc(client,key,'list_chats',{'awaiting_reply':True,'limit':100}))['items']
+    hint=lambda items:next(r['awaiting_reply'] for r in items if r['id']==queued['id'])
+    assert hint(compact)['priority']==hint(awaiting)['priority'] and hint(compact)['reasons']==hint(awaiting)['reasons']
+
+
+def test_excluded_total_honours_only_unread_like_the_other_totals(demote):
+    from messaging_service.reply_state import observe
+    s,ar,key,add,history,queue,rows=demote
+    add('unread-mailing','1',3,body='Mailing?');add('read-mailing','1',3,body='Mailing?');add('unknown-mailing','1',3,body='Mailing?')
+    history('person');add('person','1',3,body='Where are you?')
+    def seen(chat, count):
+        with s.pool.connection() as c:
+            observe(c,'demote-tg',chat,{'observed_at':datetime.now(timezone.utc).isoformat(),'unread_count':count,
+                'read_inbox_max_id':0,'basis':'telegram_dialog'})
+    seen('unread-mailing',1);seen('read-mailing',0);seen('person',1)
+    both=queue(only_unread=True,exclude_likely_broadcasts=True)
+    assert [r['provider_chat_id'] for r in both['items']]==['person']
+    # Only the mailing that passes the unread filter is counted as excluded; the read and unknown ones are not in the population.
+    assert both['excluded_likely_broadcasts_total']==1 and both['awaiting_reply_total']==1
+    assert queue(exclude_likely_broadcasts=True)['excluded_likely_broadcasts_total']==3
