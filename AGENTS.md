@@ -67,8 +67,8 @@ and Fable on the normal-level PRs it would ship, once each, and Astra on how
 the candidate fits what is deployed when it changes CI, release or deploy code,
 the schema or a consumed interface. Important and owner-level PRs are reviewed
 before they merge and never wait for it. A production operation plan gets Astra
-before the owner authorizes it. When Codex wrote the code, Fable takes Astra's
-place on it.
+before the owner authorizes it. On important-level code that Codex wrote,
+Fable takes Astra's place; at owner level both review it.
 
 The Tiden loop follows the kind of change. Use `tiden intent skip` only for
 changes without code beyond comments that leave observable product behavior

@@ -143,7 +143,8 @@ at least important (`AGENTS.md`). Prefer splitting it.
   queue's verification only in place of `checks / verify` (ANYM-321).
 - Before prepare or a package publication, the release owner runs the release
   review ([review-protocol.md](review-protocol.md)) or records why none is due;
-  its open blocking or major findings hold the release.
+  its open blocking or major findings hold the release as that document
+  describes.
 - The release owner keeps one release in flight, from prepare to acceptance. The
   host deployment lock only stops two deployment commands from running at once.
 - Release often; the target is several times a day. Once automatic deployment

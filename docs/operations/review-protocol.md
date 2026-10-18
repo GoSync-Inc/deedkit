@@ -32,7 +32,8 @@ assertion of the changed behavior and pass at the head; an import, setup or
 unrelated failure does not count. The PR records `Fails without the fix:
 <tests> failed on <assertion> with <change> undone`. A refactor, a test-only
 change or a dependency update records `Fails without the fix: n/a — <reason>`
-and the tests that pass on both revisions.
+and the tests that pass on both revisions; a documentation-only change records
+`n/a — documentation only`.
 
 ## Checklists
 
@@ -168,13 +169,17 @@ production: a CI change to how `main` push runs verify, which the host's older
   service, host tool and verifier the release touches, the schema transition and
   the apply order) and the diffs of the interface files only, not the PRs'
   whole code again. An unknown deployed SHA prevents a pass. A new commit in the
-  candidate re-opens Part B, not Part A.
+  candidate re-opens Part B; Part A runs again only for a normal-level pull
+  request it has not covered.
 - **What blocks.** An open blocking or major finding holds the release
   (Readiness decision in [tiden-product-workflow.md](tiden-product-workflow.md))
   until its fix merges, reviewed at the fix's own level and rechecked by the
   reviewer that raised it, or the pull request is reverted. A finding on agent
-  rules or process documents does not hold a release; its fix is a pull request
-  in the current wave. Minors become cards.
+  rules or process documents holds the release only when it affects the
+  candidate's operation, authority, evidence or acceptance, and the reviewer
+  says which; otherwise its fix is a pull request in the current wave. Either
+  way, a blocking or major finding on a procedure stops that procedure's use
+  until the fix merges or the owner decides. Minors become cards.
 - **Record.** The readiness decision for the candidate SHA records the reviewed
   range, each part's verdict line and report path, or the `none` reason.
 - Pull requests that `AGENTS.md` reviews before merge are not reviewed again

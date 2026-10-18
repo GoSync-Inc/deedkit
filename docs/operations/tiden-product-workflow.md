@@ -215,9 +215,10 @@ Record these independently, with timestamp, branch/release ID and exact Git SHA:
    report path, and its open blocking or major findings.
 
 Readiness remains blocked while a relevant current defect, unresolved production
-incident or required acceptance lacks evidence, or a blocking or major release
-review finding on code, contract or spec text is open. This is the project's
-release decision; do not present it as a newly computed native Tiden verdict. Classifying future proposals alone
+incident or required acceptance lacks evidence, or a release review finding
+that holds the release ([review-protocol.md](review-protocol.md)) is open. This
+is the project's release decision; do not present it as a newly computed native
+Tiden verdict. Classifying future proposals alone
 does not repair runtime incidents or establish readiness.
 
 For issue triage, read `issue fix-context`, every suspect source path and the
