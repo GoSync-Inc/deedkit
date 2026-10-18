@@ -79,6 +79,11 @@ def message_summary(row):
     return result
 
 
+def _fallback_basis(row, key='sender_name_basis'):
+    # Compact rows state the basis only when the name is not this chat's own observation.
+    return row.get(key) if row.get(key) not in (None,'message') else None
+
+
 def lean_file(row):
     return {k:row[k] for k in LEAN_FILE_FIELDS if row.get(k) is not None}
 
@@ -88,9 +93,7 @@ def lean_message(row, *, search=False, files=True):
     result={k:row[k] for k in ('id','account','chat','sender','sender_name','sent_at','direction','kind','revision')
         if row.get(k) is not None}
     if 'sender_name' not in result and row.get('username'):result['username']=row['username']
-    # Compact rows state the basis only when the name is not this chat's own observation.
-    if result.get('sender_name') and row.get('sender_name_basis') not in (None,'message'):
-        result['sender_name_basis']=row['sender_name_basis']
+    if result.get('sender_name') and _fallback_basis(row):result['sender_name_basis']=row['sender_name_basis']
     for key,maximum in [('sender_name',64),('username',64)]:
         if key in result:result[key]=result[key][:maximum]
     if search:
@@ -147,6 +150,7 @@ def lean_conversation(state, *, shown=()):
         result['latest_message_id']=latest['id']
         if latest['id'] not in shown:
             result['latest_message']={'direction':latest.get('direction'),'sender_name':latest.get('sender_name'),
+                'sender_name_basis':_fallback_basis(latest),
                 'sent_at':latest.get('sent_at'),'display_text':(latest.get('display_text') or '')[:160]}
             result['latest_message']={k:v for k,v in result['latest_message'].items() if v is not None}
     attention=state.get('owner_attention')
@@ -168,6 +172,7 @@ def lean_chat(row):
     latest=(state or {}).get('latest_known_meaningful_message')
     if latest:
         last={'id':latest['id'],'direction':latest.get('direction'),'sender_name':latest.get('sender_name'),
+            'sender_name_basis':_fallback_basis(latest),
             'display_text':latest.get('display_text') or ''}
     elif row.get('last_message_id'):
         last={'id':row['last_message_id'],'direction':row.get('last_message_direction'),
@@ -185,7 +190,7 @@ def lean_chat(row):
             'sent_at':row.get('awaiting_reply_sent_at'),
             'sender_id':row.get('awaiting_reply_sender'),
             'sender_name':row.get('awaiting_reply_sender_name') or row.get('awaiting_reply_username'),
-            'sender_name_basis':row.get('awaiting_reply_sender_name_basis') if row.get('awaiting_reply_sender_name_basis')!='message' else None,
+            'sender_name_basis':_fallback_basis(row,'awaiting_reply_sender_name_basis'),
             'priority':row.get('awaiting_reply_priority'),'reasons':row.get('awaiting_reply_priority_reasons'),
             'waiting_hours':row.get('awaiting_reply_waiting_hours'),'incoming_count':row.get('awaiting_reply_incoming_count'),
             'basis':row.get('awaiting_reply_basis')}

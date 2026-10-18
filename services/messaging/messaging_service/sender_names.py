@@ -4,20 +4,25 @@ Order: the name observed in the message's chat, a name of the same sender seen i
 another readable chat, a name of a visible non-conflicting linked PN/LID identity,
 the PN phone number. Each source authorizes exposure through a visible message.
 """
-from .policy import scope_filter
-from .whatsapp_identity import personal_id,visible_cte
+import re
 
-# A stored name that only repeats the sender ID carries no name.
-RAW_NAME_SQL = """(btrim(sp.display_name)='' OR btrim(sp.display_name) IN (sp.sender,
-    split_part(sp.sender,'@',1),split_part(split_part(sp.sender,'@',1),':',1),
-    '+'||split_part(split_part(sp.sender,'@',1),':',1)))"""
+from .policy import scope_filter
+from .whatsapp_identity import personal_id
+
+# A stored name that only repeats the sender ID (any spelling below) carries no name.
+_TRIMMED = r"regexp_replace(sp.display_name,'^\s+|\s+$','','g')"
+_DIGITS = "split_part(split_part(sp.sender,'@',1),':',1)"
+NORMALIZED_SQL = _DIGITS+"||'@'||split_part(sp.sender,'@',2)"
+RAW_NAME_SQL = ('('+_TRIMMED+"='' OR "+_TRIMMED+" IN (sp.sender,split_part(sp.sender,'@',1),"+
+    _DIGITS+",'+'||"+_DIGITS+','+NORMALIZED_SQL+'))')
 
 
 def raw_name(name, sender):
-    if not isinstance(name,str) or not name.strip():return True
+    value=re.sub(r'^\s+|\s+$','',name) if isinstance(name,str) else ''
+    if not value:return True
     if not isinstance(sender,str) or not sender:return False
-    local=sender.split('@')[0];digits=local.split(':')[0]
-    return name.strip() in (sender,local,digits,'+'+digits)
+    local,_,domain=sender.partition('@');digits=local.split(':')[0]
+    return value in (sender,local,digits,'+'+digits,digits+'@'+domain)
 
 
 def _names(c,p,accounts,identities):
@@ -31,7 +36,7 @@ def _names(c,p,accounts,identities):
     rows=c.execute('''SELECT sp.account,sp.chat,sp.display_name,messenger_whatsapp_personal_id(sp.sender) AS identity
         FROM sender_profiles sp JOIN messages m ON m.id=sp.source_message
         WHERE '''+where+''' AND NOT m.deleted AND m.account=sp.account AND m.chat=sp.chat AND m.sender=sp.sender
-          AND sp.account=ANY(%s) AND split_part(split_part(sp.sender,'@',1),':',1)||'@'||split_part(sp.sender,'@',2)=ANY(%s)
+          AND sp.account=ANY(%s) AND '''+NORMALIZED_SQL+'''=ANY(%s)
           AND messenger_whatsapp_personal_id(sp.sender)=ANY(%s) AND NOT '''+RAW_NAME_SQL+'''
         ORDER BY sp.source_sent_at DESC,sp.id''',[*args,sorted(accounts),sorted(identities),sorted(identities)]).fetchall()
     found={}
@@ -40,11 +45,26 @@ def _names(c,p,accounts,identities):
 
 
 def _links(c,p,accounts,identities):
-    """Visible PN/LID partners; a conflict anywhere in the account blocks the link."""
-    cte,args=visible_cte(p)
-    rows=c.execute('WITH '+cte+''' SELECT DISTINCT v.account,v.pn,v.lid,v.verified FROM visible_whatsapp_identity v
-        WHERE v.account=ANY(%s) AND (v.pn=ANY(%s) OR v.lid=ANY(%s))''',
-        [*args,sorted(accounts),sorted(identities),sorted(identities)]).fetchall()
+    """Visible PN/LID partners; a conflict anywhere in the account blocks the link.
+
+    Distinct pairs are checked once, as in whatsapp_identity.resolve_alias, so
+    repeated observations of one pair do not repeat the account-wide conflict test.
+    """
+    where,args=scope_filter(p,'m')
+    rows=c.execute('''WITH candidate_pairs AS MATERIALIZED (
+        SELECT DISTINCT account,pn,lid FROM whatsapp_identity_observations
+        WHERE account=ANY(%s) AND (pn=ANY(%s) OR lid=ANY(%s)))
+        SELECT pair.account,pair.pn,pair.lid,
+          NOT EXISTS(SELECT 1 FROM whatsapp_identity_observations other
+            WHERE other.account=pair.account AND other.pn=pair.pn AND other.lid<>pair.lid)
+          AND NOT EXISTS(SELECT 1 FROM whatsapp_identity_observations other
+            WHERE other.account=pair.account AND other.lid=pair.lid AND other.pn<>pair.pn) AS verified
+        FROM candidate_pairs pair
+        WHERE EXISTS(SELECT 1 FROM whatsapp_identity_observations wi JOIN messages m ON m.id=wi.source_message
+          JOIN chats ic ON ic.id=m.chat
+          WHERE wi.account=pair.account AND wi.pn=pair.pn AND wi.lid=pair.lid AND wi.account=m.account AND NOT m.deleted
+            AND (wi.identity_id=m.sender OR wi.identity_id=ic.provider_chat) AND '''+where+')',
+        [sorted(accounts),sorted(identities),sorted(identities),*args]).fetchall()
     partners={}
     for row in rows:
         for own,other in ((row['pn'],row['lid']),(row['lid'],row['pn'])):
@@ -60,7 +80,11 @@ def resolve(c,p,rows,*,account='account',chat='chat',sender='sender',name='sende
         if raw_name(row.get(name),row.get(sender)):row[name]=None
         else:row[basis]='message';continue
         identity=personal_id(row.get(sender))
-        if identity and row.get('platform') in (None,'whatsapp') and row.get(account):pending.append((row,identity))
+        if identity and row.get(account):pending.append((row,identity))
+    if pending:
+        whatsapp={r['id'] for r in c.execute("SELECT id FROM accounts WHERE id=ANY(%s) AND platform='whatsapp'",
+            (sorted({row[account] for row,_ in pending}),))}
+        pending=[(row,identity) for row,identity in pending if row[account] in whatsapp]
     if not pending:return rows
     accounts={row[account] for row,_ in pending}
     seen=_names(c,p,accounts,{identity for _,identity in pending})

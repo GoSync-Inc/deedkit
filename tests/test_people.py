@@ -194,3 +194,41 @@ def test_stored_name_equal_to_sender_id_counts_as_absent(wa_names,seeded):
     message=tg.get_context(tg_key,raw,limit=1)['message']
     assert message['sender']=='77' and message.get('sender_name') is None
     assert [r['sender_name'] for r in tg.search_people(tg_key)['items'] if r['sender_id']=='77']==[None]
+
+
+def test_raw_name_rule_covers_device_suffix_whitespace_and_non_whatsapp_accounts(wa_names,seeded):
+    s,key,say,named=wa_names
+    assert named(say(1,'777@g.us','900:2@lid','900@lid'))==('900:2@lid',None,None)
+    assert named(say(2,'777@g.us','445@c.us',' 445 '))==('445@c.us','+445','phone_number')
+    tg,ar,tg_key,_=directory(seeded)
+    shaped=ar.ingest(event(account='people-test',provider_id='31',sender='123@c.us'))['message']
+    message=tg.get_context(tg_key,shaped,limit=1)['message']
+    assert message['sender']=='123@c.us' and message.get('sender_name') is None
+
+
+def test_repeated_identity_observations_still_resolve_one_link(wa_names):
+    s,key,say,named=wa_names
+    say(1,'555@c.us','555@c.us','Synthetic Carol')
+    group=say(2,'777@g.us','900@lid',pn='555@c.us')
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
+            SELECT 'repeat-'||g,m.account,m.chat,'repeat-'||g,m.sender,'synthetic',m.sent_at FROM messages m,
+            generate_series(1,2000) g WHERE m.id=%s''',(group,))
+        c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,pn,lid,provenance,
+            first_observed_at,observed_at) SELECT account,'repeat-'||g,'900@lid','555@c.us','900@lid','webjs_contact_cache_v1',
+            now(),now() FROM messages,generate_series(1,2000) g WHERE id=%s''',(group,))
+    assert named(group)==('900@lid','Synthetic Carol','linked_identity')
+
+
+def test_conversation_views_keep_the_fallback_basis(wa_names):
+    from messaging_service.presentation import render
+    s,key,say,named=wa_names
+    say(1,'123@c.us','123@c.us','Synthetic Bob')
+    group=say(2,'777@g.us','123@c.us')
+    chat=s.get_context(key,group,limit=1)['message']['chat']
+    full=[r for r in s.list_chats(key,view='conversation',include_coverage=False)['items'] if r['id']==chat][0]
+    latest=full['conversation']['latest_known_meaningful_message']
+    assert (latest['sender_name'],latest['sender_name_basis'])==('Synthetic Bob','seen_elsewhere')
+    lean=[r for r in render('list_chats',s.list_chats(key,view='conversation',include_coverage=False),'compact')['items']
+        if r['id']==chat][0]
+    assert lean['last_message']['sender_name_basis']=='seen_elsewhere'

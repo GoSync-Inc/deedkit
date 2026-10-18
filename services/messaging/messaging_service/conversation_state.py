@@ -26,7 +26,7 @@ def _snapshot(message):
     if message is None:
         return None
     snapshot={key:message.get(key) for key in ('id', 'revision', 'direction', 'sender',
-        'sender_name', 'username', 'sent_at', 'body', 'kind', 'display_text',
+        'sender_name', 'sender_name_basis', 'username', 'sent_at', 'body', 'kind', 'display_text',
         'order_basis', 'order_status', 'timestamp_precision')} | {
             'provider_message_id':message.get('provider_id')}
     for key,limit in (('body',1000),('display_text',1200)):
