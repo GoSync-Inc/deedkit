@@ -279,7 +279,10 @@ def test_group_attention_uses_explicit_candidates_without_rescanning_broadcasts(
             'params':{'name':'list_chats','arguments':{'limit':5}}}).json()
         record_property('mcp_elapsed_ms',round((monotonic()-started)*1000,2))
         assert 'error' not in response and not response['result'].get('isError'),response
-        assert response['result']['structuredContent']['items'][0]['conversation']['owner_attention']['target_message_id']==expected
+        row=response['result']['structuredContent']['items'][0]
+        # Compact states the attention target once: in the hint when it is the hint's message.
+        attention=row['conversation']['owner_attention']
+        assert attention.get('target_message_id',row.get('awaiting_reply',{}).get('message_id'))==expected
 
 
 def test_group_reply_heads_keep_telegram_order_and_whatsapp_same_second_uncertainty(seeded):
