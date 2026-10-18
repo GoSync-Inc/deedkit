@@ -1046,7 +1046,8 @@ def test_release_workflows_record_only_verified_main_commits(tmp_path):
     # Only after the CI gate and the image publication, so every verification job, the Tiden
     # publication and the GHCR publication passed.
     assert job["needs"] == ["gate", "publish"]
-    assert job["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    assert job["if"] == ("${{ !cancelled() && needs.gate.result == 'success' && needs.publish.result == 'success' "
+                         "&& github.event_name == 'push' && github.ref == 'refs/heads/main' }}")
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in job["steps"]}
     record = steps["Record the main release in Tiden"]
     assert record["if"] == "steps.config.outputs.enabled == 'true'" and "continue-on-error" not in record
