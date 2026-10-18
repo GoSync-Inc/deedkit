@@ -677,6 +677,17 @@ def test_failed_cold_abort_keeps_the_journal_for_reconciliation(config):
     # Backup admission ignores cold journals.
     assert receive(config,cloud)['status']=='stored'
 
+# spec: ANYM-287 (receiver cold route state), ANYM-297 criterion 7 (cold copy crash safety)
+def test_cold_lock_fsyncs_state_directory_when_it_creates_cold(config,monkeypatch):
+    state=Path(config['state_directory']);real=os.fsync;synced=[]
+    def fsync(fd):synced.append(os.fstat(fd).st_ino);real(fd)
+    monkeypatch.setattr(os,'fsync',fsync)
+    # The new `cold/` entry is durable before its lock or any journal is used.
+    with r2.cold_lock(config):assert synced==[state.stat().st_ino]
+    # An existing `cold/` (FileExistsError) needs no parent sync.
+    synced.clear()
+    with r2.cold_lock(config):assert synced==[]
+
 @pytest.mark.parametrize('age_seconds',[60,30*86400])
 def test_sent_cold_completion_blocks_replacement_until_it_is_settled(config,age_seconds):
     cloud=Cloud();data=r2.AGE_HEADER+b'synthetic cold ciphertext'*8;key=config['prefix']+'/cold/'+COLD+'.age'

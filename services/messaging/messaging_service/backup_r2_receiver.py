@@ -807,6 +807,9 @@ def cold_lock(config):
             os.mkdir('cold', 0o700, dir_fd=state_fd)
         except FileExistsError:
             pass
+        else:
+            # Without this the new entry, and every journal inside it, can vanish in a crash.
+            local.fsync_dir(state_fd)
         cold_fd = os.open('cold', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
         try:
             info = os.fstat(cold_fd)
