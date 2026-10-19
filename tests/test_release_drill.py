@@ -124,6 +124,7 @@ def test_release_drill_one_version_and_one_commit_from_tag_to_tiden_release_reco
     assert archived_id == head
     assert git(repository, "rev-parse", f"v{version}^{{commit}}") == commit
     assert head in git(repository, "log", "-1", "--format=%B")
+    assert git(repository, "rev-parse", "HEAD^{tree}") == git(ROOT, "rev-parse", "HEAD^{tree}")
 
     # The tag guard of both publish workflows accepts the tag and refuses a tag moved after the dispatch.
     moved = tmp_path / "moved"
@@ -176,7 +177,10 @@ def test_release_drill_one_version_and_one_commit_from_tag_to_tiden_release_reco
             self.send_response(404)
             self.end_headers()
 
-        do_PUT = do_POST = do_DELETE = do_GET
+        def __getattr__(self, name):  # every other method is recorded too
+            if name.startswith("do_"):
+                return self.do_GET
+            raise AttributeError(name)
 
         def log_message(self, format, *args):
             pass
@@ -186,13 +190,15 @@ def test_release_drill_one_version_and_one_commit_from_tag_to_tiden_release_reco
         unreachable = f"http://127.0.0.1:{closed.getsockname()[1]}/"
     with ThreadingHTTPServer(("127.0.0.1", 0), Registry) as recording:
         threading.Thread(target=recording.serve_forever, daemon=True).start()
-        for registry in (unreachable, f"http://127.0.0.1:{recording.server_port}/"):
-            for tarball in (f"anymsg-{version}.tgz", f"deedkit-{version}.tgz"):
-                dry = run(["npm", "publish", str(dist / tarball), "--dry-run", "--ignore-scripts", "--registry", registry],
-                          tmp_path, env, timeout=120)
-                assert dry.returncode == 0, dry.stderr
-                assert f"@{version}" in dry.stdout.decode(), tarball
-        recording.shutdown()
+        try:
+            for registry in (unreachable, f"http://127.0.0.1:{recording.server_port}/"):
+                for tarball in (f"anymsg-{version}.tgz", f"deedkit-{version}.tgz"):
+                    dry = run(["npm", "publish", str(dist / tarball), "--dry-run", "--ignore-scripts", "--registry", registry],
+                              tmp_path, env, timeout=120)
+                    assert dry.returncode == 0, dry.stderr
+                    assert f"@{version}" in dry.stdout.decode(), tarball
+        finally:
+            recording.shutdown()
     assert methods and set(methods) == {"GET"}
 
     # The Tiden verdict passes on synthetic evidence of this commit and fails on one failed case.
