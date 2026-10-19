@@ -401,13 +401,14 @@ def fake_reconcile(provider, failed):
 
 
 # spec: ANYM-293
-@pytest.mark.parametrize('error', ['flood', 'rate_limited', 'unregistered', 'banned', 'connection'])
+@pytest.mark.parametrize('error', ['flood', 'rate_limited', 'unregistered', 'banned', 'duplicated', 'connection'])
 def test_rate_limit_session_terminal_and_transport_errors_still_propagate_from_reconcile(error):
     from telethon import errors
     from messaging_service.telegram_governor import ProviderRateLimited
     raised = {'flood': lambda: errors.FloodWaitError(None, capture=5), 'rate_limited': lambda: ProviderRateLimited(5),
               'unregistered': lambda: errors.AuthKeyUnregisteredError(None),
-              'banned': lambda: errors.UserDeactivatedBanError(None), 'connection': lambda: ConnectionError('synthetic')}[error]
+              'banned': lambda: errors.UserDeactivatedBanError(None),
+              'duplicated': lambda: errors.AuthKeyDuplicatedError(None), 'connection': lambda: ConnectionError('synthetic')}[error]
     calls = []; failed = []
     async def page(chat, **query):
         calls.append(chat); raise raised()

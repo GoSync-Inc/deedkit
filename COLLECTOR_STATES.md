@@ -44,7 +44,7 @@ unresolved conflict it is reported as `coverage_not_reconciled`.
 
 Telegram history reconcile isolates a provider error of one chat (ANYM-293).
 Rate limits (`FloodWaitError`, the governor's cooldown), session-terminal
-`UnauthorizedError`s and transport loss (`ConnectionError`, other `OSError`)
+`UnauthorizedError`s, a duplicated authorization key and transport loss (`ConnectionError`, other `OSError`)
 still stop the pass as before, and a private, removed or invalid peer is still
 `provider_unavailable`. A transient server error (`ServerError`, Telegram's
 `TimedOutError`, `TimeoutError`) of one chat's history page is retried for that

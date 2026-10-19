@@ -519,11 +519,13 @@ class TelegramCollector:
         Rate limits, session-terminal errors, unavailable peers and transport loss propagate as before.
         Transient server errors are retried here from a budget of CHAT_ATTEMPTS calls per chat and pass;
         they and any other provider error then fail only this chat."""
-        from telethon.errors import (ChannelPrivateError,ChatAdminRequiredError,FloodWaitError,PeerIdInvalidError,
-            RPCError,ServerError,TimedOutError,UnauthorizedError)
+        from telethon.errors import (AuthKeyDuplicatedError,ChannelPrivateError,ChatAdminRequiredError,FloodWaitError,
+            PeerIdInvalidError,RPCError,ServerError,TimedOutError,UnauthorizedError)
         while True:
             try:return await self.provider.page(chat,**query)
-            except (FloodWaitError,UnauthorizedError,ChannelPrivateError,ChatAdminRequiredError,PeerIdInvalidError):raise
+            # A duplicated authorization key is session-terminal like UnauthorizedError (Telegram 406).
+            except (FloodWaitError,UnauthorizedError,AuthKeyDuplicatedError,ChannelPrivateError,ChatAdminRequiredError,
+                    PeerIdInvalidError):raise
             except (ServerError,TimedOutError,TimeoutError) as exc:
                 self._chat_failures=getattr(self,'_chat_failures',0)+1
                 if self._chat_failures>=CHAT_ATTEMPTS:raise ChatPageFailed('provider_temporarily_unavailable',exc) from exc
