@@ -64,10 +64,15 @@ def test_people_cursor_position_fields_are_invalid_cursor(seeded, grouped, field
     s, ar, key = ranked_directory(seeded)
     call = lambda **kw: s.search_people(key, 'Агус', transliterate=True, group_by_sender=grouped, limit=1, **kw)
     cursor = call()['next_cursor']
-    body = json.loads(base64.urlsafe_b64decode(cursor[3:]+'='*(-len(cursor[3:]) % 4)))['p']
-    if field not in body:
-        pytest.skip('field belongs to the other people cursor shape')
-    rejects(call, cursor, **{field: value})
+    body = json.loads(base64.urlsafe_b64decode(cursor[3:]+'='*(-len(cursor[3:]) % 4)))
+    if field in body['p']:
+        rejects(call, cursor, **{field: value})
+        return
+    # The field belongs to the other people cursor shape: the extra key alone makes the position invalid,
+    # whatever its value (the shape check compares key sets before any field is read).
+    body['p'][field] = value
+    with pytest.raises(APIError, match='invalid_cursor'):
+        call(after='q1.'+base64.urlsafe_b64encode(json.dumps(body, separators=(',', ':')).encode()).decode().rstrip('='))
 
 
 # spec: ANYM-307
