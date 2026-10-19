@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import math
 import struct
 import threading
@@ -228,3 +229,197 @@ async def test_external_analysis_never_receives_inbound_audio_diagnostics(monkey
     assert request['metrics']['telegram_audio']=={'measurement':'worker_pcm_energy_gap','input_pcm_ms':20}
     # The server copy keeps every diagnostic.
     assert call['events'][1]['kind']=='inbound_audio' and 'media' in call['metrics']['telegram_audio']
+
+
+# The call-end verdict (ANYM-426): the flows below run a real VoiceService and TelegramCalls with a
+# synthetic SDK; inbound PCM enters through the StreamFrames callback and the shared InboundAudioProbe.
+async def _telegram_call(monkeypatch,tmp_path,audio=(),*,connect=True,emit=True):
+    import pytgcalls
+    from pipecat.processors.frame_processor import FrameDirection
+    from pytgcalls.types import Device,Direction,Frame,StreamFrames
+    from test_external_audio import _Native,_wire
+    callbacks=[];done=asyncio.Event();ready=asyncio.Event()
+    async def run_transport(transport,brief,key,state):
+        # Stands in for voice.run_transport: the same shared probe and the same final inbound_audio event.
+        probe=PCMProbe();inbound=InboundAudioProbe(probe)
+        async def push(frame,direction=FrameDirection.DOWNSTREAM):pass
+        inbound.push_frame=push
+        class Input:
+            async def push_audio_frame(self,frame):await inbound.process_frame(frame,FrameDirection.DOWNSTREAM)
+        state['input']=Input();ready.set()
+        try:await done.wait()
+        finally:
+            if emit:state['service'].runtime_event(state['call_id'],{'kind':'inbound_audio','audio':probe.snapshot()})
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,run=run_transport)
+    class Native(_Native):
+        def on_update(self):
+            def register(fn):callbacks.append(fn);return fn
+            return register
+    monkeypatch.setattr(pytgcalls,'PyTgCalls',lambda *args,**kwargs:Native(log))
+    call=new_call('123')
+    await calls.dial(call)
+    task=calls.active[call['id']]['task']
+    if connect:service.connected(call['id'])
+    await asyncio.wait_for(ready.wait(),5)
+    if audio:
+        await callbacks[0](None,StreamFrames(123,Direction.INCOMING,Device.MICROPHONE,
+                                             [Frame(i,chunk,Frame.Info()) for i,chunk in enumerate(audio)]))
+    done.set();await asyncio.wait_for(task,5)
+    return service,service.get_call(call['id'])
+
+
+def frames(value,count):
+    return [pcm(value)]*count  # 20 ms per frame at 48 kHz.
+
+
+def external_call(tmp_path):
+    from core import VoiceService
+    from outbound import AgentExternalBrief
+    from test_tasks import BRIEF
+    service=VoiceService(tmp_path/'voice')
+    brief=service.prepare(service.with_call_voice(AgentExternalBrief(
+        **{**BRIEF,'source_message_ids':[]},channel='telegram',account='telegram',destination='123')),[])
+    return service,service.start(brief['id'])
+
+
+def reports(service,call):
+    return [json.loads(r[0]) for r in service.db.execute('SELECT body FROM voice_reports WHERE call_id=?',(call['id'],))]
+
+
+# spec: ANYM-426
+async def test_telegram_call_with_only_all_zero_frames_ends_with_zero_frames(monkeypatch,tmp_path):
+    _,call=await _telegram_call(monkeypatch,tmp_path,frames(0,501))
+    assert call['status']=='finished' and call['end_reason']=='disconnected'
+    assert call['inbound_audio']=={'heard':False,'reason':'zero_frames'}
+
+
+# spec: ANYM-426
+async def test_telegram_call_with_quiet_nonzero_frames_ends_with_quiet_frames(monkeypatch,tmp_path):
+    _,call=await _telegram_call(monkeypatch,tmp_path/'quiet',frames(30,501))
+    assert call['inbound_audio']=={'heard':False,'reason':'quiet_frames'}
+    # A mix that includes all-zero frames is quiet too, not digital silence.
+    _,call=await _telegram_call(monkeypatch,tmp_path/'mix',frames(0,250)+frames(30,251))
+    assert call['inbound_audio']=={'heard':False,'reason':'quiet_frames'}
+
+
+# spec: ANYM-426
+async def test_telegram_call_with_one_active_frame_is_heard_even_under_ten_seconds(monkeypatch,tmp_path):
+    _,call=await _telegram_call(monkeypatch,tmp_path/'long',frames(0,500)+[tone()])
+    assert call['inbound_audio']=={'heard':True,'reason':None}
+    _,call=await _telegram_call(monkeypatch,tmp_path/'short',[tone()])
+    assert call['inbound_audio']=={'heard':True,'reason':None}
+
+
+# spec: ANYM-426
+async def test_connected_telegram_call_without_any_frame_ends_with_no_frames(monkeypatch,tmp_path):
+    _,call=await _telegram_call(monkeypatch,tmp_path)
+    assert call['inbound_audio']=={'heard':False,'reason':'no_frames'}
+
+
+# spec: ANYM-426
+async def test_connected_telegram_call_under_ten_seconds_without_an_active_frame_has_no_verdict(monkeypatch,tmp_path):
+    _,call=await _telegram_call(monkeypatch,tmp_path,frames(0,499))
+    assert call['inbound_audio']=={'heard':None,'reason':None}
+
+
+# spec: ANYM-426
+@pytest.mark.parametrize('emit',[True,False],ids=['with_event','without_event'])
+async def test_never_connected_telegram_call_has_no_verdict(monkeypatch,tmp_path,emit):
+    _,call=await _telegram_call(monkeypatch,tmp_path,frames(0,501),connect=False,emit=emit)
+    assert call['status']=='finished'
+    assert any(e['kind']=='inbound_audio' for e in call['events']) is emit
+    assert call['inbound_audio']=={'heard':None,'reason':None}
+
+
+# spec: ANYM-426
+@pytest.mark.parametrize('audio',[None,'text',{'input_frames':5},
+                                  {'input_frames':True,'input_active_ms':0,'input_pcm_ms':20000,'input_zero_frames':0}],
+                         ids=['missing','not_a_dict','partial','bool'])
+def test_connected_call_with_a_missing_or_malformed_inbound_event_has_an_unknown_verdict(tmp_path,audio):
+    service,call=external_call(tmp_path)
+    service.connected(call['id'])
+    if audio is not None:service.runtime_event(call['id'],{'kind':'inbound_audio','audio':audio})
+    assert service.stop(call['id'],'disconnected')['inbound_audio']=={'heard':None,'reason':'unknown'}
+    service.close()
+
+
+# spec: ANYM-426
+async def test_the_first_analysis_report_carries_the_verdict_and_a_normal_call_has_exactly_one(monkeypatch,tmp_path):
+    service,call=await _telegram_call(monkeypatch,tmp_path,frames(0,501))
+    rows=reports(service,call)
+    assert len(rows)==1
+    assert rows[0]['snapshot']['inbound_audio']=={'heard':False,'reason':'zero_frames'}
+
+
+# spec: ANYM-426
+async def test_a_raising_verdict_is_unknown_and_changes_nothing_else_about_the_call(monkeypatch,tmp_path):
+    import core
+    _,normal=await _telegram_call(monkeypatch,tmp_path/'normal',frames(0,501))
+    def broken(*args,**kwargs):raise RuntimeError('synthetic verdict failure')
+    monkeypatch.setattr(core,'inbound_audio_verdict',broken)
+    service,call=await _telegram_call(monkeypatch,tmp_path/'broken',frames(0,501))
+    assert call['inbound_audio']=={'heard':None,'reason':'unknown'}
+    assert {k:call[k] for k in ('status','end_reason','outcome')}=={k:normal[k] for k in ('status','end_reason','outcome')}
+    assert call['ended_at'] and len(reports(service,call))==1
+
+
+# spec: ANYM-426
+def test_a_call_interrupted_by_service_restart_has_no_verdict_field(tmp_path):
+    from core import VoiceService
+    service,call=external_call(tmp_path)
+    service.connected(call['id'])
+    service.runtime_event(call['id'],{'kind':'inbound_audio','audio':PCMProbe().snapshot()})
+    service.close()
+    service=VoiceService(tmp_path/'voice')
+    call=service.get_call(call['id'])
+    assert call['end_reason']=='service_restart' and 'inbound_audio' not in call
+    service.close()
+
+
+# spec: ANYM-426
+async def test_get_call_status_returns_the_verdict_without_raw_counters(tmp_path):
+    from core import VoiceService
+    from test_agent_api import api,registry
+    from test_tasks import BRIEF
+    path,_,_=registry(tmp_path)
+    service=VoiceService(tmp_path/'data');surface=api(service,path)
+    brief=await surface.call('alice','prepare_call',{'brief':{**BRIEF,'source_message_ids':[]}})
+    call=await surface.call('alice','start_call',{'brief_id':brief['id']})
+    service.connected(call['id'])
+    # A running call, like one saved before the deploy, has no field at all (absent, not null).
+    assert 'inbound_audio' not in await surface.call('alice','get_call_status',{'call_id':call['id']})
+    probe=PCMProbe();probe.input(tone())  # Browser channel: the shared probe's counters.
+    service.runtime_event(call['id'],{'kind':'inbound_audio','audio':probe.snapshot()})
+    await surface.call('alice','stop_call',{'call_id':call['id']})
+    status=await surface.call('alice','get_call_status',{'call_id':call['id']})
+    assert status['inbound_audio']=={'heard':True,'reason':None}
+    text=json.dumps(status)
+    assert not any(key in text for key in ('input_frames','input_active_ms','input_pcm_ms','input_max_rms','metrics','events'))
+    # The full record still holds the raw counters.
+    result=await surface.call('alice','get_call_result',{'call_id':call['id']})
+    assert [e['audio']['input_frames'] for e in result['events'] if e['kind']=='inbound_audio']==[1]
+    service.close()
+
+
+# spec: ANYM-426
+async def test_the_analysis_model_receives_only_heard_and_reason_from_the_verdict(monkeypatch,tmp_path):
+    from google import genai
+    import learning
+    service,call=await _telegram_call(monkeypatch,tmp_path,frames(0,501))
+    snapshot=reports(service,call)[0]['snapshot']
+    snapshot['events'].insert(0,{'kind':'transcript','role':'user','text':'Hello'})
+    sent=[]
+    class Models:
+        async def generate_content(self,model,contents,config):
+            sent.append(contents);raise RuntimeError('stop after capturing the request')
+    class Client:
+        def __init__(self,**kwargs):
+            async def aclose():pass
+            self.aio=SimpleNamespace(models=Models(),aclose=aclose)
+    monkeypatch.setattr(genai,'Client',Client)
+    with pytest.raises(RuntimeError):
+        await learning.GeminiReviewer().review(snapshot,'synthetic-key')
+    request=json.loads(sent[0])
+    assert request['inbound_audio']=={'heard':False,'reason':'zero_frames'}
+    assert 'inbound_audio' not in [e['kind'] for e in request['events']]
+    assert not set(request['metrics']['telegram_audio'])&learning.SERVER_ONLY_AUDIO

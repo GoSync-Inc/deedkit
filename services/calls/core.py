@@ -20,6 +20,19 @@ GROK_MODEL="grok-voice-3.0"
 ACTIVE={"waiting_for_browser","dialing","ringing","connecting","active"}
 
 
+def inbound_audio_verdict(events,connected):
+    """One plain verdict from the last inbound_audio counters (ANYM-426): energy at or above RMS 400, not speech."""
+    if not connected:return {'heard':None,'reason':None}
+    audio=next((e.get('audio') for e in reversed(events) if e.get('kind')=='inbound_audio'),None)
+    keys=('input_active_ms','input_frames','input_pcm_ms','input_zero_frames')
+    if not isinstance(audio,dict) or any(type(audio.get(k)) not in (int,float) for k in keys):
+        return {'heard':None,'reason':'unknown'}
+    if audio['input_active_ms']>0:return {'heard':True,'reason':None}
+    if audio['input_frames']==0:return {'heard':False,'reason':'no_frames'}
+    if audio['input_pcm_ms']<10000:return {'heard':None,'reason':None}
+    return {'heard':False,'reason':'zero_frames' if audio['input_zero_frames']==audio['input_frames'] else 'quiet_frames'}
+
+
 GeminiVoice=Literal["Kore","Puck","Charon","Fenrir","Aoede","Leda","Orus","Zephyr"]
 GrokVoice=Literal['eve','ara','rex','sal','leo']
 VOICES,GROK_VOICES=list(get_args(GeminiVoice)),list(get_args(GrokVoice))
@@ -528,6 +541,9 @@ class VoiceService:
         with self.lock:
             v=self.get_call(identity)
             if v["status"] in ACTIVE:
+                # A diagnostic failure must never change how the call ends (ANYM-409 isolation).
+                try:v['inbound_audio']=inbound_audio_verdict(v['events'],v['status']=='active')
+                except Exception:v['inbound_audio']={'heard':None,'reason':'unknown'}
                 v.update(status="failed" if reason=="model_error" else "finished",ended_at=now(),end_reason=reason)
                 if v['outcome']=='needs_summary' and any(d['status']=='answered' for d in v['decisions']):
                     v['outcome']='followup_ready'
