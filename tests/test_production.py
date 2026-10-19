@@ -21,7 +21,7 @@ SHA = "a" * 40
 IMAGE = "sha256:" + "b" * 64
 OLD_IMAGE = "sha256:" + "d" * 64
 ROOT = Path(__file__).resolve().parents[1]
-CHECK_SPACE, RETAIN_IMAGES = p.check_space, p.retain_images
+CHECK_SPACE, RETAIN_IMAGES, PROMOTABLE = p.check_space, p.retain_images, p.promotable
 
 
 @pytest.fixture(autouse=True)
@@ -1764,6 +1764,64 @@ def test_an_unreadable_protecting_source_or_a_failure_before_removal_removes_not
     assert store.removals() == [] and image_id("9") in store.references
 
 
+# spec: ANYM-439
+@pytest.mark.parametrize("failure", ["release directory", "config directory", "missing snapshot", "no snapshot"])
+def test_a_protecting_directory_it_cannot_list_or_a_missing_rollback_snapshot_removes_nothing(tmp_path, monkeypatch,
+                                                                                             failure):
+    settings = retention_settings(tmp_path)
+    state = Path(settings["state_directory"])
+    released(state, "1" * 40, image_id("1"), image_id("2"))
+    current = p.read(state / "current.json") | {"rollback": {"version": 1, "projects": [{"name": "synthetic"}]}}
+    p.write(state / "current.json", current)
+    p.CONFIG_DIRECTORY.mkdir(parents=True)
+    store = Images(monkeypatch, [runtime("1"), runtime("2"), runtime("9")])
+    # Path.glob would take an unreadable directory for an empty one and leave the rollback image unprotected.
+    unreadable = {"release directory": state / ("1" * 40), "config directory": p.CONFIG_DIRECTORY}.get(failure)
+    iterdir = Path.iterdir
+    def listing(path):
+        if path == unreadable:
+            raise PermissionError(13, "Permission denied", str(path))
+        return iterdir(path)
+    monkeypatch.setattr(Path, "iterdir", listing)
+    if failure == "missing snapshot":
+        (state / ("1" * 40) / "synthetic.before.json").unlink()
+    if failure == "no snapshot":  # a receipt without a rollback record and without any snapshot
+        p.write(state / "current.json", {key: value for key, value in current.items() if key != "rollback"})
+        (state / ("1" * 40) / "synthetic.before.json").unlink()
+    summary = p.retain_images(settings)
+    assert set(summary) == {"skipped"} and "no image is removed" in summary["skipped"]
+    assert store.removals() == [] and image_id("2") in store.references and image_id("9") in store.references
+
+
+# spec: ANYM-439
+def test_removal_takes_the_other_deploy_locks_before_the_image_lock_so_a_running_preparation_keeps_it(tmp_path,
+                                                                                                    monkeypatch):
+    import fcntl
+    settings = retention_settings(tmp_path)
+    released(Path(settings["state_directory"]), "1" * 40, image_id("1"), OLD_IMAGE)
+    other = p.HOST_STATE / "other-stack"
+    released(other, "a" * 40, image_id("a"), OLD_IMAGE)
+    store = Images(monkeypatch, [runtime("1"), runtime("a"), runtime("9")])
+    monkeypatch.setattr(p, "IMAGE_LOCK", tmp_path / "image-build.lock")
+    image_lock_free = []
+    probe = p.free_lock
+    def observed(directory, stack):
+        # What a preparation holding `other` would meet at its next image lookup, at the moment removal probes it.
+        with p.IMAGE_LOCK.open("a") as preparation:
+            try:
+                fcntl.flock(preparation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                image_lock_free.append(True)
+            except BlockingIOError:
+                image_lock_free.append(False)
+        return probe(directory, stack)
+    monkeypatch.setattr(p, "free_lock", observed)
+    with (other / "deploy.lock").open("a") as preparation:
+        fcntl.flock(preparation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert p.retain_images(settings) == {
+            "skipped": f"another production operation holds the deploy lock of {other}; no image is removed"}
+    assert image_lock_free and all(image_lock_free) and store.calls == []
+
+
 @pytest.mark.parametrize("case", ["modified", "missing"])
 def test_a_before_snapshot_changed_between_prepare_and_apply_is_refused_before_any_stop(tmp_path, monkeypatch, case):
     host = Host(tmp_path, monkeypatch)
@@ -3110,6 +3168,9 @@ def test_the_disk_floor_also_applies_to_the_containerd_image_store(tmp_path, mon
 def test_a_full_containerd_image_store_stops_both_preparations_before_any_fetch(tmp_path, monkeypatch, preparation):
     settings, calls, _ = fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(p, "check_space", CHECK_SPACE)
+    # The real verification: it would run git (recorded in `calls`) and reach GitHub before any disk check.
+    monkeypatch.setattr(p, "promotable", PROMOTABLE)
+    monkeypatch.setattr(p.urllib.request, "urlopen", lambda *args, **kwargs: pytest.fail("network before the disk check"))
     p.CONTAINERD_ROOT.mkdir(parents=True)
     monkeypatch.setattr(p.shutil, "disk_usage", lambda path: SimpleNamespace(
         free=p.MIN_FREE_BYTES - (Path(path) == p.CONTAINERD_ROOT)))

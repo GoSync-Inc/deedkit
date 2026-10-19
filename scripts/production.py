@@ -817,13 +817,14 @@ def prepare_router(settings, sha):
     """Build enrollment infrastructure from fetched main, without touching serving units."""
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise Refused("an exact lowercase 40-character commit SHA is required")
-    promotable(sha)
     state = Path(settings["state_directory"])
+    # Local headroom first: a full disk refuses before the verification fetches anything.
     check_space(state)
     docker_root = run(["docker", "info", "--format", "{{.DockerRootDir}}"]).strip()
     if not docker_root or not Path(docker_root).is_dir():
         raise Refused("preparation requires the local production Docker engine")
     check_image_space(docker_root)
+    promotable(sha)
     release = state / ("router-" + sha)
     if release.exists():
         raise Refused("router directory already exists; inspect it before a new preparation")
@@ -851,13 +852,14 @@ def published_targets(settings):
 
 
 def prepare(settings, sha):
-    evidence = promotable(sha)
     state = Path(settings["state_directory"])
+    # Local headroom first: a full disk refuses before the verification fetches anything.
     check_space(state)
     docker_root = run(["docker", "info", "--format", "{{.DockerRootDir}}"]).strip()
     if not docker_root or not Path(docker_root).is_dir():
         raise Refused("preparation requires the local production Docker engine")
     check_image_space(docker_root)
+    evidence = promotable(sha)
     release = state / sha
     if release.exists():
         raise Refused("candidate directory already exists; inspect it before a new preparation")
@@ -1119,14 +1121,45 @@ def load(path):
         raise Refused(f"cannot read {path}; no image is removed") from exc
 
 
+# Unlike Path.glob and Path.exists, which take an unreadable directory for an empty or absent one, these refuse: a
+# protecting receipt they cannot see would otherwise leave its images unprotected.
+def present(path):
+    """The stat of `path`, or None when it does not exist."""
+    try:
+        return os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise Refused(f"cannot read {path}; no image is removed") from exc
+
+
+def directory_entries(directory):
+    """The entries of `directory`, none when it does not exist."""
+    try:
+        return sorted(Path(directory).iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except OSError as exc:
+        raise Refused(f"cannot list {directory}; no image is removed") from exc
+
+
+def subdirectories(directory):
+    return [path for path in directory_entries(directory) if (found := present(path)) and stat.S_ISDIR(found.st_mode)]
+
+
+def json_files(directory):
+    return [path for path in directory_entries(directory) if path.suffix == ".json"
+            and (found := present(path)) and stat.S_ISREG(found.st_mode)]
+
+
 def retention_states(state):
-    configured = [Path(value["state_directory"]) for value in map(load, sorted(CONFIG_DIRECTORY.glob("*.json")))
+    configured = [Path(value["state_directory"]) for value in map(load, json_files(CONFIG_DIRECTORY))
                   if isinstance(value, dict) and isinstance(value.get("state_directory"), str)]
-    found = [path for path in sorted(HOST_STATE.glob("*")) if path.is_dir()
-             and ((path / "current.json").exists() or (path / "http-current.json").exists())]
+    found = [path for path in subdirectories(HOST_STATE)
+             if present(path / "current.json") or present(path / "http-current.json")]
     states, seen = [], set()
     for directory in [state, HOST_STATE, *found, *configured]:
-        if directory.is_dir() and directory.resolve() not in seen:
+        if (found := present(directory)) and stat.S_ISDIR(found.st_mode) and directory.resolve() not in seen:
             seen.add(directory.resolve())
             states.append(directory)
     return states
@@ -1142,23 +1175,36 @@ def free_lock(directory, stack):
     return True
 
 
+def rollback_snapshots(directory, current):
+    """The `*.before.json` files of the current applied release: each project its rollback record names must have one,
+    and a release without that record must have at least one, or its rollback target is unknown."""
+    release = directory / current["sha"]
+    snapshots = [path for path in directory_entries(release) if path.name.endswith(".before.json")]
+    projects = (current.get("rollback") or {}).get("projects")
+    names = [project.get("name") for project in projects] if isinstance(projects, list) else []
+    missing = [name for name in names if not isinstance(name, str) or not present(release / f"{name}.before.json")]
+    if missing or not snapshots:
+        raise Refused(f"the rollback snapshot of {release} is missing; no image is removed")
+    return snapshots
+
+
 def state_images(directory, keep, revisions, *, label, idle):
     """The images one state still needs: its current release, the images a rollback restored, the current release's
     `*.before.json` (the rollback target), every preparation neither applied nor attempted, the HTTP serving and retained
     generations, and images an operator protected. Unless the state is `idle` (its deploy lock was free), the images
     tagged with the revision of any release directory without a result: a preparation may be pulling them now."""
-    current = load(directory / "current.json") if (directory / "current.json").exists() else {}
+    current = load(directory / "current.json") if present(directory / "current.json") else {}
     for image in current.get("images", {}).values():
         keep(image, ("rolled-back release " if current.get("status") == "rolled-back" else "current release ")
              + current["sha"] + label)
     for services in current.get("previous_images", {}).values():
         for image in services.values():
             keep(image, "restored by the rollback of " + current["sha"] + label)
-    if current.get("sha"):
-        for before in (directory / current["sha"]).glob("*.before.json"):
+    if current.get("status") == "applied":
+        for before in rollback_snapshots(directory, current):
             for unit in load(before)["services"].values():
                 keep(unit.get("image"), "rollback target of the current release" + label)
-    if (directory / "http-current.json").exists():
+    if present(directory / "http-current.json"):
         # Read one level deep: each HTTP receipt nests its predecessor, and those before it are retired.
         serving = load(directory / "http-current.json")
         previous = serving.get("previous")
@@ -1166,35 +1212,33 @@ def state_images(directory, keep, revisions, *, label, idle):
                    if isinstance(previous, dict) else previous}
         for image in IMAGE_DIGEST.findall(json.dumps(serving)):
             keep(image, f"HTTP release state {directory / 'http-current.json'}")
-    for path in sorted(directory.glob("*/prepared.json")):
-        if not (path.parent / "result.json").exists() and not (path.parent / "http-attempted.json").exists():
-            for image in load(path).get("images", {}).values():
-                keep(image, f"prepared release {path.parent.name}{label} is not applied")
-    for path in sorted(directory.glob("*/http-prepared.json")):
-        if not (path.parent / "http-attempted.json").exists():
-            for image in load(path).get("images", {}).values():
-                keep(image, f"HTTP release {path.parent.name}{label} is prepared, not attempted")
-    for path in sorted(directory.glob("*.json")):
+    for release in subdirectories(directory):
+        attempted = present(release / "http-attempted.json")
+        if present(release / "prepared.json") and not present(release / "result.json") and not attempted:
+            for image in load(release / "prepared.json").get("images", {}).values():
+                keep(image, f"prepared release {release.name}{label} is not applied")
+        if present(release / "http-prepared.json") and not attempted:
+            for image in load(release / "http-prepared.json").get("images", {}).values():
+                keep(image, f"HTTP release {release.name}{label} is prepared, not attempted")
+        if (not idle and RELEASE_DIRECTORY.fullmatch(release.name) and not present(release / "result.json")
+                and not attempted):
+            revisions.setdefault(release.name, f"release {release.name}{label} may be preparing now")
+    for path in json_files(directory):
         if path.name not in ("current.json", "http-current.json", "deploy.json"):
             # Operator plans next to the receipts, such as a storage cleanup's protected images.
             plan = load(path)
             for image in plan.get("protected_images", []) if isinstance(plan, dict) else []:
                 keep(image, f"protected by {path}")
-    if not idle:
-        for release in directory.glob("*"):
-            if (RELEASE_DIRECTORY.fullmatch(release.name) and release.is_dir() and not (release / "result.json").exists()
-                    and not (release / "http-attempted.json").exists()):
-                revisions.setdefault(release.name, f"release {release.name}{label} may be preparing now")
 
 
 def pinned_images(keep, states):
     """Image IDs named in a top-level JSON file of /etc/deedkit (the configurations and the jobs that pin an image, such
     as file-lifecycle.json) or of an operator directory under the host state root that is not a state."""
     states = {path.resolve() for path in states}
-    directories = [CONFIG_DIRECTORY, *(path for path in sorted(HOST_STATE.glob("*")) if path.is_dir()
-                                       and path.resolve() not in states and not RELEASE_DIRECTORY.fullmatch(path.name))]
+    directories = [CONFIG_DIRECTORY, *(path for path in subdirectories(HOST_STATE)
+                                       if path.resolve() not in states and not RELEASE_DIRECTORY.fullmatch(path.name))]
     for directory in directories:
-        for path in sorted(directory.glob("*.json")):
+        for path in json_files(directory):
             for image in IMAGE_DIGEST.findall(json.dumps(load(path))):
                 keep(image, f"named in {path}")
 
@@ -1209,7 +1253,7 @@ def images_report(settings, *, held=(), stack=None):
     """Which `deedkit-production-<target>` images the retention rules keep, and why; `remove_images` removes the rest.
     `held` are the state directories whose deploy lock the caller holds; the others' locks are probed. A removal passes
     `stack`: it holds them there, so no preparation starts before it ends, and it removes nothing while another operation
-    holds one (a preparation in progress would also be refused the image lock the removal holds)."""
+    holds one."""
     state = Path(settings["state_directory"])
     reasons = {}
     def keep(image, why):
@@ -1264,10 +1308,20 @@ def owned_reference(name, target):
 def remove_images(settings, *, held=()):
     """Remove the retention report's candidates (production.md "Image retention"): each by its other references and then
     by image ID, never forced or pruned, so Docker still refuses an image a container uses. The caller holds the deploy
-    locks of `held` and this state; the image lock keeps pulls out and the other states' free locks stay held until it
-    ends. IDs and Docker's reasons are reported short, so a receipt holding this summary never pins an image."""
-    with image_lock(), ExitStack() as stack:
-        report = images_report(settings, held=held, stack=stack)
+    locks of `held` and this state. Like a preparation it takes every other state's deploy lock before the image lock,
+    without waiting, and holds them to the end: while another operation holds one it removes nothing, so it never takes
+    the image lock from a preparation in progress. IDs and Docker's reasons are reported short, so a receipt holding this
+    summary never pins an image."""
+    state = Path(settings["state_directory"])
+    with ExitStack() as stack:
+        mine = {Path(path).resolve() for path in (*held, state)}
+        for directory in retention_states(state):
+            if directory.resolve() not in mine and not free_lock(directory, stack):
+                raise Refused(f"another production operation holds the deploy lock of {directory}; no image is removed")
+            mine.add(directory.resolve())
+        stack.enter_context(image_lock())
+        # A state that appeared meanwhile is probed again, and held, by the report.
+        report = images_report(settings, held=mine, stack=stack)
         removed, failed, summary = [], [], {}
         for number, item in enumerate(report["candidates"]):
             image = item["image"]

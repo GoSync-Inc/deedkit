@@ -195,9 +195,10 @@ A 403 in step 2 or 3 means the configured address is not the host-side peer.
 
 The state directory, Docker's root and, when it exists, `/var/lib/containerd`
 (the containerd image store keeps image content there, often on another disk than
-Docker's root) each need at least **15 GiB free** before preparation fetches or
-pulls anything; the refusal names `production.py images --remove` (below). A refusal does not authorize pruning shared Docker objects
-or deleting runtime data. Free capacity through a reviewed, targeted operation
+Docker's root) each need at least **15 GiB free** before preparation verifies,
+fetches or pulls anything; the refusal names `production.py images --remove`
+(below). A refusal does not authorize pruning shared Docker objects or deleting
+runtime data. Free capacity through a reviewed, targeted operation
 or add storage before retrying.
 
 ## CI-published images
@@ -619,8 +620,10 @@ CI-published targets are considered. Kept, with reasons:
 - while another operation holds a state's deploy lock, the images tagged with
   the revision of each release directory there without a result (a preparation
   pulls before it writes `prepared.json`); removal then removes nothing and the
-  next pass retries. A free lock is held until the removal ends, so no
-  preparation starts there meanwhile;
+  next pass retries. Like a preparation, removal takes every state's deploy lock
+  (without waiting) before the image lock and holds them until it ends, so it
+  never takes the image lock from a preparation in progress and none starts
+  meanwhile;
 - every image ID named in a top-level JSON file of `/etc/deedkit` (configurations
   and jobs that pin an image, such as `file-lifecycle.json`) or of a non-state
   directory under the host state root;
@@ -639,8 +642,8 @@ image a container uses, and that image is listed under `failed` with Docker's
 last error line. The summary lists `removed` and `failed` images (short ID,
 tags), the `kept` count, and `interrupted`/`remaining` when an unexpected error
 stopped the pass; or only `skipped` with the reason when nothing was removed (a
-busy image or deploy lock; an unreadable receipt or configuration: a protecting source it
-cannot read removes nothing). Removal never changes the release's outcome:
+busy image or deploy lock; a protecting file or directory it cannot read or list;
+an applied current release whose rollback snapshot is missing). Removal never changes the release's outcome:
 `deploy` has written `deployed` before it starts, exits 0 and never pauses or
 retries for it; `apply` prints the summary next to its result, and `result.json`
 and `current.json` stay unchanged.

@@ -36,7 +36,8 @@ def test_router_ci_failure_does_not_fetch_build_or_write_receipt(tmp_path, monke
     monkeypatch.setattr(p, "promotable", lambda sha: (_ for _ in ()).throw(p.Refused("CI failed")))
     with pytest.raises(p.Refused, match="CI failed"):
         p.prepare_router(settings, SHA)
-    assert calls == [] and list(state.iterdir()) == []
+    # Only the local disk preflight's `docker info` precedes the verification (ANYM-439 R5).
+    assert [argv for argv, _ in calls if argv[:2] != ["docker", "info"]] == [] and list(state.iterdir()) == []
 
 
 def test_router_main_movement_prevents_build_and_enrollment_receipt(tmp_path, monkeypatch):
