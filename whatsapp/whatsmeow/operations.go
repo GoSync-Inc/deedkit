@@ -35,13 +35,19 @@ var operationFields = map[string]string{
 	"rename_group": "title", "set_group_description": "description", "add_participant": "user_id", "remove_participant": "user_id", "promote_participant": "user_id",
 	"demote_participant": "user_id", "leave_group": "", "get_invite_link": "", "revoke_invite_link": "", "add_contact": "phone first_name last_name",
 	"delete_contact": "user_id", "block_contact": "user_id", "unblock_contact": "user_id", "update_profile": "name status", "get_labels": "offset limit", "set_chat_labels": "label_ids",
+	"open_chat_by_phone": "phone create",
 }
-var globalOperations = wordSet("get_profile list_contacts list_blocked get_contact block_contact unblock_contact delete_contact create_group add_contact update_profile get_labels")
+var globalOperations = wordSet("get_profile list_contacts list_blocked get_contact block_contact unblock_contact delete_contact create_group add_contact update_profile get_labels open_chat_by_phone")
 var groupOperations = wordSet("list_participants rename_group set_group_description add_participant remove_participant promote_participant demote_participant leave_group get_invite_link revoke_invite_link")
 var readOperations = wordSet("chat_info list_participants get_reactions get_message_info get_profile list_contacts get_contact list_blocked get_pinned_messages get_labels")
 var userPattern = regexp.MustCompile(`^[0-9]{1,30}@(c\.us|lid)$`)
 var shaPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var mimePattern = regexp.MustCompile(`(?i)^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$`)
+var phonePattern = regexp.MustCompile(`^[1-9][0-9]{6,14}$`)
+
+// One usync lookup ends well before the Python worker's 30 s operation timeout,
+// so a stalled query is a complete error frame, never a desynchronized pipe.
+const phoneLookupTimeout = 10 * time.Second
 
 func wordSet(value string) map[string]bool {
 	out := map[string]bool{}
@@ -65,6 +71,7 @@ type operationRequest struct {
 	FileBytes             int64                      `json:"file_bytes"`
 	FileMime              string                     `json:"file_mime"`
 	FileName              string                     `json:"file_name"`
+	KnownChats            []string                   `json:"known_chats"`
 }
 
 type operationDependencies struct {
@@ -90,6 +97,8 @@ type operationDependencies struct {
 	page             func(string, int, []any) ([]*events.Message, error)
 	history          func(context.Context, string, int) (any, error)
 	markRead         func(context.Context, []types.MessageID, time.Time, types.JID, types.JID) error
+	isOnWhatsApp     func(context.Context, []string) ([]types.IsOnWhatsAppResponse, error)
+	lookupTimeout    time.Duration
 	ownerName        string
 	platform         string
 }
@@ -99,7 +108,7 @@ func (p *Provider) operationDependencies() operationDependencies {
 	d := operationDependencies{sendDependencies: p.sendDependencies(), group: c.GetGroupInfo, createGroup: c.CreateGroup,
 		participants: c.UpdateGroupParticipants, groupName: c.SetGroupName, groupDescription: c.SetGroupDescription, leave: c.LeaveGroup,
 		invite: c.GetGroupInviteLink, contacts: c.Store.Contacts.GetAllContacts, contact: c.Store.Contacts.GetContact,
-		settings: c.Store.ChatSettings.GetChatSettings, patch: c.SendAppState,
+		settings: c.Store.ChatSettings.GetChatSettings, patch: c.SendAppState, isOnWhatsApp: c.IsOnWhatsApp,
 		markRead: func(ctx context.Context, ids []types.MessageID, stamp time.Time, chat, sender types.JID) error {
 			return c.MarkRead(ctx, ids, stamp, chat, sender)
 		}, upload: c.Upload, latest: p.Capture.Latest, page: p.Capture.Page, receipts: p.Capture.ReceiptObservations,
@@ -220,7 +229,8 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 			return
 		}
 		switch err.Error() {
-		case "history_rate_limited", "history_anchor_unavailable", "operation_unsupported", "operation_invalid_parameters", "operation_disabled", "operation_expired", "operation_target_invalid", "operation_target_unavailable", "operation_result_too_large", "registered_file_invalid":
+		case "history_rate_limited", "history_anchor_unavailable", "operation_unsupported", "operation_invalid_parameters", "operation_disabled", "operation_expired", "operation_target_invalid", "operation_target_unavailable", "operation_result_too_large", "registered_file_invalid",
+			"invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "operation_query_failed":
 		default:
 			if readOperations[job.Operation] {
 				err = errors.New("operation_query_failed")
@@ -366,6 +376,8 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 	}
 	op := job.Operation
 	switch op {
+	case "open_chat_by_phone":
+		return openChatByPhone(ctx, job, d, check)
 	case "request_chat_history":
 		count, e := integer("count", 1, 50, 50)
 		if e != nil {
@@ -1159,4 +1171,127 @@ func participantResults(values []types.GroupParticipant, expected []types.JID) m
 		state = "partial"
 	}
 	return map[string]any{"participants": rows, "participant_state": state, "participant_coverage": "provider_response", "participants_truncated": truncated, "auto_invite_sent": false}
+}
+
+// openChatByPhone resolves one number to its canonical LID chat; it never sends
+// and never writes the archive (the Python collector materializes the chat).
+// A mapping already in the session store answers locally when the archive holds
+// that chat (known_chats); otherwise one bounded usync query runs.
+func openChatByPhone(ctx context.Context, job operationRequest, d operationDependencies, check func(string) error) (any, error) {
+	var phone string
+	if raw, found := job.Parameters["phone"]; !found || decodeValue(raw, &phone) != nil || !phonePattern.MatchString(phone) {
+		return nil, errors.New("invalid_phone")
+	}
+	if raw, found := job.Parameters["create"]; found {
+		var create bool
+		if decodeValue(raw, &create) != nil {
+			return nil, errors.New("operation_invalid_parameters")
+		}
+	}
+	if len(job.KnownChats) > 20 {
+		return nil, errors.New("operation_invalid_parameters")
+	}
+	// Discovery must be on: a LID unknown before the query cannot be matched
+	// against include_chats, and exclusions apply to both namespaces.
+	collected := func(chat string) error {
+		p, e := d.policy()
+		if e != nil || !p.Enabled {
+			return errors.New("operation_disabled")
+		}
+		if !p.DiscoverChats || !p.Allows(chat) {
+			return errors.New("chat_not_collected")
+		}
+		return nil
+	}
+	pn := types.NewJID(phone, types.DefaultUserServer)
+	if e := collected(LegacyChatID(pn)); e != nil {
+		return nil, e
+	}
+	answer := func(lid types.JID, name any, lookup bool) (any, error) {
+		chat := LegacyChatID(lid)
+		if e := collected(chat); e != nil {
+			return nil, e
+		}
+		if e := check(""); e != nil {
+			return nil, e
+		}
+		return operationOutput("confirmed", map[string]any{"on_whatsapp": true, "verified_name": name,
+			"provider_chat": chat, "provider_lookup": lookup}, "")
+	}
+	if d.lidForPN != nil {
+		if lid, e := d.lidForPN(ctx, pn); e == nil && lid.Server == types.HiddenUserServer && lid.User != "" {
+			if e = collected(LegacyChatID(lid)); e != nil {
+				return nil, e
+			}
+			for _, known := range job.KnownChats {
+				if known == LegacyChatID(lid) {
+					return answer(lid, nil, false)
+				}
+			}
+		}
+	}
+	if e := check(""); e != nil {
+		return nil, e
+	}
+	if d.isOnWhatsApp == nil {
+		return nil, errors.New("operation_unsupported")
+	}
+	timeout := d.lookupTimeout
+	if timeout <= 0 {
+		timeout = phoneLookupTimeout
+	}
+	lookup, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	type reply struct {
+		rows []types.IsOnWhatsAppResponse
+		err  error
+	}
+	done := make(chan reply, 1)
+	go func() {
+		rows, e := d.isOnWhatsApp(lookup, []string{"+" + phone})
+		done <- reply{rows, e}
+	}()
+	var got reply
+	select {
+	case got = <-done:
+	case <-lookup.Done():
+		// A query that ignores its context still cannot hold the operation lane.
+		return nil, errors.New("provider_timeout")
+	}
+	if got.err != nil {
+		if errors.Is(got.err, context.DeadlineExceeded) || lookup.Err() != nil {
+			return nil, errors.New("provider_timeout")
+		}
+		return nil, errors.New("operation_query_failed")
+	}
+	if len(got.rows) != 1 {
+		return nil, errors.New("operation_query_failed")
+	}
+	row := got.rows[0]
+	if !row.PhoneNumber.IsEmpty() && row.PhoneNumber.User != phone {
+		return nil, errors.New("operation_query_failed")
+	}
+	if !row.IsIn {
+		if e := check(""); e != nil {
+			return nil, e
+		}
+		return operationOutput("confirmed", map[string]any{"on_whatsapp": false, "verified_name": nil, "provider_lookup": true}, "")
+	}
+	lid := row.JID.ToNonAD()
+	if lid.Server != types.HiddenUserServer && d.lidForPN != nil {
+		// IsOnWhatsApp stores the mappings it receives; read the store once more.
+		if stored, e := d.lidForPN(ctx, pn); e == nil {
+			lid = stored.ToNonAD()
+		}
+	}
+	if lid.Server != types.HiddenUserServer || lid.User == "" {
+		return nil, errors.New("identity_unresolved")
+	}
+	var name any
+	if row.VerifiedName != nil && row.VerifiedName.Details != nil {
+		if v := truncate(row.VerifiedName.Details.GetVerifiedName(), 256); safeText(v, 512, false) {
+			name = v
+		}
+	}
+	return answer(lid, name, true)
 }

@@ -244,7 +244,8 @@ class NodeProvider:
             if isinstance(code,str) and code in ('operation_invalid_parameters','operation_disabled','operation_expired',
                 'operation_target_invalid','operation_target_unavailable','operation_unsupported',
                 'operation_query_failed','operation_result_too_large','registered_file_invalid',
-                'history_rate_limited','history_anchor_unavailable'):
+                'history_rate_limited','history_anchor_unavailable',
+                'invalid_phone','identity_unresolved','chat_not_collected','provider_timeout'):
                 from .commands import CommandRejected
                 raise CommandRejected(code)
             if code in ('send_expired','sending_disabled','send_target_invalid','link_preview_unsupported'):
@@ -321,7 +322,7 @@ class NodeProvider:
         payload={key:value for key,value in job.items() if key in (
             'operation','parameters','provider_chat','provider_message_id','expires_at',
             'source_provider_chat','source_provider_message','registered_file_path','trusted_blob_directory',
-            'file_digest','file_bytes','file_mime','file_name')}
+            'file_digest','file_bytes','file_mime','file_name','known_chats')}
         if report is not None:report('started')
         return await self._call_unlocked('messenger_operation',payload,sending=True)
     async def chunks(self,source,descriptor):

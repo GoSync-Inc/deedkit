@@ -583,3 +583,139 @@ func TestNativePinsExcludeKnownExpiryAndUnpin(t *testing.T) {
 		t.Fatalf("expired or removed pin included %#v", data)
 	}
 }
+
+const phoneFixture = "12025550123" // NANP fictional 555-01xx range
+const lidFixture = "987654321012345@lid"
+
+// phoneLookupFake resolves like the pinned IsOnWhatsApp: one usync row whose JID is
+// the LID, with the PN mapping stored as a side effect. It counts provider queries.
+func phoneLookupFake(t *testing.T, row *types.IsOnWhatsAppResponse, stored *types.JID) (operationDependencies, *int) {
+	t.Helper()
+	d := operationsFake(t)
+	queries := 0
+	lid, _ := ParseChatID(lidFixture)
+	d.lidForPN = func(context.Context, types.JID) (types.JID, error) {
+		if stored == nil {
+			return types.EmptyJID, nil
+		}
+		return *stored, nil
+	}
+	d.isOnWhatsApp = func(_ context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error) {
+		queries++
+		if len(phones) != 1 || phones[0] != "+"+phoneFixture {
+			t.Fatalf("unexpected query %v", phones)
+		}
+		if row != nil {
+			return []types.IsOnWhatsAppResponse{*row}, nil
+		}
+		pn := types.NewJID(phoneFixture, types.DefaultUserServer)
+		return []types.IsOnWhatsAppResponse{{Query: "+" + phoneFixture, JID: lid, IsIn: true, PhoneNumber: pn}}, nil
+	}
+	return d, &queries
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneResolvesTheCanonicalLID(t *testing.T) {
+	d, queries := phoneLookupFake(t, nil, nil)
+	value, err := executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+	data := operationResult(t, value, err, "confirmed")
+	if data["provider_chat"] != lidFixture || data["on_whatsapp"] != true || data["provider_lookup"] != true || *queries != 1 {
+		t.Fatalf("unexpected answer %#v after %d queries", data, *queries)
+	}
+	// A send to that chat archives its echo in the same chat, as the pinned sender routes.
+	lid, _ := ParseChatID(lidFixture)
+	receipt, err := sendAndCaptureReceipt(context.Background(), d.sendDependencies, lid, &waE2E.Message{Conversation: proto.String("synthetic")})
+	if err != nil || receipt["archive_reference"].(map[string]any)["provider_chat_id"] != lidFixture {
+		t.Fatalf("echo left the canonical chat: %#v %v", receipt, err)
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneAnswersAKnownMappingLocally(t *testing.T) {
+	lid, _ := ParseChatID(lidFixture)
+	d, queries := phoneLookupFake(t, nil, &lid)
+	job := operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture, "create": true})
+	job.KnownChats = []string{lidFixture}
+	value, err := executeOperation(context.Background(), job, d)
+	data := operationResult(t, value, err, "confirmed")
+	if data["provider_chat"] != lidFixture || data["provider_lookup"] != false || *queries != 0 {
+		t.Fatalf("local answer queried the provider: %#v %d", data, *queries)
+	}
+	// The same mapping without an archived chat still asks WhatsApp once.
+	job.KnownChats = nil
+	value, err = executeOperation(context.Background(), job, d)
+	if data = operationResult(t, value, err, "confirmed"); data["provider_lookup"] != true || *queries != 1 {
+		t.Fatalf("unarchived mapping answered locally: %#v %d", data, *queries)
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneNegativeUnresolvedAndPolicy(t *testing.T) {
+	pn := types.NewJID(phoneFixture, types.DefaultUserServer)
+	d, _ := phoneLookupFake(t, &types.IsOnWhatsAppResponse{Query: "+" + phoneFixture, JID: pn, IsIn: false, PhoneNumber: pn}, nil)
+	value, err := executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+	if data := operationResult(t, value, err, "confirmed"); data["on_whatsapp"] != false || data["provider_chat"] != nil {
+		t.Fatalf("unregistered number got a chat: %#v", data)
+	}
+	d, _ = phoneLookupFake(t, &types.IsOnWhatsAppResponse{Query: "+" + phoneFixture, JID: pn, IsIn: true, PhoneNumber: pn}, nil)
+	_, err = executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+	requireError(t, err, "identity_unresolved")
+	// The LID learned only from the query is excluded: refused, never returned.
+	d, queries := phoneLookupFake(t, nil, nil)
+	d.policy = func() (Policy, error) {
+		p := allowedOperationPolicy()
+		p.ExcludeChats = []string{lidFixture}
+		return p, nil
+	}
+	_, err = executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+	requireError(t, err, "chat_not_collected")
+	if *queries != 1 {
+		t.Fatalf("queries %d", *queries)
+	}
+	// Discovery off or an excluded PN refuses before any query.
+	for name, change := range map[string]func(*Policy){
+		"discovery_off": func(p *Policy) { p.DiscoverChats = false; p.IncludeChats = []string{phoneFixture + "@c.us"} },
+		"excluded_pn":   func(p *Policy) { p.ExcludeChats = []string{phoneFixture + "@c.us"} },
+	} {
+		d, queries = phoneLookupFake(t, nil, nil)
+		d.policy = func() (Policy, error) { p := allowedOperationPolicy(); change(&p); return p, nil }
+		_, err = executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+		requireError(t, err, "chat_not_collected")
+		if *queries != 0 {
+			t.Fatalf("%s queried the provider", name)
+		}
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneStalledLookupIsABoundedTimeout(t *testing.T) {
+	d, _ := phoneLookupFake(t, nil, nil)
+	d.lookupTimeout = 50 * time.Millisecond
+	release := make(chan struct{})
+	defer close(release)
+	d.isOnWhatsApp = func(context.Context, []string) ([]types.IsOnWhatsAppResponse, error) {
+		<-release // ignores its context, like a wedged socket
+		return nil, nil
+	}
+	started := time.Now()
+	_, err := executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+	requireError(t, err, "provider_timeout")
+	if time.Since(started) > 2*time.Second {
+		t.Fatal("lookup deadline not enforced")
+	}
+	if phoneLookupTimeout != 10*time.Second {
+		t.Fatal("the production deadline must stay under the 30 s worker timeout")
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneRejectsUnnormalizedNumbers(t *testing.T) {
+	for _, phone := range []any{"+12025550123", "07700 900123", "07700900123", "1 202", "", 12025550123, "12025550123@c.us"} {
+		d, queries := phoneLookupFake(t, nil, nil)
+		_, err := executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phone}), d)
+		requireError(t, err, "invalid_phone")
+		if *queries != 0 {
+			t.Fatalf("%v queried the provider", phone)
+		}
+	}
+}

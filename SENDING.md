@@ -84,11 +84,24 @@ WhatsApp multi-device behavior is provider-controlled. See [FORMATTING.md](FORMA
 [messenger-operation interface](MESSENGER_OPERATIONS.md) adds registered original
 uploads, forwarding, edits, reactions and provider-supported administrative actions;
 it has independent per-key and per-account opt-in. WhatsApp global deletion is
-unsupported, with no local-delete fallback. New conversations by arbitrary
-phone/username and a server human-approval workflow are not implemented.
+unsupported, with no local-delete fallback. A server human-approval workflow is
+not implemented.
+
 Reply to an already archived message is supported. Provider chat
 permissions still apply. Reads and WhatsApp sends do not explicitly mark chats
 read; WhatsApp uses `sendSeen: false`.
+
+### New WhatsApp conversations by phone number
+
+On native WhatsApp accounts an agent can write to a number that has no archived
+chat: check it with the `open_chat_by_phone` messenger operation (`create=false`),
+show the owner the account, number, verified name and exact text, obtain
+confirmation, call it again with `create=true` for the `chat_id`, then send with
+`send_message`. Each account allows at most 10 provider lookups per rolling hour;
+see [MESSENGER_OPERATIONS.md](MESSENGER_OPERATIONS.md#opening-a-whatsapp-chat-by-phone-number).
+Cold messages from a personal account to strangers can get it restricted or banned
+by WhatsApp, so keep them few and expected. New Telegram conversations by phone
+number or username are not implemented.
 
 ## Sender identity and provenance (0.9.12)
 

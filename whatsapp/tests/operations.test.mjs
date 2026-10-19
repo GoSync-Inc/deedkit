@@ -227,3 +227,15 @@ test('symlink CAS, oversized file and caller path/URL are rejected without readi
     await assert.rejects(executeOperation({}, job('send_file',{mode:'document',path:'/etc/passwd'}),()=>policy));
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
+
+// spec: ANYM-430
+test('open_chat_by_phone is native-only: the web fallback never resolves a number',async()=>{
+  let calls=0;const probe=async()=>{calls++;return {_serialized:'12025550123@c.us'};};
+  const client={getNumberId:probe,isRegisteredUser:probe,getContactById:probe,getChatById:probe,
+    pupPage:{evaluate:probe}};
+  const opPolicy={...policy,operations_enabled:[...policy.operations_enabled,'open_chat_by_phone']};
+  for(const parameters of [{phone:'12025550123'},{phone:'12025550123',create:true}])
+    await assert.rejects(executeOperation(client,{...job('open_chat_by_phone',parameters),provider_chat:''},()=>opPolicy),
+      /operation_unsupported/);
+  assert.equal(calls,0);
+});

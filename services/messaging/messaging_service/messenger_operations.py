@@ -11,6 +11,12 @@ from .field_errors import FIELD_NAME, field_error, one_per_field
 
 MAX_REGISTERED_FILE_BYTES = 32 * 1024**2
 CATALOG_VERSION = 1
+PHONE_LIMITATION = ('Native WhatsApp (whatsmeow) accounts only. One number per call: create=false checks it and '
+    'writes nothing; create=true after the owner confirms returns the chat_id for send_message. At most 10 provider '
+    'lookups per account per rolling hour; requires discover_chats. Sends still need exact owner confirmation.')
+# A phone-shaped chat reference: the not_found hint names open_chat_by_phone from the
+# input's shape alone, never from what the archive holds.
+PHONE_SHAPED = re.compile(r'\+?[0-9]{5,20}|[0-9]{5,20}@(?:c\.us|s\.whatsapp\.net)')
 
 
 def _field(kind, *, required=False, default=None, **limits):
@@ -115,6 +121,10 @@ OPERATIONS = {
     'set_chat_labels': _spec('chat-manage', mutation=True, platforms=('whatsapp',),
         fields={'label_ids': _field('label_ids', required=True)},
         limitation='Business feature; availability depends on the account.'),
+    'open_chat_by_phone': _spec('send', 'account', full_account=True, platforms=('whatsapp',), fields={
+        'phone': _field('phone_number', required=True),
+        'create': _field('boolean', default=False)},
+        limitation=PHONE_LIMITATION),
 }
 
 
@@ -133,7 +143,7 @@ def _supported(platform, name, spec, provider=None):
     if platform not in spec['platforms']:return False
     if platform!='whatsapp':return True
     if provider=='whatsmeow':return name not in NATIVE_UNSUPPORTED
-    return name not in ('delete_message','request_chat_history')
+    return name not in ('delete_message','request_chat_history','open_chat_by_phone')
 
 
 def _fields(platform, name, spec):
@@ -178,6 +188,8 @@ def operation_manifest(platform, *, provider=None):
             row['limitation']='Archived attachment or own destination-bound uploaded SHA-256 original only; 32 MiB bound. Sticker requires existing WebP. Audio/voice/sticker captions are unsupported; no implicit conversion.'
         elif platform=='whatsapp' and provider=='whatsmeow' and name=='forward_message':
             row['limitation']='Authorized retained ordinary content only; control, view-once and poll replay are unsupported.'
+        elif name == 'open_chat_by_phone' and not row['supported']:
+            row['limitation'] = 'Unsupported here: native WhatsApp (whatsmeow) accounts only.'
         elif platform == 'whatsapp' and name == 'delete_message':
             row['limitation'] = 'Unsupported: upstream global revoke can silently fallback to local deletion.'
         elif platform not in spec['platforms']:
@@ -188,9 +200,27 @@ def operation_manifest(platform, *, provider=None):
 
 class ParameterError(ValueError):
     """invalid_operation_parameters with bounded field_errors; never input values."""
-    def __init__(self, *errors):
-        super().__init__('invalid_operation_parameters')
+    def __init__(self, *errors, code='invalid_operation_parameters', hint=None):
+        super().__init__(code)
         self.field_errors = one_per_field(errors)  # One entry per field path, so fallback paths never crowd out others.
+        if hint: self.hint = hint
+
+
+_SEPARATORS = re.compile(r'[\s\-\u2010-\u2015\u2212.()]')
+
+
+def phone_digits(value):
+    """Digits of an international number, or None and the reviewed hint of the problem."""
+    if not isinstance(value, str) or len(value) > 64: return None, None
+    text = _SEPARATORS.sub('', value)
+    if text.startswith('+'): text, international = text[1:], True
+    elif text.startswith('00'): text, international = text[2:], True
+    else: international = False
+    if not re.fullmatch(r'[0-9]+', text, re.ASCII): return None, None
+    if text.startswith('0'): return None, None if international else 'country_code_required'
+    # A bare 8 plus ten digits is the Russian/Kazakh trunk form; +84 (Vietnam) needs its +.
+    if not international and len(text) == 11 and text.startswith('8'): return None, 'country_code_required'
+    return (text, None) if 7 <= len(text) <= 15 else (None, None)
 
 
 def _modes(platform):
@@ -211,6 +241,8 @@ def parameter_format(platform, kind):
         'upload_id': 'own upload ID up_ plus 32 lowercase hex characters, from prepare_file_upload',
         'sha256': '64 lowercase hex characters: the SHA-256 of the exact original',
         'phone': 'international number of 5-20 digits, the first 1-9, with an optional leading +, no spaces or punctuation',
+        'phone_number': 'international number with its country code, such as +49 151 1234-5678 or 0049 (151) 12345678; '
+            'spaces, dashes, dots and parentheses are ignored; 7-15 digits, no national trunk 0',
         'file_mode': 'one of ' + ', '.join(_modes(platform)),
         'poll_options': '2-10 unique non-blank strings of at most 100 UTF-16 code units',
         'poll_indices': 'up to 20 unique integers from 0 to 9 (zero-based option positions)',
@@ -242,6 +274,9 @@ def _problem(platform, descriptor, value, field):
         return None
     if kind == 'boolean':
         return None if type(value) is bool else fail('type', 'boolean')
+    if kind == 'phone_number':
+        if not isinstance(value, str): return fail('type', 'string')
+        return None if phone_digits(value)[0] else fail('format', parameter_format(platform, kind))
     if kind == 'file_mode':
         if not isinstance(value, str): return fail('type', 'string')
         return None if value in _modes(platform) else fail('enum', allowed=_modes(platform))
@@ -288,7 +323,7 @@ def validate_operation(platform, operation, parameters, *, provider=None):
             else: value = parameters[name]
             problem = _problem(platform, descriptor, value, name)
             if problem: errors.extend(problem)
-            else: output[name] = value
+            else: output[name] = phone_digits(value)[0] if descriptor['type'] == 'phone_number' else value
         # Only a bounded identifier name is returned; the submitted value never is.
         allowed = 'only ' + ', '.join(fields) if fields else 'no parameters'
         for name in parameters:
@@ -296,6 +331,8 @@ def validate_operation(platform, operation, parameters, *, provider=None):
                 errors.append(field_error(name if FIELD_NAME.fullmatch(str(name)) else 'parameters', 'unknown_field', allowed))
     except (UnicodeError, TypeError, OverflowError):
         raise ParameterError(field_error('parameters', 'type', 'JSON object of documented parameters')) from None
+    if errors and operation == 'open_chat_by_phone' and any(e['field'] == 'phone' for e in errors):
+        raise ParameterError(*errors, code='invalid_phone', hint=phone_digits(parameters.get('phone'))[1])
     if errors: raise ParameterError(*errors)
     if operation == 'update_profile' and not output:
         raise ParameterError(field_error('parameters', 'required', 'at least one of ' + ', '.join(fields)))
