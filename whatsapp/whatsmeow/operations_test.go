@@ -614,10 +614,28 @@ func phoneLookupFake(t *testing.T, row *types.IsOnWhatsAppResponse, stored *type
 	return d, &queries
 }
 
+// phoneJob is an open_chat_by_phone request with the collector's lookup grant.
+func phoneJob(params map[string]any) operationRequest {
+	job := operationJob("open_chat_by_phone", "", params)
+	job.LookupAllowed = true
+	return job
+}
+
+// waitPhoneSlot waits until an abandoned resolution has returned its slot.
+func waitPhoneSlot(t *testing.T) {
+	t.Helper()
+	select {
+	case phoneLookupSlot <- struct{}{}:
+		<-phoneLookupSlot
+	case <-time.After(2 * time.Second):
+		t.Fatal("an abandoned phone resolution never returned")
+	}
+}
+
 // spec: ANYM-430
 func TestNativeOpenChatByPhoneResolvesTheCanonicalLID(t *testing.T) {
 	d, queries := phoneLookupFake(t, nil, nil)
-	value, err := executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+	value, err := executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
 	data := operationResult(t, value, err, "confirmed")
 	if data["provider_chat"] != lidFixture || data["on_whatsapp"] != true || data["provider_lookup"] != true || *queries != 1 {
 		t.Fatalf("unexpected answer %#v after %d queries", data, *queries)
@@ -634,7 +652,7 @@ func TestNativeOpenChatByPhoneResolvesTheCanonicalLID(t *testing.T) {
 func TestNativeOpenChatByPhoneAnswersAKnownMappingLocally(t *testing.T) {
 	lid, _ := ParseChatID(lidFixture)
 	d, queries := phoneLookupFake(t, nil, &lid)
-	job := operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture, "create": true})
+	job := phoneJob(map[string]any{"phone": phoneFixture, "create": true})
 	job.KnownChats = []string{lidFixture}
 	value, err := executeOperation(context.Background(), job, d)
 	data := operationResult(t, value, err, "confirmed")
@@ -653,12 +671,12 @@ func TestNativeOpenChatByPhoneAnswersAKnownMappingLocally(t *testing.T) {
 func TestNativeOpenChatByPhoneNegativeUnresolvedAndPolicy(t *testing.T) {
 	pn := types.NewJID(phoneFixture, types.DefaultUserServer)
 	d, _ := phoneLookupFake(t, &types.IsOnWhatsAppResponse{Query: "+" + phoneFixture, JID: pn, IsIn: false, PhoneNumber: pn}, nil)
-	value, err := executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+	value, err := executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
 	if data := operationResult(t, value, err, "confirmed"); data["on_whatsapp"] != false || data["provider_chat"] != nil {
 		t.Fatalf("unregistered number got a chat: %#v", data)
 	}
 	d, _ = phoneLookupFake(t, &types.IsOnWhatsAppResponse{Query: "+" + phoneFixture, JID: pn, IsIn: true, PhoneNumber: pn}, nil)
-	_, err = executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+	_, err = executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
 	requireError(t, err, "identity_unresolved")
 	// The LID learned only from the query is excluded: refused, never returned.
 	d, queries := phoneLookupFake(t, nil, nil)
@@ -667,7 +685,7 @@ func TestNativeOpenChatByPhoneNegativeUnresolvedAndPolicy(t *testing.T) {
 		p.ExcludeChats = []string{lidFixture}
 		return p, nil
 	}
-	_, err = executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+	_, err = executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
 	requireError(t, err, "chat_not_collected")
 	if *queries != 1 {
 		t.Fatalf("queries %d", *queries)
@@ -679,7 +697,7 @@ func TestNativeOpenChatByPhoneNegativeUnresolvedAndPolicy(t *testing.T) {
 	} {
 		d, queries = phoneLookupFake(t, nil, nil)
 		d.policy = func() (Policy, error) { p := allowedOperationPolicy(); change(&p); return p, nil }
-		_, err = executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+		_, err = executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
 		requireError(t, err, "chat_not_collected")
 		if *queries != 0 {
 			t.Fatalf("%s queried the provider", name)
@@ -692,17 +710,18 @@ func TestNativeOpenChatByPhoneStalledLookupIsABoundedTimeout(t *testing.T) {
 	d, _ := phoneLookupFake(t, nil, nil)
 	d.lookupTimeout = 50 * time.Millisecond
 	release := make(chan struct{})
-	defer close(release)
 	d.isOnWhatsApp = func(context.Context, []string) ([]types.IsOnWhatsAppResponse, error) {
 		<-release // ignores its context, like a wedged socket
 		return nil, nil
 	}
 	started := time.Now()
-	_, err := executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phoneFixture}), d)
+	_, err := executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
 	requireError(t, err, "provider_timeout")
 	if time.Since(started) > 2*time.Second {
 		t.Fatal("lookup deadline not enforced")
 	}
+	close(release)
+	waitPhoneSlot(t)
 	if phoneLookupTimeout != 10*time.Second {
 		t.Fatal("the production deadline must stay under the 30 s worker timeout")
 	}
@@ -712,10 +731,67 @@ func TestNativeOpenChatByPhoneStalledLookupIsABoundedTimeout(t *testing.T) {
 func TestNativeOpenChatByPhoneRejectsUnnormalizedNumbers(t *testing.T) {
 	for _, phone := range []any{"+12025550123", "07700 900123", "07700900123", "1 202", "", 12025550123, "12025550123@c.us"} {
 		d, queries := phoneLookupFake(t, nil, nil)
-		_, err := executeOperation(context.Background(), operationJob("open_chat_by_phone", "", map[string]any{"phone": phone}), d)
+		_, err := executeOperation(context.Background(), phoneJob(map[string]any{"phone": phone}), d)
 		requireError(t, err, "invalid_phone")
 		if *queries != 0 {
 			t.Fatalf("%v queried the provider", phone)
+		}
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneDeadlineCoversTheSessionStore(t *testing.T) {
+	lid, _ := ParseChatID(lidFixture)
+	d, queries := phoneLookupFake(t, nil, &lid)
+	d.lookupTimeout = 50 * time.Millisecond
+	release := make(chan struct{})
+	d.lidForPN = func(context.Context, types.JID) (types.JID, error) {
+		<-release // a store lock held across SQL ignores the context
+		return lid, nil
+	}
+	job := phoneJob(map[string]any{"phone": phoneFixture})
+	job.KnownChats = []string{lidFixture}
+	started := time.Now()
+	_, err := executeOperation(context.Background(), job, d)
+	requireError(t, err, "provider_timeout")
+	// While the wedged read still runs, the next request does not pile up behind it.
+	_, err = executeOperation(context.Background(), job, d)
+	requireError(t, err, "provider_timeout")
+	if time.Since(started) > 2*time.Second || *queries != 0 {
+		t.Fatalf("store read escaped the deadline (%d queries)", *queries)
+	}
+	close(release)
+	waitPhoneSlot(t)
+	value, err := executeOperation(context.Background(), job, d)
+	if data := operationResult(t, value, err, "confirmed"); data["provider_lookup"] != false {
+		t.Fatalf("recovered lane did not answer locally: %#v", data)
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneSpentBudgetStillAnswersLocally(t *testing.T) {
+	lid, _ := ParseChatID(lidFixture)
+	d, queries := phoneLookupFake(t, nil, &lid)
+	job := phoneJob(map[string]any{"phone": phoneFixture, "create": true})
+	job.LookupAllowed = false
+	job.KnownChats = []string{"111222333444555@lid", lidFixture}
+	value, err := executeOperation(context.Background(), job, d)
+	if data := operationResult(t, value, err, "confirmed"); data["provider_chat"] != lidFixture || data["provider_lookup"] != false {
+		t.Fatalf("local answer refused with a spent budget: %#v", data)
+	}
+	job.KnownChats = nil
+	_, err = executeOperation(context.Background(), job, d)
+	requireError(t, err, "rate_limited")
+	if *queries != 0 {
+		t.Fatalf("spent budget still queried WhatsApp %d times", *queries)
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneErrorsSurviveTheWireSanitizer(t *testing.T) {
+	for _, code := range []string{"invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited"} {
+		if got := safeError(errors.New(code)); got != code {
+			t.Fatalf("%s crosses the lane as %s", code, got)
 		}
 	}
 }

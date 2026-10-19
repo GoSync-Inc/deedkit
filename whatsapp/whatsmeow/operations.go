@@ -49,6 +49,9 @@ var phonePattern = regexp.MustCompile(`^[1-9][0-9]{6,14}$`)
 // so a stalled query is a complete error frame, never a desynchronized pipe.
 const phoneLookupTimeout = 10 * time.Second
 
+// The collector sends every archived LID chat of the account, capped here.
+const maxKnownChats = 10000
+
 func wordSet(value string) map[string]bool {
 	out := map[string]bool{}
 	for _, v := range strings.Fields(value) {
@@ -72,6 +75,7 @@ type operationRequest struct {
 	FileMime              string                     `json:"file_mime"`
 	FileName              string                     `json:"file_name"`
 	KnownChats            []string                   `json:"known_chats"`
+	LookupAllowed         bool                       `json:"lookup_allowed"`
 }
 
 type operationDependencies struct {
@@ -230,7 +234,7 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 		}
 		switch err.Error() {
 		case "history_rate_limited", "history_anchor_unavailable", "operation_unsupported", "operation_invalid_parameters", "operation_disabled", "operation_expired", "operation_target_invalid", "operation_target_unavailable", "operation_result_too_large", "registered_file_invalid",
-			"invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "operation_query_failed":
+			"invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited", "operation_query_failed":
 		default:
 			if readOperations[job.Operation] {
 				err = errors.New("operation_query_failed")
@@ -1173,10 +1177,18 @@ func participantResults(values []types.GroupParticipant, expected []types.JID) m
 	return map[string]any{"participants": rows, "participant_state": state, "participant_coverage": "provider_response", "participants_truncated": truncated, "auto_invite_sent": false}
 }
 
+// phoneLookupSlot admits one resolution at a time per adapter. A timed-out
+// resolution keeps its slot until its store or provider call returns, so wedged
+// calls cannot accumulate; the next request gets provider_timeout at once.
+var phoneLookupSlot = make(chan struct{}, 1)
+
 // openChatByPhone resolves one number to its canonical LID chat; it never sends
 // and never writes the archive (the Python collector materializes the chat).
 // A mapping already in the session store answers locally when the archive holds
-// that chat (known_chats); otherwise one bounded usync query runs.
+// that chat (known_chats), even with the lookup budget spent; otherwise one usync
+// query runs if the collector granted one (lookup_allowed). The session-store
+// reads and the query share one deadline, so nothing here can hold the lane
+// until the worker's 30 s timeout disconnects the adapter.
 func openChatByPhone(ctx context.Context, job operationRequest, d operationDependencies, check func(string) error) (any, error) {
 	var phone string
 	if raw, found := job.Parameters["phone"]; !found || decodeValue(raw, &phone) != nil || !phonePattern.MatchString(phone) {
@@ -1188,8 +1200,12 @@ func openChatByPhone(ctx context.Context, job operationRequest, d operationDepen
 			return nil, errors.New("operation_invalid_parameters")
 		}
 	}
-	if len(job.KnownChats) > 20 {
+	if len(job.KnownChats) > maxKnownChats {
 		return nil, errors.New("operation_invalid_parameters")
+	}
+	known := make(map[string]bool, len(job.KnownChats))
+	for _, chat := range job.KnownChats {
+		known[chat] = true
 	}
 	// Discovery must be on: a LID unknown before the query cannot be matched
 	// against include_chats, and exclusions apply to both namespaces.
@@ -1207,75 +1223,98 @@ func openChatByPhone(ctx context.Context, job operationRequest, d operationDepen
 	if e := collected(LegacyChatID(pn)); e != nil {
 		return nil, e
 	}
-	answer := func(lid types.JID, name any, lookup bool) (any, error) {
-		chat := LegacyChatID(lid)
-		if e := collected(chat); e != nil {
-			return nil, e
-		}
-		if e := check(""); e != nil {
-			return nil, e
-		}
-		return operationOutput("confirmed", map[string]any{"on_whatsapp": true, "verified_name": name,
-			"provider_chat": chat, "provider_lookup": lookup}, "")
-	}
-	if d.lidForPN != nil {
-		if lid, e := d.lidForPN(ctx, pn); e == nil && lid.Server == types.HiddenUserServer && lid.User != "" {
-			if e = collected(LegacyChatID(lid)); e != nil {
-				return nil, e
-			}
-			for _, known := range job.KnownChats {
-				if known == LegacyChatID(lid) {
-					return answer(lid, nil, false)
-				}
-			}
-		}
-	}
-	if e := check(""); e != nil {
-		return nil, e
-	}
-	if d.isOnWhatsApp == nil {
-		return nil, errors.New("operation_unsupported")
-	}
 	timeout := d.lookupTimeout
 	if timeout <= 0 {
 		timeout = phoneLookupTimeout
 	}
-	lookup, cancel := context.WithTimeout(ctx, timeout)
+	deadline, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	type reply struct {
-		rows []types.IsOnWhatsAppResponse
-		err  error
+	select {
+	case phoneLookupSlot <- struct{}{}:
+	default:
+		return nil, errors.New("provider_timeout")
 	}
-	done := make(chan reply, 1)
+	done := make(chan phoneResolution, 1)
 	go func() {
-		rows, e := d.isOnWhatsApp(lookup, []string{"+" + phone})
-		done <- reply{rows, e}
+		defer func() { <-phoneLookupSlot }()
+		done <- resolvePhone(deadline, phone, pn, job.LookupAllowed, known, d, collected)
 	}()
-	var got reply
+	var got phoneResolution
 	select {
 	case got = <-done:
-	case <-lookup.Done():
-		// A query that ignores its context still cannot hold the operation lane.
+	case <-deadline.Done():
 		return nil, errors.New("provider_timeout")
 	}
 	if got.err != nil {
-		if errors.Is(got.err, context.DeadlineExceeded) || lookup.Err() != nil {
+		if errors.Is(got.err, context.DeadlineExceeded) || deadline.Err() != nil {
 			return nil, errors.New("provider_timeout")
 		}
-		return nil, errors.New("operation_query_failed")
+		return nil, got.err
 	}
-	if len(got.rows) != 1 {
-		return nil, errors.New("operation_query_failed")
-	}
-	row := got.rows[0]
-	if !row.PhoneNumber.IsEmpty() && row.PhoneNumber.User != phone {
-		return nil, errors.New("operation_query_failed")
-	}
-	if !row.IsIn {
+	if !got.on {
 		if e := check(""); e != nil {
 			return nil, e
 		}
 		return operationOutput("confirmed", map[string]any{"on_whatsapp": false, "verified_name": nil, "provider_lookup": true}, "")
+	}
+	chat := LegacyChatID(got.lid)
+	if e := collected(chat); e != nil {
+		return nil, e
+	}
+	if e := check(""); e != nil {
+		return nil, e
+	}
+	return operationOutput("confirmed", map[string]any{"on_whatsapp": true, "verified_name": got.name,
+		"provider_chat": chat, "provider_lookup": got.lookup}, "")
+}
+
+type phoneResolution struct {
+	lid    types.JID
+	name   any
+	lookup bool
+	on     bool
+	err    error
+}
+
+// resolvePhone does every session-store and provider call of openChatByPhone
+// under the caller's deadline.
+func resolvePhone(ctx context.Context, phone string, pn types.JID, allowed bool, known map[string]bool, d operationDependencies, collected func(string) error) phoneResolution {
+	if d.lidForPN != nil {
+		if lid, e := d.lidForPN(ctx, pn); e == nil && lid.Server == types.HiddenUserServer && lid.User != "" {
+			lid = lid.ToNonAD()
+			if e = collected(LegacyChatID(lid)); e != nil {
+				return phoneResolution{err: e}
+			}
+			if known[LegacyChatID(lid)] {
+				return phoneResolution{lid: lid, on: true}
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		return phoneResolution{err: ctx.Err()}
+	}
+	if !allowed {
+		return phoneResolution{err: errors.New("rate_limited")}
+	}
+	if d.isOnWhatsApp == nil {
+		return phoneResolution{err: errors.New("operation_unsupported")}
+	}
+	rows, e := d.isOnWhatsApp(ctx, []string{"+" + phone})
+	if e != nil {
+		if errors.Is(e, context.DeadlineExceeded) || ctx.Err() != nil {
+			return phoneResolution{err: context.DeadlineExceeded}
+		}
+		return phoneResolution{err: errors.New("operation_query_failed")}
+	}
+	if len(rows) != 1 {
+		return phoneResolution{err: errors.New("operation_query_failed")}
+	}
+	row := rows[0]
+	if !row.PhoneNumber.IsEmpty() && row.PhoneNumber.User != phone {
+		return phoneResolution{err: errors.New("operation_query_failed")}
+	}
+	if !row.IsIn {
+		return phoneResolution{lookup: true}
 	}
 	lid := row.JID.ToNonAD()
 	if lid.Server != types.HiddenUserServer && d.lidForPN != nil {
@@ -1285,7 +1324,7 @@ func openChatByPhone(ctx context.Context, job operationRequest, d operationDepen
 		}
 	}
 	if lid.Server != types.HiddenUserServer || lid.User == "" {
-		return nil, errors.New("identity_unresolved")
+		return phoneResolution{err: errors.New("identity_unresolved")}
 	}
 	var name any
 	if row.VerifiedName != nil && row.VerifiedName.Details != nil {
@@ -1293,5 +1332,5 @@ func openChatByPhone(ctx context.Context, job operationRequest, d operationDepen
 			name = v
 		}
 	}
-	return answer(lid, name, true)
+	return phoneResolution{lid: lid, name: name, lookup: true, on: true}
 }

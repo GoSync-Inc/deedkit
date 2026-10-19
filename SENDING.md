@@ -97,7 +97,7 @@ On native WhatsApp accounts an agent can write to a number that has no archived
 chat: check it with the `open_chat_by_phone` messenger operation (`create=false`),
 show the owner the account, number, verified name and exact text, obtain
 confirmation, call it again with `create=true` for the `chat_id`, then send with
-`send_message`. Each account allows at most 10 provider lookups per rolling hour;
+`send_message`. Each account allows at most 10 WhatsApp lookups per rolling hour (local answers are free);
 see [MESSENGER_OPERATIONS.md](MESSENGER_OPERATIONS.md#opening-a-whatsapp-chat-by-phone-number).
 Cold messages from a personal account to strangers can get it restricted or banned
 by WhatsApp, so keep them few and expected. New Telegram conversations by phone

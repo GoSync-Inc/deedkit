@@ -19,6 +19,9 @@ from .outgoing import finish_durably
 
 MAX_FILE_BYTES = 32 * 1024**2
 PHONE_LOOKUPS_PER_HOUR = 10
+MAX_KNOWN_CHATS = 10000  # whatsmeow maxKnownChats
+OPEN_CHAT_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
+    '--operations <current operations> open_chat_by_phone')
 BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session','session_data',
     'password','secret','stack','traceback','diagnostic','diagnostics','credentials'))
 
@@ -103,7 +106,9 @@ def _policy(c,account,operation,provider_chats=(),*,ready=False):
     from .collector_state import CollectorState
     row=c.execute('SELECT * FROM account_policies WHERE account=%s',(account,)).fetchone()
     if not row or not row['enabled'] or operation not in row['operations_enabled']:
-        raise APIError('operation_disabled',409)
+        failure=APIError('operation_disabled',409)
+        if operation=='open_chat_by_phone':failure.hint=OPEN_CHAT_ENABLE_STEP
+        raise failure
     if any(not CollectorState.allows(row,chat) for chat in provider_chats):
         raise APIError('not_found',404)
     if ready:
@@ -262,30 +267,27 @@ def _phone_policy(c,account,phone):
         raise APIError('chat_not_collected',409)
 
 
-def _phone_chats(c,account,phone):
-    """Archived LID chats that may be this number's canonical chat. The adapter
-    answers locally only when its own session store maps the number to one."""
-    return [r['provider_chat'] for r in c.execute('''SELECT DISTINCT ch.provider_chat FROM chats ch
-        WHERE ch.account=%s AND ch.provider_chat LIKE '%%@lid' AND (
-          ch.provider_chat IN (SELECT lid FROM whatsapp_identity_observations WHERE account=%s AND pn=%s)
-          OR ch.id IN (SELECT result->'data'->>'chat_id' FROM messenger_commands WHERE account=%s
-            AND operation='open_chat_by_phone' AND status='succeeded' AND payload->'parameters'->>'phone'=%s))
-        ORDER BY ch.provider_chat LIMIT 20''',(account,account,phone+'@c.us',account,phone)).fetchall()]
+def _phone_chats(c,account):
+    """Every archived LID chat of the account. The adapter answers locally only
+    when its own session store maps the number to one of them."""
+    return [r['provider_chat'] for r in c.execute('''SELECT provider_chat FROM chats
+        WHERE account=%s AND provider_chat LIKE '%%@lid' ORDER BY provider_chat LIMIT %s''',
+        (account,MAX_KNOWN_CHATS)).fetchall()]
 
 
-def _lookup_bound(c,account):
-    # Counted from durable rows so a restart cannot reset it. A row counts unless
-    # it never reached the adapter or was answered from the local session store.
-    rows=c.execute('''SELECT created_at FROM messenger_commands WHERE account=%s AND operation='open_chat_by_phone'
-        AND created_at>clock_timestamp()-interval '1 hour'
-        AND NOT (status IN ('cancelled','expired') AND started_at IS NULL)
+def _lookup_budget(c,account,command):
+    """Whether this dispatch may query WhatsApp, and when the oldest counted query
+    leaves the window. Counted by dispatch time from durable rows, so neither a
+    queue delay nor a restart resets it; dispatch is serial per account (one
+    fenced worker), so two principals cannot both take the last slot. A row
+    counts unless it was answered locally or refused for the bound."""
+    rows=c.execute('''SELECT started_at FROM messenger_commands WHERE account=%s AND operation='open_chat_by_phone'
+        AND id<>%s AND started_at>clock_timestamp()-interval '1 hour'
         AND coalesce(result->'data'->>'provider_lookup','true')<>'false'
-        ORDER BY created_at DESC LIMIT %s''',(account,PHONE_LOOKUPS_PER_HOUR)).fetchall()
-    if len(rows)<PHONE_LOOKUPS_PER_HOUR:return
-    failure=APIError('rate_limited',429)
-    failure.resets_in_seconds=c.execute('''SELECT greatest(1,ceil(extract(epoch FROM
-        %s::timestamptz+interval '1 hour'-clock_timestamp())))::int AS s''',(rows[-1]['created_at'],)).fetchone()['s']
-    raise failure
+        ORDER BY started_at DESC LIMIT %s''',(account,command,PHONE_LOOKUPS_PER_HOUR)).fetchall()
+    if len(rows)<PHONE_LOOKUPS_PER_HOUR:return True,None
+    return False,c.execute('''SELECT greatest(1,ceil(extract(epoch FROM
+        %s::timestamptz+interval '1 hour'-clock_timestamp())))::int AS s''',(rows[-1]['started_at'],)).fetchone()['s']
 
 
 def _digest(p,payload):
@@ -378,7 +380,6 @@ def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
     count=c.execute("SELECT count(*) AS n FROM messenger_commands WHERE account=%s AND created_at>clock_timestamp()-interval '1 minute'",
                     (account,)).fetchone()['n']
     if count>=60:raise APIError('rate_limited',429)
-    if operation=='open_chat_by_phone':_lookup_bound(c,account)
     row=c.execute('''INSERT INTO messenger_commands(principal,key_id,scope_version,key_permission_version,
         request_id,request_hash,account,chat,message,expected_revision,operation,permission,mutation,payload,preview_digest)
         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
@@ -519,7 +520,8 @@ class CommandWorker:
                 if not policy:raise APIError('operation_disabled',409)
                 payload['_policy']=dict(policy)
                 if payload['operation']=='open_chat_by_phone':
-                    payload['known_chats']=_phone_chats(c,st.account,payload['parameters']['phone'])
+                    payload['known_chats']=_phone_chats(c,st.account)
+                    payload['lookup_allowed'],job['_lookup_resets_in']=_lookup_budget(c,st.account,job['id'])
                 if payload['operation']=='send_file':
                     # Only collectors get a filesystem path; previews/status never do.
                     root=store.files
@@ -609,6 +611,8 @@ class CommandWorker:
                 'rate_limited','provider_timeout','invalid_phone') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
+            if code=='rate_limited' and job['operation']=='open_chat_by_phone':
+                result={'data':{'code':code,'resets_in_seconds':job.get('_lookup_resets_in') or 1,'provider_lookup':False}}
             await finish_durably(self.finish,job,'expired' if code=='operation_expired' else 'failed',result,code)
         except Exception:
             # A provider that reports no phase stays conservative: any mutation may have run.

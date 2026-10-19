@@ -211,17 +211,23 @@ account opt-in and, through the gateway, the `open_chat_by_phone` action grant.
 The canonical chat is the contact's LID (`<digits>@lid`), where the native sender
 archives its echo. A registered number without a LID gets `identity_unresolved`;
 a policy that excludes the number or its LID, or `discover_chats` off, gets
-`chat_not_collected` (an unknown LID cannot match `include_chats`). Each account
-allows at most 10 provider lookups per rolling hour, counted from durable operation
-rows; failed and negative lookups count, replays of the same request ID and local
-answers from the session store do not. The next one gets `rate_limited` with
-`resets_in_seconds`. A lookup has a 10-second deadline; `provider_timeout` is a
-failed read with `result.data.retry: true`, never an unknown send. `send_message`
+`chat_not_collected` (an unknown LID cannot match `include_chats`). A number whose
+LID the session store already maps to an archived chat is answered locally
+(`provider_lookup: false`). Each account allows at most 10 provider lookups per
+rolling hour, counted by dispatch time from durable operation rows; failed and
+negative lookups count, replays of the same request ID, local answers and
+refusals do not. When the budget is spent, a local answer still succeeds and a
+lookup is refused before any query: the operation fails with `rate_limited` and
+`result.data.resets_in_seconds`. The session-store reads and the lookup share a
+10-second deadline; `provider_timeout` is a failed read with
+`result.data.retry: true`, never an unknown send. `send_message`
 and `resolve_reference` add `hint: open_chat_by_phone` to `not_found` for a
 phone-shaped chat reference. The number is sent to WhatsApp and kept in the
 operation row and in the session store's PN/LID mapping; it is not logged.
 
-Enable per account (the list replaces the current one):
+Enable per account after the API and the native collectors run one release (an
+older native adapter refuses the operation); without it, `operation_disabled`
+carries this step as its `hint`. The list replaces the current one:
 
 ```sh
 python -m messaging_service set-messenger-operations --account account-demo --operations send_file open_chat_by_phone

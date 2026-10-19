@@ -153,21 +153,18 @@ def test_unregistered_or_unresolved_numbers_get_no_chat(native):
 # spec: ANYM-430
 def test_known_mapping_is_passed_for_a_local_answer_that_does_not_count(native):
     s, archive, state, key = native
+    # A LID-only archive with no PN/LID observation and no earlier receipt for the number:
+    # the adapter's own session mapping decides, so every archived LID chat is offered.
     archive_chat(state, LID, 'LID1')
-    with s.pool.connection() as c:
-        source = c.execute('SELECT id FROM messages WHERE provider_id LIKE %s', ('%LID1',)).fetchone()['id']
-        c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,pn,lid,provenance,
-            first_observed_at,observed_at) VALUES(%s,%s,%s,%s,%s,'whatsmeow_lid_store_v1',now(),now())''',
-            (ACCOUNT, source, LID, PN, LID))
+    archive_chat(state, PN, 'PN1')
     for n in range(12):
         receipt, jobs = run(s, key, 'phone-local-%04d' % n, answer(lookup=False))
         assert jobs[0]['known_chats'] == [LID] and receipt['result']['data']['existing'] is True
-    # A created chat without identity evidence is also offered for the local answer.
-    with s.pool.connection() as c: c.execute('DELETE FROM whatsapp_identity_observations')
+        assert jobs[0]['lookup_allowed'] is True  # local answers never spend the budget
     other = '111222333444555@lid'
     run(s, key, 'phone-create-0004', answer(lid=other), create=True)
     _, jobs = run(s, key, 'phone-local-0100', answer(lid=other, lookup=False))
-    assert jobs[0]['known_chats'] == [other, LID]  # LID: the earlier receipts name its chat
+    assert jobs[0]['known_chats'] == [other, LID]
 
 
 # spec: ANYM-430
@@ -184,8 +181,9 @@ def test_chat_scoped_key_and_missing_grants_are_refused_before_any_query(native)
     with pytest.raises(APIError, match='forbidden'):
         s.execute_messenger_operation(reader, **args(), request_id='phone-reader-0001')
     s.set_messenger_operations(ACCOUNT, [])
-    with pytest.raises(APIError, match='operation_disabled'):
+    with pytest.raises(APIError, match='operation_disabled') as caught:
         s.execute_messenger_operation(key, **args(), request_id='phone-disabled-0001')
+    assert 'anymsg set-messenger-operations' in error_payload(caught.value)['hint']
     with s.pool.connection() as c:
         assert c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n'] == 0
 
@@ -300,35 +298,114 @@ def test_after_commit_the_same_request_returns_the_saved_receipt(native):
     assert second['result']['data']['existing'] is True and list(chats(s)).count(LID) == 1
 
 
-def set_created(s, ages):
+def set_started(s, ages, created=None):
+    """Move dispatch times (and optionally creation times) of all commands, oldest first."""
     with s.pool.connection() as c:
         ids = [r['id'] for r in c.execute('SELECT id FROM messenger_commands ORDER BY created_at,id').fetchall()]
         for i, age in zip(ids, ages, strict=True):
-            c.execute("UPDATE messenger_commands SET created_at=clock_timestamp()-%s*interval '1 second' WHERE id=%s", (age, i))
+            c.execute("UPDATE messenger_commands SET started_at=clock_timestamp()-%s*interval '1 second' WHERE id=%s", (age, i))
+            if created is not None:
+                c.execute("UPDATE messenger_commands SET created_at=clock_timestamp()-%s*interval '1 second' WHERE id=%s",
+                          (created, i))
+
+
+def adapter(queries, result=None):
+    """Answers like operations.go: a query only with the collector's lookup grant."""
+    def execute(job):
+        if not job['lookup_allowed']: raise CommandRejected('rate_limited')
+        queries.append(job['id'])
+        if isinstance(result, Exception): raise result
+        return result or answer(on=False)
+    return execute
+
+
+def refused(receipt):
+    assert receipt['status'] == 'failed' and receipt['error_code'] == 'rate_limited'
+    assert set(receipt['result']['data']) == {'code', 'resets_in_seconds', 'provider_lookup'}
+    assert receipt['result']['data']['provider_lookup'] is False and PHONE not in json.dumps(receipt)
+    return receipt['result']['data']['resets_in_seconds']
 
 
 # spec: ANYM-430
 def test_ten_lookups_per_rolling_hour_then_rate_limited_before_any_query(native):
     s, archive, state, key = native
     other = s.issue_key('phone-other-agent', [ACCOUNT], permissions=['read', 'send'])
+    queries = []
     for n in range(10):
-        run(s, key if n % 2 else other, 'phone-bound-%04d' % n, answer(on=False) if n % 3 else CommandRejected('provider_timeout'))
+        run(s, key if n % 2 else other, 'phone-bound-%04d' % n,
+            adapter(queries, None if n % 3 else CommandRejected('provider_timeout')))
     # Idempotent replays do not count, and they still answer.
     assert s.execute_messenger_operation(other, **args(), request_id='phone-bound-0000')['status'] == 'failed'
-    set_created(s, [3599-n for n in range(10)])
-    for agent in (key, other):
-        with pytest.raises(APIError, match='rate_limited') as caught:
-            s.execute_messenger_operation(agent, **args(), request_id='phone-bound-0010')
-        detail = error_payload(caught.value)
-        assert detail['error'] == 'rate_limited' and 1 <= detail['resets_in_seconds'] <= 2
-        assert PHONE not in json.dumps(detail)
-    with s.pool.connection() as c:
-        assert c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n'] == 10
-    set_created(s, [3601]+[3500-n for n in range(9)])
-    receipt, jobs = run(s, key, 'phone-bound-0011', answer(on=False))
-    assert receipt['status'] == 'succeeded' and len(jobs) == 1
-    with pytest.raises(APIError, match='rate_limited'):
-        s.execute_messenger_operation(key, **args(), request_id='phone-bound-0012')
+    set_started(s, [3599-n for n in range(10)])
+    for n, agent in enumerate((key, other)):
+        receipt, jobs = run(s, agent, 'phone-bound-%04d' % (10+n), adapter(queries))
+        assert 1 <= refused(receipt) <= 2 and jobs[0]['lookup_allowed'] is False
+    assert len(queries) == 10
+    # The refusals themselves spend nothing: once the oldest query leaves the hour, one more runs.
+    set_started(s, [3601]+[3500-n for n in range(9)]+[5, 5])
+    receipt, _ = run(s, key, 'phone-bound-0012', adapter(queries))
+    assert receipt['status'] == 'succeeded' and len(queries) == 11
+    assert 99 <= refused(run(s, key, 'phone-bound-0013', adapter(queries))[0]) <= 101  # the 3,500 s old query
+
+
+# spec: ANYM-430
+def test_a_queue_delay_cannot_double_the_hourly_lookups(native):
+    s, archive, state, key = native
+    queries = []
+    for n in range(10):
+        run(s, key, 'phone-delay-%04d' % n, adapter(queries))
+    # Enqueued over an hour ago but dispatched minutes ago: the queries still count.
+    set_started(s, [540]*10, created=3700)
+    receipt, _ = run(s, key, 'phone-delay-0010', adapter(queries))
+    assert 3000 <= refused(receipt) <= 3060 and len(queries) == 10
+
+
+# spec: ANYM-430
+def test_a_spent_budget_still_allows_a_local_answer(native):
+    s, archive, state, key = native
+    archive_chat(state, LID, 'LID1')
+    queries = []
+    for n in range(10):
+        run(s, key, 'phone-spent-%04d' % n, adapter(queries))
+    def local(job):
+        assert job['lookup_allowed'] is False and job['known_chats'] == [LID]
+        return answer(lookup=False)  # the session store maps the number to an archived chat
+    for create in (False, True):
+        receipt, _ = run(s, key, 'phone-spent-local-%d' % create, local, create=create)
+        assert receipt['status'] == 'succeeded' and receipt['result']['data']['chat_id'] == stable_id('chat', ACCOUNT, LID)
+    refused(run(s, key, 'phone-spent-remote', adapter(queries))[0])
+    assert len(queries) == 10
+
+
+# spec: ANYM-430
+def test_concurrent_principals_cannot_both_take_the_last_lookup(native):
+    import threading
+    s, archive, state, key = native
+    queries = []
+    for n in range(9):
+        run(s, key, 'phone-race-%04d' % n, adapter(queries))
+    agents = [s.issue_key('phone-race-%d' % n, [ACCOUNT], permissions=['read', 'send']) for n in range(2)]
+    barrier, queued, errors = threading.Barrier(len(agents)), [], []
+    def enqueue(n, agent):
+        try:
+            barrier.wait(5)
+            for m in range(3):
+                queued.append((agent, s.execute_messenger_operation(agent, **args(), request_id='phone-last-%d-%d' % (n, m))))
+        except Exception as exc: errors.append(exc)
+    threads = [threading.Thread(target=enqueue, args=(n, agent)) for n, agent in enumerate(agents)]
+    for t in threads: t.start()
+    for t in threads: t.join(10)
+    assert not errors and len(queued) == 6
+    async def execute(job): return adapter(queries)(job)
+    while asyncio.run(CommandWorker(state, execute).once()): pass
+    receipts = [s.get_messenger_operation(agent, q['operation_id']) for agent, q in queued]
+    assert len(queries) == 10 and sorted(r['status'] for r in receipts) == ['failed']*5+['succeeded']
+    assert all(r['error_code'] == 'rate_limited' for r in receipts if r['status'] == 'failed')
+    # A restarted collector (new lease, new worker) reads the same durable bound.
+    archive.release(ACCOUNT, 'phone-test', state.lease[1])
+    state.lease = ('phone-test', archive.acquire(ACCOUNT, 'phone-test'))
+    refused(run(s, key, 'phone-race-restart', adapter(queries))[0])
+    assert len(queries) == 10
 
 
 # spec: ANYM-430
@@ -361,8 +438,14 @@ def test_stalled_lookup_keeps_the_adapter_connected_for_the_next_send(tmp_path):
         provider.disconnect = disconnect
         with pytest.raises(CommandRejected, match='provider_timeout'):
             await provider._call_unlocked('messenger_operation', {'operation': 'open_chat_by_phone'}, sending=True)
+        for n, code in enumerate(('invalid_phone', 'identity_unresolved', 'chat_not_collected', 'rate_limited'), 3):
+            provider.send_reader.feed_data(json.dumps({'id': n, 'error': code}).encode()+b'\n')
         sent = await provider._call_unlocked('send_text', {'chat': '1@c.us', 'text': 'Synthetic'}, sending=True)
         assert sent == {'provider_message_id': 'true_1@c.us_X'} and not disconnected
+        # Every code the native lane now passes (runtime.go safeErrors) arrives as itself.
+        for code in ('invalid_phone', 'identity_unresolved', 'chat_not_collected', 'rate_limited'):
+            with pytest.raises(CommandRejected, match=code):
+                await provider._call_unlocked('messenger_operation', {'operation': 'open_chat_by_phone'}, sending=True)
     asyncio.run(check())
 
 
@@ -379,10 +462,18 @@ def test_phone_shaped_not_found_names_the_operation(native, reference, hinted):
 
 
 # spec: ANYM-430
-def test_no_phone_number_in_audit_or_errors(native):
+def test_no_phone_number_in_audit_or_errors(native, caplog, monkeypatch):
+    import logging
+    from messaging_service import telemetry
     s, archive, state, key = native
+    events = []
+    monkeypatch.setattr(telemetry, '_reporter', SimpleNamespace(capture=lambda error, code: events.append(
+        [type(error).__name__, code, [telemetry.safe_event(error, c, code) for c in sorted(telemetry.COMPONENTS)]]) or True))
+    caplog.set_level(logging.DEBUG)
     run(s, key, 'phone-audit-0001', answer(), create=True)
     run(s, key, 'phone-audit-0002', CommandRejected('identity_unresolved'))
+    run(s, key, 'phone-audit-0003', RuntimeError('synthetic adapter failure'))
+    assert PHONE not in caplog.text and PHONE not in json.dumps(events, default=str)
     with pytest.raises(APIError) as caught:
         s.preview_messenger_operation(key, **args(phone='07700 900123'))
     assert '7700900123' not in json.dumps(error_payload(caught.value))
