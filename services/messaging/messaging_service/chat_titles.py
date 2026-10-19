@@ -16,16 +16,16 @@ NAMED = ('seen_elsewhere','linked_identity')
 
 
 def labels(c,p,pairs):
-    """{(account, chat id): (title, basis)} for readable raw-titled private chats a name or number exists for.
+    """{(account, chat id): (title, basis)} for readable raw-titled private chats; basis is None when the stored title stays.
 
     Constant statements for any number of chats: one chat read and, only for WhatsApp
     identities, the sender-name statements of `resolve`. An ID `personal_id` rejects
-    leaves the chat out.
+    leaves the stored title.
     """
     pairs=sorted(set(pairs))
     if not pairs:return {}
     where,args=scope_filter(p,'c',chat_column='id')
-    rows=c.execute('''SELECT c.account,c.id,c.provider_chat,peer.display_name AS name,
+    rows=c.execute('''SELECT c.account,c.id,c.provider_chat,c.title,peer.display_name AS name,
           (SELECT m.sender FROM messages m WHERE m.account=c.account AND m.chat=c.id AND m.direction='incoming'
             ORDER BY m.sent_at DESC,m.id DESC LIMIT 1) AS sender
         FROM unnest(%s::text[],%s::text[]) k(account,chat) JOIN chats c ON c.account=k.account AND c.id=k.chat
@@ -49,10 +49,12 @@ def labels(c,p,pairs):
         for peer in peers:by_chat.setdefault(peer['_key'],[]).append(peer)
         for key,candidates in by_chat.items():
             # Names before the phone number; the number only for the chat's own @c.us ID.
-            named=next((x for x in candidates if x['sender_name_basis'] in NAMED and x['sender_name']),None)
+            named=next((x for basis in NAMED for x in candidates if x['sender_name_basis']==basis and x['sender_name']),None)
             phone=next((x for x in candidates if x['_primary'] and x['sender_name_basis']=='phone_number'),None)
             pick=named or phone
             if pick:found[key]=(pick['sender_name'],pick['sender_name_basis'])
+    # Nothing found: the stored title, so a raw in-chat name that title_sql returned does not leak into message rows.
+    for row in rows:found.setdefault((row['account'],row['id']),(row['title'],None))
     return found
 
 

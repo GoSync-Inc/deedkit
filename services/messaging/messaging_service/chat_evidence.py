@@ -53,7 +53,7 @@ def resolve_chat(c,p,account,provider_chat_id):
     else:
         from .chat_titles import labels
         label=labels(c,p,[(row['account'],row['id'])]).get((row['account'],row['id']))
-        if label:row={**row,'title':label[0],'title_basis':label[1]}
+        if label and label[1]:row={**row,'title':label[0],'title_basis':label[1]}
     targets(p,[row['id']]);return row
 
 

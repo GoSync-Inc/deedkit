@@ -251,6 +251,42 @@ def test_in_chat_name_wins_but_a_raw_in_chat_name_counts_as_absent(wa_titles):
 
 
 # spec: ANYM-425
+def test_lid_chat_with_a_phone_sender_uses_the_sender_as_second_key_but_never_its_number(wa_titles):
+    s,key,say,chat_row=wa_titles
+    named=say(1,'900@lid','555@c.us')
+    say(2,'777@g.us','555@c.us','Synthetic Fay')
+    row=chat_row('900@lid')
+    assert row['title']=='Synthetic Fay' and row['title_basis']=='seen_elsewhere'
+    assert surfaces(s,key,named,row)==({'Synthetic Fay'},{'seen_elsewhere'})
+    unnamed=say(3,'901@lid','556@c.us')
+    plain=chat_row('901@lid')
+    assert plain['title']=='901@lid' and 'title_basis' not in plain
+    assert surfaces(s,key,unnamed,plain)==({'901@lid'},{None})
+
+
+# spec: ANYM-425
+def test_raw_in_chat_name_on_a_lid_chat_keeps_the_stored_title_on_every_surface(wa_titles):
+    s,key,say,chat_row=wa_titles
+    message=say(1,'902@lid','902@lid','902')
+    blank=say(2,'903@lid','903@lid','   ')
+    for chat,mid in (('902@lid',message),('903@lid',blank)):
+        row=chat_row(chat)
+        assert surfaces(s,key,mid,row)==({chat},{None}) and 'title_basis' not in row
+
+
+# spec: ANYM-425
+def test_the_people_and_file_title_helper_carries_the_same_chat_title(wa_titles):
+    s,key,say,chat_row=wa_titles
+    say(1,'123@c.us','123@c.us')
+    say(2,'777@g.us','123@c.us','Synthetic Bob')
+    private=chat_row('123@c.us')
+    from messaging_service.message_queries import chat_titles
+    with s.authorized(key,'search_people') as (c,p):
+        items=chat_titles(c,[{'account':'wa-titles','chat':private['id']}],p=p)
+    assert [i['chat_title'] for i in items]==['Synthetic Bob']
+
+
+# spec: ANYM-425
 def test_a_name_seen_only_on_the_own_outgoing_messages_is_never_a_title(wa_titles):
     s,key,say,chat_row=wa_titles
     say(1,'700@c.us','700@c.us')

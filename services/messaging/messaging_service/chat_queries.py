@@ -396,7 +396,9 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         basis='awaiting_reply_sender_name_basis')
     for row in private:
         if row['id'] in selves:row.update(title=SELF_CHAT_TITLE,title_basis='self_chat')
-        elif (row['account'],row['id']) in titles:row['title'],row['title_basis']=titles[(row['account'],row['id'])]
+        elif (row['account'],row['id']) in titles:
+            row['title'],basis=titles[(row['account'],row['id'])]
+            if basis:row['title_basis']=basis
     targets(p,[r['id'] for r in items])
     if include_coverage:
         from .chat_evidence import chat_statuses
