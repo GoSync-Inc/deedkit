@@ -161,6 +161,15 @@ re-publication makes queued processing eligible again. Unexpected missing bytes
 still use the failure/retry path. Install the current indexer role's read-only
 residency/journal grants before starting this worker.
 
+Since schema 37 the indexer has no direct `events` or `feed_counter` writes. It publishes
+text readiness only through `publish_file_text_event`, a fenced function that accepts the
+text kinds for an active attachment of the current message revision and a snapshot equal to
+the stored message. Apply migration 037 first, then deploy the new code, then reapply
+`indexer_role.sql`; the template revokes the earlier direct grants. Until then the new code
+publishes with the earlier grants directly. The template runs in one transaction that refuses
+below schema 37 before any revoke, and closes the publishers to `PUBLIC` again (a restore
+without ACLs reopens them; `Store.migrate()` repeats that revoke).
+
 Migration 013 adds language vectors, source-display and extraction metadata,
 processor profile/version, and occurrence indexes without another table. It does
 not re-extract historical ready documents automatically. A raw extraction may be

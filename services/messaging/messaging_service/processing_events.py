@@ -90,4 +90,5 @@ def publish(c, row, *, stage, state, identity, basis, truncated=False,
     if previous:
         return previous['id']
     return Store.append_event(c, source['account'], source['message'], kind,
-        source['origin'], event_key, snapshot_metadata={'processing': processing})
+        source['origin'], event_key, snapshot_metadata={'processing': processing},
+        publisher='publish_file_text_event' if stage == 'text' else 'publish_file_enrichment_event')

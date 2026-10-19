@@ -55,7 +55,7 @@ def test_reference_capture_retains_durable_fence_and_schema_inventory(backup_see
     create_snapshot(store,tmp_path/'capture',[sys.executable,'-c','print("synthetic dump")'],
                     reference_blobs=True,backup_fence='synthetic-reference-backup')
     manifest=verify_bundle(tmp_path/'capture',blob_root=store.files)
-    assert manifest['schema_version']==36
+    assert manifest['schema_version']==37
     assert manifest['backup_fence']=='synthetic-reference-backup'
     assert {'attachment_residency','attachment_eviction_journal','attachment_backup_fences',
             'attachment_understanding','file_understanding_profiles'}<=set(manifest['tables'])
@@ -235,7 +235,7 @@ def test_concurrent_schema_upgrade_cannot_create_unfenced_lifecycle_capture(back
             self.calls+=1
             if self.calls==1:
                 with store.pool.connection() as c:
-                    c.execute("UPDATE probe_metadata SET value='36' WHERE name='schema_version'")
+                    c.execute("UPDATE probe_metadata SET value='37' WHERE name='schema_version'")
     with pytest.raises(RuntimeError,match='backup_capture_unfenced'):
         create_snapshot(SimpleNamespace(pool=UpgradePool(),files=store.files),tmp_path/'capture',
                         [sys.executable,'-c','print("synthetic dump")'])
@@ -292,7 +292,7 @@ def test_schema35_absence_names_the_verified_cold_copy(backup_seeded,tmp_path):
     try:
         create_snapshot(store,tmp_path/'capture',[sys.executable,'-c','print("synthetic dump")'])
         manifest=verify_bundle(tmp_path/'capture')
-        assert manifest['schema_version']==36 and manifest['tables']['attachment_cold_copies']['rows']==1
+        assert manifest['schema_version']==37 and manifest['tables']['attachment_cold_copies']['rows']==1
         assert manifest['absent_blobs']==[{**expected,'cold_object_key':key}]
         assert verify_snapshot(store,tmp_path/'capture')['status']=='verified'
         # The restore check still requires the managed-absent original to be absent.

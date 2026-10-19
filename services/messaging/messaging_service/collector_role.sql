@@ -1,5 +1,8 @@
 -- Operator-only grant template. Run in the archive database after migrations.
 -- Set the password separately through a private operator connection; no secret here.
+-- Account isolation (schema 37): install one copy per account under its own role name and
+-- bind it with INSERT INTO collector_account_roles(role_name,account). A bound role writes
+-- only its account's rows; an unbound role keeps these grants for every account.
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='messaging_collector') THEN
         CREATE ROLE messaging_collector LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
@@ -37,3 +40,12 @@ GRANT SELECT ON file_uploads TO messaging_collector;
 
 -- Verified original publication changes residency, never retained CAS identity.
 GRANT EXECUTE ON FUNCTION public.register_resident_original(text,bigint) TO messaging_collector;
+-- Schema 37: a restore without ACLs reopens the owner-powered readiness publishers to
+-- PUBLIC, which would let a bound collector write another account's events; close them.
+DO $$ BEGIN
+    IF to_regprocedure('public.publish_processing_event(text[],text,text,text,text,jsonb)') IS NOT NULL THEN
+        REVOKE ALL ON FUNCTION public.publish_processing_event(text[],text,text,text,text,jsonb),
+            public.publish_file_text_event(text,text,text,text,jsonb),
+            public.publish_file_enrichment_event(text,text,text,text,jsonb) FROM PUBLIC;
+    END IF;
+END $$;

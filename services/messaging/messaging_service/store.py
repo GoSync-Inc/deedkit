@@ -848,8 +848,8 @@ class Store:
             c.execute("SET LOCAL statement_timeout='180s'")
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
-            if version>36: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql')]:
+            if version>37: raise RuntimeError('database_newer_than_runtime')
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
@@ -862,6 +862,15 @@ class Store:
                 else:
                     applied=c.execute('SELECT sha256 FROM archive_migrations WHERE version=%s',(target,)).fetchone()
                     if not applied or applied['sha256']!=sha: raise RuntimeError('migration_checksum_mismatch')
+            # Restores run without ACLs and reopen new functions to PUBLIC (ANYM-254).
+            c.execute('''DO $$ BEGIN
+                IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(
+                    'public.publish_processing_event(text[],text,text,text,text,jsonb)')),'USAGE') THEN
+                 REVOKE ALL ON FUNCTION public.publish_processing_event(text[],text,text,text,text,jsonb),
+                  public.publish_file_text_event(text,text,text,text,jsonb),
+                  public.publish_file_enrichment_event(text,text,text,text,jsonb) FROM PUBLIC;
+                END IF;
+            END $$''')
 
     def issue_key(self, principal, accounts, days=7, *, chats=UNSET, permissions=UNSET,
                   key_permissions=UNSET):
@@ -979,9 +988,7 @@ class Store:
                 ORDER BY occurred_at DESC,id DESC LIMIT %s''',(principal,principal,limit)).fetchall())
 
     @staticmethod
-    def append_event(c, account, message, kind='message.created', origin='fixture', event_key=None,
-                     snapshot_metadata=None):
-        from psycopg.types.json import Jsonb
+    def event_snapshot(c, account, message, snapshot_metadata=None):
         row=c.execute('''SELECT id AS message,account,chat,sender,provider_id,body,revision,sent_at,deleted,direction
             FROM messages WHERE id=%s AND account=%s''',(message,account)).fetchone()
         if not row: raise ValueError('invalid_event_message')
@@ -995,10 +1002,28 @@ class Store:
             row.update(snapshot_metadata)
         from .result_evidence import formatting_evidence
         formatting_evidence(c,[row])
+        return serial(row)
+
+    @staticmethod
+    def append_event(c, account, message, kind='message.created', origin='fixture', event_key=None,
+                     snapshot_metadata=None, publisher=None):
+        from psycopg.types.json import Jsonb
+        row=Store.event_snapshot(c, account, message, snapshot_metadata)
+        if publisher is not None and publisher not in ('publish_file_text_event','publish_file_enrichment_event'):
+            raise ValueError('invalid_event_publisher')
+        if publisher and c.execute(
+                "SELECT coalesce(has_function_privilege(to_regprocedure(%s),'EXECUTE'),false) AS ok",
+                ('public.'+publisher+'(text,text,text,text,jsonb)',)).fetchone()['ok']:
+            # Schema 37 file workers: a fenced function re-checks the snapshot, kind and
+            # stage, derives the origin and alone writes the journal and feed counter.
+            # Until the reapplied template grants it (schema 36, or 37 with the previous
+            # grants) the worker keeps the direct write those grants allow.
+            return c.execute('SELECT public.'+publisher+'(%s,%s,%s,%s,%s) AS id',
+                (account,message,kind,event_key,Jsonb(row))).fetchone()['id']
         value = c.execute('UPDATE feed_counter SET value=value+1 WHERE id=1 RETURNING value').fetchone()['value']
         c.execute('''INSERT INTO events(id,account,message,kind,revision,origin,snapshot,event_key)
             VALUES(%s,%s,%s,%s,%s,%s,%s,%s)''',
-            (value,account,message,kind,row['revision'],origin,Jsonb(serial(row)),event_key))
+            (value,account,message,kind,row['revision'],origin,Jsonb(row),event_key))
         return value
 
     def seed(self):
