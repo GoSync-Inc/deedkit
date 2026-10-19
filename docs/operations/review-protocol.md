@@ -15,7 +15,7 @@ history.
   question 3: the production SHA, the host `production.py` SHA, the schema and the installed
   gateway (read-only `production.py status`, or from the orchestrator).
 - `diff.patch`: `git diff <merge-base>..<head>`; for a recheck, only the fix range. A criterion
-  edit on the PR's `Tiden branch:` goes in as previous and proposed text.
+  edit or settle text on the PR's `Tiden branch:` goes in as previous and proposed text.
 - `specs.md`: the full text of the specs the PR delivers, flags in `Spec impact:` or changes; IDs
   and titles for the other specs it names or touches.
 - `pr.md`: the pull request description.
