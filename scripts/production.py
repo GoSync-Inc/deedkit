@@ -1142,13 +1142,12 @@ def free_lock(directory, stack):
     return True
 
 
-def state_images(directory, keep, *, idle):
+def state_images(directory, keep, revisions, *, label, idle):
     """The images one state still needs: its current release, the images a rollback restored, the current release's
     `*.before.json` (the rollback target), every preparation neither applied nor attempted, the HTTP serving and retained
     generations, and images an operator protected. Unless the state is `idle` (its deploy lock was free), the images
     tagged with the revision of any release directory without a result: a preparation may be pulling them now."""
     current = load(directory / "current.json") if (directory / "current.json").exists() else {}
-    label = "" if directory == keep.state else f" of {directory}"
     for image in current.get("images", {}).values():
         keep(image, ("rolled-back release " if current.get("status") == "rolled-back" else "current release ")
              + current["sha"] + label)
@@ -1178,19 +1177,20 @@ def state_images(directory, keep, *, idle):
     for path in sorted(directory.glob("*.json")):
         if path.name not in ("current.json", "http-current.json", "deploy.json"):
             # Operator plans next to the receipts, such as a storage cleanup's protected images.
-            for image in load(path).get("protected_images", []) if isinstance(load(path), dict) else []:
+            plan = load(path)
+            for image in plan.get("protected_images", []) if isinstance(plan, dict) else []:
                 keep(image, f"protected by {path}")
     if not idle:
         for release in directory.glob("*"):
             if (RELEASE_DIRECTORY.fullmatch(release.name) and release.is_dir() and not (release / "result.json").exists()
                     and not (release / "http-attempted.json").exists()):
-                keep.revisions.setdefault(release.name, f"release {release.name}{label} may be preparing now")
+                revisions.setdefault(release.name, f"release {release.name}{label} may be preparing now")
 
 
-def pinned_images(keep):
+def pinned_images(keep, states):
     """Image IDs named in a top-level JSON file of /etc/deedkit (the configurations and the jobs that pin an image, such
     as file-lifecycle.json) or of an operator directory under the host state root that is not a state."""
-    states = {path.resolve() for path in keep.states}
+    states = {path.resolve() for path in states}
     directories = [CONFIG_DIRECTORY, *(path for path in sorted(HOST_STATE.glob("*")) if path.is_dir()
                                        and path.resolve() not in states and not RELEASE_DIRECTORY.fullmatch(path.name))]
     for directory in directories:
@@ -1214,13 +1214,13 @@ def images_report(settings, *, held=(), stack=None):
     def keep(image, why):
         if isinstance(image, str) and IMAGE_DIGEST.fullmatch(image):
             reasons.setdefault(image, []).append(why)
-    keep.state, keep.revisions = state, {}
-    keep.states = retention_states(state)
+    states, revisions = retention_states(state), {}
     held = {Path(path).resolve() for path in (*held, state)}
     with ExitStack() as probes:
-        for directory in keep.states:
-            state_images(directory, keep, idle=directory.resolve() in held or free_lock(directory, stack or probes))
-    pinned_images(keep)
+        for directory in states:
+            state_images(directory, keep, revisions, label="" if directory == state else f" of {directory}",
+                         idle=directory.resolve() in held or free_lock(directory, stack or probes))
+    pinned_images(keep, states)
     containers = run(["docker", "ps", "--all", "--quiet", "--no-trunc"]).split()
     for value in json.loads(run(["docker", "inspect", *containers])) if containers else []:
         keep(value["Image"], "used by container " + value["Id"][:12])
@@ -1234,10 +1234,10 @@ def images_report(settings, *, held=(), stack=None):
             other.setdefault(image, []).append(name)
     report = {"keep": [], "candidates": []}
     for image, tagged in sorted(tags.items()):
-        targets = {release_name(name) for name in tagged}
+        targets = {release_name(name) for name in tagged} - {None}
         for name in tagged:
-            if name.rpartition(":")[2] in keep.revisions:
-                keep(image, keep.revisions[name.rpartition(":")[2]])
+            if name.rpartition(":")[2] in revisions:
+                keep(image, revisions[name.rpartition(":")[2]])
         if targets - deployed:
             # The backup runner, for one, pins its image in its own configuration.
             keep(image, "target " + ", ".join(sorted(targets - deployed)) + " is not deployed by this configuration")
@@ -1265,8 +1265,8 @@ def remove_images(settings, *, held=()):
     ends. IDs and Docker's reasons are reported short, so a receipt holding this summary never pins an image."""
     with image_lock(), ExitStack() as stack:
         report = images_report(settings, held=held, stack=stack)
-        removed, failed = [], []
-        for item in report["candidates"]:
+        removed, failed, summary = [], [], {}
+        for number, item in enumerate(report["candidates"]):
             image = item["image"]
             entry = {"image": image.removeprefix("sha256:")[:12], "tags": item["tags"]}
             try:
@@ -1284,9 +1284,17 @@ def remove_images(settings, *, held=()):
                 run(["docker", "image", "rm", "--no-prune", image], reason=True)
                 removed.append(entry)
             except (Refused, ValueError) as exc:
-                reason = str(exc) if isinstance(exc, Refused) else "its tags name several targets"
+                # Docker refused this image (a container started from it, say): it stays, the next one is tried.
+                reason = (str(exc).removesuffix("; production was not accepted") if isinstance(exc, Refused)
+                          else "its tags name several targets")
                 failed.append({**entry, "reason": IMAGE_DIGEST.sub(lambda found: found[0][7:19], reason)})
-        return {"removed": removed, "failed": failed, "kept": len(report["keep"])}
+            except Exception as exc:
+                # Anything else stops the pass; what it already removed is still reported. Its release tag stays until
+                # the image goes, so the next pass finds an interrupted image again.
+                summary = {"interrupted": f"{type(exc).__name__} at {entry['image']}",
+                           "remaining": len(report["candidates"]) - number}
+                break
+        return {"removed": removed, "failed": failed, "kept": len(report["keep"]), **summary}
 
 
 def retain_images(settings, *, held=()):
@@ -1600,9 +1608,12 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record):
         return finish(**halt(f"plan A of {candidate} is applied, but its HTTP release stopped: {message}; "
                              "inspect seamless_release.py status --sha " + candidate))
     outcome = finish("deployed", http=served.get("status"))
-    # Recorded as deployed first: removing old release images never changes that outcome.
-    outcome["images"] = retain_images(settings, held=(http_state, s.GLOBAL_LOCK))
-    write(state / "deploy.json", outcome)
+    # Recorded as deployed first: removing old release images never changes that outcome, nor does adding its summary.
+    outcome["image_removal"] = retain_images(settings, held=(http_state, s.GLOBAL_LOCK))
+    try:
+        write(state / "deploy.json", outcome)
+    except Exception:
+        outcome["image_removal"]["receipt"] = "not written; deploy.json keeps the deployed receipt without this summary"
     return outcome
 
 
@@ -1685,7 +1696,7 @@ def main(argv=None):
                               "rollback": rollback}[args.action](settings, args.sha)
                     if args.action == "apply":
                         # Printed only: result.json and current.json stay the release receipts.
-                        result = {**result, "images": retain_images(settings)}
+                        result = {**result, "image_removal": retain_images(settings)}
         # Receipts contain revisions/image IDs, never resolved Compose environments.
         if args.action == "prepare":
             result = {key: result[key] for key in ("sha", "ci", "images", "references")}

@@ -21,6 +21,14 @@ SHA = "a" * 40
 IMAGE = "sha256:" + "b" * 64
 OLD_IMAGE = "sha256:" + "d" * 64
 ROOT = Path(__file__).resolve().parents[1]
+CHECK_SPACE, RETAIN_IMAGES = p.check_space, p.retain_images
+
+
+@pytest.fixture(autouse=True)
+def no_host_state(tmp_path, monkeypatch):
+    """No test reads this machine's production state, /etc/deedkit or containerd directory."""
+    for name in ("HOST_STATE", "CONFIG_DIRECTORY", "CONTAINERD_ROOT"):
+        monkeypatch.setattr(p, name, tmp_path / "absent" / name.lower())
 
 
 def comparison(sha, *, behind=0):
@@ -1422,7 +1430,7 @@ def retention_state(tmp_path, monkeypatch, *, releases, current, prepared=(), co
             return "".join(f"{name} {image}\n" for name, image in tags)
         raise AssertionError(argv)
     monkeypatch.setattr(p, "run", run)
-    return {"version": 1, "state_directory": str(state), "projects": []}, calls
+    return {"version": 1, "state_directory": str(state), "projects": [{"name": "synthetic", "services": {"api": "runtime"}}]}, calls
 
 
 def image_id(seed):
@@ -1443,15 +1451,18 @@ def test_retention_report_keeps_current_rollback_recent_prepared_and_container_i
     report = p.images_report(settings)
     kept = {item["image"]: item["reasons"] for item in report["keep"]}
     assert kept[image_id("6")] == ["current release " + sha[5]]
-    assert kept[image_id("4")] == ["rollback target of the current release", f"one of the two newest other releases ({sha[3]})"]
-    assert kept[image_id("3")] == [f"one of the two newest other releases ({sha[2]})"]
-    assert kept[image_id("5")] == [f"release {sha[4]} without applied_at, order unknown"]
+    assert kept[image_id("4")] == ["rollback target of the current release"]
     assert kept[image_id("7")] == [f"prepared release {sha[6]} is not applied"]
     assert kept[image_id("1")] == ["used by container stopped0"]
-    # Only the eight CI-published targets' production tags are reported; the second release is the one candidate.
-    assert report["candidates"] == [{"image": image_id("2"), "reason": "no current, rollback, recent, prepared or container use",
-                                     "tags": [f"deedkit-production-runtime:{sha[1]}", "deedkit-production-runtime:extra"]}]
-    assert set(kept) | {image_id("2")} == {image_id(str(n)) for n in range(1, 8)}
+    # Only the eight CI-published targets' production tags are reported. Older applied releases, dated or not, are
+    # candidates (ANYM-439: the current release and one previous are kept, no longer the two newest others).
+    reason = "not the current release, its rollback target, prepared, named by a host receipt or used by a container"
+    assert report["candidates"] == [
+        {"image": image_id("2"), "reason": reason,
+         "tags": [f"deedkit-production-runtime:{sha[1]}", "deedkit-production-runtime:extra"]},
+        {"image": image_id("3"), "reason": reason, "tags": [f"deedkit-production-runtime:{sha[2]}"]},
+        {"image": image_id("5"), "reason": reason, "tags": [f"deedkit-production-runtime:{sha[4]}"]}]
+    assert set(kept) | {image_id(n) for n in "235"} == {image_id(str(n)) for n in range(1, 8)}
     # It only reads: no removal, prune or tag change.
     assert all(call[:2] in (["docker", "ps"], ["docker", "inspect"]) or call[:3] == ["docker", "image", "ls"] for call in calls)
     assert "--all" in calls[0]
@@ -1471,7 +1482,283 @@ def test_retention_report_after_a_rollback_keeps_the_restored_images(tmp_path, m
     kept = {item["image"]: item["reasons"] for item in p.images_report(host.settings)["keep"]}
     assert "restored by the rollback of " + RELEASES[2] in kept[host.image(RELEASES[1])]
     assert kept[host.image(RELEASES[2])][0] == "rolled-back release " + RELEASES[2]
-    assert set(kept) == {host.image(sha) for sha in RELEASES}
+    # The first release is neither restored nor the rollback target any more (ANYM-439).
+    assert set(kept) == {host.image(sha) for sha in RELEASES[1:]}
+
+
+class Images:
+    """A synthetic Docker 29 image store (containerd snapshotter) for image retention: images with every stored
+    reference, containers using them, and `docker image rm` that, like Docker without --force, refuses an image a
+    container uses and removes by ID only an image a single reference names. No Docker daemon."""
+
+    def __init__(self, monkeypatch, images, containers=()):
+        self.references = {image: list(names) for image, names in images}
+        self.containers, self.calls, self.hook = dict(containers), [], lambda argv: None
+        monkeypatch.setattr(p, "run", self.run)
+
+    @staticmethod
+    def refused(detail):
+        return p.Refused(f"docker failed (exit 1): Error response from daemon: {detail}; production was not accepted")
+
+    def run(self, argv, **kwargs):
+        self.calls.append(argv)
+        self.hook(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return "".join(container + "\n" for container in self.containers)
+        if argv[:2] == ["docker", "inspect"]:
+            return json.dumps([{"Id": container, "Image": self.containers[container]} for container in argv[2:]])
+        if argv[:3] == ["docker", "image", "ls"]:
+            return "".join(f"{name.partition('@')[0] + ':<none>' if '@' in name else name} {image}\n"
+                           for image, names in self.references.items() for name in names)
+        if argv[:3] == ["docker", "image", "inspect"]:
+            if argv[-1] not in self.references:
+                raise p.Refused("docker failed (exit 1); production was not accepted")
+            return json.dumps([{"Id": argv[-1], "RepoTags": self.references[argv[-1]]}])
+        if argv[:4] == ["docker", "image", "rm", "--no-prune"] and len(argv) == 5:
+            name = argv[4]
+            image = name if name in self.references else next(
+                image for image, names in self.references.items() if name in names)
+            names, short = self.references[image], image[7:19]
+            if name == image and len(names) > 1:
+                raise self.refused(f"conflict: unable to delete {short} (must be forced) - image is referenced in "
+                                   "multiple repositories")
+            users = [container for container, used in self.containers.items() if used == image]
+            if users and (name == image or names == [name]):
+                raise self.refused(f"conflict: unable to delete {short} (cannot be forced) - image is being used by "
+                                   f"running container {users[0][:12]}")
+            if name == image:
+                names.clear()
+            else:
+                names.remove(name)
+            if not names:
+                del self.references[image]
+            return ""
+        raise AssertionError(argv)
+
+    def removals(self):
+        return [call for call in self.calls if call[:3] == ["docker", "image", "rm"]]
+
+
+def released(state, sha, image, before):
+    """One applied release as prepare and apply leave it: receipts, Compose snapshots and current.json."""
+    (state / sha).mkdir(parents=True)
+    p.write(state / sha / "prepared.json", {"sha": sha, "images": {"runtime": image}})
+    p.write(state / sha / "synthetic.json", {"services": {"api": {"image": image}}})
+    p.write(state / sha / "synthetic.before.json", {"services": {"api": {"image": before}, "db": {"image": "postgres"}}})
+    result = {"sha": sha, "images": {"runtime": image}, "status": "applied", "applied_at": "2026-10-20T00:00:00Z"}
+    p.write(state / sha / "result.json", result)
+    p.write(state / "current.json", result)
+
+
+def retention_settings(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700, exist_ok=True)
+    return {"version": 1, "state_directory": str(state), "projects": [{"name": "synthetic", "services": {"api": "runtime"}}]}
+
+
+def runtime(seed):
+    """The image ID and production tag of the synthetic runtime release `seed * 40`."""
+    return image_id(seed), [f"deedkit-production-runtime:{seed * 40}"]
+
+
+def candidates(settings):
+    return [item["image"] for item in p.images_report(settings)["candidates"]]
+
+
+# spec: ANYM-439
+def test_of_four_completed_releases_only_the_current_and_its_rollback_target_are_kept(tmp_path, monkeypatch):
+    settings = retention_settings(tmp_path)
+    state = Path(settings["state_directory"])
+    for seed, before in (("1", OLD_IMAGE), ("2", image_id("1")), ("3", image_id("2")), ("4", image_id("3"))):
+        released(state, seed * 40, image_id(seed), before)
+    store = Images(monkeypatch, [runtime(seed) for seed in "1234"])
+    kept = {item["image"]: item["reasons"] for item in p.images_report(settings)["keep"]}
+    # Historical receipts and snapshots of earlier releases keep nothing.
+    assert kept == {image_id("4"): ["current release " + "4" * 40], image_id("3"): ["rollback target of the current release"]}
+    summary = p.remove_images(settings)
+    assert summary == {"removed": [{"image": "1" * 12, "tags": runtime("1")[1]}, {"image": "2" * 12, "tags": runtime("2")[1]}],
+                       "failed": [], "kept": 2}
+    assert set(store.references) == {image_id("3"), image_id("4")}
+
+
+# spec: ANYM-439
+@pytest.mark.parametrize("where", ["nested", "external"])
+def test_another_states_current_rollback_and_prepared_images_are_kept(tmp_path, monkeypatch, where):
+    settings = retention_settings(tmp_path)
+    released(Path(settings["state_directory"]), "1" * 40, image_id("1"), OLD_IMAGE)
+    p.HOST_STATE.mkdir(parents=True)
+    p.CONFIG_DIRECTORY.mkdir(parents=True)
+    other = p.HOST_STATE / "other-stack" if where == "nested" else tmp_path / "external"
+    if where == "external":
+        p.write(p.CONFIG_DIRECTORY / "other.json", {"version": 1, "state_directory": str(other)})
+    released(other, "a" * 40, image_id("a"), image_id("b"))
+    (other / ("c" * 40)).mkdir()
+    p.write(other / ("c" * 40) / "prepared.json", {"sha": "c" * 40, "images": {"runtime": image_id("c")}})
+    store = Images(monkeypatch, [runtime(seed) for seed in "1abc9"])
+    kept = {item["image"]: item["reasons"] for item in p.images_report(settings)["keep"]}
+    assert kept[image_id("a")] == [f"current release {'a' * 40} of {other}"]
+    assert kept[image_id("b")] == [f"rollback target of the current release of {other}"]
+    assert kept[image_id("c")] == [f"prepared release {'c' * 40} of {other} is not applied"]
+    assert p.remove_images(settings)["removed"] == [{"image": "9" * 12, "tags": runtime("9")[1]}]
+    assert set(store.references) == {image_id(seed) for seed in "1abc"}
+
+
+# spec: ANYM-439
+def test_a_busy_state_keeps_the_revisions_it_may_be_preparing_and_removal_holds_the_free_ones(tmp_path, monkeypatch):
+    import fcntl
+    settings = retention_settings(tmp_path)
+    released(Path(settings["state_directory"]), "1" * 40, image_id("1"), OLD_IMAGE)
+    other = p.HOST_STATE / "other-stack"
+    released(other, "a" * 40, image_id("a"), OLD_IMAGE)
+    # A preparation creates its release directory, then pulls; its prepared.json comes only at the end.
+    (other / ("e" * 40)).mkdir()
+    store = Images(monkeypatch, [runtime(seed) for seed in "1ae"])
+    with (other / "deploy.lock").open("a") as preparation:
+        fcntl.flock(preparation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        kept = {item["image"]: item["reasons"] for item in p.images_report(settings)["keep"]}
+        assert kept[image_id("e")] == [f"release {'e' * 40} of {other} may be preparing now"]
+        assert p.remove_images(settings)["removed"] == [] and image_id("e") in store.references
+    # Idle, the other state's lock is held for the whole removal, so no preparation can start there meanwhile.
+    held = []
+    def probe(argv):
+        if argv[:3] == ["docker", "image", "rm"]:
+            with (other / "deploy.lock").open("a") as preparation:
+                try:
+                    fcntl.flock(preparation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held.append(False)
+                except BlockingIOError:
+                    held.append(True)
+    store.hook = probe
+    assert p.remove_images(settings)["removed"] == [{"image": "e" * 12, "tags": runtime("e")[1]}]
+    assert held == [True]
+
+
+# spec: ANYM-439
+def test_http_state_keeps_the_serving_and_one_previous_generation_and_unattempted_preparations(tmp_path, monkeypatch):
+    settings = retention_settings(tmp_path)
+    released(Path(settings["state_directory"]), "1" * 40, image_id("1"), OLD_IMAGE)
+    http = tmp_path / "dk-http"
+    p.CONFIG_DIRECTORY.mkdir(parents=True)
+    p.write(p.CONFIG_DIRECTORY / "http-production.json", {"version": 1, "state_directory": str(http)})
+    http.mkdir()
+    p.write(http / "http-current.json", {"sha": "a" * 40, "status": "serving", "images": {"runtime": image_id("a")},
+                                         "previous": {"sha": "b" * 40, "images": {"runtime": image_id("b")},
+                                                      "previous": {"sha": "c" * 40, "images": {"runtime": image_id("c")}}}})
+    for seed, attempted in (("d", False), ("e", True)):
+        (http / (seed * 40)).mkdir()
+        p.write(http / (seed * 40) / "prepared.json", {"images": {"runtime": image_id(seed)}})
+        p.write(http / (seed * 40) / "http-prepared.json", {"images": {"runtime": image_id(seed)}})
+        if attempted:
+            p.write(http / (seed * 40) / "http-attempted.json", {"status": "serving"})
+    Images(monkeypatch, [runtime(seed) for seed in "1abcde"])
+    kept = {item["image"] for item in p.images_report(settings)["keep"]}
+    # The retired generation nested two levels deep and an attempted HTTP release no longer keep their images.
+    assert kept == {image_id(seed) for seed in "1abd"} and candidates(settings) == [image_id("c"), image_id("e")]
+
+
+# spec: ANYM-439
+def test_foreign_references_untracked_targets_and_pinned_or_protected_images_are_kept(tmp_path, monkeypatch):
+    settings = retention_settings(tmp_path)
+    state = Path(settings["state_directory"])
+    released(state, "1" * 40, image_id("1"), OLD_IMAGE)
+    p.CONFIG_DIRECTORY.mkdir(parents=True)
+    p.write(p.CONFIG_DIRECTORY / "file-lifecycle.json", {"job": {"image": image_id("2")}})
+    p.write(state / "storage-cleanup.json", {"protected_images": [image_id("3")]})
+    (p.HOST_STATE / "operator-notes").mkdir(parents=True)
+    p.write(p.HOST_STATE / "operator-notes" / "plan.json", {"keep": [image_id("4")]})
+    Images(monkeypatch, [runtime("1"), runtime("2"), runtime("3"), runtime("4"), runtime("9"),
+                         (image_id("5"), [*runtime("5")[1], "deedkit-rollback-retained:manual"]),
+                         (image_id("6"), ["deedkit-production-backup:" + "6" * 40])])
+    kept = {item["image"]: item["reasons"] for item in p.images_report(settings)["keep"]}
+    assert kept[image_id("2")] == [f"named in {p.CONFIG_DIRECTORY / 'file-lifecycle.json'}"]
+    assert kept[image_id("3")] == [f"protected by {state / 'storage-cleanup.json'}"]
+    assert kept[image_id("4")] == [f"named in {p.HOST_STATE / 'operator-notes' / 'plan.json'}"]
+    assert kept[image_id("5")] == ["also named deedkit-rollback-retained:manual"]
+    # The backup runner pins its image by ID in its own configuration, outside these directories.
+    assert kept[image_id("6")] == ["target backup is not deployed by this configuration"]
+    assert candidates(settings) == [image_id("9")]
+
+
+# spec: ANYM-439
+def test_removal_takes_the_other_references_first_keeps_a_release_tag_to_the_end_and_never_forces(tmp_path, monkeypatch):
+    settings = retention_settings(tmp_path)
+    released(Path(settings["state_directory"]), "1" * 40, image_id("1"), OLD_IMAGE)
+    image, (tag,) = runtime("9")
+    registry = p.REGISTRY + "runtime@sha256:" + "f" * 64
+    store = Images(monkeypatch, [runtime("1"), (image, [tag, registry, "deedkit-production-runtime:extra"])])
+    summary = p.remove_images(settings)
+    assert summary["removed"] == [{"image": "9" * 12, "tags": [tag, "deedkit-production-runtime:extra"]}]
+    # The sorted first release tag stays until the image itself goes by ID, after its other references.
+    assert store.removals() == [["docker", "image", "rm", "--no-prune", registry],
+                                ["docker", "image", "rm", "--no-prune", "deedkit-production-runtime:extra"],
+                                ["docker", "image", "rm", "--no-prune", image]]
+    assert image not in store.references
+    assert not any({"-f", "--force", "prune"} & set(call) or "system" in call for call in store.calls)
+
+
+# spec: ANYM-439
+def test_a_refused_image_stays_listed_with_dockers_reason_and_removal_goes_on(tmp_path, monkeypatch):
+    settings = retention_settings(tmp_path)
+    released(Path(settings["state_directory"]), "1" * 40, image_id("1"), OLD_IMAGE)
+    store = Images(monkeypatch, [runtime("1"), runtime("7"), runtime("8")])
+    def start(argv):
+        # A container starts from the first candidate after the report chose it.
+        if argv[-1] == image_id("7"):
+            store.containers["late-container"] = image_id("7")
+    store.hook = start
+    summary = p.remove_images(settings)
+    assert summary["removed"] == [{"image": "8" * 12, "tags": runtime("8")[1]}]
+    assert summary["failed"] == [{"image": "7" * 12, "tags": runtime("7")[1], "reason":
+                                  "docker failed (exit 1): Error response from daemon: conflict: unable to delete "
+                                  "777777777777 (cannot be forced) - image is being used by running container late-contain"}]
+    assert store.references[image_id("7")] == runtime("7")[1]
+
+
+# spec: ANYM-439
+def test_an_interrupted_removal_reports_its_progress_and_the_next_pass_finds_the_image_again(tmp_path, monkeypatch):
+    settings = retention_settings(tmp_path)
+    released(Path(settings["state_directory"]), "1" * 40, image_id("1"), OLD_IMAGE)
+    image, (tag,) = runtime("9")
+    registry = p.REGISTRY + "runtime@sha256:" + "f" * 64
+    store = Images(monkeypatch, [runtime("1"), runtime("8"), (image, [tag, registry])])
+    def timeout(argv):
+        if argv == ["docker", "image", "rm", "--no-prune", image]:
+            raise subprocess.TimeoutExpired(argv, 1800)
+    store.hook = timeout
+    summary = p.remove_images(settings)
+    assert summary == {"removed": [{"image": "8" * 12, "tags": runtime("8")[1]}], "failed": [], "kept": 1,
+                       "interrupted": "TimeoutExpired at " + "9" * 12, "remaining": 1}
+    # Its registry reference went, its release tag stayed: the next pass still sees it.
+    assert store.references[image] == [tag] and candidates(settings) == [image]
+    store.hook = lambda argv: None
+    assert p.remove_images(settings)["removed"] == [{"image": "9" * 12, "tags": [tag]}] and image not in store.references
+
+
+# spec: ANYM-439
+@pytest.mark.parametrize("failure", ["config", "receipt", "image lock", "docker"])
+def test_an_unreadable_protecting_source_or_a_failure_before_removal_removes_nothing(tmp_path, monkeypatch, failure):
+    import fcntl
+    settings = retention_settings(tmp_path)
+    state = Path(settings["state_directory"])
+    released(state, "1" * 40, image_id("1"), OLD_IMAGE)
+    store = Images(monkeypatch, [runtime("1"), runtime("9")])
+    monkeypatch.setattr(p, "IMAGE_LOCK", tmp_path / "image-build.lock")
+    with contextlib.ExitStack() as stack:
+        if failure == "config":
+            p.CONFIG_DIRECTORY.mkdir(parents=True)
+            (p.CONFIG_DIRECTORY / "broken.json").write_text("{")
+            expected = f"cannot read {p.CONFIG_DIRECTORY / 'broken.json'}; no image is removed"
+        elif failure == "receipt":
+            (state / ("1" * 40) / "synthetic.before.json").write_text("[")
+            expected = f"cannot read {state / ('1' * 40) / 'synthetic.before.json'}; no image is removed"
+        elif failure == "image lock":
+            fcntl.flock(stack.enter_context(p.IMAGE_LOCK.open("a")), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            expected = "another image build holds the production image lock"
+        else:
+            store.hook = lambda argv: (_ for _ in ()).throw(RuntimeError()) if argv[:2] == ["docker", "ps"] else None
+            expected = "RuntimeError"
+        assert p.retain_images(settings) == {"skipped": expected}
+    assert store.removals() == [] and image_id("9") in store.references
 
 
 @pytest.mark.parametrize("case", ["modified", "missing"])
@@ -1893,6 +2180,11 @@ class Deployer:
         for module, name in ((p, "prepare"), (p, "apply"), (p, "rollback"), (s, "prepare"), (s, "promote"),
                              (s, "retire")):
             monkeypatch.setattr(module, name, self.step(module is s, name))
+        self.retained = []
+        def retain(settings, *, held=()):
+            self.retained.append(held)
+            return {"removed": [], "failed": [], "kept": 2}
+        monkeypatch.setattr(p, "retain_images", retain)
 
     def current(self, sha):
         p.write(self.state / "current.json", {"sha": sha, "status": "applied", "ci": {"url": "https://example.invalid"},
@@ -2718,3 +3010,106 @@ def test_promotion_git_ignores_the_configuration_of_the_repository_it_runs_in(tm
     with pytest.raises(p.Refused, match="not a commit on main"):
         p.promotable(side)
     assert p.promotable(history[-1])["main"] == history[-1]
+
+
+# spec: ANYM-439
+def test_deploy_removes_old_release_images_once_and_only_after_it_ends_deployed(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    assert host.deploy(dry_run=True)["status"] == "plan" and host.retained == []
+    outcome = host.deploy()
+    # Under the deploy's own locks, after the deployed receipt; plan B's and the host state's locks are held already.
+    assert outcome["status"] == "deployed" and host.retained == [(host.http_state, host.s.GLOBAL_LOCK)]
+    assert outcome["image_removal"] == {"removed": [], "failed": [], "kept": 2}
+    assert p.read(host.state / "deploy.json") == outcome
+    assert host.deploy()["status"] == "current" and len(host.retained) == 1
+
+
+# spec: ANYM-439
+def test_a_deploy_halted_after_plan_a_removes_no_images(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.fail_seamless_promote = lambda sha: (_ for _ in ()).throw(p.Refused("candidate HTTP readiness did not pass"))
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.retained == [] and "image_removal" not in outcome
+
+
+# spec: ANYM-439
+@pytest.mark.parametrize("failure", ["removal", "summary write"])
+def test_a_failed_image_removal_or_summary_leaves_the_deploy_deployed_without_a_pause(tmp_path, monkeypatch, failure):
+    host = Deployer(tmp_path, monkeypatch)
+    if failure == "removal":
+        monkeypatch.setattr(p, "retain_images", RETAIN_IMAGES)
+        monkeypatch.setattr(p, "remove_images", lambda settings, held=(): (_ for _ in ()).throw(RuntimeError()))
+    else:
+        write = p.write
+        def full(path, value):
+            if path.name == "deploy.json" and "image_removal" in value:
+                raise OSError("No space left on device")
+            write(path, value)
+        monkeypatch.setattr(p, "write", full)
+    outcome = host.deploy()
+    receipt = p.read(host.state / "deploy.json")
+    assert outcome["status"] == receipt["status"] == "deployed" and host.paused() is None
+    if failure == "removal":
+        assert outcome["image_removal"] == {"skipped": "RuntimeError"} and receipt == outcome
+    else:
+        assert outcome["image_removal"]["receipt"].startswith("not written") and "image_removal" not in receipt
+
+
+# spec: ANYM-439
+def test_the_command_line_apply_and_images_remove_remove_old_images_under_the_deploy_lock(tmp_path, monkeypatch, capsys):
+    import fcntl
+    host = Host(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "config", lambda path: host.settings)
+    passes = []
+    def remove(settings, *, held=()):
+        with (host.state / "deploy.lock").open("a") as probe, pytest.raises(BlockingIOError):
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        passes.append(settings["state_directory"])
+        return {"removed": [], "failed": [], "kept": 1}
+    monkeypatch.setattr(p, "remove_images", remove)
+    host.main = RELEASES[0]
+    p.main(["prepare", "--sha", RELEASES[0]])
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        p.main(["apply", "--sha", RELEASES[1]])  # refused: not prepared
+    assert passes == []
+    p.main(["apply", "--sha", RELEASES[0]])
+    printed = json.loads(capsys.readouterr().out)
+    # Printed next to the result; the receipts stay as apply wrote them.
+    assert printed["status"] == "applied" and printed["images"] == {"runtime": host.image(RELEASES[0])}
+    assert printed["image_removal"] == {"removed": [], "failed": [], "kept": 1} and passes == [str(host.state)]
+    assert "image_removal" not in p.read(host.state / "current.json")
+    p.main(["images"])
+    assert set(json.loads(capsys.readouterr().out)) == {"keep", "candidates"} and len(passes) == 1
+    p.main(["images", "--remove"])
+    assert json.loads(capsys.readouterr().out) == {"removed": [], "failed": [], "kept": 1} and len(passes) == 2
+
+
+# spec: ANYM-439
+def test_the_disk_floor_also_applies_to_the_containerd_image_store(tmp_path, monkeypatch):
+    checked = []
+    free = {}
+    monkeypatch.setattr(p.shutil, "disk_usage", lambda path: checked.append(Path(path)) or SimpleNamespace(
+        free=free.get(Path(path), p.MIN_FREE_BYTES)))
+    docker_root = tmp_path / "docker"
+    p.check_image_space(docker_root)  # no containerd directory: only Docker's root
+    assert checked == [docker_root]
+    p.CONTAINERD_ROOT.mkdir(parents=True)
+    p.check_image_space(docker_root)  # exactly at the floor is enough
+    assert checked[1:] == [docker_root, p.CONTAINERD_ROOT]
+    free[p.CONTAINERD_ROOT] = p.MIN_FREE_BYTES - 1
+    with pytest.raises(p.Refused, match=re.escape(f"15 GiB free is required on {p.CONTAINERD_ROOT}") + ".*images --remove"):
+        p.check_image_space(docker_root)
+
+
+# spec: ANYM-439
+@pytest.mark.parametrize("preparation", ["prepare", "prepare_router"])
+def test_a_full_containerd_image_store_stops_both_preparations_before_any_fetch(tmp_path, monkeypatch, preparation):
+    settings, calls, _ = fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "check_space", CHECK_SPACE)
+    p.CONTAINERD_ROOT.mkdir(parents=True)
+    monkeypatch.setattr(p.shutil, "disk_usage", lambda path: SimpleNamespace(
+        free=p.MIN_FREE_BYTES - (Path(path) == p.CONTAINERD_ROOT)))
+    with pytest.raises(p.Refused, match="containerd"):
+        getattr(p, preparation)(settings, SHA)
+    assert calls == [] and list(Path(settings["state_directory"]).iterdir()) == []
