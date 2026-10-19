@@ -62,10 +62,14 @@ def safe_event(error, component, code):
     kind = type(error).__name__
     if kind not in EXCEPTION_TYPES:
         kind = 'UnexpectedError'
-    return {'platform': 'python', 'level': 'error', 'release': release(),
-            'tags': {'component': component, 'error_code': code},
-            'exception': {'values': [{'type': kind, 'value': code,
-                                     'stacktrace': {'frames': frames[-16:]}}]}}
+    event = {'platform': 'python', 'level': 'error', 'release': release(),
+             'tags': {'component': component, 'error_code': code},
+             'exception': {'values': [{'type': kind, 'value': code,
+                                      'stacktrace': {'frames': frames[-16:]}}]}}
+    # Tiden groups by exception type and frames; a collector stop code needs its own issue (ANYM-410).
+    if component in STOP_CODES:
+        event['fingerprint'] = ['collector-stop', component, code]
+    return event
 
 
 def before_send(event):
