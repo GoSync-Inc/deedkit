@@ -313,3 +313,23 @@ def test_excluded_collection_is_not_advertised_as_available_on_request(archive,c
     assert 'доступен по запросу' not in present_message({**row,'body':''},0)['display_text']
     # A present authorized original stays readable.
     assert s.get_attachment(key,job['id'])['download_url']
+
+
+# spec: ANYM-284
+@pytest.mark.parametrize('change',['excluded','disabled'])
+@pytest.mark.parametrize('requeued',[False,True])
+def test_excluded_collection_blocks_managed_evicted_redownload_advice(archive,change,requeued):
+    from test_file_lifecycle import processed, lifecycle
+    ar,s,key,_=archive;fid,_=processed(archive)
+    assert lifecycle().LifecycleWorker(s).run_once(apply=True)['evicted']==1
+    publish(ar)
+    if requeued:assert s.request_file_download(key,fid)['request_status']=='queued'
+    with s.pool.connection() as c:
+        if change=='excluded':c.execute("UPDATE account_policies SET exclude_chats=ARRAY['100'] WHERE account=%s",(ACCOUNT,))
+        else:c.execute('UPDATE account_policies SET enabled=false WHERE account=%s',(ACCOUNT,))
+    attachment=s.get_attachment(key,fid)
+    assert attachment['download_eligibility']=='collection_excluded'
+    assert attachment['download_reason']=='collection_excluded'
+    assert attachment['next_action']=='check_collection_policy'
+    result=s.request_file_download(key,fid)
+    assert result['request_status']=='blocked' and result['next_action']=='check_collection_policy'

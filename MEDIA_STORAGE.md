@@ -321,7 +321,9 @@ yields `outside_history_bounds`.
 
 Attachments follow the same rule, but only with a confirmed chat bound. A queued
 original of an excluded chat or a disabled account has `download_phase: blocked`,
-reason `collection_excluded` and next action `check_collection_policy`. A queued
+reason `collection_excluded` and next action `check_collection_policy`; a
+managed-evicted original there has the same reason and action instead of
+`request_file_download`. A queued
 original outside the window has
 `download_phase: available_on_request`, reason `outside_prefetch_window` and next
 action `request_file_download` (conversation text: "файл доступен по запросу"),
