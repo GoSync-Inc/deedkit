@@ -355,6 +355,31 @@ def test_stop_requested_before_the_child_starts_spawns_nothing(tmp_path,monkeypa
         module.process(tmp_path,{'source_digest':sha,'bytes':len(data),'kind':'image','mime':'image/png'},profile(tmp_path))
 
 
+# spec: ANYM-310
+def test_shutdown_unpublish_is_one_statement_whatever_the_account_count(seeded,tmp_path,monkeypatch):
+    s,_,_=seeded
+    w=local_worker(s,tmp_path);w.config['accounts']=['telegram-demo','whatsapp-demo-1']
+    w.publish_profiles()
+    statements=[]
+    real=w.connection
+    class Recording:
+        def __init__(self,c):self.c=c
+        def __enter__(self):self.c.__enter__();return self
+        def __exit__(self,*exc):return self.c.__exit__(*exc)
+        def execute(self,*a,**k):statements.append(a[0]);return self.c.execute(*a,**k)
+        def cursor(self,*a,**k):
+            cursor=self.c.cursor(*a,**k);original=cursor.executemany
+            def many(query,params,**kw):
+                statements.extend([query]*len(list(params)));return original(query,params,**kw)
+            cursor.executemany=many;return cursor
+    monkeypatch.setattr(w,'connection',lambda:Recording(real()))
+    w.unpublish_profiles()
+    assert len(statements)==1
+    with s.pool.connection() as c:
+        rows=c.execute("SELECT enabled FROM processing_profiles WHERE kind='audio'").fetchall()
+        assert len(rows)==2 and not any(r['enabled'] for r in rows)
+
+
 def stopping_worker(s,tmp_path,module):
     def stopping(files,row,profile):raise module.WorkerStopping()
     w=local_worker(s,tmp_path,stopping)

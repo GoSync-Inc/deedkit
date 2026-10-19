@@ -170,6 +170,11 @@ class EnrichmentWorker:
                     [(account,kind,profile['provider'],model,enabled,profile['timeout_seconds']+120,
                       account,kind,profile_hash(profile))
                      for account in self.config['accounts']])
+    def unpublish_profiles(self):
+        # Shutdown path: one statement, so the time does not grow with accounts x profiles.
+        with self.connection() as c:
+            c.execute('''UPDATE processing_profiles SET enabled=false,observed_at=clock_timestamp()
+                WHERE account=ANY(%s) AND kind=ANY(%s)''',(self.config['accounts'],list(self.config['profiles'])))
     def _expire_leases(self):
         # Account/row locks must all precede the publication counter. End this
         # bounded transaction before a claim examines any other account's rows.
@@ -364,7 +369,7 @@ class EnrichmentWorker:
                 if not self.once():STOP.wait(10)
         finally:
             # Also when the stop path itself fails: never keep advertising a worker that is going away.
-            self.publish_profiles(enabled=False)
+            self.unpublish_profiles()
 
 
 def main():
