@@ -40,3 +40,12 @@ GRANT SELECT ON file_uploads TO messaging_collector;
 
 -- Verified original publication changes residency, never retained CAS identity.
 GRANT EXECUTE ON FUNCTION public.register_resident_original(text,bigint) TO messaging_collector;
+-- Schema 37: a restore without ACLs reopens the owner-powered readiness publishers to
+-- PUBLIC, which would let a bound collector write another account's events; close them.
+DO $$ BEGIN
+    IF to_regprocedure('public.publish_processing_event(text[],text,text,text,text,jsonb)') IS NOT NULL THEN
+        REVOKE ALL ON FUNCTION public.publish_processing_event(text[],text,text,text,text,jsonb),
+            public.publish_file_text_event(text,text,text,text,jsonb),
+            public.publish_file_enrichment_event(text,text,text,text,jsonb) FROM PUBLIC;
+    END IF;
+END $$;

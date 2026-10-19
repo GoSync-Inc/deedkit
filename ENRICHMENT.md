@@ -157,7 +157,8 @@ Give the worker its own database login with membership in `messaging_enricher`
 the enricher has no direct `events` or `feed_counter` writes: it publishes readiness only
 through `publish_file_enrichment_event`, which accepts transcript/description kinds for an
 active attachment of the current message revision. Reapply the template after the schema-37
-code runs; it revokes the earlier direct grants. Mount only
+code runs; it revokes the earlier direct grants (until then the new code writes directly with
+them), in one transaction that refuses below schema 37 before any revoke. Mount only
 the original blob directory read-only, a private profile file and the required
 model/key files. Do not mount messenger sessions, operator credentials or Docker
 socket. Set memory, CPU and process limits on its container. Install ffmpeg for

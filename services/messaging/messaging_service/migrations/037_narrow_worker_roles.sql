@@ -17,13 +17,17 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS $$
  SELECT b.account FROM public.collector_account_roles b WHERE b.role_name=$1
 $$;
 
--- Runs as the writing role, so current_user is the connected collector, never the
--- definer. Rows of a bound role must belong to its account before and after a write.
+-- Runs as the writing role. Both the current role and the authenticated login are
+-- checked, so SET ROLE to an unbound role a login is a member of, or an owner function
+-- called from a bound session, cannot write another account. Rows of a bound identity
+-- must belong to its account before and after a write.
 CREATE FUNCTION public.collector_account_guard() RETURNS trigger
 LANGUAGE plpgsql SET search_path=pg_catalog AS $$
-DECLARE bound text := public.collector_bound_account(current_user::text); side record; pass integer;
+DECLARE bounds text[] := array_remove(ARRAY[public.collector_bound_account(current_user::text),
+  public.collector_bound_account(session_user::text)],NULL);
+ bound text; side record; pass integer;
 BEGIN
- IF bound IS NOT NULL THEN
+ FOREACH bound IN ARRAY bounds LOOP
   FOR pass IN 1..2 LOOP
    IF pass=1 THEN
     CONTINUE WHEN TG_OP='INSERT'; side := OLD;
@@ -46,7 +50,7 @@ BEGIN
     END IF;
    END IF;
   END LOOP;
- END IF;
+ END LOOP;
  IF TG_OP='DELETE' THEN RETURN OLD; END IF;
  RETURN NEW;
 END $$;
@@ -73,19 +77,25 @@ END $$;
 
 -- Fenced readiness publication for file workers. Accepts only file processing kinds of
 -- the caller's stages, for an active attachment of the current message revision, with
--- a snapshot that equals the stored message. The journal and counter stay owner-only.
+-- a snapshot that equals the stored message and processing values of the exact shape
+-- processing_events.publish produces. The journal and counter stay owner-only.
 CREATE FUNCTION public.publish_processing_event(stages text[],event_account text,event_message text,
  event_kind text,processing_key text,event_snapshot jsonb) RETURNS bigint
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
 DECLARE m record; formatting jsonb; source_origin text; p jsonb := event_snapshot->'processing';
- existing bigint; position bigint;
+ existing bigint; position bigint; required text[] := ARRAY['artifact_version','attachment_id','basis',
+  'source_revision','stage','state','text_chars','truncated'];
 BEGIN
- IF processing_key IS NULL OR processing_key !~ '^processing_[0-9a-f]{64}$' THEN
+ IF processing_key IS NULL OR processing_key !~ '^processing_[0-9a-f]{64}$' OR event_account IS NULL THEN
   RAISE EXCEPTION 'processing_event_refused' USING ERRCODE='insufficient_privilege';
  END IF;
+ -- The ingestion lock of the account, as processing_events.publish requires of its caller
+ -- (re-entrant there): an edit, deletion or a same-key call waits until this commits.
+ PERFORM pg_advisory_xact_lock(hashtextextended('archive:'||event_account,0));
  SELECT id INTO existing FROM public.events WHERE event_key=processing_key;
  IF FOUND THEN RETURN existing; END IF;
- SELECT * INTO m FROM public.messages WHERE id=event_message AND account=event_account AND NOT deleted;
+ SELECT * INTO m FROM public.messages WHERE id=event_message AND account=event_account AND NOT deleted
+  FOR SHARE;
  -- Any unknown (NULL) comparison refuses, like a mismatch.
  IF NOT FOUND OR coalesce(jsonb_typeof(event_snapshot)<>'object' OR jsonb_typeof(p)<>'object'
   OR NOT (p->>'stage')=ANY(stages)
@@ -93,10 +103,22 @@ BEGIN
   OR event_kind IS DISTINCT FROM CASE WHEN p->>'state'='failed' THEN 'file.processing.failed'
    ELSE CASE p->>'stage' WHEN 'text' THEN 'file.text.ready' WHEN 'transcript' THEN 'file.transcript.ready'
     WHEN 'description' THEN 'file.description.ready' END END
+  -- Values, not only names: no free text can ride along in an allowed field.
+  OR NOT p ?& required
+  OR EXISTS(SELECT FROM jsonb_object_keys(p) k WHERE NOT k=ANY(required)
+   AND k NOT IN ('extractor','provider','model','error_code','retryable'))
+  OR jsonb_typeof(p->'attachment_id')<>'string'
+  OR p->>'artifact_version' !~ '^artifact_[0-9a-f]{64}$' OR jsonb_typeof(p->'artifact_version')<>'string'
+  OR p->>'basis' IS DISTINCT FROM CASE WHEN p->>'stage'='text' THEN 'extracted' ELSE 'model_generated' END
+  OR jsonb_typeof(p->'truncated')<>'boolean'
+  OR jsonb_typeof(p->'text_chars')<>'number'
+  OR CASE WHEN p->>'text_chars' ~ '^[0-9]{1,7}$' THEN (p->>'text_chars')::integer>1000000 ELSE true END
+  OR EXISTS(SELECT FROM unnest(ARRAY['extractor','provider','model']) f WHERE p ? f
+   AND (jsonb_typeof(p->f)<>'string' OR p->>f !~ '^[A-Za-z0-9_.:-]{1,128}$'))
+  OR (p->>'state'='failed' AND (jsonb_typeof(p->'error_code')<>'string' OR p->>'error_code' !~ '^[a-z_]{1,64}$'
+   OR jsonb_typeof(p->'retryable')<>'boolean'))
+  OR (p->>'state'='ready' AND (p ? 'error_code' OR p ? 'retryable'))
   OR p->'source_revision' IS DISTINCT FROM to_jsonb(m.revision)
-  OR EXISTS(SELECT FROM jsonb_object_keys(p) k WHERE k NOT IN ('attachment_id','stage','state',
-   'artifact_version','basis','source_revision','truncated','text_chars','extractor','provider','model',
-   'error_code','retryable'))
   OR NOT EXISTS(SELECT FROM public.attachments a WHERE a.id=p->>'attachment_id' AND a.message=m.id AND a.active)
   OR (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(event_snapshot) k)
    IS DISTINCT FROM ARRAY['account','body','chat','deleted','direction','formatting','message','processing',
@@ -110,6 +132,8 @@ BEGIN
   OR jsonb_typeof(event_snapshot->'sent_at')<>'string',true) THEN
   RAISE EXCEPTION 'processing_event_refused' USING ERRCODE='insufficient_privilege';
  END IF;
+ -- The attachment stays active until this transaction ends.
+ PERFORM FROM public.attachments a WHERE a.id=p->>'attachment_id' FOR SHARE;
  BEGIN
   IF (event_snapshot->>'sent_at')::timestamptz IS DISTINCT FROM m.sent_at THEN
    RAISE EXCEPTION 'processing_event_refused' USING ERRCODE='insufficient_privilege';
@@ -132,7 +156,6 @@ BEGIN
  VALUES(position,m.account,m.id,event_kind,m.revision,coalesce(source_origin,'reconcile'),event_snapshot,processing_key);
  RETURN position;
 END $$;
-REVOKE ALL ON FUNCTION public.publish_processing_event(text[],text,text,text,text,jsonb) FROM PUBLIC;
 
 -- One entry point per worker role; each fixes the stages that worker produces.
 CREATE FUNCTION public.publish_file_text_event(event_account text,event_message text,event_kind text,
@@ -145,6 +168,10 @@ CREATE FUNCTION public.publish_file_enrichment_event(event_account text,event_me
 LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog AS $$
  SELECT public.publish_processing_event(ARRAY['transcript','description'],$1,$2,$3,$4,$5)
 $$;
-REVOKE ALL ON FUNCTION public.publish_file_text_event(text,text,text,text,jsonb),
+-- New functions are executable by PUBLIC by default; a restore without ACLs reopens them,
+-- so Store.migrate() and every worker role template repeat these revokes. The guard's
+-- lookup collector_bound_account stays PUBLIC: every writing role runs the trigger.
+REVOKE ALL ON FUNCTION public.publish_processing_event(text[],text,text,text,text,jsonb),
+ public.publish_file_text_event(text,text,text,text,jsonb),
  public.publish_file_enrichment_event(text,text,text,text,jsonb) FROM PUBLIC;
 SET LOCAL lock_timeout=DEFAULT;

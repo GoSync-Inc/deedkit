@@ -862,6 +862,15 @@ class Store:
                 else:
                     applied=c.execute('SELECT sha256 FROM archive_migrations WHERE version=%s',(target,)).fetchone()
                     if not applied or applied['sha256']!=sha: raise RuntimeError('migration_checksum_mismatch')
+            # Restores run without ACLs and reopen new functions to PUBLIC (ANYM-254).
+            c.execute('''DO $$ BEGIN
+                IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(
+                    'public.publish_processing_event(text[],text,text,text,text,jsonb)')),'USAGE') THEN
+                 REVOKE ALL ON FUNCTION public.publish_processing_event(text[],text,text,text,text,jsonb),
+                  public.publish_file_text_event(text,text,text,text,jsonb),
+                  public.publish_file_enrichment_event(text,text,text,text,jsonb) FROM PUBLIC;
+                END IF;
+            END $$''')
 
     def issue_key(self, principal, accounts, days=7, *, chats=UNSET, permissions=UNSET,
                   key_permissions=UNSET):
@@ -1002,11 +1011,13 @@ class Store:
         row=Store.event_snapshot(c, account, message, snapshot_metadata)
         if publisher is not None and publisher not in ('publish_file_text_event','publish_file_enrichment_event'):
             raise ValueError('invalid_event_publisher')
-        if publisher and c.execute('SELECT to_regprocedure(%s) IS NOT NULL AS ok',
+        if publisher and c.execute(
+                "SELECT coalesce(has_function_privilege(to_regprocedure(%s),'EXECUTE'),false) AS ok",
                 ('public.'+publisher+'(text,text,text,text,jsonb)',)).fetchone()['ok']:
             # Schema 37 file workers: a fenced function re-checks the snapshot, kind and
             # stage, derives the origin and alone writes the journal and feed counter.
-            # Before the migration (schema 36) the worker keeps its direct grants below.
+            # Until the reapplied template grants it (schema 36, or 37 with the previous
+            # grants) the worker keeps the direct write those grants allow.
             return c.execute('SELECT public.'+publisher+'(%s,%s,%s,%s,%s) AS id',
                 (account,message,kind,event_key,Jsonb(row))).fetchone()['id']
         value = c.execute('UPDATE feed_counter SET value=value+1 WHERE id=1 RETURNING value').fetchone()['value']
