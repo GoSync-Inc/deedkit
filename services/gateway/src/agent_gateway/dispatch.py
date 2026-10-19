@@ -334,6 +334,14 @@ class Dispatch:
                 )
                 for row in result.get("calendars", [])
             ]
+        if module == "calendar" and tool["operation"] == "members":
+            # Guardian rules follow the gateway's assignment ceiling, not only the backend key's.
+            if "assignment:read" not in set(principal["grants"].get("calendar", [])) & set(caps["permissions"]):
+                result = dict(result)
+                result["members"] = [
+                    {k: v for k, v in row.items() if k != "guardian_rules"} if isinstance(row, dict) else row
+                    for row in result.get("members", [])
+                ]
         if tool.get("action_group"):
             if tool["operation"] == "list_messenger_operations":
                 result = {

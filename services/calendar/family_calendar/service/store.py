@@ -15,6 +15,10 @@ from psycopg_pool import ConnectionPool, PoolTimeout
 from family_calendar.errors import CalendarError
 
 
+HERE = Path(__file__).parent
+MIGRATIONS = ((1, HERE / "schema.sql"), (2, HERE / "schema_v2.sql"))
+
+
 def ref(prefix):
     return prefix + "-" + uuid4().hex
 
@@ -33,6 +37,16 @@ def instant(value):
         return t.astimezone(timezone.utc)
     except (ValueError, TypeError, AttributeError, OverflowError):
         raise CalendarError("invalid_time") from None
+
+
+def consequence(provider, visibility, copy_location):
+    """Who sees a projected drive in the guardian's target calendar, by provider and visibility."""
+    seen = "the title, time and place" if copy_location else "the title and time"
+    if provider == "icloud":
+        return "iCloud does not enforce private events: everyone who can see this calendar sees " + seen
+    if visibility == "private":
+        return "viewers of this calendar without edit rights see only busy"
+    return "everyone who can see event details in this calendar sees " + seen
 
 
 class Store:
@@ -72,9 +86,8 @@ class Store:
         except (PoolTimeout, psycopg.OperationalError):
             raise CalendarError("database_unavailable") from None
 
-    def migrate(self):
-        body = Path(__file__).with_name("schema.sql").read_text()
-        checksum = hashlib.sha256(body.encode()).hexdigest()
+    def migrate(self, through=None):
+        # One transaction for all pending versions; an applied file is never edited, only a new one added.
         with self._connect() as conn:
             conn.execute("SELECT pg_advisory_xact_lock(61729128)")
             conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
@@ -82,12 +95,28 @@ class Store:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS migrations(version int PRIMARY KEY, checksum text NOT NULL)"
             )
-            row = conn.execute("SELECT checksum FROM migrations WHERE version=1").fetchone()
-            if row and row["checksum"] != checksum:
-                raise CalendarError("migration_checksum_mismatch")
-            if not row:
-                conn.execute(body)
-                conn.execute("INSERT INTO migrations VALUES (1,%s)", (checksum,))
+            for version, path in MIGRATIONS:
+                if through is not None and version > through:
+                    break
+                body = path.read_text()
+                checksum = hashlib.sha256(body.encode()).hexdigest()
+                row = conn.execute("SELECT checksum FROM migrations WHERE version=%s", (version,)).fetchone()
+                if row and row["checksum"] != checksum:
+                    raise CalendarError("migration_checksum_mismatch")
+                if not row:
+                    conn.execute(body)
+                    conn.execute("INSERT INTO migrations VALUES (%s,%s)", (version, checksum))
+
+    def guardian_readiness(self):
+        """Why guardian projections are off, or None; reads only the catalog and migrations, never the new tables."""
+        row = self.one(
+            "SELECT EXISTS(SELECT 1 FROM migrations WHERE version=2) AS schema_ready, "
+            "coalesce(has_table_privilege(to_regclass('guardian_rules'),'SELECT') "
+            "AND has_table_privilege(to_regclass('projection_links'),'SELECT'),false) AS grants_ready"
+        )
+        return None if row["schema_ready"] and row["grants_ready"] else (
+            "schema_not_ready" if not row["schema_ready"] else "grants_not_ready"
+        )
 
     def drop_test_schema(self):
         if not self.schema.startswith("test_"):
@@ -209,6 +238,113 @@ class Store:
                 (principal_id,),
             )
         return p["expires_at"], p["new"]
+
+    def guardian_rule_set(self, group_id, dependent, activity, duty, guardian, source, target, lead, title,
+                          visibility, copy_location=False, expected_version=None):
+        # Owner CLI only (SERVICE.md): a rule is the default drive duty, never a write authorization.
+        if not re.fullmatch("[0-9]{1,3}", str(lead)) or not 1 <= int(lead) <= 180:
+            raise CalendarError("invalid_lead_time")
+        if not 1 <= len(activity) <= 64 or not 1 <= len(title) <= 128 or duty not in ("dropoff", "pickup"):
+            raise CalendarError("invalid_rule")
+        if expected_version is not None and not re.fullmatch("[0-9]{1,18}", str(expected_version)):
+            raise CalendarError("version_conflict")
+        if self.guardian_readiness() == "schema_not_ready":
+            raise CalendarError("schema_not_ready")
+        with self.transaction() as c:
+            roles = {
+                r["person_id"]: r["role"]
+                for r in c.execute(
+                    "SELECT person_id,role FROM memberships WHERE group_id=%s AND person_id IN (%s,%s) AND enabled",
+                    (group_id, guardian, dependent),
+                )
+            }
+            if roles.get(guardian) not in ("group_admin", "coordinator", "adult") or roles.get(dependent) != "dependent":
+                raise CalendarError("invalid_guardian")
+            bound = {
+                (r["person_id"], r["calendar_ref"])
+                for r in c.execute(
+                    "SELECT person_id,calendar_ref FROM bindings WHERE group_id=%s", (group_id,)
+                )
+            }
+            if (dependent, source) not in bound or (guardian, target) not in bound:
+                raise CalendarError("binding_required")
+            provider = c.execute(
+                "SELECT cn.provider FROM calendars c JOIN connections cn ON cn.id=c.connection_id WHERE c.ref=%s",
+                (target,),
+            ).fetchone()["provider"]
+            if visibility not in ("private", "details"):
+                raise CalendarError(
+                    "visibility_required",
+                    details={"options": {v: consequence(provider, v, copy_location) for v in ("private", "details")}},
+                )
+            old = c.execute(
+                "SELECT id,version FROM guardian_rules WHERE group_id=%s AND dependent_id=%s AND activity=%s "
+                "AND duty=%s FOR UPDATE",
+                (group_id, dependent, activity, duty),
+            ).fetchone()
+            if expected_version is not None and (not old or old["version"] != int(expected_version)):
+                raise CalendarError("version_conflict")
+            c.execute(
+                "INSERT INTO guardians VALUES (%s,%s,%s) ON CONFLICT DO NOTHING", (group_id, guardian, dependent)
+            )
+            values = (guardian, source, target, int(lead), title, visibility, copy_location)
+            if old:
+                rule = c.execute(
+                    "UPDATE guardian_rules SET guardian_id=%s,source_calendar_ref=%s,target_calendar_ref=%s,"
+                    "lead_minutes=%s,title=%s,visibility=%s,copy_location=%s,enabled=true,version=version+1,"
+                    "updated_at=now() WHERE id=%s RETURNING id,version",
+                    (*values, old["id"]),
+                ).fetchone()
+            else:
+                try:
+                    rule = c.execute(
+                        "INSERT INTO guardian_rules(id,group_id,dependent_id,activity,duty,guardian_id,"
+                        "source_calendar_ref,target_calendar_ref,lead_minutes,title,visibility,copy_location) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,version",
+                        (ref("rule"), group_id, dependent, activity, duty, *values),
+                    ).fetchone()
+                except psycopg.errors.UniqueViolation:
+                    # A concurrent owner command created the same key first.
+                    raise CalendarError("version_conflict") from None
+            c.execute(
+                "INSERT INTO audit(action,ref,outcome) VALUES ('guardian_rule_set',%s,'saved')", (rule["id"],)
+            )
+        return {
+            "rule_id": rule["id"],
+            "version": rule["version"],
+            "consequence": consequence(provider, visibility, copy_location),
+        }
+
+    def guardian_rule_disable(self, rule_id, expected_version=None):
+        if expected_version is not None and not re.fullmatch("[0-9]{1,18}", str(expected_version)):
+            raise CalendarError("version_conflict")
+        if self.guardian_readiness() == "schema_not_ready":
+            raise CalendarError("schema_not_ready")
+        with self.transaction() as c:
+            old = c.execute("SELECT version FROM guardian_rules WHERE id=%s FOR UPDATE", (rule_id,)).fetchone()
+            if not old:
+                raise CalendarError("rule_not_found")
+            if expected_version is not None and old["version"] != int(expected_version):
+                raise CalendarError("version_conflict")
+            rule = c.execute(
+                "UPDATE guardian_rules SET enabled=false,version=version+1,updated_at=now() WHERE id=%s "
+                "RETURNING id,version",
+                (rule_id,),
+            ).fetchone()
+            c.execute(
+                "INSERT INTO audit(action,ref,outcome) VALUES ('guardian_rule_disable',%s,'disabled')", (rule_id,)
+            )
+        return {"rule_id": rule["id"], "version": rule["version"], "enabled": False}
+
+    def guardian_rule_list(self):
+        if self.guardian_readiness() == "schema_not_ready":
+            raise CalendarError("schema_not_ready")
+        # No titles: the list is for checking wiring, not for reading what guardians will see.
+        return self.query(
+            "SELECT id AS rule_id,group_id,dependent_id,activity,duty,guardian_id,source_calendar_ref,"
+            "target_calendar_ref,lead_minutes,visibility,copy_location,enabled,version FROM guardian_rules "
+            "ORDER BY group_id,dependent_id,activity,duty"
+        )
 
     def publish_window(self, calendar_ref, start, end, resources, status, error=None):
         try:
