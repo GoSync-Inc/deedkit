@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+import psycopg
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
 from .core import FamilyService
@@ -80,10 +81,13 @@ class Worker:
                         intent = await self.providers.prepare(cal, step)
                         # Revalidate after the read/prepare and immediately before durable admission to send.
                         self.service.validate_plan(plan, op["principal_id"])
-                        self.store.query(
-                            "UPDATE operation_steps SET state='sending',intent=%s WHERE operation_id=%s AND ordinal=%s",
-                            (Jsonb(intent), *args),
-                        )
+                        with self.store.transaction() as c:
+                            if step.get("link"):
+                                self._claim(c, step, cal, intent, args)
+                            c.execute(
+                                "UPDATE operation_steps SET state='sending',intent=%s WHERE operation_id=%s AND ordinal=%s",
+                                (Jsonb(intent), *args),
+                            )
                         self.store.query(
                             "UPDATE operations SET lease_until=now()+interval '2 minutes' WHERE id=%s",
                             (operation_id,),
@@ -99,10 +103,18 @@ class Worker:
                     else:
                         self._finish(operation_id, "partial" if completed else "failed", row["error"])
                         return
-                    self.store.query(
-                        "UPDATE operation_steps SET state='verified',receipt=%s,error=NULL WHERE operation_id=%s AND ordinal=%s",
-                        (Jsonb(receipt), *args),
-                    )
+                    with self.store.transaction() as c:
+                        c.execute(
+                            "UPDATE operation_steps SET state='verified',receipt=%s,error=NULL WHERE operation_id=%s AND ordinal=%s",
+                            (Jsonb(receipt), *args),
+                        )
+                        if step.get("link"):
+                            # Also the reconcile path: the claim admitted with the send becomes the live link.
+                            c.execute(
+                                "UPDATE projection_links SET state='active',etag=%s,updated_at=now() "
+                                "WHERE operation_id=%s AND ordinal=%s AND state='pending'",
+                                (receipt.get("etag"), *args),
+                            )
                     self.store.query(
                         "UPDATE coverage SET status='stale' WHERE calendar_ref=%s", (cal["ref"],)
                     )
@@ -120,10 +132,19 @@ class Worker:
                     state = (
                         "unknown" if ambiguous else "conflict" if e.code == "version_conflict" else "failed"
                     )
-                    self.store.query(
-                        "UPDATE operation_steps SET state=%s,error=%s WHERE operation_id=%s AND ordinal=%s",
-                        (state, e.code, *args),
-                    )
+                    with self.store.transaction() as c:
+                        c.execute(
+                            "UPDATE operation_steps SET state=%s,error=%s WHERE operation_id=%s AND ordinal=%s",
+                            (state, e.code, *args),
+                        )
+                        if step.get("link") and not ambiguous:
+                            # A definite failure releases the claim (no DELETE grant) so the lesson can be projected
+                            # again; an ambiguous one keeps it until reconcile.
+                            c.execute(
+                                "UPDATE projection_links SET state='removed',updated_at=now() "
+                                "WHERE operation_id=%s AND ordinal=%s AND state='pending'",
+                                args,
+                            )
                     self._finish(operation_id, state if ambiguous or not completed else "partial", e.code)
                     return
                 except Exception:
@@ -146,6 +167,37 @@ class Worker:
                     self._finish(operation_id, "unknown", "unknown_result")
                     return
             self._finish(operation_id, "verified", None)
+
+    @staticmethod
+    def _claim(c, step, cal, intent, args):
+        """Reserve the (lesson, rule) link in the admission transaction; checked only before a fresh send."""
+        link = step["link"]
+        rule = c.execute("SELECT enabled,version FROM guardian_rules WHERE id=%s", (link["rule_id"],)).fetchone()
+        if not rule or not rule["enabled"] or rule["version"] != link["rule_version"]:
+            raise CalendarError("rule_changed")
+        try:
+            c.execute(
+                "INSERT INTO projection_links(id,rule_id,rule_version,duty,source_calendar_ref,source_event_ref,"
+                "source_start,source_end,target_calendar_ref,target_id,target_resource_ref,operation_id,ordinal,state) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')",
+                (
+                    step["projection"]["link_id"],
+                    link["rule_id"],
+                    link["rule_version"],
+                    link["duty"],
+                    step["projection"]["source_calendar_ref"],
+                    link["source_event_ref"],
+                    step["source"]["start"],
+                    step["source"]["end"],
+                    cal["ref"],
+                    intent["target"],
+                    intent.get("resource_ref"),
+                    *args,
+                ),
+            )
+        except psycopg.errors.UniqueViolation:
+            # Another operation holds a pending or active link for this lesson and rule.
+            raise CalendarError("already_projected") from None
 
     def _finish(self, operation_id, state, error):
         self.store.query(

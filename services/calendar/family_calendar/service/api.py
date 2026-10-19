@@ -57,10 +57,11 @@ class EventInput(Strict):
 
 
 class Action(Strict):
-    action: Literal["create", "update", "delete"]
+    action: Literal["create", "update", "delete", "project"]
     calendar_ref: str
     event_ref: str | None = None
     event: EventInput | None = None
+    activity: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class Plan(Strict):
@@ -119,7 +120,12 @@ DESCRIPTIONS = {
     "time YYYY-MM-DDTHH:MM[:SS] read in the event's IANA timezone (timezone required). All-day event: "
     "all_day=true with start/end as YYYY-MM-DD dates, end exclusive and optional (default start+1 day), "
     "no timezone; an occurrence cannot switch between timed and all-day. Advisory cached overlap checks "
-    "cover visible calendars only.",
+    "cover visible calendars only. project (event_ref of a lesson occurrence from agenda, calendar_ref of its "
+    "calendar, activity label of the guardian rules) adds one linked drive per enabled rule of that child and "
+    "activity into the guardian's Google calendar: drop-off ends at the lesson start, pick-up at its end; the "
+    "rule's title, the place only if the rule copies it, no description or guests, private when the rule says so. "
+    "Rules that get no drive are listed in projections_skipped with a reason; nothing_to_project names the "
+    "activity labels. One project counts as one of the 8 actions; a plan holds at most 16 steps (too_many_steps).",
     "apply": "Execute a reviewed plan with a stable request_id. Requires caller authorization for the actual changes.",
     "operation": "Read durable receipts. Unknown results require reconciliation; never submit a replacement create.",
     "assignment": "Assign a dropoff/pickup/stay interval. Does not claim acceptance or create provider projections.",
@@ -149,12 +155,17 @@ HINTS = {
 }
 
 
-def failure(code, field_errors=None):
+# Errors whose fixed-shape details the agent needs to choose its next action.
+PUBLIC_DETAILS = {"nothing_to_project"}
+
+
+def failure(code, field_errors=None, details=None):
     """Fixed public code with a reviewed format hint; never provider text."""
     return {
         "error": code,
         **({"hint": HINTS[code]} if code in HINTS else {}),
         **({"field_errors": field_errors} if field_errors else {}),
+        **(details if details and code in PUBLIC_DETAILS else {}),
     }
 
 
@@ -295,7 +306,7 @@ def create_app(store, port=13232, allowed_hosts=None, allowed_origins=None):
                 structuredContent=result,
             )
         except CalendarError as e:
-            result = failure(e.code, e.field_errors)
+            result = failure(e.code, e.field_errors, e.details)
             return CallToolResult(
                 content=[TextContent(type="text", text=json.dumps(result))],
                 structuredContent=result,
@@ -350,7 +361,7 @@ def create_app(store, port=13232, allowed_hosts=None, allowed_origins=None):
             return JSONResponse(result)
         except CalendarError as e:
             return JSONResponse(
-                failure(e.code, e.field_errors),
+                failure(e.code, e.field_errors, e.details),
                 status_code=422
                 if e.code == "invalid_request"
                 else 403

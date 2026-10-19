@@ -10,12 +10,12 @@ from test_policy import config
 RULE = {"rule_id": "rule-synthetic", "activity": "Dance", "title": "SYNTHETIC-PRIVATE-RULE"}
 
 
-def gateway(tmp_path, local, backend, readiness=None):
+def gateway(tmp_path, local, backend, readiness=None, tools=("calendar_capabilities", "calendar_members")):
     key = tmp_path / "backend.key"
     key.write_text("backend-calendar-a")
     key.chmod(0o600)
     document = config()
-    document["profiles"]["reader"]["tools"] = ["calendar_capabilities", "calendar_members"]
+    document["profiles"]["reader"]["tools"] = list(tools)
     document["principals"][0]["grants"]["calendar"] = local
     document["principals"][0]["credentials"]["calendar"]["key_file"] = str(key)
     path = tmp_path / "policy.json"
@@ -27,8 +27,11 @@ def gateway(tmp_path, local, backend, readiness=None):
 
         async def call(self, module, operation, credential, arguments):
             if operation == "capabilities":
-                caps = {"permissions": backend, "calendars": [], "features": {"agenda": True}}
+                caps = {"permissions": backend, "calendars": [], "features": {"agenda": True},
+                        "constraints": {"plan_action_limit": 8, "plan_step_limit": 16}}
                 return caps | ({"guardian_projections": readiness} if readiness else {})
+            if operation == "plan":
+                return {"plan_id": "plan-synthetic", "steps": [], "projections_skipped": []}
             # The backend already applied its own rule-read policy for its adult key.
             return {"group_id": "family", "members": [
                 {"person_id": "adult-a", "role": "group_admin", "label": "A"},
@@ -69,3 +72,31 @@ def test_capabilities_keep_guardian_projection_readiness(tmp_path, readiness):
     result = asyncio.run(gateway(tmp_path, scopes, scopes, readiness).call("gateway-a", "calendar_capabilities", {}))
     assert result["guardian_projections"] == readiness
     assert "features" not in result
+
+
+PROJECT = {"action": "project", "calendar_ref": "cal-child", "event_ref": "event-lesson", "activity": "Dance"}
+PLANNER = ("calendar_capabilities", "calendar_plan", "calendar_apply")
+WRITER = ["agenda:read", "plan:create", "plan:execute", "event:create"]
+
+
+# spec: ANYM-433
+@pytest.mark.parametrize(
+    ("local", "backend", "allowed"),
+    [
+        (WRITER, WRITER + ["assignment:read"], False),
+        (WRITER + ["assignment:read"], WRITER, False),
+        (WRITER + ["assignment:read"], WRITER + ["assignment:read"], True),
+    ],
+)
+def test_project_follows_the_gateway_assignment_ceiling(tmp_path, local, backend, allowed):
+    from agent_gateway.policy import Denied
+
+    dispatch = gateway(tmp_path, local, backend, tools=PLANNER)
+    call = dispatch.call("gateway-a", "calendar_plan", {"actions": [PROJECT]})
+    if allowed:
+        assert asyncio.run(call)["plan_id"] == "plan-synthetic"
+    else:
+        with pytest.raises(Denied):
+            asyncio.run(call)
+    caps = asyncio.run(dispatch.call("gateway-a", "calendar_capabilities", {}))
+    assert caps["constraints"] == {"plan_action_limit": 8, "plan_step_limit": 16}

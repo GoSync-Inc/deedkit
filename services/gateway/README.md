@@ -117,7 +117,10 @@ also intersects local/backend scopes and requires both selected plan/apply tools
 `write_enabled` alone is not a write grant. `calendar_plan` takes, per action, a timed event (`start`, `end`,
 `timezone`), an all-day event (`all_day: true`, date `start`, exclusive date `end`, no `timezone`), or
 an `update`/`delete` with the `event_ref` of one occurrence of a series; the backend refuses series-wide
-targets and guests with `capability_unverified`, and names a missing timed field in `field_errors`. Slot requests may add explicitly reviewed
+targets and guests with `capability_unverified`, and names a missing timed field in `field_errors`. A `project`
+action (`event_ref` of a lesson occurrence, `activity` label) plans linked drives from guardian rules; the gateway
+refuses it unless `assignment:read` is in both the local grant and the backend key, the same ceiling as
+`guardian_rules` in members, and passes `plan_step_limit` (16) in constraints. Slot requests may add explicitly reviewed
 `additional_calendar_refs` to member bindings and return their exact `source_selection`.
 Pending refreshes are polled with `refresh=false`; missing or pending coverage is unknown.
 

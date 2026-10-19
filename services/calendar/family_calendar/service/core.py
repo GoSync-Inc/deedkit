@@ -341,6 +341,7 @@ class FamilyService:
                 "cache_max_age_seconds": 300,
                 "refresh_wait_seconds": 20,
                 "plan_action_limit": 8,
+                "plan_step_limit": 16,
                 "plan_ttl_seconds": 600,
                 "atomic_cross_provider": False,
                 "availability_sources": "member bindings plus additional_calendar_refs; unbound members remain unknown",
@@ -518,12 +519,32 @@ class FamilyService:
         prepared = []
         touched = set()
         selected = set()
+        sources, source_calendars, skipped, activities, projected = [], [], [], set(), set()
         for action in actions:
-            if not isinstance(action, dict) or set(action) - {"action", "calendar_ref", "event_ref", "event"}:
+            if not isinstance(action, dict) or set(action) - {"action", "calendar_ref", "event_ref", "event", "activity"}:
                 raise CalendarError("invalid_action")
             kind = action.get("action")
-            if kind not in ("create", "update", "delete"):
+            if kind not in ("create", "update", "delete", "project"):
                 raise CalendarError("unsupported_action")
+            if kind == "project":
+                label = action.get("activity")
+                if not isinstance(label, str) or not 1 <= len(label) <= 64 or "event" in action:
+                    raise CalendarError("invalid_action")
+                if action.get("event_ref") in projected:
+                    raise CalendarError("duplicate_resource_action")
+                projected.add(action.get("event_ref"))
+                source, scope, steps, skips, labels = self._project(key, p, action)
+                if source["ref"] not in [s["calendar_ref"] for s in sources]:
+                    sources.append({"calendar_ref": source["ref"], "scope": scope})
+                    source_calendars.append(source)
+                for step, cal in steps:
+                    prepared.append(dict(step, ordinal=len(prepared)))
+                    calendars.append(cal)
+                skipped += skips
+                activities |= labels
+                continue
+            if "activity" in action:
+                raise CalendarError("invalid_action")
             _, cal = self.authorize(key, action.get("calendar_ref"), "plan:create")
             self.authorize(key, cal["ref"], "event:" + kind)
             calendars.append(cal)
@@ -588,13 +609,20 @@ class FamilyService:
                     before=before,
                 )
             prepared.append(step)
+        if projected and not prepared:
+            raise CalendarError(
+                "nothing_to_project",
+                details={"projections_skipped": skipped, "activities": sorted(activities)},
+            )
+        if len(prepared) > 16:
+            raise CalendarError("too_many_steps")
         overlap_check = self._overlap_check(key, p, prepared, selected)
         plan_id = ref("plan")
         expires = datetime.now(timezone.utc) + timedelta(minutes=10)
-        payload = {"steps": prepared}
+        payload = {"steps": prepared, **({"sources": sources} if sources else {})}
         self.store.query(
             "INSERT INTO plans(id,principal_id,payload,scope_hash,expires_at) VALUES (%s,%s,%s,%s,%s)",
-            (plan_id, p["id"], Jsonb(payload), self._scope_hash(p, calendars), expires),
+            (plan_id, p["id"], Jsonb(payload), self._scope_hash(p, calendars + source_calendars), expires),
         )
         return {
             "plan_id": plan_id,
@@ -603,7 +631,103 @@ class FamilyService:
             "notifications": "none; events with guests are blocked",
             "atomic": False,
             "overlap_check": overlap_check,
+            **({"projections_skipped": skipped} if projected else {}),
         }
+
+    def _source(self, key, calendar_ref):
+        """The lesson's calendar as the principal reads it with details, and the scope that grants it."""
+        for scope in ("event:read", "agenda:read"):
+            try:
+                _, cal = self.authorize(key, calendar_ref, scope)
+            except CalendarError:
+                continue
+            if cal["visibility"] == "details":
+                return cal, scope
+        raise CalendarError("not_found_or_forbidden")
+
+    def _project(self, key, p, action):
+        """One linked create per enabled rule of the lesson's children whose Google target the principal can write."""
+        if self.store.guardian_readiness():
+            raise CalendarError("capability_unverified")
+        if not self.rule_reader(p):
+            raise CalendarError("not_found_or_forbidden")
+        source, scope = self._source(key, action.get("calendar_ref"))
+        occ = self.store.one(
+            "SELECT o.*,r.target FROM occurrences o JOIN resources r ON r.ref=o.resource_ref "
+            "WHERE o.ref=%s AND o.calendar_ref=%s",
+            (action.get("event_ref"), source["ref"]),
+        )
+        if not occ:
+            raise CalendarError("not_found_or_forbidden")
+        if occ["details"].get("all_day"):
+            raise CalendarError("source_all_day")
+        # Projecting a drive would chain links; any link naming this event as its target refuses it.
+        if self.store.one(
+            "SELECT 1 FROM projection_links WHERE target_calendar_ref=%s AND target_id=%s",
+            (source["ref"], occ["target"]),
+        ):
+            raise CalendarError("projection_source_is_projection")
+        start = instant(occ["start_at"])
+        end = start if occ["details"].get("instant") else instant(occ["end_at"])
+        rules = self.store.query(
+            "SELECT r.*,m.enabled AS guardian_enabled,cn.provider AS target_provider,"
+            "(SELECT l.state FROM projection_links l WHERE l.source_event_ref=%s AND l.rule_id=r.id "
+            "AND l.state IN ('pending','active','repairing')) AS claim "
+            "FROM guardian_rules r JOIN bindings b ON b.group_id=r.group_id AND b.person_id=r.dependent_id "
+            "AND b.calendar_ref=r.source_calendar_ref "
+            "JOIN memberships m ON m.group_id=r.group_id AND m.person_id=r.guardian_id "
+            "JOIN calendars c ON c.ref=r.target_calendar_ref JOIN connections cn ON cn.id=c.connection_id "
+            "WHERE r.group_id=%s AND r.source_calendar_ref=%s ORDER BY r.dependent_id,r.duty,r.id",
+            (occ["ref"], p["group_id"], source["ref"]),
+        )
+        steps, skips = [], []
+        for r in rules:
+            if r["activity"] != action["activity"]:
+                continue
+            reason = (
+                "disabled"
+                if not r["enabled"]
+                else "guardian_disabled"
+                if not r["guardian_enabled"]
+                else "projection_pending"
+                if r["claim"] == "pending"
+                else "already_projected"
+                if r["claim"]
+                else self.rule_view(p, r)["not_ready_reason"]
+                or (None if self._can(p, r["target_calendar_ref"], "plan:create") else "target_not_writable")
+                or (None if r["target_provider"] == "google" else "provider_not_supported")
+            )
+            if reason:
+                skips.append({"rule_id": r["id"], "duty": r["duty"], "guardian_id": r["guardian_id"], "reason": reason})
+                continue
+            _, target = self.authorize(key, r["target_calendar_ref"], "event:create")
+            lead = timedelta(minutes=r["lead_minutes"])
+            # Both drives end at the lesson boundary they serve.
+            a, b = (start - lead, start) if r["duty"] == "dropoff" else (end - lead, end)
+            event = {"title": r["title"], "start": a.isoformat(), "end": b.isoformat(), "timezone": target["timezone"]}
+            if r["copy_location"] and occ["details"].get("location"):
+                event["location"] = occ["details"]["location"]
+            step = {
+                "action": "create",
+                "calendar_ref": target["ref"],
+                "provider": target["provider"],
+                "event": event,
+                "span": {"start": a.isoformat(), "end": b.isoformat()},
+                "resource_ref": ref("res"),
+                "target_id": uuid_token(),
+                "link": {
+                    "rule_id": r["id"],
+                    "rule_version": r["version"],
+                    "duty": r["duty"],
+                    "guardian_id": r["guardian_id"],
+                    "source_event_ref": occ["ref"],
+                },
+                "source": {"start": start.isoformat(), "end": end.isoformat(), "title": occ["details"].get("title")},
+                # Worker-only: the opaque link ID is the one marker the provider event carries.
+                "projection": {"link_id": ref("link"), "source_calendar_ref": source["ref"], "visibility": r["visibility"]},
+            }
+            steps.append((step, target))
+        return source, scope, steps, skips, {r["activity"] for r in rules if r["enabled"]}
 
     def _overlap_check(self, key, principal, prepared, selected):
         """Advisory cached evidence within current read grants, never permission
@@ -668,6 +792,9 @@ class FamilyService:
                 if cal["visibility"] == "details" and event.get("event_ref") in selected:
                     continue
                 for step in proposed:
+                    # A drive never overlaps the lesson it serves.
+                    if event.get("event_ref") and event["event_ref"] == step.get("link", {}).get("source_event_ref"):
+                        continue
                     if instant(event["start"]) < instant(step["span"]["end"]) and instant(
                         event["end"]
                     ) > instant(step["span"]["start"]):
@@ -723,7 +850,7 @@ class FamilyService:
         if update and was != will:
             diff["all_day"] = {"before": was, "after": will}
         return {
-            **{k: v for k, v in step.items() if k not in ("target_id", "resource_ref", "expected_etag", "span")},
+            **{k: v for k, v in step.items() if k not in ("target_id", "resource_ref", "expected_etag", "span", "projection")},
             "diff": diff,
         }
 
@@ -735,6 +862,18 @@ class FamilyService:
             _, cal = self.authorize(
                 None, step["calendar_ref"], "event:" + step["action"], principal_id=principal_id
             )
+            calendars.append(cal)
+        sources = plan["payload"].get("sources", [])
+        if sources and not self.rule_reader(p):
+            raise CalendarError("scope_changed")
+        for source in sources:
+            # The lesson must stay readable with details, by the scope the preview used.
+            try:
+                _, cal = self.authorize(None, source["calendar_ref"], source["scope"], principal_id=principal_id)
+            except CalendarError:
+                raise CalendarError("scope_changed") from None
+            if cal["visibility"] != "details":
+                raise CalendarError("scope_changed")
             calendars.append(cal)
         if self._scope_hash(p, calendars) != plan["scope_hash"]:
             raise CalendarError("scope_changed")

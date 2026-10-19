@@ -2699,7 +2699,7 @@
   },
   {
     "name": "calendar_plan",
-    "description": "Prepare an immutable preview and field diff for 1–8 guest-free changes: a single event, an all-day event, or one occurrence of a recurring series (update or delete=cancel, by the event_ref from agenda; the preview names the series and the occurrence's original start). Series-wide, this-and-following and guest changes are refused with capability_unverified. Only a local plan record is stored for apply; no calendar mutation occurs. Timed event start/end: ISO 8601 with offset, or wall time YYYY-MM-DDTHH:MM[:SS] read in the event's IANA timezone (timezone required). All-day event: all_day=true with start/end as YYYY-MM-DD dates, end exclusive and optional (default start+1 day), no timezone; an occurrence cannot switch between timed and all-day. Advisory cached overlap checks cover visible calendars only.",
+    "description": "Prepare an immutable preview and field diff for 1–8 guest-free changes: a single event, an all-day event, or one occurrence of a recurring series (update or delete=cancel, by the event_ref from agenda; the preview names the series and the occurrence's original start). Series-wide, this-and-following and guest changes are refused with capability_unverified. Only a local plan record is stored for apply; no calendar mutation occurs. Timed event start/end: ISO 8601 with offset, or wall time YYYY-MM-DDTHH:MM[:SS] read in the event's IANA timezone (timezone required). All-day event: all_day=true with start/end as YYYY-MM-DD dates, end exclusive and optional (default start+1 day), no timezone; an occurrence cannot switch between timed and all-day. Advisory cached overlap checks cover visible calendars only. project (event_ref of a lesson occurrence from agenda, calendar_ref of its calendar, activity label of the guardian rules) adds one linked drive per enabled rule of that child and activity into the guardian's Google calendar: drop-off ends at the lesson start, pick-up at its end; the rule's title, the place only if the rule copies it, no description or guests, private when the rule says so. Rules that get no drive are listed in projections_skipped with a reason; nothing_to_project names the activity labels. One project counts as one of the 8 actions; a plan holds at most 16 steps (too_many_steps).",
     "inputSchema": {
       "$defs": {
         "Action": {
@@ -2709,7 +2709,8 @@
               "enum": [
                 "create",
                 "update",
-                "delete"
+                "delete",
+                "project"
               ],
               "title": "Action",
               "type": "string"
@@ -2740,6 +2741,20 @@
                 }
               ],
               "default": null
+            },
+            "activity": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Activity"
             }
           },
           "required": [
