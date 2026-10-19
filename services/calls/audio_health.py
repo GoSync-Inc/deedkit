@@ -97,3 +97,12 @@ class RuntimeAudioHealth:
                 'delivery_frames':self.delivery_frames,'delivery_late_events':self.delivery_late_events,
                 'max_delivery_lateness_ms':round(self.max_delivery_lateness_ms,2),
                 'late_observations':[dict(e) for e in self.late_observations]}
+
+
+class NoRuntimeAudioHealth:
+    # Stands in when the RuntimeAudioHealth constructor fails: nothing is measured and the snapshot is empty.
+    async def monitor(self):await asyncio.Event().wait()
+    def tick(self,*args,**kwargs):pass
+    def audio(self,*args,**kwargs):pass
+    def stop_audio(self):pass
+    def snapshot(self):return {}

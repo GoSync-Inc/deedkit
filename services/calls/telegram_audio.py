@@ -186,7 +186,9 @@ class TelegramCalls:
             state['task']=asyncio.create_task(self._run(cid,transport,state),name='telegram-audio-'+cid)
             return {'provider_call_id':str(peer.id),'provider_status':'connected'}
         except (Exception,asyncio.CancelledError):
-            await self._release(cid);raise
+            # The original setup exception or cancellation propagates, whatever release does.
+            with contextlib.suppress(Exception):await self._release(cid)
+            raise
 
     async def _run(self,cid,transport,state):
         from voice import run_transport
@@ -199,22 +201,30 @@ class TelegramCalls:
         except TimeoutError: reason='duration_limit'
         except Exception: reason='model_error'
         finally:
-            await self._release(cid)
-            # Diagnostics are best effort: a failure here must not skip service.stop.
-            with contextlib.suppress(Exception):
-                value=self.service.get_call(cid)
-                self.service.result(cid,metrics={**value['metrics'],
-                    'telegram_audio':{**state['audio_probe'].snapshot(),'media':state['media'].snapshot()}})
-            self.service.stop(cid,reason)
+            try:await self._release(cid)
+            finally:
+                # Diagnostics are best effort: a failure here must not skip service.stop.
+                with contextlib.suppress(Exception):
+                    value=self.service.get_call(cid)
+                    self.service.result(cid,metrics={**value['metrics'],
+                        'telegram_audio':{**state['audio_probe'].snapshot(),'media':state['media'].snapshot()}})
+                self.service.stop(cid,reason)
 
     async def _release(self,cid):
         state=self.active.pop(cid,None)
         if not state:return
-        py=state['py']
-        with contextlib.suppress(Exception): await asyncio.wait_for(py.leave_call(state['user']),10)
-        with contextlib.suppress(Exception): await py._binding.stop(state['user'])
-        await state['client'].close()
-        dispose_native(py)
+        py,held=state['py'],None
+        async def leave():await asyncio.wait_for(py.leave_call(state['user']),10)
+        async def stop():await py._binding.stop(state['user'])
+        async def close():await state['client'].close()
+        # Every step is attempted. A cancellation that arrives meanwhile is held until the last step
+        # has run, then re-raised, so the caller still gets to stop the call with its own reason.
+        for step in (leave,stop,close):
+            try:await step()
+            except asyncio.CancelledError as error:held=held or error
+            except Exception:pass
+        with contextlib.suppress(Exception):dispose_native(py)
+        if held:raise held
 
     async def hangup(self,sid):
         for cid,state in list(self.active.items()):
@@ -224,14 +234,24 @@ class TelegramCalls:
     async def cancel_attempt(self,cid):
         state=self.active.get(cid)
         if not state:return
-        state['end_reason']='owner_stop'
-        if state.get('runner'):await state['runner'].cancel()
+        state['end_reason']='owner_stop';held=None
+        if state.get('runner'):
+            with contextlib.suppress(Exception):await state['runner'].cancel()
         task=state.get('task') or state.get('dial_task')
         if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):await task
-        await self._release(cid)
+            try:await task
+            except asyncio.CancelledError as error:
+                # The child's own cancellation is consumed here; the caller's own is held and re-raised.
+                if asyncio.current_task().cancelling():held=error
+            except Exception:pass
+        try:await self._release(cid)
+        except asyncio.CancelledError as error:held=held or error
+        if held:raise held
 
     async def close(self):
+        held=None
         for cid,state in list(self.active.items()):
-            await self.cancel_attempt(cid)
+            try:await self.cancel_attempt(cid)
+            except asyncio.CancelledError as error:held=held or error
+        if held:raise held

@@ -60,3 +60,18 @@ def test_runtime_probe_keeps_a_bounded_trace_without_audio_content():
     value=probe.snapshot()
     assert len(value['late_observations'])<=12
     assert all(set(e)=={'kind','offset_ms','late_ms'} for e in value['late_observations'])
+
+
+# spec: ANYM-409
+async def test_the_runtime_health_stand_in_is_a_no_op_with_a_cancellable_coroutine_monitor():
+    import asyncio
+    stand_in=importlib.import_module('audio_health').NoRuntimeAudioHealth()
+    stand_in.tick();stand_in.tick(1.5);stand_in.audio(960,24000,1);stand_in.audio(960,24000,1,at=2.0);stand_in.stop_audio()
+    assert stand_in.snapshot()=={}
+    before=asyncio.all_tasks()
+    task=asyncio.create_task(stand_in.monitor())
+    await asyncio.sleep(0)
+    assert not task.done()
+    task.cancel()
+    await asyncio.gather(task,return_exceptions=True)
+    assert task.cancelled() and asyncio.all_tasks()==before

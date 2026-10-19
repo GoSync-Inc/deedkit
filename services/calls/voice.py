@@ -17,7 +17,7 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.workers.runner import WorkerRunner
 
 from core import TOOL_MODELS
-from audio_health import RuntimeAudioHealth
+from audio_health import NoRuntimeAudioHealth, RuntimeAudioHealth
 from audio_probe import PCMProbe, diagnostics
 from call_errors import record_model_error
 
@@ -194,7 +194,9 @@ async def run_transport(transport,brief,key,state,browser=False):
                      input_rate=input_sample_rate(transport))
     live_flows=brief.get('dialog_engine')=='gemini_live_flows'
     ending_tasks=[]
-    runtime_health=RuntimeAudioHealth()
+    # Diagnostics are best effort: a constructor failure must never stop the call before the runner starts.
+    try:runtime_health=RuntimeAudioHealth()
+    except Exception:runtime_health=NoRuntimeAudioHealth()
     inbound_audio=diagnostics(PCMProbe)
 
     async def handle(name,params):
