@@ -357,7 +357,7 @@ def edit_single(data, rid, start, end, *, summary=None, location=None, descripti
 
 def _write_override(cal, root, rid, start, end, **text):
     event = _override(cal, rid)
-    if str((event or root).get("STATUS", "")).upper() == "CANCELLED":
+    if any(str(e.get("STATUS", "")).upper() == "CANCELLED" for e in (root, event) if e is not None):
         # The occurrence (or the whole series) is gone: a stale plan must not bring it back.
         raise CalendarError("version_conflict")
     if event is None:

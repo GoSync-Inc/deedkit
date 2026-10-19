@@ -395,3 +395,15 @@ def test_cancelling_one_occurrence_of_a_series_of_instants_keeps_it_an_instant()
     rid = datetime(2026, 11, 9, 16, tzinfo=BERLIN)
     [override] = override_of(cancel_single(instants, rid), rid)
     assert str(override["STATUS"]) == "CANCELLED" and override.decoded("DTEND") == override.decoded("DTSTART") == rid
+
+
+# spec: ANYM-234
+def test_an_existing_override_of_a_cancelled_series_is_not_written():
+    cancelled_master = fixture_bytes().replace(b"BEGIN:VEVENT\r\n", b"BEGIN:VEVENT\r\nSTATUS:CANCELLED\r\n", 1)
+    moved = datetime(2026, 11, 16, 16, tzinfo=BERLIN)  # fixture override, not cancelled itself
+    for write in (
+        lambda: edit_single(cancelled_master, moved, moved, moved + timedelta(hours=1)),
+        lambda: cancel_single(cancelled_master, moved),
+    ):
+        with pytest.raises(CalendarError, match="version_conflict"):
+            write()

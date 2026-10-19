@@ -718,6 +718,9 @@ async def test_caldav_occurrence_cancelled_elsewhere_is_a_conflict_not_a_resurre
     for action in ("update", "delete"):
         with pytest.raises(CalendarError, match="version_conflict"):
             await providers.prepare(ICLOUD_CAL, caldav_step(action, "2026-11-09T16:00:00+01:00"))
+        # ... also for an occurrence that already has an override of its own.
+        with pytest.raises(CalendarError, match="version_conflict"):
+            await providers.prepare(ICLOUD_CAL, caldav_step(action, "2026-11-16T16:00:00+01:00"))
     assert server.puts == 0
 
 
