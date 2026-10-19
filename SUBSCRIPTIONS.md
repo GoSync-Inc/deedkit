@@ -260,7 +260,8 @@ validation (at most 2 s) and the pinned TLS exchange (5 s deadline), so:
   `get_subscription_events`, `fetch`, `wait`, `list_subscriptions`), and while a
   revocation for the principal is queued behind an attempt, PostgreSQL queues every
   new request of that principal behind it, so all of that principal's API calls can
-  stall for the same time (`Store.identity_digest` takes the shared lock on each
+  stall for up to the 5 s statement timeout and then fail with `query_timeout`
+  (`Store.identity_digest` takes the shared lock on each
   call; unmeasured).
 
 Running more than one dispatcher process lowers the head-of-line delay
