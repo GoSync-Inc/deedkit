@@ -316,7 +316,7 @@ jobs:
     # recorded for a SHA whose images were not published. Tiden captures a release gate from the
     # main gate when the release is first created (TIDEN-CI.md), so a commit whose evidence
     # publication was not verified records nothing and warns.
-    # Temporary (ANYM-411): until Tiden health is green, an unavailable Tiden (CLI download, a failed, unparseable
+    # Temporary (ANYM-411, end condition in TIDEN-CI.md): an unavailable Tiden (CLI download, a failed, unparseable
     # or hung call) only warns with a receipt. Every step has a timeout and together they stay below the job's,
     # so the warning and the receipt upload always run.
     name: Tiden release record
@@ -384,7 +384,7 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-release-receipt.json").write_text(json.dumps({"state": "not_attempted", "version": "deedkit@" + os.environ["SHA"], "environment": "github-actions-synthetic", "download": os.environ["DOWNLOAD"]}, indent=2))'
-          echo "::warning title=Tiden release not recorded::the Tiden CLI download ended ${DOWNLOAD:-not run} (receipt state not_attempted); until Tiden health is green a Tiden error in the CI release record only warns (ANYM-411, TIDEN-CI.md)"
+          echo "::warning title=Tiden release not recorded::the Tiden CLI download ended ${DOWNLOAD:-not run} (receipt state not_attempted); for now a Tiden error in the CI release record only warns (ANYM-411, TIDEN-CI.md)"
       - name: Record the main release in Tiden
         if: steps.config.outputs.enabled == 'true' && steps.download.outcome == 'success'
         # scripts/tiden_ci.py CI_RELEASE_DEADLINE ends its own work at least 30 seconds before this.
