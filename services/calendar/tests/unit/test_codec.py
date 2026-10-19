@@ -11,6 +11,7 @@ from family_calendar.providers.caldav.codec import (
     shift_series,
     move_single,
     cancel_single,
+    edit_single,
     split_future,
     occurrences,
     native_future,
@@ -266,3 +267,101 @@ def test_unknown_timezone_parameter_is_preserved_in_comparison():
     observed = Calendar.from_ical(desired)
     observed.walk("VTIMEZONE")[0]["TZID"].params["X-OPAQUE"] = "keep"
     assert semantic_hash(desired) != semantic_hash(observed.to_ical())
+
+
+BERLIN = ZoneInfo("Europe/Berlin")
+
+
+def fixture_bytes(name="weekly-exceptions.ics"):
+    return (Path(__file__).parents[1] / "fixtures" / "ics" / name).read_bytes()
+
+
+def components(data):
+    return semantic_snapshot(data)["calendar"]["components"]
+
+
+def override_of(data, rid):
+    return [e for e in Calendar.from_ical(data).walk("VEVENT") if e.get("RECURRENCE-ID") and e.decoded("RECURRENCE-ID") == rid]
+
+
+# spec: ANYM-234
+def test_caldav_occurrence_update_and_cancel_preserve_the_rest_of_the_series():
+    source = fixture_bytes()
+    before = components(source)
+    update_rid = datetime(2026, 11, 9, 16, tzinfo=BERLIN)
+    cancel_rid = datetime(2026, 11, 23, 16, tzinfo=BERLIN)
+    updated = edit_single(
+        source, update_rid, update_rid + timedelta(hours=2), update_rid + timedelta(hours=3), summary="Moved", location="Room 2"
+    )
+    cancelled = cancel_single(source, cancel_rid)
+    for data, rid in ((updated, update_rid), (cancelled, cancel_rid)):
+        after = components(data)
+        # Master, VTIMEZONE, VALARM, X-properties and the other exceptions are all still there, unchanged.
+        assert all(c in after for c in before)
+        [added] = [c for c in after if c not in before]
+        props = added["properties"]
+        assert props["RECURRENCE-ID"]["value"] == rid.isoformat()
+        assert props["RECURRENCE-ID"]["params"] == {"TZID": "Europe/Berlin"}
+        assert not {"RRULE", "RDATE", "EXDATE"} & set(props)
+        assert added["components"][0]["type"] == "VALARM"  # copied from the master
+        assert props["X-FAMILY-FIXTURE"]["params"] == {"X-MODE": "keep"}
+    [override] = override_of(updated, update_rid)
+    assert (override["SUMMARY"], override["LOCATION"]) == ("Moved", "Room 2")
+    assert override.decoded("DTSTART") == update_rid + timedelta(hours=2) and "STATUS" not in override
+    [override] = override_of(cancelled, cancel_rid)
+    assert str(override["STATUS"]) == "CANCELLED"
+    # Cancelling adds the override; it never adds or removes an EXDATE.
+    assert b"EXDATE" in source and cancelled.count(b"EXDATE") == updated.count(b"EXDATE") == source.count(b"EXDATE")
+    values = occurrences(cancelled, START - timedelta(days=1), START + timedelta(weeks=8))
+    assert cancel_rid not in [x["identity"] for x in values] and update_rid in [x["identity"] for x in values]
+
+
+# spec: ANYM-234
+def test_occurrence_edit_keeps_identity_and_rejects_foreign_identities():
+    source = fixture_bytes()
+    moved = datetime(2026, 11, 16, 16, tzinfo=BERLIN)  # fixture override, actually at 18:00
+    once = edit_single(source, moved, moved + timedelta(hours=3), moved + timedelta(hours=4), summary="Again")
+    twice = edit_single(once, moved, moved + timedelta(hours=3), moved + timedelta(hours=4), summary="Again")
+    assert len(override_of(once, moved)) == len(override_of(twice, moved)) == 1
+    assert len(Calendar.from_ical(once).walk("VEVENT")) == len(Calendar.from_ical(source).walk("VEVENT"))
+    # A UTC identity from storage is written in the master's own zone.
+    utc = datetime(2026, 11, 9, 15, tzinfo=ZoneInfo("UTC"))
+    written = edit_single(source, utc, utc, utc + timedelta(hours=1), summary="UTC identity")
+    [override] = override_of(written, utc)
+    assert override["RECURRENCE-ID"].params["TZID"] == "Europe/Berlin"
+    # EXDATE'd, never generated and cancelled-and-gone identities are not occurrences of the series.
+    for rid in (datetime(2026, 10, 26, 16, tzinfo=BERLIN), datetime(2026, 11, 10, 16, tzinfo=BERLIN), datetime(2026, 11, 9, 17, tzinfo=BERLIN)):
+        with pytest.raises(CalendarError, match="invalid_occurrence_identity"):
+            cancel_single(source, rid)
+    with pytest.raises(CalendarError, match="invalid_occurrence_identity"):
+        edit_single(source, datetime(2026, 11, 9).date(), datetime(2026, 11, 9).date(), datetime(2026, 11, 10).date())
+
+
+# spec: ANYM-234
+def test_all_day_series_occurrence_keeps_date_values_and_exclusive_end():
+    from datetime import date
+
+    data = create_event(
+        "all-day-series@family.invalid", date(2026, 10, 19), date(2026, 10, 20), "Daily", rrule={"FREQ": "DAILY", "COUNT": 4}
+    )
+    rid = date(2026, 10, 21)
+    moved = edit_single(data, rid, date(2026, 10, 25), date(2026, 10, 26), summary="Shifted")
+    [override] = override_of(moved, rid)
+    assert override.to_ical().count(b"VALUE=DATE") >= 3 and override.decoded("DTEND") == date(2026, 10, 26)
+    [override] = override_of(cancel_single(data, rid), rid)
+    assert str(override["STATUS"]) == "CANCELLED" and override.decoded("DTEND") - override.decoded("DTSTART") == timedelta(days=1)
+    # A date identity cannot address a timed series, and the reverse.
+    with pytest.raises(CalendarError, match="invalid_occurrence_identity"):
+        cancel_single(weekly(), date(2026, 10, 26))
+
+
+# spec: ANYM-234
+def test_cancel_keeps_the_times_of_an_already_moved_occurrence_and_duration_properties():
+    source = fixture_bytes()
+    moved = datetime(2026, 11, 16, 16, tzinfo=BERLIN)
+    [override] = override_of(cancel_single(source, moved), moved)
+    assert str(override["STATUS"]) == "CANCELLED" and override.decoded("DTSTART") == moved + timedelta(hours=2)
+    durable = source.replace(b"DTEND;TZID=Europe/Berlin:20261019T170000", b"DURATION:PT1H")
+    rid = datetime(2026, 11, 9, 16, tzinfo=BERLIN)
+    [override] = override_of(cancel_single(durable, rid), rid)
+    assert override.decoded("DTEND") == rid + timedelta(hours=1) and "DURATION" not in override

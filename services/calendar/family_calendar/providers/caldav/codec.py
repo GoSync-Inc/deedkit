@@ -319,37 +319,71 @@ def _assert_identity(root, rid):
         raise CalendarError("invalid_occurrence_identity")
 
 
-def move_single(data, rid, start, end):
+def _identity(root, rid):
+    """Write an identity in the zone of the series start, so a UTC value read back from storage
+    still names the series' own wall time."""
+    start = root.decoded("DTSTART")
+    if isinstance(rid, datetime) and rid.tzinfo is not None and isinstance(start, datetime) and start.tzinfo:
+        return rid.astimezone(start.tzinfo)
+    return rid
+
+
+def _override(cal, rid):
+    return next(
+        (e for e in cal.walk("VEVENT") if e.get("RECURRENCE-ID") and e.decoded("RECURRENCE-ID") == rid), None
+    )
+
+
+def _duration(event):
+    if "DTEND" in event:
+        return event.decoded("DTEND") - event.decoded("DTSTART")
+    if "DURATION" in event:
+        return event.decoded("DURATION")
+    # RFC 5545 3.6.1: a DATE event lasts a day, a DATE-TIME event without an end is an instant.
+    return timedelta(days=1) if not isinstance(event.decoded("DTSTART"), datetime) else timedelta(0)
+
+
+def edit_single(data, rid, start, end, *, summary=None, location=None, description=None):
+    """Create or update the override of exactly one occurrence, keyed by its original identity."""
     cal = parse(data)
     root = master(cal)
+    rid = _identity(root, rid)
     _assert_identity(root, rid)
     if type(start) is not type(rid) or type(end) is not type(rid) or end <= start:
         raise CalendarError("invalid_time_range")
-    existing = next(
-        (e for e in cal.walk("VEVENT") if e.get("RECURRENCE-ID") and e.decoded("RECURRENCE-ID") == rid), None
-    )
-    event = existing if existing is not None else deepcopy(root)
-    if existing is None:
+    event = _override(cal, rid)
+    if event is None:
+        event = deepcopy(root)
         for key in ("RRULE", "RDATE", "EXDATE"):
             event.pop(key, None)
         event.add("RECURRENCE-ID", rid)
         cal.add_component(event)
     _set(event, "DTSTART", start)
     _set(event, "DTEND", end)
+    event.pop("DURATION", None)
     event.pop("STATUS", None)
+    for name, value in (("SUMMARY", summary), ("LOCATION", location), ("DESCRIPTION", description)):
+        if value is not None:
+            _set(event, name, value)
     _touch(event)
     return cal.to_ical()
 
 
+def move_single(data, rid, start, end):
+    return edit_single(data, rid, start, end)
+
+
 def cancel_single(data, rid):
+    """A CANCELLED override with the original RECURRENCE-ID; the master and its EXDATE stay as they are."""
     cal = parse(data)
     root = master(cal)
-    duration = root.decoded("DTEND") - root.decoded("DTSTART")
-    changed = parse(move_single(data, rid, rid, rid + duration))
-    event = next(
-        e for e in changed.walk("VEVENT") if e.get("RECURRENCE-ID") and e.decoded("RECURRENCE-ID") == rid
-    )
-    _set(event, "STATUS", "CANCELLED", params={})
+    rid = _identity(root, rid)
+    _assert_identity(root, rid)
+    existing = _override(cal, rid)
+    # An occurrence moved before keeps the time it was moved to.
+    source, start = (existing, existing.decoded("DTSTART")) if existing is not None else (root, rid)
+    changed = parse(edit_single(data, rid, start, start + _duration(source)))
+    _set(_override(changed, rid), "STATUS", "CANCELLED", params={})
     return changed.to_ical()
 
 

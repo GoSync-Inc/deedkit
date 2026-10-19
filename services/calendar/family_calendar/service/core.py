@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -41,19 +41,85 @@ def wall_time(value, zone):
     return t
 
 
-def validate_event(event):
-    allowed = {"title", "start", "end", "timezone", "location", "description"}
-    if not isinstance(event, dict) or set(event) - allowed or not {"start", "end", "timezone"} <= set(event):
-        raise CalendarError("invalid_event")
+EVENT_WRITE = (
+    "guest-free single event, all-day event (date range, exclusive end), or one occurrence of a "
+    "recurring series (update or cancel, chosen by its event_ref); series, this-and-following and "
+    "invitations are not written"
+)
+# Per provider, exactly what the write path implements; both rest on synthetic evidence until the owner's live run.
+PROVIDER_WRITE = {
+    provider: {"occurrence_write": True, "all_day_write": True} for provider in ("google", "icloud")
+}
+LIMITS = [("title", 256), ("location", 512), ("description", 4000)]
+DATE_VALUE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def invalid(path, *problems):
+    """invalid_event naming each field at fault: (field, reason) pairs relative to `path`."""
+    return CalendarError("invalid_event", [{"field": f"{path}/{f}", "reason": r} for f, r in problems])
+
+
+def day(value, path, field):
+    if not isinstance(value, str) or not DATE_VALUE.fullmatch(value):
+        raise invalid(path, (field, "date"))
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise invalid(path, (field, "date")) from None
+
+
+def validate_all_day(event, path):
+    """Date range with an exclusive end; a missing end is one day. No time or timezone."""
+    if "timezone" in event:
+        raise invalid(path, ("timezone", "not_allowed_for_all_day"))
+    if "start" not in event:
+        raise invalid(path, ("start", "required"))
+    a = day(event["start"], path, "start")
+    b = day(event["end"], path, "end") if "end" in event else a + timedelta(days=1)
+    if not a < b or b - a > timedelta(days=31):
+        raise CalendarError("invalid_window")
+    return dict(event, all_day=True, start=a.isoformat(), end=b.isoformat())
+
+
+def validate_timed(event, path):
+    missing = [(f, "required") for f in ("start", "end", "timezone") if f not in event]
+    if missing:
+        raise invalid(path, *missing)
     try:
         zone = ZoneInfo(event["timezone"])
     except (ZoneInfoNotFoundError, TypeError, ValueError):
         raise CalendarError("invalid_timezone") from None
     a, b = window(wall_time(event["start"], zone), wall_time(event["end"], zone))
-    for k, limit in [("title", 256), ("location", 512), ("description", 4000)]:
+    return {k: v for k, v in event.items() if k != "all_day"} | {"start": a.isoformat(), "end": b.isoformat()}
+
+
+def validate_event(event, path="event"):
+    allowed = {"title", "start", "end", "timezone", "location", "description", "all_day"}
+    if not isinstance(event, dict):
+        raise CalendarError("invalid_event")
+    if set(event) - allowed:
+        raise invalid(path, *((f, "unknown") for f in sorted(set(event) - allowed)))
+    if not isinstance(event.get("all_day", False), bool):
+        raise invalid(path, ("all_day", "type"))
+    result = validate_all_day(event, path) if event.get("all_day") else validate_timed(event, path)
+    for k, limit in LIMITS:
         if k in event and (not isinstance(event[k], str) or len(event[k]) > limit):
-            raise CalendarError("invalid_event")
-    return dict(event, start=a.isoformat(), end=b.isoformat())
+            raise invalid(path, (k, "type" if not isinstance(event[k], str) else "max_length"))
+    return result
+
+
+def event_span(event, zone_name):
+    """Instants an event occupies; an all-day event spans whole days of its calendar's own timezone."""
+    if not event.get("all_day"):
+        return instant(event["start"]), instant(event["end"])
+    try:
+        zone = ZoneInfo(zone_name)
+    except (ZoneInfoNotFoundError, TypeError, ValueError):
+        raise CalendarError("invalid_timezone") from None
+    return tuple(
+        datetime.combine(date.fromisoformat(event[k]), time.min, zone).astimezone(timezone.utc)
+        for k in ("start", "end")
+    )
 
 
 class FamilyService:
@@ -201,8 +267,11 @@ class FamilyService:
             calendars,
             permissions=sorted(self.principal(key)["scopes"]),
             constraints={
-                "event_write": "single non-recurring timed guest-free event",
+                "event_write": EVENT_WRITE,
                 "time_format": TIME_FORMAT,
+                "occurrence_write": True,
+                "all_day_write": True,
+                "provider_write": PROVIDER_WRITE,
                 "recurrence_write": False,
                 "future_split": False,
                 "invitations": False,
@@ -222,9 +291,11 @@ class FamilyService:
                 "slots": True,
                 "assignments": True,
                 "event_create": True,
-                "event_update": "single non-recurring guest-free event",
-                "event_delete": "single non-recurring guest-free event",
+                "event_update": EVENT_WRITE,
+                "event_delete": EVENT_WRITE,
                 "recurrence_read": True,
+                "occurrence_write": True,
+                "all_day_write": True,
                 "recurrence_write": False,
                 "future_split": False,
                 "invitations": False,
@@ -382,7 +453,9 @@ class FamilyService:
                 "ordinal": len(prepared),
             }
             if kind != "delete":
-                step["event"] = validate_event(action.get("event"))
+                step["event"] = validate_event(action.get("event"), f"actions/{len(prepared)}/event")
+                a, b = event_span(step["event"], cal["timezone"])
+                step["span"] = {"start": a.isoformat(), "end": b.isoformat()}
             if kind == "create":
                 if not step["event"].get("title"):
                     raise CalendarError("invalid_event")
@@ -399,26 +472,38 @@ class FamilyService:
                 if row["resource_ref"] in touched:
                     raise CalendarError("duplicate_resource_action")
                 touched.add(row["resource_ref"])
-                if (
-                    row["details"].get("recurring")
-                    or row["details"].get("guests")
-                    or row["details"].get("special")
-                ):
+                details = row["details"]
+                if details.get("guests") or details.get("special"):
                     raise CalendarError("capability_unverified")
+                if details.get("recurring"):
+                    # One occurrence only: a series-wide target (a master, or a row stored without
+                    # an occurrence identity) has no original start to name.
+                    if not (details.get("series_ref") and details.get("original_start")):
+                        raise CalendarError("capability_unverified")
+                    if kind == "update" and bool(step["event"].get("all_day")) != bool(details.get("all_day")):
+                        raise CalendarError("capability_unverified")
+                    step["occurrence"] = {
+                        "series_ref": details["series_ref"],
+                        "original_start": details["original_start"],
+                    }
                 if not row["etag"]:
                     raise CalendarError("conditional_write_unavailable")
+                before = {
+                    "start": row["start_at"].isoformat(),
+                    # The stored instant span is internal; the source event ends at its start.
+                    "end": (row["start_at"] if details.get("instant") else row["end_at"]).isoformat(),
+                    **details,
+                }
+                if details.get("all_day"):
+                    # Stored at local midnight; the event itself is a date range.
+                    zone = ZoneInfo(cal["timezone"])
+                    for field, stored in (("start", row["start_at"]), ("end", row["end_at"])):
+                        before[field] = stored.astimezone(zone).date().isoformat()
                 step.update(
                     resource_ref=row["resource_ref"],
                     target_id=row["target"],
                     expected_etag=row["etag"],
-                    before={
-                        "start": row["start_at"].isoformat(),
-                        # The stored instant span is internal; the source event ends at its start.
-                        "end": (
-                            row["start_at"] if row["details"].get("instant") else row["end_at"]
-                        ).isoformat(),
-                        **row["details"],
-                    },
+                    before=before,
                 )
             prepared.append(step)
         overlap_check = self._overlap_check(key, p, prepared, touched)
@@ -453,8 +538,8 @@ class FamilyService:
         if not proposed:
             result["status"] = "not_applicable"
             return result
-        a = min(instant(s["event"]["start"]) for s in proposed)
-        b = max(instant(s["event"]["end"]) for s in proposed)
+        a = min(instant(s["span"]["start"]) for s in proposed)
+        b = max(instant(s["span"]["end"]) for s in proposed)
         # Independent valid actions may span more than the maximum read window.
         # Such a plan stays valid but its overlap check is explicitly incomplete.
         if b - a > timedelta(days=31):
@@ -508,9 +593,9 @@ class FamilyService:
                 ):
                     continue
                 for step in proposed:
-                    if instant(event["start"]) < instant(step["event"]["end"]) and instant(
+                    if instant(event["start"]) < instant(step["span"]["end"]) and instant(
                         event["end"]
-                    ) > instant(step["event"]["start"]):
+                    ) > instant(step["span"]["start"]):
                         overlap = {
                             "step": step["ordinal"],
                             "calendar_ref": calendar_ref,
@@ -526,9 +611,9 @@ class FamilyService:
                             return result
         for index, step in enumerate(proposed):
             for other in proposed[index + 1 :]:
-                if instant(step["event"]["start"]) < instant(other["event"]["end"]) and instant(
-                    step["event"]["end"]
-                ) > instant(other["event"]["start"]):
+                if instant(step["span"]["start"]) < instant(other["span"]["end"]) and instant(
+                    step["span"]["end"]
+                ) > instant(other["span"]["start"]):
                     result["overlaps"].append(
                         {"step": step["ordinal"], "other_step": other["ordinal"], "kind": "proposed_overlap"}
                     )
@@ -547,6 +632,7 @@ class FamilyService:
         fields = ("title", "start", "end", "timezone", "location", "description")
         diff = {}
         update = step.get("action") == "update"
+        was, will = bool(before.get("all_day")), bool(after.get("all_day"))
         for field in fields:
             # Providers keep fields an update omits, and stored details carry no original
             # timezone; neither may be shown as a change the apply would not make.
@@ -554,15 +640,15 @@ class FamilyService:
                 continue
             old, new = before.get(field), after.get(field)
             equal = old == new
-            if field in ("start", "end") and old and new:
+            # Dates compare as written; timed values by instant, whatever offset spells them.
+            if field in ("start", "end") and old and new and not was and not will:
                 equal = instant(old) == instant(new)
             if not equal:
                 diff[field] = {"before": old, "after": new}
-        if update and before.get("all_day"):
-            # Writes are always timed, so applying converts an all-day event.
-            diff["all_day"] = {"before": True, "after": False}
+        if update and was != will:
+            diff["all_day"] = {"before": was, "after": will}
         return {
-            **{k: v for k, v in step.items() if k not in ("target_id", "resource_ref", "expected_etag")},
+            **{k: v for k, v in step.items() if k not in ("target_id", "resource_ref", "expected_etag", "span")},
             "diff": diff,
         }
 

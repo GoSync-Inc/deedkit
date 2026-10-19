@@ -15,7 +15,16 @@ from google.oauth2 import id_token
 from family_calendar.errors import CalendarError
 from family_calendar.providers.caldav.adapter import CalDAVAdapter
 from family_calendar.providers.caldav.transport import DAVTransport, within_collection
-from family_calendar.providers.caldav.codec import create_event, parse, master, _set, _touch, semantic_hash
+from family_calendar.providers.caldav.codec import (
+    cancel_single,
+    create_event,
+    edit_single,
+    parse,
+    master,
+    _set,
+    _touch,
+    semantic_hash,
+)
 from family_calendar.providers.google.adapter import GoogleAdapter
 from .store import digest, instant
 
@@ -40,6 +49,11 @@ _DAYS_PER_PERIOD = {"WEEKLY": 7, "MONTHLY": 31, "YEARLY": 366}
 
 def source_ref(prefix, *parts):
     return prefix + "-" + digest(parts)[:32]
+
+
+def series_ref(calendar_ref, series):
+    """Public name of a recurring series: the provider's own ID or href is never shown."""
+    return source_ref("series", calendar_ref, series)
 
 
 def ical_time(value, zone):
@@ -146,22 +160,29 @@ def normalize_icloud(calendar_ref, resource, start, end, zone, budget=None):
             # A zero-length event (e.g. DTSTART without DTEND) is a non-blocking instant.
             if a >= end or (b <= start if b > a else a < start):
                 continue
-            identity = (e.get("RECURRENCE-ID") or e["DTSTART"]).to_ical().decode() if recurring else "master"
+            original = e.get("RECURRENCE-ID") or e["DTSTART"]
+            identity = original.to_ical().decode() if recurring else "master"
+            details = {
+                "title": provider_text(e.get("SUMMARY", ""), 256),
+                "location": provider_text(e.get("LOCATION", ""), 512),
+                "description": provider_text(e.get("DESCRIPTION", ""), 4000),
+                "recurring": recurring,
+                "guests": "ATTENDEE" in e or "ORGANIZER" in e,
+                "all_day": not isinstance(e.decoded("DTSTART"), datetime),
+                "instant": a == b,
+            }
+            if recurring:
+                # The series and the occurrence's original start name exactly one occurrence.
+                details.update(
+                    series_ref=series_ref(calendar_ref, resource["href"]), original_start=original.dt.isoformat()
+                )
             occurrences.append(
                 {
                     "ref": source_ref("event", resource_ref, str(e["UID"]), identity),
                     "start": a,
                     "end": b,
                     "busy": b > a and str(e.get("TRANSP", "OPAQUE")).upper() != "TRANSPARENT",
-                    "details": {
-                        "title": provider_text(e.get("SUMMARY", ""), 256),
-                        "location": provider_text(e.get("LOCATION", ""), 512),
-                        "description": provider_text(e.get("DESCRIPTION", ""), 4000),
-                        "recurring": recurring,
-                        "guests": "ATTENDEE" in e or "ORGANIZER" in e,
-                        "all_day": not isinstance(e.decoded("DTSTART"), datetime),
-                        "instant": a == b,
-                    },
+                    "details": details,
                 }
             )
             if len(occurrences) > budget["occurrences"]:
@@ -196,6 +217,20 @@ def normalize_google(calendar_ref, e, zone):
         if b < a:
             raise CalendarError("invalid_provider_event_time")
         identity = e.get("originalStartTime", "master")
+        details = {
+            "title": provider_text(e.get("summary", ""), 256),
+            "location": provider_text(e.get("location", ""), 512),
+            "description": provider_text(e.get("description", ""), 4000),
+            "recurring": bool(e.get("recurringEventId") or e.get("recurrence")),
+            "guests": bool(e.get("attendees")),
+            "special": e.get("eventType", "default") != "default",
+            "all_day": "date" in e["start"],
+            "instant": a == b,
+        }
+        original = identity.get("dateTime") or identity.get("date") if isinstance(identity, dict) else None
+        if e.get("recurringEventId") and original and not e.get("recurrence"):
+            # An instance (singleEvents=true) names its series and its original start; a master has neither.
+            details.update(series_ref=series_ref(calendar_ref, e["recurringEventId"]), original_start=original)
         rows.append(
             {
                 "ref": source_ref("event", resource_ref, identity),
@@ -203,16 +238,7 @@ def normalize_google(calendar_ref, e, zone):
                 "end": b,
                 # A zero-length event is a non-blocking instant.
                 "busy": b > a and e.get("transparency") != "transparent",
-                "details": {
-                    "title": provider_text(e.get("summary", ""), 256),
-                    "location": provider_text(e.get("location", ""), 512),
-                    "description": provider_text(e.get("description", ""), 4000),
-                    "recurring": bool(e.get("recurringEventId") or e.get("recurrence")),
-                    "guests": bool(e.get("attendees")),
-                    "special": e.get("eventType", "default") != "default",
-                    "all_day": "date" in e["start"],
-                    "instant": a == b,
-                },
+                "details": details,
             }
         )
     return {
@@ -222,6 +248,20 @@ def normalize_google(calendar_ref, e, zone):
         "payload": e,
         "occurrences": rows,
     }
+
+
+def same_time(actual, desired):
+    """A Google start/end read back as written; a null part of `desired` must be absent."""
+    for part, wanted in desired.items():
+        if wanted is None:
+            if actual.get(part) is not None:
+                return False
+        elif part == "dateTime":
+            if "dateTime" not in actual or instant(actual["dateTime"]) != instant(wanted):
+                return False
+        elif actual.get(part) != wanted:
+            return False
+    return True
 
 
 class Providers:
@@ -312,9 +352,65 @@ class Providers:
             return await adapter.read(target)
         return await adapter.read(cal["target"], target)
 
+    @staticmethod
+    def _guard_google(cal, old, occurrence):
+        if old.get("status") == "cancelled":
+            raise CalendarError("version_conflict")
+        if old.get("attendees") or old.get("eventType", "default") != "default":
+            raise CalendarError("capability_unverified")
+        if occurrence is None:
+            if old.get("recurrence") or old.get("recurringEventId"):
+                raise CalendarError("capability_unverified")
+            return
+        # Only an instance of a series, never the master.
+        if old.get("recurrence") or not old.get("recurringEventId"):
+            raise CalendarError("capability_unverified")
+        started, wanted = old.get("originalStartTime") or {}, occurrence["original_start"]
+        same = (
+            "T" in wanted and instant(started["dateTime"]) == instant(wanted)
+            if "dateTime" in started
+            else started.get("date") == wanted
+        )
+        if not same or series_ref(cal["ref"], old["recurringEventId"]) != occurrence["series_ref"]:
+            raise CalendarError("version_conflict")
+
+    @staticmethod
+    def _guard_caldav(cal, target, original, occurrence):
+        events = original.walk("VEVENT")
+        e = master(original)
+        if any(k in ev for ev in events for k in ("ATTENDEE", "ORGANIZER")):
+            raise CalendarError("capability_unverified")
+        if occurrence is None:
+            if len(events) != 1 or any(k in e for k in ("RRULE", "RDATE", "RECURRENCE-ID")):
+                raise CalendarError("capability_unverified")
+            return
+        # A series of this module's kind: one master, exceptions that name a single occurrence each.
+        if not ("RRULE" in e or "RDATE" in e) or any(
+            "RANGE" in ev["RECURRENCE-ID"].params for ev in events if "RECURRENCE-ID" in ev
+        ):
+            raise CalendarError("capability_unverified")
+        if series_ref(cal["ref"], target) != occurrence["series_ref"]:
+            raise CalendarError("version_conflict")
+
+    @staticmethod
+    def _google_times(event, old):
+        """Date or dateTime for start and end. A conversion removes the other form: a patch only merges."""
+        times = {}
+        for name in ("start", "end"):
+            previous = (old or {}).get(name) or {}
+            if event.get("all_day"):
+                value = {"date": event[name]}
+                value.update({k: None for k in ("dateTime", "timeZone") if k in previous})
+            else:
+                value = {"dateTime": event[name], "timeZone": event["timezone"]}
+                value.update({"date": None} if "date" in previous else {})
+            times[name] = value
+        return times
+
     async def prepare(self, cal, step):
         target = step["target_id"]
         event = step.get("event", {})
+        occurrence = step.get("occurrence")
         if step["action"] == "create" and cal["provider"] == "icloud":
             target = cal["target"].rstrip("/") + "/" + target + ".ics"
         old = await self.read(cal, target)
@@ -324,33 +420,22 @@ class Providers:
             if not old or old.get("etag") != step["expected_etag"]:
                 raise CalendarError("version_conflict")
             if cal["provider"] == "google":
-                if (
-                    old.get("recurrence")
-                    or old.get("recurringEventId")
-                    or old.get("attendees")
-                    or old.get("eventType", "default") != "default"
-                ):
-                    raise CalendarError("capability_unverified")
+                self._guard_google(cal, old, occurrence)
             else:
-                original = parse(old["data"])
-                e = master(original)
-                if len(original.walk("VEVENT")) != 1 or any(
-                    k in e for k in ("RRULE", "RDATE", "ATTENDEE", "ORGANIZER", "RECURRENCE-ID")
-                ):
-                    raise CalendarError("capability_unverified")
+                self._guard_caldav(cal, target, parse(old["data"]), occurrence)
         intent = {
             "action": step["action"],
             "target": target,
             "expected_etag": step.get("expected_etag"),
             "resource_ref": source_ref("res", cal["ref"], target),
         }
-        if step["action"] == "delete":
+        if occurrence:
+            intent["scope"] = "occurrence"
+        if step["action"] == "delete" and cal["provider"] == "google":
+            # A deleted instance becomes a cancelled instance; the series is untouched.
             intent["desired"] = None
         elif cal["provider"] == "google":
-            desired = {
-                "start": {"dateTime": event["start"], "timeZone": event["timezone"]},
-                "end": {"dateTime": event["end"], "timeZone": event["timezone"]},
-            }
+            desired = self._google_times(event, old)
             desired.update(
                 {
                     {"title": "summary", "location": "location", "description": "description"}[k]: event[k]
@@ -361,30 +446,55 @@ class Providers:
             if step["action"] == "create":
                 desired["id"] = target
             intent["desired"] = desired
+        elif occurrence:
+            if step["action"] == "delete":
+                # Cancelling one occurrence rewrites the resource; the resource itself is not deleted.
+                intent["action"] = "update"
+            try:
+                wanted = occurrence["original_start"]
+                rid = datetime.fromisoformat(wanted) if "T" in wanted else date.fromisoformat(wanted)
+                data = (
+                    cancel_single(old["data"], rid)
+                    if step["action"] == "delete"
+                    else edit_single(old["data"], rid, *self._caldav_times(event), **self._caldav_text(event))
+                )
+            except CalendarError:
+                raise
+            except Exception:
+                # Nothing was sent yet: an unexpected shape is a definite refusal, never an unknown write.
+                raise CalendarError("unsupported_recurrence") from None
+            intent["desired"] = base64.b64encode(data).decode()
+            intent["semantic_hash"] = semantic_hash(data)
+        elif step["action"] == "delete":
+            intent["desired"] = None
         else:
             original = (
                 parse(old["data"])
                 if old
-                else Calendar.from_ical(
-                    create_event(
-                        step["target_id"], instant(event["start"]), instant(event["end"]), event["title"]
-                    )
-                )
+                else Calendar.from_ical(create_event(step["target_id"], *self._caldav_times(event), event["title"]))
             )
             e = master(original)
-            _set(e, "DTSTART", instant(event["start"]))
-            _set(e, "DTEND", instant(event["end"]))
-            for k, property_name in [
-                ("title", "SUMMARY"),
-                ("location", "LOCATION"),
-                ("description", "DESCRIPTION"),
-            ]:
-                if k in event:
-                    _set(e, property_name, event[k])
+            start, end = self._caldav_times(event)
+            _set(e, "DTSTART", start)
+            _set(e, "DTEND", end)
+            e.pop("DURATION", None)
+            for name, value in self._caldav_text(event).items():
+                _set(e, name.upper(), value)
             _touch(e)
             intent["desired"] = base64.b64encode(original.to_ical()).decode()
             intent["semantic_hash"] = semantic_hash(original.to_ical())
         return intent
+
+    @staticmethod
+    def _caldav_times(event):
+        if event.get("all_day"):
+            return date.fromisoformat(event["start"]), date.fromisoformat(event["end"])
+        return instant(event["start"]), instant(event["end"])
+
+    @staticmethod
+    def _caldav_text(event):
+        fields = (("summary", "title"), ("location", "location"), ("description", "description"))
+        return {name: event[key] for name, key in fields if key in event}
 
     async def mutate(self, cal, intent):
         adapter = await self.adapter(cal)
@@ -420,14 +530,9 @@ class Providers:
         else:
 
             def equal(k, v):
-                actual = value.get(k)
                 if k in ("start", "end"):
-                    return (
-                        actual
-                        and instant(actual.get("dateTime")) == instant(v["dateTime"])
-                        and actual.get("timeZone") == v.get("timeZone")
-                    )
-                return actual == v
+                    return same_time(value.get(k) or {}, v)
+                return value.get(k) == v
 
             match = all(equal(k, v) for k, v in intent["desired"].items())
         return (

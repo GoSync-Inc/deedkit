@@ -9,7 +9,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Read-only. Granted calendars with allowed event actions, plus constraints: accepted time format, window/calendar/event limits, plan action limit and TTL, and unsupported writes (recurrence, invitations). Read this before planning.",
+      "description": "Read-only. Granted calendars with allowed event actions, plus constraints: accepted time format, window/calendar/event limits, plan action limit and TTL, and unsupported writes (series, this-and-following, invitations). Read this before planning.",
       "inputSchema": {
         "properties": {},
         "type": "object",
@@ -156,7 +156,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Prepare an immutable preview and field diff for 1–8 guest-free single-event changes. Only a local plan record is stored for apply; no calendar mutation occurs. Event start/end: ISO 8601 with offset, or wall time YYYY-MM-DDTHH:MM[:SS] read in the event's IANA timezone. Advisory cached overlap checks cover visible calendars only.",
+      "description": "Prepare an immutable preview and field diff for 1–8 guest-free changes: a single event, an all-day event, or one occurrence of a recurring series (update or delete=cancel, by the event_ref from agenda; the preview names the series and the occurrence's original start). Series-wide, this-and-following and guest changes are refused with capability_unverified. Only a local plan record is stored for apply; no calendar mutation occurs. Timed event start/end: ISO 8601 with offset, or wall time YYYY-MM-DDTHH:MM[:SS] read in the event's IANA timezone (timezone required). All-day event: all_day=true with start/end as YYYY-MM-DD dates, end exclusive and optional (default start+1 day), no timezone; an occurrence cannot switch between timed and all-day. Advisory cached overlap checks cover visible calendars only.",
       "inputSchema": {
         "properties": {
           "actions": {
@@ -242,12 +242,40 @@
                 "type": "string"
               },
               "end": {
-                "title": "End",
-                "type": "string"
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "End"
               },
               "timezone": {
-                "title": "Timezone",
-                "type": "string"
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Timezone"
+              },
+              "all_day": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "All Day"
               },
               "location": {
                 "anyOf": [
@@ -277,9 +305,7 @@
               }
             },
             "required": [
-              "start",
-              "end",
-              "timezone"
+              "start"
             ],
             "title": "EventInput",
             "type": "object"

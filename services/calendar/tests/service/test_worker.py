@@ -318,3 +318,100 @@ def test_operation_receipt_remains_readable_after_write_opt_in_removed(operation
     store, key, op_id = operation
     store.write_opt_in("cal-a", False)
     assert FamilyService(store).operation(key, op_id)["state"] == "queued"
+
+
+# --- ANYM-234: an unknown occurrence write is reconciled, never sent again --------------------------
+
+
+def _publish_icloud_series(store):
+    from family_calendar.service.providers import normalize_icloud
+    from tests.service.test_providers import ICLOUD_CAL, SERIES_URL, weekly_exceptions
+    from datetime import datetime, timezone
+
+    store.connection("conn-i", "adult-a", "icloud")
+    store.calendar(ICLOUD_CAL["ref"], "conn-i", ICLOUD_CAL["target"], "Family", "Europe/Berlin", "write")
+    a, b = datetime(2026, 10, 19, tzinfo=timezone.utc), datetime(2026, 12, 31, tzinfo=timezone.utc)
+    resource = normalize_icloud(
+        ICLOUD_CAL["ref"], {"href": SERIES_URL, "etag": '"v1"', "data": weekly_exceptions()}, a, b, "Europe/Berlin"
+    )
+    store.publish_window(ICLOUD_CAL["ref"], a, b, [resource], "complete")
+    return resource
+
+
+def _publish_google_series(store, calendar_ref="cal-a"):
+    from family_calendar.service.providers import normalize_google
+    from tests.service.test_providers import google_series
+    from datetime import datetime, timezone
+
+    a, b = datetime(2026, 10, 19, tzinfo=timezone.utc), datetime(2026, 11, 2, tzinfo=timezone.utc)
+    rows = [normalize_google(calendar_ref, e, "Asia/Makassar") for e in google_series() if e["id"] != "series"]
+    store.publish_window(calendar_ref, a, b, rows, "complete")
+    return rows
+
+
+class SendThenLoseTheAnswer:
+    """Real provider logic whose first mutation reaches the server but never reports back."""
+
+    def __init__(self, providers):
+        self.providers, self.mutations = providers, 0
+
+    def __getattr__(self, name):
+        return getattr(self.providers, name)
+
+    async def mutate(self, cal, intent):
+        self.mutations += 1
+        await self.providers.mutate(cal, intent)
+        raise CalendarError("unknown_result")
+
+
+async def _lose_answer_then_reconcile(household, ref, found, event, providers, writes):
+    from family_calendar.service.worker import Worker
+
+    household.grant("family", "adult-a", ref, SCOPES, "details")
+    household.write_opt_in(ref, True)
+    key = household.agent("agent-" + ref, "family", "adult-a", SCOPES, [ref])
+    service = FamilyService(household)
+    [target] = [e for e in service.agenda(key, [ref], *found)["events"] if e["recurring"]]
+    assert target["original_start"] and target["series_ref"]
+    action = {"action": "update", "calendar_ref": ref, "event_ref": target["event_ref"], "event": event}
+    op_id = service.apply(key, service.plan(key, [action])["plan_id"], "request-occurrence")["operation_id"]
+    flaky = SendThenLoseTheAnswer(providers)
+    worker = Worker(household, flaky)
+    await worker.run_operation(op_id)
+    assert service.operation(key, op_id)["state"] == "unknown" and writes() == 1
+    # Reconcile reads back by the same href / instance ID: the write is recognised, never repeated.
+    await worker.run_operation(op_id, reconcile=True)
+    assert service.operation(key, op_id)["state"] == "verified"
+    assert flaky.mutations == 1 and writes() == 1
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_unknown_occurrence_write_reconciles_without_duplicate(household):
+    from tests.service.test_providers import ICLOUD_CAL, SERIES_URL, caldav_world, google_world, weekly_exceptions
+
+    # CalDAV: one conditional PUT; the series keeps exactly one override per identity.
+    _publish_icloud_series(household)
+    providers, server = caldav_world(weekly_exceptions())
+    event = {"title": "Moved once", "start": "2026-11-09T14:00:00Z", "end": "2026-11-09T15:00:00Z", "timezone": "Europe/Berlin"}
+    await _lose_answer_then_reconcile(
+        household, ICLOUD_CAL["ref"], ("2026-11-09T00:00:00Z", "2026-11-10T00:00:00Z"), event, providers, lambda: server.puts
+    )
+    data = server.resources[SERIES_URL][0]
+    assert data.count(b"RECURRENCE-ID") == weekly_exceptions().count(b"RECURRENCE-ID") + 1
+    assert data.count(b"Moved once") == 1
+    # Google: one PATCH of the same instance; no instance is created.
+    household.connection("conn-g", "adult-a", "google")
+    household.calendar("cal-g", "conn-g", "calendar-id", "Google", "Asia/Makassar", "write")
+    providers, server = google_world()
+    _publish_google_series(household, "cal-g")
+    await _lose_answer_then_reconcile(
+        household,
+        "cal-g",
+        ("2026-10-19T00:00:00Z", "2026-10-20T00:00:00Z"),
+        {"title": "Moved once", "start": "2026-10-19T10:00:00Z", "end": "2026-10-19T11:00:00Z", "timezone": "UTC"},
+        providers,
+        lambda: len([r for r in server.requests if r.method == "PATCH"]),
+    )
+    assert sorted(server.events) == ["series", "series_20261019T080000Z", "series_20261026T080000Z"]
+    assert server.events["series_20261019T080000Z"]["summary"] == "Moved once"
