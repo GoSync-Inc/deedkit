@@ -763,7 +763,7 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
     except json.JSONDecodeError:
         answer = output
     gate = answer if isinstance(answer, dict) else {}
-    if returncode and answer is None:
+    if returncode and not output.strip():
         # Tiden exits non-zero and prints nothing when the release captured no gate.
         print("::warning title=Tiden release gate::no gate was captured for " + version)
         own_gate = None

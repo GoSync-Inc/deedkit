@@ -1410,6 +1410,37 @@ def test_a_gate_check_answer_that_is_neither_a_verdict_nor_a_missing_gate_means_
 
 
 # spec: ANYM-411
+def test_a_gate_check_that_fails_printing_json_null_is_no_missing_gate(tmp_path, monkeypatch, capsys):
+    import subprocess
+    from scripts.tiden_ci import TidenUnavailable
+
+    def answering(monkeypatch):
+        calls = release_cli(monkeypatch)
+        synthetic = subprocess.run
+        def run(args, **kwargs):
+            if args[1:3] == ["gate", "check"]:
+                return subprocess.CompletedProcess(args, 1, stdout="null", stderr="synthetic unavailable")
+            return synthetic(args, **kwargs)
+        monkeypatch.setattr(subprocess, "run", run)
+        return calls
+
+    # Only empty output means a missing gate; a printed JSON null is no answer.
+    calls = answering(monkeypatch)
+    main_push_manifest(tmp_path)
+    assert run_release(monkeypatch, tmp_path, "--environment", "github-actions-synthetic") == 0
+    out = capsys.readouterr().out
+    assert "receipt state not_verified" in out and "no gate was captured" not in out
+    assert sum(call[1:3] == ["release", "create"] for call in calls) == 1
+    assert {key: receipt(tmp_path).get(key) for key in ("state", "releaseId", "createdAt")} == {
+        "state": "not_verified", "releaseId": "release-id", "createdAt": CREATED}
+    calls = answering(monkeypatch)
+    with pytest.raises(TidenUnavailable):
+        run_release(monkeypatch, tmp_path, *PRODUCTION)
+    assert sum(call[1:3] == ["release", "create"] for call in calls) == 1
+    assert receipt(tmp_path)["state"] == "not_verified"
+
+
+# spec: ANYM-411
 def test_the_receipt_is_current_before_the_create_call_is_sent(tmp_path, monkeypatch):
     import subprocess
     release_cli(monkeypatch)
