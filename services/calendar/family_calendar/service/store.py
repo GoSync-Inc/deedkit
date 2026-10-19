@@ -186,6 +186,30 @@ class Store:
     def revoke(self, principal_id):
         self.query("UPDATE principals SET enabled=false,version=version+1 WHERE id=%s", (principal_id,))
 
+    def extend_agent(self, principal_id, days):
+        # Renew in place within the issued 90-day lifetime: same key, scopes, calendars and version.
+        if not re.fullmatch("[0-9]{1,2}", days) or not 1 <= int(days) <= 90:
+            raise CalendarError("invalid_agent_lifetime")
+        with self.transaction() as c:
+            # now() is the transaction's instant, the same clock authentication compares against.
+            p = c.execute(
+                "SELECT enabled,expires_at,expires_at>now() AS live,now()+make_interval(days=>%s) AS new "
+                "FROM principals WHERE id=%s FOR UPDATE",
+                (int(days), principal_id),
+            ).fetchone()
+            if not p or not p["enabled"]:
+                raise CalendarError("not_found_or_forbidden")
+            if not p["live"]:
+                raise CalendarError("agent_expired")
+            if p["new"] < p["expires_at"]:
+                raise CalendarError("agent_lifetime_would_shorten")
+            c.execute("UPDATE principals SET expires_at=%s WHERE id=%s", (p["new"], principal_id))
+            c.execute(
+                "INSERT INTO audit(principal_id,action,outcome) VALUES (%s,'extend_agent','extended')",
+                (principal_id,),
+            )
+        return p["expires_at"], p["new"]
+
     def publish_window(self, calendar_ref, start, end, resources, status, error=None):
         try:
             self._publish_window(calendar_ref, start, end, resources, status, error)
