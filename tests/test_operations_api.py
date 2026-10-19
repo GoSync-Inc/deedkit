@@ -64,7 +64,7 @@ def test_operation_rest_and_mcp_match_exact_payload(method):
 
 # spec: ANYM-306
 @pytest.mark.parametrize('body', [b'\xff', b'\xff\xfe\x00', b'{"query": "\xc3\x28"}', b'{"query": ', b'[]', b'{"token": "x"}',
-    b'{"limit": '+b'1'*4400+b'}', b'['*3000+b']'*3000])
+    b'{"limit": '+b'1'*4400+b'}'])
 def test_rest_body_that_cannot_be_decoded_is_invalid_parameters_not_retryable(body):
     store = RecordingStore()
     with TestClient(create_app(store, ['testserver'])) as client:
@@ -72,6 +72,15 @@ def test_rest_body_that_cannot_be_decoded_is_invalid_parameters_not_retryable(bo
     assert rest.status_code == 400
     assert rest.json()['error'] == 'invalid_parameters' and rest.json()['retryable'] is False
     assert 'retry_after_seconds' not in rest.json()
+    assert store.calls == []
+
+
+# spec: ANYM-306
+def test_rest_body_nested_beyond_the_parser_recursion_limit_is_invalid_parameters():
+    store = RecordingStore()
+    with TestClient(create_app(store, ['testserver'])) as client:
+        rest = client.post('/v1/upload_file_chunk', headers={'Authorization': 'Bearer synthetic-token'}, content=b'['*12000+b']'*12000)
+    assert rest.status_code == 400 and rest.json()['error'] == 'invalid_parameters' and rest.json()['retryable'] is False
     assert store.calls == []
 
 
