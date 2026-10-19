@@ -158,3 +158,8 @@ or public egress. A separate `messaging_event_delivery` role can deliver hints;
 it cannot read message bodies, API token hashes, subscription page receipts or
 ACK state. Its deployment requires explicit HTTPS egress and private secret
 mounts; installation alone activates nothing. [Delivery contract](SUBSCRIPTIONS.md).
+The wake relay (`packages/wake-relay/`) runs on the owner's agent host, not on the
+DeedKit host. It holds the receiver secret and the vendor credentials (Claude
+routine token, Grok webhook secret) in owner-only files, and forwards only the
+content-free hint fields. A woken run reads and ACKs events only through its own
+DeedKit key, so key revocation still stops it ([Host receivers](SUBSCRIPTIONS.md#host-receivers-wake-relay)).

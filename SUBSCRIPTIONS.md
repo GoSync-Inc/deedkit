@@ -249,6 +249,81 @@ the gateway's own schema check returns `invalid_arguments` with `field_errors`, 
 backend's `invalid_feedback` `field_errors` after rechecking the shape and vocabulary (a malformed list is
 dropped, never partly relayed).
 
+## Host receivers (wake relay)
+
+`packages/wake-relay/` (Node 24, `node:crypto` and `node:sqlite` only) is a host
+receiver: it turns one signed hint into at most one run of the owner's assistant.
+It runs on the owner's agent host behind a public HTTPS name on 443 (Caddy or a
+tunnel), never on the DeedKit production host: it holds vendor credentials that
+DeedKit does not hold. Registration stays an operator action (`--register-receiver`
+with the relay's `https://<name>/hints/<receiver-id>` URL); there is no agent
+onboarding-link API. Configuration is in [the package README](packages/wake-relay/README.md).
+
+**Wire format.** The relay verifies `X-DeedKit-Signature` with a constant-time
+compare over the exact raw body, rejects timestamps older than 300 s or more than
+60 s ahead and bodies over 64 KiB. The signature covers timestamp and body only, so
+`X-DeedKit-Hint-ID` must equal the signed body `hint_id` (otherwise `401`), and the
+relay deduplicates on the signed `hint_id`, never on the header. Only the six
+content-free body fields are kept and forwarded; any other field is dropped.
+`tests/test_event_delivery.py` keeps the relay's signed-hint vector in the live
+dispatcher's format.
+
+**State machine.** One SQLite row per signed `hint_id`; each transition commits
+before the action that follows it.
+
+| State | Meaning |
+|---|---|
+| `pending` | Committed before the dispatcher gets its `2xx`. Nothing was written downstream. |
+| `sending` | Committed after DNS, TCP and TLS succeed, just before the first request byte. |
+| `accepted` | The vendor returned 2xx: Claude with its documented session ID (stored), Grok `202` (no run ID exists). A Claude 2xx without a session ID is `unknown`. |
+| `unknown` | Any outcome after `sending` that the vendor does not document as a refusal: timeout, reset, crash, 500, 503, unlisted status, a response over 64 KiB. Never re-fired. |
+| `failed` | A documented refusal (Anthropic 400/404, Grok 400/413), or a local error before `sending` such as a malformed credential. |
+| `revoked` | Credential rejected (Anthropic 401/403, Grok 401), or the adapter disabled or its credential file removed. |
+| `expired` | `max_hold_s` (default 120 s, at most 600 s after the signed timestamp) ran out before a send. |
+| `folded` | Merged into the subscription's open fire; kept only for deduplication. |
+
+Pre-send failures retry with backoff inside the hold. A `429` returns the row to
+`pending` after `Retry-After`, or `expired` if that passes the hold. On restart,
+`pending` rows fire and `sending` rows become `unknown`. A redelivered known
+`hint_id` gets `2xx` with no new fire. "Exactly one run" is claimed only for `accepted`.
+
+**Coalescing and budgets.** At most one `pending` or `sending` fire per receiver and
+subscription; later hints fold into it and the highest `through` wins. A new fire
+needs a slot in a sliding hour, per vendor target (default 20; one adapter per
+routine or webhook, the same destination however its URL is spelled) and per vendor
+account (default 60). The slot is reserved at acknowledgement and re-dated to each
+send, so every sliding hour holds at most the budget of fires. A request the vendor
+refuses with `429` starts no run: its retry is the same fire and reuses the row's
+slot, so HTTP requests can exceed the budget only by such refusals. Without a slot the relay answers
+`503` with `Retry-After`, stores no row and counts `budget_refused` per
+subscription; the hint stays in the DeedKit outbox under the server fence and
+dead-letters after the dispatcher's eight attempts (about four minutes) if no slot
+opens. A budget-refused hint is not guaranteed a wake.
+
+**Lost wakes and revocation.** No event is lost: a woken run fetches from the ACK
+position and ACKs what it handled. A wake can be lost (`budget_refused`, `expired`,
+`unknown`, dead letter), so the routine or automation also carries a schedule
+trigger at the adapter's shortest cadence (Claude routine: hourly; Grok: per its
+documented schedules) that fetches and ACKs outstanding events. The server fence
+stops new hints but cannot reach work the relay already acknowledged: that work
+fires within `max_hold_s` at most. `--disable-receiver` stops hints only; the key
+can still read. Revoking the key also makes the woken run's fetch and ACK fail.
+Removing an adapter's credential file stops its pending fires, also one whose
+connection is being set up; `"enabled": false` takes effect at the next restart,
+which revokes its pending rows.
+
+**Vendor limits** (vendor documentation, 2026-10-19). Claude routine `/fire`: 30
+fires per hour per routine, 100 API fires per hour per account, `Retry-After` on
+`429`, no idempotency key, `text` up to 65,536 characters wrapped as untrusted
+`<routine-fire-payload>`. Grok Automations webhook: Standard Webhooks signature,
+timestamps within five minutes, body up to 1 MiB, no published rate limit or
+`webhook-id` deduplication.
+
+`host_turn_verified` stays `false` on every hint: the dispatcher cannot see a host
+turn. A relay `accepted` row plus the run's own `fetch_subscription_events` and
+`ack_subscription_events` (ACK position advanced in `get_subscription`) is the
+host-turn evidence the live acceptance of ANYM-228 records.
+
 ## Remaining extensions and verification boundaries
 
 Quiet hours, silence timers, debounce/batch windows, coalescing across overlapping

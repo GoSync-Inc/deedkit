@@ -281,7 +281,8 @@ jobs:
         id: npm
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: packages/npm
-        run: node --test --test-reporter=junit test/*.test.js > "$RUNNER_TEMP/ci-evidence/npm.xml"
+        # The wake relay shares this report: a new evidence file would need its own scripts/tiden_ci.py fragment entry.
+        run: node --test --test-reporter=junit test/*.test.js ../wake-relay/test/*.test.mjs > "$RUNNER_TEMP/ci-evidence/npm.xml"
       - name: Real synthetic MCP and HTTP with restricted gateway role
         id: smoke
         run: uv run python scripts/smoke.py --dsn-file "$RUNNER_TEMP/anymsg-test.dsn"
