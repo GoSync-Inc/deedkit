@@ -52,7 +52,8 @@ def run(s, key, request_id, result, **changes):
     async def execute(job):
         jobs.append(job)
         if isinstance(result, Exception): raise result
-        return result(job) if callable(result) else result
+        out = result(job) if callable(result) else result
+        return await out if asyncio.iscoroutine(out) else out
     assert asyncio.run(CommandWorker(run.state, execute).once())
     return s.get_messenger_operation(key, queued['operation_id']), jobs
 
@@ -77,7 +78,7 @@ def bind_state(request):
 @pytest.mark.parametrize('text,digits', [
     ('+1 (202) 555-0123', PHONE), ('001 202 555 0123', PHONE), ('+1.202.555.01.23', PHONE),
     ('+44 7700\u00a0900123', '447700900123'), ('+44 (7700) 900\u2011123', '447700900123'), (PHONE, PHONE),
-    ('447700900123', '447700900123')])
+    ('447700900123', '447700900123'), ('8 (900) 555-01-23', '89005550123')])
 def test_google_maps_style_numbers_normalize_to_digits(text, digits):
     assert phone_digits(text) == (digits, None)
     assert validate_operation('whatsapp', 'open_chat_by_phone', {'phone': text}, provider='whatsmeow') == \
@@ -86,7 +87,7 @@ def test_google_maps_style_numbers_normalize_to_digits(text, digits):
 
 # spec: ANYM-430
 @pytest.mark.parametrize('text,hint', [
-    ('07700 900123', 'country_code_required'), ('8 (900) 555-01-23', 'country_code_required'),
+    ('07700 900123', 'country_code_required'),
     ('+07700 900123', None), ('+1 202', None), ('+1 202 555 0123 4567 89', None), ('tel:+12025550123', None),
     ('+1 202 555 0123 ext 2', None), ('+１２０２５５５０１２３', None), (PN, None), ('', None)])
 def test_other_inputs_are_invalid_phone_without_echoing_the_value(text, hint):
@@ -157,14 +158,18 @@ def test_known_mapping_is_passed_for_a_local_answer_that_does_not_count(native):
     # the adapter's own session mapping decides, so every archived LID chat is offered.
     archive_chat(state, LID, 'LID1')
     archive_chat(state, PN, 'PN1')
+    seen = []
+    async def local(job):
+        seen.append([await job['_archived'](chat) for chat in (LID, PN, '111222333444555@lid')])
+        return answer(lookup=False)
     for n in range(12):
-        receipt, jobs = run(s, key, 'phone-local-%04d' % n, answer(lookup=False))
-        assert jobs[0]['known_chats'] == [LID] and receipt['result']['data']['existing'] is True
+        receipt, jobs = run(s, key, 'phone-local-%04d' % n, local)
+        assert receipt['result']['data']['existing'] is True and seen[-1] == [True, True, False]
         assert jobs[0]['lookup_allowed'] is True  # local answers never spend the budget
     other = '111222333444555@lid'
     run(s, key, 'phone-create-0004', answer(lid=other), create=True)
-    _, jobs = run(s, key, 'phone-local-0100', answer(lid=other, lookup=False))
-    assert jobs[0]['known_chats'] == [other, LID]
+    run(s, key, 'phone-local-0100', local)
+    assert seen[-1] == [True, True, True]
 
 
 # spec: ANYM-430
@@ -298,12 +303,13 @@ def test_after_commit_the_same_request_returns_the_saved_receipt(native):
     assert second['result']['data']['existing'] is True and list(chats(s)).count(LID) == 1
 
 
-def set_started(s, ages, created=None):
-    """Move dispatch times (and optionally creation times) of all commands, oldest first."""
+def set_started(s, ages, created=None, started=None):
+    """Move finish times (and optionally claim and creation times) of all commands, oldest first."""
     with s.pool.connection() as c:
         ids = [r['id'] for r in c.execute('SELECT id FROM messenger_commands ORDER BY created_at,id').fetchall()]
         for i, age in zip(ids, ages, strict=True):
-            c.execute("UPDATE messenger_commands SET started_at=clock_timestamp()-%s*interval '1 second' WHERE id=%s", (age, i))
+            c.execute("""UPDATE messenger_commands SET finished_at=clock_timestamp()-%s*interval '1 second',
+                started_at=clock_timestamp()-%s*interval '1 second' WHERE id=%s""", (age, started or age, i))
             if created is not None:
                 c.execute("UPDATE messenger_commands SET created_at=clock_timestamp()-%s*interval '1 second' WHERE id=%s",
                           (created, i))
@@ -354,8 +360,8 @@ def test_a_queue_delay_cannot_double_the_hourly_lookups(native):
     queries = []
     for n in range(10):
         run(s, key, 'phone-delay-%04d' % n, adapter(queries))
-    # Enqueued over an hour ago but dispatched minutes ago: the queries still count.
-    set_started(s, [540]*10, created=3700)
+    # Enqueued and claimed over an hour ago, finished minutes ago: the queries still count.
+    set_started(s, [540]*10, created=3700, started=3650)
     receipt, _ = run(s, key, 'phone-delay-0010', adapter(queries))
     assert 3000 <= refused(receipt) <= 3060 and len(queries) == 10
 
@@ -367,8 +373,8 @@ def test_a_spent_budget_still_allows_a_local_answer(native):
     queries = []
     for n in range(10):
         run(s, key, 'phone-spent-%04d' % n, adapter(queries))
-    def local(job):
-        assert job['lookup_allowed'] is False and job['known_chats'] == [LID]
+    async def local(job):
+        assert job['lookup_allowed'] is False and await job['_archived'](LID)
         return answer(lookup=False)  # the session store maps the number to an archived chat
     for create in (False, True):
         receipt, _ = run(s, key, 'phone-spent-local-%d' % create, local, create=create)
@@ -446,6 +452,29 @@ def test_stalled_lookup_keeps_the_adapter_connected_for_the_next_send(tmp_path):
         for code in ('invalid_phone', 'identity_unresolved', 'chat_not_collected', 'rate_limited'):
             with pytest.raises(CommandRejected, match=code):
                 await provider._call_unlocked('messenger_operation', {'operation': 'open_chat_by_phone'}, sending=True)
+    asyncio.run(check())
+
+
+# spec: ANYM-430
+@pytest.mark.parametrize('stored,archived,offered', [
+    (LID, True, [LID]), (LID, False, []), (None, False, []), ('987@c.us', True, [])])
+def test_the_collector_offers_the_adapter_only_its_archived_local_lid(tmp_path, stored, archived, offered):
+    async def check():
+        provider = NodeProvider({}, tmp_path/'unused', 3)
+        provider.process = SimpleNamespace(returncode=None, stdout=asyncio.StreamReader())
+        provider.send_reader, provider.send_writer = asyncio.StreamReader(), Writer()
+        provider.send_reader.feed_data(json.dumps({'id': 1, 'result': {'outcome': 'confirmed', 'data': {'local_lid': stored}}}).encode()+b'\n')
+        provider.send_reader.feed_data(json.dumps({'id': 2, 'result': answer(lookup=False)}).encode()+b'\n')
+        asked = []
+        async def is_archived(chat): asked.append(chat); return archived
+        job = {'operation': 'open_chat_by_phone', 'parameters': {'phone': PHONE, 'create': False}, 'expires_at': 1.0,
+               'known_chats': [], 'lookup_allowed': False, '_archived': is_archived}
+        async with provider.send_lock:
+            await provider.execute_operation(job)
+        local, final = (line['params'] for line in provider.send_writer.lines)
+        assert local['local_only'] is True and local['known_chats'] == [] and 'local_only' not in final
+        assert final['known_chats'] == offered and final['lookup_allowed'] is False
+        assert asked == ([stored] if stored == LID else [])
     asyncio.run(check())
 
 

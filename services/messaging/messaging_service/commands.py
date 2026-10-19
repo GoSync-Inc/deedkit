@@ -19,7 +19,6 @@ from .outgoing import finish_durably
 
 MAX_FILE_BYTES = 32 * 1024**2
 PHONE_LOOKUPS_PER_HOUR = 10
-MAX_KNOWN_CHATS = 10000  # whatsmeow maxKnownChats
 OPEN_CHAT_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
     '--operations <current operations> open_chat_by_phone')
 BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session','session_data',
@@ -267,27 +266,21 @@ def _phone_policy(c,account,phone):
         raise APIError('chat_not_collected',409)
 
 
-def _phone_chats(c,account):
-    """Every archived LID chat of the account. The adapter answers locally only
-    when its own session store maps the number to one of them."""
-    return [r['provider_chat'] for r in c.execute('''SELECT provider_chat FROM chats
-        WHERE account=%s AND provider_chat LIKE '%%@lid' ORDER BY provider_chat LIMIT %s''',
-        (account,MAX_KNOWN_CHATS)).fetchall()]
-
-
 def _lookup_budget(c,account,command):
     """Whether this dispatch may query WhatsApp, and when the oldest counted query
-    leaves the window. Counted by dispatch time from durable rows, so neither a
-    queue delay nor a restart resets it; dispatch is serial per account (one
-    fenced worker), so two principals cannot both take the last slot. A row
-    counts unless it was answered locally or refused for the bound."""
-    rows=c.execute('''SELECT started_at FROM messenger_commands WHERE account=%s AND operation='open_chat_by_phone'
-        AND id<>%s AND started_at>clock_timestamp()-interval '1 hour'
+    leaves the window. A dispatched row counts until an hour after it finished
+    (a query runs between claim and finish; an unfinished row counts now), so
+    neither a queue delay, a slow store read nor a restart resets the bound.
+    Dispatch is serial per account (one fenced worker), so two principals cannot
+    both take the last slot. Local answers and bound refusals do not count."""
+    rows=c.execute('''SELECT coalesce(finished_at,clock_timestamp()) AS at FROM messenger_commands
+        WHERE account=%s AND operation='open_chat_by_phone' AND id<>%s AND started_at IS NOT NULL
+        AND coalesce(finished_at,clock_timestamp())>clock_timestamp()-interval '1 hour'
         AND coalesce(result->'data'->>'provider_lookup','true')<>'false'
-        ORDER BY started_at DESC LIMIT %s''',(account,command,PHONE_LOOKUPS_PER_HOUR)).fetchall()
+        ORDER BY 1 DESC LIMIT %s''',(account,command,PHONE_LOOKUPS_PER_HOUR)).fetchall()
     if len(rows)<PHONE_LOOKUPS_PER_HOUR:return True,None
     return False,c.execute('''SELECT greatest(1,ceil(extract(epoch FROM
-        %s::timestamptz+interval '1 hour'-clock_timestamp())))::int AS s''',(rows[-1]['started_at'],)).fetchone()['s']
+        %s::timestamptz+interval '1 hour'-clock_timestamp())))::int AS s''',(rows[-1]['at'],)).fetchone()['s']
 
 
 def _digest(p,payload):
@@ -520,7 +513,7 @@ class CommandWorker:
                 if not policy:raise APIError('operation_disabled',409)
                 payload['_policy']=dict(policy)
                 if payload['operation']=='open_chat_by_phone':
-                    payload['known_chats']=_phone_chats(c,st.account)
+                    payload['known_chats']=[]
                     payload['lookup_allowed'],job['_lookup_resets_in']=_lookup_budget(c,st.account,job['id'])
                 if payload['operation']=='send_file':
                     # Only collectors get a filesystem path; previews/status never do.
@@ -541,6 +534,12 @@ class CommandWorker:
             c.execute('''UPDATE messenger_commands SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
                 WHERE id=%s AND status='dispatching' AND lease_epoch=%s''',
                 (status,Jsonb(result) if result is not None else None,code,job['id'],st.lease[1]))
+
+    def archived(self,chat):
+        """Whether the archive holds this exact chat (the adapter's local LID)."""
+        with self.state.archive.store.pool.connection() as c:
+            return c.execute('SELECT 1 FROM chats WHERE account=%s AND provider_chat=%s',
+                             (self.state.account,chat)).fetchone() is not None
 
     def finish_open_chat(self,job,answer):
         """Recheck authority and policy against the resolved LID, then create or
@@ -596,6 +595,9 @@ class CommandWorker:
             async def last_moment_preflight():
                 await asyncio.to_thread(self.preflight,job,verify_file=False)
             job['_preflight']=last_moment_preflight
+            if job['operation']=='open_chat_by_phone':
+                async def archived(chat):return await asyncio.to_thread(self.archived,chat)
+                job['_archived']=archived
             # Providers report 'waiting' and then 'started' before the first mutation.
             job['_provider_phase']=phases.append
             timeout=180 if job['operation']=='send_file' else 30

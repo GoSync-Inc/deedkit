@@ -198,8 +198,9 @@ account opt-in and, through the gateway, the `open_chat_by_phone` action grant.
 
 1. Check: `parameters={"phone": "+1 202 555 0123"}` (`create` defaults to false).
    Spaces, dashes, dots, parentheses and a leading `+` or `00` are ignored. A
-   national number such as `0…` or a bare Russian `8…` gets `invalid_phone` with
-   `hint: country_code_required`. The result is `on_whatsapp`, `verified_name`
+   national number such as `0…` gets `invalid_phone` with
+   `hint: country_code_required`; a bare Russian `8…` is read as a country code, so
+   write `+7`. The result is `on_whatsapp`, `verified_name`
    (business accounts, else null), `provider_lookup`, and `chat_id` with
    `existing: true` only when the number's chat is already archived. Nothing is written.
 2. Show the owner the account, number, verified name and exact text; obtain confirmation.
@@ -211,10 +212,11 @@ account opt-in and, through the gateway, the `open_chat_by_phone` action grant.
 The canonical chat is the contact's LID (`<digits>@lid`), where the native sender
 archives its echo. A registered number without a LID gets `identity_unresolved`;
 a policy that excludes the number or its LID, or `discover_chats` off, gets
-`chat_not_collected` (an unknown LID cannot match `include_chats`). A number whose
-LID the session store already maps to an archived chat is answered locally
-(`provider_lookup: false`). Each account allows at most 10 provider lookups per
-rolling hour, counted by dispatch time from durable operation rows; failed and
+`chat_not_collected` (an unknown LID cannot match `include_chats`). The collector
+first asks the native session store for the number's LID and checks that one chat
+in the archive; if it is archived, the answer is local (`provider_lookup: false`).
+Each account allows at most 10 provider lookups per rolling hour, counted from
+durable operation rows until an hour after each finished; failed and
 negative lookups count, replays of the same request ID, local answers and
 refusals do not. When the budget is spent, a local answer still succeeds and a
 lookup is refused before any query: the operation fails with `rate_limited` and

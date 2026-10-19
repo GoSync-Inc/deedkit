@@ -49,8 +49,8 @@ var phonePattern = regexp.MustCompile(`^[1-9][0-9]{6,14}$`)
 // so a stalled query is a complete error frame, never a desynchronized pipe.
 const phoneLookupTimeout = 10 * time.Second
 
-// The collector sends every archived LID chat of the account, capped here.
-const maxKnownChats = 10000
+// The collector sends at most the one archived chat it checked for the local LID.
+const maxKnownChats = 20
 
 func wordSet(value string) map[string]bool {
 	out := map[string]bool{}
@@ -76,6 +76,7 @@ type operationRequest struct {
 	FileName              string                     `json:"file_name"`
 	KnownChats            []string                   `json:"known_chats"`
 	LookupAllowed         bool                       `json:"lookup_allowed"`
+	LocalOnly             bool                       `json:"local_only"`
 }
 
 type operationDependencies struct {
@@ -1184,11 +1185,13 @@ var phoneLookupSlot = make(chan struct{}, 1)
 
 // openChatByPhone resolves one number to its canonical LID chat; it never sends
 // and never writes the archive (the Python collector materializes the chat).
-// A mapping already in the session store answers locally when the archive holds
-// that chat (known_chats), even with the lookup budget spent; otherwise one usync
-// query runs if the collector granted one (lookup_allowed). The session-store
-// reads and the query share one deadline, so nothing here can hold the lane
-// until the worker's 30 s timeout disconnects the adapter.
+// The collector first asks with local_only for the LID the session store maps the
+// number to, checks that exact chat in the archive, then asks again: a mapping
+// whose chat is archived (known_chats) answers locally, even with the lookup
+// budget spent; otherwise one usync query runs if the collector granted one
+// (lookup_allowed). The session-store reads and the query share one deadline, so
+// nothing here can hold the lane until the worker's 30 s timeout disconnects
+// the adapter.
 func openChatByPhone(ctx context.Context, job operationRequest, d operationDependencies, check func(string) error) (any, error) {
 	var phone string
 	if raw, found := job.Parameters["phone"]; !found || decodeValue(raw, &phone) != nil || !phonePattern.MatchString(phone) {
@@ -1237,7 +1240,7 @@ func openChatByPhone(ctx context.Context, job operationRequest, d operationDepen
 	done := make(chan phoneResolution, 1)
 	go func() {
 		defer func() { <-phoneLookupSlot }()
-		done <- resolvePhone(deadline, phone, pn, job.LookupAllowed, known, d, collected)
+		done <- resolvePhone(deadline, phone, pn, job, known, d, collected, check)
 	}()
 	var got phoneResolution
 	select {
@@ -1250,6 +1253,16 @@ func openChatByPhone(ctx context.Context, job operationRequest, d operationDepen
 			return nil, errors.New("provider_timeout")
 		}
 		return nil, got.err
+	}
+	if job.LocalOnly {
+		var local any
+		if !got.lid.IsEmpty() {
+			local = LegacyChatID(got.lid)
+		}
+		if e := check(""); e != nil {
+			return nil, e
+		}
+		return operationOutput("confirmed", map[string]any{"local_lid": local}, "")
 	}
 	if !got.on {
 		if e := check(""); e != nil {
@@ -1277,27 +1290,43 @@ type phoneResolution struct {
 }
 
 // resolvePhone does every session-store and provider call of openChatByPhone
-// under the caller's deadline.
-func resolvePhone(ctx context.Context, phone string, pn types.JID, allowed bool, known map[string]bool, d operationDependencies, collected func(string) error) phoneResolution {
+// under the caller's deadline. Opt-in, expiry and collection policy are checked
+// again right before the number goes to WhatsApp.
+func resolvePhone(ctx context.Context, phone string, pn types.JID, job operationRequest, known map[string]bool, d operationDependencies, collected, check func(string) error) phoneResolution {
+	var local types.JID
 	if d.lidForPN != nil {
 		if lid, e := d.lidForPN(ctx, pn); e == nil && lid.Server == types.HiddenUserServer && lid.User != "" {
-			lid = lid.ToNonAD()
-			if e = collected(LegacyChatID(lid)); e != nil {
+			local = lid.ToNonAD()
+			if e = collected(LegacyChatID(local)); e != nil {
 				return phoneResolution{err: e}
 			}
-			if known[LegacyChatID(lid)] {
-				return phoneResolution{lid: lid, on: true}
+			if known[LegacyChatID(local)] {
+				return phoneResolution{lid: local, on: true}
 			}
 		}
+	}
+	if job.LocalOnly {
+		return phoneResolution{lid: local}
 	}
 	if ctx.Err() != nil {
 		return phoneResolution{err: ctx.Err()}
 	}
-	if !allowed {
+	if !job.LookupAllowed {
 		return phoneResolution{err: errors.New("rate_limited")}
 	}
 	if d.isOnWhatsApp == nil {
 		return phoneResolution{err: errors.New("operation_unsupported")}
+	}
+	if e := check(""); e != nil {
+		return phoneResolution{err: e}
+	}
+	if e := collected(LegacyChatID(pn)); e != nil {
+		return phoneResolution{err: e}
+	}
+	if !local.IsEmpty() {
+		if e := collected(LegacyChatID(local)); e != nil {
+			return phoneResolution{err: e}
+		}
 	}
 	rows, e := d.isOnWhatsApp(ctx, []string{"+" + phone})
 	if e != nil {

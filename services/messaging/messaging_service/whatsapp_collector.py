@@ -324,6 +324,13 @@ class NodeProvider:
             'source_provider_chat','source_provider_message','registered_file_path','trusted_blob_directory',
             'file_digest','file_bytes','file_mime','file_name','known_chats','lookup_allowed')}
         if report is not None:report('started')
+        if job['operation']=='open_chat_by_phone' and job.get('_archived') is not None:
+            # First ask only the session store for the number's LID, then offer the
+            # adapter that exact chat if the archive holds it (local answer, no query).
+            local=await self._call_unlocked('messenger_operation',{**payload,'local_only':True,'known_chats':[]},sending=True)
+            lid=local.get('data',{}).get('local_lid') if isinstance(local,dict) and isinstance(local.get('data'),dict) else None
+            payload['known_chats']=[lid] if isinstance(lid,str) and re.fullmatch(r'[0-9]{1,30}@lid',lid) \
+                and await job['_archived'](lid) else []
         return await self._call_unlocked('messenger_operation',payload,sending=True)
     async def chunks(self,source,descriptor):
         complete=False

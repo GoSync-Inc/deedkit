@@ -795,3 +795,48 @@ func TestNativeOpenChatByPhoneErrorsSurviveTheWireSanitizer(t *testing.T) {
 		}
 	}
 }
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneRevokedOptInBeforeTheQuery(t *testing.T) {
+	for name, revoke := range map[string]func(*Policy){
+		"operation": func(p *Policy) { p.OperationsEnabled = nil },
+		"exclusion": func(p *Policy) { p.ExcludeChats = []string{phoneFixture + "@c.us"} },
+	} {
+		d, queries := phoneLookupFake(t, nil, nil)
+		revoked := false
+		d.policy = func() (Policy, error) {
+			p := allowedOperationPolicy()
+			if revoked {
+				revoke(&p)
+			}
+			return p, nil
+		}
+		d.lidForPN = func(context.Context, types.JID) (types.JID, error) {
+			revoked = true // the owner turns it off while the store is read
+			return types.EmptyJID, nil
+		}
+		_, err := executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
+		if err == nil || *queries != 0 {
+			t.Fatalf("%s: the number went to WhatsApp after the revocation (%v, %d queries)", name, err, *queries)
+		}
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneLocalOnlyStepNeverQueries(t *testing.T) {
+	lid, _ := ParseChatID(lidFixture)
+	for _, stored := range []*types.JID{&lid, nil} {
+		d, queries := phoneLookupFake(t, nil, stored)
+		job := phoneJob(map[string]any{"phone": phoneFixture})
+		job.LocalOnly = true
+		value, err := executeOperation(context.Background(), job, d)
+		data := operationResult(t, value, err, "confirmed")
+		want := any(nil)
+		if stored != nil {
+			want = lidFixture
+		}
+		if data["local_lid"] != want || *queries != 0 || data["provider_chat"] != nil {
+			t.Fatalf("local step answered %#v after %d queries", data, *queries)
+		}
+	}
+}

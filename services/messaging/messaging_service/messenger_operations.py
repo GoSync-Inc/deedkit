@@ -218,8 +218,6 @@ def phone_digits(value):
     else: international = False
     if not re.fullmatch(r'[0-9]+', text, re.ASCII): return None, None
     if text.startswith('0'): return None, None if international else 'country_code_required'
-    # A bare 8 plus ten digits is the Russian/Kazakh trunk form; +84 (Vietnam) needs its +.
-    if not international and len(text) == 11 and text.startswith('8'): return None, 'country_code_required'
     return (text, None) if 7 <= len(text) <= 15 else (None, None)
 
 
