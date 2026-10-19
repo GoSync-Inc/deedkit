@@ -353,3 +353,41 @@ def test_stop_requested_before_the_child_starts_spawns_nothing(tmp_path,monkeypa
     module.STOP.set()
     with pytest.raises(module.WorkerStopping):
         module.process(tmp_path,{'source_digest':sha,'bytes':len(data),'kind':'image','mime':'image/png'},profile(tmp_path))
+
+
+def stopping_worker(s,tmp_path,module):
+    def stopping(files,row,profile):raise module.WorkerStopping()
+    w=local_worker(s,tmp_path,stopping)
+    with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
+    return w
+
+
+# spec: ANYM-310
+def test_requeue_retries_a_cancelled_statement_and_still_releases_the_slot(seeded,tmp_path,monkeypatch,stop_state):
+    import psycopg
+    module=stop_state
+    s,_,_=seeded;add_audio(s);w=stopping_worker(s,tmp_path,module)
+    real=w._requeue;calls=[]
+    def flaky(row):
+        calls.append(1)
+        if len(calls)==1:raise psycopg.errors.QueryCanceled('synthetic lock wait')
+        return real(row)
+    monkeypatch.setattr(w,'_requeue',flaky);monkeypatch.setattr(module.time,'sleep',lambda *_:None)
+    assert w.once() and len(calls)==2
+    with s.pool.connection() as c:
+        assert c.execute("SELECT state,attempts FROM attachment_enrichment WHERE attachment='enrich-audio'").fetchone()=={'state':'queued','attempts':0}
+        assert c.execute("SELECT lease_until<=clock_timestamp() AS free FROM processing_resource_leases WHERE resource='local-heavy'").fetchone()['free']
+
+
+# spec: ANYM-310
+def test_profile_is_unpublished_even_when_the_requeue_keeps_failing(seeded,tmp_path,monkeypatch,stop_state):
+    import psycopg
+    module=stop_state
+    s,_,_=seeded;add_audio(s);w=stopping_worker(s,tmp_path,module)
+    def broken(row):raise psycopg.errors.QueryCanceled('synthetic lock wait')
+    monkeypatch.setattr(w,'_requeue',broken);monkeypatch.setattr(module,'REQUEUE_SECONDS',0)
+    with pytest.raises(psycopg.errors.QueryCanceled):w.run()
+    with s.pool.connection() as c:
+        assert c.execute("SELECT enabled FROM processing_profiles WHERE account='telegram-demo' AND kind='audio'").fetchone()['enabled'] is False
+        # The failed requeue left the DB lease; keep it from blocking later tests.
+        c.execute("UPDATE processing_resource_leases SET lease_until=clock_timestamp() WHERE resource='local-heavy'")

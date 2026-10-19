@@ -21,8 +21,10 @@ x-enrichment-common: &enrichment-common
   cpus: 2
   pids_limit: 96
   # SIGTERM ends the child group and requeues the job, so the grace period never
-  # follows the job timeout. Rule: teardown bound 60s (child reap 10s, final
-  # write 35s, profile unpublish 15s) plus 30s margin.
+  # follows the job timeout. Rule: teardown bound 45s (child kill is immediate,
+  # requeue retries for at most 30s, profile unpublish 15s) plus 45s margin. A
+  # finish() already running keeps its own statement timeouts; if Docker ends it,
+  # the lease expires as before.
   stop_grace_period: 90s
   logging:
     driver: json-file

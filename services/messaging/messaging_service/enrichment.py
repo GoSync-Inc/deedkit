@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from uuid import uuid4
 
 import psycopg
@@ -84,6 +85,7 @@ class WorkerStopping(Exception):
 
 STOP=threading.Event()
 CHILDREN=set()
+REQUEUE_SECONDS=30
 
 
 def kill_group(child):
@@ -319,15 +321,26 @@ class EnrichmentWorker:
             resource_admission.release(c,row.get('_resource_lease'))
             if finished and error:resource_admission.pause_profile(c,row['account'],row['kind'],row['profile_hash'],error)
             return finished
+    def _requeue(self,row):
+        with self.connection() as c:
+            c.execute('''UPDATE attachment_enrichment SET state='queued',error_code='worker_stopping',
+                attempts=greatest(attempts-1,0),lease_token=NULL,lease_until=NULL,
+                next_due=clock_timestamp(),updated_at=clock_timestamp()
+                WHERE attachment=%s AND state='leased' AND lease_token=%s''',(row['attachment'],row['lease_token']))
+            resource_admission.release(c,row.get('_resource_lease'))
     def requeue(self,row):
-        """Stop path: give the leased job back without consuming its attempt; the daily budget stays spent."""
+        """Stop path: give the leased job back without consuming its attempt; the daily budget stays spent.
+
+        A replay is harmless: the token-matched UPDATE finds nothing once the first one committed, so a
+        lock wait or an uncertain commit is retried for REQUEUE_SECONDS instead of abandoning the lease.
+        """
+        deadline=time.monotonic()+REQUEUE_SECONDS
         try:
-            with self.connection() as c:
-                c.execute('''UPDATE attachment_enrichment SET state='queued',error_code='worker_stopping',
-                    attempts=greatest(attempts-1,0),lease_token=NULL,lease_until=NULL,
-                    next_due=clock_timestamp(),updated_at=clock_timestamp()
-                    WHERE attachment=%s AND state='leased' AND lease_token=%s''',(row['attachment'],row['lease_token']))
-                resource_admission.release(c,row.get('_resource_lease'))
+            while True:
+                try:return self._requeue(row)
+                except psycopg.Error:
+                    if time.monotonic()>=deadline:raise
+                    time.sleep(1)
         finally:
             # The child group is already gone; only now drop the inherited OS lock.
             lease=row.get('_resource_lease')
@@ -345,10 +358,13 @@ class EnrichmentWorker:
             self.finish(row,error='enrichment_failed')
         return True
     def run(self):
-        while not STOP.is_set():
-            self.publish_profiles()
-            if not self.once():STOP.wait(10)
-        self.publish_profiles(enabled=False)
+        try:
+            while not STOP.is_set():
+                self.publish_profiles()
+                if not self.once():STOP.wait(10)
+        finally:
+            # Also when the stop path itself fails: never keep advertising a worker that is going away.
+            self.publish_profiles(enabled=False)
 
 
 def main():
