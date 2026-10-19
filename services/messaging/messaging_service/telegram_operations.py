@@ -67,6 +67,10 @@ JOIN_REFUSALS = {'HIDE_REQUESTER_MISSING': 'no_pending_request', 'USER_ALREADY_P
 # Telethon raises a typed error per known name; its message is the generic class text.
 JOIN_REFUSAL_ERRORS = {errors.rpcerrorlist.rpc_errors_dict[name]: name for name in JOIN_REFUSALS}
 JOIN_REQUESTS_BYTES = 48000
+# No new requester starts after this many seconds of a batch. The worker cancels at 30 s
+# (commands.py); one more ID costs at most a paced lookup and a paced mutation (1 s each
+# under RequestGovernor) plus their round trips, so 20 s leaves about 10 s for that ID.
+JOIN_BATCH_BUDGET_SECONDS = 20.0
 
 
 def reject(code):
@@ -872,18 +876,38 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                     'has_more': len(rows) < len(importers) or (count is not None and count > len(rows))}
 
         if operation in ('approve_join_requests', 'reject_join_requests'):
-            from .commands import CommandRejected
             approved, ids, rows = operation == 'approve_join_requests', parameters['user_ids'], []
+
+            async def requester(value):
+                # A requester cached in the session file (list_join_requests stores it) resolves
+                # locally without a paced call, so 20 IDs fit the worker's 30 s; only an uncached
+                # one costs a paced lookup.
+                uid = number_id(value)
+                try:
+                    cached = await utils.maybe_async(client.session.get_input_entity(types.PeerUser(uid)))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    cached = None
+                if isinstance(cached, types.InputPeerUser) and cached.user_id == uid:
+                    return utils.get_input_user(cached)
+                return await user_input(value)
+            # The governor's clock paces the calls, so the budget reads the same clock.
+            clock = getattr(governor, 'clock', time.monotonic)
+            started = clock()
             for index, value in enumerate(ids):
                 attempted = False
+                if clock() - started >= JOIN_BATCH_BUDGET_SECONDS:
+                    rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index:])
+                    break
 
                 async def hide():
                     nonlocal attempted
                     attempted = True
                     return await client(functions.messages.HideChatJoinRequestRequest(peer, user, approved=approved))
                 try:
-                    # Each rpc rechecks expiry, access and the trusted preflight before its call.
-                    user = await user_input(value)
+                    # The mutation's rpc rechecks expiry, access and the trusted preflight right before it.
+                    user = await requester(value)
                     await rpc(hide, mutation=True)
                     rows.append({'id': value, 'state': 'applied'})
                     continue
@@ -895,10 +919,6 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                         rows.append({'id': value, 'state': 'refused', 'reason': JOIN_REFUSALS[code],
                                      'provider_code': code[:64]})
                         continue
-                    if not rows and not attempted:
-                        if isinstance(error, CommandRejected):
-                            raise
-                        reject('provider_preflight_failed')
                 rows.append({'id': value, 'state': 'unknown' if attempted else 'not_attempted'})
                 rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index + 1:])
                 break

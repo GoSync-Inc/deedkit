@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -1119,5 +1120,34 @@ func TestChatInfoGroupSettings(t *testing.T) {
 	result, err = runOperation(context.Background(), operationJob("chat_info", operationsChat, nil), groupOperationDeps(t, r))
 	if data := operationResult(t, result, err, "confirmed"); data["group_settings"] != nil {
 		t.Fatalf("private chat settings %#v", data["group_settings"])
+	}
+}
+
+// spec: ANYM-242
+func TestJoinRequestsProjectionStaysWithinReceiptBudget(t *testing.T) {
+	long := strings.Repeat("名", 300) + strings.Repeat("<\"& ", 53)
+	for _, limit := range []int{50, 100} {
+		r := &recordingIQ{reply: func(int, whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+			requests := make([]waBinary.Node, 100)
+			for i := range requests {
+				j, _ := ParseChatID(fmt.Sprintf("1555000%04d@c.us", i))
+				requests[i] = waBinary.Node{Tag: "membership_approval_request", Attrs: waBinary.Attrs{"jid": j, "request_time": fmt.Sprint(1700000000 + i)}}
+			}
+			return iqResult(waBinary.Node{Tag: "membership_approval_requests", Content: requests}), nil
+		}}
+		d := groupOperationDeps(t, r)
+		d.contact = func(context.Context, types.JID) (types.ContactInfo, error) {
+			return types.ContactInfo{Found: true, FullName: long}, nil
+		}
+		result, err := runOperation(context.Background(), operationJob("list_join_requests", operationsGroup, map[string]any{"limit": limit}), d)
+		data := operationResult(t, result, err, "confirmed")
+		rows := data["requests"].([]any)
+		encoded, _ := json.Marshal(result)
+		if len(rows) == 0 || len(rows) >= limit || data["has_more"] != true || len(encoded) > joinRequestsBytes {
+			t.Fatalf("limit %d: %d rows, has_more=%v, %d bytes", limit, len(rows), data["has_more"], len(encoded))
+		}
+		if rows[0].(map[string]any)["name"] != truncate(long, 512) {
+			t.Fatal("a fitting row lost its name")
+		}
 	}
 }

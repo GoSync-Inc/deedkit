@@ -871,3 +871,78 @@ def test_join_request_batch_recheck_failure_stops_without_provider_call(operatio
     with pytest.raises(CommandRejected, match='operation_expired'):
         asyncio.run(execute(first, job(operation, {'user_ids': ['201']}, provider_chat=SUPERGROUP, expires_at=1)))
     assert first.mutations() == []
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+def test_join_request_batch_of_20_cached_requesters_fits_worker_deadline_with_real_governor(operation):
+    from telethon.sessions import MemorySession
+    from messaging_service.telegram_governor import RequestGovernor
+    class State:
+        def cooldown_remaining(self): return 0
+        def status(self, *args): pass
+    clock = [0.0]
+    async def sleep(delay): clock[0] += delay
+    client = GroupClient()
+    ids = list(range(201, 221))
+    client.session = MemorySession()
+    # list_join_requests stores the requesters in the session file like this.
+    client.session.process_entities(types.messages.ChatInviteImporters(count=20, importers=[],
+        users=[types.User(id=i, access_hash=7, first_name='Synthetic') for i in ids]))
+    result = asyncio.run(execute(client, job(operation, {'user_ids': [str(i) for i in ids]}, provider_chat=SUPERGROUP),
+                                 governor=RequestGovernor(State(), clock=lambda: clock[0], sleep=sleep)))
+    assert result['outcome'] == 'confirmed' and result['data']['all_applied'] is True
+    assert [c.user_id for c in client.mutations()] == [types.InputUser(i, 7) for i in ids]
+    assert not any(c[0] == 'get_input_entity' and c[1] in ids for c in client.calls if isinstance(c, tuple))
+    # One paced group lookup and 20 paced mutations, inside the worker's 30 s.
+    assert clock[0] == 20.0 and clock[0] < 30
+
+
+class LookupFailure(GroupClient):
+    async def get_input_entity(self, peer):
+        if peer == 201:
+            raise ValueError('synthetic unresolved requester')
+        return await super().get_input_entity(peer)
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+@pytest.mark.parametrize('failure', ['lookup', 'revoked'])
+def test_join_request_batch_first_id_failure_still_returns_rows(operation, failure):
+    from messaging_service.commands import CommandRejected
+    client = LookupFailure() if failure == 'lookup' else GroupClient()
+    candidate = job(operation, {'user_ids': ['201', '202']}, provider_chat=SUPERGROUP)
+    async def preflight():
+        if failure == 'revoked' and ('get_input_entity', 201) in client.calls:
+            raise CommandRejected('operation_access_changed')
+    candidate['_preflight'] = preflight
+    result = asyncio.run(execute(client, candidate))
+    assert result == {'outcome': 'unknown', 'data': {'all_applied': False, 'results': [
+        {'id': '201', 'state': 'not_attempted'}, {'id': '202', 'state': 'not_attempted'}]}}
+    assert client.mutations() == []
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+def test_join_request_batch_of_20_uncached_requesters_stops_at_budget_with_real_governor(operation):
+    from messaging_service.telegram_governor import RequestGovernor
+    from messaging_service.telegram_operations import JOIN_BATCH_BUDGET_SECONDS
+    class State:
+        def cooldown_remaining(self): return 0
+        def status(self, *args): pass
+    clock = [0.0]
+    async def sleep(delay): clock[0] += delay
+    client = GroupClient()  # No session cache: every requester costs a paced lookup.
+    ids = [str(i) for i in range(201, 221)]
+    result = asyncio.run(execute(client, job(operation, {'user_ids': ids}, provider_chat=SUPERGROUP),
+                                 governor=RequestGovernor(State(), clock=lambda: clock[0], sleep=sleep)))
+    states = [r['state'] for r in result['data']['results']]
+    applied = states.count('applied')
+    assert result['outcome'] == 'unknown' and result['data']['all_applied'] is False
+    assert [r['id'] for r in result['data']['results']] == ids
+    assert 0 < applied < 20 and states == ['applied'] * applied + ['not_attempted'] * (20 - applied)
+    # Nothing after the stop: no lookup or mutation of a not_attempted requester.
+    assert [c.user_id.user_id for c in client.mutations()] == [int(i) for i in ids[:applied]]
+    assert not any(c == ('get_input_entity', int(i)) for i in ids[applied:] for c in client.calls)
+    # The last ID started inside the budget; the adapter answered well inside the worker's 30 s.
+    assert clock[0] < JOIN_BATCH_BUDGET_SECONDS + 2 < 30

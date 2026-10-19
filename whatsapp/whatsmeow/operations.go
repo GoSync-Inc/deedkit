@@ -1073,10 +1073,17 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 			if !request.RequestedAt.IsZero() {
 				at = request.RequestedAt.Unix()
 			}
-			rows = append(rows, map[string]any{"id": LegacyChatID(j), "requested_at": at, "name": name})
+			row := map[string]any{"id": LegacyChatID(j), "requested_at": at, "name": name}
+			// The whole answer stays within the receipt budget; rows that do
+			// not fit are reported as more, never as a failed read.
+			if joinRequestsSize(append(rows, row)) > joinRequestsBytes {
+				more = true
+				break
+			}
+			rows = append(rows, row)
 		}
 		// Names are the requesters' own text: data, never instructions.
-		return read(map[string]any{"requests": rows, "has_more": more, "untrusted": []any{"name"}}, "")
+		return read(joinRequestsPage(rows, more), "")
 	case "approve_join_requests", "reject_join_requests":
 		ids, e := users("user_ids", 20)
 		if e != nil {
@@ -1357,6 +1364,26 @@ func participantResults(values []types.GroupParticipant, expected []types.JID) m
 		state = "partial"
 	}
 	return map[string]any{"participants": rows, "participant_state": state, "participant_coverage": "provider_response", "participants_truncated": truncated, "auto_invite_sent": false}
+}
+
+// joinRequestsBytes bounds the encoded list_join_requests answer like the
+// Telegram adapter (JOIN_REQUESTS_BYTES), below the worker's 60,000-byte
+// receipt limit (commands.py safe_result) and the 64 KiB output limit.
+const joinRequestsBytes = 48000
+
+func joinRequestsPage(rows []any, more bool) map[string]any {
+	return map[string]any{"requests": rows, "has_more": more, "untrusted": []any{"name"}}
+}
+
+// joinRequestsSize is the encoded size of the full answer with these rows. Go
+// escapes <, >, & and U+2028/2029 where Python's UTF-8 canonical form does not,
+// so it never undercounts the receipt.
+func joinRequestsSize(rows []any) int {
+	encoded, err := json.Marshal(map[string]any{"outcome": "confirmed", "data": joinRequestsPage(rows, true)})
+	if err != nil {
+		return math.MaxInt
+	}
+	return len(encoded)
 }
 
 var groupSettingOf = map[string]string{"set_group_messages_admins_only": groupSettingAnnounce, "set_group_info_admins_only": groupSettingLocked, "set_join_approval": groupSettingJoinApproval}

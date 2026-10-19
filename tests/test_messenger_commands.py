@@ -557,3 +557,26 @@ def test_join_request_batch_worker_receipt_keeps_rows(operator,failure,status):
     assert receipt['status']==status and receipt['result']['data']['all_applied'] is False
     assert [r['state'] for r in receipt['result']['data']['results']]==(
         ['applied','refused','applied'] if failure=='refused' else ['applied','unknown','not_attempted'])
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation',['approve_join_requests','reject_join_requests'])
+def test_join_request_batch_worker_first_id_revoked_keeps_rows(operator,operation):
+    from messaging_service.commands import CommandWorker
+    from messaging_service.telegram_operations import execute
+    from test_telegram_operations import SUPERGROUP,GroupClient
+    s,_,key,state=operator
+    s.set_messenger_operations('command-fixture',[operation])
+    class Revoking(GroupClient):
+        async def get_input_entity(self,peer):
+            # The owner withdraws the opt-in after admission, before the first mutation.
+            if peer==201:s.set_messenger_operations('command-fixture',[])
+            return await super().get_input_entity(peer)
+    client=Revoking()
+    async def provider(job):return await execute(client,{**job,'provider_chat':SUPERGROUP})
+    queued=queue(s,key,operation=operation,message_id='',expected_revision=0,parameters={'user_ids':['201','202']})
+    assert asyncio.run(CommandWorker(state,provider).once())
+    receipt=s.get_messenger_operation(key,queued['operation_id'])
+    assert receipt['status']=='unknown' and client.mutations()==[]
+    assert receipt['result']['data']=={'all_applied':False,'results':[
+        {'id':'201','state':'not_attempted'},{'id':'202','state':'not_attempted'}]}
