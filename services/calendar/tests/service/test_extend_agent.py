@@ -96,10 +96,12 @@ def test_extended_key_authenticates_after_the_old_expiry_until_the_new_one(house
     assert household.one("SELECT now()>%s AS past", (old,))["past"]
     assert service.principal(key)["id"] == "agent"
     # Move the new instant a few seconds ahead, as for the old one; from it the key stops.
-    household.query(
-        "UPDATE principals SET expires_at=expires_at-interval '1 day'+interval '2 seconds' WHERE id='agent'"
+    [new] = household.query(
+        "UPDATE principals SET expires_at=now()+interval '2 seconds' WHERE id='agent' RETURNING expires_at"
     )
+    assert service.principal(key)["id"] == "agent"
     time.sleep(3)
+    assert household.one("SELECT now()>%s AS past", (new["expires_at"],))["past"]
     with pytest.raises(CalendarError, match="^not_found_or_forbidden$"):
         service.principal(key)
 
