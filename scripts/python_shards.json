@@ -115,6 +115,7 @@
   "tests/test_receipt_api.py": 1.1,
   "tests/test_receipts.py": 5.0,
   "tests/test_recovery.py": 3.3,
+  "tests/test_release_drill.py": 150.0,
   "tests/test_release_messaging.py": 0.2,
   "tests/test_release_router_integration.py": 79.5,
   "tests/test_release_runtime.py": 0.0,
