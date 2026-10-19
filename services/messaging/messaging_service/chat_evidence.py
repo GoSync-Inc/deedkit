@@ -50,6 +50,10 @@ def resolve_chat(c,p,account,provider_chat_id):
     from .chat_queries import SELF_CHAT_TITLE,self_chat_sql
     if c.execute("SELECT c.chat_type='private' AND "+self_chat_sql()+' AS self FROM chats c WHERE c.id=%s',
             (row['id'],)).fetchone()['self']:row={**row,'title':SELF_CHAT_TITLE,'title_basis':'self_chat'}
+    else:
+        from .chat_titles import labels
+        label=labels(c,p,[(row['account'],row['id'])]).get((row['account'],row['id']))
+        if label:row={**row,'title':label[0],'title_basis':label[1]}
     targets(p,[row['id']]);return row
 
 

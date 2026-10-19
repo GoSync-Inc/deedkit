@@ -103,7 +103,8 @@ also available for history/context. Context accepts separate `before_count`
 and `after_count`, always preserving the authorized anchor.
 
 Message metadata includes the sender name with its `sender_name_basis` (fallback
-order in [PEOPLE.md](PEOPLE.md#sender-names)), username, chat title/type,
+order in [PEOPLE.md](PEOPLE.md#sender-names)), username, chat title (the order for a chat titled
+only by its provider ID is in [PEOPLE.md](PEOPLE.md#chat-titles); `list_chats` adds `title_basis`) and type,
 direction, and known reply/forward/media fields. Unknown metadata remains null.
 Older messages acquire provider metadata as they are observed again; this does
 not invent a new content revision.

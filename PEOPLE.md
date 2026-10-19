@@ -54,6 +54,26 @@ hint show `sender_name_basis` only when it is not `message`; the queue hint keep
 Telegram username in `sender_name` when there is no name. These labels are
 reading aids, not identity proof.
 
+## Chat titles
+
+A private chat whose stored title is empty or equals its provider chat ID gets a readable
+title on `list_chats` (`title`, with `title_basis`), on the `resolve_reference` chat and as
+`chat_title` of every message, people and file row. The peer is the chat's provider ID
+(device suffix ignored) and, as a second key, its latest incoming sender. The first match wins:
+
+1. `latest_incoming_sender_name`: the newest incoming name stored for this chat, unless it
+   is raw by the rule above;
+2. `seen_elsewhere`, 3. `linked_identity`: as under Sender names, from another chat of the
+   same account the caller can read; only names seen on incoming messages count;
+4. `phone_number`: `+<digits>` for a `@c.us` chat;
+5. otherwise the stored title stays; a `@lid` chat is never shown as a phone number.
+
+A self chat is `Saved messages` (`self_chat`). A chat with a provider title keeps it and has
+no `title_basis`. Message, people and file rows carry the same `chat_title` and no basis.
+Title `query` matching still uses the stored title (and, for a raw-titled private chat, the
+incoming name stored for that chat); fallback names are not search aliases. Titles are
+reading aids, not identity proof.
+
 A name update does not create a new revision of the message text. An old backfill,
 a conflicting event or a deletion does not replace the latest name observation.
 The operation reads the archive without provider read receipts and without advancing the agent ACK.

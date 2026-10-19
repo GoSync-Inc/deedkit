@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from .chat_queries import title_sql
+from .chat_titles import retitle
 from .policy import scope_filter, targets
 from .sender_names import resolve
 from .search_query import (compile_query, coverage, cursor_binding, decode_cursor,
@@ -119,7 +120,7 @@ def reply_context(c, p, rows):
     return rows
 
 
-def chat_titles(c, items, *, cap=64):
+def chat_titles(c, items, *, cap=64, p=None):
     """Each item that names an authorized account and chat gains chat_title (at most cap characters)."""
     pairs=sorted({(i['account'],i['chat']) for i in items if i.get('account') and i.get('chat')})
     if not pairs:
@@ -131,10 +132,12 @@ def chat_titles(c, items, *, cap=64):
         title=titles.get((item.get('account'),item.get('chat')))
         if title:
             item['chat_title']=title[:cap]
+    if p is not None:
+        retitle(c,p,items,cap=cap)
     return items
 
 
-def enrich(c, rows, p):
+def enrich(c, rows, p, *, titles=None):
     """Rows were individually authorized; metadata comes from the same chat.
 
     A missing sender name falls back only to names the caller can read (sender_names).
@@ -145,6 +148,7 @@ def enrich(c, rows, p):
         ([r['id'] for r in rows],)).fetchall()
     resolve(c,p,forward_presence(metadata))
     reply_context(c,p,metadata)
+    retitle(c,p,metadata,titles=titles)
     by_id={r['id']:r for r in metadata}
     for row in rows:
         row.update(by_id.get(row['id'],{}))
@@ -322,6 +326,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         if snapshot is not None and snapshot!=current_snapshot:raise APIError('cursor_changed',409)
         snapshot=current_snapshot
     items=reply_context(c,p,resolve(c,p,forward_presence(rows[:limit])))
+    retitle(c,p,items)
     next_cursor=None
     if len(rows)>limit:
         last=items[-1]
