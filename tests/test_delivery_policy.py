@@ -496,3 +496,40 @@ def test_hint_failure_code_passes_the_telemetry_allowlist():
         raise RuntimeError('synthetic hint failure')
     except RuntimeError as error:
         assert safe_event(error, 'subscriptions', 'subscription_hint_failed') is not None
+
+
+# spec: ANYM-252
+def test_recovery_settles_nothing_until_every_page_is_replayed(seeded, tmp_path, monkeypatch):
+    from functools import partial
+    store, _, _ = seeded
+    token = identity(store)
+    sid = reply_subscription(store, token, tmp_path, {'expect_reply_within_s': 60})
+    failing_hint_step(monkeypatch)
+    matched(store)
+    reply(store)
+    monkeypatch.undo()
+    # One match per page and one page per tick: the on-time reply sits on the second page.
+    monkeypatch.setattr(delivery_policy, '_absorb', partial(delivery_policy._absorb, limit=1, pages=1))
+    shift(store, sid, 61)
+    flush_hints(store)
+    assert hints(store, sid, 'silence') == [] and hints(store, sid) == []
+    flush_hints(store)
+    flush_hints(store)
+    assert hints(store, sid, 'silence') == []
+    assert store.get_subscription(token, sid)['delivery']['silence']['state'] == 'replied'
+
+
+# spec: ANYM-252
+def test_matcher_after_a_failed_first_step_replays_from_the_start(seeded, tmp_path, monkeypatch):
+    store, _, _ = seeded
+    token = identity(store)
+    sid = reply_subscription(store, token, tmp_path, {'expect_reply_within_s': 60})
+    failing_hint_step(monkeypatch)
+    reply(store)
+    monkeypatch.undo()
+    # The worker restarts and matches a later reply before any recovery tick ran.
+    shift(store, sid, 61)
+    reply(store)
+    flush_hints(store)
+    assert hints(store, sid, 'silence') == []
+    assert store.get_subscription(token, sid)['delivery']['silence']['state'] == 'replied'

@@ -135,11 +135,11 @@ def _armed(row, binding):
     return binding['silence_deadline'] is not None and binding['policy_version'] == row['version']
 
 
-def _window(c, row, base=None):
-    # A new row starts at base (default: the frontier the caller holds); matches above it are unhinted.
+def _window(c, row):
+    # No row means no hint step ever committed (migration 037 backfilled existing subscriptions),
+    # so every committed match above the subscription's start is still unhinted.
     c.execute('''INSERT INTO subscription_hint_windows(subscription,subscription_version,hinted_through)
-        VALUES(%s,%s,%s) ON CONFLICT DO NOTHING''',
-        (row['id'], row['version'], row['matched_through'] if base is None else base))
+        VALUES(%s,%s,%s) ON CONFLICT DO NOTHING''', (row['id'], row['version'], row['start_position']))
     window = c.execute('SELECT * FROM subscription_hint_windows WHERE subscription=%s FOR UPDATE',
         (row['id'],)).fetchone()
     if window['subscription_version'] != row['version']:
@@ -226,12 +226,20 @@ def _settle(c, row, binding, window, now, through):
     return emitted
 
 
-def _absorb(c, row, binding, window, *, limit=1000):
-    """Fold the committed matches above the held range into it, from durable rows only.
+def _absorb(c, row, binding, window, *, limit=1000, pages=16):
+    """Fold every committed match above the held range into it; False if pages ran out first.
 
     The matcher and the recovery tick share this path, so a failed hint step loses no reason,
-    count, match time or on-time reply: the next tick replays the same committed matches.
+    count, match time or on-time reply: the next tick replays the same committed matches. A
+    caller settles nothing on False: the progress is saved and the next tick continues.
     """
+    for _ in range(pages):
+        if _absorb_page(c, row, binding, window, limit) < limit:
+            return True
+    return False
+
+
+def _absorb_page(c, row, binding, window, limit):
     start = window['through_position']
     if start is None:
         start = window['hinted_through'] if window['hinted_through'] is not None else row['start_position']
@@ -243,7 +251,7 @@ def _absorb(c, row, binding, window, *, limit=1000):
         WHERE m.subscription=%s AND m.event>%s ORDER BY m.event LIMIT %s''',
         (row['id'], start, limit)).fetchall()
     if not matches:
-        return False
+        return 0
     from .subscription_consumption import wake_reason
     reasons = set(window['reasons'])
     for item in matches:
@@ -259,7 +267,7 @@ def _absorb(c, row, binding, window, *, limit=1000):
     window['match_count'] = min(1000000, window['match_count'] + len(matches))
     window['through_position'] = matches[-1]['event']
     window['reasons'] = sorted(reasons)[:16]
-    return True
+    return len(matches)
 
 
 def after_match(c, row, through):
@@ -271,8 +279,7 @@ def after_match(c, row, through):
         window['hinted_through'] = max(window['hinted_through'] or 0, through)
         _save(c, window)
         return 0
-    _absorb(c, row, binding, window)
-    emitted = _settle(c, row, binding, window, _now(c), through)
+    emitted = _settle(c, row, binding, window, _now(c), through) if _absorb(c, row, binding, window) else 0
     _save(c, window)
     return emitted
 
@@ -309,7 +316,7 @@ def flush_hints(store, *, limit=32):
                 row = _state(c, row, p)
             binding = _binding(c, row)
             # A missing row means no hint step ever committed for this subscription.
-            window = _window(c, row, row['start_position'])
+            window = _window(c, row)
             if p is None or row['state'] != 'active' or binding is None:
                 # Cancelled, not deferred: these matches are never hinted, so they are not reopened.
                 window.update(_EMPTY, silence_due_at=None, silence_held_reason=None,
@@ -319,10 +326,10 @@ def flush_hints(store, *, limit=32):
                 _save(c, window)
                 stats['cancelled'] += 1
                 continue
-            # A failed hint step left committed matches outside the held range: replay them.
-            _absorb(c, row, binding, window)
-            now = _now(c)
-            stats['emitted'] += _settle(c, row, binding, window, now, row['matched_through'])
+            # A failed hint step left committed matches outside the held range: replay all of them
+            # before any range or silence timer is settled.
+            if _absorb(c, row, binding, window):
+                stats['emitted'] += _settle(c, row, binding, window, _now(c), row['matched_through'])
             stats['held'] += window['due_at'] is not None or window['silence_due_at'] is not None
             _save(c, window)
     return stats
