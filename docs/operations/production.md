@@ -301,6 +301,8 @@ python3 /usr/local/lib/deedkit/production.py prepare --sha <40-character-main-sh
 ```
 
 Promotion makes no GitHub REST API request and needs no token (ANYM-406).
+Its git runs isolated from the operator's environment and configuration
+(below, Continuous deployment).
 `prepare`, `apply`, `prepare-router` and `seamless_release.py` prepare and
 promote prove a candidate the same way each time they check it:
 
@@ -582,10 +584,14 @@ Otherwise it:
 2. fetches a blobless mirror of `main` into `<state>/deploy-source.git` (an
    existing path there must be that bare repository) and
    picks the newest first-parent commit after the current release whose
-   `deedkit-runtime` image the verifier accepts (its push run passed `CI gate`
-   and published; a commit whose run still runs or failed is passed over); a
-   commit whose deployment was attempted is never retried, and no older commit
-   follows it;
+   images, every CI-published target plan A or plan B uses plus
+   `deedkit-runtime`, the verifier all accepts. A commit the verifier reports
+   as not published, or published without an attestation yet (its run still
+   runs, or failed before `publish` finished), is passed over for an older one.
+   When GHCR cannot be read, no older commit is taken: the run ends with
+   `error`. Evidence that does not verify (another commit, signer or digest)
+   pauses. A commit whose deployment was attempted is never retried, and no
+   older commit follows it;
 3. pauses with a reason when the range changes the SQL inventory (any `*.sql`,
    `services/*/migrations/**`) or a deploy tool (`scripts/production.py`,
    `scripts/seamless_release.py`, `tools/attest-verify/**`,
@@ -601,15 +607,21 @@ Otherwise it:
 
 No step reads GitHub's REST API, so a deploy needs no API quota and no token
 (ANYM-406); each check of a candidate costs one `git ls-remote`, one treeless
-fetch of main and one verifier run against GHCR.
+fetch of main and one verifier run against GHCR. That git runs without the
+operator's `GIT_*` variables, global or system configuration, replacement
+objects or templates, so neither a URL rewrite nor `GIT_DIR` can change which
+history it reads.
 
 On a failure it writes `/etc/deedkit/autodeploy.pause` (JSON with the reason)
 and exits 1; nothing deploys until a human removes it. A refusal before any
 change pauses, and so does any other error or state it cannot classify (a
 malformed receipt, `deploy.json` included, a failed retirement of the previous
-HTTP generation, a lock it cannot take); only a connection error, git failing
-to read main inside a release step ("main could not be read") or a GitHub
-server error (5xx) before any change is retried by the next run. A failed `git ls-remote` or mirror fetch (any cause, the
+HTTP generation, a lock it cannot take); only a connection error, git or GHCR
+failing to be read ("main could not be read", a verifier registry failure) or
+a GitHub server error (5xx) before any change is retried by the next run. The
+git or GHCR failures are counted in `deploy.json` (`unreachable`); the third
+run in a row that ends this way pauses, and a run that gets past them resets
+the count. A failed `git ls-remote` or mirror fetch (any cause, the
 mirror check included) changes nothing: the run prints `fetch_failed` with
 git's last error line, exits 1 and counts it in `deploy.json`
 (`fetch_failures`); a successful fetch resets the count, and the third failure

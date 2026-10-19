@@ -1878,7 +1878,7 @@ class Deployer:
         self.settings = {"version": 1, "state_directory": str(self.state), "projects": [project]}
         self.http = {"version": 1, "state_directory": str(self.http_state), "projects": [project], "http_release": {}}
         self.history, self.changes = [BASE, *history], changes or {}
-        self.green = set(green)
+        self.green, self.unreached = set(green), set()
         self.steps, self.requests, self.git = [], [], []
         self.blobs, self.git_failures = {}, {}
         self.current(BASE)
@@ -1931,6 +1931,8 @@ class Deployer:
     def attested(self, sha):
         """The verifier's answer for the proof image of `sha`: attested only once its CI published it."""
         self.requests.append(sha)
+        if sha in self.unreached:
+            raise p.Unreachable("attest-verify failed (exit 1): attest-verify: refused: registry request failed: timeout")
         if sha not in self.green:
             raise p.Unattested("attest-verify failed (exit 1): attest-verify: no attestation")
         return {"digest": IMAGE}
@@ -2459,8 +2461,8 @@ def test_a_deploy_and_a_backup_never_hold_the_backup_runner_lock_at_once(tmp_pat
 
 
 def main_repository(tmp_path, monkeypatch, *, commits=3):
-    """A synthetic GitHub: a local repository that real git reaches under the repository's https URL, with a main
-    history and one commit off main. Returns (main commits, oldest first; the side commit)."""
+    """A synthetic GitHub: a local repository that real git reaches as `SOURCE`, with a main history and one commit off
+    main. Returns (main commits, oldest first; the side commit)."""
     origin = tmp_path / "origin"
     environment = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
@@ -2485,15 +2487,14 @@ def main_repository(tmp_path, monkeypatch, *, commits=3):
 
 
 def redirect(monkeypatch, url):
-    """Every git process of the test reaches `url` where production.py names the GitHub repository."""
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{url}.insteadOf")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/" + p.REPOSITORY + ".git")
+    """production.py reads main from `url` instead of GitHub."""
+    monkeypatch.setattr(p, "SOURCE", url)
 
 
 def accepting_verifier(tmp_path, monkeypatch, attested=None):
     """The pinned verifier as a script: it reports a valid attestation for every commit, or only for `attested`."""
-    known = "" if attested is None else f'[ "$4" = "{attested}" ] || {{ echo "attest-verify: refused: no attestation" >&2; exit 1; }}\n'
+    known = "" if attested is None else (f'[ "$4" = "{attested}" ] || {{ echo "attest-verify: refused: manifest '
+                                         f'deedkit-runtime:$4 not found" >&2; exit 1; }}\n')
     reference = p.REGISTRY + "runtime@" + MANIFEST
     return fake_verifier(tmp_path, monkeypatch, ("#!/bin/sh\n" + known + "printf '{\"reference\": \"%s\", \"digest\": \"%s\", "
                          "\"config_digest\": \"%s\", \"sha\": \"%s\"}' " + f"'{reference}' '{MANIFEST}' '{IMAGE}' \"$4\"\n").encode())
@@ -2557,7 +2558,7 @@ def test_promotion_refuses_a_commit_without_a_valid_attestation_before_any_pull(
     # The verifier refuses a commit with no publication, or one signed for another SHA, ref or workflow (ANYM-301 B2).
     accepting_verifier(tmp_path, monkeypatch, attested=history[0])
     assert p.promotable(history[0])["attestation"]["digest"] == MANIFEST
-    with pytest.raises(p.Unattested, match="attest-verify failed \\(exit 1\\): attest-verify: refused: no attestation"):
+    with pytest.raises(p.Unattested, match="attest-verify failed \\(exit 1\\): attest-verify: refused: manifest .* not found"):
         p.promotable(history[-1])
     # prepare runs that proof before it fetches, pulls or builds anything.
     (tmp_path / "host").mkdir()
@@ -2580,3 +2581,112 @@ def test_a_failed_rerun_after_the_images_were_attested_does_not_block_promotion(
         p.verify(history[-1], get)  # the REST check of the release record refuses it
     requests = offline(monkeypatch)
     assert p.promotable(history[-1])["sha"] == history[-1] and requests == []
+
+
+# spec: ANYM-406
+@pytest.mark.parametrize("line, refusal", [
+    ("manifest deedkit-runtime:" + SHA + " not found", p.Unattested),
+    ("no Sigstore bundle is attached to ghcr.io/gosync-inc/deedkit-runtime@" + MANIFEST, p.Unattested),
+    ("registry request failed: context deadline exceeded", p.Unreachable),
+    ("anonymous registry token for deedkit-runtime: HTTP 503", p.Unreachable),
+    ("manifest deedkit-runtime:" + SHA + ": HTTP 429", p.Unreachable),
+    ("no attached bundle verified for ghcr.io/gosync-inc/deedkit-runtime@" + MANIFEST + ": expected SourceRepositoryDigest",
+     p.Refused),
+    ("manifest deedkit-runtime:" + SHA + ": Docker-Content-Digest sha256:1 differs from body digest sha256:2", p.Refused),
+], ids=["not-published", "not-attested-yet", "timeout", "token-unavailable", "rate-limited", "wrong-commit",
+        "digest-mismatch"])
+def test_a_verifier_refusal_is_told_apart_as_not_published_unreachable_or_invalid(tmp_path, monkeypatch, line, refusal):
+    fake_verifier(tmp_path, monkeypatch, f"#!/bin/sh\necho 'attest-verify: refused: {line}' 1>&2\nexit 1\n".encode())
+    with pytest.raises(p.Refused) as refused:
+        p.published("runtime", SHA)
+    assert type(refused.value) is refusal and line in str(refused.value)
+    fake_verifier(tmp_path, monkeypatch, b"#!/bin/sh\necho '{}'\n")  # an answer that verifies nothing
+    with pytest.raises(p.Refused, match="no verified reference") as refused:
+        p.published("runtime", SHA)
+    assert type(refused.value) is p.Refused
+
+
+# spec: ANYM-406
+def test_deploy_never_takes_an_older_commit_while_ghcr_is_unreachable_and_pauses_on_the_third_run(tmp_path,
+                                                                                                    monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.unreached.add(NEWEST)
+    for count in (1, 2):
+        outcome = host.deploy()
+        assert outcome["status"] == "error" and "registry request failed" in outcome["reason"] and host.steps == []
+        assert p.read(host.state / "deploy.json")["unreachable"]["count"] == count and host.paused() is None
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "could not be read 3 times in a row" in outcome["reason"]
+    assert host.steps == [] and host.paused() == outcome["reason"]
+    # The count resets once a run reads GHCR again.
+    p.PAUSE.unlink()
+    host.unreached.clear()
+    host.green = set()
+    assert host.deploy()["status"] == "waiting" and "unreachable" not in p.read(host.state / "deploy.json")
+
+
+# spec: ANYM-406
+def test_git_or_ghcr_failing_inside_a_release_step_is_retried_and_the_third_run_in_a_row_pauses(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    def unreachable(sha):
+        # Its first check failed before preparation started: nothing is left behind.
+        (host.state / sha / "prepared.json").unlink()
+        (host.state / sha).rmdir()
+        raise p.Unreachable("main could not be read: git failed (exit 128): fatal: unable to access")
+    host.fail_prepare = unreachable
+    for count in (1, 2):
+        outcome = host.deploy()
+        assert outcome["status"] == "error" and outcome["unreachable"]["count"] == count and host.paused() is None
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "could not be read 3 times in a row" in outcome["reason"]
+    assert host.paused() == outcome["reason"]
+    # A run that gets past the step starts counting again.
+    p.PAUSE.unlink()
+    host.fail_prepare = None
+    assert host.deploy()["status"] == "deployed" and "unreachable" not in p.read(host.state / "deploy.json")
+
+
+# spec: ANYM-406
+def test_deploy_takes_a_commit_only_when_every_image_of_plans_a_and_b_is_attested(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.http["projects"] = [{**host.http["projects"][0], "services": {"api": "runtime", "gateway": "gateway"}}]
+    p.write(host.http_state / "http-current.json", {"sha": BASE, "status": "serving", "config_digest": p.digest(host.http)})
+    checked = []
+    def published(target, sha):
+        checked.append((target, sha))
+        if sha == NEWEST and target == "gateway":  # runtime is attested, the gateway's publication still runs
+            raise p.Unattested("attest-verify failed (exit 1): attest-verify: refused: manifest deedkit-gateway:x not found")
+        return verified_image(target, IMAGE)
+    monkeypatch.setattr(p, "published", published)
+    outcome = p.deploy(host.settings, host.http)
+    assert outcome["status"] == "deployed" and outcome["sha"] == NEWER
+    assert ("gateway", NEWEST) in checked and {target for target, sha in checked if sha == NEWER} == {"runtime", "gateway"}
+    # Evidence that does not verify is no publication in progress: it pauses before any step.
+    (tmp_path / "invalid").mkdir()
+    other = Deployer(tmp_path / "invalid", monkeypatch)
+    monkeypatch.setattr(p, "published", lambda target, sha: (_ for _ in ()).throw(p.Refused(
+        "attest-verify failed (exit 1): attest-verify: refused: no attached bundle verified for x: wrong signer")))
+    outcome = p.deploy(other.settings, other.http)
+    assert outcome["status"] == "halted" and "wrong signer" in outcome["reason"] and other.steps == []
+
+
+# spec: ANYM-406
+def test_promotion_git_ignores_the_operator_environment_and_global_configuration(tmp_path, monkeypatch):
+    history, side = main_repository(tmp_path, monkeypatch)
+    accepting_verifier(tmp_path, monkeypatch)
+    offline(monkeypatch)
+    # A repository whose main contains the side commit, reachable through GIT_DIR or a global or environment URL rewrite.
+    other = tmp_path / "other.git"
+    subprocess.run(["git", "clone", "--quiet", "--bare", str(tmp_path / "origin"), str(other)], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(other), "update-ref", "refs/heads/main", side], check=True, capture_output=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text(f'[url "file://{other}"]\n\tinsteadOf = {p.SOURCE}\n')
+    for name, value in (("GIT_DIR", str(other)), ("HOME", str(home)), ("GIT_DEFAULT_HASH", "sha256"),
+                        ("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", f"url.file://{other}.insteadOf"),
+                        ("GIT_CONFIG_VALUE_0", p.SOURCE)):
+        monkeypatch.setenv(name, value)
+    with pytest.raises(p.Refused, match="not a commit on main"):
+        p.promotable(side)
+    assert p.promotable(history[-1])["main"] == history[-1]
