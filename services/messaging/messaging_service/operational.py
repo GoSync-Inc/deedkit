@@ -20,6 +20,8 @@ MEDIA_ERRORS = {'media_unavailable','media_reference_changed','unsupported_media
 LOCAL_STORAGE_ERRORS = {'storage_unavailable','media_storage_unavailable'}
 # The fixed causes of a fail-closed live capture write (ANYM-352).
 CAPTURE_STOP_DETAILS = {'spool_full','disk_reserve','spool_io_error','capture_error'}
+# Which bound a capture_overload stop tripped (ANYM-291); status and supervisor line only, not telemetry.
+OVERLOAD_STOP_DETAILS = {'waiters_limit','slot_wait_timeout'}
 # Fixed codes each collector prints to its supervisor when it stops.
 SUPERVISOR_STOP_CODES = {
     'telegram':frozenset({'collector_disabled','session_handover_not_confirmed','telegram_pairing_required',
@@ -54,13 +56,14 @@ def collector_stop(exc, component):
     if type(text) is not str:text=''
     code=text if text in SUPERVISOR_STOP_CODES[component] else 'collector_failed'
     detail=None
-    if component=='telegram' and text=='durable_capture_failed':
+    if component=='telegram' and text in ('durable_capture_failed','capture_overload'):
         try:detail=getattr(exc,'detail',None)
         except Exception:detail=None
-        if type(detail) is not str or detail not in CAPTURE_STOP_DETAILS:detail=None
+        allowed=CAPTURE_STOP_DETAILS if text=='durable_capture_failed' else OVERLOAD_STOP_DETAILS
+        if type(detail) is not str or detail not in allowed:detail=None
     # A qualified code comes only from the fixed detail, never from exception text.
-    event=(text+'.'+detail if detail else text if text in SUPERVISOR_STOP_CODES[component] or text in CONNECTION_ERRORS
-        else 'collector_failed')
+    event=(text+'.'+detail if detail and text=='durable_capture_failed' else
+        text if text in SUPERVISOR_STOP_CODES[component] or text in CONNECTION_ERRORS else 'collector_failed')
     return code,detail,event
 
 

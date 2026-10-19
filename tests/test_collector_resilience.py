@@ -518,6 +518,33 @@ def test_capture_stop_detail_is_kept_in_live_capture_status(worker):
     assert live['last_capture_stop']['detail'] is None and live['last_capture_stop']['code']=='durable_capture_failed'
 
 
+# spec: ANYM-291
+def test_capture_overload_stop_keeps_which_bound_tripped(worker):
+    w,s,_=worker
+    class LooksSafe(str):
+        # Private text whose hash and equality pretend to be a fixed detail.
+        def __eq__(self,other):return other==self.target
+        def __hash__(self):return hash(self.target)
+    for code,target in [('capture_overload','waiters_limit'),('durable_capture_failed','disk_reserve')]:
+        spoof=LooksSafe('synthetic-private-detail');spoof.target=target
+        for detail in ['waiters_limit','slot_wait_timeout','disk_reserve','synthetic-private',spoof,['waiters_limit']]:
+            w.state.connection_failed(code,detail)
+            with s.pool.connection() as c:
+                stop=c.execute('SELECT operations FROM collector_health WHERE account=%s',(w.account,)).fetchone()['operations']['live_capture']['last_capture_stop']
+            fixed={'capture_overload':('waiters_limit','slot_wait_timeout'),'durable_capture_failed':('disk_reserve',)}[code]
+            assert stop['code']==code
+            assert stop['detail']==(detail if type(detail) is str and detail in fixed else None)
+            assert 'synthetic-private' not in str(stop)
+
+
+# spec: ANYM-291
+def test_overload_records_which_bound_tripped(worker):
+    w,_,_=worker
+    w.capture_count=16;w.capture_wait_seconds=0
+    asyncio.run(w.capture(NS(message=message(8))))
+    assert (w.failure_code,w.failure_detail)==('capture_overload','slot_wait_timeout')
+
+
 def test_rejected_counts_are_bounded_and_validated(worker):
     w,s,_=worker
     # Code-shaped exception text from a validator is not trusted as a reason.

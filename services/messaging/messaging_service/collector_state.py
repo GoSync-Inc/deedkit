@@ -8,7 +8,7 @@ import re
 import stat
 from psycopg.types.json import Jsonb
 
-from .operational import CAPTURE_STOP_DETAILS,CONNECTION_ERRORS,TERMINAL,PHASE_STATES,PHASE_REASONS
+from .operational import CAPTURE_STOP_DETAILS,OVERLOAD_STOP_DETAILS,CONNECTION_ERRORS,TERMINAL,PHASE_STATES,PHASE_REASONS
 
 from .envelope import canonical,utc,validate,stable_id,MAX_ENVELOPE
 from .spool import DurableSpool
@@ -202,7 +202,9 @@ class CollectorState:
 
     def connection_failed(self,code,detail=None):
         if code not in CONNECTION_ERRORS:code='provider_disconnected'
-        if detail not in CAPTURE_STOP_DETAILS or code!='durable_capture_failed':detail=None
+        # Exactly a built-in str of the fixed vocabulary; a str subclass could fake equality.
+        if not (type(detail) is str and (code=='durable_capture_failed' and detail in CAPTURE_STOP_DETAILS
+                or code=='capture_overload' and detail in OVERLOAD_STOP_DETAILS)):detail=None
         with self.archive.store.pool.connection() as c:
             row=self._operations(c);value=row['operations'];now=row['observed']
             attempts=min(1024,value.get('connection',{}).get('retry_attempts',0)+1)

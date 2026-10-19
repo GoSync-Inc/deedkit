@@ -1,5 +1,6 @@
 """Single-owner Telegram collector. No sign-in, messages or secrets in gateway tools."""
 import asyncio
+from collections import deque
 from contextlib import suppress
 from datetime import datetime,timezone
 import errno
@@ -284,6 +285,10 @@ def media_deadline(size):
 # Deterministic failures of a pure parser on malformed provider input. Resource,
 # I/O and unexpected errors are not among them and still fail capture closed.
 PARSE_ERRORS=(ValueError,TypeError,KeyError,AttributeError,IndexError,RecursionError)
+# Live capture backpressure (ANYM-291): at most CAPTURE_WRITES spool writes run at once;
+# further callbacks wait in arrival order. More than CAPTURE_WAITERS waiting callbacks, or one
+# wait longer than CAPTURE_WAIT_SECONDS, fails the collector closed with capture_overload.
+CAPTURE_WRITES=16; CAPTURE_WAITERS=512; CAPTURE_WAIT_SECONDS=30
 
 
 class TelegramCollector:
@@ -305,6 +310,7 @@ class TelegramCollector:
         self.lease_ttl,self.heartbeat_interval=lease_ttl,heartbeat_interval
         self.state=None; self.stopping=asyncio.Event(); self.failed=asyncio.Event()
         self.capture_count=0; self.failure_code=None; self.policy=None
+        self.capture_waiters=deque(); self.capture_wait_seconds=CAPTURE_WAIT_SECONDS
         self._dialog_cache=None; self._next_discovery=0; self._history_spool=None
         self.invalid_messages=0; self._lease_valid_until=None
         self.failure_detail=None; self.rejected={}; self.rejected_messages=[]
@@ -329,6 +335,36 @@ class TelegramCollector:
             else 'spool_io_error' if isinstance(exc,OSError) else 'capture_error')
         self.fail('durable_capture_failed',detail)
 
+    async def capture_slot(self):
+        """Take one capture write slot, waiting in arrival order; False when the collector stops instead."""
+        if self.capture_count<CAPTURE_WRITES and not self.capture_waiters:
+            self.capture_count+=1; return True
+        if len(self.capture_waiters)>=CAPTURE_WAITERS: self.fail('capture_overload','waiters_limit'); return False
+        waiter=asyncio.get_running_loop().create_future(); self.capture_waiters.append(waiter)
+        try:
+            async with asyncio.timeout(self.capture_wait_seconds): await waiter
+        except BaseException as exc:
+            # A slot granted in the same tick as the timeout or a cancel is kept or passed on, never leaked.
+            granted=waiter.done() and not waiter.cancelled()
+            if not granted:
+                with suppress(ValueError): self.capture_waiters.remove(waiter)
+                self.grant_captures()
+            if not isinstance(exc,TimeoutError):
+                if granted: self.release_capture()
+                raise
+            if not granted: self.fail('capture_overload','slot_wait_timeout'); return False
+        if self.stopping.is_set() or self.failed.is_set(): self.release_capture(); return False
+        return True
+
+    def release_capture(self):
+        self.capture_count-=1; self.grant_captures()
+
+    def grant_captures(self):
+        # Free slots go to the oldest waiters; a granted waiter already counts as a running write.
+        while self.capture_count<CAPTURE_WRITES and self.capture_waiters:
+            waiter=self.capture_waiters.popleft()
+            if not waiter.done(): waiter.set_result(None); self.capture_count+=1
+
     def reject(self,code,chat=None,message_id=None):
         """Count one deterministically unstorable live item; a restart cannot fix it."""
         # Only fixed codes reach status, never text that merely looks like one.
@@ -341,11 +377,10 @@ class TelegramCollector:
                 'reason_code':code,'observed_at':datetime.now(timezone.utc).isoformat()}][-20:]
 
     async def capture(self,event):
-        # Bound pending fsync work. Overload fails closed; reconciliation after
-        # restart is required rather than claiming dropped callbacks succeeded.
+        # Bound pending fsync work: callbacks wait for a slot. Overload fails closed; reconciliation
+        # after restart is required rather than claiming dropped callbacks succeeded.
         if self.stopping.is_set() or self.failed.is_set(): return
-        if self.capture_count>=16: self.fail('capture_overload'); return
-        self.capture_count+=1
+        if not await self.capture_slot(): return
         message=chat=None
         try:
             message=event.message; chat=str(getattr(message,'chat_id',None))
@@ -361,12 +396,11 @@ class TelegramCollector:
                 'captured_at':datetime.now(timezone.utc).isoformat()})
         except InvalidCapture as exc: self.reject(str(exc),chat,getattr(message,'id',None))
         except Exception as exc: self.capture_failed(exc)
-        finally: self.capture_count-=1
+        finally: self.release_capture()
 
     async def deleted(self,event):
         if self.stopping.is_set() or self.failed.is_set(): return
-        if self.capture_count>=16: self.fail('capture_overload'); return
-        self.capture_count+=1
+        if not await self.capture_slot(): return
         try:
             chat=str(event.chat_id) if event.chat_id is not None else ''
             if chat and not self.state.allows(self.policy,chat): return
@@ -378,7 +412,7 @@ class TelegramCollector:
                         'chat':chat,'ids':ids[start:start+1000],'observed_at':observed})
                 except InvalidCapture as exc: self.reject(str(exc))
         except Exception as exc: self.capture_failed(exc)
-        finally: self.capture_count-=1
+        finally: self.release_capture()
 
     async def owner_read(self,event):
         if self.stopping.is_set() or self.failed.is_set():return
@@ -393,13 +427,13 @@ class TelegramCollector:
                 self.reject('read_parse_failed');return
             if capture is None or not self.policy or self.policy.get('account')!=self.account:return
             if not self.state.allows(self.policy,capture['chat']):return
-            if self.capture_count>=16:self.fail('capture_overload');return
-            self.capture_count+=1;pending=True
+            if not await self.capture_slot():return
+            pending=True
             await asyncio.to_thread(self.spool.put,capture)
         except InvalidCapture as exc:self.reject(str(exc))
         except Exception as exc:self.capture_failed(exc)
         finally:
-            if pending:self.capture_count-=1
+            if pending:self.release_capture()
 
     async def receipt(self,event):
         if self.stopping.is_set() or self.failed.is_set(): return
@@ -417,13 +451,13 @@ class TelegramCollector:
             if not self.policy or self.policy.get('account')!=self.account: return
             if getattr(self.state,'account',self.account)!=self.account: return
             if not self.state.allows(self.policy,capture['chat']): return
-            if self.capture_count>=16: self.fail('capture_overload'); return
-            self.capture_count+=1; pending=True
+            if not await self.capture_slot(): return
+            pending=True
             await asyncio.to_thread(self.spool.put,capture)
         except InvalidCapture as exc: self.reject(str(exc))
         except Exception as exc: self.capture_failed(exc)
         finally:
-            if pending:self.capture_count-=1
+            if pending:self.release_capture()
 
     async def commit_page(self,messages,chat,title,kind,origin):
         ids=[]
