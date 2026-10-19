@@ -1,11 +1,13 @@
 """Messaging rejections name the field, the reason and the allowed values, and never echo input."""
 import json
+import pathlib
 
 import pytest
 from starlette.testclient import TestClient
 
 from messaging_service.app import create_app
 from messaging_service.field_errors import MAX_FIELD_ERRORS, field_error, one_per_field
+from messaging_service.policy import OPERATION_PERMISSIONS
 from messaging_service.store import APIError
 from tests.test_audit_api import Store
 from tests.test_event_delivery import call, identity
@@ -111,6 +113,22 @@ def test_boundary_rejections_carry_field_errors_over_rest_and_mcp(args, expected
     assert rest.json()['field_errors'] == expected == mcp.json()['error']['data']['field_errors']
     assert rest.json()['fields'] == mcp.json()['error']['data']['fields']
     assert store.calls == []
+
+
+# spec: ANYM-295
+def test_feedback_operation_schema_lists_exactly_the_names_the_backend_accepts():
+    # Regression (Grok feedback 2026-10-19): operation=calls_dial_call passed the schema, then the backend
+    # refused it as "a documented operation name" without saying which names are documented.
+    allowed = sorted(OPERATION_PERMISSIONS)
+    catalog = json.loads((pathlib.Path(__file__).resolve().parents[1] / 'services/gateway/src/agent_gateway/catalog.json').read_text())
+    gateway = next(t for t in catalog if t['name'] == 'messages_submit_feedback')['inputSchema']['properties']['operation']
+    assert gateway['anyOf'][0]['enum'] == allowed
+    store = Store()
+    with TestClient(create_app(store, ['testserver'])) as client:
+        listed = client.post('/mcp', headers={**HEADERS, 'Accept': 'application/json, text/event-stream'},
+            json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})
+        tool = next(t for t in listed.json()['result']['tools'] if t['name'] == 'submit_feedback')
+    assert tool['inputSchema']['properties']['operation'] == gateway
 
 
 # spec: ANYM-295

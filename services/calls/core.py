@@ -155,7 +155,7 @@ def build_prompt(b, instruction=''):
     lang={"ru":"Russian","en":"English","id":"Indonesian"}[b["language"]]
     forms={"feminine":"Use feminine Russian self-reference: я поняла, я уточнила.",
            "masculine":"Use masculine Russian self-reference: я понял, я уточнил.",
-           "neutral":"Use neutral Russian phrasing: понятно, время уточнено; avoid gendered past tense."}[b["self_reference"]]
+           "neutral":"Use neutral Russian phrasing: понятно, время уточнено; avoid gendered past tense."}[b["self_reference"]]+" " if b["language"]=="ru" else ""
     spec={k:b[k] for k in ("goal","counterparty","facts","success_fields")}
     spec['approval_fields']=b.get('approval_fields',[])
     spec['conversation_mode']=b.get('conversation_mode','task')
@@ -170,7 +170,7 @@ def build_prompt(b, instruction=''):
               'Do not promise a callback time or say it has been scheduled.' if external else
               'No external callback channel is connected in this browser rehearsal. Do not promise a callback or a message.')
     return f"""{role}
-Speak {lang}. {forms} Introduce yourself briefly as the owner's assistant.
+Speak {lang}. {forms}Introduce yourself briefly as the owner's assistant.
 {'Use a warm, friendly, relaxed conversational manner. Natural short pauses; no repetitive confirmations or forced laughter.' if b.get('voice_style')=='friendly' else 'Use plain adult conversational delivery, an ordinary pace and understated intonation. No cutesy voice, exaggerated warmth, forced laughter or repeated praise like wonderful/excellent.'}
 {'You are speaking with a replicated owner voice. Disclose in your first spoken turn that you are the owner\'s voice bot using their voice. Never claim to be the owner personally.' if b.get('custom_voice_id') else ''}
 Your task is to collect the requested information, not invent the outcome.
