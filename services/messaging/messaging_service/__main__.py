@@ -15,7 +15,7 @@ def main():
     parser.add_argument('command',choices=['serve','init','migrate','issue-key','revoke-key',
         'replay','snapshot','verify-restore','quarantine-restore','register-account',
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
-        'set-messenger-operations'])
+        'set-messenger-operations','extend-key'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -32,7 +32,7 @@ def main():
     state.add_argument('--enable',action='store_true')
     state.add_argument('--disable',action='store_true')
     parser.add_argument('--limit',type=int,default=50)
-    parser.add_argument('--days',type=int,default=7)
+    parser.add_argument('--days',type=int,help='issue-key: 1-30 (default 7); extend-key: required, 1-183')
     parser.add_argument('--input',type=Path)
     parser.add_argument('--spool',type=Path)
     parser.add_argument('--snapshot-dir',type=Path)
@@ -112,7 +112,7 @@ def main():
             # Reserve the output first; never silently replace a user's active credential.
             fd=os.open(args.key_file,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
             with os.fdopen(fd,'w') as out:
-                out.write(store.issue_key(args.principal,args.accounts,args.days,
+                out.write(store.issue_key(args.principal,args.accounts,7 if args.days is None else args.days,
                     chats=None if args.all_chats else args.chats,permissions=args.permissions,
                     key_permissions=args.key_permissions)+'\n')
             print(json.dumps({'issued':True,'principal':args.principal,'key_file':str(args.key_file)}))
@@ -120,6 +120,10 @@ def main():
             if bool(args.key_file)==bool(args.key_id):parser.error('revoke-key requires exactly one of --key-file or --key-id')
             count=store.revoke(args.key_file.read_text().strip() if args.key_file else None,credential_id=args.key_id)
             print(json.dumps({'revoked':count}))
+        elif args.command=='extend-key':
+            if not args.key_id or args.key_file or args.days is None:
+                parser.error('extend-key requires --key-id and --days, never --key-file')
+            print(json.dumps(store.extend_key(args.key_id,args.days)))
         elif args.command=='set-access':
             if not args.principal:parser.error('set-access requires --principal')
             result=store.set_access(args.principal,accounts=args.accounts if args.accounts is not None else UNSET,

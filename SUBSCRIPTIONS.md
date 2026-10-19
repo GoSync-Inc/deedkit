@@ -3,7 +3,7 @@
 Current delivery work and priority: [BACKLOG.md](BACKLOG.md), DK-08–DK-10.
 This document is the API and delivery contract.
 
-Status: since **schema 32** (current schema 35) DeedKit implements persistent structural subscriptions, passive
+Status: since **schema 32** (current schema 36) DeedKit implements persistent structural subscriptions, passive
 inspection, independent fetch/ACK, bounded long polling, native wake selectors,
 operator-registered signed hints and private feedback. Installing the package
 does not register a receiver, create a subscription, activate a provider or

@@ -846,8 +846,8 @@ class Store:
             c.execute("SET LOCAL statement_timeout='180s'")
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
-            if version>35: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql')]:
+            if version>36: raise RuntimeError('database_newer_than_runtime')
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
@@ -943,6 +943,25 @@ class Store:
             changed=c.execute('UPDATE api_keys SET revoked=true WHERE '+clause,(selector,)).rowcount
             audit(c,{'id':row['principal'],'key_id':row['id']},'revoke_key','ok')
             return changed
+
+    def extend_key(self,credential_id,days):
+        # Renewal in place (ANYM-422): token, digest, permissions and scope stay unchanged.
+        credential_id=key_id(credential_id)
+        if type(days) is not int or not 1<=days<=183:raise ValueError('invalid_key_lifetime')
+        with self.pool.connection() as c:
+            known=c.execute('SELECT principal FROM api_keys WHERE id=%s',(credential_id,)).fetchone()
+            if not known:raise ValueError('unknown_key')
+            lock_principal(c,known['principal'])
+            # The clock is read after the lock, as authentication does.
+            row=c.execute('''SELECT id,principal,revoked,expires_at,clock_timestamp() AS now,
+                clock_timestamp()+make_interval(days=>%s) AS extended FROM api_keys WHERE id=%s FOR UPDATE''',
+                (days,credential_id)).fetchone()
+            if row['revoked']:raise ValueError('key_revoked')
+            if row['expires_at']<=row['now']:raise ValueError('key_expired')
+            if row['extended']<row['expires_at']:raise ValueError('key_lifetime_would_shorten')
+            c.execute('UPDATE api_keys SET expires_at=%s WHERE id=%s',(row['extended'],credential_id))
+            audit(c,{'id':row['principal'],'key_id':row['id']},'extend_key','ok')
+            return serial({'key_id':row['id'],'previous_expires_at':row['expires_at'],'expires_at':row['extended']})
 
     def list_keys(self,principal):
         principal_id(principal)

@@ -52,7 +52,7 @@ In the working environment the local setting is in the ignored `.local/voice-ser
 {"base_url":"https://your-anymsg.example/prefix","token_file":"/private/path/anymsg.token"}
 ```
 
-`base_url` is the root of the REST API without `/mcp`; the file contains a Bearer token without a prefix. The files must be accessible only to the owner. The service does not read a messenger session/profile and does not start collectors. Only `POST /v1/capabilities`, `/v1/search`, `/v1/get_context` are used. A separate AnyMsg principal with read-only rights is recommended.
+`base_url` is the root of the REST API without `/mcp`; the file contains a Bearer token without a prefix. The files must be accessible only to the owner. The service does not read a messenger session/profile and does not start collectors. Only `POST /v1/capabilities`, `/v1/search`, `/v1/get_context` are used. A separate AnyMsg principal with read-only rights is recommended. Before its key expires the owner extends it in place with AnyMsg `extend-key` ([ACCESS.md](../../ACCESS.md#extending-a-key)); the token stays the same, so the token file and this JSON need no change.
 
 Search is limited to 12 results. On preparation each selected anchor is read with `before_count=0`, `after_count=0`; neighboring messages, attachments and reviews are not included in the prompt. A deleted/unavailable source stops preparation. The snapshot stores the ID, revision, account, chat, date, conflict and a flag that the text was shortened. Archive data remains observations, not a check of the current state at the provider. A read error is not replaced by an empty successful response.
 
