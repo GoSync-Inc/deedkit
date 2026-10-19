@@ -791,6 +791,19 @@ run: the stop (or the 4-hour start timeout) kills `production.py` and its
 children, which can leave the selected services stopped mid-apply; the next
 run then finds the unfinished attempt and pauses for a human.
 
+### Wait for a merged commit
+
+`python3 scripts/receipt_watch.py <40-hex main sha>` (ANYM-440) waits read-only, over
+`ssh deedkit-prod`, until the receipts show that commit deployed and settled, and prints one line;
+run it as one background command. `LIVE` (exit 0): plan A `applied` and the HTTP release `serving`
+(or `serving-retirement-pending`) both contain the commit, with no pause and no unfinished attempt.
+`UNSETTLED` (1): both contain it, but a pause exists or an attempt is unfinished, so do not report it
+live. `REFUSED` (1): the commit is not deployed and a pause exists. `TIMEOUT` and `UNREACHABLE` (2):
+no verdict (default budget 4 hours, because the timer starts no deploy from 13:00 to 18:59 UTC). Each
+poll runs one constant ssh command that sends a fixed read-only script, which prints only `sha`,
+`status`, `reason` and `at` of `current.json`, `http-current.json` and `deploy.json`, the pause
+reason and the names of unfinished and serving attempts. The tool reads receipts; it does not probe containers.
+
 ## Record the production release
 
 After a successful `apply`, the release owner records the release in Tiden from
