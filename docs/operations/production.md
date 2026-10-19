@@ -143,6 +143,26 @@ from the reviewed candidate; keep the default collector command for installation
 without this extension. CI and preparation import the modules without connecting
 an account or starting a broker.
 
+The calls service admits its owner panel, owner APIs and `/control` only from a
+loopback transport peer or a peer in `VOICE_TRUSTED_PEERS` (ANYM-304); the
+`/v1/<operation>` agent route and the Twilio callbacks keep their own
+authentication. Under Docker the owner's connection through the published
+`127.0.0.1:13842` reaches the container from the host's address on the bridge
+network that carries the published port. Docker uses the container's first
+network in lexical name order (unless `gw_priority` is set), so with the default
+names that is `deedkit-calls_calls-egress`. Set `CALLS_TRUSTED_PEERS` to exactly
+that network's gateway, one address such as `172.24.0.1`:
+`docker network inspect deedkit-calls_calls-egress --format '{{(index .IPAM.Config 0).Gateway}}'`.
+The gateway address belongs to the host and Docker assigns it to no container.
+Never set the `integration` subnet, or any network wider than that one address.
+Set the variable in the Compose shell environment or the project `.env`, not in
+`private/calls.env`: the overlay's `environment` entry overrides the env file.
+Unset, only loopback is trusted and the owner gets 403 `Local peer required`
+through the published port. Check it after enrollment and whenever that network
+is recreated (its gateway can change): from the host, `/api/health` with the owner
+credential returns 200; the same request from another container on `integration`
+returns 403; the gateway's `calls_*` tools keep working.
+
 The state directory and Docker filesystem each need at least **15 GiB free**
 before preparation. A refusal does not authorize pruning shared Docker objects
 or deleting runtime data. Free capacity through a reviewed, targeted operation

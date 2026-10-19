@@ -150,6 +150,21 @@ def test_gateway_proxy_and_owner_pairing_exposure_is_explicit():
     assert account_mounts[0].isdisjoint(account_mounts[1])
 
 
+# spec: ANYM-304
+def test_calls_overlay_passes_the_trusted_host_peer_and_keeps_loopback_publishing():
+    calls = document('deploy/compose.calls.yaml')
+    unit = calls['services']['calls']
+    # Empty by default: only loopback is trusted until the operator names the host-side peer.
+    assert unit['environment']['VOICE_TRUSTED_PEERS'] == '${CALLS_TRUSTED_PEERS:-}'
+    assert unit['ports'] == ['127.0.0.1:13842:13842']
+    assert unit['networks'] == ['integration', 'calls-egress']
+    assert calls['networks']['integration'] == {'external': True, 'name': '${DEEDKIT_NETWORK:-deedkit-integration}'}
+    # The image starts the entry point that turns proxy-header rewriting off.
+    dockerfile = (ROOT / 'services/calls/Dockerfile').read_text()
+    assert dockerfile.rstrip().endswith('CMD ["python", "app.py"]') and 'VOICE_BIND=0.0.0.0' in dockerfile
+    assert 'proxy_headers=False' in (ROOT / 'services/calls/app.py').read_text()
+
+
 def docker_stages():
     # Parse Dockerfile instructions after folding continuations; do not execute builds.
     lines = (ROOT / 'services/messaging/Dockerfile').read_text().replace('\\\n', ' ').splitlines()

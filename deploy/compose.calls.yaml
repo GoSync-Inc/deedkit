@@ -9,6 +9,8 @@ services:
       VOICE_AGENT_REGISTRY: /run/deedkit/agents.json
       VOICE_BROWSER_ENABLED: "0"
       VOICE_EXTERNAL_MCP: "0"
+      # The host-side Docker peer (docs/operations/production.md), never the integration subnet.
+      VOICE_TRUSTED_PEERS: ${CALLS_TRUSTED_PEERS:-}
     volumes:
       - type: bind
         source: ${CALLS_STATE_DIR:?Set explicit existing calls state directory}

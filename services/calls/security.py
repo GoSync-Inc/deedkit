@@ -3,6 +3,7 @@ import asyncio
 import base64
 import binascii
 import hmac
+import ipaddress
 import os
 import re
 import secrets
@@ -62,6 +63,14 @@ class OwnerCredential:
             return False
 
 
+def trusted_peers(value):
+    """VOICE_TRUSTED_PEERS: comma-separated IP addresses or networks; an invalid entry stops startup."""
+    try:
+        return tuple(ipaddress.ip_network(item.strip()) for item in (value or '').split(',') if item.strip())
+    except ValueError:
+        raise ValueError('Invalid VOICE_TRUSTED_PEERS') from None
+
+
 @dataclass(frozen=True)
 class CallbackLimits:
     body_bytes: int = 64 * 1024
@@ -73,11 +82,21 @@ class CallbackLimits:
 
 
 class VoiceBoundary:
-    def __init__(self, app, *, owner, control_token, outbound, limits=None):
+    def __init__(self, app, *, owner, control_token, outbound, limits=None, peers=()):
         self.app, self.owner = app, owner
         self.control_token, self.outbound = control_token, outbound
         self.limits = limits or CallbackLimits()
+        self.peers = tuple(peers)
         self.pending_callbacks = 0
+
+    def local_peer(self, scope):
+        """The transport peer, never a proxy header: loopback or an explicitly trusted host-side peer."""
+        try:
+            peer = ipaddress.ip_address(scope['client'][0])
+        except (KeyError, TypeError, IndexError, ValueError):
+            return False
+        peer = getattr(peer, 'ipv4_mapped', None) or peer
+        return peer.is_loopback or any(peer in network for network in self.peers)
 
     async def __call__(self, scope, receive, send):
         if scope['type'] != 'http':
@@ -168,12 +187,16 @@ class VoiceBoundary:
 
         if hostname not in {'127.0.0.1', 'localhost', 'testserver'}:
             return await reject(403, 'Loopback host required')
+        # Only an exact /v1/<operation> is the agent route: a dot segment would reach the panel's static files.
+        agent = re.fullmatch(r'/v1/[A-Za-z0-9_]+', path) is not None
+        if not agent and not self.local_peer(scope):
+            return await reject(403, 'Local peer required')
         authorization = request.headers.getlist('authorization')
         credential = authorization[0] if len(authorization) == 1 else ''
         if path == '/control' or path.startswith('/control/'):
             if not hmac.compare_digest(credential.encode('utf-8'), ('Bearer ' + self.control_token).encode('utf-8')):
                 return await reject(401, 'Control credential required')
-        elif path.startswith('/v1/'):
+        elif agent:
             pass  # AgentAPI authenticates its own principal and bounds its request body.
         else:
             if not self.owner.accepts(credential):
