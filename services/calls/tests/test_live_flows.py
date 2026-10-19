@@ -398,7 +398,9 @@ def test_standard_prompt_gives_russian_self_reference_only_to_russian_briefs(tmp
     for language in ('en','id'):
         assert 'Russian' not in prompt(language)
         assert not any(word in prompt(language) for word in ('я понял','я поняла','понятно'))
-    assert 'Russian' in prompt('ru')
+    form={'masculine':'я понял','feminine':'я поняла','neutral':'понятно'}[self_reference]
+    assert f'Russian self-reference: {form}' in prompt('ru') or f'Russian phrasing: {form}' in prompt('ru')
+    assert 'Speak English. Introduce' in prompt('en')
 
 
 @pytest.mark.parametrize('question,answer,accepted',[

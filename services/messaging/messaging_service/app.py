@@ -27,10 +27,10 @@ from .security_logging import redact_library_logs
 from . import __version__
 from .error_details import payload,classified
 from .field_errors import field_error,pydantic_field_errors
+from .policy import OPERATION_PERMISSIONS
 from .presentation import options, render
 from .telemetry import capture as capture_error
 from .uploads import UPLOAD_BODY_BYTES
-from .policy import OPERATION_PERMISSIONS
 
 WaitSeconds = Annotated[float, Field(strict=True,ge=0,le=25,allow_inf_nan=False)]
 WakeRule = Literal['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send']
@@ -43,6 +43,7 @@ FeedbackReference = Annotated[StrictStr, Field(min_length=1,max_length=256,patte
 FeedbackReferences = dict[Literal['message_ids','chat_ids','subscription_ids'],Annotated[list[FeedbackReference],Field(max_length=32)]]
 FeedbackDescription = Annotated[StrictStr,Field(min_length=1,max_length=4000,pattern=r'^[^\x00-\x08\x0b-\x1f\x7f]+$')]
 # The backend accepts only these names (feedback.py); the schema lists them so a client sees them before a call.
+# A field error relays at most MAX_ALLOWED (50) of them; test_field_errors_messaging checks the gateway copy.
 FeedbackOperation = Annotated[StrictStr,Field(min_length=1,max_length=128,pattern=r'^[a-z][a-z0-9_]*$',
     json_schema_extra={'enum':sorted(OPERATION_PERMISSIONS)})]
 Detail = Literal['compact','full']
