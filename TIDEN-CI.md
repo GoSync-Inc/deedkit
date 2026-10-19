@@ -326,11 +326,12 @@ cover an earlier commit, so dispatch a dropped run again from main with its SHA
 (`gh workflow run tiden-sync.yml --ref main -f sha=<sha>`). Never repair sources
 by hand while a sync runs.
 
-Until check A has run green on three pull requests, the sync runs `--dry-run`
-and writes nothing. The agent that merged runs it after the CI push run
-completes, first with `--dry-run`, then without
-(`TIDEN_PRODUCT_ID=<id> uv run python scripts/tiden_sync.py --sha <sha>` from a
-main checkout), and reads back the result (AGENTS.md section 4).
+The sync writes to Tiden since check A ran green on three pull requests. The
+agent that merged reads back the result after the sync run (AGENTS.md section 4).
+When the run failed or was dropped, the agent runs it from a main checkout,
+first with `--dry-run`, then without
+(`TIDEN_PRODUCT_ID=<id> uv run python scripts/tiden_sync.py --sha <sha>`), or
+dispatches it again by SHA.
 
 ## Drift watermark
 

@@ -81,8 +81,8 @@ jobs:
           echo "3f6b650c4cabd58ce4149d9106325cbd36d1472cccc9c63ca03137668b80e4a6  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
           mkdir "$RUNNER_TEMP/tiden-bin"
           tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
-      # --dry-run until check A has run green on three pull requests (ANYM-405); then the flag is removed by a
-      # reviewed pull request. Without TIDEN_API_TOKEN the sync fails, so a missing credential is never green.
+      # It writes since check A ran green on three pull requests (#136, #137, #138; ANYM-405). Without
+      # TIDEN_API_TOKEN the sync fails, so a missing credential is never green.
       - name: Merge the named branch, link the marked tests, anchor the files and set the status
         env:
           TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
@@ -91,4 +91,4 @@ jobs:
           TIDEN_BASE_URL: https://app.tiden.ai
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ steps.guard.outputs.sha }}
-        run: python scripts/tiden_sync.py --sha "$SHA" --cli "$RUNNER_TEMP/tiden-bin/tiden" --dry-run
+        run: python scripts/tiden_sync.py --sha "$SHA" --cli "$RUNNER_TEMP/tiden-bin/tiden"

@@ -489,13 +489,20 @@ def test_the_sync_workflow_runs_after_main_ci_serialized_with_main_tools_and_a_d
     assert steps.index(checkout) == 1 and steps[2]["run"] == 'git merge-base --is-ancestor "$SHA" HEAD'
     holders = [step["name"] for step in steps if any("secrets." in str(v) or "github.token" in str(v)
                                                      for v in step.get("env", {}).values())]
-    assert holders == [steps[-1]["name"]] and "--dry-run" in steps[-1]["run"].split()
+    assert holders == [steps[-1]["name"]]
     assert all("secrets." not in step.get("run", "") and "GITHUB_PATH" not in step.get("run", "") for step in steps)
 
     def pinned(text):
         return next(line.strip() for line in text.splitlines() if "sha256sum --check" in line)
     install = next(step for step in steps if step.get("name") == "Install pinned Tiden CLI with integrity check")
     assert pinned(install["run"]) == pinned((Path(SCRIPT).parents[1] / ".github/workflows/ci.yml").read_text())
+
+
+# spec: ANYM-405
+def test_the_sync_workflow_writes_to_tiden_once_check_a_has_run_green_on_three_pull_requests():
+    steps = sync_workflow()["jobs"]["sync"]["steps"]
+    command = steps[-1]["run"].split()
+    assert command[:2] == ["python", "scripts/tiden_sync.py"] and "--dry-run" not in command
 
 
 # spec: ANYM-405
