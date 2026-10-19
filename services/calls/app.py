@@ -589,8 +589,8 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
                 session['task']=asyncio.current_task();joined=True
             from pipecat.serializers.twilio import TwilioFrameSerializer
             from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport,FastAPIWebsocketParams
-            from voice import run_transport
-            serializer=TwilioFrameSerializer(stream_sid=start['streamSid'],params=TwilioFrameSerializer.InputParams(auto_hang_up=False))
+            from voice import KeypadTwilioSerializer,run_transport
+            serializer=KeypadTwilioSerializer(stream_sid=start['streamSid'],params=TwilioFrameSerializer.InputParams(auto_hang_up=False))
             transport=FastAPIWebsocketTransport(websocket=socket,params=FastAPIWebsocketParams(
                 audio_in_enabled=True,audio_out_enabled=True,audio_out_sample_rate=8000,
                 audio_out_end_silence_secs=0,serializer=serializer))

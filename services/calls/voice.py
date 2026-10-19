@@ -2,8 +2,11 @@
 import asyncio
 import contextlib
 import json
+import time
 from datetime import datetime, timezone
 
+from pipecat.audio.dtmf.types import KeypadEntry
+from pipecat.audio.dtmf.utils import load_dtmf_audio
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import EndFrame, InputAudioRawFrame, InputTextRawFrame, LLMRunFrame, LLMTextFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, OutputAudioRawFrame, BotStoppedSpeakingFrame, InterruptionFrame
@@ -12,12 +15,13 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.workers.runner import WorkerRunner
 
-from core import TOOL_MODELS, call_clock
+from core import KEYPAD_CHANNELS, TOOL_MODELS, call_clock
 from audio_health import NoRuntimeAudioHealth, RuntimeAudioHealth
 from audio_probe import PCMProbe, diagnostics
 from call_errors import record_model_error
@@ -60,8 +64,89 @@ DESCRIPTIONS={
     'request_owner_decision':'Save an asynchronous owner question. Reuses a pending round; after an answer starts a NEW round. Do not hold the counterparty waiting. Pending is never approval. Only the owner channel can respond.',
     'consult_supervisor':'Ask a separate contextual adviser one concrete question. Waits at most six seconds. Guidance has no approval authority; timeout or obsolete advice means clarify or escalate.',
     'finish_task':'Summarize collected information. Returns missing fields or pending decisions. In social mode this saves notes and does not imply the conversation is finished. Does not execute any external action.',
+    'press_keys':'Press phone keypad keys (in-band tones) to choose an option in an automated menu. Phone, SIP and browser rehearsal calls only. '
+                 'A menu choice of at most three keys; quote the menu prompt you heard. Never key in a PIN, password, one-time code, card, account or reference number; '
+                 'never choose an option that pays, subscribes, consents, confirms or cancels anything. After pressing, stay silent and wait for the menu to react.',
     'end_conversation':'After a short spoken goodbye, end as completed, needs_owner, refused or unavailable. In social mode completed requires the latest explicit human goodbye quoted in evidence; collected notes are not a reason to stop. Criticism of audio or voice is not a refusal. needs_owner preserves a pending owner question for later; do not wait on the line. For refusal/unavailability quote the human exactly. No automatic callback is scheduled.',
 }
+
+
+class KeypadTones:
+    """In-band DTMF for press_keys (ANYM-428): Pipecat's tone audio queued as uninterruptible output audio,
+    chunked and paced by the transport like speech. Tone bytes count down as the transport writes them,
+    so the Twilio serializer can hold back a `clear` that would cut a tone in two."""
+    def __init__(self,output):
+        self.output,self.tones,self.pending,self.deadline=output,None,0,0.0
+        write=output.write_audio_frame
+        async def counted(frame):
+            if self.pending and not frame.interruptible:
+                self.pending=max(0,self.pending-len(frame.audio))
+            return await write(frame)
+        output.write_audio_frame=counted
+
+    async def preload(self):
+        rate,chunk=self.output.sample_rate,self.output.audio_chunk_size
+        tones={}
+        for key in '0123456789*#':
+            audio=await load_dtmf_audio(KeypadEntry(key),sample_rate=rate)
+            tones[key]=audio+bytes(-len(audio)%chunk)  # whole chunks: no tone tail waits in the sender
+        self.rate,self.chunk,self.tones=rate,chunk,tones
+
+    async def press(self,keys):
+        if not self.tones:raise RuntimeError('keypad_not_ready')
+        audio=b''.join(self.tones[key] for key in keys)
+        frame=OutputAudioRawFrame(audio=audio,sample_rate=self.rate,num_channels=1)
+        frame.interruptible=False
+        seconds=len(audio)/(2*self.rate)
+        self.pending+=len(audio)
+        # A stalled sender must not hold back interruptions for long.
+        self.deadline=max(self.deadline,time.monotonic())+seconds+30
+        try:await self.output.queue_frame(frame)
+        except BaseException:
+            self.pending=max(0,self.pending-len(audio));raise
+        return round(seconds*1000)
+
+    def playing(self):
+        # A remainder under one chunk was mixed with speech or dropped with it; it holds nothing back.
+        return bool(self.tones) and self.pending>=self.chunk and time.monotonic()<self.deadline
+
+
+class KeypadTwilioSerializer(TwilioFrameSerializer):
+    """Twilio media: no `clear` while keypad tones are queued or in flight. Audio ahead of the tones is
+    already sent then, and Pipecat still drains the interruptible speech queued after them."""
+    keypad=None
+
+    async def serialize(self,frame):
+        if isinstance(frame,InterruptionFrame) and self.keypad is not None:
+            holding=False
+            with contextlib.suppress(Exception):holding=self.keypad.playing()
+            if holding:return None
+        return await super().serialize(frame)
+
+
+def keypad_for(transport,channel):
+    """Keypad tones for the channels that may press keys, bound to a Twilio serializer; None elsewhere."""
+    if channel not in KEYPAD_CHANNELS:
+        return None
+    output=transport.output()
+    keypad=KeypadTones(output)
+    serializer=getattr(getattr(output,'_params',None),'serializer',None)
+    if isinstance(serializer,KeypadTwilioSerializer):
+        serializer.keypad=keypad
+    return keypad
+
+
+async def deliver_keys(keypad,service,identity,result):
+    """Queue the tones of an accepted press. A failure answers keypress_unavailable and never ends the call."""
+    if not result.get('ok'):
+        return result
+    try:
+        if keypad is None:raise RuntimeError('keypad_unavailable')
+        return {**result,'tones_ms':await keypad.press(result['keys'])}
+    except Exception:
+        with contextlib.suppress(Exception):
+            service.runtime_event(identity,{'kind':'keypress_failed','keys':result['keys']})
+        return {'error':'keypress_unavailable'}
 
 
 def tool_schemas(handler):
@@ -212,12 +297,25 @@ async def run_transport(transport,brief,key,state,browser=False):
     try:runtime_health=RuntimeAudioHealth()
     except Exception:runtime_health=NoRuntimeAudioHealth()
     inbound_audio=diagnostics(PCMProbe)
+    keypad=None
+    if not live_flows:
+        # Best effort too: without a keypad a press answers keypress_unavailable; the call goes on.
+        with contextlib.suppress(Exception):keypad=keypad_for(transport,brief.get('channel','browser'))
+    pressed={}
 
     async def handle(name,params):
         if name=='consult_supervisor' and state.get('supervisor'):
             result=await state['supervisor'].consult(identity,dict(params.arguments),params.tool_call_id)
         else:
             result=service.tool(identity,name,dict(params.arguments),params.tool_call_id)
+        if name=='press_keys':
+            # Tones once per provider tool call. The model gets its result before anything else is awaited,
+            # so an interruption from the still-talking menu cannot cancel the call without a result.
+            if params.tool_call_id not in pressed:
+                pressed[params.tool_call_id]=await deliver_keys(keypad,service,identity,result)
+            await params.result_callback(pressed[params.tool_call_id])
+            await worker.rtvi.send_server_message({'kind':'tool','name':name,'result':pressed[params.tool_call_id]})
+            return
         await worker.rtvi.send_server_message({'kind':'tool','name':name,'result':result})
         await params.result_callback(result)
         if result.get('end_requested'):
@@ -293,6 +391,9 @@ async def run_transport(transport,brief,key,state,browser=False):
         context.add_message({'role':'user','content':('Begin the browser rehearsal now. The human plays the counterparty. ' if browser else
                             'The counterparty has answered this real call. ')+'Introduce yourself and ask the first relevant question.'})
         await worker.queue_frames([LLMRunFrame()])
+        if keypad:
+            # Loaded once per call, so a press awaits no file I/O before its result.
+            with contextlib.suppress(Exception):await keypad.preload()
 
     if browser:
         @worker.rtvi.event_handler('on_client_ready')
