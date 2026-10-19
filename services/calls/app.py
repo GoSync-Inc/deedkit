@@ -28,7 +28,7 @@ from outbound import Outbound,CallingSettings,TwilioCalls,ExternalBrief
 from destination_policy import PREMIUM_UNITS,recipient_policy
 from settings import Setup,read_private,write_private
 from call_errors import record_model_error
-from security import OwnerCredential, VoiceBoundary
+from security import OwnerCredential, VoiceBoundary, trusted_peers
 
 SOURCE = Path(__file__).resolve()
 PRIVATE = Path(os.environ.get('VOICE_STATE_DIR', str(Path.home() / '.local' / 'share' / 'deedkit' / 'calls')))
@@ -130,6 +130,7 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
     directory = Path(data_dir or os.environ.get('VOICE_DATA_DIR',str(PRIVATE / 'data')))
     if data_dir is None and (not directory.is_absolute() or not directory.is_dir()):
         raise ValueError("Set VOICE_DATA_DIR to an explicitly initialized absolute state directory")
+    peers = trusted_peers(os.environ.get('VOICE_TRUSTED_PEERS'))
     service = VoiceService(directory)
     try:
         owner = OwnerCredential(directory)
@@ -228,7 +229,7 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
     app.state.outbound=outbound
 
     app.add_middleware(VoiceBoundary, owner=owner, control_token=control_token,
-                       outbound=outbound, limits=callback_limits)
+                       outbound=outbound, limits=callback_limits, peers=peers)
 
     @app.exception_handler(RequestValidationError)
     async def invalid(request, exc):
@@ -614,8 +615,14 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
     return app
 
 
-if __name__ == '__main__':
+def server(app):
+    """The supported entry point: proxy headers never rewrite the transport peer that VoiceBoundary admits."""
     import uvicorn
+    return uvicorn.Server(uvicorn.Config(app,host=os.environ.get('VOICE_BIND','127.0.0.1'),port=int(os.environ.get('VOICE_PORT','13842')),
+                                         access_log=False,proxy_headers=False))
+
+
+if __name__ == '__main__':
     logger.remove()
     logger.add(sys.stderr,level='ERROR',format='{time:HH:mm:ss} | voice pipeline error')
-    uvicorn.run(create_app(),host=os.environ.get('VOICE_BIND','127.0.0.1'),port=int(os.environ.get('VOICE_PORT','13842')),access_log=False)
+    server(create_app()).run()

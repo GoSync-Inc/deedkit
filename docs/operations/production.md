@@ -143,6 +143,56 @@ from the reviewed candidate; keep the default collector command for installation
 without this extension. CI and preparation import the modules without connecting
 an account or starting a broker.
 
+The calls service admits its owner panel, owner APIs and `/control` only from a
+loopback transport peer or a peer in `VOICE_TRUSTED_PEERS` (ANYM-304); the
+`/v1/<operation>` agent route and the Twilio callbacks keep their own
+authentication. Under Docker the owner's connection through the published
+loopback port (the panel and the SSH-tunnelled control MCP) reaches the container
+from the host's address on the bridge network that carries the published port,
+never from loopback. Trust exactly that network's IPv4 gateway, one address: it
+belongs to the host and Docker assigns it to no container. Never trust the
+`integration` subnet or any wider network. Docker picks that network by gateway
+priority, then other properties (internal, IPv4/IPv6 gateway), with name order
+only as the tie-breaker. Do not infer it from the names: start the service, then
+read each network's gateway with
+`docker network inspect <network> --format '{{(index .IPAM.Config 0).Gateway}}'`
+and confirm the choice with the check below. With both networks equal, IPv4-only
+bridges and the default names, a synthetic run on 10-19 showed the gateway of
+`deedkit-calls_calls-egress`. Recheck after the network is recreated or the
+container's networks or gateway priorities change.
+
+Where the value comes from:
+
+- The repository launcher (`scripts/deedkit.py`, `config/modules/calls.toml`) passes
+  `deploy/private/calls.env` to Compose as `--env-file`, so `CALLS_TRUSTED_PEERS=<gateway>`
+  belongs in that file or the shell. A project `.env` is not read then, and a
+  `VOICE_TRUSTED_PEERS` line in `calls.env` is overridden by the overlay's `environment` entry.
+- The current production host runs calls as the enrolled project
+  `personal-os-voice` (service `voice`, port `127.0.0.1:13844`, one network
+  `personal-os-probe_frontend`), not from this overlay. Its source document is the
+  plan A project's `files` entry
+  (`/var/lib/deedkit-production/e3a52a34…/personal-os-voice.json` on 10-19). The release
+  copies are generated from it. Add `"VOICE_TRUSTED_PEERS": "<gateway>"` (`172.20.0.1` on
+  10-19) to `services.voice.environment` there. That changes the project's Compose
+  document, so the next `deploy` pauses for configuration drift. Apply the change by
+  hand: pause, edit, `prepare`/review/`apply` at the newest green `main` SHA, `status`,
+  then remove the pause. Code before ANYM-304 ignores the variable, so the value can go
+  in first. After ANYM-304 an invalid value stops the service at start.
+
+Check it, without a call or a provider action:
+
+1. `docker inspect <container> --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^VOICE_TRUSTED_PEERS='`
+   shows the single gateway address.
+2. From the host, `/api/health` through the published port with the owner credential returns 200.
+3. From the host, `/control/mcp` with the control token completes MCP `initialize` and `tools/list`
+   (for example the owner's `agent_mcp.py` proxy listing the tools).
+4. From another container on the same network, the same two requests with valid credentials return
+   403 `Local peer required`.
+5. The gateway's `calls_capabilities` succeeds with a principal key, and `/v1/capabilities` without
+   one returns 401.
+
+A 403 in step 2 or 3 means the configured address is not the host-side peer.
+
 The state directory and Docker filesystem each need at least **15 GiB free**
 before preparation. A refusal does not authorize pruning shared Docker objects
 or deleting runtime data. Free capacity through a reviewed, targeted operation

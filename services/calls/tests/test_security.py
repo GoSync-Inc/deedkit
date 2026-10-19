@@ -10,9 +10,10 @@ from urllib.parse import urlencode
 import httpx
 import pytest
 
+import app as entry
 from app import create_app
 from outbound import TwilioCalls
-from security import CallbackLimits, OwnerCredential
+from security import CallbackLimits, OwnerCredential, trusted_peers
 from test_tasks import Archive, HEADERS, owner_headers
 
 CFG = {'account_sid': 'AC' + '1' * 32, 'auth_token': 'synthetic-only',
@@ -249,3 +250,149 @@ def test_control_token_created_private_and_stable(tmp_path):
     first = control_key(tmp_path)
     assert os.stat(tmp_path / 'control.token').st_mode & 0o777 == 0o600
     assert control_key(tmp_path) == first
+
+
+async def from_peer(app, peer, method, path, headers=()):
+    """Raw ASGI keeps a dot-segment path and the transport peer exactly as sent."""
+    scope = {'type': 'http', 'asgi': {'version': '3.0'}, 'http_version': '1.1', 'scheme': 'http', 'method': method,
+             'path': path, 'raw_path': path.encode(), 'query_string': b'', 'root_path': '', 'server': ('127.0.0.1', 13842),
+             'client': (peer, 4321), 'headers': [(b'host', b'127.0.0.1'), *((k.lower().encode(), v.encode()) for k, v in headers)]}
+    messages, requested = [], asyncio.Event()
+
+    async def receive():
+        if requested.is_set():
+            await asyncio.sleep(3600)
+        requested.set()
+        return {'type': 'http.request', 'body': b'{}', 'more_body': False}
+
+    async def send(message):
+        messages.append(message)
+
+    async with asyncio.timeout(10):
+        await app(scope, receive, send)
+    status = next(m['status'] for m in messages if m['type'] == 'http.response.start')
+    return status, b''.join(m.get('body', b'') for m in messages if m['type'] == 'http.response.body')
+
+
+# spec: ANYM-304
+async def test_a_neighbour_peer_with_a_loopback_host_gets_403_before_side_effects(application, tmp_path):
+    owner = owner_headers(tmp_path)['Authorization']
+    for credential in [(), (('Authorization', owner),), (('Authorization', 'Bearer control-fixture'),)]:
+        for method, path in [('GET', '/'), ('GET', '/api/config'), ('GET', '/api/health'), ('POST', '/api/calling'),
+                             ('POST', '/api/calls/start'), ('POST', '/control/mcp'), ('GET', '/v1/../index.html'),
+                             ('POST', '/v1/../api/calling'), ('GET', '/v1/..')]:
+            headers = (*credential, ('Origin', 'http://127.0.0.1'), ('X-Voice-Service', '1'),
+                       ('X-Forwarded-For', '127.0.0.1'), ('Forwarded', 'for=127.0.0.1'), ('Content-Type', 'application/json'))
+            assert await from_peer(application, '172.23.0.5', method, path, headers) == (
+                403, b'{"detail":"Local peer required"}'), (method, path, credential)
+    assert not (tmp_path / 'calling.json').exists()
+    assert application.state.service.list_calls() == []
+
+
+# spec: ANYM-304
+async def test_only_loopback_and_the_configured_trusted_peers_reach_owner_and_control_authentication(tmp_path, monkeypatch):
+    monkeypatch.setenv('VOICE_TRUSTED_PEERS', ' 192.0.2.1 , 198.51.100.0/30,')
+    app = create_app(tmp_path, Archive(), control_token='control-fixture')
+    try:
+        owner = (('Authorization', owner_headers(tmp_path)['Authorization']),)
+        for peer in ['127.0.0.1', '127.8.9.10', '::1', '192.0.2.1', '::ffff:192.0.2.1', '198.51.100.3']:
+            assert (await from_peer(app, peer, 'GET', '/api/health', owner))[0] == 200, peer
+            assert (await from_peer(app, peer, 'GET', '/api/health'))[0] == 401, peer
+            assert (await from_peer(app, peer, 'POST', '/control/mcp'))[0] == 401, peer
+        for peer in ['192.0.2.2', '198.51.100.4', '172.23.0.1', 'testclient', '', 'fe80::1']:
+            assert (await from_peer(app, peer, 'GET', '/api/health', owner))[0] == 403, peer
+    finally:
+        app.state.service.close()
+
+
+# spec: ANYM-304
+@pytest.mark.parametrize('value', ['calls', '192.0.2.1/24', '192.0.2.300', '172.23.0.1;172.23.0.2'])
+def test_an_invalid_trusted_peer_list_stops_startup(tmp_path, monkeypatch, value):
+    monkeypatch.setenv('VOICE_TRUSTED_PEERS', value)
+    with pytest.raises(ValueError, match='VOICE_TRUSTED_PEERS'):
+        create_app(tmp_path, Archive(), control_token='control-fixture')
+    assert not (tmp_path / 'owner.token').exists()
+    assert trusted_peers(None) == trusted_peers('') == ()
+
+
+# spec: ANYM-304
+async def test_agent_routes_and_provider_callbacks_from_a_neighbour_keep_their_own_authentication(application):
+    assert await from_peer(application, '172.23.0.5', 'POST', '/v1/capabilities') == (401, b'{"error":"unauthorized"}')
+    assert (await from_peer(application, '172.23.0.5', 'POST', '/v1/capabilities',
+                            (('Authorization', 'Bearer control-fixture'),)))[0] == 401
+    assert await invoke(application) == 200
+
+
+# spec: ANYM-304
+async def test_the_entry_point_admits_the_transport_peer_whatever_forwarded_headers_say(tmp_path, monkeypatch):
+    monkeypatch.setenv('VOICE_BIND', '127.0.0.1')
+    monkeypatch.setenv('VOICE_PORT', '0')
+
+    async def health(name, configure):
+        (tmp_path / name).mkdir()
+        server = configure(create_app(tmp_path / name, Archive(), control_token='control-fixture'))
+        headers = {**owner_headers(tmp_path / name), 'X-Forwarded-For': '192.0.2.9', 'Forwarded': 'for=192.0.2.9'}
+        task = asyncio.create_task(server.serve())
+        try:
+            async with asyncio.timeout(20):
+                while not server.started:
+                    await asyncio.sleep(0.05)
+            port = server.servers[0].sockets[0].getsockname()[1]
+            async with httpx.AsyncClient(base_url=f'http://127.0.0.1:{port}', trust_env=False) as c:
+                return server, (await c.get('/api/health', headers=headers)).status_code
+        finally:
+            server.should_exit = True
+            await task
+
+    server, status = await health('entry', entry.server)
+    assert server.config.proxy_headers is False and status == 200
+    # The same request through uvicorn's default proxy handling would be refused for the forged header.
+    import uvicorn
+    _, status = await health('rewritten', lambda app: uvicorn.Server(uvicorn.Config(
+        app, host='127.0.0.1', port=0, access_log=False, proxy_headers=True, forwarded_allow_ips='127.0.0.1')))
+    assert status == 403
+
+
+# spec: ANYM-304
+async def test_ipv4_mapped_trusted_entries_admit_their_peer_in_either_form(tmp_path, monkeypatch):
+    monkeypatch.setenv('VOICE_TRUSTED_PEERS', '::ffff:192.0.2.1,::ffff:198.51.100.0/120')
+    app = create_app(tmp_path, Archive(), control_token='control-fixture')
+    try:
+        owner = (('Authorization', owner_headers(tmp_path)['Authorization']),)
+        for peer in ['::ffff:192.0.2.1', '192.0.2.1', '::ffff:198.51.100.7', '198.51.100.7']:
+            assert (await from_peer(app, peer, 'GET', '/api/health', owner))[0] == 200, peer
+        for peer in ['192.0.2.2', '::ffff:192.0.2.2', '198.51.101.7']:
+            assert (await from_peer(app, peer, 'GET', '/api/health', owner))[0] == 403, peer
+    finally:
+        app.state.service.close()
+
+
+# spec: ANYM-304
+async def test_a_mounted_calls_app_refuses_requests_before_the_agent_route_exemption(application):
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+    parent = Starlette(routes=[Mount('/v1', app=application)])
+    transport = httpx.ASGITransport(parent, client=('172.23.0.5', 4321))
+    async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1') as c:
+        for path in ['/v1/docs', '/v1/redoc', '/v1/openapi.json', '/v1/api/health']:
+            assert (await c.get(path)).status_code == 404, path
+
+
+# spec: ANYM-304
+async def test_a_trusted_host_peer_with_the_control_token_lists_the_control_tools(tmp_path, monkeypatch):
+    import httpx2
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+    monkeypatch.setenv('VOICE_TRUSTED_PEERS', '172.20.0.1')
+    app = create_app(tmp_path, Archive(), control_token='control-fixture')
+    async with app.router.lifespan_context(app):
+        for peer, admitted in [('172.20.0.1', True), ('172.20.0.5', False)]:
+            transport = httpx2.ASGITransport(app, client=(peer, 4321))
+            async with httpx2.AsyncClient(transport=transport, headers={'Authorization': 'Bearer control-fixture'}) as http:
+                if not admitted:
+                    assert (await http.post('http://testserver/control/mcp', json={})).status_code == 403
+                    continue
+                async with streamable_http_client('http://testserver/control/mcp', http_client=http) as (read, write):
+                    async with ClientSession(read, write) as client:
+                        await client.initialize()
+                        assert 'get_voice_capabilities' in {tool.name for tool in (await client.list_tools()).tools}
