@@ -77,6 +77,7 @@ type operationRequest struct {
 	KnownChats            []string                   `json:"known_chats"`
 	LookupAllowed         bool                       `json:"lookup_allowed"`
 	LocalOnly             bool                       `json:"local_only"`
+	LookupMillis          int64                      `json:"lookup_ms"`
 }
 
 type operationDependencies struct {
@@ -1229,6 +1230,14 @@ func openChatByPhone(ctx context.Context, job operationRequest, d operationDepen
 	timeout := d.lookupTimeout
 	if timeout <= 0 {
 		timeout = phoneLookupTimeout
+	}
+	// The collector passes what is left of the resolution's shared deadline
+	// after the local-only call and its archive check.
+	if job.LookupMillis < 0 {
+		return nil, errors.New("operation_invalid_parameters")
+	}
+	if job.LookupMillis > 0 && job.LookupMillis < timeout.Milliseconds() {
+		timeout = time.Duration(job.LookupMillis) * time.Millisecond
 	}
 	deadline, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

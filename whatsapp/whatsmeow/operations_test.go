@@ -728,6 +728,34 @@ func TestNativeOpenChatByPhoneStalledLookupIsABoundedTimeout(t *testing.T) {
 }
 
 // spec: ANYM-430
+func TestNativeOpenChatByPhoneLookupKeepsToTheCollectorsRemainingBudget(t *testing.T) {
+	d, _ := phoneLookupFake(t, nil, nil)
+	release := make(chan struct{})
+	d.isOnWhatsApp = func(context.Context, []string) ([]types.IsOnWhatsAppResponse, error) {
+		<-release
+		return nil, nil
+	}
+	job := phoneJob(map[string]any{"phone": phoneFixture})
+	// What the local-only call and archive check left of the shared deadline, as the collector sends it.
+	if err := json.Unmarshal([]byte(`{"lookup_ms":50}`), &job); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err := executeOperation(context.Background(), job, d)
+	requireError(t, err, "provider_timeout")
+	if time.Since(started) > 2*time.Second {
+		t.Fatal("lookup outlived the collector's remaining budget")
+	}
+	close(release)
+	waitPhoneSlot(t)
+	if err := json.Unmarshal([]byte(`{"lookup_ms":-1}`), &job); err != nil {
+		t.Fatal(err)
+	}
+	_, err = executeOperation(context.Background(), job, d)
+	requireError(t, err, "operation_invalid_parameters")
+}
+
+// spec: ANYM-430
 func TestNativeOpenChatByPhoneRejectsUnnormalizedNumbers(t *testing.T) {
 	for _, phone := range []any{"+12025550123", "07700 900123", "07700900123", "1 202", "", 12025550123, "12025550123@c.us"} {
 		d, queries := phoneLookupFake(t, nil, nil)

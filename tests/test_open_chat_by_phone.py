@@ -474,7 +474,40 @@ def test_the_collector_offers_the_adapter_only_its_archived_local_lid(tmp_path, 
         local, final = (line['params'] for line in provider.send_writer.lines)
         assert local['local_only'] is True and local['known_chats'] == [] and 'local_only' not in final
         assert final['known_chats'] == offered and final['lookup_allowed'] is False
+        assert 0 < final['lookup_ms'] <= 10000  # what is left of the shared deadline
         assert asked == ([stored] if stored == LID else [])
+    asyncio.run(check())
+
+
+# spec: ANYM-430
+def test_a_slow_archive_check_is_a_retryable_timeout_and_the_next_send_still_works(tmp_path, monkeypatch):
+    import time
+    from messaging_service import whatsapp_collector
+    monkeypatch.setattr(whatsapp_collector, 'PHONE_RESOLUTION_SECONDS', 0.3, raising=False)
+    async def check():
+        provider = NodeProvider({}, tmp_path/'unused', 3)
+        provider.process = SimpleNamespace(returncode=None, stdout=asyncio.StreamReader())
+        provider.send_reader, provider.send_writer = asyncio.StreamReader(), Writer()
+        disconnected = []
+        async def disconnect(): disconnected.append(True)
+        provider.disconnect = disconnect
+        provider.send_reader.feed_data(json.dumps({'id': 1, 'result': {'outcome': 'confirmed', 'data': {'local_lid': LID}}}).encode()+b'\n')
+        provider.send_reader.feed_data(json.dumps({'id': 2, 'result': {'provider_message_id': 'true_1@c.us_X'}}).encode()+b'\n')
+        worker = CommandWorker(SimpleNamespace(cooldown_remaining=lambda: 0), provider.execute_operation, provider.send_gate)
+        job = {'id': 'cmd_slow_archive', 'operation': 'open_chat_by_phone', 'mutation': False,
+               'parameters': {'phone': PHONE, 'create': True}, 'expires_at': time.time()+600,
+               'known_chats': [], 'lookup_allowed': True}
+        worker.claim = lambda: job
+        worker.preflight = lambda *args, **kwargs: None
+        worker.archived = lambda chat: time.sleep(1) or True  # a queued executor or a slow store read
+        finished = []
+        worker.finish = lambda *args: finished.append(args[1:])
+        assert await worker.once()
+        assert finished == [('failed', {'data': {'code': 'provider_timeout', 'retry': True}}, 'provider_timeout')]
+        assert len(provider.send_writer.lines) == 1 and not disconnected  # no second call, pipe synchronized
+        async with provider.send_lock:
+            sent = await provider._call_unlocked('send_text', {'chat': '1@c.us', 'text': 'Synthetic'}, sending=True)
+        assert sent == {'provider_message_id': 'true_1@c.us_X'} and not disconnected
     asyncio.run(check())
 
 
