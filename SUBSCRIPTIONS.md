@@ -147,16 +147,19 @@ changes the provider's read state or archive consumer positions.
 `wait_for_subscription_events` carry `readOnlyHint=true`, as do
 `get_subscription_events` and the other subscription views. Here the term means:
 no change to consumption (`acked_through`, ACK version), subscription version or
-lifecycle for an active subscription with unchanged scope, provider state, or
-another key's data. A fetch still writes issuance bookkeeping, like a pagination
+lifecycle for an active subscription whose expiry is not reached and whose scope is
+unchanged, provider state, or another key's data. A fetch still writes issuance bookkeeping, like a pagination
 cursor: it creates the initial consumption row at `start_position` if missing and,
 for a key with `subscription-ack` and a non-empty page, prunes expired receipts,
 evicts the oldest receipts beyond 128 and stores one new receipt hash with a
 five-minute expiry. The receipt is short-lived and safe to retry; a retry returns
-the same events, and the eviction means an old receipt then fails closed. Expiry
+the same events from the same position (plus any matched in between), and the
+eviction means an old receipt then fails closed. Expiry
 and access-change are checked on every subscription read (even `get_subscription`
 and `list_subscriptions`), so a read that finds the definition expired or
-its grant changed moves it to `expired` or `access_changed` and bumps `version`;
+its grant changed moves it to `expired` or `access_changed` and bumps `version`
+(`get_subscription`, `list_subscriptions` and `get_subscription_events` keep it;
+a `fetch`/`wait` that fails on the first check rolls it back, one that returns keeps it);
 the next `update_subscription` then gets `subscription_conflict`. Clients should
 treat the hint as retry safety, not as proof that nothing is written. The
 gateway turns a backend failure of a read-only tool into `backend_unavailable`;
@@ -252,7 +255,13 @@ validation (at most 2 s) and the pinned TLS exchange (5 s deadline), so:
 - an agent `update_subscription`, `configure_subscription_delivery` or ACK on that
   subscription waits likewise, and the matcher skips the locked row;
 - attempts in one dispatcher pass are serial (up to 16), so one slow receiver can
-  delay other subscriptions' hints by up to about 16 × 7 s per pass.
+  delay other subscriptions' hints by up to about 16 × 7 s per pass;
+- reads of that subscription row wait as well (`get_subscription`,
+  `get_subscription_events`, `fetch`, `wait`, `list_subscriptions`), and while a
+  revocation for the principal is queued behind an attempt, PostgreSQL queues every
+  new request of that principal behind it, so all of that principal's API calls can
+  stall for the same time (`Store.identity_digest` takes the shared lock on each
+  call; unmeasured).
 
 Running more than one dispatcher process lowers the head-of-line delay
 (`FOR UPDATE SKIP LOCKED`). No latency incident or measurement exists. Decided
