@@ -93,18 +93,32 @@ def quiet_until(c, policy, at):
         (Jsonb({'timezone': quiet['timezone'], 'windows': windows}), at)).fetchone()['t']
 
 
+def _slot(c, owner, column, now):
+    limit = _bound_setting('SUBSCRIPTION_MAX_HINTS_PER_HOUR', 20, 1, 1000)
+    c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('subscription-hints:' + str(owner['key_id']),))
+    charged = c.execute('''SELECT o.{0} AS t FROM subscription_outbox o JOIN subscriptions s ON s.id=o.subscription
+        WHERE s.principal=%s AND s.key_id=%s AND o.{0}>%s-interval '1 hour'
+        ORDER BY o.{0} DESC OFFSET %s LIMIT 1'''.format(column),
+        (owner['principal'], owner['key_id'], now, limit - 1)).fetchone()
+    return None if charged is None else charged['t'] + timedelta(hours=1)
+
+
 def budget_slot(c, row, now):
     """None if the key may commit a hint now, else when its next hourly slot opens.
 
     Every outbox row of the key counts once, at creation, in the transaction that commits it;
     the per-key lock serializes the count with that insert across workers and the gateway.
     """
-    limit = _bound_setting('SUBSCRIPTION_MAX_HINTS_PER_HOUR', 20, 1, 1000)
-    c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('subscription-hints:' + str(row['key_id']),))
-    charged = c.execute('''SELECT o.created_at FROM subscription_outbox o JOIN subscriptions s ON s.id=o.subscription
-        WHERE s.principal=%s AND s.key_id=%s AND o.created_at>%s-interval '1 hour'
-        ORDER BY o.created_at DESC OFFSET %s LIMIT 1''', (row['principal'], row['key_id'], now, limit - 1)).fetchone()
-    return None if charged is None else charged['created_at'] + timedelta(hours=1)
+    return _slot(c, row, 'created_at', now)
+
+
+def admission_slot(c, owner, now):
+    """Dispatcher side of the same budget: None if a hint ID may make its first POST now.
+
+    Counts the key's hints admitted in the rolling hour, so a backlog after downtime still
+    sends at most the budget of distinct hints per hour. Retries are not new admissions.
+    """
+    return _slot(c, owner, 'admitted_at', now)
 
 
 def _now(c):
@@ -121,14 +135,17 @@ def _armed(row, binding):
     return binding['silence_deadline'] is not None and binding['policy_version'] == row['version']
 
 
-def _window(c, row):
-    c.execute('''INSERT INTO subscription_hint_windows(subscription,subscription_version) VALUES(%s,%s)
-        ON CONFLICT DO NOTHING''', (row['id'], row['version']))
+def _window(c, row, base=None):
+    # A new row starts at base (default: the frontier the caller holds); matches above it are unhinted.
+    c.execute('''INSERT INTO subscription_hint_windows(subscription,subscription_version,hinted_through)
+        VALUES(%s,%s,%s) ON CONFLICT DO NOTHING''',
+        (row['id'], row['version'], row['matched_through'] if base is None else base))
     window = c.execute('SELECT * FROM subscription_hint_windows WHERE subscription=%s FOR UPDATE',
         (row['id'],)).fetchone()
     if window['subscription_version'] != row['version']:
-        # Held hints of an older version are cancelled; the window counter never goes back.
-        window.update(_EMPTY, **_NO_SILENCE, subscription_version=row['version'])
+        # Held hints of an older version are cancelled, not retried; the window counter never goes back.
+        window.update(_EMPTY, **_NO_SILENCE, subscription_version=row['version'],
+            hinted_through=max(window['hinted_through'] or 0, window['through_position'] or 0))
     return window
 
 
@@ -136,6 +153,7 @@ def _save(c, window):
     c.execute('''UPDATE subscription_hint_windows SET subscription_version=%(subscription_version)s,
         next_window=%(next_window)s,first_match_at=%(first_match_at)s,last_match_at=%(last_match_at)s,
         match_count=%(match_count)s,through_position=%(through_position)s,bypass=%(bypass)s,
+        hinted_through=%(hinted_through)s,
         due_at=%(due_at)s,held_reason=%(held_reason)s,silence_state=%(silence_state)s,
         silence_fired_at=%(silence_fired_at)s,silence_due_at=%(silence_due_at)s,
         silence_held_reason=%(silence_held_reason)s,updated_at=clock_timestamp()
@@ -186,6 +204,7 @@ def _settle(c, row, binding, window, now, through):
         window['due_at'], window['held_reason'] = _gate(c, row, policy, due, reason, window['bypass'], now)
         if window['due_at'] is None:
             emitted += _emit(c, row, binding, window, 'events', window['through_position'])
+            window['hinted_through'] = max(window['hinted_through'] or 0, window['through_position'])
             window.update(_EMPTY)
     if _armed(row, binding):
         if window['silence_state'] is None and now >= binding['silence_deadline']:
@@ -203,10 +222,13 @@ def _settle(c, row, binding, window, now, through):
 def after_match(c, row, through, matched):
     """Matcher transaction, after new matches: hold or commit the hint. Returns hints committed."""
     binding = _binding(c, row)
+    window = _window(c, row)
     if binding is None:
+        # Nothing to hint: these matches are handled, so a later binding does not reopen them.
+        window['hinted_through'] = max(window['hinted_through'] or 0, through)
+        _save(c, window)
         return 0
     now = _now(c)
-    window = _window(c, row)
     policy = binding['policy'] or {}
     reasons = set()
     if policy.get('quiet_bypass') or _armed(row, binding):
@@ -239,7 +261,13 @@ def flush_hints(store, *, limit=32):
             UNION SELECT d.subscription FROM subscription_delivery d JOIN subscriptions s ON s.id=d.subscription
             LEFT JOIN subscription_hint_windows w ON w.subscription=d.subscription AND w.subscription_version=s.version
             WHERE d.silence_deadline<=clock_timestamp() AND s.state='active' AND s.version=d.policy_version
-            AND w.silence_state IS NULL) ORDER BY id LIMIT %s''', (limit,)).fetchall()
+            AND w.silence_state IS NULL
+            UNION SELECT s.id FROM subscriptions s JOIN subscription_delivery d ON d.subscription=s.id
+            LEFT JOIN subscription_hint_windows w ON w.subscription=s.id
+            WHERE s.state='active' AND (w.subscription IS NULL OR w.first_match_at IS NULL OR
+                w.subscription_version<>s.version) AND EXISTS(SELECT 1 FROM subscription_matches m
+                WHERE m.subscription=s.id AND m.event>coalesce(w.hinted_through,s.start_position)))
+            ORDER BY id LIMIT %s''', (limit,)).fetchall()
     for candidate in candidates:
         with store.pool.connection() as c:
             # Same ACL fence as matching and dispatch: the shared principal lock precedes the
@@ -252,15 +280,25 @@ def flush_hints(store, *, limit=32):
             if p is not None:
                 row = _state(c, row, p)
             binding = _binding(c, row)
-            window = _window(c, row)
+            # A missing row means no hint step ever committed for this subscription.
+            window = _window(c, row, row['start_position'])
             if p is None or row['state'] != 'active' or binding is None:
-                window.update(_EMPTY, silence_due_at=None, silence_held_reason=None)
+                # Cancelled, not deferred: these matches are never hinted, so they are not reopened.
+                window.update(_EMPTY, silence_due_at=None, silence_held_reason=None,
+                    hinted_through=max(window['hinted_through'] or 0, row['matched_through']))
                 if window['silence_state'] in (None, 'fired'):
                     window['silence_state'] = 'cancelled'
                 _save(c, window)
                 stats['cancelled'] += 1
                 continue
-            stats['emitted'] += _settle(c, row, binding, window, _now(c), row['matched_through'])
+            now = _now(c)
+            if (window['first_match_at'] is None and window['hinted_through'] is not None and
+                    c.execute('''SELECT 1 FROM subscription_matches WHERE subscription=%s AND event>%s
+                    LIMIT 1''', (row['id'], window['hinted_through'])).fetchone()):
+                # A failed hint step left committed matches unhinted: reopen the range.
+                window.update(first_match_at=now, last_match_at=now, match_count=1,
+                    through_position=row['matched_through'])
+            stats['emitted'] += _settle(c, row, binding, window, now, row['matched_through'])
             stats['held'] += window['due_at'] is not None or window['silence_due_at'] is not None
             _save(c, window)
     return stats
@@ -275,8 +313,9 @@ def carry_window(c, row, previous_version):
         (row['version'], row['id'], previous_version))
 
 
-def delivery_state(c, row, binding):
+def delivery_state(c, row):
     """Content-free policy, held state and silence timer for get_subscription."""
+    binding = _binding(c, row)
     if binding is None:
         return {'policy': None, 'held_reason': None, 'next_hint_at': None, 'silence': None}
     window = c.execute('SELECT * FROM subscription_hint_windows WHERE subscription=%s', (row['id'],)).fetchone()

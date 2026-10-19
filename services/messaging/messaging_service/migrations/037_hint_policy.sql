@@ -19,6 +19,10 @@ ALTER TABLE subscription_outbox ADD COLUMN window_id bigint CHECK(window_id>0);
 CREATE UNIQUE INDEX subscription_hint_window ON subscription_outbox(subscription,subscription_version,kind,window_id)
  WHERE window_id IS NOT NULL;
 CREATE INDEX subscription_hint_budget ON subscription_outbox(subscription,created_at);
+-- Dispatcher admission: the first POST of a hint ID reserves one slot of the key's rolling hour.
+ALTER TABLE subscription_outbox ADD COLUMN admitted_at timestamptz;
+CREATE INDEX subscription_hint_admission ON subscription_outbox(subscription,admitted_at)
+ WHERE admitted_at IS NOT NULL;
 -- The policy is the whole delivery configuration; silence timers belong to policy_version only.
 ALTER TABLE subscription_delivery ADD COLUMN policy jsonb
  CHECK(policy IS NULL OR (jsonb_typeof(policy)='object' AND octet_length(policy::text)<=4096));
@@ -36,6 +40,8 @@ CREATE TABLE subscription_hint_windows (
  match_count integer NOT NULL DEFAULT 0 CHECK(match_count BETWEEN 0 AND 1000000),
  through_position bigint CHECK(through_position>=0),
  bypass boolean NOT NULL DEFAULT false,
+ -- Matches above hinted_through with no held range are reopened, so a failed hint step retries.
+ hinted_through bigint CHECK(hinted_through>=0),
  due_at timestamptz,
  held_reason text CHECK(held_reason IN ('debounce','batch','quiet_hours','budget')),
  silence_state text CHECK(silence_state IN ('replied','fired','hinted','cancelled')),
@@ -45,6 +51,9 @@ CREATE TABLE subscription_hint_windows (
  CHECK((first_match_at IS NULL)=(through_position IS NULL))
 );
 CREATE INDEX subscription_hint_due ON subscription_hint_windows(due_at) WHERE due_at IS NOT NULL;
+-- Every match of an existing subscription was hinted by schema-36 code in its matching transaction.
+INSERT INTO subscription_hint_windows(subscription,subscription_version,hinted_through)
+ SELECT id,version,matched_through FROM subscriptions;
 CREATE INDEX subscription_silence_due ON subscription_hint_windows(silence_due_at) WHERE silence_due_at IS NOT NULL;
 
 -- PostgreSQL moves a skipped local time forward by the gap and maps an ambiguous local time
@@ -101,5 +110,8 @@ DO $$ BEGIN
   GRANT SELECT ON subscription_hint_windows TO messaging_gateway;
   GRANT UPDATE(subscription_version,due_at,silence_state,silence_fired_at,silence_due_at,
    silence_held_reason,updated_at) ON subscription_hint_windows TO messaging_gateway;
+ END IF;
+ IF EXISTS(SELECT FROM pg_roles WHERE rolname='messaging_event_delivery') THEN
+  GRANT UPDATE(admitted_at) ON subscription_outbox TO messaging_event_delivery;
  END IF;
 END $$;

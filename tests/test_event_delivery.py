@@ -629,3 +629,43 @@ def test_wake_relay_hint_vector_has_the_live_dispatcher_wire_format(seeded, tmp_
         assert signed['X-DeedKit-Hint-ID'] == json.loads(raw)['hint_id']
         assert signed['X-DeedKit-Signature'] == 'sha256=' + hmac.new(key,
             signed['X-DeedKit-Timestamp'].encode() + b'.' + raw, hashlib.sha256).hexdigest()
+
+
+# spec: ANYM-252
+def test_budget_applies_without_policy(seeded, tmp_path, monkeypatch):
+    from datetime import timedelta
+    from messaging_service.delivery_policy import flush_hints
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    monkeypatch.setenv('SUBSCRIPTION_MAX_HINTS_PER_HOUR', '3')
+    token = identity(store)
+    rid, _ = receiver(store, token, tmp_path)
+    sids = [subscription(store, token) for _ in range(2)]
+    for sid in sids:
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    emit(store)
+    match_subscriptions(store)
+    emit(store)
+    match_subscriptions(store)
+    # Matcher side: the fourth hint of the key in the hour is held, not queued or dropped.
+    with store.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM subscription_outbox WHERE kind='events'").fetchone()['n'] == 3
+    assert {store.get_subscription(token, sid)['delivery']['held_reason'] for sid in sids} == {None, 'budget'}
+    # Dispatcher side: a backlog queued during downtime is admitted at most 3 per rolling hour.
+    with store.pool.connection() as c:
+        c.execute('UPDATE subscription_outbox SET created_at=created_at-%s WHERE kind=%s',
+            (timedelta(hours=2), 'events'))
+        c.execute('UPDATE subscription_hint_windows SET due_at=due_at-%s WHERE due_at IS NOT NULL',
+            (timedelta(hours=2),))
+    emit(store)
+    match_subscriptions(store)
+    flush_hints(store)
+    with store.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM subscription_outbox WHERE state='pending'").fetchone()['n'] == 5
+    stats = dispatch_hints(store, transport=lambda *a, **k: 204, resolver=lambda *a, **k: ['93.184.216.34'])
+    assert stats['delivered'] == 3 and stats['deferred'] == 2 and stats['dead_letter'] == 0
+    with store.pool.connection() as c:
+        waiting = c.execute("""SELECT attempts,next_attempt_at>clock_timestamp()+interval '50 minutes' AS later
+            FROM subscription_outbox WHERE state='pending'""").fetchall()
+    assert [(row['attempts'], row['later']) for row in waiting] == [(0, True), (0, True)]
+    assert all(store.get_subscription_events(token, sid)['items'] for sid in sids)

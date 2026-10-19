@@ -136,7 +136,7 @@ _SUBSCRIPTION_FIELDS = {
     'fetch_subscription_events': ({'subscription_id'}, {'subscription_id','limit'}),
     'ack_subscription_events': ({'subscription_id','receipt','version'}, {'subscription_id','receipt','version'}),
     'wait_for_subscription_events': ({'subscription_id'}, {'subscription_id','timeout','limit'}),
-    'configure_subscription_delivery': ({'subscription_id','version'}, {'subscription_id','version','receiver_id'}),
+    'configure_subscription_delivery': ({'subscription_id','version'}, {'subscription_id','version','receiver_id','delivery_policy'}),
     'test_subscription': ({'subscription_id','request_id'}, {'subscription_id','request_id'}),
 }
 _FEEDBACK_FIELDS = {
@@ -189,6 +189,8 @@ def _subscription_parameters(operation, parameters):
             valid=value is None or isinstance(value,str) and bool(re.fullmatch(
                 r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',value))
         elif name=='reply_to_send':valid=value is None or isinstance(value,str) and 1<=len(value)<=128
+        # The server validates fields and bounds (invalid_delivery_policy); the envelope is a small object.
+        elif name=='delivery_policy':valid=value is None or isinstance(value,dict) and len(json.dumps(value))<=4096
         elif name=='label':valid=isinstance(value,str) and len(value)<=128 and not re.search(r'[\x00-\x1f\x7f]',value)
         elif name in ('action','direction','resume_policy'):
             valid=isinstance(value,str) and value in {
@@ -553,9 +555,11 @@ class Client:
         """Wait up to 25 seconds without ACK or provider polling. Explicit client timeouts apply."""
         return self.call('wait_for_subscription_events',dict(subscription_id=subscription_id,timeout=timeout,limit=limit))
 
-    def configure_subscription_delivery(self, *, subscription_id, version, receiver_id=None):
+    def configure_subscription_delivery(self, *, subscription_id, version, receiver_id=None, delivery_policy=None):
         """Bind an operator-registered receiver, or disable with None. URLs are not accepted."""
-        return self.call('configure_subscription_delivery',dict(subscription_id=subscription_id,version=version,receiver_id=receiver_id))
+        arguments = dict(subscription_id=subscription_id,version=version,receiver_id=receiver_id)
+        if delivery_policy is not None: arguments['delivery_policy'] = delivery_policy
+        return self.call('configure_subscription_delivery',arguments)
 
     def test_subscription(self, *, subscription_id, request_id):
         """Queue an idempotent synthetic hint; receiver success never proves a host turn."""

@@ -15,6 +15,8 @@ import threading
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
+from psycopg.types.json import Jsonb
+
 from .subscriptions import _owned, _state, _view, _worker_identity
 
 
@@ -127,7 +129,7 @@ def disable_receiver(store, receiver_id):
             WHERE receiver=%s AND state IN ('pending','leased')""", (receiver_id,))
     return {'receiver_id': receiver_id, 'enabled': False}
 
-def configure_subscription_delivery(store, c, p, subscription_id, version, receiver_id):
+def configure_subscription_delivery(store, c, p, subscription_id, version, receiver_id, delivery_policy=None):
     from .store import APIError
     if 'read' not in p['permissions']:
         raise APIError('forbidden', 403)
@@ -140,6 +142,11 @@ def configure_subscription_delivery(store, c, p, subscription_id, version, recei
         raise APIError('subscription_closed', 409)
     if row['version'] != version:
         raise APIError('subscription_conflict', 409)
+    from .delivery_policy import carry_window, normalize_policy
+    policy = normalize_policy(c, delivery_policy, row['selector'])
+    if policy is not None and receiver_id is None:
+        raise APIError('invalid_delivery_policy')
+    previous = c.execute('SELECT receiver FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
     if receiver_id is None:
         c.execute('DELETE FROM subscription_delivery WHERE subscription=%s', (row['id'],))
     else:
@@ -151,16 +158,28 @@ def configure_subscription_delivery(store, c, p, subscription_id, version, recei
             AND key_id=%s AND enabled''', (receiver_id, p['id'], p['key_id'])).fetchone()
         if allowed is None:
             raise APIError('not_found', 404)
-        c.execute('''INSERT INTO subscription_delivery(subscription,receiver) VALUES(%s,%s)
-            ON CONFLICT(subscription) DO UPDATE SET receiver=excluded.receiver,configured_at=clock_timestamp()''',
-            (row['id'], receiver_id))
+        # The whole delivery configuration belongs to the next version; a silence timer starts
+        # at this commit and any later version change cancels it.
+        expect = (policy or {}).get('expect_reply_within_s')
+        c.execute('''INSERT INTO subscription_delivery(subscription,receiver,policy,policy_version,silence_deadline)
+            VALUES(%s,%s,%s,%s,CASE WHEN %s::integer IS NULL THEN NULL
+                ELSE clock_timestamp()+%s::integer*interval '1 second' END)
+            ON CONFLICT(subscription) DO UPDATE SET receiver=excluded.receiver,configured_at=clock_timestamp(),
+            policy=excluded.policy,policy_version=excluded.policy_version,silence_deadline=excluded.silence_deadline''',
+            (row['id'], receiver_id, Jsonb(policy) if policy else None, row['version'] + 1, expect, expect))
     row = c.execute('''UPDATE subscriptions SET version=version+1,updated_at=clock_timestamp()
         WHERE id=%s RETURNING *''', (row['id'],)).fetchone()
     c.execute("""UPDATE subscription_outbox SET state='cancelled',finished_at=clock_timestamp(),
         error_code='configuration_changed' WHERE subscription=%s AND state IN ('pending','leased')""", (row['id'],))
+    if previous is not None and str(previous['receiver']) == receiver_id:
+        carry_window(c, row, version)
     result = _view(c, row)
     result['delivery'] = {'passive_read': True, 'ack': True, 'push': receiver_id is not None,
         'receiver_id': receiver_id, 'host_wakeup': 'unverified', 'host_turn_verified': False}
+    if row['state'] != 'access_changed':
+        from .delivery_policy import delivery_state
+        from .store import serial
+        result['delivery'].update(serial(delivery_state(c, row)))
     return result
 
 
@@ -197,6 +216,10 @@ def test_subscription(store, c, p, subscription_id, request_id):
         return _probe_view(existing)
     if c.execute('''SELECT 1 FROM subscription_outbox WHERE subscription=%s AND kind='test'
         AND created_at>clock_timestamp()-interval '1 minute' LIMIT 1''', (row['id'],)).fetchone():
+        raise APIError('rate_limited', 429)
+    # A probe is an explicit request, not a held event: over the key's budget it is refused.
+    from .delivery_policy import budget_slot
+    if budget_slot(c, row, c.execute('SELECT clock_timestamp() AS t').fetchone()['t']) is not None:
         raise APIError('rate_limited', 429)
     hint = enqueue_hint(c, row, row['matched_through'], kind='test', request_id=request_id)
     if hint is None:
@@ -239,7 +262,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
     """Leased at-least-once hints, independently reauthorized before each send."""
     from .store import bounded
     bounded(limit, 100)
-    stats = dict(delivered=0, retried=0, dead_letter=0, cancelled=0)
+    stats = dict(delivered=0, retried=0, dead_letter=0, cancelled=0, deferred=0)
     for _ in range(limit):
         lease = uuid4()
         with store.pool.connection() as c:
@@ -255,10 +278,24 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
                 stats['dead_letter'] += 1
                 continue
+            if hint['admitted_at'] is None:
+                # The first POST of a hint ID takes one slot of the key's rolling hour, with or
+                # without a delivery policy. At the limit it waits for the next slot: no attempt
+                # is consumed and it never dead-letters for the budget.
+                from .delivery_policy import admission_slot
+                owner = c.execute('SELECT principal,key_id FROM subscriptions WHERE id=%s',
+                    (hint['subscription'],)).fetchone()
+                slot = admission_slot(c, owner, c.execute('SELECT clock_timestamp() AS t').fetchone()['t'])
+                if slot is not None:
+                    c.execute("""UPDATE subscription_outbox SET state='pending',next_attempt_at=%s,
+                        lease_token=NULL,lease_until=NULL WHERE id=%s""", (slot, hint['id']))
+                    stats['deferred'] += 1
+                    continue
             # Commit the reservation before any external I/O. A process crash
             # after POST can lose the result, never the consumed attempt slot.
-            c.execute("""UPDATE subscription_outbox SET state='leased',lease_token=%s,
-                attempts=attempts+1,lease_until=clock_timestamp()+interval '1 minute' WHERE id=%s""", (lease, hint['id']))
+            c.execute("""UPDATE subscription_outbox SET state='leased',lease_token=%s,attempts=attempts+1,
+                admitted_at=coalesce(admitted_at,clock_timestamp()),
+                lease_until=clock_timestamp()+interval '1 minute' WHERE id=%s""", (lease, hint['id']))
         state, error = 'pending', 'receiver_unavailable'
         with store.pool.connection() as c:
             # Principal lock precedes subscription lock, matching gateway ACL

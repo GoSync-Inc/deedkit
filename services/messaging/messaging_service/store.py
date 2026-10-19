@@ -287,7 +287,19 @@ class Store:
                     'source_scope_change':'masked_access_changed_recreate_required',
                     'ack':True,'ack_permission':'subscription-ack','push':'operator_registered_signed_hints','wait_max_seconds':25,'verified_host':False,'native_reply_preset':True,
                     'provider_polling':False,'start_boundary':'committed_archive_frontier',
-                    'existing_update_consumers_unchanged':True},
+                    'existing_update_consumers_unchanged':True,
+                    'delivery_policy':{'tool':'configure_subscription_delivery','argument':'delivery_policy',
+                        'changes':'hint_timing_only','changes_matches_ack_or_reads':False,'requires_receiver':True,
+                        'bounds':{'debounce_s':[0,600],'max_wait_s':[1,3600],'batch_window_s':[0,86400],
+                            'batch_count':[1,1000],'expect_reply_within_s':[60,1209600],'quiet_windows':[1,4]},
+                        'debounce_and_batch_exclusive':True,'max_wait_default':'max(300,debounce_s)',
+                        'quiet_hours':'iana_timezone_weekday_windows_held_not_dropped',
+                        'quiet_bypass':['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send','silence'],
+                        'silence_timer':'reply_to_send_subscriptions_only','silence_hint_kind':'silence',
+                        'key_budget':{'setting':'SUBSCRIPTION_MAX_HINTS_PER_HOUR','default':20,'bounds':[1,1000],
+                            'scope':'every_hint_of_the_key','applies_without_policy':True,'over_budget':'coalesced_never_dropped'},
+                        'held_reasons':['debounce','batch','quiet_hours','budget'],'clock':'database_utc',
+                        'idempotency':'one_hint_per_subscription_version_window'}},
                 'events':{'fetch':'fetch_subscription_events','ack':'ack_subscription_events','wait':'wait_for_subscription_events','wait_max_seconds':25,'test':'test_subscription','delivery':'operator_registered_signed_hints','host_turn_verified':False},
                 'feedback':{'implemented':True,'write_permission':'feedback-write','ownership':'exact_credential','external_delivery':False},
                 'sending':{'implemented':True,'wait_max_seconds':25,'approval_mode':'acting_agent_obtains_exact_owner_confirmation',
@@ -797,10 +809,10 @@ class Store:
         with self.authorized(token, 'ack_subscription_events') as (c, p):
             return ack_subscription_events(self, c, p, subscription_id, receipt, version)
 
-    def configure_subscription_delivery(self, token, subscription_id, version, receiver_id):
+    def configure_subscription_delivery(self, token, subscription_id, version, receiver_id, delivery_policy=None):
         from .event_delivery import configure_subscription_delivery
         with self.authorized(token, 'configure_subscription_delivery') as (c, p):
-            return configure_subscription_delivery(self, c, p, subscription_id, version, receiver_id)
+            return configure_subscription_delivery(self, c, p, subscription_id, version, receiver_id, delivery_policy)
 
     def test_subscription(self, token, subscription_id, request_id):
         from .event_delivery import test_subscription
