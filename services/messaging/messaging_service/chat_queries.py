@@ -298,7 +298,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         if not c.execute('SELECT 1 FROM chats c WHERE c.id=%s AND '+scope,[cid,*scope_filter(p,'c',chat_column='id')[1]]).fetchone():raise APIError('not_found',404)
         if order=='id':clauses.append('c.id>%s');args.append(cid)
         else:
-            at=None if pos['at'] is None else position_date(pos['at'])
+            at=None if pos['at'] is None and order=='activity' else position_date(pos['at'])
             if order=='activity':
                 clauses.append("(coalesce(last.sent_at,'-infinity'),c.id)<(coalesce(%s::timestamptz,'-infinity'),%s)");args.extend([at,cid])
             else:

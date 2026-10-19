@@ -10,8 +10,8 @@ from messaging_service.store import APIError
 from test_archive import event
 from test_query_reliability import ranked_directory
 
-BAD_TEXT = ['', 5, None, ['x'], 'a\x00b', 'x'*257]
-BAD_DATE = [*BAD_TEXT, 'not-a-date', '2026-10-19T10:00:00']
+BAD_TEXT = ['', 5, None, ['x'], 'a\x00b', 'x'*257, '\ud800', 'a\udfffb']
+BAD_DATE = [*BAD_TEXT, 'not-a-date', '2026-10-19T10:00:00', '0001-01-01T00:00:00+01:00', '9999-12-31T23:59:59-01:00']
 
 
 def tampered(cursor, **fields):
@@ -97,7 +97,7 @@ def chats(seeded):
 # spec: ANYM-307
 @pytest.mark.parametrize('order,field,value', [
     *[('activity', f, v) for f, vs in [('id', BAD_TEXT), ('at', [x for x in BAD_DATE if x is not None])] for v in vs],
-    *[('priority', f, v) for f, vs in [('id', BAD_TEXT), ('at', [x for x in BAD_DATE if x is not None]), ('as_of', BAD_DATE),
+    *[('priority', f, v) for f, vs in [('id', BAD_TEXT), ('at', BAD_DATE), ('as_of', BAD_DATE),
                                         ('score', ['1', None, True, 1.5])] for v in vs]])
 def test_chat_cursor_position_fields_are_invalid_cursor(chats, order, field, value):
     s, key = chats
