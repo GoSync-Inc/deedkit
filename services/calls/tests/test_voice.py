@@ -137,6 +137,7 @@ async def test_a_failing_provider_audio_health_write_never_skips_transport_clean
     assert results==[{'metrics':{'replicated_tts':[{'synthetic':True}]}}]
 
 
+# spec: ANYM-382
 async def test_a_failing_replicated_tts_metrics_write_never_masks_the_runner_exception(monkeypatch):
     import voice
     class Service:
@@ -179,6 +180,7 @@ def _stubbed_run_transport(monkeypatch,service,runner_run,probe=None):
     return voice.run_transport(pcm_transport(send,lambda value:None),{'dialog_engine':'gemini_live'},'synthetic-key',state)
 
 
+# spec: ANYM-382
 async def test_a_failing_replicated_tts_metrics_result_write_never_masks_the_runner_exception(monkeypatch):
     called=[]
     class Service:
@@ -192,6 +194,7 @@ async def test_a_failing_replicated_tts_metrics_result_write_never_masks_the_run
     assert called==['result']
 
 
+# spec: ANYM-382
 async def test_a_failing_inbound_probe_constructor_never_stops_the_call_before_the_runner(monkeypatch):
     ran=[];events=[]
     class Service:
