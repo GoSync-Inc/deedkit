@@ -16,6 +16,14 @@ def isolated_processing_lock(tmp_path, monkeypatch):
     monkeypatch.setenv('PROCESSING_LOCK_DIR', str(directory))
 
 
+@pytest.fixture(autouse=True)
+def no_tiden_retry_delay(monkeypatch):
+    # The Tiden scripts pause before the one retry of a read; tests do not wait.
+    for name in ('scripts.tiden_drift','scripts.tiden_sync','scripts.tiden_health'):
+        if name in sys.modules:
+            monkeypatch.setattr(sys.modules[name],'RETRY_DELAY',0)
+
+
 @pytest.fixture(scope='session')
 def database(tmp_path_factory):
     filename=os.environ.get('PROBE_TEST_DSN_FILE')

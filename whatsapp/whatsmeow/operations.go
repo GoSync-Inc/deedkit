@@ -83,10 +83,11 @@ type operationRequest struct {
 type operationDependencies struct {
 	sendDependencies
 	group            func(context.Context, types.JID) (*types.GroupInfo, error)
+	groupSettle      func(context.Context) error
 	createGroup      func(context.Context, whatsmeow.ReqCreateGroup) (*types.GroupInfo, error)
 	participants     func(context.Context, types.JID, []types.JID, whatsmeow.ParticipantChange) ([]types.GroupParticipant, error)
 	groupName        func(context.Context, types.JID, string) error
-	groupDescription func(context.Context, types.JID, string) error
+	groupDescription func(context.Context, types.JID, string, string) error
 	leave            func(context.Context, types.JID) error
 	invite           func(context.Context, types.JID, bool) (string, error)
 	contacts         func(context.Context) (map[types.JID]types.ContactInfo, error)
@@ -107,13 +108,19 @@ type operationDependencies struct {
 	lookupTimeout    time.Duration
 	ownerName        string
 	platform         string
+	// Set by runOperation for group operations (ANYM-431).
+	gate               *operationGate
+	groupOperationDone func()
+}
+
+func (d *operationDependencies) useGroupIQ(iq groupIQ) {
+	d.group, d.createGroup, d.participants, d.groupName, d.groupDescription, d.leave, d.invite = iq.info, iq.create, iq.participants, iq.setName, iq.setTopic, iq.leave, iq.invite
+	d.groupSettle = iq.settle
 }
 
 func (p *Provider) operationDependencies() operationDependencies {
 	c := p.Client
-	d := operationDependencies{sendDependencies: p.sendDependencies(), group: c.GetGroupInfo, createGroup: c.CreateGroup,
-		participants: c.UpdateGroupParticipants, groupName: c.SetGroupName, groupDescription: c.SetGroupDescription, leave: c.LeaveGroup,
-		invite: c.GetGroupInviteLink, contacts: c.Store.Contacts.GetAllContacts, contact: c.Store.Contacts.GetContact,
+	d := operationDependencies{sendDependencies: p.sendDependencies(), contacts: c.Store.Contacts.GetAllContacts, contact: c.Store.Contacts.GetContact,
 		settings: c.Store.ChatSettings.GetChatSettings, patch: c.SendAppState, isOnWhatsApp: c.IsOnWhatsApp,
 		markRead: func(ctx context.Context, ids []types.MessageID, stamp time.Time, chat, sender types.JID) error {
 			return c.MarkRead(ctx, ids, stamp, chat, sender)
@@ -146,6 +153,7 @@ func (p *Provider) operationDependencies() operationDependencies {
 			return c.Store.LIDs.GetPNForLID(ctx, j)
 		},
 	}
+	d.useGroupIQ(newGroupIQ(c, &p.groupRefresh))
 	return d
 }
 
@@ -154,7 +162,60 @@ func (p *Provider) Operation(ctx context.Context, raw json.RawMessage) (any, err
 	if err := decodeStrict(raw, &req); err != nil {
 		return nil, errors.New("operation_invalid_parameters")
 	}
-	return executeOperation(ctx, req, p.operationDependencies())
+	return runOperation(ctx, req, p.operationDependencies())
+}
+
+// groupBounded names the operations that only make group IQs and local reads.
+func groupBounded(job operationRequest) bool {
+	if job.Operation == "chat_info" {
+		target, err := ParseChatID(job.ProviderChat)
+		return err == nil && target.Server == types.GroupServer
+	}
+	return job.Operation == "create_group" || groupOperations[job.Operation]
+}
+
+// runOperation answers a group operation within groupOperationDeadline even
+// when its goroutine waits on a library lock that ignores contexts, so the
+// Python worker's 30 s timeout never tears down the shared native process. The
+// gate keeps a late goroutine from starting a change after the answer; a frame
+// it was already writing was answered unknown (ANYM-431).
+func runOperation(ctx context.Context, job operationRequest, d operationDependencies) (any, error) {
+	if !groupBounded(job) {
+		return executeOperation(ctx, job, d)
+	}
+	ctx, cancel := context.WithTimeout(ctx, groupOperationDeadline)
+	gate := &operationGate{}
+	d.gate = gate
+	type answer struct {
+		result any
+		err    error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		defer cancel()
+		result, err := executeOperation(ctx, job, d)
+		done <- answer{result, err}
+		if d.groupOperationDone != nil {
+			d.groupOperationDone()
+		}
+	}()
+	select {
+	case a := <-done:
+		return a.result, a.err
+	case <-ctx.Done():
+	}
+	select {
+	case a := <-done:
+		return a.result, a.err
+	default:
+	}
+	if gate.answer() {
+		return operationOutput("unknown", map[string]any{"code": "provider_operation_uncertain"}, "")
+	}
+	if readOperations[job.Operation] {
+		return nil, errors.New("operation_query_failed")
+	}
+	return nil, errors.New("operation_target_unavailable")
 }
 
 func operationOutput(outcome string, data map[string]any, id string) (any, error) {
@@ -248,6 +309,10 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 	mutate := func(extra string, fn func() error) error {
 		if e := check(extra); e != nil {
 			return e
+		}
+		// After a deadline answer, no change may start (ANYM-431).
+		if d.gate != nil && !d.gate.start() {
+			return errors.New("operation_target_unavailable")
 		}
 		mutating = true
 		return fn()
@@ -878,8 +943,15 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 		}
 		return submitted(data)
 	case "rename_group", "set_group_description", "add_participant", "remove_participant", "promote_participant", "demote_participant", "leave_group", "get_invite_link", "revoke_invite_link":
-		if _, err = getGroup(); err != nil {
-			return nil, err
+		g, e := getGroup()
+		if e != nil {
+			return nil, e
+		}
+		// The target read's cache refresh lands before the change (ANYM-431).
+		if d.groupSettle != nil {
+			if e := d.groupSettle(ctx); e != nil {
+				return nil, e
+			}
 		}
 		if op == "rename_group" {
 			value, e := text("title", 128, false, nil)
@@ -892,7 +964,7 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 			if e != nil {
 				return nil, e
 			}
-			err = mutate("", func() error { return d.groupDescription(ctx, target, value) })
+			err = mutate("", func() error { return d.groupDescription(ctx, target, g.TopicID, value) })
 		} else if op == "leave_group" {
 			err = mutate("", func() error { return d.leave(ctx, target) })
 		} else if op == "get_invite_link" || op == "revoke_invite_link" {

@@ -957,7 +957,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
     @mcp.tool(structured_output=True,annotations=upload_write)
     def configure_subscription_delivery(ctx: Context,subscription_id: SubscriptionReference,version: SubscriptionVersion,receiver_id: ReceiverReference | None=None,delivery_policy: DeliveryPolicy | None=None) -> dict[str,Any]:
         """Select an operator-registered receiver ID for signed hints; null disables. Optional delivery_policy times hints only (debounce or batch, quiet hours, expected-reply silence timer). Never accepts URLs or grants access."""
-        # An omitted policy keeps the schema-36 payload, so existing audit records and callers are unchanged.
+        # An omitted policy keeps the schema-37 payload, so existing audit records and callers are unchanged.
         return call(ctx,'configure_subscription_delivery',subscription_id=subscription_id,version=version,receiver_id=receiver_id,**({} if delivery_policy is None else {'delivery_policy':delivery_policy}))
 
     @mcp.tool(structured_output=True,annotations=upload_write)
@@ -993,7 +993,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
             if method in ('list_chats','search','get_messages','get_context'):
                 params.setdefault('view','archive')
             params=validate_arguments(models,method,params)
-            # An omitted delivery policy keeps the schema-36 payload (same rule as the MCP tool).
+            # An omitted delivery policy keeps the schema-37 payload (same rule as the MCP tool).
             if method=='configure_subscription_delivery' and params.get('delivery_policy') is None: params.pop('delivery_policy',None)
             arguments,detail=options(method,params)
             result=render(method,await invoke(method,bearer(request.headers),arguments),detail)

@@ -33,6 +33,8 @@ type Provider struct {
 	workers     sync.WaitGroup
 	failureOnce sync.Once
 	failure     atomic.Value // first failure code (string)
+	// Orders group cache refreshes across operations (ANYM-431).
+	groupRefresh groupRefresher
 }
 
 // Connection failures the Python collector retries or blocks on

@@ -1,5 +1,5 @@
 -- Per-subscription hint timing (ANYM-252): debounce, batch, quiet hours, silence timers and a
--- per-key hourly hint budget. Expand-only: schema-36 code never reads the new columns or the
+-- per-key hourly hint budget. Expand-only: schema-37 code never reads the new columns or the
 -- held-state table and never writes kind 'silence'. Policy changes only when the matcher
 -- emits a hint, never matches, ACK positions or passive reads.
 -- A short lock wait fails the upgrade instead of stalling hint writers. NOT VALID skips the
@@ -54,7 +54,7 @@ CREATE TABLE subscription_hint_windows (
  CHECK((first_match_at IS NULL)=(through_position IS NULL))
 );
 CREATE INDEX subscription_hint_due ON subscription_hint_windows(due_at) WHERE due_at IS NOT NULL;
--- Every match of an existing subscription was hinted by schema-36 code in its matching transaction.
+-- Every match of an existing subscription was hinted by schema-37 code in its matching transaction.
 INSERT INTO subscription_hint_windows(subscription,subscription_version,hinted_through)
  SELECT id,version,matched_through FROM subscriptions;
 CREATE INDEX subscription_silence_due ON subscription_hint_windows(silence_due_at) WHERE silence_due_at IS NOT NULL;
@@ -104,7 +104,7 @@ BEGIN
 END $$;
 
 -- Existing restricted logins get the held state with the schema, so no deployed state runs the
--- schema-37 code without it (the 034 precedent). The role files repeat these for new installs.
+-- schema-38 code without it (the 034 precedent). The role files repeat these for new installs.
 DO $$ BEGIN
  IF EXISTS(SELECT FROM pg_roles WHERE rolname='messaging_subscriptions') THEN
   GRANT SELECT,INSERT,UPDATE ON subscription_hint_windows TO messaging_subscriptions;

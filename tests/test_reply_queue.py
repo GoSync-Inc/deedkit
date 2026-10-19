@@ -390,7 +390,7 @@ def test_backup_hashes_exact_owner_observations_and_key_local_dismissal(inbox):
         observe(c,'queue-test','100',{'observed_at':datetime.now(timezone.utc).isoformat(),
             'unread_count':0,'read_inbox_max_id':1,'basis':'telegram_dialog'})
         manifest=database_manifest(c)
-        assert len(manifest)==65
+        assert len(manifest)==66
         assert manifest['reply_dismissals']['rows']==manifest['chat_read_observations']['rows']==1
         c.execute('UPDATE chat_read_observations SET unread_count=1 WHERE chat=%s',(chat,))
         changed=database_manifest(c)

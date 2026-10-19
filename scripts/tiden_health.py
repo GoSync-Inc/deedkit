@@ -2,15 +2,16 @@
 """One read-only report of whether Tiden still matches the code at one main commit (ANYM-360, TIDEN-CI.md).
 
 Four metrics, each `pass`, `fail` or `unknown` with its reason: drift (the watermark covers TARGET), unlinked tests
-(per suite and overall, against the Tiden main run of TARGET), stale anchors (repo_file sources of untracked paths)
-and Done specs with an open check marker. Exit 0 when all pass, 1 when any fails, 2 when none fails and any is
+(per suite and overall, against the Tiden main run of TARGET, read after the `Tiden sync` run of TARGET has finished,
+ANYM-438), stale anchors (repo_file sources of untracked paths) and Done specs with an open check marker. Exit 0 when all pass, 1 when any fails, 2 when none fails and any is
 unknown. Every input must be provably complete; anything else makes the metrics that need it unknown, never green.
-It writes nothing to Tiden, and to Git only a fetch of main when `--fetch` is given (the workflow does).
+It writes nothing to Tiden, and to Git only a fetch of main when `--fetch` is given (the workflow does). With
+`--sync-repository` it also lists that repository's workflow runs through `gh api` (read-only).
 """
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -49,7 +50,12 @@ BARE_GO_TEST = re.compile(r"[^/]*_test\.go")
 # Tiden's Go reporter records bare file names, so the router's cases are told apart by their package.
 ROUTER_SIGNATURE = "s:github.com/GoSync-Inc/deedkit/services/release-router::"
 SHA = re.compile(r"[0-9a-f]{40}")
+REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+SYNC_WORKFLOW, SYNC_PAGE_SIZE, SYNC_MAX_PAGES = "tiden-sync.yml", 100, 10
+SYNC_SLACK = timedelta(days=1)  # a run that processes TARGET is created after TARGET exists; the slack covers clock skew
 TIMEOUT = 120
+RETRY_DELAY = 2  # seconds before the one retry of a listing
+RETRY_MIN = 10  # a retry needs at least this many seconds left of the call's one TIMEOUT budget
 PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
 
 
@@ -148,11 +154,23 @@ class Tiden:
         self.cli, self.product, self.workspace = cli, product, workspace
 
     def call(self, *arguments: str) -> dict:
+        """One listing; a failed one is repeated once inside the same TIMEOUT budget, since nothing here writes."""
+        start = time.monotonic()
+        try:
+            return self.once(*arguments)
+        except Unknown:
+            left = TIMEOUT - (time.monotonic() - start) - RETRY_DELAY
+            if left < RETRY_MIN:
+                raise
+        time.sleep(RETRY_DELAY)
+        return self.once(*arguments, timeout=left)
+
+    def once(self, *arguments: str, timeout: float | None = None) -> dict:
         label = " ".join(arguments[:2])
         try:
             completed = subprocess.run([self.cli, *arguments, "--product-id", self.product, "--workspace-id",
                                         self.workspace, "--format", "json"], capture_output=True, text=True,
-                                       timeout=TIMEOUT)
+                                       timeout=timeout or TIMEOUT)
         except subprocess.TimeoutExpired:
             raise Unknown(f"tiden {label} timed out") from None
         except (OSError, UnicodeDecodeError):
@@ -247,6 +265,106 @@ class Tiden:
 
     def results(self, seq: int) -> list[dict]:
         return self.pages("results", "run", "results", str(seq), "--latest-only")
+
+
+def moment(value: object) -> datetime | None:
+    """An ISO 8601 timestamp with a zone, else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else None
+
+
+def valid_run(row: object) -> bool:
+    return (isinstance(row, dict) and type(row.get("id")) is int and type(row.get("run_attempt")) is int
+            and isinstance(row.get("display_title"), str) and isinstance(row.get("html_url"), str)
+            and isinstance(row.get("status"), str) and moment(row.get("updated_at")) is not None
+            and isinstance(row.get("conclusion"), str if row.get("status") == "completed" else type(None)))
+
+
+class Actions:
+    """Read-only listing of the `Tiden sync` workflow runs of main through `gh api` (token: GH_TOKEN). A failure is
+    named by the command only; the response body, which may echo request data, is never shown."""
+
+    def __init__(self, repository: str, gh: str = "gh", clock=time.monotonic):
+        self.repository, self.gh, self.clock = repository, gh, clock
+
+    def page(self, number: int, created: str, end: float) -> dict:
+        if not REPOSITORY_NAME.fullmatch(self.repository) or any(not part.strip(".") for part in self.repository.split("/")):
+            raise Unknown("the sync lookup repository is not owner/name")
+        endpoint = f"repos/{self.repository}/actions/workflows/{SYNC_WORKFLOW}/runs"
+        command = [self.gh, "api", "--method", "GET", endpoint, "-f", "branch=main", "-f", f"created=>={created}",
+                   "-F", f"per_page={SYNC_PAGE_SIZE}", "-F", f"page={number}"]
+        try:
+            # All pages of one lookup share one TIMEOUT budget, so a slow API cannot outlast the report's deadlines.
+            remaining = end - self.clock()
+            if remaining <= 0:
+                raise Unknown("gh api timed out")
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise Unknown("gh api timed out") from None
+        except (OSError, UnicodeDecodeError):
+            raise Unknown("gh api could not run") from None
+        if completed.returncode:
+            raise Unknown(f"gh api exited {completed.returncode}")
+        try:
+            return json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            raise Unknown("gh api returned malformed JSON") from None
+
+    def runs(self, since: datetime, within: float | None = None) -> list[dict]:
+        """Every run created at or after SINCE (a rerun keeps its `created_at`, so no run of TARGET is hidden by
+        age); the pages count only when their rows equal `total_count`, which GitHub caps at 1000. The pages take
+        WITHIN seconds (what the report deadline leaves) at the most."""
+        created = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = self.clock() + (TIMEOUT if within is None else min(TIMEOUT, within))
+        rows: list[dict] = []
+        for number in range(1, SYNC_MAX_PAGES + 1):
+            page = self.page(number, created, end)
+            batch, total = page.get("workflow_runs") if isinstance(page, dict) else None, \
+                page.get("total_count") if isinstance(page, dict) else None
+            if not isinstance(batch, list) or type(total) is not int or total < 0:
+                raise Unknown("gh api returned no run page")
+            if not all(valid_run(row) for row in batch):
+                raise Unknown("gh api returned a malformed or duplicate run")
+            rows += batch
+            if len({row["id"] for row in rows}) != len(rows):
+                raise Unknown("gh api returned a malformed or duplicate run")
+            if len(rows) == total:
+                return rows
+            if len(rows) > total or len(batch) < SYNC_PAGE_SIZE:
+                break
+        raise Unknown("gh api pagination is incomplete")
+
+
+def sync_runs(runs: list[dict], target: str) -> list[dict]:
+    """The sync runs that processed TARGET: the run title names the commit, a skipped run processed nothing."""
+    return [run for run in runs if run["display_title"] == f"Tiden sync {target}" and run["conclusion"] != "skipped"]
+
+
+def decisive(runs: list[dict]) -> dict:
+    """The latest finished run: a rerun moves `updated_at` forward while the run ID stays; ties go to the greater
+    (id, attempt)."""
+    return max(runs, key=lambda run: (moment(run["updated_at"]), run["id"], run["run_attempt"]))
+
+
+def fingerprint(runs: list[dict]) -> list[tuple]:
+    """What a later look must find unchanged: every kept run with its attempt, state and completion time."""
+    return sorted((run["id"], run["run_attempt"], run["status"], run["conclusion"], run["updated_at"]) for run in runs)
+
+
+def await_sync(actions: Actions, target: str, since: datetime, deadline: float, clock, sleep) -> list[dict]:
+    """The `Tiden sync` runs of TARGET once none is active; none, or an active one at the deadline, is unknown."""
+    while True:
+        kept = sync_runs(actions.runs(since, deadline - clock()), target)
+        if kept and all(run["status"] == "completed" for run in kept):
+            return kept
+        sleep(min(POLL, max(deadline - clock(), 0)))
+        if clock() >= deadline:
+            raise Unknown("no finished Tiden sync run of TARGET")
 
 
 def metric(state: str, reason: str, **values) -> dict:
@@ -465,10 +583,13 @@ def unlinked_metric(cases: list[dict], results: list[dict], seq: int, listed: di
 
 
 def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool, clock=time.monotonic,
-           sleep=time.sleep, unconfigured: str | None = None) -> dict:
-    """The four metrics at TARGET; `unconfigured` names missing Tiden configuration, which makes every one unknown."""
+           sleep=time.sleep, unconfigured: str | None = None, actions: Actions | None = None) -> dict:
+    """The four metrics at TARGET; `unconfigured` names missing Tiden configuration, which makes every one unknown.
+    With `actions` the unlinked-test count is read only after the sync run of TARGET succeeded (ANYM-438)."""
     start = clock()
-    data = {"target": None, "observedAt": datetime.now(timezone.utc).isoformat(), "evidence": {}, "metrics": {}}
+    data = {"target": None, "observedAt": datetime.now(timezone.utc).isoformat(), "evidence": {},
+            "sync": {"checked": actions is not None, "target": None, "run_id": None, "run_attempt": None, "url": None,
+                     "conclusion": None, "completed_at": None, "inventory_read_at": None}, "metrics": {}}
     upstream = {key.lower(): os.environ[key] for key in ("UPSTREAM_RUN_URL", "UPSTREAM_CONCLUSION", "UPSTREAM_SHA")
                 if os.environ.get(key)}
     if upstream:
@@ -510,12 +631,38 @@ def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool
     measure("stale_anchors", lambda: with_specs(lambda specs: anchors_metric(specs, tracked(root, target))))
     measure("done_open_checks", lambda: with_specs(done_metric))
 
+    def settled_cases() -> list[dict]:
+        """The case inventory, kept only when the sync runs of TARGET were finished before it and unchanged after it."""
+        committed = moment(git(root, "show", "-s", "--format=%cI", target).decode("ascii", "replace").strip())
+        if committed is None:
+            raise Unknown("git show returned no commit date of TARGET")
+        since = committed - SYNC_SLACK
+        while True:
+            kept = await_sync(actions, target, since, start + TESTS_WAIT, clock, sleep)
+            sync = decisive(kept)
+            data["sync"] |= {"target": target, "run_id": sync["id"], "run_attempt": sync["run_attempt"],
+                             "url": sync["html_url"], "conclusion": sync["conclusion"],
+                             "completed_at": sync["updated_at"], "inventory_read_at": None}
+            if sync["conclusion"] != "success":
+                raise Unknown(f"Tiden sync run {shown(sync['html_url'])} of TARGET concluded "
+                              f"{shown(sync['conclusion'])}; the links of TARGET may be missing")
+            data["sync"]["inventory_read_at"] = datetime.now(timezone.utc).isoformat()
+            cases = tiden.cases()
+            if fingerprint(sync_runs(actions.runs(since, start + TESTS_WAIT - clock()), target)) == fingerprint(kept):
+                return cases
+            # That inventory is discarded, and so is the sync record that vouched for it.
+            data["sync"] |= {"target": None, "run_id": None, "run_attempt": None, "url": None, "conclusion": None,
+                             "completed_at": None, "inventory_read_at": None}
+            if clock() >= start + TESTS_WAIT:
+                raise Unknown("a Tiden sync run of TARGET changed while the case inventory was read")
+            sleep(min(POLL, start + TESTS_WAIT - clock()))
+
     def unlinked():
         listed, list_errors = no_spec_list(root, target)
         main = tiden.main_branch()
         run = evidence(tiden, main, target, start + TESTS_WAIT, clock, sleep)
         data["evidence"]["run"] = summarize(run)
-        cases = tiden.cases()
+        cases = settled_cases() if actions is not None else tiden.cases()
         return unlinked_metric(cases, tiden.results(run["seqNum"]), run["seqNum"], listed, list_errors)
 
     measure("unlinked_tests", unlinked)
@@ -540,6 +687,15 @@ def render(data: dict, code: int) -> list[str]:
         lines.append(f"Test evidence: Tiden run {run['seqNum']} on main, {run['environmentSlug']}, build "
                      f"`{run['buildSha']}`, {run['status']}, live-doc {run['liveDocStatus']}, completed "
                      f"{run['completedAt']}.")
+    sync = data["sync"]
+    if sync["run_id"] is not None:
+        lines.append(f"Tiden sync of TARGET: run {sync['run_id']} attempt {sync['run_attempt']}, "
+                     f"{shown(sync['conclusion'])}, completed {sync['completed_at']}, {shown(sync['url'])}; inventory "
+                     f"read {sync['inventory_read_at'] or 'not started'}.")
+    elif sync["checked"]:
+        lines.append("Tiden sync of TARGET: no finished run read, so the unlinked-test count is unknown.")
+    else:
+        lines.append("Tiden sync of TARGET: not checked (no --sync-repository).")
     older = data["evidence"].get("older_run")
     if older:
         lines.append(f"Not evidence for TARGET: newest completed main run {older['seqNum']} is for its own SHA "
@@ -579,6 +735,9 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--cli", default="tiden")
     parser.add_argument("--fetch", action="store_true", help="fetch main when the watermark is newer than the clone")
+    parser.add_argument("--sync-repository", help="owner/name whose `Tiden sync` runs must finish before the "
+                        "unlinked tests are read (the workflow passes it; GH_TOKEN needs actions: read)")
+    parser.add_argument("--gh", default="gh")
     parser.add_argument("--output", type=Path, help="write the full report as JSON")
     parser.add_argument("--require-token", action="store_true",
                         help="treat an unset TIDEN_API_TOKEN as missing configuration (the workflow passes it)")
@@ -590,7 +749,8 @@ def main() -> int:
     elif args.require_token and not os.environ.get("TIDEN_API_TOKEN"):
         unconfigured = "Tiden is not configured: TIDEN_API_TOKEN is not set (TIDEN-CI.md)"
     data = report(args.root.resolve(), Tiden(args.cli, args.product_id or "", args.workspace_id or ""), args.target,
-                  args.main_ref, args.fetch, unconfigured=unconfigured)
+                  args.main_ref, args.fetch, unconfigured=unconfigured,
+                  actions=None if args.sync_repository is None else Actions(args.sync_repository, args.gh))
     code = outcome(data)
     lines = render(data, code)
     print("\n".join(lines))

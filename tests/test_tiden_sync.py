@@ -569,6 +569,38 @@ def test_the_sync_workflow_writes_to_tiden_once_check_a_has_run_green_on_three_p
     assert command[:2] == ["python", "scripts/tiden_sync.py"] and "--dry-run" not in command
 
 
+def render_run_name(expression, **contexts):
+    """The `a || b` run-name expression as GitHub evaluates it: the first non-empty operand, empty when none."""
+    inner = expression.split("${{", 1)[1].rsplit("}}", 1)[0]
+    for operand in (part.strip() for part in inner.split("||")):
+        value = contexts.get(operand)
+        if value:
+            return expression.split("${{", 1)[0] + value
+    return expression.split("${{", 1)[0]
+
+
+# spec: ANYM-438
+def test_the_sync_run_title_names_the_commit_it_processes_for_each_trigger():
+    value = sync_workflow()
+    assert value["run-name"] == "Tiden sync ${{ github.event.workflow_run.head_sha || inputs.sha }}"
+    # A workflow_run carries the CI run's commit; a dispatch carries its input, and the default-branch head_sha of
+    # either kind of run is not what names the title.
+    assert render_run_name(value["run-name"], **{"github.event.workflow_run.head_sha": "a" * 40}) == "Tiden sync " + "a" * 40
+    assert render_run_name(value["run-name"], **{"inputs.sha": "b" * 40}) == "Tiden sync " + "b" * 40
+    assert render_run_name(value["run-name"], **{"github.event.workflow_run.head_sha": "a" * 40,
+                                                 "inputs.sha": ""}) == "Tiden sync " + "a" * 40
+
+
+# spec: ANYM-438
+def test_the_run_title_is_the_only_change_to_the_sync_workflow_shape():
+    value = sync_workflow()
+    assert set(value) == {"name", "run-name", True, "permissions", "concurrency", "jobs"}
+    assert value["name"] == "Tiden sync" and value["permissions"] == {"contents": "read"}
+    assert value["concurrency"] == {"group": "tiden-sync", "cancel-in-progress": False}
+    assert set(value[True]) == {"workflow_run", "workflow_dispatch"} and set(value["jobs"]) == {"sync"}
+    assert value["jobs"]["sync"]["name"] == "Tiden sync"
+
+
 # spec: ANYM-405
 @pytest.mark.parametrize(("env", "passes"), [
     ({"EVENT": "workflow_run", "UPSTREAM_EVENT": "push", "UPSTREAM_BRANCH": "main", "UPSTREAM_REPOSITORY": "o/r"}, True),

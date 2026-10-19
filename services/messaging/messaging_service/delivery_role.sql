@@ -15,5 +15,5 @@ GRANT UPDATE(state,version,updated_at) ON subscriptions TO messaging_event_deliv
 GRANT SELECT ON subscription_outbox TO messaging_event_delivery;
 GRANT UPDATE(state,attempts,next_attempt_at,lease_token,lease_until,finished_at,error_code)
     ON subscription_outbox TO messaging_event_delivery;
--- Schema 37: per-key admission before the first POST of a hint ID.
+-- Schema 38: per-key admission before the first POST of a hint ID.
 GRANT UPDATE(admitted_at) ON subscription_outbox TO messaging_event_delivery;

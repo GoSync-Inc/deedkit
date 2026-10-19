@@ -3,9 +3,9 @@
 Current delivery work and priority: [BACKLOG.md](BACKLOG.md), DK-08–DK-10.
 This document is the API and delivery contract.
 
-Status: since **schema 32** (current schema 37) DeedKit implements persistent structural subscriptions, passive
+Status: since **schema 32** (current schema 38) DeedKit implements persistent structural subscriptions, passive
 inspection, independent fetch/ACK, bounded long polling, native wake selectors,
-operator-registered signed hints and private feedback. Schema 37 adds hint timing:
+operator-registered signed hints and private feedback. Schema 38 adds hint timing:
 debounce or batch windows, quiet hours, expected-reply silence timers and a per-key
 hourly hint budget. Installing the package
 does not register a receiver, create a subscription, activate a provider or
@@ -306,7 +306,7 @@ the gateway's own schema check returns `invalid_arguments` with `field_errors`, 
 backend's `invalid_feedback` `field_errors` after rechecking the shape and vocabulary (a malformed list is
 dropped, never partly relayed).
 
-## Schema 37: hint timing policy
+## Schema 38: hint timing policy
 
 `configure_subscription_delivery(subscription_id, version, receiver_id, delivery_policy)`
 sets the whole delivery configuration and bumps the version (`subscription-write`,
