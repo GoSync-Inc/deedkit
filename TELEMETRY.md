@@ -46,7 +46,10 @@ capture details of `live_capture.last_capture_stop` reports
 `durable_capture_failed.<detail>` (the Telegram-only codes below); without a
 detail, or with any other value, it reports `durable_capture_failed`. These
 qualified codes are built only from that detail: an exception whose text is a
-qualified code reports `collector_failed`, and WhatsApp never reports one. The
+qualified code reports `collector_failed`, and WhatsApp never reports one. A
+Telegram `capture_overload` stop names the bound that tripped (`waiters_limit` or
+`slot_wait_timeout`) in `last_capture_stop` and the supervisor line only; its
+event still reports `capture_overload`. The
 supervisor stop line keeps its own smaller vocabulary; exception text, cause
 chains and an exception's detail value never enter the event. Other components
 keep their generic codes.

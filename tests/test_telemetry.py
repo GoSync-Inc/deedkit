@@ -332,6 +332,20 @@ def test_collector_stop_reports_the_fixed_stop_code(component, text, detail, cod
     assert json.loads(capsys.readouterr().out) == {'status': 'stopped', **line}
 
 
+# spec: ANYM-291
+@pytest.mark.parametrize('detail,line', [
+    ('waiters_limit', {'code': 'capture_overload', 'detail': 'waiters_limit'}),
+    ('slot_wait_timeout', {'code': 'capture_overload', 'detail': 'slot_wait_timeout'}),
+    ('spool_full', {'code': 'capture_overload'}), (SECRET, {'code': 'capture_overload'}),
+])
+def test_capture_overload_stop_line_names_the_bound_and_telemetry_stays_unqualified(detail, line, monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr(telemetry, 'capture', lambda error, code: seen.append(code))
+    stopped('telegram', monkeypatch, 'capture_overload', detail)
+    assert seen == ['capture_overload']
+    assert json.loads(capsys.readouterr().out) == {'status': 'stopped', **line}
+
+
 class LooksSafe(str):
     """Private text whose hash and equality pretend to be an allowlisted code."""
     def __new__(cls, text, target):

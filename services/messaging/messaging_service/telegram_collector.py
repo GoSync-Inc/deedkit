@@ -339,7 +339,7 @@ class TelegramCollector:
         """Take one capture write slot, waiting in arrival order; False when the collector stops instead."""
         if self.capture_count<CAPTURE_WRITES and not self.capture_waiters:
             self.capture_count+=1; return True
-        if len(self.capture_waiters)>=CAPTURE_WAITERS: self.fail('capture_overload'); return False
+        if len(self.capture_waiters)>=CAPTURE_WAITERS: self.fail('capture_overload','waiters_limit'); return False
         waiter=asyncio.get_running_loop().create_future(); self.capture_waiters.append(waiter)
         try:
             async with asyncio.timeout(self.capture_wait_seconds): await waiter
@@ -352,7 +352,7 @@ class TelegramCollector:
             if not isinstance(exc,TimeoutError):
                 if granted: self.release_capture()
                 raise
-            if not granted: self.fail('capture_overload'); return False
+            if not granted: self.fail('capture_overload','slot_wait_timeout'); return False
         if self.stopping.is_set() or self.failed.is_set(): self.release_capture(); return False
         return True
 

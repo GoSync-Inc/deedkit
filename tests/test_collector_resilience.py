@@ -518,6 +518,25 @@ def test_capture_stop_detail_is_kept_in_live_capture_status(worker):
     assert live['last_capture_stop']['detail'] is None and live['last_capture_stop']['code']=='durable_capture_failed'
 
 
+# spec: ANYM-291
+def test_capture_overload_stop_keeps_which_bound_tripped(worker):
+    w,s,_=worker
+    for detail in ['waiters_limit','slot_wait_timeout','disk_reserve','synthetic-private']:
+        w.state.connection_failed('capture_overload',detail)
+        with s.pool.connection() as c:
+            stop=c.execute('SELECT operations FROM collector_health WHERE account=%s',(w.account,)).fetchone()['operations']['live_capture']['last_capture_stop']
+        assert stop['code']=='capture_overload'
+        assert stop['detail']==(detail if detail in ('waiters_limit','slot_wait_timeout') else None)
+
+
+# spec: ANYM-291
+def test_overload_records_which_bound_tripped(worker):
+    w,_,_=worker
+    w.capture_count=16;w.capture_wait_seconds=0
+    asyncio.run(w.capture(NS(message=message(8))))
+    assert (w.failure_code,w.failure_detail)==('capture_overload','slot_wait_timeout')
+
+
 def test_rejected_counts_are_bounded_and_validated(worker):
     w,s,_=worker
     # Code-shaped exception text from a validator is not trusted as a reason.

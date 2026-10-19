@@ -107,11 +107,18 @@ Telegram live callbacks (messages, deletions, read receipts and owner reads)
 share 16 capture write slots, so at most 16 spool writes run at once. A
 callback that finds all slots busy waits in arrival order instead of failing,
 so a burst of updates (albums, busy groups, reconnect catch-up) is written in
-full. The collector still fails closed with `capture_overload` when more than
-N = 512 callbacks wait, or when one callback waits longer than T = 30 s for a
-slot. The overloading callback writes nothing; callbacks still waiting at the
-stop also write nothing, and reconciliation after the restart covers messages
-as above (ANYM-291).
+full. Under such a burst a live event, and a subscription on it, may be
+written up to 30 seconds later than usual. The collector still fails closed
+with `capture_overload` when more than 512 callbacks wait, or when one
+callback waits longer than 30 seconds for a slot. The two bounds mean
+different things, so `live_capture.last_capture_stop.detail` and the
+supervisor line name the one that tripped: `waiters_limit` is a burst larger
+than the queue, `slot_wait_timeout` means 16 writes made no progress for 30
+seconds, which points at the disk or spool rather than at Telegram. The
+overloading callback writes nothing, and neither do the up to 512 callbacks
+still waiting at the stop. Reconciliation after the restart re-reads their
+messages as above; their deletions, read receipts and owner reads are lost,
+as for any other stop (ANYM-291).
 
 If a spool record fails validation or its send receipt permanently
 disagrees with the DB (for example, after restoring an old backup), `drain`

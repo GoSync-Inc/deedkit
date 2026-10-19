@@ -177,6 +177,7 @@ def test_shared_capture_overload_fails_closed(tmp_path):
         assert not worker.failed.is_set()
         await worker.receipt(update(max_id=9999))
         assert worker.failed.is_set() and worker.failure_code == 'capture_overload'
+        assert worker.failure_detail == 'waiters_limit'
         release.set(); await asyncio.gather(*tasks)
     asyncio.run(overload())
     # Only the 16 writes already in flight complete; waiters see the stop and write nothing.
@@ -213,6 +214,7 @@ def test_capture_slot_wait_longer_than_bound_fails_closed(tmp_path):
     worker = collector(tmp_path); worker.capture_count = 16; worker.capture_wait_seconds = 0.01
     asyncio.run(worker.capture(NS(message=message(12))))
     assert worker.failed.is_set() and worker.failure_code == 'capture_overload'
+    assert worker.failure_detail == 'slot_wait_timeout'
     assert not list(worker.spool.path.glob('*.json'))
     assert worker.capture_count == 16 and not worker.capture_waiters
     assert (telegram_collector.CAPTURE_WRITES, telegram_collector.CAPTURE_WAITERS,
