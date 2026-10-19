@@ -5,7 +5,7 @@ from .chat_queries import title_sql
 from .policy import scope_filter, targets
 from .sender_names import resolve
 from .search_query import (compile_query, coverage, cursor_binding, decode_cursor,
-    encode_cursor, filter_values, fingerprint, output_options, shape_messages, valid_text)
+    encode_cursor, filter_values, fingerprint, output_options, position_date, position_text, shape_messages, valid_text)
 
 CHAT_TYPES = ('private','group','channel','unknown')
 
@@ -134,7 +134,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
            *,accounts=None,chats=None,senders=None,query_mode='all',order='asc',before='',direction='',
            search_language='auto',fuzzy=False,compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False,
            exclude_channels=False,chat_types=None,include_channels=None):
-    from .store import APIError,bounded,date_bound,serial
+    from .store import APIError,bounded,serial
     import re
     from .conversation import options,numeric_order_sql,visible_sql,decorate_messages,presentation
     options(view,include_system)
@@ -199,8 +199,8 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
             position=decode_cursor(cursor,binding)
             if set(position)!=({'id','at','score','revision','fuzzy','source_order','snapshot'} if conversation else {'id','at','score','revision','fuzzy'}):
                 raise APIError('invalid_cursor')
-            mid=valid_text(position['id'],empty=False)
-            at=date_bound(position['at'])
+            mid=position_text(position['id'])
+            at=position_date(position['at'])
             if (at is None or type(position['score']) is not int or not 0<=position['score']<=1000000
                     or type(position['revision']) is not int or type(position['fuzzy']) is not bool
                     or position['fuzzy']!=fuzzy_used):

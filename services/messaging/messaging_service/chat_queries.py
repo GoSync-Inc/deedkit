@@ -2,7 +2,7 @@
 from psycopg.types.json import Jsonb
 
 from .policy import scope_filter,targets
-from .search_query import coverage,cursor_binding,decode_cursor,encode_cursor,filter_values,valid_text
+from .search_query import coverage,cursor_binding,decode_cursor,encode_cursor,filter_values,position_date,position_text,valid_text
 from .conversation import meaningful_sql,options
 from .conversation_state import conversation_state,group_thread_query
 
@@ -174,9 +174,10 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         binding=cursor_binding(p,'chats-conversation-v1',{'archive_binding':binding})
     pos=decode_cursor(after,binding) if after and order!='id' else None
     now=c.execute('SELECT CURRENT_TIMESTAMP AS t').fetchone()['t'];score_at=now
+    if pos and order=='activity' and set(pos)!={'id','at'}:raise APIError('invalid_cursor')
     if pos and order=='priority':
         if set(pos)!={'id','at','score','as_of'} or type(pos['score']) is not int:raise APIError('invalid_cursor')
-        score_at=date_bound(pos['as_of'])
+        score_at=position_date(pos['as_of'])
         if score_at is None or score_at>now:raise APIError('invalid_cursor')
     age='true' if not awaiting_reply_days else f"attention.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days'"
     attention_age='true' if not awaiting_reply_days else f"m.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days'"
@@ -293,12 +294,11 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     if only_unread:clauses.append(unread+' IS TRUE')
     total=c.execute('SELECT count(*) AS n'+base+' AND '.join(clauses),[*base_args,*args]).fetchone()['n'] if awaiting_reply and only_unread else (totals['n'] if totals else None)
     if after:
-        cid=after if order=='id' else pos.get('id');valid_text(cid,empty=False)
+        cid=valid_text(after,empty=False) if order=='id' else position_text(pos.get('id'))
         if not c.execute('SELECT 1 FROM chats c WHERE c.id=%s AND '+scope,[cid,*scope_filter(p,'c',chat_column='id')[1]]).fetchone():raise APIError('not_found',404)
         if order=='id':clauses.append('c.id>%s');args.append(cid)
         else:
-            if order=='activity' and set(pos)!={'id','at'}:raise APIError('invalid_cursor')
-            at=None if pos['at'] is None else date_bound(pos['at'])
+            at=None if pos['at'] is None and order=='activity' else position_date(pos['at'])
             if order=='activity':
                 clauses.append("(coalesce(last.sent_at,'-infinity'),c.id)<(coalesce(%s::timestamptz,'-infinity'),%s)");args.extend([at,cid])
             else:

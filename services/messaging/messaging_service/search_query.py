@@ -27,6 +27,23 @@ def valid_text(value, maximum=256, *, empty=True):
     return value
 
 
+def position_text(value):
+    """A text field inside a decoded cursor position: any defect is invalid_cursor."""
+    if not isinstance(value, str) or not value or len(value)>256 or '\x00' in value:
+        invalid('invalid_cursor')
+    try: value.encode()
+    except UnicodeEncodeError: invalid('invalid_cursor')
+    return value
+
+
+def position_date(value):
+    """A timestamp inside a decoded cursor position; the empty string is not a missing bound."""
+    from .store import APIError, date_bound
+    position_text(value)
+    try: return date_bound(value)
+    except (APIError, OverflowError): invalid('invalid_cursor')
+
+
 def filter_values(values):
     if values is None:
         return None
