@@ -9,8 +9,10 @@ permissions:
   contents: read
 jobs:
   changes:
-    # A pull request whose merge commit changes no image input skips the builds; the
-    # calling job still succeeds. Every other event, and any doubt, builds all targets.
+    # A pull request whose merge commit changes no image input skips the builds, and a
+    # merge queue run never builds: the pull request built any changed input and the main
+    # push builds every target before publication (process v2 P6). The calling job still
+    # succeeds. Every other event, and any doubt, builds all targets.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -50,7 +52,9 @@ jobs:
             .github/workflows/images.yml
         run: |
           build=true reason="$EVENT_NAME runs always build"
-          if [ "$EVENT_NAME" = pull_request ]; then
+          if [ "$EVENT_NAME" = merge_group ]; then
+            build=false reason='merge queue runs never build; the main push builds every target before publication'
+          elif [ "$EVENT_NAME" = pull_request ]; then
             reason='the pull request merge commit could not be established'
             # Only GitHub's two-parent merge of this exact head yields the pull request's diff.
             if [ "$(git rev-parse HEAD^@ | wc -l | tr -d ' ')" = 2 ] && [ "$(git rev-parse HEAD^2)" = "$HEAD_SHA" ]; then

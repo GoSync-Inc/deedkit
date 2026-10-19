@@ -696,12 +696,21 @@ def test_image_build_runs_whenever_the_pull_request_diff_is_uncertain(tmp_path):
     checkout, head = pull_request_checkout(tmp_path / "not-a-merge", docs_only, merge=False)
     outputs, summary = image_decision(checkout, tmp_path, "pull_request", head)
     assert outputs == ["build=true"] and "could not be established" in summary
-    # Other events build without reading Git at all, even outside a checkout.
-    for event in ("push", "merge_group", "workflow_dispatch"):
+    # Other events but the merge queue build without reading Git at all, even outside a checkout.
+    for event in ("push", "workflow_dispatch"):
         empty = tmp_path / event
         empty.mkdir()
         assert image_decision(empty, tmp_path, event, head)[0] == ["build=true"]
 
+
+
+# spec: ANYM-300
+def test_a_merge_queue_run_never_builds_images_and_the_main_push_always_does(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    outputs, summary = image_decision(empty, tmp_path, "merge_group", "a" * 40)
+    assert outputs == ["build=false"] and "merge queue runs never build" in summary
+    assert image_decision(empty, tmp_path, "push")[0] == ["build=true"]
 
 def test_image_build_job_is_gated_only_by_the_change_decision():
     import yaml

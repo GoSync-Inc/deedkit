@@ -77,7 +77,8 @@ def digest(data):
 def queue_run(run_id=QUEUE_ID, attempt=2, **change):
     return {"id": run_id, "run_attempt": attempt, "head_sha": SHA, "event": "merge_group", "head_branch": QUEUE_BRANCH,
             "status": "completed", "conclusion": "success", "head_repository": {"full_name": REPOSITORY},
-            "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{run_id}", **change}
+            "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{run_id}", "run_started_at": "2026-10-17T08:20:00Z",
+            **change}
 
 
 def artifact(artifact_id=77, created="2026-10-17T08:30:00Z", data=b"", **change):
@@ -716,7 +717,8 @@ PR_JOBS = ("checks / verify", "checks / load", "checks / evidence", "CI gate")
 
 def pr_run(run_id=PR_RUN_ID, attempt=1, **change):
     return {"id": run_id, "run_attempt": attempt, "head_sha": HEAD_SHA, "event": "pull_request", "head_branch": PR_BRANCH,
-            "status": "completed", "conclusion": "success", "head_repository": {"full_name": REPOSITORY}, **change}
+            "status": "completed", "conclusion": "success", "head_repository": {"full_name": REPOSITORY},
+            "created_at": "2026-10-17T08:00:00Z", **change}
 
 
 class PullGitHub:
@@ -744,7 +746,7 @@ class PullGitHub:
         if path.startswith("actions/workflows/ci.yml/runs?"):
             assert "event=pull_request" in path and f"head_sha={HEAD_SHA}" in path
             return {"total_count": len(self.runs), "workflow_runs": self.runs}
-        if path.startswith(f"actions/runs/{PR_RUN_ID}/attempts/") and "/jobs?" in path:
+        if "/jobs?" in path and any(path.startswith(f"actions/runs/{run['id']}/attempts/") for run in self.runs):
             return {"total_count": len(self.jobs), "jobs": self.jobs}
         if path.startswith(f"actions/runs/{PR_RUN_ID}/attempts/"):
             return {"id": PR_RUN_ID, "run_attempt": int(path.rsplit("/", 1)[1]), "run_started_at": "2026-10-17T08:20:00Z"}
@@ -994,3 +996,413 @@ def test_the_push_after_a_reusing_queue_run_verifies_in_full_and_promotion_takes
     assert production.verify(SHA, get=github) == {
         "sha": SHA, "run_id": PUSH_ID, "run_attempt": 1, "url": push["html_url"], "verify_run_id": PUSH_ID,
         "verify_run_attempt": 1, "verify_run_url": push["html_url"]}
+
+
+# The PR→queue chain: the queue run reused pull request run PR_RUN_ID, so the main push reuses that run's evidence.
+def named_steps(*names, conclusion="success"):
+    return [{"name": name, "status": "completed", "conclusion": conclusion} for name in names]
+
+
+def chain_queue_jobs(*steps):
+    """The queue run's jobs; its reuse job names the pull request run its decision reused in a step (ci.yml)."""
+    steps = steps or ("Set up job", f"Reused pull request run {PR_RUN_ID} attempt 1", "Complete job")
+    return [{"name": "checks / verify", "status": "completed", "conclusion": "skipped"},
+            {"name": "Reuse the pull request verification", "status": "completed", "conclusion": "success",
+             "steps": [step if isinstance(step, dict) else named_steps(step)[0] for step in steps]},
+            {"name": "CI gate", "status": "completed", "conclusion": "success"}]
+
+
+CHAIN_QUEUE_JOBS = chain_queue_jobs()
+
+
+class ChainGitHub:
+    """A synthetic GitHub API for a main push whose queue run reused a pull request run: GitHub for the queue run,
+    PullGitHub for the merged pull request, its run, evidence artifact and commits."""
+
+    def __init__(self, data, queue_jobs=None, pull=None, **state):
+        self.queue = GitHub(jobs=queue_jobs or CHAIN_QUEUE_JOBS, artifacts=[])
+        self.pr = PullGitHub(data, pull={"state": "closed", "merged": True, "merge_commit_sha": SHA, **(pull or {})}, **state)
+        self.calls, self.after = [], {}
+
+    def __call__(self, path):
+        self.calls.append(path)
+        for prefix, action in list(self.after.items()):
+            if path.startswith(prefix):
+                action(self)
+        if "event=merge_group" in path or path.startswith(f"actions/runs/{QUEUE_ID}/"):
+            return self.queue(path)
+        if path.startswith("actions/artifacts/"):
+            found = next((value for value in self.pr.artifacts if value["id"] == int(path.split("/")[2])), None)
+            if found is None:
+                raise production.Refused("HTTP 404")
+            return found
+        return self.pr(path)
+
+
+def chain_pin(data, **change):
+    return {"run_id": str(PR_RUN_ID), "run_attempt": "1", "artifact_id": "88", "artifact_digest": digest(data),
+            "pull_request": str(PR_NUMBER), **change}
+
+
+def adopt_chain(tmp_path, github, data, pinned=None, tree=TREE, out="published"):
+    return ci_reuse.adopt(pinned or chain_pin(data), SHA, REPOSITORY, str(PUSH_ID), "1", tmp_path / out, get=github,
+                          fetch=lambda path: data) if tree is None else ci_reuse.adopt_chain(
+        pinned or chain_pin(data), SHA, REPOSITORY, str(PUSH_ID), "1", tmp_path / out, get=github,
+        fetch=lambda path: data, local_tree=lambda sha: tree)
+
+
+# spec: ANYM-322
+def test_a_push_after_a_queue_run_that_reused_a_pull_request_run_pins_that_run_its_artifact_and_pull_request(tmp_path):
+    data = archive(pr_evidence(tmp_path))
+    github = ChainGitHub(data)
+    assert ci_reuse.decide(SHA, REPOSITORY, get=github, sleep=lambda seconds: None) == chain_pin(data)
+    assert f"pulls/{PR_NUMBER}" in github.calls
+    assert f"actions/runs/{PR_RUN_ID}/attempts/1/jobs?per_page=100&page=1" in github.calls
+
+
+# spec: ANYM-322
+def test_the_push_publishes_the_pull_request_evidence_only_for_exactly_its_own_git_tree(tmp_path, monkeypatch):
+    evidence = pr_evidence(tmp_path)
+    data = archive(evidence)
+    github = ChainGitHub(data)
+    trees = []
+    monkeypatch.setattr(ci_reuse, "checkout_tree", lambda sha: trees.append(sha) or TREE)
+    record = adopt_chain(tmp_path, github, data, tree=None)
+    # The local checkout of the push commit and both commits' API trees are the one tree the pull request run tested.
+    assert trees == [SHA] and {f"git/commits/{TESTED_SHA}", f"git/commits/{SHA}"} <= set(github.calls)
+    assert record["producer"] == {"repository": REPOSITORY, "workflow": ci_reuse.WORKFLOW, "run_id": str(PR_RUN_ID),
+                                  "run_attempt": "1", "url": PR_URL, "artifact_id": "88",
+                                  "artifact_digest": digest(data), "sha": TESTED_SHA}
+    assert record["chain"] == {"pull_request": str(PR_NUMBER), "head_branch": PR_BRANCH, "queue_run_id": str(QUEUE_ID),
+                               "queue_run_attempt": "2", "tree": TREE}
+    published = tmp_path / "published"
+    assert all((published / name).read_bytes() == (evidence / name).read_bytes() for name in ci_reuse.EVIDENCE_FILES)
+    assert json.loads((published / tiden_ci.PUBLICATION).read_text()) == record
+
+
+def queue_rerun(state):
+    state.queue.runs[0] = queue_run(attempt=3)
+
+
+# spec: ANYM-322
+@pytest.mark.parametrize("build, reason", [
+    (lambda data: (ChainGitHub(data), {"tree": "0" * 40}), "not exactly this commit's tree"),
+    (lambda data: (ChainGitHub(data), {"tree": ""}), "not exactly this commit's tree"),
+    (lambda data: (ChainGitHub(data, commits={SHA: {"sha": SHA, "tree": {"sha": "0" * 40}, "parents": [{"sha": BASE_SHA}]}}), {}),
+     "not exactly this commit's tree"),
+    (lambda data: (ChainGitHub(data, commits={TESTED_SHA: {"sha": TESTED_SHA, "tree": {"sha": TREE},
+                                                           "parents": [{"sha": BASE_SHA}, {"sha": "b" * 40}]}}), {}),
+     "not GitHub's merge"),
+    (lambda data: (ChainGitHub(data, queue_jobs=[*CHAIN_QUEUE_JOBS, {"name": "checks / documentation", "status": "completed",
+                                                                   "conclusion": "success"}]), {}), "did not pass by reusing"),
+    (lambda data: (ChainGitHub(data, queue_jobs=[job for job in CHAIN_QUEUE_JOBS if job["name"] != "Reuse the pull request verification"]), {}),
+     "did not pass by reusing"),
+    (lambda data: (ChainGitHub(data, pull={"merged": False}), {}), "did not merge into main as this commit"),
+    (lambda data: (ChainGitHub(data, pull={"merge_commit_sha": "b" * 40}), {}), "did not merge into main as this commit"),
+    (lambda data: (ChainGitHub(data, jobs=skipped_verify()), {}), "pull request job did not pass: checks / verify"),
+    (lambda data: (ChainGitHub(data, runs=[pr_run(), pr_run(run_id=PR_RUN_ID + 1, conclusion="failure")]), {}),
+     "not a completed success"),
+    (lambda data: (ChainGitHub(data), {"pinned": chain_pin(data, run_attempt="2")}), "not the pinned one"),
+    (lambda data: (ChainGitHub(data), {"pinned": chain_pin(data, pull_request="8")}), "not the pinned one"),
+    (lambda data: (ChainGitHub(data), {"pinned": chain_pin(b"other")}), "pinned evidence artifact is gone"),
+], ids=["local-tree", "unreadable-local-tree", "push-tree", "merge-of-another-head", "docs-only-queue", "no-pull-request-reuse",
+        "not-merged", "other-merge-commit", "pull-request-job-failed", "newer-pull-request-run", "other-attempt",
+        "other-pull-request", "other-artifact"])
+def test_the_push_refuses_pull_request_evidence_of_any_other_tree_run_or_queue_decision(tmp_path, build, reason):
+    data = archive(pr_evidence(tmp_path))
+    github, change = build(data)
+    with pytest.raises(ci_reuse.Refused, match=reason):
+        adopt_chain(tmp_path, github, data, **change)
+    assert not (tmp_path / "published" / tiden_ci.PUBLICATION).exists()
+
+
+# spec: ANYM-322
+def test_a_queue_or_pull_request_rerun_during_chain_validation_fails_the_push_run(tmp_path):
+    data = archive(pr_evidence(tmp_path))
+    github = ChainGitHub(data)
+    github.after[f"git/commits/{SHA}"] = queue_rerun
+    with pytest.raises(ci_reuse.Refused, match="newer merge queue run or rerun"):
+        adopt_chain(tmp_path, github, data)
+    github = ChainGitHub(data)
+    github.after[f"git/commits/{SHA}"] = lambda state: state.pr.runs.__setitem__(0, pr_run(attempt=2))
+    with pytest.raises(ci_reuse.Refused, match="not the pinned one"):
+        adopt_chain(tmp_path, github, data, out="again")
+
+
+# spec: ANYM-322
+def test_without_a_pull_request_reuse_job_the_skipped_queue_verify_still_means_full_verification(tmp_path):
+    data = archive(pr_evidence(tmp_path))
+    jobs = [job for job in CHAIN_QUEUE_JOBS if job["name"] != "Reuse the pull request verification"]
+    with pytest.raises(ci_reuse.Refused, match="did not pass: checks / verify; the merge queue run did not pass by reusing"):
+        ci_reuse.decide(SHA, REPOSITORY, get=ChainGitHub(data, queue_jobs=jobs), sleep=lambda seconds: None)
+
+
+def chain_push(github, jobs=None):
+    """The main push run that reused the chain: every required job passed except the skipped checks / verify."""
+    push = {"id": PUSH_ID, "run_attempt": 1, "head_sha": SHA, "head_branch": "main", "event": "push", "status": "completed",
+            "conclusion": "success", "head_repository": {"full_name": REPOSITORY},
+            "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{PUSH_ID}"}
+    jobs = jobs or [{"name": name, "status": "completed", "conclusion": "skipped" if name == "checks / verify" else "success"}
+                    for name in production.REQUIRED_JOBS]
+    github.queue.runs[0]["html_url"] = f"https://github.com/{REPOSITORY}/actions/runs/{QUEUE_ID}"
+    for run in github.pr.runs:
+        run["html_url"] = f"https://github.com/{REPOSITORY}/actions/runs/{run['id']}"
+
+    def get(path):
+        if path == "compare/main..." + SHA:
+            return {"status": "identical", "ahead_by": 0, "merge_base_commit": {"sha": SHA}}
+        if path.startswith("actions/workflows/ci.yml/runs?") and "event=push" in path:
+            return {"total_count": 1, "workflow_runs": [push]}
+        if path.startswith(f"actions/runs/{PUSH_ID}/attempts/1/jobs?"):
+            return {"total_count": len(jobs), "jobs": jobs}
+        return github(path)
+    return get
+
+
+# spec: ANYM-322
+def test_promotion_accepts_a_skipped_push_verify_through_the_chain_to_the_passed_pull_request_run(tmp_path):
+    github = ChainGitHub(b"")
+    assert production.verify(SHA, get=chain_push(github)) == {
+        "sha": SHA, "run_id": PUSH_ID, "run_attempt": 1, "url": f"https://github.com/{REPOSITORY}/actions/runs/{PUSH_ID}",
+        "verify_run_id": PR_RUN_ID, "verify_run_attempt": 1,
+        "verify_run_url": f"https://github.com/{REPOSITORY}/actions/runs/{PR_RUN_ID}"}
+    for broken, reason in ((ChainGitHub(b"", pull={"merge_commit_sha": "b" * 40}), "did not merge into main as this commit"),
+                           (ChainGitHub(b"", jobs=skipped_verify()), "pull request job did not pass"),
+                           (ChainGitHub(b"", queue_jobs=[*CHAIN_QUEUE_JOBS, {"name": "checks / documentation",
+                                                                             "status": "completed", "conclusion": "success"}]),
+                            "did not pass by reusing")):
+        with pytest.raises(production.Refused, match=reason):
+            production.verify(SHA, get=chain_push(broken))
+
+
+def chain_published(tmp_path, monkeypatch, tree=TREE):
+    data = archive(pr_evidence(tmp_path))
+    adopt_chain(tmp_path, ChainGitHub(data), data)
+    monkeypatch.setattr(tiden_ci, "checkout_tree", lambda sha: tree if sha == SHA else "")
+    monkeypatch.setattr(tiden_ci, "commit_tree", lambda repository, sha: TREE if (repository, sha) == (REPOSITORY, TESTED_SHA) else "")
+    return tmp_path / "published"
+
+
+# spec: ANYM-322
+def test_the_push_run_publishes_the_chained_pull_request_evidence_to_main_as_its_own_commit(tmp_path, monkeypatch):
+    published = chain_published(tmp_path, monkeypatch)
+    code, calls = tiden_main(monkeypatch, published, {}, "publish")
+    assert code == 0
+    create = next(call for call in calls if call[1:3] == ["run", "create"])
+    assert create[create.index("--branch") + 1] == "main" and create[create.index("--build-sha") + 1] == SHA
+    meta = [create[i + 1] for i, value in enumerate(create) if value == "--client-meta"]
+    assert meta == ["git_branch=main", "ci_url=" + PUSH_URL, "tested_in=" + PR_URL]
+    manifest = tiden_ci.published_manifest(published, json.loads((published / "manifest.json").read_text()))
+    assert (manifest["sha"], manifest["tested_sha"], manifest["event"], manifest["tiden_branch"], manifest["pr_tiden_links"]) \
+        == (SHA, TESTED_SHA, "push", "", [])
+    rows = json.loads((published / "ci-checks-published.json").read_text())
+    assert all(row["message"].endswith("tested in " + PR_URL) for row in rows)
+
+
+# spec: ANYM-322
+def test_chained_pull_request_evidence_publishes_nothing_unless_the_record_and_checkout_tree_match(tmp_path, monkeypatch):
+    published = chain_published(tmp_path, monkeypatch)
+    record = json.loads((published / "publication.json").read_text())
+    manifest = json.loads((published / "manifest.json").read_text())
+    for tree in ("0" * 40, ""):
+        monkeypatch.setattr(tiden_ci, "checkout_tree", lambda sha, tree=tree: tree)
+        with pytest.raises(ValueError, match="publication record"):
+            tiden_main(monkeypatch, published, {}, "publish")
+    monkeypatch.setattr(tiden_ci, "checkout_tree", lambda sha: TREE)
+    chain = record["chain"]
+    for change in ({"chain": {**chain, "tree": "0" * 40}}, {"chain": {**chain, "tree": TREE.upper()}},
+                   {"chain": {key: value for key, value in chain.items() if key != "tree"}},
+                   {"chain": {**chain, "head_branch": "other/branch"}}, {"chain": {**chain, "pull_request": "x"}},
+                   {"chain": {**chain, "extra": "1"}}, {"chain": "yes"}, {"extra": 1},
+                   {"producer": {**record["producer"], "sha": SHA}},
+                   {"producer": {**record["producer"], "sha": "b" * 40}}):
+        (published / "publication.json").write_text(json.dumps({**record, **change}))
+        with pytest.raises(ValueError, match="publication record"):
+            tiden_main(monkeypatch, published, {}, "publish")
+    (published / "publication.json").write_text(json.dumps(record))
+    # Evidence beside the record that is not the pull request run's: a queue run's, another branch's or another commit's.
+    for change in ({"event": "merge_group", "git_branch": QUEUE_BRANCH}, {"git_branch": "other/branch"}, {"sha": "b" * 40},
+                   {"event": "push", "git_branch": "main"}):
+        (published / "manifest.json").write_text(json.dumps({**manifest, **change}))
+        with pytest.raises(ValueError, match="publication record"):
+            tiden_main(monkeypatch, published, {}, "publish")
+
+
+# spec: ANYM-322
+def test_the_reuse_job_passes_the_chained_pull_request_from_its_decision_to_its_validation(tmp_path, monkeypatch):
+    ci, _ = workflows()
+    steps = {step.get("id"): step for step in ci["jobs"]["reuse"]["steps"]}
+    assert steps["adopt"]["env"]["QUEUE_PULL_REQUEST"] == "${{ steps.decide.outputs.pull_request }}"
+    data = archive(pr_evidence(tmp_path))
+    output = tmp_path / "output"
+    for name, value in {"GITHUB_OUTPUT": str(output), "GITHUB_SHA": SHA, "GITHUB_REPOSITORY": REPOSITORY,
+                        "GITHUB_RUN_ID": str(PUSH_ID), "GITHUB_RUN_ATTEMPT": "1"}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(ci_reuse.decide, "__defaults__", (ChainGitHub(data), lambda seconds: None, ci_reuse.time.monotonic))
+    monkeypatch.setattr(sys, "argv", ["ci_reuse.py", "decide"])
+    output.write_text("")
+    assert ci_reuse.main() == 0
+    decided = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert decided == {"decision": "reuse", **chain_pin(data)}
+    for key in ("run_id", "run_attempt", "artifact_id", "artifact_digest", "pull_request"):
+        monkeypatch.setenv("QUEUE_" + key.upper(), decided[key])
+    monkeypatch.setattr(ci_reuse.adopt, "__defaults__", (ChainGitHub(data), lambda path: data))
+    monkeypatch.setattr(ci_reuse, "checkout_tree", lambda sha: TREE)
+    monkeypatch.setattr(sys, "argv", ["ci_reuse.py", "adopt", "--directory", str(tmp_path / "published")])
+    output.write_text("")
+    assert ci_reuse.main() == 0 and output.read_text() == f"validated_sha={SHA}\n"
+    assert json.loads((tmp_path / "published" / tiden_ci.PUBLICATION).read_text())["chain"]["tree"] == TREE
+    # The same decision with another local tree fails the push run instead of publishing.
+    monkeypatch.setattr(ci_reuse, "checkout_tree", lambda sha: "0" * 40)
+    monkeypatch.setattr(sys, "argv", ["ci_reuse.py", "adopt", "--directory", str(tmp_path / "other")])
+    with pytest.raises(ci_reuse.Refused, match="not exactly this commit's tree"):
+        ci_reuse.main()
+
+
+# spec: ANYM-322
+def test_within_one_deploy_chained_verifications_fit_the_anonymous_quota_and_a_queue_rerun_is_verified_again(tmp_path):
+    github = ChainGitHub(b"")
+    get = chain_push(github)
+    paths = []
+
+    def counted(path):
+        paths.append(path)
+        return get(path)
+    # Plans A and B verify 10 times and plan B 6 times; the first verification reads the queue run once, not twice.
+    for steps, count, listing in (("plan A and B", 10, 1), ("plan B", 6, 0)):
+        paths.clear()
+        with production.verification_reuse():
+            first = production.verify(SHA, counted)
+            assert len(paths) == 11
+            for _ in range(count - 1):
+                assert production.verify(SHA, counted) == first
+        assert len(paths) + listing <= production.QUOTA[steps] - 4, (steps, len(paths))  # 4 spare for a second page
+    # A later verification re-reads the queue run that reused the pull request run, and a rerun of it is read in full.
+    with production.verification_reuse():
+        production.verify(SHA, counted)
+        github.queue.runs[0] = {**github.queue.runs[0], "run_attempt": 3}
+        paths.clear()
+        assert production.verify(SHA, counted)["verify_run_id"] == PR_RUN_ID
+        assert f"actions/runs/{QUEUE_ID}/attempts/3/jobs?per_page=100&page=1" in paths
+
+
+def git(root, *arguments):
+    return subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True, text=True,
+                          env={"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "HOME": str(root),
+                               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}).stdout.strip()
+
+
+# spec: ANYM-322
+def test_the_checkout_tree_ignores_git_replacements_and_inherited_git_settings(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    git(repository, "init", "-q")
+    (repository / "file").write_text("pushed")
+    git(repository, "add", "file")
+    git(repository, "commit", "-q", "-m", "pushed")
+    pushed, pushed_tree = git(repository, "rev-parse", "HEAD"), git(repository, "rev-parse", "HEAD^{tree}")
+    (repository / "file").write_text("other")
+    git(repository, "commit", "-q", "-am", "other")
+    other, other_tree = git(repository, "rev-parse", "HEAD"), git(repository, "rev-parse", "HEAD^{tree}")
+    git(repository, "checkout", "-q", pushed)
+    # A replacement object makes plain git show the other commit's tree for the pushed commit.
+    git(repository, "replace", pushed, other)
+    assert git(repository, "rev-parse", "HEAD^{tree}") == other_tree
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("GIT_DIR", str(elsewhere))
+    monkeypatch.setenv("GIT_REPLACE_REF_BASE", "refs/replace/")
+    assert tiden_ci.checkout_tree(pushed, repository) == ci_reuse.checkout_tree(pushed, repository) == pushed_tree
+    assert tiden_ci.checkout_tree(other, repository) == "" and tiden_ci.checkout_tree(pushed, elsewhere) == ""
+    with pytest.raises(ci_reuse.Refused, match="not this commit"):
+        ci_reuse.checkout_tree(other, repository)
+
+
+# spec: ANYM-322
+def test_chained_evidence_publishes_nothing_when_github_records_another_tree_for_the_tested_commit(tmp_path, monkeypatch):
+    published = chain_published(tmp_path, monkeypatch)
+    # A record and manifest that agree with each other and with the checkout, for a tested commit of another tree.
+    for recorded in ("0" * 40, ""):
+        monkeypatch.setattr(tiden_ci, "commit_tree", lambda repository, sha, recorded=recorded: recorded)
+        with pytest.raises(ValueError, match="publication record"):
+            tiden_main(monkeypatch, published, {}, "publish")
+    asked = []
+    monkeypatch.setattr(tiden_ci, "commit_tree", lambda repository, sha: asked.append((repository, sha)) or TREE)
+    assert tiden_main(monkeypatch, published, {}, "publish")[0] == 0 and asked == [(REPOSITORY, TESTED_SHA)]
+
+
+# spec: ANYM-322
+def test_github_commit_tree_reads_only_an_exact_commit_anonymously_and_fails_closed(monkeypatch):
+    requests = []
+
+    def answer(body):
+        def urlopen(request, timeout):
+            requests.append((request.full_url, dict(request.header_items()), timeout))
+            if isinstance(body, Exception):
+                raise body
+            return Response(json.dumps(body).encode())
+        return urlopen
+    monkeypatch.setattr(tiden_ci.urllib.request, "urlopen", answer({"sha": TESTED_SHA, "tree": {"sha": TREE}}))
+    assert tiden_ci.commit_tree(REPOSITORY, TESTED_SHA) == TREE
+    url, headers, _ = requests[0]
+    assert url == f"https://api.github.com/repos/{REPOSITORY}/git/commits/{TESTED_SHA}"
+    assert not any(name.lower() == "authorization" for name in headers)
+    for body in ({"sha": "b" * 40, "tree": {"sha": TREE}}, {"sha": TESTED_SHA, "tree": {"sha": "short"}}, [],
+                 OSError("down")):
+        monkeypatch.setattr(tiden_ci.urllib.request, "urlopen", answer(body))
+        assert tiden_ci.commit_tree(REPOSITORY, TESTED_SHA) == ""
+    requests.clear()
+    assert tiden_ci.commit_tree("fork/deedkit/../x", TESTED_SHA) == tiden_ci.commit_tree(REPOSITORY, "HEAD") == ""
+    assert requests == []
+
+
+# spec: ANYM-322
+def test_promotion_refuses_a_pull_request_run_newer_than_the_queue_decision(tmp_path):
+    # Two successful runs of the same head: the queue decided on 640; 641, created after the queue attempt started,
+    # may test another merge base and tree, so promotion and the push reuse refuse it rather than name it.
+    newer = pr_run(run_id=PR_RUN_ID + 1, created_at="2026-10-17T08:30:00Z")
+    with pytest.raises(production.Refused, match="not the one the merge queue decision evaluated"):
+        production.verify(SHA, get=chain_push(ChainGitHub(b"", runs=[pr_run(), newer])))
+    with pytest.raises(ci_reuse.Refused, match="not the one the merge queue decision evaluated"):
+        ci_reuse.decide(SHA, REPOSITORY, get=ChainGitHub(b"", runs=[pr_run(), newer]), sleep=lambda seconds: None)
+    for broken in ({"created_at": None}, {"created_at": "2026-10-17T08:00:00"}):
+        with pytest.raises(production.Refused, match="not the one the merge queue decision evaluated"):
+            production.verify(SHA, get=chain_push(ChainGitHub(b"", runs=[pr_run(**broken)])))
+
+
+# spec: ANYM-322
+def test_promotion_follows_only_the_pull_request_run_the_queue_named_and_refuses_it_when_gone(tmp_path):
+    # The queue decided on 640 and named it; once 640 is deleted, the older successful 639 of the same head (which may
+    # have tested another tree) is refused by promotion and by the push decision, never substituted.
+    older = [pr_run(run_id=PR_RUN_ID - 1)]
+    with pytest.raises(production.Refused, match="not the one the merge queue decision evaluated"):
+        production.verify(SHA, get=chain_push(ChainGitHub(b"", runs=older)))
+    with pytest.raises(ci_reuse.Refused, match="not the one the merge queue decision evaluated"):
+        ci_reuse.decide(SHA, REPOSITORY, get=ChainGitHub(b"", runs=older), sleep=lambda seconds: None)
+    named = f"Reused pull request run {PR_RUN_ID} attempt 1"
+    for steps, reason in ((("Reused pull request run 639 attempt 1",), "not the one"),
+                          ((f"Reused pull request run {PR_RUN_ID} attempt 2",), "not the one"),
+                          (("Set up job", "Complete job"), "does not name the one"),
+                          (("Reused pull request run  attempt ",), "does not name the one"),
+                          ((named_steps(named, conclusion="skipped")[0],), "does not name the one"),
+                          ((f"{named} ",), "does not name the one"),
+                          ((named, "Reused pull request run 639 attempt 1"), "does not name the one")):
+        with pytest.raises(production.Refused, match=reason):
+            production.verify(SHA, get=chain_push(ChainGitHub(b"", queue_jobs=chain_queue_jobs(*steps))))
+    # A later attempt of the named run tests the same merge commit, so its result counts.
+    verified = production.verify(SHA, get=chain_push(ChainGitHub(b"", runs=[pr_run(attempt=2)])))
+    assert (verified["verify_run_id"], verified["verify_run_attempt"]) == (PR_RUN_ID, 2)
+
+
+# spec: ANYM-322
+def test_within_one_deploy_a_failed_or_pending_pull_request_rerun_is_never_taken_from_the_cache(tmp_path):
+    for change, reason in (({"run_attempt": 2, "conclusion": "failure"}, "not a completed success"),
+                           ({"run_attempt": 2, "status": "in_progress", "conclusion": None}, "not a completed success")):
+        github = ChainGitHub(b"")
+        get = chain_push(github)
+        with production.verification_reuse():
+            production.verify(SHA, get)
+            github.pr.runs[0] = {**github.pr.runs[0], **change}  # between preparation and application
+            with pytest.raises(production.Refused, match=reason):
+                production.verify(SHA, get)

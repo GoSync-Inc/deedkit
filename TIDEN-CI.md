@@ -133,8 +133,12 @@ dispatch the older one of the same ref. A pull request run builds the container
 image targets only when its merge commit changes an image input listed in
 `.github/workflows/images.yml`, or when the merge diff cannot be established;
 otherwise the build is skipped and `CI gate` stays green. A failed change
-detection or build turns `CI gate` red. Push, merge queue and dispatch runs
-always build them.
+detection or build turns `CI gate` red. A merge queue run never builds them:
+the pull request run built any changed input, and the main push builds every
+target before publication. Push and dispatch runs always build them. The push
+run publishes the eight images, then confirms their attestations, in parallel
+threads; every target finishes its own write-once decision before the first
+refusal fails the job.
 
 A merge queue run (`merge_group`, Git branch `gh-readonly-queue/...`) verifies
 the temporary group commit with the same required checks, `CI gate` and
@@ -163,19 +167,19 @@ merge commit must be GitHub's merge of that head, and its tree must equal the
 group commit's tree. A re-read must show the same run. Anything else, including
 any error, means full verification, never a failed run. On a reuse
 `checks / verify`, `checks / python`, `checks / load` and `checks / evidence` are skipped;
-`native / synthetic` and the image builds run. `checks / tiden` runs no Tiden
+`native / synthetic` runs. `checks / tiden` runs no Tiden
 command: its receipt records `skipped` with the reused run attempt's URL
 (`tested_in`), the merge commit it tested and the group commit, and the job fails
 without them. `CI gate` accepts that skip only for this decision on this group
 commit. The decision script runs from the group commit's tree like every queue
 workflow, so the fork exclusion selects evidence and is no sandbox; queued
 workflow changes are still reviewed. Such a queue run has a skipped
-`checks / verify`, so its main push verifies in full (below).
+`checks / verify`; its main push reuses the pull request run's evidence by the
+chain rules below.
 
 A queue run that ran the suite is the authoritative test run of a merged SHA; the
 main push run of that SHA validates and publishes it instead of testing the
-commit again (ANYM-322); after a queue run that reused a pull request run, the
-push run verifies in full. Its first job, `Reuse the merge queue verification`,
+commit again (ANYM-322). Its first job, `Reuse the merge queue verification`,
 one of the two CI jobs with `actions: read`, finds the latest merge queue run of the exact commit by the
 rules `production.py verify` applies (ANYM-321), waits up to five minutes for it
 to complete, and pins its latest attempt and the one `ci-evidence` artifact
@@ -193,6 +197,32 @@ reuse `checks / verify`, `checks / python`, `checks / load` and `checks / eviden
 `native / synthetic`, the image builds, `publish` and the release record run as on
 every push. `CI gate` accepts a skipped `checks / verify` only for a validated
 reuse of this commit; otherwise `checks / verify` must have tested this commit.
+
+After a queue run that reused a pull request run (the PR→queue chain), the
+push run reuses that pull request run's evidence instead. The queue run's
+latest attempt must have passed `CI gate` and `Reuse the pull request
+verification` with `checks / verify` skipped, never by a docs-only decision;
+the pull request named by its group ref must have merged into `main` as exactly
+this commit, and the latest run of its head must have passed every job a full
+pull request run needs, be the run, at that or a later attempt, that the reuse
+job's one passed step `Reused pull request run <id> attempt <n>` names, and
+have been created before the queue run's latest attempt started, so it is the
+run the queue decision evaluated; a deleted or replaced producer is refused,
+never substituted. The job pins that run's latest attempt and its one
+current artifact, validates the evidence by the rules above for the merge
+commit it tested and the pull request's head branch, and then requires that
+merge commit to be GitHub's merge of that head and its Git tree hash to equal
+this commit's tree in the API and in the job's own checkout, read by Git
+without replacement objects or inherited `GIT_*` settings. A changed queue or
+pull request run, a rerun or any mismatch fails the push run. The record also
+names the pull request, its head branch, the queue run attempt and the tree;
+`tiden_ci.py publish` and `release` accept it only when the tree GitHub records
+for the tested commit (one anonymous read of the public API), the record's tree
+and their own checkout's tree of this commit are one tree. The Tiden run then names this commit, with
+`tested_sha` the tested merge commit and `tested_in` the pull request run
+attempt. `production.py verify` follows the same chain to the pull request run
+when the push run skipped `checks / verify` after such a queue run; within one
+deploy it re-reads the queue run, the pull request run and the push run.
 `tiden_ci.py publish` and `release` accept the record only when it names their
 own job's repository, run, attempt and commit. The Tiden run on `main`, its
 thirteen check row IDs and the release then carry this push run's attempt URL,
