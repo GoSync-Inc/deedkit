@@ -968,7 +968,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
             params=validate_arguments(models,method,params)
             arguments,detail=options(method,params)
             result=render(method,await invoke(method,bearer(request.headers),arguments),detail)
-        except (json.JSONDecodeError, TypeError): raise APIError('invalid_parameters') from None
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError): raise APIError('invalid_parameters') from None
         except Exception as error:
             error.operation=method
             raise

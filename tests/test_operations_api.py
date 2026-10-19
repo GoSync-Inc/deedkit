@@ -62,6 +62,18 @@ def test_operation_rest_and_mcp_match_exact_payload(method):
     assert store.calls == [(method, params), (method, params)]
 
 
+# spec: ANYM-306
+@pytest.mark.parametrize('body', [b'\xff', b'\xff\xfe\x00', b'{"query": "\xc3\x28"}', b'{"query": ', b'[]', b'{"token": "x"}'])
+def test_rest_body_that_cannot_be_decoded_is_invalid_parameters_not_retryable(body):
+    store = RecordingStore()
+    with TestClient(create_app(store, ['testserver'])) as client:
+        rest = client.post('/v1/search', headers={'Authorization': 'Bearer synthetic-token'}, content=body)
+    assert rest.status_code == 400
+    assert rest.json()['error'] == 'invalid_parameters' and rest.json()['retryable'] is False
+    assert 'retry_after_seconds' not in rest.json()
+    assert store.calls == []
+
+
 @pytest.mark.parametrize('method', METHODS)
 def test_operation_arguments_reject_unknown_before_backend(method):
     store = RecordingStore()
