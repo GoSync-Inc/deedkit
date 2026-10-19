@@ -323,14 +323,17 @@ overlap and a run in progress is never cancelled (one concurrency group), becaus
 the sync is the only automated writer of anchors and replaces whole source lists.
 GitHub keeps one waiting run and drops an older waiting one. A later run does not
 cover an earlier commit, so dispatch a dropped run again from main with its SHA
-(`gh workflow run tiden-sync.yml --ref main -f sha=<sha>`). Never repair sources
-by hand while a sync runs.
+(`gh workflow run tiden-sync.yml --ref main -f sha=<sha>`).
 
-Until check A has run green on three pull requests, the sync runs `--dry-run`
-and writes nothing. The agent that merged runs it after the CI push run
-completes, first with `--dry-run`, then without
-(`TIDEN_PRODUCT_ID=<id> uv run python scripts/tiden_sync.py --sha <sha>` from a
-main checkout), and reads back the result (AGENTS.md section 4).
+The sync writes to Tiden since check A ran green on three pull requests. The
+agent that merged waits for the sync run of its squash and reads back the result
+(AGENTS.md section 4). A failed or dropped run is recovered only by dispatching
+it again by SHA, as above, or by rerunning it, so that it joins the concurrency
+group. A local `scripts/tiden_sync.py` runs only with `--dry-run`: a local write
+or a source repair by hand is outside the group, and a B run that starts during
+it can lose anchors, since both replace whole source lists. Such a write needs a
+maintenance window agreed with the owner, with the workflow disabled and no
+run in progress for the whole operation.
 
 ## Drift watermark
 
@@ -347,10 +350,14 @@ it is when the run starts, not its event commit, and runs
    links, not anchors.
 2. Every remaining path needs a `repo_file` anchor on some spec on Tiden main.
    If one lacks it, the run fails, lists the paths in its summary and leaves the
-   watermark. Add each path as a `repo_file` source of the spec it implements
-   on Tiden main with `tiden spec update --id <spec> --sources-file <file>`,
-   which replaces the whole list, so resend every existing source with its
-   fields (AGENTS.md section 4), then rerun the failed run.
+   watermark. Drift can finish before the sync of the same push: wait for that
+   sync run (dispatch it by SHA if it failed or was dropped), then rerun the
+   failed run. A path no sync anchors (a commit without a pull request, or a
+   sync that failed at step anchors) is added as a `repo_file` source of the spec
+   it implements with `tiden spec update --id <spec> --sources-file <file>` only
+   in a maintenance window, with the sync workflow disabled and no run in
+   progress (main sync). The command replaces the whole list, so resend every
+   existing source with its fields, then rerun the failed run.
 3. Otherwise it runs `tiden drift advance --from W --to <checkout> --reason
    empty_sync` once, requires `"advanced": true` and reads the watermark back.
    The server compares `--from` with the current watermark and answers a stale
@@ -428,9 +435,10 @@ rule and still counts as unlinked in the share. The rule does not depend on when
 a case was created: a case first published on an intent branch fails when it
 becomes active on `main`, on every run until it is linked or listed.
 
-After the `main` push run of a squash publishes its evidence, the agent that
-merged it links each new test case of the change on Tiden main and reruns a
-failed `Tiden health` run (`AGENTS.md`). The measuring command gives the same
+After the `main` push run of a squash publishes its evidence, sync B links each
+marked new test case of the change on Tiden main. The agent that merged it waits
+for that sync run, reads back the links and reruns a failed `Tiden health` run
+(`AGENTS.md`). The measuring command gives the same
 report locally, read-only, without fetching:
 
 ```sh

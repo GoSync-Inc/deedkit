@@ -467,6 +467,25 @@ def test_a_null_spec_number_in_any_copy_is_never_merged(root, server, change):
     assert not server.writes()
 
 
+# spec: ANYM-405
+@pytest.mark.parametrize("state", [
+    {"previews": {"proposal/x": {"additions": [{"seqNum": 50}], "modifications": [], "stats": {"conflicts": 1}}}},
+    {"fault": {"branch merge": "exit"}},
+    {"fault": {"spec update": "exit"}},
+    {"fault": {"spec update": "drop"}},
+])
+def test_a_failed_sync_recovers_by_rerun_or_dispatch_and_a_change_by_hand_needs_a_maintenance_window(root, server, state):
+    full_server(server)
+    server.set(**state)
+    merged(root, server, {"app/new.py": "y\n"}, "Delivers: ANYM-50\nTiden branch: proposal/x")
+    code, out = run(root, server)
+    lines = out.splitlines()
+    assert code == 1 and any(line.startswith("Failed at step") for line in lines), out
+    # A merge failure stops the sync and names the recovery itself; any later failure ends with one recovery line.
+    assert "rerun this job or dispatch this SHA from main" in lines[-1], out
+    assert all("maintenance window" in line for line in lines if "hand" in line), out
+
+
 def sync_workflow():
     import yaml
     return yaml.safe_load((Path(SCRIPT).parents[1] / ".github/workflows/tiden-sync.yml").read_text())
@@ -489,13 +508,20 @@ def test_the_sync_workflow_runs_after_main_ci_serialized_with_main_tools_and_a_d
     assert steps.index(checkout) == 1 and steps[2]["run"] == 'git merge-base --is-ancestor "$SHA" HEAD'
     holders = [step["name"] for step in steps if any("secrets." in str(v) or "github.token" in str(v)
                                                      for v in step.get("env", {}).values())]
-    assert holders == [steps[-1]["name"]] and "--dry-run" in steps[-1]["run"].split()
+    assert holders == [steps[-1]["name"]]
     assert all("secrets." not in step.get("run", "") and "GITHUB_PATH" not in step.get("run", "") for step in steps)
 
     def pinned(text):
         return next(line.strip() for line in text.splitlines() if "sha256sum --check" in line)
     install = next(step for step in steps if step.get("name") == "Install pinned Tiden CLI with integrity check")
     assert pinned(install["run"]) == pinned((Path(SCRIPT).parents[1] / ".github/workflows/ci.yml").read_text())
+
+
+# spec: ANYM-405
+def test_the_sync_workflow_writes_to_tiden_once_check_a_has_run_green_on_three_pull_requests():
+    steps = sync_workflow()["jobs"]["sync"]["steps"]
+    command = steps[-1]["run"].split()
+    assert command[:2] == ["python", "scripts/tiden_sync.py"] and "--dry-run" not in command
 
 
 # spec: ANYM-405

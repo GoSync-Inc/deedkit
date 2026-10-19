@@ -13,9 +13,10 @@ validated. In order, each step reading back what it wrote:
    check.
 
 Every step is idempotent, so a rerun finishes what an earlier run left. Any mismatch fails the run and names the step;
-the author then does that step by hand on Tiden main and reruns. Runs must not overlap: the anchors step reads the
-spec again right before it replaces the source list, but only one writer at a time makes that safe (the workflow job
-uses one concurrency group).
+recovery is a rerun of the job or a dispatch of the SHA, both inside the workflow's one concurrency group. Writers must
+not overlap: the anchors step reads the spec again right before it replaces the source list, but only one writer at a
+time makes that safe. So a change on Tiden by hand (a conflicted branch, a source repair) waits for a maintenance
+window with the workflow disabled and no run in progress.
 """
 from __future__ import annotations
 
@@ -48,6 +49,9 @@ PREVIEW_EMPTY = ("deletions", "testAdditions", "testModifications", "testDeletio
                  "componentModifications", "componentDeletions")
 PREVIEW_OTHER = ("stats", "intentSession", "blockingSessions", "hasRequirementChanges")
 TIMEOUT = 120
+# Recovery stays inside the workflow's concurrency group; a write by hand outside it can drop sources a run adds.
+RECOVER = "rerun this job or dispatch this SHA from main (TIDEN-CI.md, main sync)"
+WINDOW = "only in a maintenance window, with the sync workflow disabled and no run in progress (TIDEN-CI.md)"
 
 
 def write(cli: str, arguments: list[str], product: str | None) -> None:
@@ -152,7 +156,7 @@ def preview_numbers(preview: dict, name: str) -> set[int]:
         other.append("hasRequirementChanges")
     if other:
         raise StepFailed("merge", f"the preview of {name} holds more than spec changes ({', '.join(other)}); "
-                                  "merge it by hand")
+                                  f"merge it by hand {WINDOW}, then {RECOVER}")
     return {preview_number(item) for key in PREVIEW_CHANGES for item in lists[key]}
 
 
@@ -183,7 +187,7 @@ def merge(cli: str, product: str, name: str, named: list[int], report, dry: bool
     try:
         write(cli, ["branch", "merge", "--name", name], product)
     except Refused as error:
-        raise StepFailed("merge", f"{error}; read the branch back before merging by hand") from None
+        raise StepFailed("merge", f"{error}; {RECOVER}: it reads the branch back first") from None
     try:
         status = branch_status(cli, product, name)
     except Refused as error:
@@ -329,7 +333,7 @@ def anchor(cli: str, product: str, paths: list[str], primary: int | None, main: 
         write(cli, ["spec", "update", "--id", spec["id"], "--sources-file", stream.name], None)
         after = listing(cli, product, "main").get(primary)
     except Refused as error:
-        raise StepFailed("anchors", f"{error}; read ANYM-{primary} back before anchoring by hand") from None
+        raise StepFailed("anchors", f"{error}; {RECOVER}: it reads ANYM-{primary} again first") from None
     finally:
         os.unlink(stream.name)
     if after is None:
@@ -338,8 +342,7 @@ def anchor(cli: str, product: str, paths: list[str], primary: int | None, main: 
     if expected != actual:
         raise StepFailed("anchors", f"read-back of ANYM-{primary}: {sum((expected - actual).values())} sent source(s) "
                                     f"missing or changed, {sum((actual - expected).values())} unexpected; "
-                                    f"check and repair "
-                                    f"the sources of ANYM-{primary} by hand")
+                                    f"repair the sources of ANYM-{primary} by hand {WINDOW}")
     report(f"anchors: {len(missing)} file(s) anchored to ANYM-{primary}: " + ", ".join(shown(p) for p in missing))
 
 
@@ -415,7 +418,7 @@ def sync(root: Path, sha: str, number: int, body: str, cli: str, product: str, r
     if failures:
         for failure in failures:
             report(f"Failed at step {failure.step}: {failure}")
-        report("Do each failed step by hand on Tiden main (TIDEN-CI.md, main sync), then rerun this job.")
+        report(f"Recovery: {RECOVER}; a change by hand on Tiden main needs a maintenance window (TIDEN-CI.md).")
         return 1
     report("Dry run: nothing was written." if dry else "Synced.")
     return 0

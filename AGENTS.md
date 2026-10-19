@@ -61,10 +61,10 @@ Done: the squash's `main` push run is green.
 - PR lines: `Spec: ANYM-n[, …]` (implements or keeps), `Delivers: ANYM-n` (completes), optional
   `Tiden branch: proposal/<name>` or `review/<name>`, the only place to edit criteria. The first
   ID is primary; new files are anchored to it.
-- Check A (PR) and sync B (main push) will enforce this. Until they run, check markers
-  and IDs yourself; after the push run, merge the named branch when its preview holds only the
-  named cards, anchor new files, link marked tests, set card status, read back, rerun failed
-  `Tiden health`.
+- Check A (PR) checks markers and IDs; sync B (main push) merges the named branch, anchors,
+  links, sets status. Wait for B on your squash, read back, rerun or dispatch a failed B by SHA,
+  rerun failed `Tiden drift` and `Tiden health`. Tiden writes by hand need a maintenance window
+  (TIDEN-CI.md).
 - Cards, markers and the daily delta audit: docs/operations/tiden-product-workflow.md.
 
 ## 5. Reviews
