@@ -128,6 +128,8 @@ class FakeDocker:
     """Models the actual journal boundary between host, detached Docker and files."""
     def __init__(self,root):
         self.root=root;self.containers={};self.calls=[];self.capture_fails=False;self.hold_worker=False;self.transient=False
+        # Runs the isolated abandon_fence action for a job directory; returns its exit code.
+        self.fence_worker=None
         self.containers['tg-id']=self.collector('tg-id','telegram',True)
         self.containers['wa-id']=self.collector('wa-id','whatsapp1',False)
     @staticmethod
@@ -160,7 +162,13 @@ class FakeDocker:
             return name
         if args[0]=='start':
             info=self.containers[args[1]];info['State'].update(Running=True,Status='running')
-            if args[1].startswith('pos-backup-'):
+            if info['Config']['Labels'].get('personal-os.backup.action')=='abandon_fence':
+                work=self.root/info['Config']['Labels']['personal-os.backup.id']
+                if self.fence_worker:code=self.fence_worker(work)
+                else:
+                    code=0;write_json(work/'fence-abandoned.json',{'id':work.name,'backup_fence':work.name,'status':'fence_absent'})
+                info['State'].update(Running=False,Status='exited',ExitCode=code)
+            elif args[1].startswith('pos-backup-'):
                 work=self.root/info['Config']['Labels']['personal-os.backup.id']
                 (work/'snapshot').mkdir();(work/'snapshot/private').write_bytes(b'PLAINTEXT')
                 if not self.capture_fails:write_json(work/'captured.json',{'id':work.name,'status':'capture_complete'})

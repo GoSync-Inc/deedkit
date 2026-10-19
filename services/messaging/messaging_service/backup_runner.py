@@ -28,7 +28,7 @@ COLLECTOR_LABEL='org.messaging-archive.collector'
 SAFE_ERRORS={'backup_capture_failed','backup_capture_timeout','backup_container_disappeared','backup_container_mismatch',
     'backup_delivery_failed','invalid_backup_receipt','local_backup_corrupt','receiver_quota','receiver_disk_reserve',
     'receiver_busy','backup_id_conflict','docker_inspection_failed','docker_operation_failed',
-    'backup_fence_release_failed','backup_capture_unfenced',
+    'backup_fence_release_failed','backup_capture_unfenced','backup_fence_retained',
     'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop'}
 
 
@@ -429,32 +429,36 @@ class Runner:
         if 'backup_fence' not in metadata:return  # Pre-lifecycle deliveries remain compatible.
         if metadata['backup_fence']!=self.journal['id']:raise RuntimeError('backup_capture_unfenced')
         expected={'id':self.journal['id'],'backup_fence':self.journal['id'],'status':'fence_released'}
-        released=(work/'fence-released.json').exists()
-        if released:
-            if read_json(work/'fence-released.json')!=expected:raise RuntimeError('backup_fence_release_failed')
+        self.fence_action(work,'release',[expected],'backup_fence_release_failed')
+    def fence_action(self,work,kind,results,error):
+        """Run the worker's ``<kind>_fence`` action for this job; return its marker, one of ``results``."""
+        marker=work/{'release':'fence-released.json','abandon':'fence-abandoned.json'}[kind]
+        config=work/('fence-'+kind+'.json');action=kind+'_fence'
+        done=marker.exists()
+        if done and read_json(marker) not in results:raise RuntimeError(error)
         # A separate, labelled operator action receives only DB credentials and
-        # this job's receipt. No provider sessions, originals, SSH key or socket.
-        name='pos-backup-release-'+self.journal['id'].lower()
+        # this job's directory. No provider sessions, originals, SSH key or socket.
+        name='pos-backup-'+kind+'-'+self.journal['id'].lower()
         def inspect():
             info=self.check_worker(self.docker.inspect(name))
-            if info is not None and info['Config'].get('Labels',{}).get('personal-os.backup.action')!='release_fence':
+            if info is not None and info['Config'].get('Labels',{}).get('personal-os.backup.action')!=action:
                 raise RuntimeError('backup_container_mismatch')
             return info
         info=inspect()
-        if released and info is None:return
+        if done and info is None:return read_json(marker)
         if info is not None and not info['State']['Running'] and info['State']['Status']!='created':
             self.docker.call('rm',name);info=None
-            if released:return
+            if done:return read_json(marker)
         if info is None:
-            write_json(work/'fence-release.json',{'action':'release_fence','id':self.journal['id'],
+            write_json(config,{'action':action,'id':self.journal['id'],
                 'dsn_file':'/run/secrets/database_url','work_directory':'/work'})
             self.docker.call('create','--name',name,'--label','personal-os.backup.id='+self.journal['id'],
                 '--label','personal-os.backup.project='+self.cfg['project'],
-                '--label','personal-os.backup.action=release_fence','--network',self.cfg['network'],
+                '--label','personal-os.backup.action='+action,'--network',self.cfg['network'],
                 '--read-only','--user','0','--cap-drop','ALL','--security-opt','no-new-privileges',
                 '--memory','128m','--cpus','0.25','--pids-limit','32','--tmpfs','/tmp:size=8m,noexec,nosuid',
                 '--mount','type=bind,src='+str(work)+',dst=/work',
-                '--mount','type=bind,src='+str(work/'fence-release.json')+',dst=/run/secrets/backup_config,readonly',
+                '--mount','type=bind,src='+str(config)+',dst=/run/secrets/backup_config,readonly',
                 '--mount','type=bind,src='+self.cfg['dsn_file']+',dst=/run/secrets/database_url,readonly',
                 self.cfg['image'],'python','-m','messaging_service.backup_worker','--config','/run/secrets/backup_config')
             info=inspect()
@@ -465,13 +469,41 @@ class Runner:
             info=inspect()
             if info is None:raise RuntimeError('backup_container_disappeared')
             if not info['State']['Running']:
-                if info['State'].get('ExitCode')!=0:raise RuntimeError('backup_fence_release_failed')
+                if info['State'].get('ExitCode')!=0:raise RuntimeError(error)
                 break
-            if self.clock()-started>60:raise RuntimeError('backup_fence_release_failed')
+            if self.clock()-started>60:raise RuntimeError(error)
             self.sleep(.1)
-        if not (work/'fence-released.json').exists() or read_json(work/'fence-released.json')!=expected:
-            raise RuntimeError('backup_fence_release_failed')
+        if not marker.exists() or read_json(marker) not in results:raise RuntimeError(error)
         self.docker.call('rm',name)
+        return read_json(marker)
+    def abandon(self,work):
+        """Settle a stopped capture: keep a published one, else end exactly its own fence, then remove it."""
+        if work.is_symlink():raise ValueError('unexpected_staging_symlink')
+        if self.journal['phase']!='abandoning':
+            # Defensive: a delivered recovery point is never an abandoned capture.
+            if (work/'delivery.json').exists():raise RuntimeError('invalid_backup_journal')
+            if self.cfg.get('delivery_mode')=='stream_v2':
+                # The published reference snapshot is reused by the retry under
+                # this ID, and its fence must stay open until that delivery.
+                if (work/'snapshot').exists():return
+            elif (work/'result.json').exists():
+                # Encryption finished before the phase update; deliver it on retry.
+                # Staged plaintext alone copied its originals and is not reusable.
+                self.journal['phase']='upload';self.save();return
+            # Durable decision first: a lost acknowledgement is read back, never guessed.
+            self.journal['phase']='abandoning';self.save()
+        # Nothing here is reusable. Every attempt reads the outcome back from the
+        # database, and the isolated action sees only its own config and marker.
+        self.remove_abandoned(work);work.mkdir(mode=0o700)
+        jid=self.journal['id']
+        results=[{'id':jid,'backup_fence':jid,'status':s} for s in ('fence_released','fence_absent')]
+        try:result=self.fence_action(work,'abandon',results,'backup_fence_retained')
+        except Exception as exc:
+            self.status('error','backup_fence_retained');raise RuntimeError('backup_fence_retained') from exc
+        shutil.rmtree(work)
+        status=read_json(self.status_path) if self.status_path.exists() else {}
+        status.update(abandoned_id=jid,abandoned_fence=result['status']);write_json(self.status_path,status)
+        self.journal_path.unlink()
     def finish(self,work,result,receipt):
         write_json(work/'delivery.json',receipt)
         self.release_fence(work)
@@ -489,6 +521,9 @@ class Runner:
     def run(self):
         self.prepare();work=self.root/self.journal['id']
         try:
+            if self.journal['phase']=='abandoning':
+                # Read back the retained release before taking a new capture.
+                self.abandon(work);self.prepare();work=self.root/self.journal['id']
             if self.cfg.get('delivery_mode')=='stream_v2':
                 return self.run_stream(work)
             if self.journal['phase']!='upload':self.collect(work)
@@ -510,15 +545,16 @@ class Runner:
         if not self.journal_path.exists():return
         self.journal=read_json(self.journal_path)
         if not ID.fullmatch(self.journal['id']):raise ValueError('invalid_backup_journal')
-        release_name='pos-backup-release-'+self.journal['id'].lower()
-        release=self.check_worker(self.docker.inspect(release_name))
-        if release is not None:
-            if release['Config'].get('Labels',{}).get('personal-os.backup.action')!='release_fence':
-                raise RuntimeError('backup_container_mismatch')
-            if release['State']['Running']:self.docker.call('stop','--time','25',release_name)
+        for kind in ('release','abandon'):
+            release_name='pos-backup-'+kind+'-'+self.journal['id'].lower()
             release=self.check_worker(self.docker.inspect(release_name))
-            if release is None or release['State']['Running']:raise RuntimeError('backup_shutdown_unverified')
-            self.docker.call('rm',release_name)
+            if release is not None:
+                if release['Config'].get('Labels',{}).get('personal-os.backup.action')!=kind+'_fence':
+                    raise RuntimeError('backup_container_mismatch')
+                if release['State']['Running']:self.docker.call('stop','--time','25',release_name)
+                release=self.check_worker(self.docker.inspect(release_name))
+                if release is None or release['State']['Running']:raise RuntimeError('backup_shutdown_unverified')
+                self.docker.call('rm',release_name)
         info=self.check_worker(self.docker.inspect(self.journal['container']))
         if info and info['State']['Running']:
             self.docker.call('stop','--time','25',self.journal['container'])
@@ -533,10 +569,10 @@ class Runner:
             # A failed cold capture must be retried from a NEW snapshot, after
             # collectors have recovered; never publish its partial plaintext.
             if info:self.docker.call('rm',self.journal['container'])
-            self.remove_abandoned(self.root/self.journal['id'])
-            self.journal_path.unlink()
+            self.abandon(self.root/self.journal['id'])
         # Preserve the actionable error from the initiating process.
-        if not self.status_path.exists() or read_json(self.status_path).get('state')!='error':
+        status=read_json(self.status_path) if self.status_path.exists() else {}
+        if status.get('state')!='error' or status.get('error_code')=='backup_fence_retained':
             self.status('error','backup_job_failed')
 
 
