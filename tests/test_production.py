@@ -3298,9 +3298,9 @@ def test_the_calls_probe_dies_at_its_lifetime_even_inside_a_sqlite_wait(calls_di
     database.rollback()
 
 
+# spec: ANYM-442
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the permission bits that stand in for a read-only mount")
 @pytest.mark.parametrize("sidecars", [False, True], ids=["wal-without-sidecars", "wal-with-sidecars"])
-# spec: ANYM-442
 def test_a_wal_database_on_a_read_only_mount_is_read_or_refused_and_never_written(calls_dir, sidecars):
     # The probe's container mounts the calls state directory read-only; permission bits stand in for that here.
     database = calls_database(calls_dir, {CALL: "active"})
@@ -3339,8 +3339,8 @@ class Clock:
 
 class CallHost(Host):
     """Host with the host's second kind of project: `personal-os-voice`, whose `voice` service is the calls target.
-    Each project runs its own container; `docker exec` answers the calls probe from `answers` in turn (the last one
-    repeats). Time is a fake clock."""
+    Each project runs its own container; the probe container (`docker run`) answers from `answers` in turn (the last
+    one repeats). Pulls carry each target's own recipe labels. Time is a fake clock."""
 
     def __init__(self, tmp_path, monkeypatch, answers=((),)):
         super().__init__(tmp_path, monkeypatch)
@@ -3366,6 +3366,17 @@ class CallHost(Host):
         self.events.append("promotable")
         return {"sha": sha, "run_id": 12}
 
+    def target_image(self, reference):
+        """The CI image a pulled reference names: each target carries its own build recipe labels."""
+        target = reference.removeprefix(p.REGISTRY).partition("@")[0]
+        identity = self.image(self.main) if target == "runtime" else "sha256:" + hashlib.sha256(
+            f"ci {target} {self.main}".encode()).hexdigest()
+        return identity, ImageStore.image("c", target, revision=self.main, source=self.main) | {"Id": identity}
+
+    def published(self, target, sha):
+        reference = verified_image(target, "", "sha256:" + hashlib.sha256(sha.encode()).hexdigest())["reference"]
+        return verified_image(target, self.target_image(reference)[0], reference.partition("@")[2])
+
     def answer(self):
         answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
         if isinstance(answer, BaseException):
@@ -3375,17 +3386,25 @@ class CallHost(Host):
     def run(self, argv, **kwargs):
         label = next((item.rpartition("=")[2] for item in argv if item.startswith("label=com.docker.compose.project=")),
                      None)
-        if argv[:2] == ["docker", "run"]:
-            assert p.CALLS_PROBE in argv and 5 <= kwargs.get("timeout") <= p.CALL_PROBE
-            attempted = sorted(path.parent.name for path in self.state.glob("*/*attempted.json"))
+        if argv[:2] == ["docker", "run"] and p.CALLS_PROBE in argv:
+            assert 5 <= kwargs.get("timeout") <= p.CALL_PROBE
+            attempted = sorted(str(path.relative_to(self.state)) for path in self.state.glob("*/*attempted.json"))
             self.events.append(("probe", self.inspected, attempted))
             return self.answer()
+        if argv[:2] in (["docker", "pull"], ["docker", "tag"]) or argv[:3] == ["docker", "image", "inspect"] and "@" in argv[-1]:
+            self.calls.append(argv)
+            identity, image = self.target_image(argv[-2] if argv[1] == "tag" else argv[-1])
+            if argv[1] == "pull":
+                self.images[identity] = image
+            if argv[1] == "tag":
+                self.tags[argv[-1]] = identity
+            return identity if argv[1] == "image" else ""
         if argv[:2] == ["docker", "compose"]:
             self.calls.append(argv)
-            name = argv[argv.index("--project-name") + 1]
-            container = self.containers[name]
             if "config" in argv:
                 return json.dumps(json.loads(Path(argv[argv.index("-f") + 1]).read_text())).replace("$$", "$")
+            name = argv[argv.index("--project-name") + 1]
+            container = self.containers[name]
             if "stop" in argv:
                 self.events.append(("stop", name))
                 container["State"] = {"Running": False}
@@ -3426,11 +3445,11 @@ def test_apply_waits_for_an_active_call_and_stops_nothing_before_it_ends(tmp_pat
     host.prepared(RELEASES[0])
     assert p.apply(host.settings, RELEASES[0])["status"] == "applied"
     # Two polls while the call runs, the last remote gate, a second check, then the marker and the first stop.
-    assert host.events[:6] == [("probe", "voice0", []), ("probe", "voice0", []), ("probe", "voice0", []),
-                               "promotable", ("probe", "voice0", []), ("stop", "synthetic")]
+    assert host.events[:7] == ["promotable", ("probe", "voice0", []), ("probe", "voice0", []),
+                               ("probe", "voice0", []), "promotable", ("probe", "voice0", []), ("stop", "synthetic")]
     assert host.clock.sleeps == [p.CALL_POLL, p.CALL_POLL]
     # Before the second project's stop it checks again, with the marker written.
-    assert host.events[6:] == [("probe", "voice0", [RELEASES[0]]), ("stop", "personal-os-voice")]
+    assert host.events[7:] == [("probe", "voice0", [f"{RELEASES[0]}/attempted.json"]), ("stop", "personal-os-voice")]
     assert f"calls check: waiting for a call to end: {CALL} (active)" in capsys.readouterr().err
 
 
@@ -3439,7 +3458,7 @@ def test_a_call_starting_during_the_last_ci_check_is_waited_for_before_anything_
     host = CallHost(tmp_path, monkeypatch, answers=((), [(CALL, "ringing")], ()))
     host.prepared(RELEASES[0])
     p.apply(host.settings, RELEASES[0])
-    assert host.events[:5] == [("probe", "voice0", []), "promotable", ("probe", "voice0", []),
+    assert host.events[:6] == ["promotable", ("probe", "voice0", []), "promotable", ("probe", "voice0", []),
                                ("probe", "voice0", []), ("stop", "synthetic")]
 
 
@@ -3451,7 +3470,7 @@ def test_a_call_that_outlasts_the_bound_refuses_apply_before_any_change(tmp_path
     with pytest.raises(p.CallActive, match=re.escape(f"a call is active: {CALL} (waiting_for_browser)")):
         p.apply(host.settings, RELEASES[0])
     # It waited out the bound, never longer, then stopped nothing and wrote nothing in the release.
-    assert host.clock.now == p.CALL_WAIT and "promotable" not in host.events
+    assert host.clock.now == p.CALL_WAIT and host.events.count("promotable") == 1
     assert host.mutations() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
     assert capsys.readouterr().err.count("calls check: waiting") == 1
 
@@ -3483,10 +3502,13 @@ def test_rollback_waits_for_a_call_and_refuses_before_any_change_at_the_bound(tm
     host.events.clear()
     host.answers = [[(CALL, "active")], (), ()]
     assert p.rollback(host.settings, RELEASES[1])["status"] == "rolled-back"
-    assert host.events == [("probe", "voice0", []), ("probe", "voice0", []), ("stop", "synthetic"),
-                           ("probe", "voice1", [RELEASES[1]]), ("stop", "personal-os-voice")]
+    applied = [f"{sha}/attempted.json" for sha in RELEASES[:2]]
+    assert host.events == [("probe", "voice4", applied), ("probe", "voice4", applied), ("stop", "synthetic"),
+                           ("probe", "voice4", sorted([*applied, f"{RELEASES[1]}/rollback-attempted.json"])),
+                           ("stop", "personal-os-voice")]
 
 
+# spec: ANYM-442
 @pytest.mark.parametrize("answer, category", [
     ('{"error": "busy"}', "busy"),
     ('{"error": "read_only_recovery_needed"}', "read_only_recovery_needed"),
@@ -3500,7 +3522,6 @@ def test_rollback_waits_for_a_call_and_refuses_before_any_change_at_the_bound(tm
     (subprocess.TimeoutExpired("docker", 20), "probe_timeout"),
 ], ids=["busy", "hot-journal", "raw-error", "not-json", "non-uuid", "unknown-status", "extra-field", "not-a-list",
         "exec-failed", "exec-timeout"])
-# spec: ANYM-442
 def test_an_unreadable_or_untrusted_probe_answer_is_never_taken_for_no_call(tmp_path, monkeypatch, answer, category):
     host = CallHost(tmp_path, monkeypatch, answers=(answer,))
     host.prepared(RELEASES[0])
@@ -3640,10 +3661,10 @@ def test_a_call_refusal_after_plan_a_started_pauses_as_an_unknown_state(tmp_path
     assert host.paused() == outcome["reason"] and "call_waits" not in outcome
 
 
+# spec: ANYM-442
 @pytest.mark.parametrize("refusal", [p.CallActive(f"a call is active: {CALL} (active)"),
                                      p.CallsUnknown("whether a call is active could not be read: busy")],
                          ids=["call-active", "calls-unknown"])
-# spec: ANYM-442
 def test_an_automatic_rollback_that_meets_a_call_pauses_with_no_further_step(tmp_path, monkeypatch, refusal):
     host = Deployer(tmp_path, monkeypatch)
     def unhealthy(sha):
