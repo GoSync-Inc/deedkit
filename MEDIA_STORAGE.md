@@ -302,6 +302,9 @@ each queued original without a registered original exactly once:
   `request_file_download`, whatever code they recorded earlier.
 - **`outside_history_bounds_jobs`**: messages older than the chat's confirmed
   history bound; a request does not download them.
+- **`history_bound_unknown_jobs`**: messages older than the run's published bound
+  in a chat whose bound is not confirmed (see below); the run does not download
+  them, and a request cannot be promised.
 - **`collection_excluded_jobs`**: collection disabled for the account or chat.
 
 `errors` keeps every recorded code as evidence, and `download` counts are
@@ -316,7 +319,10 @@ is a confirmed unbounded history. A row a live callback created without a bound,
 row from an earlier configuration, or a missing row is unknown evidence and never
 yields `outside_history_bounds`.
 
-Attachments follow the same rule. A queued original outside the window has
+Attachments follow the same rule, but only with a confirmed chat bound. A queued
+original of an excluded chat or a disabled account has `download_phase: blocked`,
+reason `collection_excluded` and next action `check_collection_policy`. A queued
+original outside the window has
 `download_phase: available_on_request`, reason `outside_prefetch_window` and next
 action `request_file_download` (conversation text: "файл доступен по запросу"),
 not `blocked`. Before a confirmed bound, an original that needs a provider download
@@ -325,15 +331,18 @@ or re-download (including a managed-evicted one) has reason
 `request_status: unavailable` with that reason and records no `requested_until`. A
 present original stays `ready` regardless of the bound. Access, deletion,
 active-transfer and terminal-failure answers keep their precedence. With an
-unknown bound a request is still recorded (`request_status: queued`) but reports
-`download_eligibility: unknown` and `eligibility_reason: history_bound_unknown`.
+unknown bound (or no current record) the attachment and every request for it,
+including a repeated (`coalesced`) one, report `download_eligibility: unknown` and
+`eligibility_reason: history_bound_unknown`; the first request is still recorded
+(`request_status: queued`) and nothing is advertised as available on request.
 
 A local write failure that is not a capacity limit (missing directory,
 permissions, read-only mount, or the native adapter's temporary media directory)
 is `error_code=storage_unavailable`, not `network_error`. Like a capacity pause it
 does not consume a provider attempt and never fails the job terminally; it
 retries every 5 minutes, and account media operations report
-`state=storage_unavailable` and `storage_unavailable_jobs`. Fix the storage path,
+`state=storage_unavailable` and `storage_unavailable_jobs` (eligible jobs only, as
+described above: an aged-out job resumes only on request). Fix the storage path,
 then downloads resume on their own. Jobs recorded as `network_error` before this
 classification keep their recorded code.
 

@@ -47,7 +47,7 @@ DETAILS={
     'outside_prefetch_window':('The message is outside the collector\'s automatic prefetch window. The original is a known occurrence, downloaded only on an explicit request; a recorded earlier reason is history.','request_file_download'),
     'outside_history_bounds':('The message is older than the collector\'s configured history bound. The original is not downloaded, even on request.','get_sync_status_for_chat'),
     'collection_excluded':('Collection is disabled for this account or chat; the original is not downloaded.','check_collection_policy'),
-    'history_bound_unknown':('The collector has not confirmed the history bound of this chat; the request is recorded, but whether the collector can download the original is unknown.','get_attachment'),
+    'history_bound_unknown':('The collector has not confirmed the history bound of this chat. A request is recorded, but whether the collector can download the original is unknown.','get_sync_status_for_chat'),
 }
 
 

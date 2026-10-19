@@ -17,6 +17,8 @@ CONNECTION_ERRORS = set(TERMINAL) | {'provider_disconnected','provider_not_ready
 MEDIA_ERRORS = {'media_unavailable','media_reference_changed','unsupported_media_type',
     'media_hash_mismatch','media_size_mismatch','media_size_limit','media_metadata_unavailable',
     'invalid_media_path','media_timeout','media_network_error','media_storage_unavailable'}
+# Why a queued original is not automatic work of the current run (ANYM-284).
+INELIGIBLE = ('outside_prefetch_window','outside_history_bounds','history_bound_unknown','collection_excluded')
 LOCAL_STORAGE_ERRORS = {'storage_unavailable','media_storage_unavailable'}
 # The fixed causes of a fail-closed live capture write (ANYM-352).
 CAPTURE_STOP_DETAILS = {'spool_full','disk_reserve','spool_io_error','capture_error'}
@@ -103,7 +105,7 @@ def operations(row, history, files, now=None, *, eligibility=None):
             for code in set(error_states)|{code for code in eligible if code is not None}}
         error_states={code:states for code,states in error_states.items() if states}
         ineligible={reason:sum(eligibility['queued'].get(reason,{}).values())
-            for reason in ('outside_prefetch_window','outside_history_bounds','collection_excluded')}
+            for reason in INELIGIBLE}
     diagnostics=[]
     for code in sorted(errors if eligibility is None else error_states):
         states=error_states.get(code)
@@ -129,8 +131,7 @@ def operations(row, history, files, now=None, *, eligibility=None):
         'storage_paused_basis':'unknown' if eligibility is None else 'eligible_jobs',
         'prefetch_window_days':eligibility['prefetch_days'] if eligibility is not None else None,
         'eligible_queued_jobs':eligible_queued,
-        **{reason+'_jobs':ineligible.get(reason) for reason in
-            ('outside_prefetch_window','outside_history_bounds','collection_excluded')},
+        **{reason+'_jobs':ineligible.get(reason) for reason in INELIGIBLE},
         'storage_unavailable_jobs':storage_unavailable,
         'terminal_failed_jobs':counts['failed'],'needs_attention':bool(counts['failed']),
         'retry_queued_jobs':retry_queued}

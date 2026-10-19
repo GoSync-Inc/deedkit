@@ -5,7 +5,7 @@ from .envelope import stable_id
 from .policy import scope_filter
 from .status_details import describe,freshness
 from .operational import liveness, operations
-from .media_policy import ELIGIBILITY, ELIGIBILITY_JOIN, published_window
+from .media_policy import ELIGIBILITY_JOIN, published_window
 
 
 DOWNLOAD_STATES = ('queued', 'leased', 'ready', 'failed', 'superseded')
@@ -180,12 +180,9 @@ def _eligibility(c, accounts):
             +' WHERE a.id=ANY(%s) AND mp.published', (accounts,))}
     if not result:
         return {}
-    for row in c.execute('''SELECT m.account,CASE WHEN NOT p.enabled OR ch.provider_chat=ANY(p.exclude_chats)
-            OR NOT (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) THEN 'collection_excluded'
-            ELSE '''+ELIGIBILITY+''' END AS eligibility,j.error_code,count(*) AS count
+    for row in c.execute('''SELECT m.account,el.claim AS eligibility,j.error_code,count(*) AS count
         FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
-        JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
-        JOIN account_policies p ON p.account=m.account '''+published_window('m.account')+' '+ELIGIBILITY_JOIN+'''
+        JOIN chats ch ON ch.id=m.chat AND ch.account=m.account '''+ELIGIBILITY_JOIN+'''
         LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
         WHERE j.state='queued' AND a.id IS NULL AND NOT m.deleted AND m.account=ANY(%s)
         GROUP BY 1,2,3''', (list(result),)):

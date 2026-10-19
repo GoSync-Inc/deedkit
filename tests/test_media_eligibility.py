@@ -260,3 +260,56 @@ def test_collector_run_publishes_its_effective_window(archive):
     assert value['media_policy']['epoch']==state.lease[1]
     for bad in [(-1,None),(7,datetime(2026,7,13)),(7,'2026-07-13')]:
         with pytest.raises(ValueError):state.media_policy(*bad)
+
+
+# spec: ANYM-284
+@pytest.mark.parametrize('evidence',['absent','live_callback_row','stale_row'])
+@pytest.mark.parametrize('age',[30,90])
+def test_unknown_history_bound_holds_for_repeated_request_and_passive_reads(archive,evidence,age):
+    ar,s,key,_=archive
+    fid=queued(ar,s,days=age,code='paused_storage')
+    bounded(ar,s,chat_since={'absent':'absent','live_callback_row':None,
+        'stale_row':datetime.now(timezone.utc)-timedelta(days=120)}[evidence])
+    before=s.get_attachment(key,fid)
+    first=s.request_file_download(key,fid)
+    again=s.request_file_download(key,fid)
+    after=s.get_attachment(key,fid)
+    assert first['request_status']=='queued' and again['request_status']=='coalesced'
+    for result in (before,first,again,after):
+        assert result['download_eligibility']=='unknown'
+        assert result['eligibility_reason']=='history_bound_unknown'
+        assert result['download_phase']!='available_on_request'
+    assert again['next_action']!='request_file_download' and after['next_action']!='request_file_download'
+    status,_=media(s)
+    # Before the run's own bound the run never claims it; inside, the request makes it eligible.
+    assert status['history_bound_unknown_jobs']==(1 if age==90 else 0)
+    assert status['outside_history_bounds_jobs']==status['outside_prefetch_window_jobs']==0
+
+
+# spec: ANYM-284
+@pytest.mark.parametrize('change',['excluded','disabled'])
+def test_excluded_collection_is_not_advertised_as_available_on_request(archive,change):
+    from messaging_service.blobs import BlobWriter
+    from messaging_service.result_evidence import decorate
+    from messaging_service.conversation import present_message
+    ar,s,key,_=archive;publish(ar)
+    queued(ar,s,days=1,mid='307')
+    job=ar.claim_media('fixture',media_prefetch_days=7)
+    writer=BlobWriter(s.files,reserve_bytes=0);ar.finish_media(job,writer.write([b'p'*64]),writer)
+    fid=queued(ar,s,code='paused_storage')
+    with s.pool.connection() as c:
+        if change=='excluded':c.execute("UPDATE account_policies SET exclude_chats=ARRAY['100'] WHERE account=%s",(ACCOUNT,))
+        else:c.execute('UPDATE account_policies SET enabled=false WHERE account=%s',(ACCOUNT,))
+    attachment=s.get_attachment(key,fid)
+    assert attachment['download_eligibility']=='collection_excluded'
+    assert attachment['download_reason']=='collection_excluded' and attachment['download_phase']=='blocked'
+    assert attachment['next_action']=='check_collection_policy'
+    result=s.request_file_download(key,fid)
+    assert result['request_status']=='blocked' and result['reason']=='collection_disabled'
+    with s.pool.connection() as c:
+        row=c.execute('SELECT * FROM messages WHERE id=%s',(attachment['message_id'],)).fetchone()
+        decorate(c,[row])
+    assert row['attachments'][0]['next_action']=='check_collection_policy'
+    assert 'доступен по запросу' not in present_message({**row,'body':''},0)['display_text']
+    # A present authorized original stays readable.
+    assert s.get_attachment(key,job['id'])['download_url']
