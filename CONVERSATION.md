@@ -82,7 +82,8 @@ without `type` (unknown chat type) omits nothing under these rules:
 - C1. On a channel row, and on a private row with `title_basis: "self_chat"`:
   `conversation.last_turn` and `conversation.suggested_action` are
   `"not_applicable"` and `conversation.basis` is `"channel_or_self_chat"`. They
-  are omitted together, only when all three hold; otherwise all three stay.
+  are omitted together, only when all three hold; otherwise all three stay and
+  a self-chat row follows C5.
 - C2. On a group row: `conversation.last_turn` is `"not_applicable"`.
 - C3. On a group row without `awaiting_reply` and no owner attention observed:
   `conversation.suggested_action` is `"not_applicable"`, `conversation.basis` is
@@ -92,7 +93,8 @@ without `type` (unknown chat type) omits nothing under these rules:
 - C4. On a group row with `awaiting_reply`: an absent
   `conversation.owner_attention` is `{"last_turn": "peer"}` (the peer wrote
   last); any other attention object stays whole.
-- C5. On a private row without the C1 values: `conversation.last_turn` `"owner"`
+- C5. On a private row that C1 left whole (`conversation.suggested_action` is
+  present), including a self-chat row: `conversation.last_turn` `"owner"`
   or `"peer"` is omitted when it equals the shown head's direction (`outgoing`
   is `owner`, `incoming` is `peer`): `last_message.direction`, or the hint's
   incoming head when the hint is the head and `last_message` is omitted. When
@@ -103,8 +105,11 @@ without `type` (unknown chat type) omits nothing under these rules:
   `"last_archived_message_incoming"`.
 - C8. A `last_message` with `direction: "outgoing"` from the account's own
   identity (a personal sender ID) omits `sender_name` and `sender_name_basis`:
-  the sender is the owner. An outgoing post signed as a channel, a group or an
-  anonymous admin carries that chat's ID as its sender and keeps its name.
+  the sender is the owner, whose profile name is the same on every such row of
+  the account (`detail="full"` shows it). An outgoing post signed as a channel, a
+  group or an anonymous admin carries that chat's ID as its sender and keeps its
+  name; when that name is unknown, `last_message.sender_id` carries the ID, so an
+  outgoing head without both `sender_name` and `sender_id` is always the owner.
 - C9. An absent `conversation.head_freshness` is `"stale"` (the common value).
   `recently_verified`, `unknown`, `behind_latest_message` and
   `invalid_observation` stay explicit; `provider_head_verified_at` still shows
@@ -112,7 +117,8 @@ without `type` (unknown chat type) omits nothing under these rules:
 
 Beside a hint, an absent `conversation.basis` is the hint's `confidence`, or
 without one its `basis` (after C7). The `list_chats` tool description carries the
-same legend in short form.
+same legend in short form. REST in its default archive view is unchanged; a REST
+call with `view="conversation"` returns the same compact rows as MCP.
 
 The remaining hint fields keep their names and meanings: `message_id`,
 `revision`, `sender_id`, `sender_name`, `sender_name_basis`, `priority`,

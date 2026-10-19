@@ -609,13 +609,13 @@ def create_app(store: Store, allowed_hosts: list[str]):
         has not answered, and provider business/verified senders; it reports excluded_likely_broadcasts_total within
         scope. detail=full adds awaiting_reply_priority_components (points per reason).
         Compact rows omit values the row fixes; an absent field means the value below.
-        last_turn: the shown head's direction (owner/peer; the hint when it is the head) on private rows,
-        not_applicable on group, channel and self_chat rows. suggested_action and basis on channel and self_chat
-        rows: not_applicable, channel_or_self_chat. On a group without a hint, suggested_action, basis and
+        last_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;
+        else the shown head's direction (owner/peer; a head hint: peer).
+        suggested_action and basis on channel and self_chat rows: not_applicable, channel_or_self_chat. On a group without a hint, suggested_action, basis and
         owner_attention: not_applicable, no_observed_owner_attention (no owner attention observed).
         owner_attention on a group with a hint: last_turn peer (the peer wrote last).
         A question is question_mark in reasons. A private hint's basis: last_archived_message_incoming.
-        sender_name on an outgoing head: the owner. head_freshness: stale.
+        sender_name on an outgoing head without sender_id: the owner. head_freshness: stale.
         Without conversation.basis beside a hint, the hint's confidence, else its basis, gives the reason.
         Rows without type omit nothing.
         limit defaults to 25 (maximum 100); continue with next_cursor.

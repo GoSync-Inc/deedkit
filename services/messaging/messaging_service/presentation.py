@@ -201,8 +201,11 @@ def lean_chat(row):
         last={'id':latest['id'],'direction':latest.get('direction'),'sender_name':latest.get('sender_name'),
             'sender_name_basis':_fallback_basis(latest),
             'display_text':latest.get('display_text') or '',**forward_fields(latest,brief=True)}
-        # C8: the owner's own head names the same owner on every row of the account.
-        if kind in KNOWN_TYPES and _own_head(latest):last.update(sender_name=None,sender_name_basis=None)
+        if kind in KNOWN_TYPES and latest.get('direction')=='outgoing':
+            # C8: the owner's own head names the same owner on every row of the account. Another
+            # outgoing sender without a name keeps its ID, so an absent name still means the owner.
+            if _own_head(latest):last.update(sender_name=None,sender_name_basis=None)
+            elif not last['sender_name']:last['sender_id']=latest.get('sender') or ''
     elif row.get('last_message_id'):
         last={'id':row['last_message_id'],'direction':row.get('last_message_direction'),
             'display_text':row.get('last_message_snippet') or ''}
@@ -265,12 +268,14 @@ def omit_fixed(result, last, hint, kind, self_chat):
         if all(result.get(k)==v for k,v in values.items()):
             for k in values:result.pop(k)
     if kind=='channel' or kind=='private' and self_chat:omit(FIXED_BY_KIND['channel_or_self_chat'])  # C1
-    elif kind=='group':
+    if kind=='group':
         if result['last_turn']=='not_applicable':result.pop('last_turn')  # C2
         if hint:omit({'owner_attention':{'last_turn':'peer'}})  # C4
         else:omit(FIXED_BY_KIND['no_observed_owner_attention'])  # C3
-    elif kind=='private' and last and result['last_turn']==TURN_OF_DIRECTION.get(last.get('direction')):
-        # C5: the shown head's direction, or the incoming hint when the hint is the head.
+    elif kind=='private' and 'suggested_action' in result and last and \
+            result['last_turn']==TURN_OF_DIRECTION.get(last.get('direction')):
+        # C5 (also on a self-chat row that C1 left whole): the shown head's direction, or the incoming
+        # hint when the hint is the head.
         result.pop('last_turn')
     return result
 

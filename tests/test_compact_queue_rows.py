@@ -300,6 +300,8 @@ def build_default_list(s, now):
     scan('fixed-tg','-200',30)
     add('fixed-tg','-201','1',54,'group',sender='62',mentions_owner=True)
     scan('fixed-tg','-201',0)
+    # An outgoing message signed as another chat whose name is unknown keeps that chat's ID.
+    add('fixed-tg','-202','1',53,'group','outgoing',sender='-1003',name='')
     add('fixed-wa','300@g.us','true_OUT',53,'group','outgoing')
     add('fixed-wa','300@g.us','false_IN',53,'group',sender='63@c.us',mentions_owner=True)
     # Private: owner last (stale), a question hint (stale), a hint (recently verified), an owner/peer tie.
@@ -326,9 +328,8 @@ def restore(row):
     conversation,hint,kind=row.get('conversation',{}),row.get('awaiting_reply'),row.get('type')
     if kind is None:return row
     conversation.setdefault('head_freshness','stale')
-    if kind=='channel' or kind=='private' and row.get('title_basis')=='self_chat':
-        if 'suggested_action' not in conversation:
-            conversation.update(last_turn='not_applicable',suggested_action='not_applicable',basis='channel_or_self_chat')
+    if (kind=='channel' or kind=='private' and row.get('title_basis')=='self_chat') and 'suggested_action' not in conversation:
+        conversation.update(last_turn='not_applicable',suggested_action='not_applicable',basis='channel_or_self_chat')
     elif kind=='group':
         conversation.setdefault('last_turn','not_applicable')
         if hint:conversation.setdefault('owner_attention',{'last_turn':'peer'})
@@ -344,7 +345,7 @@ def restore(row):
         if 'question_mark' in hint.get('reasons',[]):hint['has_question']=True
         conversation.setdefault('basis',hint.get('confidence') or hint['basis'])
     head=row.get('last_message')
-    if head and head.get('direction')=='outgoing' and 'sender_name' not in head:
+    if head and head.get('direction')=='outgoing' and 'sender_name' not in head and 'sender_id' not in head:
         head['sender_name']=OWNER_NAMES[row['account']][:64]
     return row
 
@@ -369,9 +370,11 @@ def assert_restores_full(compact, full):
             assert hint['basis']==source['awaiting_reply_basis'],row
         latest=state['latest_known_meaningful_message']
         if 'last_message' in restored:
-            assert restored['last_message']['sender_name']==(latest['sender_name'] or '')[:64],row
-            if 'sender_name' not in row['last_message']:
-                assert latest['direction']=='outgoing' and latest['sender'] in OWNER_IDS,row
+            assert restored['last_message'].get('sender_name','')==(latest['sender_name'] or '')[:64],row
+            if 'sender_name' not in row['last_message'] and latest['direction']=='outgoing':
+                # Absent name and ID: the owner; absent name with an ID: that sender, name unknown.
+                assert (latest['sender'] in OWNER_IDS)==('sender_id' not in row['last_message']),row
+                assert row['last_message'].get('sender_id',latest['sender'])==latest['sender'],row
 
 
 def assert_no_fixed_text(compact, full):
@@ -385,12 +388,12 @@ def assert_no_fixed_text(compact, full):
         if kind=='channel' or kind=='private' and row.get('title_basis')=='self_chat':
             assert conversation.get('last_turn')!='not_applicable' and conversation.get('basis')!='channel_or_self_chat' \
                 and conversation.get('suggested_action')!='not_applicable',row                      # C1
-        elif kind=='group':
+        if kind=='group':
             assert 'last_turn' not in conversation,row                                               # C2
             if hint:assert conversation.get('owner_attention')!={'last_turn':'peer'},row             # C4
             else:assert conversation.get('owner_attention')!={'last_turn':'not_applicable'} and \
                 conversation.get('basis')!='no_observed_owner_attention',row                         # C3
-        else:
+        elif kind=='private':
             shown=row['last_message']['direction'] if 'last_message' in row else \
                 'incoming' if hint and latest and latest['id']==hint['message_id'] else None
             assert conversation.get('last_turn')!={'outgoing':'owner','incoming':'peer'}.get(shown),row  # C5
@@ -415,7 +418,7 @@ def test_compact_rows_omit_values_fixed_by_the_row(seeded, recent_queue):
     assert len(queue)==25
     key=build_default_list(s,datetime.now(timezone.utc).replace(microsecond=0))
     rows,full=both_details(s,key)
-    assert len(rows)==13
+    assert len(rows)==14
     for compact,source in ((queue,queue_full),(rows,full)):
         assert_no_fixed_text(compact,source)
         assert_restores_full(compact,source)
@@ -426,8 +429,12 @@ def test_compact_rows_omit_values_fixed_by_the_row(seeded, recent_queue):
     assert by['fixed-tg','-1002']['conversation']['head_freshness']=='recently_verified'
     assert by['fixed-wa','48000000000001@lid']['conversation']['head_freshness']=='unknown'
     labelled=by['fixed-wa',WA_OWNER]
-    assert labelled['title_basis']=='self_chat' and labelled['conversation']['last_turn']=='owner'
+    # A self-chat row whose state is not fixed keeps C1's triple, and C5 then applies to it.
+    assert labelled['title_basis']=='self_chat' and 'last_turn' not in labelled['conversation']
     assert labelled['conversation']['suggested_action']=='unclear' and 'sender_name' not in labelled['last_message']
+    unnamed=by['fixed-tg','-202']['last_message']
+    assert 'sender_name' not in unnamed and unnamed['sender_id']=='-1003'
+    assert 'sender_id' not in by['fixed-tg','5001']['last_message'] and 'sender_id' not in signed['last_message']
     tied_group=by['fixed-wa','300@g.us']['conversation']
     assert tied_group['owner_attention']=={'last_turn':'unknown'} and tied_group['suggested_action']=='unclear'
     attention=by['fixed-tg','-201']['conversation']
@@ -471,3 +478,19 @@ def test_list_chats_description_explains_compact_omissions(seeded):
     for rule in ('last_turn','channel_or_self_chat','no_observed_owner_attention',"owner_attention",'question_mark',
             'last_archived_message_incoming','outgoing','stale','beside a hint'):
         assert sum(rule in x for x in sentences)>=1,rule
+
+
+# spec: ANYM-408
+def test_rest_list_chats_keeps_archive_rows_and_mirrors_mcp_in_conversation_view(seeded, recent_queue):
+    """REST in its default archive view keeps every hint field; an explicit conversation view equals MCP (ANYM-23)."""
+    s,key=recent_queue
+    headers={'Authorization':'Bearer '+key}
+    arguments={'awaiting_reply':True,'order':'priority','limit':25}
+    with TestClient(create_app(s,['testserver'])) as client:
+        archive=client.post('/v1/list_chats',headers=headers,json=arguments).json()
+        rest=client.post('/v1/list_chats',headers=headers,json={**arguments,'view':'conversation'}).json()
+        mcp=structured(rpc(client,key,'list_chats',arguments))
+    assert archive['items'] and all('conversation' not in r for r in archive['items'])
+    assert any(r.get('awaiting_reply_has_question') for r in archive['items'])
+    assert {r['awaiting_reply_basis'] for r in archive['items'] if r['type']=='private'}=={'last_archived_message_incoming'}
+    assert masked(rest)==masked(mcp)
