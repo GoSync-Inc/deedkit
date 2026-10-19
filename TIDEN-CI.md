@@ -463,8 +463,21 @@ completed last it records nothing and writes no receipt, and when the release
 captured another run's gate its `tiden-release-receipt` artifact records
 `gateFromThisCommit: false`. When the commit's evidence publication was not
 verified, the job warns `Tiden release not recorded` before any Tiden call
-and records nothing. A Tiden error in the release record fails the job and with
-it the main run, and `production.py verify` then refuses that commit. The
+and records nothing. Temporarily (ANYM-411), an unavailable Tiden only warns
+`Tiden release not recorded`: a failed CLI download, or a Tiden call that exits
+non-zero, prints unparseable output or passes its timeout. The receipt records
+`state`: `not_attempted` when no create call was made, `not_verified` when one
+was sent, keeping the known release identity; an uncertain create is never
+retried. A checksum mismatch, a missing product or workspace ID, a validation
+error, a rewritten release identity and any other error still fail the job and
+with it the main run, which `production.py verify` then refuses. Every step has
+a timeout and the script ends its own work at least 30 seconds before its
+step's, so the warning and the receipt upload always run. The `production`
+record still fails on every Tiden error. The rule lasts until three consecutive
+automatic `Tiden health` runs (`workflow_run`, distinct TARGET SHAs, each
+upstream CI run `success`) report `## Tiden health: PASS`; a FAIL, UNKNOWN or
+missing report resets the streak. Then a pull request makes a Tiden error in
+the release record fail the job again (ANYM-411 criterion 6). The
 `production` release is recorded by the dispatch in
 [production.md](docs/operations/production.md). `synthetic` is
 historical: release 0.9.16 is attached to it, so keep it, but send no new runs
