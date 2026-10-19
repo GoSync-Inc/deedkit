@@ -74,6 +74,66 @@ def hint_forward_origin(c, rows):
     return rows
 
 
+REPLY_SNIPPET_CHARS = 80
+
+
+def reply_context(c, p, rows):
+    """Rows that answer an archived message gain reply_to: {message_id, snippet, sender_name}.
+
+    The target is looked up inside the replying message's own account and chat and the caller's
+    scope. A missing, deleted or unreadable target adds nothing, so those cases look alike.
+    The snippet is untrusted message text, cut to REPLY_SNIPPET_CHARS.
+    """
+    asking=[r for r in rows if r.get('reply_to_provider_id') and r.get('account') and r.get('chat')]
+    if not asking:
+        return rows
+    where,scope=scope_filter(p,'m')
+    # WhatsApp stores a native reference as true|false_<chat>_<stanza>[_<participant>].
+    native='''EXISTS(SELECT 1 FROM unnest(ARRAY['true_','false_']) side
+        WHERE left(m.provider_id,length(side||r.pchat||'_'))=side||r.pchat||'_'
+          AND split_part(substr(m.provider_id,length(side||r.pchat||'_')+1),'_',1)=r.ref)'''
+    found={}
+    for exact in (True,False):
+        todo=[(i,r) for i,r in enumerate(asking) if i not in found
+            and (exact or r.get('platform')=='whatsapp' and r.get('provider_chat_id'))]
+        if not todo:
+            continue
+        for hit in c.execute('''SELECT r.idx,m.id,m.account,m.chat,m.sender,left(m.body,400) AS body,nullif(sp.display_name,'') AS sender_name
+            FROM unnest(%s::integer[],%s::text[],%s::text[],%s::text[],%s::text[]) AS r(idx,account,chat,ref,pchat)
+            JOIN messages m ON m.account=r.account AND m.chat=r.chat AND NOT m.deleted AND '''+where+'''
+              AND '''+('m.provider_id=r.ref' if exact else native)+'''
+            LEFT JOIN sender_profiles sp ON sp.account=m.account AND sp.chat=m.chat AND sp.sender=m.sender
+              AND EXISTS(SELECT 1 FROM messages source WHERE source.id=sp.source_message
+                AND source.account=m.account AND source.chat=m.chat AND source.sender=m.sender AND NOT source.deleted)
+            ORDER BY r.idx,m.sent_at,m.id''',
+                [[i for i,_ in todo],[r['account'] for _,r in todo],[r['chat'] for _,r in todo],
+                 [r['reply_to_provider_id'] for _,r in todo],[r.get('provider_chat_id') or '' for _,r in todo],*scope]).fetchall():
+            found.setdefault(hit['idx'],hit)
+    if found:
+        resolve(c,p,list(found.values()))
+    for index,hit in found.items():
+        reply={'message_id':hit['id'],'snippet':' '.join((hit['body'] or '').split())[:REPLY_SNIPPET_CHARS]}
+        if hit.get('sender_name'):
+            reply['sender_name']=hit['sender_name'][:64]
+        asking[index]['reply_to']=reply
+    return rows
+
+
+def chat_titles(c, items, *, cap=64):
+    """Each item that names an authorized account and chat gains chat_title (at most cap characters)."""
+    pairs=sorted({(i['account'],i['chat']) for i in items if i.get('account') and i.get('chat')})
+    if not pairs:
+        return items
+    titles={(r['account'],r['id']):r['title'] for r in c.execute(
+        'SELECT ch.account,ch.id,'+title_sql('ch')+' AS title FROM unnest(%s::text[],%s::text[]) AS k(account,chat) '
+        'JOIN chats ch ON ch.account=k.account AND ch.id=k.chat',([a for a,_ in pairs],[x for _,x in pairs]))}
+    for item in items:
+        title=titles.get((item.get('account'),item.get('chat')))
+        if title:
+            item['chat_title']=title[:cap]
+    return items
+
+
 def enrich(c, rows, p):
     """Rows were individually authorized; metadata comes from the same chat.
 
@@ -84,6 +144,7 @@ def enrich(c, rows, p):
     metadata=c.execute('SELECT m.id,m.account,m.chat,m.sender,'+META+' FROM messages m '+JOINS+' WHERE m.id=ANY(%s)',
         ([r['id'] for r in rows],)).fetchall()
     resolve(c,p,forward_presence(metadata))
+    reply_context(c,p,metadata)
     by_id={r['id']:r for r in metadata}
     for row in rows:
         row.update(by_id.get(row['id'],{}))
@@ -128,6 +189,23 @@ def filters(p, *, account='',chat='',sender='',accounts=None,chats=None,senders=
     for bound,op in [(lower,'>='),(upper,'<')]:
         if bound:clauses.append('m.sent_at'+op+'%s');args.append(bound)
     return clauses,args,normalized
+
+
+def named_chats(c, p, chat='', chats=None):
+    """Every explicitly named chat that is unknown or outside the key's scope is one not_found.
+
+    The code and text are the same for both, so the answer never says whether the chat exists.
+    chats=[] names nothing and matches nothing. Malformed values keep invalid_filter.
+    """
+    from .store import APIError
+    for parameter,names in (('chat',[valid_text(chat)] if chat else []),('chats',filter_values(chats) or [])):
+        if not names:
+            continue
+        where,args=scope_filter(p,'c',chat_column='id')
+        known={r['id'] for r in c.execute('SELECT c.id FROM chats c WHERE c.id=ANY(%s) AND '+where,[names,*args])}
+        if any(name not in known for name in names):
+            failure=APIError('not_found',404);failure.fields=[parameter]
+            raise failure
 
 
 def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time='',after='',limit=20,
@@ -243,7 +321,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         current_snapshot=fingerprint({'n':rows[0]['snapshot_count'],'checksum':rows[0]['snapshot_checksum']})
         if snapshot is not None and snapshot!=current_snapshot:raise APIError('cursor_changed',409)
         snapshot=current_snapshot
-    items=resolve(c,p,forward_presence(rows[:limit]))
+    items=reply_context(c,p,resolve(c,p,forward_presence(rows[:limit])))
     next_cursor=None
     if len(rows)>limit:
         last=items[-1]

@@ -515,7 +515,9 @@ class Store:
                chat_types=None,include_channels=False):
         # None is the internal no-default sentinel of message_queries.search, never a public value.
         if type(include_channels) is not bool:raise APIError('invalid_filter')
+        from .message_queries import named_chats
         with self.authorized(token,'search') as (c,p):
+            named_chats(c,p,chat,chats)
             return self._search(c,p,query,account,chat,sender,from_time,to_time,after,limit,
                 accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,
                 order=order,before=before,direction=direction,search_language=search_language,

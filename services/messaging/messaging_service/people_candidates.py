@@ -6,6 +6,7 @@ from .search_query import cursor_binding,decode_cursor,encode_cursor,filter_valu
 from .name_variants import patterns
 from .whatsapp_identity import visible_cte,people_join
 from .sender_names import resolve
+from .message_queries import chat_titles
 
 
 def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=20,
@@ -108,6 +109,7 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
     # display_name stays this chat's observation; sender_name is the readable label.
     for row in observations:row['sender_name']=row['display_name']
     resolve(c,p,observations,sender='sender_id')
+    chat_titles(c,observations)
     refs=[r['source_message'] for r in observations]
     targets(p,refs)
     return serial({'items':items,'next_cursor':cursor,'identity_model':'provider_sender_per_account_and_chat',
