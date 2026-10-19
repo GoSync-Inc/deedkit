@@ -398,8 +398,10 @@ def test_standard_prompt_gives_russian_self_reference_only_to_russian_briefs(tmp
     for language in ('en','id'):
         assert 'Russian' not in prompt(language)
         assert not any(word in prompt(language) for word in ('я понял','я поняла','понятно'))
-    form={'masculine':'я понял','feminine':'я поняла','neutral':'понятно'}[self_reference]
-    assert f'Russian self-reference: {form}' in prompt('ru') or f'Russian phrasing: {form}' in prompt('ru')
+    form={'masculine':'Use masculine Russian self-reference: я понял, я уточнил.',
+          'feminine':'Use feminine Russian self-reference: я поняла, я уточнила.',
+          'neutral':'Use neutral Russian phrasing: понятно, время уточнено;'}[self_reference]
+    assert f'Speak Russian. {form}' in prompt('ru')
     assert 'Speak English. Introduce' in prompt('en')
 
 
