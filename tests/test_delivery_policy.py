@@ -75,6 +75,7 @@ def shift(store, sid, seconds):
             configured_at=configured_at-%s WHERE subscription=%s''', (step, step, sid))
         c.execute('''UPDATE subscription_outbox SET created_at=created_at-%s,admitted_at=admitted_at-%s,
             next_attempt_at=next_attempt_at-%s WHERE subscription=%s''', (step, step, step, sid))
+        c.execute('UPDATE subscription_matches SET matched_at=matched_at-%s WHERE subscription=%s', (step, sid))
 
 
 def hints(store, sid, kind='events'):
@@ -400,3 +401,98 @@ def test_matcher_role_holds_and_flushes_hints(seeded, tmp_path):
         with store.pool.connection() as c:
             c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
             c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
+def failing_hint_step(monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError('synthetic hint failure')
+    monkeypatch.setattr(delivery_policy, 'after_match', broken)
+
+
+# spec: ANYM-252
+@pytest.mark.parametrize('held_first', [False, True])
+def test_recovery_replays_reasons_and_an_on_time_reply(seeded, tmp_path, monkeypatch, held_first):
+    store, _, _ = seeded
+    token = identity(store)
+    policy = {'expect_reply_within_s': 60, **({'debounce_s': 600, 'max_wait_s': 3600} if held_first else {})}
+    sid = reply_subscription(store, token, tmp_path, policy)
+    if held_first:
+        matched(store)
+        assert held(store, token, sid)[0] == 'debounce'
+    failing_hint_step(monkeypatch)
+    reply(store)
+    monkeypatch.undo()
+    # The deadline passes before any tick replays the failed step: the on-time reply still counts.
+    shift(store, sid, 61)
+    flush_hints(store)
+    flush_hints(store)
+    assert hints(store, sid, 'silence') == []
+    assert store.get_subscription(token, sid)['delivery']['silence']['state'] == 'replied'
+    with store.pool.connection() as c:
+        window = c.execute('SELECT match_count,reasons FROM subscription_hint_windows WHERE subscription=%s',
+            (sid,)).fetchone()
+    if held_first:
+        assert window['match_count'] == 2 and 'reply_to_confirmed_send' in window['reasons']
+    else:
+        assert len(hints(store, sid)) == 1
+
+
+# spec: ANYM-252
+def test_reconfiguration_derives_quiet_bypass_from_the_current_policy(seeded, tmp_path):
+    store, _, _ = seeded
+    token = identity(store)
+    quiet = local_window('Europe/Moscow', 60, 60)
+    sid = bound(store, token, tmp_path, {'debounce_s': 30, 'quiet_hours': quiet, 'quiet_bypass': ['incoming_message']})
+    rid = store.get_subscription(token, sid)['delivery']['receiver_id']
+    matched(store)
+    assert held(store, token, sid)[0] == 'debounce'
+    configure(store, token, sid, rid, {'debounce_s': 30, 'quiet_hours': quiet})
+    shift(store, sid, 31)
+    flush_hints(store)
+    assert held(store, token, sid)[0] == 'quiet_hours' and hints(store, sid) == []
+    configure(store, token, sid, rid, {'debounce_s': 30, 'quiet_hours': quiet, 'quiet_bypass': ['incoming_message']})
+    flush_hints(store)
+    assert len([h for h in hints(store, sid) if h['state'] == 'pending']) == 1
+
+
+# spec: ANYM-252
+def test_dispatcher_holds_a_committed_hint_that_reaches_quiet_hours(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = bound(store, token, tmp_path, {'quiet_hours': local_window('Europe/Moscow', -30, 90)})
+    matched(store)
+    assert [h['state'] for h in hints(store, sid)] == ['pending']
+    # A budget slot or a retry moved the first POST into the quiet window.
+    with store.pool.connection() as c:
+        c.execute('UPDATE subscription_delivery SET policy=%s WHERE subscription=%s',
+            (Jsonb({'quiet_hours': local_window('Europe/Moscow', 60, 60)}), sid))
+    stats = dispatch_hints(store, transport=lambda *a, **k: pytest.fail('sent during quiet hours'),
+        resolver=lambda *a, **k: ['93.184.216.34'])
+    assert stats['deferred'] == 1 and stats['dead_letter'] == 0
+    with store.pool.connection() as c:
+        row = c.execute("""SELECT attempts,admitted_at,next_attempt_at>clock_timestamp()+interval '58 minutes' AS later
+            FROM subscription_outbox WHERE subscription=%s""", (sid,)).fetchone()
+    assert (row['attempts'], row['admitted_at'], row['later']) == (0, None, True)
+
+
+# spec: ANYM-252
+def test_waiting_for_admission_never_expires_a_hint(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = bound(store, token, tmp_path)
+    matched(store)
+    with store.pool.connection() as c:
+        c.execute("UPDATE subscription_outbox SET created_at=created_at-interval '8 days' WHERE subscription=%s", (sid,))
+    stats = dispatch_hints(store, transport=lambda *a, **k: 204, resolver=lambda *a, **k: ['93.184.216.34'])
+    assert stats['delivered'] == 1 and stats['dead_letter'] == 0
+
+
+# spec: ANYM-252
+def test_hint_failure_code_passes_the_telemetry_allowlist():
+    from messaging_service.telemetry import safe_event
+    try:
+        raise RuntimeError('synthetic hint failure')
+    except RuntimeError as error:
+        assert safe_event(error, 'subscriptions', 'subscription_hint_failed') is not None

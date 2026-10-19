@@ -22,7 +22,7 @@ HELD_REASONS = ('debounce', 'batch', 'quiet_hours', 'budget')
 _CLOCK = re.compile(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]')
 _ZONE = re.compile(r'[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+){0,2}')
 _EMPTY = dict(first_match_at=None, last_match_at=None, match_count=0, through_position=None,
-    bypass=False, due_at=None, held_reason=None)
+    reasons=[], due_at=None, held_reason=None)
 _NO_SILENCE = dict(silence_state=None, silence_fired_at=None, silence_due_at=None, silence_held_reason=None)
 
 
@@ -152,7 +152,7 @@ def _window(c, row, base=None):
 def _save(c, window):
     c.execute('''UPDATE subscription_hint_windows SET subscription_version=%(subscription_version)s,
         next_window=%(next_window)s,first_match_at=%(first_match_at)s,last_match_at=%(last_match_at)s,
-        match_count=%(match_count)s,through_position=%(through_position)s,bypass=%(bypass)s,
+        match_count=%(match_count)s,through_position=%(through_position)s,reasons=%(reasons)s,
         hinted_through=%(hinted_through)s,
         due_at=%(due_at)s,held_reason=%(held_reason)s,silence_state=%(silence_state)s,
         silence_fired_at=%(silence_fired_at)s,silence_due_at=%(silence_due_at)s,
@@ -188,10 +188,15 @@ def _gate(c, row, policy, due, reason, bypass, now):
     return (slot, 'budget') if slot else (None, None)
 
 
-def _emit(c, row, binding, window, kind, through):
+def _bypass(policy, reasons):
+    return bool(set(reasons) & set(policy.get('quiet_bypass', ())))
+
+
+def _emit(c, row, binding, window, kind, through, bypass):
     hint = c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,receiver,
-        through_position,kind,window_id) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id''',
-        (row['id'], row['version'], binding['receiver'], through, kind, window['next_window'])).fetchone()
+        through_position,kind,window_id,quiet_bypass) VALUES(%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT DO NOTHING RETURNING id''',
+        (row['id'], row['version'], binding['receiver'], through, kind, window['next_window'], bypass)).fetchone()
     window['next_window'] += 1
     return hint is not None
 
@@ -201,9 +206,11 @@ def _settle(c, row, binding, window, now, through):
     emitted = 0
     if window['first_match_at'] is not None:
         due, reason = _due(policy, window)
-        window['due_at'], window['held_reason'] = _gate(c, row, policy, due, reason, window['bypass'], now)
+        # The current policy decides the bypass from the range's reasons, also after a reconfiguration.
+        bypass = _bypass(policy, window['reasons'])
+        window['due_at'], window['held_reason'] = _gate(c, row, policy, due, reason, bypass, now)
         if window['due_at'] is None:
-            emitted += _emit(c, row, binding, window, 'events', window['through_position'])
+            emitted += _emit(c, row, binding, window, 'events', window['through_position'], bypass)
             window['hinted_through'] = max(window['hinted_through'] or 0, window['through_position'])
             window.update(_EMPTY)
     if _armed(row, binding):
@@ -211,15 +218,51 @@ def _settle(c, row, binding, window, now, through):
             # The committed silence reference: anchor and deadline only, no content.
             window['silence_state'], window['silence_fired_at'] = 'fired', now
         if window['silence_state'] == 'fired':
-            window['silence_due_at'], window['silence_held_reason'] = _gate(c, row, policy, now, None,
-                'silence' in policy.get('quiet_bypass', ()), now)
+            bypass = 'silence' in policy.get('quiet_bypass', ())
+            window['silence_due_at'], window['silence_held_reason'] = _gate(c, row, policy, now, None, bypass, now)
             if window['silence_due_at'] is None:
-                emitted += _emit(c, row, binding, window, 'silence', through)
+                emitted += _emit(c, row, binding, window, 'silence', through, bypass)
                 window['silence_state'] = 'hinted'
     return emitted
 
 
-def after_match(c, row, through, matched):
+def _absorb(c, row, binding, window, *, limit=1000):
+    """Fold the committed matches above the held range into it, from durable rows only.
+
+    The matcher and the recovery tick share this path, so a failed hint step loses no reason,
+    count, match time or on-time reply: the next tick replays the same committed matches.
+    """
+    start = window['through_position']
+    if start is None:
+        start = window['hinted_through'] if window['hinted_through'] is not None else row['start_position']
+    matches = c.execute('''SELECT m.event,m.matched_at,e.account,e.kind,e.origin,
+        jsonb_strip_nulls(jsonb_build_object('chat',e.snapshot->'chat',
+            'sender',e.snapshot->'sender','direction',e.snapshot->'direction',
+            'metadata',e.snapshot->'metadata','reply_evidence',e.snapshot->'reply_evidence')) AS snapshot
+        FROM subscription_matches m JOIN events e ON e.id=m.event
+        WHERE m.subscription=%s AND m.event>%s ORDER BY m.event LIMIT %s''',
+        (row['id'], start, limit)).fetchall()
+    if not matches:
+        return False
+    from .subscription_consumption import wake_reason
+    reasons = set(window['reasons'])
+    for item in matches:
+        found = wake_reason({**item['snapshot'], 'account': item['account'], 'kind': item['kind'],
+            'historical': item['origin'] in ('backfill', 'reconcile')}, row['selector'])
+        reasons.update(found)
+        if (binding is not None and _armed(row, binding) and window['silence_state'] is None and
+                'reply_to_confirmed_send' in found and item['matched_at'] < binding['silence_deadline']):
+            window['silence_state'] = 'replied'
+    if window['first_match_at'] is None:
+        window['first_match_at'] = matches[0]['matched_at']
+    window['last_match_at'] = max(window['last_match_at'] or matches[-1]['matched_at'], matches[-1]['matched_at'])
+    window['match_count'] = min(1000000, window['match_count'] + len(matches))
+    window['through_position'] = matches[-1]['event']
+    window['reasons'] = sorted(reasons)[:16]
+    return True
+
+
+def after_match(c, row, through):
     """Matcher transaction, after new matches: hold or commit the hint. Returns hints committed."""
     binding = _binding(c, row)
     window = _window(c, row)
@@ -228,23 +271,8 @@ def after_match(c, row, through, matched):
         window['hinted_through'] = max(window['hinted_through'] or 0, through)
         _save(c, window)
         return 0
-    now = _now(c)
-    policy = binding['policy'] or {}
-    reasons = set()
-    if policy.get('quiet_bypass') or _armed(row, binding):
-        from .subscription_consumption import wake_reason
-        for item in matched:
-            reasons.update(wake_reason(item, row['selector']))
-    if window['first_match_at'] is None:
-        window['first_match_at'] = now
-    window['last_match_at'] = now
-    window['match_count'] = min(1000000, window['match_count'] + len(matched))
-    window['through_position'] = through
-    window['bypass'] = window['bypass'] or bool(reasons & set(policy.get('quiet_bypass', ())))
-    if (_armed(row, binding) and window['silence_state'] is None and
-            'reply_to_confirmed_send' in reasons and now < binding['silence_deadline']):
-        window['silence_state'] = 'replied'
-    emitted = _settle(c, row, binding, window, now, through)
+    _absorb(c, row, binding, window)
+    emitted = _settle(c, row, binding, window, _now(c), through)
     _save(c, window)
     return emitted
 
@@ -264,9 +292,9 @@ def flush_hints(store, *, limit=32):
             AND w.silence_state IS NULL
             UNION SELECT s.id FROM subscriptions s JOIN subscription_delivery d ON d.subscription=s.id
             LEFT JOIN subscription_hint_windows w ON w.subscription=s.id
-            WHERE s.state='active' AND (w.subscription IS NULL OR w.first_match_at IS NULL OR
-                w.subscription_version<>s.version) AND EXISTS(SELECT 1 FROM subscription_matches m
-                WHERE m.subscription=s.id AND m.event>coalesce(w.hinted_through,s.start_position)))
+            WHERE s.state='active' AND EXISTS(SELECT 1 FROM subscription_matches m WHERE m.subscription=s.id
+                AND m.event>coalesce(CASE WHEN w.subscription_version=s.version THEN w.through_position END,
+                    w.hinted_through,s.start_position)))
             ORDER BY id LIMIT %s''', (limit,)).fetchall()
     for candidate in candidates:
         with store.pool.connection() as c:
@@ -291,13 +319,9 @@ def flush_hints(store, *, limit=32):
                 _save(c, window)
                 stats['cancelled'] += 1
                 continue
+            # A failed hint step left committed matches outside the held range: replay them.
+            _absorb(c, row, binding, window)
             now = _now(c)
-            if (window['first_match_at'] is None and window['hinted_through'] is not None and
-                    c.execute('''SELECT 1 FROM subscription_matches WHERE subscription=%s AND event>%s
-                    LIMIT 1''', (row['id'], window['hinted_through'])).fetchone()):
-                # A failed hint step left committed matches unhinted: reopen the range.
-                window.update(first_match_at=now, last_match_at=now, match_count=1,
-                    through_position=row['matched_through'])
             stats['emitted'] += _settle(c, row, binding, window, now, row['matched_through'])
             stats['held'] += window['due_at'] is not None or window['silence_due_at'] is not None
             _save(c, window)

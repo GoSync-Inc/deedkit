@@ -328,7 +328,11 @@ passive reads return. `capabilities.subscriptions.delivery_policy` lists the fie
 Debounce and batch are alternatives (both set: `invalid_delivery_policy`). Gate order: the window
 (debounce or batch) decides when a hint is due; quiet hours hold a due hint to the window end, even
 past `max_wait_s` (held, never dropped); the per-key budget holds it to the next slot. A bypass
-reason skips only the quiet-hours step. A hint carries the batch `through`.
+reason skips only the quiet-hours step; the held range keeps the wake reasons of its matches and
+the current policy's `quiet_bypass` decides at each tick. A hint carries the batch `through`. The
+dispatcher rechecks quiet hours before each POST of an `events` or `silence` hint without a bypass,
+so a hint moved by the budget or a retry into a quiet window waits for its end without using an
+attempt.
 
 **Silence timer.** The deadline is the configuration commit time plus `expect_reply_within_s`. If
 no `reply_to_confirmed_send` match commits by then, the worker records one silence reference and
@@ -345,7 +349,7 @@ subscriptions that already have a receiver. The matcher holds a new hint over bu
 (`held_reason: "budget"`) so held matches coalesce into one hint at the next slot. The dispatcher
 also admits at most that many distinct hint IDs per rolling hour before their first POST, so a
 backlog after downtime cannot burst; retries of an admitted hint are not new admissions. Deferral
-never dead-letters and loses no event reference. A `test_subscription` probe over budget is refused
+never dead-letters and loses no event reference: the seven-day retry age starts at admission. A `test_subscription` probe over budget is refused
 with `rate_limited`.
 
 `get_subscription` shows `delivery.policy`, `held_reason` (`debounce|batch|quiet_hours|budget`)
@@ -364,7 +368,8 @@ and `next_hint_at`. Rules, all enforced by the matcher worker on durable rows:
   index, so retries and parallel workers cannot double-emit.
 - **Failure isolation:** the hint step runs in a savepoint after the matches. A failure rolls back
   only that step (telemetry code `subscription_hint_failed`, no content); matches and the frontier
-  commit and the next tick reopens the unhinted range.
+  commit, and the next tick replays the committed matches above the held range (reasons, count,
+match times, an on-time reply) before it settles the range or a silence timer.
 
 Automatic wake scheduling (ANYM-228) depends on these rules and the per-key budget: they are the
 server-side gate before a relay fires an agent run.

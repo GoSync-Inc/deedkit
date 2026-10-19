@@ -21,6 +21,8 @@ CREATE UNIQUE INDEX subscription_hint_window ON subscription_outbox(subscription
 CREATE INDEX subscription_hint_budget ON subscription_outbox(subscription,created_at);
 -- Dispatcher admission: the first POST of a hint ID reserves one slot of the key's rolling hour.
 ALTER TABLE subscription_outbox ADD COLUMN admitted_at timestamptz;
+-- The emitted hint keeps its quiet-hours bypass, so the dispatcher rechecks quiet hours before each POST.
+ALTER TABLE subscription_outbox ADD COLUMN quiet_bypass boolean NOT NULL DEFAULT false;
 CREATE INDEX subscription_hint_admission ON subscription_outbox(subscription,admitted_at)
  WHERE admitted_at IS NOT NULL;
 -- The policy is the whole delivery configuration; silence timers belong to policy_version only.
@@ -39,7 +41,8 @@ CREATE TABLE subscription_hint_windows (
  first_match_at timestamptz, last_match_at timestamptz,
  match_count integer NOT NULL DEFAULT 0 CHECK(match_count BETWEEN 0 AND 1000000),
  through_position bigint CHECK(through_position>=0),
- bypass boolean NOT NULL DEFAULT false,
+ -- Wake reasons of the held range; the current policy's quiet_bypass decides at each tick.
+ reasons text[] NOT NULL DEFAULT '{}' CHECK(cardinality(reasons)<=16),
  -- Matches above hinted_through with no held range are reopened, so a failed hint step retries.
  hinted_through bigint CHECK(hinted_through>=0),
  due_at timestamptz,

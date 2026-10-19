@@ -278,6 +278,19 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
                 stats['dead_letter'] += 1
                 continue
+            now = c.execute('SELECT clock_timestamp() AS t').fetchone()['t']
+            if hint['kind'] != 'test' and not hint['quiet_bypass']:
+                # A hint deferred by the budget or retried after receiver downtime can reach a
+                # quiet window after it was committed: it waits, no attempt is consumed.
+                from .delivery_policy import quiet_until
+                binding = c.execute('''SELECT policy FROM subscription_delivery WHERE subscription=%s
+                    AND policy_version=%s''', (hint['subscription'], hint['subscription_version'])).fetchone()
+                quiet = quiet_until(c, binding['policy'], now) if binding else None
+                if quiet is not None:
+                    c.execute("""UPDATE subscription_outbox SET state='pending',next_attempt_at=%s,
+                        lease_token=NULL,lease_until=NULL WHERE id=%s""", (quiet, hint['id']))
+                    stats['deferred'] += 1
+                    continue
             if hint['admitted_at'] is None:
                 # The first POST of a hint ID takes one slot of the key's rolling hour, with or
                 # without a delivery policy. At the limit it waits for the next slot: no attempt
@@ -285,7 +298,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 from .delivery_policy import admission_slot
                 owner = c.execute('SELECT principal,key_id FROM subscriptions WHERE id=%s',
                     (hint['subscription'],)).fetchone()
-                slot = admission_slot(c, owner, c.execute('SELECT clock_timestamp() AS t').fetchone()['t'])
+                slot = admission_slot(c, owner, now)
                 if slot is not None:
                     c.execute("""UPDATE subscription_outbox SET state='pending',next_attempt_at=%s,
                         lease_token=NULL,lease_until=NULL WHERE id=%s""", (slot, hint['id']))
@@ -320,8 +333,9 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 continue
             if not eligible:
                 state, error = 'cancelled', 'access_or_configuration_changed'
+            # The retry age starts at admission: waiting for a budget slot or quiet hours never expires a hint.
             elif hint['attempts'] >= 8 or c.execute("SELECT %s<clock_timestamp()-interval '7 days' AS expired",
-                    (hint['created_at'],)).fetchone()['expired']:
+                    (hint['admitted_at'] or now,)).fetchone()['expired']:
                 state, error = 'dead_letter', 'delivery_budget_exhausted'
             else:
                 try:

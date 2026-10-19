@@ -347,7 +347,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
             lookup = {(source['account'], source['chat']): source['sender_ids'] for source in sources}
             selector = row['selector']
             position = row['matched_through']
-            newly_matched = []
+            newly_matched = False
             missing = 0
             reason = None
             gap = row['gap'] if row['gap'] and row['gap'].get('intentional') else None
@@ -373,10 +373,10 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                         matches = False
                     else:
                         matches = snapshot['sender'] in lookup[source]
-                evidence = {**snapshot, 'account': event['account'], 'kind': event['kind'],
-                    'historical': event['origin'] in ('backfill', 'reconcile')}
                 if matches and selector.get('wake_rules'):
                     from .subscription_consumption import wake_reason
+                    evidence = {**snapshot, 'account': event['account'], 'kind': event['kind'],
+                        'historical': event['origin'] in ('backfill', 'reconcile')}
                     matches = bool(set(selector['wake_rules']) & set(wake_reason(evidence, selector)))
                 if matches:
                     if count >= maximum:
@@ -389,7 +389,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     if inserted:
                         count += 1
                         stats['matched'] += 1
-                        newly_matched.append(evidence)
+                        newly_matched = True
                 position = event['id']
                 stats['scanned'] += 1
             # If the retained range ends below a known committed frontier, the
@@ -410,8 +410,9 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     # The hint step cannot undo or block the matches and frontier above:
                     # a failure rolls back only the savepoint and a later tick reopens the range.
                     with c.transaction():
-                        after_match(c, row, position, newly_matched)
+                        after_match(c, row, position)
                 except Exception as error:
                     from .telemetry import capture
                     capture(error, 'subscription_hint_failed')
+                    print(json.dumps({'error': 'subscription_hint_failed'}), flush=True)
     return stats

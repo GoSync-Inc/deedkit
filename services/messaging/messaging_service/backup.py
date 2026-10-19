@@ -306,7 +306,7 @@ def quarantine_restore(store):
         if version>=37:
             # Held hints and silence timers never fire from a restored snapshot.
             c.execute("""UPDATE subscription_hint_windows SET first_match_at=NULL,last_match_at=NULL,match_count=0,
-                through_position=NULL,bypass=false,due_at=NULL,held_reason=NULL,silence_state='cancelled',
+                through_position=NULL,reasons='{}',due_at=NULL,held_reason=NULL,silence_state='cancelled',
                 silence_due_at=NULL,silence_held_reason=NULL,updated_at=clock_timestamp()""")
         if version>=29:
             # Upload staging is transient and excluded from original blob backups.
