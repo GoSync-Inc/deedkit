@@ -99,11 +99,13 @@ the never-downgraded list above or anything in AGENTS.md section 2.
 ## Pull request lines
 
 - `Change path:` comes from the changed files and AGENTS.md section 2. Grep the diff for its
-  signals; a hit is an item to read, not a verdict, and in doubt the path is OWNER:
+  signals. A hit is an item to read, not a verdict; no hit does not make a PR AUTO. Read the
+  changed blocks of every listed file (a workflow's `permissions:` and jobs, SQL grants, secret
+  mounts); in doubt the path is OWNER:
 
   ```sh
-  git diff --name-only origin/main... | grep -E 'main-ruleset\.json|_role\.sql$|migrations/|gitleaks|\.claude/settings\.json|^AGENTS\.md$'
-  git diff -U0 origin/main... | grep -E '^[-+].*(secrets\.|permissions:|\b(DROP|TRUNCATE|DELETE FROM|RENAME)\b|ALTER )'
+  git diff --name-only origin/main... | grep -E '^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|\.claude/settings\.json|^AGENTS\.md$'
+  git diff -U5 origin/main... | grep -E -i '^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|RENAME)\b|ALTER )'
   ```
 
   A card's own level label adds no merge gate; a host-tool change still waits for the owner to
