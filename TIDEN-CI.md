@@ -475,7 +475,7 @@ the `Tiden sync` runs of `main` created since one day before the commit date of
 TARGET (a run that processes TARGET cannot be older; a rerun keeps its
 `created_at`, so none is hidden by age). The lookup is
 `gh api repos/<repo>/actions/workflows/tiden-sync.yml/runs`, every page until
-the rows equal `total_count`; its pages share one 120-second budget, and a
+the rows equal `total_count`; its pages share one budget of 120 seconds or what is left of the deadline below, whichever is less, and a
 window GitHub cannot list completely (it caps a filtered search at 1000 runs)
 is a lookup error. The report keeps those whose title is `Tiden sync <TARGET>`
 (above), ignoring runs with conclusion `skipped`. While any kept run is queued,

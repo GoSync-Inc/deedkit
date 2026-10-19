@@ -989,8 +989,8 @@ class FakeActions:
         self.snapshots, self.calls, self.seen, self.server, self.hook = snapshots, 0, [], server, hook
         self.since = None
 
-    def runs(self, since):
-        self.since = since
+    def runs(self, since, within=None):
+        self.since, self.within = since, within
         if self.hook:
             self.hook(self.calls)
         if self.server and not self.calls:  # what had been read when the first lookup ran
@@ -1270,6 +1270,32 @@ def test_the_pages_of_one_lookup_share_one_time_budget(monkeypatch):
         health.Actions("o/r", clock=lambda: now[0]).runs(SINCE)
     assert str(raised.value) == "gh api timed out" and timeouts == [health.TIMEOUT, health.TIMEOUT - 50,
                                                                    health.TIMEOUT - 100]
+
+
+# spec: ANYM-438
+def test_a_lookup_that_would_end_after_the_report_deadline_is_unknown_and_the_report_is_complete(repo, server,
+                                                                                               monkeypatch):
+    _, b = history(repo)
+    # The evidence appears at second 1770; the sync lookup may take 30 more seconds and each call would take 80.
+    server.world(b, runs=[[]] * 59 + [[run(10, b)]])
+    clock, timeouts, real = Clock(), [], subprocess.run
+
+    def slow(arguments, **options):
+        if arguments[:1] != ["gh"]:
+            return real(arguments, **options)
+        timeouts.append(options["timeout"])
+        clock.now += min(80, options["timeout"])
+        if options["timeout"] < 80:
+            raise subprocess.TimeoutExpired(arguments, options["timeout"])
+        return subprocess.CompletedProcess(arguments, 0, json.dumps({"total_count": 1, "workflow_runs": [
+            sync_row(1, b)]}), "")
+
+    monkeypatch.setattr(health.subprocess, "run", slow)
+    code, data = measure(repo, server, b, clock=clock, actions=health.Actions("o/r", clock=clock))
+    assert timeouts == [health.TESTS_WAIT - 59 * health.POLL]
+    assert code == 2 and states(data) == {"drift": PASS, "unlinked_tests": UNKNOWN, "stale_anchors": PASS,
+                                          "done_open_checks": PASS}
+    assert data["metrics"]["unlinked_tests"]["reason"] == "gh api timed out" and data["sync"] == NO_SYNC
 
 
 @pytest.fixture

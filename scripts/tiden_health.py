@@ -301,11 +301,12 @@ class Actions:
         except json.JSONDecodeError:
             raise Unknown("gh api returned malformed JSON") from None
 
-    def runs(self, since: datetime) -> list[dict]:
+    def runs(self, since: datetime, within: float | None = None) -> list[dict]:
         """Every run created at or after SINCE (a rerun keeps its `created_at`, so no run of TARGET is hidden by
-        age); the pages count only when their rows equal `total_count`, which GitHub caps at 1000."""
+        age); the pages count only when their rows equal `total_count`, which GitHub caps at 1000. The pages take
+        WITHIN seconds (what the report deadline leaves) at the most."""
         created = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        end = self.clock() + TIMEOUT
+        end = self.clock() + (TIMEOUT if within is None else min(TIMEOUT, within))
         rows: list[dict] = []
         for number in range(1, SYNC_MAX_PAGES + 1):
             page = self.page(number, created, end)
@@ -344,12 +345,12 @@ def fingerprint(runs: list[dict]) -> list[tuple]:
 def await_sync(actions: Actions, target: str, since: datetime, deadline: float, clock, sleep) -> list[dict]:
     """The `Tiden sync` runs of TARGET once none is active; none, or an active one at the deadline, is unknown."""
     while True:
-        kept = sync_runs(actions.runs(since), target)
+        kept = sync_runs(actions.runs(since, deadline - clock()), target)
         if kept and all(run["status"] == "completed" for run in kept):
             return kept
+        sleep(min(POLL, max(deadline - clock(), 0)))
         if clock() >= deadline:
             raise Unknown("no finished Tiden sync run of TARGET")
-        sleep(POLL)
 
 
 def metric(state: str, reason: str, **values) -> dict:
@@ -633,14 +634,14 @@ def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool
                               f"{shown(sync['conclusion'])}; the links of TARGET may be missing")
             data["sync"]["inventory_read_at"] = datetime.now(timezone.utc).isoformat()
             cases = tiden.cases()
-            if fingerprint(sync_runs(actions.runs(since), target)) == fingerprint(kept):
+            if fingerprint(sync_runs(actions.runs(since, start + TESTS_WAIT - clock()), target)) == fingerprint(kept):
                 return cases
             # That inventory is discarded, and so is the sync record that vouched for it.
             data["sync"] |= {"target": None, "run_id": None, "run_attempt": None, "url": None, "conclusion": None,
                              "completed_at": None, "inventory_read_at": None}
             if clock() >= start + TESTS_WAIT:
                 raise Unknown("a Tiden sync run of TARGET changed while the case inventory was read")
-            sleep(POLL)
+            sleep(min(POLL, start + TESTS_WAIT - clock()))
 
     def unlinked():
         listed, list_errors = no_spec_list(root, target)
