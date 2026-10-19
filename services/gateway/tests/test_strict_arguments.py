@@ -212,8 +212,10 @@ def test_nested_union_object_reports_each_child_in_schema_order():
     action = {"action": "create", "calendar_ref": "synthetic-cal"}
     assert fields({"actions": [{**action, "event": {"start": 17, "end": False, "timezone": "UTC"}}]}) == [
         ("actions/0/event/start", "type"), ("actions/0/event/end", "type")]
-    assert fields({"actions": [{**action, "event": {"start": 17}}]}) == [
-        ("actions/0/event/start", "type"), ("actions/0/event/end", "required"), ("actions/0/event/timezone", "required")]
+    # end and timezone are optional in the schema (an all-day event has neither); the service requires them
+    # for a timed event.
+    assert fields({"actions": [{**action, "event": {"start": 17}}]}) == [("actions/0/event/start", "type")]
+    assert fields({"actions": [{}]}) == [("actions/0/action", "required"), ("actions/0/calendar_ref", "required")]
 
 
 def test_nested_fields_follow_the_reviewed_schema_order():

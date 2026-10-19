@@ -129,3 +129,36 @@ def test_calendar_constraints_survive_without_advertising_hidden_writes(tmp_path
         }
         assert "calendar_plan" not in result["gateway_tools"]
         assert "features" not in result and "secret_option" not in str(result)
+
+
+# spec: ANYM-234
+def test_calendar_write_scope_constraints_pass_and_series_writes_stay_listed_as_off(tmp_path):
+    key = tmp_path / "backend.key"
+    key.write_text("backend-calendar-a")
+    key.chmod(0o600)
+    value = config()
+    value["profiles"]["reader"]["tools"].append("calendar_capabilities")
+    value["principals"][0]["credentials"]["calendar"]["key_file"] = str(key)
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(value))
+    path.chmod(0o600)
+    constraints = {
+        "event_write": "guest-free single event, all-day event or one occurrence",
+        "occurrence_write": True,
+        "all_day_write": True,
+        "provider_write": {"google": {"occurrence_write": True, "all_day_write": True}},
+        "recurrence_write": False,
+        "future_split": False,
+        "invitations": False,
+        "series_write": True,
+    }
+
+    def backend(request):
+        return httpx.Response(200, json={"permissions": ["agenda:read"], "constraints": constraints, "calendars": []})
+
+    app = create_app(path, "http://testserver", transports={"calendar": httpx.MockTransport(backend)})
+    with TestClient(app) as c:
+        result = rpc(c, "tools/call", {"name": "calendar_capabilities", "arguments": {}}).json()["result"][
+            "structuredContent"
+        ]
+    assert result["constraints"] == {k: v for k, v in constraints.items() if k != "series_write"}

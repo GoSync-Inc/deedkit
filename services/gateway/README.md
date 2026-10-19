@@ -98,11 +98,16 @@ not forwarded as diagnostics. MCP and REST return the same safe error. A failure
 after a mutation is dispatched still reports `mutation_outcome_unknown` and forbids
 automatic retries, even when a backend error classification is available.
 Calendar capabilities retain a reviewed `constraints` allowlist (write limitations,
+including `occurrence_write`, `all_day_write` and `provider_write`; `recurrence_write`, `future_split` and
+`invitations` are listed as false, so series-wide, this-and-following and guest writes are never advertised;
 accepted time format, freshness, bounded refresh and request limits), while upstream
 feature/tool catalogs remain hidden. `gateway_tools` is the selected connection's operation ceiling;
 `gateway_actions` describes messenger actions only. Calendar `allowed_event_actions`
 also intersects local/backend scopes and requires both selected plan/apply tools.
-`write_enabled` alone is not a write grant. Slot requests may add explicitly reviewed
+`write_enabled` alone is not a write grant. `calendar_plan` takes, per action, a timed event (`start`, `end`,
+`timezone`), an all-day event (`all_day: true`, date `start`, exclusive date `end`, no `timezone`), or
+an `update`/`delete` with the `event_ref` of one occurrence of a series; the backend refuses series-wide
+targets and guests with `capability_unverified`, and names a missing timed field in `field_errors`. Slot requests may add explicitly reviewed
 `additional_calendar_refs` to member bindings and return their exact `source_selection`.
 Pending refreshes are polled with `refresh=false`; missing or pending coverage is unknown.
 

@@ -61,3 +61,16 @@ def test_calendar_reads_and_local_plan_are_not_presented_as_provider_writes():
         assert CATALOG["calendar_" + name]["annotations"] == {
             "readOnlyHint": False, "destructiveHint": True, "openWorldHint": True,
         }
+
+
+# spec: ANYM-234
+def test_calendar_plan_describes_all_day_and_occurrence_scope_without_series_or_guest_fields():
+    plan = CATALOG["calendar_plan"]
+    event = plan["inputSchema"]["$defs"]["EventInput"]
+    assert event["required"] == ["start"] and event["properties"]["all_day"]["anyOf"][0] == {"type": "boolean"}
+    assert not {"attendees", "recurrence", "rrule", "range", "scope", "guests"} & set(event["properties"])
+    action = plan["inputSchema"]["$defs"]["Action"]["properties"]
+    assert set(action) == {"action", "calendar_ref", "event_ref", "event"}
+    for phrase in ("all-day", "one occurrence", "this-and-following", "capability_unverified"):
+        assert phrase in plan["description"]
+    assert "guest-free single-event" not in plan["description"]

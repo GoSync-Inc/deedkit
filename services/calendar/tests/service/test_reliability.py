@@ -270,3 +270,248 @@ def test_plan_reads_offset_free_event_times_in_the_event_timezone(household):
         with pytest.raises(CalendarError, match=code):
             service.plan(key, [wall(start, end, zone)])
     assert service.capabilities(key)["constraints"]["time_format"].startswith("ISO 8601")
+
+
+OCCURRENCE = {
+    "title": "Lesson",
+    "recurring": True,
+    "series_ref": "series-cal-a",
+    "original_start": START.replace("Z", "+00:00"),
+}
+
+
+def occurrence_update(**event):
+    return {
+        "action": "update",
+        "calendar_ref": "cal-a",
+        "event_ref": "event-cal-a",
+        "event": {
+            "title": "Moved lesson",
+            "start": "2026-10-19T10:00:00Z",
+            "end": "2026-10-19T11:00:00Z",
+            "timezone": "UTC",
+            **event,
+        },
+    }
+
+
+OCCURRENCE_DELETE = {"action": "delete", "calendar_ref": "cal-a", "event_ref": "event-cal-a"}
+
+
+# spec: ANYM-234
+def test_capabilities_report_occurrence_and_all_day_scope_without_series_or_invitations(household):
+    service, key = setup(household)
+    value = service.capabilities(key)
+    constraints, features = value["constraints"], value["features"]
+    assert "one occurrence" in constraints["event_write"] and "all-day" in constraints["event_write"]
+    for scope in (constraints, features):
+        assert scope["occurrence_write"] is True and scope["all_day_write"] is True
+        assert (scope["recurrence_write"], scope["future_split"], scope["invitations"]) == (
+            False,
+            False,
+            False,
+        )
+    assert features["recurrence_read"] is True
+    assert constraints["provider_write"] == {
+        "google": {"occurrence_write": True, "all_day_write": True},
+        "icloud": {"occurrence_write": True, "all_day_write": True},
+    }
+
+
+# spec: ANYM-234
+def test_plan_targets_one_occurrence_and_rejects_series_scope(household):
+    service, key = setup(household)
+    publish(household, details=dict(OCCURRENCE))
+    [step] = service.plan(key, [occurrence_update()])["steps"]
+    # The preview names the series and the occurrence's original start, never provider IDs.
+    assert step["occurrence"] == {"series_ref": "series-cal-a", "original_start": "2026-10-19T08:00:00+00:00"}
+    assert step["diff"]["title"] == {"before": "Lesson", "after": "Moved lesson"}
+    assert set(step["diff"]) == {"title", "start", "end"}
+    assert "target_id" not in step and "provider-private-cal-a" not in str(step)
+    [cancel] = service.plan(key, [OCCURRENCE_DELETE])["steps"]
+    assert cancel["action"] == "delete" and cancel["occurrence"] == step["occurrence"]
+    stored = household.one("SELECT payload FROM plans WHERE id=%s", (service.plan(key, [OCCURRENCE_DELETE])["plan_id"],))
+    assert stored["payload"]["steps"][0]["occurrence"] == step["occurrence"]
+    # A series-wide target has no occurrence identity: a master, or a row stored before identities existed.
+    for details in (
+        {"title": "Lesson", "recurring": True, "series_ref": "series-cal-a"},
+        {"title": "Lesson", "recurring": True, "original_start": OCCURRENCE["original_start"]},
+        {"title": "Lesson", "recurring": True},
+    ):
+        publish(household, details=details)
+        for action in (occurrence_update(), OCCURRENCE_DELETE):
+            with pytest.raises(CalendarError, match="capability_unverified"):
+                service.plan(key, [action])
+
+
+# spec: ANYM-234
+def test_occurrence_with_guests_stays_unverified(household):
+    service, key = setup(household)
+    for flag in ("guests", "special"):
+        publish(household, details=dict(OCCURRENCE, **{flag: True}))
+        for action in (occurrence_update(), OCCURRENCE_DELETE):
+            with pytest.raises(CalendarError, match="capability_unverified"):
+                service.plan(key, [action])
+    # No write path asks the provider to notify anybody.
+    assert service.plan(key, [create()])["notifications"].startswith("none")
+
+
+# spec: ANYM-234
+def test_occurrence_cannot_change_between_timed_and_all_day(household):
+    service, key = setup(household)
+    publish(household, details=dict(OCCURRENCE))
+    with pytest.raises(CalendarError, match="capability_unverified"):
+        service.plan(key, [dict(occurrence_update(), event=all_day())])
+    publish(household, details=dict(OCCURRENCE, all_day=True))
+    with pytest.raises(CalendarError, match="capability_unverified"):
+        service.plan(key, [occurrence_update()])
+
+
+def all_day(start="2026-10-19", end="2026-10-20", **extra):
+    event = {"all_day": True, "start": start, **extra}
+    if end:
+        event["end"] = end
+    return event
+
+
+def all_day_action(kind="create", **event):
+    action = {"action": kind, "calendar_ref": "cal-a", "event": all_day(**event)}
+    if kind == "update":
+        action["event_ref"] = "event-cal-a"
+    return action
+
+
+# Asia/Makassar is UTC+8 without DST: local midnight 2026-10-19 is 2026-10-18T16:00Z.
+MIDNIGHT = "2026-10-18T16:00:00Z"
+NEXT_MIDNIGHT = "2026-10-19T16:00:00Z"
+
+
+# spec: ANYM-234
+def test_all_day_update_and_conversion_preview(household):
+    service, key = setup(household)
+    publish(household, start=MIDNIGHT, end=NEXT_MIDNIGHT, details={"title": "Holiday", "all_day": True})
+    # Staying all-day: the same dates are no change and no conversion is shown.
+    [step] = service.plan(key, [all_day_action("update", title="Holiday!")])["steps"]
+    assert step["diff"] == {"title": {"before": "Holiday", "after": "Holiday!"}}
+    assert step["event"]["all_day"] is True
+    # A single day without an end is start + 1 day; moving it shows both dates.
+    [step] = service.plan(key, [all_day_action("update", start="2026-10-21", end=None)])["steps"]
+    assert step["event"]["end"] == "2026-10-22"
+    assert step["diff"] == {
+        "start": {"before": "2026-10-19", "after": "2026-10-21"},
+        "end": {"before": "2026-10-20", "after": "2026-10-22"},
+    }
+    # Explicit conversions in both directions.
+    timed = {"start": "2026-10-19T10:00:00Z", "end": "2026-10-19T11:00:00Z", "timezone": "UTC"}
+    [step] = service.plan(key, [dict(all_day_action("update"), event=timed)])["steps"]
+    assert step["diff"]["all_day"] == {"before": True, "after": False}
+    publish(household, details={"title": "Dentist"})
+    [step] = service.plan(key, [all_day_action("update")])["steps"]
+    assert step["diff"]["all_day"] == {"before": False, "after": True}
+    # Create keeps the date values and a multi-day exclusive end.
+    [step] = service.plan(key, [all_day_action(title="Trip", end="2026-10-22")])["steps"]
+    assert (step["event"]["start"], step["event"]["end"]) == ("2026-10-19", "2026-10-22")
+
+
+# spec: ANYM-234
+@pytest.mark.parametrize(
+    "event,code",
+    [
+        (all_day(end="2026-10-19"), "invalid_window"),
+        (all_day(end="2026-10-18"), "invalid_window"),
+        (all_day(end="2026-12-19"), "invalid_window"),
+        (all_day(timezone="UTC"), "invalid_event"),
+        (all_day(start="2026-10-19T10:00:00Z", end="2026-10-20T10:00:00Z"), "invalid_event"),
+        (all_day(start="2026-10-19", end="2026-10-20T00:00:00"), "invalid_event"),
+        (all_day(start="2026-13-40"), "invalid_event"),
+        (all_day(all_day="yes"), "invalid_event"),
+        ({"all_day": True, "end": "2026-10-20"}, "invalid_event"),
+        ({"start": "2026-10-19", "end": "2026-10-20", "timezone": "UTC"}, "invalid_time"),
+    ],
+)
+def test_invalid_all_day_ranges_and_mixed_fields_are_rejected(household, event, code):
+    service, key = setup(household)
+    with pytest.raises(CalendarError, match=code):
+        service.plan(key, [{"action": "create", "calendar_ref": "cal-a", "event": dict(event, title="x")}])
+
+
+# spec: ANYM-234
+def test_all_day_event_blocks_the_whole_local_day_in_the_overlap_check(household):
+    service, key = setup(household)
+    publish(household)  # 08:00-09:00Z is 16:00-17:00 on 2026-10-19 in Asia/Makassar
+    overlaps = service.plan(key, [all_day_action(title="Holiday")])["overlap_check"]["overlaps"]
+    assert [o["event_ref"] for o in overlaps] == ["event-cal-a"]
+    overlaps = service.plan(key, [all_day_action(title="Later", start="2026-10-20", end=None)])["overlap_check"]
+    assert overlaps["overlaps"] == []
+
+
+# spec: ANYM-234
+@pytest.mark.parametrize("missing", ["start", "end", "timezone"])
+def test_timed_event_without_a_required_field_is_rejected_naming_the_field(household, missing):
+    service, key = setup(household)
+    event = {"title": "x", "start": START, "end": END, "timezone": "UTC"}
+    del event[missing]
+    with pytest.raises(CalendarError, match="invalid_event") as caught:
+        service.plan(key, [create(), {"action": "create", "calendar_ref": "cal-a", "event": event}])
+    assert caught.value.field_errors == [{"field": f"actions/1/event/{missing}", "reason": "required"}]
+    # Nothing was stored for apply and no provider is reachable from planning.
+    assert household.one("SELECT count(*) AS n FROM plans")["n"] == 0
+
+
+# spec: ANYM-234
+def test_all_day_event_with_a_timezone_is_rejected_naming_the_field(household):
+    service, key = setup(household)
+    with pytest.raises(CalendarError, match="invalid_event") as caught:
+        service.plan(key, [all_day_action(timezone="UTC")])
+    assert caught.value.field_errors == [{"field": "actions/0/event/timezone", "reason": "not_allowed_for_all_day"}]
+
+
+# spec: ANYM-234
+def test_overlap_check_still_sees_the_untouched_siblings_of_a_series(household):
+    service, key = setup(household)
+    household.publish_window(
+        "cal-a",
+        START,
+        "2026-10-27T12:00:00Z",
+        [
+            {
+                "resource_ref": "res-series",
+                "target": "provider-private-series",
+                "etag": '"v1"',
+                "payload": {},
+                "occurrences": [
+                    {
+                        "ref": f"event-{day}",
+                        "start": f"2026-10-{day}T08:00:00Z",
+                        "end": f"2026-10-{day}T09:00:00Z",
+                        "details": dict(OCCURRENCE, original_start=f"2026-10-{day}T08:00:00+00:00"),
+                        "busy": True,
+                    }
+                    for day in (19, 26)
+                ],
+            }
+        ],
+        "complete",
+    )
+    # Moving the first occurrence onto the second one: only the moved occurrence is left out of the check.
+    move = dict(occurrence_update(start="2026-10-26T08:00:00Z", end="2026-10-26T09:00:00Z"), event_ref="event-19")
+    overlaps = service.plan(key, [move])["overlap_check"]["overlaps"]
+    assert [o["event_ref"] for o in overlaps] == ["event-26"]
+    # A cancel of one occurrence plus a create over its sibling is the same.
+    cancel = dict(OCCURRENCE_DELETE, event_ref="event-19")
+    replacement = create(start="2026-10-26T08:00:00Z", end="2026-10-26T09:00:00Z")
+    overlaps = service.plan(key, [cancel, replacement])["overlap_check"]["overlaps"]
+    assert [o["event_ref"] for o in overlaps] == ["event-26"]
+    # The moved occurrence's own old slot does not collide with its new one.
+    stay = dict(occurrence_update(start="2026-10-19T08:30:00Z", end="2026-10-19T09:30:00Z"), event_ref="event-19")
+    assert service.plan(key, [stay])["overlap_check"]["overlaps"] == []
+
+
+# spec: ANYM-234
+@pytest.mark.parametrize("start", ["9999-12-31", "0001-01-01"])
+def test_all_day_event_at_the_edge_of_the_supported_dates_is_a_definite_input_error(household, start):
+    service, key = setup(household)
+    # 9999-12-31 has no following day; midnight of 0001-01-01 in an eastern zone precedes year 1 in UTC.
+    with pytest.raises(CalendarError, match="invalid_window"):
+        service.plan(key, [all_day_action(start=start, end=None, title="Edge")])
+    assert household.one("SELECT count(*) AS n FROM plans")["n"] == 0

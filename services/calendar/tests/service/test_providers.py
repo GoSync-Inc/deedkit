@@ -1,8 +1,11 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
 import httpx
 import pytest
 from family_calendar.errors import CalendarError
+from tests.fakes import FakeGoogle, MemoryDAV
 
 
 def test_google_conditional_patch_preserves_unrelated_fields():
@@ -370,3 +373,383 @@ def test_google_zero_length_and_reversed_events():
     event["end"] = {"dateTime": "2026-10-19T07:59:00Z"}
     with pytest.raises(CalendarError, match="invalid_provider_event_time"):
         normalize_google("cal", event, "Asia/Makassar")
+
+
+# --- ANYM-234: one occurrence of a series and all-day events -------------------------------------
+
+GOOGLE_CAL = {
+    "ref": "cal-g",
+    "connection_id": "conn-g",
+    "provider": "google",
+    "target": "calendar-id",
+    "timezone": "Asia/Makassar",
+}
+ICLOUD_CAL = {
+    "ref": "cal-i",
+    "connection_id": "conn-i",
+    "provider": "icloud",
+    "target": "https://p01-caldav.icloud.com/test/cal/",
+    "timezone": "Europe/Berlin",
+}
+SERIES_URL = ICLOUD_CAL["target"] + "series.ics"
+FIXTURES = Path(__file__).parents[1] / "fixtures" / "ics"
+
+
+def google_instance(day, **extra):
+    start = f"2026-10-{day}T08:00:00Z"
+    return {
+        "id": f"series_202610{day}T080000Z",
+        "etag": f'"i{day}"',
+        "summary": "Lesson",
+        "recurringEventId": "series",
+        "originalStartTime": {"dateTime": start},
+        "start": {"dateTime": start},
+        "end": {"dateTime": f"2026-10-{day}T09:00:00Z"},
+        **extra,
+    }
+
+
+def google_series(**extra):
+    master = {
+        "id": "series",
+        "etag": '"m1"',
+        "summary": "Lesson",
+        "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=3"],
+        "start": {"dateTime": "2026-10-19T08:00:00Z"},
+        "end": {"dateTime": "2026-10-19T09:00:00Z"},
+    }
+    return [master, google_instance(19), google_instance(26), *extra.get("more", [])]
+
+
+def occurrence_step(action, original="2026-10-19T08:00:00+00:00", target=None, etag=None, ref=None, **event):
+    from family_calendar.service.providers import series_ref
+
+    day = original[8:10]
+    step = {
+        "action": action,
+        "ordinal": 0,
+        "target_id": target or f"series_202610{day}T080000Z",
+        "expected_etag": etag or f'"i{day}"',
+        "occurrence": {"series_ref": ref or series_ref("cal-g", "series"), "original_start": original},
+    }
+    if action != "delete":
+        step["event"] = {
+            "title": "Moved",
+            "start": "2026-10-19T10:00:00+00:00",
+            "end": "2026-10-19T11:00:00+00:00",
+            "timezone": "UTC",
+            **event,
+        }
+    return step
+
+
+def google_world(events=None, drop_response=False):
+    from family_calendar.providers.google.adapter import GoogleAdapter
+    from family_calendar.service.providers import Providers
+
+    server = FakeGoogle(events if events is not None else google_series())
+    server.drop_response = drop_response
+    client = httpx.AsyncClient(transport=httpx.MockTransport(server))
+    providers = Providers(None, None)
+    providers.adapters["conn-g"] = GoogleAdapter("conn-g", client, lambda: "canary-token")
+    return providers, server
+
+
+def caldav_world(data=None):
+    from family_calendar.providers.caldav.adapter import CalDAVAdapter
+    from family_calendar.providers.caldav.transport import DAVTransport
+    from family_calendar.service.providers import Providers
+
+    server = MemoryDAV()
+    if data is not None:
+        server.resources[SERIES_URL] = (data, '"v1"')
+    transport = DAVTransport("a", "secret", client=httpx.AsyncClient(transport=httpx.MockTransport(server)))
+    providers = Providers(None, None)
+    providers.adapters["conn-i"] = CalDAVAdapter("conn-i", transport)
+    return providers, server
+
+
+def weekly_exceptions():
+    return (FIXTURES / "weekly-exceptions.ics").read_bytes()
+
+
+def caldav_step(action, original, **event):
+    from family_calendar.service.providers import series_ref
+
+    step = {
+        "action": action,
+        "ordinal": 0,
+        "target_id": SERIES_URL,
+        "expected_etag": '"v1"',
+        "occurrence": {"series_ref": series_ref("cal-i", SERIES_URL), "original_start": original},
+    }
+    if action != "delete":
+        step["event"] = {
+            "title": "Moved",
+            "start": "2026-11-09T14:00:00+00:00",
+            "end": "2026-11-09T15:00:00+00:00",
+            "timezone": "Europe/Berlin",
+            **event,
+        }
+    return step
+
+
+async def apply_step(providers, cal, step):
+    intent = await providers.prepare(cal, step)
+    await providers.mutate(cal, intent)
+    return intent, await providers.verify(cal, intent)
+
+
+def caldav_agenda(data, start="2026-10-19", end="2026-12-31"):
+    from family_calendar.service.providers import normalize_icloud
+
+    resource = {"href": SERIES_URL, "etag": '"v1"', "data": data}
+    a, b = (datetime.fromisoformat(x).replace(tzinfo=timezone.utc) for x in (start, end))
+    return {
+        o["details"]["original_start"]: o
+        for o in normalize_icloud("cal-i", resource, a, b, "Europe/Berlin")["occurrences"]
+    }
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_google_occurrence_update_and_cancel_touch_only_the_instance():
+    providers, server = google_world()
+    before = json.dumps(server.events, sort_keys=True)
+    others = {k: json.dumps(v, sort_keys=True) for k, v in server.events.items() if k != "series_20261019T080000Z"}
+    intent, receipt = await apply_step(providers, GOOGLE_CAL, occurrence_step("update"))
+    assert receipt["verified"] is True
+    [patch] = [r for r in server.requests if r.method == "PATCH"]
+    assert patch.url.path.endswith("/events/series_20261019T080000Z")
+    assert patch.headers["if-match"] == '"i19"' and patch.url.params["sendUpdates"] == "none"
+    body = json.loads(patch.content)
+    assert body["summary"] == "Moved" and body["start"]["dateTime"] == "2026-10-19T10:00:00+00:00"
+    assert not {"recurrence", "recurringEventId", "attendees", "id"} & set(body)
+    assert server.events["series_20261019T080000Z"]["summary"] == "Moved"
+    # Read-back: every other instance and the master are untouched.
+    assert {k: json.dumps(v, sort_keys=True) for k, v in server.events.items() if k != "series_20261019T080000Z"} == others
+    assert json.dumps(server.events, sort_keys=True) != before
+    # Cancel the second instance: DELETE of that instance only, conditional, without notifications.
+    cancel = occurrence_step("delete", "2026-10-26T08:00:00+00:00")
+    intent, receipt = await apply_step(providers, GOOGLE_CAL, cancel)
+    assert receipt["deleted"] is True and intent["action"] == "delete"
+    [delete] = [r for r in server.requests if r.method == "DELETE"]
+    assert delete.url.path.endswith("/events/series_20261026T080000Z")
+    assert delete.headers["if-match"] == '"i26"' and delete.url.params["sendUpdates"] == "none"
+    assert server.events["series_20261026T080000Z"]["status"] == "cancelled"
+    assert server.events["series"]["etag"] == '"m1"' and "series_20261019T080000Z" in server.events
+    assert {r.method for r in server.requests} <= {"GET", "PATCH", "DELETE"}
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_google_series_scope_and_guests_stay_unverified_at_write_time():
+    guest = google_instance(26, attendees=[{"email": "someone@example.invalid"}])
+    providers, server = google_world([google_series()[0], google_instance(19), guest])
+    master = occurrence_step("update", target="series", etag='"m1"')
+    guests = occurrence_step("update", "2026-10-26T08:00:00+00:00")
+    # An instance reached without an occurrence identity is also refused: it is a series member.
+    plain = {k: v for k, v in occurrence_step("update").items() if k != "occurrence"}
+    for step in (master, guests, plain):
+        with pytest.raises(CalendarError, match="capability_unverified"):
+            await providers.prepare(GOOGLE_CAL, step)
+    # An identity that names another occurrence than the instance is a conflict, not a write.
+    other = occurrence_step("update", "2026-10-26T08:00:00+00:00", target="series_20261019T080000Z")
+    with pytest.raises(CalendarError, match="version_conflict"):
+        await providers.prepare(GOOGLE_CAL, other)
+    assert [r.method for r in server.requests if r.method != "GET"] == []
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_caldav_series_scope_and_guests_stay_unverified_at_write_time():
+    providers, server = caldav_world(weekly_exceptions())
+    rid = "2026-11-09T16:00:00+01:00"
+    plain = {k: v for k, v in caldav_step("update", rid).items() if k != "occurrence"}
+    with pytest.raises(CalendarError, match="capability_unverified"):
+        await providers.prepare(ICLOUD_CAL, plain)
+    for marker in (b"ATTENDEE:mailto:someone@example.invalid", b"ORGANIZER:mailto:someone@example.invalid"):
+        data = weekly_exceptions().replace(b"RRULE:FREQ=WEEKLY;COUNT=6", b"RRULE:FREQ=WEEKLY;COUNT=6\r\n" + marker)
+        guests, _ = caldav_world(data)
+        with pytest.raises(CalendarError, match="capability_unverified"):
+            await guests.prepare(ICLOUD_CAL, caldav_step("update", rid))
+        # ... also when only a stored exception has guests.
+        data = weekly_exceptions().replace(b"STATUS:CANCELLED", b"STATUS:CANCELLED\r\n" + marker)
+        guests, _ = caldav_world(data)
+        with pytest.raises(CalendarError, match="capability_unverified"):
+            await guests.prepare(ICLOUD_CAL, caldav_step("update", rid))
+    ranged = weekly_exceptions().replace(b"RECURRENCE-ID;TZID=", b"RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=", 1)
+    sliced, _ = caldav_world(ranged)
+    with pytest.raises(CalendarError, match="capability_unverified"):
+        await sliced.prepare(ICLOUD_CAL, caldav_step("update", rid))
+    assert server.puts == 0
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_occurrence_edit_is_idempotent_by_identity_and_conditional():
+    # CalDAV: an occurrence moved before keeps its recurrence identity; no second override appears.
+    providers, server = caldav_world(weekly_exceptions())
+    moved = "2026-11-16T16:00:00+01:00"  # fixture override: moved to 18:00
+    step = caldav_step("update", moved, start="2026-11-16T19:00:00+00:00", end="2026-11-16T20:00:00+00:00")
+    _, receipt = await apply_step(providers, ICLOUD_CAL, step)
+    assert receipt["verified"] is True and server.puts == 1
+    data = server.resources[SERIES_URL][0]
+    assert data.count(b"RECURRENCE-ID") == weekly_exceptions().count(b"RECURRENCE-ID")
+    assert caldav_agenda(data)[moved]["start"] == datetime(2026, 11, 16, 19, tzinfo=timezone.utc)
+    # The same edit again, with the new etag, is the same override again.
+    step = dict(step, expected_etag=server.resources[SERIES_URL][1])
+    await apply_step(providers, ICLOUD_CAL, step)
+    assert server.resources[SERIES_URL][0].count(b"RECURRENCE-ID") == data.count(b"RECURRENCE-ID")
+    # A stale etag, a vanished resource and an identity outside the series write nothing.
+    puts = server.puts
+    with pytest.raises(CalendarError, match="version_conflict"):
+        await providers.prepare(ICLOUD_CAL, caldav_step("update", moved))
+    server.resources.pop(SERIES_URL)
+    with pytest.raises(CalendarError, match="version_conflict"):
+        await providers.prepare(ICLOUD_CAL, caldav_step("delete", moved))
+    providers, server = caldav_world(weekly_exceptions())
+    for original in ("2026-10-26T16:00:00+01:00", "2026-11-10T16:00:00+01:00", "2026-11-09T17:00:00+01:00"):
+        with pytest.raises(CalendarError, match="invalid_occurrence_identity"):
+            await providers.prepare(ICLOUD_CAL, caldav_step("delete", original))
+    assert server.puts == 0 and puts == 2
+    # Google: the instance ID is the identity; a second edit patches the same instance.
+    providers, server = google_world()
+    await apply_step(providers, GOOGLE_CAL, occurrence_step("update"))
+    instance = "series_20261019T080000Z"
+    etag = server.events[instance]["etag"]
+    await apply_step(providers, GOOGLE_CAL, occurrence_step("update", etag=etag, title="Moved again"))
+    assert sorted(server.events) == ["series", instance, "series_20261026T080000Z"]
+    assert server.events[instance]["summary"] == "Moved again"
+    patches = lambda: len([r for r in server.requests if r.method == "PATCH"])  # noqa: E731
+    assert patches() == 2
+    # A stale etag is refused before a write, and a 412 from the server writes nothing.
+    with pytest.raises(CalendarError, match="version_conflict"):
+        await providers.prepare(GOOGLE_CAL, occurrence_step("update", etag=etag))
+    intent = await providers.prepare(GOOGLE_CAL, occurrence_step("update", etag=server.events[instance]["etag"]))
+    server.events[instance]["etag"] = '"changed-by-someone-else"'
+    with pytest.raises(CalendarError, match="version_conflict"):
+        await providers.mutate(GOOGLE_CAL, intent)
+    assert server.events[instance]["summary"] == "Moved again"
+    # A cancelled instance no longer exists as an occurrence.
+    await apply_step(providers, GOOGLE_CAL, occurrence_step("delete", etag='"changed-by-someone-else"'))
+    with pytest.raises(CalendarError, match="version_conflict"):
+        await providers.prepare(GOOGLE_CAL, occurrence_step("update", etag=server.events[instance]["etag"]))
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_all_day_create_roundtrips_as_date_values():
+    from family_calendar.service.providers import normalize_google, normalize_icloud
+    from family_calendar.providers.caldav.codec import parse
+
+    event = {"title": "Holiday", "all_day": True, "start": "2026-10-19", "end": "2026-10-20"}
+    # Google: DATE values, no dateTime or timeZone.
+    providers, server = google_world([])
+    step = {"action": "create", "ordinal": 0, "target_id": "fcsallday", "event": event}
+    intent, receipt = await apply_step(providers, GOOGLE_CAL, step)
+    assert receipt["verified"] is True
+    assert intent["desired"]["start"] == {"date": "2026-10-19"} and intent["desired"]["end"] == {"date": "2026-10-20"}
+    [row] = normalize_google("cal-g", server.events["fcsallday"], "Asia/Makassar")["occurrences"]
+    assert row["details"]["all_day"] is True
+    assert (row["start"], row["end"]) == (
+        datetime(2026, 10, 18, 16, tzinfo=timezone.utc),
+        datetime(2026, 10, 19, 16, tzinfo=timezone.utc),
+    )
+    # CalDAV: DTSTART/DTEND;VALUE=DATE with the exclusive end, read back as one all_day occurrence.
+    providers, server = caldav_world()
+    step = {"action": "create", "ordinal": 0, "target_id": "fcsallday", "event": event}
+    intent, receipt = await apply_step(providers, ICLOUD_CAL, step)
+    assert receipt["verified"] is True
+    data = next(iter(server.resources.values()))[0]
+    assert b"DTSTART;VALUE=DATE:20261019" in data and b"DTEND;VALUE=DATE:20261020" in data
+    assert b"TZID" not in data and len(parse(data).walk("VEVENT")) == 1
+    resource = {"href": SERIES_URL, "etag": '"v1"', "data": data}
+    window = (datetime(2026, 10, 1, tzinfo=timezone.utc), datetime(2026, 11, 1, tzinfo=timezone.utc))
+    [row] = normalize_icloud("cal-i", resource, *window, "Asia/Makassar")["occurrences"]
+    assert row["details"]["all_day"] is True
+    assert (row["start"], row["end"]) == (
+        datetime(2026, 10, 18, 16, tzinfo=timezone.utc),
+        datetime(2026, 10, 19, 16, tzinfo=timezone.utc),
+    )
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_all_day_update_is_written_as_dates_and_conversion_clears_the_other_form():
+    # Google all-day stays all-day.
+    day = {"id": "day", "etag": '"d1"', "summary": "Holiday", "start": {"date": "2026-10-19"}, "end": {"date": "2026-10-20"}}
+    timed = {"id": "timed", "etag": '"t1"', "summary": "Dentist", "start": {"dateTime": "2026-10-19T08:00:00Z", "timeZone": "UTC"}, "end": {"dateTime": "2026-10-19T09:00:00Z", "timeZone": "UTC"}}
+    providers, server = google_world([day, timed])
+    new = {"all_day": True, "start": "2026-10-21", "end": "2026-10-22", "title": "Holiday"}
+    _, receipt = await apply_step(providers, GOOGLE_CAL, {"action": "update", "ordinal": 0, "target_id": "day", "expected_etag": '"d1"', "event": new})
+    assert receipt["verified"] and server.events["day"]["start"] == {"date": "2026-10-21"}
+    # timed -> all-day: the dateTime form is removed, not left beside the date.
+    _, receipt = await apply_step(providers, GOOGLE_CAL, {"action": "update", "ordinal": 0, "target_id": "timed", "expected_etag": '"t1"', "event": new})
+    assert receipt["verified"] and server.events["timed"]["start"] == {"date": "2026-10-21"}
+    # all-day -> timed.
+    etag = server.events["day"]["etag"]
+    back = {"start": "2026-10-21T10:00:00+00:00", "end": "2026-10-21T11:00:00+00:00", "timezone": "UTC"}
+    _, receipt = await apply_step(providers, GOOGLE_CAL, {"action": "update", "ordinal": 0, "target_id": "day", "expected_etag": etag, "event": back})
+    assert receipt["verified"] and "date" not in server.events["day"]["start"]
+    # CalDAV: DATE stays DATE with an exclusive end; conversion rewrites both properties.
+    ics = (FIXTURES / "all-day.ics").read_bytes()
+    providers, server = caldav_world(ics)
+    step = {"action": "update", "ordinal": 0, "target_id": SERIES_URL, "expected_etag": '"v1"', "event": dict(new, title="Renamed")}
+    _, receipt = await apply_step(providers, ICLOUD_CAL, step)
+    data = server.resources[SERIES_URL][0]
+    assert receipt["verified"] and b"DTSTART;VALUE=DATE:20261021" in data and b"DTEND;VALUE=DATE:20261022" in data
+    step = dict(step, expected_etag=server.resources[SERIES_URL][1], event=back)
+    _, receipt = await apply_step(providers, ICLOUD_CAL, step)
+    data = server.resources[SERIES_URL][0]
+    assert receipt["verified"] and b"VALUE=DATE" not in data and b"DTSTART:20261021T100000Z" in data
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_caldav_occurrence_cancelled_elsewhere_is_a_conflict_not_a_resurrection():
+    providers, server = caldav_world(weekly_exceptions())
+    gone = "2026-11-02T16:00:00+01:00"  # a fixture override with STATUS:CANCELLED, the etag is current
+    for action in ("update", "delete"):
+        with pytest.raises(CalendarError, match="version_conflict"):
+            await providers.prepare(ICLOUD_CAL, caldav_step(action, gone))
+    cancelled_series = weekly_exceptions().replace(b"BEGIN:VEVENT\r\n", b"BEGIN:VEVENT\r\nSTATUS:CANCELLED\r\n", 1)
+    providers, server = caldav_world(cancelled_series)
+    for action in ("update", "delete"):
+        with pytest.raises(CalendarError, match="version_conflict"):
+            await providers.prepare(ICLOUD_CAL, caldav_step(action, "2026-11-09T16:00:00+01:00"))
+        # ... also for an occurrence that already has an override of its own.
+        with pytest.raises(CalendarError, match="version_conflict"):
+            await providers.prepare(ICLOUD_CAL, caldav_step(action, "2026-11-16T16:00:00+01:00"))
+    assert server.puts == 0
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_caldav_occurrence_of_a_series_of_instants_can_be_cancelled():
+    instants = weekly_exceptions().replace(b"DTEND;TZID=Europe/Berlin:20261019T170000\r\n", b"")
+    providers, server = caldav_world(instants)
+    rid = "2026-11-09T16:00:00+01:00"
+    assert caldav_agenda(instants)[rid]["details"]["instant"] is True
+    intent, receipt = await apply_step(providers, ICLOUD_CAL, caldav_step("delete", rid))
+    assert intent["action"] == "update" and receipt["verified"] is True and server.puts == 1
+    assert rid not in caldav_agenda(server.resources[SERIES_URL][0])
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_google_instance_identity_that_cannot_be_compared_is_a_definite_error_before_any_write():
+    # A timestamp outside the range of datetime arithmetic is not an identity to publish ...
+    from family_calendar.service.providers import normalize_google
+
+    extreme = google_instance(19)
+    extreme["originalStartTime"] = {"dateTime": "0001-01-01T00:00:00+14:00"}
+    for identity in (extreme["originalStartTime"], {"dateTime": 5}, {"dateTime": ["x"]}, {"date": "not-a-date"}):
+        [row] = normalize_google("cal-g", dict(extreme, originalStartTime=identity), "UTC")["occurrences"]
+        assert "original_start" not in row["details"] and "series_ref" not in row["details"]
+    # ... and one that reaches the guard through a changed provider event is a CalendarError, not an exception.
+    providers, server = google_world([google_series()[0], extreme, google_instance(26)])
+    step = occurrence_step("update", "2026-10-19T08:00:00+00:00")
+    with pytest.raises(CalendarError):
+        await providers.prepare(GOOGLE_CAL, step)
+    assert [r.method for r in server.requests if r.method != "GET"] == []

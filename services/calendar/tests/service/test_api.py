@@ -189,3 +189,27 @@ def test_time_errors_name_the_accepted_format_in_both_transports(household):
     assert rest.status_code == 409
     assert rest.json() == mcp["structuredContent"] == {"error": "invalid_time", "hint": TIME_FORMAT}
     assert mcp["isError"] is True
+
+
+# spec: ANYM-234
+def test_plan_error_names_the_missing_field_in_both_transports(household):
+    household.write_opt_in("cal-a", True)
+    c, key = client(household)
+    arguments = {"actions": [{"action": "create", "calendar_ref": "cal-a", "event": {"title": "x", "start": "2026-10-20T10:00:00Z"}}]}
+    expected = {
+        "error": "invalid_event",
+        "field_errors": [
+            {"field": "actions/0/event/end", "reason": "required"},
+            {"field": "actions/0/event/timezone", "reason": "required"},
+        ],
+    }
+    with c:
+        headers = {"Authorization": "Bearer " + key}
+        rest = c.post("/v1/plan", json=arguments, headers=headers)
+        mcp = c.post(
+            "/mcp",
+            headers={**headers, "Accept": "application/json, text/event-stream"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "family_plan", "arguments": arguments}},
+        ).json()["result"]
+    assert rest.json() == mcp["structuredContent"] == expected and mcp["isError"] is True
+    assert rest.status_code == 409

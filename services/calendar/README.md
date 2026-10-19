@@ -4,7 +4,7 @@ Shared backlog, priorities and statuses: **[DeedKit BACKLOG](../../BACKLOG.md)**
 
 A separate local service for agent management of several **Google Calendar and iCloud CalDAV** accounts. Version 0.2.0 includes PostgreSQL 18, family roles, explicit grants, duties, a shared agenda/slots and a unified MCP/REST. Creating, moving and deleting individual events has been verified live on the test calendars of both providers.
 
-Connection, startup, roles, agent keys and examples: **[docs/SERVICE.md](docs/SERVICE.md)**. Recurring events are read; changing them, invitations, sharing and linked family projections are not yet enabled in MCP. The original iCloud harness below is kept independent of the service.
+Connection, startup, roles, agent keys and examples: **[docs/SERVICE.md](docs/SERVICE.md)**. Recurring events are read; one occurrence of a series can be updated or cancelled and all-day events can be written (see SERVICE.md). Series-wide changes, this-and-following, invitations, sharing and linked family projections are not yet enabled in MCP. The original iCloud harness below is kept independent of the service.
 
 ## Starting the service
 

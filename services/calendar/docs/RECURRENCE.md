@@ -4,7 +4,7 @@ The original VCALENDAR is copied whole; the needed properties are changed. The m
 
 ## Single and series
 
-`move_single` creates/changes an exception with the original RECURRENCE-ID. `cancel_single` marks such an exception CANCELLED. `shift_series` shifts the master, RDATE/EXDATE and recurrence identities. Previously moved/cancelled exceptions keep their actual absolute time (`preserve_absolute`).
+`move_single` creates/changes an exception with the original RECURRENCE-ID; `edit_single` is the same with title/location/description (the service's occurrence update; a second call updates the same exception, and a UTC identity read from storage is written in the master's own zone). `cancel_single` marks such an exception CANCELLED, keeps the time of an exception moved before, and never adds EXDATE. The service (MCP) uses `edit_single` and `cancel_single` for one occurrence of a Google/CalDAV series (see SERVICE.md); `shift_series` and the splits stay harness-only. `shift_series` shifts the master, RDATE/EXDATE and recurrence identities. Previously moved/cancelled exceptions keep their actual absolute time (`preserve_absolute`).
 
 A nonexistent and an ambiguous local DST time are rejected. When the zone changes, the value gets its own TZID/UTC encoding, and opaque parameters are preserved. Native RANGE exceptions cannot be silently rewritten by an ordinary series shift. Moving a BYDAY series to another weekday is rejected until the rule transformation is implemented.
 

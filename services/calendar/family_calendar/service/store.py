@@ -31,7 +31,7 @@ def instant(value):
         if t.tzinfo is None:
             raise ValueError
         return t.astimezone(timezone.utc)
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError, OverflowError):
         raise CalendarError("invalid_time") from None
 
 
