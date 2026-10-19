@@ -90,7 +90,8 @@ whole stated contract.
   still upload its real report. Fork PRs never receive reporting credentials.
 - Ordinary CI publishes executions; it does not regenerate specs or replace
   test links. Agents review and update behavior changes on the corresponding
-  intent branch, then reconcile source anchors and assertion-level links.
+  intent branch (while the loop is paused, the card's `Tiden branch:`), then
+  reconcile source anchors and assertion-level links.
 - R1 acceptance adds G1–G6 and the calendar read contracts it actually exercises.
   Later increments add G7, calendar mutation/server and calls requirements when
   implemented. No full-platform green verdict while required areas are unrun.
