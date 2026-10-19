@@ -122,6 +122,9 @@ with `operation_not_started`.
 `result.outcome` separately preserves `confirmed`, `submitted` or `unknown` provider
 evidence when it exists. Status is visible only within the originating key/principal's permitted scope.
 No automatic retry of ambiguous writes is provided by the SDK or command worker.
+Native WhatsApp group operations also send each provider query once and answer
+within 20 s; other native WhatsApp mutations still go through the library
+transport, which may resend a frame after a reconnect (docs/whatsapp-native.md).
 
 ## Parameter formats and field errors
 

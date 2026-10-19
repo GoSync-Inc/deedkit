@@ -77,6 +77,16 @@ The account sync status includes `operations.provider_history` for the latest
 native history batch: state, bounded retry count, next attempt and safe reason.
 It is independent of chat coverage and never proves complete history. Its
 `observed_at` and `checked_at` distinguish provider activity from status polling.
+Group operations (`list_participants`, group `chat_info`, `create_group`,
+renames, descriptions, participant changes, `leave_group`, invite links) send
+each group query once (`NoRetry`, `group_iq.go`): whatsmeow's own group helpers
+resend a frame after a reconnect, so a dropped change ends `unknown`, never a
+second write. They answer within 20 s even when the library waits on a lock that
+ignores contexts; after that answer no change starts. A description takes the
+previous topic ID from its target read. Known limits, left to a follow-up:
+message sends, block/unblock, app-state patches and status still use the
+library transport, which resends after a reconnect, and have no native deadline;
+`send_file` has a 90 s IPC wait under the worker's 180 s.
 Reply/edit/revoke/forward/media targets require the original in the native cache;
 an older PostgreSQL-only record can still be read but may return
 `operation_target_unavailable` until native history supplies it.
@@ -110,7 +120,9 @@ Native images include a module/version inventory and dependency license texts
 under `/app/whatsmeow-licenses`. Upstream source for the pinned revision is
 https://github.com/tulir/whatsmeow/tree/f16f9ca30d6a . Changes to MPL-covered files
 must remain available under MPL when distributed; this adapter does not edit
-upstream files. Release source includes the Go module lock and adapter sources.
+upstream files. `group_iq.go` transcribes upstream group node shapes and is
+itself MPL-2.0 (file header). Release source includes the Go module lock and
+adapter sources.
 
 ### Wire receipts and shutdown
 

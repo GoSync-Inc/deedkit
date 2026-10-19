@@ -376,7 +376,7 @@ func TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites(t *testing.
 				}
 				return nil
 			}
-			d.groupDescription = func(_ context.Context, j types.JID, description string) error {
+			d.groupDescription = func(_ context.Context, j types.JID, _ string, description string) error {
 				calls++
 				if j != group || description != "Description" {
 					t.Fatal("wrong description")
