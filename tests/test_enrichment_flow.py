@@ -101,7 +101,7 @@ def test_stored_image_becomes_searchable_attributed_text_through_the_real_worker
             image=[x for x in source['processing_profiles'] if x['kind']=='image']
             assert len(image)==1 and image[0]['provider']=='ollama' and image[0]['model']=='stub-vision'
             assert image[0]['configured'] and image[0]['worker_current']
-            shown=json.dumps(status['structuredContent'])
+            shown=json.dumps(status)
             for hidden in (url,'127.0.0.1:%d'%stub.server_address[1],str(key_file),str(tmp_path),'synthetic-stub-key'):
                 assert hidden not in shown
             with s.pool.connection() as c:
