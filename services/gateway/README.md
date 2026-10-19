@@ -65,6 +65,14 @@ from the schema, never from the submitted value, and an unknown key is named onl
 identifier. Other rejections (non-finite numbers, a non-object body) keep the bare
 `{"error": "invalid_arguments"}`.
 
+A messaging consumption rejection (for example `invalid_feedback`) relays the backend's `field_errors` only when
+the whole list passes `platform_contracts.field_errors.validated` and the tool's reviewed schema: at most 20
+entries, one per field; each `field` a declared path of that tool's input schema (or `arguments`); a `reason`
+from the vocabulary above; `expected` one of a closed set of hints (types, length and count limits, a few fixed
+phrases) or `matching <pattern>` equal to the schema's own pattern; `allowed` at most 50 short values, each one of
+the schema's own enum values or declared keys. Any other list, extra key, non-string reason, text that is not
+valid UTF-8, or an unlisted error code drops `field_errors` altogether; the other backend detail stays dropped.
+
 `platform_capabilities.tools` and a fresh MCP `tools/list` use the same effective
 catalog. Both expose `discovery` metadata (under `_meta["deedkit.discovery"]` for
 `tools/list`): selected tool count, a SHA-256 of the effective public schemas,

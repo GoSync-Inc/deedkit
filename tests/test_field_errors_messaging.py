@@ -141,3 +141,51 @@ def test_integer_map_keys_are_never_named_and_never_raise():
         Model.model_validate({'refs': {12345: [4]}, 'others': 1}, strict=True)
     assert pydantic_field_errors(Model, failure.value.errors(include_input=False)) == [
         {'field': 'refs', 'reason': 'unknown_field'}, {'field': 'others', 'reason': 'type', 'expected': 'object'}]
+
+
+# spec: ANYM-295
+def test_messaging_shape_matches_the_shared_platform_contract():
+    # Messaging stays independent of platform packages at runtime; the gateway validates what it relays.
+    from messaging_service import field_errors as local
+    from messaging_service.feedback import _ref_errors
+    from platform_contracts import field_errors as shared
+    assert (local.FIELD_ERROR_REASONS, local.MAX_FIELD_ERRORS, local.MAX_FIELD_PATH, local.MAX_ALLOWED) == (
+        shared.REASONS, shared.MAX_ENTRIES, shared.MAX_PATH, shared.MAX_ALLOWED)
+    assert local.SEGMENT.pattern == shared.SEGMENT.pattern
+    # What the real builders emit passes the shared check: hints from the closed set (or a schema pattern), bounded values.
+    bad = dict(request_id='short', category='bugs', description='  ', operation='Nope', refs={'x': [3]})
+    other = dict(request_id=CANARY * 10, category=CANARY, description=CANARY * 400, operation=CANARY,
+        refs={CANARY: [CANARY], 'chat_ids': [CANARY] * 40, 'message_ids': [3, '', 'a' * 257, 'a\x00']}, **{CANARY: CANARY})
+    emitted = [local.one_per_field(local.field_error(*e) for e in _ref_errors(other['refs'])),
+               [local.field_error('description', 'blank', 'text with a non-space character'),
+                local.field_error('refs', 'size', 'at most 8 KiB'),
+                local.field_error('reply_to_send', 'required', 'set when wake_rules has reply_to_confirmed_send')]]
+    for args in (bad, other):
+        store = Store()
+        with TestClient(create_app(store, ['testserver'])) as client:
+            response = client.post('/v1/submit_feedback', headers=HEADERS, json=args)
+        assert response.status_code == 400
+        emitted.append(response.json()['field_errors'])
+    for entries in emitted:
+        assert entries and shared.validated(entries) == entries
+    assert shared.validated([{**emitted[0][0], 'expected': 'invented text'}]) is None
+
+
+# spec: ANYM-295
+def test_every_hint_literal_of_the_feedback_and_argument_checks_is_in_the_shared_hint_set():
+    import ast
+    import pathlib
+    import messaging_service
+    from platform_contracts import field_errors as shared
+    root = pathlib.Path(messaging_service.__file__).parent
+    found = set()
+    for name in ('feedback.py', 'app.py'):
+        for node in ast.walk(ast.parse((root / name).read_text())):
+            # `(field, reason, hint, ...)` error tuples; a hint may be a conditional between two literals.
+            if isinstance(node, ast.Tuple) and len(node.elts) >= 3 and isinstance(node.elts[0], ast.Constant) and (
+                    reasons := {n.value for n in ast.walk(node.elts[1]) if isinstance(n, ast.Constant) and isinstance(n.value, str)}) and reasons <= shared.REASONS:
+                found.update(n.value for n in ast.walk(node.elts[2]) if isinstance(n, ast.Constant) and isinstance(n.value, str))
+    assert {'8–128 characters: letters, digits and _ . : -', 'a documented operation name', 'at most 8 KiB',
+            'no control characters except newline and tab', 'string'} <= found
+    assert [hint for hint in sorted(found) if not shared.hint(hint)] == []
+    assert shared.hint('at most 9007199254740991') and not shared.hint('at most 90071992547409910')

@@ -7,7 +7,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from agent_gateway.catalog import CATALOG, InvalidArguments, arguments
-from agent_gateway.field_errors import REASONS
+from platform_contracts.field_errors import REASONS
 from test_diagnostics import configured, HEADERS
 
 
