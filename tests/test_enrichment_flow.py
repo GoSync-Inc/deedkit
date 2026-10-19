@@ -42,13 +42,15 @@ def test_stored_image_becomes_searchable_attributed_text_through_the_real_worker
     s,_,reader=seeded
     outsider=s.issue_key('agent-whatsapp-only',['whatsapp-demo-1'])
     png=b'\x89PNG\r\n\x1a\nsynthetic-image-bytes'
+    key_file=tmp_path/'stub-model-key';key_file.write_text('synthetic-stub-key');key_file.chmod(0o600)
+    with s.pool.connection() as c:sent=c.execute('SELECT count(*) n FROM outgoing_messages').fetchone()['n']
     add_file(s,'flow-image','demo-tg-1',png,'chart.png','image/png')
     drain(worker_for(s))
     stub=Stub();threading.Thread(target=stub.serve_forever,daemon=True).start()
     try:
         url='http://127.0.0.1:%d'%stub.server_address[1]
         profile=validate_profile({'provider':'ollama','model':'stub-vision','local_only_daemon':True,'base_url':url,
-            'timeout_seconds':30},'image')
+            'api_key_file':str(key_file),'timeout_seconds':30},'image')
         cfg={'accounts':['telegram-demo'],'max_jobs_per_day':20,'profiles':{'image':profile}}
         with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
         first=EnrichmentWorker(s.pool.conninfo,s.files,cfg,lock_directory=str(tmp_path))
@@ -71,6 +73,8 @@ def test_stored_image_becomes_searchable_attributed_text_through_the_real_worker
         # The instruction inside the text stays derived data, labelled as model output.
         assert row['metadata']['generated_by_model'] is True and row['metadata']['prompt_version']=='file-description-v2'
         assert row['provider']=='ollama' and row['model']=='stub-vision'
+        with s.pool.connection() as c:
+            assert c.execute('SELECT count(*) n FROM outgoing_messages').fetchone()['n']==sent
         with TestClient(create_app(s,['testserver'])) as client:
             headers={'Authorization':'Bearer '+reader,'Accept':'application/json, text/event-stream'}
             found=call(client,headers,'search_files',{'query':'zephyrmarker'})
@@ -98,6 +102,9 @@ def test_stored_image_becomes_searchable_attributed_text_through_the_real_worker
             assert len(image)==1 and image[0]['provider']=='ollama' and image[0]['model']=='stub-vision'
             assert image[0]['configured'] and image[0]['worker_current']
             shown=json.dumps(status['structuredContent'])
-            assert url not in shown and str(stub.server_address[1]) not in shown and str(tmp_path) not in shown
+            for hidden in (url,'127.0.0.1:%d'%stub.server_address[1],str(key_file),str(tmp_path),'synthetic-stub-key'):
+                assert hidden not in shown
+            with s.pool.connection() as c:
+                assert c.execute('SELECT count(*) n FROM outgoing_messages').fetchone()['n']==sent
     finally:
         stub.shutdown();stub.server_close()
