@@ -14,6 +14,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
+
+RETRY_DELAY = 2  # seconds before the one retry of a command
 
 
 class SnapshotError(RuntimeError):
@@ -83,6 +86,15 @@ class CLI:
         self.repo, self.product_id, self.workspace_id, self.branch = repo, product_id, workspace_id, branch
 
     def call(self, *args):
+        """A read-only Tiden command; a failed one is repeated once."""
+        try:
+            return self.once(*args)
+        except (SnapshotError, subprocess.TimeoutExpired):
+            pass
+        time.sleep(RETRY_DELAY)
+        return self.once(*args)
+
+    def once(self, *args):
         result = subprocess.run(["tiden", *args, "--format", "json", "--workspace-id", self.workspace_id],
                                 cwd=self.repo, capture_output=True, text=True, timeout=90)
         if result.returncode:

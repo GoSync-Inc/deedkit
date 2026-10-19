@@ -252,7 +252,7 @@ def diff_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Test]
 
 def listing(cli: str, product: str, branch: str) -> dict[int, dict]:
     """Specs of one Tiden branch by number, validated as complete; each keeps its sources."""
-    value = tiden(cli, ["spec", "list", "--branch", branch, "--include-sources"], product)
+    value = tiden(cli, ["spec", "list", "--branch", branch, "--include-sources"], product, retry=True)
     specs, pagination = value.get("requirements"), value.get("pagination")
     if (not isinstance(specs, list) or not isinstance(pagination, dict) or pagination.get("nextPageToken") != ""
             or type(pagination.get("totalCount")) is not int or pagination["totalCount"] != len(specs)):
@@ -299,7 +299,7 @@ def story(spec: dict) -> bool:
 
 
 def branch_status(cli: str, product: str, name: str) -> str | None:
-    value = tiden(cli, ["branch", "list"], product)
+    value = tiden(cli, ["branch", "list"], product, retry=True)
     branches = value.get("branches")
     if not isinstance(branches, list) or not all(isinstance(branch, dict) for branch in branches):
         raise Refused("the branch listing is malformed")

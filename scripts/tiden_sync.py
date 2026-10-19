@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import REPOSITORY, Refused, excluded, shown, tiden  # noqa: E402
@@ -50,6 +51,7 @@ PREVIEW_EMPTY = ("deletions", "testAdditions", "testModifications", "testDeletio
                  "componentModifications", "componentDeletions")
 PREVIEW_OTHER = ("stats", "intentSession", "blockingSessions", "hasRequirementChanges")
 TIMEOUT = 120
+RETRY_DELAY = 2  # seconds before the one retry of a read
 # Recovery stays inside the workflow's concurrency group; a write by hand outside it can drop sources a run adds.
 RECOVER = "rerun this job or dispatch this SHA from main (TIDEN-CI.md, main sync)"
 WINDOW = "only in a maintenance window, with the sync workflow disabled and no run in progress (TIDEN-CI.md)"
@@ -68,7 +70,16 @@ def write(cli: str, arguments: list[str], product: str | None) -> None:
 
 
 def read(cli: str, arguments: list[str]) -> dict:
-    """A read by global ID, without `--product-id`, validated like tiden_drift.tiden."""
+    """A read by global ID, without `--product-id`, validated like tiden_drift.tiden; a failed read is repeated once."""
+    try:
+        return read_once(cli, arguments)
+    except Refused:
+        pass
+    time.sleep(RETRY_DELAY)
+    return read_once(cli, arguments)
+
+
+def read_once(cli: str, arguments: list[str]) -> dict:
     try:
         completed = subprocess.run([cli, *arguments, "--format", "json"], capture_output=True, text=True,
                                    timeout=TIMEOUT)
@@ -173,7 +184,7 @@ def merge(cli: str, product: str, name: str, named: list[int], report, dry: bool
     if status != "open":
         raise StepFailed("merge", f"{name} is {'missing' if status is None else status}, not open")
     try:
-        preview = tiden(cli, ["branch", "merge-preview", "--name", name], product)
+        preview = tiden(cli, ["branch", "merge-preview", "--name", name], product, retry=True)
     except Refused as error:
         raise StepFailed("merge", str(error)) from None
     numbers = preview_numbers(preview, name)
@@ -200,7 +211,7 @@ def merge(cli: str, product: str, name: str, named: list[int], report, dry: bool
 
 
 def identities(cli: str, product: str) -> list[dict]:
-    value = tiden(cli, ["test", "list", "--all", "--view", "identity"], product)
+    value = tiden(cli, ["test", "list", "--all", "--view", "identity"], product, retry=True)
     rows, pagination = value.get("identities"), value.get("pagination")
     if (not isinstance(rows, list) or not isinstance(pagination, dict) or pagination.get("nextPageToken") != ""
             or type(pagination.get("totalCount")) is not int or pagination["totalCount"] != len(rows)

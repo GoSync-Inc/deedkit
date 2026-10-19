@@ -50,6 +50,7 @@ BARE_GO_TEST = re.compile(r"[^/]*_test\.go")
 ROUTER_SIGNATURE = "s:github.com/GoSync-Inc/deedkit/services/release-router::"
 SHA = re.compile(r"[0-9a-f]{40}")
 TIMEOUT = 120
+RETRY_DELAY = 2  # seconds before the one retry of a listing
 PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
 
 
@@ -148,6 +149,15 @@ class Tiden:
         self.cli, self.product, self.workspace = cli, product, workspace
 
     def call(self, *arguments: str) -> dict:
+        """One listing; a failed one is repeated once, since nothing here writes."""
+        try:
+            return self.once(*arguments)
+        except Unknown:
+            pass
+        time.sleep(RETRY_DELAY)
+        return self.once(*arguments)
+
+    def once(self, *arguments: str) -> dict:
         label = " ".join(arguments[:2])
         try:
             completed = subprocess.run([self.cli, *arguments, "--product-id", self.product, "--workspace-id",
