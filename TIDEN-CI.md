@@ -354,6 +354,12 @@ GitHub keeps one waiting run and drops an older waiting one. A later run does no
 cover an earlier commit, so dispatch a dropped run again from main with its SHA
 (`gh workflow run tiden-sync.yml --ref main -f sha=<sha>`).
 
+The run title (`run-name`) is `Tiden sync <sha>`: the commit the run processes,
+which is `github.event.workflow_run.head_sha` (the CI run's commit) for a
+`workflow_run` run and `inputs.sha` for a dispatch. The run's own `head_sha` is
+the default-branch commit and says nothing about it, so `Tiden health` finds the
+sync of its TARGET by this title (ANYM-438).
+
 The sync writes to Tiden since check A ran green on three pull requests. The
 agent that merged waits for the sync run of its squash and reads back the result
 (AGENTS.md section 4). A failed or dropped run is recovered only by dispatching
@@ -414,9 +420,11 @@ still matches the code (ANYM-360). It runs when a `CI` run of a `main` push
 completes, whatever its conclusion, and on dispatch from `main`; the job's `if:`
 and a shell guard refuse any other upstream event or branch. Runs never overlap
 (one concurrency group, no cancelling). Each run checks out `main` as it is when
-it starts and freezes that HEAD as TARGET. It has `contents: read`, no persisted
-Git credential, the pinned CLI 0.33.0 called by its path, and the token only in
-its report step. It is not a required check: a red run blocks no merge, release
+it starts and freezes that HEAD as TARGET. It has no persisted
+Git credential, the pinned CLI 0.33.0 called by its path, and the Tiden token only
+in its report step. Its permissions are `contents: read` and `actions: read`
+(ANYM-438, the sync lookup below, no write scope); the job's `GITHUB_TOKEN`
+reaches the report step alone, as `GH_TOKEN`. It is not a required check: a red run blocks no merge, release
 or promotion, and `CI`, `CI gate`, `checks / verify`, the seven `anymsg-ci::*`
 checks, `deploy/main-ruleset.json` and `production.py verify` do not read it.
 
@@ -458,6 +466,39 @@ listing counts only when it ends with an empty `nextPageToken`, its integer
 equals its sources, each with a unique ID and a type. The artifact keeps every
 stale anchor path in full; the summary shortens and escapes it. CLI errors name
 the command only, never the response.
+
+The unlinked-test count is read only after the sync of TARGET (ANYM-438). `Tiden
+health` and `Tiden sync` both start from the same `CI` run, in different
+concurrency groups, so without this order the health run could list a test that
+the sync was about to link. Before it reads the case inventory, the report lists
+the `Tiden sync` runs of `main` created since one day before the commit date of
+TARGET (a run that processes TARGET cannot be older; a rerun keeps its
+`created_at`, so none is hidden by age). The lookup is
+`gh api repos/<repo>/actions/workflows/tiden-sync.yml/runs`, every page until
+the rows equal `total_count`; its pages share one budget of 120 seconds or what is left of the deadline below, whichever is less, and a
+window GitHub cannot list completely (it caps a filtered search at 1000 runs)
+is a lookup error. The report keeps those whose title is `Tiden sync <TARGET>`
+(above), ignoring runs with conclusion `skipped`. While any kept run is queued,
+in progress or waiting it checks again every 30 seconds; when none is active, the
+kept run that completed last decides (`updated_at`, which a rerun moves forward;
+ties go to the greater run ID, then attempt). The wait shares the 30-minute
+deadline of the test evidence, counted from the start of the report; it resets no
+other deadline. A decisive run with conclusion `success` is the normal path,
+once a second look after the case inventory read finds the kept runs unchanged
+(same runs, attempts, states and completion times); if a rerun or a new run
+began meanwhile, the inventory is discarded, the wait starts again within the
+same deadline and the inventory is read again.
+Another conclusion, no kept run, a run still active at the deadline, or a failed
+lookup (`gh` missing or timed out, API denied, malformed JSON, incomplete pages)
+makes only the unlinked-test metric unknown, with the run URL and conclusion or
+the command name, because the links of TARGET may be missing; the other three
+metrics, the summary and the artifact are as before. `tiden-health.json` and the
+summary hold a `sync` object: `target`, `run_id`, `run_attempt`, `url`,
+`conclusion` and `completed_at` (all `null` when no run finished), and
+`inventory_read_at`, when the case inventory read began. Run locally without
+`--sync-repository`, the report skips this wait and says so (`checked: false`).
+Rerun a failed `Tiden health` run after a missing or failed sync is repaired, as
+before; the ordering race itself needs no rerun.
 
 A historical anchor is provenance, not staleness: the 2026-10-16 reconciliation
 kept the former repository's anchors with their receipts and anchored each moved
