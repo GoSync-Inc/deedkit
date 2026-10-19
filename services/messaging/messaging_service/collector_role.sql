@@ -1,5 +1,8 @@
 -- Operator-only grant template. Run in the archive database after migrations.
 -- Set the password separately through a private operator connection; no secret here.
+-- Account isolation (schema 37): install one copy per account under its own role name and
+-- bind it with INSERT INTO collector_account_roles(role_name,account). A bound role writes
+-- only its account's rows; an unbound role keeps these grants for every account.
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='messaging_collector') THEN
         CREATE ROLE messaging_collector LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE

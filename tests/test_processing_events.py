@@ -242,7 +242,8 @@ def test_expired_multi_account_publication_does_not_deadlock_ingestion_or_queue_
                     if 'pg_advisory_xact_lock(hashtextextended' in query:
                         lock_kind = 'lifecycle' if params[0] == 'attachment-residency-v1' else 'account'
                         trace.append((transaction_id, lock_kind, params[0]))
-                    elif query.startswith('UPDATE feed_counter'):
+                    # Schema 37 advances the counter inside the fenced publication function.
+                    elif query.startswith('UPDATE feed_counter') or query.startswith('SELECT public.publish_file_'):
                         trace.append((transaction_id, 'feed', None))
                         first_feed.set()
                     elif 'FOR UPDATE' in query and 'SKIP LOCKED' in query:
