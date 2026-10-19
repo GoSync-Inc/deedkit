@@ -85,7 +85,8 @@ second write. They answer within 20 s even when the library waits on a lock that
 ignores contexts; after that answer no change starts. A description takes the
 previous topic ID from its target read. A failed send keeps its reply waiter
 until the reply or the next disconnect (closing it races the receive loop). Group
-cache refreshes apply in reply order off the reply path; a change waits for its
+cache refreshes apply in reply order off the reply path, and a slow LID or
+contact store write never delays a later cache write; a change waits for its
 target read's refresh. Known limits, left to a follow-up (ANYM-441):
 message sends, block/unblock, app-state patches and status still use the
 library transport, which resends after a reconnect, and have no native deadline;

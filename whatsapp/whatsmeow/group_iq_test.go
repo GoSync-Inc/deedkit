@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
@@ -511,7 +513,7 @@ func TestGroupRefreshOrdering(t *testing.T) {
 	ctx := context.Background()
 	group := types.NewJID("15550000000-123456789", types.GroupServer)
 	t.Run("refreshes apply one at a time in reply order", func(t *testing.T) {
-		var r groupRefresher
+		var r refreshQueue
 		var mu sync.Mutex
 		var order []int
 		record := func(i int) {
@@ -562,6 +564,35 @@ func TestGroupRefreshOrdering(t *testing.T) {
 		cached, err := w.client.DangerousInternals().GetCachedGroupData(ctx, group)
 		if err != nil || !reflect.DeepEqual(cached.Members, []types.JID{types.NewJID("111", types.HiddenUserServer)}) {
 			t.Fatalf("older snapshot won: %#v %v", cached, err)
+		}
+	})
+	// Sol r2 on #186: a stalled store write of an earlier read must not hold a
+	// later read's cache write back past a provider membership notification.
+	t.Run("a stalled store write never delays a cache write past a notification", func(t *testing.T) {
+		w := newWiredClient(t)
+		single := waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"id": "15550000000-123456789", "subject": "Synthetic"}, Content: []waBinary.Node{
+			{Tag: "participant", Attrs: waBinary.Attrs{"jid": types.NewJID("15550009999", types.DefaultUserServer)}}}}
+		g := w.groupIQ(func(int, whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) { return iqResult(single), nil })
+		w.block()
+		for range 2 {
+			if _, err := g.info(ctx, group); err != nil {
+				t.Fatal(err)
+			}
+		}
+		prompt, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := w.iq.cache.wait(prompt); err != nil {
+			t.Fatalf("cache write waited behind a stalled store write: %v", err)
+		}
+		joined := types.NewJID("15550008888", types.DefaultUserServer)
+		w.client.DangerousInternals().UpdateGroupParticipantCache(&events.GroupInfo{JID: group, Join: []types.JID{joined}})
+		w.release()
+		if err := g.settle(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cached, err := w.client.DangerousInternals().GetCachedGroupData(ctx, group)
+		if err != nil || !slices.Contains(cached.Members, joined) {
+			t.Fatalf("queued snapshot erased the notification: %#v %v", cached, err)
 		}
 	})
 	t.Run("a change starts after its target read is cached", func(t *testing.T) {

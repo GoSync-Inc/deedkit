@@ -62,22 +62,38 @@ func newGroupIQ(c *whatsmeow.Client, refresher *groupRefresher) groupIQ {
 		parse: in.ParseGroupNode, pnForLID: c.Store.LIDs.GetPNForLID, tcToken: in.EnsureTCToken,
 		newID: func() string { return string(c.GenerateMessageID()) },
 		refresh: func(info *types.GroupInfo) {
-			refresher.enqueue(func() {
-				storeGroupInfo(info, in.CacheGroupInfo, c.Store.LIDs.PutManyLIDMappings, c.Store.Contacts.PutManyRedactedPhones,
-					func(format string, args ...any) { c.Log.Warnf(format, args...) })
+			refresher.cache.enqueue(func() {
+				lids, phones := in.CacheGroupInfo(info, true)
+				refresher.store.enqueue(func() {
+					storeGroupInfo(info, lids, phones, c.Store.LIDs.PutManyLIDMappings, c.Store.Contacts.PutManyRedactedPhones,
+						func(format string, args ...any) { c.Log.Warnf(format, args...) })
+				})
 			})
 		}, settle: refresher.wait}
 }
 
-// groupRefresher applies group reads' local side effects one at a time, in the
-// order of the replies, so an older snapshot never replaces a newer one. One
-// per Provider; a stalled refresh delays only later refreshes and changes.
-type groupRefresher struct {
+// groupRefresher applies group reads' local side effects in the order of the
+// replies, so an older read never replaces a newer one. One per Provider. Cache
+// writes have their own queue: like the pinned getGroupInfo they wait only on
+// the library's group cache lock, which provider notifications also take, and
+// never behind a slow LID or contact store write.
+type groupRefresher struct{ cache, store refreshQueue }
+
+// wait returns once every queued cache write and store write is applied.
+func (r *groupRefresher) wait(ctx context.Context) error {
+	if err := r.cache.wait(ctx); err != nil {
+		return err
+	}
+	return r.store.wait(ctx)
+}
+
+// refreshQueue runs its functions one at a time in enqueue order.
+type refreshQueue struct {
 	mu   sync.Mutex
 	tail chan struct{}
 }
 
-func (r *groupRefresher) enqueue(fn func()) {
+func (r *refreshQueue) enqueue(fn func()) {
 	r.mu.Lock()
 	prev, done := r.tail, make(chan struct{})
 	r.tail = done
@@ -91,7 +107,7 @@ func (r *groupRefresher) enqueue(fn func()) {
 	}()
 }
 
-func (r *groupRefresher) wait(ctx context.Context) error {
+func (r *refreshQueue) wait(ctx context.Context) error {
 	r.mu.Lock()
 	tail := r.tail
 	r.mu.Unlock()
@@ -160,14 +176,13 @@ func sendGroupQuery(ctx context.Context, wire iqWire, q whatsmeow.DangerousInfoQ
 	}
 }
 
-// storeGroupInfo mirrors the tail of the pinned getGroupInfo: cache first, then
-// best-effort storage whose errors are only logged.
-func storeGroupInfo(info *types.GroupInfo, cache func(*types.GroupInfo, bool) ([]store.LIDMapping, []store.RedactedPhoneEntry),
+// storeGroupInfo mirrors the tail of the pinned getGroupInfo after its cache
+// write: best-effort storage whose errors are only logged.
+func storeGroupInfo(info *types.GroupInfo, lids []store.LIDMapping, phones []store.RedactedPhoneEntry,
 	putLIDs func(context.Context, []store.LIDMapping) error, putPhones func(context.Context, []store.RedactedPhoneEntry) error,
 	warn func(string, ...any)) {
 	ctx, done := context.WithTimeout(context.Background(), time.Minute)
 	defer done()
-	lids, phones := cache(info, true)
 	if err := putLIDs(ctx, lids); err != nil {
 		warn("Failed to store LID mappings for members of %s: %v", info.JID, err)
 	}
