@@ -202,9 +202,9 @@ class RouterProof:
             "version": 1, "target": "http-router", "sha": sha,
             "image": metadata["Id"], "ci": {"sha": sha, "ci": "synthetic"},
         })
-        # Only GitHub's external CI lookup is synthetic. Bootstrap still checks
-        # the actual immutable image, revision/source labels and generated unit.
-        with patch.object(release.p, "verify", return_value={"sha": sha, "ci": "synthetic"}):
+        # Only the main membership and attestation lookup is synthetic. Bootstrap
+        # still checks the actual immutable image, revision/source labels and generated unit.
+        with patch.object(release.p, "promotable", return_value={"sha": sha, "ci": "synthetic"}):
             artifact = release.bootstrap(self.settings, sha)
         unit = json.loads(Path(artifact["compose"]).read_text())["services"]["router"]
         assert not unit.get("ports")
