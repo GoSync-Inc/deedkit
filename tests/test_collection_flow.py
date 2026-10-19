@@ -108,12 +108,18 @@ def test_both_providers_backfill_live_restart_and_status_through_mcp(worker,wa):
         for old in (tg,w):  # The old instances lost their lease and cannot consume what they left behind.
             with pytest.raises(RuntimeError,match='lease_lost'):(old.spool if old is tg else old.events_spool).drain(old.state.apply)
         assert len(list(tg2.spool.path.glob('*.json')))==2 and len(list(w2.events_spool.path.glob('*.json')))==2
-        # The providers now carry the live changes: an edited 5, 6 and 7, and no deleted 4.
+        # The providers now carry the live changes: an edited 5, 6 and 7, and no deleted 4 (the tombstones must survive without them).
         tg2.provider.messages=[m for m in tg2.provider.messages if m.id not in (4,5)]+[edited,message(6),message(7)]
         w2.provider.messages=[e for e in w2.provider.messages if e['messageId']!=event(4)['messageId'] and e['messageId']!=event(5)['messageId']]+[
             event(5,body='corrected',edited=1791840000000),event(6),event(7)]
         tg2.spool.drain(tg2.state.apply);w2.events_spool.drain(w2.state.apply)
         assert not list(tg2.spool.path.glob('*.json')) and not list(w2.events_spool.path.glob('*.json'))
+        # Only the drain has run: the spooled captures are archived, and no cursor moved.
+        drained=rows(client,key)
+        assert len(drained)==len({(a,t) for a,t,_ in drained})==10
+        assert {(a,t) for a,t,_ in drained}>={(tg.account,'message 7'),(w.account,'item 7')}
+        assert (tg2.state.chat('100','user')['high_water'],w2.state.progress('123@c.us','user')['head'])==before
+        tg2.provider.reads.clear()
         for _ in range(3):asyncio.run(tg2.sync_once());asyncio.run(w2.sync_once())
         found=rows(client,key)
         assert len(found)==len({(a,t) for a,t,_ in found})==10
@@ -122,6 +128,7 @@ def test_both_providers_backfill_live_restart_and_status_through_mcp(worker,wa):
         assert tombstone(client,key,tg.account,'100','4') and tombstone(client,key,w.account,'123@c.us',event(4)['messageId'])
         after=(tg2.state.chat('100','user')['high_water'],w2.state.progress('123@c.us','user')['head'])
         assert after[0]>=before[0] and after[1]>=before[1]
+        assert tg2.provider.reads and all(read[1]>=before[0] for read in tg2.provider.reads if read[3])
         assert tg2.state.chat('100','user')['window_complete'] and w2.state.progress('123@c.us','user')['history_exhausted']
 
         # Health: both sources show the three phases; a connection failure degrades only its own source.
@@ -132,10 +139,11 @@ def test_both_providers_backfill_live_restart_and_status_through_mcp(worker,wa):
             phases=source(client,key,account)['operations']
             assert phases['connection']['state']=='connected' and phases['live_capture']['state']=='receiving'
             assert phases['history']['state']=='partial' and phases['connection']['collector_running'] is True
-        tg2.state.connection_failed('provider_unavailable')
+        tg2.state.connection_failed('provider_disconnected')
         tg2.state.status('degraded','provider_temporarily_unavailable')
         broken=source(client,key,tg.account)
         assert broken['status']=='degraded' and broken['operations']['connection']['state']=='retry_wait'
+        assert broken['operations']['connection']['reason_code']=='provider_disconnected'
         assert broken['operations']['live_capture']['state']=='paused' and broken['liveness']['connected'] is False
         healthy=source(client,key,w.account)
         assert healthy['status']=='receiving' and healthy['operations']['connection']['state']=='connected'
