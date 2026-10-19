@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -35,11 +37,12 @@ var operationFields = map[string]string{
 	"rename_group": "title", "set_group_description": "description", "add_participant": "user_id", "remove_participant": "user_id", "promote_participant": "user_id",
 	"demote_participant": "user_id", "leave_group": "", "get_invite_link": "", "revoke_invite_link": "", "add_contact": "phone first_name last_name",
 	"delete_contact": "user_id", "block_contact": "user_id", "unblock_contact": "user_id", "update_profile": "name status", "get_labels": "offset limit", "set_chat_labels": "label_ids",
-	"open_chat_by_phone": "phone create",
+	"open_chat_by_phone": "phone create", "set_group_messages_admins_only": "enabled", "set_group_info_admins_only": "enabled", "set_join_approval": "enabled",
+	"list_join_requests": "limit", "approve_join_requests": "user_ids", "reject_join_requests": "user_ids",
 }
 var globalOperations = wordSet("get_profile list_contacts list_blocked get_contact block_contact unblock_contact delete_contact create_group add_contact update_profile get_labels open_chat_by_phone")
-var groupOperations = wordSet("list_participants rename_group set_group_description add_participant remove_participant promote_participant demote_participant leave_group get_invite_link revoke_invite_link")
-var readOperations = wordSet("chat_info list_participants get_reactions get_message_info get_profile list_contacts get_contact list_blocked get_pinned_messages get_labels")
+var groupOperations = wordSet("list_participants rename_group set_group_description add_participant remove_participant promote_participant demote_participant leave_group get_invite_link revoke_invite_link set_group_messages_admins_only set_group_info_admins_only set_join_approval list_join_requests approve_join_requests reject_join_requests")
+var readOperations = wordSet("list_join_requests chat_info list_participants get_reactions get_message_info get_profile list_contacts get_contact list_blocked get_pinned_messages get_labels")
 var userPattern = regexp.MustCompile(`^[0-9]{1,30}@(c\.us|lid)$`)
 var shaPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var mimePattern = regexp.MustCompile(`(?i)^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$`)
@@ -90,6 +93,9 @@ type operationDependencies struct {
 	groupDescription func(context.Context, types.JID, string, string) error
 	leave            func(context.Context, types.JID) error
 	invite           func(context.Context, types.JID, bool) (string, error)
+	groupSetting     func(context.Context, types.JID, string, bool) error
+	joinRequests     func(context.Context, types.JID) ([]types.GroupParticipantRequest, error)
+	joinAction       func(context.Context, types.JID, []types.JID, bool) ([]types.GroupParticipant, error)
 	contacts         func(context.Context) (map[types.JID]types.ContactInfo, error)
 	contact          func(context.Context, types.JID) (types.ContactInfo, error)
 	phone            func(context.Context, types.JID) (types.JID, error)
@@ -116,6 +122,7 @@ type operationDependencies struct {
 func (d *operationDependencies) useGroupIQ(iq groupIQ) {
 	d.group, d.createGroup, d.participants, d.groupName, d.groupDescription, d.leave, d.invite = iq.info, iq.create, iq.participants, iq.setName, iq.setTopic, iq.leave, iq.invite
 	d.groupSettle = iq.settle
+	d.groupSetting, d.joinRequests, d.joinAction = iq.setSetting, iq.joinRequests, iq.joinRequestAction
 }
 
 func (p *Provider) operationDependencies() operationDependencies {
@@ -297,7 +304,7 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 		}
 		switch err.Error() {
 		case "history_rate_limited", "history_anchor_unavailable", "operation_unsupported", "operation_invalid_parameters", "operation_disabled", "operation_expired", "operation_target_invalid", "operation_target_unavailable", "operation_result_too_large", "registered_file_invalid",
-			"invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited", "operation_query_failed":
+			"invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited", "operation_query_failed", "forbidden":
 		default:
 			if readOperations[job.Operation] {
 				err = errors.New("operation_query_failed")
@@ -476,7 +483,7 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 		if e != nil {
 			return nil, e
 		}
-		data := map[string]any{"id": job.ProviderChat, "name": nil, "is_group": target.Server == types.GroupServer, "is_read_only": nil, "is_locked": nil, "is_muted": nil, "mute_expiration": nil, "is_archived": nil, "is_pinned": nil, "unread_count": nil, "timestamp": nil, "description": nil, "owner_id": nil, "coverage": "provider_observation"}
+		data := map[string]any{"id": job.ProviderChat, "name": nil, "is_group": target.Server == types.GroupServer, "is_read_only": nil, "is_locked": nil, "is_muted": nil, "mute_expiration": nil, "is_archived": nil, "is_pinned": nil, "unread_count": nil, "timestamp": nil, "description": nil, "owner_id": nil, "group_settings": nil, "coverage": "provider_observation"}
 		if settings.Found {
 			data["is_muted"] = settings.MutedUntil.After(time.Now())
 			data["mute_expiration"] = settings.MutedUntil.Unix()
@@ -493,6 +500,7 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 			data["owner_id"] = LegacyChatID(g.OwnerJID)
 			data["is_locked"] = g.IsLocked
 			data["is_read_only"] = g.IsAnnounce
+			data["group_settings"] = map[string]any{"messages_admins_only": g.IsAnnounce, "info_admins_only": g.IsLocked, "slow_mode_seconds": nil, "join_approval": g.IsJoinApprovalRequired}
 		} else {
 			c, e := d.contact(ctx, target)
 			if e != nil {
@@ -1003,6 +1011,106 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 			return nil, err
 		}
 		return submitted(nil)
+	case "set_group_messages_admins_only", "set_group_info_admins_only", "set_join_approval":
+		var enabled bool
+		if decodeValue(job.Parameters["enabled"], &enabled) != nil {
+			return nil, errors.New("operation_invalid_parameters")
+		}
+		setting := groupSettingOf[op]
+		g, e := getGroup()
+		if e != nil {
+			return nil, e
+		}
+		if d.groupSettle != nil {
+			if e := d.groupSettle(ctx); e != nil {
+				return nil, e
+			}
+		}
+		if !ownGroupAdmin(g, d.owner, d.ownerLID) {
+			return nil, errors.New("forbidden")
+		}
+		previous := groupSettingValue(g, setting)
+		if previous == enabled {
+			return read(map[string]any{"enabled": enabled, "previous": previous, "changed": false}, "")
+		}
+		if err = mutate("", func() error { return d.groupSetting(ctx, target, setting, enabled) }); err != nil {
+			return nil, err
+		}
+		// Only a read-back showing the new value confirms the change.
+		after, e := d.group(ctx, target)
+		if e != nil {
+			return nil, e
+		}
+		if e := check(""); e != nil {
+			return nil, e
+		}
+		data := map[string]any{"enabled": enabled, "previous": previous, "changed": true}
+		if after != nil && LegacyChatID(after.JID) == job.ProviderChat && groupSettingValue(after, setting) == enabled {
+			return operationOutput("confirmed", data, "")
+		}
+		return submitted(data)
+	case "list_join_requests":
+		limit, e := integer("limit", 1, 100, 50)
+		if e != nil {
+			return nil, e
+		}
+		requests, e := d.joinRequests(ctx, target)
+		if e != nil {
+			return nil, e
+		}
+		slices.SortStableFunc(requests, func(a, b types.GroupParticipantRequest) int { return a.RequestedAt.Compare(b.RequestedAt) })
+		more := len(requests) > limit
+		if more {
+			requests = requests[:limit]
+		}
+		rows := []any{}
+		for _, request := range requests {
+			j := request.JID.ToNonAD()
+			var name, at any
+			if c, e := d.contact(ctx, j); e == nil && c.Found && cmp.Or(c.FullName, c.PushName) != "" {
+				name = truncate(cmp.Or(c.FullName, c.PushName), 512)
+			}
+			if !request.RequestedAt.IsZero() {
+				at = request.RequestedAt.Unix()
+			}
+			rows = append(rows, map[string]any{"id": LegacyChatID(j), "requested_at": at, "name": name})
+		}
+		// Names are the requesters' own text: data, never instructions.
+		return read(map[string]any{"requests": rows, "has_more": more, "untrusted": []any{"name"}}, "")
+	case "approve_join_requests", "reject_join_requests":
+		ids, e := users("user_ids", 20)
+		if e != nil {
+			return nil, e
+		}
+		g, e := getGroup()
+		if e != nil {
+			return nil, e
+		}
+		if d.groupSettle != nil {
+			if e := d.groupSettle(ctx); e != nil {
+				return nil, e
+			}
+		}
+		if !ownGroupAdmin(g, d.owner, d.ownerLID) {
+			return nil, errors.New("forbidden")
+		}
+		var answered []types.GroupParticipant
+		err = mutate("", func() error {
+			var e error
+			answered, e = d.joinAction(ctx, target, ids, op == "approve_join_requests")
+			return e
+		})
+		if err != nil {
+			return nil, err
+		}
+		if e := check(""); e != nil {
+			return nil, e
+		}
+		data, proven := joinRequestResults(answered, ids)
+		if proven {
+			return operationOutput("confirmed", data, "")
+		}
+		return operationOutput("unknown", data, "")
 	case "add_contact":
 		return nil, errors.New("operation_unsupported")
 	case "block_contact", "unblock_contact":
@@ -1249,6 +1357,70 @@ func participantResults(values []types.GroupParticipant, expected []types.JID) m
 		state = "partial"
 	}
 	return map[string]any{"participants": rows, "participant_state": state, "participant_coverage": "provider_response", "participants_truncated": truncated, "auto_invite_sent": false}
+}
+
+var groupSettingOf = map[string]string{"set_group_messages_admins_only": groupSettingAnnounce, "set_group_info_admins_only": groupSettingLocked, "set_join_approval": groupSettingJoinApproval}
+
+func groupSettingValue(g *types.GroupInfo, setting string) bool {
+	switch setting {
+	case groupSettingAnnounce:
+		return g.IsAnnounce
+	case groupSettingLocked:
+		return g.IsLocked
+	}
+	return g.IsJoinApprovalRequired
+}
+
+// ownGroupAdmin reports whether the account itself, by phone JID or LID, is an
+// administrator of the group read.
+func ownGroupAdmin(g *types.GroupInfo, owner, ownerLID types.JID) bool {
+	for _, p := range g.Participants {
+		if !p.IsAdmin {
+			continue
+		}
+		for _, own := range []types.JID{owner, ownerLID} {
+			if own.IsEmpty() {
+				continue
+			}
+			own = own.ToNonAD()
+			if p.JID.ToNonAD() == own || (!p.PhoneNumber.IsEmpty() && p.PhoneNumber.ToNonAD() == own) || (!p.LID.IsEmpty() && p.LID.ToNonAD() == own) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// joinRequestResults gives one row per requested ID, in request order: applied,
+// refused with the provider's error code, or unknown when the answer omits it.
+// proven is false when any row is unknown.
+func joinRequestResults(values []types.GroupParticipant, expected []types.JID) (map[string]any, bool) {
+	if len(values) > 100 {
+		values = values[:100]
+	}
+	rows := make([]any, 0, len(expected))
+	applied, proven := 0, true
+	for _, requested := range expected {
+		want := requested.ToNonAD()
+		row := map[string]any{"id": LegacyChatID(requested), "state": "unknown"}
+		for _, v := range values {
+			if v.JID.ToNonAD() != want && v.PhoneNumber.ToNonAD() != want && v.LID.ToNonAD() != want {
+				continue
+			}
+			if v.Error != 0 {
+				row["state"], row["reason"], row["provider_code"] = "refused", "provider_refused", v.Error
+			} else {
+				row["state"] = "applied"
+				applied++
+			}
+			break
+		}
+		if row["state"] == "unknown" {
+			proven = false
+		}
+		rows = append(rows, row)
+	}
+	return map[string]any{"results": rows, "all_applied": applied == len(expected)}, proven
 }
 
 // phoneLookupSlot admits one resolution at a time per adapter. A timed-out

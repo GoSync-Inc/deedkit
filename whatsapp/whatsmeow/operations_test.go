@@ -6,13 +6,16 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -866,5 +869,255 @@ func TestNativeOpenChatByPhoneLocalOnlyStepNeverQueries(t *testing.T) {
 		if data["local_lid"] != want || *queries != 0 || data["provider_chat"] != nil {
 			t.Fatalf("local step answered %#v after %d queries", data, *queries)
 		}
+	}
+}
+
+// groupWith is the synthetic group with extra setting children (ANYM-242).
+func groupWith(children ...waBinary.Node) *waBinary.Node {
+	node := syntheticGroupNode()
+	node.Content = append(node.Content.([]waBinary.Node), children...)
+	return iqResult(node)
+}
+
+// settingIQ answers group reads with the setting on or off, flipping it when a
+// change arrives unless frozen (a read-back that does not show the change).
+func settingIQ(child waBinary.Node, on, frozen bool) *recordingIQ {
+	return &recordingIQ{reply: func(_ int, q whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+		content := q.Content.([]waBinary.Node)[0]
+		if content.Tag == "query" {
+			if on {
+				return groupWith(child), nil
+			}
+			return groupWith(), nil
+		}
+		if !frozen {
+			on = !on
+		}
+		return iqResult(), nil
+	}}
+}
+
+var groupSettingCases = []struct {
+	op, onTag, offTag string
+	child             waBinary.Node
+	node              func(bool) waBinary.Node
+}{
+	{"set_group_messages_admins_only", "announcement", "not_announcement", waBinary.Node{Tag: "announcement"}, nil},
+	{"set_group_info_admins_only", "locked", "unlocked", waBinary.Node{Tag: "locked"}, nil},
+	{"set_join_approval", "membership_approval_mode", "membership_approval_mode", waBinary.Node{Tag: "membership_approval_mode", Content: []waBinary.Node{{Tag: "group_join", Attrs: waBinary.Attrs{"state": "on"}}}},
+		func(on bool) waBinary.Node {
+			state := map[bool]string{true: "on", false: "off"}[on]
+			return waBinary.Node{Tag: "membership_approval_mode", Content: []waBinary.Node{{Tag: "group_join", Attrs: waBinary.Attrs{"state": state}}}}
+		}},
+}
+
+// spec: ANYM-242
+func TestGroupSettingsChangeConfirmsFromReadBack(t *testing.T) {
+	for _, c := range groupSettingCases {
+		for _, enabled := range []bool{true, false} {
+			r := settingIQ(c.child, !enabled, false)
+			result, err := runOperation(context.Background(), operationJob(c.op, operationsGroup, map[string]any{"enabled": enabled}), groupOperationDeps(t, r))
+			data := operationResult(t, result, err, "confirmed")
+			if !reflect.DeepEqual(data, map[string]any{"enabled": enabled, "previous": !enabled, "changed": true}) {
+				t.Fatalf("%s %v: %#v", c.op, enabled, data)
+			}
+			if len(r.calls) != 3 {
+				t.Fatalf("%s: %d calls", c.op, len(r.calls))
+			}
+			got := r.calls[1]
+			want := waBinary.Node{Tag: map[bool]string{true: c.onTag, false: c.offTag}[enabled]}
+			if c.node != nil {
+				want = c.node(enabled)
+			}
+			if got.Type != groupIQSet || !reflect.DeepEqual(got.Content, []waBinary.Node{want}) || LegacyChatID(got.To) != operationsGroup {
+				t.Fatalf("%s %v sent %#v", c.op, enabled, got)
+			}
+		}
+	}
+}
+
+// spec: ANYM-242
+func TestGroupSettingsAlreadyInStateDoesNotMutate(t *testing.T) {
+	for _, c := range groupSettingCases {
+		for _, enabled := range []bool{true, false} {
+			r := settingIQ(c.child, enabled, false)
+			result, err := runOperation(context.Background(), operationJob(c.op, operationsGroup, map[string]any{"enabled": enabled}), groupOperationDeps(t, r))
+			data := operationResult(t, result, err, "confirmed")
+			if !reflect.DeepEqual(data, map[string]any{"enabled": enabled, "previous": enabled, "changed": false}) || len(r.calls) != 1 {
+				t.Fatalf("%s %v: %#v, %d calls", c.op, enabled, data, len(r.calls))
+			}
+		}
+	}
+}
+
+// spec: ANYM-242
+func TestGroupSettingsUnconfirmedReadBackIsSubmitted(t *testing.T) {
+	for _, c := range groupSettingCases {
+		r := settingIQ(c.child, false, true)
+		result, err := runOperation(context.Background(), operationJob(c.op, operationsGroup, map[string]any{"enabled": true}), groupOperationDeps(t, r))
+		data := operationResult(t, result, err, "submitted")
+		if !reflect.DeepEqual(data, map[string]any{"enabled": true, "previous": false, "changed": true}) {
+			t.Fatalf("%s: %#v", c.op, data)
+		}
+	}
+}
+
+// spec: ANYM-242
+func TestGroupSettingsRefuseNonAdminBeforeMutation(t *testing.T) {
+	for _, op := range []string{"set_group_messages_admins_only", "set_group_info_admins_only", "set_join_approval", "approve_join_requests", "reject_join_requests"} {
+		r := &recordingIQ{reply: syntheticReply}
+		d := groupOperationDeps(t, r)
+		d.ownerLID = types.NewJID("999", types.HiddenUserServer)
+		_, err := runOperation(context.Background(), groupJob(op), d)
+		requireError(t, err, "forbidden")
+		if len(r.calls) != 1 {
+			t.Fatalf("%s mutated a group it does not administer: %d calls", op, len(r.calls))
+		}
+	}
+}
+
+// spec: ANYM-242
+func TestGroupSettingsParameters(t *testing.T) {
+	for name, job := range map[string]operationRequest{
+		"slow mode is Telegram only": operationJob("set_slow_mode", operationsGroup, map[string]any{"seconds": 10}),
+		"missing enabled":            operationJob("set_join_approval", operationsGroup, nil),
+		"null enabled":               operationJob("set_join_approval", operationsGroup, map[string]any{"enabled": nil}),
+		"string enabled":             operationJob("set_join_approval", operationsGroup, map[string]any{"enabled": "true"}),
+		"rights payload":             operationJob("set_group_messages_admins_only", operationsGroup, map[string]any{"enabled": true, "rights": map[string]any{}}),
+		"not a group":                operationJob("set_group_info_admins_only", operationsChat, map[string]any{"enabled": true}),
+		"21 ids":                     operationJob("approve_join_requests", operationsGroup, map[string]any{"user_ids": manyUsers(21)}),
+		"duplicate ids":              operationJob("reject_join_requests", operationsGroup, map[string]any{"user_ids": []string{operationsChat, operationsChat}}),
+		"limit 0":                    operationJob("list_join_requests", operationsGroup, map[string]any{"limit": 0}),
+		"limit 101":                  operationJob("list_join_requests", operationsGroup, map[string]any{"limit": 101}),
+	} {
+		r := &recordingIQ{reply: syntheticReply}
+		if _, err := runOperation(context.Background(), job, groupOperationDeps(t, r)); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+		if len(r.calls) > 1 || len(r.calls) == 1 && r.calls[0].Type != groupIQGet {
+			t.Fatalf("%s reached a change: %#v", name, r.calls)
+		}
+	}
+}
+
+func manyUsers(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("1555000%04d@c.us", i)
+	}
+	return out
+}
+
+func batchIQ(answer func([]waBinary.Node) []waBinary.Node) *recordingIQ {
+	return &recordingIQ{reply: func(n int, q whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+		content := q.Content.([]waBinary.Node)[0]
+		if content.Tag != "membership_requests_action" {
+			return syntheticReply(n, q)
+		}
+		action := content.Content.([]waBinary.Node)[0]
+		return iqResult(waBinary.Node{Tag: "membership_requests_action", Content: []waBinary.Node{{Tag: action.Tag, Content: answer(action.Content.([]waBinary.Node))}}}), nil
+	}}
+}
+
+// spec: ANYM-242
+func TestJoinRequestBatchPerIDRows(t *testing.T) {
+	ids := manyUsers(3)
+	r := batchIQ(func(requested []waBinary.Node) []waBinary.Node {
+		requested[2].Attrs = waBinary.Attrs{"jid": requested[2].Attrs["jid"], "error": "404"}
+		// The provider answers out of order; rows follow the request.
+		return []waBinary.Node{requested[2], requested[0], requested[1]}
+	})
+	result, err := runOperation(context.Background(), operationJob("approve_join_requests", operationsGroup, map[string]any{"user_ids": ids}), groupOperationDeps(t, r))
+	data := operationResult(t, result, err, "confirmed")
+	want := map[string]any{"all_applied": false, "results": []any{
+		map[string]any{"id": ids[0], "state": "applied"},
+		map[string]any{"id": ids[1], "state": "applied"},
+		map[string]any{"id": ids[2], "state": "refused", "reason": "provider_refused", "provider_code": 404},
+	}}
+	if !reflect.DeepEqual(data, want) {
+		t.Fatalf("%#v", data)
+	}
+	if len(r.calls) != 2 {
+		t.Fatalf("%d calls, want one read and one batch request", len(r.calls))
+	}
+	sent := r.calls[1].Content.([]waBinary.Node)[0].Content.([]waBinary.Node)[0]
+	if sent.Tag != "approve" || len(sent.Content.([]waBinary.Node)) != 3 {
+		t.Fatalf("batch node %#v", sent)
+	}
+}
+
+// spec: ANYM-242
+func TestJoinRequestBatchMissingIDIsUnknown(t *testing.T) {
+	ids := manyUsers(2)
+	r := batchIQ(func(requested []waBinary.Node) []waBinary.Node { return requested[:1] })
+	result, err := runOperation(context.Background(), operationJob("approve_join_requests", operationsGroup, map[string]any{"user_ids": ids}), groupOperationDeps(t, r))
+	data := operationResult(t, result, err, "unknown")
+	want := map[string]any{"all_applied": false, "results": []any{
+		map[string]any{"id": ids[0], "state": "applied"},
+		map[string]any{"id": ids[1], "state": "unknown"},
+	}}
+	if !reflect.DeepEqual(data, want) {
+		t.Fatalf("%#v", data)
+	}
+}
+
+// spec: ANYM-242
+func TestJoinRequestBatchRejectSendsRejectAction(t *testing.T) {
+	ids := manyUsers(2)
+	r := batchIQ(func(requested []waBinary.Node) []waBinary.Node { return requested })
+	result, err := runOperation(context.Background(), operationJob("reject_join_requests", operationsGroup, map[string]any{"user_ids": ids}), groupOperationDeps(t, r))
+	data := operationResult(t, result, err, "confirmed")
+	if data["all_applied"] != true {
+		t.Fatalf("%#v", data)
+	}
+	sent := r.calls[1].Content.([]waBinary.Node)[0].Content.([]waBinary.Node)[0]
+	if sent.Tag != "reject" {
+		t.Fatalf("reject sent %q", sent.Tag)
+	}
+}
+
+// spec: ANYM-242
+func TestJoinRequestsProjection(t *testing.T) {
+	request := func(user string, at string) waBinary.Node {
+		j, _ := ParseChatID(user)
+		return waBinary.Node{Tag: "membership_approval_request", Attrs: waBinary.Attrs{"jid": j, "request_time": at}}
+	}
+	r := &recordingIQ{reply: func(int, whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+		return iqResult(waBinary.Node{Tag: "membership_approval_requests", Content: []waBinary.Node{
+			request("15550001111@c.us", "1700000300"), request("222@lid", "1700000100"), request("15550003333@c.us", "1700000200"),
+		}}), nil
+	}}
+	d := groupOperationDeps(t, r)
+	d.contact = func(_ context.Context, j types.JID) (types.ContactInfo, error) {
+		if j.User == "222" {
+			return types.ContactInfo{Found: true, PushName: "Pushed"}, nil
+		}
+		return types.ContactInfo{}, nil
+	}
+	result, err := runOperation(context.Background(), operationJob("list_join_requests", operationsGroup, map[string]any{"limit": 2}), d)
+	data := operationResult(t, result, err, "confirmed")
+	want := map[string]any{"has_more": true, "untrusted": []any{"name"}, "requests": []any{
+		map[string]any{"id": "222@lid", "requested_at": int64(1700000100), "name": "Pushed"},
+		map[string]any{"id": "15550003333@c.us", "requested_at": int64(1700000200), "name": nil},
+	}}
+	if !reflect.DeepEqual(data, want) {
+		t.Fatalf("%#v", data)
+	}
+}
+
+// spec: ANYM-242
+func TestChatInfoGroupSettings(t *testing.T) {
+	r := &recordingIQ{reply: func(int, whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+		return groupWith(waBinary.Node{Tag: "announcement"}, waBinary.Node{Tag: "membership_approval_mode", Content: []waBinary.Node{{Tag: "group_join", Attrs: waBinary.Attrs{"state": "on"}}}}), nil
+	}}
+	result, err := runOperation(context.Background(), operationJob("chat_info", operationsGroup, nil), groupOperationDeps(t, r))
+	data := operationResult(t, result, err, "confirmed")
+	want := map[string]any{"messages_admins_only": true, "info_admins_only": false, "slow_mode_seconds": nil, "join_approval": true}
+	if !reflect.DeepEqual(data["group_settings"], want) {
+		t.Fatalf("%#v", data["group_settings"])
+	}
+	result, err = runOperation(context.Background(), operationJob("chat_info", operationsChat, nil), groupOperationDeps(t, r))
+	if data := operationResult(t, result, err, "confirmed"); data["group_settings"] != nil {
+		t.Fatalf("private chat settings %#v", data["group_settings"])
 	}
 }

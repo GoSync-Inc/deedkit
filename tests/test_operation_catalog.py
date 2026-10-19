@@ -102,3 +102,53 @@ def test_parameter_formats_described():
     whatsapp = {r['operation']: r for r in operation_manifest('whatsapp')}
     assert '@c.us' in whatsapp['get_contact']['parameters_schema']['user_id']['format']
     assert 'format' not in OPERATIONS['create_group']['fields']['user_ids']
+
+
+GROUP_ADMIN = ['set_group_messages_admins_only', 'set_group_info_admins_only', 'set_slow_mode', 'set_join_approval',
+               'list_join_requests', 'approve_join_requests', 'reject_join_requests']
+
+
+# spec: ANYM-242
+def test_group_admin_operations_validate_parameters():
+    from messaging_service.messenger_operations import ParameterError
+    def errors(platform, operation, parameters):
+        with pytest.raises(ParameterError, match='^invalid_operation_parameters$') as failure:
+            validate_operation(platform, operation, parameters, provider='whatsmeow')
+        return failure.value.field_errors
+    assert errors('telegram', 'set_slow_mode', {'seconds': 45}) == [
+        {'field': 'seconds', 'reason': 'enum', 'allowed': [0, 10, 30, 60, 300, 900, 3600]}]
+    assert validate_operation('telegram', 'set_slow_mode', {'seconds': 0}) == {'seconds': 0}
+    assert errors('telegram', 'set_slow_mode', {'seconds': True})[0]['reason'] == 'type'
+    ids = [str(100 + i) for i in range(21)]
+    assert errors('telegram', 'approve_join_requests', {'user_ids': ids}) == [
+        {'field': 'user_ids', 'reason': 'max_items', 'expected': 'at most 20 items'}]
+    assert errors('whatsapp', 'reject_join_requests', {'user_ids': ['1@lid', '1@lid']})[0]['reason'] == 'unique'
+    assert errors('telegram', 'approve_join_requests', {'user_ids': []})[0]['reason'] == 'min_items'
+    assert errors('telegram', 'set_group_messages_admins_only', {'enabled': True, 'rights': {'send_messages': True}}) == [
+        {'field': 'rights', 'reason': 'unknown_field', 'expected': 'only enabled'}]
+    assert errors('whatsapp', 'set_join_approval', {'enabled': 'yes'})[0] == {'field': 'enabled', 'reason': 'type', 'expected': 'boolean'}
+    assert errors('telegram', 'set_group_info_admins_only', {})[0]['reason'] == 'required'
+    assert validate_operation('whatsapp', 'list_join_requests', {}, provider='whatsmeow') == {'limit': 50}
+    assert errors('whatsapp', 'list_join_requests', {'limit': 101})[0]['reason'] == 'maximum'
+    for name in GROUP_ADMIN:
+        spec = operation_spec(name)
+        assert spec['target'] == 'chat' and not spec['full_account']
+        assert spec['permission'] == ('groups-read' if name == 'list_join_requests' else 'groups-manage')
+        assert spec['mutation'] is (name != 'list_join_requests')
+
+
+# spec: ANYM-242
+def test_group_admin_catalog_support():
+    telegram = {r['operation']: r for r in operation_manifest('telegram')}
+    native = {r['operation']: r for r in operation_manifest('whatsapp', provider='whatsmeow')}
+    browser = {r['operation']: r for r in operation_manifest('whatsapp', provider='webjs')}
+    assert not telegram['set_join_approval']['supported'] and not native['set_slow_mode']['supported']
+    assert all(telegram[n]['supported'] for n in GROUP_ADMIN if n != 'set_join_approval')
+    assert all(native[n]['supported'] for n in GROUP_ADMIN if n != 'set_slow_mode')
+    assert not any(browser[n]['supported'] for n in GROUP_ADMIN)
+    assert 'native' in browser['set_join_approval']['limitation']
+    for name in GROUP_ADMIN:
+        with pytest.raises(ValueError, match='unsupported_operation'):
+            validate_operation('whatsapp', name, {'enabled': True}, provider='webjs')
+    assert 'overwritten' in telegram['set_group_messages_admins_only']['limitation']
+    assert telegram['set_slow_mode']['parameters_schema']['seconds']['format'].startswith('one of 0, 10')

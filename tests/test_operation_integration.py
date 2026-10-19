@@ -69,3 +69,15 @@ def test_node_known_operation_error_keeps_pipe_synchronized(tmp_path):
             await provider.reply(1,sending=True)
         assert (await provider.reply(2,sending=True))['result']['outcome']=='confirmed'
     asyncio.run(scenario())
+
+
+# spec: ANYM-242
+def test_native_not_admin_refusal_is_a_known_rejection(tmp_path):
+    from messaging_service.commands import CommandRejected
+    provider=NodeProvider({'events_directory':str(tmp_path/'events')},tmp_path/'unused',None)
+    async def scenario():
+        provider.send_reader=asyncio.StreamReader()
+        provider.send_reader.feed_data(b'{"id":1,"error":"forbidden"}\n')
+        with pytest.raises(CommandRejected,match='^forbidden$'):
+            await provider.reply(1,sending=True)
+    asyncio.run(scenario())

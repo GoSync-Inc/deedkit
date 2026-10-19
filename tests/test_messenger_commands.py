@@ -477,3 +477,83 @@ def test_send_file_mode_mismatch_names_field(operator):
     assert failure.value.field_errors==[{'field':'mode','reason':'format','expected':
         'a mode matching the original MIME family: photo and sticker image/*, video and video_note video/*, '
         'audio and voice audio/*; document for any file'}]
+
+
+GROUP_ADMIN_TELEGRAM = ['set_group_messages_admins_only', 'set_group_info_admins_only', 'set_slow_mode',
+                        'list_join_requests', 'approve_join_requests', 'reject_join_requests']
+
+
+# spec: ANYM-242
+def test_group_admin_operations_need_permission_and_opt_in(operator):
+    s,_,key,_=operator
+    def rows(token):
+        return {r['operation']:r for r in s.list_messenger_operations(token,account='command-fixture')['items']}
+    listed=rows(key)
+    assert 'set_join_approval' not in listed
+    assert all(listed[n]['key_permitted'] and not listed[n]['account_enabled'] and not listed[n]['available']
+               for n in GROUP_ADMIN_TELEGRAM)
+    chat=stable_id('chat','command-fixture','100')
+    with pytest.raises(APIError,match='operation_disabled'):
+        s.preview_messenger_operation(key,account='command-fixture',operation='set_slow_mode',chat_id=chat,
+                                      parameters={'seconds':30})
+    s.set_messenger_operations('command-fixture',['set_slow_mode','list_join_requests'])
+    listed=rows(key)
+    assert {n for n in GROUP_ADMIN_TELEGRAM if listed[n]['available']}=={'set_slow_mode','list_join_requests'}
+    assert s.preview_messenger_operation(key,account='command-fixture',operation='set_slow_mode',chat_id=chat,
+                                         parameters={'seconds':30})['parameters']=={'seconds':30}
+    reader=s.issue_key('command-agent',['command-fixture'],permissions=['read','groups-read'])
+    listed=rows(reader)
+    assert listed['list_join_requests']['available'] and not listed['set_slow_mode']['available']
+    assert listed['set_slow_mode']['account_enabled'] and not listed['set_slow_mode']['key_permitted']
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('failure',['timeout','crash'])
+def test_join_request_batch_worker_interrupted_receipt_is_unknown_without_rows(operator,monkeypatch,failure):
+    from messaging_service.commands import CommandWorker
+    from messaging_service.telegram_operations import execute
+    from test_telegram_operations import SUPERGROUP,GroupClient
+    s,_,key,state=operator
+    s.set_messenger_operations('command-fixture',['approve_join_requests'])
+    client=GroupClient()
+    client.hide[202]='hang' if failure=='timeout' else RuntimeError('synthetic crash')
+    original=asyncio.wait_for
+    monkeypatch.setattr(asyncio,'wait_for',lambda awaitable,timeout:original(awaitable,0.5))
+    async def provider(job):
+        result=await execute(client,{**job,'provider_chat':SUPERGROUP})
+        if failure=='crash':raise RuntimeError('synthetic worker crash after the provider answered')
+        return result
+    args=dict(operation='approve_join_requests',message_id='',expected_revision=0,parameters={'user_ids':['201','202']})
+    queued=queue(s,key,**args)
+    worker=CommandWorker(state,provider)
+    assert asyncio.run(worker.once())
+    receipt=s.get_messenger_operation(key,queued['operation_id'])
+    assert receipt['status']=='unknown' and receipt['result'] is None
+    assert receipt['error_code']=='operation_result_unknown'
+    assert receipt['next_action']=='verify_provider_state_before_any_new_action'
+    assert [c.user_id.user_id for c in client.mutations()]==[201,202]
+    # The same request_id returns that receipt; nothing is dispatched again.
+    again=queue(s,key,**args)
+    assert again['operation_id']==queued['operation_id'] and again['status']=='unknown'
+    assert not asyncio.run(worker.once()) and len(client.mutations())==2
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('failure,status',[('refused','succeeded'),('503','unknown')])
+def test_join_request_batch_worker_receipt_keeps_rows(operator,failure,status):
+    from telethon.errors import HideRequesterMissingError,RPCError
+    from messaging_service.commands import CommandWorker
+    from messaging_service.telegram_operations import execute
+    from test_telegram_operations import SUPERGROUP,GroupClient
+    s,_,key,state=operator
+    s.set_messenger_operations('command-fixture',['approve_join_requests'])
+    client=GroupClient()
+    client.hide[202]=HideRequesterMissingError(None) if failure=='refused' else RPCError(None,'TIMEOUT',503)
+    async def provider(job):return await execute(client,{**job,'provider_chat':SUPERGROUP})
+    queued=queue(s,key,operation='approve_join_requests',message_id='',expected_revision=0,
+                 parameters={'user_ids':['201','202','203']})
+    assert asyncio.run(CommandWorker(state,provider).once())
+    receipt=s.get_messenger_operation(key,queued['operation_id'])
+    assert receipt['status']==status and receipt['result']['data']['all_applied'] is False
+    assert [r['state'] for r in receipt['result']['data']['results']]==(
+        ['applied','refused','applied'] if failure=='refused' else ['applied','unknown','not_attempted'])
