@@ -76,17 +76,56 @@ as a monetary or subscription-usage guarantee.
 
 ## Before enabling beside local ASR
 
-The current enrichment budget table counts attempts globally. A second worker
-with a small Codex limit would see ASR attempts in that counter. Separate budgets
-by profile/provider before enabling both concurrently. Also add a persistent
-profile-wide pause for authentication failure, usage exhaustion and required CLI
-upgrades; per-file retries must not spin over the entire corpus. The adapter
-returns safe `model_rate_limited`, `codex_chatgpt_login_required`,
-`codex_upgrade_required` and other code-only failures.
+State of each prerequisite, checked against the code. Paths are in
+`services/messaging/messaging_service/`.
 
-Keep the example disabled until these controls, isolated deployment and owner
-login are complete. Start with a small representative set and measure quality,
-attempts, latency and shared usage before enabling all accounts/files. Nothing
+**Done**
+
+- Separate attempt counts per profile. `processing_budget` is keyed by day,
+  account, kind and profile hash (`migrations/020_processing_admission.sql:3-9`)
+  and is incremented per claimed attempt (`enrichment.py:262-265`,
+  `file_understanding.py:422-424`).
+- A persistent profile pause for authentication failure, a required CLI upgrade
+  and an unavailable CLI. `resource_admission.pause_profile` stores it per
+  account, kind and profile hash in `processing_control`, without an end time for
+  `codex_chatgpt_login_required`, `codex_private_auth_required`,
+  `codex_login_check_failed`, `codex_upgrade_required` and
+  `codex_cli_unavailable` (`resource_admission.py:120-132`; called at
+  `enrichment.py:327`). Claims skip a paused scope (`enrichment.py:241`). A new
+  profile hash starts unpaused. `file_understanding.py:400,469` repeats this logic
+  for the separate understanding worker, which does not run `codex_cli`.
+
+**Partly done**
+
+- Usage exhaustion. The adapter maps a usage or rate limit to `model_rate_limited`
+  (`codex_enrichment.py:122`), which pauses that scope for a fixed 30 minutes
+  (`resource_admission.py:125-132`). Nothing reads the reset time the CLI may
+  report, so a longer subscription window is retried every 30 minutes.
+
+**Missing**
+
+- Global and per-account daily counters are shared. The global ceiling
+  `max_jobs_per_day` reads `enrichment_budget`, which every claim increments
+  (`enrichment.py:214-217,262`, `file_understanding.py:371-373,422`). The
+  per-account cap sums `processing_budget` over all kinds and profiles
+  (`enrichment.py:219-229`, `file_understanding.py:389-390`). ASR attempts
+  therefore count against a small Codex limit.
+- The per-kind cap `profile_max_jobs_per_day` sums every profile and provider of
+  that kind (`enrichment.py:221-224`, `file_understanding.py:385-386`). This is
+  intended and pinned by
+  `tests/test_processing_admission.py::test_cooldown_persists_and_new_profile_does_not_reset_day_limit`,
+  so a cap for one profile alone would be new behaviour.
+- Per-file retries of errors that do not pause. `pause_profile` ignores every
+  code outside its list (`resource_admission.py:125-126`), e.g. `codex_run_failed`,
+  `codex_run_incomplete` and `codex_tool_use_rejected`. Each file is attempted up
+  to three times, 10 minutes apart (`enrichment.py:242-244,303`), so a systematic
+  failure still walks the whole corpus.
+
+Keep the example disabled (`enabled: false` in `enrichment.codex.example.json`)
+until the missing and partly done controls, isolated deployment and owner login are complete,
+or the owner accepts the open items. Whether to build them is decided under
+ANYM-231. Start with a small representative set and measure quality, attempts,
+latency and shared usage before enabling all accounts/files. Nothing
 automatically changes the live audio profile.
 
 ## Validation
