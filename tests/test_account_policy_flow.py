@@ -81,24 +81,47 @@ def connection(store, key):
     return operations['connection'], operations['live_capture']
 
 
-def run_collector(store, tmp_path, provider, until, state_class=CollectorState, settle=1.0):
-    """Build a collector, run it until `until()` holds and it has settled, then stop it."""
+class WaitCountingEvent(asyncio.Event):
+    waits = 0
+
+    async def wait(self):
+        self.waits += 1
+        return await super().wait()
+
+
+def run_collector(store, tmp_path, provider, until, state_class=CollectorState, blocked=False):
+    """Build a collector and run it until `until()` holds, then stop it.
+
+    The stop waits for real progress: a collection pass that returned from `sync_once()`, or, for a
+    blocked connection, the collector sitting in its blocked wait after it read the gate. A delay would
+    only guess that a late provider read or connect had not happened yet.
+    """
     archive = Archive(store)
     spool = CaptureSpool(tmp_path / ('capture-' + str(time.monotonic_ns())), reserve_bytes=0)
     collector = TelegramCollector(archive, ACCOUNT, provider, spool, batch_size=2, interval=60,
         writer=BlobWriter(store.files, reserve_bytes=0), owner='flow-' + str(time.monotonic_ns()))
     collector.state_class = state_class
+    collector.stopping = WaitCountingEvent()
+    passes = []
+    pass_once = collector.sync_once
+
+    async def counted_pass():
+        await pass_once()
+        passes.append(True)
+    collector.sync_once = counted_pass
+
+    def progressed():
+        # run() waits on `stopping` once; the blocked branch of connect_provider is the second waiter.
+        return collector.stopping.waits >= 2 if blocked else bool(passes)
 
     async def scenario():
         running = asyncio.create_task(collector.run())
         try:
-            deadline = time.monotonic() + 15
-            while not until():
+            deadline = time.monotonic() + 20
+            while not (progressed() and until()):
                 assert not running.done(), running.exception()
                 assert time.monotonic() < deadline, 'collector did not reach the expected state'
                 await asyncio.sleep(.05)
-            # Let the collector act on what it saw: a late provider read or connect must still show up.
-            await asyncio.sleep(settle)
             assert not running.done(), running.exception()
         finally:
             collector.stopping.set()
@@ -119,10 +142,10 @@ def blocked_restart_probe(dsn_file, files, capture, key):
             seen.append(connection(store, key))
         return bool(seen)
     try:
-        run_collector(store, Path(capture), provider, gate_checked_while_running, GateCountingState)
+        run_collector(store, Path(capture), provider, gate_checked_while_running, GateCountingState, blocked=True)
     finally:
         store.close()
-    return {'connection': seen[0][0], 'live_capture': seen[0][1], 'connects': provider.connects, 'reads': provider.reads}
+    return {'connection': seen[-1][0], 'live_capture': seen[-1][1], 'connects': provider.connects, 'reads': provider.reads}
 
 
 # spec: ANYM-415
@@ -172,7 +195,7 @@ def test_registered_policy_collects_allowed_chats_blocks_on_identity_mismatch_an
 
     # Identity mismatch: recorded by the collector, blocked for a fresh process that never connects.
     run_collector(store, tmp_path, FlowProvider(messages(1, 2, 3), identity_mismatch=True),
-        lambda: connection(store, key)[0]['state'] == 'blocked')
+        lambda: connection(store, key)[0]['state'] == 'blocked', blocked=True)
     # The restart is a real child process: own interpreter, own Store, nothing shared with this one.
     probe = subprocess.run([sys.executable, '-c',
         'import json, sys, test_account_policy_flow as t; print(json.dumps(t.blocked_restart_probe(*sys.argv[1:])))',
