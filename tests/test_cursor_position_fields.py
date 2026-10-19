@@ -68,7 +68,8 @@ def test_people_cursor_position_fields_are_invalid_cursor(seeded, grouped, field
     if field in body['p']:
         rejects(call, cursor, **{field: value})
         return
-    # The field belongs to the other people cursor shape: a position that carries it is not this shape's position.
+    # The field belongs to the other people cursor shape: the extra key alone makes the position invalid,
+    # whatever its value (the shape check compares key sets before any field is read).
     body['p'][field] = value
     with pytest.raises(APIError, match='invalid_cursor'):
         call(after='q1.'+base64.urlsafe_b64encode(json.dumps(body, separators=(',', ':')).encode()).decode().rstrip('='))
