@@ -1,4 +1,6 @@
 name: Tiden sync
+# The run title names the commit the run processes, so Tiden health can find the sync of its TARGET (ANYM-438).
+run-name: Tiden sync ${{ github.event.workflow_run.head_sha || inputs.sha }}
 on:
   # Sync B (ANYM-405, TIDEN-CI.md): after the CI run of every main push, write the merged pull request's Tiden
   # bookkeeping to Tiden main. A workflow of its own, so a red or dropped sync never touches the `CI` push run that

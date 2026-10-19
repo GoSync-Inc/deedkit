@@ -199,10 +199,10 @@ def history(repo, entries=()):
     return a, b
 
 
-def measure(repo, server, target, fetch=False, clock=None):
+def measure(repo, server, target, fetch=False, clock=None, actions=None):
     clock = clock or Clock()
     data = report(repo, Tiden(server.cli, "product", "workspace"), target, "refs/remotes/origin/main", fetch, clock,
-                  clock.sleep)
+                  clock.sleep, actions=actions)
     return outcome(data), data
 
 
@@ -944,6 +944,372 @@ def test_the_reviewed_no_spec_list_in_the_repository_is_valid():
     assert all(value["externalId"].startswith("s:") for value in entries.values())
 
 
+# Waiting for the sync B run of TARGET (ANYM-438).
+FAKE_GH = textwrap.dedent(f"""\
+    #!{sys.executable}
+    import json, os, sys, time
+    path = os.environ["FAKE_GH_STATE"]
+    state = json.load(open(path))
+    args = sys.argv[1:]
+    state.setdefault("calls", []).append(args)
+    json.dump(state, open(path, "w"))
+    mode = state.get("mode")
+    if mode == "exit":
+        sys.stderr.write("response body {SECRET}\\n"); print("{SECRET}"); sys.exit(1)
+    if mode == "garbage":
+        print("not json {SECRET}"); sys.exit(0)
+    if mode == "scalar":
+        print("[1]"); sys.exit(0)
+    page = int(next(arg for arg in args if arg.startswith("page=")).split("=")[1])
+    rows = state["rows"]
+    chunk = rows[(page - 1) * 100:page * 100]
+    body = {{"total_count": state.get("total", len(rows)), "workflow_runs": chunk}}
+    if mode == "no-total":
+        del body["total_count"]
+    print(json.dumps(body))
+""")
+NO_SYNC = {"checked": True, "target": None, "run_id": None, "run_attempt": None, "url": None, "conclusion": None,
+           "completed_at": None, "inventory_read_at": None}
+
+
+def sync_row(run_id, sha, conclusion="success", updated="2026-10-19T10:00:00Z", attempt=1, status="completed",
+             title=None, head="f" * 40):
+    return {"id": run_id, "display_title": f"Tiden sync {sha}" if title is None else title, "head_sha": head,
+            "status": status, "conclusion": conclusion if status == "completed" else None, "updated_at": updated,
+            "run_attempt": attempt, "html_url": f"https://example.invalid/runs/{run_id}"}
+
+
+class FakeActions:
+    """Scripted `Actions.runs()` snapshots, the last one repeating; an exception in the script is raised."""
+
+    def __init__(self, *snapshots, server=None):
+        self.snapshots, self.calls, self.seen, self.server = snapshots, 0, [], server
+
+    def runs(self):
+        if self.server:
+            self.seen = [call[:2] for call in self.server.state()["calls"]]
+        snapshot = self.snapshots[min(self.calls, len(self.snapshots) - 1)]
+        self.calls += 1
+        if isinstance(snapshot, Exception):
+            raise snapshot
+        return snapshot
+
+
+def synced(repo, server, rows_for, clock=None, **world):
+    """A healthy world at B and the `Actions` script `rows_for(a, b)` builds; returns (a, b, clock, actions, result)."""
+    a, b = history(repo)
+    server.world(b, **world)
+    clock, actions = clock or Clock(), FakeActions(*rows_for(a, b), server=server)
+    return a, b, clock, actions, measure(repo, server, b, clock=clock, actions=actions)
+
+
+def decided(data, run_id, attempt=1, conclusion="success", updated="2026-10-19T10:00:00Z"):
+    sync = data["sync"]
+    assert (sync["checked"], sync["run_id"], sync["run_attempt"], sync["conclusion"], sync["completed_at"]) == \
+        (True, run_id, attempt, conclusion, updated)
+    assert sync["target"] == data["target"] and sync["url"] == f"https://example.invalid/runs/{run_id}"
+
+
+# spec: ANYM-438
+def test_a_successful_sync_of_target_is_read_before_the_inventory_and_recorded(repo, server):
+    _, b, clock, actions, (code, data) = synced(
+        repo, server, lambda a, b: [[sync_row(7, b, updated="2026-10-19T10:05:00Z", attempt=2)]])
+    assert code == 0 and clock.sleeps == 0 and actions.calls == 1
+    decided(data, 7, attempt=2, updated="2026-10-19T10:05:00Z")
+    assert ["run", "list"] in actions.seen and ["test", "list"] not in actions.seen
+    assert data["sync"]["inventory_read_at"] and data["sync"]["inventory_read_at"] >= "2026-10-19T10:05:00+00:00"
+    assert json.loads(json.dumps(data))["sync"] == data["sync"]
+
+
+# spec: ANYM-438
+def test_a_running_sync_is_waited_for_and_then_a_success_passes(repo, server):
+    _, b, clock, actions, (code, data) = synced(
+        repo, server, lambda a, b: [[sync_row(7, b, status="in_progress")], [sync_row(7, b, status="queued")],
+                                    [sync_row(7, b, updated="2026-10-19T10:09:00Z")]])
+    assert code == 0 and clock.sleeps == 2 and actions.calls == 3
+    decided(data, 7, updated="2026-10-19T10:09:00Z")
+
+
+# spec: ANYM-438
+def test_a_sync_published_while_waiting_is_used(repo, server):
+    _, b, clock, _, (code, data) = synced(repo, server, lambda a, b: [[], [], [sync_row(7, b)]])
+    assert code == 0 and clock.sleeps == 2
+    decided(data, 7)
+
+
+# spec: ANYM-438
+def test_a_failed_sync_followed_by_a_successful_recovery_run_passes(repo, server):
+    _, b, _, _, (code, data) = synced(repo, server, lambda a, b: [[
+        sync_row(1, b, conclusion="failure"), sync_row(2, b, updated="2026-10-19T10:05:00Z")]])
+    assert code == 0
+    decided(data, 2, updated="2026-10-19T10:05:00Z")
+
+
+# spec: ANYM-438
+def test_a_failure_after_a_success_decides_and_the_unlinked_metric_is_unknown_with_the_run(repo, server):
+    _, b, _, _, (code, data) = synced(repo, server, lambda a, b: [[
+        sync_row(1, b), sync_row(2, b, conclusion="failure", updated="2026-10-19T10:05:00Z")]])
+    assert code == 2 and states(data)["unlinked_tests"] == UNKNOWN
+    reason = data["metrics"]["unlinked_tests"]["reason"]
+    assert "https://example.invalid/runs/2" in reason and "failure" in reason and "links" in reason
+    decided(data, 2, conclusion="failure", updated="2026-10-19T10:05:00Z")
+    assert data["sync"]["inventory_read_at"] is None
+
+
+# spec: ANYM-438
+def test_a_newer_running_run_after_a_success_is_waited_for(repo, server):
+    _, b, clock, _, (code, data) = synced(repo, server, lambda a, b: [
+        [sync_row(1, b), sync_row(2, b, status="in_progress")],
+        [sync_row(1, b), sync_row(2, b, conclusion="failure", updated="2026-10-19T10:30:00Z")]])
+    assert clock.sleeps == 1 and states(data)["unlinked_tests"] == UNKNOWN
+    decided(data, 2, conclusion="failure", updated="2026-10-19T10:30:00Z")
+
+
+# spec: ANYM-438
+@pytest.mark.parametrize(("rows", "run_id", "attempt", "conclusion", "updated"), [
+    # R1 created first and succeeded, R2 succeeded later, then R1 was rerun and failed: the failure is the latest.
+    ([(1, "failure", "10:10", 2), (2, "success", "10:05", 1)], 1, 2, "failure", "10:10"),
+    # R2 failed, then R1 (the older run ID) was rerun and succeeded: the success is the latest.
+    ([(1, "success", "10:10", 2), (2, "failure", "10:05", 1)], 1, 2, "success", "10:10"),
+    # R1 was rerun and failed again after R2 succeeded.
+    ([(1, "failure", "10:20", 3), (2, "success", "10:15", 1)], 1, 3, "failure", "10:20"),
+    # Equal completion times: the greater run ID decides, either way.
+    ([(1, "failure", "10:05", 1), (2, "success", "10:05", 1)], 2, 1, "success", "10:05"),
+    ([(2, "failure", "10:05", 1), (1, "success", "10:05", 1)], 2, 1, "failure", "10:05"),
+])
+def test_the_latest_completion_decides_even_for_a_rerun_of_an_older_run_id(repo, server, rows, run_id, attempt,
+                                                                          conclusion, updated):
+    day = "2026-10-19T{}:00Z"
+    _, b, _, _, (code, data) = synced(repo, server, lambda a, b: [[
+        sync_row(number, b, conclusion=kind, updated=day.format(moment), attempt=tries)
+        for number, kind, moment, tries in rows]])
+    assert (code == 0) == (conclusion == "success")
+    decided(data, run_id, attempt, conclusion, day.format(updated))
+
+
+# spec: ANYM-438
+def test_a_tie_on_the_completion_time_and_the_run_id_is_broken_by_the_attempt():
+    rows = [sync_row(5, "a" * 40, conclusion="failure", attempt=1), sync_row(5, "a" * 40, attempt=2)]
+    assert health.decisive(rows)["run_attempt"] == 2 and health.decisive(rows[::-1])["run_attempt"] == 2
+
+
+# spec: ANYM-438
+def test_runs_titled_for_another_commit_are_ignored_even_when_their_head_is_target(repo, server):
+    # A delayed CI of A completes after main moved to B: the sync run's head_sha is B, its title names A.
+    a, b, clock, _, (code, data) = synced(repo, server, lambda a, b: [[
+        sync_row(1, a, head=b), sync_row(2, a, status="in_progress", head=b),
+        sync_row(3, b, updated="2026-10-19T09:00:00Z")]])
+    assert code == 0 and clock.sleeps == 0
+    decided(data, 3, updated="2026-10-19T09:00:00Z")
+
+
+# spec: ANYM-438
+def test_only_runs_of_other_commits_leave_the_unlinked_metric_unknown_at_the_deadline(repo, server):
+    _, b, clock, _, (code, data) = synced(repo, server, lambda a, b: [[sync_row(1, a, head=b)]])
+    assert code == 2 and states(data) == {"drift": PASS, "unlinked_tests": UNKNOWN, "stale_anchors": PASS,
+                                          "done_open_checks": PASS}
+    assert data["metrics"]["unlinked_tests"]["reason"] == "no finished Tiden sync run of TARGET"
+    assert data["sync"] == NO_SYNC and health.TESTS_WAIT <= clock.now < health.TESTS_WAIT + health.POLL + 1
+
+
+# spec: ANYM-438
+def test_a_dispatch_for_a_started_from_main_b_is_found_for_target_a(repo, server):
+    a, b = history(repo)
+    server.world(a)
+    actions = FakeActions([sync_row(1, a, head=b), sync_row(2, b, head=b, conclusion="failure")])
+    code, data = measure(repo, server, a, actions=actions)
+    assert code == 0 and data["target"] == a
+    decided(data, 1)
+
+
+# spec: ANYM-438
+def test_a_skipped_run_is_ignored_and_only_skipped_runs_mean_no_sync(repo, server):
+    _, b, clock, _, (code, data) = synced(repo, server, lambda a, b: [[
+        sync_row(1, b), sync_row(2, b, conclusion="skipped", updated="2026-10-19T10:10:00Z")]])
+    assert code == 0 and clock.sleeps == 0
+    decided(data, 1)
+    *_, (code, data) = synced(repo, server, lambda a, b: [[sync_row(2, b, conclusion="skipped")]], clock=Clock())
+    assert code == 2 and data["metrics"]["unlinked_tests"]["reason"] == "no finished Tiden sync run of TARGET"
+    assert data["sync"] == NO_SYNC
+
+
+# spec: ANYM-438
+def test_a_sync_still_running_at_the_deadline_is_unknown_never_the_earlier_success(repo, server):
+    _, b, clock, _, (code, data) = synced(repo, server, lambda a, b: [[
+        sync_row(1, b), sync_row(2, b, status="in_progress")]])
+    assert code == 2 and states(data)["unlinked_tests"] == UNKNOWN and states(data)["drift"] == PASS
+    assert data["metrics"]["unlinked_tests"]["reason"] == "no finished Tiden sync run of TARGET"
+    assert data["sync"] == NO_SYNC and health.TESTS_WAIT <= clock.now < health.TESTS_WAIT + health.POLL + 1
+
+
+# spec: ANYM-438
+def test_the_sync_wait_shares_the_evidence_deadline_and_neither_wait_resets_the_other(repo, server):
+    a, b = history(repo)
+    # Drift waits 15 minutes, the evidence appears 5 minutes later, the sync never finishes.
+    server.world(b, watermarks=[a] * 30 + [b], runs=[[]] * 10 + [[run(10, b)]])
+    clock = Clock()
+    code, data = measure(repo, server, b, clock=clock, actions=FakeActions([sync_row(1, b, status="queued")]))
+    assert states(data) == {"drift": PASS, "unlinked_tests": UNKNOWN, "stale_anchors": PASS, "done_open_checks": PASS}
+    assert health.TESTS_WAIT <= clock.now < health.TESTS_WAIT + health.POLL + 1
+    assert (health.TESTS_WAIT + health.POLL) / 60 < workflow()["jobs"]["report"]["timeout-minutes"]
+
+
+# spec: ANYM-438
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", "action_required", "neutral", "stale"])
+def test_any_other_conclusion_makes_only_the_unlinked_metric_unknown_and_the_others_stay_as_measured(
+        repo, server, conclusion):
+    a, b = history(repo)
+    server.world(b, specs=[spec(1, paths=["services/app.py", "gone.py"])])
+    baseline = measure(repo, server, b)[1]["metrics"]
+    server.world(b, specs=[spec(1, paths=["services/app.py", "gone.py"])])
+    code, data = measure(repo, server, b, actions=FakeActions([sync_row(4, b, conclusion=conclusion)]))
+    assert code == 1  # the stale anchor still fails
+    assert states(data)["unlinked_tests"] == UNKNOWN and conclusion in data["metrics"]["unlinked_tests"]["reason"]
+    for name in ("drift", "stale_anchors", "done_open_checks"):
+        assert data["metrics"][name] == baseline[name]
+    decided(data, 4, conclusion=conclusion)
+    summary = "\n".join(health.render(data, code))
+    assert "https://example.invalid/runs/4" in summary and conclusion in summary
+
+
+# spec: ANYM-438
+@pytest.mark.parametrize(("script", "reason"), [
+    (lambda b: [health.Unknown("gh api timed out")], "gh api timed out"),
+    (lambda b: [[sync_row(1, b, status="queued")], health.Unknown("gh api exited 1")], "gh api exited 1"),
+])
+def test_a_lookup_error_makes_only_the_unlinked_metric_unknown_and_the_report_is_still_complete(repo, server, script,
+                                                                                               reason):
+    _, b, _, _, (code, data) = synced(repo, server, lambda a, b: script(b))
+    assert code == 2 and states(data) == {"drift": PASS, "unlinked_tests": UNKNOWN, "stale_anchors": PASS,
+                                          "done_open_checks": PASS}
+    assert data["metrics"]["unlinked_tests"]["reason"] == reason
+    assert data["sync"] == NO_SYNC and json.dumps(data)
+
+
+# spec: ANYM-438
+def test_the_summary_states_the_sync_that_was_waited_for(repo, server):
+    _, b, _, _, (code, data) = synced(repo, server, lambda a, b: [[sync_row(7, b)]])
+    text = "\n".join(health.render(data, code))
+    assert "Tiden sync" in text and "https://example.invalid/runs/7" in text and "success" in text
+    _, _, _, _, (code, data) = synced(repo, server, lambda a, b: [[]], clock=Clock())
+    assert "no finished" in "\n".join(health.render(data, code))
+
+
+# spec: ANYM-438
+def test_without_a_sync_lookup_the_report_is_as_before_and_says_so(repo, server):
+    _, b = history(repo)
+    server.world(b)
+    code, data = measure(repo, server, b)
+    assert code == 0 and data["sync"] == {**NO_SYNC, "checked": False}
+
+
+@pytest.fixture
+def gh(tmp_path, monkeypatch):
+    cli, path = tmp_path / "gh", tmp_path / "gh-state.json"
+    cli.write_text(FAKE_GH)
+    cli.chmod(0o755)
+    monkeypatch.setenv("FAKE_GH_STATE", str(path))
+
+    class Gh:
+        def __init__(self):
+            self.cli, self.state = str(cli), str(path)
+
+        def set(self, **values):
+            path.write_text(json.dumps(values))
+
+        def calls(self):
+            return json.loads(path.read_text()).get("calls", []) if path.exists() else []
+
+    return Gh()
+
+
+# spec: ANYM-438
+def test_the_lookup_reads_the_sync_workflow_runs_of_main_over_every_page_with_get_queries(gh):
+    gh.set(rows=[sync_row(number, "a" * 40) for number in range(1, 251)])
+    rows = health.Actions("o/r", gh.cli).runs()
+    assert [row["id"] for row in rows] == list(range(1, 251))
+    calls = gh.calls()
+    assert [next(arg for arg in call if arg.startswith("page=")) for call in calls] == ["page=1", "page=2", "page=3"]
+    first = calls[0]
+    assert first[:4] == ["api", "--method", "GET", "repos/o/r/actions/workflows/tiden-sync.yml/runs"]
+    assert "branch=main" in first and "per_page=100" in first
+    assert any(arg.startswith("created=>=20") for arg in first) and first.count("-f") == 2 and first.count("-F") == 2
+
+
+# spec: ANYM-438
+@pytest.mark.parametrize(("values", "reason"), [
+    ({"rows": [], "mode": "exit"}, "gh api exited 1"),
+    ({"rows": [], "mode": "garbage"}, "gh api returned malformed JSON"),
+    ({"rows": [], "mode": "scalar"}, "gh api returned no run page"),
+    ({"rows": [], "mode": "no-total"}, "gh api returned no run page"),
+    ({"rows": [sync_row(1, "a" * 40)], "total": 2}, "gh api pagination is incomplete"),
+    ({"rows": [sync_row(1, "a" * 40), sync_row(1, "a" * 40)]}, "gh api returned a malformed or duplicate run"),
+    ({"rows": [{"id": 1}]}, "gh api returned a malformed or duplicate run"),
+    ({"rows": [{**sync_row(1, "a" * 40), "updated_at": "yesterday"}]}, "gh api returned a malformed or duplicate run"),
+])
+def test_a_lookup_that_is_not_a_complete_valid_run_list_is_a_named_error_without_the_response(gh, values, reason):
+    gh.set(**values)
+    with pytest.raises(health.Unknown) as raised:
+        health.Actions("o/r", gh.cli).runs()
+    assert str(raised.value) == reason and SECRET not in str(raised.value)
+
+
+# spec: ANYM-438
+@pytest.mark.parametrize("repository", ["", "o", "o/r/x", "--paginate", "o/r?x=1", "o/ r"])
+def test_a_repository_that_is_not_owner_and_name_is_a_lookup_error_before_any_call(gh, repository):
+    gh.set(rows=[])
+    with pytest.raises(health.Unknown, match="repository"):
+        health.Actions(repository, gh.cli).runs()
+    assert gh.calls() == []
+
+
+# spec: ANYM-438
+def test_a_missing_gh_and_a_stalled_gh_are_named_errors(tmp_path, monkeypatch):
+    with pytest.raises(health.Unknown) as raised:
+        health.Actions("o/r", str(tmp_path / "missing-gh")).runs()
+    assert str(raised.value) == "gh api could not run"
+
+    def stalled(arguments, **options):
+        raise subprocess.TimeoutExpired(arguments, health.TIMEOUT, output=SECRET.encode())
+
+    monkeypatch.setattr(health.subprocess, "run", stalled)
+    with pytest.raises(health.Unknown) as raised:
+        health.Actions("o/r").runs()
+    assert str(raised.value) == "gh api timed out" and SECRET not in str(raised.value)
+
+
+# spec: ANYM-438
+def test_a_lookup_failure_through_the_real_command_leaves_the_other_metrics_and_the_artifact(repo, server, gh):
+    _, b = history(repo)
+    server.world(b)
+    gh.set(rows=[], mode="exit")
+    actions = health.Actions("o/r", gh.cli)
+    code, data = measure(repo, server, b, actions=actions)
+    assert code == 2 and states(data)["unlinked_tests"] == UNKNOWN and data["sync"] == NO_SYNC
+    assert data["metrics"]["unlinked_tests"]["reason"] == "gh api exited 1" and SECRET not in json.dumps(data)
+
+
+# spec: ANYM-438
+def test_the_command_takes_the_repository_for_the_sync_lookup_and_an_empty_one_is_a_lookup_error(repo, server, gh,
+                                                                                                 tmp_path):
+    _, b = history(repo)
+    server.world(b)
+    common = ("--product-id", "product", "--workspace-id", "workspace", "--target", b, "--require-token", "--gh",
+              gh.cli)
+    gh.set(rows=[sync_row(3, b)])
+    completed, data = command(repo, tmp_path, server.cli, *common, "--sync-repository", "o/r",
+                              env={"TIDEN_API_TOKEN": SECRET, "FAKE_GH_STATE": gh.state})
+    assert completed.returncode == 0, completed.stderr
+    decided(data, 3)
+    assert "Tiden sync" in completed.stdout and len(gh.calls()) == 1
+    server.world(b)
+    gh.set(rows=[sync_row(3, b)])
+    completed, data = command(repo, tmp_path, server.cli, *common, "--sync-repository", "",
+                              env={"TIDEN_API_TOKEN": SECRET, "FAKE_GH_STATE": gh.state})
+    assert completed.returncode == 2 and data["sync"] == NO_SYNC and gh.calls() == []
+    assert states(data) == {"drift": PASS, "unlinked_tests": UNKNOWN, "stale_anchors": PASS, "done_open_checks": PASS}
+
+
 # The workflow.
 
 def workflow():
@@ -954,7 +1320,7 @@ def test_the_workflow_runs_after_every_main_ci_run_and_on_dispatch_only():
     data = workflow()
     triggers = data.get("on", data.get(True))
     assert triggers == {"workflow_run": {"workflows": ["CI"], "types": ["completed"]}, "workflow_dispatch": None}
-    assert data["permissions"] == {"contents": "read"}
+    assert data["permissions"] == {"contents": "read", "actions": "read"}  # ANYM-438: the sync run lookup, no write scope
     assert data["concurrency"] == {"group": "tiden-health", "cancel-in-progress": False}
     job = data["jobs"]["report"]
     condition = " ".join(job["if"].split())
@@ -988,6 +1354,19 @@ def test_the_workflow_checks_out_main_without_credentials_and_pins_the_cli_as_ci
     upload = steps[-1]
     assert upload["uses"].startswith("actions/upload-artifact@") and upload["if"].startswith("always()")
     assert upload["with"]["name"] == "tiden-health" and upload["with"]["overwrite"] is True
+
+
+# spec: ANYM-438
+def test_the_job_token_reaches_the_report_step_alone_and_the_lookup_names_the_repository():
+    steps = workflow()["jobs"]["report"]["steps"]
+    holders = [step["name"] for step in steps if "github.token" in json.dumps(step)]
+    assert holders == ["Measure drift, unlinked tests, stale anchors and Done specs with open checks"]
+    report_step = next(step for step in steps if step.get("name") == holders[0])
+    assert report_step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert report_step["run"].endswith('--fetch --sync-repository "$GITHUB_REPOSITORY" --output '
+                                       '"$RUNNER_TEMP/tiden-health.json"')
+    assert "GH_TOKEN" not in json.dumps(workflow().get("env", {})) and "env" not in workflow()["jobs"]["report"]
+    assert workflow()["jobs"]["report"]["timeout-minutes"] == 45
 
 
 def test_the_workflow_is_not_a_required_check():

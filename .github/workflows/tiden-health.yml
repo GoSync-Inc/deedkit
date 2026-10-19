@@ -8,6 +8,8 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  # The lookup of the Tiden sync run of TARGET (ANYM-438); read only, reaches the report step as GH_TOKEN.
+  actions: read
 concurrency:
   # Runs never overlap. GitHub may replace a pending run with a newer one; each run measures the head of main when it
   # starts, so whichever run executes last covers every merge.
@@ -21,7 +23,8 @@ jobs:
       github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'))
     runs-on: ubuntu-latest
-    # The report waits up to 15 minutes for the watermark and 30 minutes from its start for the test evidence.
+    # The report waits up to 15 minutes for the watermark and 30 minutes from its start for the test evidence and the
+    # Tiden sync run of TARGET.
     timeout-minutes: 45
     steps:
       # Expression comparisons ignore case; these do not, and run before any repository code.
@@ -61,9 +64,10 @@ jobs:
           UPSTREAM_RUN_URL: ${{ github.event.workflow_run.html_url }}
           UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           UPSTREAM_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
         # Exit 1: a metric failed; exit 2: none failed and one is unknown. Missing configuration (the token or either
         # ID) still writes the full report, every metric unknown, so the run is never green without one.
-        run: python3 scripts/tiden_health.py --cli "$RUNNER_TEMP/tiden-bin/tiden" --require-token --fetch --output "$RUNNER_TEMP/tiden-health.json"
+        run: python3 scripts/tiden_health.py --cli "$RUNNER_TEMP/tiden-bin/tiden" --require-token --fetch --sync-repository "$GITHUB_REPOSITORY" --output "$RUNNER_TEMP/tiden-health.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
