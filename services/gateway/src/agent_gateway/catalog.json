@@ -3103,6 +3103,20 @@
               "minimum": 30,
               "title": "Max Duration Secs",
               "type": "integer"
+            },
+            "timezone": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Timezone"
             }
           },
           "required": [
@@ -3140,7 +3154,7 @@
     "scopes": [
       "calls:prepare"
     ],
-    "description": "Local write; places no call. Saves a new outbound brief for one exact channel (phone, sip, whatsapp or telegram), account and destination and returns its id as brief_id. The destination may be one the owner named or one you found for the owner's task; no recipient list applies (SIP: exact allowlist). Emergency numbers and short codes are refused: tell the owner to call them directly. The owner sets the voice for all calls (capabilities call_voice). Next: preflight_call, then dial_call.",
+    "description": "Local write; places no call. Saves a new outbound brief for one exact channel (phone, sip, whatsapp or telegram), account and destination and returns its id as brief_id. The destination may be one the owner named or one you found for the owner's task; no recipient list applies (SIP: exact allowlist). Emergency numbers and short codes are refused: tell the owner to call them directly. Set timezone (IANA, e.g. Asia/Makassar) when you know where the counterparty is: the call then greets by their local time, otherwise neutrally. The owner sets the voice for all calls (capabilities call_voice). Next: preflight_call, then dial_call.",
     "inputSchema": {
       "$defs": {
         "AgentExternalBrief": {
@@ -3230,6 +3244,20 @@
               "minimum": 30,
               "title": "Max Duration Secs",
               "type": "integer"
+            },
+            "timezone": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Timezone"
             },
             "channel": {
               "pattern": "^(telegram|whatsapp|phone|sip)$",

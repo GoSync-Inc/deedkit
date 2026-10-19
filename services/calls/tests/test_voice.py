@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from core import BriefInput, VoiceService, TOOL_MODELS
+from core import BriefInput, VoiceService, TOOL_MODELS, call_clock
 
 
 def test_native_gemini_uses_saved_prompt_voice_and_model(tmp_path):
@@ -13,7 +13,7 @@ def test_native_gemini_uses_saved_prompt_voice_and_model(tmp_path):
     model=voice.create_model(brief,'fixture-not-a-key')
     assert model._settings.model == brief['model']
     assert model._settings.voice == 'Kore'
-    assert model._settings.system_instruction == brief['prompt']
+    assert model._settings.system_instruction == brief['prompt'] + '\n' + call_clock(brief, None)
     store.close()
 
 
