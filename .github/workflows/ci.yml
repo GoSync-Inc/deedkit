@@ -316,14 +316,18 @@ jobs:
     # recorded for a SHA whose images were not published. Tiden captures a release gate from the
     # main gate when the release is first created (TIDEN-CI.md), so a commit whose evidence
     # publication was not verified records nothing and warns.
+    # Temporary (ANYM-411, end condition in TIDEN-CI.md): an unavailable Tiden (CLI download, a failed, unparseable
+    # or hung call) only warns with a receipt. Every step has a timeout and together they stay below the job's,
+    # so the warning and the receipt upload always run.
     name: Tiden release record
     needs: [gate, publish, checks]
     if: ${{ !cancelled() && needs.gate.result == 'success' && needs.publish.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 20
     steps:
       - name: Check optional Tiden configuration
         id: config
+        timeout-minutes: 1
         env:
           TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
           TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
@@ -334,7 +338,9 @@ jobs:
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             echo 'Tiden reporting is not configured; see TIDEN-CI.md.' >> "$GITHUB_STEP_SUMMARY"
           else
-            test -n "$TIDEN_PRODUCT_ID" && test -n "$TIDEN_WORKSPACE_ID"
+            # Two commands: `bash -e` ignores a failure on the left of `&&`.
+            test -n "$TIDEN_PRODUCT_ID"
+            test -n "$TIDEN_WORKSPACE_ID"
             if [ "$TIDEN_PUBLISHED" = true ]; then
               echo 'enabled=true' >> "$GITHUB_OUTPUT"
             else
@@ -345,24 +351,44 @@ jobs:
           fi
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         if: steps.config.outputs.enabled == 'true'
+        timeout-minutes: 2
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: steps.config.outputs.enabled == 'true'
+        timeout-minutes: 3
         with:
           name: ci-evidence
           path: ${{ runner.temp }}/ci-evidence
-      - name: Install pinned Tiden CLI with integrity check
+      # Only the download may fail without failing the job; the checksum and extraction below may not.
+      - name: Download pinned Tiden CLI
+        id: download
         if: steps.config.outputs.enabled == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        run: curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.33.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
+      - name: Install pinned Tiden CLI with integrity check
+        if: steps.config.outputs.enabled == 'true' && steps.download.outcome == 'success'
+        timeout-minutes: 1
         run: |
-          curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.33.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
           echo "3f6b650c4cabd58ce4149d9106325cbd36d1472cccc9c63ca03137668b80e4a6  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
           mkdir "$RUNNER_TEMP/tiden-bin"
           tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
           echo "$RUNNER_TEMP/tiden-bin" >> "$GITHUB_PATH"
+      - name: Warn that the Tiden CLI was not downloaded
+        if: steps.config.outputs.enabled == 'true' && steps.download.outcome != 'success'
+        timeout-minutes: 1
+        env:
+          DOWNLOAD: ${{ steps.download.outcome }}
+          SHA: ${{ github.sha }}
+        run: |
+          python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-release-receipt.json").write_text(json.dumps({"state": "not_attempted", "version": "deedkit@" + os.environ["SHA"], "environment": "github-actions-synthetic", "download": os.environ["DOWNLOAD"]}, indent=2))'
+          echo "::warning title=Tiden release not recorded::the Tiden CLI download ended ${DOWNLOAD:-not run} (receipt state not_attempted); for now a Tiden error in the CI release record only warns (ANYM-411, TIDEN-CI.md)"
       - name: Record the main release in Tiden
-        if: steps.config.outputs.enabled == 'true'
+        if: steps.config.outputs.enabled == 'true' && steps.download.outcome == 'success'
+        # scripts/tiden_ci.py CI_RELEASE_DEADLINE ends its own work at least 30 seconds before this.
+        timeout-minutes: 5
         env:
           TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
           TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
@@ -371,6 +397,7 @@ jobs:
         run: python scripts/tiden_ci.py release --directory "$RUNNER_TEMP/ci-evidence" --environment github-actions-synthetic
       - name: Retain the release receipt
         if: ${{ always() && steps.config.outputs.enabled == 'true' }}
+        timeout-minutes: 3
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tiden-release-receipt

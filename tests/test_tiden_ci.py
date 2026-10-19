@@ -1059,7 +1059,8 @@ def test_release_workflows_record_only_verified_main_commits(tmp_path):
                          "&& github.event_name == 'push' && github.ref == 'refs/heads/main' }}")
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in job["steps"]}
     record = steps["Record the main release in Tiden"]
-    assert record["if"] == "steps.config.outputs.enabled == 'true'" and "continue-on-error" not in record
+    assert record["if"] == "steps.config.outputs.enabled == 'true' && steps.download.outcome == 'success'"
+    assert "continue-on-error" not in record
     assert record["run"] == ('python scripts/tiden_ci.py release --directory "$RUNNER_TEMP/ci-evidence" '
                              '--environment github-actions-synthetic')
     assert steps["actions/download-artifact"]["with"]["name"] == "ci-evidence"
@@ -1094,7 +1095,404 @@ def test_release_workflows_record_only_verified_main_commits(tmp_path):
     assert "${{" not in steps[verify]["run"] and "${{" not in steps[publish]["run"]
 
 
-ATTEMPT_URL = "https://github.com/example/repo/actions/runs/1/attempts/2"
+def unavailable_cli(monkeypatch, fail, mode, **options):
+    """The synthetic Tiden of release_cli, unavailable at the `fail`-th call of one command: exit 1, garbage or a hang."""
+    import subprocess
+    calls = release_cli(monkeypatch, **options)
+    synthetic, seen, timeouts = subprocess.run, Counter(), []
+    def run(args, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        command, number = fail
+        seen[tuple(args[1:3])] += 1
+        if tuple(args[1:3]) == command and seen[command] == number:
+            calls.append(args)
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return subprocess.CompletedProcess(args, 1 if mode == "exit" else 0,
+                                               stdout="" if mode == "exit" else "<html>502</html>", stderr="")
+        return synthetic(args, **kwargs)
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls, timeouts
+
+
+LISTING, CREATE, GATE = ("run", "list"), ("release", "create"), ("gate", "check")
+
+
+# spec: ANYM-411
+@pytest.mark.parametrize("mode", ["exit", "unparseable", "timeout"])
+def test_an_unavailable_tiden_only_warns_in_the_ci_release_record_and_still_fails_production(tmp_path, monkeypatch,
+                                                                                            capsys, mode):
+    from scripts.tiden_ci import TidenUnavailable
+    calls, _ = unavailable_cli(monkeypatch, (LISTING, 1), mode)
+    main_push_manifest(tmp_path)
+    assert run_release(monkeypatch, tmp_path, "--environment", "github-actions-synthetic") == 0
+    out = capsys.readouterr().out
+    assert out.startswith("::warning title=Tiden release not recorded::") and "TIDEN-CI.md" in out
+    assert "receipt state not_attempted" in out and "ANYM-411" in out
+    assert not any(call[1:3] == ["release", "create"] for call in calls)
+    assert receipt(tmp_path) == {"state": "not_attempted", "version": "deedkit@" + RELEASE_SHA,
+                                 "environment": "github-actions-synthetic", "url": RUN_URL,
+                                 "releasedAt": receipt(tmp_path)["releasedAt"]}
+    # The production record keeps failing on every error the CI record tolerates.
+    unavailable_cli(monkeypatch, (LISTING, 1), mode)
+    with pytest.raises(TidenUnavailable):
+        run_release(monkeypatch, tmp_path, *PRODUCTION)
+    assert receipt(tmp_path)["state"] == "not_attempted" and receipt(tmp_path)["environment"] == "production"
+
+
+# spec: ANYM-411
+@pytest.mark.parametrize("fail, mode, release_id", [
+    ((LISTING, 2), "exit", "release-id"),  # the create succeeded, then the captured-run read failed
+    ((LISTING, 2), "timeout", "release-id"),
+    ((GATE, 1), "timeout", "release-id"),
+    ((CREATE, 1), "timeout", None),  # the create was sent, but its response never came
+    ((CREATE, 1), "unparseable", None),
+    ((CREATE, 1), "exit", None),
+], ids=["captured-read-exit", "captured-read-timeout", "gate-timeout", "create-timeout", "create-unparseable",
+        "create-exit"])
+def test_a_sent_release_create_is_never_retried_and_its_receipt_says_not_verified(tmp_path, monkeypatch, capsys,
+                                                                                 fail, mode, release_id):
+    from scripts.tiden_ci import TidenUnavailable
+    calls, _ = unavailable_cli(monkeypatch, fail, mode)
+    main_push_manifest(tmp_path)
+    assert run_release(monkeypatch, tmp_path, "--environment", "github-actions-synthetic") == 0
+    assert "receipt state not_verified" in capsys.readouterr().out
+    assert sum(call[1:3] == ["release", "create"] for call in calls) == 1
+    recorded = receipt(tmp_path)
+    assert recorded["state"] == "not_verified" and recorded.get("releaseId") == release_id
+    assert (recorded["version"], recorded["environment"], recorded["url"]) == (
+        "deedkit@" + RELEASE_SHA, "github-actions-synthetic", RUN_URL)
+    assert ("createdAt" in recorded) == bool(release_id) and "gateFromThisCommit" not in recorded
+    calls, _ = unavailable_cli(monkeypatch, fail, mode)
+    with pytest.raises(TidenUnavailable):
+        run_release(monkeypatch, tmp_path, *PRODUCTION)
+    assert sum(call[1:3] == ["release", "create"] for call in calls) == 1
+    assert receipt(tmp_path)["state"] == "not_verified" and receipt(tmp_path).get("releaseId") == release_id
+
+
+# spec: ANYM-411
+def test_a_recorded_release_receipt_says_recorded(tmp_path, monkeypatch):
+    release_cli(monkeypatch)
+    main_push_manifest(tmp_path)
+    assert run_release(monkeypatch, tmp_path, "--environment", "github-actions-synthetic") == 0
+    assert receipt(tmp_path)["state"] == "recorded" and receipt(tmp_path)["releaseId"] == "release-id"
+
+
+# spec: ANYM-411
+def test_the_ci_release_record_ends_every_call_and_the_settle_wait_by_its_deadline(tmp_path, monkeypatch):
+    import yaml
+    from scripts import tiden_ci
+    root = Path(__file__).resolve().parents[1]
+    job = yaml.safe_load((root / ".github/workflows/ci.yml").read_text())["jobs"]["release"]
+    steps = {step.get("name") or step["uses"].split("@")[0]: step for step in job["steps"]}
+    # Every step has its own timeout and together, with a minute of headroom, they stay below the job's, so the
+    # warning and the receipt upload always run; the script ends its own work 30 seconds before its step's timeout.
+    assert all("timeout-minutes" in step for step in steps.values())
+    assert sum(step["timeout-minutes"] for step in steps.values()) + 1 < job["timeout-minutes"]
+    assert tiden_ci.CI_RELEASE_DEADLINE <= steps["Record the main release in Tiden"]["timeout-minutes"] * 60 - 30
+    assert tiden_ci.CLI_TIMEOUT == 120
+
+    clock = [1000.0]
+    monkeypatch.setattr(tiden_ci.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(tiden_ci.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    now = datetime.now(timezone.utc)
+    def stamp(value):
+        return value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    # The run just completed, so the gate settles in about 50 seconds, but only 20 are left.
+    runs = [main_run(created=stamp(now - timedelta(seconds=15)), completed=stamp(now - timedelta(seconds=10)))]
+    calls, timeouts = unavailable_cli(monkeypatch, (GATE, 99), "exit", runs=runs)
+    with pytest.raises(tiden_ci.TidenUnavailable, match="deadline"):
+        tiden_ci.record_release(tmp_path, RELEASE_SHA, "github-actions-synthetic", RUN_URL, "2026-01-01T00:20:00Z",
+                                PRODUCT, deadline=1020.0)
+    assert clock[0] == 1020.0 and timeouts == [20.0]
+    assert not any(call[1:3] == ["release", "create"] for call in calls)
+    assert receipt(tmp_path)["state"] == "not_attempted"
+    # Each call's timeout is the smaller of 120 seconds and the time left.
+    clock[0] = 1000.0
+    calls, timeouts = unavailable_cli(monkeypatch, (GATE, 99), "exit")
+    tiden_ci.record_release(tmp_path, RELEASE_SHA, "github-actions-synthetic", RUN_URL, "2026-01-01T00:20:00Z",
+                            PRODUCT, deadline=1090.0)
+    assert timeouts and all(timeout == 90.0 for timeout in timeouts)
+    # Production keeps no deadline: each call keeps its 120-second timeout.
+    _, timeouts = unavailable_cli(monkeypatch, (GATE, 99), "exit")
+    assert run_release(monkeypatch, tmp_path, *PRODUCTION) == 0
+    assert timeouts and all(timeout == 120 for timeout in timeouts)
+
+
+FAKE_TIDEN = """#!{python}
+import json, os, sys
+scenario, args = os.environ["FAKE_TIDEN"], sys.argv[1:3]
+if os.environ.get("FAKE_TIDEN_LOG"):
+    with open(os.environ["FAKE_TIDEN_LOG"], "a") as log:
+        log.write(" ".join(args) + "\\n")
+if scenario == "exit":
+    sys.exit(1)
+if scenario == "unparseable":
+    print("<html>502 Bad Gateway</html>")
+    sys.exit(0)
+if args == ["run", "list"]:
+    run = {{"id": "run-a", "buildSha": "{sha}", "status": "passed", "createdAt": "2026-01-01T00:00:00.000000Z",
+            "completedAt": "2026-01-01T00:00:05.000000Z"}}
+    print(json.dumps({{"listing": [run]}} if scenario == "unexpected" else {{"runs": [run], "pagination": {{}}}}))
+elif args == ["release", "create"]:
+    print(json.dumps({{"id": "release-id", "version": "anymsg@0.9.19", "environmentSlug": "github-actions-synthetic",
+                      "url": "{url}", "createdAt": "2026-01-01T00:10:00.000000Z"}}))
+else:
+    sys.exit(2)
+"""
+
+
+# spec: ANYM-411
+def test_the_release_job_tolerates_only_an_unavailable_tiden(tmp_path):
+    import os
+    import subprocess
+    import tarfile
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    job = yaml.safe_load((root / ".github/workflows/ci.yml").read_text())["jobs"]["release"]
+    steps = {step.get("name") or step["uses"].split("@")[0]: step for step in job["steps"]}
+    names = list(steps)
+    download, install = "Download pinned Tiden CLI", "Install pinned Tiden CLI with integrity check"
+    warn, record = "Warn that the Tiden CLI was not downloaded", "Record the main release in Tiden"
+    # Only the download may fail without failing the job, and it only downloads; no job-level suppression.
+    assert [name for name, step in steps.items() if step.get("continue-on-error")] == [download]
+    assert "continue-on-error" not in job and steps[download]["id"] == "download"
+    assert steps[download]["run"].startswith("curl ") and "\n" not in steps[download]["run"].strip()
+    assert names.index(download) < names.index(install) < names.index(warn) < names.index(record)
+    assert steps[install]["if"] == steps[record]["if"] == (
+        "steps.config.outputs.enabled == 'true' && steps.download.outcome == 'success'")
+    assert steps[warn]["if"] == "steps.config.outputs.enabled == 'true' && steps.download.outcome != 'success'"
+    script = steps[install]["run"]
+    assert script.index("sha256sum --check") < script.index("tar -xzf")
+
+    def bash(step, temp, **env):
+        temp.mkdir(exist_ok=True)
+        return subprocess.run(["bash", "-e", "-c", steps[step]["run"]], capture_output=True, text=True, env={
+            "PATH": os.environ["PATH"], "RUNNER_TEMP": str(temp), "GITHUB_PATH": str(temp / "path"),
+            "GITHUB_OUTPUT": str(temp / "output"), "GITHUB_STEP_SUMMARY": str(temp / "summary"), **env})
+
+    # A failed download warns with a receipt that records no create call.
+    completed = bash(warn, tmp_path / "download", DOWNLOAD="failure", SHA=RELEASE_SHA)
+    assert completed.returncode == 0
+    assert completed.stdout.startswith("::warning title=Tiden release not recorded::the Tiden CLI download ended "
+                                       "failure (receipt state not_attempted)") and "TIDEN-CI.md" in completed.stdout
+    assert json.loads((tmp_path / "download" / "ci-evidence" / "tiden-release-receipt.json").read_text()) == {
+        "state": "not_attempted", "version": "deedkit@" + RELEASE_SHA, "environment": "github-actions-synthetic",
+        "download": "failure"}
+    # A missing product or workspace ID with a token set fails the job.
+    for product, workspace in (("", "workspace"), ("product", ""), ("", "")):
+        completed = bash("Check optional Tiden configuration", tmp_path / f"config-{product}-{workspace}",
+                         TIDEN_API_TOKEN="synthetic-token", TIDEN_PRODUCT_ID=product, TIDEN_WORKSPACE_ID=workspace,
+                         TIDEN_PUBLISHED="true")
+        assert completed.returncode != 0, (product, workspace)
+    # A checksum mismatch fails the job, and the downloaded CLI is never extracted or put on the path.
+    tampered = tmp_path / "tampered"
+    tampered.mkdir()
+    (tampered / "tiden").write_text("#!/bin/sh\nexit 0\n")
+    with tarfile.open(tampered / "tiden.tar.gz", "w:gz") as archive:
+        archive.add(tampered / "tiden", arcname="tiden")
+    assert bash(install, tampered).returncode != 0
+    assert not (tampered / "tiden-bin").exists() and not (tampered / "path").exists()
+
+    # The record step itself, with a synthetic Tiden CLI on the path.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "tiden").write_text(FAKE_TIDEN.format(python=sys.executable, sha=RELEASE_SHA, url=RUN_URL))
+    (bin_dir / "tiden").chmod(0o755)
+    path = os.pathsep.join([str(bin_dir), str(Path(sys.executable).parent), "/usr/bin", "/bin"])
+
+    def recorded(scenario, product=PRODUCT, **change):
+        temp = tmp_path / f"record-{scenario}-{bool(product)}-{bool(change)}"
+        (temp / "ci-evidence").mkdir(parents=True)
+        main_push_manifest(temp / "ci-evidence", **change)
+        completed = subprocess.run(["bash", "-e", "-c", steps[record]["run"]], capture_output=True, text=True,
+                                   cwd=root, env={"PATH": path, "RUNNER_TEMP": str(temp), "FAKE_TIDEN": scenario,
+                                                  "TIDEN_API_TOKEN": "synthetic-token", "TIDEN_PRODUCT_ID": product,
+                                                  "TIDEN_WORKSPACE_ID": "workspace"})
+        return completed, temp / "ci-evidence"
+
+    for scenario in ("exit", "unparseable"):
+        completed, directory = recorded(scenario)
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.startswith("::warning title=Tiden release not recorded::")
+        assert json.loads((directory / "tiden-release-receipt.json").read_text())["state"] == "not_attempted"
+    # Still fatal: a rewritten release identity, an unexpected response, a non-main-push manifest, no product ID.
+    for scenario, product, change, error in (("rewritten", PRODUCT, {}, "rewrote the release identity"),
+                                             ("unexpected", PRODUCT, {}, "KeyError"),
+                                             ("exit", PRODUCT, {"event": "pull_request"}, "main push"),
+                                             ("exit", "", {}, "TIDEN_PRODUCT_ID")):
+        completed, _ = recorded(scenario, product, **change)
+        assert completed.returncode != 0 and error in completed.stderr, (scenario, completed.stderr)
+        assert "::warning" not in completed.stdout
+
+
+# spec: ANYM-411
+def test_the_release_entrypoints_fail_on_invalid_input_before_any_tiden_call(tmp_path):
+    import os
+    import subprocess
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    ci = yaml.safe_load((root / ".github/workflows/ci.yml").read_text())["jobs"]["release"]
+    ci_step = next(step for step in ci["steps"] if step.get("name") == "Record the main release in Tiden")
+    production = yaml.safe_load((root / ".github/workflows/production-release.yml").read_text())["jobs"]["record"]
+    production_step = next(step for step in production["steps"] if "tiden_ci.py release" in step.get("run", ""))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "tiden").write_text(FAKE_TIDEN.format(python=sys.executable, sha=RELEASE_SHA, url=RUN_URL))
+    (bin_dir / "tiden").chmod(0o755)
+    path = os.pathsep.join([str(bin_dir), str(Path(sys.executable).parent), "/usr/bin", "/bin"])
+
+    def step(script, name, **env):
+        temp = tmp_path / name
+        temp.mkdir()
+        log = temp / "tiden-calls"
+        completed = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True, cwd=root, env={
+            "PATH": path, "RUNNER_TEMP": str(temp), "FAKE_TIDEN": "exit", "FAKE_TIDEN_LOG": str(log),
+            "TIDEN_API_TOKEN": "synthetic-token", "TIDEN_PRODUCT_ID": PRODUCT, "TIDEN_WORKSPACE_ID": "workspace", **env})
+        # An exit-1 Tiden would only warn on the CI path, so a failure here comes from validation before any call.
+        assert completed.returncode != 0 and not log.exists() and "::warning" not in completed.stdout, (
+            name, completed.stdout, completed.stderr)
+        return temp
+
+    for name, change in (("upper-sha", {"sha": "A" * 40}), ("short-sha", {"sha": "a" * 12}),
+                         ("foreign-url", {"ci_url": "https://example.invalid/run/7"}),
+                         ("escaping-url", {"ci_url": RUN_URL + "/../../evil"})):
+        evidence = tmp_path / "evidence" / name
+        evidence.mkdir(parents=True)
+        main_push_manifest(evidence, **change)
+        directory = step(f'cp -R "{evidence}" "$RUNNER_TEMP/ci-evidence"\n' + ci_step["run"], name)
+        assert not (directory / "ci-evidence" / "tiden-release-receipt.json").exists()
+    production_inputs = {"SHA": RELEASE_SHA, "RUN_URL": RUN_URL, "RELEASED_AT": "2026-01-01T00:20:00Z",
+                         "ENVIRONMENT": "production"}
+    for name, change in (("production-upper-sha", {"SHA": "A" * 40}), ("production-short-sha", {"SHA": "a" * 12}),
+                         ("production-foreign-url", {"RUN_URL": "https://example.invalid/run/7"}),
+                         ("production-local-time", {"RELEASED_AT": "2026-10-17T00:00:30+03:00"}),
+                         ("production-spaced-time", {"RELEASED_AT": "2026-10-17 00:00:30"}),
+                         ("production-future-time", {"RELEASED_AT": "2999-01-01T00:00:00Z"}),
+                         ("production-staging", {"ENVIRONMENT": "staging"}),
+                         ("production-synthetic", {"ENVIRONMENT": "synthetic"})):
+        step(production_step["run"], name, **{**production_inputs, **change})
+
+
+# spec: ANYM-411
+@pytest.mark.parametrize("code, stdout", [(0, "<html>502</html>"), (1, '{"error": "unavailable"}'), (0, "[]"), (0, ""),
+                                          (3, '{"computedAt": "2026-01-01T00:10:01Z"}')],
+                         ids=["garbage", "error-object", "list", "empty", "verdict-without-status"])
+def test_a_gate_check_answer_that_is_neither_a_verdict_nor_a_missing_gate_means_tiden_was_unavailable(
+        tmp_path, monkeypatch, capsys, code, stdout):
+    import subprocess
+    from scripts.tiden_ci import TidenUnavailable
+
+    def answering(monkeypatch):
+        calls = release_cli(monkeypatch)
+        synthetic = subprocess.run
+        def run(args, **kwargs):
+            if args[1:3] == ["gate", "check"]:
+                calls.append(args)
+                return subprocess.CompletedProcess(args, code, stdout=stdout, stderr="")
+            return synthetic(args, **kwargs)
+        monkeypatch.setattr(subprocess, "run", run)
+        return calls
+
+    calls = answering(monkeypatch)
+    main_push_manifest(tmp_path)
+    assert run_release(monkeypatch, tmp_path, "--environment", "github-actions-synthetic") == 0
+    out = capsys.readouterr().out
+    assert "Tiden release not recorded" in out and "receipt state not_verified" in out
+    assert "no gate was captured" not in out
+    assert sum(call[1:3] == ["release", "create"] for call in calls) == 1
+    assert {key: receipt(tmp_path).get(key) for key in ("state", "releaseId", "createdAt")} == {
+        "state": "not_verified", "releaseId": "release-id", "createdAt": CREATED}
+    answering(monkeypatch)
+    with pytest.raises(TidenUnavailable):
+        run_release(monkeypatch, tmp_path, *PRODUCTION)
+    assert receipt(tmp_path)["state"] == "not_verified"
+
+
+# spec: ANYM-411
+def test_a_gate_check_that_fails_printing_json_null_is_no_missing_gate(tmp_path, monkeypatch, capsys):
+    import subprocess
+    from scripts.tiden_ci import TidenUnavailable
+
+    def answering(monkeypatch):
+        calls = release_cli(monkeypatch)
+        synthetic = subprocess.run
+        def run(args, **kwargs):
+            if args[1:3] == ["gate", "check"]:
+                return subprocess.CompletedProcess(args, 1, stdout="null", stderr="synthetic unavailable")
+            return synthetic(args, **kwargs)
+        monkeypatch.setattr(subprocess, "run", run)
+        return calls
+
+    # Only empty output means a missing gate; a printed JSON null is no answer.
+    calls = answering(monkeypatch)
+    main_push_manifest(tmp_path)
+    assert run_release(monkeypatch, tmp_path, "--environment", "github-actions-synthetic") == 0
+    out = capsys.readouterr().out
+    assert "receipt state not_verified" in out and "no gate was captured" not in out
+    assert sum(call[1:3] == ["release", "create"] for call in calls) == 1
+    assert {key: receipt(tmp_path).get(key) for key in ("state", "releaseId", "createdAt")} == {
+        "state": "not_verified", "releaseId": "release-id", "createdAt": CREATED}
+    calls = answering(monkeypatch)
+    with pytest.raises(TidenUnavailable):
+        run_release(monkeypatch, tmp_path, *PRODUCTION)
+    assert sum(call[1:3] == ["release", "create"] for call in calls) == 1
+    assert receipt(tmp_path)["state"] == "not_verified"
+
+
+# spec: ANYM-411
+def test_the_receipt_is_current_before_the_create_call_is_sent(tmp_path, monkeypatch):
+    import subprocess
+    release_cli(monkeypatch)
+    synthetic = subprocess.run
+    def run(args, **kwargs):
+        if args[1:3] == ["release", "create"]:
+            # The process dies while the create is in flight: whatever the receipt says now is what is left.
+            assert receipt(tmp_path)["state"] == "not_verified" and "releaseId" not in receipt(tmp_path)
+            raise OSError("killed")
+        assert receipt(tmp_path)["state"] == "not_attempted"
+        return synthetic(args, **kwargs)
+    monkeypatch.setattr(subprocess, "run", run)
+    main_push_manifest(tmp_path)
+    with pytest.raises(OSError, match="killed"):
+        run_release(monkeypatch, tmp_path, "--environment", "github-actions-synthetic")
+    assert receipt(tmp_path)["state"] == "not_verified"
+
+
+# spec: ANYM-411
+def test_the_overall_deadline_ends_a_hang_outside_tiden_calls_and_fails_the_ci_record(tmp_path, monkeypatch):
+    import signal
+    import time as clock
+    from scripts import tiden_ci
+    assert 0 < tiden_ci.CI_RECORD_MARGIN < tiden_ci.CI_RELEASE_DEADLINE
+    # The Tiden calls get the overall deadline less the margin.
+    seen = {}
+    def recorded(*arguments, deadline: float, **options):
+        seen["left"] = deadline - clock.monotonic()
+        return {"state": "recorded"}
+    monkeypatch.setattr(tiden_ci, "record_release", recorded)
+    main_push_manifest(tmp_path)
+    assert run_release(monkeypatch, tmp_path, "--environment", "github-actions-synthetic") == 0
+    budget = tiden_ci.CI_RELEASE_DEADLINE - tiden_ci.CI_RECORD_MARGIN
+    assert budget - 5 < seen["left"] <= budget
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    monkeypatch.undo()
+
+    # A hang in manifest validation (a pull request chain reads GitHub) is ended by the overall deadline: the job
+    # fails, the receipt says no create was sent, and the timer and handler are restored.
+    calls = release_cli(monkeypatch)
+    monkeypatch.setattr(tiden_ci, "CI_RELEASE_DEADLINE", 0.3)
+    monkeypatch.setattr(tiden_ci, "published_manifest", lambda directory, manifest: clock.sleep(5))
+    handler = signal.getsignal(signal.SIGALRM)
+    started = clock.monotonic()
+    with pytest.raises(tiden_ci.RecordDeadline):
+        run_release(monkeypatch, tmp_path, "--environment", "github-actions-synthetic")
+    assert clock.monotonic() - started < 3 and calls == []
+    assert receipt(tmp_path) == {"state": "not_attempted"}
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0) and signal.getsignal(signal.SIGALRM) == handler
+
+
+ATTEMPT_URL ="https://github.com/example/repo/actions/runs/1/attempts/2"
 LOAD_REPORT = '<testsuite><testcase name="budgets" file="tests/platform/benchmarks/gateway_read_load.py"/></testsuite>'
 PASSED = {"verify": ("success", "a" * 40), "load": ("success", "a" * 40), **dict.fromkeys(SHARD_JOBS, ("success", "a" * 40))}
 
@@ -1482,6 +1880,8 @@ def test_a_main_commit_whose_publication_was_not_verified_records_no_release(tmp
     assert config["id"] == "config" and config["env"]["TIDEN_PUBLISHED"] == "${{ needs.checks.outputs.tiden_published }}"
     # Every later step, Tiden calls included, runs only when the configuration step enabled the record.
     assert all(step["if"] in ("steps.config.outputs.enabled == 'true'",
+                              "steps.config.outputs.enabled == 'true' && steps.download.outcome == 'success'",
+                              "steps.config.outputs.enabled == 'true' && steps.download.outcome != 'success'",
                               "${{ always() && steps.config.outputs.enabled == 'true' }}") for step in release["steps"][1:])
 
     def configured(published, token="synthetic-token"):
