@@ -69,6 +69,22 @@ def validate_capture(value):
 
 
 MAX_REJECTED_MESSAGES=20
+# Per-chat history scan errors (ANYM-293): an unavailable peer, a rate limit, a transient server
+# error after its retries, or any other provider error of that chat. The last two are stored as
+# provider_unavailable, which every deployed reader knows; history.chat_errors keeps the exact one.
+CHAT_SCAN_ERRORS=('provider_unavailable','rate_limited','provider_temporarily_unavailable','provider_chat_error')
+MAX_CHAT_ERRORS=20
+
+
+def validate_chat_error(evidence):
+    """Only a class name and a fixed Telegram RPC code; never exception text."""
+    if (not isinstance(evidence,dict) or set(evidence)-{'error_class','rpc_message'}
+            or type(evidence.get('error_class')) is not str
+            or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}',evidence['error_class'])
+            or 'rpc_message' in evidence and (type(evidence['rpc_message']) is not str
+                or not re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}',evidence['rpc_message']))):
+        raise ValueError('invalid_chat_error')
+    return {k:evidence[k] for k in ('error_class','rpc_message') if k in evidence}
 # Reason codes a skipped live capture may report: the capture validators' own
 # codes plus the collector's parser codes. Anything else is `invalid_capture`.
 LIVE_REJECT_CODES=frozenset({'invalid_capture','invalid_capture_kind','invalid_capture_account','invalid_capture_chat',
@@ -340,12 +356,21 @@ class CollectorState:
             c.execute('UPDATE collector_chats SET last_attempt_at=clock_timestamp() WHERE account=%s AND provider_chat=%s',
                       (self.account,chat))
 
-    def failed(self,chat,code):
-        if code not in ('provider_unavailable','rate_limited'):raise ValueError('invalid_scan_error')
+    def failed(self,chat,code,evidence=None):
+        if code not in CHAT_SCAN_ERRORS:raise ValueError('invalid_scan_error')
+        if evidence is not None:evidence=validate_chat_error(evidence)
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)
             c.execute('UPDATE collector_chats SET last_error_code=%s,last_error_at=clock_timestamp() '
-                'WHERE account=%s AND provider_chat=%s',(code,self.account,chat))
+                'WHERE account=%s AND provider_chat=%s',
+                (code if code in ('provider_unavailable','rate_limited') else 'provider_unavailable',self.account,chat))
+            if evidence is not None:
+                # The class of a chat's provider error outlives the container's logs (ANYM-293).
+                row=self._operations(c);value=row['operations'];history=dict(value.get('history') or {})
+                entry={'chat':chat,'reason_code':code,**evidence,'at':row['observed'].isoformat()}
+                history['chat_errors']=[*[e for e in history.get('chat_errors',[]) if e.get('chat')!=chat],
+                    entry][-MAX_CHAT_ERRORS:]
+                value['history']=history;self._save_operations(c,value)
 
     def checkpoint(self,chat,*,high_water=None,history_before=None,exhausted=False,initialized=False,
                    window_complete=False,head_complete=False):
