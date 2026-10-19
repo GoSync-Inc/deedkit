@@ -2476,6 +2476,12 @@ def test_both_shard_lines_deselect_exactly_the_nodes_the_module_steps_run():
         step = next(step for step in jobs[job]["steps"] if step.get("id") == "python")
         assert set(re.findall(r"--deselect (\S+)", step["run"])) == nodes, job
         assert step["run"].rstrip().endswith(" tests")
+    # pytest deselects by node ID prefix, so no other test of these files may start with a deselected name.
+    root = Path(__file__).resolve().parents[1]
+    for node in nodes:
+        file, name = node.split("::")
+        assert [test for test in re.findall(r"^def (test_\w+)", (root / file).read_text(), re.MULTILINE)
+                if test.startswith(name)] == [name]
     outcomes = next(step for step in jobs["verify"]["steps"] if step.get("name") == "Prepare honest CI evidence")["env"]
     pairs = re.findall(r'"(\w+)":"\$\{\{ steps\.(\w+)\.outcome \}\}"', outcomes["MODULE_OUTCOMES"])
     assert dict(pairs) == {name: name for name in FRAGMENTS["verify"][0]} and len(pairs) == len(FRAGMENTS["verify"][0])
