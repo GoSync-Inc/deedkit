@@ -1,13 +1,17 @@
 """Synthetic Telethon read boundaries; no provider sessions or RPCs."""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import threading
 from types import SimpleNamespace as NS
 
 import pytest
 from telethon import events, types
 
 from messaging_service.collector_state import CaptureSpool
+from messaging_service import telegram_collector
 from messaging_service.telegram_collector import TelegramCollector, TelethonProvider
+from test_collectors import message
 
 
 OBSERVED = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
@@ -162,10 +166,76 @@ def test_receipt_capture_does_not_use_other_account_state(tmp_path):
 
 
 def test_shared_capture_overload_fails_closed(tmp_path):
-    worker = collector(tmp_path); worker.capture_count = 16
-    asyncio.run(worker.receipt(update()))
+    # ANYM-291: 16 writes run and 512 callbacks wait; the next one fails closed without a write.
+    worker = collector(tmp_path); release = threading.Event(); put = worker.spool.put
+    worker.spool.put = lambda item: (release.wait(10), put(item))[1]
+    async def overload():
+        tasks = [asyncio.create_task(worker.receipt(update(max_id=n + 1)))
+                 for n in range(16 + 512)]
+        await asyncio.sleep(0.05)
+        assert worker.capture_count == 16 and len(worker.capture_waiters) == 512
+        assert not worker.failed.is_set()
+        await worker.receipt(update(max_id=9999))
+        assert worker.failed.is_set() and worker.failure_code == 'capture_overload'
+        release.set(); await asyncio.gather(*tasks)
+    asyncio.run(overload())
+    # Only the 16 writes already in flight complete; waiters see the stop and write nothing.
+    assert len(list(worker.spool.path.glob('*.json'))) == 16
+    assert worker.capture_count == 0 and not worker.capture_waiters
+
+
+# spec: ANYM-291
+def test_capture_burst_waits_for_slots_and_spools_every_update(tmp_path):
+    worker = collector(tmp_path); put = worker.spool.put; lock = threading.Lock()
+    running = [0, 0]; full = threading.Event()
+    def slow_put(item):
+        with lock:
+            running[0] += 1; running[1] = max(running)
+            if running[0] == 16: full.set()
+        full.wait(5)  # The first 16 writes overlap, so a 17th concurrent write would be seen.
+        try: return put(item)
+        finally:
+            with lock: running[0] -= 1
+    worker.spool.put = slow_put
+    async def burst():
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(64))
+        await asyncio.gather(*[worker.capture(NS(message=message(n, chat=str(100 + n))))
+                               for n in range(1, 101)],
+                             *[worker.receipt(update(max_id=n)) for n in range(1, 101)])
+    asyncio.run(burst())
+    assert not worker.failed.is_set() and worker.failure_code is None
+    assert len(list(worker.spool.path.glob('*.json'))) == 200
+    assert running[1] == 16 and worker.capture_count == 0 and not worker.capture_waiters
+
+
+# spec: ANYM-291
+def test_capture_slot_wait_longer_than_bound_fails_closed(tmp_path):
+    worker = collector(tmp_path); worker.capture_count = 16; worker.capture_wait_seconds = 0.01
+    asyncio.run(worker.capture(NS(message=message(12))))
     assert worker.failed.is_set() and worker.failure_code == 'capture_overload'
-    assert not list(worker.spool.path.glob('*.json')) and worker.capture_count == 16
+    assert not list(worker.spool.path.glob('*.json'))
+    assert worker.capture_count == 16 and not worker.capture_waiters
+    assert (telegram_collector.CAPTURE_WRITES, telegram_collector.CAPTURE_WAITERS,
+            telegram_collector.CAPTURE_WAIT_SECONDS) == (16, 512, 30)
+
+
+# spec: ANYM-291
+def test_cancelled_capture_waiter_never_leaks_a_slot(tmp_path):
+    worker = collector(tmp_path)
+    async def scenario():
+        worker.capture_count = 16
+        first = asyncio.create_task(worker.receipt(update(max_id=1)))
+        second = asyncio.create_task(worker.receipt(update(max_id=2)))
+        await asyncio.sleep(0)
+        assert len(worker.capture_waiters) == 2
+        # The first waiter is granted a slot and cancelled in the same tick; the slot passes on.
+        worker.release_capture(); first.cancel()
+        with pytest.raises(asyncio.CancelledError): await first
+        await second
+        worker.capture_count -= 15
+    asyncio.run(scenario())
+    assert worker.capture_count == 0 and not worker.capture_waiters and not worker.failed.is_set()
+    assert len(list(worker.spool.path.glob('*.json'))) == 1
 
 
 def test_unsupported_receipt_does_not_overload_message_capture(tmp_path):

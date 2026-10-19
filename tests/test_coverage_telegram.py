@@ -270,7 +270,7 @@ def test_live_capture_is_durable_before_database_and_overload_fails_closed(tmp_p
     assert payload['kind'] == 'message' and payload['peer_kind'] == 'user'
     assert datetime.fromisoformat(payload['captured_at']).tzinfo is not None
     assert payload['envelope']['provider_id'] == '12'
-    collector.capture_count = 16
+    collector.capture_count = 16; collector.capture_wait_seconds = 0  # ANYM-291: no slot frees
     asyncio.run(collector.capture(NS(message=message(13))))
     assert collector.failed.is_set() and collector.failure_code == 'capture_overload'
     assert list(spool.path.glob('*.json')) == writes

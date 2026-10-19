@@ -103,6 +103,16 @@ A `durable_capture_failed` stop without a detail did not come from a live
 callback (for example a capture after a confirmed send) and is read as
 `capture_error`. Exception text never leaves the process.
 
+Telegram live callbacks (messages, deletions, read receipts and owner reads)
+share 16 capture write slots, so at most 16 spool writes run at once. A
+callback that finds all slots busy waits in arrival order instead of failing,
+so a burst of updates (albums, busy groups, reconnect catch-up) is written in
+full. The collector still fails closed with `capture_overload` when more than
+N = 512 callbacks wait, or when one callback waits longer than T = 30 s for a
+slot. The overloading callback writes nothing; callbacks still waiting at the
+stop also write nothing, and reconciliation after the restart covers messages
+as above (ANYM-291).
+
 If a spool record fails validation or its send receipt permanently
 disagrees with the DB (for example, after restoring an old backup), `drain`
 moves the file to `quarantine/` inside the same spool
