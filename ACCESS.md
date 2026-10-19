@@ -1,6 +1,6 @@
 # Agent access and audit
 
-Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 36. Setup is done by the operator through the local CLI
+Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 37. Setup is done by the operator through the local CLI
 or SSH with the owner DSN. There are no remote MCP/REST methods for managing keys and permissions.
 Provider sessions, the owner DSN and the backup decryption key are not given to agents.
 

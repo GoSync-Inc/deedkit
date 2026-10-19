@@ -3,12 +3,13 @@
 Current delivery work and priority: [BACKLOG.md](BACKLOG.md), DK-08–DK-10.
 This document is the API and delivery contract.
 
-Status: since **schema 32** (current schema 36) DeedKit implements persistent structural subscriptions, passive
+Status: since **schema 32** (current schema 37) DeedKit implements persistent structural subscriptions, passive
 inspection, independent fetch/ACK, bounded long polling, native wake selectors,
-operator-registered signed hints and private feedback. Installing the package
+operator-registered signed hints and private feedback. Schema 37 adds hint timing:
+debounce or batch windows, quiet hours, expected-reply silence timers and a per-key
+hourly hint budget. Installing the package
 does not register a receiver, create a subscription, activate a provider or
-verify a host turn. Batching, quiet hours, silence timers and unsolicited MCP
-resource notifications remain future work.
+verify a host turn. Unsolicited MCP resource notifications remain future work.
 
 ## Available API
 
@@ -305,6 +306,69 @@ the gateway's own schema check returns `invalid_arguments` with `field_errors`, 
 backend's `invalid_feedback` `field_errors` after rechecking the shape and vocabulary (a malformed list is
 dropped, never partly relayed).
 
+## Schema 37: hint timing policy
+
+`configure_subscription_delivery(subscription_id, version, receiver_id, delivery_policy)`
+sets the whole delivery configuration and bumps the version (`subscription-write`,
+`subscription_conflict` on a stale version, `invalid_delivery_policy` for a bad policy). Omitting
+`delivery_policy` means none; a policy needs a receiver. A policy changes only **when hints are
+emitted**: never which events match, ACK positions or what `fetch_subscription_events` and the
+passive reads return. `capabilities.subscriptions.delivery_policy` lists the fields and bounds.
+
+| Field | Bounds | Meaning |
+|---|---|---|
+| `debounce_s` | 0–600 | one hint after this many seconds without a new match |
+| `max_wait_s` | 1–3600, ≥ debounce | latest hint after the first unhinted match; default max(300, `debounce_s`) |
+| `batch_window_s` | 0–86400 | one hint this long after the first unhinted match |
+| `batch_count` | 1–1000 | one hint at this many matches (also flushes at `max_wait_s`) |
+| `quiet_hours` | IANA `timezone`, 1–4 `windows` | `{days: [mon..sun], start: "HH:MM", end: "HH:MM"}`; `days` names the day a window starts, `end` ≤ `start` crosses midnight, adjacent windows chain |
+| `quiet_bypass` | ⊆ `incoming_message`, `owner_mention`, `reply_to_owner`, `reply_to_confirmed_send`, `silence` | reasons that skip quiet hours (default none) |
+| `expect_reply_within_s` | 60 s–14 d | silence timer; only for a `reply_to_send` subscription |
+
+Debounce and batch are alternatives (both set: `invalid_delivery_policy`). Gate order: the window
+(debounce or batch) decides when a hint is due; quiet hours hold a due hint to the window end, even
+past `max_wait_s` (held, never dropped); the per-key budget holds it to the next slot. A bypass
+reason skips only the quiet-hours step. A hint carries the batch `through`.
+
+**Silence timer.** The deadline is the configuration commit time plus `expect_reply_within_s`. If
+no `reply_to_confirmed_send` match commits by then, the worker records one silence reference and
+emits one hint with `kind: "silence"`. The reference is the timer record in `get_subscription`
+(`delivery.silence`: anchor `send_id`, `deadline`, `state` `pending|replied|fired|hinted|cancelled`,
+`fired_at`), not an archive event, so fetch results do not change. A reply before the deadline
+cancels the timer; a later reply is a normal match. Any later version change cancels it: configure
+again to re-arm.
+
+**Per-key budget.** `SUBSCRIPTION_MAX_HINTS_PER_HOUR` (default 20, bounds 1–1000, set on the
+matcher and dispatcher) counts every hint of a key across its subscriptions (`events`, `silence`,
+`test`), with or without a policy: this deliberately changes schema-32 hint timing for
+subscriptions that already have a receiver. The matcher holds a new hint over budget
+(`held_reason: "budget"`) so held matches coalesce into one hint at the next slot. The dispatcher
+also admits at most that many distinct hint IDs per rolling hour before their first POST, so a
+backlog after downtime cannot burst; retries of an admitted hint are not new admissions. Deferral
+never dead-letters and loses no event reference. A `test_subscription` probe over budget is refused
+with `rate_limited`.
+
+`get_subscription` shows `delivery.policy`, `held_reason` (`debounce|batch|quiet_hours|budget`)
+and `next_hint_at`. Rules, all enforced by the matcher worker on durable rows:
+
+- **Clock:** every deadline uses the database clock (`clock_timestamp()`), stored as UTC.
+- **DST:** local windows use PostgreSQL time zone rules; a non-existent local time snaps forward,
+  an ambiguous one uses its first occurrence.
+- **Restart:** held ranges and timers are rows; after a worker restart an overdue hint fires once,
+  at the first moment quiet hours and the budget allow.
+- **Revocation:** an access change, pause, close, receiver change or removal, or a revoked key
+  cancels held hints and timers under the existing ACL fence; nothing is emitted after the
+  revocation commits. A same-receiver reconfiguration carries the held range to the new version and
+  re-plans it under the new policy.
+- **Idempotency:** one hint per (subscription, version, kind, window ID), enforced by a unique
+  index, so retries and parallel workers cannot double-emit.
+- **Failure isolation:** the hint step runs in a savepoint after the matches. A failure rolls back
+  only that step (telemetry code `subscription_hint_failed`, no content); matches and the frontier
+  commit and the next tick reopens the unhinted range.
+
+Automatic wake scheduling (ANYM-228) depends on these rules and the per-key budget: they are the
+server-side gate before a relay fires an agent run.
+
 ## Host receivers (wake relay)
 
 `packages/wake-relay/` (Node 24, `node:crypto` and `node:sqlite` only) is a host
@@ -411,10 +475,10 @@ deletion, so it is a separate owner-level change.
 
 ## Remaining extensions and verification boundaries
 
-Quiet hours, silence timers, debounce/batch windows, coalescing across overlapping
-subscriptions, stream resource notifications, automatic retention and text/model
-relevance predicates are not implemented. Current hints are eligible after each
-bounded matcher pass; retry/delivery progress remains separate from event ACK.
+Coalescing across subscriptions of different keys, stream resource notifications,
+automatic retention and text/model relevance predicates are not implemented. Without a
+policy a hint is eligible after each bounded matcher pass, within the per-key budget;
+retry/delivery progress remains separate from event ACK.
 There is no arbitrary agent URL registration, provider polling on demand, remote
 task execution or automatic MCP host scheduling. A host adapter must verify its
 own receipt handling, deduplication and actual turn creation with explicit live
