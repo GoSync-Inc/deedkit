@@ -91,9 +91,9 @@ State of each prerequisite, checked against the code. Paths are in
   `codex_chatgpt_login_required`, `codex_private_auth_required`,
   `codex_login_check_failed`, `codex_upgrade_required` and
   `codex_cli_unavailable` (`resource_admission.py:120-132`; called at
-  `enrichment.py:327`, `file_understanding.py:469`). Claims skip a paused scope
-  (`enrichment.py:241`, `file_understanding.py:400`). A new profile hash starts
-  unpaused.
+  `enrichment.py:327`). Claims skip a paused scope (`enrichment.py:241`). A new
+  profile hash starts unpaused. `file_understanding.py:400,469` repeats this logic
+  for the separate understanding worker, which does not run `codex_cli`.
 
 **Partly done**
 
@@ -114,16 +114,15 @@ State of each prerequisite, checked against the code. Paths are in
   that kind (`enrichment.py:221-224`, `file_understanding.py:385-386`). This is
   intended and pinned by
   `tests/test_processing_admission.py::test_cooldown_persists_and_new_profile_does_not_reset_day_limit`,
-  so a cap for one profile alone does not exist.
+  so a cap for one profile alone would be new behaviour.
 - Per-file retries of errors that do not pause. `pause_profile` ignores every
   code outside its list (`resource_admission.py:125-126`), e.g. `codex_run_failed`,
-  `codex_run_incomplete` and `codex_tool_use_rejected`. Each file is retried up to
-  three times, 10 minutes apart (`enrichment.py:243-244,303,322-326`,
-  `file_understanding.py:401-402,461`), so a systematic failure still walks the
-  whole corpus.
+  `codex_run_incomplete` and `codex_tool_use_rejected`. Each file is attempted up
+  to three times, 10 minutes apart (`enrichment.py:242-244,303`), so a systematic
+  failure still walks the whole corpus.
 
 Keep the example disabled (`enabled: false` in `enrichment.codex.example.json`)
-until the missing controls, isolated deployment and owner login are complete,
+until the missing and partly done controls, isolated deployment and owner login are complete,
 or the owner accepts the open items. Whether to build them is decided under
 ANYM-231. Start with a small representative set and measure quality, attempts,
 latency and shared usage before enabling all accounts/files. Nothing
