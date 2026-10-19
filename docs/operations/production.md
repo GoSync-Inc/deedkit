@@ -193,9 +193,12 @@ Check it, without a call or a provider action:
 
 A 403 in step 2 or 3 means the configured address is not the host-side peer.
 
-The state directory and Docker filesystem each need at least **15 GiB free**
-before preparation. A refusal does not authorize pruning shared Docker objects
-or deleting runtime data. Free capacity through a reviewed, targeted operation
+The state directory, Docker's root and, when it exists, `/var/lib/containerd`
+(the containerd image store keeps image content there, often on another disk than
+Docker's root) each need at least **15 GiB free** before preparation verifies,
+fetches or pulls anything; the refusal names `production.py images --remove`
+(below). A refusal does not authorize pruning shared Docker objects or deleting
+runtime data. Free capacity through a reviewed, targeted operation
 or add storage before retrying.
 
 ## CI-published images
@@ -589,21 +592,67 @@ unattempted candidate directory for the same SHA is renamed (for example to
 `prepared-older-tool-<sha>`), never deleted or edited, because preparation
 refuses an existing directory; receipts and their digests are never rewritten.
 
-## Image retention report
+## Image retention
 
 ```sh
-python3 /usr/local/lib/deedkit/production.py images
+python3 /usr/local/lib/deedkit/production.py images            # report only
+python3 /usr/local/lib/deedkit/production.py images --remove   # remove the candidates now
 ```
 
-The report lists the image IDs behind the eight CI-published targets'
-`deedkit-production-<target>:*` tags in two groups, with reasons. Kept: the
-images of `current.json` (including those a rollback restored), of the current
-release's `*.before.json`, of the two newest other `result.json` by `applied_at`
-(a release without `applied_at` is kept, order unknown), of every `prepared.json`
-without `result.json`, and of every container, running or stopped. Everything
-else is a removal candidate. It removes nothing: deleting an image stays a
-manual owner step by image ID, after checking that no container uses it. Never
-use `docker image prune`, `docker system prune` or volume removal for this.
+Old release images are removed by themselves (ANYM-439): after a `deploy` that
+ends `deployed` (the timer included) and after a successful manual `apply`. Not
+after `--dry-run`, `rollback`, a refused or failed apply, or a deploy ending in any
+other status. `images --remove` runs the same removal by hand, for example after
+a disk-space pause.
+
+Only images carrying a `deedkit-production-<target>:*` tag of the eight
+CI-published targets are considered. Kept, with reasons:
+
+- for every production state (this configuration's, the host state root
+  `/var/lib/deedkit-production` and its subdirectories with a `current.json` or
+  `http-current.json`, and the `state_directory` of every `/etc/deedkit/*.json`):
+  the images of `current.json` and those a rollback restored, of the current
+  release's `*.before.json` (the one previous release `rollback` restores), of
+  every `prepared.json` without `result.json` or `http-attempted.json`, of every
+  `http-prepared.json` without `http-attempted.json`, of `http-current.json` and
+  its one `previous` generation (older nested generations are retired), and the
+  `protected_images` of a top-level plan file such as a storage cleanup's;
+- while another operation holds a state's deploy lock, the images tagged with
+  the revision of each release directory there without a result (a preparation
+  pulls before it writes `prepared.json`); removal then removes nothing and the
+  next pass retries. Like a preparation, removal takes every state's deploy lock
+  (without waiting) before the image lock and holds them until it ends, so it
+  never takes the image lock from a preparation in progress and none starts
+  meanwhile;
+- every image ID named in a top-level JSON file of `/etc/deedkit` (configurations
+  and jobs that pin an image, such as `file-lifecycle.json`) or of a non-state
+  directory under the host state root;
+- the image of every container, running or stopped; an image with any other
+  name (for example `deedkit-rollback-retained:*`); an image of a target this
+  configuration does not deploy (the backup runner pins its image by ID in its
+  own configuration).
+
+Everything else is removed under the deploy lock and the host image lock: the
+image is inspected again and skipped if its ID or names changed; its other
+names go first with `docker image rm --no-prune <name>`, then the image with
+`docker image rm --no-prune <ID>` while one release tag still names it, so an
+interrupted pass leaves it a candidate of the next one. Never `--force`, never
+`docker image prune` or `docker system prune`, never volumes: Docker refuses an
+image a container uses, and that image is listed under `failed` with Docker's
+last error line. The summary lists `removed` and `failed` images (short ID,
+tags), the `kept` count, and `interrupted`/`remaining` when an unexpected error
+stopped the pass; or only `skipped` with the reason when nothing was removed (a
+busy image or deploy lock; a protecting file or directory it cannot read or list;
+an applied current release whose rollback snapshot is missing; a configured state directory that does not exist yet, or a state that appeared during the pass). Removal never changes the release's outcome:
+`deploy` has written `deployed` before it starts, exits 0 and never pauses or
+retries for it; `apply` prints the summary next to its result, and `result.json`
+and `current.json` stay unchanged.
+
+Undo: revert the change. An image published to GHCR is pulled again by its
+digest (`ghcr.io/gosync-inc/deedkit-<target>@sha256:...`, the receipt's
+`references`) while that package version exists, and tagged
+`deedkit-production-<target>:<sha>`. A local-only build (built on the host before
+CI publication started on 2026-10-17) has no such copy and cannot be restored.
 
 Only `apply`, `rollback` and `deploy` (below) change runtime processes; `apply`
 and `rollback` after review of the candidate and any required live-session
@@ -654,7 +703,9 @@ Otherwise it:
    `promote` (plan B), all at that one SHA with every guard of those steps;
    when plan A is ahead of the HTTP release, it runs plan B only;
 5. writes `<state>/deploy.json` (SHA, base, start, end, outcome) and
-   prints one JSON line for the journal.
+   prints one JSON line for the journal; a run that ends `deployed` then
+   removes old release images ("Image retention" below) and adds the summary
+   as `image_removal`.
 
 No step reads GitHub's REST API, so a deploy needs no API quota and no token
 (ANYM-406); each check of a candidate costs one `git ls-remote`, one treeless
