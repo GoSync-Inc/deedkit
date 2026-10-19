@@ -165,6 +165,14 @@ ceilings. Existing NULL legacy key ceilings inherit neither capability. Page
 receipts bind principal, exact key, policy versions, subscription generation and
 consumption version/positions; only receipt hashes are stored. A changed policy,
 paused/closed subscription, expiry or stale concurrent page cannot advance it.
+`fetch_subscription_events` and `wait_for_subscription_events` stay `readOnlyHint=true`:
+issuing a receipt (and creating the initial consumption row) is bookkeeping that
+changes no consumption, provider state or other key's data. The exact meaning,
+including lifecycle checks on every subscription read, is in
+[SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#schema-32-explicit-consumption-and-registered-hints).
+A revocation or ACL change waits for a hint attempt in flight (about 7 s as built),
+and new requests of that principal queue behind the waiting revocation; see its
+revocation fence there.
 
 The gateway can bind only an operator-registered opaque receiver belonging to
 that exact principal/key; it cannot read endpoint URLs or signing-secret paths.

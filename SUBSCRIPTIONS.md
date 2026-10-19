@@ -95,8 +95,10 @@ Operator bounds are `SUBSCRIPTION_MAX_DEFINITIONS` (default 64 per key, includin
 closed definitions; 1–1000) and `SUBSCRIPTION_MAX_MATCHES` (default 10,000 references
 per subscription; 1–1,000,000). Set the match bound on the worker and the definition
 bound on the API. Raising a match budget resumes retained events without provider
-polling. This slice does not delete match rows or apply automatic journal
-retention. Listing has no continuation cursor yet; keep the default definition
+polling. Today nothing deletes match rows or outbox rows; a subscription at its
+match bound stops with `match_budget` and needs the operator. The agreed
+retention contract is in [Event retention](#event-retention-specified-not-implemented).
+Listing has no continuation cursor yet; keep the default definition
 bound within one 100-item page or manage known IDs individually.
 
 Schema-26 backups include definitions, source sets and matched references.
@@ -140,6 +142,29 @@ original result; competing pages, configuration changes, expiry and changed
 permissions cannot advance it. At most 128 live receipts are retained for one
 subscription. Passive `get_subscription_events` remains independent. Neither ACK
 changes the provider's read state or archive consumer positions.
+
+**What "read-only" means for these tools.** `fetch_subscription_events` and
+`wait_for_subscription_events` carry `readOnlyHint=true`, as do
+`get_subscription_events` and the other subscription views. Here the term means:
+no change to consumption (`acked_through`, ACK version), subscription version or
+lifecycle for an active subscription whose expiry is not reached and whose scope is
+unchanged, provider state, or another key's data. A fetch still writes issuance bookkeeping, like a pagination
+cursor: it creates the initial consumption row at `start_position` if missing and,
+for a key with `subscription-ack` and a non-empty page, prunes expired receipts,
+evicts the oldest receipts beyond 128 and stores one new receipt hash with a
+five-minute expiry. The receipt is short-lived and safe to retry; a retry returns
+the same events from the same position (plus any matched in between), and the
+eviction means an old receipt then fails closed. Expiry
+and access-change are checked on every subscription read (even `get_subscription`
+and `list_subscriptions`), so a read that finds the definition expired or
+its grant changed moves it to `expired` or `access_changed` and bumps `version`
+(`get_subscription`, `list_subscriptions` and `get_subscription_events` keep it;
+a `fetch`/`wait` that fails on the first check rolls it back, one that returns keeps it);
+the next `update_subscription` then gets `subscription_conflict`. Clients should
+treat the hint as retry safety, not as proof that nothing is written. The
+gateway turns a backend failure of a read-only tool into `backend_unavailable`;
+for a tool without the hint it would become `mutation_outcome_unknown`, which an
+agent must never retry. That is why these tools stay read-only.
 
 `wait_for_subscription_events(subscription_id, timeout=25, limit=50)` polls those
 pages for at most 25 seconds. Every read reauthorizes and releases its connection
@@ -217,6 +242,35 @@ check timestamp age before accepting a request. TLS pins a validated public DNS
 address for the connection; redirects, private addresses and mixed public/private
 DNS responses fail closed. Response reads and TLS exchange are bounded. Hint
 counts are visible through `get_subscription`.
+
+**Revocation fence and its latency.** No hint is sent unless authorization is
+rechecked under a lock that keeps a revocation from committing until the send ends,
+because a sent hint cannot be recalled. Each attempt takes, in one transaction, the
+shared principal advisory lock and a `FOR UPDATE` lock on the subscription row
+(`event_delivery.py` `dispatch_hints`). As built, both are held through DNS
+validation (at most 2 s) and the pinned TLS exchange (5 s deadline), so:
+
+- an operator ACL change or revocation for that principal waits up to about 7 s per
+  in-flight attempt;
+- an agent `update_subscription`, `configure_subscription_delivery` or ACK on that
+  subscription waits likewise, and the matcher skips the locked row;
+- attempts in one dispatcher pass are serial (up to 16), so one slow receiver can
+  delay other subscriptions' hints by up to about 16 × 7 s per pass;
+- reads of that subscription row wait as well (`get_subscription`,
+  `get_subscription_events`, `fetch`, `wait`, `list_subscriptions`), and while a
+  revocation for the principal is queued behind an attempt, PostgreSQL queues every
+  new request of that principal behind it, so all of that principal's API calls can
+  stall for up to the 5 s statement timeout and then fail with `query_timeout`
+  (`Store.identity_digest` takes the shared lock on each
+  call; unmeasured).
+
+Running more than one dispatcher process lowers the head-of-line delay
+(`FOR UPDATE SKIP LOCKED`). No latency incident or measurement exists. Decided
+(2026-10-17, ANYM-257): the fence stays; DNS validation, the secret read and the
+body build move before the lock so the hold is bounded by the 5 s transport
+deadline plus database time, and the dispatcher records each fence hold in its
+statistics. Neither change is built yet; an unfenced send with post-send checks is
+rejected because a hint would still reach a receiver after revocation.
 
 Schema-32 backup manifests include consumption, hashed receipts, receiver
 registrations, bindings, outbox and local feedback. Quarantine disables receivers,
@@ -325,6 +379,35 @@ timestamps within five minutes, body up to 1 MiB, no published rate limit or
 turn. A relay `accepted` row plus the run's own `fetch_subscription_events` and
 `ack_subscription_events` (ACK position advanced in `get_subscription`) is the
 host-turn evidence the live acceptance of ANYM-228 records.
+
+## Event retention (specified, not implemented)
+
+Status: specified (ANYM-257, decided 2026-10-17 by the orchestrator under the owner's
+delegation); implementation pending. Until then the behavior is the one described
+under [Running the matcher](#running-the-matcher): nothing deletes match rows or
+terminal outbox rows, only receipts are pruned (lazily, on fetch), and closed
+definitions count toward `SUBSCRIPTION_MAX_DEFINITIONS`. The contract below is what
+the implementation must deliver; retention may lose events only with an explicit gap.
+
+- **Explicit-ACK subscriptions:** match references at or below `acked_through` and
+  older than `SUBSCRIPTION_ACKED_RETENTION_DAYS` (default 7, bounds 1–366) are
+  deleted and stop counting toward `SUBSCRIPTION_MAX_MATCHES`.
+- **Passive-only subscriptions** (never fetched): nothing is deleted. The
+  `match_budget` stop stays operator-visible, because deleting would silently break
+  the `after` positions these subscribers keep themselves.
+- **Pruned positions:** an `after` below the retained floor returns a
+  `retention_gap` carrying the floor, never an empty complete page.
+- **Terminal outbox rows** (`delivered`, `cancelled`, `dead_letter`): deleted after
+  30 days; per-state counts remain as counters on `get_subscription`.
+- **Closed, expired and `access_changed` definitions:** after 30 days their
+  matches, receipts, outbox rows and consumption are deleted; a masked tombstone
+  (ID, state, version, `closed_at`) remains, and tombstones older than 30 days stop
+  counting toward `SUBSCRIPTION_MAX_DEFINITIONS`.
+- **Mechanics:** pruning runs as bounded batches in the subscription worker under
+  the same locks. Quarantine restore and backup manifests carry the retention floor.
+
+The implementation needs a migration (floor column, indexes) and irreversible
+deletion, so it is a separate owner-level change.
 
 ## Remaining extensions and verification boundaries
 
