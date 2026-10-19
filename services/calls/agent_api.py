@@ -125,8 +125,10 @@ DESCRIPTIONS = {
     "destination and returns its id as brief_id. The destination may be one the owner "
     "named or one you found for the owner's task; no recipient list applies (SIP: "
     "exact allowlist). Emergency numbers and short codes are refused: tell the owner "
-    "to call them directly. The owner sets the voice for all calls (capabilities "
-    "call_voice). Next: preflight_call, then dial_call.",
+    "to call them directly. Set timezone (IANA, e.g. Asia/Makassar) when you know "
+    "where the counterparty is: the call then greets by their local time, otherwise "
+    "neutrally. The owner sets the voice for all calls (capabilities call_voice). "
+    "Next: preflight_call, then dial_call.",
     "start_call": "Local write; places no phone call. Opens a browser rehearsal for a "
     "prepared browser brief: the call waits as waiting_for_browser until a human opens "
     "the local voice UI and joins with a microphone. Repeating with the same brief_id "

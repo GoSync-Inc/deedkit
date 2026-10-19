@@ -7,10 +7,12 @@ import sqlite3
 import threading
 import uuid
 from datetime import datetime,timezone
+from functools import cache
 from pathlib import Path
 from typing import Annotated,Literal,get_args
+from zoneinfo import ZoneInfo,ZoneInfoNotFoundError,available_timezones
 
-from pydantic import BaseModel,ConfigDict,Field,model_validator
+from pydantic import AfterValidator,BaseModel,ConfigDict,Field,model_validator
 
 PROMPT_VERSION="2026-10-14.task-v7"
 MODEL="gemini-3.8-live"
@@ -22,6 +24,21 @@ GeminiVoice=Literal["Kore","Puck","Charon","Fenrir","Aoede","Leda","Orus","Zephy
 GrokVoice=Literal['eve','ara','rex','sal','leo']
 VOICES,GROK_VOICES=list(get_args(GeminiVoice)),list(get_args(GrokVoice))
 CustomVoiceId=Annotated[str|None,Field(pattern=r'^voice_[A-Za-z0-9_]{4,100}$')]
+
+
+@cache
+def _zones():
+    # Area/Location keys and UTC only: localtime, posixrules and Factory are host files, not places.
+    # Etc/GMT+N means UTC-N (POSIX sign), so an agent's "GMT+7" would land 14 hours off.
+    return frozenset(z for z in available_timezones() if '/' in z and not z.startswith('Etc/GMT') or z=='UTC')
+
+
+def _zone(value):
+    if value not in _zones():raise ValueError('timezone must be an IANA zone such as Asia/Makassar')
+    return value
+
+
+TimeZone=Annotated[str|None,Field(min_length=1,max_length=64),AfterValidator(lambda v:v if v is None else _zone(v))]
 VoiceStyle=Literal['neutral','friendly']
 
 
@@ -39,6 +56,7 @@ class AgentBrief(BaseModel):
     conversation_mode:Literal['task','social']='task'
     self_reference:Literal["feminine","masculine","neutral"]="masculine"
     max_duration_secs:int=Field(default=600,ge=30,le=600)
+    timezone:TimeZone=None
 
 
 # Owner rehearsals choose their own engine and voice.
@@ -146,6 +164,28 @@ def now():
 def _spoken_words(text):
     """Compare spoken wording, keeping the original transcript for the audit."""
     return ' '.join(re.findall(r'\w+',text.casefold()))
+
+
+# Local hour bands per call language; outside them (night) the model greets neutrally.
+GREETINGS={'id':('Halo',[(4,11,'Selamat pagi'),(11,15,'Selamat siang'),(15,18,'Selamat sore'),(18,24,'Selamat malam')]),
+           'ru':('Здравствуйте',[(5,12,'Доброе утро'),(12,18,'Добрый день'),(18,23,'Добрый вечер')]),
+           'en':('Hello',[(5,12,'Good morning'),(12,18,'Good afternoon'),(18,23,'Good evening')])}
+
+
+def call_clock(b, at):
+    """Counterparty time for the call start; the saved prompt is written earlier and never carries a time."""
+    neutral,bands=GREETINGS[b['language']]
+    # A zone the host can no longer load reads as unknown: the clock must never stop a call from starting.
+    try:local=at.astimezone(ZoneInfo(b['timezone'])) if b.get('timezone') else None
+    except (ZoneInfoNotFoundError,ValueError,OSError):local=None
+    if local is None:
+        return (f"The counterparty's local time is unknown: greet with '{neutral}' and use no morning, "
+                'afternoon or evening greeting.')
+    head=f"Counterparty local time at call start: {local:%A %Y-%m-%d %H:%M} ({b['timezone']}). "
+    for start,end,greeting in bands:
+        if start<=local.hour<end:
+            return head+f"If you greet by time of day, a time-of-day greeting must be '{greeting}'; never another one."
+    return head+f"It is night there: greet with '{neutral}' and use no time-of-day greeting."
 
 
 def build_prompt(b, instruction=''):
@@ -1003,7 +1043,8 @@ class VoiceService:
                 conversation_mode=parent.get('conversation_mode','task'),
                 dialog_engine=parent.get('dialog_engine','gemini_live'),grok_voice=parent.get('grok_voice','rex'),
                 owner_notes=parent['owner_notes'],supervisor_notes=parent.get('supervisor_notes',''),
-                success_fields=['counterparty_response'],max_duration_secs=parent['max_duration_secs'])
+                success_fields=['counterparty_response'],max_duration_secs=parent['max_duration_secs'],
+                timezone=parent.get('timezone'))
             if parent.get('channel','browser')!='browser':
                 from outbound import ExternalBrief
                 selected=ExternalBrief(**selected.model_dump(),channel=parent['channel'],

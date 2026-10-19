@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import json
+from datetime import datetime, timezone
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -16,7 +17,7 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.workers.runner import WorkerRunner
 
-from core import TOOL_MODELS
+from core import TOOL_MODELS, call_clock
 from audio_health import NoRuntimeAudioHealth, RuntimeAudioHealth
 from audio_probe import PCMProbe, diagnostics
 from call_errors import record_model_error
@@ -152,7 +153,9 @@ def input_sample_rate(transport):
     return transport.input()._params.audio_in_sample_rate or PipelineParams().audio_in_sample_rate
 
 
-def create_model(brief,key,recorder=None,input_rate=None):
+def create_model(brief,key,recorder=None,input_rate=None,at=None):
+    # The local time is read when the call starts; the brief's prompt and snapshot stay unchanged.
+    brief={**brief,'prompt':brief['prompt']+'\n'+call_clock(brief,at or datetime.now(timezone.utc))}
     if brief.get('dialog_engine')=='grok_realtime':
         from grok_voice import AuditedGrok
         return AuditedGrok(brief,key,recorder,input_rate=input_rate or PipelineParams().audio_in_sample_rate)
@@ -161,6 +164,16 @@ def create_model(brief,key,recorder=None,input_rate=None):
         model=brief['model'],system_instruction=brief['prompt'],voice=brief['voice']),
         transcription_language={'ru':'ru-RU','en':'en-US','id':'id-ID'}[brief['language']]
             if brief.get('dialog_engine')=='gemini_live_flows' else None)
+
+
+def record_clock(service,identity,brief,llm):
+    # Best effort, like the audio diagnostics: the call keeps the exact clock line its model received.
+    try:
+        sent=llm._settings.system_instruction
+        if sent.startswith(brief['prompt']+'\n'):
+            service.runtime_event(identity,{'kind':'call_clock','text':sent[len(brief['prompt'])+1:]})
+    except Exception:
+        pass
 
 
 async def send_owner_update(worker,decision):
@@ -192,6 +205,7 @@ async def run_transport(transport,brief,key,state,browser=False):
     context=LLMContext()
     llm=create_model(brief,key,recorder=lambda role,text:service.transcript_chunk(identity,role,text),
                      input_rate=input_sample_rate(transport))
+    record_clock(service,identity,brief,llm)
     live_flows=brief.get('dialog_engine')=='gemini_live_flows'
     ending_tasks=[]
     # Diagnostics are best effort: a constructor failure must never stop the call before the runner starts.

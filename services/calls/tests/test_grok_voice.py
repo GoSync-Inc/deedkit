@@ -11,7 +11,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.xai.realtime.llm import GrokRealtimeLLMService
 
 from app import create_app
-from core import AgentBrief, BriefInput, CallVoice, GROK_MODEL, ServiceError, TOOL_MODELS, VoiceService
+from core import AgentBrief, BriefInput, CallVoice, GROK_MODEL, ServiceError, TOOL_MODELS, VoiceService, call_clock
 from outbound import AgentExternalBrief, ExternalBrief
 from test_tasks import Archive, BRIEF, HEADERS, owner_headers
 from voice import create_model, tool_schemas
@@ -38,7 +38,8 @@ def test_grok_snapshot_pins_provider_and_does_not_reuse_gemini_learning(tmp_path
     assert isinstance(model, GrokRealtimeLLMService)
     assert model._settings.model==GROK_MODEL
     assert model._settings.session_properties.voice=='rex'
-    assert model._settings.system_instruction==brief['prompt']
+    # The saved prompt plus the call-start clock line; a zone-less brief's line names no time.
+    assert model._settings.system_instruction==brief['prompt']+'\n'+call_clock(brief,None)
     assert model._settings.session_properties.audio.input.transcription.language_hint==language
     service.close()
 
@@ -80,7 +81,7 @@ async def test_grok_serializes_only_scoped_tools_and_returns_tool_results(tmp_pa
     model.send_client_event=send
     await model._send_session_update()
     session=wire[0]['session']
-    assert session['instructions']==brief['prompt'] and session['voice']=='rex'
+    assert session['instructions']==brief['prompt']+'\n'+call_clock(brief,None) and session['voice']=='rex'
     assert {tool['name'] for tool in session['tools']}==set(TOOL_MODELS)
     assert all(tool['type']=='function' for tool in session['tools'])
     service.transcript(call['id'],'user','Delivery is 12–13.')
