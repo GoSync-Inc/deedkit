@@ -246,7 +246,7 @@ def durable_write(path, value):
 
 def bootstrap(settings, sha):
     validate_settings(settings)
-    evidence = p.verify(sha)
+    evidence = p.promotable(sha)
     router = settings['http_release']['router']
     receipt_path = Path(settings['state_directory']) / ('router-' + sha) / 'router-build.json'
     try:
@@ -466,7 +466,7 @@ def prepare(settings, sha):
         'baseline': original['projects'],
         'retained': ([previous['generation']] if previous else []), 'previous': previous, 'ci': original['ci']}
     check_schema(settings, receipt)
-    p.verify(sha)
+    p.promotable(sha)
     durable_write(release / 'http-prepared.json', receipt)
     return {'sha': sha, 'generation': generation, 'ci': original['ci'], 'images': original['images'], 'status': 'prepared'}
 
@@ -553,14 +553,14 @@ def wait_ready(settings, receipt):
 
 def promote(settings, sha):
     validate_settings(settings)
-    p.verify(sha)
+    p.promotable(sha)
     release = Path(settings['state_directory']) / sha
     receipt = p.read(release / 'http-prepared.json')
     if receipt['sha'] != sha or (release / 'http-attempted.json').exists():
         raise Refused('HTTP release was already attempted or has a different revision; inspect recovery state')
     validate_prepared(settings, receipt)
     check_schema(settings, receipt)
-    p.verify(sha)  # final remote gate before the first runtime startup
+    p.promotable(sha)  # final remote gate before the first runtime startup
     durable_write(release / 'http-attempted.json', {'status': 'starting', 'sha': sha})
     try:
         p.run(candidate_command(receipt) + ['up', '-d', '--no-build', '--pull', 'never', '--no-deps',
@@ -586,7 +586,7 @@ def promote(settings, sha):
     try:
         if p.digest(p.read(settings['http_release']['router']['config_file'])) != receipt['router_source_digest']:
             raise Refused('persisted router configuration changed before traffic admission')
-        p.verify(sha)  # successful exact main push-CI immediately before traffic
+        p.promotable(sha)  # main contains it and its images are attested, immediately before traffic
         active_candidate(receipt)
         if router_identity(settings) != receipt['router_container']:
             raise Refused('dedicated router identity changed before traffic admission')

@@ -17,6 +17,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import uuid
 import urllib.error
 import urllib.parse
@@ -60,6 +61,14 @@ REGISTRY = "ghcr.io/gosync-inc/deedkit-"
 VERIFIER = Path("/usr/local/libexec/deedkit/attest-verify")
 VERIFIER_SHA256 = "af405433c424fe20580cc86e2d96221670b0a75d6af9068ab06d309ec49344db"
 IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# The pinned verifier's refusal lines (tools/attest-verify main.go, registry.go). Only a registry 404 for the image
+# tag proves it is not published yet. "No bundle attached" is also printed when the referrers API failed, and a bundle
+# that could not be fetched is nested in "no attached bundle verified ...", so both count as GHCR not read: retried,
+# never a reason to take an older commit. Any other refusal is evidence that does not verify.
+VERIFIER_ABSENT = re.compile(r"attest-verify: refused: manifest \S+ not found(; |$)")
+VERIFIER_UNREACHED = re.compile(r"attest-verify: refused: no Sigstore bundle is attached to |registry (request|read) "
+                                r"failed|: HTTP \d+")
+SOURCE = "https://github.com/" + REPOSITORY + ".git"
 
 
 class Refused(RuntimeError):
@@ -82,6 +91,15 @@ class Busy(Refused):
 
 class RateLimited(Refused):
     """GitHub's API quota ran out: nothing is wrong with the candidate, and `deploy` retries after the reset."""
+
+
+class Unreachable(Refused):
+    """git could not read main from GitHub, or the verifier could not reach GHCR: nothing is known about the candidate.
+    `deploy` retries it, and the third run in a row that ends this way pauses."""
+
+
+class Unattested(Refused):
+    """The registry has no image tag for the target at the commit: not published (yet)."""
 
 
 def run(argv, *, cwd=None, umask=-1, env=None, reason=False):
@@ -260,6 +278,8 @@ def queue_chain(sha, get, queue=None, jobs=None):
 
 
 def verify(sha, get=api):
+    """The main push run of `sha` and its jobs, read through the GitHub REST API: `production.py verify` and the release
+    record (production-release.yml, with the runner's token). Promotion on the host proves CI with `promotable`."""
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise Refused("an exact lowercase 40-character commit SHA is required")
     # Any commit main contains is promotable, not only its head, so merging never waits for a release.
@@ -270,10 +290,10 @@ def verify(sha, get=api):
         raise Refused("candidate is not a commit on main")
     known = _verified.get(sha) if _verified is not None else None
     if known and known.get("pull") is not None:
-        # Within one deploy run, a verification through the PR→queue chain re-reads the queue run, the pull request
+        # Within one verification_reuse block, a verification through the PR→queue chain re-reads the queue run, the pull request
         # run and then the push run, each once and none of their jobs: a rerun or newer run of any of them, or a push
         # run that changed at any time since it was verified, means a full verification. Reading the push run only
-        # last keeps plans A and B inside the host's anonymous quota.
+        # last bounds the requests to the anonymous quota.
         if (unchanged(known["queue"], latest_run(sha, "merge_group", get))
                 and unchanged(known["pull"], latest_run(known["pull"]["head_sha"], "pull_request", get))
                 and unchanged(known["push"], latest_run(sha, "push", get))):
@@ -290,7 +310,7 @@ def verify(sha, get=api):
     if known and unchanged(known["push"], latest) and (known["queue"] is None or (
             unchanged(known["queue"], latest_run(sha, "merge_group", get))
             and unchanged(latest, latest_run(sha, "push", get)))):
-        # Within one deploy run: the same completed attempts have the same jobs, so the runs are read again
+        # Within one verification_reuse block: the same completed attempts have the same jobs, so the runs are read again
         # but not their jobs (the host's anonymous GitHub quota is 60 requests an hour). After the queue read
         # the push run is read once more, as the full path does, so a rerun between the reads is not missed.
         return known["result"]
@@ -320,7 +340,7 @@ def verify(sha, get=api):
     return result
 
 
-# Full verifications of this process, set only while `deploy` runs (verification_reuse).
+# Full verifications of this process, set only inside `verification_reuse`.
 _verified = None
 
 
@@ -332,6 +352,41 @@ def verification_reuse():
         yield
     finally:
         _verified = None
+
+
+# The image whose attestation proves a commit's CI to promotion. ci.yml's `publish` job, the only one that can sign as
+# ci.yml@refs/heads/main, runs only on a main push after `CI gate` passed: the commit's own verification, or a
+# validated reuse of the merge queue's or the pull request run's (scripts/ci_reuse.py applies queue_chain there).
+PROOF_TARGET = "runtime"
+
+
+def promotable(sha):
+    """Whether promotion may take `sha`, without the GitHub REST API (ANYM-406): main contains it, by `git ls-remote`
+    and main's history fetched treeless, and the verifier accepts its `PROOF_TARGET` attestation. An attestation never
+    changes, so a later failed rerun of the commit's run does not withdraw it."""
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise Refused("an exact lowercase 40-character commit SHA is required")
+    with tempfile.TemporaryDirectory(prefix="deedkit-main-") as directory:
+        repository = Path(directory) / "main.git"
+        # git sees only this repository: no inherited GIT_* variable (GIT_DIR, GIT_DEFAULT_HASH ...), no global or
+        # system configuration (URL rewrites, credential helpers), replacement objects, templates or prompts.
+        environment = {**{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+                       "HOME": directory, "XDG_CONFIG_HOME": directory, "GIT_CONFIG_NOSYSTEM": "1",
+                       "GIT_CONFIG_GLOBAL": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"}
+        # A local failure is no network blip: it pauses a deploy (Refused).
+        run(["git", "init", "--quiet", "--bare", "--template=", str(repository)], env=environment)
+        try:
+            # From inside the empty repository: the caller's working directory repository and its config never apply.
+            head = remote_main(environment, cwd=repository)
+            # Commits only (no trees, no blobs): exactly the history of the head ls-remote named.
+            run(["git", "-C", str(repository), "fetch", "--quiet", "--filter=tree:0", SOURCE, head],
+                env=environment, reason=True)
+        except Refused as exc:
+            raise Unreachable(f"main could not be read: {exc}") from None
+        if not on_main(repository, sha, head, environment):
+            raise Refused("candidate is not a commit on main")
+    proof = published(PROOF_TARGET, sha)
+    return {"sha": sha, "main": head, "attestation": {"target": PROOF_TARGET, **proof}}
 
 
 def read(path):
@@ -662,6 +717,12 @@ def published(target, sha):
                      reason=True)
     except OSError as exc:  # for example a pinned file without the execute bit
         raise Refused(f"the attestation verifier {VERIFIER} could not be run") from exc
+    except Refused as exc:
+        if VERIFIER_ABSENT.search(str(exc)):
+            raise Unattested(str(exc)) from None
+        if VERIFIER_UNREACHED.search(str(exc)):
+            raise Unreachable(str(exc)) from None
+        raise
     try:
         value = json.loads(output)
     except ValueError:
@@ -745,7 +806,7 @@ def prepare_router(settings, sha):
     """Build enrollment infrastructure from fetched main, without touching serving units."""
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise Refused("an exact lowercase 40-character commit SHA is required")
-    verify(sha)
+    promotable(sha)
     state = Path(settings["state_directory"])
     check_space(state)
     docker_root = run(["docker", "info", "--format", "{{.DockerRootDir}}"]).strip()
@@ -759,7 +820,7 @@ def prepare_router(settings, sha):
     source = release / "source"
     run(["git", "init", "--quiet", str(source)])
     run(["git", "-C", str(source), "remote", "add", "origin", "https://github.com/" + REPOSITORY + ".git"])
-    # The verified commit itself, which main contains (verify), whether or not main moved on since.
+    # The verified commit itself, which main contains (promotable), whether or not main moved on since.
     run(["git", "-C", str(source), "fetch", "--depth=1", "origin", sha])
     if run(["git", "-C", str(source), "rev-parse", "FETCH_HEAD"]).strip() != sha:
         raise Refused("fetched source is not the verified candidate commit")
@@ -767,14 +828,19 @@ def prepare_router(settings, sha):
     image = build_image(source, sha, "http-router")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise Refused("router build did not produce an immutable image ID")
-    evidence = verify(sha)
+    evidence = promotable(sha)
     receipt = {"version": 1, "target": "http-router", "sha": sha, "image": image, "ci": evidence}
     write(release / "router-build.json", receipt)
     return receipt
 
 
+def published_targets(settings):
+    """The CI-published targets the projects of `settings` select."""
+    return sorted({target for project in settings["projects"] for target in project["services"].values()} & set(PUBLISHED))
+
+
 def prepare(settings, sha):
-    evidence = verify(sha)
+    evidence = promotable(sha)
     state = Path(settings["state_directory"])
     check_space(state)
     docker_root = run(["docker", "info", "--format", "{{.DockerRootDir}}"]).strip()
@@ -788,7 +854,7 @@ def prepare(settings, sha):
     source = release / "source"
     run(["git", "init", "--quiet", str(source)])
     run(["git", "-C", str(source), "remote", "add", "origin", "https://github.com/" + REPOSITORY + ".git"])
-    # The verified commit itself, which main contains (verify), whether or not main moved on since.
+    # The verified commit itself, which main contains (promotable), whether or not main moved on since.
     run(["git", "-C", str(source), "fetch", "--depth=1", "origin", sha])
     if run(["git", "-C", str(source), "rev-parse", "FETCH_HEAD"]).strip() != sha:
         raise Refused("fetched source is not the verified candidate commit")
@@ -802,11 +868,11 @@ def prepare(settings, sha):
     images = {}
     targets = sorted({target for project in settings["projects"] for target in project["services"].values()})
     # Every CI-published target is resolved and attested before the first pull.
-    verified = {target: published(target, sha) for target in targets if target in PUBLISHED}
+    verified = {target: published(target, sha) for target in published_targets(settings)}
     for target in targets:
         images[target] = build_image(source, sha, target, verified=verified.get(target))
     # Recheck after potentially long image builds. No production command ran yet.
-    evidence = verify(sha)
+    evidence = promotable(sha)
     projects = []
     for item in snapshots:
         project, before = item["project"], item["before"]
@@ -848,7 +914,7 @@ def now():
 
 
 def apply(settings, sha):
-    verify(sha)
+    promotable(sha)
     state = Path(settings["state_directory"])
     release = state / sha
     receipt = read(release / "prepared.json")
@@ -873,7 +939,7 @@ def apply(settings, sha):
         if not previous.exists() or digest(read(previous)) != item["before_file_digest"]:
             raise Refused("the before-release snapshot is missing or changed since preparation")
     # Last remote gate immediately before the first mutation, under the host lock.
-    evidence = verify(sha)
+    evidence = promotable(sha)
     write(release / "attempted.json", {"sha": sha, "ci": evidence, "status": "applying"})
     started, touched = {}, []
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
@@ -950,7 +1016,7 @@ def rollback(settings, sha):
     """Return the current release's selected services to the images and configuration that ran before it, or
     those of a release whose apply failed its health wait (`unhealthy`), which never became current.
 
-    Owner-confirmed like apply, except as `deploy`'s one automatic rollback. It never calls verify(): the previous
+    Owner-confirmed like apply, except as `deploy`'s one automatic rollback. It never calls promotable(): the previous
     revision is no longer current main. The caller holds the host lock, as main() does for every state-changing action.
     """
     state = Path(settings["state_directory"])
@@ -1086,28 +1152,9 @@ FETCH_FAILURES = 3
 # Changes a human applies or installs by hand, so the deployer pauses for them.
 SQL_INVENTORY = re.compile(r"\.sql$|^services/.+/migrations/")
 DEPLOY_TOOLS = ("scripts/production.py", "scripts/seamless_release.py", "tools/attest-verify/", "services/release-router/")
-# GitHub requests one deploy run needs, against the anonymous quota of 60 an hour; below it the deploy waits for the
-# reset. Plan A verifies 4 times (prepare 2, apply 2) and plan B 6 times (prepare 3, promote 3); through the PR→queue
-# chain the first verify() reads 11 (7 through the queue's own verification) and each later one 4 (verification_reuse):
-# 47 and 31, plus the deploy's own run listing and a small margin. These hold for unchanged attempts and one-page
-# listings; more pages or a rerun can need more, and the rate limit then stops the run (retried before any change,
-# otherwise a pause).
-QUOTA = {"plan A and B": 52, "plan B": 35}
-
-
-def quota():
-    """Remaining core GitHub API requests and their reset time; reading them costs no request."""
-    request = urllib.request.Request("https://api.github.com/rate_limit", headers={"User-Agent": "deedkit-production",
-        **({"Authorization": "Bearer " + os.environ["GH_TOKEN"]} if os.environ.get("GH_TOKEN") else {})})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        core = json.loads(response.read(1024 * 1024))["resources"]["core"]
-    return core["remaining"], datetime.fromtimestamp(core["reset"], timezone.utc).strftime("%H:%M:%SZ")
-
-
-def remote_main():
+def remote_main(env=None, cwd=None):
     """main's head from `git ls-remote`, which the API quota does not meter."""
-    line = run(["git", "ls-remote", "https://github.com/" + REPOSITORY + ".git", "refs/heads/main"],
-               reason=True).split()
+    line = run(["git", "ls-remote", SOURCE, "refs/heads/main"], cwd=cwd, env=env, reason=True).split()
     if len(line) != 2 or line[1] != "refs/heads/main" or not re.fullmatch(r"[0-9a-f]{40}", line[0]):
         raise Refused("git ls-remote returned no main commit")
     return line[0]
@@ -1129,9 +1176,9 @@ def main_history(state):
     return mirror
 
 
-def on_main(mirror, ancestor, sha):
+def on_main(mirror, ancestor, sha, env=None):
     try:
-        run(["git", "-C", str(mirror), "merge-base", "--is-ancestor", ancestor, sha])
+        run(["git", "-C", str(mirror), "merge-base", "--is-ancestor", ancestor, sha], env=env)
         return True
     except Refused:
         return False
@@ -1176,7 +1223,7 @@ def configuration_drift(settings, http, current, serving):
     return None
 
 
-def deploy(settings, http, *, auto=False, dry_run=False, get=None):
+def deploy(settings, http, *, auto=False, dry_run=False, attested=None):
     """Deploy the newest green main commit with plan A and then plan B, or pause with a reason (production.md)."""
     if PAUSE.exists():
         return {"status": "paused", "reason": PAUSE.read_text()[:1000].strip()}
@@ -1200,18 +1247,21 @@ def deploy(settings, http, *, auto=False, dry_run=False, get=None):
         except Exception as exc:
             return halt("deploy could not take the host locks: " + (str(exc) if isinstance(exc, Refused)
                                                                      else type(exc).__name__))
-        held.enter_context(verification_reuse())
-        return deploy_locked(settings, http, s, auto=auto, dry_run=dry_run, get=get or api, halt=halt)
+        # A candidate is taken only when every image plan A or plan B pulls is attested, so publication that is still
+        # running or failed for one target never starts a release that stops halfway.
+        targets = sorted(set(published_targets(settings)) | set(published_targets(http)) | {PROOF_TARGET})
+        return deploy_locked(settings, http, s, auto=auto, dry_run=dry_run, halt=halt, attested=attested or (
+            lambda sha: [published(target, sha) for target in targets]))
 
 
-def deploy_locked(settings, http, s, *, auto, dry_run, get, halt):
+def deploy_locked(settings, http, s, *, auto, dry_run, attested, halt):
     state = Path(settings["state_directory"])
     record = {}
     try:
-        return deploy_steps(settings, http, s, auto=auto, dry_run=dry_run, get=get, halt=halt, record=record)
+        return deploy_steps(settings, http, s, auto=auto, dry_run=dry_run, attested=attested, halt=halt, record=record)
     except Exception as exc:
         # Every failure the steps do not classify themselves ends here: a pause, unless nothing changed yet
-        # and it was the network or the API quota.
+        # and it was the network.
         message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
         if record:
             outcome = halt(f"deploy of {record['sha']} stopped in an unknown state: {message}; inspect it")
@@ -1229,14 +1279,15 @@ def serving_settled(receipt):
                                                  and receipt.get("previous") is None)
 
 
-def deploy_steps(settings, http, s, *, auto, dry_run, get, halt, record):
+def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record):
     state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
     try:
         last = read(state / "deploy.json") if (state / "deploy.json").exists() else {}
         started = last.get("started_at") and datetime.strptime(last["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
             tzinfo=timezone.utc)
         failures = last.get("fetch_failures", {"count": 0})["count"]
-        if type(failures) is not int or failures < 0:
+        misses = last.get("unreachable", {"count": 0})["count"]
+        if type(failures) is not int or failures < 0 or type(misses) is not int or misses < 0:
             raise ValueError("fetch failure count")
     except (ValueError, TypeError, AttributeError, KeyError):
         return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it")
@@ -1303,44 +1354,55 @@ def deploy_steps(settings, http, s, *, auto, dry_run, get, halt, record):
     if drift := configuration_drift(settings, http, current, serving):
         return halt(drift + "; apply the next release by hand")
     installed = {"scripts/production.py": __file__, "scripts/seamless_release.py": s.__file__}
-    steps = "plan B" if serving["sha"] != base else "plan A and B"
-    remaining, reset = quota()
-    if remaining < QUOTA[steps]:
-        return {"status": "waiting", "reason": f"{remaining} GitHub API requests left until {reset}"}
     if serving["sha"] != base:
-        # Plan A is ahead of the HTTP pair: a deploy that waited for API quota, or plan A applied by hand.
-        candidate, run_url = base, current.get("ci", {}).get("url")
+        # Plan A is ahead of the HTTP pair: a deploy whose HTTP release stopped before any change, or plan A applied
+        # by hand.
+        candidate = base
         reasons = pause_reasons(mirror, serving["sha"], base, installed)
     else:
-        listing = get("actions/workflows/ci.yml/runs?" + urllib.parse.urlencode(
-            {"branch": "main", "event": "push", "per_page": 100}))["workflow_runs"]
-        newest = {}
-        for value in listing:
-            if value.get("id", 0) > newest.get(value.get("head_sha"), {}).get("id", 0):
-                newest[value.get("head_sha")] = value
-        candidate = run_url = None
+        candidate = None
         for sha in run(["git", "-C", str(mirror), "rev-list", "--first-parent", f"{base}..{head}"]).split():
             # A commit whose deployment was attempted is never retried, and older ones never follow it.
             if (state / sha / "attempted.json").exists() or (http_state / sha / "http-attempted.json").exists():
                 break
-            value = newest.get(sha, {})
-            if (value.get("status"), value.get("conclusion"), value.get("head_branch")) == ("completed", "success", "main"):
-                candidate, run_url = sha, value.get("html_url")
-                break
+            # Green CI is the attestation `publish` signs after `CI gate` (promotable); no GitHub API request.
+            try:
+                attested(sha)
+            except Unattested:
+                continue  # not published (yet): its CI still runs or failed, and an older commit may be deployed
+            except Unreachable as exc:
+                # GHCR could not be read: no older commit is taken instead; nothing changed.
+                if misses + 1 >= FETCH_FAILURES:
+                    return halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {exc}")
+                if not dry_run:
+                    write(state / "deploy.json", {**{key: value for key, value in last.items() if key != "unreachable"},
+                                                  "unreachable": {"count": misses + 1, "at": now(), "reason": str(exc)}})
+                return {"status": "error", "reason": f"{exc}; nothing changed, the next run retries"}
+            candidate = sha
+            break
         if candidate is None:
-            return {"status": "waiting", "reason": "no newer main commit has a green push run yet", "sha": base}
+            if "unreachable" in last and not dry_run:
+                write(state / "deploy.json", {key: value for key, value in last.items() if key != "unreachable"})
+            return {"status": "waiting", "reason": "no newer main commit has attested images yet", "sha": base}
         reasons = pause_reasons(mirror, base, candidate, installed)
     if reasons:
         return halt("; ".join(reasons), sha=candidate)
     if dry_run:
-        return {"status": "plan", "sha": candidate, "base": base, "run": run_url,
+        return {"status": "plan", "sha": candidate, "base": base,
                 "steps": (["plan A"] if candidate != base else []) + ["plan B"]}
-    record.update(sha=candidate, base=base, run=run_url, started_at=now(), status="deploying")
+    record.update(sha=candidate, base=base, started_at=now(), status="deploying")
     write(state / "deploy.json", record)
     def finish(status, **fields):
         record.update(status=status, finished_at=now(), **fields)
         write(state / "deploy.json", record)
         return record
+    def retry(exc, message):
+        # A network error changed nothing; git or GHCR failing to be read the third run in a row pauses.
+        if isinstance(exc, Unreachable):
+            if misses + 1 >= FETCH_FAILURES:
+                return finish(**halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {message}"))
+            record["unreachable"] = {"count": misses + 1, "at": now(), "reason": message}
+        return finish("error", reason=message + "; nothing changed, the next run retries")
     release = state / candidate
     if candidate != base:
         try:
@@ -1354,7 +1416,7 @@ def deploy_steps(settings, http, s, *, auto, dry_run, get, halt, record):
             if not (release / "attempted.json").exists():
                 # A network or quota error before preparation started or after it finished changed nothing.
                 if transient(exc) and ((release / "prepared.json").exists() or not release.exists()):
-                    return finish("error", reason=message + "; nothing changed, the next run retries")
+                    return retry(exc, message)
                 return finish(**halt(f"plan A of {candidate} was refused before any change: {message}"))
             result = read(release / "result.json") if (release / "result.json").exists() else {}
             if result.get("status") != "unhealthy":
@@ -1379,18 +1441,18 @@ def deploy_steps(settings, http, s, *, auto, dry_run, get, halt, record):
         directory = http_state / candidate
         if transient(exc) and not (directory / "http-attempted.json").exists() and (
                 (directory / "http-prepared.json").exists() or not directory.exists()):
-            return finish("error", reason=message + "; nothing changed, the next run retries")
+            return retry(exc, message)
         return finish(**halt(f"plan A of {candidate} is applied, but its HTTP release stopped: {message}; "
                              "inspect seamless_release.py status --sha " + candidate))
     return finish("deployed", http=served.get("status"))
 
 
 def transient(exc):
-    """A network error, a GitHub server error or an exhausted API quota says nothing about the candidate: the next run
-    retries it. Anything else (a refusal, a malformed receipt, a program error) pauses."""
+    """A network error, git failing to read main, a GitHub server error or an exhausted API quota says nothing about
+    the candidate: the next run retries it. Anything else (a refusal, a malformed receipt, a program error) pauses."""
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code >= 500
-    return isinstance(exc, (RateLimited, urllib.error.URLError, TimeoutError, ConnectionError))
+    return isinstance(exc, (RateLimited, Unreachable, urllib.error.URLError, TimeoutError, ConnectionError))
 
 
 def http_release_tool():

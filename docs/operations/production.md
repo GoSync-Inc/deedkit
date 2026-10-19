@@ -184,8 +184,8 @@ ANYM-301); only `http-router` and `check-image` still build on the host.
   write, through the job-scoped `GITHUB_TOKEN`; no secret is stored. Pull request,
   merge queue and dispatch runs never run it.
 - **Failure.** A failed publication fails the `main` push run, so
-  `production.py verify` refuses that commit, and the Tiden release record waits
-  for `publish`. Publishing is not a required check.
+  `production.py verify` refuses that commit, promotion finds no attestation of
+  an image it did not publish, and the Tiden release record waits for `publish`. Publishing is not a required check.
 
 - **Secret scan.** Before the archive is kept, each build job scans it with
   `scripts/scan_image.py` and the gitleaks 8.30.1 binary pinned by SHA-256 as in
@@ -297,18 +297,42 @@ new build.
 ## Prepare and inspect
 
 ```sh
-python3 /usr/local/lib/deedkit/production.py verify --sha <40-character-main-sha>
 python3 /usr/local/lib/deedkit/production.py prepare --sha <40-character-main-sha>
 ```
 
-The guard queries GitHub directly. The SHA must be a commit `main` contains
-(`compare/main...<sha>` reports `identical` or `behind` with nothing ahead), not
-necessarily its head, so merges never wait for a release; preparation fetches
-that exact commit (`git fetch --depth=1 origin <sha>`). Only the latest
-successful **push** CI run for that SHA qualifies, with successful package, native and
-aggregate jobs from its current attempt, including exactly one passed `publish`
-job (preparation pulls what it published). A PR run, manual baseline run, earlier
-successful run followed by failure, missing job or skipped check is refused.
+Promotion makes no GitHub REST API request and needs no token (ANYM-406).
+Its git runs isolated from the operator's environment and configuration
+(below, Continuous deployment).
+`prepare`, `apply`, `prepare-router` and `seamless_release.py` prepare and
+promote prove a candidate the same way each time they check it:
+
+1. `main` contains it. `git ls-remote https://github.com/GoSync-Inc/deedkit.git
+   refs/heads/main` must print exactly one line, the head; main's history up to
+   that head is fetched treeless (`--filter=tree:0`, commits only) into a
+   temporary repository, and the SHA must be the head or one of its ancestors.
+   So a commit main has moved past stays promotable and merges never wait for a
+   release. A git failure here is reported as "main could not be read" and
+   `deploy` retries it on its next run.
+2. CI passed on it. The pinned verifier ([Attestation verifier](#attestation-verifier))
+   must accept the attestation of `ghcr.io/gosync-inc/deedkit-runtime` at that
+   SHA. Only the `publish` job of a `main` push run of `ci.yml` can sign it, and
+   `publish` runs only after `CI gate` passed in that run: the commit's own
+   `checks / verify`, or the validated reuse of the merge queue run or of the
+   pull request run of the identical tree that the queue reused. The reuse job
+   (`scripts/ci_reuse.py`) applies the queue rules below inside CI, with the
+   job's token, before `CI gate` can pass. An attestation never changes, so a
+   later failed or cancelled rerun of the same commit's run does not withdraw it.
+
+The evidence (`ci` in the receipts) records the SHA, the main head that was read
+and the verified reference and digests of the proof image; it names no CI run.
+
+`production.py verify --sha <sha>` is the GitHub REST check the release record
+(`production-release.yml`) runs with the runner's token, and is no longer a
+promotion step. It requires a commit `main` contains (`compare/main...<sha>`)
+and the latest successful **push** CI run for that SHA, with successful package,
+native and aggregate jobs from its current attempt, including exactly one passed
+`publish` job. A PR run, manual baseline run, earlier successful run followed
+by failure, missing job or skipped check is refused.
 One exception (ANYM-321): a push run whose `checks / verify` was skipped because
 it reused the merge queue's verification qualifies only when the latest merge
 queue run of the same SHA, from this repository's `gh-readonly-queue/main/`
@@ -333,9 +357,8 @@ latest attempt started, so it is the run the queue decision evaluated; a
 deleted or replaced producer is refused, never substituted. Both runs are
 read again, and the result names the pull request run. The tree equality is
 the queue decision's, checked again by the main push run before it publishes.
-The public repository supports anonymous API reads; optional `GH_TOKEN` may be
-provided by the operator's secret mechanism to increase API limits. Never copy a
-maintainer's broad token onto the host for routine deployment.
+Run on the host, it spends the anonymous quota (60 requests an hour); an
+exhausted quota is refused as "GitHub rate limit exhausted, resets at <time>".
 
 Preparation fetches only `main` and checks the fetched SHA again. It then
 obtains the selected targets: each CI-published target is first verified
@@ -420,7 +443,7 @@ python3 /usr/local/lib/deedkit/production.py apply --sha <same-sha>
 python3 /usr/local/lib/deedkit/production.py status
 ```
 
-Apply locks the host, checks main/CI again and validates the prepared
+Apply locks the host, checks main and the attestation again and validates the prepared
 image labels, configuration hashes and existing container identities, and that
 each `<project>.before.json` still has the digest `prepared.json` recorded when
 preparation wrote it. A container identity is its ID, image and a digest of its
@@ -477,7 +500,7 @@ Rollback is a production change: the owner confirms it like `apply` (except
 the one automatic rollback of `deploy`, below). It returns
 the current release's selected services to the images and configuration that
 ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
-`verify()` (the previous revision is no longer current `main`), does not run or
+`promotable()` (the previous revision is no longer current `main`), does not run or
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
 
@@ -547,9 +570,7 @@ sudo touch /etc/deedkit/autodeploy.pause     # stop deploying; remove the file t
 `deploy` runs as root and holds the global, plan A and HTTP host locks for the
 whole run. It exits quietly (`paused`, `busy`, `current`, `waiting`, exit 0)
 when the pause file exists, another operation holds a lock, `git ls-remote`
-shows no new `main` commit, no newer commit has a green push run yet, the API
-quota left (`/rate_limit`, which costs no request) is below what the run needs,
-or, with `--auto` (the timer), the last deploy started less than 20 minutes ago.
+shows no new `main` commit, no newer commit has attested images yet, or, with `--auto` (the timer), the last deploy started less than 20 minutes ago.
 Otherwise it:
 
 1. reads the current plan A release (`current.json`, status `applied`) and the
@@ -562,8 +583,15 @@ Otherwise it:
    an ancestor of it (`promote` stopped before it published `http-current.json`);
 2. fetches a blobless mirror of `main` into `<state>/deploy-source.git` (an
    existing path there must be that bare repository) and
-   picks the newest first-parent commit after the current release whose latest
-   push run succeeded; a commit whose deployment was attempted is never
+   picks the newest first-parent commit after the current release whose
+   images, every CI-published target plan A or plan B uses plus
+   `deedkit-runtime`, the verifier all accepts. A commit whose image tag the
+   registry reports not found (its run still runs, or failed before `publish`
+   pushed) is passed over for an older one. When GHCR cannot be read, or an
+   image has no attestation bundle yet (also what a failed referrers lookup
+   reports), no older commit is taken: the run ends with `error`, and the third
+   such run in a row pauses. Evidence that does not verify (another commit,
+   signer or digest) pauses. A commit whose deployment was attempted is never
    retried, and no older commit follows it;
 3. pauses with a reason when the range changes the SQL inventory (any `*.sql`,
    `services/*/migrations/**`) or a deploy tool (`scripts/production.py`,
@@ -575,29 +603,26 @@ Otherwise it:
 4. runs `prepare` + `apply` (plan A), then `seamless_release.py prepare` +
    `promote` (plan B), all at that one SHA with every guard of those steps;
    when plan A is ahead of the HTTP release, it runs plan B only;
-5. writes `<state>/deploy.json` (SHA, base, run URL, start, end, outcome) and
+5. writes `<state>/deploy.json` (SHA, base, start, end, outcome) and
    prints one JSON line for the journal.
 
-Within one run `verify()` reads the run and job listings once per SHA and
-afterwards re-reads only the runs (a completed attempt keeps its jobs; the push
-run is read again after the merge queue run; through the pull request chain the
-queue run, the pull request run and then the push run are each read once), so a
-deploy of plans A and B
-makes about 48 of the host's 60 anonymous requests an hour and starts only with
-52 left (plan B alone: 31, starts with 35); in practice at most one deploy an
-hour. These
-numbers hold for unchanged run attempts and one-page listings: a listing with a
-second page or a rerun during the deploy can need more. A GitHub rate-limit
-response is refused as "GitHub rate limit exhausted, resets at <time>"; before
-any change the next run retries it, after a release step started it pauses.
+No step reads GitHub's REST API, so a deploy needs no API quota and no token
+(ANYM-406); each check of a candidate costs one `git ls-remote`, one treeless
+fetch of main and one verifier run against GHCR. That git runs without the
+operator's `GIT_*` variables, global or system configuration, replacement
+objects or templates, so neither a URL rewrite nor `GIT_DIR` can change which
+history it reads.
 
 On a failure it writes `/etc/deedkit/autodeploy.pause` (JSON with the reason)
 and exits 1; nothing deploys until a human removes it. A refusal before any
 change pauses, and so does any other error or state it cannot classify (a
 malformed receipt, `deploy.json` included, a failed retirement of the previous
-HTTP generation, a lock it cannot take); only a GitHub API connection error,
-a GitHub server error (5xx) or an exhausted quota before any change is retried
-by the next run. A failed `git ls-remote` or mirror fetch (any cause, the
+HTTP generation, a lock it cannot take); only a connection error, git or GHCR
+failing to be read ("main could not be read", a verifier registry failure) or
+a GitHub server error (5xx) before any change is retried by the next run. The
+git or GHCR failures are counted in `deploy.json` (`unreachable`); the third
+run in a row that ends this way pauses, and a run that gets past them resets
+the count. A failed `git ls-remote` or mirror fetch (any cause, the
 mirror check included) changes nothing: the run prints `fetch_failed` with
 git's last error line, exits 1 and counts it in `deploy.json`
 (`fetch_failures`); a successful fetch resets the count, and the third failure
@@ -622,7 +647,7 @@ enabled later than that, the first run starts at once. `--auto` keeps at least
 20 minutes between two deploy starts. The unit reads
 `/etc/deedkit/production.json` and `/etc/deedkit/http-production.json` unless
 the optional `/etc/deedkit/autodeploy.env` (root-owned, mode `0600`) sets
-`DEEDKIT_DEPLOY_CONFIG`; an owner-added `GH_TOKEN` goes into the same file.
+`DEEDKIT_DEPLOY_CONFIG`.
 
 A deploy and the daily backup never overlap; the backup stops the collectors
 (`personal-os-backup.timer`, 18:00 UTC) and an apply would recreate them.
@@ -640,12 +665,10 @@ before starting a backup by hand. While a backup holds the lock, the deploy
 exits 75 and the run counts as a skip. A skipped run (condition or lock) prints
 no JSON line.
 
-The unit adds no destination: `deploy` reads `main` from GitHub over HTTPS,
-GitHub's REST API (runs, jobs, comparisons, `/rate_limit`) and GHCR (manifests,
-attestations, images). `GH_TOKEN`, when set, is sent only as the
-`Authorization` header of the GitHub API requests; the attestation verifier
-runs with an empty environment. The journal gets one JSON line per run (SHAs,
-the CI run URL, times, the outcome and its reason, at most git's last error
+The unit adds no destination: `deploy` reads `main` from GitHub over HTTPS
+(git only, no REST API) and GHCR (manifests, attestations, images); the
+attestation verifier runs with an empty environment. The journal gets one JSON
+line per run (SHAs, times, the outcome and its reason, at most git's last error
 line), never resolved Compose settings.
 
 Install it once, after a clean manual `deploy`, from the same reviewed `main`

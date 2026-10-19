@@ -26,14 +26,14 @@ def fixture(tmp_path, monkeypatch):
         return ""
     monkeypatch.setattr(p, "run", command)
     monkeypatch.setattr(p, "check_space", lambda path: None)
-    monkeypatch.setattr(p, "verify", lambda sha: {"sha": sha, "run_id": 123})
+    monkeypatch.setattr(p, "promotable", lambda sha: {"sha": sha, "run_id": 123})
     monkeypatch.setattr(p, "build_image", lambda source, sha, target: IMAGE)
     return settings, calls, state
 
 
 def test_router_ci_failure_does_not_fetch_build_or_write_receipt(tmp_path, monkeypatch):
     settings, calls, state = fixture(tmp_path, monkeypatch)
-    monkeypatch.setattr(p, "verify", lambda sha: (_ for _ in ()).throw(p.Refused("CI failed")))
+    monkeypatch.setattr(p, "promotable", lambda sha: (_ for _ in ()).throw(p.Refused("CI failed")))
     with pytest.raises(p.Refused, match="CI failed"):
         p.prepare_router(settings, SHA)
     assert calls == [] and list(state.iterdir()) == []
@@ -57,7 +57,7 @@ def test_router_final_ci_failure_never_creates_authorizing_receipt(tmp_path, mon
         if len(attempts) == 2:
             raise p.Refused("new CI failed")
         return {"sha": sha}
-    monkeypatch.setattr(p, "verify", verify)
+    monkeypatch.setattr(p, "promotable", verify)
     with pytest.raises(p.Refused, match="new CI failed"):
         p.prepare_router(settings, SHA)
     assert attempts == [SHA, SHA]
