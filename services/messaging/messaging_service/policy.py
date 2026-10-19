@@ -39,7 +39,7 @@ OPERATION_PERMISSIONS = {
 }
 AUDIT_OPERATIONS = frozenset(OPERATION_PERMISSIONS) | {
     'issue_key', 'revoke_key', 'set_access', 'http_boundary', 'send_dispatch', 'set_sending',
-    'set_key_permissions', 'set_operations', 'messenger_dispatch',
+    'set_key_permissions', 'set_operations', 'messenger_dispatch', 'extend_key',
 }
 AUDIT_CODES = frozenset({
     'unauthorized', 'forbidden', 'not_found', 'invalid_limit', 'invalid_query',
@@ -135,7 +135,7 @@ def audit(c, p, operation, outcome, code=None):
     p = p or {}
     values = (p.get('id'), p.get('key_id'), operation, outcome, safe_code,
               p.get('_audit_targets', []) if outcome == 'ok' else [])
-    if operation in ('issue_key','revoke_key','set_access','set_sending','set_key_permissions','set_operations'):
+    if operation in ('issue_key','revoke_key','extend_key','set_access','set_sending','set_key_permissions','set_operations'):
         c.execute('''INSERT INTO audit_log(principal,key_id,operation,outcome,error_code,resource_ids,actor)
             VALUES(%s,%s,%s,%s,%s,%s,'operator')''', values)
     elif operation in ('send_dispatch','messenger_dispatch'):

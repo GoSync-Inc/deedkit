@@ -40,7 +40,9 @@ only. In the window, a principal's first request each UTC day logs one warning p
 gateway process; an idle principal logs nothing, so use `--check` for an overview.
 These warnings cover only the gateway principal's key. Each backend enforces its own
 key expiry and reports none of it to the gateway, so the owner checks the backend
-credentials' expiries separately.
+credentials' expiries separately. A messaging backend key is extended in place with
+`extend-key` ([ACCESS.md](../../ACCESS.md#extending-a-key)); its token stays the same, so
+`key_sha256` and the credential binding in this policy do not change.
 
 To extend a key, the owner writes a new policy file with a later `expires_at` for
 that principal, the same `key_sha256` and credential binding, and a higher

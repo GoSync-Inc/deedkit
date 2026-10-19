@@ -1,13 +1,13 @@
 # Agent access and audit
 
-Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 35. Setup is done by the operator through the local CLI
+Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 36. Setup is done by the operator through the local CLI
 or SSH with the owner DSN. There are no remote MCP/REST methods for managing keys and permissions.
 Provider sessions, the owner DSN and the backup decryption key are not given to agents.
 
 ## What a credential allows
 
-Each agent has its own principal and a separate Bearer key. A key is valid
-for 1–30 days (7 by default), is stored in the DB only as a SHA256, and has a public UUID
+Each agent has its own principal and a separate Bearer key. A key is issued
+for 1–30 days (7 by default), can be extended in place by the owner ([below](#extending-a-key)), is stored in the DB only as a SHA256, and has a public UUID
 for revocation. Several keys of one principal share the principal scope and the
 archive-consumer ACK; the subscription ACK and feedback belong to the exact key.
 Different agents get different principals. Keys must not be passed in a query string,
@@ -55,6 +55,7 @@ python -m messaging_service set-access --principal assistant-work \
 
 python -m messaging_service list-keys --principal assistant-work
 python -m messaging_service revoke-key --key-id PUBLIC_CREDENTIAL_UUID
+python -m messaging_service extend-key --key-id PUBLIC_CREDENTIAL_UUID --days 183
 python -m messaging_service set-access --principal assistant-work --disable
 python -m messaging_service set-access --principal assistant-work --enable
 python -m messaging_service audit-tail --principal assistant-work --limit 50
@@ -64,6 +65,20 @@ Permissions that are not specified are preserved. Issuing another key to the sam
 without `--chats`/`--permissions` keeps its restrictions; the account list must be given
 explicitly. Rotation with the same permissions does not reset the ACK. Issuing a key to a disabled
 principal does not enable it again.
+
+### Extending a key
+
+Since schema 36 `extend-key` sets one live key's expiry to now + `--days` (an integer 1–183,
+required), measured by the database clock under the principal lock. The token, its digest,
+permissions and the principal's scope stay the same, so its subscriptions, their ACK and its
+feedback keep working, and neither the gateway policy (`key_sha256`) nor a calls `archive_config`
+token file needs a change. An unknown, revoked or already expired key is refused (`unknown_key`,
+`key_revoked`, `key_expired`), and so is a value that would move the expiry earlier
+(`key_lifetime_would_shorten`); a refusal changes nothing. The command prints only the public
+key ID and the previous and new `expires_at`; `list-keys` shows the new date. It writes one
+operator audit row `extend_key` (principal and public key ID, never the token or digest) in the
+same transaction, so a failed audit write leaves the expiry unchanged. Agents cannot extend
+their own keys. After a suspected leak, rotate with `issue-key` and `revoke-key` instead.
 
 Any change to accounts, chats, operations or enabled increases the scope version:
 old receipts and download grants stop working. The same consumer starts
