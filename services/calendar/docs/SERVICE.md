@@ -88,7 +88,7 @@ uv run family-calendar service guardian-rule list
 
 `disable` keeps the rule with `enabled=false` and version +1. `list` prints the rules without titles. Every `set` and `disable` writes one audit row (`guardian_rule_set`, `guardian_rule_disable`) with the rule ID only.
 
-Readiness: rules live in migration 2. The feature is off until the owner runs `migrate` (schema version 2) and then `db-roles` again, so the runtime role can read the new tables; until then every existing tool works as before. `capabilities` reports `features.guardian_projections` as `{"available": true}` or `{"available": false, "reason": "schema_not_ready" | "grants_not_ready"}`. The gateway role only reads both tables; the worker role reads rules and reads, inserts and updates projection links.
+Readiness: rules live in migration 2. The feature is off until the owner runs `migrate` (schema version 2) and then `db-roles` again, so the runtime role can read the new tables; until then every existing tool works as before. `capabilities` reports top-level `guardian_projections` (kept by the common gateway) as `{"available": true}` or `{"available": false, "reason": "schema_not_ready" | "grants_not_ready"}`. The gateway role only reads both tables; the worker role reads rules and reads, inserts and updates projection links.
 
 ## Unified MCP
 

@@ -362,8 +362,9 @@ class FamilyService:
                 "window_limit_days": 31,
                 "event_limit": 500,
                 "atomic_cross_provider": False,
-                "guardian_projections": self.guardian_projections(),
             },
+            # Top level: the common gateway drops backend `features` but passes this through.
+            guardian_projections=self.guardian_projections(),
         )
 
     def guardian_projections(self):

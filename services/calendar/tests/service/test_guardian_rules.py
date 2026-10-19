@@ -224,7 +224,7 @@ async def test_schema_one_and_missing_grants_keep_existing_paths(schema_one, rol
     # New code, schema 1.
     baseline = await existing_paths(gateway, worker, key, 1)
     assert (baseline[6], baseline[7]["state"], baseline[8]) == ("unknown", "verified", 1)
-    assert service.capabilities(key)["features"]["guardian_projections"] == {
+    assert service.capabilities(key)["guardian_projections"] == {
         "available": False, "reason": "schema_not_ready"
     }
     assert all("guardian_rules" not in m for m in service.family(key)["members"])
@@ -232,22 +232,23 @@ async def test_schema_one_and_missing_grants_keep_existing_paths(schema_one, rol
     # New code, schema 2 before db-roles: the runtime role cannot read the new tables, and nothing tries to.
     s.migrate()
     assert await existing_paths(gateway, worker, key, 2) == baseline
-    assert service.capabilities(key)["features"]["guardian_projections"] == {
+    assert service.capabilities(key)["guardian_projections"] == {
         "available": False, "reason": "grants_not_ready"
     }
     assert all("guardian_rules" not in m for m in service.family(key)["members"])
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         gateway.query("SELECT 1 FROM guardian_rules")
 
-    # Base-commit code on schema 2: its only migration check (version 1 checksum) still passes,
-    # and every path it runs returns what it returned on schema 1.
+    # Schema 2 after db-roles: the version-1 checksum the base-commit migrator checks is unchanged,
+    # and the same paths return the schema-1 results apart from the new rules key. (Base-commit modules
+    # on schema 2 were run once against this harness for PR #183; CI keeps no base checkout.)
     assert s.one("SELECT checksum FROM migrations WHERE version=1")["checksum"] == SCHEMA_ONE_SHA256
     apply_roles()
     ready = await existing_paths(gateway, worker, key, 3)
     for m in ready[0]["members"]:
         m.pop("guardian_rules", None)
     assert ready == baseline
-    assert service.capabilities(key)["features"]["guardian_projections"] == {"available": True}
+    assert service.capabilities(key)["guardian_projections"] == {"available": True}
 
 
 @pytest.fixture
