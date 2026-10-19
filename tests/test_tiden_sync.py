@@ -212,7 +212,11 @@ def test_a_go_test_resolves_to_its_nearest_module_quoted_or_commented_and_never_
     commit(root, {"outer/go.mod": "module example.com/outer\n",
                   "outer/inner/go.mod": "module example.com/inner // the nested module\n",
                   "outer/quoted/go.mod": 'module "example.com/quoted"\n',
-                  "outer/broken/go.mod": "go 1.26\n"}, "modules")
+                  "outer/broken/go.mod": "go 1.26\n",
+                  "outer/tight/go.mod": "module example.com/tight//note\n",
+                  "outer/escaped/go.mod": 'module "example.com/\\x73caped"\n'}, "modules")
+    assert tiden_sync.go_package(root, "HEAD", "outer/tight/x_test.go") == "example.com/tight"
+    assert tiden_sync.go_package(root, "HEAD", "outer/escaped/x_test.go") == "example.com/scaped"
     assert tiden_sync.go_package(root, "HEAD", "outer/inner/x_test.go") == "example.com/inner"
     assert tiden_sync.go_package(root, "HEAD", "outer/inner/pkg/x_test.go") == "example.com/inner/pkg"
     assert tiden_sync.go_package(root, "HEAD", "outer/quoted/x_test.go") == "example.com/quoted"

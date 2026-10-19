@@ -6,6 +6,7 @@ only this tool and the pinned Tiden CLI, never tests or application code.
 from __future__ import annotations
 
 import argparse
+import ast
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import json
@@ -173,10 +174,9 @@ def normalize_junit(path: Path, root: Path, framework: str, source_prefix: str =
 
 
 GO_VERDICTS = {"pass": "passed", "fail": "failed", "skip": "skipped"}
-GO_ACTIONS = {"start", "run", "pause", "cont", "pass", "bench", "fail", "output", "skip", "build-output", "build-fail"}
 GO_TEST_FUNCTION = re.compile(r"^func ((?:Test|Example|Fuzz)[A-Za-z0-9_]*)\(", re.MULTILINE)
-# A go.mod `module` directive: the path bare, "quoted" or `raw`, optionally followed by a // comment.
-GO_MODULE = re.compile(r"^[ \t]*module[ \t]+(?:\"([^\"\s]+)\"|`([^`\s]+)`|([^\s\"`/][^\s\"`]*))[ \t]*(?://.*)?$", re.MULTILINE)
+# A go.mod `module` directive's argument: an interpreted "string" (Go escapes), a `raw` string or a bare token.
+GO_MODULE_ARGUMENT = re.compile(r'"((?:[^"\\\n]|\\.)*)"|`([^`\n]*)`|(\S+)')
 # `go test -json` writes test names with spaces as underscores, so a name is any run of non-space characters.
 GO_SIGNATURE = re.compile(r"[A-Za-z0-9._~/-]+::(?:Test|Example|Fuzz)\S*")
 BARE_GO_FILE = re.compile(r"[A-Za-z0-9_.-]+_test\.go")
@@ -193,9 +193,25 @@ def row_id(ci_url: str, check: str, signature: str) -> str:
 
 
 def go_module_path(text: str) -> str | None:
-    """The module path a go.mod declares, or None when it declares none."""
-    found = GO_MODULE.search(text)
-    return next((group for group in found.groups() if group), None) if found else None
+    """The module path a go.mod declares, read as the Go tool reads it: `//` starts a comment anywhere outside a
+    string, and a quoted path has Go escapes decoded. None when no `module` line declares a usable path."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("module") or line[6:7] not in (" ", "\t"):
+            continue
+        found = GO_MODULE_ARGUMENT.match(line[6:].lstrip())
+        if not found:
+            return None
+        quoted, raw, bare = found.groups()
+        if quoted is not None:
+            try:  # Go's interpreted-string escapes are a subset of Python's for a double-quoted literal.
+                path = ast.literal_eval(f'"{quoted}"')
+            except (ValueError, SyntaxError):
+                return None
+        else:
+            path = raw if raw is not None else bare.split("//", 1)[0]
+        return path if path and path[0] != "(" and not re.search(r'[\s"`\\]', path) else None
+    return None
 
 
 def go_module_of(root: Path, check: str) -> str:
@@ -231,9 +247,10 @@ def go_results(path: Path, root: Path, module_dir: str, ci_url: str, check: str)
         if not line.strip():
             continue
         event = json.loads(line)
-        if not isinstance(event, dict) or not all(isinstance(event.get(key, ""), str)
-                                                   for key in ("Action", "Package", "Test", "ImportPath")) \
-                or event.get("Action") not in GO_ACTIONS:
+        # Any action is accepted (go test adds new ones, such as `attr` and `artifacts`); only run and the verdicts
+        # make rows, and no other field of an event leaves.
+        if not isinstance(event, dict) or not event.get("Action") \
+                or not all(isinstance(event.get(key, ""), str) for key in ("Action", "Package", "Test", "ImportPath")):
             raise ValueError("not a go test -json event")
         action, package, test = event["Action"], event.get("Package", ""), event.get("Test", "")
         if action.startswith("build-"):
@@ -245,6 +262,8 @@ def go_results(path: Path, root: Path, module_dir: str, ci_url: str, check: str)
         if not test:
             if action == "fail":
                 failed_packages.add(package)
+            continue
+        if action != "run" and action not in GO_VERDICTS:
             continue
         key = (package, test)
         if key not in verdicts and key not in started:

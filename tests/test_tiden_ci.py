@@ -2028,11 +2028,30 @@ def test_go_subtest_names_with_slashes_colons_or_spaces_keep_their_exact_leaf_id
 
 
 # spec: ANYM-421
+def test_go_metadata_events_such_as_attr_and_artifacts_leave_the_test_passed_and_add_nothing(tmp_path):
+    from scripts.tiden_ci import go_results
+    module = go_module(tmp_path, "whatsmeow")
+    # Emitted by Go 1.26 for t.Attr and, with -artifacts, t.ArtifactDir.
+    stream = tmp_path / "whatsmeow.json"
+    stream.write_text(go_stream({"Action": "run", "Package": module, "Test": "TestPasses"},
+                                {"Action": "attr", "Package": module, "Test": "TestPasses", "Key": "k", "Value": "SECRET-ATTR"},
+                                {"Action": "artifacts", "Package": module, "Test": "TestPasses", "Path": "/tmp/SECRET-DIR"},
+                                {"Action": "pass", "Package": module, "Test": "TestPasses", "Elapsed": 0.01},
+                                {"Action": "pass", "Package": module}))
+    rows, counts, unexplained = go_results(stream, tmp_path, "whatsapp/whatsmeow", ATTEMPT_URL, "whatsmeow")
+    assert [(row["signature"], row["execution"]["status"]) for row in rows] == [(f"{module}::TestPasses", "passed")]
+    assert counts == Counter(passed=1) and not unexplained and "SECRET" not in json.dumps(rows)
+
+
+# spec: ANYM-421
 @pytest.mark.parametrize("text, module", [
     ("module example.com/bare\n", "example.com/bare"), ('module "example.com/quoted"\n', "example.com/quoted"),
     ("module `example.com/raw`\n", "example.com/raw"), ("module example.com/commented // note\n", "example.com/commented"),
-    ("// module example.com/not\ngo 1.26\n", None), ("go 1.26\n", None)],
-    ids=["bare", "quoted", "raw", "commented", "commented-out", "none"])
+    ("// module example.com/not\ngo 1.26\n", None), ("go 1.26\n", None),
+    ("module example.com/tight//note\n", "example.com/tight"), ('module "example.com/\\x73caped"\n', "example.com/scaped"),
+    ("module (\n\texample.com/block\n)\n", None)],
+    ids=["bare", "quoted", "raw", "commented", "commented-out", "none", "comment-without-space", "escaped-quoted",
+         "block-form"])
 def test_a_go_mod_module_path_is_read_bare_quoted_or_commented(tmp_path, text, module):
     from scripts.tiden_ci import go_module_path, go_results
     assert go_module_path(text) == module
