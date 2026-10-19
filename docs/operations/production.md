@@ -643,7 +643,7 @@ last error line. The summary lists `removed` and `failed` images (short ID,
 tags), the `kept` count, and `interrupted`/`remaining` when an unexpected error
 stopped the pass; or only `skipped` with the reason when nothing was removed (a
 busy image or deploy lock; a protecting file or directory it cannot read or list;
-an applied current release whose rollback snapshot is missing). Removal never changes the release's outcome:
+an applied current release whose rollback snapshot is missing; a configured state directory that does not exist yet, or a state that appeared during the pass). Removal never changes the release's outcome:
 `deploy` has written `deployed` before it starts, exits 0 and never pauses or
 retries for it; `apply` prints the summary next to its result, and `result.json`
 and `current.json` stay unchanged.
