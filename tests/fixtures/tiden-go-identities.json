@@ -1,0 +1,1118 @@
+[
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestActuallyFullSpoolAllowsReadyAndRecoversAfterConsumerDrain",
+  "title": "TestActuallyFullSpoolAllowsReadyAndRecoversAfterConsumerDrain",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestBoundedMediaFileCannotBypassLimitThroughCopyOrWriteAt",
+  "title": "TestBoundedMediaFileCannotBypassLimitThroughCopyOrWriteAt",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestCaptureSpoolExportForPython",
+  "title": "TestCaptureSpoolExportForPython",
+  "suite": "whatsmeow",
+  "file": "spool_integrity_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestCaptureSpoolFilenameHashesExactPublishedPayload",
+  "title": "TestCaptureSpoolFilenameHashesExactPublishedPayload",
+  "suite": "whatsmeow",
+  "file": "spool_integrity_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestConnectFailureIsReportedInsteadOfGenericDisconnect",
+  "title": "TestConnectFailureIsReportedInsteadOfGenericDisconnect",
+  "suite": "whatsmeow",
+  "file": "connection_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestDialogsMarkOwnerLIDChatAsSelfChat",
+  "title": "TestDialogsMarkOwnerLIDChatAsSelfChat",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestDurableDedupeAndLocalPage",
+  "title": "TestDurableDedupeAndLocalPage",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestEditTargetAndWireTimeStableAcrossReplay/UTC",
+  "title": "TestEditTargetAndWireTimeStableAcrossReplay/UTC",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestEditTargetAndWireTimeStableAcrossReplay/source-offset",
+  "title": "TestEditTargetAndWireTimeStableAcrossReplay/source-offset",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestEveryLifecycleClientDefersACKUntilDurableHandling",
+  "title": "TestEveryLifecycleClientDefersACKUntilDurableHandling",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestExactOutgoingRetryPayloadSurvivesRestartAndExpires",
+  "title": "TestExactOutgoingRetryPayloadSurvivesRestartAndExpires",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestExactSendJournalPrecedesCaptureAndLostIPCDoesNotResend/capture_failure",
+  "title": "TestExactSendJournalPrecedesCaptureAndLostIPCDoesNotResend/capture_failure",
+  "suite": "whatsmeow",
+  "file": "send_receipt_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestExactSendJournalPrecedesCaptureAndLostIPCDoesNotResend/success",
+  "title": "TestExactSendJournalPrecedesCaptureAndLostIPCDoesNotResend/success",
+  "suite": "whatsmeow",
+  "file": "send_receipt_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestExclusiveNativeSessionLock",
+  "title": "TestExclusiveNativeSessionLock",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestGlobalRevokeNoBlankHumanMessage",
+  "title": "TestGlobalRevokeNoBlankHumanMessage",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestHistoryBackpressureClassification",
+  "title": "TestHistoryBackpressureClassification",
+  "suite": "whatsmeow",
+  "file": "history_backpressure_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestHistoryBackpressureIsDeferredWithoutConsumingAttempts",
+  "title": "TestHistoryBackpressureIsDeferredWithoutConsumingAttempts",
+  "suite": "whatsmeow",
+  "file": "history_backpressure_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestHistoryBatchSkipsInvalidItemsAndCapturesTheRest",
+  "title": "TestHistoryBatchSkipsInvalidItemsAndCapturesTheRest",
+  "suite": "whatsmeow",
+  "file": "skip_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestHistoryBatchUnderFullSpoolIsJournaledAndRetriedWithoutDuplicates",
+  "title": "TestHistoryBatchUnderFullSpoolIsJournaledAndRetriedWithoutDuplicates",
+  "suite": "whatsmeow",
+  "file": "history_backpressure_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestHistoryDecompressionRejectsBombAndCorruptPayload",
+  "title": "TestHistoryDecompressionRejectsBombAndCorruptPayload",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestHistoryDownloadRetriesResumeAfterCrashWithPersistedBackoff",
+  "title": "TestHistoryDownloadRetriesResumeAfterCrashWithPersistedBackoff",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestHistoryKnownDownloadFailuresStopAfterThreeAttempts",
+  "title": "TestHistoryKnownDownloadFailuresStopAfterThreeAttempts",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestHistoryOriginAcceptedByArchiveContract",
+  "title": "TestHistoryOriginAcceptedByArchiveContract",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestHistoryWorkerDefersLocalCapacityWithoutFailingProvider",
+  "title": "TestHistoryWorkerDefersLocalCapacityWithoutFailingProvider",
+  "suite": "whatsmeow",
+  "file": "history_backpressure_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestIDsRetainObservedNamespaces",
+  "title": "TestIDsRetainObservedNamespaces",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestInvalidLiveMessageIsAcknowledgedAndCountedWithoutFailingCapture",
+  "title": "TestInvalidLiveMessageIsAcknowledgedAndCountedWithoutFailingCapture",
+  "suite": "whatsmeow",
+  "file": "skip_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestJournalQuotaNeverEvictsUnconsumedLegacySemanticFilename",
+  "title": "TestJournalQuotaNeverEvictsUnconsumedLegacySemanticFilename",
+  "suite": "whatsmeow",
+  "file": "spool_integrity_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestJournalQuotaNeverEvictsUnconsumedSpool",
+  "title": "TestJournalQuotaNeverEvictsUnconsumedSpool",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestLongNonLatinBodyIsMeasuredInCharacters",
+  "title": "TestLongNonLatinBodyIsMeasuredInCharacters",
+  "suite": "whatsmeow",
+  "file": "skip_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestMediaDescriptorExactFallbackAndFilename",
+  "title": "TestMediaDescriptorExactFallbackAndFilename",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeBusinessSenderFlagIsGatedAndStatedOnly",
+  "title": "TestNativeBusinessSenderFlagIsGatedAndStatedOnly",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeDeleteIsGlobalOwnMessageOnly",
+  "title": "TestNativeDeleteIsGlobalOwnMessageOnly",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeEnvelopeNormalizesMimeAndOutOfRangeSize",
+  "title": "TestNativeEnvelopeNormalizesMimeAndOutOfRangeSize",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeEnvelopeOmitsUnarchivableReferencesAndEditTimes",
+  "title": "TestNativeEnvelopeOmitsUnarchivableReferencesAndEditTimes",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeEnvelopeRejectsUnrepresentableIdentityAndTime",
+  "title": "TestNativeEnvelopeRejectsUnrepresentableIdentityAndTime",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeEnvelopeSanitizesSenderControlledDisplayFields",
+  "title": "TestNativeEnvelopeSanitizesSenderControlledDisplayFields",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeFileUploadVerifiedBeforeSendAndReauthorizedAfterUpload/revoked",
+  "title": "TestNativeFileUploadVerifiedBeforeSendAndReauthorizedAfterUpload/revoked",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeFileUploadVerifiedBeforeSendAndReauthorizedAfterUpload/valid",
+  "title": "TestNativeFileUploadVerifiedBeforeSendAndReauthorizedAfterUpload/valid",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeForwardOriginIsOmittedUnlessEnabledAndForwarded",
+  "title": "TestNativeForwardOriginIsOmittedUnlessEnabledAndForwarded",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeForwardOriginStatesNewsletterOrUnknown",
+  "title": "TestNativeForwardOriginStatesNewsletterOrUnknown",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeForwardStripsSourceContextAndRechecksSourceScope",
+  "title": "TestNativeForwardStripsSourceContextAndRechecksSourceScope",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/add_participant",
+  "title": "TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/add_participant",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/demote_participant",
+  "title": "TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/demote_participant",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/get_invite_link",
+  "title": "TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/get_invite_link",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/leave_group",
+  "title": "TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/leave_group",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/promote_participant",
+  "title": "TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/promote_participant",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/remove_participant",
+  "title": "TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/remove_participant",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/rename_group",
+  "title": "TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/rename_group",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/revoke_invite_link",
+  "title": "TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/revoke_invite_link",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/set_group_description",
+  "title": "TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites/set_group_description",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeIPCProcessHelper",
+  "title": "TestNativeIPCProcessHelper",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeIdentityPairsOnlyForArchivablePersonalIDs",
+  "title": "TestNativeIdentityPairsOnlyForArchivablePersonalIDs",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMarkReadRechecksPolicyBetweenReceiptAndPatch",
+  "title": "TestNativeMarkReadRechecksPolicyBetweenReceiptAndPatch",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMarkReadWholeChatAndBoundedReviewedReceipts",
+  "title": "TestNativeMarkReadWholeChatAndBoundedReviewedReceipts",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaDeadlineScalesWithDeclaredSize",
+  "title": "TestNativeMediaDeadlineScalesWithDeclaredSize",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaKeepaliveWriteFailureStopsTransfer",
+  "title": "TestNativeMediaKeepaliveWriteFailureStopsTransfer",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaNeverEmitsBeforeHashAndSizeVerification/hash",
+  "title": "TestNativeMediaNeverEmitsBeforeHashAndSizeVerification/hash",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaNeverEmitsBeforeHashAndSizeVerification/overflow",
+  "title": "TestNativeMediaNeverEmitsBeforeHashAndSizeVerification/overflow",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaNeverEmitsBeforeHashAndSizeVerification/size",
+  "title": "TestNativeMediaNeverEmitsBeforeHashAndSizeVerification/size",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRechecksScopeAfterDownloadAndEachChunk/after_download",
+  "title": "TestNativeMediaRechecksScopeAfterDownloadAndEachChunk/after_download",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRechecksScopeAfterDownloadAndEachChunk/after_first_chunk",
+  "title": "TestNativeMediaRechecksScopeAfterDownloadAndEachChunk/after_first_chunk",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/bytes",
+  "title": "TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/bytes",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/filename",
+  "title": "TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/filename",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/mime",
+  "title": "TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/mime",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/provider_id",
+  "title": "TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/provider_id",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/scope",
+  "title": "TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/scope",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/size_limit",
+  "title": "TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/size_limit",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/viewonce",
+  "title": "TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/viewonce",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/wrong_chat",
+  "title": "TestNativeMediaRejectsChangedDescriptorsAndViewOnceBeforeDownload/wrong_chat",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRejectsUnsafeTemporaryArea/public",
+  "title": "TestNativeMediaRejectsUnsafeTemporaryArea/public",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRejectsUnsafeTemporaryArea/symlink",
+  "title": "TestNativeMediaRejectsUnsafeTemporaryArea/symlink",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaRootSymlinkAndPublicDirectoryRejected",
+  "title": "TestNativeMediaRootSymlinkAndPublicDirectoryRejected",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaSlowDownloadIsKeptAliveWithoutUnverifiedBytes",
+  "title": "TestNativeMediaSlowDownloadIsKeptAliveWithoutUnverifiedBytes",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaStalledDownloadEndsWithTimeoutFrame",
+  "title": "TestNativeMediaStalledDownloadEndsWithTimeoutFrame",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaTemporaryStaysOutsideSpoolQuota",
+  "title": "TestNativeMediaTemporaryStaysOutsideSpoolQuota",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaUnwritableStorageIsNotANetworkError",
+  "title": "TestNativeMediaUnwritableStorageIsNotANetworkError",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaVerifiedStreamingAndCleanup",
+  "title": "TestNativeMediaVerifiedStreamingAndCleanup",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMediaWithUnknownArchiveSizeIsNeverFetched",
+  "title": "TestNativeMediaWithUnknownArchiveSizeIsNeverFetched",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMessageMetadataOwnerLIDAndNoMillisecondInvention",
+  "title": "TestNativeMessageMetadataOwnerLIDAndNoMillisecondInvention",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMessageOperationsTargetExactCapturedMessage/edit_message",
+  "title": "TestNativeMessageOperationsTargetExactCapturedMessage/edit_message",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMessageOperationsTargetExactCapturedMessage/pin_message",
+  "title": "TestNativeMessageOperationsTargetExactCapturedMessage/pin_message",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMessageOperationsTargetExactCapturedMessage/send_reaction",
+  "title": "TestNativeMessageOperationsTargetExactCapturedMessage/send_reaction",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMessageOperationsTargetExactCapturedMessage/star_message",
+  "title": "TestNativeMessageOperationsTargetExactCapturedMessage/star_message",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMessageOperationsTargetExactCapturedMessage/unpin_message",
+  "title": "TestNativeMessageOperationsTargetExactCapturedMessage/unpin_message",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMessageOperationsTargetExactCapturedMessage/unstar_message",
+  "title": "TestNativeMessageOperationsTargetExactCapturedMessage/unstar_message",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeMutationErrorsAreUnknownWithoutRetry",
+  "title": "TestNativeMutationErrorsAreUnknownWithoutRetry",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeOperationRejectsUnknownNullAndOutOfBounds/duplicate_options",
+  "title": "TestNativeOperationRejectsUnknownNullAndOutOfBounds/duplicate_options",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeOperationRejectsUnknownNullAndOutOfBounds/expired",
+  "title": "TestNativeOperationRejectsUnknownNullAndOutOfBounds/expired",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeOperationRejectsUnknownNullAndOutOfBounds/invalid_latitude",
+  "title": "TestNativeOperationRejectsUnknownNullAndOutOfBounds/invalid_latitude",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeOperationRejectsUnknownNullAndOutOfBounds/null_latitude",
+  "title": "TestNativeOperationRejectsUnknownNullAndOutOfBounds/null_latitude",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeOperationRejectsUnknownNullAndOutOfBounds/null_poll_multiple",
+  "title": "TestNativeOperationRejectsUnknownNullAndOutOfBounds/null_poll_multiple",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeOperationRejectsUnknownNullAndOutOfBounds/unknown_param",
+  "title": "TestNativeOperationRejectsUnknownNullAndOutOfBounds/unknown_param",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeOperationRejectsUnknownNullAndOutOfBounds/wrong_group",
+  "title": "TestNativeOperationRejectsUnknownNullAndOutOfBounds/wrong_group",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeOperationSendIncludesWireArchiveReference",
+  "title": "TestNativeOperationSendIncludesWireArchiveReference",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeParticipantRefusalAndInvitationRemainVisible",
+  "title": "TestNativeParticipantRefusalAndInvitationRemainVisible",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativePinsExcludeKnownExpiryAndUnpin",
+  "title": "TestNativePinsExcludeKnownExpiryAndUnpin",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeProcessExitsWithInheritedBlockingIPC/action-eof",
+  "title": "TestNativeProcessExitsWithInheritedBlockingIPC/action-eof",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeProcessExitsWithInheritedBlockingIPC/background-eof",
+  "title": "TestNativeProcessExitsWithInheritedBlockingIPC/background-eof",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeProcessExitsWithInheritedBlockingIPC/sigterm",
+  "title": "TestNativeProcessExitsWithInheritedBlockingIPC/sigterm",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeProcessExitsWithInheritedBlockingIPC/sigterm-output-backpressure",
+  "title": "TestNativeProcessExitsWithInheritedBlockingIPC/sigterm-output-backpressure",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeReadDoesNotReleaseRevokedContact",
+  "title": "TestNativeReadDoesNotReleaseRevokedContact",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeReceiptReadsReportObservedPartialEvidence",
+  "title": "TestNativeReceiptReadsReportObservedPartialEvidence",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeRegisteredFilesRequireExactDigestRegularNoSymlinks",
+  "title": "TestNativeRegisteredFilesRequireExactDigestRegularNoSymlinks",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeRequestHistoryBoundedAndExplicit",
+  "title": "TestNativeRequestHistoryBoundedAndExplicit",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeRoundVideoDownloadsAndVerifiesWithVideoKeys",
+  "title": "TestNativeRoundVideoDownloadsAndVerifiesWithVideoKeys",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeRoundVideoInPreUpgradeCacheRecordStaysAttachmentFree/current_round_video",
+  "title": "TestNativeRoundVideoInPreUpgradeCacheRecordStaysAttachmentFree/current_round_video",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeRoundVideoInPreUpgradeCacheRecordStaysAttachmentFree/legacy_image",
+  "title": "TestNativeRoundVideoInPreUpgradeCacheRecordStaysAttachmentFree/legacy_image",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeRoundVideoInPreUpgradeCacheRecordStaysAttachmentFree/legacy_round_video",
+  "title": "TestNativeRoundVideoInPreUpgradeCacheRecordStaysAttachmentFree/legacy_round_video",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeRoundVideoIsCapturedAsVideoAttachment",
+  "title": "TestNativeRoundVideoIsCapturedAsVideoAttachment",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendGroupReceiptPreservesPublicIDAndWireSender",
+  "title": "TestNativeSendGroupReceiptPreservesPublicIDAndWireSender",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendNeverRetriesAmbiguousOutcome/capture_failure",
+  "title": "TestNativeSendNeverRetriesAmbiguousOutcome/capture_failure",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendNeverRetriesAmbiguousOutcome/missing_timestamp",
+  "title": "TestNativeSendNeverRetriesAmbiguousOutcome/missing_timestamp",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendNeverRetriesAmbiguousOutcome/timeout",
+  "title": "TestNativeSendNeverRetriesAmbiguousOutcome/timeout",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendNeverRetriesAmbiguousOutcome/wrong_chat",
+  "title": "TestNativeSendNeverRetriesAmbiguousOutcome/wrong_chat",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendNeverRetriesAmbiguousOutcome/wrong_id",
+  "title": "TestNativeSendNeverRetriesAmbiguousOutcome/wrong_id",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendPNReceiptRetainsVerifiedWireIdentity",
+  "title": "TestNativeSendPNReceiptRetainsVerifiedWireIdentity",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendReceiptJournalIsPrivateExactBoundedAndContentFree",
+  "title": "TestNativeSendReceiptJournalIsPrivateExactBoundedAndContentFree",
+  "suite": "whatsmeow",
+  "file": "send_receipt_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/different_lid",
+  "title": "TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/different_lid",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/group_alias",
+  "title": "TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/group_alias",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/lid_to_pn",
+  "title": "TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/lid_to_pn",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/mapping_error",
+  "title": "TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/mapping_error",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/missing_chat",
+  "title": "TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/missing_chat",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/missing_sender",
+  "title": "TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/missing_sender",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/no_mapping",
+  "title": "TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/no_mapping",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/reverse_mismatch",
+  "title": "TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/reverse_mismatch",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/same_digits",
+  "title": "TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/same_digits",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/unknown_sender",
+  "title": "TestNativeSendRejectsUnprovenReceiptIdentitiesOnce/unknown_sender",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeSendWireEchoKeepsOneArchiveIdentity",
+  "title": "TestNativeSendWireEchoKeepsOneArchiveIdentity",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextChecksRevocationAfterResolvingReply",
+  "title": "TestNativeTextChecksRevocationAfterResolvingReply",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextPlainLinkAndQuoteAreExact",
+  "title": "TestNativeTextPlainLinkAndQuoteAreExact",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextProtocolRejectsUnknownFieldsAndTrailingJSON",
+  "title": "TestNativeTextProtocolRejectsUnknownFieldsAndTrailingJSON",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextValidatesBeforeSend/control",
+  "title": "TestNativeTextValidatesBeforeSend/control",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextValidatesBeforeSend/empty",
+  "title": "TestNativeTextValidatesBeforeSend/empty",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextValidatesBeforeSend/expired",
+  "title": "TestNativeTextValidatesBeforeSend/expired",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextValidatesBeforeSend/infinite",
+  "title": "TestNativeTextValidatesBeforeSend/infinite",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextValidatesBeforeSend/nan",
+  "title": "TestNativeTextValidatesBeforeSend/nan",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextValidatesBeforeSend/rich_preview",
+  "title": "TestNativeTextValidatesBeforeSend/rich_preview",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextValidatesBeforeSend/target",
+  "title": "TestNativeTextValidatesBeforeSend/target",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextValidatesBeforeSend/utf16",
+  "title": "TestNativeTextValidatesBeforeSend/utf16",
+  "suite": "whatsmeow",
+  "file": "send_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeUnsupportedOperationsFailBeforeMutation/add_contact",
+  "title": "TestNativeUnsupportedOperationsFailBeforeMutation/add_contact",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeUnsupportedOperationsFailBeforeMutation/delete_contact",
+  "title": "TestNativeUnsupportedOperationsFailBeforeMutation/delete_contact",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeUnsupportedOperationsFailBeforeMutation/get_labels",
+  "title": "TestNativeUnsupportedOperationsFailBeforeMutation/get_labels",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeUnsupportedOperationsFailBeforeMutation/set_chat_labels",
+  "title": "TestNativeUnsupportedOperationsFailBeforeMutation/set_chat_labels",
+  "suite": "whatsmeow",
+  "file": "operations_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeViewOnceRoundVideoIsNotRetained/extension",
+  "title": "TestNativeViewOnceRoundVideoIsNotRetained/extension",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeViewOnceRoundVideoIsNotRetained/flag",
+  "title": "TestNativeViewOnceRoundVideoIsNotRetained/flag",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeViewOnceRoundVideoIsNotRetained/v1",
+  "title": "TestNativeViewOnceRoundVideoIsNotRetained/v1",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeViewOnceRoundVideoIsNotRetained/v2",
+  "title": "TestNativeViewOnceRoundVideoIsNotRetained/v2",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeViewOnceRoundVideoStaysUnretainedAfterCacheReload/flag",
+  "title": "TestNativeViewOnceRoundVideoStaysUnretainedAfterCacheReload/flag",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeViewOnceRoundVideoStaysUnretainedAfterCacheReload/wrapped_edit",
+  "title": "TestNativeViewOnceRoundVideoStaysUnretainedAfterCacheReload/wrapped_edit",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeViewOnceRoundVideoStaysUnretainedAfterCacheReload/wrapper",
+  "title": "TestNativeViewOnceRoundVideoStaysUnretainedAfterCacheReload/wrapper",
+  "suite": "whatsmeow",
+  "file": "envelope_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNonReconnectingWhatsAppEventsMapToCodesPythonUnderstands",
+  "title": "TestNonReconnectingWhatsAppEventsMapToCodesPythonUnderstands",
+  "suite": "whatsmeow",
+  "file": "connection_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestOnlyVerifiedProviderAcknowledgementIsJournaled/bad_correlation",
+  "title": "TestOnlyVerifiedProviderAcknowledgementIsJournaled/bad_correlation",
+  "suite": "whatsmeow",
+  "file": "send_receipt_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestOnlyVerifiedProviderAcknowledgementIsJournaled/journal_failure",
+  "title": "TestOnlyVerifiedProviderAcknowledgementIsJournaled/journal_failure",
+  "suite": "whatsmeow",
+  "file": "send_receipt_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestOnlyVerifiedProviderAcknowledgementIsJournaled/timeout",
+  "title": "TestOnlyVerifiedProviderAcknowledgementIsJournaled/timeout",
+  "suite": "whatsmeow",
+  "file": "send_receipt_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestOnlyVerifiedProviderAcknowledgementIsJournaled/wrong_id",
+  "title": "TestOnlyVerifiedProviderAcknowledgementIsJournaled/wrong_id",
+  "suite": "whatsmeow",
+  "file": "send_receipt_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestOnlyVerifiedProviderAcknowledgementIsJournaled/wrong_sender",
+  "title": "TestOnlyVerifiedProviderAcknowledgementIsJournaled/wrong_sender",
+  "suite": "whatsmeow",
+  "file": "send_receipt_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestOutgoingRetryCacheEnforcesCountAndByteBounds",
+  "title": "TestOutgoingRetryCacheEnforcesCountAndByteBounds",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestOversizedDialogsAnswerWithErrorFrameAndKeepLane",
+  "title": "TestOversizedDialogsAnswerWithErrorFrameAndKeepLane",
+  "suite": "whatsmeow",
+  "file": "lane_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestOversizedNativeEvidenceStillExportsBoundedEnvelope",
+  "title": "TestOversizedNativeEvidenceStillExportsBoundedEnvelope",
+  "suite": "whatsmeow",
+  "file": "skip_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestPageOmitsRetainedRevisionTheArchiveCannotRepresent",
+  "title": "TestPageOmitsRetainedRevisionTheArchiveCannotRepresent",
+  "suite": "whatsmeow",
+  "file": "skip_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestPageUsesExactCollectorContractAndNeverClaimsComplete",
+  "title": "TestPageUsesExactCollectorContractAndNeverClaimsComplete",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestPairRequiresTerminalBeforeOpeningAuth",
+  "title": "TestPairRequiresTerminalBeforeOpeningAuth",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestPolicyFreshFileAndExclusions",
+  "title": "TestPolicyFreshFileAndExclusions",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestPolicySymlinkRejected",
+  "title": "TestPolicySymlinkRejected",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestProtocolRetryIsFencedByFreshIdentityReadinessAndPolicy",
+  "title": "TestProtocolRetryIsFencedByFreshIdentityReadinessAndPolicy",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestReceiptsRetainOnlyObservedOutgoingEvidence",
+  "title": "TestReceiptsRetainOnlyObservedOutgoingEvidence",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestReplayBatchSharesConservativeSpoolQuota",
+  "title": "TestReplayBatchSharesConservativeSpoolQuota",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestReplayPublishesBoundedOldestBatches",
+  "title": "TestReplayPublishesBoundedOldestBatches",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestRequestsAfterFailureReportRecordedConnectionCode",
+  "title": "TestRequestsAfterFailureReportRecordedConnectionCode",
+  "suite": "whatsmeow",
+  "file": "connection_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestScopedPolicyStillDurablyQueuesHistoryControl",
+  "title": "TestScopedPolicyStillDurablyQueuesHistoryControl",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestSkipCounterIsContentFree",
+  "title": "TestSkipCounterIsContentFree",
+  "suite": "whatsmeow",
+  "file": "skip_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestSpoolFailureSurvivesRestartReplay",
+  "title": "TestSpoolFailureSurvivesRestartReplay",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestSpoolMeasurementToleratesConcurrentConsumerUnlink",
+  "title": "TestSpoolMeasurementToleratesConcurrentConsumerUnlink",
+  "suite": "whatsmeow",
+  "file": "runtime_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestStartupSweepsOnlyStaleNativeTemporaries",
+  "title": "TestStartupSweepsOnlyStaleNativeTemporaries",
+  "suite": "whatsmeow",
+  "file": "media_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestAdminShutdownKeepsProcessLockUntilPublicStreamDrains",
+  "title": "TestAdminShutdownKeepsProcessLockUntilPublicStreamDrains",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestCancelledResponseReleasesLeaseAfterBackendCancellation",
+  "title": "TestCancelledResponseReleasesLeaseAfterBackendCancellation",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestConfigCASRejectsStaleETagWithoutChangingRoutes",
+  "title": "TestConfigCASRejectsStaleETagWithoutChangingRoutes",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestLeaseIsAcquiredBeforeDialAndBlocksRemoval",
+  "title": "TestLeaseIsAcquiredBeforeDialAndBlocksRemoval",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestOwnershipWaitIncludesUpgradedProxyLeaseAfterHTTPShutdown",
+  "title": "TestOwnershipWaitIncludesUpgradedProxyLeaseAfterHTTPShutdown",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestPrivateAdminRequiresStrictBoundedObjectConfiguration",
+  "title": "TestPrivateAdminRequiresStrictBoundedObjectConfiguration",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestRetirementFenceCannotBeForgottenByDeletingGeneration",
+  "title": "TestRetirementFenceCannotBeForgottenByDeletingGeneration",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestRetirementFenceRetainsAdmittedStreamUntilResponseCompletes",
+  "title": "TestRetirementFenceRetainsAdmittedStreamUntilResponseCompletes",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestRoutesPreserveHostCredentialsAndTicketIssuer",
+  "title": "TestRoutesPreserveHostCredentialsAndTicketIssuer",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestSlowHeadersSelectGenerationAfterCAS",
+  "title": "TestSlowHeadersSelectGenerationAfterCAS",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestUnixAdminRecoversOnlyStaleOwnedSockets",
+  "title": "TestUnixAdminRecoversOnlyStaleOwnedSockets",
+  "suite": "release-router",
+  "file": "router_test.go"
+ },
+ {
+  "signature": "github.com/GoSync-Inc/deedkit/services/release-router::TestUnixAdminSocketIsPrivateAndNeverReplacesExistingEntry",
+  "title": "TestUnixAdminSocketIsPrivateAndNeverReplacesExistingEntry",
+  "suite": "release-router",
+  "file": "router_test.go"
+ }
+]

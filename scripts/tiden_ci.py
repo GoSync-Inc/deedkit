@@ -28,8 +28,12 @@ MODULE_REPORTS = {
     "calls": ("calls.xml", "python", "services/calls"),
     "calls_frontend": ("calls-frontend.xml", "node", "services/calls/frontend"),
     "backup_restore": ("backup-restore.xml", "python", ""),
+    # `go test -json` streams of the `go` job, published as result rows (go_results), not JUnit.
+    "whatsmeow": ("whatsmeow.json", "go", "whatsapp/whatsmeow"),
+    "release_router": ("release-router.json", "go", "services/release-router"),
 }
-_VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load")
+GO_MODULES = tuple(name for name, (_, framework, _) in MODULE_REPORTS.items() if framework == "go")
+_VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and name not in GO_MODULES)
 # The root Python suite runs in file-level shards (scripts/python_shards.py): verify runs shard 1, each
 # `checks / python` matrix job one of the others, and assembly merges their reports into python.xml.
 PYTHON_SHARDS = 4
@@ -43,6 +47,7 @@ FRAGMENTS = {
                                  *(MODULE_REPORTS[name][0] for name in _VERIFY_MODULES))),
     "load": (("load",), ("outcomes.json", MODULE_REPORTS["load"][0], "load.json")),
     **{job: ((), ("outcomes.json", report)) for job, report in zip(SHARD_JOBS, SHARD_REPORTS[1:])},
+    "go": (GO_MODULES, ("outcomes.json", *(MODULE_REPORTS[name][0] for name in GO_MODULES))),
 }
 CONTROL_FILES = {"source-sha", "attempt", "metadata.json", "outcomes.json"}
 # Every file assembly writes besides `source-sha` and `metadata.json`.
@@ -167,6 +172,113 @@ def normalize_junit(path: Path, root: Path, framework: str, source_prefix: str =
     return ET.tostring(document, encoding="utf-8", xml_declaration=True), counts
 
 
+GO_VERDICTS = {"pass": "passed", "fail": "failed", "skip": "skipped"}
+GO_TEST_FUNCTION = re.compile(r"^func ((?:Test|Example|Fuzz)[A-Za-z0-9_]*)\(", re.MULTILINE)
+GO_MODULE = re.compile(r"^module[ \t]+(\S+)[ \t]*$", re.MULTILINE)
+GO_SIGNATURE = re.compile(r"[A-Za-z0-9._~/-]+::(?:Test|Example|Fuzz)[^\s:]*")
+BARE_GO_FILE = re.compile(r"[A-Za-z0-9_.-]+_test\.go")
+
+
+def normalized_report(check: str) -> str:
+    return f"normalized-{check}.json" if MODULE_REPORTS.get(check, ("", ""))[1] == "go" else f"normalized-{check}.xml"
+
+
+def row_id(ci_url: str, check: str, signature: str) -> str:
+    """A Go result row's ID, the idempotency key Tiden deduplicates on: new for every publishing run attempt."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{ci_url}/{check}/{signature}"))
+
+
+def go_results(path: Path, root: Path, module_dir: str, ci_url: str, check: str) -> tuple[list[dict], Counter, bool]:
+    """Tiden result rows from one `go test -json` stream, named as Tiden CLI 0.33.0's Go reporter (`tiden run exec`)
+    named them, so the existing cases and their spec links keep receiving results: signature `<Package>::<Test>`
+    byte for byte (Tiden lowercases JUnit identities), title the test name, the package's last path element as the
+    suite and the bare name of the `_test.go` file declaring the top-level test. Only names, statuses and durations
+    leave; test output does not. A test that started without a verdict failed. Also returns whether a package failed
+    without a failed test to explain it (a build failure, a panic after the tests). Raises ValueError for a stream
+    without any test result, a package outside the module or a test whose file cannot be named."""
+    data = path.read_bytes()
+    if len(data) > MAX_BYTES:
+        raise ValueError("oversized go test stream")
+    found = GO_MODULE.search((root / module_dir / "go.mod").read_text())
+    if not found:
+        raise ValueError("the Go module path is missing")
+    module, verdicts, started, failed_packages, order = found.group(1), {}, set(), set(), []
+    for line in data.splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if not isinstance(event, dict):
+            raise ValueError("not a go test -json event")
+        action, package, test = event.get("Action"), event.get("Package"), event.get("Test")
+        if action == "build-fail":
+            failed_packages.add(str(event.get("ImportPath") or ""))
+        if not isinstance(package, str) or not package:
+            continue
+        if not test:
+            if action == "fail":
+                failed_packages.add(package)
+            continue
+        if not isinstance(test, str):
+            raise ValueError("not a go test -json event")
+        key = (package, test)
+        if key not in verdicts and key not in started:
+            order.append(key)
+        if action == "run":
+            started.add(key)
+        elif action in GO_VERDICTS:
+            elapsed = event.get("Elapsed") or 0
+            if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool) or not 0 <= elapsed < 10**6:
+                raise ValueError("a go test -json duration is malformed")
+            verdicts[key] = (GO_VERDICTS[action], int(elapsed * 1000))
+    # Like Tiden's Go reporter, a test with subtests is no case of its own: its subtests are.
+    parents = {(package, test.rsplit("/", 1)[0]) for package, test in order if "/" in test}
+    order = [key for key in order if key not in parents]
+    if not order:
+        raise ValueError("the go test stream has no test results")
+    declared: dict[str, dict[str, list[str]]] = {}
+    rows, counts = [], Counter()
+    for package, test in order:
+        if package != module and (not package.startswith(module + "/")
+                                  or {"", ".", ".."} & set(package[len(module) + 1:].split("/"))):
+            raise ValueError("a Go package lies outside its module")
+        if package not in declared:
+            directory = root / module_dir / package[len(module) + 1:]
+            files = declared[package] = {}
+            for file in sorted(directory.glob("*_test.go")):
+                for name in GO_TEST_FUNCTION.findall(file.read_text()):
+                    files.setdefault(name, []).append(file.name)
+        files = declared[package].get(test.split("/", 1)[0], [])
+        if len(files) != 1:
+            raise ValueError("a Go test's source file cannot be named")
+        status, duration = verdicts.get((package, test), ("failed", 0))
+        signature = f"{package}::{test}"
+        if not GO_SIGNATURE.fullmatch(signature):
+            raise ValueError("a Go test identity is malformed")
+        rows.append({"id": row_id(ci_url, check, signature), "title": test, "signature": signature,
+                     "execution": {"status": status, "duration": duration},
+                     "suitePath": [{"title": package.rsplit("/", 1)[-1]}], "fields": {"file_path": files[0]}})
+        counts[status] += 1
+    explained = {package for (package, _), row in zip(order, rows) if row["execution"]["status"] == "failed"}
+    return rows, counts, bool(failed_packages - explained)
+
+
+def go_row_counts(rows: object) -> Counter:
+    """The statuses of prepared Go result rows, refused unless every row has the shape go_results writes."""
+    if not isinstance(rows, list) or not rows or len(rows) > 10000:
+        raise ValueError("Go results must contain bounded real executions")
+    counts = Counter()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"id", "title", "signature", "execution", "suitePath", "fields"} \
+                or not isinstance(row["signature"], str) or not GO_SIGNATURE.fullmatch(row["signature"]) \
+                or row["title"] != row["signature"].split("::", 1)[1] \
+                or not isinstance(row["execution"], dict) or row["execution"].get("status") not in GO_VERDICTS.values() \
+                or not isinstance(row["fields"], dict) or not BARE_GO_FILE.fullmatch(str(row["fields"].get("file_path"))):
+            raise ValueError("a Go result row is malformed")
+        counts[row["execution"]["status"]] += 1
+    return counts
+
+
+
 def prepare(root: Path, directory: Path, metadata: dict) -> dict:
     if not re.fullmatch(r"[a-f0-9]{40}", metadata.get("sha", "")):
         raise ValueError("actual tested commit SHA is required")
@@ -188,12 +300,17 @@ def prepare(root: Path, directory: Path, metadata: dict) -> dict:
         if check in REPORTS or check in MODULE_REPORTS:
             try:
                 filename, framework, prefix = MODULE_REPORTS.get(check, (REPORTS.get(check), check, ""))
-                normalized, totals = normalize_junit(directory / filename, root, framework, prefix)
-                filename = f"normalized-{check}.xml"
+                unexplained = False
+                if framework == "go":
+                    results, totals, unexplained = go_results(directory / filename, root, prefix, metadata["ci_url"], check)
+                    normalized = json.dumps(results, indent=2).encode()
+                else:
+                    normalized, totals = normalize_junit(directory / filename, root, framework, prefix)
+                filename = normalized_report(check)
                 (directory / filename).write_bytes(normalized)
                 reports.append(filename)
                 counts.update(totals)
-                if totals["failed"] and outcome == "success":
+                if (totals["failed"] or unexplained) and outcome == "success":
                     outcome = "failure"
                 if not totals["passed"] and not totals["failed"]:
                     outcome, reason = "skipped", "No tests executed; only skipped tests"
@@ -378,6 +495,7 @@ def published_manifest(directory: Path, manifest: dict) -> dict:
     repository, run_id, attempt, sha, event, ref = (os.environ.get(name, "") for name in (
         "GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "GITHUB_EVENT_NAME", "GITHUB_REF"))
     ci_url = f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{attempt}"
+    go_reports: dict[str, list] = {}
     try:
         record = json.loads(control_file(directory, PUBLICATION))
         producer = record["producer"]
@@ -417,13 +535,23 @@ def published_manifest(directory: Path, manifest: dict) -> dict:
         rows = json.loads(control_file(directory, "ci-checks.json")) if valid else []
         published = [{**row, "id": str(uuid.uuid5(uuid.NAMESPACE_URL, ci_url + "/" + row["signature"].split("::", 1)[1])),
                       "message": f"{row['message']}; tested in {producer['url']}"} for row in rows]
+        # Go result rows carry IDs too; Tiden deduplicates on them, so this run publishes them under its own.
+        for check in GO_MODULES:
+            if normalized_report(check) in manifest["reports"] and valid:
+                results = json.loads(control_file(directory, normalized_report(check)))
+                go_row_counts(results)
+                go_reports[normalized_report(check)] = [{**row, "id": row_id(ci_url, check, row["signature"])}
+                                                        for row in results]
     except (ValueError, KeyError, TypeError, AttributeError, IndexError):
         valid = False
     if not valid:
         raise ValueError("the publication record does not name this main push run and its merge queue evidence, "
                          "or the pull request evidence of exactly this commit's tree")
     (directory / PUBLISHED_CHECKS).write_text(json.dumps(published, indent=2))
-    reports = [name for name in manifest["reports"] if name != "ci-checks.json"] + [PUBLISHED_CHECKS]
+    for name, results in go_reports.items():
+        (directory / ("published-" + name)).write_text(json.dumps(results, indent=2))
+    reports = [("published-" + name if name in go_reports else name) for name in manifest["reports"]
+               if name != "ci-checks.json"] + [PUBLISHED_CHECKS]
     chained = {"sha": sha, "tested_sha": tested} if tested != sha else {}
     return {**manifest, "event": "push", "git_branch": "main", "tiden_branch": "", "pr_tiden_links": [],
             "ci_url": ci_url, "tested_in": producer["url"], "reports": reports, **chained}

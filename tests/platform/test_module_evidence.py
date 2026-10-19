@@ -20,7 +20,17 @@ def test_module_reports_add_identities_without_changing_existing_checks(tmp_path
         "checks": {name: "success" for name in ci.CHECKS},
         "module_checks": {name: "success" for name in ci.MODULE_REPORTS},
     }
-    for name, (filename, _, _) in ci.MODULE_REPORTS.items():
+    for name, (filename, framework, prefix) in ci.MODULE_REPORTS.items():
+        if framework == "go":
+            # A Go module reports a `go test -json` stream of a synthetic module under the source root.
+            module = "example.com/" + name
+            (tmp_path / prefix).mkdir(parents=True)
+            (tmp_path / prefix / "go.mod").write_text(f"module {module}\n")
+            (tmp_path / prefix / "api_test.go").write_text("func TestSame(t *testing.T) {}\n")
+            (tmp_path / filename).write_text(
+                json.dumps({"Action": "pass", "Package": module, "Test": "TestSame"}) + "\n"
+            )
+            continue
         (tmp_path / filename).write_text(
             '<testsuite><testcase name="same" classname="tests.test_api" file="tests/test_api.py"/></testsuite>'
         )
@@ -39,6 +49,11 @@ def test_module_reports_add_identities_without_changing_existing_checks(tmp_path
         == "failed"
     )
     assert summary["test_counts"] == {"passed": len(ci.MODULE_REPORTS) - 1, "failed": 1}
+    assert {
+        c["signature"]: c["execution"]["status"]
+        for c in checks
+        if c["signature"] in {"deedkit-ci::whatsmeow", "deedkit-ci::release_router"}
+    } == {"deedkit-ci::whatsmeow": "passed", "deedkit-ci::release_router": "passed"}
     gateway = next(ET.parse(tmp_path / "normalized-gateway.xml").iter("testcase"))
     calendar = next(ET.parse(tmp_path / "normalized-calendar.xml").iter("testcase"))
     assert gateway.get("file") == "services/gateway/tests/test_api.py"

@@ -42,6 +42,29 @@ whether or not Tiden reporting is configured. So `CI gate` never depends on the
 outcome of the Tiden publication. The reporting job still fails on a
 configuration error, a missing evidence artifact or an unproven receipt.
 
+The native Go suites reach Tiden through the `checks / go` job (ANYM-421): it
+runs `go test -race -count=1 -json ./...` in `whatsapp/whatsmeow` and in
+`services/release-router` and uploads both streams in its `ci-evidence-go`
+fragment as module checks `deedkit-ci::whatsmeow` and
+`deedkit-ci::release_router`. The suites also still run in ci.yml's `native`
+job, which production promotion requires; a job of another workflow cannot feed
+this evidence. Go results are not JUnit, because Tiden lowercases JUnit
+identities and the existing Go cases and their links would be orphaned.
+`scripts/tiden_ci.py` turns each stream into Tiden result rows named exactly as
+Tiden's own Go reporter named them: signature `<Package>::<Test>` byte for byte
+(subtests `<Test>/<sub>`; a test with subtests is no case of its own), title the
+test name, suite the package's last path element and `file_path` the bare name
+of the one `_test.go` file that declares the top-level test. Only those names,
+the status and the duration leave the runner; test output stays in the GitHub
+artifacts (`ci-evidence-go` 1 day, `ci-evidence` 14 days). A test that started
+without a verdict failed. A stream without test results, a malformed event, a
+package outside its module, a test whose file is missing or ambiguous, or a
+package failure that no failed test explains blocks or fails that module's check
+only, and so fails `checks / evidence`. A missing `go` fragment blocks both. Each
+row's ID is a UUIDv5 of the publishing run attempt, the check and the signature,
+so a main push that publishes reused queue or pull request evidence gives the Go
+rows its own IDs.
+
 The separate reporting job receives no database or messenger credentials. It
 uses Tiden CLI 0.33.0 from the official release with a pinned SHA-256 checksum.
 Fork pull requests do not receive the Tiden secret or publish evidence. Package
@@ -304,7 +327,10 @@ pull request named by `(#n)` in the commit subject, it:
 
 1. merges the body's `Tiden branch:` when its preview holds only the named
    specs;
-2. links each marked test the commit adds to its specs;
+2. links each marked test the commit adds to its specs (a Go test,
+   `// spec: ANYM-n` above `func TestX`, links the cases whose signature is
+   `<module path>[/<package dir>]::TestX` or starts with `<that>::TestX/`, the
+   module path read from the nearest `go.mod` at the commit);
 3. anchors each unanchored changed code file to the primary spec;
 4. sets each `Delivers:` spec to Done, or to Review while it has an open live or
    measured check;

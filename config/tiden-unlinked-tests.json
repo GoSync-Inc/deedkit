@@ -2,6 +2,12 @@
   "format": 1,
   "cases": [
     {
+      "caseId": "b5046165-2d76-4aa0-961f-c584e5223c49",
+      "externalId": "s:github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeIPCProcessHelper",
+      "category": "helper",
+      "reason": "Subprocess body of the native IPC test: it returns at once unless that test re-executes the binary with ANYMSG_TEST_IPC_PROCESS=1; the parent test asserts the behaviour"
+    },
+    {
       "caseId": "c2c532fb-3617-4c31-a846-2ad60cac109e",
       "externalId": "s:services.gateway.tests.test_shared_contracts::test_calls_reference_does_not_wrap_or_drop_domain_payload",
       "category": "missing-spec",

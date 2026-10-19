@@ -124,9 +124,10 @@ def test_publisher_refuses_partial_results_even_when_tiden_returns_passed(tmp_pa
 
 
 def test_publisher_counts_additive_module_checks_without_changing_legacy_checks(tmp_path, monkeypatch):
-    _, manifest = cli_fixture(monkeypatch, tmp_path, attempts="13")
-    manifest["module_checks"] = {name: "success" for name in ("gateway", "calendar", "calls", "calls_frontend", "load", "backup_restore")}
-    manifest["check_counts"] = {"passed": 13}
+    _, manifest = cli_fixture(monkeypatch, tmp_path, attempts="15")
+    manifest["module_checks"] = {name: "success" for name in ("gateway", "calendar", "calls", "calls_frontend", "load", "backup_restore",
+                                                              "whatsmeow", "release_router")}
+    manifest["check_counts"] = {"passed": 15}
     assert publish(tmp_path, manifest, "intent/feature", "product")["status"] == "passed"
 
 
@@ -1494,7 +1495,31 @@ def test_the_overall_deadline_ends_a_hang_outside_tiden_calls_and_fails_the_ci_r
 
 ATTEMPT_URL ="https://github.com/example/repo/actions/runs/1/attempts/2"
 LOAD_REPORT = '<testsuite><testcase name="budgets" file="tests/platform/benchmarks/gateway_read_load.py"/></testsuite>'
-PASSED = {"verify": ("success", "a" * 40), "load": ("success", "a" * 40), **dict.fromkeys(SHARD_JOBS, ("success", "a" * 40))}
+PASSED = {"verify": ("success", "a" * 40), "load": ("success", "a" * 40), **dict.fromkeys(SHARD_JOBS, ("success", "a" * 40)),
+          "go": ("success", "a" * 40)}
+# Synthetic Go modules at the module directories of the two Go checks; `go_results` reads only go.mod and *_test.go.
+GO_MODULE_PATHS = {"whatsmeow": "example.com/whatsmeow", "release_router": "example.com/release/router"}
+
+
+def go_module(root, check, source="func TestPasses(t *testing.T) {}\n", file="x_test.go"):
+    """Write a synthetic Go module for `check` under `root` (one test file); return its module path."""
+    from scripts.tiden_ci import MODULE_REPORTS
+    directory = root / MODULE_REPORTS[check][2]
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "go.mod").write_text(f"module {GO_MODULE_PATHS[check]}\n\ngo 1.26\n")
+    (directory / file).write_text('package x\n\nimport "testing"\n\n' + source)
+    return GO_MODULE_PATHS[check]
+
+
+def go_stream(*events):
+    return "".join((event if isinstance(event, str) else json.dumps(event)) + "\n" for event in events)
+
+
+def passing_go_stream(module, test="TestPasses"):
+    return go_stream({"Action": "start", "Package": module}, {"Action": "run", "Package": module, "Test": test},
+                     {"Action": "output", "Package": module, "Test": test, "Output": f"=== RUN   {test}\n"},
+                     {"Action": "pass", "Package": module, "Test": test, "Elapsed": 0.01},
+                     {"Action": "pass", "Package": module, "Elapsed": 0.02})
 
 
 def shard_report(job):
@@ -1502,7 +1527,7 @@ def shard_report(job):
 
 
 def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=True, load_attempt="2",
-                       verify_modules=None, verify_files=(), load_files=(), shards=SHARD_JOBS):
+                       verify_modules=None, verify_files=(), load_files=(), shards=SHARD_JOBS, go=True, go_streams=None):
     fragments = tmp_path / "fragments"
     verify = fragments / "ci-evidence-verify"
     verify.mkdir(parents=True)
@@ -1528,6 +1553,14 @@ def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=
             (fragment / name).write_text(LOAD_REPORT)
         (fragment / "load.json").write_text('{"status": "passed"}')
         (fragment / "outcomes.json").write_text(json.dumps(load_outcomes or {"module_checks": {"load": "success"}}))
+    if go:  # the `go` job: one `go test -json` stream per Go module, of modules under the prepare root
+        fragment = fragments / "ci-evidence-go"
+        fragment.mkdir()
+        (fragment / "source-sha").write_text("a" * 40 + "\n")
+        (fragment / "attempt").write_text("2\n")
+        for check, name in (("whatsmeow", "whatsmeow.json"), ("release_router", "release-router.json")):
+            (fragment / name).write_text((go_streams or {}).get(check) or passing_go_stream(go_module(tmp_path, check)))
+        (fragment / "outcomes.json").write_text(json.dumps({"module_checks": {"whatsmeow": "success", "release_router": "success"}}))
     return fragments
 
 
@@ -1542,20 +1575,21 @@ def test_parallel_load_fragment_is_assembled_with_verify_evidence_of_the_same_co
     out = tmp_path / "ci-evidence"
     merged = assemble(out, evidence_fragments(tmp_path), ATTEMPT_URL, PASSED)
     # The assembling attempt names the evidence, so a rerun of one test job publishes under new row identities.
-    assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load", *SHARD_JOBS] and merged["missing"] == []
+    assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load", *SHARD_JOBS, "go"] and merged["missing"] == []
     assert merged["module_checks"]["load"] == "success" and set(merged["module_checks"]) == {
-        "gateway", "calendar", "calls", "calls_frontend", "load", "backup_restore"}
-    assert {path.name for path in out.iterdir()} == {"metadata.json", "source-sha", "python.xml", "load.xml", "load.json"}
+        "gateway", "calendar", "calls", "calls_frontend", "load", "backup_restore", "whatsmeow", "release_router"}
+    assert {path.name for path in out.iterdir()} == {"metadata.json", "source-sha", "python.xml", "load.xml", "load.json",
+                                                     "whatsmeow.json", "release-router.json"}
     # The four shard reports merge into the one python report, in shard order, so test identities do not change.
     assert [case.get("name") for case in ET.parse(out / "python.xml").getroot().iter("testcase")] == ["x", *SHARD_JOBS]
     rows = assembled_rows(tmp_path, merged)
-    assert rows["deedkit-ci::load"] == rows["anymsg-ci::python"] == "passed"
+    assert rows["deedkit-ci::load"] == rows["anymsg-ci::python"] == rows["deedkit-ci::whatsmeow"] == "passed"
     # A job that succeeded and was not rerun keeps its earlier attempt's fragment, and the evidence says so.
     earlier = assemble(tmp_path / "earlier", evidence_fragments(tmp_path / "e", load_attempt="1"), ATTEMPT_URL, PASSED)
-    assert earlier["fragments"] == ["verify", "load", *SHARD_JOBS]
+    assert earlier["fragments"] == ["verify", "load", *SHARD_JOBS, "go"]
     assert earlier["producers"] == {"verify": {"result": "success", "sha": "a" * 40, "attempt": "2"},
                                     "load": {"result": "success", "sha": "a" * 40, "attempt": "1"},
-                                    **{job: {"result": "success", "sha": "a" * 40, "attempt": "2"} for job in SHARD_JOBS}}
+                                    **{job: {"result": "success", "sha": "a" * 40, "attempt": "2"} for job in (*SHARD_JOBS, "go")}}
     # Assembling again into a used directory could keep a report the new fragments no longer supply.
     with pytest.raises(ValueError, match="new or empty"):
         assemble(out, evidence_fragments(tmp_path / "again", load=False), ATTEMPT_URL, PASSED)
@@ -1606,7 +1640,7 @@ def test_assembly_refuses_a_fragment_of_another_commit_or_of_foreign_checks(tmp_
 def test_missing_load_fragment_is_recorded_as_an_unrun_check(tmp_path):
     from scripts.tiden_ci import assemble
     merged = assemble(tmp_path / "ci-evidence", evidence_fragments(tmp_path, load=False), ATTEMPT_URL, PASSED)
-    assert merged["fragments"] == ["verify", *SHARD_JOBS] and merged["missing"] == ["load"] and merged["module_checks"]["load"] == "skipped"
+    assert merged["fragments"] == ["verify", *SHARD_JOBS, "go"] and merged["missing"] == ["load"] and merged["module_checks"]["load"] == "skipped"
     assert assembled_rows(tmp_path, merged)["deedkit-ci::load"] == "blocked"
 
 
@@ -1646,7 +1680,8 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     assert step["env"] == {"VERIFY": "verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}",
                            "LOAD": "load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}",
                            **{f"PYTHON_{index}": f"python-{index}:${{{{ needs.python-{index}.result }}}}:${{{{ needs.python-{index}.outputs.source_sha }}}}"
-                              for index in range(2, 5)}}
+                              for index in range(2, 5)},
+                           "GO": "go:${{ needs.go.result }}:${{ needs.go.outputs.source_sha }}"}
     work = tmp_path / "work"
     work.mkdir()
     (work / "ci-tools").symlink_to(root, target_is_directory=True)
@@ -1655,7 +1690,8 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     evidence_fragments(temp, load=False)  # both jobs report success, the load artifact is gone, Tiden is unconfigured
     env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin", "RUNNER_TEMP": str(temp), "GITHUB_REPOSITORY": "example/repo",
            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "VERIFY": "verify:success:" + "a" * 40,
-           "LOAD": "load:success:" + "a" * 40, **{f"PYTHON_{index}": f"python-{index}:success:" + "a" * 40 for index in range(2, 5)}}
+           "LOAD": "load:success:" + "a" * 40, **{f"PYTHON_{index}": f"python-{index}:success:" + "a" * 40 for index in range(2, 5)},
+           "GO": "go:success:" + "a" * 40}
     result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, capture_output=True, text=True, env=env)
     assert result.returncode != 0, result.stderr
     rows = json.loads((temp / "ci-evidence" / "ci-checks.json").read_text())  # the evidence still exists for upload
@@ -1694,7 +1730,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         assert upload["with"]["name"] == f"ci-evidence-{job}" and upload["if"] == "${{ always() }}"
         assert upload["with"]["overwrite"] is True
     evidence = jobs["evidence"]
-    assert evidence["needs"] == ["documentation", "verify", "load", "python-2", "python-3", "python-4"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
+    assert evidence["needs"] == ["documentation", "verify", "load", "python-2", "python-3", "python-4", "go"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     assert jobs["tiden"]["needs"] == ["documentation", "evidence"]
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in evidence["steps"]}
     assert steps["actions/download-artifact"]["with"]["pattern"] == "ci-evidence-*"
@@ -1704,15 +1740,17 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     require = steps["Require every test job to have succeeded"]
     assert require["if"] == "${{ always() }}"
     assert require["env"] == {"VERIFY_RESULT": "${{ needs.verify.result }}", "LOAD_RESULT": "${{ needs.load.result }}",
-                              **{f"PYTHON_{index}_RESULT": f"${{{{ needs.python-{index}.result }}}}" for index in range(2, 5)}}
-    for verify, load_result, shards in [("success", "success", "success"), ("success", "failure", "success"),
-                                        ("success", "cancelled", "success"), ("success", "skipped", "success"),
-                                        ("failure", "success", "success"), ("skipped", "success", "success"),
-                                        ("success", "success", "failure"), ("success", "success", "skipped")]:
+                              **{f"PYTHON_{index}_RESULT": f"${{{{ needs.python-{index}.result }}}}" for index in range(2, 5)},
+                              "GO_RESULT": "${{ needs.go.result }}"}
+    for verify, load_result, shards, go in [("success", "success", "success", "success"), ("success", "failure", "success", "success"),
+                                            ("success", "cancelled", "success", "success"), ("success", "skipped", "success", "success"),
+                                            ("failure", "success", "success", "success"), ("skipped", "success", "success", "success"),
+                                            ("success", "success", "failure", "success"), ("success", "success", "skipped", "success"),
+                                            ("success", "success", "success", "failure"), ("success", "success", "success", "skipped")]:
         result = subprocess.run(["bash", "-e", "-c", require["run"]], capture_output=True,
                                 env={"VERIFY_RESULT": verify, "LOAD_RESULT": load_result, "PYTHON_2_RESULT": "success",
-                                     "PYTHON_3_RESULT": shards, "PYTHON_4_RESULT": "success"})
-        assert (result.returncode == 0) == (verify == load_result == shards == "success"), (verify, load_result, shards)
+                                     "PYTHON_3_RESULT": shards, "PYTHON_4_RESULT": "success", "GO_RESULT": go})
+        assert (result.returncode == 0) == (verify == load_result == shards == go == "success"), (verify, load_result, shards, go)
 
 
 def test_python_suite_reports_its_slowest_tests_and_waits_for_its_background_images(tmp_path):
@@ -1901,3 +1939,225 @@ def test_a_main_commit_whose_publication_was_not_verified_records_no_release(tmp
         assert completed.stdout.startswith("::warning title=Tiden release not recorded::")
     completed, written = configured("false", token="")
     assert completed.returncode == 0 and written == "enabled=false\n" and not completed.stdout
+
+
+# spec: ANYM-421
+def test_the_go_job_uploads_both_native_go_suites_as_a_fragment_the_evidence_job_requires(tmp_path):
+    import os
+    import subprocess
+    import yaml
+    from scripts.tiden_ci import FRAGMENTS
+    root = Path(__file__).resolve().parents[1]
+    jobs = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]
+    go = jobs["go"]
+    # Skipped exactly when the other test jobs are: a reusing push or queue run, or a docs-only run.
+    assert (go["needs"], go["if"]) == (jobs["load"]["needs"], jobs["load"]["if"])
+    steps = {step.get("id") or step.get("name"): step for step in go["steps"]}
+    for check, directory, report in (("whatsmeow", "whatsapp/whatsmeow", "whatsmeow.json"),
+                                     ("release_router", "services/release-router", "release-router.json")):
+        assert steps[check]["working-directory"] == directory
+        assert steps[check]["run"] == f'go test -race -count=1 -json ./... > "$RUNNER_TEMP/ci-evidence/{report}"'
+    assert steps["release_router"]["if"] == "${{ !cancelled() }}"  # runs, into its own file, after a whatsmeow failure
+    record = steps["Record the Go outcomes"]
+    assert record["if"] == "${{ always() }}" and record["env"] == {
+        "WHATSMEOW_OUTCOME": "${{ steps.whatsmeow.outcome }}", "RELEASE_ROUTER_OUTCOME": "${{ steps.release_router.outcome }}"}
+    (tmp_path / "ci-evidence").mkdir()
+    recorded = subprocess.run(["bash", "-e", "-c", record["run"]], capture_output=True, text=True, env={
+        "PATH": os.environ["PATH"], "RUNNER_TEMP": str(tmp_path), "WHATSMEOW_OUTCOME": "failure", "RELEASE_ROUTER_OUTCOME": "success"})
+    assert recorded.returncode == 0, recorded.stderr
+    assert json.loads((tmp_path / "ci-evidence" / "outcomes.json").read_text()) == {
+        "module_checks": {"whatsmeow": "failure", "release_router": "success"}}
+    assert FRAGMENTS["go"] == (("whatsmeow", "release_router"), ("outcomes.json", "whatsmeow.json", "release-router.json"))
+    upload = next(step for step in go["steps"] if step.get("uses", "").startswith("actions/upload-artifact"))
+    assert upload["if"] == "${{ always() }}" and upload["with"]["name"] == "ci-evidence-go"
+    assert upload["with"]["path"] == "${{ runner.temp }}/ci-evidence" and upload["with"]["overwrite"] is True
+    evidence = jobs["evidence"]
+    assert "go" in evidence["needs"]
+    evidence_steps = {step.get("name"): step for step in evidence["steps"]}
+    merge = evidence_steps["Merge the fragments of the tested commit and record every check outcome"]
+    assert merge["env"]["GO"] == "go:${{ needs.go.result }}:${{ needs.go.outputs.source_sha }}"
+    assert '--producer "$GO"' in merge["run"]
+    require = evidence_steps["Require every test job to have succeeded"]
+    assert require["env"]["GO_RESULT"] == "${{ needs.go.result }}" and 'test "$GO_RESULT" = success' in require["run"].splitlines()
+    # The Tiden configuration check tests each ID on its own line, so under bash -e either missing ID fails the step.
+    config = next(step for step in jobs["tiden"]["steps"] if step.get("id") == "config")
+    lines = [line.strip() for line in config["run"].splitlines()]
+    assert 'test -n "$TIDEN_PRODUCT_ID"' in lines and 'test -n "$TIDEN_WORKSPACE_ID"' in lines
+    assert not any("test -n" in line and "&&" in line for line in lines)
+
+    def configured(product, workspace):
+        output = tmp_path / f"output-{bool(product)}-{bool(workspace)}"
+        output.write_text("")
+        completed = subprocess.run(["bash", "-e", "-c", config["run"]], capture_output=True, text=True, env={
+            "PATH": os.environ["PATH"], "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+            "TIDEN_API_TOKEN": "synthetic-token", "TIDEN_PRODUCT_ID": product, "TIDEN_WORKSPACE_ID": workspace,
+            "EVENT_NAME": "push", "SOURCE_BRANCH": "main", "DOCS_ONLY": "false", "PR_REUSED": "false"})
+        return completed.returncode, output.read_text()
+    assert configured("product", "workspace") == (0, "enabled=true\n")
+    for product, workspace in (("", "workspace"), ("product", "")):
+        code, written = configured(product, workspace)
+        assert code != 0 and "enabled=true" not in written, (product, workspace)
+
+
+GO_SOURCE = """func TestPasses(t *testing.T) {}
+func TestFails(t *testing.T) {}
+func TestSkipped(t *testing.T) {}
+func TestParent(t *testing.T) {}
+func TestHangs(t *testing.T) {}
+"""
+
+
+# spec: ANYM-421
+def test_a_go_test_stream_becomes_one_result_row_per_test_under_its_existing_go_identity(tmp_path):
+    from scripts.tiden_ci import go_results, row_id
+    module = go_module(tmp_path, "whatsmeow", GO_SOURCE, file="cases_test.go")
+    deep = tmp_path / "whatsapp/whatsmeow/inner/deep"
+    deep.mkdir(parents=True)
+    (deep / "deep_test.go").write_text('package deep\n\nimport "testing"\n\nfunc TestDeep(t *testing.T) {}\n')
+    secret = "SYNTHETIC-OUTPUT-NEVER-PUBLISHED"
+
+    def test(action, name, package=module, **extra):
+        return {"Action": action, "Package": package, "Test": name, **extra}
+    events = [{"Action": "start", "Package": module}]
+    for name in ("TestPasses", "TestFails", "TestSkipped", "TestParent", "TestParent/first", "TestParent/second", "TestHangs"):
+        events += [test("run", name), test("output", name, Output=f"=== RUN {name} {secret}\n")]
+    events += [test("pass", "TestPasses", Elapsed=0.25), test("fail", "TestFails", Elapsed=0.5), test("skip", "TestSkipped"),
+               test("pass", "TestParent/first", Elapsed=0.1), test("fail", "TestParent/second", Elapsed=0.2),
+               test("fail", "TestParent", Elapsed=0.3), {"Action": "output", "Package": module, "Output": f"FAIL {secret}\n"},
+               {"Action": "fail", "Package": module, "Elapsed": 1}]
+    package = module + "/inner/deep"
+    events += [test("run", "TestDeep", package), test("pass", "TestDeep", package, Elapsed=0.01), {"Action": "pass", "Package": package}]
+    stream = tmp_path / "whatsmeow.json"
+    stream.write_text(go_stream(*events))
+    url = "https://github.com/example/repo/actions/runs/1/attempts/2"
+    rows, counts, unexplained = go_results(stream, tmp_path, "whatsapp/whatsmeow", url, "whatsmeow")
+
+    def row(package, name, status, duration, suite, file):
+        signature = f"{package}::{name}"
+        return {"id": row_id(url, "whatsmeow", signature), "title": name, "signature": signature,
+                "execution": {"status": status, "duration": duration}, "suitePath": [{"title": suite}],
+                "fields": {"file_path": file}}
+    expected = [row(module, "TestPasses", "passed", 250, "whatsmeow", "cases_test.go"),
+                row(module, "TestFails", "failed", 500, "whatsmeow", "cases_test.go"),
+                row(module, "TestSkipped", "skipped", 0, "whatsmeow", "cases_test.go"),
+                row(module, "TestParent/first", "passed", 100, "whatsmeow", "cases_test.go"),
+                row(module, "TestParent/second", "failed", 200, "whatsmeow", "cases_test.go"),
+                row(module, "TestHangs", "failed", 0, "whatsmeow", "cases_test.go"),  # started, never finished
+                row(package, "TestDeep", "passed", 10, "deep", "deep_test.go")]
+    # A test with subtests is no row of its own: its subtests are.
+    assert sorted(rows, key=lambda r: r["signature"]) == sorted(expected, key=lambda r: r["signature"])
+    assert counts == Counter(passed=3, failed=3, skipped=1)
+    assert unexplained is False  # the package failure is explained by its failed tests
+    assert secret not in json.dumps(rows) and "Output" not in json.dumps(rows)
+
+
+# spec: ANYM-421
+def test_the_real_go_suites_produce_every_existing_tiden_go_identity(tmp_path):
+    import os
+    import shutil
+    import subprocess
+    from scripts.tiden_ci import MODULE_REPORTS, go_results
+    if shutil.which("go") is None:
+        if os.environ.get("CI"):
+            pytest.fail("go is required on CI to check the Go identities")
+        pytest.skip("go is not installed")
+    root = Path(__file__).resolve().parents[1]
+    rows = []
+    for check in ("whatsmeow", "release_router"):
+        stream = tmp_path / f"{check}.json"
+        with stream.open("wb") as output:
+            subprocess.run(["go", "test", "-count=1", "-json", "./..."], cwd=root / MODULE_REPORTS[check][2], stdout=output,
+                           stderr=subprocess.DEVNULL, timeout=300, check=False)
+        found, _, unexplained = go_results(stream, root, MODULE_REPORTS[check][2], ATTEMPT_URL, check)
+        assert not unexplained, check
+        rows += found
+    produced = {row["signature"]: (row["title"], row["suitePath"], row["fields"]["file_path"]) for row in rows}
+    identities = json.loads((root / "tests/fixtures/tiden-go-identities.json").read_text())
+    assert identities and {item["signature"]: (item["title"], [{"title": item["suite"]}], item["file"])
+                           for item in identities}.items() <= produced.items()
+    assert {row["execution"]["status"] for row in rows} == {"passed"}
+
+
+def broken_go_stream(case, root, module):
+    """A `go test -json` stream of `module` (under `root`) that must never yield a passed check."""
+    passing = {"Action": "pass", "Package": module, "Test": "TestPasses", "Elapsed": 0.1}
+    if case == "no-test-result":
+        return go_stream({"Action": "start", "Package": module}, {"Action": "output", "Package": module, "Output": "ok\n"},
+                         {"Action": "pass", "Package": module})
+    if case == "non-json-line":
+        return go_stream(passing, "panic: not an event")
+    if case == "non-object-event":
+        return go_stream(passing, "[1, 2]")
+    if case == "package-outside-module":
+        # Only a name prefix of the module: read as the module's own directory, it would name TestPasses' file.
+        return go_stream(passing, {"Action": "pass", "Package": module + "x", "Test": "TestPasses"})
+    if case == "package-escaping-module":
+        # `..` in the package path would read another directory's test files as this module's.
+        (root / "whatsapp/escaped").mkdir(parents=True, exist_ok=True)
+        (root / "whatsapp/escaped/e_test.go").write_text('package e\n\nimport "testing"\n\nfunc TestEscaped(t *testing.T) {}\n')
+        return go_stream(passing, {"Action": "pass", "Package": module + "/../escaped", "Test": "TestEscaped"})
+    if case == "undeclared-test":
+        return go_stream(passing, {"Action": "pass", "Package": module, "Test": "TestNowhere"})
+    if case == "ambiguous-test-file":
+        (root / "whatsapp/whatsmeow/twice_test.go").write_text('package x\n\nimport "testing"\n\nfunc TestPasses(t *testing.T) {}\n')
+        return go_stream(passing)
+    if case == "unexplained-package-failure":  # a panic after the tests, or a package that failed to build
+        return go_stream(passing, {"Action": "fail", "Package": module, "Elapsed": 0.2},
+                         {"Action": "start", "Package": module + "/broken"},
+                         {"Action": "fail", "Package": module + "/broken", "FailedBuild": module + "/broken [build failed]"})
+    raise AssertionError(case)
+
+
+# spec: ANYM-421
+@pytest.mark.parametrize("case, status", [
+    ("no-test-result", "blocked"), ("non-json-line", "blocked"), ("non-object-event", "blocked"),
+    ("package-outside-module", "blocked"), ("package-escaping-module", "blocked"), ("undeclared-test", "blocked"), ("ambiguous-test-file", "blocked"),
+    ("unexplained-package-failure", "failed")])
+def test_an_unusable_go_stream_fails_only_its_own_check(tmp_path, case, status):
+    from scripts.tiden_ci import MODULE_REPORTS
+    root, directory = tmp_path / "source", tmp_path / "ci-evidence"
+    directory.mkdir()
+    (directory / "whatsmeow.json").write_text(broken_go_stream(case, root, go_module(root, "whatsmeow")))
+    (directory / "release-router.json").write_text(passing_go_stream(go_module(root, "release_router")))
+    (directory / "python.xml").write_text(PASSING)
+    meta = {**metadata(), "module_checks": dict.fromkeys(MODULE_REPORTS, "success")}
+    manifest = prepare(root, directory, meta)
+    rows = {row["signature"]: row for row in json.loads((directory / "ci-checks.json").read_text())}
+    assert rows["deedkit-ci::whatsmeow"]["execution"]["status"] == status
+    if status == "blocked":  # a ValueError: no report of it is published, and the check says why
+        assert rows["deedkit-ci::whatsmeow"]["message"] == "Missing or invalid test report; verification incomplete"
+        assert "normalized-whatsmeow.json" not in manifest["reports"] and not (directory / "normalized-whatsmeow.json").exists()
+    # The other Go module and the other reports are prepared all the same.
+    assert rows["deedkit-ci::release_router"]["execution"]["status"] == rows["anymsg-ci::python"]["execution"]["status"] == "passed"
+    assert {"normalized-release_router.json", "normalized-python.xml"} <= set(manifest["reports"])
+    assert json.loads((directory / "normalized-release_router.json").read_text())[0]["signature"] == \
+        GO_MODULE_PATHS["release_router"] + "::TestPasses"
+
+
+# spec: ANYM-421
+def test_a_missing_go_fragment_leaves_both_go_checks_unpassed_and_fails_the_evidence_verdict(tmp_path):
+    import subprocess
+    from scripts.tiden_ci import assemble
+    root = Path(__file__).resolve().parents[1]
+    out = tmp_path / "ci-evidence"
+    merged = assemble(out, evidence_fragments(tmp_path, go=False), ATTEMPT_URL, PASSED)
+    assert merged["missing"] == ["go"] and "go" not in merged["fragments"]
+    assert (merged["module_checks"]["whatsmeow"], merged["module_checks"]["release_router"]) == ("skipped", "skipped")
+    rows = assembled_rows(tmp_path, merged)
+    assert (rows["deedkit-ci::whatsmeow"], rows["deedkit-ci::release_router"]) == ("blocked", "blocked")
+    assert rows["deedkit-ci::load"] == "passed"  # the other fragments still count
+    def verdict(directory):
+        return subprocess.run([sys.executable, str(root / "scripts/tiden_ci.py"), "verdict", "--directory", str(directory)],
+                              capture_output=True, text=True)
+    # The synthetic verify fragment lacks some module reports, so compare with the same evidence plus the go fragment.
+    with_go = tmp_path / "with-go"
+    assembled_rows(with_go, assemble(with_go / "ci-evidence", evidence_fragments(with_go), ATTEMPT_URL, PASSED))
+    blocked = sum(status == "blocked" for status in rows.values())
+    assert verdict(out).returncode == 1 and f"records {blocked} blocked check(s)" in verdict(out).stdout
+    assert f"records {blocked - 2} blocked check(s)" in verdict(with_go / "ci-evidence").stdout
+    # A go job that failed in this attempt leaves only an earlier attempt's fragment: still never passed.
+    stale = evidence_fragments(tmp_path / "stale")
+    (stale / "ci-evidence-go" / "attempt").write_text("1\n")
+    merged = assemble(tmp_path / "stale" / "ci-evidence", stale, ATTEMPT_URL, {**PASSED, "go": ("failure", "a" * 40)})
+    assert merged["missing"] == ["go"] and merged["module_checks"]["whatsmeow"] == merged["module_checks"]["release_router"] == "failure"
+    assert not (tmp_path / "stale" / "ci-evidence" / "whatsmeow.json").exists()

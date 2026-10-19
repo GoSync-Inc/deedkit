@@ -48,7 +48,7 @@ REPORT_CHECKS = (*tiden_ci.REPORTS, *tiden_ci.MODULE_REPORTS)
 # Exactly what the queue run's evidence job uploads: the assembled fragments and what `prepare` adds to them.
 EVIDENCE_FILES = frozenset({
     "source-sha", "metadata.json", "manifest.json", "ci-checks.json", *tiden_ci.ASSEMBLED_FILES,
-    *(f"normalized-{check}.xml" for check in REPORT_CHECKS)})
+    *(tiden_ci.normalized_report(check) for check in REPORT_CHECKS)})
 SHA = re.compile(r"[0-9a-f]{40}")
 # The merge queue names a group of main after the pull request it tests last: pr-<number>-<group base SHA>.
 GROUP_REF = re.compile("refs/heads/" + re.escape(production.QUEUE_BRANCH_PREFIX) + r"pr-([1-9][0-9]*)-[0-9a-f]{40}")
@@ -238,14 +238,17 @@ def validate(directory: Path, sha: str, producer_url: str, attempt: int, pull_re
                 not isinstance(job, dict) or job.get("result") != "success" or job.get("sha") != sha
                 or not str(job.get("attempt")).isdigit() or int(job["attempt"]) > attempt for job in producers.values()):
         raise Refused("a test job of the queue run did not produce passing evidence of this commit")
-    reports = [f"normalized-{check}.xml" for check in REPORT_CHECKS]
+    reports = [tiden_ci.normalized_report(check) for check in REPORT_CHECKS]
     if sorted(manifest.get("reports") or []) != sorted([*reports, "ci-checks.json"]):
         raise Refused("the evidence manifest does not list every required report")
     totals = {}
     for check, report in zip(REPORT_CHECKS, reports):
         _, framework, _ = tiden_ci.MODULE_REPORTS.get(check, (None, check, None))
         try:
-            _, counts = tiden_ci.normalize_junit(directory / report, directory, framework)
+            if framework == "go":
+                counts = tiden_ci.go_row_counts(json.loads((directory / report).read_text()))
+            else:
+                _, counts = tiden_ci.normalize_junit(directory / report, directory, framework)
         except (OSError, ValueError, SyntaxError) as exc:
             raise Refused(f"the {check} report is unsafe or malformed: {exc}") from None
         if counts["failed"] or not counts["passed"]:
@@ -260,7 +263,7 @@ def validate(directory: Path, sha: str, producer_url: str, attempt: int, pull_re
                 for check in (*tiden_ci.CHECKS, *tiden_ci.MODULE_REPORTS)]
     if not isinstance(rows, list) or [(row.get("signature"), row.get("id")) for row in rows if isinstance(row, dict)] != expected \
             or any((row.get("execution") or {}).get("status") != "passed" for row in rows):
-        raise Refused("the evidence check rows are not the queue run's thirteen passed checks")
+        raise Refused("the evidence check rows are not the queue run's passed checks: the thirteen CI and module checks and the Go module checks")
     return manifest
 
 

@@ -33,14 +33,15 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import REPOSITORY, Refused, excluded, shown, tiden  # noqa: E402
-from tiden_pr_check import (anchor_map, branch_status, changed, diff_tests, language,  # noqa: E402
+from tiden_pr_check import (anchor_map, blob, branch_status, changed, diff_tests, language,  # noqa: E402
                             listing, parse_body, story)
 
 SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 SHA = re.compile(r"[0-9a-f]{40}")
 OPEN_CHECK = re.compile(r"\[open: (?:live|measured)\]")
 # Test files whose suite CI does not publish to Tiden, so a marked test there has no identity to link yet.
-UNPUBLISHED = (("*_test.go", "CI publishes no Go report to Tiden (ANYM-360)"),)
+UNPUBLISHED: tuple[tuple[str, str], ...] = ()
+GO_MODULE = re.compile(r"^module[ \t]+(\S+)[ \t]*$", re.MULTILINE)
 SOURCE_FIELDS = ("sourceType", "title", "locator", "url", "repoPath", "repository", "lineStart", "lineEnd", "excerpt")
 # The merge-preview shape of CLI 0.33.0 (read 2026-10-19 from 62 open branches); empty fields may be omitted. Any
 # other key is a change this job cannot judge, so it refuses.
@@ -208,9 +209,27 @@ def identities(cli: str, product: str) -> list[dict]:
     return [row for row in rows if row.get("kind") == "case"]
 
 
-def matches(rows: list[dict], path: str, name: str) -> list[dict]:
+def go_package(root: Path, sha: str, path: str) -> str | None:
+    """The Go import path of a test file's package at `sha`, `<module>[/<package dir>]`, from the nearest go.mod above
+    it; None outside any module."""
+    directory = PurePosixPath(path).parent
+    for parent in (directory, *directory.parents):
+        found = GO_MODULE.search(blob(root, sha, str(parent / "go.mod")) or "")
+        if found:
+            below = directory.relative_to(parent)
+            return found.group(1) + ("" if str(below) == "." else f"/{below}")
+    return None
+
+
+def matches(rows: list[dict], path: str, name: str, package: str | None = None) -> list[dict]:
     """The Tiden cases CI imported for one test: a Python identity is `<module>[.<Class>]::<name>[<params>]`, a Node
-    one is its file path and title."""
+    one is its file path and title, a Go one `<package>::<Test>` or, for each subtest, `<package>::<Test>/<sub>`."""
+    if language(path) == "go":
+        if not package:
+            return []
+        prefix = f"{package}::{name}"
+        return [row for row in rows if row.get("signature") == prefix
+                or str(row.get("signature", "")).startswith(prefix + "/")]
     if language(path) == "python":
         cls, _, leaf = name.rpartition("::")  # nested classes are `Outer::Inner`, dotted in the JUnit class name
         prefix = (str(PurePosixPath(path).with_suffix("")).replace("/", ".") + (f".{cls.replace('::', '.')}" if cls
@@ -229,7 +248,8 @@ def linked(cli: str, test: str) -> set[str]:
     return {link["requirementId"] for link in links}
 
 
-def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry: bool = False) -> None:
+def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry: bool = False,
+         packages: dict[str, str | None] | None = None) -> None:
     marked = [test for test in tests if test.specs]
     if not marked:
         report("links: no marked test added.")
@@ -249,7 +269,11 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
             missing.append(f"{shown(test.name)} names " + ", ".join(f"ANYM-{number}" for number in unknown)
                            + ", not on Tiden main")
             continue
-        cases = matches(rows, test.path, test.name)
+        package = (packages or {}).get(test.path)
+        if language(test.path) == "go" and not package:
+            missing.append(f"{shown(test.path)} {shown(test.name)} lies in no Go module")
+            continue
+        cases = matches(rows, test.path, test.name, package)
         if not cases:
             missing.append(f"{shown(test.path)} {shown(test.name)} has no imported case on Tiden main")
             continue
@@ -402,7 +426,9 @@ def sync(root: Path, sha: str, number: int, body: str, cli: str, product: str, r
     unknown = [n for n in lines.named if n not in main]
     if unknown:
         failures.append(StepFailed("resolve", ", ".join(f"ANYM-{n}" for n in unknown) + " not on Tiden main"))
-    steps = (("links", lambda: link(cli, product, tests, main, report, dry)),
+    steps = (("links", lambda: link(cli, product, tests, main, report, dry,
+                                   {test.path: go_package(root, sha, test.path) for test in tests
+                                    if language(test.path) == "go"})),
              ("anchors", lambda: anchor(cli, product, code, lines.named[0] if lines.named else None, main, sha, number,
                                         report, dry)),
              ("status", lambda: settle_status(cli, product, lines.delivers, main, report, dry)))
