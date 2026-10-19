@@ -476,6 +476,17 @@ class Runner:
         if not marker.exists() or read_json(marker) not in results:raise RuntimeError(error)
         self.docker.call('rm',name)
         return read_json(marker)
+    def settle_fence_action(self,kind):
+        """Stop and remove this job's leftover ``<kind>_fence`` container; its outcome is read back later."""
+        release_name='pos-backup-'+kind+'-'+self.journal['id'].lower()
+        release=self.check_worker(self.docker.inspect(release_name))
+        if release is not None:
+            if release['Config'].get('Labels',{}).get('personal-os.backup.action')!=kind+'_fence':
+                raise RuntimeError('backup_container_mismatch')
+            if release['State']['Running']:self.docker.call('stop','--time','25',release_name)
+            release=self.check_worker(self.docker.inspect(release_name))
+            if release is None or release['State']['Running']:raise RuntimeError('backup_shutdown_unverified')
+            self.docker.call('rm',release_name)
     def abandon(self,work):
         """Settle a stopped capture: keep a published one, else end exactly its own fence, then remove it."""
         if work.is_symlink():raise ValueError('unexpected_staging_symlink')
@@ -492,16 +503,21 @@ class Runner:
                 self.journal['phase']='upload';self.save();return
             # Durable decision first: a lost acknowledgement is read back, never guessed.
             self.journal['phase']='abandoning';self.save()
-        # Nothing here is reusable. Every attempt reads the outcome back from the
-        # database, and the isolated action sees only its own config and marker.
-        self.remove_abandoned(work);work.mkdir(mode=0o700)
         jid=self.journal['id']
         results=[{'id':jid,'backup_fence':jid,'status':s} for s in ('fence_released','fence_absent')]
-        try:result=self.fence_action(work,'abandon',results,'backup_fence_retained')
+        try:
+            # Nothing here is reusable. Every attempt reads the outcome back from
+            # the database, so a leftover helper (even one created but never
+            # started) goes first, and the new one sees only its config and marker.
+            self.settle_fence_action('abandon')
+            self.remove_abandoned(work);work.mkdir(mode=0o700)
+            result=self.fence_action(work,'abandon',results,'backup_fence_retained')
         except Exception as exc:
             self.status('error','backup_fence_retained');raise RuntimeError('backup_fence_retained') from exc
         shutil.rmtree(work)
+        # The read-back settles the retained error before the journal goes.
         status=read_json(self.status_path) if self.status_path.exists() else {}
+        if status.get('error_code')=='backup_fence_retained':status['error_code']='backup_job_failed'
         status.update(abandoned_id=jid,abandoned_fence=result['status']);write_json(self.status_path,status)
         self.journal_path.unlink()
     def finish(self,work,result,receipt):
@@ -545,16 +561,7 @@ class Runner:
         if not self.journal_path.exists():return
         self.journal=read_json(self.journal_path)
         if not ID.fullmatch(self.journal['id']):raise ValueError('invalid_backup_journal')
-        for kind in ('release','abandon'):
-            release_name='pos-backup-'+kind+'-'+self.journal['id'].lower()
-            release=self.check_worker(self.docker.inspect(release_name))
-            if release is not None:
-                if release['Config'].get('Labels',{}).get('personal-os.backup.action')!=kind+'_fence':
-                    raise RuntimeError('backup_container_mismatch')
-                if release['State']['Running']:self.docker.call('stop','--time','25',release_name)
-                release=self.check_worker(self.docker.inspect(release_name))
-                if release is None or release['State']['Running']:raise RuntimeError('backup_shutdown_unverified')
-                self.docker.call('rm',release_name)
+        for kind in ('release','abandon'):self.settle_fence_action(kind)
         info=self.check_worker(self.docker.inspect(self.journal['container']))
         if info and info['State']['Running']:
             self.docker.call('stop','--time','25',self.journal['container'])
@@ -571,8 +578,7 @@ class Runner:
             if info:self.docker.call('rm',self.journal['container'])
             self.abandon(self.root/self.journal['id'])
         # Preserve the actionable error from the initiating process.
-        status=read_json(self.status_path) if self.status_path.exists() else {}
-        if status.get('state')!='error' or status.get('error_code')=='backup_fence_retained':
+        if not self.status_path.exists() or read_json(self.status_path).get('state')!='error':
             self.status('error','backup_job_failed')
 
 
