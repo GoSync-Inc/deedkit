@@ -75,7 +75,11 @@ def validate_all_day(event, path):
     if "start" not in event:
         raise invalid(path, ("start", "required"))
     a = day(event["start"], path, "start")
-    b = day(event["end"], path, "end") if "end" in event else a + timedelta(days=1)
+    try:
+        b = day(event["end"], path, "end") if "end" in event else a + timedelta(days=1)
+    except OverflowError:
+        # The last supported date has no following day.
+        raise CalendarError("invalid_window") from None
     if not a < b or b - a > timedelta(days=31):
         raise CalendarError("invalid_window")
     return dict(event, all_day=True, start=a.isoformat(), end=b.isoformat())
@@ -116,10 +120,14 @@ def event_span(event, zone_name):
         zone = ZoneInfo(zone_name)
     except (ZoneInfoNotFoundError, TypeError, ValueError):
         raise CalendarError("invalid_timezone") from None
-    return tuple(
-        datetime.combine(date.fromisoformat(event[k]), time.min, zone).astimezone(timezone.utc)
-        for k in ("start", "end")
-    )
+    try:
+        return tuple(
+            datetime.combine(date.fromisoformat(event[k]), time.min, zone).astimezone(timezone.utc)
+            for k in ("start", "end")
+        )
+    except OverflowError:
+        # A boundary date whose midnight does not exist in UTC.
+        raise CalendarError("invalid_window") from None
 
 
 class FamilyService:
@@ -437,6 +445,7 @@ class FamilyService:
         calendars = []
         prepared = []
         touched = set()
+        selected = set()
         for action in actions:
             if not isinstance(action, dict) or set(action) - {"action", "calendar_ref", "event_ref", "event"}:
                 raise CalendarError("invalid_action")
@@ -472,6 +481,7 @@ class FamilyService:
                 if row["resource_ref"] in touched:
                     raise CalendarError("duplicate_resource_action")
                 touched.add(row["resource_ref"])
+                selected.add(action["event_ref"])
                 details = row["details"]
                 if details.get("guests") or details.get("special"):
                     raise CalendarError("capability_unverified")
@@ -506,7 +516,7 @@ class FamilyService:
                     before=before,
                 )
             prepared.append(step)
-        overlap_check = self._overlap_check(key, p, prepared, touched)
+        overlap_check = self._overlap_check(key, p, prepared, selected)
         plan_id = ref("plan")
         expires = datetime.now(timezone.utc) + timedelta(minutes=10)
         payload = {"steps": prepared}
@@ -523,7 +533,7 @@ class FamilyService:
             "overlap_check": overlap_check,
         }
 
-    def _overlap_check(self, key, principal, prepared, touched):
+    def _overlap_check(self, key, principal, prepared, selected):
         """Advisory cached evidence within current read grants, never permission
         to read a hidden calendar or a guarantee against a concurrent edit."""
         proposed = [s for s in prepared if s["action"] != "delete"]
@@ -581,16 +591,9 @@ class FamilyService:
             for event in agenda["events"]:
                 if not event["busy"]:
                     continue
-                # Exclude every occurrence of a resource moved/deleted by this
-                # plan. This lookup remains inside the same authorized calendar.
-                if (
-                    touched
-                    and cal["visibility"] == "details"
-                    and self.store.one(
-                        "SELECT 1 FROM occurrences WHERE ref=%s AND calendar_ref=%s AND resource_ref=ANY(%s)",
-                        (event.get("event_ref"), calendar_ref, list(touched)),
-                    )
-                ):
+                # Exclude only the occurrences this plan moves or deletes: the other occurrences of a
+                # series stay where they are, even though they share its resource.
+                if cal["visibility"] == "details" and event.get("event_ref") in selected:
                     continue
                 for step in proposed:
                     if instant(event["start"]) < instant(step["span"]["end"]) and instant(

@@ -415,3 +415,21 @@ async def test_unknown_occurrence_write_reconciles_without_duplicate(household):
     )
     assert sorted(server.events) == ["series", "series_20261019T080000Z", "series_20261026T080000Z"]
     assert server.events["series_20261019T080000Z"]["summary"] == "Moved once"
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_unexpected_fault_before_a_step_is_admitted_to_send_is_a_definite_failure(operation):
+    from family_calendar.service.worker import Worker
+
+    class Broken(AmbiguousProvider):
+        async def prepare(self, cal, step):
+            raise OverflowError("date value out of range")
+
+    store, key, op_id = operation
+    provider = Broken()
+    await Worker(store, provider).run_operation(op_id)
+    # Nothing was sent: the step is not an unknown result that reconciliation could never resolve.
+    [step] = store.query("SELECT state,error,intent FROM operation_steps WHERE operation_id=%s", (op_id,))
+    assert (step["state"], step["intent"], provider.mutations) == ("failed", None, 0)
+    assert FamilyService(store).operation(key, op_id)["state"] == "failed"

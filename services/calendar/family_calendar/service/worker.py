@@ -127,6 +127,17 @@ class Worker:
                     self._finish(operation_id, state if ambiguous or not completed else "partial", e.code)
                     return
                 except Exception:
+                    current = self.store.one(
+                        "SELECT state FROM operation_steps WHERE operation_id=%s AND ordinal=%s", args
+                    )["state"]
+                    if current == "prepared":
+                        # No intent was admitted to send, so nothing can have been mutated.
+                        self.store.query(
+                            "UPDATE operation_steps SET state='failed',error='service_unavailable' WHERE operation_id=%s AND ordinal=%s",
+                            args,
+                        )
+                        self._finish(operation_id, "partial" if completed else "failed", "service_unavailable")
+                        return
                     # Even an unexpected local fault may follow a successful remote mutation.
                     self.store.query(
                         "UPDATE operation_steps SET state='unknown',error='unknown_result' WHERE operation_id=%s AND ordinal=%s",

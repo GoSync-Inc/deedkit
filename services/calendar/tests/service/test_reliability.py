@@ -464,3 +464,54 @@ def test_all_day_event_with_a_timezone_is_rejected_naming_the_field(household):
     with pytest.raises(CalendarError, match="invalid_event") as caught:
         service.plan(key, [all_day_action(timezone="UTC")])
     assert caught.value.field_errors == [{"field": "actions/0/event/timezone", "reason": "not_allowed_for_all_day"}]
+
+
+# spec: ANYM-234
+def test_overlap_check_still_sees_the_untouched_siblings_of_a_series(household):
+    service, key = setup(household)
+    household.publish_window(
+        "cal-a",
+        START,
+        "2026-10-27T12:00:00Z",
+        [
+            {
+                "resource_ref": "res-series",
+                "target": "provider-private-series",
+                "etag": '"v1"',
+                "payload": {},
+                "occurrences": [
+                    {
+                        "ref": f"event-{day}",
+                        "start": f"2026-10-{day}T08:00:00Z",
+                        "end": f"2026-10-{day}T09:00:00Z",
+                        "details": dict(OCCURRENCE, original_start=f"2026-10-{day}T08:00:00+00:00"),
+                        "busy": True,
+                    }
+                    for day in (19, 26)
+                ],
+            }
+        ],
+        "complete",
+    )
+    # Moving the first occurrence onto the second one: only the moved occurrence is left out of the check.
+    move = dict(occurrence_update(start="2026-10-26T08:00:00Z", end="2026-10-26T09:00:00Z"), event_ref="event-19")
+    overlaps = service.plan(key, [move])["overlap_check"]["overlaps"]
+    assert [o["event_ref"] for o in overlaps] == ["event-26"]
+    # A cancel of one occurrence plus a create over its sibling is the same.
+    cancel = dict(OCCURRENCE_DELETE, event_ref="event-19")
+    replacement = create(start="2026-10-26T08:00:00Z", end="2026-10-26T09:00:00Z")
+    overlaps = service.plan(key, [cancel, replacement])["overlap_check"]["overlaps"]
+    assert [o["event_ref"] for o in overlaps] == ["event-26"]
+    # The moved occurrence's own old slot does not collide with its new one.
+    stay = dict(occurrence_update(start="2026-10-19T08:30:00Z", end="2026-10-19T09:30:00Z"), event_ref="event-19")
+    assert service.plan(key, [stay])["overlap_check"]["overlaps"] == []
+
+
+# spec: ANYM-234
+@pytest.mark.parametrize("start", ["9999-12-31", "0001-01-01"])
+def test_all_day_event_at_the_edge_of_the_supported_dates_is_a_definite_input_error(household, start):
+    service, key = setup(household)
+    # 9999-12-31 has no following day; midnight of 0001-01-01 in an eastern zone precedes year 1 in UTC.
+    with pytest.raises(CalendarError, match="invalid_window"):
+        service.plan(key, [all_day_action(start=start, end=None, title="Edge")])
+    assert household.one("SELECT count(*) AS n FROM plans")["n"] == 0

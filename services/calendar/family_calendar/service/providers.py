@@ -201,6 +201,17 @@ def normalize_icloud(calendar_ref, resource, start, end, zone, budget=None):
         raise CalendarError("coverage_incomplete") from None
 
 
+def valid_original(value):
+    """An instance identity the guard can compare: a timestamp with an offset or a calendar date."""
+    if not isinstance(value, str):
+        return False
+    try:
+        instant(value) if "T" in value else date.fromisoformat(value)
+    except (CalendarError, ValueError):
+        return False
+    return True
+
+
 def normalize_google(calendar_ref, e, zone):
     resource_ref = source_ref("res", calendar_ref, e["id"])
     rows = []
@@ -228,6 +239,8 @@ def normalize_google(calendar_ref, e, zone):
             "instant": a == b,
         }
         original = identity.get("dateTime") or identity.get("date") if isinstance(identity, dict) else None
+        if not valid_original(original):
+            original = None
         if e.get("recurringEventId") and original and not e.get("recurrence"):
             # An instance (singleEvents=true) names its series and its original start; a master has neither.
             details.update(series_ref=series_ref(calendar_ref, e["recurringEventId"]), original_start=original)
@@ -366,6 +379,8 @@ class Providers:
         if old.get("recurrence") or not old.get("recurringEventId"):
             raise CalendarError("capability_unverified")
         started, wanted = old.get("originalStartTime") or {}, occurrence["original_start"]
+        if not isinstance(started, dict):
+            raise CalendarError("version_conflict")
         same = (
             "T" in wanted and instant(started["dateTime"]) == instant(wanted)
             if "dateTime" in started

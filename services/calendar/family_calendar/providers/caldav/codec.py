@@ -351,7 +351,15 @@ def edit_single(data, rid, start, end, *, summary=None, location=None, descripti
     _assert_identity(root, rid)
     if type(start) is not type(rid) or type(end) is not type(rid) or end <= start:
         raise CalendarError("invalid_time_range")
+    _write_override(cal, root, rid, start, end, summary=summary, location=location, description=description)
+    return cal.to_ical()
+
+
+def _write_override(cal, root, rid, start, end, **text):
     event = _override(cal, rid)
+    if str((event or root).get("STATUS", "")).upper() == "CANCELLED":
+        # The occurrence (or the whole series) is gone: a stale plan must not bring it back.
+        raise CalendarError("version_conflict")
     if event is None:
         event = deepcopy(root)
         for key in ("RRULE", "RDATE", "EXDATE"):
@@ -361,12 +369,11 @@ def edit_single(data, rid, start, end, *, summary=None, location=None, descripti
     _set(event, "DTSTART", start)
     _set(event, "DTEND", end)
     event.pop("DURATION", None)
-    event.pop("STATUS", None)
-    for name, value in (("SUMMARY", summary), ("LOCATION", location), ("DESCRIPTION", description)):
+    for name, value in text.items():
         if value is not None:
-            _set(event, name, value)
+            _set(event, name.upper(), value)
     _touch(event)
-    return cal.to_ical()
+    return event
 
 
 def move_single(data, rid, start, end):
@@ -380,11 +387,13 @@ def cancel_single(data, rid):
     rid = _identity(root, rid)
     _assert_identity(root, rid)
     existing = _override(cal, rid)
-    # An occurrence moved before keeps the time it was moved to.
+    # An occurrence moved before keeps the time it was moved to; an instant stays an instant.
     source, start = (existing, existing.decoded("DTSTART")) if existing is not None else (root, rid)
-    changed = parse(edit_single(data, rid, start, start + _duration(source)))
-    _set(_override(changed, rid), "STATUS", "CANCELLED", params={})
-    return changed.to_ical()
+    if type(start) is not type(rid):
+        raise CalendarError("invalid_time_range")
+    event = _write_override(cal, root, rid, start, start + _duration(source))
+    _set(event, "STATUS", "CANCELLED", params={})
+    return cal.to_ical()
 
 
 def _shift_date_lists(event, delta):

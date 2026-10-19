@@ -703,3 +703,50 @@ async def test_all_day_update_is_written_as_dates_and_conversion_clears_the_othe
     _, receipt = await apply_step(providers, ICLOUD_CAL, step)
     data = server.resources[SERIES_URL][0]
     assert receipt["verified"] and b"VALUE=DATE" not in data and b"DTSTART:20261021T100000Z" in data
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_caldav_occurrence_cancelled_elsewhere_is_a_conflict_not_a_resurrection():
+    providers, server = caldav_world(weekly_exceptions())
+    gone = "2026-11-02T16:00:00+01:00"  # a fixture override with STATUS:CANCELLED, the etag is current
+    for action in ("update", "delete"):
+        with pytest.raises(CalendarError, match="version_conflict"):
+            await providers.prepare(ICLOUD_CAL, caldav_step(action, gone))
+    cancelled_series = weekly_exceptions().replace(b"BEGIN:VEVENT\r\n", b"BEGIN:VEVENT\r\nSTATUS:CANCELLED\r\n", 1)
+    providers, server = caldav_world(cancelled_series)
+    for action in ("update", "delete"):
+        with pytest.raises(CalendarError, match="version_conflict"):
+            await providers.prepare(ICLOUD_CAL, caldav_step(action, "2026-11-09T16:00:00+01:00"))
+    assert server.puts == 0
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_caldav_occurrence_of_a_series_of_instants_can_be_cancelled():
+    instants = weekly_exceptions().replace(b"DTEND;TZID=Europe/Berlin:20261019T170000\r\n", b"")
+    providers, server = caldav_world(instants)
+    rid = "2026-11-09T16:00:00+01:00"
+    assert caldav_agenda(instants)[rid]["details"]["instant"] is True
+    intent, receipt = await apply_step(providers, ICLOUD_CAL, caldav_step("delete", rid))
+    assert intent["action"] == "update" and receipt["verified"] is True and server.puts == 1
+    assert rid not in caldav_agenda(server.resources[SERIES_URL][0])
+
+
+# spec: ANYM-234
+@pytest.mark.asyncio
+async def test_google_instance_identity_that_cannot_be_compared_is_a_definite_error_before_any_write():
+    # A timestamp outside the range of datetime arithmetic is not an identity to publish ...
+    from family_calendar.service.providers import normalize_google
+
+    extreme = google_instance(19)
+    extreme["originalStartTime"] = {"dateTime": "0001-01-01T00:00:00+14:00"}
+    for identity in (extreme["originalStartTime"], {"dateTime": 5}, {"dateTime": ["x"]}, {"date": "not-a-date"}):
+        [row] = normalize_google("cal-g", dict(extreme, originalStartTime=identity), "UTC")["occurrences"]
+        assert "original_start" not in row["details"] and "series_ref" not in row["details"]
+    # ... and one that reaches the guard through a changed provider event is a CalendarError, not an exception.
+    providers, server = google_world([google_series()[0], extreme, google_instance(26)])
+    step = occurrence_step("update", "2026-10-19T08:00:00+00:00")
+    with pytest.raises(CalendarError):
+        await providers.prepare(GOOGLE_CAL, step)
+    assert [r.method for r in server.requests if r.method != "GET"] == []

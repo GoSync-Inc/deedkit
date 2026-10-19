@@ -365,3 +365,33 @@ def test_cancel_keeps_the_times_of_an_already_moved_occurrence_and_duration_prop
     rid = datetime(2026, 11, 9, 16, tzinfo=BERLIN)
     [override] = override_of(cancel_single(durable, rid), rid)
     assert override.decoded("DTEND") == rid + timedelta(hours=1) and "DURATION" not in override
+
+
+# spec: ANYM-234
+def test_a_cancelled_occurrence_or_series_is_never_brought_back_by_an_edit_or_a_second_cancel():
+    source = fixture_bytes()
+    gone = datetime(2026, 11, 2, 16, tzinfo=BERLIN)  # fixture override with STATUS:CANCELLED
+    for write in (
+        lambda: edit_single(source, gone, gone, gone + timedelta(hours=1), summary="Back"),
+        lambda: cancel_single(source, gone),
+    ):
+        with pytest.raises(CalendarError, match="version_conflict"):
+            write()
+    cancelled_master = source.replace(b"BEGIN:VEVENT\r\n", b"BEGIN:VEVENT\r\nSTATUS:CANCELLED\r\n", 1)
+    rid = datetime(2026, 11, 9, 16, tzinfo=BERLIN)
+    with pytest.raises(CalendarError, match="version_conflict"):
+        edit_single(cancelled_master, rid, rid, rid + timedelta(hours=1))
+    # A status nobody asked to change survives the edit.
+    tentative = source.replace(b"BEGIN:VEVENT\r\n", b"BEGIN:VEVENT\r\nSTATUS:TENTATIVE\r\n", 1)
+    [override] = override_of(edit_single(tentative, rid, rid, rid + timedelta(hours=1)), rid)
+    assert str(override["STATUS"]) == "TENTATIVE"
+
+
+# spec: ANYM-234
+def test_cancelling_one_occurrence_of_a_series_of_instants_keeps_it_an_instant():
+    source = fixture_bytes()
+    instants = source.replace(b"DTEND;TZID=Europe/Berlin:20261019T170000\r\n", b"")
+    assert b"DTEND;TZID=Europe/Berlin:20261019T170000" not in instants
+    rid = datetime(2026, 11, 9, 16, tzinfo=BERLIN)
+    [override] = override_of(cancel_single(instants, rid), rid)
+    assert str(override["STATUS"]) == "CANCELLED" and override.decoded("DTEND") == override.decoded("DTSTART") == rid
