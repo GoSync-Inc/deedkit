@@ -91,7 +91,7 @@ a suspect spec is not proof that its tests cover the incident. Resolve an issue 
 matching regression test fails before and passes after the fix, never on age or a nearby green
 test, and never start a provider session or weaken redaction to diagnose one.
 
-## One Tiden branch per pull request (intent loop paused, owner 10-19)
+## One Tiden branch per pull request
 
 A worker runs `tiden intent skip` and reads the card and `product-context` before code; it
 opens no `intent/` branch. The card's proposal or review branch carries the card and any
@@ -99,19 +99,21 @@ criterion edit made while coding; the PR names it as `Tiden branch:`, check A re
 and sync B merges it after the squash. A PR that delivers no new card and changes no criterion
 names no branch. Each deliverable has its own branch, because B merges only the specs a PR names.
 
-Every PR description carries `Spec impact:` (each spec it implements, delivers or changes, with
-its flags, such as a criterion deferred or not built, and the anchors it adds) and `Settle text:`
-(the exact spec text it promises or flags, or `none`). Reviewers read both in `pr.md` and the
-spec text in `specs.md`. Sync B writes that text from the PR's `Tiden branch:` after the squash;
-text without a branch waits for a Tiden maintenance window (TIDEN-CI.md).
+The intent loop is paused (owner 10-19; the pilot ended in PR #162): no PR runs `tiden intent
+start`, settle and close or uses the `start-intent` and `capture-intent` skills, and none needs a
+`Tiden intent branch:` line (CI then records a skipped route and stays green). The loop returns
+after a trial the orchestrator starts once Tiden fixes settle and close at DeedKit scale (settle
+times out reading an intent branch; close counts specs a rebase pulled in, reads main's run
+instead of the PR's and times out reading branch specs). Three feature PRs in a row that the
+orchestrator picks run the full loop as the exception, and each settles and closes without a
+timeout or an owner risk acceptance; a failure restarts the count. The orchestrator reports the
+trial's start and result in the digest, and the loop returns with that report.
 
-The intent loop is paused: no PR runs `tiden intent start`, settle and close, and none needs a
-`Tiden intent branch:` line (CI then records a skipped route and stays green). The pilot
-ended on 10-19: ANYM-228 and ANYM-234 each lost about 40–45 minutes to Tiden and neither
-session closed, while a skip cost 0–8 minutes. The loop returns when a trial of three
-consecutive sessions settles and closes without a timeout or an owner risk acceptance; the
-orchestrator runs that trial after Tiden ships fixes for items 51, 54 and 57–59 of the owner's
-third Tiden feedback list.
+Instead, every PR description carries `Spec impact:` (the `Spec:` and `Delivers:` IDs, each with
+its flags, such as a criterion deferred or not built, and the anchors it adds, or `none`) and
+`Settle text:` (`none`, or a reviewer copy of the text on the PR's `Tiden branch:`). Every
+criterion edit or flag goes on that branch, and sync B merges it after the squash; only text that
+B failed to write waits for a Tiden maintenance window (TIDEN-CI.md).
 
 Criteria change only through a card's branch reviewed with its PR; no daily delta audit runs.
 

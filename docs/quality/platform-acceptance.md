@@ -7,6 +7,10 @@ repository; it does not establish a second product or repository connection.
 
 ## How changes reach Tiden
 
+While the intent loop is paused
+([product workflow](../operations/tiden-product-workflow.md#one-tiden-branch-per-pull-request)),
+steps 1 and 3 use the card's `Tiden branch:` instead of an intent session.
+
 1. Start a scoped intent in the existing product and record its branch/session.
    Use the current Git branch and explicit product/workspace. Do not run setup
    to create or replace the product. Link the code PR with `tiden intent link-pr`.
