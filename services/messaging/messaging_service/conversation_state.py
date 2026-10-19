@@ -223,7 +223,7 @@ def group_thread_query(projection, *, account='c.account',chat='c.id',
     return sql
 
 
-def conversation_state(c,p,account,chat):
+def conversation_state(c,p,account,chat,*,titles=None):
     """Resolve the actual archive head only after checking exact account/chat ACL."""
     from .store import APIError
     from .conversation import decorate_messages, meaningful_sql, visible_sql
@@ -259,7 +259,7 @@ def conversation_state(c,p,account,chat):
         [account,chat,account,chat]).fetchall()
     truncated=len(observed)>HEAD_LIMIT and observed[0]['sent_at']==observed[-1]['sent_at']
     observed=observed[:HEAD_LIMIT]
-    enrich(c,observed,p);decorate_messages(c,p,observed)
+    enrich(c,observed,p,titles=titles);decorate_messages(c,p,observed)
     fallback=None
     if not any(_meaningful(m) for m in observed):
         fallback_sql='SELECT '+BASE+','+numeric+''' AS numeric_id FROM messages m CROSS JOIN scope LEFT JOIN message_metadata md
@@ -268,7 +268,7 @@ def conversation_state(c,p,account,chat):
         fallback=c.execute('WITH scope AS (SELECT %s::text AS account,%s::text AS chat) '+
             latest_sql(fallback_sql,both_directions=True,platform=platform),[account,chat]).fetchone()
         if fallback:
-            enrich(c,[fallback],p);decorate_messages(c,p,[fallback])
+            enrich(c,[fallback],p,titles=titles);decorate_messages(c,p,[fallback])
     attention=[]
     if info['chat_type']=='group':
         projection=(BASE+", CASE WHEN gs.platform='whatsapp' AND "+group_after_owner_sql('gs.platform',same_time=True)+
@@ -278,7 +278,7 @@ def conversation_state(c,p,account,chat):
             SELECT threads.* FROM group_scope gs CROSS JOIN LATERAL ('''+group_thread_query(projection,
                 account='gs.account',chat='gs.chat',provider_chat='gs.provider_chat',platform='gs.platform',limit=17)+
             ') threads',[account,chat,info['provider_chat'],info['platform']]).fetchall()
-        enrich(c,attention,p);decorate_messages(c,p,attention)
+        enrich(c,attention,p,titles=titles);decorate_messages(c,p,attention)
     coverage_rows=rows(c,p,[chat],[account])
     covered=coverage_history(coverage_rows[0]) if coverage_rows else {}
     result=derive_state(observed, platform=info['platform'], chat_type=info['chat_type'],

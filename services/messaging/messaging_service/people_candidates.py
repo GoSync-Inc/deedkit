@@ -109,7 +109,7 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
     # display_name stays this chat's observation; sender_name is the readable label.
     for row in observations:row['sender_name']=row['display_name']
     resolve(c,p,observations,sender='sender_id')
-    chat_titles(c,observations)
+    chat_titles(c,observations,p=p)
     refs=[r['source_message'] for r in observations]
     targets(p,refs)
     return serial({'items':items,'next_cursor':cursor,'identity_model':'provider_sender_per_account_and_chat',

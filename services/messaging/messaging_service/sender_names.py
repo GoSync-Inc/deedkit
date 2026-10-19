@@ -27,17 +27,18 @@ def raw_name(name, sender):
     return value in (sender,local) or bool(match and match[1]==local.split(':')[0])
 
 
-def _names(c,p,accounts,identities):
+def _names(c,p,accounts,identities,incoming=False):
     """Newest visible, non-raw names per (account, normalized sender), newest first.
 
     No (account, sender) index exists: the split_part prefilter keeps the account scan
-    cheap and the regex function only rechecks the few matches.
+    cheap and the regex function only rechecks the few matches. `incoming` keeps names
+    observed on incoming messages only (a name on the account's own messages is the owner's).
     """
     if not identities:return {}
     where,args=scope_filter(p,'m')
     rows=c.execute('''SELECT sp.account,sp.chat,sp.display_name,messenger_whatsapp_personal_id(sp.sender) AS identity
         FROM sender_profiles sp JOIN messages m ON m.id=sp.source_message
-        WHERE '''+where+''' AND NOT m.deleted AND m.account=sp.account AND m.chat=sp.chat AND m.sender=sp.sender
+        WHERE '''+where+(" AND m.direction='incoming'" if incoming else '')+''' AND NOT m.deleted AND m.account=sp.account AND m.chat=sp.chat AND m.sender=sp.sender
           AND sp.account=ANY(%s) AND '''+NORMALIZED_SQL+'''=ANY(%s)
           AND messenger_whatsapp_personal_id(sp.sender)=ANY(%s) AND NOT '''+RAW_NAME_SQL+'''
         ORDER BY sp.source_sent_at DESC,sp.id''',[*args,sorted(accounts),sorted(identities),sorted(identities)]).fetchall()
@@ -74,7 +75,7 @@ def _links(c,p,accounts,identities):
     return {key:next(iter(value)) for key,value in partners.items() if len(value)==1 and None not in value}
 
 
-def resolve(c,p,rows,*,account='account',chat='chat',sender='sender',name='sender_name',basis='sender_name_basis'):
+def resolve(c,p,rows,*,account='account',chat='chat',sender='sender',name='sender_name',basis='sender_name_basis',incoming=False):
     """Fill rows in place. Telegram and other platforms only lose raw-ID names."""
     pending=[]
     for row in rows:
@@ -89,11 +90,11 @@ def resolve(c,p,rows,*,account='account',chat='chat',sender='sender',name='sende
         pending=[(row,identity) for row,identity in pending if row[account] in whatsapp]
     if not pending:return rows
     accounts={row[account] for row,_ in pending}
-    seen=_names(c,p,accounts,{identity for _,identity in pending})
+    seen=_names(c,p,accounts,{identity for _,identity in pending},incoming)
     unnamed=[(row,identity) for row,identity in pending
         if not any(n['chat']!=row.get(chat) for n in seen.get((row[account],identity),()))]
     links=_links(c,p,accounts,{identity for _,identity in unnamed}) if unnamed else {}
-    linked=_names(c,p,accounts,set(links.values()))
+    linked=_names(c,p,accounts,set(links.values()),incoming)
     for row,identity in pending:
         other=next((n for n in seen.get((row[account],identity),()) if n['chat']!=row.get(chat)),None)
         partner=links.get((row[account],identity))

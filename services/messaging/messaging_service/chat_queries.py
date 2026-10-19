@@ -349,6 +349,14 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         row=items[-1];position={'id':row['id'],'at':row['last_activity']}
         if order=='priority':position.update(at=row['awaiting_reply_sent_at'],score=row['awaiting_reply_priority'],as_of=score_at)
         cursor=row['id'] if order=='id' else encode_cursor(binding,position)
+    # Titles of raw-titled private chats are resolved once per page; conversation reads reuse them.
+    from .chat_titles import labels
+    private=[row for row in items if row['type']=='private']
+    selves=set()
+    if private:
+        selves={r['id'] for r in c.execute('SELECT c.id FROM chats c WHERE c.id=ANY(%s) AND '+self_chat_sql(),
+            ([row['id'] for row in private],))}
+    titles=labels(c,p,[(row['account'],row['id']) for row in private if row['id'] not in selves])
     # Compute run counts only for the returned page, never for every chat.
     for row in items:
         if row['awaiting_reply']:
@@ -374,7 +382,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         for key in ('_own_sent_at','_own_numeric_id','_platform'):row.pop(key,None)
         if not include_dismissed:row.pop('_incoming_head',None)
         if view=='conversation':
-            state=conversation_state(c,p,row['account'],row['id'])
+            state=conversation_state(c,p,row['account'],row['id'],titles=titles)
             row['conversation']=state
             latest=state['latest_known_meaningful_message']
             if latest is None:
@@ -386,14 +394,11 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     from .sender_names import resolve
     resolve(c,p,items,chat='id',sender='awaiting_reply_sender',name='awaiting_reply_sender_name',
         basis='awaiting_reply_sender_name_basis')
-    private=[row['id'] for row in items if row['type']=='private']
-    if private:
-        labels={r['id']:r for r in c.execute('SELECT c.id,CASE WHEN '+raw_title_sql()+' THEN '+peer_name_sql()+
-            ' END AS name,'+self_chat_sql()+' AS self FROM chats c WHERE c.id=ANY(%s)',(private,))}
-        for row in items:
-            label=labels.get(row['id'])
-            if label and label['self']:row.update(title=SELF_CHAT_TITLE,title_basis='self_chat')
-            elif label and label['name']:row.update(title=label['name'],title_basis='latest_incoming_sender_name')
+    for row in private:
+        if row['id'] in selves:row.update(title=SELF_CHAT_TITLE,title_basis='self_chat')
+        elif (row['account'],row['id']) in titles:
+            row['title'],basis=titles[(row['account'],row['id'])]
+            if basis:row['title_basis']=basis
     targets(p,[r['id'] for r in items])
     if include_coverage:
         from .chat_evidence import chat_statuses
