@@ -1152,14 +1152,19 @@ def json_files(directory):
             and (found := present(path)) and stat.S_ISREG(found.st_mode)]
 
 
-def retention_states(state):
+def retention_states(state, *, removing=False):
+    """The production states on this host. For a removal, a configured state directory that does not exist yet refuses:
+    a first preparation there would take its deploy lock only after the removal took the image lock."""
     configured = [Path(value["state_directory"]) for value in map(load, json_files(CONFIG_DIRECTORY))
                   if isinstance(value, dict) and isinstance(value.get("state_directory"), str)]
     found = [path for path in subdirectories(HOST_STATE)
              if present(path / "current.json") or present(path / "http-current.json")]
     states, seen = [], set()
     for directory in [state, HOST_STATE, *found, *configured]:
-        if (found := present(directory)) and stat.S_ISDIR(found.st_mode) and directory.resolve() not in seen:
+        exists = (found := present(directory)) and stat.S_ISDIR(found.st_mode)
+        if removing and not exists and directory in configured:
+            raise Refused(f"the configured state directory {directory} does not exist; no image is removed")
+        if exists and directory.resolve() not in seen:
             seen.add(directory.resolve())
             states.append(directory)
     return states
@@ -1252,8 +1257,7 @@ def release_name(name):
 def images_report(settings, *, held=(), stack=None):
     """Which `deedkit-production-<target>` images the retention rules keep, and why; `remove_images` removes the rest.
     `held` are the state directories whose deploy lock the caller holds; the others' locks are probed. A removal passes
-    `stack`: it holds them there, so no preparation starts before it ends, and it removes nothing while another operation
-    holds one."""
+    `stack` with every state's lock held already; a state outside them refuses."""
     state = Path(settings["state_directory"])
     reasons = {}
     def keep(image, why):
@@ -1263,9 +1267,10 @@ def images_report(settings, *, held=(), stack=None):
     held = {Path(path).resolve() for path in (*held, state)}
     with ExitStack() as probes:
         for directory in states:
-            idle = directory.resolve() in held or free_lock(directory, stack or probes)
-            if not idle and stack is not None:
-                raise Refused(f"another production operation holds the deploy lock of {directory}; no image is removed")
+            if stack is not None and directory.resolve() not in held:
+                # Never a deploy lock under the image lock: a preparation takes them in the other order.
+                raise Refused(f"the production state {directory} appeared during the removal; no image is removed")
+            idle = directory.resolve() in held or free_lock(directory, probes)
             state_images(directory, keep, revisions, label="" if directory == state else f" of {directory}", idle=idle)
     pinned_images(keep, states)
     containers = run(["docker", "ps", "--all", "--quiet", "--no-trunc"]).split()
@@ -1315,12 +1320,12 @@ def remove_images(settings, *, held=()):
     state = Path(settings["state_directory"])
     with ExitStack() as stack:
         mine = {Path(path).resolve() for path in (*held, state)}
-        for directory in retention_states(state):
+        for directory in retention_states(state, removing=True):
             if directory.resolve() not in mine and not free_lock(directory, stack):
                 raise Refused(f"another production operation holds the deploy lock of {directory}; no image is removed")
             mine.add(directory.resolve())
         stack.enter_context(image_lock())
-        # A state that appeared meanwhile is probed again, and held, by the report.
+        # The report refuses a state that appeared meanwhile instead of locking it.
         report = images_report(settings, held=mine, stack=stack)
         removed, failed, summary = [], [], {}
         for number, item in enumerate(report["candidates"]):

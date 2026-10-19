@@ -1822,6 +1822,47 @@ def test_removal_takes_the_other_deploy_locks_before_the_image_lock_so_a_running
     assert image_lock_free and all(image_lock_free) and store.calls == []
 
 
+# spec: ANYM-439
+@pytest.mark.parametrize("late", ["configured, not created yet", "created during the removal"])
+def test_a_state_its_first_lock_pass_cannot_hold_stops_removal_without_taking_a_lock_under_the_image_lock(
+        tmp_path, monkeypatch, late):
+    import fcntl
+    settings = retention_settings(tmp_path)
+    released(Path(settings["state_directory"]), "1" * 40, image_id("1"), OLD_IMAGE)
+    store = Images(monkeypatch, [runtime("1"), runtime("9")])
+    monkeypatch.setattr(p, "IMAGE_LOCK", tmp_path / "image-build.lock")
+    other = tmp_path / "first-use"
+    p.CONFIG_DIRECTORY.mkdir(parents=True)
+    p.HOST_STATE.mkdir(parents=True)
+    probes = []
+    probe = p.free_lock
+    def observed(directory, stack):
+        with p.IMAGE_LOCK.open("a") as preparation:
+            try:
+                fcntl.flock(preparation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                probes.append(True)
+            except BlockingIOError:
+                probes.append(False)
+        return probe(directory, stack)
+    monkeypatch.setattr(p, "free_lock", observed)
+    if late == "configured, not created yet":
+        p.write(p.CONFIG_DIRECTORY / "other.json", {"version": 1, "state_directory": str(other)})
+        expected = f"the configured state directory {other} does not exist; no image is removed"
+    else:
+        image_lock = p.image_lock
+        @contextlib.contextmanager
+        def admitted():
+            with image_lock():
+                # A first preparation elsewhere creates its state between the two discovery passes.
+                released(p.HOST_STATE / "new-stack", "a" * 40, image_id("a"), OLD_IMAGE)
+                yield
+        monkeypatch.setattr(p, "image_lock", admitted)
+        expected = f"the production state {p.HOST_STATE / 'new-stack'} appeared during the removal; no image is removed"
+    assert p.retain_images(settings) == {"skipped": expected}
+    # Every deploy lock it probed, it probed with the image lock free; nothing was removed.
+    assert all(probes) and store.removals() == [] and image_id("9") in store.references
+
+
 @pytest.mark.parametrize("case", ["modified", "missing"])
 def test_a_before_snapshot_changed_between_prepare_and_apply_is_refused_before_any_stop(tmp_path, monkeypatch, case):
     host = Host(tmp_path, monkeypatch)
