@@ -80,6 +80,9 @@ def parser():
     agent.add_argument("--output", type=Path, required=True)
     revoke = sub.add_parser("revoke-agent")
     revoke.add_argument("--id", required=True)
+    extend = sub.add_parser("extend-agent")
+    extend.add_argument("--id", required=True)
+    extend.add_argument("--days", required=True, help="New lifetime from now, 1-183 days")
     disconnect = sub.add_parser("disconnect")
     disconnect.add_argument("--connection", required=True)
     reconcile = sub.add_parser("reconcile")
@@ -233,6 +236,9 @@ def dispatch(args, home, root, config, store):
     if args.action == "revoke-agent":
         store.revoke(args.id)
         return {"revoked": True}
+    if args.action == "extend-agent":
+        previous, new = store.extend_agent(args.id, args.days)
+        return {"principal_id": args.id, "previous_expires_at": previous.isoformat(), "expires_at": new.isoformat()}
     if args.action == "disconnect":
         with store.transaction() as c:
             c.execute(

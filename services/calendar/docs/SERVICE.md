@@ -54,7 +54,7 @@ uv run family-calendar service grant --member egor --calendar CALENDAR_REF --sco
 uv run family-calendar service agent-key --id planner --member egor --calendar CALENDAR_REF --scopes agenda:read,availability:read,event:read,assignment:read,assignment:write,plan:create,plan:execute,event:create,event:update,event:delete --output .local/service/keys/planner.key
 ```
 
-For several calendars, repeat `--calendar`. New calendars are not added automatically. Each agent gets a separate key, valid for 90 days; the DB stores only the SHA-256. `revoke-agent --id planner` revokes the key and unfinished plans. For a new key use a new principal ID. `disconnect --connection ID` disconnects the account and the write opt-in; connect it again with a new connection ID and explicit grants.
+For several calendars, repeat `--calendar`. New calendars are not added automatically. Each agent gets a separate key, valid for 90 days; the DB stores only the SHA-256. `revoke-agent --id planner` revokes the key and unfinished plans. `extend-agent --id planner --days N` sets the expiry of an enabled, unexpired key to now + N days (database clock, N from 1 to 183) and prints the principal ID with the previous and new expiry; it refuses a shorter expiry (`agent_lifetime_would_shorten`), an expired key (`agent_expired`) and an unknown or revoked one (`not_found_or_forbidden`), and writes one `extend_agent` audit row. The key, scopes, calendars and principal version stay the same, so prepared plans still apply and the gateway policy needs no change. For a new key use a new principal ID. `disconnect --connection ID` disconnects the account and the write opt-in; connect it again with a new connection ID and explicit grants.
 
 Writing is off by default. The owner's choice:
 
