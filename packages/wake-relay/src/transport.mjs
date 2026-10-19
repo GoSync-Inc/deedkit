@@ -25,7 +25,8 @@ export function send(socket,request,{timeoutMs}){
     const req=http.request({createConnection:()=>socket,method:'POST',path:target.pathname+target.search,
       headers:{...request.headers,host:target.host,'content-length':String(request.body.length),connection:'close'}},response=>{
       const chunks=[];let size=0;
-      response.on('data',chunk=>{size+=chunk.length;if(size<=RESPONSE_LIMIT)chunks.push(chunk);});
+      // An oversized response is an error, never a truncated body whose prefix could read as a success.
+      response.on('data',chunk=>{size+=chunk.length;if(size>RESPONSE_LIMIT)return finish(new Error('response_too_large'));chunks.push(chunk);});
       response.on('end',()=>finish(null,{status:response.statusCode,headers:response.headers,body:Buffer.concat(chunks)}));
       response.on('error',error=>finish(error));
     });

@@ -113,3 +113,46 @@ test('two adapter names for one vendor target are rejected, so a target budget c
     b:{type:'claude-routine',routine_id:ROUTINE,credential_file:space.claudeToken}};
   assert.throws(()=>relay(space,{configOverrides:{adapters,receivers:{[RECEIVER]:{secret_file:space.receiverSecret,adapter:'a'}}}}),/already fires/);
 });
+
+// spec: ANYM-228
+test('equivalent spellings of one vendor target are one target, and a URL fragment or userinfo is refused',()=>{
+  const space=workspace(),receivers={[RECEIVER]:{secret_file:space.receiverSecret,adapter:'a'}};
+  const claude=api_base=>({type:'claude-routine',routine_id:ROUTINE,credential_file:space.claudeToken,api_base});
+  const grok=endpoint=>({type:'grok-automation',endpoint,credential_file:space.grokSecret});
+  const load=(a,b)=>()=>relay(space,{configOverrides:{adapters:{a,b},receivers}});
+  assert.throws(load(claude('https://api.anthropic.com'),claude('https://API.ANTHROPIC.COM:443')),/adapter b: adapter a already fires the same target/);
+  assert.throws(load(grok('https://grok.example.test/hook'),grok('https://GROK.example.test:443/hook')),/already fires the same target/);
+  for(const endpoint of ['https://grok.example.test/hook#same','https://grok.example.test/hook#','https://user@grok.example.test/hook'])
+    assert.throws(load(grok(endpoint),claude('https://api.anthropic.com')),/no userinfo or fragment/,endpoint);
+  assert.throws(load(claude('https://user@api.anthropic.com'),grok('https://grok.example.test/hook')),/no userinfo or fragment/);
+});
+
+// spec: ANYM-228
+test('slots an earlier build stored under the adapter name still count after upgrade, and the target is kept only as a fingerprint',async()=>{
+  const space=workspace(),time=clock(),fake=downstream([],{clock:time});
+  const first=relay(space,{clock:time,transport:fake});
+  for(let i=0;i<20;i++)first.run('INSERT INTO slots VALUES(?,?,?,?)',crypto.randomUUID(),i%2?'claude':`https://api.anthropic.com/v1/claude_code/routines/${ROUTINE}/fire`,'anthropic',time.now());
+  await first.close();
+  const instance=relay(space,{clock:time,transport:fake});
+  const hint=signed({},Math.floor(time.now()/1000));
+  assert.equal(instance.receive(RECEIVER,hint.raw,hint.headers).status,503);
+  assert.deepEqual(instance.all('SELECT DISTINCT target FROM slots').map(r=>/^[0-9a-f]{64}$/.test(r.target)),[true]);
+  await instance.close();
+});
+
+// spec: ANYM-228
+test('a 429-refused request starts no run: its retry is the same fire, reusing the one slot re-dated to the retry',async()=>{
+  const space=workspace(),time=clock(),fake=downstream([{status:429,headers:{'retry-after':'5'}},{status:429,headers:{'retry-after':'5'}}],{clock:time});
+  const instance=relay(space,{clock:time,transport:fake,configOverrides:{adapters:{claude:{type:'claude-routine',routine_id:ROUTINE,
+    credential_file:space.claudeToken,account:'anthropic',hourly_budget:2}}}});
+  const deliver=()=>{const h=signed({},Math.floor(time.now()/1000));return instance.receive(RECEIVER,h.raw,h.headers);};
+  assert.deepEqual([deliver().status,deliver().status],[202,202]);
+  await instance.fireDue();
+  time.advance(5000);
+  await instance.fireDue();
+  assert.equal(deliver().status,503);
+  assert.deepEqual(rows(instance).map(r=>[r.state,r.attempts]),[['accepted',2],['accepted',2]]);
+  assert.equal(fake.fires.length,4);
+  assert.deepEqual(instance.all('SELECT at FROM slots').map(r=>r.at),[time.now(),time.now()]);
+  await instance.close();
+});

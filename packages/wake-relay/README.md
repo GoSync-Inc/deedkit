@@ -39,12 +39,16 @@ npm test
   of the relay (Caddy or a tunnel) on port 443.
 - Secret and credential files must be absolute, regular and owner-only (`0600`).
   The receiver secret holds the same bytes as DeedKit's `secret_file`. A routine token
-  is `sk-ant-oat01-...`; a Grok secret is `whsec_...`.
+  is `sk-ant-oat01-...`. A Grok secret is `whsec_` (optional) followed by canonical,
+  padded base64 of at least 16 bytes; any other form fails locally before a send.
 - Removing a credential file stops every pending fire of that adapter at once.
   `"enabled": false` needs a restart (the config is read at start); the restart marks
   the adapter's pending rows `revoked`, and a row already `sending` ends `unknown`.
 - Anthropic 401/403 and Grok 401 mark the adapter revoked until its credential file
-  changes. Each routine or webhook may appear in only one adapter.
+  changes. Each routine or webhook may appear in only one adapter; URLs that reach the
+  same destination count as one, and a URL with userinfo or a fragment is refused.
+- The SQLite database keeps a vendor target only as a SHA-256 fingerprint (budget
+  slots), never its URL.
 - The relay answers `503` with `Retry-After` and stores nothing when no budget slot
   is free (`budget_refused`), when the adapter is disabled or revoked
   (`adapter_unavailable`), or when a hint arrives after its hold window

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import net from 'node:net';
+import {Duplex} from 'node:stream';
 import {httpsTransport,tlsConnect} from '../src/transport.mjs';
 import {RECEIVER,clock,downstream,httpServer,relay,rows,signed,workspace} from './helpers.mjs';
 
@@ -198,4 +199,41 @@ test('a Claude 2xx without a valid session ID is unknown, not accepted, and is n
     assert.deepEqual([instance.row(id).state,instance.row(id).outcome,instance.row(id).vendor_id,fake.fires.length],['unknown','http_200_without_session_id',null,1],body);
     await instance.close();
   }
+});
+
+// spec: ANYM-228
+test('a credential removed while the fire waits for the database write lock stops the fire before sending',async()=>{
+  const {space,fake,instance,deliver}=setup();
+  const {id}=deliver();
+  // The removal lands where another writer would hold BEGIN IMMEDIATE: after the connect, before the lock is granted.
+  const tx=instance.tx.bind(instance);
+  instance.tx=fn=>{fs.rmSync(space.claudeToken,{force:true});return tx(fn);};
+  await instance.fireDue();
+  assert.deepEqual([instance.row(id).state,instance.row(id).outcome,instance.row(id).attempts,fake.fires.length],['revoked','adapter_disabled',0,0]);
+  await instance.close();
+});
+
+// A socket that answers the first request write with `parts`, one parser read each.
+function answering(parts){
+  const socket=new Duplex({read(){},write(chunk,encoding,callback){
+    callback();
+    if(socket.answered)return;
+    socket.answered=true;
+    const next=()=>{if(!parts.length)return socket.push(null);socket.push(parts.shift());setImmediate(next);};
+    setImmediate(next);
+  }});
+  return socket;
+}
+
+// spec: ANYM-228
+test('a response over 64 KiB is unknown, never a truncated prefix that reads as an accepted session',async()=>{
+  const json='{"claude_code_session_id":"session_01SYNTHETIC"}',junk='x'.repeat(70_000);
+  const head=`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${json.length+junk.length}\r\nconnection: close\r\n\r\n`;
+  const transport=httpsTransport({responseTimeoutMs:2000,connectSocket:async()=>answering([head+json,junk])});
+  const {time,instance,deliver}=setup({transport});
+  const {id}=deliver();
+  await instance.fireDue();
+  time.advance(600_000);await instance.fireDue();
+  assert.deepEqual([instance.row(id).state,instance.row(id).outcome,instance.row(id).vendor_id,instance.row(id).attempts],['unknown','response_too_large',null,1]);
+  await instance.close();
 });

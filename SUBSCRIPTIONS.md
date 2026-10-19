@@ -274,7 +274,7 @@ before the action that follows it.
 | `pending` | Committed before the dispatcher gets its `2xx`. Nothing was written downstream. |
 | `sending` | Committed after DNS, TCP and TLS succeed, just before the first request byte. |
 | `accepted` | The vendor returned 2xx: Claude with its documented session ID (stored), Grok `202` (no run ID exists). A Claude 2xx without a session ID is `unknown`. |
-| `unknown` | Any outcome after `sending` that the vendor does not document as a refusal: timeout, reset, crash, 500, 503, unlisted status. Never re-fired. |
+| `unknown` | Any outcome after `sending` that the vendor does not document as a refusal: timeout, reset, crash, 500, 503, unlisted status, a response over 64 KiB. Never re-fired. |
 | `failed` | A documented refusal (Anthropic 400/404, Grok 400/413), or a local error before `sending` such as a malformed credential. |
 | `revoked` | Credential rejected (Anthropic 401/403, Grok 401), or the adapter disabled or its credential file removed. |
 | `expired` | `max_hold_s` (default 120 s, at most 600 s after the signed timestamp) ran out before a send. |
@@ -288,9 +288,11 @@ Pre-send failures retry with backoff inside the hold. A `429` returns the row to
 **Coalescing and budgets.** At most one `pending` or `sending` fire per receiver and
 subscription; later hints fold into it and the highest `through` wins. A new fire
 needs a slot in a sliding hour, per vendor target (default 20; one adapter per
-routine or webhook) and per vendor account (default 60). The slot is reserved at
-acknowledgement and re-dated to each send, so every sliding hour holds at most the
-budget of fires. Without a slot the relay answers
+routine or webhook, the same destination however its URL is spelled) and per vendor
+account (default 60). The slot is reserved at acknowledgement and re-dated to each
+send, so every sliding hour holds at most the budget of fires. A request the vendor
+refuses with `429` starts no run: its retry is the same fire and reuses the row's
+slot, so HTTP requests can exceed the budget only by such refusals. Without a slot the relay answers
 `503` with `Retry-After`, stores no row and counts `budget_refused` per
 subscription; the hint stays in the DeedKit outbox under the server fence and
 dead-letters after the dispatcher's eight attempts (about four minutes) if no slot

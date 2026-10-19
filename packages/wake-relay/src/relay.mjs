@@ -45,16 +45,16 @@ export function readSecret(file,{min=1,max=4096}={}){
 export function loadConfig(config){
   const maxHoldS=config.max_hold_s??120;
   if(!Number.isInteger(maxHoldS)||maxHoldS<1||maxHoldS>600)throw new Error('max_hold_s must be 1..600');
-  const accounts=config.accounts??{},adapters=new Map(),targets=new Set();
+  const accounts=config.accounts??{},adapters=new Map(),targets=new Map();
   for(const [name,value] of Object.entries(config.adapters??{})){
     const budget=value.hourly_budget??20,account=value.account??name;
     const accountBudget=accounts[account]?.hourly_budget??60;
     if(!Number.isInteger(budget)||budget<1||!Number.isInteger(accountBudget)||accountBudget<1)throw new Error(`adapter ${name}: budgets must be positive integers`);
-    const impl=createAdapter(value);
+    const impl=createAdapter(value),target=targetKey(impl.url,name);
     // The target budget belongs to the vendor target, so two adapter names may not share one routine or webhook.
-    if(targets.has(impl.url))throw new Error(`adapter ${name}: another adapter already fires ${impl.url}`);
-    targets.add(impl.url);
-    adapters.set(name,{name,impl,target:impl.url,enabled:value.enabled!==false,credentialFile:value.credential_file,
+    if(targets.has(target))throw new Error(`adapter ${name}: adapter ${targets.get(target)} already fires the same target`);
+    targets.set(target,name);
+    adapters.set(name,{name,impl,target,enabled:value.enabled!==false,credentialFile:value.credential_file,
       budget,account,accountBudget});
   }
   const receivers=new Map();
@@ -67,6 +67,15 @@ export function loadConfig(config){
 }
 
 const fingerprint=value=>createHash('sha256').update(value).digest('hex');
+// The destination the transport reaches (host lowercased, default port dropped, path and query as sent), stored
+// only as a fingerprint. A fragment or userinfo never reaches the request, so it is refused rather than an alias.
+function targetKey(url,name){
+  let target;
+  try{target=new URL(url);}catch{target=null;}
+  if(!target||target.protocol!=='https:'||target.username||target.password||url.includes('#'))
+    throw new Error(`adapter ${name}: the target must be https with no userinfo or fragment`);
+  return fingerprint(target.host+target.pathname+target.search);
+}
 const errorCode=error=>String(error?.code??error?.message??'error').slice(0,64).replace(/[^A-Za-z0-9_.-]/g,'_');
 function statusOf(db){
   const all=sql=>db.prepare(sql).all();
@@ -110,8 +119,11 @@ export class Relay{
     const now=this.clock.now();
     this.tx(()=>{
       this.run(`UPDATE hints SET state='unknown',outcome='interrupted_after_send',updated_at=? WHERE state='sending'`,now);
-      for(const adapter of this.config.adapters.values())
+      for(const adapter of this.config.adapters.values()){
+        // Slots written by earlier builds are keyed by adapter name or raw URL; they keep counting for the target.
+        this.run('UPDATE slots SET target=? WHERE target IN (?,?)',adapter.target,adapter.name,adapter.impl.url);
         if(!adapter.enabled)this.run(`UPDATE hints SET state='revoked',outcome='adapter_disabled',updated_at=? WHERE state='pending' AND adapter=?`,now,adapter.name);
+      }
     });
   }
 
@@ -216,29 +228,31 @@ export class Relay{
     let sending=false;
     try{
       this.step('beforeSending');
-      row=this.row(id);
-      const now=this.clock.now();
-      if(row?.state!=='pending'||this.closed)return;
-      // The credential is read again after the connect: one removed, rotated or revoked meanwhile is honoured.
-      const credential=this.fenced(id,adapter);
-      if(!credential)return;
-      if(now>=row.hold_until)return this.transition(id,'pending','expired','hold_elapsed');
-      const payload={hint_id:row.hint_id,subscription_id:row.subscription_id,subscription_version:row.subscription_version,
-        through:row.through,kind:row.kind,host_turn_verified:false};
-      let request;
-      try{request=adapter.impl.build(payload,credential,now);}catch(error){return this.transition(id,'pending','failed',errorCode(error));}
-      sending=this.tx(()=>{
-        const changed=this.run(`UPDATE hints SET state='sending',attempts=attempts+1,updated_at=? WHERE hint_id=? AND state='pending'`,
-          now,id).changes===1;
-        if(changed)this.run('UPDATE slots SET at=max(at,?) WHERE hint_id=?',now,id);
-        return changed;
+      // Every check runs after the write lock is granted, so a credential removed, rotated or revoked during the
+      // connect or while another writer held the lock is honoured; nothing awaits between them and `sending`.
+      const prepared=this.tx(()=>{
+        row=this.row(id);
+        const now=this.clock.now();
+        if(row?.state!=='pending'||this.closed)return null;
+        const credential=this.fenced(id,adapter);
+        if(!credential)return null;
+        if(now>=row.hold_until){this.transition(id,'pending','expired','hold_elapsed');return null;}
+        const payload={hint_id:row.hint_id,subscription_id:row.subscription_id,subscription_version:row.subscription_version,
+          through:row.through,kind:row.kind,host_turn_verified:false};
+        let request;
+        try{request=adapter.impl.build(payload,credential,now);}catch(error){this.transition(id,'pending','failed',errorCode(error));return null;}
+        if(this.run(`UPDATE hints SET state='sending',attempts=attempts+1,updated_at=? WHERE hint_id=? AND state='pending'`,
+          now,id).changes!==1)return null;
+        this.run('UPDATE slots SET at=max(at,?) WHERE hint_id=?',now,id);
+        return {request,credential};
       });
-      if(!sending)return;
+      if(!prepared)return;
+      sending=true;
       this.step('afterSending');
       let response;
-      try{response=await this.transport.send(socket,request);}
+      try{response=await this.transport.send(socket,prepared.request);}
       catch(error){return this.transition(id,'sending','unknown',errorCode(error));}
-      return this.settle(row,adapter,credential,response);
+      return this.settle(row,adapter,prepared.credential,response);
     }finally{if(!sending)this.transport.close(socket);}
   }
 

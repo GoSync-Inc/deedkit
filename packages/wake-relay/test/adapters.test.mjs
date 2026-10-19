@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHmac} from 'node:crypto';
-import {CLAUDE_TEXT_LIMIT,WEBHOOK_BODY_LIMIT,claudeRoutine,standardWebhookSignature} from '../src/adapters.mjs';
+import {CLAUDE_TEXT_LIMIT,WEBHOOK_BODY_LIMIT,claudeRoutine,grokAutomation,standardWebhookSignature} from '../src/adapters.mjs';
 import {httpsTransport} from '../src/transport.mjs';
 import {GROK_SECRET,RECEIVER,ROUTINE,clock,httpServer,relay,signed,workspace} from './helpers.mjs';
 
@@ -71,4 +71,18 @@ test('only the content-free hint fields leave the relay, even when the signed bo
     for(const value of Object.values(CONTENT))assert.ok(!wire.includes(value),`${adapter.type} leaked ${value}`);
     for(const key of Object.keys(CONTENT))assert.ok(!wire.includes(`"${key}"`)||key==='text'&&adapter.type==='claude-routine',`${adapter.type} leaked ${key}`);
   }
+});
+
+// spec: ANYM-228
+test('the Grok secret contract: canonical padded base64 of at least 16 bytes, with or without whsec_; anything else fails locally',()=>{
+  const adapter=grokAutomation({endpoint:'https://grok.example.test/hook'}),payload={hint_id:'msg_synthetic'};
+  const build=secret=>adapter.build(payload,Buffer.from(secret),Date.UTC(2026,9,19));
+  for(const size of [16,24,32,64]){
+    const encoded=Buffer.alloc(size,7).toString('base64');
+    for(const secret of [`whsec_${encoded}`,encoded,` whsec_${encoded}\n`])
+      assert.equal(build(secret).headers['webhook-signature'],standardWebhookSignature(secret,payload.hint_id,String(Date.UTC(2026,9,19)/1000),build(secret).body),secret);
+  }
+  const short=Buffer.from('synthetic-key').toString('base64'),unpadded=Buffer.alloc(32,7).toString('base64').replace(/=+$/,'');
+  for(const secret of ['',`whsec_`,`whsec_${short}`,`whsec_${unpadded}`,'whsec_!!!',`whsec_${'-_'.repeat(22)}`])
+    assert.throws(()=>build(secret),/invalid_credential/,secret);
 });
