@@ -128,7 +128,8 @@ def test_both_providers_backfill_live_restart_and_status_through_mcp(worker,wa):
         assert tombstone(client,key,tg.account,'100','4') and tombstone(client,key,w.account,'123@c.us',event(4)['messageId'])
         after=(tg2.state.chat('100','user')['high_water'],w2.state.progress('123@c.us','user')['head'])
         assert after[0]>=before[0] and after[1]>=before[1]
-        assert tg2.provider.reads and all(read[1]>=before[0] for read in tg2.provider.reads if read[3])
+        forward=[read for read in tg2.provider.reads if read[3]]
+        assert forward and all(read[1]>=before[0] for read in forward)
         assert tg2.state.chat('100','user')['window_complete'] and w2.state.progress('123@c.us','user')['history_exhausted']
 
         # Health: both sources show the three phases; a connection failure degrades only its own source.
