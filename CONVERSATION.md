@@ -144,6 +144,7 @@ Direct Store calls, which have no presentation level, always include it.
 | `question_mark` | +25 | the attention message has question punctuation |
 | `provider_contact` | +10 | the sender is an observed provider contact |
 | `waiting_age`, `waiting_age_capped` | +1 to +19, +20 | square root of waiting hours; capped after about 17 days |
+| `owner_question` | +40 | a group message that mentions the owner (basis `owner_mention`) with question punctuation, from a sender that is not an observed bot, a provider business/verified sender or another account of the key |
 | `one_way_chat` | -60 | private chat in which no meaningful owner message is archived |
 | `provider_business_or_verified` | -40 | the provider stated a business/verified (WhatsApp `VerifiedName`) or verified/support (Telegram) sender |
 | `own_account` | -80 | the sender ID is a recent outgoing sender of another account of the key |
@@ -151,7 +152,11 @@ Direct Store calls, which have no presentation level, always include it.
 | `observed_bot` | -20 | a group message from a sender the provider marks as a bot |
 
 A demotion never excludes a row (private bots stay excluded as before); a
-demoted private hint may rank below a group hint. Weights were checked only
+demoted private hint may rank below a group hint, and a group question that
+mentions the owner (+40, owner decision 2026-10-19) outranks a one-way mailing
+with a question mark up to 85 points (waiting capped, no contact). Replies to the
+owner and statements without a question get no bonus; channels have no hints.
+Every private question without a demotion still outranks every group hint. Weights were checked only
 against the synthetic labelled fixture in `tests/test_queue_demotion.py`. All
 signals are archive or provider facts: an unknown or absent flag never demotes,
 and a chat the owner wrote in before the archive began looks one-way. The

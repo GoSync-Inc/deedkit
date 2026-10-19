@@ -240,13 +240,16 @@ request was answered.
 
 `order='priority'` requires `awaiting_reply=true`. The score is 100 for private
 chats or 25 for explicit group attention, +25 for question punctuation, +10 for
-an observed provider contact, plus waiting points: the square root of waiting hours
+an observed provider contact, +40 when a group message that mentions the owner
+asks a question and its sender is no observed bot, business/verified sender or
+other account of the key, plus waiting points: the square root of waiting hours
 (1 hour = 1, 1 day = 4, 4 days = 9), capped at 20 after about 17 days, minus
 demotions for chats the owner never wrote in, provider business/verified
 senders, the owner's other accounts, closing courtesies and group bots
 (weights and rules in [CONVERSATION.md](CONVERSATION.md#queue-priority-components)).
-Every private hint without a demotion outranks a group hint; a demoted private
-hint may rank below one. Each row
+Every private question without a demotion outranks a group hint; a demoted
+private hint, or a private statement, may rank below a group question that
+mentions the owner. Each row
 includes the score, `awaiting_reply_waiting_hours` and reasons; `waiting_age` or
 `waiting_age_capped` appear only when waiting points were added, and
 `detail=full` adds `awaiting_reply_priority_components` with the points per reason.
