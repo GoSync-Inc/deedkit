@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from scripts.tiden_ci import (CHECKS, SHARD_JOBS, intent_links, linked_intent_branch, normalize_junit, prepare, publish,
+from scripts.tiden_ci import (CHECKS, FRAGMENTS, MODULE_REPORTS, REQUIRED_EXECUTIONS, SHARD_JOBS, intent_links, linked_intent_branch, normalize_junit, prepare, publish,
                               resolve_branch, route_branch)
 
 
@@ -124,10 +124,9 @@ def test_publisher_refuses_partial_results_even_when_tiden_returns_passed(tmp_pa
 
 
 def test_publisher_counts_additive_module_checks_without_changing_legacy_checks(tmp_path, monkeypatch):
-    _, manifest = cli_fixture(monkeypatch, tmp_path, attempts="15")
-    manifest["module_checks"] = {name: "success" for name in ("gateway", "calendar", "calls", "calls_frontend", "load", "backup_restore",
-                                                              "whatsmeow", "release_router")}
-    manifest["check_counts"] = {"passed": 15}
+    _, manifest = cli_fixture(monkeypatch, tmp_path, attempts=str(len(CHECKS) + len(MODULE_REPORTS)))
+    manifest["module_checks"] = dict.fromkeys(MODULE_REPORTS, "success")
+    manifest["check_counts"] = {"passed": len(CHECKS) + len(MODULE_REPORTS)}
     assert publish(tmp_path, manifest, "intent/feature", "product")["status"] == "passed"
 
 
@@ -1533,7 +1532,7 @@ def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=
     verify.mkdir(parents=True)
     (verify / "source-sha").write_text("a" * 40 + "\n")
     (verify / "attempt").write_text("2\n")
-    modules = verify_modules or {name: "success" for name in ("gateway", "calendar", "calls", "calls_frontend", "backup_restore")}
+    modules = verify_modules or dict.fromkeys(FRAGMENTS["verify"][0], "success")
     (verify / "metadata.json").write_text(json.dumps({**metadata(), "tiden_branch": "", "module_checks": modules}))
     for name in ("python-1.xml", *verify_files):
         (verify / name).write_text('<testsuite><testcase name="x" file="tests/x.py"/></testsuite>')
@@ -1576,8 +1575,7 @@ def test_parallel_load_fragment_is_assembled_with_verify_evidence_of_the_same_co
     merged = assemble(out, evidence_fragments(tmp_path), ATTEMPT_URL, PASSED)
     # The assembling attempt names the evidence, so a rerun of one test job publishes under new row identities.
     assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load", *SHARD_JOBS, "go"] and merged["missing"] == []
-    assert merged["module_checks"]["load"] == "success" and set(merged["module_checks"]) == {
-        "gateway", "calendar", "calls", "calls_frontend", "load", "backup_restore", "whatsmeow", "release_router"}
+    assert merged["module_checks"]["load"] == "success" and set(merged["module_checks"]) == set(MODULE_REPORTS)
     assert {path.name for path in out.iterdir()} == {"metadata.json", "source-sha", "python.xml", "load.xml", "load.json",
                                                      "whatsmeow.json", "release-router.json"}
     # The four shard reports merge into the one python report, in shard order, so test identities do not change.
@@ -1609,7 +1607,7 @@ def test_assembly_refuses_a_fragment_of_another_commit_or_of_foreign_checks(tmp_
         assemble(tmp_path / "d", evidence_fragments(tmp_path / "python", load_outcomes={"checks": {"python": "success"}}),
                  ATTEMPT_URL, PASSED)
     # Neither job can supply the other's checks or reports: verify claiming the load gate, load supplying pytest.
-    claimed = {name: "success" for name in ("gateway", "calendar", "calls", "calls_frontend", "backup_restore", "load")}
+    claimed = {**dict.fromkeys(FRAGMENTS["verify"][0], "success"), "load": "success"}
     with pytest.raises(ValueError, match="only its own"):
         assemble(tmp_path / "e", evidence_fragments(tmp_path / "claim", load=False, verify_modules=claimed), ATTEMPT_URL, PASSED)
     with pytest.raises(ValueError, match="does not produce"):
@@ -2229,3 +2227,255 @@ def test_a_missing_go_fragment_leaves_both_go_checks_unpassed_and_fails_the_evid
     merged = assemble(tmp_path / "stale" / "ci-evidence", stale, ATTEMPT_URL, {**PASSED, "go": ("failure", "a" * 40)})
     assert merged["missing"] == ["go"] and merged["module_checks"]["whatsmeow"] == merged["module_checks"]["release_router"] == "failure"
     assert not (tmp_path / "stale" / "ci-evidence" / "whatsmeow.json").exists()
+
+
+ROOT_NODE = "tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root"
+AUDIO_NODES = ("tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download",
+               "tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model[wav]",
+               "tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model[ogg]")
+
+
+def node_report(*cases):
+    """xunit1 JUnit of `file::name` nodes; a case may carry a result element, as in ("node", "<skipped/>")."""
+    cases = [case if isinstance(case, tuple) else (case, "") for case in cases]
+    return "<testsuite>" + "".join(
+        '<testcase classname="{0}" name="{1}" file="{2}">{3}</testcase>'.format(
+            node.split("::")[0][:-3].replace("/", "."), node.split("::")[1], node.split("::")[0], result)
+        for node, result in cases) + "</testsuite>"
+
+
+def module_rows(tmp_path, reports, outcome="success"):
+    """The CI rows `prepare` records for the module reports given as {module: JUnit text}."""
+    meta = {**metadata(), "module_checks": dict.fromkeys(MODULE_REPORTS, outcome)}
+    for module, xml in reports.items():
+        (tmp_path / MODULE_REPORTS[module][0]).write_text(xml)
+    prepare(tmp_path, tmp_path, meta)
+    return {row["signature"]: row for row in json.loads((tmp_path / "ci-checks.json").read_text())}
+
+
+# spec: ANYM-429
+def test_the_root_only_and_native_audio_modules_require_exactly_their_root_suite_nodes():
+    assert REQUIRED_EXECUTIONS == {"root_session_lock": {ROOT_NODE}, "enricher_audio": set(AUDIO_NODES)}
+    assert MODULE_REPORTS["root_session_lock"] == ("root-session-lock.xml", "python", "")
+    assert MODULE_REPORTS["enricher_audio"] == ("enricher-audio.xml", "python", "")
+    assert {"root_session_lock", "enricher_audio"} <= set(FRAGMENTS["verify"][0])
+    assert {"root-session-lock.xml", "enricher-audio.xml"} <= set(FRAGMENTS["verify"][1])
+
+
+# spec: ANYM-429
+@pytest.mark.parametrize("module, cases, status", [
+    ("enricher_audio", AUDIO_NODES, "passed"),
+    ("enricher_audio", AUDIO_NODES[:1], "failed"),
+    ("enricher_audio", (*AUDIO_NODES[:2], (AUDIO_NODES[2], "<skipped/>")), "failed"),
+    ("enricher_audio", (*AUDIO_NODES, "tests/test_audio_native.py::test_invalid_native_audio_does_not_reach_provider"), "failed"),
+    ("enricher_audio", (*AUDIO_NODES, AUDIO_NODES[0]), "failed"),
+    ("enricher_audio", (*AUDIO_NODES[:2], (AUDIO_NODES[2], "<failure/>")), "failed"),
+    ("enricher_audio", None, "blocked"),
+    ("root_session_lock", (ROOT_NODE,), "passed"),
+    ("root_session_lock", ((ROOT_NODE, "<skipped/>"),), "failed"),
+    ("root_session_lock", None, "blocked"),
+], ids=["exact", "one-case", "pass-plus-skip", "extra-case", "duplicate", "failed-case", "missing-report",
+        "root-exact", "root-skipped", "root-missing-report"])
+def test_a_root_suite_node_module_passes_only_with_exactly_its_executions_each_once_and_passed(tmp_path, module, cases,
+                                                                                             status):
+    rows = module_rows(tmp_path, {} if cases is None else {module: node_report(*cases)})
+    row = rows["deedkit-ci::" + module]
+    assert row["execution"]["status"] == status, row["message"]
+    if status == "blocked":  # a missing report keeps today's incomplete verification
+        assert row["message"] == "Missing or invalid test report; verification incomplete"
+    # The rule holds whatever the step reported: a failed step never reads as passed either.
+    if cases is not None:
+        (tmp_path / "failed-step").mkdir()
+        rows = module_rows(tmp_path / "failed-step", {module: node_report(*cases)}, "failure")
+        assert rows["deedkit-ci::" + module]["execution"]["status"] == "failed"
+
+
+# spec: ANYM-429
+def test_assembly_refuses_evidence_whose_shard_report_holds_a_node_only_its_module_check_may_run(tmp_path):
+    from scripts.tiden_ci import assemble
+    for index, node in enumerate((ROOT_NODE, AUDIO_NODES[2])):
+        fragments = evidence_fragments(tmp_path / str(index))
+        (fragments / "ci-evidence-python-3" / "python-3.xml").write_text(node_report(node, "tests/x.py::kept"))
+        with pytest.raises(ValueError, match="only its own module check"):
+            assemble(tmp_path / str(index) / "ci-evidence", fragments, ATTEMPT_URL, PASSED)
+    # Without such a node the same fragments assemble, and the module reports of verify read as passed.
+    fragments = evidence_fragments(tmp_path / "clean", verify_files=("root-session-lock.xml", "enricher-audio.xml"))
+    (fragments / "ci-evidence-verify" / "root-session-lock.xml").write_text(node_report(ROOT_NODE))
+    (fragments / "ci-evidence-verify" / "enricher-audio.xml").write_text(node_report(*AUDIO_NODES))
+    rows = assembled_rows(tmp_path / "clean", assemble(tmp_path / "clean" / "ci-evidence", fragments, ATTEMPT_URL, PASSED))
+    assert rows["deedkit-ci::root_session_lock"] == rows["deedkit-ci::enricher_audio"] == "passed"
+
+
+def verify_steps():
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    return yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]
+
+
+def stub_tools(tmp_path):
+    """`docker`, `sudo` and the checkout's `.venv/bin/python` stubs that record each call in $CALLS; a test run writes
+    its JUnit report to the `--junitxml` path (docker: under the mounted evidence directory) and exits $STUB_EXIT."""
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "docker").write_text('''#!/bin/sh
+echo "docker $*" >> "$CALLS"
+if [ "$1" = run ]; then
+  evidence=""
+  for arg; do case "$previous" in --volume) evidence="${arg%%:*}";; esac; previous="$arg"; done
+  echo '<testsuite/>' > "$evidence/enricher-audio.xml"
+  exit "${STUB_EXIT:-0}"
+fi
+''')
+    (tools / "sudo").write_text('#!/bin/sh\necho "sudo $*" >> "$CALLS"\nexec "$@"\n')
+    python = '''#!/bin/sh
+echo "python $*" >> "$CALLS"
+case "$*" in *--collect-only*) grep -q "def ${ROOT_NODE##*::}(" tests/test_collectors.py; exit $?;; esac
+for arg; do case "$arg" in --junitxml=*) echo '<testsuite/>' > "${arg#--junitxml=}";; esac; done
+exit "${STUB_EXIT:-0}"
+'''
+    for path in (tools / "docker", tools / "sudo"):
+        path.chmod(0o755)
+    return tools, python
+
+
+def fixture_source(tmp_path, python, *, node=True, target=True):
+    """A tested checkout with or without the root-only node and the enricher-test Dockerfile target."""
+    source = tmp_path / "source"
+    (source / "tests").mkdir(parents=True)
+    (source / ".venv" / "bin").mkdir(parents=True)
+    (source / ".venv" / "bin" / "python").write_text(python)
+    (source / ".venv" / "bin" / "python").chmod(0o755)
+    (source / "tests" / "test_collectors.py").write_text(
+        "def test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root(tmp_path):\n    pass\n" if node else
+        "def test_session_lock_creates_missing_parent_private_and_keeps_symlink_code(tmp_path):\n    pass\n")
+    (source / "Dockerfile").write_text("FROM enricher-local AS enricher-test\n" if target else "FROM enricher-local AS enricher-local\n")
+    return source
+
+
+def run_step(step, source, tools, temp, **env):
+    import subprocess
+    (temp / "ci-evidence").mkdir(parents=True, exist_ok=True)
+    return subprocess.run(["bash", "-e", "-c", step["run"]], cwd=source, capture_output=True, text=True, timeout=30,
+                          env={"PATH": f"{tools}:/usr/bin:/bin:/usr/sbin", "RUNNER_TEMP": str(temp), "CALLS": str(temp / "calls"),
+                               **{key: str(value) for key, value in (step.get("env") or {}).items()}, **env})
+
+
+def named(steps, name):
+    return next(step for step in steps if step.get("name") == name)
+
+
+START_AUDIO = "Start the native audio test image build in the background"
+SHARED_WAIT = "Wait for the background router image and Python image"
+
+
+# spec: ANYM-429
+def test_the_native_audio_step_waits_only_for_its_own_build_and_keeps_its_test_status_and_report(tmp_path):
+    import time
+    steps = verify_steps()["verify"]["steps"]
+    ids = [step.get("id") for step in steps]
+    audio = steps[ids.index("enricher_audio")]
+    assert ids.index("enricher_audio") > ids.index("python") and ids.index("root_session_lock") > ids.index("python")
+    assert audio["if"] == "${{ !cancelled() && steps.build.outcome == 'success' }}" and "AUDIO_IMAGE_WAIT_SECONDS" in audio["env"]
+    names = [step.get("name") for step in steps]
+    assert names.index(START_AUDIO) < names.index("Gateway isolated package and transport tests")
+    tools, python = stub_tools(tmp_path)
+    source = fixture_source(tmp_path, python)
+    temp = tmp_path / "runner"
+    background = temp / "background"
+    background.mkdir(parents=True)
+    # (a) A failed build fails the step, and so does a build that never finished within the step's own timeout.
+    (background / "enricher-test.exit").write_text("1\n")
+    assert run_step(audio, source, tools, temp, AUDIO_IMAGE_WAIT_SECONDS="1").returncode != 0
+    (background / "enricher-test.exit").unlink()
+    began = time.monotonic()
+    assert run_step(audio, source, tools, temp, AUDIO_IMAGE_WAIT_SECONDS="1").returncode != 0
+    assert time.monotonic() - began < 10 and not (temp / "calls").exists()
+    # (b) The shared wait of the Python shard reads only the router and Python image results, never this build.
+    (background / "router.exit").write_text("0\n")
+    (background / "python-image.exit").write_text("0\n")
+    (background / "enricher-test.exit").write_text("1\n")
+    assert run_step(named(steps, SHARED_WAIT), source, tools, temp, BACKGROUND_WAIT_SECONDS="1").returncode == 0
+    assert "enricher" not in named(steps, SHARED_WAIT)["run"]
+    # (c) A test run that writes its report and fails fails the step, and the report stays for the evidence.
+    (background / "enricher-test.exit").write_text("0\n")
+    failed = run_step(audio, source, tools, temp, STUB_EXIT="1")
+    assert failed.returncode != 0 and (temp / "ci-evidence" / "enricher-audio.xml").is_file()
+    (temp / "ci-evidence" / "enricher-audio.xml").unlink()
+    assert run_step(audio, source, tools, temp).returncode == 0 and (temp / "ci-evidence" / "enricher-audio.xml").is_file()
+    runs = [line for line in (temp / "calls").read_text().splitlines() if line.startswith("docker run")]
+    assert len(runs) == 2
+    for flags in ("--network none", "--read-only", "--tmpfs /tmp", "--user ", "deedkit-enricher-test:ci",
+                  "--junitxml=/evidence/enricher-audio.xml", "-o junit_family=xunit1", "-p no:cacheprovider"):
+        assert flags in runs[-1], flags
+    assert {node.split("[")[0] for node in AUDIO_NODES} == {arg for arg in runs[-1].split() if arg.startswith("tests/")}
+
+
+# spec: ANYM-429
+def test_the_root_step_runs_only_its_node_under_sudo_and_hands_the_report_back_after_a_failing_run(tmp_path):
+    steps = verify_steps()["verify"]["steps"]
+    root_step = next(step for step in steps if step.get("id") == "root_session_lock")
+    assert root_step["if"] == "${{ !cancelled() && steps.build.outcome == 'success' }}"
+    assert root_step["env"]["ROOT_NODE"] == ROOT_NODE and str(root_step["env"]["PYTHONDONTWRITEBYTECODE"]) == "1"
+    # The backup restore step keeps its own condition.
+    assert next(step for step in steps if step.get("id") == "backup_restore")["if"] == root_step["if"]
+    tools, python = stub_tools(tmp_path)
+    source = fixture_source(tmp_path, python)
+    temp = tmp_path / "runner"
+    report = temp / "ci-evidence" / "root-session-lock.xml"
+    # (c), (d) A failing test run fails the step, its report stays, and sudo hands the report back to the runner user.
+    failed = run_step(root_step, source, tools, temp, STUB_EXIT="1")
+    assert failed.returncode == 1 and report.is_file(), failed.stderr
+    calls = (temp / "calls").read_text().splitlines()
+    run = next(line for line in calls if line.startswith("sudo env"))
+    for flags in ("PYTHONDONTWRITEBYTECODE=1", "-p no:cacheprovider", "-o junit_family=xunit1", f"--junitxml={report}"):
+        assert flags in run, flags
+    assert run.endswith(ROOT_NODE)
+    assert calls[-1].startswith("sudo chown ") and calls[-1].endswith(str(report))
+    report.unlink()
+    assert run_step(root_step, source, tools, temp).returncode == 0 and report.is_file()
+
+
+# spec: ANYM-429
+def test_a_tested_source_without_the_root_node_or_the_enricher_target_runs_neither_and_reads_blocked(tmp_path):
+    import time
+    steps = verify_steps()["verify"]["steps"]
+    start = named(steps, START_AUDIO)
+    root_step, audio = (next(step for step in steps if step.get("id") == name) for name in ("root_session_lock", "enricher_audio"))
+    tools, python = stub_tools(tmp_path)
+    for present in (False, True):
+        work = tmp_path / str(present)
+        source = fixture_source(work, python, node=present, target=present)
+        temp = work / "runner"
+        assert run_step(start, source, tools, temp).returncode == 0
+        for _ in range(100):  # the background build is a stub that finishes at once
+            if not present or (temp / "background" / "enricher-test.exit").exists():
+                break
+            time.sleep(0.1)
+        assert run_step(root_step, source, tools, temp).returncode == 0
+        assert run_step(audio, source, tools, temp, AUDIO_IMAGE_WAIT_SECONDS="5").returncode == 0
+        calls = (temp / "calls").read_text().splitlines() if (temp / "calls").exists() else []
+        runs = (sum(line.startswith("docker build") for line in calls), sum(line.startswith("sudo env") for line in calls),
+                sum(line.startswith("docker run") for line in calls))
+        reports = {path.name for path in (temp / "ci-evidence").iterdir()}
+        if present:
+            assert runs == (1, 1, 1) and reports == {"root-session-lock.xml", "enricher-audio.xml"}
+            assert "--target enricher-test" in next(line for line in calls if line.startswith("docker build"))
+            continue
+        assert runs == (0, 0, 0) and reports == set() and not any("--junitxml" in line for line in calls)
+        rows = module_rows(temp / "ci-evidence", {})
+        for module in ("root_session_lock", "enricher_audio"):
+            assert rows["deedkit-ci::" + module]["execution"]["status"] == "blocked"
+
+
+# spec: ANYM-429
+def test_both_shard_lines_deselect_exactly_the_nodes_the_module_steps_run():
+    import re
+    jobs = verify_steps()
+    nodes = {node.split("[")[0] for required in REQUIRED_EXECUTIONS.values() for node in required}
+    for job in ("verify", *SHARD_JOBS):
+        step = next(step for step in jobs[job]["steps"] if step.get("id") == "python")
+        assert set(re.findall(r"--deselect (\S+)", step["run"])) == nodes, job
+        assert step["run"].rstrip().endswith(" tests")
+    outcomes = next(step for step in jobs["verify"]["steps"] if step.get("name") == "Prepare honest CI evidence")["env"]
+    pairs = re.findall(r'"(\w+)":"\$\{\{ steps\.(\w+)\.outcome \}\}"', outcomes["MODULE_OUTCOMES"])
+    assert dict(pairs) == {name: name for name in FRAGMENTS["verify"][0]} and len(pairs) == len(FRAGMENTS["verify"][0])
