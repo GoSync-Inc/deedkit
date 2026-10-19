@@ -46,8 +46,9 @@ class GateCountingState(CollectorState):
     gate_checks = 0
 
     def connection_gate(self):
+        gate = super().connection_gate()
         type(self).gate_checks += 1
-        return super().connection_gate()
+        return gate
 
 
 def messages(*ids):
@@ -80,8 +81,8 @@ def connection(store, key):
     return operations['connection'], operations['live_capture']
 
 
-def run_collector(store, tmp_path, provider, until, state_class=CollectorState):
-    """Build a collector as a fresh process would, run it until `until()` holds, then stop it."""
+def run_collector(store, tmp_path, provider, until, state_class=CollectorState, settle=1.0):
+    """Build a collector, run it until `until()` holds and it has settled, then stop it."""
     archive = Archive(store)
     spool = CaptureSpool(tmp_path / ('capture-' + str(time.monotonic_ns())), reserve_bytes=0)
     collector = TelegramCollector(archive, ACCOUNT, provider, spool, batch_size=2, interval=60,
@@ -96,10 +97,32 @@ def run_collector(store, tmp_path, provider, until, state_class=CollectorState):
                 assert not running.done(), running.exception()
                 assert time.monotonic() < deadline, 'collector did not reach the expected state'
                 await asyncio.sleep(.05)
+            # Let the collector act on what it saw: a late provider read or connect must still show up.
+            await asyncio.sleep(settle)
+            assert not running.done(), running.exception()
         finally:
             collector.stopping.set()
             await asyncio.wait_for(running, 15)
     asyncio.run(scenario())
+
+
+def blocked_restart_probe(dsn_file, files, capture, key):
+    """Child-process body: a restarted collector with its own Store, observed while it runs."""
+    from messaging_service.store import Store
+    store = Store(Path(dsn_file).read_text().strip(), Path(files), 'http://testserver')
+    GateCountingState.gate_checks = 0
+    provider = FlowProvider(messages(1, 2, 3))
+    seen = []
+
+    def gate_checked_while_running():
+        if GateCountingState.gate_checks:
+            seen.append(connection(store, key))
+        return bool(seen)
+    try:
+        run_collector(store, Path(capture), provider, gate_checked_while_running, GateCountingState)
+    finally:
+        store.close()
+    return {'connection': seen[0][0], 'live_capture': seen[0][1], 'connects': provider.connects, 'reads': provider.reads}
 
 
 # spec: ANYM-415
@@ -119,10 +142,12 @@ def test_registered_policy_collects_allowed_chats_blocks_on_identity_mismatch_an
         assert c.execute('SELECT 1 FROM collector_leases WHERE account=%s', (ACCOUNT,)).fetchone() is None
         assert c.execute('SELECT 1 FROM collector_health WHERE account=%s', (ACCOUNT,)).fetchone() is None
     empty = cli('messaging_service', register, env)
-    assert empty.returncode != 0 and 'empty_collection_policy' in empty.stderr
+    assert empty.returncode != 0 and 'Traceback' in empty.stderr
+    assert empty.stderr.rstrip().splitlines()[-1] == 'ValueError: empty_collection_policy'
     other_platform = cli('messaging_service', ['register-account', '--account', ACCOUNT, '--platform', 'whatsapp',
         '--label', 'Synthetic flow', '--discover-chats'], env)
-    assert other_platform.returncode != 0 and 'account_identity_change' in other_platform.stderr
+    assert other_platform.returncode != 0 and 'Traceback' in other_platform.stderr
+    assert other_platform.stderr.rstrip().splitlines()[-1] == 'ValueError: account_identity_change'
     with store.pool.connection() as c:
         policy = c.execute('SELECT * FROM account_policies WHERE account=%s', (ACCOUNT,)).fetchone()
         assert (c.execute('SELECT platform FROM accounts WHERE id=%s', (ACCOUNT,)).fetchone()['platform']) == 'telegram'
@@ -148,19 +173,17 @@ def test_registered_policy_collects_allowed_chats_blocks_on_identity_mismatch_an
     # Identity mismatch: recorded by the collector, blocked for a fresh process that never connects.
     run_collector(store, tmp_path, FlowProvider(messages(1, 2, 3), identity_mismatch=True),
         lambda: connection(store, key)[0]['state'] == 'blocked')
-    GateCountingState.gate_checks = 0
-    blocked = FlowProvider(messages(1, 2, 3))
-    seen = []
-
-    def gate_checked_while_running():
-        if GateCountingState.gate_checks:
-            seen.append(connection(store, key))
-        return bool(seen)
-    run_collector(store, tmp_path, blocked, gate_checked_while_running, GateCountingState)
-    state, live = seen[0]
+    # The restart is a real child process: own interpreter, own Store, nothing shared with this one.
+    probe = subprocess.run([sys.executable, '-c',
+        'import json, sys, test_account_policy_flow as t; print(json.dumps(t.blocked_restart_probe(*sys.argv[1:])))',
+        str(dsn_file), str(tmp_path / 'files'), str(tmp_path), key],
+        env={**env, 'PYTHONPATH': str(Path(__file__).parent)}, capture_output=True, text=True, timeout=60)
+    assert probe.returncode == 0, probe.stderr
+    observed = json.loads(probe.stdout.strip().splitlines()[-1])
+    state, live = observed['connection'], observed['live_capture']
     assert state['state'] == 'blocked' and state['reason_code'] == 'telegram_identity_mismatch'
     assert live['state'] == 'paused' and live['reason_code'] == 'telegram_identity_mismatch'
-    assert blocked.connects == 0 and blocked.reads == []
+    assert observed['connects'] == 0 and observed['reads'] == []
     assert connection(store, key)[0]['state'] == 'blocked'
 
     # Owner resume: recorded once, refused the second time, then the collector connects and collects.
