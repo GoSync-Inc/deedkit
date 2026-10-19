@@ -232,6 +232,27 @@ def test_consumption_field_errors_with_a_lone_surrogate_are_dropped(tmp_path, en
 
 
 # spec: ANYM-295
+@pytest.mark.parametrize("entry", [
+    {"field": "operation", "reason": "enum", "expected": "a documented operation name"},
+    {"field": "request_id", "reason": "pattern", "expected": "8–128 characters: letters, digits and _ . : -"},
+    {"field": "description", "reason": "pattern", "expected": "no control characters except newline and tab"},
+    {"field": "refs", "reason": "size", "expected": "at most 8 KiB"},
+    {"field": "refs/message_ids", "reason": "max_items", "expected": "at most 32 items"},
+])
+def test_every_reviewed_feedback_hint_of_the_backend_is_relayed(tmp_path, entry):
+    rest = feedback_failure(tmp_path, 422, {"error": "invalid_feedback", "field_errors": [entry]})
+    assert rest.json()["field_errors"] == [entry]
+
+
+# spec: ANYM-295
+def test_consumption_version_limit_hint_is_relayed():
+    from agent_gateway.diagnostics import reviewed_field_errors
+    entries = [{"field": "version", "reason": "maximum", "expected": "at most 9007199254740991"}]
+    assert reviewed_field_errors("ack_subscription_events", entries) == entries
+    assert reviewed_field_errors("configure_subscription_delivery", entries) == entries
+
+
+# spec: ANYM-295
 @pytest.mark.parametrize("expected,relayed", [
     ("matching ^[a-z][a-z0-9_]*$", True),
     ("matching " + CANARY, False),

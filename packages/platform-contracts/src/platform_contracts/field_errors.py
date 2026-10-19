@@ -23,12 +23,13 @@ MAX_PATTERN = 80
 HINT_TEXTS = frozenset((
     "string", "integer", "number", "boolean", "array", "object",
     "text with a non-space character", "at most 8 KiB", "only the listed reference types",
-    "no control characters", "set when wake_rules has reply_to_confirmed_send",
+    "no control characters", "set when wake_rules has reply_to_confirmed_send", "a documented operation name",
+    "8–128 characters: letters, digits and _ . : -", "no control characters except newline and tab",
 ))
 HINT_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"[0-9]{1,6}–[0-9]{1,6} characters",
     r"at (?:least|most) [0-9]{1,6} (?:characters?|items)",
-    r"(?:at least|more than|at most|less than) -?[0-9]{1,15}(?:\.[0-9]{1,6})?",
+    r"(?:at least|more than|at most|less than) -?[0-9]{1,16}(?:\.[0-9]{1,6})?",
 ))
 
 

@@ -169,3 +169,23 @@ def test_messaging_shape_matches_the_shared_platform_contract():
     for entries in emitted:
         assert entries and shared.validated(entries) == entries
     assert shared.validated([{**emitted[0][0], 'expected': 'invented text'}]) is None
+
+
+# spec: ANYM-295
+def test_every_hint_literal_of_the_feedback_and_argument_checks_is_in_the_shared_hint_set():
+    import ast
+    import pathlib
+    import messaging_service
+    from platform_contracts import field_errors as shared
+    root = pathlib.Path(messaging_service.__file__).parent
+    found = set()
+    for name in ('feedback.py', 'app.py'):
+        for node in ast.walk(ast.parse((root / name).read_text())):
+            # `(field, reason, hint, ...)` error tuples; a hint may be a conditional between two literals.
+            if isinstance(node, ast.Tuple) and len(node.elts) >= 3 and isinstance(node.elts[0], ast.Constant) and (
+                    reasons := {n.value for n in ast.walk(node.elts[1]) if isinstance(n, ast.Constant) and isinstance(n.value, str)}) and reasons <= shared.REASONS:
+                found.update(n.value for n in ast.walk(node.elts[2]) if isinstance(n, ast.Constant) and isinstance(n.value, str))
+    assert {'8–128 characters: letters, digits and _ . : -', 'a documented operation name', 'at most 8 KiB',
+            'no control characters except newline and tab', 'string'} <= found
+    assert [hint for hint in sorted(found) if not shared.hint(hint)] == []
+    assert shared.hint('at most 9007199254740991') and not shared.hint('at most 90071992547409910')
