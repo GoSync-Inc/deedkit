@@ -103,8 +103,17 @@ def test_unknown_and_forbidden_chat_are_indistinguishable(seeded):
     with pytest.raises(APIError) as error:
         s.search(b,chats=['no-such-chat',forbidden])
     assert error.value.code=='not_found' and payload(error.value,'search')['fields']==['chats']
-    # A list that still names a readable chat intersects with the scope, as documented.
-    assert {r['chat'] for r in s.search(b,chats=['no-such-chat',forbidden,'telegram-demo-chat'])['items']}=={'telegram-demo-chat'}
+    # One unreadable name makes the list not_found, even beside a readable chat and other filters.
+    for kwargs in ({},{'accounts':['telegram-demo']},{'senders':['nobody']}):
+        for names in (['no-such-chat','telegram-demo-chat'],[forbidden,'telegram-demo-chat']):
+            with pytest.raises(APIError) as error:
+                s.search(b,chats=names,**kwargs)
+            assert error.value.code=='not_found'
+    # Malformed values keep invalid_filter, not not_found or a retryable database error.
+    for bad in ('x'*257,'x\x00'):
+        with pytest.raises(APIError) as error:
+            s.search(b,chat=bad)
+        assert error.value.code=='invalid_filter'
     assert s.search(a,chat=forbidden)['items']
     assert s.search(b,chats=[])['items']==[]
     assert s.search(b,chat='telegram-demo-chat')['items']
@@ -134,3 +143,17 @@ def test_reply_to_resolves_a_whatsapp_native_reference(seeded):
     by_id={i['id']:i for i in items}
     assert by_id[reply]['reply_to']['message_id']==target and by_id[reply]['reply_to']['snippet']=='Исходное сообщение группы'
     assert 'reply_to' not in by_id[miss]
+
+
+# spec: ANYM-253
+def test_reply_to_sender_name_ignores_a_deleted_profile_source(replies):
+    s,key,add=replies
+    target=add('100','10',1,body='Исходное',sender='7')
+    named=add('100','11',2,body='позже',sender='7',sender_profile={'display_name':'DELETED_PROFILE_NAME'})
+    reply=add('100','12',3,body='ответ',metadata={'reply_to_provider_id':'10'})
+    with s.pool.connection() as c:
+        c.execute('UPDATE messages SET deleted=true WHERE id=%s',(named,))
+    for view in ('conversation','archive'):
+        item=next(i for i in render('search',s.search(key,compact=True,view=view),'compact')['items'] if i['id']==reply)
+        assert item['reply_to']['message_id']==target
+        assert 'sender_name' not in item['reply_to'] and 'DELETED_PROFILE_NAME' not in str(item)

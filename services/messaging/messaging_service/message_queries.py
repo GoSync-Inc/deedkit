@@ -103,6 +103,8 @@ def reply_context(c, p, rows):
             JOIN messages m ON m.account=r.account AND m.chat=r.chat AND NOT m.deleted AND '''+where+'''
               AND '''+('m.provider_id=r.ref' if exact else native)+'''
             LEFT JOIN sender_profiles sp ON sp.account=m.account AND sp.chat=m.chat AND sp.sender=m.sender
+              AND EXISTS(SELECT 1 FROM messages source WHERE source.id=sp.source_message
+                AND source.account=m.account AND source.chat=m.chat AND source.sender=m.sender AND NOT source.deleted)
             ORDER BY r.idx,m.sent_at,m.id''',
                 [[i for i,_ in todo],[r['account'] for _,r in todo],[r['chat'] for _,r in todo],
                  [r['reply_to_provider_id'] for _,r in todo],[r.get('provider_chat_id') or '' for _,r in todo],*scope]).fetchall():
@@ -190,19 +192,18 @@ def filters(p, *, account='',chat='',sender='',accounts=None,chats=None,senders=
 
 
 def named_chats(c, p, chat='', chats=None):
-    """A named chat that is unknown or outside the key's scope is one not_found.
+    """Every explicitly named chat that is unknown or outside the key's scope is one not_found.
 
     The code and text are the same for both, so the answer never says whether the chat exists.
-    A chats list that still names a readable chat intersects with the scope as before; one that
-    names nothing readable is not_found. chats=[] names nothing and matches nothing.
+    chats=[] names nothing and matches nothing. Malformed values keep invalid_filter.
     """
     from .store import APIError
-    chat=chat if isinstance(chat,str) else ''  # a non-string is rejected by the search itself
-    for parameter,names in (('chat',[chat] if chat else []),('chats',filter_values(chats) or [])):
+    for parameter,names in (('chat',[valid_text(chat)] if chat else []),('chats',filter_values(chats) or [])):
         if not names:
             continue
         where,args=scope_filter(p,'c',chat_column='id')
-        if not c.execute('SELECT 1 FROM chats c WHERE c.id=ANY(%s) AND '+where+' LIMIT 1',[names,*args]).fetchone():
+        known={r['id'] for r in c.execute('SELECT c.id FROM chats c WHERE c.id=ANY(%s) AND '+where,[names,*args])}
+        if any(name not in known for name in names):
             failure=APIError('not_found',404);failure.fields=[parameter]
             raise failure
 

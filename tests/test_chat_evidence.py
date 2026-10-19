@@ -79,10 +79,11 @@ def test_hidden_and_absent_chats_have_identical_empty_diagnostics(seeded):
     # ANYM-253: search names a hidden or absent chat with one not_found instead of an empty page.
     for chat in ('whatsapp-demo-1-chat','absent'):
         with pytest.raises(APIError,match='not_found'):s.search(b,'missing',chat=chat)
-    hidden=s.search(b,'missing',chats=['whatsapp-demo-1-chat','telegram-demo-chat'])['result_evidence']
-    absent=s.search(b,'missing',chats=['absent','telegram-demo-chat'])['result_evidence']
-    assert hidden==absent
-    assert hidden['empty_reason']=='not_found_or_not_permitted'
+    errors=[]
+    for chat in ('whatsapp-demo-1-chat','absent'):
+        with pytest.raises(APIError) as error:s.search(b,'missing',chat=chat)
+        errors.append((error.value.code,error.value.status,getattr(error.value,'fields',None)))
+    assert errors[0]==errors[1]
     for chat in ('whatsapp-demo-1-chat','absent'):
         with pytest.raises(APIError,match='not_found'):s.get_sync_status(b,chat_id=chat)
     assert s.search(b,accounts=[],query='missing')['result_evidence']['empty_reason']=='empty_filter'

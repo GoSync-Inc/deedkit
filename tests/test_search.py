@@ -14,14 +14,15 @@ def ids(result):
 
 def test_multi_filters_intersect_scope_and_legacy_filters(seeded):
     s,a,b=seeded
-    chats=['telegram-demo-chat','whatsapp-demo-1-chat','whatsapp-demo-2-chat']
+    chats=['telegram-demo-chat','whatsapp-demo-1-chat']  # ANYM-253: a named chat outside the scope is not_found
     assert ids(s.search(a,chats=chats,senders=['demo-person-1','demo-person-3']))==['demo-tg-1','demo-wa-1']
-    assert ids(s.search(b,chats=chats,accounts=['whatsapp-demo-1','telegram-demo']))==['demo-tg-1','demo-tg-2']
+    assert ids(s.search(b,chats=['telegram-demo-chat'],accounts=['whatsapp-demo-1','telegram-demo']))==['demo-tg-1','demo-tg-2']
     assert ids(s.search(a,chats=chats,chat='telegram-demo-chat',sender='demo-person-1'))==['demo-tg-1']
     for field in ['accounts','chats','senders']:
         assert ids(s.search(a,**{field:[]}))==[]
     s.set_access('agent-a',chats=['telegram-demo-chat'])
-    assert ids(s.search(a,chats=chats))==['demo-tg-1','demo-tg-2']
+    assert ids(s.search(a,chats=['telegram-demo-chat']))==['demo-tg-1','demo-tg-2']
+    with pytest.raises(APIError,match='not_found'):s.search(a,chats=chats)
     assert s.get_updates(a,'search-only')['ack_version']==0
 
 
@@ -108,7 +109,7 @@ def test_invalid_search_parameters_have_safe_errors(seeded,params):
 
 def test_rest_and_mcp_share_extended_filters_and_keep_scope(seeded):
     s,a,b=seeded
-    kwargs={'view':'archive','chats':['telegram-demo-chat','whatsapp-demo-1-chat'],
+    kwargs={'view':'archive','chats':['telegram-demo-chat'],
             'senders':['demo-person-1'],'query':'Маяк OR Atlas','query_mode':'web','order':'desc'}
     with TestClient(create_app(s,['testserver'])) as client:
         headers={'Authorization':'Bearer '+b,'Accept':'application/json, text/event-stream'}
