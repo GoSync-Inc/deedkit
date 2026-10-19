@@ -89,6 +89,8 @@ def title_sql(chat='c'):
 
 # ANYM-276: one fixed integer per component; a row's priority is the sum of its non-zero components.
 DEMOTIONS={'one_way_chat':-60,'provider_business_or_verified':-40,'own_account':-80,'closing_courtesy':-30,'observed_bot':-20}
+# A person's question that mentions the owner in a group outranks a demoted one-way private mailing (owner decision 2026-10-19).
+OWNER_QUESTION=40
 COURTESY_WORDS=('спасибо','спс','благодарю','ок','окей','хорошо','ясно','понятно','понял','поняла','принято','отлично','супер',
     'взаимно','пожалуйста','thanks','thank you','thx','ty','ok','okay','noted','got it','great','perfect','cool','appreciated',
     'terima kasih','makasih','trims','oke','siap','baik','sip','mantap','ya','iya')
@@ -189,17 +191,19 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     waited="greatest(0,extract(epoch FROM (score_clock.at-attention.sent_at))/3600)"
     waiting="least(20,floor(sqrt("+waited+"))::integer)"
     # Each component is a CASE yielding its points or NULL; the score is their sum and the reasons their keys.
+    own_sender="coalesce((score_clock.owners->(a.platform||'|'||attention.sender))-c.account<>'[]'::jsonb,false)"
     def demotion(code,condition):return code,f'CASE WHEN {condition} THEN {DEMOTIONS[code]} END'
     components=[('private_chat',"CASE WHEN c.chat_type='private' THEN 100 END"),
         ('group_attention',"CASE WHEN c.chat_type IS DISTINCT FROM 'private' THEN 25 END"),
         ('question_mark','CASE WHEN attention.question THEN 25 END'),
         ('provider_contact','CASE WHEN attention.known_contact THEN 10 END'),
+        ('owner_question',f"CASE WHEN c.chat_type='group' AND attention.basis='owner_mention' AND attention.question AND NOT coalesce(attention.bot,false) AND NOT coalesce(attention.business,false) AND NOT {own_sender} THEN {OWNER_QUESTION} END"),
         ('waiting_age_capped',f'CASE WHEN {waiting}>=20 THEN 20 END'),
         ('waiting_age',f'CASE WHEN {waiting} BETWEEN 1 AND 19 THEN {waiting} END'),
         demotion('one_way_chat',"c.chat_type='private' AND own_last.sent_at IS NULL"),
         demotion('provider_business_or_verified','coalesce(attention.business,false)'),
         demotion('observed_bot',"c.chat_type='group' AND coalesce(attention.bot,false)"),
-        demotion('own_account',"coalesce((score_clock.owners->(a.platform||'|'||attention.sender))-c.account<>'[]'::jsonb,false)"),
+        demotion('own_account',own_sender),
         demotion('closing_courtesy','coalesce(attention.courtesy,false)')]
     score='('+'+'.join(f'coalesce({sql},0)' for _,sql in components)+')'
     broadcast="(c.chat_type='private' AND own_last.sent_at IS NULL OR coalesce(attention.business,false))"

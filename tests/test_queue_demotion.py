@@ -20,7 +20,7 @@ def structured(response):
     return body['result']['structuredContent']
 
 CODES={'private_chat','group_attention','question_mark','provider_contact','waiting_age','waiting_age_capped',
-    'one_way_chat','provider_business_or_verified','observed_bot','own_account','closing_courtesy'}
+    'one_way_chat','provider_business_or_verified','observed_bot','own_account','closing_courtesy','owner_question'}
 OWNER_SENDER='OWNER2'
 
 
@@ -152,7 +152,7 @@ def test_unknown_provider_flags_do_not_demote(demote):
     by_chat=rows()
     for chat in ('100','200','300'):
         assert set(components(by_chat[chat]))=={'private_chat','question_mark','waiting_age'},components(by_chat[chat])
-    assert set(components(by_chat['400']))=={'group_attention','question_mark','waiting_age'}
+    assert set(components(by_chat['400']))=={'group_attention','question_mark','waiting_age','owner_question'}
     assert by_chat['100']['awaiting_reply_priority']==125+components(by_chat['100'])['waiting_age']
 
 
@@ -306,3 +306,43 @@ def test_excluded_total_honours_only_unread_like_the_other_totals(demote):
     # Only the mailing that passes the unread filter is counted as excluded; the read and unknown ones are not in the population.
     assert both['excluded_likely_broadcasts_total']==1 and both['awaiting_reply_total']==1
     assert queue(exclude_likely_broadcasts=True)['excluded_likely_broadcasts_total']==3
+
+
+# spec: ANYM-276
+def test_group_owner_mention_question_outranks_one_way_mailing(demote):
+    s,ar,key,add,history,queue,rows=demote
+    # Live shape 2026-10-19: a 10-day-old one-way private mailing with a question mark (no owner message, no contact).
+    add('mailing','1',240,body='Your statement is ready. Questions? Call us?',sender='BANK')
+    # Two people's questions to the owner in groups: one from a provider contact, one from a stranger.
+    add('g1','1',20,chat_type='group',body='@owner can you confirm?',sender='P1',mentions_owner=True,sender_is_contact=True)
+    add('g2','1',3,chat_type='group',body='@owner where is the file?',sender='P2',mentions_owner=True)
+    got=rows()
+    assert components(got['mailing'])['one_way_chat']==-60
+    for chat in ('g1','g2'):
+        assert components(got[chat])['owner_question']==40
+        assert got[chat]['awaiting_reply_priority']>got['mailing']['awaiting_reply_priority'],chat
+    order=[r['provider_chat_id'] for r in queue(order='priority',limit=100)['items']]
+    assert order.index('mailing')>max(order.index('g1'),order.index('g2'))
+
+
+# spec: ANYM-276
+def test_owner_question_bonus_is_narrow(demote):
+    s,ar,key,add,history,queue,rows=demote
+    def group(chat, body='@owner can you confirm?', sender=None, **metadata):
+        add(chat,'1',5,chat_type='group',body=body,sender=sender or 'S'+chat,**{'mentions_owner':True,**metadata})
+    add('o2','1',500,direction='outgoing',sender=OWNER_SENDER,account='demote-tg2',body='Synthetic owner message')
+    group('plain')
+    group('statement',body='@owner the report is ready')
+    group('bot',sender_is_bot=True)
+    group('business',sender_is_business_or_verified=True)
+    group('own',sender=OWNER_SENDER)
+    group('reply_only',mentions_owner=False,reply_to_owner=True)
+    add('chan','1',5,chat_type='channel',body='Weekly digest, questions?',sender='S',mentions_owner=True)
+    history('priv');add('priv','1',5,body='@owner can you confirm?',sender='Spriv',mentions_owner=True)
+    got=rows()
+    assert components(got['plain'])['owner_question']==40
+    for chat in ('statement','bot','business','own','reply_only','priv'):
+        assert 'owner_question' not in components(got[chat]),chat
+    assert 'chan' not in got
+    # Every private question without a demotion still outranks the best group hint, bonus included.
+    assert got['priv']['awaiting_reply_priority']>got['plain']['awaiting_reply_priority']
