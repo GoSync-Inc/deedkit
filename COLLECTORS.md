@@ -113,8 +113,9 @@ with `capture_overload` when more than 512 callbacks wait, or when one
 callback waits longer than 30 seconds for a slot. The two bounds mean
 different things, so `live_capture.last_capture_stop.detail` and the
 supervisor line name the one that tripped: `waiters_limit` is a burst larger
-than the queue, `slot_wait_timeout` means 16 writes made no progress for 30
-seconds, which points at the disk or spool rather than at Telegram. The
+than the queue, `slot_wait_timeout` means one callback waited more than 30
+seconds for a slot because capture writes could not keep up; a slow disk or
+spool is a likely cause, not a proven one. The
 overloading callback writes nothing, and neither do the up to 512 callbacks
 still waiting at the stop. Reconciliation after the restart re-reads their
 messages as above; their deletions, read receipts and owner reads are lost,

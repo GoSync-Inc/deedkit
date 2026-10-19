@@ -521,12 +521,20 @@ def test_capture_stop_detail_is_kept_in_live_capture_status(worker):
 # spec: ANYM-291
 def test_capture_overload_stop_keeps_which_bound_tripped(worker):
     w,s,_=worker
-    for detail in ['waiters_limit','slot_wait_timeout','disk_reserve','synthetic-private']:
-        w.state.connection_failed('capture_overload',detail)
-        with s.pool.connection() as c:
-            stop=c.execute('SELECT operations FROM collector_health WHERE account=%s',(w.account,)).fetchone()['operations']['live_capture']['last_capture_stop']
-        assert stop['code']=='capture_overload'
-        assert stop['detail']==(detail if detail in ('waiters_limit','slot_wait_timeout') else None)
+    class LooksSafe(str):
+        # Private text whose hash and equality pretend to be a fixed detail.
+        def __eq__(self,other):return other==self.target
+        def __hash__(self):return hash(self.target)
+    for code,target in [('capture_overload','waiters_limit'),('durable_capture_failed','disk_reserve')]:
+        spoof=LooksSafe('synthetic-private-detail');spoof.target=target
+        for detail in ['waiters_limit','slot_wait_timeout','disk_reserve','synthetic-private',spoof,['waiters_limit']]:
+            w.state.connection_failed(code,detail)
+            with s.pool.connection() as c:
+                stop=c.execute('SELECT operations FROM collector_health WHERE account=%s',(w.account,)).fetchone()['operations']['live_capture']['last_capture_stop']
+            fixed={'capture_overload':('waiters_limit','slot_wait_timeout'),'durable_capture_failed':('disk_reserve',)}[code]
+            assert stop['code']==code
+            assert stop['detail']==(detail if type(detail) is str and detail in fixed else None)
+            assert 'synthetic-private' not in str(stop)
 
 
 # spec: ANYM-291

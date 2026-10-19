@@ -202,8 +202,9 @@ class CollectorState:
 
     def connection_failed(self,code,detail=None):
         if code not in CONNECTION_ERRORS:code='provider_disconnected'
-        if not (code=='durable_capture_failed' and detail in CAPTURE_STOP_DETAILS
-                or code=='capture_overload' and detail in OVERLOAD_STOP_DETAILS):detail=None
+        # Exactly a built-in str of the fixed vocabulary; a str subclass could fake equality.
+        if not (type(detail) is str and (code=='durable_capture_failed' and detail in CAPTURE_STOP_DETAILS
+                or code=='capture_overload' and detail in OVERLOAD_STOP_DETAILS)):detail=None
         with self.archive.store.pool.connection() as c:
             row=self._operations(c);value=row['operations'];now=row['observed']
             attempts=min(1024,value.get('connection',{}).get('retry_attempts',0)+1)
