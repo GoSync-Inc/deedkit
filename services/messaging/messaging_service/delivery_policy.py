@@ -126,7 +126,7 @@ def _now(c):
 
 
 def _binding(c, row):
-    return c.execute('''SELECT receiver,policy,policy_version,silence_deadline FROM subscription_delivery
+    return c.execute('''SELECT receiver,policy,policy_version,silence_deadline,configured_at FROM subscription_delivery
         WHERE subscription=%s''', (row['id'],)).fetchone()
 
 
@@ -259,7 +259,8 @@ def _absorb_page(c, row, binding, window, limit):
             'historical': item['origin'] in ('backfill', 'reconcile')}, row['selector'])
         reasons.update(found)
         if (binding is not None and _armed(row, binding) and window['silence_state'] is None and
-                'reply_to_confirmed_send' in found and item['matched_at'] < binding['silence_deadline']):
+                'reply_to_confirmed_send' in found and
+                binding['configured_at'] <= item['matched_at'] < binding['silence_deadline']):
             window['silence_state'] = 'replied'
     if window['first_match_at'] is None:
         window['first_match_at'] = matches[0]['matched_at']
