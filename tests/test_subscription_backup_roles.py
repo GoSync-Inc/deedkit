@@ -114,7 +114,7 @@ def test_native_schema26_quarantine_closes_versions_preserves_refs_and_revokes_r
             assert connection.execute('SELECT count(*) AS n FROM subscription_receipts').fetchone()['n'] == 0
             assert after['subscription_consumption'] == before['subscription_consumption']
             assert after['agent_feedback'] == before['agent_feedback']
-        assert len(after) == 64 and after['subscriptions']['rows'] == 2
+        assert len(after) == 65 and after['subscriptions']['rows'] == 2
         assert all(row['state'] == 'closed' and row['version'] == before_versions[str(row['id'])] + 1
             for row in definitions)
         assert after['subscription_sources'] == before['subscription_sources']
