@@ -92,14 +92,37 @@ def release_delivered_fence(store,work,backup_id):
     return result
 
 
+def abandon_unpublished_fence(store,work,backup_id):
+    """The host's deliberate abandonment of a stopped capture that published nothing.
+
+    Ends only this job's fence and reads nothing else; a repeat reports the same
+    result. Absent means the capture stopped before its fence committed: the
+    lifecycle lock waits out a begin that was still in flight.
+    """
+    from .backup_receiver import BACKUP_ID
+    if not isinstance(backup_id,str) or not BACKUP_ID.fullmatch(backup_id):raise ValueError('invalid_backup_id')
+    from .file_lifecycle import end_backup_fence,lifecycle_lock
+    row=None
+    with store.pool.connection() as c:
+        if int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])>=33:
+            lifecycle_lock(c)
+            row=c.execute('SELECT ended_at FROM attachment_backup_fences WHERE id=%s',(backup_id,)).fetchone()
+            if row is not None and row['ended_at'] is None:end_backup_fence(c,backup_id)
+    result={'id':backup_id,'backup_fence':backup_id,'status':'fence_absent' if row is None else 'fence_released'}
+    write_json(Path(work)/'fence-abandoned.json',result)
+    return result
+
+
 def run(config):
-    if config.get('action')=='release_fence':
+    if config.get('action') in ('release_fence','abandon_fence'):
         if set(config)!={'action','id','dsn_file','work_directory'}:raise ValueError('invalid_backup_worker_config')
         work=Path(config['work_directory'])
         if work.is_symlink() or not work.is_dir() or work.stat().st_mode&0o077:
             raise ValueError('private_work_directory_required')
         store=Store(Path(config['dsn_file']).read_text().strip(),work,'http://backup.invalid')
-        try:return release_delivered_fence(store,work,config['id'])
+        try:
+            if config['action']=='abandon_fence':return abandon_unpublished_fence(store,work,config['id'])
+            return release_delivered_fence(store,work,config['id'])
         finally:store.close()
     required={'id','dsn_file','files_directory','recovery_config_file','recipient_file','work_directory'}
     if set(config)-{'mode'}!=required or config.get('mode','staged_v1') not in ('staged_v1','stream_v2'):

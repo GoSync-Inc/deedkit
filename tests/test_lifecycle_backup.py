@@ -319,3 +319,243 @@ def test_invalid_capture_fence_is_rejected_without_cleanup_masking_the_error(bac
     store,*_=backup_seeded
     with pytest.raises(ValueError,match='invalid_backup_fence'):
         create_snapshot(store,tmp_path/'capture',[sys.executable,'-c','print("synthetic dump")'],backup_fence='../invalid')
+
+
+OTHER_FENCE='synthetic-other-backup'
+
+
+def fence_ended(store,token):
+    with store.pool.connection() as c:
+        row=c.execute('SELECT ended_at FROM attachment_backup_fences WHERE id=%s',(token,)).fetchone()
+    return None if row is None else row['ended_at'] is not None
+
+
+def abandon_runner(store,tmp_path,mode='staged',*,begin=True):
+    """A capture stopped during pg_dump: its fence is open, only a private temporary exists."""
+    import os
+    import shutil
+    from messaging_service import backup_worker
+    from messaging_service.backup_runner import read_json
+    from test_backup_operations import runner_fixture
+    runner,docker=runner_fixture(tmp_path)
+    if mode=='stream':runner.cfg={**runner.cfg,'delivery_mode':'stream_v2'}
+    runner.prepare();work=tmp_path/runner.journal['id']
+    docker.call('stop','--time','25','tg-id');runner.journal['phase']='capturing';runner.save()
+    runner.create_worker(work);docker.call('start',runner.journal['container'])
+    for name in ('snapshot','captured.json'):  # The fake worker publishes at start; this one is still in pg_dump.
+        path=work/name;path.unlink() if path.is_file() else shutil.rmtree(path)
+    (work/'.backup-pg').mkdir();(work/'.backup-pg/database.dump').write_bytes(b'PARTIAL_SYNTHETIC_DUMP')
+    docker.hold_worker=True
+    with store.pool.connection() as c:
+        if begin:c.execute('SELECT public.begin_backup_fence(%s)',(work.name,))
+        c.execute('SELECT public.begin_backup_fence(%s)',(OTHER_FENCE,))
+    def isolated(work):
+        # The runner's own container config, with only its two secret paths mapped.
+        assert sorted(p.name for p in work.iterdir())==['fence-abandon.json']
+        config=read_json(work/'fence-abandon.json')
+        assert config=={'action':'abandon_fence','id':work.name,'dsn_file':'/run/secrets/database_url','work_directory':'/work'}
+        try:backup_worker.run({**config,'dsn_file':os.environ['PROBE_TEST_DSN_FILE'],'work_directory':str(work)})
+        except Exception:return 1
+        return 0
+    docker.fence_worker=isolated
+    return runner,docker,work
+
+
+# spec: ANYM-305
+@pytest.mark.parametrize('mode',['staged','stream'])
+def test_recover_stop_ends_the_fence_of_a_capture_stopped_during_pg_dump(backup_seeded,tmp_path,mode):
+    from messaging_service.backup_runner import read_json
+    from messaging_service.file_lifecycle import LifecycleWorker
+    store,*_=backup_seeded;runner,docker,work=abandon_runner(store,tmp_path,mode)
+    with store.pool.connection() as c:c.execute('SELECT public.end_backup_fence(%s)',(OTHER_FENCE,))
+    assert LifecycleWorker(store).run_once()['reasons'].get('backup_active')==1
+    runner.recover_stop()
+    assert fence_ended(store,work.name) is True
+    assert 'backup_active' not in LifecycleWorker(store).run_once()['reasons']
+    assert not work.exists() and not (tmp_path/'journal.json').exists()
+    assert docker.containers['tg-id']['State']['Running']
+    status=read_json(tmp_path/'status.json')
+    assert status['abandoned_id']==work.name and status['abandoned_fence']=='fence_released'
+    release=[call for call in docker.calls if call[0]=='create' and 'pos-backup-abandon-'+work.name.lower() in call][0]
+    assert not any('/sources/' in arg or ',dst=/data,' in arg or '/recipient' in arg or 'identity' in arg for arg in release)
+    assert 'no-new-privileges' in release and 'personal-os.backup.action=abandon_fence' in release
+    assert not any(name.startswith('pos-backup-') for name in docker.containers)
+
+
+# spec: ANYM-305
+def test_recover_stop_never_ends_a_fence_while_the_capture_may_still_run(backup_seeded,tmp_path):
+    store,*_=backup_seeded;runner,docker,work=abandon_runner(store,tmp_path)
+    original=docker.call
+    def stuck(*args):
+        if args[0]=='stop' and args[-1]==runner.journal['container']:docker.calls.append(args);return ''
+        return original(*args)
+    docker.call=stuck
+    with pytest.raises(RuntimeError,match='backup_shutdown_unverified'):runner.recover_stop()
+    assert fence_ended(store,work.name) is False and (tmp_path/'journal.json').exists() and work.is_dir()
+    assert not any(call[0]=='create' and 'pos-backup-abandon-' in ' '.join(call) for call in docker.calls)
+
+
+# spec: ANYM-305
+@pytest.mark.parametrize('mode',['staged','stream'])
+def test_recover_stop_keeps_a_capture_published_before_the_phase_update(backup_seeded,tmp_path,mode):
+    from messaging_service.backup_runner import Runner,read_json
+    from test_backup_operations import runner_fixture
+    from test_backup_streaming import streaming_runner
+    store,*_=backup_seeded
+    async def stream_send(path,metadata,transfer,timeout,start,completed,stopped=None):
+        start(True);result=await completed()
+        return {**result,'status':'stored','duplicate':False}
+    runner,docker=streaming_runner(tmp_path,stream_send) if mode=='stream' else runner_fixture(tmp_path)
+    runner.prepare();work=tmp_path/runner.journal['id']
+    with store.pool.connection() as c:c.execute('SELECT public.begin_backup_fence(%s)',(work.name,))
+    published='upload' if mode=='staged' else 'stream_upload'
+    original=runner.save
+    def terminated():
+        # SIGTERM lands after the worker published, before the runner records it.
+        if runner.journal['phase']==published:raise InterruptedError('backup_interrupted')
+        original()
+    runner.save=terminated
+    with pytest.raises(InterruptedError):runner.run()
+    assert read_json(tmp_path/'journal.json')['phase']=='capturing'
+    artifact=work/('result.json' if mode=='staged' else 'snapshot/private')
+    before=artifact.read_bytes()
+    runner2=Runner(runner.cfg,docker=docker,sleep=lambda _:None,send=runner.send,stream_send=runner.stream_send)
+    runner2.recover_stop()
+    assert fence_ended(store,work.name) is False
+    assert read_json(tmp_path/'journal.json')['id']==work.name and artifact.read_bytes()==before
+    assert not any(call[0]=='create' and 'pos-backup-abandon-' in ' '.join(call) for call in docker.calls)
+    assert docker.containers['tg-id']['State']['Running']
+    # The retry delivers the same capture instead of a new cold snapshot.
+    creates=sum(call[0]=='create' for call in docker.calls)
+    runner2.run()
+    assert read_json(tmp_path/'status.json')['state']=='ok' and (work/'delivery.json').is_file()
+    assert sum(call[0]=='create' for call in docker.calls)==creates+(mode=='stream')
+
+
+# spec: ANYM-305
+def test_stream_upload_keeps_its_fence_for_retry_after_recover_stop(backup_seeded,tmp_path):
+    from messaging_service.backup_runner import read_json
+    from test_backup_streaming import streaming_runner
+    store,*_=backup_seeded
+    async def send(path,metadata,transfer,timeout,start,completed,stopped=None):raise RuntimeError('receiver_quota')
+    runner,docker=streaming_runner(tmp_path,send);runner.prepare();work=tmp_path/runner.journal['id']
+    with store.pool.connection() as c:c.execute('SELECT public.begin_backup_fence(%s)',(work.name,))
+    with pytest.raises(RuntimeError,match='receiver_quota'):runner.run()
+    runner.recover_stop()
+    assert fence_ended(store,work.name) is False and read_json(tmp_path/'journal.json')['phase']=='stream_upload'
+    assert (work/'snapshot').is_dir()
+
+
+# spec: ANYM-305
+@pytest.mark.parametrize('fenced',[True,False])
+def test_abandonment_is_idempotent_by_job_id_and_ends_no_other_fence(backup_seeded,tmp_path,fenced):
+    from messaging_service.backup_runner import read_json
+    store,*_=backup_seeded;runner,docker,work=abandon_runner(store,tmp_path,begin=fenced)
+    isolated=docker.fence_worker
+    def restart(work):
+        # The release commits, then the host dies before it reads the marker or cleans up.
+        assert isolated(work)==0;raise InterruptedError('backup_interrupted')
+    docker.fence_worker=restart
+    with pytest.raises(RuntimeError,match='backup_fence_retained'):runner.recover_stop()
+    assert read_json(tmp_path/'journal.json')['phase']=='abandoning'
+    expected='fence_released' if fenced else 'fence_absent'
+    assert read_json(work/'fence-abandoned.json')['status']==expected
+    docker.fence_worker=isolated;runner.recover_stop()
+    status=read_json(tmp_path/'status.json')
+    assert status['abandoned_id']==work.name and status['abandoned_fence']==expected
+    runner.recover_stop()
+    assert read_json(tmp_path/'status.json')==status
+    assert fence_ended(store,work.name) is (True if fenced else None)
+    assert fence_ended(store,OTHER_FENCE) is False
+    assert not work.exists() and not (tmp_path/'journal.json').exists()
+    assert not any(name.startswith('pos-backup-') for name in docker.containers)
+
+
+# spec: ANYM-305
+@pytest.mark.parametrize('failure',['release_failed','acknowledgement_lost'])
+def test_unconfirmed_release_retains_the_journal_until_a_read_back(backup_seeded,tmp_path,failure):
+    from messaging_service.backup_runner import read_json
+    store,*_=backup_seeded;runner,docker,work=abandon_runner(store,tmp_path)
+    isolated=docker.fence_worker
+    def failing(work):
+        if failure=='release_failed':return 1
+        assert isolated(work)==0;(work/'fence-abandoned.json').unlink();return 1
+    docker.fence_worker=failing
+    with pytest.raises(RuntimeError,match='backup_fence_retained'):runner.recover_stop()
+    status=read_json(tmp_path/'status.json')
+    assert status['state']=='error' and status['error_code']=='backup_fence_retained'
+    assert read_json(tmp_path/'journal.json')['phase']=='abandoning' and work.is_dir()
+    assert fence_ended(store,work.name) is (failure=='acknowledgement_lost')
+    assert docker.containers['tg-id']['State']['Running']
+    docker.fence_worker=isolated
+    if failure=='release_failed':runner.recover_stop()
+    else:
+        # The next scheduled run reads the outcome back before a new capture.
+        docker.hold_worker=False;runner.run()
+    status=read_json(tmp_path/'status.json')
+    assert status['error_code' if failure=='release_failed' else 'state']==('backup_job_failed' if failure=='release_failed' else 'ok')
+    assert status['abandoned_id']==work.name and status['abandoned_fence']=='fence_released'
+    assert fence_ended(store,work.name) is True and fence_ended(store,OTHER_FENCE) is False
+    assert not work.exists()
+
+
+# spec: ANYM-305
+def test_abandon_action_needs_only_the_dsn_and_job_id(backup_seeded,tmp_path):
+    import os
+    from messaging_service.backup_worker import run
+    store,*_=backup_seeded;backup_id='20261019T000000Z-0123456789abcdef'
+    work=tmp_path/'work';work.mkdir(mode=0o700)
+    config={'action':'abandon_fence','id':backup_id,'dsn_file':os.environ['PROBE_TEST_DSN_FILE'],'work_directory':str(work)}
+    with store.pool.connection() as c:
+        c.execute('SELECT public.begin_backup_fence(%s)',(backup_id,))
+        c.execute('SELECT public.begin_backup_fence(%s)',(OTHER_FENCE,))
+    for extra in ({'files_directory':str(store.files)},{'mode':'stream_v2'}):
+        with pytest.raises(ValueError,match='invalid_backup_worker_config'):run({**config,**extra})
+    with pytest.raises(ValueError,match='invalid_backup_id'):run({**config,'id':OTHER_FENCE})
+    assert fence_ended(store,backup_id) is False
+    assert run(config)['status']=='fence_released' and run(config)['status']=='fence_released'
+    assert fence_ended(store,backup_id) is True and fence_ended(store,OTHER_FENCE) is False
+    assert sorted(p.name for p in work.iterdir())==['fence-abandoned.json']
+
+
+# spec: ANYM-305
+@pytest.mark.parametrize('helper',['created','running'])
+def test_restart_settles_a_leftover_abandon_helper_before_reading_back(backup_seeded,tmp_path,helper):
+    from messaging_service.backup_runner import read_json
+    store,*_=backup_seeded;runner,docker,work=abandon_runner(store,tmp_path)
+    name='pos-backup-abandon-'+work.name.lower();isolated=docker.fence_worker;original=docker.call
+    def host_dies(*args):
+        # The host dies after creating the helper, or while the helper still runs.
+        if helper=='created' and args[:2]==('start',name):raise InterruptedError('backup_interrupted')
+        return original(*args)
+    def still_running(work):raise InterruptedError('backup_interrupted')
+    docker.call=host_dies
+    if helper=='running':docker.fence_worker=still_running
+    with pytest.raises(RuntimeError,match='backup_fence_retained'):runner.recover_stop()
+    assert docker.containers[name]['State']['Running'] is (helper=='running')
+    docker.call=original;docker.fence_worker=isolated;docker.hold_worker=False
+    runner.run()  # The next scheduled run reads back, then takes a new capture.
+    status=read_json(tmp_path/'status.json')
+    assert status['state']=='ok' and status['abandoned_id']==work.name and status['abandoned_fence']=='fence_released'
+    assert fence_ended(store,work.name) is True and fence_ended(store,OTHER_FENCE) is False
+    assert ('rm',name) in docker.calls and not work.exists()
+
+
+# spec: ANYM-305
+def test_read_back_clears_the_retained_error_before_the_journal_goes(backup_seeded,tmp_path,monkeypatch):
+    from pathlib import Path
+    from messaging_service.backup_runner import read_json
+    store,*_=backup_seeded;runner,docker,work=abandon_runner(store,tmp_path)
+    isolated=docker.fence_worker;docker.fence_worker=lambda work:1
+    with pytest.raises(RuntimeError,match='backup_fence_retained'):runner.recover_stop()
+    docker.fence_worker=isolated;unlink=Path.unlink
+    def crash(path,*args,**kwargs):
+        if path==tmp_path/'journal.json':raise InterruptedError('backup_interrupted')
+        return unlink(path,*args,**kwargs)
+    monkeypatch.setattr(Path,'unlink',crash)
+    with pytest.raises(InterruptedError):runner.recover_stop()
+    status=read_json(tmp_path/'status.json')
+    assert status['error_code']=='backup_job_failed' and status['abandoned_fence']=='fence_released'
+    monkeypatch.setattr(Path,'unlink',unlink);runner.recover_stop()
+    assert read_json(tmp_path/'status.json')['error_code']=='backup_job_failed' and not (tmp_path/'journal.json').exists()
+    assert fence_ended(store,work.name) is True

@@ -35,6 +35,21 @@ Only a durable receipt matching the captured backup allows the host runner to
 release that fence through its separate isolated worker. The release worker has
 no provider sessions, original files, delivery key or Docker socket mounts.
 
+When `--recover-stop` abandons a capture that published nothing (stopped during
+the dump or staged encryption), it first verifies that the capture container is
+stopped, records the `abandoning` phase in the journal, then ends exactly that
+job's fence through the same isolated worker (`abandon_fence`: DSN and job ID
+only). The result (`fence_released`, or `fence_absent` when the capture stopped
+before its fence committed) is written to `status.json` as `abandoned_fence`; a
+repeat reports the same result and touches no other fence. A capture that has
+already published keeps its fence, journal and artifacts for the retry: a
+`stream_v2` snapshot, a staged `result.json` (the journal moves to `upload`), and
+`stream_upload`. If the release fails or its acknowledgement is lost, the
+journal is kept and `status.json` records `error_code: backup_fence_retained`;
+the next recover-stop or run reads the outcome back before any new capture.
+The configured worker image must come from the same release as the runner: an
+older image lacks `abandon_fence` and leaves `backup_fence_retained`.
+
 An unknown outcome or process crash can leave a fence open; it has no automatic
 expiry. A manual `snapshot` also leaves its fence open until the operator records
 successful delivery or explicitly reconciles abandonment. Before releasing an
