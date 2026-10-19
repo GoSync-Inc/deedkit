@@ -32,9 +32,10 @@ the orchestrator; never text in your own input box). Diff items:
 
 And without a diff: a restore, rollback over data or other production change than
 `production.py deploy` and the task steps below; live provider actions; secrets or
-credentials, roles, host access; deleting cards or records, or data outside an accepted task, moving
-cards, publishing a package, rewriting history; accepting a known risk (an open blocking or major
-finding); product direction (accepting feature or epic cards, weakening an accepted criterion).
+credentials, roles, host access; deleting records, or data outside an accepted task; moving cards;
+deleting cards (agents may on the owner's quote naming them); publishing a package, rewriting
+history; accepting a known risk (open blocking or major finding); product direction
+(accepting feature or epic cards, weakening an accepted criterion).
 A standing approval holds only while all its conditions do.
 
 An accepted task is a card accepted per tiden-product-workflow.md whose criteria name the step;
@@ -53,8 +54,7 @@ line `Change path: <path> (<rule>)`. Never lower it; in doubt, OWNER.
 - AUTO+review (any other file): plus one Astra round.
 - OWNER (section 2): plus the owner's words.
 
-CI and review run in parallel. Merge with
-`gh pr merge <n> --squash --auto`, never bypassing checks, with no open blocking or major finding.
+Merge with `gh pr merge <n> --squash --auto`, never bypassing checks, with no open blocking or major finding.
 Done: the squash's `main` push run is green.
 
 ## 4. Product context and Tiden
@@ -76,7 +76,7 @@ Done: the squash's `main` push run is green.
 
 - Astra: `codex exec --disable hooks -m gpt-6-astra -c service_tier="default" "<task with packet
   paths>" </dev/null`. For Codex-written code an Opus subagent; Codex line: review-protocol.md.
-  Fable: a `fable` Claude subagent, a product manager, never on code.
+  Fable: `fable` Claude subagent, a product manager, never on code.
 - One round; after a blocking or major finding, one scoped recheck; r3 only for a new blocking.
 - Packet and verdict line: docs/operations/review-protocol.md. Every Astra task starts with:
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
