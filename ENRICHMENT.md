@@ -131,7 +131,11 @@ Configure the same global UTC-day cap on all workers. Optional
 `profile_max_jobs_per_day` (including `video`) and `account_max_jobs_per_day`
 provide additional caps; profile changes do not reset the day's counters.
 Failures count, retries stop after three attempts for an input/profile, and
-authentication/rate-limit pauses use the existing durable controls. Fairness
+authentication/rate-limit pauses use the existing durable controls. On SIGTERM the
+enrichment worker ends its child process group, requeues the job as `queued` /
+`worker_stopping` without consuming an attempt (the daily budget stays spent),
+releases its local-heavy lease and unpublishes its profile within the 90 s grace
+period. Fairness
 between modalities/accounts prevents a continuous audio backlog from hiding
 video work. All of this is source functionality; production enablement requires
 the verified promotion and applicable live-session authority in

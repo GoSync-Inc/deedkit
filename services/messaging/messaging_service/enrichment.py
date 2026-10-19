@@ -78,12 +78,27 @@ def child_limits(profile):
         resource.setrlimit(resource.RLIMIT_AS,(memory,memory))
 
 
+class WorkerStopping(Exception):
+    """The worker was told to stop while this job was in flight; the job is given back."""
+
+
+STOP=threading.Event()
+CHILDREN=set()
+
+
 def kill_group(child):
     try:os.killpg(child.pid,signal.SIGKILL)
     except ProcessLookupError:pass
 
 
+def request_stop():
+    """Signal-safe: end every running child group so the blocked job can be requeued."""
+    STOP.set()
+    for child in list(CHILDREN):kill_group(child)
+
+
 def process(files,row,profile):
+    if STOP.is_set():raise WorkerStopping
     with tempfile.TemporaryDirectory(prefix='archive-enrich-') as directory:
         path=verified_copy(files,row,directory,profile['max_input_bytes'])
         payload={'profile':profile,'kind':row['kind'],'path':str(path),'mime':row['mime'],
@@ -100,14 +115,19 @@ def process(files,row,profile):
                 stdout=output,stderr=subprocess.DEVNULL,env=env,cwd=directory,
                 start_new_session=True,close_fds=True,
                 pass_fds=(row['_resource_lease'].fd,) if row.get('_resource_lease') else ())
+            CHILDREN.add(child)
             try:
+                # A stop between the check above and the registration must not leave the child running.
+                if STOP.is_set():kill_group(child)
                 child.communicate(json.dumps(payload).encode(),timeout=profile['timeout_seconds']+10)
             except subprocess.TimeoutExpired:
                 kill_group(child);child.wait()
                 raise ModelError('model_timeout') from None
             finally:
+                CHILDREN.discard(child)
                 # Includes ffmpeg/native descendants even if the main child died.
                 kill_group(child)
+            if STOP.is_set() and child.returncode:raise WorkerStopping
             if child.returncode:raise ModelError('model_process_failed')
             output.seek(0);raw=output.read(MAX_RESULT_BYTES+1)
         if len(raw)>MAX_RESULT_BYTES:raise ModelError('model_response_too_large')
@@ -299,17 +319,36 @@ class EnrichmentWorker:
             resource_admission.release(c,row.get('_resource_lease'))
             if finished and error:resource_admission.pause_profile(c,row['account'],row['kind'],row['profile_hash'],error)
             return finished
+    def requeue(self,row):
+        """Stop path: give the leased job back without consuming its attempt; the daily budget stays spent."""
+        try:
+            with self.connection() as c:
+                c.execute('''UPDATE attachment_enrichment SET state='queued',error_code='worker_stopping',
+                    attempts=greatest(attempts-1,0),lease_token=NULL,lease_until=NULL,
+                    next_due=clock_timestamp(),updated_at=clock_timestamp()
+                    WHERE attachment=%s AND state='leased' AND lease_token=%s''',(row['attachment'],row['lease_token']))
+                resource_admission.release(c,row.get('_resource_lease'))
+        finally:
+            # The child group is already gone; only now drop the inherited OS lock.
+            lease=row.get('_resource_lease')
+            if lease:lease.close()
     def once(self):
         claim=self.claim()
         if not claim:return False
         row,profile=claim
         try:self.finish(row,self.processor(self.files,row,profile))
+        except WorkerStopping:self.requeue(row)
         except ModelError as exc:self.finish(row,error=exc.code)
         except Exception as error:
             from .telemetry import capture
             capture(error, 'enrichment_failed')
             self.finish(row,error='enrichment_failed')
         return True
+    def run(self):
+        while not STOP.is_set():
+            self.publish_profiles()
+            if not self.once():STOP.wait(10)
+        self.publish_profiles(enabled=False)
 
 
 def main():
@@ -331,11 +370,7 @@ def main():
     configure('enricher')
     cfg=configuration(args.config)
     worker=EnrichmentWorker(private_text(os.environ['DATABASE_URL_FILE']).strip(),os.environ['PROBE_FILES'],cfg)
-    stop=threading.Event()
-    for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:stop.set())
-    while not stop.is_set():
-        worker.publish_profiles()
-        if not worker.once():stop.wait(10)
-    worker.publish_profiles(enabled=False)
+    for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:request_stop())
+    worker.run()
 
 if __name__=='__main__':main()

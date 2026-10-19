@@ -20,8 +20,10 @@ x-enrichment-common: &enrichment-common
   mem_limit: 3g
   cpus: 2
   pids_limit: 96
-  # A job may use the configured maximum 600s plus bounded child teardown.
-  stop_grace_period: 630s
+  # SIGTERM ends the child group and requeues the job, so the grace period never
+  # follows the job timeout. Rule: teardown bound 60s (child reap 10s, final
+  # write 35s, profile unpublish 15s) plus 30s margin.
+  stop_grace_period: 90s
   logging:
     driver: json-file
     options: {max-size: 5m, max-file: "2"}
