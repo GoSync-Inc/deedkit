@@ -44,9 +44,11 @@ def problems(catalog, settings):
             name = entry[len(PREFIX):]
             if not entry.startswith(PREFIX):
                 found.append(f"{entry} in {kind} names the DeedKit server outside the pinned prefix")
-            elif name not in read_only:
+                continue
+            if name not in read_only:
                 found.append(f"{entry} in {kind} names no catalog tool")
-            elif name in seen:
+                continue
+            if name in seen:
                 found.append(f"{name} is classified twice ({seen[name]}, {kind})")
             seen[name] = kind
     for entry in lists.get("deny", []):
@@ -158,3 +160,14 @@ def test_platform_capabilities_constant_matches_the_gateway_code():
     source = CATALOG_CODE.read_text()
     block = source[source.index('CATALOG["platform_capabilities"]'):]
     assert '"name": "platform_capabilities"' in block and '"readOnlyHint": True' in block
+
+
+# spec: ANYM-309
+def test_renamed_ask_tool_and_foreign_ask_entries_are_listed_not_raised():
+    catalog, settings = load()
+    renamed = [dict(tool, name="calls_stop_call_now") if tool["name"] == "calls_stop_call" else tool for tool in catalog]
+    assert problems(renamed, settings) == [f"{PREFIX}calls_stop_call in ask names no catalog tool",
+                                           "calls_stop_call_now is unclassified"]
+    foreign = copy.deepcopy(settings)
+    foreign["permissions"]["ask"].append("mcp__deedkit__messages_search")
+    assert problems(catalog, foreign) == ["mcp__deedkit__messages_search in ask names the DeedKit server outside the pinned prefix"]
