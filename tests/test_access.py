@@ -46,7 +46,7 @@ def test_chat_scope_covers_every_read_file_and_event_route(seeded):
     assert outputs[0]['sources'][0]['last_ingest_at'] is None
     assert outputs[0]['coverage']=='chat_scope_only'
     assert not outputs[5]['has_more'] and len(outputs[5]['items'])==2
-    assert s.search(b,chat='hidden-chat')['items']==[]
+    with pytest.raises(APIError,match='not_found'):s.search(b,chat='hidden-chat')  # ANYM-253
     assert s.search(b,sender='hidden-person')['items']==[]
     assert s.get_messages(b,'hidden-chat')['items']==[]
     for method,args in [('get_context',('hidden-message',)),('search',()),

@@ -12,6 +12,8 @@ readable label described under Sender names. One sender may
 appear in several chats as separate rows. These are provider hints,
 not confirmation of identity; identical names/IDs of different accounts are not merged.
 
+Each observation names its chat in `chat_title` (at most 64 characters); `source_sent_at` is the
+time of the source message.
 For the next step, pass `account` + `sender_id` to `search` (also `chat` if needed),
 or `source_message` to `get_context`. `next_cursor` is used
 as `after`. Account/chat/read permissions are checked on every call, including the cursor.

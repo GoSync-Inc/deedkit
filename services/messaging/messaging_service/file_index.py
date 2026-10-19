@@ -374,6 +374,8 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         ' WHERE ' + ' AND '.join(clauses) + ' ORDER BY ' + ordering + ' LIMIT %s',
         [*plan.params, *candidate_args, *passage_args, *args, limit + 1]).fetchall()
     items = [_response(r) for r in rows[:limit] if _retained_readable(store,c,r)]
+    from .message_queries import chat_titles
+    chat_titles(c, items)
     targets(p, [r['attachment_id'] for r in items])
     cursor = None
     if len(rows) > limit:

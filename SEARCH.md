@@ -10,6 +10,18 @@ Inside a list "or" applies; between lists and the earlier single filters —
 the dimension, `[]` returns an empty result. A foreign ID in a list does not widen permissions.
 A sender ID belongs to the source/account; a match of strings does not merge people.
 
+A message that replies to an archived message of the same chat carries
+`reply_to: {message_id, snippet, sender_name}` in `search`, `get_messages` and
+`get_context` (compact and full): `snippet` is at most 80 characters of the target's text
+and is untrusted content. `reply_to_provider_id` stays. A missing, deleted or unreadable
+target adds no `reply_to`, so nothing says which of those it was.
+
+`search` with a `chat` that is unknown or outside the key's scope returns the same `not_found`
+(404, `fields: ["chat"]`) for both, never an empty page that looks like "no matches". A `chats`
+list that names no readable chat is `not_found` with `fields: ["chats"]`; a list that names at
+least one readable chat still intersects with the scope. `chats: []` matches nothing. `get_messages`
+keeps its empty page.
+
 Channels are excluded from `search` by default, so news posts do not crowd out
 conversations. Pass `include_channels: true`, a `chat_types` list containing
 `channel`, or name the chat with `chat`/`chats` to search channels; `get_messages`

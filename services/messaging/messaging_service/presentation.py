@@ -3,7 +3,7 @@ import re
 
 MESSAGE_FIELDS = ('id','message','account','chat','sender','sent_at','revision','direction',
     'provider_message_id','kind','origin','historical','is_backfill','event_sequence','sender_name','sender_name_basis','username',
-    'chat_title','chat_type','reply_to_provider_id','mentions_owner','reply_to_owner','forwarded','media_kind','body_truncated',
+    'chat_title','chat_type','reply_to_provider_id','reply_to','mentions_owner','reply_to_owner','forwarded','media_kind','body_truncated',
     'sender_identity_basis','agent_send','delivery_receipt','formatting')
 CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','order_basis',
     'order_status','timestamp_resolution','first_observed_at','first_observed_basis',
@@ -129,6 +129,7 @@ def lean_message(row, *, search=False, files=True):
         if row.get(flag) is True:result[flag]=True
     result.update(forward_fields(row))
     if row.get('reply_to_provider_id'):result['reply_to_provider_id']=row['reply_to_provider_id']
+    if row.get('reply_to'):result['reply_to']=row['reply_to']
     if row.get('agent_send'):
         result['agent_send']={k:row['agent_send'][k] for k in ('send_id','basis') if k in row['agent_send']}
     receipt=row.get('delivery_receipt') or {}
@@ -443,7 +444,8 @@ def render(method, result, detail):
             for key in ('read_state_unknown_total','only_unread_notice'):
                 if result.get(key) is None:result.pop(key,None)
     elif method=='search_files':
-        result['items']=[file_summary(row) for row in result['items']]
+        result['items']=[{**file_summary(row),**{k:row[k] for k in ('chat_title','sent_at') if row.get(k) is not None}}
+            for row in result['items']]
     if method in ('search_files','get_file_text','get_file_segments'):
         result.pop('status',None)  # Legacy extraction alias remains in full mode.
     result['detail']='compact'

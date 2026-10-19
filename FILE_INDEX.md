@@ -48,7 +48,8 @@ search. It supports `query_mode=all|phrase|web|exact`,
 `search_language=auto|simple|russian|english|indonesian`, scalar/list account,
 chat and sender filters, `[from_time,to_time)` dates and direction. Lists are OR
 within one dimension and AND across dimensions; empty lists match nothing.
-`filename` is a literal case-insensitive substring, including literal `%`/`_`.
+Each item names its chat in `chat_title` (at most 64 characters) and the source message time in
+`sent_at`, also in compact detail. `filename` is a literal case-insensitive substring, including literal `%`/`_`.
 PostgreSQL stemming uses the same configuration for index and query. Auto tries
 each complete query under all four configurations. There is no semantic search
 or implicit spelling correction in file search.

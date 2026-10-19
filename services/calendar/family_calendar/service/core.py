@@ -338,6 +338,12 @@ class FamilyService:
                     "error": cov.get("error") if cov else None,
                 }
             )
+            try:
+                zone = ZoneInfo(cal["timezone"])
+            except (ZoneInfoNotFoundError, TypeError, ValueError):
+                zone = None  # a bad stored zone must not fail the whole agenda; UTC fields remain
+            # The label follows the calendars() visibility rule: busy_only callers never see the real one.
+            label = cal["label"] if cal["visibility"] == "details" else "Calendar"
             for e in self.store.query(
                 "SELECT * FROM occurrences WHERE calendar_ref=%s AND start_at<%s AND end_at>%s "
                 "ORDER BY start_at LIMIT 501",
@@ -348,7 +354,16 @@ class FamilyService:
                     "start": e["start_at"].isoformat(),
                     "end": (e["start_at"] if e["details"].get("instant") else e["end_at"]).isoformat(),
                     "busy": e["busy"],
+                    "calendar_label": label,
                 }
+                if zone:
+                    event.update(
+                        local_start=e["start_at"].astimezone(zone).isoformat(),
+                        local_end=(e["start_at"] if e["details"].get("instant") else e["end_at"])
+                        .astimezone(zone)
+                        .isoformat(),
+                        timezone=cal["timezone"],
+                    )
                 if cal["visibility"] == "details":
                     event.update(event_ref=e["ref"], **e["details"])
                 events.append(event)
