@@ -63,6 +63,9 @@ class Unknown(Exception):
 
 def suite(case: dict) -> str:
     path, external = case.get("filePath") or "", case.get("externalId") or ""
+    # The router's package signature wins over every path rule: its rows carry bare or arbitrary file names.
+    if path.startswith("services/release-router/") or external.startswith(ROUTER_SIGNATURE):
+        return "release-router-go"
     if path.startswith("tests/"):
         return "root-python"
     if path.startswith("services/calendar/"):
@@ -73,8 +76,6 @@ def suite(case: dict) -> str:
         return "calls"
     if path.startswith("services/gateway/"):
         return "gateway"
-    if path.startswith("services/release-router/") or external.startswith(ROUTER_SIGNATURE):
-        return "release-router-go"
     if path.startswith("whatsapp/whatsmeow/") or BARE_GO_TEST.fullmatch(path):
         return "whatsmeow-go"
     if path.startswith("whatsapp/"):

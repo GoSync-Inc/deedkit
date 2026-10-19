@@ -625,6 +625,20 @@ def test_a_router_case_with_a_bare_path_belongs_to_the_router_suite_and_a_whatsm
     assert suite({"filePath": "send_test.go", "externalId": whatsmeow}) == "whatsmeow-go"
 
 
+# spec: ANYM-420
+@pytest.mark.parametrize("path", ["tests/router_test.go", "services/calendar/router_test.go",
+                                  "services/calls/frontend/router_test.go", "services/calls/router_test.go",
+                                  "services/gateway/router_test.go", "whatsapp/whatsmeow/router_test.go"])
+def test_a_router_signature_wins_over_any_path_rule_and_its_suite_still_fails_as_not_reporting(repo, server, path):
+    router = "s:github.com/GoSync-Inc/deedkit/services/release-router::TestConfigCASRejectsStaleETagWithoutChangingRoutes"
+    assert suite({"filePath": path, "externalId": router}) == "release-router-go"
+    _, b = history(repo)
+    server.world(b, cases=[case("c1"), case("go1", path, external=router)], active=["c1"])
+    metric = measure(repo, server, b)[1]["metrics"]["unlinked_tests"]
+    assert metric["state"] == FAIL and metric["findings"] == ["release-router-go: not reporting (1 case rows, none "
+                                                              "active in run 10)"]
+
+
 FORMER = "github.com/GoSync-Inc/anymsg"
 
 

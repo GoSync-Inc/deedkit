@@ -423,7 +423,7 @@ never deleted. The suites are fixed in the script, one path rule each: root
 `tests/`, calendar, calls frontend, calls, gateway, release router Go
 (`services/release-router/`, or an `externalId` starting with
 `s:github.com/GoSync-Inc/deedkit/services/release-router::`, since Tiden's Go
-reporter records bare file names), whatsmeow Go (also a bare `*_test.go` path),
+reporter records bare file names; checked before every other rule), whatsmeow Go (also a bare `*_test.go` path),
 WhatsApp Node, npm and CI verifications (`.github/`). Every
 listing counts only when it ends with an empty `nextPageToken`, its integer
 `totalCount` equals its rows, its IDs are unique and, per spec, `sourceCount`
@@ -436,7 +436,8 @@ kept the former repository's anchors with their receipts and anchored each moved
 file again under `services/messaging/`
 ([receipt](docs/quality/tiden-reconciliation-2026-10-16.md)). An untracked
 anchor of repository `github.com/GoSync-Inc/anymsg` whose metadata has a
-non-empty `historical_source_id`, and whose spec also anchors
+non-empty string `historical_source_id`, and whose spec also has a `repo_file`
+anchor (of this repository, the former one or none) on
 `services/messaging/<its path>` tracked at TARGET, is counted as `historical`
 and listed in the artifact, never stale (owner decision 2026-10-19). Every other
 untracked anchor still fails.
