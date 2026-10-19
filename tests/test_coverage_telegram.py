@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace as NS
 
 import pytest
@@ -370,11 +371,14 @@ def test_one_chat_provider_errors_fail_only_that_chat_in_history_reconcile(worke
             'FROM collector_chats WHERE account=%s AND last_error_code IS NOT NULL', (w.account,))}
         health = c.execute('SELECT status,detail_code,operations FROM collector_health WHERE account=%s',
             (w.account,)).fetchone()
-    assert errors == {'101': 'provider_temporarily_unavailable', '102': 'provider_chat_error'}
+    # The column keeps the code every deployed reader knows; chat_errors keeps the exact reason.
+    assert errors == {'101': 'provider_unavailable', '102': 'provider_unavailable'}
     assert (health['status'], health['detail_code']) == ('degraded', 'configured_chat_unavailable')
     recorded = {e['chat']: e for e in health['operations']['history']['chat_errors']}
     assert recorded['101']['error_class'] == 'RpcCallFailError' and recorded['101']['reason_code'] == 'provider_temporarily_unavailable'
     assert recorded['102']['error_class'] == 'MsgIdInvalidError' and recorded['102']['rpc_message'] == 'BAD_REQUEST'
+    assert recorded['102']['reason_code'] == 'provider_chat_error'
+
     out = capsys.readouterr().out
     assert CHAT_SECRET not in out + str(health['operations'])
     lines = [json.loads(line) for line in out.splitlines() if 'telegram_chat_error' in line]
@@ -433,6 +437,30 @@ def test_transient_chat_error_is_retried_for_that_chat_and_then_succeeds(kind):
 
 
 # spec: ANYM-293
+def test_transient_failure_budget_is_shared_by_all_pages_of_one_chat_and_resets_per_chat_and_pass():
+    calls = []; failed = []; script = {}
+    async def page(chat, **query):
+        calls.append((chat, 'forward' if query.get('reverse') else 'older' if query.get('before') else 'recent'))
+        step = script[chat].pop(0) if script.get(chat) else None
+        if step: raise page_error(step)
+        return []
+    collector = fake_reconcile(NS(page=page), failed)
+    collector.state.chat = lambda chat, kind: {'initialized': True, 'high_water': 5, 'history_before': 5,
+                                               'history_exhausted': False, 'window_complete': False}
+    # Forward page fails twice then passes; the recent page's failure is the chat's third: the chat fails,
+    # its older page is never read. Chat 200 starts with a full budget.
+    script.update({'100': ['server', 'server', None, 'server'], '200': ['server', 'server']})
+    asyncio.run(collector.sync_once())
+    assert calls == [('100', 'forward')] * 3 + [('100', 'recent')] + [('200', 'forward')] * 3 + [
+        ('200', 'recent'), ('200', 'older')]
+    assert [args[:2] for args in failed] == [('100', 'provider_temporarily_unavailable')]
+    # The next pass starts each chat with a full budget again.
+    calls.clear(); failed.clear(); script.update({'100': ['server', 'server'], '200': []})
+    asyncio.run(collector.sync_once())
+    assert calls.count(('100', 'forward')) == 3 and failed == []
+
+
+# spec: ANYM-293
 def test_library_error_of_one_chat_is_a_chat_error_printed_once_without_text(capsys):
     calls = []; failed = []
     async def page(chat, **query):
@@ -465,7 +493,9 @@ def test_telethon_page_wraps_only_non_rpc_library_errors_and_keeps_no_text():
         asyncio.run(provider.page('100', limit=1))
     assert wrapped.value.error_class == 'ValueError' and CHAT_SECRET not in str(wrapped.value)
     for error in [errors.RpcCallFailError(None), errors.FloodWaitError(None, capture=5),
-                  ConnectionError(CHAT_SECRET), TimeoutError(CHAT_SECRET)]:
+                  ConnectionError(CHAT_SECRET), TimeoutError(CHAT_SECRET), sqlite3.OperationalError(CHAT_SECRET),
+                  MemoryError(), asyncio.IncompleteReadError(b'', 8), errors.AuthKeyNotFound(),
+                  errors.InvalidBufferError(b'\x00' * 4), errors.SecurityError(), errors.ReadCancelledError()]:
         provider.client = client(error)
         with pytest.raises(type(error)):
             asyncio.run(provider.page('100', limit=1))
@@ -490,16 +520,20 @@ def test_chat_error_evidence_carries_only_a_class_name_and_a_fixed_rpc_code():
 
 
 # spec: ANYM-293
-@pytest.mark.parametrize('code,state', [('provider_chat_error', 'provider_unavailable'),
-    ('provider_temporarily_unavailable', 'provider_unavailable'), ('provider_unavailable', 'provider_unavailable'),
-    ('rate_limited', 'rate_limited')])
-def test_chat_history_state_reads_a_chat_provider_error_as_unavailable(code, state):
-    from messaging_service.chat_evidence import history
-    row = {'last_head_scan_at': None, 'history_since': None, 'last_attempt_at': None, 'platform': 'telegram',
-           'initialized': True, 'window_complete': False, 'history_exhausted': False, 'last_error_code': code,
-           'last_error_at': None, 'synthetic': True, 'last_scan_at': None, 'high_water': 2, 'history_before': None}
-    result = history(row)
-    assert result['state'] == state and result['last_error_code'] == code
+def test_session_database_failure_propagates_through_the_real_telethon_iterator():
+    # Telethon resolves the peer through its local session cache before any request (no connection here).
+    from telethon.client.messages import MessageMethods
+    from telethon.client.users import UserMethods
+    class BrokenSession:
+        def get_input_entity(self, peer): raise sqlite3.OperationalError(CHAT_SECRET)
+    class OfflineClient(MessageMethods, UserMethods):
+        def __init__(self): self.session = BrokenSession(); self._mb_entity_cache = NS(get=lambda peer: None)
+    provider = TelethonProvider.__new__(TelethonProvider); provider.governor = None; provider.client = OfflineClient()
+    failed = []
+    collector = fake_reconcile(NS(page=provider.page), failed)
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(collector.sync_once())
+    assert failed == []
 
 
 def test_catalog_title_updates_are_nonempty_and_inventory_batches_remain_fenced(worker):

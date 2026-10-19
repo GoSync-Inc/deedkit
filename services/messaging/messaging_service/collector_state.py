@@ -70,7 +70,8 @@ def validate_capture(value):
 
 MAX_REJECTED_MESSAGES=20
 # Per-chat history scan errors (ANYM-293): an unavailable peer, a rate limit, a transient server
-# error after its retries, or any other provider error of that chat.
+# error after its retries, or any other provider error of that chat. The last two are stored as
+# provider_unavailable, which every deployed reader knows; history.chat_errors keeps the exact one.
 CHAT_SCAN_ERRORS=('provider_unavailable','rate_limited','provider_temporarily_unavailable','provider_chat_error')
 MAX_CHAT_ERRORS=20
 
@@ -361,7 +362,8 @@ class CollectorState:
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)
             c.execute('UPDATE collector_chats SET last_error_code=%s,last_error_at=clock_timestamp() '
-                'WHERE account=%s AND provider_chat=%s',(code,self.account,chat))
+                'WHERE account=%s AND provider_chat=%s',
+                (code if code in ('provider_unavailable','rate_limited') else 'provider_unavailable',self.account,chat))
             if evidence is not None:
                 # The class of a chat's provider error outlives the container's logs (ANYM-293).
                 row=self._operations(c);value=row['operations'];history=dict(value.get('history') or {})

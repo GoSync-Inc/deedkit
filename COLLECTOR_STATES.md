@@ -44,24 +44,29 @@ unresolved conflict it is reported as `coverage_not_reconciled`.
 
 Telegram history reconcile isolates a provider error of one chat (ANYM-293).
 Rate limits (`FloodWaitError`, the governor's cooldown), session-terminal
-`UnauthorizedError`s, a duplicated authorization key and transport loss (`ConnectionError`, other `OSError`)
+`UnauthorizedError`s, a duplicated authorization key, transport loss
+(`ConnectionError`, other `OSError`, a cancelled read), the transport's
+authorization key or crypto, the local session database (`sqlite3`) and memory
 still stop the pass as before, and a private, removed or invalid peer is still
 `provider_unavailable`. A transient server error (`ServerError`, Telegram's
 `TimedOutError`, `TimeoutError`) of one chat's history page is retried for that
-chat only, at most 3 calls per chat and pass with 1 s and 2 s between them; it
-then marks the chat `provider_temporarily_unavailable`. Any other provider error
+chat only, after 1 s and then 2 s; a chat may fail this way at most 3 times per
+pass over all its pages (successful pages do not count), and the third failure
+fails the chat with reason `provider_temporarily_unavailable`. Any other error
 of that page, an RPC error or a Telethon library error such as an unresolvable
-entity or an unknown TL constructor, marks the chat `provider_chat_error` with
-no retry. The pass goes on with the next chat in the usual order, and account
-status becomes `degraded` / `configured_chat_unavailable`, as for an
-unavailable chat; the chat's coverage reads `provider_unavailable` with the
-exact `last_error_code`. `history.chat_errors` keeps the last 20 failed chats
-(chat, code, time, the exception class name and, for an RPC error, Telegram's
-fixed code such as `BAD_REQUEST`), and the collector prints one
-`telegram_chat_error` line per chat and process with the class name and code
-frames. Exception text, which can carry provider bytes, is never kept. The
-trade-off: a provider bug that hits every chat now leaves the collector
-running with every chat failed and status degraded, instead of restarting it.
+entity or an unknown TL constructor, fails the chat with reason
+`provider_chat_error`, with no retry. The pass goes on with the next chat in the
+usual order, and account status becomes `degraded` /
+`configured_chat_unavailable`, as for an unavailable chat. The failed chat's
+`last_error_code` is `provider_unavailable`, a code every deployed reader
+already knows; `history.chat_errors` in the account's operations keeps the
+exact reason for the last 20 failed chats (chat, `reason_code`, time, the
+exception class name and, for an RPC error, Telegram's fixed code such as
+`BAD_REQUEST`), and the collector prints one `telegram_chat_error` line per chat
+and process with the reason, the class name and code frames. Exception text,
+which can carry provider bytes, is never kept. The trade-off: a provider bug
+that hits every chat now leaves the collector running with every chat failed
+and status degraded, instead of restarting it.
 
 Connection failures survive Node exits through a private fsynced side-channel
 file. No unsolicited stdout frame can interleave with a page/media RPC. Raw

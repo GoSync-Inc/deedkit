@@ -85,8 +85,7 @@ def history(row,lower=None,upper=None):
         state='provider_exhausted' if complete else ('loading' if type(progress.get('history_exhausted')) is bool else 'not_scanned')
         if gaps:state='gaps'
     error=row['last_error_code']
-    # A provider error of one chat (ANYM-293) reads as unavailable; last_error_code keeps the exact code.
-    if error:state='rate_limited' if error=='rate_limited' else 'provider_unavailable'
+    if error:state='provider_unavailable' if error=='provider_unavailable' else 'rate_limited'
     range_inside=complete and scanned is not None and not gaps and not row['synthetic'] and not error
     if floor is not None and (lower is None or lower<floor):range_inside=False
     # Only an explicit finite interval can be marked traversed. An open upper

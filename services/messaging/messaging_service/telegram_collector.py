@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import secrets
 import signal
+import sqlite3
 import stat
 import time
 import traceback
@@ -239,12 +240,17 @@ class TelethonProvider:
         if batch:yield batch
 
     async def page(self,chat,*,limit,min_id=0,before=0,reverse=False):
-        from telethon.errors import RPCError
+        from telethon.errors import (AuthKeyNotFound,InvalidBufferError,InvalidChecksumError,ReadCancelledError,
+            RPCError,SecurityError)
         async def read():
             try:
                 return [m async for m in self.client.iter_messages(int(chat),limit=limit,min_id=min_id,
                                                                   offset_id=before,reverse=reverse)]
-            except (RPCError,OSError):raise
+            # RPC errors are classified by the caller. The local session database, memory, a lost or
+            # cancelled connection and the transport's authorization key or crypto are not one chat's
+            # error and propagate as before (ANYM-293).
+            except (RPCError,OSError,EOFError,sqlite3.Error,MemoryError,AuthKeyNotFound,InvalidBufferError,
+                    InvalidChecksumError,ReadCancelledError,SecurityError):raise
             except Exception as exc:
                 # Entity resolution, an unknown TL constructor and similar library errors of this
                 # one read; the governor's own state calls stay outside and still propagate.
@@ -309,8 +315,9 @@ PARSE_ERRORS=(ValueError,TypeError,KeyError,AttributeError,IndexError,RecursionE
 # further callbacks wait in arrival order. More than CAPTURE_WAITERS waiting callbacks, or one
 # wait longer than CAPTURE_WAIT_SECONDS, fails the collector closed with capture_overload.
 CAPTURE_WRITES=16; CAPTURE_WAITERS=512; CAPTURE_WAIT_SECONDS=30
-# History reconcile of one chat (ANYM-293): transient server errors get at most CHAT_ATTEMPTS calls
-# per chat and pass, waiting CHAT_RETRY_DELAYS seconds between them.
+# History reconcile of one chat (ANYM-293): one chat may fail with a transient server error at most
+# CHAT_ATTEMPTS times per pass, over all its pages; successful pages do not count. A failed page is
+# retried after CHAT_RETRY_DELAYS seconds while the budget lasts.
 CHAT_ATTEMPTS=3; CHAT_RETRY_DELAYS=(1,2,4)
 
 
@@ -517,8 +524,9 @@ class TelegramCollector:
         """One provider history page of one chat, classified per ANYM-293.
 
         Rate limits, session-terminal errors, unavailable peers and transport loss propagate as before.
-        Transient server errors are retried here from a budget of CHAT_ATTEMPTS calls per chat and pass;
-        they and any other provider error then fail only this chat."""
+        Transient server errors are retried here from a budget of CHAT_ATTEMPTS transient failures per
+        chat and pass, shared by all pages of the chat; they and any other provider error then fail only
+        this chat."""
         from telethon.errors import (AuthKeyDuplicatedError,ChannelPrivateError,ChatAdminRequiredError,FloodWaitError,
             PeerIdInvalidError,RPCError,ServerError,TimedOutError,UnauthorizedError)
         while True:
