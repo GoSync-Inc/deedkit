@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 import yaml
 
 from scripts import python_shards, tiden_ci
+from tests.test_ci_reuse import go_stream
 from tests.test_tiden_ci import ATTEMPT_URL, PASSED, assembled_rows, evidence_fragments, shard_report
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -316,7 +317,8 @@ def test_the_python_producer_names_every_shard_job_of_the_matrix(tmp_path):
     evidence_fragments(tmp_path)
     env = {"PATH": os.environ["PATH"], "GITHUB_REPOSITORY": "example/repo", "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2"}
     base = [sys.executable, str(ROOT / "scripts/tiden_ci.py"), "assemble", "--fragments", str(tmp_path / "fragments"),
-            "--producer", "verify:success:" + "a" * 40, "--producer", "load:success:" + "a" * 40]
+            "--producer", "verify:success:" + "a" * 40, "--producer", "load:success:" + "a" * 40,
+            "--producer", "go:success:" + "a" * 40]
     shards = [argument for job in tiden_ci.SHARD_JOBS for argument in ("--producer", f"{job}:success:" + "a" * 40)]
     passed = subprocess.run([*base, "--directory", str(tmp_path / "ok"), *shards], env=env, capture_output=True, text=True)
     assert passed.returncode == 0, passed.stderr
@@ -370,6 +372,7 @@ def test_a_shard_job_that_fails_after_uploading_a_passing_fragment_never_reads_a
     merge = next(step for step in jobs()["evidence"]["steps"]
                  if step.get("name") == "Merge the fragments of the tested commit and record every check outcome")
     needs = {"verify": {"result": "success", "sha": "a" * 40}, "load": {"result": "success", "sha": "a" * 40},
+             "go": {"result": "success", "sha": "a" * 40},
              **{job: {"result": "success", "sha": "a" * 40} for job in tiden_ci.SHARD_JOBS}}
     needs["python-3"]["result"] = late
     work = tmp_path / "work"
@@ -377,7 +380,8 @@ def test_a_shard_job_that_fails_after_uploading_a_passing_fragment_never_reads_a
     (work / "ci-tools").symlink_to(root, target_is_directory=True)
     temp = tmp_path / "runner"
     temp.mkdir()
-    evidence_fragments(temp)  # every fragment, python-3's included, reports passing tests of this attempt
+    # Every fragment, python-3's included, reports passing tests of this attempt; prepare reads the real Go modules.
+    evidence_fragments(temp, go_streams={check: go_stream(check) for check in tiden_ci.GO_MODULES})
     env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin", "RUNNER_TEMP": str(temp), "GITHUB_REPOSITORY": "example/repo",
            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", **{name: resolve(value, needs) for name, value in merge["env"].items()}}
     subprocess.run(["bash", "-e", "-c", merge["run"]], cwd=work, capture_output=True, text=True, env=env)

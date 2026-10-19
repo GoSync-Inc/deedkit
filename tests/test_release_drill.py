@@ -16,6 +16,7 @@ import zipfile
 import yaml
 
 from tests.test_tiden_ci import ATTEMPT_URL, RUN_URL, evidence_fragments, main_push_manifest, main_run, release_cli, run_release
+from tests.test_ci_reuse import go_stream
 
 ROOT = Path(__file__).resolve().parents[1]
 SYNTHETIC_GIT = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "Synthetic", "GIT_AUTHOR_EMAIL": "synthetic@example.invalid",
@@ -96,13 +97,15 @@ def rewritten_npm_version(tarball):
 
 def evidence_for(tmp_path, name, commit, reports):
     """Synthetic fragments of every producer for `commit`, assembled and prepared by the repository's own tool."""
-    fragments = evidence_fragments(tmp_path / name, verify_files=VERIFY_REPORTS)
+    # The drill prepares against the archived tree, so the Go streams name its real modules and tests.
+    fragments = evidence_fragments(tmp_path / name, verify_files=VERIFY_REPORTS,
+                                   go_streams={check: go_stream(check) for check in ("whatsmeow", "release_router")})
     for path in fragments.rglob("*"):
         if path.is_file():
             path.write_text(path.read_text().replace("a" * 40, commit))
     for fragment, report in reports.items():
         (fragments / "ci-evidence-verify" / fragment).write_text(report)
-    producers = [f"{job}:success:{commit}" for job in ("verify", "load", "python-2", "python-3", "python-4")]
+    producers = [f"{job}:success:{commit}" for job in ("verify", "load", "python-2", "python-3", "python-4", "go")]
     env = {"PATH": os.environ["PATH"], "GITHUB_REPOSITORY": "example/repo", "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2"}
     directory = tmp_path / f"{name}-evidence"
     tool = ["scripts/tiden_ci.py"]
