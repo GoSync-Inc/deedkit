@@ -5,7 +5,7 @@ import logging
 import re
 from uuid import uuid4
 
-from platform_contracts.field_errors import validated
+from platform_contracts.field_errors import MATCHING, validated
 
 from .catalog import CATALOG, public
 
@@ -81,15 +81,78 @@ CONSUMPTION_ERRORS = frozenset({
 })
 
 
-def consumption_failure(status, value, header_request_id=None):
+def _node(schema, node):
+    """Follow a local $ref and, for a nullable union, its first non-null branch."""
+    for _ in range(8):
+        if not isinstance(node, dict):
+            return {}
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/"):
+            node = schema
+            for part in ref[2:].split("/"):
+                node = node.get(part, {}) if isinstance(node, dict) else {}
+        elif isinstance(node.get("anyOf"), list):
+            node = next((b for b in node["anyOf"] if isinstance(b, dict) and b.get("type") != "null"), {})
+        else:
+            return node
+    return {}
+
+
+def declared(schema, path):
+    """The reviewed schema node of a field path, or None when the schema does not declare it."""
+    node = _node(schema, schema)
+    for segment in path.split("/"):
+        if segment.isdigit() and "items" in node:
+            node = _node(schema, node["items"])
+        elif segment in node.get("properties", {}):
+            node = _node(schema, node["properties"][segment])
+        elif segment in node.get("propertyNames", {}).get("enum", ()):
+            node = _node(schema, node.get("additionalProperties", {}))
+        else:
+            return None
+    return node
+
+
+def reviewed_field_errors(operation, value):
+    """A backend `field_errors` list that is well formed and names only what the reviewed tool schema declares.
+
+    Fields must be declared paths (or `arguments`, the whole input), and `allowed` values must come from that
+    schema's own enum or its declared keys; one violation drops the whole list.
+    """
+    entries = validated(value)
+    tool = CATALOG.get("messages_" + operation)
+    if not entries or tool is None:
+        return None
+    schema = tool["inputSchema"]
+    for entry in entries:
+        if entry["field"] == "arguments" and "arguments" not in schema.get("properties", {}):
+            node = _node(schema, schema)
+        else:
+            node = declared(schema, entry["field"])
+        if node is None:
+            return None
+        expected = entry.get("expected", "")
+        if expected.startswith(MATCHING) and expected[len(MATCHING):] != node.get("pattern"):
+            return None
+        if "allowed" in entry:
+            permitted = [*node.get("enum", ()), *([node["const"]] if "const" in node else ()),
+                         *node.get("propertyNames", {}).get("enum", ()),
+                         *(node.get("properties", {}) if entry["reason"] == "unknown_field" else ())]
+            if any(not any(v == p and type(v) is type(p) for p in permitted) for v in entry["allowed"]):
+                return None
+    return entries
+
+
+def consumption_failure(status, value, header_request_id=None, operation=None):
     result = failure_details(status, value, header_request_id)
     result.pop("backend_error", None)
     code = value.get("error")
     result["error"] = code if isinstance(code, str) and code in CONSUMPTION_ERRORS else "backend_denied"
-    # The one backend detail relayed: a list that passes the shared shape and vocabulary, else nothing.
-    field_errors = validated(value.get("field_errors")) if result["error"] != "backend_denied" else None
-    if field_errors:
-        result["field_errors"] = field_errors
+    # The one backend detail relayed: a list that passes the shared shape, hint set and the tool's reviewed schema.
+    if result["error"] != "backend_denied" and isinstance(operation, str):
+        field_errors = reviewed_field_errors(operation, value.get("field_errors"))
+        if field_errors:
+            result["field_errors"] = field_errors
     return result
 
 

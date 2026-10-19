@@ -160,7 +160,7 @@ class Clients:
                         # Existing operation receipts/ACK errors remain visible, but
                         # never leak transport exceptions or arbitrary response text.
                         error.detail = (
-                            consumption_failure(response.status_code, result, response.headers.get("x-request-id"))
+                            consumption_failure(response.status_code, result, response.headers.get("x-request-id"), operation)
                             if module == "messaging" and operation in CONSUMPTION_OPERATIONS else result
                         )
                         raise error

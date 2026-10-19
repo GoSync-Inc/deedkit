@@ -147,10 +147,25 @@ def test_integer_map_keys_are_never_named_and_never_raise():
 def test_messaging_shape_matches_the_shared_platform_contract():
     # Messaging stays independent of platform packages at runtime; the gateway validates what it relays.
     from messaging_service import field_errors as local
+    from messaging_service.feedback import _ref_errors
     from platform_contracts import field_errors as shared
     assert (local.FIELD_ERROR_REASONS, local.MAX_FIELD_ERRORS, local.MAX_FIELD_PATH, local.MAX_ALLOWED) == (
         shared.REASONS, shared.MAX_ENTRIES, shared.MAX_PATH, shared.MAX_ALLOWED)
     assert local.SEGMENT.pattern == shared.SEGMENT.pattern
-    entries = [local.field_error('refs/message_ids/0', 'format', 'x' * 100, ['a', 1, True]),
-               local.field_error('category', 'enum', allowed=['bug'] * 50)]
-    assert shared.validated(entries) == entries
+    # What the real builders emit passes the shared check: hints from the closed set (or a schema pattern), bounded values.
+    bad = dict(request_id='short', category='bugs', description='  ', operation='Nope', refs={'x': [3]})
+    other = dict(request_id=CANARY * 10, category=CANARY, description=CANARY * 400, operation=CANARY,
+        refs={CANARY: [CANARY], 'chat_ids': [CANARY] * 40, 'message_ids': [3, '', 'a' * 257, 'a\x00']}, **{CANARY: CANARY})
+    emitted = [local.one_per_field(local.field_error(*e) for e in _ref_errors(other['refs'])),
+               [local.field_error('description', 'blank', 'text with a non-space character'),
+                local.field_error('refs', 'size', 'at most 8 KiB'),
+                local.field_error('reply_to_send', 'required', 'set when wake_rules has reply_to_confirmed_send')]]
+    for args in (bad, other):
+        store = Store()
+        with TestClient(create_app(store, ['testserver'])) as client:
+            response = client.post('/v1/submit_feedback', headers=HEADERS, json=args)
+        assert response.status_code == 400
+        emitted.append(response.json()['field_errors'])
+    for entries in emitted:
+        assert entries and shared.validated(entries) == entries
+    assert shared.validated([{**emitted[0][0], 'expected': 'invented text'}]) is None
