@@ -9,6 +9,17 @@ import struct
 import time
 
 
+class NoDiagnostics:
+    # Stands in when a diagnostics constructor fails: every method is a no-op and every snapshot is empty.
+    def __getattr__(self,name): return lambda *args,**kwargs:{}
+
+
+def diagnostics(factory):
+    # Diagnostics are best effort: a constructor failure must never break call setup.
+    try: return factory()
+    except Exception: return NoDiagnostics()
+
+
 class PCMProbe:
     def __init__(self,max_samples=100):
         self.max_samples=max_samples

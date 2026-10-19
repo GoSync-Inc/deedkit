@@ -18,7 +18,7 @@ from pipecat.workers.runner import WorkerRunner
 
 from core import TOOL_MODELS
 from audio_health import RuntimeAudioHealth
-from audio_probe import PCMProbe
+from audio_probe import PCMProbe, diagnostics
 from call_errors import record_model_error
 
 
@@ -195,7 +195,7 @@ async def run_transport(transport,brief,key,state,browser=False):
     live_flows=brief.get('dialog_engine')=='gemini_live_flows'
     ending_tasks=[]
     runtime_health=RuntimeAudioHealth()
-    inbound_audio=PCMProbe()
+    inbound_audio=diagnostics(PCMProbe)
 
     async def handle(name,params):
         if name=='consult_supervisor' and state.get('supervisor'):
@@ -316,5 +316,7 @@ async def run_transport(transport,brief,key,state,browser=False):
         if ending_tasks:
             await asyncio.gather(*ending_tasks,return_exceptions=True)
         if 'tts_metrics' in state:
-            value=service.get_call(identity)
-            service.result(identity,metrics={**value['metrics'],'replicated_tts':state['tts_metrics']})
+            # Best effort too: a failure here must not mask the runner's own exception.
+            with contextlib.suppress(Exception):
+                value=service.get_call(identity)
+                service.result(identity,metrics={**value['metrics'],'replicated_tts':state['tts_metrics']})

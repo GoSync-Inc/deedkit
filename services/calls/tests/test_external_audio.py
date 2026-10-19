@@ -149,3 +149,97 @@ async def test_a_failing_telegram_audio_probe_never_drops_or_skips_audio(monkeyp
         await outputs[0](audio)
         assert sent==[audio]
     finally:await calls.close()
+
+
+# spec: ANYM-382
+async def test_failing_diagnostics_constructors_never_break_telegram_call_setup(monkeypatch):
+    import pytgcalls
+    import telegram_audio
+
+    closed=[]
+    class Client:
+        def __init__(self,*args):pass
+        async def connect(self):pass
+        async def close(self):closed.append(True)
+    class Native:
+        def __init__(self,*args,**kwargs):
+            self._app=self;self._binding=self
+        def on_update(self):return lambda fn:fn
+        async def start(self):pass
+        async def play(self,*args,**kwargs):pass
+        async def record(self,*args,**kwargs):pass
+        async def get_input_call(self,*args):return SimpleNamespace(id=101)
+        async def send_frame(self,*args):pass
+        async def leave_call(self,*args):pass
+        async def stop(self,*args):pass
+    def broken():raise RuntimeError('synthetic constructor failure')
+    async def waiting(self,*args):await asyncio.Event().wait()
+    monkeypatch.setattr(telegram_audio,'BrokerClient',Client)
+    monkeypatch.setattr(pytgcalls,'PyTgCalls',Native)
+    monkeypatch.setattr(telegram_audio,'dispose_native',lambda py:None)
+    monkeypatch.setattr(telegram_audio,'PCMProbe',broken)
+    monkeypatch.setattr(telegram_audio,'MediaDiagnostics',broken)
+    monkeypatch.setattr(telegram_audio,'pcm_transport',lambda send,set_input:SimpleNamespace())
+    monkeypatch.setattr(telegram_audio.TelegramCalls,'_run',waiting)
+    calls=telegram_audio.TelegramCalls({'socket':'/fixture'},None,None,None)
+    monkeypatch.setattr(calls,'token',lambda:'fixture-token')
+    try:
+        result=await calls.dial({'id':'fixture','brief':{'destination':'123'}})
+        assert result['provider_status']=='connected'
+        state=calls.active['fixture']
+        # The stand-ins accept every probe call and snapshot to nothing.
+        state['audio_probe'].input(b'x');state['audio_probe'].output(b'x')
+        assert state['audio_probe'].snapshot()=={} and state['media'].snapshot()=={}
+    finally:await calls.close()
+    assert closed==[True]
+
+
+# spec: ANYM-382
+async def test_a_failing_final_telegram_audio_metrics_write_never_skips_stop(monkeypatch):
+    import telegram_audio
+    import voice
+
+    stops=[]
+    class Service:
+        def get_call(self,cid):raise RuntimeError('synthetic metrics read failure')
+        def stop(self,cid,reason):stops.append((cid,reason))
+    async def finished(*args,**kwargs):pass
+    monkeypatch.setattr(voice,'run_transport',finished)
+    calls=telegram_audio.TelegramCalls({},Service(),lambda brief:'synthetic-key',None)
+    await calls._run('fixture',SimpleNamespace(),{'brief':{'max_duration_secs':5}})
+    assert stops==[('fixture','disconnected')]
+    class BrokenSnapshot:
+        def snapshot(self):raise RuntimeError('synthetic snapshot failure')
+    class Reading(Service):
+        def get_call(self,cid):return {'metrics':{}}
+        def result(self,cid,**kwargs):pass
+    stops.clear()
+    calls=telegram_audio.TelegramCalls({},Reading(),lambda brief:'synthetic-key',None)
+    await calls._run('fixture',SimpleNamespace(),{'brief':{'max_duration_secs':5},'audio_probe':BrokenSnapshot(),'media':BrokenSnapshot()})
+    assert stops==[('fixture','disconnected')]
+
+
+# spec: ANYM-382
+async def test_a_failing_final_telegram_audio_result_write_or_media_snapshot_never_skips_stop(monkeypatch):
+    import telegram_audio
+    import voice
+
+    stops=[];called=[]
+    class Service:
+        def get_call(self,cid):return {'metrics':{}}
+        def result(self,cid,**kwargs):
+            called.append('result');raise RuntimeError('synthetic result write failure')
+        def stop(self,cid,reason):stops.append((cid,reason))
+    class Probe:
+        def snapshot(self):return {}
+    class BrokenMedia:
+        def snapshot(self):
+            called.append('media');raise RuntimeError('synthetic media snapshot failure')
+    async def finished(*args,**kwargs):pass
+    monkeypatch.setattr(voice,'run_transport',finished)
+    calls=telegram_audio.TelegramCalls({},Service(),lambda brief:'synthetic-key',None)
+    await calls._run('fixture',SimpleNamespace(),{'brief':{'max_duration_secs':5},'audio_probe':Probe(),'media':Probe()})
+    assert called==['result'] and stops==[('fixture','disconnected')]
+    called.clear();stops.clear()
+    await calls._run('fixture',SimpleNamespace(),{'brief':{'max_duration_secs':5},'audio_probe':Probe(),'media':BrokenMedia()})
+    assert called==['media'] and stops==[('fixture','disconnected')]
