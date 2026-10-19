@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 REPOSITORY = "github.com/GoSync-Inc/deedkit"
 # Anchors recorded before the rename carry the former repository name, or none.
@@ -47,6 +48,8 @@ EXCLUDED = (
 )
 SHA = re.compile(r"[0-9a-f]{40}")
 TIMEOUT = 120
+RETRY_DELAY = 2  # seconds before the one retry of a read-only listing
+RETRY_MIN = 10  # a retry needs at least this many seconds left of the call's one TIMEOUT budget
 
 
 class Refused(Exception):
@@ -103,12 +106,26 @@ def shown(path: str) -> str:
     return path.encode("unicode_escape").decode("ascii") if not path.isprintable() or not path.isascii() else path
 
 
-def tiden(cli: str, arguments: list[str], product: str) -> dict:
-    """One Tiden CLI command; its stderr and a failing stdout are never shown, since they may echo request data."""
+def tiden(cli: str, arguments: list[str], product: str, retry: bool = False) -> dict:
+    """One Tiden CLI command; its stderr and a failing stdout are never shown, since they may echo request data.
+    `retry` repeats a failed read-only call once, inside the same TIMEOUT budget; a write never sets it, since a
+    repeat could apply it twice."""
+    start = time.monotonic()
+    try:
+        return once(cli, arguments, product)
+    except Refused:
+        left = TIMEOUT - (time.monotonic() - start) - RETRY_DELAY
+        if not retry or left < RETRY_MIN:
+            raise
+    time.sleep(RETRY_DELAY)
+    return once(cli, arguments, product, left)
+
+
+def once(cli: str, arguments: list[str], product: str, timeout: float | None = None) -> dict:
     label = " ".join(arguments[:2])
     try:
         completed = subprocess.run([cli, *arguments, "--product-id", product, "--format", "json"],
-                                   capture_output=True, text=True, timeout=TIMEOUT)
+                                   capture_output=True, text=True, timeout=timeout or TIMEOUT)
     except subprocess.TimeoutExpired:
         raise Refused(f"tiden {label} timed out") from None
     if completed.returncode:
@@ -123,7 +140,7 @@ def tiden(cli: str, arguments: list[str], product: str) -> dict:
 
 
 def watermark(cli: str, product: str) -> str:
-    status = tiden(cli, ["drift", "status"], product)
+    status = tiden(cli, ["drift", "status"], product, retry=True)
     value = status.get("watermarkSha")
     if status.get("repository") != REPOSITORY or not isinstance(value, str) or not SHA.fullmatch(value):
         raise Refused("tiden drift status names no watermark commit of this repository")
@@ -131,7 +148,7 @@ def watermark(cli: str, product: str) -> str:
 
 
 def anchors(cli: str, product: str) -> set[str]:
-    listing = tiden(cli, ["spec", "list", "--branch", "main", "--include-sources"], product)
+    listing = tiden(cli, ["spec", "list", "--branch", "main", "--include-sources"], product, retry=True)
     specs, pagination = listing.get("requirements"), listing.get("pagination")
     if (not isinstance(specs, list) or not isinstance(pagination, dict) or pagination.get("nextPageToken") != ""
             or type(pagination.get("totalCount")) is not int or pagination["totalCount"] != len(specs)):

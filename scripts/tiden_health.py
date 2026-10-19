@@ -54,6 +54,8 @@ REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SYNC_WORKFLOW, SYNC_PAGE_SIZE, SYNC_MAX_PAGES = "tiden-sync.yml", 100, 10
 SYNC_SLACK = timedelta(days=1)  # a run that processes TARGET is created after TARGET exists; the slack covers clock skew
 TIMEOUT = 120
+RETRY_DELAY = 2  # seconds before the one retry of a listing
+RETRY_MIN = 10  # a retry needs at least this many seconds left of the call's one TIMEOUT budget
 PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
 
 
@@ -152,11 +154,23 @@ class Tiden:
         self.cli, self.product, self.workspace = cli, product, workspace
 
     def call(self, *arguments: str) -> dict:
+        """One listing; a failed one is repeated once inside the same TIMEOUT budget, since nothing here writes."""
+        start = time.monotonic()
+        try:
+            return self.once(*arguments)
+        except Unknown:
+            left = TIMEOUT - (time.monotonic() - start) - RETRY_DELAY
+            if left < RETRY_MIN:
+                raise
+        time.sleep(RETRY_DELAY)
+        return self.once(*arguments, timeout=left)
+
+    def once(self, *arguments: str, timeout: float | None = None) -> dict:
         label = " ".join(arguments[:2])
         try:
             completed = subprocess.run([self.cli, *arguments, "--product-id", self.product, "--workspace-id",
                                         self.workspace, "--format", "json"], capture_output=True, text=True,
-                                       timeout=TIMEOUT)
+                                       timeout=timeout or TIMEOUT)
         except subprocess.TimeoutExpired:
             raise Unknown(f"tiden {label} timed out") from None
         except (OSError, UnicodeDecodeError):
