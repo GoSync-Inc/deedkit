@@ -41,7 +41,7 @@ An accepted task is a card accepted per tiden-product-workflow.md whose criteria
 cardless work has none. Inside one the agent applies its migration (production.md backup gate),
 deletes the data or files the card names, and ships its owner-accepted feature enabled: after merge and deploy it
 sets the card's flag or operation opt-in and grants only what the criteria name, never send, call,
-pairing, session or allowlist changes It reports commands and undo. None of this runs
+pairing, session or allowlist changes. It reports commands and undo. None of this runs
 during an active call; check read-only first.
 
 ## 3. Change paths
