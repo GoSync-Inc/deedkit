@@ -510,13 +510,19 @@ def test_two_stop_codes_give_two_fingerprints_and_one_code_keeps_its_own(monkeyp
                                                ('durable_capture_failed.disk_reserve', 'durable_capture_failed', 'disk_reserve'),
                                                ('durable_capture_failed.spool_full', 'durable_capture_failed', 'spool_full')]}
     assert len({tuple(value) for value in fingerprints.values()}) == 4
-    # The same code under another exception type and other frames keeps one fingerprint.
-    other = compile_error('store.py')
-    first = telemetry.safe_event(error(), 'telegram', 'capture_overload')
-    second = telemetry.safe_event(other, 'telegram', 'capture_overload')
+    # The same code under another exception type and other frames keeps one fingerprint on the wire.
+    transport = Transport()
+    client = Client('https://synthetic-key@ingest.example.test/synthetic-project',
+                    before_send=telemetry.before_send, transport=transport)
+    for exc in (error(), compile_error('store.py')):
+        event = telemetry.safe_event(exc, 'telegram', 'capture_overload')
+        event.update(event_id='e'*32, timestamp=1, environment='local-synthetic')
+        client.capture_event(event)
+    first, second = (json.loads(raw.decode().splitlines()[2]) for raw in transport.envelopes)
     assert first['exception']['values'][0]['type'] != second['exception']['values'][0]['type']
     assert first['exception']['values'][0]['stacktrace'] != second['exception']['values'][0]['stacktrace']
-    assert first['fingerprint'] == second['fingerprint'] == fingerprints['capture_overload']
+    assert first['fingerprint'] == second['fingerprint'] == ['collector-stop', 'telegram', 'capture_overload']
+    assert first['fingerprint'] == fingerprints['capture_overload']
 
 
 def compile_error(name):
