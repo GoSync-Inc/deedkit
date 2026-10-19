@@ -1,5 +1,6 @@
 """Consistent, bounded message/file evidence from already authorized rows."""
 from .attachment_metadata import attachment_fields
+from .media_policy import ELIGIBILITY_JOIN
 
 
 def send_provenance(c,rows):
@@ -60,12 +61,13 @@ def decorate(c,rows):
     files=c.execute('''SELECT j.message,j.id AS attachment_id,a.id,a.filename,a.mime,a.bytes,a.digest,
         j.descriptor,j.attempts,j.next_due,j.requested_until,m.account,m.chat,m.revision AS message_revision,
         m.provider_id AS provider_message_id,ch.provider_chat AS provider_chat_id,
-        j.state AS job_state,j.error_code AS download_error_code,
+        j.state AS job_state,j.error_code AS download_error_code,el.occurrence AS download_eligibility,
         coalesce(a.filename,j.descriptor->>'filename') AS source_name,
         coalesce(f.state,'unknown') AS extraction_state,CASE WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio' WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END) THEN 'queued' ELSE coalesce(e.state,'unconfigured') END AS enrichment_state
         FROM media_jobs j JOIN messages m ON m.id=j.message
         JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
         LEFT JOIN attachments a ON a.id=j.id AND a.active
+        '''+ELIGIBILITY_JOIN+'''
         LEFT JOIN attachment_text f ON f.attachment=a.id AND f.source_digest=a.digest
             AND f.source_revision=m.revision AND f.source_filename=a.filename AND f.source_mime=a.mime
             AND f.source_bytes=a.bytes AND f.state<>'superseded'

@@ -822,6 +822,9 @@ class TelegramCollector:
         try:
             self.policy=await asyncio.to_thread(self.state.policy)
             await asyncio.to_thread(self.state.status,'starting',self.coverage_code)
+            # Status evidence only: without it sync status keeps its unknown basis.
+            with suppress(Exception):
+                await asyncio.to_thread(self.state.media_policy,self.media_prefetch_days,self.history_since)
             sweep=getattr(self.writer,'sweep_abandoned',None)
             if sweep is not None:
                 # Best effort: leftovers only waste disk, they never block capture.

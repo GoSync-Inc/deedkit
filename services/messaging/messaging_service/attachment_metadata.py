@@ -13,6 +13,11 @@ from .file_index import file_response_fields
 from .status_details import describe
 
 
+# Download phase of a queued original the current collector run will not fetch by itself.
+WAITING = {'outside_prefetch_window':'available_on_request','outside_history_bounds':'unavailable',
+    'collection_excluded':'blocked'}
+
+
 def processing_phases(c, row):
     """Current authorized occurrence, independent of original filesystem presence."""
     if not row.get('digest'):
@@ -71,6 +76,7 @@ def attachment_fields(row, *, original_present=None):
     until=row.get('requested_until')
     requested=isinstance(until,datetime) and until.tzinfo is not None and until>datetime.now(timezone.utc)
     request_state='requested' if requested else 'expired' if until is not None else 'not_requested'
+    eligibility=row.get('download_eligibility')
     if registered:
         download_status='unavailable' if original_present is False else 'ready'
         phase='unavailable' if original_present is False else 'ready'
@@ -78,11 +84,17 @@ def attachment_fields(row, *, original_present=None):
         action='check_original_storage' if original_present is False else 'get_attachment'
         if original_present is False and row.get('original_residency')=='evicted':
             reason='original_evicted';action='request_file_download'
+            # A re-download is bound by collection policy and the history bound (ANYM-284).
+            if eligibility in ('outside_history_bounds','collection_excluded'):
+                reason=eligibility;action=describe(eligibility)['next_action']
     else:
         download_status={'leased':'processing','ready':'unavailable'}.get(state,state)
         phase=download_status
         reason=error or {'leased':'transfer_in_progress','ready':'original_not_registered'}.get(state,state)
-        if error:
+        if diagnostic_state=='queued' and eligibility in WAITING:
+            # Why the job waits now, not a code recorded while it was eligible (ANYM-284).
+            reason=eligibility;action=describe(eligibility)['next_action'];phase=WAITING[eligibility]
+        elif error:
             phase='blocked' if error in ('paused_storage','disk_reserve','media_size_limit') else download_status
             action=describe(error,job_state=diagnostic_state)['next_action']
         else:
@@ -93,7 +105,8 @@ def attachment_fields(row, *, original_present=None):
         if registered and key in row}
     provenance={key:row[key] for key in ('provider_platform','provider_message_id','media_kind') if key in row}
     description={key:value for key,value in row.items() if key.startswith('understanding_')}
-    detail=describe(error,job_state=diagnostic_state) if error else None
+    detail=(describe(reason) if reason in WAITING else
+        describe(error,job_state=diagnostic_state) if error else None)
     item=file_response_fields({'id':attachment_id,'attachment_id':attachment_id,
         'filename':filename,'mime':mime,'bytes':size,'sha256':digest if registered else None,
         'digest':digest if registered else None,'error_code':error,**coverage,**provenance,**description},
@@ -111,8 +124,9 @@ def attachment_fields(row, *, original_present=None):
         download_phase=phase,download_reason=reason,reason=reason,next_action=action,
         download_request={'state':request_state,'until':until},error_detail=detail,
         download_retry_scheduled=bool(detail and detail.get('retry_scheduled')))
-    for key in ('attempts','next_due'):
+    for key in ('attempts','next_due','download_eligibility'):
         if key in row:item[key]=row[key]
+    if eligibility=='unknown':item['eligibility_reason']='history_bound_unknown'
     source={}
     for name,aliases in {'account':('account',),'chat':('chat',),'message_id':('message_id','message'),
             'provider_chat_id':('provider_chat_id','provider_chat'),

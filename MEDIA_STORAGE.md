@@ -277,12 +277,74 @@ another automatic retry. `needs_attention` remains true when other jobs are
 simultaneously paused for storage. Other smaller eligible jobs can proceed on later passes.
 Normal capture and metadata/text search remain independent of this pause.
 
+### Which queued originals count as pending (schema 35, no migration)
+
+A recorded `error_code` is the reason of the job's last attempt, not a current
+diagnosis: a job paused while its message was in the window keeps
+`paused_storage` after the message ages out, and is then no longer claimed. Each
+collector run therefore publishes the window and history bound it claims with in
+`collector_health.operations.media_policy` (`prefetch_days`, `history_since`,
+`epoch`). Sync status uses that record only while its `epoch` equals the account's
+collector lease epoch, so a run that could not publish never inherits an earlier
+run's window.
+
+With a current record, account media operations report
+`storage_paused_basis: "eligible_jobs"` and `prefetch_window_days`, and classify
+each queued original without a registered original exactly once:
+
+- **eligible**: an unexpired explicit request, or a message inside the window
+  (`null` window: any message), in both cases not before the run's history bound.
+  `eligible_queued_jobs` counts them. `storage_paused_jobs`,
+  `storage_unavailable_jobs`, `retry_queued_jobs` and the queued `diagnostics`
+  count eligible jobs only, by their recorded code. Media `state` is
+  `paused_storage` or `queued` only because of eligible jobs.
+- **`outside_prefetch_window_jobs`**: known occurrences that wait for an explicit
+  `request_file_download`, whatever code they recorded earlier.
+- **`outside_history_bounds_jobs`**: messages older than the chat's confirmed
+  history bound; a request does not download them.
+- **`history_bound_unknown_jobs`**: messages older than the run's published bound
+  in a chat whose bound is not confirmed (see below); the run does not download
+  them, and a request cannot be promised.
+- **`collection_excluded_jobs`**: collection disabled for the account or chat.
+
+`errors` keeps every recorded code as evidence, and `download` counts are
+unchanged (each occurrence in exactly one download state). Without a current
+record (a collector from before this change, or a run that has not published yet),
+status keeps the recorded-code counting and reports `storage_paused_basis:
+"unknown"` with the new counters `null`.
+
+A chat's history bound is **confirmed** only when its `collector_chats.history_since`
+equals the bound the current run published; a `NULL` equal to a published `null`
+is a confirmed unbounded history. A row a live callback created without a bound, a
+row from an earlier configuration, or a missing row is unknown evidence and never
+yields `outside_history_bounds`.
+
+Attachments follow the same rule, but only with a confirmed chat bound. A queued
+original of an excluded chat or a disabled account has `download_phase: blocked`,
+reason `collection_excluded` and next action `check_collection_policy`; a
+managed-evicted original there has the same reason and action instead of
+`request_file_download`. A queued
+original outside the window has
+`download_phase: available_on_request`, reason `outside_prefetch_window` and next
+action `request_file_download` (conversation text: "файл доступен по запросу"),
+not `blocked`. Before a confirmed bound, an original that needs a provider download
+or re-download (including a managed-evicted one) has reason
+`outside_history_bounds` and no `request_file_download` action; its request returns
+`request_status: unavailable` with that reason and records no `requested_until`. A
+present original stays `ready` regardless of the bound. Access, deletion,
+active-transfer and terminal-failure answers keep their precedence. With an
+unknown bound (or no current record) the attachment and every request for it,
+including a repeated (`coalesced`) one, report `download_eligibility: unknown` and
+`eligibility_reason: history_bound_unknown`; the first request is still recorded
+(`request_status: queued`) and nothing is advertised as available on request.
+
 A local write failure that is not a capacity limit (missing directory,
 permissions, read-only mount, or the native adapter's temporary media directory)
 is `error_code=storage_unavailable`, not `network_error`. Like a capacity pause it
 does not consume a provider attempt and never fails the job terminally; it
 retries every 5 minutes, and account media operations report
-`state=storage_unavailable` and `storage_unavailable_jobs`. Fix the storage path,
+`state=storage_unavailable` and `storage_unavailable_jobs` (eligible jobs only, as
+described above: an aged-out job resumes only on request). Fix the storage path,
 then downloads resume on their own. Jobs recorded as `network_error` before this
 classification keep their recorded code.
 
@@ -334,4 +396,5 @@ original without a job is `ready`, and a `ready` job without a registered origin
 is `unavailable`. `download.ready` therefore equals `stored_files`.
 `current_files` sums every state except `superseded` (replaced older revisions);
 `download_basis: current_file_occurrences` names this rule. Queued originals
-outside the prefetch window are known occurrences that are not stored yet.
+outside the prefetch window are known occurrences that are not stored yet; account
+media operations count them in `outside_prefetch_window_jobs`, not as pending work.

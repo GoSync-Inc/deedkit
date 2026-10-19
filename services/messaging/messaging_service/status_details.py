@@ -44,6 +44,10 @@ DETAILS={
     'media_storage_unavailable':('The native media temporary directory could not be written. Provider attempts are not consumed.','check_media_storage_path'),
     'paused_storage':('Original download is deferred by local storage admission. Message capture and searchable metadata remain independent; provider attempts are not consumed.','check_media_storage_capacity'),
     'durable_capture_failed':('A callback could not be durably saved; reconnect reconciliation is required.','check_collector_health'),
+    'outside_prefetch_window':('The message is outside the collector\'s automatic prefetch window. The original is a known occurrence, downloaded only on an explicit request; a recorded earlier reason is history.','request_file_download'),
+    'outside_history_bounds':('The message is older than the collector\'s configured history bound. The original is not downloaded, even on request.','get_sync_status_for_chat'),
+    'collection_excluded':('Collection is disabled for this account or chat; the original is not downloaded.','check_collection_policy'),
+    'history_bound_unknown':('The collector has not confirmed the history bound of this chat. A request is recorded, but whether the collector can download the original is unknown.','get_sync_status_for_chat'),
 }
 
 
