@@ -230,7 +230,7 @@ def fixture(tmp_path, monkeypatch):
         'retained': [], 'previous': None, 'ci': {'sha': SHA}, 'baseline': [],
         'controls': {name: str(release / name / 'control.sock') for name in ['api', 'gateway']}}
     s.p.write(release / 'http-prepared.json', receipt)
-    monkeypatch.setattr(s.p, 'verify', lambda sha: calls.append('verify') or {'sha': sha})
+    monkeypatch.setattr(s.p, 'promotable', lambda sha: calls.append('verify') or {'sha': sha})
     monkeypatch.setattr(s, 'validate_prepared', lambda *a: calls.append('validate'))
     monkeypatch.setattr(s, 'check_schema', lambda *a: calls.append('schema'))
     monkeypatch.setattr(s, 'router_identity', lambda *a: ROUTER_ID)
@@ -358,7 +358,7 @@ def test_local_unix_control_uses_bounded_json_protocol(tmp_path):
 
 def test_ci_failure_before_start_never_mutates_runtime(tmp_path, monkeypatch):
     cfg, release, calls, _ = fixture(tmp_path, monkeypatch)
-    monkeypatch.setattr(s.p, 'verify', lambda sha: (_ for _ in ()).throw(s.Refused('CI failed')))
+    monkeypatch.setattr(s.p, 'promotable', lambda sha: (_ for _ in ()).throw(s.Refused('CI failed')))
     with pytest.raises(s.Refused, match='CI failed'):
         s.promote(cfg, SHA)
     assert not calls
@@ -491,7 +491,7 @@ def test_bootstrap_writes_only_pinned_private_router_artifacts(tmp_path, monkeyp
     cfg = settings(tmp_path)
     router_build_receipt(cfg)
     calls = []
-    monkeypatch.setattr(s.p, 'verify', lambda sha: calls.append(('verify', sha)) or {'sha': sha})
+    monkeypatch.setattr(s.p, 'promotable', lambda sha: calls.append(('verify', sha)) or {'sha': sha})
     def inspect(command):
         calls.append(command)
         assert command == ['docker', 'image', 'inspect', IMAGE]
@@ -524,7 +524,7 @@ def test_bootstrap_rejects_unverified_source_before_writing_artifacts(tmp_path, 
         if failure == 'ci':
             raise s.Refused('CI failed')
         return {'sha': sha}
-    monkeypatch.setattr(s.p, 'verify', verify)
+    monkeypatch.setattr(s.p, 'promotable', verify)
     image = {'Id': OLD if failure == 'image-id' else IMAGE, 'Config': {'Labels': {
         'org.opencontainers.image.revision': 'd'*40 if failure == 'revision' else SHA,
         'org.opencontainers.image.source': 'https://untrusted.invalid/code' if failure == 'source' else 'https://github.com/'+s.p.REPOSITORY}}}
@@ -554,7 +554,7 @@ def test_prepare_preserves_legacy_and_allows_next_managed_generation(tmp_path, m
     monkeypatch.setattr(s, 'router_identity', lambda *a: None)
     monkeypatch.setattr(s, 'router_get', lambda *a: (live, '"etag"'))
     monkeypatch.setattr(s, 'schema_inventory', lambda *a: {'schema.sql': '1'*64, 'migrations/002_archive.sql': '2'*64})
-    monkeypatch.setattr(s.p, 'verify', lambda *a: {'sha': SHA})
+    monkeypatch.setattr(s.p, 'promotable', lambda *a: {'sha': SHA})
     commands = []
     def resolve(command):
         commands.append(command)
@@ -752,7 +752,7 @@ def test_bootstrap_requires_clean_verified_router_build_receipt(tmp_path, monkey
         value = s.p.read(path)
         value[failure] = {'sha': 'd'*40} if failure == 'ci' else 'wrong'
         s.p.write(path, value)
-    monkeypatch.setattr(s.p, 'verify', lambda sha: {'sha': sha})
+    monkeypatch.setattr(s.p, 'promotable', lambda sha: {'sha': sha})
     monkeypatch.setattr(s.p, 'run', lambda *a: json.dumps([{'Id': IMAGE, 'Config': {'Labels': {
         'org.opencontainers.image.revision': SHA,
         'org.opencontainers.image.source': 'https://github.com/'+s.p.REPOSITORY}}}]))
@@ -859,7 +859,7 @@ def test_prepare_after_plan_a_reuses_its_images_for_the_schema_probe(tmp_path, m
     s.p.write(Path(cfg['http_release']['router']['config_file']), live)
     monkeypatch.setattr(s, 'router_identity', lambda *a: None)
     monkeypatch.setattr(s, 'router_get', lambda *a: (live, '"etag"'))
-    monkeypatch.setattr(s.p, 'verify', lambda *a: {'sha': SHA})
+    monkeypatch.setattr(s.p, 'promotable', lambda *a: {'sha': SHA})
     assert s.prepare(cfg, SHA)['images'] == plan_a
     assert len(store.pulls()) == 2 and store.built() == [] and set(plan_a.values()) <= set(store.images)
     # The receipt schema, the candidate and the running plan A API image are all probed, on plan A's image.
@@ -868,25 +868,28 @@ def test_prepare_after_plan_a_reuses_its_images_for_the_schema_probe(tmp_path, m
 
 
 def test_promotion_accepts_a_verified_commit_that_main_has_moved_past(tmp_path, monkeypatch):
-    from tests.test_production import comparison, github
-    verify = s.p.verify
-    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
-    get, _, _ = github()
-    compared = []
-    def moved(path):
-        if path.startswith('compare/main...'):
-            compared.append(path)
-            return comparison(SHA, behind=2)  # two commits merged after SHA
-        if path == 'git/ref/heads/main':
-            return {'object': {'sha': 'f' * 40}}  # main's head is one of them
-        return get(path)
-    monkeypatch.setattr(s.p, 'verify', lambda sha: calls.append('verify') or verify(sha, moved))
+    from tests.test_production import accepting_verifier, main_repository, offline
+    promotable, run = s.p.promotable, s.p.run
+    history, side = main_repository(tmp_path, monkeypatch)  # two commits merged after history[0]
+    accepting_verifier(tmp_path, monkeypatch)
+    requests = offline(monkeypatch)
+    def gate(sha, calls):
+        # The real check (git and the verifier) inside the fixture's synthetic Docker.
+        calls.append('verify')
+        fake = s.p.run
+        s.p.run = run
+        try:
+            return promotable(history[0] if sha == SHA else side)
+        finally:
+            s.p.run = fake
+    (tmp_path / 'host').mkdir()
+    cfg, release, calls, receipt = fixture(tmp_path / 'host', monkeypatch)
+    monkeypatch.setattr(s.p, 'promotable', lambda sha: gate(sha, calls))
     s.promote(cfg, SHA)
-    assert 'switch' in calls and len(compared) == calls.count('verify') >= 3
-    diverged = lambda path: {**comparison(SHA), 'status': 'diverged', 'ahead_by': 1} if path.startswith('compare/') else get(path)
+    assert 'switch' in calls and calls.count('verify') >= 3 and requests == []
     (tmp_path / 'other').mkdir()
     cfg, release, calls, receipt = fixture(tmp_path / 'other', monkeypatch)
-    monkeypatch.setattr(s.p, 'verify', lambda sha: verify(sha, diverged))
+    monkeypatch.setattr(s.p, 'promotable', lambda sha: gate('c' * 40, calls))  # a commit off main
     with pytest.raises(s.Refused, match='not a commit on main'):
         s.promote(cfg, SHA)
     assert 'switch' not in calls and not (release / 'http-attempted.json').exists()

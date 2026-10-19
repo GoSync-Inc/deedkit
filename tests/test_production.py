@@ -148,7 +148,7 @@ def fixture(tmp_path, monkeypatch):
             return "replacement123\n"
         return ""
     monkeypatch.setattr(p, "run", command)
-    monkeypatch.setattr(p, "verify", lambda sha: {"sha": sha, "run_id": 12})
+    monkeypatch.setattr(p, "promotable", lambda sha: {"sha": sha, "run_id": 12})
     monkeypatch.setattr(p, "published", lambda target, sha: verified_image(target, IMAGE))
     monkeypatch.setattr(p, "IMAGE_LOCK", tmp_path / "absent" / "image-build.lock")
     monkeypatch.setattr(p, "check_space", lambda directory: None)
@@ -420,7 +420,7 @@ def test_ci_becoming_red_after_build_prevents_a_prepared_release(tmp_path, monke
         if len(attempts) == 2:
             raise p.Refused("latest CI failed")
         return {"sha": sha}
-    monkeypatch.setattr(p, "verify", gate)
+    monkeypatch.setattr(p, "promotable", gate)
     with pytest.raises(p.Refused):
         p.prepare(settings, SHA)
     assert not (Path(settings["state_directory"]) / SHA / "prepared.json").exists()
@@ -453,7 +453,7 @@ def test_changed_candidate_or_live_runtime_is_refused_before_first_stop(tmp_path
     elif change == "snapshot":
         Path(receipt["projects"][0]["file"]).write_text("{}")
     elif change == "ci":
-        monkeypatch.setattr(p, "verify", lambda sha: (_ for _ in ()).throw(p.Refused("red CI")))
+        monkeypatch.setattr(p, "promotable", lambda sha: (_ for _ in ()).throw(p.Refused("red CI")))
     else:
         def changed(argv, **kw):
             if change == "container" and argv[:2] == ["docker", "ps"]:
@@ -1192,7 +1192,7 @@ class Host:
         self.tags, self.calls, self.main, self.serial = {}, [], SHA, 0
         self.container = {"Id": "container0", "Image": OLD_IMAGE, "State": {"Running": True}}
         monkeypatch.setattr(p, "run", self.run)
-        monkeypatch.setattr(p, "verify", lambda sha: {"sha": sha, "run_id": 12})
+        monkeypatch.setattr(p, "promotable", lambda sha: {"sha": sha, "run_id": 12})
         monkeypatch.setattr(p, "published", self.published)
         monkeypatch.setattr(p, "check_space", lambda directory: None)
         monkeypatch.setattr(p, "IMAGE_LOCK", tmp_path / "absent" / "image-build.lock")
@@ -1739,26 +1739,30 @@ def test_a_push_run_change_during_the_queue_read_of_a_reused_verification_is_ref
             p.verify(SHA, racing)
 
 
-def test_the_quota_a_deploy_waits_for_covers_every_verification_of_plans_a_and_b():
+def test_the_quota_a_deploy_waits_for_covers_every_verification_of_plans_a_and_b(tmp_path, monkeypatch):
     import ast
     import inspect
     import textwrap
     from scripts import seamless_release as s
-    def verifications(function):
+    def calls(function, name):
         tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-        return sum(isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) == "verify"
+        return sum(isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) == name
                    for node in ast.walk(tree))
     # seamless prepare runs production.py prepare first.
-    plan_a = verifications(p.prepare) + verifications(p.apply)
-    plan_b = verifications(p.prepare) + verifications(s.prepare) + verifications(s.promote)
+    plan_a = calls(p.prepare, "promotable") + calls(p.apply, "promotable")
+    plan_b = calls(p.prepare, "promotable") + calls(s.prepare, "promotable") + calls(s.promote, "promotable")
     assert (plan_a, plan_b) == (4, 6)
-    get, _, _ = queue_github()  # the costliest path: the push run reused the queue's verification
-    for steps, count, listing in (("plan A and B", plan_a + plan_b, 1), ("plan B", plan_b, 0)):
-        paths = []
-        with p.verification_reuse():
-            for _ in range(count):
-                p.verify(SHA, lambda path: paths.append(path) or get(path))
-        assert len(paths) + listing <= p.QUOTA[steps] - 4, (steps, len(paths))  # 4 spare for a second page
+    # No step of a release reads GitHub's REST API or its quota any more (ANYM-406), so there is no quota to wait for.
+    steps = (p.prepare, p.apply, p.prepare_router, p.promotable, p.deploy, p.deploy_locked, p.deploy_steps,
+             s.bootstrap, s.prepare, s.promote)
+    assert not hasattr(p, "QUOTA") and not any(calls(step, name) for step in steps
+                                               for name in ("verify", "api", "latest_run", "urlopen", "quota"))
+    history, _ = main_repository(tmp_path, monkeypatch)
+    accepting_verifier(tmp_path, monkeypatch)
+    requests = offline(monkeypatch)
+    for _ in range(plan_a + plan_b):
+        p.promotable(history[-1])
+    assert requests == []
 
 
 def test_an_exhausted_github_quota_is_refused_with_its_reset_time(monkeypatch):
@@ -1857,9 +1861,9 @@ BASE, NEWER, NEWEST = "0" * 40, "1" * 40, "2" * 40
 
 
 class Deployer:
-    """A synthetic host for `deploy`: plan A and HTTP state at BASE, a main history BASE..NEWEST, a CI listing,
-    and the release steps recorded instead of run. No git (but the check of an existing source mirror), GitHub or
-    Docker access."""
+    """A synthetic host for `deploy`: plan A and HTTP state at BASE, a main history BASE..NEWEST, the commits whose
+    images are attested, and the release steps recorded instead of run. No git (but the check of an existing source
+    mirror), GitHub, registry or Docker access."""
     real_run = staticmethod(p.run)
 
     def __init__(self, tmp_path, monkeypatch, *, history=(NEWER, NEWEST), green=(NEWER, NEWEST), changes=None):
@@ -1874,11 +1878,8 @@ class Deployer:
         self.settings = {"version": 1, "state_directory": str(self.state), "projects": [project]}
         self.http = {"version": 1, "state_directory": str(self.http_state), "projects": [project], "http_release": {}}
         self.history, self.changes = [BASE, *history], changes or {}
-        self.runs = [{"id": 100 + index, "head_sha": sha, "head_branch": "main", "event": "push",
-                      "status": "completed" if sha in green else "in_progress",
-                      "conclusion": "success" if sha in green else None, "html_url": f"https://example.invalid/{index}"}
-                     for index, sha in enumerate(self.history)]
-        self.steps, self.requests, self.git, self.remaining = [], [], [], 60
+        self.green = set(green)
+        self.steps, self.requests, self.git = [], [], []
         self.blobs, self.git_failures = {}, {}
         self.current(BASE)
         p.write(self.http_state / "http-current.json",
@@ -1886,7 +1887,9 @@ class Deployer:
         monkeypatch.setattr(p, "PAUSE", tmp_path / "autodeploy.pause")
         monkeypatch.setattr(s, "GLOBAL_LOCK", tmp_path / "global")
         monkeypatch.setattr(p, "run", self.run)
-        monkeypatch.setattr(p, "quota", lambda: (self.remaining, "12:00:00Z"))
+        def offline(*args, **kwargs):
+            raise AssertionError("deploy made a GitHub API request")
+        monkeypatch.setattr(p.urllib.request, "urlopen", offline)
         for module, name in ((p, "prepare"), (p, "apply"), (p, "rollback"), (s, "prepare"), (s, "promote"),
                              (s, "retire")):
             monkeypatch.setattr(module, name, self.step(module is s, name))
@@ -1925,10 +1928,12 @@ class Deployer:
             return {"sha": sha}
         return call
 
-    def get(self, path):
-        self.requests.append(path)
-        assert path.startswith("actions/workflows/ci.yml/runs?") and "branch=main" in path and "event=push" in path
-        return {"workflow_runs": self.runs[::-1]}
+    def attested(self, sha):
+        """The verifier's answer for the proof image of `sha`: attested only once its CI published it."""
+        self.requests.append(sha)
+        if sha not in self.green:
+            raise p.Unattested("attest-verify failed (exit 1): attest-verify: no attestation")
+        return {"digest": IMAGE}
 
     def run(self, argv, **kwargs):
         if argv[:2] == ["docker", "compose"] and "config" in argv:
@@ -1965,7 +1970,7 @@ class Deployer:
         return ""  # clone and fetch of the blobless mirror
 
     def deploy(self, **options):
-        return p.deploy(self.settings, self.http, get=self.get, **options)
+        return p.deploy(self.settings, self.http, attested=self.attested, **options)
 
     def paused(self):
         return json.loads(p.PAUSE.read_text())["reason"] if p.PAUSE.exists() else None
@@ -1978,12 +1983,12 @@ def test_deploy_applies_the_newest_green_main_commit_with_plan_a_then_plan_b(tmp
     assert host.steps == [("prepare", NEWEST), ("apply", NEWEST), ("seamless prepare", NEWEST),
                           ("seamless promote", NEWEST)]
     assert outcome["status"] == "deployed" and outcome["sha"] == NEWEST and outcome["base"] == BASE
-    assert outcome["run"] == "https://example.invalid/2" and outcome["http"] == "serving"
+    assert "run" not in outcome and outcome["http"] == "serving"
     assert p.read(host.state / "deploy.json") == outcome and host.paused() is None
-    assert len(host.requests) == 1
-    # The next run waits for the newest commit's CI, with one listing.
+    assert host.requests == ["3" * 40, NEWEST]  # newest first, until one is attested
+    # The next run waits for the newest commit's CI: it is not attested yet.
     host.requests.clear()
-    assert host.deploy()["status"] == "waiting" and len(host.requests) == 1 and len(host.steps) == 4
+    assert host.deploy()["status"] == "waiting" and host.requests == ["3" * 40] and len(host.steps) == 4
 
 
 def test_deploy_without_a_new_main_commit_reads_neither_the_api_nor_the_history(tmp_path, monkeypatch):
@@ -2091,7 +2096,8 @@ def test_a_refusal_before_any_change_pauses_and_a_network_or_quota_error_is_retr
     host.fail_prepare = lambda sha: (_ for _ in ()).throw(p.Refused("latest main CI run is not a completed success"))
     outcome = host.deploy()
     assert outcome["status"] == "halted" and "refused before any change" in outcome["reason"]
-    for error in (TimeoutError(), p.RateLimited("GitHub rate limit exhausted, resets at 12:00:00Z")):
+    for error in (TimeoutError(), p.RateLimited("GitHub rate limit exhausted, resets at 12:00:00Z"),
+                  p.Unreachable("main could not be read: git failed (exit 128)")):
         (tmp_path / type(error).__name__).mkdir()
         host = Deployer(tmp_path / type(error).__name__, monkeypatch)
         def early(sha, host=host, error=error):
@@ -2108,13 +2114,9 @@ def test_a_refusal_before_any_change_pauses_and_a_network_or_quota_error_is_retr
 
 def test_deploy_waits_for_the_api_quota_and_for_the_interval_between_automatic_deploys(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch)
-    host.remaining = p.QUOTA["plan A and B"] - 1
-    outcome = host.deploy()
-    assert outcome["status"] == "waiting" and "until 12:00:00Z" in outcome["reason"] and host.requests == []
-    host.remaining = 60
-    assert host.deploy()["status"] == "deployed"
-    host.runs.append({"id": 200, "head_sha": "3" * 40, "head_branch": "main", "status": "completed",
-                      "conclusion": "success", "html_url": "https://example.invalid/3"})
+    # No API quota is read or waited for (ANYM-406): the harness fails any GitHub API request.
+    assert not hasattr(p, "quota") and host.deploy()["status"] == "deployed"
+    host.green.add("3" * 40)
     host.history.append("3" * 40)
     host.steps.clear()
     assert host.deploy(auto=True)["status"] == "waiting" and host.steps == []
@@ -2123,7 +2125,7 @@ def test_deploy_waits_for_the_api_quota_and_for_the_interval_between_automatic_d
 
 def test_deploy_finishes_plan_b_when_plan_a_is_ahead_of_the_serving_http_release(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch)
-    host.current(NEWER)  # plan A applied NEWER; its HTTP release waited for the API quota
+    host.current(NEWER)  # plan A applied NEWER; its HTTP release stopped before any change
     assert host.deploy()["status"] == "deployed"
     assert host.steps == [("seamless prepare", NEWER), ("seamless promote", NEWER)] and host.requests == []
 
@@ -2322,8 +2324,7 @@ def test_a_bare_mirror_under_a_path_with_spaces_is_fetched(tmp_path, monkeypatch
 
 def test_a_dry_run_reports_the_plan_or_the_pause_reason_and_changes_nothing(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch)
-    assert host.deploy(dry_run=True) == {"status": "plan", "sha": NEWEST, "base": BASE,
-                                         "run": "https://example.invalid/2", "steps": ["plan A", "plan B"]}
+    assert host.deploy(dry_run=True) == {"status": "plan", "sha": NEWEST, "base": BASE, "steps": ["plan A", "plan B"]}
     host.changes = {NEWEST: ["services/messaging/messaging_service/migrations/036_synthetic.sql"]}
     assert "SQL inventory" in host.deploy(dry_run=True)["would_pause"]
     assert host.steps == [] and host.paused() is None and not (host.state / "deploy.json").exists()
@@ -2343,7 +2344,7 @@ def test_the_command_line_runs_deploy_only_as_the_host_operator_and_exits_1_on_a
     monkeypatch.setattr(host.s, "locks", lambda settings: contextlib.nullcontext())
     monkeypatch.setattr(p, "config", lambda name: host.settings if name == "plan-a.json" else host.http)
     monkeypatch.setattr(host.s, "validate_settings", lambda value: value)
-    monkeypatch.setattr(p, "api", host.get)
+    monkeypatch.setattr(p, "published", lambda target, sha: host.attested(sha))
     with pytest.raises(SystemExit) as stopped:
         p.main(arguments)
     printed = json.loads(capsys.readouterr().out)
@@ -2452,3 +2453,130 @@ def test_a_deploy_and_a_backup_never_hold_the_backup_runner_lock_at_once(tmp_pat
         # flock does not forward signals to its command: stop the whole session it started.
         os.killpg(running.pid, signal.SIGTERM)
         running.wait()
+
+
+# Promotion without the GitHub REST API (ANYM-406): main by `git ls-remote` and fetched history, CI by attestation.
+
+
+def main_repository(tmp_path, monkeypatch, *, commits=3):
+    """A synthetic GitHub: a local repository that real git reaches under the repository's https URL, with a main
+    history and one commit off main. Returns (main commits, oldest first; the side commit)."""
+    origin = tmp_path / "origin"
+    environment = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    def git(*arguments):
+        return subprocess.run(["git", "-C", str(origin), *arguments], check=True, capture_output=True, text=True,
+                              env=environment).stdout.strip()
+    origin.mkdir()
+    git("init", "--quiet", "--initial-branch=main")
+    history = []
+    for index in range(commits):
+        git("commit", "--quiet", "--allow-empty", "-m", f"synthetic {index}")
+        history.append(git("rev-parse", "HEAD"))
+    git("checkout", "--quiet", "-b", "feature")
+    git("commit", "--quiet", "--allow-empty", "-m", "synthetic side")
+    side = git("rev-parse", "HEAD")
+    git("checkout", "--quiet", "main")
+    git("config", "uploadpack.allowFilter", "true")
+    git("config", "uploadpack.allowAnySHA1InWant", "true")
+    redirect(monkeypatch, "file://" + str(origin))
+    return history, side
+
+
+def redirect(monkeypatch, url):
+    """Every git process of the test reaches `url` where production.py names the GitHub repository."""
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{url}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/" + p.REPOSITORY + ".git")
+
+
+def accepting_verifier(tmp_path, monkeypatch, attested=None):
+    """The pinned verifier as a script: it reports a valid attestation for every commit, or only for `attested`."""
+    known = "" if attested is None else f'[ "$4" = "{attested}" ] || {{ echo "attest-verify: refused: no attestation" >&2; exit 1; }}\n'
+    reference = p.REGISTRY + "runtime@" + MANIFEST
+    return fake_verifier(tmp_path, monkeypatch, ("#!/bin/sh\n" + known + "printf '{\"reference\": \"%s\", \"digest\": \"%s\", "
+                         "\"config_digest\": \"%s\", \"sha\": \"%s\"}' " + f"'{reference}' '{MANIFEST}' '{IMAGE}' \"$4\"\n").encode())
+
+
+def offline(monkeypatch):
+    """Any GitHub API request (the REST calls and /rate_limit all go through urlopen) fails the test."""
+    requests = []
+    def refuse(request, *args, **kwargs):
+        requests.append(getattr(request, "full_url", request))
+        raise AssertionError("a GitHub API request was made")
+    monkeypatch.setattr(p.urllib.request, "urlopen", refuse)
+    return requests
+
+
+# spec: ANYM-406
+def test_promotion_proves_a_commit_on_main_by_git_and_its_attestation_without_any_github_api_request(tmp_path,
+                                                                                                     monkeypatch):
+    history, _ = main_repository(tmp_path, monkeypatch)
+    accepting_verifier(tmp_path, monkeypatch)
+    requests = offline(monkeypatch)
+    # The head and a commit main has moved past are both promotable; the evidence keeps the attested digests.
+    for sha in (history[-1], history[0]):
+        evidence = p.promotable(sha)
+        assert evidence == {"sha": sha, "main": history[-1], "attestation": {
+            "target": "runtime", "reference": p.REGISTRY + "runtime@" + MANIFEST, "digest": MANIFEST,
+            "config_digest": IMAGE}}
+        assert not any("run" in key or "url" in key for key in evidence)  # no run URL is invented
+    assert requests == []
+
+
+# spec: ANYM-406
+def test_promotion_refuses_a_commit_main_does_not_contain_and_any_unreadable_or_ambiguous_main(tmp_path, monkeypatch):
+    history, side = main_repository(tmp_path, monkeypatch)
+    accepting_verifier(tmp_path, monkeypatch)
+    offline(monkeypatch)
+    verified = []
+    real = p.published
+    monkeypatch.setattr(p, "published", lambda target, sha: verified.append(sha) or real(target, sha))
+    for sha in (side, "c" * 40):  # a pushed branch commit, and a commit the repository does not have
+        with pytest.raises(p.Refused, match="not a commit on main"):
+            p.promotable(sha)
+    with pytest.raises(p.Refused, match="40-character"):
+        p.promotable(history[-1][:12])
+    assert verified == []  # refused before the verifier runs
+    # `refs/heads/main` also names this tag's tail, so ls-remote prints two lines: refused, never the first one.
+    subprocess.run(["git", "-C", str(tmp_path / "origin"), "tag", "refs/heads/main", history[0]], check=True,
+                   capture_output=True)
+    with pytest.raises(p.Unreachable, match="git ls-remote returned no main commit"):
+        p.promotable(history[-1])
+    redirect(monkeypatch, "file://" + str(tmp_path / "missing"))  # ls-remote fails
+    with pytest.raises(p.Unreachable, match="main could not be read: git failed"):
+        p.promotable(history[-1])
+    assert verified == [] and p.transient(p.Unreachable("main could not be read"))
+
+
+# spec: ANYM-406
+def test_promotion_refuses_a_commit_without_a_valid_attestation_before_any_pull(tmp_path, monkeypatch):
+    history, _ = main_repository(tmp_path, monkeypatch)
+    offline(monkeypatch)
+    # The verifier refuses a commit with no publication, or one signed for another SHA, ref or workflow (ANYM-301 B2).
+    accepting_verifier(tmp_path, monkeypatch, attested=history[0])
+    assert p.promotable(history[0])["attestation"]["digest"] == MANIFEST
+    with pytest.raises(p.Unattested, match="attest-verify failed \\(exit 1\\): attest-verify: refused: no attestation"):
+        p.promotable(history[-1])
+    # prepare runs that proof before it fetches, pulls or builds anything.
+    (tmp_path / "host").mkdir()
+    settings, calls, _ = fixture(tmp_path / "host", monkeypatch)
+    monkeypatch.setattr(p, "promotable", lambda sha: (_ for _ in ()).throw(p.Unattested("attest-verify failed (exit 1)")))
+    with pytest.raises(p.Unattested):
+        p.prepare(settings, SHA)
+    assert calls == [] and not (Path(settings["state_directory"]) / SHA).exists()
+
+
+# spec: ANYM-406
+def test_a_failed_rerun_after_the_images_were_attested_does_not_block_promotion(tmp_path, monkeypatch):
+    history, _ = main_repository(tmp_path, monkeypatch)
+    accepting_verifier(tmp_path, monkeypatch)
+    # Whatever GitHub now says about the commit's runs (a failed rerun, an exhausted quota), promotion never asks.
+    failed, _, _ = github(sha=history[-1], conclusion="failure")
+    get = lambda path: {"status": "identical", "ahead_by": 0, "merge_base_commit": {"sha": history[-1]}} \
+        if path.startswith("compare/") else failed(path)
+    with pytest.raises(p.Refused, match="not a completed success"):
+        p.verify(history[-1], get)  # the REST check of the release record refuses it
+    requests = offline(monkeypatch)
+    assert p.promotable(history[-1])["sha"] == history[-1] and requests == []

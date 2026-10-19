@@ -1276,7 +1276,8 @@ def test_within_one_deploy_chained_verifications_fit_the_anonymous_quota_and_a_q
             assert len(paths) == 11
             for _ in range(count - 1):
                 assert production.verify(SHA, counted) == first
-        assert len(paths) + listing <= production.QUOTA[steps] - 4, (steps, len(paths))  # 4 spare for a second page
+        # The anonymous quota a deploy reserved for them before promotion stopped reading the API (ANYM-406).
+        assert len(paths) + listing <= {"plan A and B": 52, "plan B": 35}[steps] - 4, (steps, len(paths))
     # A later verification re-reads the queue run that reused the pull request run, and a rerun of it is read in full.
     with production.verification_reuse():
         production.verify(SHA, counted)
