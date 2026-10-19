@@ -350,10 +350,14 @@ it is when the run starts, not its event commit, and runs
    links, not anchors.
 2. Every remaining path needs a `repo_file` anchor on some spec on Tiden main.
    If one lacks it, the run fails, lists the paths in its summary and leaves the
-   watermark. Add each path as a `repo_file` source of the spec it implements
-   on Tiden main with `tiden spec update --id <spec> --sources-file <file>`,
-   which replaces the whole list, so resend every existing source with its
-   fields (AGENTS.md section 4), then rerun the failed run.
+   watermark. Drift can finish before the sync of the same push: wait for that
+   sync run (dispatch it by SHA if it failed or was dropped), then rerun the
+   failed run. A path no sync anchors (a commit without a pull request, or a
+   sync that failed at step anchors) is added as a `repo_file` source of the spec
+   it implements with `tiden spec update --id <spec> --sources-file <file>` only
+   in a maintenance window, with the sync workflow disabled and no run in
+   progress (main sync). The command replaces the whole list, so resend every
+   existing source with its fields, then rerun the failed run.
 3. Otherwise it runs `tiden drift advance --from W --to <checkout> --reason
    empty_sync` once, requires `"advanced": true` and reads the watermark back.
    The server compares `--from` with the current watermark and answers a stale

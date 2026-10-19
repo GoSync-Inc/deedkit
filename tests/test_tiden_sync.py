@@ -467,6 +467,25 @@ def test_a_null_spec_number_in_any_copy_is_never_merged(root, server, change):
     assert not server.writes()
 
 
+# spec: ANYM-405
+@pytest.mark.parametrize("state", [
+    {"previews": {"proposal/x": {"additions": [{"seqNum": 50}], "modifications": [], "stats": {"conflicts": 1}}}},
+    {"fault": {"branch merge": "exit"}},
+    {"fault": {"spec update": "exit"}},
+    {"fault": {"spec update": "drop"}},
+])
+def test_a_failed_sync_recovers_by_rerun_or_dispatch_and_a_change_by_hand_needs_a_maintenance_window(root, server, state):
+    full_server(server)
+    server.set(**state)
+    merged(root, server, {"app/new.py": "y\n"}, "Delivers: ANYM-50\nTiden branch: proposal/x")
+    code, out = run(root, server)
+    lines = out.splitlines()
+    assert code == 1 and any(line.startswith("Failed at step") for line in lines), out
+    # A merge failure stops the sync and names the recovery itself; any later failure ends with one recovery line.
+    assert "rerun this job or dispatch this SHA from main" in lines[-1], out
+    assert all("maintenance window" in line for line in lines if "hand" in line), out
+
+
 def sync_workflow():
     import yaml
     return yaml.safe_load((Path(SCRIPT).parents[1] / ".github/workflows/tiden-sync.yml").read_text())
