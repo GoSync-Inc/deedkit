@@ -34,10 +34,10 @@ on:
         description: Exact commit these checks tested
         value: ${{ jobs.verify.outputs.source_sha }}
       docs_only:
-        description: Whether the documentation job classified this pull request run as documentation-only
+        description: Whether the documentation job classified this pull request or merge queue run as documentation-only
         value: ${{ jobs.documentation.outputs.docs_only }}
       docs_sha:
-        description: The pull request merge commit the docs-only decision classified
+        description: The pull request merge commit or merge queue group commit the docs-only decision classified
         value: ${{ jobs.documentation.outputs.docs_sha }}
       tiden_published:
         description: Whether a passed Tiden run of this run's evidence was published and verified (not a skip)
@@ -49,9 +49,10 @@ permissions:
   contents: read
 jobs:
   documentation:
-    # A pull request run that changes only reviewed documentation nothing reads skips the test jobs (ANYM-323,
-    # scripts/docs_only.py, .github/docs-only-paths.txt). Every other event, and any doubt, verifies in full.
-    if: ${{ github.event_name == 'pull_request' && inputs.source_ref == '' && !inputs.reuse_queue_evidence }}
+    # A pull request or merge queue run that changes only documentation (`*.md` or `.claude/**`, outside the deny
+    # rules of scripts/docs_only.py) skips the test jobs (ANYM-323). Every other event, and any doubt, verifies in
+    # full; the main push of a docs-only group verifies in full because no queue run verified it.
+    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && inputs.source_ref == '' && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -62,13 +63,15 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 2
-      - name: Decide whether this pull request changes only reviewed documentation
+      - name: Decide whether this change is documentation only
         id: decide
         # A failed decision runs the full suite, never a failed run.
         continue-on-error: true
         env:
           EVENT_NAME: ${{ github.event_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # The pull request head, or the merge queue group commit and its base.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: python3 scripts/docs_only.py
   verify:
     needs: documentation
@@ -783,13 +786,13 @@ jobs:
             # A queue run that reused the pull request verification ran no tests and assembled no evidence.
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             echo 'pr_reused=true' >> "$GITHUB_OUTPUT"
+          elif [ "$DOCS_ONLY" = true ]; then
+            # A docs-only pull request or merge queue run ran no tests, so it has no evidence to publish.
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'docs_only=true' >> "$GITHUB_OUTPUT"
           elif [ "$EVENT_NAME" = merge_group ] || [[ "$SOURCE_BRANCH" == gh-readonly-queue/* ]]; then
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             echo 'queue=true' >> "$GITHUB_OUTPUT"
-          elif [ "$DOCS_ONLY" = true ]; then
-            # A docs-only pull request run ran no tests, so it has no evidence to publish.
-            echo 'enabled=false' >> "$GITHUB_OUTPUT"
-            echo 'docs_only=true' >> "$GITHUB_OUTPUT"
           elif [ -z "$TIDEN_API_TOKEN" ]; then
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             echo 'Tiden reporting is not configured; see TIDEN-CI.md.' >> "$GITHUB_STEP_SUMMARY"
@@ -848,11 +851,11 @@ jobs:
         if: steps.config.outputs.queue == 'true'
         timeout-minutes: 1
         run: python scripts/tiden_ci.py publish --directory "$RUNNER_TEMP/ci-evidence"
-      - name: Record that a docs-only pull request run publishes nothing
+      - name: Record that a docs-only run publishes nothing
         if: steps.config.outputs.docs_only == 'true'
         timeout-minutes: 1
         env:
-          REASON: docs-only pull request run of reviewed documentation; no tests ran, and main CI publishes the merged code
+          REASON: docs-only run of documentation paths; no tests ran, and the main push run verifies and publishes the merged code
         run: |
           python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-route.json").write_text(json.dumps({"branch": None, "source": "skipped", "reason": os.environ["REASON"]}))'
           echo "::notice title=Tiden evidence not published::$REASON"
