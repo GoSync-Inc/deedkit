@@ -34,7 +34,6 @@ def backfill(c):
 
 def resolve_chat(c,p,account,provider_chat_id):
     """Provider chat IDs are exact marked IDs, not usernames or positive channel aliases."""
-    from .store import APIError
     valid_text(account,64,empty=False);valid_text(provider_chat_id,160,empty=False)
     where,args=scope_filter(p,'c',chat_column='id')
     row=c.execute('SELECT c.id,c.account,c.title,c.provider_chat,a.platform FROM chats c '
@@ -45,7 +44,9 @@ def resolve_chat(c,p,account,provider_chat_id):
         row=resolve_alias(c,p,account,provider_chat_id)
         if row:row={**row,'reference_resolution':{'method':'verified_whatsapp_alias',
             'requested_provider_chat_id':provider_chat_id,'original_provider_chat_id':row['provider_chat']}}
-    if not row:raise APIError('not_found',404)
+    if not row:
+        from .outgoing import phone_not_found
+        raise phone_not_found(provider_chat_id)
     # ANYM-361: the same self-chat label as list_chats; the stored title is not returned for it.
     from .chat_queries import SELF_CHAT_TITLE,self_chat_sql
     if c.execute("SELECT c.chat_type='private' AND "+self_chat_sql()+' AS self FROM chats c WHERE c.id=%s',

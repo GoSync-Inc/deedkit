@@ -540,7 +540,7 @@ def test_catalog_covers_explicit_families_and_provider_differences():
         'read-live': ['chat_info', 'get_reactions', 'get_message_info', 'get_pinned_messages', 'request_chat_history'],
         'groups-read': ['list_participants', 'list_topics'],
         'profile-read': ['get_profile'], 'contacts-read': ['list_contacts', 'get_contact', 'list_blocked', 'get_labels'],
-        'send': ['send_file', 'forward_message', 'send_poll', 'send_contact', 'send_location'],
+        'send': ['send_file', 'forward_message', 'send_poll', 'send_contact', 'send_location', 'open_chat_by_phone'],
         'message-edit': ['edit_message'], 'message-delete': ['delete_message'],
         'message-react': ['send_reaction', 'vote_poll'], 'message-pin': ['pin_message', 'unpin_message'],
         'read-state': ['mark_read', 'mark_unread'],

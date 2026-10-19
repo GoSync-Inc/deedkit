@@ -12,12 +12,15 @@ import stat
 
 from psycopg.types.json import Jsonb
 
-from .envelope import canonical
+from .envelope import canonical, stable_id
 from .policy import audit, effective_permissions, lock_principal, targets
 from .store import APIError, serial
 from .outgoing import finish_durably
 
 MAX_FILE_BYTES = 32 * 1024**2
+PHONE_LOOKUPS_PER_HOUR = 10
+OPEN_CHAT_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
+    '--operations <current operations> open_chat_by_phone')
 BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session','session_data',
     'password','secret','stack','traceback','diagnostic','diagnostics','credentials'))
 
@@ -102,7 +105,9 @@ def _policy(c,account,operation,provider_chats=(),*,ready=False):
     from .collector_state import CollectorState
     row=c.execute('SELECT * FROM account_policies WHERE account=%s',(account,)).fetchone()
     if not row or not row['enabled'] or operation not in row['operations_enabled']:
-        raise APIError('operation_disabled',409)
+        failure=APIError('operation_disabled',409)
+        if operation=='open_chat_by_phone':failure.hint=OPEN_CHAT_ENABLE_STEP
+        raise failure
     if any(not CollectorState.allows(row,chat) for chat in provider_chats):
         raise APIError('not_found',404)
     if ready:
@@ -178,9 +183,12 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     if validate_parameters:
         try:parameters=validate_operation(account_row['platform'],operation,parameters,provider=provider)
         except (ValueError,TypeError,UnicodeError) as exc:
-            code=str(exc) if str(exc) in ('unsupported_operation','invalid_operation_parameters') else 'invalid_operation_parameters'
+            code=str(exc) if str(exc) in ('unsupported_operation','invalid_operation_parameters','invalid_phone') else 'invalid_operation_parameters'
             failure=APIError(code)
             if isinstance(exc,ParameterError):failure.field_errors=exc.field_errors
+            if getattr(exc,'hint',None):failure.hint=exc.hint
+            if code=='unsupported_operation' and operation=='open_chat_by_phone':
+                failure.hint='native_whatsapp_accounts_only'
             raise failure from None
     else:
         # Persisted normalized parameters are immutable. Do not apply a newer
@@ -242,8 +250,37 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
         if provider=='whatsmeow' and (mode=='sticker' and mime!='image/webp' or
             mode in ('audio','voice','sticker') and parameters['caption']):raise APIError('unsupported_operation')
     _policy(c,account,operation,provider_chats,ready=ready)
+    if operation=='open_chat_by_phone':_phone_policy(c,account,parameters['phone'])
     targets(p,refs)
     return payload,spec
+
+
+def _phone_policy(c,account,phone):
+    """Conservative admission: the LID is unknown before the query, so it can
+    only be collected under discovery; exclusions apply to every known namespace."""
+    from .collector_state import CollectorState
+    row=c.execute('SELECT * FROM account_policies WHERE account=%s',(account,)).fetchone()
+    known=[phone+'@c.us',*(r['lid'] for r in c.execute('''SELECT DISTINCT lid FROM whatsapp_identity_observations
+        WHERE account=%s AND pn=%s LIMIT 20''',(account,phone+'@c.us')).fetchall())]
+    if not row or not row['discover_chats'] or any(not CollectorState.allows(row,chat) for chat in known):
+        raise APIError('chat_not_collected',409)
+
+
+def _lookup_budget(c,account,command):
+    """Whether this dispatch may query WhatsApp, and when the oldest counted query
+    leaves the window. A dispatched row counts until an hour after it finished
+    (a query runs between claim and finish; an unfinished row counts now), so
+    neither a queue delay, a slow store read nor a restart resets the bound.
+    Dispatch is serial per account (one fenced worker), so two principals cannot
+    both take the last slot. Local answers and bound refusals do not count."""
+    rows=c.execute('''SELECT coalesce(finished_at,clock_timestamp()) AS at FROM messenger_commands
+        WHERE account=%s AND operation='open_chat_by_phone' AND id<>%s AND started_at IS NOT NULL
+        AND coalesce(finished_at,clock_timestamp())>clock_timestamp()-interval '1 hour'
+        AND coalesce(result->'data'->>'provider_lookup','true')<>'false'
+        ORDER BY 1 DESC LIMIT %s''',(account,command,PHONE_LOOKUPS_PER_HOUR)).fetchall()
+    if len(rows)<PHONE_LOOKUPS_PER_HOUR:return True,None
+    return False,c.execute('''SELECT greatest(1,ceil(extract(epoch FROM
+        %s::timestamptz+interval '1 hour'-clock_timestamp())))::int AS s''',(rows[-1]['at'],)).fetchone()['s']
 
 
 def _digest(p,payload):
@@ -475,6 +512,9 @@ class CommandWorker:
                     FROM account_policies WHERE account=%s''',(st.account,)).fetchone()
                 if not policy:raise APIError('operation_disabled',409)
                 payload['_policy']=dict(policy)
+                if payload['operation']=='open_chat_by_phone':
+                    payload['known_chats']=[]
+                    payload['lookup_allowed'],job['_lookup_resets_in']=_lookup_budget(c,st.account,job['id'])
                 if payload['operation']=='send_file':
                     # Only collectors get a filesystem path; previews/status never do.
                     root=store.files
@@ -495,6 +535,50 @@ class CommandWorker:
                 WHERE id=%s AND status='dispatching' AND lease_epoch=%s''',
                 (status,Jsonb(result) if result is not None else None,code,job['id'],st.lease[1]))
 
+    def archived(self,chat):
+        """Whether the archive holds this exact chat (the adapter's local LID)."""
+        with self.state.archive.store.pool.connection() as c:
+            return c.execute('SELECT 1 FROM chats WHERE account=%s AND provider_chat=%s',
+                             (self.state.account,chat)).fetchone() is not None
+
+    def finish_open_chat(self,job,answer):
+        """Recheck authority and policy against the resolved LID, then create or
+        reuse its chat and record the receipt in one fenced transaction."""
+        from .collector_state import CollectorState
+        st=self.state;store=st.archive.store
+        with store.pool.connection() as c:
+            st.archive.fence(c,st.account,st.lease)
+            row=c.execute('''SELECT * FROM messenger_commands WHERE id=%s AND account=%s AND status='dispatching'
+                AND lease_epoch=%s FOR UPDATE''',(job['id'],st.account,st.lease[1])).fetchone()
+            if not row:return
+            data=answer.get('data') if isinstance(answer.get('data'),dict) else {}
+            name=data.get('verified_name')
+            try:
+                if type(data.get('on_whatsapp')) is not bool or type(data.get('provider_lookup')) is not bool or (
+                    name is not None and (not isinstance(name,str) or not name.strip() or len(name)>512)):
+                    raise APIError('operation_result_unknown')
+                public={'on_whatsapp':data['on_whatsapp'],'verified_name':name,'provider_lookup':data['provider_lookup']}
+                if data['on_whatsapp']:
+                    chat=data.get('provider_chat')
+                    if not isinstance(chat,str) or not re.fullmatch(r'[0-9]{1,30}@lid',chat):
+                        raise APIError('operation_result_unknown')
+                    _check_saved(store,c,self._identity(c,row),row,ready=False,verify_file=False)
+                    policy=c.execute('SELECT * FROM account_policies WHERE account=%s',(st.account,)).fetchone()
+                    if not policy or not policy['discover_chats'] or not CollectorState.allows(policy,chat):
+                        raise APIError('chat_not_collected')
+                    chat_id=stable_id('chat',st.account,chat)
+                    existing=c.execute('SELECT 1 FROM chats WHERE id=%s',(chat_id,)).fetchone() is not None
+                    if not existing and row['payload']['parameters'].get('create') is True:
+                        existing=c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat)
+                            VALUES(%s,%s,%s,'private',%s) ON CONFLICT DO NOTHING RETURNING id''',
+                            (chat_id,st.account,name or '+'+row['payload']['parameters']['phone'],chat)).fetchone() is None
+                        public.update(chat_id=chat_id,existing=existing)
+                    elif existing:public.update(chat_id=chat_id,existing=True)
+                status,result,code='succeeded',{'outcome':'confirmed','data':public},None
+            except APIError as exc:status,result,code='failed',None,exc.code
+            c.execute('''UPDATE messenger_commands SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
+                WHERE id=%s''',(status,Jsonb(result) if result is not None else None,code,row['id']))
+
     async def once(self):
         if await asyncio.to_thread(self.state.cooldown_remaining)>0:return False
         if self.gate is not None:
@@ -511,6 +595,9 @@ class CommandWorker:
             async def last_moment_preflight():
                 await asyncio.to_thread(self.preflight,job,verify_file=False)
             job['_preflight']=last_moment_preflight
+            if job['operation']=='open_chat_by_phone':
+                async def archived(chat):return await asyncio.to_thread(self.archived,chat)
+                job['_archived']=archived
             # Providers report 'waiting' and then 'started' before the first mutation.
             job['_provider_phase']=phases.append
             timeout=180 if job['operation']=='send_file' else 30
@@ -522,8 +609,13 @@ class CommandWorker:
         except CommandRejected as exc:
             code=str(exc) if str(exc) in ('operation_expired','operation_disabled','operation_access_changed',
                 'operation_target_changed','sender_not_ready','attachment_unavailable','unsupported_operation',
-                'forbidden','not_found','operation_rejected') else 'operation_rejected'
-            await finish_durably(self.finish,job,'expired' if code=='operation_expired' else 'failed',None,code)
+                'forbidden','not_found','operation_rejected','identity_unresolved','chat_not_collected',
+                'rate_limited','provider_timeout','invalid_phone') else 'operation_rejected'
+            # Nothing was sent, so a lookup that ran out of time is a retryable read.
+            result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
+            if code=='rate_limited' and job['operation']=='open_chat_by_phone':
+                result={'data':{'code':code,'resets_in_seconds':job.get('_lookup_resets_in') or 1,'provider_lookup':False}}
+            await finish_durably(self.finish,job,'expired' if code=='operation_expired' else 'failed',result,code)
         except Exception:
             # A provider that reports no phase stays conservative: any mutation may have run.
             if job['mutation'] and phases and phases[-1]!='started':
@@ -531,6 +623,9 @@ class CommandWorker:
             else:
                 await finish_durably(self.finish,job,'unknown' if job['mutation'] else 'failed',None,'operation_result_unknown')
         else:
+            if job['operation']=='open_chat_by_phone' and answer['outcome']=='confirmed':
+                await finish_durably(self.finish_open_chat,job,answer)
+                return True
             confirmed=answer['outcome']=='confirmed'
             await finish_durably(self.finish,job,'succeeded' if confirmed else
                 'unknown' if job['mutation'] else 'failed',answer,None if confirmed else 'operation_result_unknown')

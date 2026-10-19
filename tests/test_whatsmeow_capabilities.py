@@ -86,8 +86,8 @@ def test_fenced_observation_updates_manifest_without_expanding_grants(native_acc
     with pytest.raises(ValueError,match='unsupported_operation'):
         s.set_messenger_operations('wa-native',['add_contact'])
     caps=s.capabilities(key)['messenger_operations']['supported_by_account']['wa-native']
-    assert caps['provider']=='whatsmeow' and caps['count']==43
-    assert len(caps['operations'])==43
+    assert caps['provider']=='whatsmeow' and caps['count']==44
+    assert len(caps['operations'])==44
     assert 'delete_message' in caps['operations'] and 'add_contact' not in caps['operations']
     a.release('wa-native','native-test',state.lease[1])
     with pytest.raises(RuntimeError,match='collector_lease_lost'):state.provider_observation('webjs')

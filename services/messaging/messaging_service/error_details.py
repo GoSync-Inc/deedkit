@@ -24,6 +24,8 @@ def payload(error,operation='',request_id=None):
     info={'error':code,'request_id':request_id or uuid4().hex,'retryable':retry}
     if hasattr(error,'fields'):info['fields']=error.fields
     if hasattr(error,'field_errors'):info['field_errors']=error.field_errors
+    for name in ('hint','resets_in_seconds'):  # Reviewed constants and counters, never input values.
+        if hasattr(error,name):info[name]=getattr(error,name)
     if retry:info['retry_after_seconds']=2
     if code in EXPECTED:info['expected']=EXPECTED[code]
     if operation in ('search','search_files'):info['results_state']='not_returned_due_to_error'

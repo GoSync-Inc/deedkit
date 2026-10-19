@@ -78,6 +78,9 @@
   "mute_chat": [
     "chat-manage"
   ],
+  "open_chat_by_phone": [
+    "send"
+  ],
   "pin_chat": [
     "chat-manage"
   ],

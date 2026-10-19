@@ -22,6 +22,9 @@ from .telegram_collector import TelegramCollector,ProviderUnavailable,private_js
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy
 
+# open_chat_by_phone: both adapter calls and the archive check (the native lookup's 10 s).
+PHONE_RESOLUTION_SECONDS=10
+
 
 class ProviderOperationError(RuntimeError): pass
 
@@ -244,7 +247,8 @@ class NodeProvider:
             if isinstance(code,str) and code in ('operation_invalid_parameters','operation_disabled','operation_expired',
                 'operation_target_invalid','operation_target_unavailable','operation_unsupported',
                 'operation_query_failed','operation_result_too_large','registered_file_invalid',
-                'history_rate_limited','history_anchor_unavailable'):
+                'history_rate_limited','history_anchor_unavailable',
+                'invalid_phone','identity_unresolved','chat_not_collected','provider_timeout','rate_limited'):
                 from .commands import CommandRejected
                 raise CommandRejected(code)
             if code in ('send_expired','sending_disabled','send_target_invalid','link_preview_unsupported'):
@@ -321,8 +325,26 @@ class NodeProvider:
         payload={key:value for key,value in job.items() if key in (
             'operation','parameters','provider_chat','provider_message_id','expires_at',
             'source_provider_chat','source_provider_message','registered_file_path','trusted_blob_directory',
-            'file_digest','file_bytes','file_mime','file_name')}
+            'file_digest','file_bytes','file_mime','file_name','known_chats','lookup_allowed')}
         if report is not None:report('started')
+        if job['operation']=='open_chat_by_phone' and job.get('_archived') is not None:
+            # First ask only the session store for the number's LID, then offer the
+            # adapter that exact chat if the archive holds it (local answer, no query).
+            # Both calls and the archive check share one deadline well inside the
+            # worker's 30 s timeout: running out between the calls is a retryable
+            # provider_timeout on a synchronized pipe, never a disconnect.
+            from .commands import CommandRejected
+            deadline=time.monotonic()+PHONE_RESOLUTION_SECONDS
+            local=await self._call_unlocked('messenger_operation',{**payload,'local_only':True,'known_chats':[]},sending=True)
+            lid=local.get('data',{}).get('local_lid') if isinstance(local,dict) and isinstance(local.get('data'),dict) else None
+            archived=False
+            if isinstance(lid,str) and re.fullmatch(r'[0-9]{1,30}@lid',lid):
+                try:archived=await asyncio.wait_for(job['_archived'](lid),max(deadline-time.monotonic(),0))
+                except TimeoutError:raise CommandRejected('provider_timeout') from None
+            payload['known_chats']=[lid] if archived else []
+            remaining=int((deadline-time.monotonic())*1000)
+            if remaining<100:raise CommandRejected('provider_timeout')
+            payload['lookup_ms']=remaining
         return await self._call_unlocked('messenger_operation',payload,sending=True)
     async def chunks(self,source,descriptor):
         complete=False

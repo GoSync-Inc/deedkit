@@ -54,7 +54,7 @@ python -m messaging_service set-messenger-operations --account account-demo --op
 | Permission | Reviewed operation family |
 | --- | --- |
 | `read-live` | Live chat/message information, reactions and provider-supported pins |
-| `send` | Registered original uploads, forwarding, polls, contact cards and locations |
+| `send` | Registered original uploads, forwarding, polls, contact cards, locations and opening a WhatsApp chat by phone number |
 | `message-edit` / `message-delete` | Own outgoing message edit / Telegram global revoke |
 | `message-react` / `message-pin` | Reaction/poll voting / pin and unpin |
 | `read-state` | Explicit provider mark-read / mark-unread |
@@ -186,6 +186,54 @@ and destination must be authorized in the **same account**. The preview must sho
 the source, its full visible content/files and destination to the owner. It is a
 provider forward, not an implicit copy across accounts. Provider forwarding
 restrictions and unavailable originals remain limitations.
+
+## Opening a WhatsApp chat by phone number
+
+`open_chat_by_phone` gives a number that has never been in a chat an archive
+`chat_id` for the unchanged `send_message`. It runs only on native WhatsApp
+(whatsmeow) accounts; the whatsapp-web.js fallback and Telegram return
+`unsupported_operation` with `hint: native_whatsapp_accounts_only`. It needs the
+`send` permission, a full-account key (a key with a chat list gets `forbidden`), the
+account opt-in and, through the gateway, the `open_chat_by_phone` action grant.
+
+1. Check: `parameters={"phone": "+1 202 555 0123"}` (`create` defaults to false).
+   Spaces, dashes, dots, parentheses and a leading `+` or `00` are ignored. A
+   national number such as `0…` gets `invalid_phone` with
+   `hint: country_code_required`; a bare Russian `8…` is read as a country code, so
+   write `+7`. The result is `on_whatsapp`, `verified_name`
+   (business accounts, else null), `provider_lookup`, and `chat_id` with
+   `existing: true` only when the number's chat is already archived. Nothing is written.
+2. Show the owner the account, number, verified name and exact text; obtain confirmation.
+3. Create: the same call with `"create": true` returns `chat_id` and `existing`.
+   The collector creates the chat row only after rechecking the key, the opt-in and
+   the collection policy against the resolved WhatsApp ID; the contact sees nothing.
+4. Send with `send_message(account, chat_id, text, request_id)` as usual.
+
+The canonical chat is the contact's LID (`<digits>@lid`), where the native sender
+archives its echo. A registered number without a LID gets `identity_unresolved`;
+a policy that excludes the number or its LID, or `discover_chats` off, gets
+`chat_not_collected` (an unknown LID cannot match `include_chats`). The collector
+first asks the native session store for the number's LID and checks that one chat
+in the archive; if it is archived, the answer is local (`provider_lookup: false`).
+Each account allows at most 10 provider lookups per rolling hour, counted from
+durable operation rows until an hour after each finished; failed and
+negative lookups count, replays of the same request ID, local answers and
+refusals do not. When the budget is spent, a local answer still succeeds and a
+lookup is refused before any query: the operation fails with `rate_limited` and
+`result.data.resets_in_seconds`. The session-store reads and the lookup share a
+10-second deadline; `provider_timeout` is a failed read with
+`result.data.retry: true`, never an unknown send. `send_message`
+and `resolve_reference` add `hint: open_chat_by_phone` to `not_found` for a
+phone-shaped chat reference. The number is sent to WhatsApp and kept in the
+operation row and in the session store's PN/LID mapping; it is not logged.
+
+Enable per account after the API and the native collectors run one release (an
+older native adapter refuses the operation); without it, `operation_disabled`
+carries this step as its `hint`. The list replaces the current one:
+
+```sh
+python -m messaging_service set-messenger-operations --account account-demo --operations send_file open_chat_by_phone
+```
 
 ## Important platform differences
 
