@@ -1,9 +1,10 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import psycopg
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
 from .core import FamilyService
+from .store import instant
 
 AMBIGUOUS = {"unknown_result", "write_unknown", "provider_unavailable"}
 
@@ -188,7 +189,8 @@ class Worker:
                     step["projection"]["source_calendar_ref"],
                     link["source_event_ref"],
                     step["source"]["start"],
-                    step["source"]["end"],
+                    # An instant lesson keeps the smallest span CHECK(source_end>source_start) allows, as occurrences do.
+                    max(instant(step["source"]["end"]), instant(step["source"]["start"]) + timedelta(microseconds=1)),
                     cal["ref"],
                     intent["target"],
                     intent.get("resource_ref"),

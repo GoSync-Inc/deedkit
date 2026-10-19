@@ -693,7 +693,8 @@ class FamilyService:
                 if r["claim"] == "pending"
                 else "already_projected"
                 if r["claim"]
-                else self.rule_view(p, r)["not_ready_reason"]
+                # _source already proved source details through event:read or agenda:read.
+                else {"source_not_visible": None}.get(ready := self.rule_view(p, r)["not_ready_reason"], ready)
                 or (None if self._can(p, r["target_calendar_ref"], "plan:create") else "target_not_writable")
                 or (None if r["target_provider"] == "google" else "provider_not_supported")
             )

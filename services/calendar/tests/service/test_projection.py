@@ -385,3 +385,39 @@ def test_partial_projection_replans_only_the_missing_duty(store):
     assert [st["link"]["duty"] for st in again["steps"]] == ["pickup"]
     assert again["projections_skipped"] == [
         {"rule_id": drop, "duty": "dropoff", "guardian_id": "adult-a", "reason": "already_projected"}]
+
+
+# spec: ANYM-433
+def test_event_read_source_projects_and_keeps_authority(store):
+    s = store
+    service, key, drop, pick = household(s)
+    s.guardian_rule_disable(pick)
+    # Source details through event:read alone, no agenda:read on the lesson calendar.
+    s.grant("family", "adult-a", "cal-child", ["event:read", "assignment:read"], "details")
+    plan = service.plan(key, [project()])
+    assert [step["link"]["rule_id"] for step in plan["steps"]] == [drop]
+    assert [skip["reason"] for skip in plan["projections_skipped"]] == ["disabled"]
+    operation_id = service.apply(key, plan["plan_id"], "request-event-read")["operation_id"]
+    assert run(s, Fake(), operation_id)["state"] == "verified"
+    assert [row["state"] for row in links(s)] == ["active"]
+    lessons(s, ("event-lesson-12", "2026-10-20T12:00:00Z", "2026-10-20T13:00:00Z", {}))
+    late = service.apply(key, service.plan(key, [project("event-lesson-12")])["plan_id"], "request-late")["operation_id"]
+    s.grant("family", "adult-a", "cal-child", ["assignment:read"], "details")
+    fake = Fake()
+    assert run(s, fake, late) == {"state": "failed", "error": "scope_changed"} and fake.sent == []
+
+
+# spec: ANYM-433
+def test_instant_lesson_projects_and_reserves_its_link(store):
+    s = store
+    service, key, drop, pick = household(s)
+    at = "2026-10-20T12:00:00Z"
+    lessons(s, ("event-instant", at, at, {"instant": True}))
+    plan = service.plan(key, [project("event-instant")])
+    dropoff, pickup = plan["steps"]
+    assert dropoff["source"]["start"] == dropoff["source"]["end"] == "2026-10-20T12:00:00+00:00"
+    assert (dropoff["event"]["start"], dropoff["event"]["end"]) == ("2026-10-20T11:40:00+00:00", "2026-10-20T12:00:00+00:00")
+    assert (pickup["event"]["start"], pickup["event"]["end"]) == ("2026-10-20T11:45:00+00:00", "2026-10-20T12:00:00+00:00")
+    operation_id = service.apply(key, plan["plan_id"], "request-instant")["operation_id"]
+    assert run(s, Fake(), operation_id)["state"] == "verified"
+    assert [row["state"] for row in links(s)] == ["active", "active"]
