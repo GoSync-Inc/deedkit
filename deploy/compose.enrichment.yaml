@@ -20,8 +20,13 @@ x-enrichment-common: &enrichment-common
   mem_limit: 3g
   cpus: 2
   pids_limit: 96
-  # A job may use the configured maximum 600s plus bounded child teardown.
-  stop_grace_period: 630s
+  # SIGTERM ends the child group and requeues the job, so the grace period never
+  # follows the job timeout. Rule: teardown bound 50s (child kill is immediate,
+  # requeue retries for 30s plus one last attempt of at most 10s, profile unpublish
+  # one statement of at most 10s: 5s connect + 5s statement timeout) plus 40s
+  # margin. A finish() already running keeps its own statement timeouts; if
+  # Docker ends it, the lease expires as before.
+  stop_grace_period: 90s
   logging:
     driver: json-file
     options: {max-size: 5m, max-file: "2"}

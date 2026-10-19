@@ -668,3 +668,10 @@ def test_whatsapp_top_level_failure_reports_code_without_exception_text(monkeypa
     assert result.value.code == 1
     assert seen == [('configure', 'whatsapp'), ('capture', 'RuntimeError', 'collector_failed')]
     assert json.loads(capsys.readouterr().out) == {'status': 'stopped', 'code': 'collector_failed'}
+
+
+# spec: ANYM-310
+def test_enrichment_grace_period_follows_the_teardown_bound_not_the_job_timeout():
+    for name in ('enricher', 'enricher-local'):
+        assert units()[name]['stop_grace_period'] == '90s'
+    assert 'teardown' in (ROOT / 'deploy/compose.enrichment.yaml').read_text()
