@@ -51,7 +51,8 @@ BARE_GO_TEST = re.compile(r"[^/]*_test\.go")
 ROUTER_SIGNATURE = "s:github.com/GoSync-Inc/deedkit/services/release-router::"
 SHA = re.compile(r"[0-9a-f]{40}")
 REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
-SYNC_WORKFLOW, SYNC_WINDOW_DAYS, SYNC_PAGE_SIZE, SYNC_MAX_PAGES = "tiden-sync.yml", 3, 100, 10
+SYNC_WORKFLOW, SYNC_PAGE_SIZE, SYNC_MAX_PAGES = "tiden-sync.yml", 100, 10
+SYNC_SLACK = timedelta(days=1)  # a run that processes TARGET is created after TARGET exists; the slack covers clock skew
 TIMEOUT = 120
 PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
 
@@ -274,17 +275,21 @@ class Actions:
     """Read-only listing of the `Tiden sync` workflow runs of main through `gh api` (token: GH_TOKEN). A failure is
     named by the command only; the response body, which may echo request data, is never shown."""
 
-    def __init__(self, repository: str, gh: str = "gh"):
-        self.repository, self.gh = repository, gh
+    def __init__(self, repository: str, gh: str = "gh", clock=time.monotonic):
+        self.repository, self.gh, self.clock = repository, gh, clock
 
-    def page(self, number: int, created: str) -> dict:
+    def page(self, number: int, created: str, end: float) -> dict:
         if not REPOSITORY_NAME.fullmatch(self.repository) or any(not part.strip(".") for part in self.repository.split("/")):
             raise Unknown("the sync lookup repository is not owner/name")
         endpoint = f"repos/{self.repository}/actions/workflows/{SYNC_WORKFLOW}/runs"
         command = [self.gh, "api", "--method", "GET", endpoint, "-f", "branch=main", "-f", f"created=>={created}",
                    "-F", f"per_page={SYNC_PAGE_SIZE}", "-F", f"page={number}"]
         try:
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=TIMEOUT)
+            # All pages of one lookup share one TIMEOUT budget, so a slow API cannot outlast the report's deadlines.
+            remaining = end - self.clock()
+            if remaining <= 0:
+                raise Unknown("gh api timed out")
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=remaining)
         except subprocess.TimeoutExpired:
             raise Unknown("gh api timed out") from None
         except (OSError, UnicodeDecodeError):
@@ -296,12 +301,14 @@ class Actions:
         except json.JSONDecodeError:
             raise Unknown("gh api returned malformed JSON") from None
 
-    def runs(self) -> list[dict]:
-        """Every run created in the last days; the pages count only when their rows equal `total_count`."""
-        created = (datetime.now(timezone.utc) - timedelta(days=SYNC_WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    def runs(self, since: datetime) -> list[dict]:
+        """Every run created at or after SINCE (a rerun keeps its `created_at`, so no run of TARGET is hidden by
+        age); the pages count only when their rows equal `total_count`, which GitHub caps at 1000."""
+        created = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = self.clock() + TIMEOUT
         rows: list[dict] = []
         for number in range(1, SYNC_MAX_PAGES + 1):
-            page = self.page(number, created)
+            page = self.page(number, created, end)
             batch, total = page.get("workflow_runs") if isinstance(page, dict) else None, \
                 page.get("total_count") if isinstance(page, dict) else None
             if not isinstance(batch, list) or type(total) is not int or total < 0:
@@ -329,12 +336,17 @@ def decisive(runs: list[dict]) -> dict:
     return max(runs, key=lambda run: (moment(run["updated_at"]), run["id"], run["run_attempt"]))
 
 
-def await_sync(actions: Actions, target: str, deadline: float, clock, sleep) -> dict:
-    """The decisive `Tiden sync` run of TARGET once none is active; none, or an active one at the deadline, is unknown."""
+def fingerprint(runs: list[dict]) -> list[tuple]:
+    """What a later look must find unchanged: every kept run with its attempt, state and completion time."""
+    return sorted((run["id"], run["run_attempt"], run["status"], run["conclusion"], run["updated_at"]) for run in runs)
+
+
+def await_sync(actions: Actions, target: str, since: datetime, deadline: float, clock, sleep) -> list[dict]:
+    """The `Tiden sync` runs of TARGET once none is active; none, or an active one at the deadline, is unknown."""
     while True:
-        kept = sync_runs(actions.runs(), target)
+        kept = sync_runs(actions.runs(since), target)
         if kept and all(run["status"] == "completed" for run in kept):
-            return decisive(kept)
+            return kept
         if clock() >= deadline:
             raise Unknown("no finished Tiden sync run of TARGET")
         sleep(POLL)
@@ -604,21 +616,38 @@ def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool
     measure("stale_anchors", lambda: with_specs(lambda specs: anchors_metric(specs, tracked(root, target))))
     measure("done_open_checks", lambda: with_specs(done_metric))
 
+    def settled_cases() -> list[dict]:
+        """The case inventory, kept only when the sync runs of TARGET were finished before it and unchanged after it."""
+        committed = moment(git(root, "show", "-s", "--format=%cI", target).decode("ascii", "replace").strip())
+        if committed is None:
+            raise Unknown("git show returned no commit date of TARGET")
+        since = committed - SYNC_SLACK
+        while True:
+            kept = await_sync(actions, target, since, start + TESTS_WAIT, clock, sleep)
+            sync = decisive(kept)
+            data["sync"] |= {"target": target, "run_id": sync["id"], "run_attempt": sync["run_attempt"],
+                             "url": sync["html_url"], "conclusion": sync["conclusion"],
+                             "completed_at": sync["updated_at"], "inventory_read_at": None}
+            if sync["conclusion"] != "success":
+                raise Unknown(f"Tiden sync run {shown(sync['html_url'])} of TARGET concluded "
+                              f"{shown(sync['conclusion'])}; the links of TARGET may be missing")
+            data["sync"]["inventory_read_at"] = datetime.now(timezone.utc).isoformat()
+            cases = tiden.cases()
+            if fingerprint(sync_runs(actions.runs(since), target)) == fingerprint(kept):
+                return cases
+            # That inventory is discarded, and so is the sync record that vouched for it.
+            data["sync"] |= {"target": None, "run_id": None, "run_attempt": None, "url": None, "conclusion": None,
+                             "completed_at": None, "inventory_read_at": None}
+            if clock() >= start + TESTS_WAIT:
+                raise Unknown("a Tiden sync run of TARGET changed while the case inventory was read")
+            sleep(POLL)
+
     def unlinked():
         listed, list_errors = no_spec_list(root, target)
         main = tiden.main_branch()
         run = evidence(tiden, main, target, start + TESTS_WAIT, clock, sleep)
         data["evidence"]["run"] = summarize(run)
-        if actions is not None:
-            sync = await_sync(actions, target, start + TESTS_WAIT, clock, sleep)
-            data["sync"] |= {"target": target, "run_id": sync["id"], "run_attempt": sync["run_attempt"],
-                             "url": sync["html_url"], "conclusion": sync["conclusion"],
-                             "completed_at": sync["updated_at"]}
-            if sync["conclusion"] != "success":
-                raise Unknown(f"Tiden sync run {shown(sync['html_url'])} of TARGET concluded "
-                              f"{shown(sync['conclusion'])}; the links of TARGET may be missing")
-            data["sync"]["inventory_read_at"] = datetime.now(timezone.utc).isoformat()
-        cases = tiden.cases()
+        cases = settled_cases() if actions is not None else tiden.cases()
         return unlinked_metric(cases, tiden.results(run["seqNum"]), run["seqNum"], listed, list_errors)
 
     measure("unlinked_tests", unlinked)

@@ -471,15 +471,23 @@ The unlinked-test count is read only after the sync of TARGET (ANYM-438). `Tiden
 health` and `Tiden sync` both start from the same `CI` run, in different
 concurrency groups, so without this order the health run could list a test that
 the sync was about to link. Before it reads the case inventory, the report lists
-the `Tiden sync` runs of `main` created in the last three days
-(`gh api repos/<repo>/actions/workflows/tiden-sync.yml/runs`, every page until
-the rows equal `total_count`) and keeps those whose title is `Tiden sync <TARGET>`
+the `Tiden sync` runs of `main` created since one day before the commit date of
+TARGET (a run that processes TARGET cannot be older; a rerun keeps its
+`created_at`, so none is hidden by age). The lookup is
+`gh api repos/<repo>/actions/workflows/tiden-sync.yml/runs`, every page until
+the rows equal `total_count`; its pages share one 120-second budget, and a
+window GitHub cannot list completely (it caps a filtered search at 1000 runs)
+is a lookup error. The report keeps those whose title is `Tiden sync <TARGET>`
 (above), ignoring runs with conclusion `skipped`. While any kept run is queued,
 in progress or waiting it checks again every 30 seconds; when none is active, the
 kept run that completed last decides (`updated_at`, which a rerun moves forward;
 ties go to the greater run ID, then attempt). The wait shares the 30-minute
 deadline of the test evidence, counted from the start of the report; it resets no
-other deadline. A decisive run with conclusion `success` is the normal path.
+other deadline. A decisive run with conclusion `success` is the normal path,
+once a second look after the case inventory read finds the kept runs unchanged
+(same runs, attempts, states and completion times); if a rerun or a new run
+began meanwhile, the inventory is discarded, the wait starts again within the
+same deadline and the inventory is read again.
 Another conclusion, no kept run, a run still active at the deadline, or a failed
 lookup (`gh` missing or timed out, API denied, malformed JSON, incomplete pages)
 makes only the unlinked-test metric unknown, with the run URL and conclusion or

@@ -1,4 +1,5 @@
 """The Tiden health report against temporary Git repositories and a fake Tiden CLI; it never calls Tiden."""
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import subprocess
@@ -961,20 +962,22 @@ FAKE_GH = textwrap.dedent(f"""\
     if mode == "scalar":
         print("[1]"); sys.exit(0)
     page = int(next(arg for arg in args if arg.startswith("page=")).split("=")[1])
-    rows = state["rows"]
+    cutoff = next(arg for arg in args if arg.startswith("created=>=")).split(">=")[1]
+    rows = [row for row in state["rows"] if row.get("created_at", "z") >= cutoff]
     chunk = rows[(page - 1) * 100:page * 100]
     body = {{"total_count": state.get("total", len(rows)), "workflow_runs": chunk}}
     if mode == "no-total":
         del body["total_count"]
     print(json.dumps(body))
 """)
+SINCE = datetime(2026, 10, 19, 9, 0, tzinfo=timezone.utc)
 NO_SYNC = {"checked": True, "target": None, "run_id": None, "run_attempt": None, "url": None, "conclusion": None,
            "completed_at": None, "inventory_read_at": None}
 
 
 def sync_row(run_id, sha, conclusion="success", updated="2026-10-19T10:00:00Z", attempt=1, status="completed",
-             title=None, head="f" * 40):
-    return {"id": run_id, "display_title": f"Tiden sync {sha}" if title is None else title, "head_sha": head,
+             title=None, head="f" * 40, **fields):
+    return {**fields, "id": run_id, "display_title": f"Tiden sync {sha}" if title is None else title, "head_sha": head,
             "status": status, "conclusion": conclusion if status == "completed" else None, "updated_at": updated,
             "run_attempt": attempt, "html_url": f"https://example.invalid/runs/{run_id}"}
 
@@ -982,11 +985,15 @@ def sync_row(run_id, sha, conclusion="success", updated="2026-10-19T10:00:00Z", 
 class FakeActions:
     """Scripted `Actions.runs()` snapshots, the last one repeating; an exception in the script is raised."""
 
-    def __init__(self, *snapshots, server=None):
-        self.snapshots, self.calls, self.seen, self.server = snapshots, 0, [], server
+    def __init__(self, *snapshots, server=None, hook=None):
+        self.snapshots, self.calls, self.seen, self.server, self.hook = snapshots, 0, [], server, hook
+        self.since = None
 
-    def runs(self):
-        if self.server:
+    def runs(self, since):
+        self.since = since
+        if self.hook:
+            self.hook(self.calls)
+        if self.server and not self.calls:  # what had been read when the first lookup ran
             self.seen = [call[:2] for call in self.server.state()["calls"]]
         snapshot = self.snapshots[min(self.calls, len(self.snapshots) - 1)]
         self.calls += 1
@@ -995,11 +1002,11 @@ class FakeActions:
         return snapshot
 
 
-def synced(repo, server, rows_for, clock=None, **world):
+def synced(repo, server, rows_for, clock=None, hook=None, **world):
     """A healthy world at B and the `Actions` script `rows_for(a, b)` builds; returns (a, b, clock, actions, result)."""
     a, b = history(repo)
     server.world(b, **world)
-    clock, actions = clock or Clock(), FakeActions(*rows_for(a, b), server=server)
+    clock, actions = clock or Clock(), FakeActions(*rows_for(a, b), server=server, hook=hook)
     return a, b, clock, actions, measure(repo, server, b, clock=clock, actions=actions)
 
 
@@ -1014,7 +1021,7 @@ def decided(data, run_id, attempt=1, conclusion="success", updated="2026-10-19T1
 def test_a_successful_sync_of_target_is_read_before_the_inventory_and_recorded(repo, server):
     _, b, clock, actions, (code, data) = synced(
         repo, server, lambda a, b: [[sync_row(7, b, updated="2026-10-19T10:05:00Z", attempt=2)]])
-    assert code == 0 and clock.sleeps == 0 and actions.calls == 1
+    assert code == 0 and clock.sleeps == 0 and actions.calls == 2  # the look before and the look after the read
     decided(data, 7, attempt=2, updated="2026-10-19T10:05:00Z")
     assert ["run", "list"] in actions.seen and ["test", "list"] not in actions.seen
     assert data["sync"]["inventory_read_at"] and data["sync"]["inventory_read_at"] >= "2026-10-19T10:05:00+00:00"
@@ -1026,7 +1033,7 @@ def test_a_running_sync_is_waited_for_and_then_a_success_passes(repo, server):
     _, b, clock, actions, (code, data) = synced(
         repo, server, lambda a, b: [[sync_row(7, b, status="in_progress")], [sync_row(7, b, status="queued")],
                                     [sync_row(7, b, updated="2026-10-19T10:09:00Z")]])
-    assert code == 0 and clock.sleeps == 2 and actions.calls == 3
+    assert code == 0 and clock.sleeps == 2 and actions.calls == 4
     decided(data, 7, updated="2026-10-19T10:09:00Z")
 
 
@@ -1203,6 +1210,68 @@ def test_without_a_sync_lookup_the_report_is_as_before_and_says_so(repo, server)
     assert code == 0 and data["sync"] == {**NO_SYNC, "checked": False}
 
 
+# spec: ANYM-438
+def test_the_lookup_window_starts_one_day_before_the_commit_of_target(repo, server):
+    _, b, _, actions, _ = synced(repo, server, lambda a, b: [[sync_row(1, b)]])
+    committed = datetime.fromisoformat(git(repo, "show", "-s", "--format=%cI", b))
+    assert actions.since == committed - timedelta(days=1)
+
+
+# spec: ANYM-438
+def test_a_rerun_after_the_sync_snapshot_but_during_the_inventory_read_is_waited_for_and_the_inventory_read_again(
+        repo, server):
+    _, b, clock, actions, (code, data) = synced(repo, server, lambda a, b: [
+        [sync_row(1, b)], [sync_row(1, b, status="in_progress", attempt=2)],
+        [sync_row(1, b, attempt=2, updated="2026-10-19T10:30:00Z")]])
+    assert code == 0 and actions.calls == 4 and clock.sleeps == 1
+    decided(data, 1, attempt=2, updated="2026-10-19T10:30:00Z")
+    reads = [call for call in server.state()["calls"] if call[:2] == ["test", "list"]]
+    assert len(reads) == 2  # the first inventory was discarded
+
+
+# spec: ANYM-438
+def test_a_new_sync_run_started_during_the_inventory_read_that_never_finishes_leaves_the_metric_unknown(repo, server):
+    _, b, clock, _, (code, data) = synced(repo, server, lambda a, b: [
+        [sync_row(1, b)], [sync_row(1, b), sync_row(2, b, status="queued")]])
+    assert code == 2 and states(data)["unlinked_tests"] == UNKNOWN
+    assert data["metrics"]["unlinked_tests"]["reason"] == "no finished Tiden sync run of TARGET"
+    assert data["sync"] == NO_SYNC and clock.now >= health.TESTS_WAIT
+
+
+# spec: ANYM-438
+def test_a_sync_that_changes_during_the_inventory_read_at_the_deadline_is_unknown_and_its_record_is_dropped(
+        repo, server):
+    clock = Clock()
+
+    def late(calls):
+        if calls == 1:  # the look after the inventory read happens at the deadline
+            clock.now = health.TESTS_WAIT
+
+    _, b, _, _, (code, data) = synced(repo, server, lambda a, b: [
+        [sync_row(1, b)], [sync_row(1, b, attempt=2, updated="2026-10-19T10:30:00Z")]], clock=clock, hook=late)
+    assert code == 2 and states(data)["unlinked_tests"] == UNKNOWN
+    assert "changed while the case inventory was read" in data["metrics"]["unlinked_tests"]["reason"]
+    assert data["sync"] == NO_SYNC
+
+
+# spec: ANYM-438
+def test_the_pages_of_one_lookup_share_one_time_budget(monkeypatch):
+    now, timeouts = [0.0], []
+
+    def slow(arguments, **options):
+        timeouts.append(options["timeout"])
+        now[0] += 50
+        page = int(next(arg for arg in arguments if arg.startswith("page=")).split("=")[1])
+        rows = [sync_row(page * 1000 + index, "a" * 40) for index in range(100)]
+        return subprocess.CompletedProcess(arguments, 0, json.dumps({"total_count": 1000, "workflow_runs": rows}), "")
+
+    monkeypatch.setattr(health.subprocess, "run", slow)
+    with pytest.raises(health.Unknown) as raised:
+        health.Actions("o/r", clock=lambda: now[0]).runs(SINCE)
+    assert str(raised.value) == "gh api timed out" and timeouts == [health.TIMEOUT, health.TIMEOUT - 50,
+                                                                   health.TIMEOUT - 100]
+
+
 @pytest.fixture
 def gh(tmp_path, monkeypatch):
     cli, path = tmp_path / "gh", tmp_path / "gh-state.json"
@@ -1226,14 +1295,21 @@ def gh(tmp_path, monkeypatch):
 # spec: ANYM-438
 def test_the_lookup_reads_the_sync_workflow_runs_of_main_over_every_page_with_get_queries(gh):
     gh.set(rows=[sync_row(number, "a" * 40) for number in range(1, 251)])
-    rows = health.Actions("o/r", gh.cli).runs()
+    rows = health.Actions("o/r", gh.cli).runs(SINCE)
     assert [row["id"] for row in rows] == list(range(1, 251))
     calls = gh.calls()
     assert [next(arg for arg in call if arg.startswith("page=")) for call in calls] == ["page=1", "page=2", "page=3"]
     first = calls[0]
     assert first[:4] == ["api", "--method", "GET", "repos/o/r/actions/workflows/tiden-sync.yml/runs"]
     assert "branch=main" in first and "per_page=100" in first
-    assert any(arg.startswith("created=>=20") for arg in first) and first.count("-f") == 2 and first.count("-F") == 2
+    assert "created=>=2026-10-19T09:00:00Z" in first and first.count("-f") == 2 and first.count("-F") == 2
+
+
+# spec: ANYM-438
+def test_runs_created_before_the_window_are_not_listed_and_a_rerun_of_a_run_inside_it_is(gh):
+    gh.set(rows=[sync_row(1, "a" * 40, created_at="2026-10-19T08:59:59Z"),
+                 sync_row(2, "a" * 40, created_at="2026-10-19T09:00:00Z", attempt=3, updated="2026-10-22T10:00:00Z")])
+    assert [row["id"] for row in health.Actions("o/r", gh.cli).runs(SINCE)] == [2]
 
 
 # spec: ANYM-438
@@ -1250,7 +1326,7 @@ def test_the_lookup_reads_the_sync_workflow_runs_of_main_over_every_page_with_ge
 def test_a_lookup_that_is_not_a_complete_valid_run_list_is_a_named_error_without_the_response(gh, values, reason):
     gh.set(**values)
     with pytest.raises(health.Unknown) as raised:
-        health.Actions("o/r", gh.cli).runs()
+        health.Actions("o/r", gh.cli).runs(SINCE)
     assert str(raised.value) == reason and SECRET not in str(raised.value)
 
 
@@ -1259,14 +1335,14 @@ def test_a_lookup_that_is_not_a_complete_valid_run_list_is_a_named_error_without
 def test_a_repository_that_is_not_owner_and_name_is_a_lookup_error_before_any_call(gh, repository):
     gh.set(rows=[])
     with pytest.raises(health.Unknown, match="repository"):
-        health.Actions(repository, gh.cli).runs()
+        health.Actions(repository, gh.cli).runs(SINCE)
     assert gh.calls() == []
 
 
 # spec: ANYM-438
 def test_a_missing_gh_and_a_stalled_gh_are_named_errors(tmp_path, monkeypatch):
     with pytest.raises(health.Unknown) as raised:
-        health.Actions("o/r", str(tmp_path / "missing-gh")).runs()
+        health.Actions("o/r", str(tmp_path / "missing-gh")).runs(SINCE)
     assert str(raised.value) == "gh api could not run"
 
     def stalled(arguments, **options):
@@ -1274,7 +1350,7 @@ def test_a_missing_gh_and_a_stalled_gh_are_named_errors(tmp_path, monkeypatch):
 
     monkeypatch.setattr(health.subprocess, "run", stalled)
     with pytest.raises(health.Unknown) as raised:
-        health.Actions("o/r").runs()
+        health.Actions("o/r").runs(SINCE)
     assert str(raised.value) == "gh api timed out" and SECRET not in str(raised.value)
 
 
@@ -1301,7 +1377,7 @@ def test_the_command_takes_the_repository_for_the_sync_lookup_and_an_empty_one_i
                               env={"TIDEN_API_TOKEN": SECRET, "FAKE_GH_STATE": gh.state})
     assert completed.returncode == 0, completed.stderr
     decided(data, 3)
-    assert "Tiden sync" in completed.stdout and len(gh.calls()) == 1
+    assert "Tiden sync" in completed.stdout and len(gh.calls()) == 2  # before and after the inventory read
     server.world(b)
     gh.set(rows=[sync_row(3, b)])
     completed, data = command(repo, tmp_path, server.cli, *common, "--sync-repository", "",
