@@ -11,8 +11,8 @@ documents hold contracts; BACKLOG.md is navigation only.
 - No send, call, ACK, pairing or provider-session start/stop without the owner's exact
   confirmation. Never retry an uncertain mutation or mint a new request ID. Never run two clients
   on one provider session. Tests and health checks never touch a live provider.
-- Synthetic fixtures; disposable test databases. Stop the processes and containers you started,
-  never shared ones. No secrets, sessions, dumps or private reports in Git, images, logs
+- Synthetic fixtures; disposable test databases. Stop only the processes and containers you
+  started. No secrets, sessions, dumps or private reports in Git, images, logs
   or packages.
 - Never change applied migrations, provider IDs, existing test paths, names or parameters (Tiden
   IDs) or the seven `anymsg-ci::*` checks.
@@ -31,11 +31,16 @@ the orchestrator; never text in your own input box). Diff items:
 3. Destructive SQL (DROP, TRUNCATE, DELETE, RENAME, narrowing ALTER) or an edited migration.
 4. This list and section 3.
 
-And without a diff: a migration apply, restore, rollback over data or other production change
-than `production.py deploy`; live provider actions; credentials, roles, host access; deleting
-data, cards or records, moving cards, publishing a package, rewriting history; accepting a known
-risk (an open blocking or major finding); product direction (accepting feature or epic cards,
-weakening an accepted criterion). A standing approval holds only while all its conditions do.
+And without a diff: a restore, rollback over data or other production change than
+`production.py deploy` and the task steps below; live provider actions; new secrets or
+credentials, roles, host access; deleting data, cards or records outside an accepted task, moving
+cards, publishing a package, rewriting history; accepting a known risk (an open blocking or major
+finding); product direction (accepting feature or epic cards, weakening an accepted criterion).
+A standing approval holds only while all its conditions do.
+
+Inside an accepted task the agent applies its migration (verified backup first), cleans up and
+deletes, and after merge and deploy enables its feature (opt-in, gateway grants to existing
+principals, flags), reporting commands and undo; never during an active call.
 
 ## 3. Change paths
 
@@ -52,8 +57,8 @@ Done: the squash's `main` push run is green.
 
 ## 4. Product context and Tiden
 
-- First step of any task touching product code, specs or tests: `tiden intent skip` (intent loop
-  paused), the card (`tiden spec get`) and `product-context`, then code.
+- First step of any task touching product code, specs or tests: `tiden intent skip`, the card
+  (`tiden spec get`) and `product-context`, then code.
 - Spec, tests, code: the accepted card is the spec; failing tests come first. Each new test has
   `# spec: ANYM-n` (Python) or `// spec: ANYM-n` (JS, TS, Go) directly above it and its
   decorators, naming a story-level spec, or sits in `config/tiden-unlinked-tests.json`. Defects, infra and refactors
@@ -61,45 +66,42 @@ Done: the squash's `main` push run is green.
 - PR lines: `Spec: ANYM-n[, …]` (implements or keeps), `Delivers: ANYM-n` (completes), at most one
   `Tiden branch: proposal/<name>` or `review/<name>`, the only place to edit criteria. The first
   ID is primary; new files are anchored to it.
-- Check A (PR) checks markers and IDs; sync B (main push) merges the named branch, anchors,
-  links, sets status. Wait for B on your squash, read back, rerun or dispatch a failed B by SHA,
-  rerun failed `Tiden drift` and `Tiden health`. Tiden writes by hand need a maintenance window
-  (TIDEN-CI.md).
-- Cards, markers, the paused loop, commands: docs/operations/tiden-product-workflow.md.
+- Check A (PR) checks markers and IDs; sync B (main push) merges the named branch. Wait for B
+  on your squash, read back, rerun a failed B (by SHA), `Tiden drift` or `Tiden health`. Tiden
+  writes by hand need a maintenance window (TIDEN-CI.md).
+- Cards, markers, commands: docs/operations/tiden-product-workflow.md.
 
 ## 5. Reviews
 
 - Astra: `codex exec --disable hooks -m gpt-6-astra -c service_tier="default" "<task with packet
   paths>" </dev/null`. For Codex-written code an Opus subagent; Codex line: review-protocol.md.
-  Fable: a Claude subagent with model `fable`, a product manager, never on code.
+  Fable: a `fable` Claude subagent, a product manager, never on code.
 - One round; after a blocking or major finding, one scoped recheck; r3 only for a new blocking.
-- Packet (docs/operations/review-protocol.md): `task.md`, `diff.patch`, `specs.md`, `pr.md`, `context.md`. Every
-  Astra task starts with:
+- Packet and verdict line: docs/operations/review-protocol.md. Every Astra task starts with:
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
      existing path (call audio, sends, collectors, queue, backup)? Name the line.
   2. Data egress vs PR claims: what data leaves the process (model APIs, logs, telemetry, third
      parties, files), and does it match what the PR description and spec say? Anything unlisted is
      a finding.
   3. Deployed-version compatibility: does it work against what is deployed now (other services at
-     the current prod SHA, schema N-1, the host `production.py`, the installed gateway)? Name any
-     consumer that breaks.
+     the current prod SHA, schema N-1, the host `production.py`, the installed gateway)? Name the
+     breaking consumer.
   4. Tests: do the new tests fail on the base commit (run them), and do they assert the spec
      criterion?
-- Verdict line: `VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <path>`.
-- Cards: Opus writes big ones, Sonnet simple ones. Product cards get one Fable round, contract cards
-  (code, CI, data, security) Astra (r1, one scoped recheck), small cards a self-check. Production
-  operation plans get Astra.
+- Cards: Opus high writes new capability, infrastructure and main-research ones; Opus medium
+  defects and small improvements with clear evidence; Sonnet simple ones. Product cards get one
+  Fable round, contract cards (code, CI, data, security) and operation plans Astra, small cards a
+  self-check (review-protocol.md, rounds 6-7).
 
 ## 6. Working with the orchestrator
 
 - The card or brief is the plan. Decide in scope; ask only before leaving it (another task's
-  files, section 2, the card's criteria, a fork without an obvious answer), with a recommendation.
-- Run only the tests of code you touched and your new ones. Hot files: lanes in
+  files, section 2, the card's criteria, a fork without an obvious answer).
+- Run only tests of touched code and your new ones. Hot files: lanes in
   docs/operations/parallel-development.md.
-- Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_DONE` or
-  `SUPERSET_WORKER_BLOCKED` block. Wait with one background command, never poll.
-- Near 250k tokens, at the next boundary: a handoff of at most 40 lines (state, next, open
-  findings, files read, decisions), `RESTART <path>` to the orchestrator, stop. Not with about 30
-  calls left: finish. From 150k, restart before an expected idle of over an hour.
+- Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_*` block.
+  Wait with one background command, never poll.
+- At the token limit in your brief, at the next boundary: a handoff of at most 40 lines,
+  `RESTART <path>` to the orchestrator, stop. Not with about 30 calls left: finish.
 - Budget: 1,000 words (`wc -w`). A rule change replaces or deletes words and names its incident and
   enforcer; an incident gets a test or hook first.
