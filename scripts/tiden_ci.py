@@ -197,10 +197,11 @@ def case_status(case: ET.Element) -> str:
         "skipped" if case.find("skipped") is not None else "passed")
 
 
-def executions(cases: object) -> Counter:
-    """Each JUnit test case's `file::name` identity (xunit2 omits file: its classname's path) with its status."""
-    return Counter(((case.get("file") or case.get("classname", "").replace(".", "/") + ".py") + "::" + case.get("name", ""),
-                    case_status(case)) for case in cases)
+def executions(cases: object, root: Path) -> Counter:
+    """Each JUnit test case's `file::name` identity, its path placed as `normalize_junit` places it (xunit2 omits
+    file: its classname's path), with its status."""
+    return Counter((source_path(case.get("file") or case.get("classname", "").replace(".", "/") + ".py", root)
+                    + "::" + case.get("name", ""), case_status(case)) for case in cases)
 
 
 def normalized_report(check: str) -> str:
@@ -391,7 +392,7 @@ def prepare(root: Path, directory: Path, metadata: dict) -> dict:
                     outcome = "failure"
                 if not totals["passed"] and not totals["failed"]:
                     outcome, reason = "skipped", "No tests executed; only skipped tests"
-                if check in REQUIRED_EXECUTIONS and executions(ET.fromstring(normalized).iter("testcase")) != Counter(
+                if check in REQUIRED_EXECUTIONS and executions(ET.fromstring(normalized).iter("testcase"), root) != Counter(
                         (name, "passed") for name in REQUIRED_EXECUTIONS[check]):
                     outcome, reason = "failure", "The report does not hold exactly the required executions, each once and passed"
             except (OSError, ValueError, ET.ParseError):
@@ -547,7 +548,7 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, 
         present.append(job)
     checks["python"] = combined_outcome(shards)
     required = set().union(*REQUIRED_EXECUTIONS.values())
-    if any(name in required for name, _ in executions(case for suite in suites for case in suite.iter("testcase"))):
+    if any(name in required for name, _ in executions((case for suite in suites for case in suite.iter("testcase")), source_root)):
         raise ValueError("a shard report holds a test that only its own module check may run")
     if suites:
         merged = ET.Element("testsuites", {"name": "pytest tests"})

@@ -2293,11 +2293,21 @@ def test_a_root_suite_node_module_passes_only_with_exactly_its_executions_each_o
 # spec: ANYM-429
 def test_assembly_refuses_evidence_whose_shard_report_holds_a_node_only_its_module_check_may_run(tmp_path):
     from scripts.tiden_ci import assemble
-    for index, node in enumerate((ROOT_NODE, AUDIO_NODES[2])):
+    source = tmp_path / "checkout"
+    (source / "tests").mkdir(parents=True)
+    for file in {node.split("::")[0] for node in (ROOT_NODE, *AUDIO_NODES)}:  # xunit2 places a file by its classname
+        (source / file).write_text("")
+    # Each spelling of the node's path that shard validation accepts, placed in the checkout as prepare places it.
+    for index, (node, spelling) in enumerate([(ROOT_NODE, ""), (AUDIO_NODES[2], ""), (ROOT_NODE, "./"),
+                                               (AUDIO_NODES[0], f"{source}/"), (AUDIO_NODES[1], "classname")]):
         fragments = evidence_fragments(tmp_path / str(index))
-        (fragments / "ci-evidence-python-3" / "python-3.xml").write_text(node_report(node, "tests/x.py::kept"))
+        report = node_report(node, "tests/x.py::kept")
+        file = node.split("::")[0]
+        report = report.replace(f' file="{file}"', "") if spelling == "classname" else report.replace(
+            f'file="{file}"', f'file="{spelling}{file}"')
+        (fragments / "ci-evidence-python-3" / "python-3.xml").write_text(report)
         with pytest.raises(ValueError, match="only its own module check"):
-            assemble(tmp_path / str(index) / "ci-evidence", fragments, ATTEMPT_URL, PASSED)
+            assemble(tmp_path / str(index) / "ci-evidence", fragments, ATTEMPT_URL, PASSED, source_root=source)
     # Without such a node the same fragments assemble, and the module reports of verify read as passed.
     fragments = evidence_fragments(tmp_path / "clean", verify_files=("root-session-lock.xml", "enricher-audio.xml"))
     (fragments / "ci-evidence-verify" / "root-session-lock.xml").write_text(node_report(ROOT_NODE))
