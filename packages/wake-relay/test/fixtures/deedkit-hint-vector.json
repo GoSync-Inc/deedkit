@@ -1,0 +1,10 @@
+{
+  "body": "{\"hint_id\":\"843e9165-d7bc-447d-90b5-8b022831d7ca\",\"host_turn_verified\":false,\"kind\":\"events\",\"subscription_id\":\"08d216c2-297e-4b59-97b7-567034b4c4e6\",\"subscription_version\":2,\"through\":5}",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-DeedKit-Hint-ID": "843e9165-d7bc-447d-90b5-8b022831d7ca",
+    "X-DeedKit-Signature": "sha256=ab748136ae50a06d9401c0becff474b0aa63fb4d7087bd2deebeace2d81355b3",
+    "X-DeedKit-Timestamp": "1792385307"
+  },
+  "secret": "synthetic receiver secret bytes 0123456789"
+}

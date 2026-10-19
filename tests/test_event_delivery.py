@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -590,3 +591,41 @@ def test_certificate_failure_retries_and_non_ascii_path_is_rejected(seeded, tmp_
     def untrusted(*args, **kwargs):
         raise ssl.SSLCertVerificationError('synthetic certificate failure')
     assert dispatch_hints(store, transport=untrusted, resolver=lambda *a, **k: ['93.184.216.34'])['retried'] == 1
+
+
+HINT_VECTOR = Path(__file__).parents[1] / 'packages/wake-relay/test/fixtures/deedkit-hint-vector.json'
+
+
+# spec: ANYM-228
+def test_wake_relay_hint_vector_has_the_live_dispatcher_wire_format(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, secret = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    emit(store)
+    match_subscriptions(store)
+    sent = []
+    def transport(endpoint, body, headers, **kwargs):
+        sent.append((body, headers))
+        return 202
+    assert dispatch_hints(store, transport=transport, resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    body, headers = sent[0]
+    if os.environ.get('DEEDKIT_WRITE_HINT_VECTOR') == '1':  # regenerate after a deliberate wire change
+        HINT_VECTOR.write_text(json.dumps({'secret': secret.read_text(), 'headers': headers, 'body': body.decode()},
+            indent=2, sort_keys=True) + '\n')
+    vector = json.loads(HINT_VECTOR.read_text())
+    # packages/wake-relay/test verifies this vector; it must keep the dispatcher's header names, body fields,
+    # value types, canonical body bytes and signature rule.
+    live, fixed = json.loads(body), json.loads(vector['body'])
+    assert set(vector['headers']) == set(headers)
+    assert {k: type(v) for k, v in fixed.items()} == {k: type(v) for k, v in live.items()}
+    assert body == json.dumps(live, sort_keys=True, separators=(',', ':')).encode()
+    assert vector['body'] == json.dumps(fixed, sort_keys=True, separators=(',', ':'))
+    assert fixed['kind'] == live['kind'] == 'events' and fixed['host_turn_verified'] is False
+    for raw, signed, key in ((body, headers, secret.read_bytes()),
+            (vector['body'].encode(), vector['headers'], vector['secret'].encode())):
+        assert signed['X-DeedKit-Hint-ID'] == json.loads(raw)['hint_id']
+        assert signed['X-DeedKit-Signature'] == 'sha256=' + hmac.new(key,
+            signed['X-DeedKit-Timestamp'].encode() + b'.' + raw, hashlib.sha256).hexdigest()
