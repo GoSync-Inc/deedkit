@@ -386,6 +386,21 @@ def test_non_russian_prompt_does_not_supply_russian_self_reference_examples(tmp_
     assert 'я уточнил' not in brief['prompt']
 
 
+# spec: ANYM-375
+@pytest.mark.parametrize('engine',['gemini_live','grok_realtime'])
+@pytest.mark.parametrize('self_reference',['masculine','feminine','neutral'])
+def test_standard_prompt_gives_russian_self_reference_only_to_russian_briefs(tmp_path,engine,self_reference):
+    # Regression (Grok feedback 2026-10-19): an Indonesian call prompt said "Use masculine Russian self-reference".
+    store=VoiceService(tmp_path)
+    def prompt(language):
+        return store.prepare(BriefInput(goal='Delivery',counterparty='Browser',language=language,
+            success_fields=['window'],dialog_engine=engine,self_reference=self_reference),[])['prompt']
+    for language in ('en','id'):
+        assert 'Russian' not in prompt(language)
+        assert not any(word in prompt(language) for word in ('я понял','я поняла','понятно'))
+    assert 'Russian' in prompt('ru')
+
+
 @pytest.mark.parametrize('question,answer,accepted',[
     ('Есть ещё вопросы?','Да.',False),
     ('Is there anything else?','Yes.',False),

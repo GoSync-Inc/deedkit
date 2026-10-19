@@ -227,7 +227,9 @@ configuration and must be backed up separately under the recovery-state policy.
 `submit_feedback(request_id, category, description, operation?, refs?)` records
 private feedback locally with explicit `feedback-write`. Categories are `bug`,
 `feature`, `quality` and `other`; descriptions are limited to 4000 characters and
-references to 32 IDs per type. Message/chat/subscription references are validated
+references to 32 IDs per type. `operation`, when given, is one messaging operation name;
+the input schema lists the accepted names (`enum`), so feedback about a tool of another
+module, such as `calls_dial_call`, names that tool in `description` instead. Message/chat/subscription references are validated
 against the current credential. Each key has a 1000-record bound; request-ID
 retries are idempotent and changed payloads conflict. `list_feedback(limit=50)`
 returns only this exact key's records; source reference IDs are omitted to avoid

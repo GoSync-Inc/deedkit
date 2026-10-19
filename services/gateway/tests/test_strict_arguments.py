@@ -195,6 +195,18 @@ def test_feedback_field_errors_match_the_card_example_over_both_transports(tmp_p
     assert mcp["isError"] and mcp["structuredContent"] == rest.json()
 
 
+# spec: ANYM-295
+def test_feedback_operation_of_another_module_names_the_messaging_operations(tmp_path):
+    # Regression (Grok feedback 2026-10-19): operation=calls_dial_call passed the schema, then the backend
+    # refused it as "a documented operation name" without saying which names are documented.
+    enum = CATALOG["messages_submit_feedback"]["inputSchema"]["properties"]["operation"]["anyOf"][0]["enum"]
+    assert {"search", "send_message", "submit_feedback"} <= set(enum) and not [n for n in enum if n.startswith("calls_")]
+    values = {"request_id": "synthetic-request", "category": "bug", "description": "x", "operation": "calls_dial_call"}
+    rest, mcp = post_both(messaging_app(tmp_path, "messages_submit_feedback"), "messages_submit_feedback", values)
+    assert rest.status_code == 422 and rest.json()["field_errors"] == [{"field": "operation", "reason": "enum", "allowed": enum}]
+    assert mcp["isError"] and mcp["structuredContent"] == rest.json()
+
+
 def test_union_failures_keep_their_descendant_paths_over_both_transports(tmp_path):
     allowed = ["private", "group", "channel", "unknown"]
     rest, mcp = post_both(messaging_app(tmp_path, "messages_list_chats"), "messages_list_chats",

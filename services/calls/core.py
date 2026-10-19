@@ -155,7 +155,7 @@ def build_prompt(b, instruction=''):
     lang={"ru":"Russian","en":"English","id":"Indonesian"}[b["language"]]
     forms={"feminine":"Use feminine Russian self-reference: я поняла, я уточнила.",
            "masculine":"Use masculine Russian self-reference: я понял, я уточнил.",
-           "neutral":"Use neutral Russian phrasing: понятно, время уточнено; avoid gendered past tense."}[b["self_reference"]]
+           "neutral":"Use neutral Russian phrasing: понятно, время уточнено; avoid gendered past tense."}[b["self_reference"]] if b["language"]=="ru" else ""
     spec={k:b[k] for k in ("goal","counterparty","facts","success_fields")}
     spec['approval_fields']=b.get('approval_fields',[])
     spec['conversation_mode']=b.get('conversation_mode','task')
