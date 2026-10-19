@@ -132,8 +132,12 @@ BEGIN
   OR jsonb_typeof(event_snapshot->'sent_at')<>'string',true) THEN
   RAISE EXCEPTION 'processing_event_refused' USING ERRCODE='insufficient_privilege';
  END IF;
- -- The attachment stays active until this transaction ends.
- PERFORM FROM public.attachments a WHERE a.id=p->>'attachment_id' FOR SHARE;
+ -- The attachment stays active until this transaction ends. A direct write takes no
+ -- advisory lock: after waiting for it the lock rechecks every predicate on the new row.
+ PERFORM FROM public.attachments a WHERE a.id=p->>'attachment_id' AND a.message=m.id AND a.active FOR SHARE;
+ IF NOT FOUND THEN
+  RAISE EXCEPTION 'processing_event_refused' USING ERRCODE='insufficient_privilege';
+ END IF;
  BEGIN
   IF (event_snapshot->>'sent_at')::timestamptz IS DISTINCT FROM m.sent_at THEN
    RAISE EXCEPTION 'processing_event_refused' USING ERRCODE='insufficient_privilege';

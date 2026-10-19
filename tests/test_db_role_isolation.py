@@ -374,12 +374,34 @@ PUBLISHERS = ('public.publish_processing_event(text[],text,text,text,text,jsonb)
               'public.publish_file_enrichment_event(text,text,text,text,jsonb)')
 
 
-def previous_append_event(c, account, message, kind, origin, event_key, snapshot):
-    """The base release's Store.append_event writes, verbatim (a rolled-back worker)."""
+def previous_append_event(c, account, message, kind='message.created', origin='fixture', event_key=None,
+                          snapshot_metadata=None, publisher=None):
+    """Store.append_event of the base release (96b72f2), verbatim but for ``publisher``.
+
+    Workers and collectors differ from the base release only in this function and in
+    processing_events.publish passing ``publisher``, which the base release did not have;
+    with this patched in, every statement they send is the previous release's.
+    """
+    import json
+    from messaging_service.store import serial
+    from psycopg.types.json import Jsonb
+    row=c.execute('''SELECT id AS message,account,chat,sender,provider_id,body,revision,sent_at,deleted,direction
+        FROM messages WHERE id=%s AND account=%s''',(message,account)).fetchone()
+    if not row: raise ValueError('invalid_event_message')  # noqa: E701 (verbatim)
+    if snapshot_metadata is not None:
+        if (not isinstance(snapshot_metadata,dict) or set(snapshot_metadata)-{'processing','reply_evidence'} or
+                len(json.dumps(snapshot_metadata,ensure_ascii=False).encode())>16384):
+            raise ValueError('invalid_event_metadata')
+        if 'reply_evidence' in snapshot_metadata:
+            from messaging_service.reply_evidence import validate as validate_reply_evidence
+            validate_reply_evidence(snapshot_metadata['reply_evidence'])
+        row.update(snapshot_metadata)
+    from messaging_service.result_evidence import formatting_evidence
+    formatting_evidence(c,[row])
     value = c.execute('UPDATE feed_counter SET value=value+1 WHERE id=1 RETURNING value').fetchone()['value']
     c.execute('''INSERT INTO events(id,account,message,kind,revision,origin,snapshot,event_key)
         VALUES(%s,%s,%s,%s,%s,%s,%s,%s)''',
-        (value, account, message, kind, snapshot['revision'], origin, Jsonb(snapshot), event_key))
+        (value,account,message,kind,row['revision'],origin,Jsonb(serial(row)),event_key))
     return value
 
 
@@ -397,11 +419,12 @@ def feed_state(store):
 
 
 # spec: ANYM-254
-def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store):
+def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkeypatch):
     from messaging_service.subscriptions import match_subscriptions
     from test_event_delivery import call, emit, identity, subscription
     store = schema36_store
     drain(worker_for(store))
+    Archive(store).register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100'])
     reader = store.issue_key('feed-reader', ['telegram-demo'])
     page = store.get_updates(reader, 'main')
     store.ack_updates(reader, 'main', page['receipt'], page['ack_version'])
@@ -411,10 +434,13 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store):
     match_subscriptions(store)
     fetched = call(store, token, 'fetch_subscription_events', sid)
     call(store, token, 'ack_subscription_events', sid, fetched['receipt'], fetched['ack_version'])
-    # The deployed indexer login holds the previous template's grants.
+    # The deployed indexer and collector logins hold the previous templates' grants.
     role = 'anym254_upgrade_' + uuid4().hex[:10]
+    collector = 'anym254_collector_' + uuid4().hex[:10]
     with store.pool.connection() as c:
         c.execute(PREVIOUS_INDEXER.replace('messaging_indexer', role))
+        c.execute(SOURCE.joinpath('collector_role.sql').read_text().split('-- Schema 37:')[0]
+            .replace('messaging_collector', collector))
         migrations = c.execute('SELECT * FROM archive_migrations ORDER BY version').fetchall()
     before = feed_state(store)
 
@@ -443,21 +469,30 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store):
         published = processing_event(store, 'file-upgrade', 'file.text.ready')['id']
         assert published == expanded + 1
 
-        # Rollback of the file worker: its previous grants restored, the base release's
-        # two statements append directly on schema 37.
+        # Rollback of the file worker and collector: the previous release (the base
+        # append_event) with the previous grants restored, running on schema 37.
         with store.pool.connection() as c:
             c.execute(PREVIOUS_INDEXER.replace('messaging_indexer', role))
-        with as_role(store, role) as c:
-            snapshot = Store.event_snapshot(c, 'telegram-demo', 'demo-tg-1',
-                {'processing': {'stage': 'text'}})
-            rolled_back = previous_append_event(c, 'telegram-demo', 'demo-tg-1', 'file.text.ready', 'live',
-                'processing_' + 'b' * 64, snapshot)
+            # The collector grants are unchanged; only the schema-37 PUBLIC revoke is new.
+            c.execute(SOURCE.joinpath('collector_role.sql').read_text().split('-- Schema 37:')[0]
+                .replace('messaging_collector', collector))
+        monkeypatch.setattr(Store, 'append_event', staticmethod(previous_append_event))
+        add_file(store, 'file-rollback', 'demo-tg-1', b'rollback readiness')
+        assert worker.run_once()['status'] == 'ready'
+        rolled_back = processing_event(store, 'file-rollback', 'file.text.ready')['id']
         assert rolled_back == published + 1
+        previous = Archive(NS(pool=RolePool(store, collector), append_event=previous_append_event, files=store.files))
+        collected = previous.ingest(media_event())
+        assert collected['outcome'] == 'created'
+        monkeypatch.undo()
+        with store.pool.connection() as c:
+            ingested = c.execute('SELECT id FROM events WHERE message=%s', (collected['message'],)).fetchone()['id']
+        assert ingested == rolled_back + 1
         second = emit(store)
-        assert second == rolled_back + 1
+        assert second == ingested + 1
         with store.pool.connection() as c:
             assert [r['id'] for r in c.execute('SELECT id FROM events WHERE id>=%s ORDER BY id', (first,))] == [
-                first, expanded, published, rolled_back, second] == list(range(first, second + 1))
+                first, expanded, published, rolled_back, ingested, second] == list(range(first, second + 1))
         # The reader's cursor resumes after its acknowledged position, with no gap or repeat.
         assert [i['event_sequence'] for i in store.get_updates(reader, 'main')['items']] == [first, second]
         match_subscriptions(store)
@@ -465,6 +500,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store):
         assert first not in [e['event_id'] for e in following['items']] and second in [e['event_id'] for e in following['items']]
     finally:
         drop_role(store, role)
+        drop_role(store, collector)
 
 
 def statements(text):
@@ -665,16 +701,20 @@ def publish_in_thread(store, role, args, results):
 def wait_for_lock_waiters(store, count):
     deadline = time.monotonic() + 20
     with psycopg.connect(store.pool.conninfo, autocommit=True) as c:
-        while c.execute("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted").fetchone()[0] < count:
-            assert time.monotonic() < deadline, 'publication did not wait for the account lock'
+        while c.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock'").fetchone()[0] < count:
+            assert time.monotonic() < deadline, 'publication did not wait for the held lock'
             time.sleep(0.05)
 
 
-def under_account_lock(store, role, calls, change=None):
-    """Hold the account's ingestion lock while publications start, then change and commit."""
+ACCOUNT_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('archive:telegram-demo',0))"
+
+
+def under_account_lock(store, role, calls, change=None, hold=ACCOUNT_LOCK):
+    """Hold a lock (by default the account's ingestion lock) while publications start,
+    then change and commit."""
     results = []
     with psycopg.connect(store.pool.conninfo) as holder:
-        holder.execute("SELECT pg_advisory_xact_lock(hashtextextended('archive:telegram-demo',0))")
+        holder.execute(hold)
         threads = [threading.Thread(target=publish_in_thread, args=(store, role, args, results)) for args in calls]
         for thread in threads:
             thread.start()
@@ -703,5 +743,24 @@ def test_publication_holds_the_account_lock_against_an_edit_and_a_concurrent_rep
         assert len(stale) == 1 and isinstance(stale[0], FORBIDDEN)
         with s.pool.connection() as c:
             assert c.execute('SELECT max(id) AS id FROM events').fetchone()['id'] == same[0]
+    finally:
+        remove(s, role)
+
+
+# spec: ANYM-254
+def test_publication_refuses_an_attachment_deactivated_while_it_waits(seeded):
+    s, _, _ = seeded
+    role = install(s, 'indexer_role.sql', 'messaging_indexer')
+    try:
+        snapshot = text_snapshot(s, role)
+        with s.pool.connection() as c:
+            newest = c.execute('SELECT max(id) AS id FROM events').fetchone()['id']
+        # A direct collector write takes no advisory lock: the publication waits on the row itself.
+        waited = under_account_lock(s, role, [('telegram-demo', 'demo-tg-1', 'file.text.ready', forged_key(), snapshot)],
+            hold="UPDATE attachments SET active=false WHERE id='file-values'")
+        assert len(waited) == 1 and isinstance(waited[0], FORBIDDEN)
+        with s.pool.connection() as c:
+            assert c.execute('SELECT max(id) AS id,(SELECT value FROM feed_counter) AS counter FROM events').fetchone() == {
+                'id': newest, 'counter': newest}
     finally:
         remove(s, role)
