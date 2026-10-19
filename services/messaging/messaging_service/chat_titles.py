@@ -64,5 +64,5 @@ def retitle(c,p,items,*,titles=None,account='account',chat='chat',title='chat_ti
         titles=labels(c,p,[(i[account],i[chat]) for i in items if i.get(account) and i.get(chat)])
     for item in items:
         found=titles.get((item.get(account),item.get(chat)))
-        if found:item[title]=found[0][:cap] if cap else found[0]
+        if found and found[0]:item[title]=found[0][:cap] if cap else found[0]
     return titles
