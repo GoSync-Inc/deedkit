@@ -12,7 +12,8 @@ import pytest
 from telethon import events, functions, types
 
 from messaging_service.collector_state import CaptureSpool, session_lock
-from messaging_service.telegram_collector import TelegramCollector, TelethonProvider, configuration, private_json
+from messaging_service.telegram_collector import (
+    ProviderPageError, TelegramCollector, TelethonProvider, configuration, private_json)
 from messaging_service.telegram_operations import execute
 from test_collectors import message, worker
 from test_telegram_operations import Client, job, run
@@ -329,6 +330,175 @@ def test_unavailable_dialog_does_not_starve_other_chats_and_missing_include_is_v
     asyncio.run(collector.sync_once())
     assert attempts == ['100', '200'] and errors == [('100', 'provider_unavailable')]
     assert statuses[-1] == ('degraded', 'configured_chat_unavailable')
+
+
+CHAT_SECRET = 'synthetic-private-text chat=secret body=hello'
+
+
+def page_error(kind):
+    from telethon import errors
+    return {'server': lambda: errors.RpcCallFailError(None),
+            'timeout': lambda: TimeoutError(CHAT_SECRET),
+            'rpc': lambda: errors.MsgIdInvalidError(None),
+            'library': lambda: ProviderPageError('TypeNotFoundError')}[kind]()
+
+
+class ChatErrorProvider:
+    """Five synthetic chats; chat 101 fails transiently on every call, chat 102 with a chat error."""
+    def __init__(self, failing):
+        self.failing = failing; self.calls = []
+        self.messages = {str(c): [message(n, chat=str(c)) for n in (1, 2)] for c in range(101, 106)}
+    async def dialogs(self, limit): return [(str(c), 'user', f'Chat {c}') for c in range(101, 106)][:limit]
+    async def page(self, chat, *, limit, min_id=0, before=0, reverse=False):
+        self.calls.append(chat)
+        if chat in self.failing: raise self.failing[chat]()
+        found = [m for m in self.messages[chat] if m.id > min_id and (not before or m.id < before)]
+        return sorted(found, key=lambda m: m.id, reverse=not reverse)[:limit]
+
+
+# spec: ANYM-293
+def test_one_chat_provider_errors_fail_only_that_chat_in_history_reconcile(worker, capsys):
+    w, store, _ = worker
+    w.provider = ChatErrorProvider({'101': lambda: page_error('server'), '102': lambda: page_error('rpc')})
+    w.chat_retry_delays = (0, 0, 0)
+    asyncio.run(w.sync_once())
+    assert w.provider.calls.count('101') == 3 and w.provider.calls.count('102') == 1
+    for chat in ('103', '104', '105'):
+        assert w.state.chat(chat, 'user')['initialized'] is True
+    with store.pool.connection() as c:
+        errors = {r['provider_chat']: r['last_error_code'] for r in c.execute('SELECT provider_chat,last_error_code '
+            'FROM collector_chats WHERE account=%s AND last_error_code IS NOT NULL', (w.account,))}
+        health = c.execute('SELECT status,detail_code,operations FROM collector_health WHERE account=%s',
+            (w.account,)).fetchone()
+    assert errors == {'101': 'provider_temporarily_unavailable', '102': 'provider_chat_error'}
+    assert (health['status'], health['detail_code']) == ('degraded', 'configured_chat_unavailable')
+    recorded = {e['chat']: e for e in health['operations']['history']['chat_errors']}
+    assert recorded['101']['error_class'] == 'RpcCallFailError' and recorded['101']['reason_code'] == 'provider_temporarily_unavailable'
+    assert recorded['102']['error_class'] == 'MsgIdInvalidError' and recorded['102']['rpc_message'] == 'BAD_REQUEST'
+    out = capsys.readouterr().out
+    assert CHAT_SECRET not in out + str(health['operations'])
+    lines = [json.loads(line) for line in out.splitlines() if 'telegram_chat_error' in line]
+    assert [(line['chat'], line['code'], line['error_class']) for line in lines] == [
+        ('101', 'provider_temporarily_unavailable', 'RpcCallFailError'), ('102', 'provider_chat_error', 'MsgIdInvalidError')]
+    assert all(line['frames'] for line in lines)
+    # Every chat was attempted once; the next pass keeps the same fair rotation, no extra retry first.
+    assert w.state.inventory(asyncio.run(w.provider.dialogs(10)), None) == ['101', '102', '103', '104', '105']
+
+
+def fake_reconcile(provider, failed):
+    async def dialogs(limit): return [('100', 'user', 'One'), ('200', 'user', 'Two')]
+    provider.dialogs = dialogs
+    collector = TelegramCollector(None, 'synthetic-tg', provider, NS(), writer=object())
+    collector.chat_retry_delays = (0, 0, 0)
+    collector.state = NS(policy=lambda: {'include_chats': [], 'exclude_chats': []},
+        allows=lambda *args: True, inventory=lambda *args, **kwargs: ['100', '200'],
+        discovery_started=lambda: None, discovery_finished=lambda limited: None,
+        attempted=lambda chat: None, failed=lambda *args: failed.append(args),
+        status=lambda *args: None, chat=lambda chat, kind: {'initialized': False},
+        checkpoint=lambda *args, **kwargs: None)
+    collector.commit_page = lambda *args: asyncio.sleep(0, [])
+    return collector
+
+
+# spec: ANYM-293
+@pytest.mark.parametrize('error', ['flood', 'rate_limited', 'unregistered', 'banned', 'connection'])
+def test_rate_limit_session_terminal_and_transport_errors_still_propagate_from_reconcile(error):
+    from telethon import errors
+    from messaging_service.telegram_governor import ProviderRateLimited
+    raised = {'flood': lambda: errors.FloodWaitError(None, capture=5), 'rate_limited': lambda: ProviderRateLimited(5),
+              'unregistered': lambda: errors.AuthKeyUnregisteredError(None),
+              'banned': lambda: errors.UserDeactivatedBanError(None), 'connection': lambda: ConnectionError('synthetic')}[error]
+    calls = []; failed = []
+    async def page(chat, **query):
+        calls.append(chat); raise raised()
+    collector = fake_reconcile(NS(page=page), failed)
+    with pytest.raises(type(raised())):
+        asyncio.run(collector.sync_once())
+    assert calls == ['100']
+    assert failed in ([], [('100', 'rate_limited')])
+
+
+# spec: ANYM-293
+@pytest.mark.parametrize('kind', ['server', 'timeout'])
+def test_transient_chat_error_is_retried_for_that_chat_and_then_succeeds(kind):
+    calls = []; failed = []
+    async def page(chat, **query):
+        calls.append(chat)
+        if chat == '100' and calls.count('100') < 3: raise page_error(kind)
+        return []
+    collector = fake_reconcile(NS(page=page), failed)
+    asyncio.run(collector.sync_once())
+    assert calls == ['100', '100', '100', '200'] and failed == []
+
+
+# spec: ANYM-293
+def test_library_error_of_one_chat_is_a_chat_error_printed_once_without_text(capsys):
+    calls = []; failed = []
+    async def page(chat, **query):
+        calls.append(chat)
+        if chat == '100':
+            try: raise ValueError(CHAT_SECRET)
+            except ValueError as cause: raise ProviderPageError('ValueError') from cause
+        return []
+    collector = fake_reconcile(NS(page=page), failed)
+    asyncio.run(collector.sync_once()); asyncio.run(collector.sync_once())
+    assert failed == [('100', 'provider_chat_error', {'error_class': 'ValueError'})] * 2
+    assert calls.count('100') == 2 and calls.count('200') == 2
+    out = capsys.readouterr().out
+    lines = [json.loads(line) for line in out.splitlines() if 'telegram_chat_error' in line]
+    assert len(lines) == 1 and lines[0]['error_class'] == 'ValueError' and CHAT_SECRET not in out
+    assert any('test_coverage_telegram.py' in frame for frame in lines[0]['frames'])
+
+
+# spec: ANYM-293
+def test_telethon_page_wraps_only_non_rpc_library_errors_and_keeps_no_text():
+    from telethon import errors
+    provider = TelethonProvider.__new__(TelethonProvider); provider.governor = None
+    def client(error):
+        async def iterate(*args, **kwargs):
+            raise error
+            yield
+        return NS(iter_messages=iterate)
+    provider.client = client(ValueError(CHAT_SECRET))
+    with pytest.raises(ProviderPageError) as wrapped:
+        asyncio.run(provider.page('100', limit=1))
+    assert wrapped.value.error_class == 'ValueError' and CHAT_SECRET not in str(wrapped.value)
+    for error in [errors.RpcCallFailError(None), errors.FloodWaitError(None, capture=5),
+                  ConnectionError(CHAT_SECRET), TimeoutError(CHAT_SECRET)]:
+        provider.client = client(error)
+        with pytest.raises(type(error)):
+            asyncio.run(provider.page('100', limit=1))
+
+
+# spec: ANYM-293
+def test_chat_error_evidence_carries_only_a_class_name_and_a_fixed_rpc_code():
+    from telethon import errors
+    from messaging_service.collector_state import CollectorState
+    from messaging_service.telegram_collector import chat_error_evidence
+    assert chat_error_evidence(errors.MsgIdInvalidError(None)) == {'error_class': 'MsgIdInvalidError', 'rpc_message': 'BAD_REQUEST'}
+    # An RPC error Telethon does not know keeps Telegram's fixed code, the useful part of a generic class.
+    unknown = errors.rpc_message_to_error(NS(error_message='SYNTHETIC_NEW_ERROR', error_code=400), None)
+    assert chat_error_evidence(unknown) == {'error_class': 'BadRequestError', 'rpc_message': 'SYNTHETIC_NEW_ERROR'}
+    assert chat_error_evidence(ProviderPageError(CHAT_SECRET)) == {'error_class': 'unknown'}
+    assert chat_error_evidence(errors.RPCError(None, CHAT_SECRET)) == {'error_class': 'RPCError'}
+    state = CollectorState.__new__(CollectorState)
+    for bad in [{'error_class': CHAT_SECRET}, {'error_class': 'ValueError', 'text': CHAT_SECRET},
+                {'error_class': 'RPCError', 'rpc_message': CHAT_SECRET}, 'ValueError']:
+        with pytest.raises(ValueError, match='invalid_chat_error'): state.failed('100', 'provider_chat_error', bad)
+    with pytest.raises(ValueError, match='invalid_scan_error'): state.failed('100', 'synthetic_code')
+
+
+# spec: ANYM-293
+@pytest.mark.parametrize('code,state', [('provider_chat_error', 'provider_unavailable'),
+    ('provider_temporarily_unavailable', 'provider_unavailable'), ('provider_unavailable', 'provider_unavailable'),
+    ('rate_limited', 'rate_limited')])
+def test_chat_history_state_reads_a_chat_provider_error_as_unavailable(code, state):
+    from messaging_service.chat_evidence import history
+    row = {'last_head_scan_at': None, 'history_since': None, 'last_attempt_at': None, 'platform': 'telegram',
+           'initialized': True, 'window_complete': False, 'history_exhausted': False, 'last_error_code': code,
+           'last_error_at': None, 'synthetic': True, 'last_scan_at': None, 'high_water': 2, 'history_before': None}
+    result = history(row)
+    assert result['state'] == state and result['last_error_code'] == code
 
 
 def test_catalog_title_updates_are_nonempty_and_inventory_batches_remain_fenced(worker):

@@ -13,6 +13,7 @@ import secrets
 import signal
 import stat
 import time
+import traceback
 
 from .adapters import telegram_message
 from .archive import Archive
@@ -27,6 +28,18 @@ from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy,validate_pr
 
 
 class ProviderUnavailable(Exception): pass
+
+
+class ProviderPageError(Exception):
+    """A non-RPC failure inside one Telethon history read; keeps only the class name, never its text."""
+    def __init__(self,error_class):
+        self.error_class=error_class; super().__init__('provider_page_error')
+
+
+class ChatPageFailed(Exception):
+    """One chat's history page failed for a provider reason that must not stop the collector (ANYM-293)."""
+    def __init__(self,code,error):
+        self.code=code; self.error=error; super().__init__(code)
 
 
 def database_errors():
@@ -226,9 +239,16 @@ class TelethonProvider:
         if batch:yield batch
 
     async def page(self,chat,*,limit,min_id=0,before=0,reverse=False):
+        from telethon.errors import RPCError
         async def read():
-            return [m async for m in self.client.iter_messages(int(chat),limit=limit,min_id=min_id,
-                                                              offset_id=before,reverse=reverse)]
+            try:
+                return [m async for m in self.client.iter_messages(int(chat),limit=limit,min_id=min_id,
+                                                                  offset_id=before,reverse=reverse)]
+            except (RPCError,OSError):raise
+            except Exception as exc:
+                # Entity resolution, an unknown TL constructor and similar library errors of this
+                # one read; the governor's own state calls stay outside and still propagate.
+                raise ProviderPageError(type(exc).__name__) from exc
         return await self.rpc(read,'telegram_history')
 
     async def chunks(self,source,descriptor):
@@ -289,6 +309,18 @@ PARSE_ERRORS=(ValueError,TypeError,KeyError,AttributeError,IndexError,RecursionE
 # further callbacks wait in arrival order. More than CAPTURE_WAITERS waiting callbacks, or one
 # wait longer than CAPTURE_WAIT_SECONDS, fails the collector closed with capture_overload.
 CAPTURE_WRITES=16; CAPTURE_WAITERS=512; CAPTURE_WAIT_SECONDS=30
+# History reconcile of one chat (ANYM-293): transient server errors get at most CHAT_ATTEMPTS calls
+# per chat and pass, waiting CHAT_RETRY_DELAYS seconds between them.
+CHAT_ATTEMPTS=3; CHAT_RETRY_DELAYS=(1,2,4)
+
+
+def chat_error_evidence(error):
+    """Class name and Telegram's fixed RPC code of a chat's provider error; never exception text."""
+    name=error.error_class if isinstance(error,ProviderPageError) else type(error).__name__
+    evidence={'error_class':name if type(name) is str and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}',name) else 'unknown'}
+    message=getattr(error,'message',None) if type(error).__module__.startswith('telethon.') else None
+    if type(message) is str and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}',message):evidence['rpc_message']=message
+    return evidence
 
 
 class TelegramCollector:
@@ -314,6 +346,7 @@ class TelegramCollector:
         self._dialog_cache=None; self._next_discovery=0; self._history_spool=None
         self.invalid_messages=0; self._lease_valid_until=None
         self.failure_detail=None; self.rejected={}; self.rejected_messages=[]
+        self.chat_retry_delays=CHAT_RETRY_DELAYS; self._chat_failures=0; self._logged_chat_errors=set()
 
     @property
     def history_spool(self):
@@ -480,10 +513,37 @@ class TelegramCollector:
             ids.append(message.id)
         return ids
 
+    async def chat_page(self,chat,**query):
+        """One provider history page of one chat, classified per ANYM-293.
+
+        Rate limits, session-terminal errors, unavailable peers and transport loss propagate as before.
+        Transient server errors are retried here from a budget of CHAT_ATTEMPTS calls per chat and pass;
+        they and any other provider error then fail only this chat."""
+        from telethon.errors import (ChannelPrivateError,ChatAdminRequiredError,FloodWaitError,PeerIdInvalidError,
+            RPCError,ServerError,TimedOutError,UnauthorizedError)
+        while True:
+            try:return await self.provider.page(chat,**query)
+            except (FloodWaitError,UnauthorizedError,ChannelPrivateError,ChatAdminRequiredError,PeerIdInvalidError):raise
+            except (ServerError,TimedOutError,TimeoutError) as exc:
+                self._chat_failures=getattr(self,'_chat_failures',0)+1
+                if self._chat_failures>=CHAT_ATTEMPTS:raise ChatPageFailed('provider_temporarily_unavailable',exc) from exc
+                await asyncio.sleep(self.chat_retry_delays[self._chat_failures-1])
+            except (RPCError,ProviderPageError) as exc:raise ChatPageFailed('provider_chat_error',exc) from exc
+
+    def chat_failed(self,chat,failure):
+        """Print one content-free diagnostic per chat and process: class name and frames, never exception text."""
+        if chat in self._logged_chat_errors:return
+        self._logged_chat_errors.add(chat)
+        error=failure.error;cause=error.__cause__ if isinstance(error,ProviderPageError) else error
+        frames=[f'{os.path.basename(f.filename)}:{f.lineno}:{f.name}'
+                for f in traceback.extract_tb(getattr(cause,'__traceback__',None))][-12:]
+        print(json.dumps({'event':'telegram_chat_error','chat':chat,'code':failure.code,
+            **chat_error_evidence(error),'frames':frames}),flush=True)
+
     async def sync_chat(self,chat,kind,title):
         state=await asyncio.to_thread(self.state.chat,chat,kind)
         if not state['initialized']:
-            recent=await self.provider.page(chat,limit=self.batch_size)
+            recent=await self.chat_page(chat,limit=self.batch_size)
             kept=self.in_window(recent)
             ids=await self.commit_page(kept,chat,title,kind,'backfill')
             # Keep the cursor ABOVE skipped old messages so expanding the
@@ -493,17 +553,17 @@ class TelegramCollector:
                 history_before=boundary,exhausted=len(recent)<self.batch_size and len(kept)==len(recent),
                 initialized=True,window_complete=len(kept)<len(recent),head_complete=True)
             return
-        new=await self.provider.page(chat,limit=self.batch_size,min_id=state['high_water'],reverse=True)
+        new=await self.chat_page(chat,limit=self.batch_size,min_id=state['high_water'],reverse=True)
         await self.commit_page(self.in_window(new),chat,title,kind,'reconcile')
         if new: await asyncio.to_thread(self.state.checkpoint,chat,high_water=max(m.id for m in new))
         # Recent overlap catches edits after the library's update state advanced
         # ahead of durable capture. It cannot prove absence of older edits/deletes.
-        recent=await self.provider.page(chat,limit=self.batch_size)
+        recent=await self.chat_page(chat,limit=self.batch_size)
         await self.commit_page(self.in_window(recent),chat,title,kind,'reconcile')
         if len(new)<self.batch_size:
             await asyncio.to_thread(self.state.checkpoint,chat,head_complete=True)
         if not state['history_exhausted'] and not state['window_complete'] and state['history_before']:
-            older=await self.provider.page(chat,limit=self.batch_size,before=state['history_before'])
+            older=await self.chat_page(chat,limit=self.batch_size,before=state['history_before'])
             kept=self.in_window(older)
             ids=await self.commit_page(kept,chat,title,kind,'backfill')
             await asyncio.to_thread(self.state.checkpoint,chat,history_before=min(ids) if ids else None,
@@ -544,6 +604,7 @@ class TelegramCollector:
             chat,kind,title=by_id[chat][:3]
             if not self.state.allows(self.policy,chat): continue
             await asyncio.to_thread(self.state.attempted,chat)
+            self._chat_failures=0
             try:
                 await self.sync_chat(chat,kind,title); seen.add(chat)
             except (ChannelPrivateError,ChatAdminRequiredError,PeerIdInvalidError):
@@ -554,6 +615,11 @@ class TelegramCollector:
             except FloodWaitError:
                 await asyncio.to_thread(self.state.failed,chat,'rate_limited')
                 raise
+            except ChatPageFailed as failure:
+                # One chat's provider error marks only that chat; the pass goes on (ANYM-293).
+                unavailable=True
+                self.chat_failed(chat,failure)
+                await asyncio.to_thread(self.state.failed,chat,failure.code,chat_error_evidence(failure.error))
         missing=set(self.policy['include_chats'])-set(self.policy['exclude_chats'])-seen
         code='dialog_discovery_limited' if self.max_dialogs is not None and len(dialogs)>=self.max_dialogs else 'telegram_history_partial'
         if missing or unavailable: code='configured_chat_unavailable'
