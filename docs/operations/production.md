@@ -326,9 +326,11 @@ skipped and no docs-only decision; the pull request named by its
 `gh-readonly-queue/main/pr-<N>-<sha>` branch merged into `main` as exactly this
 SHA from this repository; and the latest `pull_request` run of its head, on its
 head branch, completed successfully with `checks / verify`, `checks / load`,
-`checks / evidence` and `CI gate` passed in its latest attempt, and was created
-before the queue run's latest attempt started (the queue decision reuses only
-the latest run of the head, so this is the run it evaluated). Both runs are
+`checks / evidence` and `CI gate` passed in its latest attempt, is the run, at
+that or a later attempt, that the reuse job's one passed step `Reused pull
+request run <id> attempt <n>` names, and was created before the queue run's
+latest attempt started, so it is the run the queue decision evaluated; a
+deleted or replaced producer is refused, never substituted. Both runs are
 read again, and the result names the pull request run. The tree equality is
 the queue decision's, checked again by the main push run before it publishes.
 The public repository supports anonymous API reads; optional `GH_TOKEN` may be

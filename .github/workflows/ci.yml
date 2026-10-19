@@ -108,6 +108,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci_reuse.py group
+      - name: Reused pull request run ${{ steps.decide.outputs.run_id }} attempt ${{ steps.decide.outputs.run_attempt }}
+        # This step's name in the run's jobs names the decision's producer: promotion and the main push follow the
+        # chain to that run only, and refuse it when the step is absent or the run is gone (production.py queue_chain).
+        if: steps.decide.outcome == 'success' && steps.decide.outputs.decision == 'reuse'
+        run: 'true'
   checks:
     # After the decisions: a validated reuse skips the test jobs (on a main push it publishes the queue's evidence);
     # every other run verifies in full. A reuse that failed validation leaves checks skipped, so the gate fails.

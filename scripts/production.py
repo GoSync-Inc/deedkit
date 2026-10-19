@@ -32,6 +32,8 @@ QUEUE_BRANCH_PREFIX = "gh-readonly-queue/main/"
 # tree (ANYM-358): promotion follows that chain to the pull request run, whose jobs below must have passed.
 QUEUE_PR_REUSE_JOB = "Reuse the pull request verification"
 PULL_REQUEST_JOBS = ("checks / verify", "checks / load", "checks / evidence", "CI gate")
+# The one passed step of that job that names the pull request run its decision reused (ci.yml): the queue's producer.
+QUEUE_PR_REUSE_STEP = re.compile(r"Reused pull request run ([1-9][0-9]*) attempt ([1-9][0-9]*)")
 # The merge queue names a group of main after the pull request it tests last: pr-<number>-<group base SHA>.
 QUEUE_GROUP_BRANCH = re.compile(re.escape(QUEUE_BRANCH_PREFIX) + r"pr-([1-9][0-9]*)-[0-9a-f]{40}")
 MAX_PAGES = 10
@@ -204,10 +206,10 @@ def queue_chain(sha, get, queue=None, jobs=None):
     Returns (queue run, pull request run, pull request number, head branch). The queue run must have passed `CI gate`
     with `checks / verify` skipped after its pull request reuse job, and not by its docs-only decision; the pull
     request must have merged as exactly this commit, and the latest run of its head must have passed every
-    `PULL_REQUEST_JOBS` job. That run must have been created before the queue run's latest attempt started: the queue
-    decision reuses only the latest pull request run of the head, so it is the run the decision evaluated (a rerun
-    attempt tests the same merge commit). The exact tree equality is the queue gate's (ANYM-358), checked again by the
-    push run. `queue` and `jobs`, when given, are the latest queue run and its attempt's jobs as just read.
+    `PULL_REQUEST_JOBS` job. That run must be the one the reuse job's one passed `QUEUE_PR_REUSE_STEP` step names, at
+    that or a later attempt (a rerun attempt tests the same merge commit), created before the queue run's latest attempt
+    started: a deleted or replaced producer is refused, never substituted. The exact tree equality is the queue gate's
+    (ANYM-358), checked again by the push run. `queue` and `jobs`, when given, are the latest queue run and its attempt's jobs as just read.
     """
     if queue is None:
         queue = latest_run(sha, "merge_group", get)
@@ -221,6 +223,13 @@ def queue_chain(sha, get, queue=None, jobs=None):
     if not (job_concluded(jobs, "CI gate") and job_concluded(jobs, QUEUE_VERIFIED_JOB, "skipped")
             and job_concluded(jobs, QUEUE_PR_REUSE_JOB)) or job_concluded(jobs, "checks / documentation"):
         raise Refused("the merge queue run did not pass by reusing a pull request verification")
+    reuse = next(job for job in jobs if job["name"] == QUEUE_PR_REUSE_JOB)
+    named = [QUEUE_PR_REUSE_STEP.fullmatch(str(step.get("name", ""))) for step in reuse.get("steps") or []
+             if step.get("status") == "completed" and step.get("conclusion") == "success"]
+    named = [found for found in named if found]
+    if len(named) != 1:
+        raise Refused("the merge queue run's pull request reuse job does not name the one pull request run it reused")
+    decided_id, decided_attempt = map(int, named[0].groups())
     number = int(match.group(1))
     pull = get(f"pulls/{number}")
     head = pull.get("head") or {}
@@ -235,7 +244,8 @@ def queue_chain(sha, get, queue=None, jobs=None):
                        run.get("conclusion"), (run.get("head_repository") or {}).get("full_name")) != expected:
         raise Refused("the latest pull request run of the merged head is not a completed success of this repository")
     try:
-        decided = timestamp(run["created_at"]) <= timestamp(queue["run_started_at"])
+        decided = run["id"] == decided_id and int(run["run_attempt"]) >= decided_attempt \
+            and timestamp(run["created_at"]) <= timestamp(queue["run_started_at"])
     except (KeyError, TypeError, ValueError):
         decided = False
     if not decided:

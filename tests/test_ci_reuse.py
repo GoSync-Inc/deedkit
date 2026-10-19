@@ -746,7 +746,7 @@ class PullGitHub:
         if path.startswith("actions/workflows/ci.yml/runs?"):
             assert "event=pull_request" in path and f"head_sha={HEAD_SHA}" in path
             return {"total_count": len(self.runs), "workflow_runs": self.runs}
-        if path.startswith(f"actions/runs/{PR_RUN_ID}/attempts/") and "/jobs?" in path:
+        if "/jobs?" in path and any(path.startswith(f"actions/runs/{run['id']}/attempts/") for run in self.runs):
             return {"total_count": len(self.jobs), "jobs": self.jobs}
         if path.startswith(f"actions/runs/{PR_RUN_ID}/attempts/"):
             return {"id": PR_RUN_ID, "run_attempt": int(path.rsplit("/", 1)[1]), "run_started_at": "2026-10-17T08:20:00Z"}
@@ -999,8 +999,20 @@ def test_the_push_after_a_reusing_queue_run_verifies_in_full_and_promotion_takes
 
 
 # The PR→queue chain: the queue run reused pull request run PR_RUN_ID, so the main push reuses that run's evidence.
-CHAIN_QUEUE_JOBS = [{"name": name, "status": "completed", "conclusion": conclusion} for name, conclusion in (
-    ("checks / verify", "skipped"), ("Reuse the pull request verification", "success"), ("CI gate", "success"))]
+def named_steps(*names, conclusion="success"):
+    return [{"name": name, "status": "completed", "conclusion": conclusion} for name in names]
+
+
+def chain_queue_jobs(*steps):
+    """The queue run's jobs; its reuse job names the pull request run its decision reused in a step (ci.yml)."""
+    steps = steps or ("Set up job", f"Reused pull request run {PR_RUN_ID} attempt 1", "Complete job")
+    return [{"name": "checks / verify", "status": "completed", "conclusion": "skipped"},
+            {"name": "Reuse the pull request verification", "status": "completed", "conclusion": "success",
+             "steps": [step if isinstance(step, dict) else named_steps(step)[0] for step in steps]},
+            {"name": "CI gate", "status": "completed", "conclusion": "success"}]
+
+
+CHAIN_QUEUE_JOBS = chain_queue_jobs()
 
 
 class ChainGitHub:
@@ -1357,6 +1369,30 @@ def test_promotion_refuses_a_pull_request_run_newer_than_the_queue_decision(tmp_
     for broken in ({"created_at": None}, {"created_at": "2026-10-17T08:00:00"}):
         with pytest.raises(production.Refused, match="not the one the merge queue decision evaluated"):
             production.verify(SHA, get=chain_push(ChainGitHub(b"", runs=[pr_run(**broken)])))
+
+
+# spec: ANYM-322
+def test_promotion_follows_only_the_pull_request_run_the_queue_named_and_refuses_it_when_gone(tmp_path):
+    # The queue decided on 640 and named it; once 640 is deleted, the older successful 639 of the same head (which may
+    # have tested another tree) is refused by promotion and by the push decision, never substituted.
+    older = [pr_run(run_id=PR_RUN_ID - 1)]
+    with pytest.raises(production.Refused, match="not the one the merge queue decision evaluated"):
+        production.verify(SHA, get=chain_push(ChainGitHub(b"", runs=older)))
+    with pytest.raises(ci_reuse.Refused, match="not the one the merge queue decision evaluated"):
+        ci_reuse.decide(SHA, REPOSITORY, get=ChainGitHub(b"", runs=older), sleep=lambda seconds: None)
+    named = f"Reused pull request run {PR_RUN_ID} attempt 1"
+    for steps, reason in ((("Reused pull request run 639 attempt 1",), "not the one"),
+                          ((f"Reused pull request run {PR_RUN_ID} attempt 2",), "not the one"),
+                          (("Set up job", "Complete job"), "does not name the one"),
+                          (("Reused pull request run  attempt ",), "does not name the one"),
+                          ((named_steps(named, conclusion="skipped")[0],), "does not name the one"),
+                          ((f"{named} ",), "does not name the one"),
+                          ((named, "Reused pull request run 639 attempt 1"), "does not name the one")):
+        with pytest.raises(production.Refused, match=reason):
+            production.verify(SHA, get=chain_push(ChainGitHub(b"", queue_jobs=chain_queue_jobs(*steps))))
+    # A later attempt of the named run tests the same merge commit, so its result counts.
+    verified = production.verify(SHA, get=chain_push(ChainGitHub(b"", runs=[pr_run(attempt=2)])))
+    assert (verified["verify_run_id"], verified["verify_run_attempt"]) == (PR_RUN_ID, 2)
 
 
 # spec: ANYM-322

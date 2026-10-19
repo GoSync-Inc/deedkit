@@ -204,8 +204,11 @@ latest attempt must have passed `CI gate` and `Reuse the pull request
 verification` with `checks / verify` skipped, never by a docs-only decision;
 the pull request named by its group ref must have merged into `main` as exactly
 this commit, and the latest run of its head must have passed every job a full
-pull request run needs and have been created before the queue run's latest
-attempt started, so it is the run the queue decision evaluated. The job pins that run's latest attempt and its one
+pull request run needs, be the run, at that or a later attempt, that the reuse
+job's one passed step `Reused pull request run <id> attempt <n>` names, and
+have been created before the queue run's latest attempt started, so it is the
+run the queue decision evaluated; a deleted or replaced producer is refused,
+never substituted. The job pins that run's latest attempt and its one
 current artifact, validates the evidence by the rules above for the merge
 commit it tested and the pull request's head branch, and then requires that
 merge commit to be GitHub's merge of that head and its Git tree hash to equal
