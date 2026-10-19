@@ -9,7 +9,8 @@ function reply(res,{status,headers={},body}){
 
 export function createServer(relay){
   const server=http.createServer((req,res)=>{
-    const match=/^\/hints\/([A-Za-z0-9-]{1,64})$/.exec(new URL(req.url,'http://relay').pathname);
+    // A plain string match: an unauthenticated request target can never throw before verification.
+    const match=/^\/hints\/([A-Za-z0-9-]{1,64})(?:\?.*)?$/.exec(String(req.url));
     if(req.method!=='POST'||!match){req.resume();return reply(res,{status:404,body:{error:'not_found'}});}
     if(Number(req.headers['content-length']??0)>MAX_BODY){req.resume();return reply(res,{status:413,body:{error:'body_too_large'}});}
     const chunks=[];let size=0,over=false;

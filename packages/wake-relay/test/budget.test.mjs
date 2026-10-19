@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {RECEIVER,ROUTINE,clock,downstream,relay,rows,signed,workspace} from './helpers.mjs';
 
+
 const HOUR=3600_000;
 const maxInSlidingHour=times=>Math.max(0,...times.map(end=>times.filter(at=>at>end-HOUR&&at<=end).length));
 
@@ -84,4 +85,31 @@ test('when the quota outlasts the hold, the third hint is refused on all 8 dispa
   assert.equal(instance.row(fields.hint_id),undefined);
   assert.equal(instance.get(`SELECT count FROM refusals WHERE subscription_id=? AND reason='budget_refused'`,three).count,8);
   await instance.close();
+});
+
+// spec: ANYM-228
+test('a slot is dated by its actual send, so fires delayed inside the hold still count in the next sliding hour',async()=>{
+  const space=workspace(),time=clock(),fake=downstream([],{clock:time});
+  const instance=relay(space,{clock:time,transport:fake});
+  const deliver=()=>{const h=signed({},Math.floor(time.now()/1000));return instance.receive(RECEIVER,h.raw,h.headers);};
+  const start=time.now();
+  for(let i=0;i<20;i++)assert.equal(deliver().status,202);
+  time.advance(119_000);
+  await instance.fireDue();
+  time.t=start+3600_000;
+  assert.equal(deliver().status,503);
+  time.t=start+119_000+3600_000+1;
+  assert.equal(deliver().status,202);
+  await instance.fireDue();
+  assert.equal(fake.fires.length,21);
+  assert.ok(maxInSlidingHour(fake.fires.map(f=>f.at))<=20);
+  await instance.close();
+});
+
+// spec: ANYM-228
+test('two adapter names for one vendor target are rejected, so a target budget cannot be doubled by aliasing',()=>{
+  const space=workspace();
+  const adapters={a:{type:'claude-routine',routine_id:ROUTINE,credential_file:space.claudeToken},
+    b:{type:'claude-routine',routine_id:ROUTINE,credential_file:space.claudeToken}};
+  assert.throws(()=>relay(space,{configOverrides:{adapters,receivers:{[RECEIVER]:{secret_file:space.receiverSecret,adapter:'a'}}}}),/already fires/);
 });

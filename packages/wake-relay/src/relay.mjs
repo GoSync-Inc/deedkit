@@ -1,5 +1,6 @@
 // Wake relay: one durable row per signed hint_id, at most one downstream fire per row (SUBSCRIPTIONS.md "Host receivers").
-// Every transition commits before the action that follows it; nothing after `sending` is ever re-fired.
+// Every transition commits before the action that follows it. After `sending`, only a documented 429 refusal
+// returns a row to `pending`; every other outcome is final.
 import {createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -44,12 +45,16 @@ export function readSecret(file,{min=1,max=4096}={}){
 export function loadConfig(config){
   const maxHoldS=config.max_hold_s??120;
   if(!Number.isInteger(maxHoldS)||maxHoldS<1||maxHoldS>600)throw new Error('max_hold_s must be 1..600');
-  const accounts=config.accounts??{},adapters=new Map();
+  const accounts=config.accounts??{},adapters=new Map(),targets=new Set();
   for(const [name,value] of Object.entries(config.adapters??{})){
     const budget=value.hourly_budget??20,account=value.account??name;
     const accountBudget=accounts[account]?.hourly_budget??60;
     if(!Number.isInteger(budget)||budget<1||!Number.isInteger(accountBudget)||accountBudget<1)throw new Error(`adapter ${name}: budgets must be positive integers`);
-    adapters.set(name,{name,impl:createAdapter(value),enabled:value.enabled!==false,credentialFile:value.credential_file,
+    const impl=createAdapter(value);
+    // The target budget belongs to the vendor target, so two adapter names may not share one routine or webhook.
+    if(targets.has(impl.url))throw new Error(`adapter ${name}: another adapter already fires ${impl.url}`);
+    targets.add(impl.url);
+    adapters.set(name,{name,impl,target:impl.url,enabled:value.enabled!==false,credentialFile:value.credential_file,
       budget,account,accountBudget});
   }
   const receivers=new Map();
@@ -63,6 +68,22 @@ export function loadConfig(config){
 
 const fingerprint=value=>createHash('sha256').update(value).digest('hex');
 const errorCode=error=>String(error?.code??error?.message??'error').slice(0,64).replace(/[^A-Za-z0-9_.-]/g,'_');
+function statusOf(db){
+  const all=sql=>db.prepare(sql).all();
+  return {
+    states:Object.fromEntries(all('SELECT state, count(*) AS n FROM hints GROUP BY state').map(r=>[r.state,r.n])),
+    refusals:all('SELECT receiver,subscription_id,reason,count,last_at FROM refusals ORDER BY last_at DESC LIMIT 50'),
+    revocations:all('SELECT adapter,status,at FROM revocations ORDER BY at DESC'),
+    recent:all(`SELECT hint_id,subscription_id,state,outcome,through,attempts,vendor_id,updated_at FROM hints
+      WHERE state<>'folded' ORDER BY updated_at DESC LIMIT 20`),
+  };
+}
+// Read-only inspection for `wake-relay status`: no schema, no recovery, so a live `sending` row stays untouched.
+export function readStatus(database){
+  const db=new DatabaseSync(database,{readOnly:true});
+  try{return statusOf(db);}finally{db.close();}
+}
+
 export const monotonicClock={now:()=>Math.floor(performance.timeOrigin+performance.now())};
 
 export class Relay{
@@ -101,9 +122,11 @@ export class Relay{
   revoked(adapter,credential){
     return Boolean(this.get('SELECT 1 FROM revocations WHERE adapter=? AND credential=?',adapter.name,fingerprint(credential)));
   }
-  // Seconds until a slot opens, or 0 when the target and its account both have one now.
+  // Seconds until a slot opens, or 0 when the target and its account both have one now. A slot is dated at
+  // acknowledgement and moves to the time of each send, so it counts in every sliding hour that holds its fire;
+  // an unsent slot is younger than max_hold_s and therefore always counted.
   budgetWait(adapter,now){
-    for(const [column,key,limit] of [['target',adapter.name,adapter.budget],['account',adapter.account,adapter.accountBudget]]){
+    for(const [column,key,limit] of [['target',adapter.target,adapter.budget],['account',adapter.account,adapter.accountBudget]]){
       const used=this.get(`SELECT count(*) AS n, min(at) AS first FROM slots WHERE ${column}=? AND at>?`,key,now-HOUR);
       if(used.n>=limit)return Math.max(1,Math.ceil((used.first+HOUR-now)/1000));
     }
@@ -147,7 +170,7 @@ export class Relay{
       this.run(`INSERT INTO hints(hint_id,receiver,adapter,subscription_id,subscription_version,kind,through,state,signed_at,
         received_at,hold_until,retry_at,updated_at) VALUES(?,?,?,?,?,?,?,'pending',?,?,?,?,?)`,hint.hint_id,receiver.id,adapter.name,
         hint.subscription_id,hint.subscription_version,hint.kind,hint.through,signedAt*1000,now,holdUntil,now,now);
-      this.run('INSERT INTO slots VALUES(?,?,?,?)',hint.hint_id,adapter.name,adapter.account,now);
+      this.run('INSERT INTO slots VALUES(?,?,?,?)',hint.hint_id,adapter.target,adapter.account,now);
       this.run('DELETE FROM slots WHERE at<=?',now-2*HOUR);
       this.step('beforePendingCommit');
       return {status:202,body:{result:'accepted'}};
@@ -184,9 +207,8 @@ export class Relay{
   async fire(id){
     let row=this.row(id);
     if(row?.state!=='pending'||this.closed)return;
-    const adapter=this.config.adapters.get(row.adapter),credential=this.credential(adapter);
-    if(!credential)return this.transition(id,'pending','revoked','adapter_disabled');
-    if(this.revoked(adapter,credential))return this.transition(id,'pending','revoked','adapter_revoked');
+    const adapter=this.config.adapters.get(row.adapter);
+    if(!this.fenced(id,adapter))return;
     if(this.clock.now()>=row.hold_until)return this.transition(id,'pending','expired','hold_elapsed');
     let socket;
     try{socket=await this.transport.connect(adapter.impl.url);}
@@ -197,13 +219,20 @@ export class Relay{
       row=this.row(id);
       const now=this.clock.now();
       if(row?.state!=='pending'||this.closed)return;
+      // The credential is read again after the connect: one removed, rotated or revoked meanwhile is honoured.
+      const credential=this.fenced(id,adapter);
+      if(!credential)return;
       if(now>=row.hold_until)return this.transition(id,'pending','expired','hold_elapsed');
       const payload={hint_id:row.hint_id,subscription_id:row.subscription_id,subscription_version:row.subscription_version,
         through:row.through,kind:row.kind,host_turn_verified:false};
       let request;
       try{request=adapter.impl.build(payload,credential,now);}catch(error){return this.transition(id,'pending','failed',errorCode(error));}
-      sending=this.tx(()=>this.run(`UPDATE hints SET state='sending',attempts=attempts+1,updated_at=? WHERE hint_id=? AND state='pending'`,
-        now,id).changes===1);
+      sending=this.tx(()=>{
+        const changed=this.run(`UPDATE hints SET state='sending',attempts=attempts+1,updated_at=? WHERE hint_id=? AND state='pending'`,
+          now,id).changes===1;
+        if(changed)this.run('UPDATE slots SET at=max(at,?) WHERE hint_id=?',now,id);
+        return changed;
+      });
       if(!sending)return;
       this.step('afterSending');
       let response;
@@ -213,6 +242,14 @@ export class Relay{
     }finally{if(!sending)this.transport.close(socket);}
   }
 
+  // The current credential, or null after moving the row to `revoked` (adapter disabled, credential gone or revoked).
+  fenced(id,adapter){
+    const credential=this.credential(adapter);
+    if(!credential){this.transition(id,'pending','revoked','adapter_disabled');return null;}
+    if(this.revoked(adapter,credential)){this.transition(id,'pending','revoked','adapter_revoked');return null;}
+    return credential;
+  }
+
   preSendFailure(row,code){
     const now=this.clock.now(),delay=Math.min(30,2**row.connects)*1000;
     if(now+delay>=row.hold_until)return this.transition(row.hint_id,'pending','expired',`pre_send:${code}`,{connects:row.connects+1});
@@ -220,7 +257,7 @@ export class Relay{
   }
 
   settle(row,adapter,credential,response){
-    const now=this.clock.now(),result=adapter.impl.classify(response,now),status=`http_${response.status}`;
+    const now=this.clock.now(),result=adapter.impl.classify(response,now),status=result.outcome??`http_${response.status}`;
     if(result.state==='accepted')return this.transition(row.hint_id,'sending','accepted',status,{vendor_id:result.vendorId});
     if(result.state==='pending'){
       const retryAt=now+(result.retryAfter??DEFAULT_RETRY_AFTER_S)*1000;
@@ -250,15 +287,7 @@ export class Relay{
 
   start(){this.schedule();return this;}
 
-  status(){
-    return {
-      states:Object.fromEntries(this.all('SELECT state, count(*) AS n FROM hints GROUP BY state').map(r=>[r.state,r.n])),
-      refusals:this.all('SELECT receiver,subscription_id,reason,count,last_at FROM refusals ORDER BY last_at DESC LIMIT 50'),
-      revocations:this.all('SELECT adapter,status,at FROM revocations ORDER BY at DESC'),
-      recent:this.all(`SELECT hint_id,subscription_id,state,outcome,through,attempts,vendor_id,updated_at FROM hints
-        WHERE state<>'folded' ORDER BY updated_at DESC LIMIT 20`),
-    };
-  }
+  status(){return statusOf(this.db);}
 
   async close(){
     this.closed=true;clearTimeout(this.timer);

@@ -159,3 +159,43 @@ test('a pending hint past max_hold_s expires with zero fires',async()=>{
   assert.equal(rows(instance).length,1);
   await instance.close();
 });
+
+// spec: ANYM-228
+test('a credential removed while the connection is being set up stops the fire before sending',async()=>{
+  const {space,instance,deliver}=setup();
+  let release,writes=0;
+  instance.transport={connect:()=>new Promise(resolve=>{release=resolve;}),send:async()=>{writes++;return {status:200,headers:{},body:Buffer.alloc(0)};},close(){}};
+  const {id}=deliver();
+  const firing=instance.fireDue();
+  await new Promise(resolve=>setImmediate(resolve));
+  fs.rmSync(space.claudeToken);
+  release({});
+  await firing;
+  assert.deepEqual([instance.row(id).state,instance.row(id).outcome,instance.row(id).attempts,writes],['revoked','adapter_disabled',0,0]);
+  await instance.close();
+});
+
+// spec: ANYM-228
+test('a malformed Grok secret fails locally with no sending transition and nothing written',async()=>{
+  for(const secret of ['whsec_!!!','whsec_','whsec_c2hvcnQ=']){
+    const {space,fake,instance,deliver}=setup({adapter:GROK});
+    fs.writeFileSync(space.grokSecret,secret,{mode:0o600});
+    const {id}=deliver();
+    await instance.fireDue();
+    assert.deepEqual([instance.row(id).state,instance.row(id).outcome,instance.row(id).attempts,fake.fires.length],['failed','invalid_credential',0,0],secret);
+    await instance.close();
+  }
+});
+
+// spec: ANYM-228
+test('a Claude 2xx without a valid session ID is unknown, not accepted, and is never re-fired',async()=>{
+  for(const body of ['','not json','{"claude_code_session_id":""}','{"type":"routine_fire"}']){
+    const {time,fake,instance,deliver}=setup();
+    fake.script.push({status:200,body:Buffer.from(body)});
+    const {id}=deliver();
+    await instance.fireDue();
+    time.advance(600_000);await instance.fireDue();
+    assert.deepEqual([instance.row(id).state,instance.row(id).outcome,instance.row(id).vendor_id,fake.fires.length],['unknown','http_200_without_session_id',null,1],body);
+    await instance.close();
+  }
+});

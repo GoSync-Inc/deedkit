@@ -40,8 +40,11 @@ npm test
 - Secret and credential files must be absolute, regular and owner-only (`0600`).
   The receiver secret holds the same bytes as DeedKit's `secret_file`. A routine token
   is `sk-ant-oat01-...`; a Grok secret is `whsec_...`.
-- `"enabled": false`, or removing a credential file, stops every pending fire of that
-  adapter. A 401/403 marks the adapter revoked until its credential file changes.
+- Removing a credential file stops every pending fire of that adapter at once.
+  `"enabled": false` needs a restart (the config is read at start); the restart marks
+  the adapter's pending rows `revoked`, and a row already `sending` ends `unknown`.
+- Anthropic 401/403 and Grok 401 mark the adapter revoked until its credential file
+  changes. Each routine or webhook may appear in only one adapter.
 - The relay answers `503` with `Retry-After` and stores nothing when no budget slot
   is free (`budget_refused`), when the adapter is disabled or revoked
   (`adapter_unavailable`), or when a hint arrives after its hold window

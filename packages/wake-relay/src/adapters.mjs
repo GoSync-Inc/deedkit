@@ -15,7 +15,11 @@ export function retryAfterSeconds(value,nowMs){
 // definite; everything else after the first byte was written is `unknown` and never re-fired.
 function outcome(table,response,nowMs,vendorId){
   const {status}=response;
-  if(status>=200&&status<300)return {state:'accepted',vendorId:vendorId(response)};
+  if(status>=200&&status<300){
+    // A Claude 2xx without the documented session ID is not a confirmed run: `unknown`, never re-fired.
+    const id=vendorId(response);
+    return id||!table.runId?{state:'accepted',vendorId:id}:{state:'unknown',outcome:`http_${status}_without_session_id`};
+  }
   if(status===429&&table.rateLimited)return {state:'pending',retryAfter:retryAfterSeconds(response.headers['retry-after'],nowMs)};
   if(table.revoked.includes(status))return {state:'revoked'};
   if(table.failed.includes(status))return {state:'failed'};
@@ -35,7 +39,7 @@ export function claudeRoutine(config){
   if(!ROUTINE.test(config.routine_id??''))throw new Error('claude-routine needs routine_id trig_...');
   const base=config.api_base??'https://api.anthropic.com';
   if(!/^https:\/\/[^/?#]+$/.test(base))throw new Error('claude-routine api_base must be an https origin');
-  const table={failed:[400,404],revoked:[401,403],rateLimited:true};
+  const table={failed:[400,404],revoked:[401,403],rateLimited:true,runId:true};
   return {
     type:'claude-routine',url:`${base}/v1/claude_code/routines/${config.routine_id}/fire`,
     build(payload,credential){
@@ -48,6 +52,13 @@ export function claudeRoutine(config){
     },
     classify:(response,nowMs)=>outcome(table,response,nowMs,sessionId),
   };
+}
+
+// The key is the canonical base64 after `whsec_`; anything else is a local error before `sending`.
+export function webhookKey(secret){
+  const encoded=String(secret).trim().replace(/^whsec_/,''),key=Buffer.from(encoded,'base64');
+  if(!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)||key.length<16||key.toString('base64')!==encoded)throw new Error('invalid_credential');
+  return key;
 }
 
 export function standardWebhookSignature(secret,id,timestamp,body){
@@ -65,6 +76,7 @@ export function grokAutomation(config){
     build(payload,credential,nowMs){
       const body=Buffer.from(JSON.stringify(payload)),timestamp=String(Math.floor(nowMs/1000));
       if(body.length>WEBHOOK_BODY_LIMIT)throw new Error('webhook_body_too_large');
+      webhookKey(credential.toString('utf8'));
       return {url:this.url,body,headers:{'content-type':'application/json','webhook-id':payload.hint_id,
         'webhook-timestamp':timestamp,'webhook-signature':standardWebhookSignature(credential.toString('utf8'),payload.hint_id,timestamp,body)}};
     },

@@ -2,7 +2,7 @@
 // wake-relay serve --config <file> [--drop-ack-once] | wake-relay status --config <file>
 import fs from 'node:fs';
 import {parseArgs} from 'node:util';
-import {Relay} from '../src/relay.mjs';
+import {Relay,loadConfig,readStatus} from '../src/relay.mjs';
 import {createServer} from '../src/server.mjs';
 
 const {positionals,values}=parseArgs({allowPositionals:true,options:{config:{type:'string'},'drop-ack-once':{type:'boolean',default:false}}});
@@ -13,9 +13,7 @@ if(!values.config||!['serve','status'].includes(command)){
 const config=JSON.parse(fs.readFileSync(values.config,'utf8'));
 const log=entry=>process.stderr.write(JSON.stringify({at:new Date().toISOString(),...entry})+'\n');
 if(command==='status'){
-  const relay=new Relay({config,log,autoFire:false});
-  process.stdout.write(JSON.stringify(relay.status(),null,2)+'\n');
-  await relay.close();
+  process.stdout.write(JSON.stringify(readStatus(loadConfig(config).database),null,2)+'\n');
 }else{
   const relay=new Relay({config,log,dropAckOnce:values['drop-ack-once']}).start();
   const server=createServer(relay);

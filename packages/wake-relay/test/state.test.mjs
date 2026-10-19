@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readStatus} from '../src/relay.mjs';
 import {RECEIVER,clock,crash,downstream,relay,rows,signed,workspace} from './helpers.mjs';
 
 class Crash extends Error{}
@@ -130,4 +131,20 @@ test('a hint that arrives while its subscription is sending folds into that fire
   await Promise.race([instance.fireDue(),new Promise(resolve=>setTimeout(resolve,20))]);
   assert.equal(fake.fires.length,1);
   crash(instance);
+});
+
+// spec: ANYM-228
+test('wake-relay status reads without recovery: a live sending row stays sending and still records its session ID',async()=>{
+  const {fake,start,deliver}=setup();
+  let respond;
+  fake.send=async request=>{fake.fires.push(request);return new Promise(resolve=>{respond=resolve;});};
+  const instance=start();
+  deliver(instance);
+  const firing=instance.fireDue();
+  await until(()=>fake.fires.length===1);
+  assert.deepEqual(readStatus(instance.config.database).states,{sending:1});
+  respond({status:200,headers:{},body:Buffer.from('{"claude_code_session_id":"session_01SYNTHETIC"}')});
+  await firing;
+  assert.deepEqual([rows(instance)[0].state,rows(instance)[0].vendor_id],['accepted','session_01SYNTHETIC']);
+  await instance.close();
 });

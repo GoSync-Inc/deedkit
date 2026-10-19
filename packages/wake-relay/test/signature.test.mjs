@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import {createServer} from '../src/server.mjs';
 import {RECEIVER,clock,downstream,lower,relay,rows,signed,vector,workspace} from './helpers.mjs';
 
@@ -69,4 +70,16 @@ test('a bad signature, a timestamp outside -300 s/+60 s, a body over 64 KiB and 
   assert.equal(rows(instance).length,1);
   await instance.fireDue();
   assert.equal(fake.fires.length,1);
+});
+
+// spec: ANYM-228
+test('an unauthenticated request target the URL parser rejects gets 404 and the relay keeps serving',async t=>{
+  const {port}=await serve(t);
+  const raw=await new Promise((resolve,reject)=>{
+    const socket=net.connect(port,'127.0.0.1',()=>socket.write('GET // HTTP/1.1\r\nHost: relay\r\nConnection: close\r\n\r\n'));
+    const chunks=[];socket.on('data',c=>chunks.push(c));socket.on('end',()=>resolve(Buffer.concat(chunks).toString()));socket.on('error',reject);
+  });
+  assert.match(raw,/^HTTP\/1\.1 404 /);
+  const hint=signed({},Number(vector.headers['X-DeedKit-Timestamp']));
+  assert.equal((await post(port,hint.raw,hint.headers)).status,202);
 });

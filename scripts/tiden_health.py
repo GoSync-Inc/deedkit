@@ -69,7 +69,7 @@ def suite(case: dict) -> str:
         return "whatsmeow-go"
     if path.startswith("whatsapp/"):
         return "whatsapp-node"
-    if path.startswith("packages/npm/"):
+    if path.startswith(("packages/npm/", "packages/wake-relay/")):  # one `npm` CI step runs both
         return "npm"
     if path.startswith(".github/"):
         return "ci"

@@ -537,6 +537,11 @@ def test_each_case_belongs_to_one_fixed_suite(path, external, name):
     assert suite({"filePath": path, "externalId": external}) == name
 
 
+# spec: ANYM-228
+def test_wake_relay_cases_belong_to_the_npm_suite_that_runs_them():
+    assert suite({"filePath": "packages/wake-relay/test/state.test.mjs", "externalId": ""}) == "npm"
+
+
 # Stale anchors.
 
 ODD = ("services/café.py", "services/with space.py", "services/new\nline.py", 'services/quo"te.py')

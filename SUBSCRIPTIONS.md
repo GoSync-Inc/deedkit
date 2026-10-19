@@ -273,10 +273,10 @@ before the action that follows it.
 |---|---|
 | `pending` | Committed before the dispatcher gets its `2xx`. Nothing was written downstream. |
 | `sending` | Committed after DNS, TCP and TLS succeed, just before the first request byte. |
-| `accepted` | The vendor returned 2xx; the Claude session ID is stored (the Grok webhook returns none). |
+| `accepted` | The vendor returned 2xx: Claude with its documented session ID (stored), Grok `202` (no run ID exists). A Claude 2xx without a session ID is `unknown`. |
 | `unknown` | Any outcome after `sending` that the vendor does not document as a refusal: timeout, reset, crash, 500, 503, unlisted status. Never re-fired. |
-| `failed` | A documented refusal: Anthropic 400/404, Grok 400/413. |
-| `revoked` | Credential rejected (401/403, Grok 401), or the adapter disabled or its credential file removed. |
+| `failed` | A documented refusal (Anthropic 400/404, Grok 400/413), or a local error before `sending` such as a malformed credential. |
+| `revoked` | Credential rejected (Anthropic 401/403, Grok 401), or the adapter disabled or its credential file removed. |
 | `expired` | `max_hold_s` (default 120 s, at most 600 s after the signed timestamp) ran out before a send. |
 | `folded` | Merged into the subscription's open fire; kept only for deduplication. |
 
@@ -287,13 +287,14 @@ Pre-send failures retry with backoff inside the hold. A `429` returns the row to
 
 **Coalescing and budgets.** At most one `pending` or `sending` fire per receiver and
 subscription; later hints fold into it and the highest `through` wins. A new fire
-needs a slot in a sliding hour, per adapter target (default 20) and per vendor
-account (default 60), counted at acknowledgement. Without a slot the relay answers
+needs a slot in a sliding hour, per vendor target (default 20; one adapter per
+routine or webhook) and per vendor account (default 60). The slot is reserved at
+acknowledgement and re-dated to each send, so every sliding hour holds at most the
+budget of fires. Without a slot the relay answers
 `503` with `Retry-After`, stores no row and counts `budget_refused` per
 subscription; the hint stays in the DeedKit outbox under the server fence and
 dead-letters after the dispatcher's eight attempts (about four minutes) if no slot
-opens. A budget-refused hint is not guaranteed a wake. A `429` or pre-send retry
-fires up to `max_hold_s` after its slot, so the defaults stay below the vendor limits.
+opens. A budget-refused hint is not guaranteed a wake.
 
 **Lost wakes and revocation.** No event is lost: a woken run fetches from the ACK
 position and ACKs what it handled. A wake can be lost (`budget_refused`, `expired`,
@@ -303,7 +304,9 @@ documented schedules) that fetches and ACKs outstanding events. The server fence
 stops new hints but cannot reach work the relay already acknowledged: that work
 fires within `max_hold_s` at most. `--disable-receiver` stops hints only; the key
 can still read. Revoking the key also makes the woken run's fetch and ACK fail.
-Disabling the adapter locally or removing its credential stops all its pending fires.
+Removing an adapter's credential file stops its pending fires, also one whose
+connection is being set up; `"enabled": false` takes effect at the next restart,
+which revokes its pending rows.
 
 **Vendor limits** (vendor documentation, 2026-10-19). Claude routine `/fire`: 30
 fires per hour per routine, 100 API fires per hour per account, `Retry-After` on
