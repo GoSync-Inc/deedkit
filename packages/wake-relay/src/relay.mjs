@@ -76,6 +76,13 @@ function targetKey(url,name){
     throw new Error(`adapter ${name}: the target must be https with no userinfo or fragment`);
   return fingerprint(target.host+target.pathname+target.search);
 }
+// A slot key written by an earlier build: a raw URL becomes the fingerprint of its destination however it was
+// spelled; an adapter name maps to that adapter. A name no current adapter has stays as it is.
+function legacyTargetKey(key,adapters){
+  if(adapters.has(key))return adapters.get(key).target;
+  if(!key.includes('://'))return null;
+  try{const target=new URL(key);return fingerprint(target.host+target.pathname+target.search);}catch{return fingerprint(key);}
+}
 const errorCode=error=>String(error?.code??error?.message??'error').slice(0,64).replace(/[^A-Za-z0-9_.-]/g,'_');
 function statusOf(db){
   const all=sql=>db.prepare(sql).all();
@@ -119,9 +126,12 @@ export class Relay{
     const now=this.clock.now();
     this.tx(()=>{
       this.run(`UPDATE hints SET state='unknown',outcome='interrupted_after_send',updated_at=? WHERE state='sending'`,now);
+      // Slots written by earlier builds are keyed by adapter name or raw URL; they keep counting for the target.
+      for(const {target} of this.all('SELECT DISTINCT target FROM slots')){
+        const key=/^[0-9a-f]{64}$/.test(target)?null:legacyTargetKey(target,this.config.adapters);
+        if(key)this.run('UPDATE slots SET target=? WHERE target=?',key,target);
+      }
       for(const adapter of this.config.adapters.values()){
-        // Slots written by earlier builds are keyed by adapter name or raw URL; they keep counting for the target.
-        this.run('UPDATE slots SET target=? WHERE target IN (?,?)',adapter.target,adapter.name,adapter.impl.url);
         if(!adapter.enabled)this.run(`UPDATE hints SET state='revoked',outcome='adapter_disabled',updated_at=? WHERE state='pending' AND adapter=?`,now,adapter.name);
       }
     });

@@ -141,6 +141,20 @@ test('slots an earlier build stored under the adapter name still count after upg
 });
 
 // spec: ANYM-228
+test('slots an earlier build stored under another spelling of the same target URL still count after upgrade',async()=>{
+  const space=workspace(),time=clock(),fake=downstream([],{clock:time});
+  const first=relay(space,{clock:time,transport:fake});
+  for(let i=0;i<20;i++)first.run('INSERT INTO slots VALUES(?,?,?,?)',crypto.randomUUID(),`https://API.ANTHROPIC.COM:443/v1/claude_code/routines/${ROUTINE}/fire`,'other',time.now());
+  first.run('INSERT INTO slots VALUES(?,?,?,?)',crypto.randomUUID(),'renamed-adapter','other',time.now());
+  await first.close();
+  const instance=relay(space,{clock:time,transport:fake});
+  const hint=signed({},Math.floor(time.now()/1000));
+  assert.equal(instance.receive(RECEIVER,hint.raw,hint.headers).status,503);
+  assert.deepEqual(instance.all('SELECT target FROM slots').filter(r=>r.target.includes('://')),[]);
+  await instance.close();
+});
+
+// spec: ANYM-228
 test('a 429-refused request starts no run: its retry is the same fire, reusing the one slot re-dated to the retry',async()=>{
   const space=workspace(),time=clock(),fake=downstream([{status:429,headers:{'retry-after':'5'}},{status:429,headers:{'retry-after':'5'}}],{clock:time});
   const instance=relay(space,{clock:time,transport:fake,configOverrides:{adapters:{claude:{type:'claude-routine',routine_id:ROUTINE,
