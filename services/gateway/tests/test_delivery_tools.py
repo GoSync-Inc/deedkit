@@ -136,3 +136,68 @@ def test_consumption_error_diagnostics_never_copy_arbitrary_backend_text(tmp_pat
     assert response.json() == mcp["structuredContent"] == {
         "error": expected, "backend_status": 409, "request_id": "c" * 32,
     }
+
+
+FEEDBACK = {"request_id": "synthetic-request", "category": "bug", "description": "Synthetic feedback"}
+GOOD_FIELD_ERRORS = [
+    {"field": "category", "reason": "enum", "allowed": ["bug", "feature", "quality", "other"]},
+    {"field": "description", "reason": "blank", "expected": "text with a non-space character"},
+    {"field": "refs/message_ids/0", "reason": "format"},
+]
+
+
+def feedback_failure(tmp_path, status, body):
+    def backend(request):
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json={"permissions": ["read", "feedback-write"],
+                                            "tool_manifest": {"names": ["submit_feedback"]}})
+        return httpx.Response(status, json=body)
+
+    name = "messages_submit_feedback"
+    app, _, _ = configured(tmp_path, backend, module="messaging", tools=[name], grants=["read", "feedback-write"])
+    with TestClient(app) as client:
+        rest = client.post("/v1/" + name, json=FEEDBACK, headers=HEADERS)
+        mcp = rpc(client, "tools/call", {"name": name, "arguments": FEEDBACK}).json()["result"]
+    assert mcp["isError"] and rest.json() == mcp["structuredContent"]
+    return rest
+
+
+# spec: ANYM-295
+def test_feedback_field_errors_relay_end_to_end(tmp_path):
+    rest = feedback_failure(tmp_path, 422, {
+        "error": "invalid_feedback", "request_id": "c" * 32, "next_action": "PRIVATE BACKEND INSTRUCTION",
+        "field_errors": GOOD_FIELD_ERRORS, "private": "synthetic-secret"})
+    assert rest.status_code == 422
+    assert rest.json() == {"error": "invalid_feedback", "backend_status": 422, "request_id": "c" * 32,
+                           "field_errors": GOOD_FIELD_ERRORS}
+
+
+# spec: ANYM-295
+@pytest.mark.parametrize("malformed", [
+    [{"field": f"f{i}", "reason": "type"} for i in range(21)],
+    [{"field": "category", "reason": "invented"}],
+    [{"field": "not an identifier", "reason": "enum"}],
+    [{"field": "a" * 129, "reason": "enum"}],
+    [{"field": "refs//0", "reason": "format"}],
+    [{"field": "category", "reason": "enum"}, {"field": "category", "reason": "type"}],
+    [{"field": "category", "reason": "enum", "private": "synthetic-secret"}],
+    [{"field": "category", "reason": "enum", "expected": "x" * 161}],
+    [{"field": "category", "reason": "enum", "expected": ["bug"]}],
+    [{"field": "category", "reason": "enum", "allowed": [{"nested": "x"}]}],
+    [{"field": "category", "reason": "enum", "allowed": ["x" * 65]}],
+    [{"field": "category", "reason": "enum", "allowed": [str(i) for i in range(51)]}],
+    [GOOD_FIELD_ERRORS[0], "category"],
+    {"field": "category", "reason": "enum"},
+    "category",
+    [],
+])
+def test_consumption_field_errors_validated(tmp_path, malformed):
+    rest = feedback_failure(tmp_path, 422, {"error": "invalid_feedback", "request_id": "c" * 32,
+                                            "field_errors": malformed})
+    assert rest.json() == {"error": "invalid_feedback", "backend_status": 422, "request_id": "c" * 32}
+
+
+# spec: ANYM-295
+def test_consumption_field_errors_dropped_with_an_unlisted_error_code(tmp_path):
+    rest = feedback_failure(tmp_path, 422, {"error": "private_internal_error", "field_errors": GOOD_FIELD_ERRORS})
+    assert rest.json() == {"error": "backend_denied", "backend_status": 422}

@@ -6,16 +6,8 @@ schema, never from the submitted value. An unknown key the agent sent is named o
 when it is a short identifier.
 """
 
-import re
+from platform_contracts.field_errors import MAX_ALLOWED, MAX_ENTRIES, MAX_PATH, SEGMENT
 
-REASONS = frozenset((
-    "required", "unknown_field", "type", "enum", "min_length", "max_length", "pattern", "minimum",
-    "maximum", "min_items", "max_items", "unique", "format", "blank", "size",
-))
-MAX_ENTRIES = 20
-MAX_PATH = 128
-MAX_ALLOWED = 50
-SEGMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}|[0-9]{1,4}")
 # `$` stands for the arguments object itself.
 ROOT = "$"
 

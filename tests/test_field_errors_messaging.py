@@ -141,3 +141,16 @@ def test_integer_map_keys_are_never_named_and_never_raise():
         Model.model_validate({'refs': {12345: [4]}, 'others': 1}, strict=True)
     assert pydantic_field_errors(Model, failure.value.errors(include_input=False)) == [
         {'field': 'refs', 'reason': 'unknown_field'}, {'field': 'others', 'reason': 'type', 'expected': 'object'}]
+
+
+# spec: ANYM-295
+def test_messaging_shape_matches_the_shared_platform_contract():
+    # Messaging stays independent of platform packages at runtime; the gateway validates what it relays.
+    from messaging_service import field_errors as local
+    from platform_contracts import field_errors as shared
+    assert (local.FIELD_ERROR_REASONS, local.MAX_FIELD_ERRORS, local.MAX_FIELD_PATH, local.MAX_ALLOWED) == (
+        shared.REASONS, shared.MAX_ENTRIES, shared.MAX_PATH, shared.MAX_ALLOWED)
+    assert local.SEGMENT.pattern == shared.SEGMENT.pattern
+    entries = [local.field_error('refs/message_ids/0', 'format', 'x' * 100, ['a', 1, True]),
+               local.field_error('category', 'enum', allowed=['bug'] * 50)]
+    assert shared.validated(entries) == entries

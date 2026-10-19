@@ -5,6 +5,8 @@ import logging
 import re
 from uuid import uuid4
 
+from platform_contracts.field_errors import validated
+
 from .catalog import CATALOG, public
 
 
@@ -84,6 +86,10 @@ def consumption_failure(status, value, header_request_id=None):
     result.pop("backend_error", None)
     code = value.get("error")
     result["error"] = code if isinstance(code, str) and code in CONSUMPTION_ERRORS else "backend_denied"
+    # The one backend detail relayed: a list that passes the shared shape and vocabulary, else nothing.
+    field_errors = validated(value.get("field_errors")) if result["error"] != "backend_denied" else None
+    if field_errors:
+        result["field_errors"] = field_errors
     return result
 
 

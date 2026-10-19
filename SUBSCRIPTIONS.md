@@ -245,7 +245,9 @@ and `allowed` lists the permitted values, for example the four categories. There
 one entry per field, in parameter order, at most 20, and no submitted value is ever
 returned: an unknown key is named only when it is a short identifier. A reference that
 is valid but not found or not permitted stays `not_found`. Through the common gateway,
-the gateway's own schema check returns `invalid_arguments` with `field_errors`.
+the gateway's own schema check returns `invalid_arguments` with `field_errors`, and it relays the
+backend's `invalid_feedback` `field_errors` after rechecking the shape and vocabulary (a malformed list is
+dropped, never partly relayed).
 
 ## Remaining extensions and verification boundaries
 
