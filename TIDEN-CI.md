@@ -59,7 +59,8 @@ In GitHub Actions repository settings, add:
 
 A mapping must name an existing Tiden branch and always wins. Otherwise a pull
 request run uses the intent branch linked in the pull request description, as the
-intent loop requires:
+intent loop requires (paused; see
+[the product workflow](docs/operations/tiden-product-workflow.md#one-tiden-branch-per-pull-request-intent-loop-paused-owner-10-19)):
 
 ```text
 Tiden intent branch: [intent/<date>-<slug>](https://app.tiden.ai/<workspace>/products/<product>/branches/<id>)

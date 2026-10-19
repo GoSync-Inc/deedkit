@@ -19,6 +19,9 @@ history.
 - `specs.md`: the full text of the specs the PR delivers and of those whose criteria change; IDs
   and titles for the other specs it names or touches.
 - `pr.md`: the pull request description.
+- `context.md`: the `product-context` answer the author read at the start, saved to a file then
+  and attached unchanged, on every change path, so the reviewer sees the criteria of the specs
+  around the change, including those it does not change. It costs no new Tiden call.
 
 A card has no diff: its packet holds the proposed text, the search results for similar specs (ID,
 title, status), the text of specs it references and `git ls-files -- <expected paths>`.
