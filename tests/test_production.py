@@ -1617,7 +1617,10 @@ def test_a_busy_state_keeps_the_revisions_it_may_be_preparing_and_removal_holds_
         fcntl.flock(preparation, fcntl.LOCK_EX | fcntl.LOCK_NB)
         kept = {item["image"]: item["reasons"] for item in p.images_report(settings)["keep"]}
         assert kept[image_id("e")] == [f"release {'e' * 40} of {other} may be preparing now"]
-        assert p.remove_images(settings)["removed"] == [] and image_id("e") in store.references
+        # Removal waits for the next pass: it would also take the image lock that preparation needs.
+        assert p.retain_images(settings) == {
+            "skipped": f"another production operation holds the deploy lock of {other}; no image is removed"}
+        assert store.removals() == [] and image_id("e") in store.references
     # Idle, the other state's lock is held for the whole removal, so no preparation can start there meanwhile.
     held = []
     def probe(argv):

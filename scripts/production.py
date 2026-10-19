@@ -1207,8 +1207,9 @@ def release_name(name):
 
 def images_report(settings, *, held=(), stack=None):
     """Which `deedkit-production-<target>` images the retention rules keep, and why; `remove_images` removes the rest.
-    `held` are the state directories whose deploy lock the caller holds; the others' locks are probed, and held on
-    `stack` when given, so no preparation starts there before the removal ends."""
+    `held` are the state directories whose deploy lock the caller holds; the others' locks are probed. A removal passes
+    `stack`: it holds them there, so no preparation starts before it ends, and it removes nothing while another operation
+    holds one (a preparation in progress would also be refused the image lock the removal holds)."""
     state = Path(settings["state_directory"])
     reasons = {}
     def keep(image, why):
@@ -1218,8 +1219,10 @@ def images_report(settings, *, held=(), stack=None):
     held = {Path(path).resolve() for path in (*held, state)}
     with ExitStack() as probes:
         for directory in states:
-            state_images(directory, keep, revisions, label="" if directory == state else f" of {directory}",
-                         idle=directory.resolve() in held or free_lock(directory, stack or probes))
+            idle = directory.resolve() in held or free_lock(directory, stack or probes)
+            if not idle and stack is not None:
+                raise Refused(f"another production operation holds the deploy lock of {directory}; no image is removed")
+            state_images(directory, keep, revisions, label="" if directory == state else f" of {directory}", idle=idle)
     pinned_images(keep, states)
     containers = run(["docker", "ps", "--all", "--quiet", "--no-trunc"]).split()
     for value in json.loads(run(["docker", "inspect", *containers])) if containers else []:
