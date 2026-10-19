@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_FILE = ROOT / "services/gateway/src/agent_gateway/catalog.json"
+CATALOG_CODE = ROOT / "services/gateway/src/agent_gateway/catalog.py"
 SETTINGS_FILE = ROOT / ".claude/settings.json"
 PREFIX = "mcp__claude_ai_Deedkit__"
 # The gateway adds this tool in code (services/gateway/src/agent_gateway/catalog.py), outside catalog.json, read-only.
@@ -25,30 +26,40 @@ def load():
     return json.loads(CATALOG_FILE.read_text()) + [PLATFORM_CAPABILITIES], json.loads(SETTINGS_FILE.read_text())
 
 
+def hint_of(tool):
+    """The gateway treats a missing hint as a write (services/gateway/src/agent_gateway/dispatch.py)."""
+    return tool.get("annotations", {}).get("readOnlyHint", False)
+
+
 def problems(catalog, settings):
     """Every way the permission lists disagree with the catalog and the pinned decisions."""
-    read_only = {tool["name"]: tool["annotations"]["readOnlyHint"] for tool in catalog}
+    read_only = {tool["name"]: hint_of(tool) for tool in catalog}
     lists = settings["permissions"]
     found = []
     seen = {}
     for kind in ("allow", "ask"):
         for entry in lists.get(kind, []):
-            if not entry.startswith(PREFIX):
+            if not entry.startswith("mcp__") or "deedkit" not in entry.casefold():
                 continue
             name = entry[len(PREFIX):]
-            if name not in read_only:
+            if not entry.startswith(PREFIX):
+                found.append(f"{entry} in {kind} names the DeedKit server outside the pinned prefix")
+            elif name not in read_only:
                 found.append(f"{entry} in {kind} names no catalog tool")
             elif name in seen:
                 found.append(f"{name} is classified twice ({seen[name]}, {kind})")
             seen[name] = kind
     for entry in lists.get("deny", []):
-        if entry.startswith(PREFIX):
+        if entry.startswith("mcp__") and "deedkit" in entry.casefold():
             found.append(f"{entry} in deny: DeedKit tools are classified only in allow and ask")
     for name, hint in read_only.items():
         if name not in seen:
             found.append(f"{name} is unclassified")
         elif seen[name] == "allow" and hint is not True and name not in OWNER_ALLOWED_WRITES:
             found.append(f"{name} (readOnlyHint={hint}) is in allow without a recorded owner decision")
+    for name, kind in sorted(seen.items()):
+        if kind == "ask" and read_only[name] is True and name not in RULE_B_ASK:
+            found.append(f"{name} is read-annotated in ask outside the Rule B table")
     for table, kind in ((RULE_B_ALLOW, "allow"), (RULE_B_ASK, "ask")):
         for name in sorted(table):
             if seen.get(name) != kind:
@@ -79,13 +90,9 @@ def test_current_files_classify_every_tool_once():
 # spec: ANYM-309
 def test_rule_b_table_is_exact_and_disjoint():
     catalog, settings = load()
-    allow = {entry[len(PREFIX):] for entry in settings["permissions"]["allow"] if entry.startswith(PREFIX)}
-    ask = {entry[len(PREFIX):] for entry in settings["permissions"]["ask"] if entry.startswith(PREFIX)}
-    read_only = {tool["name"]: tool["annotations"]["readOnlyHint"] for tool in catalog}
-    assert RULE_B_ALLOW <= allow and RULE_B_ASK <= ask and not RULE_B_ALLOW & RULE_B_ASK
-    # Rule B holds the four ask rows apart from the other reads: they are exactly the read-annotated tools in `ask`.
-    assert {name for name in ask if read_only[name]} == RULE_B_ASK
-    assert {name for name in allow if read_only[name] is False} == set(OWNER_ALLOWED_WRITES)
+    assert not RULE_B_ALLOW & RULE_B_ASK
+    assert (len(RULE_B_ALLOW), len(RULE_B_ASK), set(OWNER_ALLOWED_WRITES)) == (5, 4, {"calls_raise_call_cap"})
+    assert problems(catalog, settings) == []
 
 
 # spec: ANYM-309
@@ -115,9 +122,11 @@ def test_double_or_missing_classification_and_rule_b_moves_fail():
     catalog, settings = load()
     twice = copy.deepcopy(settings)
     twice["permissions"]["ask"].append(PREFIX + "messages_search")
-    assert problems(catalog, twice) == ["messages_search is classified twice (allow, ask)"]
+    assert problems(catalog, twice) == ["messages_search is classified twice (allow, ask)",
+                                        "messages_search is read-annotated in ask outside the Rule B table"]
     assert problems(catalog, move(settings, "messages_search", "allow", None)) == ["messages_search is unclassified"]
     assert problems(catalog, move(settings, "calendar_agenda", "allow", "ask")) == [
+        "calendar_agenda is read-annotated in ask outside the Rule B table",
         "Rule B: calendar_agenda must be in allow, found ask"]
     assert problems(catalog, move(settings, "calls_preflight_call", "ask", "allow")) == [
         "Rule B: calls_preflight_call must be in ask, found allow"]
@@ -126,3 +135,26 @@ def test_double_or_missing_classification_and_rule_b_moves_fail():
     denied = copy.deepcopy(settings)
     denied["permissions"]["deny"].append(PREFIX + "messages_search")
     assert problems(catalog, denied) == [f"{PREFIX}messages_search in deny: DeedKit tools are classified only in allow and ask"]
+
+
+# spec: ANYM-309
+def test_other_spellings_of_the_server_and_a_missing_hint_fail():
+    catalog, settings = load()
+    for entry in (PREFIX.rstrip("_"), "mcp__deedkit__messages_send_message", "mcp__claude_ai_DeedKit__messages_search"):
+        granted = copy.deepcopy(settings)
+        granted["permissions"]["allow"].append(entry)
+        assert problems(catalog, granted) == [f"{entry} in allow names the DeedKit server outside the pinned prefix"]
+    unhinted = [dict(tool, annotations={}) if tool["name"] == "messages_search" else tool for tool in catalog]
+    assert problems(unhinted, settings) == ["messages_search (readOnlyHint=False) is in allow without a recorded owner decision"]
+    assert problems(catalog, move(settings, "messages_search", "allow", "ask")) == [
+        "messages_search is read-annotated in ask outside the Rule B table"]
+    flipped = [dict(tool, annotations={"readOnlyHint": True}) if tool["name"] == "messages_send_message" else tool
+               for tool in catalog]
+    assert problems(flipped, settings) == ["messages_send_message is read-annotated in ask outside the Rule B table"]
+
+
+# spec: ANYM-309
+def test_platform_capabilities_constant_matches_the_gateway_code():
+    source = CATALOG_CODE.read_text()
+    block = source[source.index('CATALOG["platform_capabilities"]'):]
+    assert '"name": "platform_capabilities"' in block and '"readOnlyHint": True' in block
