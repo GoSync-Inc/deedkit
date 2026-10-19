@@ -83,7 +83,10 @@ each group query once (`NoRetry`, `group_iq.go`): whatsmeow's own group helpers
 resend a frame after a reconnect, so a dropped change ends `unknown`, never a
 second write. They answer within 20 s even when the library waits on a lock that
 ignores contexts; after that answer no change starts. A description takes the
-previous topic ID from its target read. Known limits, left to a follow-up:
+previous topic ID from its target read. A failed send keeps its reply waiter
+until the reply or the next disconnect (closing it races the receive loop). Group
+cache refreshes apply in reply order off the reply path; a change waits for its
+target read's refresh. Known limits, left to a follow-up (ANYM-441):
 message sends, block/unblock, app-state patches and status still use the
 library transport, which resends after a reconnect, and have no native deadline;
 `send_file` has a 90 s IPC wait under the worker's 180 s.

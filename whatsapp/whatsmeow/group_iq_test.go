@@ -19,6 +19,7 @@ import (
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 const testTopicID = "TOPIC1"
@@ -243,7 +244,7 @@ func TestGroupOperationsUseNoReplayIQ(t *testing.T) {
 		}
 	})
 	t.Run("no library group helper", func(t *testing.T) {
-		helpers := regexp.MustCompile(`\.(CreateGroup|SetGroupName|SetGroupDescription|SetGroupTopic|UpdateGroupParticipants|LeaveGroup|GetGroupInviteLink|GetGroupInfo)\b`)
+		helpers := regexp.MustCompile(`\.(CreateGroup|SetGroupName|SetGroupDescription|SetGroupTopic|UpdateGroupParticipants|LeaveGroup|GetGroupInviteLink|GetGroupInfo|SendIQ)\b`)
 		files, _ := filepath.Glob("*.go")
 		for _, file := range files {
 			if strings.HasSuffix(file, "_test.go") {
@@ -274,11 +275,11 @@ func TestGroupIQResponseParity(t *testing.T) {
 			t.Fatalf("missing group node: %v", err)
 		}
 		_, err = reply(nil, &whatsmeow.IQError{Code: 404, Text: "item-not-found"}).groupIQ().info(ctx, group)
-		if !errors.Is(err, whatsmeow.ErrGroupNotFound) || !errors.Is(err, whatsmeow.ErrIQNotFound) {
+		if !errors.Is(err, whatsmeow.ErrGroupNotFound) || !errors.Is(err, whatsmeow.ErrIQNotFound) || err.Error() != whatsmeow.ErrGroupNotFound.Error() {
 			t.Fatalf("404: %v", err)
 		}
 		_, err = reply(nil, &whatsmeow.IQError{Code: 403, Text: "forbidden"}).groupIQ().info(ctx, group)
-		if !errors.Is(err, whatsmeow.ErrNotInGroup) || !errors.Is(err, whatsmeow.ErrIQForbidden) {
+		if !errors.Is(err, whatsmeow.ErrNotInGroup) || !errors.Is(err, whatsmeow.ErrIQForbidden) || err.Error() != whatsmeow.ErrNotInGroup.Error() {
 			t.Fatalf("403: %v", err)
 		}
 	})
@@ -342,39 +343,290 @@ func TestGroupIQResponseParity(t *testing.T) {
 		for code, want := range map[int]error{401: whatsmeow.ErrGroupInviteLinkUnauthorized, 403: whatsmeow.ErrNotInGroup, 404: whatsmeow.ErrGroupNotFound} {
 			iq := map[int]*whatsmeow.IQError{401: {Code: 401, Text: "not-authorized"}, 403: {Code: 403, Text: "forbidden"}, 404: {Code: 404, Text: "item-not-found"}}[code]
 			_, err = reply(nil, iq).groupIQ().invite(ctx, group, true)
-			if !errors.Is(err, want) || !errors.Is(err, iq) {
+			if !errors.Is(err, want) || !errors.Is(err, iq) || err.Error() != want.Error() {
 				t.Fatalf("%d: %v", code, err)
 			}
 		}
 	})
-	t.Run("stores and warm cache", func(t *testing.T) {
-		client := whatsmeow.NewClient(&store.Device{}, nil).DangerousInternals()
-		lid := types.NewJID("111", types.HiddenUserServer)
-		client.CacheGroupInfo(&types.GroupInfo{JID: group, Participants: []types.GroupParticipant{{JID: types.NewJID("15550009999", types.DefaultUserServer)}}}, true)
-		r := reply(iqResult(syntheticGroupNode()), nil)
-		info, err := r.groupIQ().info(ctx, group)
-		if err != nil {
+	t.Run("production refresh: off the reply path, stores and warm cache", func(t *testing.T) {
+		w := newWiredClient(t)
+		w.client.DangerousInternals().CacheGroupInfo(&types.GroupInfo{JID: group, Participants: []types.GroupParticipant{{JID: types.NewJID("15550009999", types.DefaultUserServer)}}}, true)
+		g := w.groupIQ(func(int, whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) { return iqResult(lidGroupNode()), nil })
+		w.block()
+		type answer struct {
+			info *types.GroupInfo
+			err  error
+		}
+		answered := make(chan answer, 1)
+		go func() {
+			info, err := g.info(ctx, group)
+			answered <- answer{info, err}
+		}()
+		var a answer
+		select {
+		case a = <-answered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("group read waited for its blocked refresh")
+		}
+		info, err := a.info, a.err
+		if err != nil || info.AddressingMode != types.AddressingModeLID {
+			t.Fatalf("read answered %v %#v while its refresh is blocked", err, info)
+		}
+		w.release()
+		if err := g.settle(ctx); err != nil {
 			t.Fatal(err)
 		}
-		info.AddressingMode = types.AddressingModeLID
-		var lids []store.LIDMapping
-		var warnings []string
-		storeGroupInfo(info, client.CacheGroupInfo,
-			func(_ context.Context, m []store.LIDMapping) error {
-				lids = m
-				return errors.New("synthetic storage failure")
-			},
-			func(context.Context, []store.RedactedPhoneEntry) error {
-				warnings = append(warnings, "phones stored")
-				return nil
-			},
-			func(format string, _ ...any) { warnings = append(warnings, format) })
-		if len(lids) != 1 || lids[0].LID != lid || len(warnings) != 2 || !strings.Contains(warnings[0], "LID mappings") {
-			t.Fatalf("stores lids=%#v warnings=%v", lids, warnings)
+		lid, pn := types.NewJID("111", types.HiddenUserServer), types.NewJID("15551234567", types.DefaultUserServer)
+		if lids, phones := w.stored(); !reflect.DeepEqual(lids, []store.LIDMapping{{LID: lid, PN: pn}}) || !reflect.DeepEqual(phones, []store.RedactedPhoneEntry{{JID: lid, RedactedPhone: "+1•••4567"}}) {
+			t.Fatalf("stores lids=%#v phones=%#v", lids, phones)
 		}
-		cached, err := client.GetCachedGroupData(ctx, group)
-		if err != nil || cached.AddressingMode != types.AddressingModeLID || len(cached.Members) != 1 || cached.Members[0] != types.NewJID("15551234567", types.DefaultUserServer) {
+		if warnings := w.warnings(); len(warnings) != 1 || !strings.Contains(warnings[0], "LID mappings") {
+			t.Fatalf("storage error not logged: %v", warnings)
+		}
+		cached, err := w.client.DangerousInternals().GetCachedGroupData(ctx, group)
+		if err != nil || cached.AddressingMode != types.AddressingModeLID || !reflect.DeepEqual(cached.Members, []types.JID{lid}) {
 			t.Fatalf("warm cache not refreshed: %#v %v", cached, err)
+		}
+	})
+}
+
+// lidGroupNode is a LID-addressed group whose member carries a phone number
+// and a redacted display name.
+func lidGroupNode() waBinary.Node {
+	return waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"id": "15550000000-123456789", "subject": "Synthetic", "addressing_mode": "lid"}, Content: []waBinary.Node{
+		{Tag: "participant", Attrs: waBinary.Attrs{"jid": types.NewJID("111", types.HiddenUserServer), "phone_number": types.NewJID("15551234567", types.DefaultUserServer), "display_name": "+1•••4567"}},
+	}}
+}
+
+// wiredClient is a real, never connected whatsmeow.Client with synthetic LID
+// and contact stores, for the production groupIQ wiring. The LID store fails
+// every write and can be blocked, standing for a slow store or cache lock.
+type wiredClient struct {
+	client *whatsmeow.Client
+	lids   *syntheticLIDs
+	phones *syntheticContacts
+	log    *recordingLog
+	iq     *groupRefresher
+}
+
+type syntheticLIDs struct {
+	store.LIDStore
+	mu    sync.Mutex
+	gate  chan struct{}
+	saved []store.LIDMapping
+	calls int
+}
+
+func (s *syntheticLIDs) PutManyLIDMappings(_ context.Context, m []store.LIDMapping) error {
+	s.mu.Lock()
+	gate := s.gate
+	s.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saved, s.calls = append(s.saved, m...), s.calls+1
+	return errors.New("synthetic storage failure")
+}
+
+type syntheticContacts struct {
+	store.ContactStore
+	mu    sync.Mutex
+	saved []store.RedactedPhoneEntry
+}
+
+func (s *syntheticContacts) PutManyRedactedPhones(_ context.Context, e []store.RedactedPhoneEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saved = append(s.saved, e...)
+	return nil
+}
+
+type recordingLog struct {
+	waLog.Logger
+	mu   sync.Mutex
+	warn []string
+}
+
+func (l *recordingLog) Warnf(format string, _ ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warn = append(l.warn, format)
+}
+
+func newWiredClient(t *testing.T) *wiredClient {
+	w := &wiredClient{lids: &syntheticLIDs{}, phones: &syntheticContacts{}, log: &recordingLog{Logger: waLog.Noop}, iq: &groupRefresher{}}
+	w.client = whatsmeow.NewClient(&store.Device{LIDs: w.lids, Contacts: w.phones}, w.log)
+	t.Cleanup(w.release)
+	return w
+}
+
+// groupIQ is the production wiring with only the network replaced.
+func (w *wiredClient) groupIQ(reply func(int, whatsmeow.DangerousInfoQuery) (*waBinary.Node, error)) groupIQ {
+	g := newGroupIQ(w.client, w.iq)
+	var mu sync.Mutex
+	n := 0
+	g.send = func(_ context.Context, q whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+		mu.Lock()
+		i := n
+		n++
+		mu.Unlock()
+		return reply(i, q)
+	}
+	return g
+}
+
+func (w *wiredClient) block() {
+	w.lids.mu.Lock()
+	defer w.lids.mu.Unlock()
+	w.lids.gate = make(chan struct{})
+}
+
+func (w *wiredClient) release() {
+	w.lids.mu.Lock()
+	defer w.lids.mu.Unlock()
+	if w.lids.gate != nil {
+		close(w.lids.gate)
+		w.lids.gate = nil
+	}
+}
+
+func (w *wiredClient) stored() ([]store.LIDMapping, []store.RedactedPhoneEntry) {
+	w.lids.mu.Lock()
+	defer w.lids.mu.Unlock()
+	w.phones.mu.Lock()
+	defer w.phones.mu.Unlock()
+	return w.lids.saved, w.phones.saved
+}
+
+func (w *wiredClient) warnings() []string {
+	w.log.mu.Lock()
+	defer w.log.mu.Unlock()
+	return w.log.warn
+}
+
+// spec: ANYM-431
+func TestGroupRefreshOrdering(t *testing.T) {
+	ctx := context.Background()
+	group := types.NewJID("15550000000-123456789", types.GroupServer)
+	t.Run("refreshes apply one at a time in reply order", func(t *testing.T) {
+		var r groupRefresher
+		var mu sync.Mutex
+		var order []int
+		record := func(i int) {
+			mu.Lock()
+			defer mu.Unlock()
+			order = append(order, i)
+		}
+		gate := make(chan struct{})
+		r.enqueue(func() { <-gate; record(1) })
+		r.enqueue(func() { record(2) })
+		short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		if err := r.wait(short); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("wait returned %v while a refresh is blocked", err)
+		}
+		mu.Lock()
+		early := len(order)
+		mu.Unlock()
+		close(gate)
+		if err := r.wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if early != 0 || !reflect.DeepEqual(order, []int{1, 2}) {
+			t.Fatalf("early=%d order=%v", early, order)
+		}
+	})
+	t.Run("an older read never replaces a newer one", func(t *testing.T) {
+		w := newWiredClient(t)
+		older := waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"id": "15550000000-123456789", "subject": "Synthetic"}, Content: []waBinary.Node{
+			{Tag: "participant", Attrs: waBinary.Attrs{"jid": types.NewJID("15550009999", types.DefaultUserServer)}}}}
+		g := w.groupIQ(func(n int, _ whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+			if n == 0 {
+				return iqResult(older), nil
+			}
+			return iqResult(lidGroupNode()), nil
+		})
+		w.block()
+		if _, err := g.info(ctx, group); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := g.info(ctx, group); err != nil {
+			t.Fatal(err)
+		}
+		w.release()
+		if err := g.settle(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cached, err := w.client.DangerousInternals().GetCachedGroupData(ctx, group)
+		if err != nil || !reflect.DeepEqual(cached.Members, []types.JID{types.NewJID("111", types.HiddenUserServer)}) {
+			t.Fatalf("older snapshot won: %#v %v", cached, err)
+		}
+	})
+	t.Run("a change starts after its target read is cached", func(t *testing.T) {
+		w := newWiredClient(t)
+		changed := make(chan []types.JID, 1)
+		g := w.groupIQ(func(n int, q whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+			if n == 1 {
+				cached, _ := w.client.DangerousInternals().GetCachedGroupData(ctx, group)
+				changed <- cached.Members
+			}
+			return syntheticReply(n, q)
+		})
+		w.block()
+		d := groupOperationDeps(t, &recordingIQ{reply: syntheticReply})
+		d.useGroupIQ(g)
+		answered := make(chan error, 1)
+		go func() {
+			_, err := runOperation(ctx, groupJob("rename_group"), d)
+			answered <- err
+		}()
+		select {
+		case <-changed:
+			t.Fatal("change sent before its target read was cached")
+		case <-time.After(100 * time.Millisecond):
+		}
+		w.release()
+		select {
+		case members := <-changed:
+			if !reflect.DeepEqual(members, []types.JID{types.NewJID("15551234567", types.DefaultUserServer)}) {
+				t.Fatalf("change saw cache %v", members)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("change not sent after the refresh landed")
+		}
+		if err := <-answered; err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("a refresh blocked past the deadline stops the change", func(t *testing.T) {
+		shortGroupDeadline(t)
+		w := newWiredClient(t)
+		calls := 0
+		var mu sync.Mutex
+		g := w.groupIQ(func(n int, q whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			return syntheticReply(n, q)
+		})
+		w.block()
+		d := groupOperationDeps(t, &recordingIQ{reply: syntheticReply})
+		d.useGroupIQ(g)
+		result, err := runOperation(ctx, groupJob("rename_group"), d)
+		if err == nil || err.Error() != "operation_target_unavailable" {
+			t.Fatalf("deadline during refresh: %v %#v", err, result)
+		}
+		w.release()
+		if err := g.settle(ctx); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		if calls != 1 {
+			t.Fatalf("%d IQs after a deadline answer during the refresh, want only the target read", calls)
 		}
 	})
 }
@@ -413,14 +665,104 @@ func TestGroupIQPhaseOutcomes(t *testing.T) {
 	}
 }
 
+// fakeWire is a real, never connected client's response waiters with a
+// synthetic socket write.
+type fakeWire struct {
+	*whatsmeow.DangerousInternalClient
+	write func(waBinary.Node) error
+	sent  []waBinary.Node
+}
+
+func (f *fakeWire) SendNode(_ context.Context, node waBinary.Node) error {
+	f.sent = append(f.sent, node)
+	return f.write(node)
+}
+
 // spec: ANYM-431
-func TestPinnedNoRetryContract(t *testing.T) {
-	body := functionBody(t, filepath.Join(moduleDir(t), "request.go"), "func (cli *Client) sendIQ(")
-	noRetry := strings.Index(body, "if query.NoRetry {")
-	retry := strings.Index(body, "cli.retryFrame(")
-	if noRetry < 0 || retry < 0 || noRetry > retry || !strings.HasPrefix(strings.TrimSpace(body[noRetry+len("if query.NoRetry {"):]), "return nil, &DisconnectedError{") {
-		t.Fatal("pinned sendIQ no longer returns before retryFrame for NoRetry queries")
+func TestGroupQueryTransport(t *testing.T) {
+	ctx := context.Background()
+	group := types.NewJID("15550000000-123456789", types.GroupServer)
+	query := whatsmeow.DangerousInfoQuery{Namespace: "w:g2", Type: groupIQGet, To: group, Content: []waBinary.Node{{Tag: "query"}}, Timeout: time.Second, NoRetry: true}
+	wire := func(write func(*whatsmeow.DangerousInternalClient, waBinary.Node) error) *fakeWire {
+		in := whatsmeow.NewClient(&store.Device{}, nil).DangerousInternals()
+		return &fakeWire{DangerousInternalClient: in, write: func(n waBinary.Node) error { return write(in, n) }}
 	}
+	reply := func(in *whatsmeow.DangerousInternalClient, n waBinary.Node, attrs waBinary.Attrs, content ...waBinary.Node) bool {
+		attrs["id"] = n.Attrs["id"]
+		return in.ReceiveResponse(ctx, &waBinary.Node{Tag: "iq", Attrs: attrs, Content: content})
+	}
+	t.Run("node and result", func(t *testing.T) {
+		w := wire(func(in *whatsmeow.DangerousInternalClient, n waBinary.Node) error {
+			reply(in, n, waBinary.Attrs{"type": "result"})
+			return nil
+		})
+		res, err := sendGroupQuery(ctx, w, query)
+		if err != nil || res.Attrs["type"] != "result" || len(w.sent) != 1 {
+			t.Fatalf("%v %v", res, err)
+		}
+		got := w.sent[0]
+		if got.Tag != "iq" || got.Attrs["xmlns"] != "w:g2" || got.Attrs["type"] != "get" || got.Attrs["to"] != group || got.Attrs["id"] == "" || !reflect.DeepEqual(got.Content, query.Content) {
+			t.Fatalf("node %#v", got)
+		}
+	})
+	t.Run("error reply", func(t *testing.T) {
+		w := wire(func(in *whatsmeow.DangerousInternalClient, n waBinary.Node) error {
+			reply(in, n, waBinary.Attrs{"type": "error"}, waBinary.Node{Tag: "error", Attrs: waBinary.Attrs{"code": "404", "text": "item-not-found"}})
+			return nil
+		})
+		_, err := sendGroupQuery(ctx, w, query)
+		var iq *whatsmeow.IQError
+		if !errors.As(err, &iq) || iq.Code != 404 || iq.Text != "item-not-found" || iq.ErrorNode == nil || !errors.Is(err, whatsmeow.ErrIQNotFound) {
+			t.Fatalf("%v", err)
+		}
+	})
+	t.Run("disconnect is never resent", func(t *testing.T) {
+		w := wire(func(in *whatsmeow.DangerousInternalClient, n waBinary.Node) error {
+			in.ClearResponseWaiters(&waBinary.Node{Tag: "stream:error"})
+			return nil
+		})
+		if _, err := sendGroupQuery(ctx, w, query); !errors.As(err, new(*whatsmeow.DisconnectedError)) || len(w.sent) != 1 {
+			t.Fatalf("%v, %d sends", err, len(w.sent))
+		}
+	})
+	t.Run("timeout", func(t *testing.T) {
+		w := wire(func(*whatsmeow.DangerousInternalClient, waBinary.Node) error { return nil })
+		q := query
+		q.Timeout = 10 * time.Millisecond
+		if _, err := sendGroupQuery(ctx, w, q); !errors.Is(err, whatsmeow.ErrIQTimedOut) {
+			t.Fatal(err)
+		}
+	})
+	// Regression: whatsmeow's sendIQ closes the waiter after any send error,
+	// which panics the receive loop when the frame left after the context
+	// expired and its reply is being delivered.
+	t.Run("a failed send whose frame may have left keeps its waiter open", func(t *testing.T) {
+		var sent waBinary.Node
+		w := wire(func(_ *whatsmeow.DangerousInternalClient, n waBinary.Node) error {
+			sent = n
+			return context.DeadlineExceeded
+		})
+		if _, err := sendGroupQuery(ctx, w, query); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatal(err)
+		}
+		if !reply(w.DangerousInternalClient, sent, waBinary.Attrs{"type": "result"}) {
+			t.Fatal("waiter closed after a send whose frame may have left")
+		}
+		w.ClearResponseWaiters(&waBinary.Node{Tag: "xmlstreamend"})
+	})
+	t.Run("a send that never left closes its waiter", func(t *testing.T) {
+		var sent waBinary.Node
+		w := wire(func(_ *whatsmeow.DangerousInternalClient, n waBinary.Node) error {
+			sent = n
+			return whatsmeow.ErrNotConnected
+		})
+		if _, err := sendGroupQuery(ctx, w, query); !errors.Is(err, whatsmeow.ErrNotConnected) {
+			t.Fatal(err)
+		}
+		if reply(w.DangerousInternalClient, sent, waBinary.Attrs{"type": "result"}) {
+			t.Fatal("waiter left registered after ErrNotConnected")
+		}
+	})
 }
 
 // spec: ANYM-431

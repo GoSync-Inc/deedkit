@@ -83,6 +83,7 @@ type operationRequest struct {
 type operationDependencies struct {
 	sendDependencies
 	group            func(context.Context, types.JID) (*types.GroupInfo, error)
+	groupSettle      func(context.Context) error
 	createGroup      func(context.Context, whatsmeow.ReqCreateGroup) (*types.GroupInfo, error)
 	participants     func(context.Context, types.JID, []types.JID, whatsmeow.ParticipantChange) ([]types.GroupParticipant, error)
 	groupName        func(context.Context, types.JID, string) error
@@ -114,6 +115,7 @@ type operationDependencies struct {
 
 func (d *operationDependencies) useGroupIQ(iq groupIQ) {
 	d.group, d.createGroup, d.participants, d.groupName, d.groupDescription, d.leave, d.invite = iq.info, iq.create, iq.participants, iq.setName, iq.setTopic, iq.leave, iq.invite
+	d.groupSettle = iq.settle
 }
 
 func (p *Provider) operationDependencies() operationDependencies {
@@ -151,7 +153,7 @@ func (p *Provider) operationDependencies() operationDependencies {
 			return c.Store.LIDs.GetPNForLID(ctx, j)
 		},
 	}
-	d.useGroupIQ(newGroupIQ(c))
+	d.useGroupIQ(newGroupIQ(c, &p.groupRefresh))
 	return d
 }
 
@@ -944,6 +946,12 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 		g, e := getGroup()
 		if e != nil {
 			return nil, e
+		}
+		// The target read's cache refresh lands before the change (ANYM-431).
+		if d.groupSettle != nil {
+			if e := d.groupSettle(ctx); e != nil {
+				return nil, e
+			}
 		}
 		if op == "rename_group" {
 			value, e := text("title", 128, false, nil)

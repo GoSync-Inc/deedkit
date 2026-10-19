@@ -36,6 +36,10 @@ type groupIQ struct {
 	// cache, LID mappings, redacted phones). It runs off the reply path: the
 	// group cache lock can be held across a network read by a concurrent send.
 	refresh func(*types.GroupInfo)
+	// settle waits until every queued refresh is applied. A change waits for it
+	// after its target read, so the read's snapshot never overwrites the
+	// membership notification the change causes.
+	settle func(context.Context) error
 }
 
 // groupOperationDeadline bounds the IPC answer of every group operation, well
@@ -50,14 +54,110 @@ const (
 	groupIQSet whatsmeow.DangerousInfoQueryType = "set"
 )
 
-func newGroupIQ(c *whatsmeow.Client) groupIQ {
+func newGroupIQ(c *whatsmeow.Client, refresher *groupRefresher) groupIQ {
 	in := c.DangerousInternals()
-	return groupIQ{send: in.SendIQ, parse: in.ParseGroupNode, pnForLID: c.Store.LIDs.GetPNForLID, tcToken: in.EnsureTCToken,
+	return groupIQ{send: func(ctx context.Context, q whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+		return sendGroupQuery(ctx, in, q)
+	},
+		parse: in.ParseGroupNode, pnForLID: c.Store.LIDs.GetPNForLID, tcToken: in.EnsureTCToken,
 		newID: func() string { return string(c.GenerateMessageID()) },
 		refresh: func(info *types.GroupInfo) {
-			go storeGroupInfo(info, in.CacheGroupInfo, c.Store.LIDs.PutManyLIDMappings, c.Store.Contacts.PutManyRedactedPhones,
-				func(format string, args ...any) { c.Log.Warnf(format, args...) })
-		}}
+			refresher.enqueue(func() {
+				storeGroupInfo(info, in.CacheGroupInfo, c.Store.LIDs.PutManyLIDMappings, c.Store.Contacts.PutManyRedactedPhones,
+					func(format string, args ...any) { c.Log.Warnf(format, args...) })
+			})
+		}, settle: refresher.wait}
+}
+
+// groupRefresher applies group reads' local side effects one at a time, in the
+// order of the replies, so an older snapshot never replaces a newer one. One
+// per Provider; a stalled refresh delays only later refreshes and changes.
+type groupRefresher struct {
+	mu   sync.Mutex
+	tail chan struct{}
+}
+
+func (r *groupRefresher) enqueue(fn func()) {
+	r.mu.Lock()
+	prev, done := r.tail, make(chan struct{})
+	r.tail = done
+	r.mu.Unlock()
+	go func() {
+		defer close(done)
+		if prev != nil {
+			<-prev
+		}
+		fn()
+	}()
+}
+
+func (r *groupRefresher) wait(ctx context.Context) error {
+	r.mu.Lock()
+	tail := r.tail
+	r.mu.Unlock()
+	if tail == nil {
+		return nil
+	}
+	select {
+	case <-tail:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// iqWire is the part of whatsmeow's DangerousInternalClient a group IQ uses.
+type iqWire interface {
+	GenerateRequestID() string
+	WaitResponse(string) chan *waBinary.Node
+	CancelResponse(string, chan *waBinary.Node)
+	SendNode(context.Context, waBinary.Node) error
+}
+
+// sendGroupQuery is the pinned sendIQ with NoRetry, except after a failed
+// send. sendIQ closes the waiter then, but a frame can leave after the context
+// expired (the noise socket returns on ctx.Done while its writer goroutine
+// still writes), and closing races the receive loop that already took the
+// waiter: a send on a closed channel panics the whole native process. The
+// waiter is closed only when no frame left (ErrNotConnected); otherwise it
+// stays registered, and its reply or the next disconnect clears it.
+func sendGroupQuery(ctx context.Context, wire iqWire, q whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+	id := wire.GenerateRequestID()
+	waiter := wire.WaitResponse(id)
+	attrs := waBinary.Attrs{"id": id, "xmlns": q.Namespace, "type": string(q.Type)}
+	if !q.To.IsEmpty() {
+		attrs["to"] = q.To
+	}
+	if err := wire.SendNode(ctx, waBinary.Node{Tag: "iq", Attrs: attrs, Content: q.Content}); err != nil {
+		if errors.Is(err, whatsmeow.ErrNotConnected) {
+			wire.CancelResponse(id, waiter)
+		}
+		return nil, err
+	}
+	timer := time.NewTimer(q.Timeout)
+	defer timer.Stop()
+	select {
+	case res, ok := <-waiter:
+		if !ok || res == nil || res.Tag == "xmlstreamend" || res.Tag == "stream:error" {
+			return nil, &whatsmeow.DisconnectedError{Action: "info query", Node: res}
+		}
+		resType, _ := res.Attrs["type"].(string)
+		if res.Tag != "iq" || (resType != "result" && resType != "error") {
+			return res, &whatsmeow.IQError{RawNode: res}
+		} else if resType == "error" {
+			iqErr := &whatsmeow.IQError{RawNode: res}
+			if node, ok := res.GetOptionalChildByTag("error"); ok {
+				ag := node.AttrGetter()
+				iqErr.ErrorNode, iqErr.Code, iqErr.Text = &node, ag.OptionalInt("code"), ag.OptionalString("text")
+			}
+			return res, iqErr
+		}
+		return res, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, whatsmeow.ErrIQTimedOut
+	}
 }
 
 // storeGroupInfo mirrors the tail of the pinned getGroupInfo: cache first, then
@@ -258,9 +358,15 @@ func parseGroupParticipant(child *waBinary.Node) types.GroupParticipant {
 	return participant
 }
 
-// wrapGroupError keeps errors.Is for both the library's group error and the IQ
-// error, like the pinned wrapIQError.
-func wrapGroupError(human, iq error) error { return fmt.Errorf("%w: %w", human, iq) }
+// groupError mirrors the pinned wrappedIQError: the library's group error as
+// text and for errors.Is, the IQ error underneath.
+type groupError struct{ human, iq error }
+
+func (e *groupError) Error() string       { return e.human.Error() }
+func (e *groupError) Is(other error) bool { return errors.Is(other, e.human) }
+func (e *groupError) Unwrap() error       { return e.iq }
+
+func wrapGroupError(human, iq error) error { return &groupError{human, iq} }
 
 // operationGate serializes the deadline answer with the start of a change: once
 // the answer is chosen no change may start, and a started change is answered
