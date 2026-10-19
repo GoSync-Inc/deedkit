@@ -64,7 +64,7 @@ def no_delay(monkeypatch):
         monkeypatch.setattr(module, "RETRY_DELAY", 0, raising=False)
 
 
-# spec: ANYM-355, ANYM-360, ANYM-202, ANYM-405
+# spec: ANYM-355, ANYM-360, ANYM-405
 @pytest.mark.parametrize("failure", FAILURES)
 @pytest.mark.parametrize("reader", ["drift", "sync", "health", "snapshot"])
 def test_a_read_that_fails_once_succeeds_on_the_one_retry(monkeypatch, reader, failure):
@@ -75,7 +75,7 @@ def test_a_read_that_fails_once_succeeds_on_the_one_retry(monkeypatch, reader, f
     assert len(fake.calls) == 2 and fake.calls[0] == fake.calls[1]
 
 
-# spec: ANYM-355, ANYM-360, ANYM-202, ANYM-405
+# spec: ANYM-355, ANYM-360, ANYM-405
 @pytest.mark.parametrize("failure", FAILURES)
 @pytest.mark.parametrize("reader", ["drift", "sync", "health", "snapshot"])
 def test_a_read_that_fails_twice_fails_after_exactly_two_calls(monkeypatch, reader, failure):
@@ -137,7 +137,7 @@ def clock(monkeypatch, *ticks):
     monkeypatch.setattr(time, "monotonic", lambda: remaining.pop(0) if len(remaining) > 1 else remaining[0])
 
 
-# spec: ANYM-355, ANYM-360, ANYM-202, ANYM-405
+# spec: ANYM-355, ANYM-360, ANYM-405
 @pytest.mark.parametrize("reader", ["drift", "sync", "health", "snapshot"])
 def test_the_retry_sleeps_between_the_two_calls_and_runs_inside_the_one_budget(monkeypatch, reader):
     events = []
@@ -157,7 +157,7 @@ def test_the_retry_sleeps_between_the_two_calls_and_runs_inside_the_one_budget(m
     assert fake.timeouts == [BUDGET[reader], BUDGET[reader] - 30 - 7]
 
 
-# spec: ANYM-355, ANYM-360, ANYM-202, ANYM-405
+# spec: ANYM-355, ANYM-360, ANYM-405
 @pytest.mark.parametrize("reader", ["drift", "sync", "health", "snapshot"])
 def test_a_first_attempt_that_used_the_budget_is_not_retried(monkeypatch, reader):
     fake = Cli("timeout", "ok")
