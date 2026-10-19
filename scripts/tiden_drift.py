@@ -49,6 +49,7 @@ EXCLUDED = (
 SHA = re.compile(r"[0-9a-f]{40}")
 TIMEOUT = 120
 RETRY_DELAY = 2  # seconds before the one retry of a read-only listing
+RETRY_MIN = 10  # a retry needs at least this many seconds left of the call's one TIMEOUT budget
 
 
 class Refused(Exception):
@@ -107,21 +108,24 @@ def shown(path: str) -> str:
 
 def tiden(cli: str, arguments: list[str], product: str, retry: bool = False) -> dict:
     """One Tiden CLI command; its stderr and a failing stdout are never shown, since they may echo request data.
-    `retry` repeats a failed read-only call once; a write never sets it, since a repeat could apply it twice."""
+    `retry` repeats a failed read-only call once, inside the same TIMEOUT budget; a write never sets it, since a
+    repeat could apply it twice."""
+    start = time.monotonic()
     try:
         return once(cli, arguments, product)
     except Refused:
-        if not retry:
+        left = TIMEOUT - (time.monotonic() - start) - RETRY_DELAY
+        if not retry or left < RETRY_MIN:
             raise
     time.sleep(RETRY_DELAY)
-    return once(cli, arguments, product)
+    return once(cli, arguments, product, left)
 
 
-def once(cli: str, arguments: list[str], product: str) -> dict:
+def once(cli: str, arguments: list[str], product: str, timeout: float | None = None) -> dict:
     label = " ".join(arguments[:2])
     try:
         completed = subprocess.run([cli, *arguments, "--product-id", product, "--format", "json"],
-                                   capture_output=True, text=True, timeout=TIMEOUT)
+                                   capture_output=True, text=True, timeout=timeout or TIMEOUT)
     except subprocess.TimeoutExpired:
         raise Refused(f"tiden {label} timed out") from None
     if completed.returncode:

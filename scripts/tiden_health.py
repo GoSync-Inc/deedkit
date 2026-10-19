@@ -51,6 +51,7 @@ ROUTER_SIGNATURE = "s:github.com/GoSync-Inc/deedkit/services/release-router::"
 SHA = re.compile(r"[0-9a-f]{40}")
 TIMEOUT = 120
 RETRY_DELAY = 2  # seconds before the one retry of a listing
+RETRY_MIN = 10  # a retry needs at least this many seconds left of the call's one TIMEOUT budget
 PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
 
 
@@ -149,20 +150,23 @@ class Tiden:
         self.cli, self.product, self.workspace = cli, product, workspace
 
     def call(self, *arguments: str) -> dict:
-        """One listing; a failed one is repeated once, since nothing here writes."""
+        """One listing; a failed one is repeated once inside the same TIMEOUT budget, since nothing here writes."""
+        start = time.monotonic()
         try:
             return self.once(*arguments)
         except Unknown:
-            pass
+            left = TIMEOUT - (time.monotonic() - start) - RETRY_DELAY
+            if left < RETRY_MIN:
+                raise
         time.sleep(RETRY_DELAY)
-        return self.once(*arguments)
+        return self.once(*arguments, timeout=left)
 
-    def once(self, *arguments: str) -> dict:
+    def once(self, *arguments: str, timeout: float | None = None) -> dict:
         label = " ".join(arguments[:2])
         try:
             completed = subprocess.run([self.cli, *arguments, "--product-id", self.product, "--workspace-id",
                                         self.workspace, "--format", "json"], capture_output=True, text=True,
-                                       timeout=TIMEOUT)
+                                       timeout=timeout or TIMEOUT)
         except subprocess.TimeoutExpired:
             raise Unknown(f"tiden {label} timed out") from None
         except (OSError, UnicodeDecodeError):

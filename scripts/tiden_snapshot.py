@@ -16,7 +16,9 @@ from pathlib import Path
 import subprocess
 import time
 
+TIMEOUT = 90
 RETRY_DELAY = 2  # seconds before the one retry of a command
+RETRY_MIN = 10  # a retry needs at least this many seconds left of the command's one TIMEOUT budget
 
 
 class SnapshotError(RuntimeError):
@@ -86,17 +88,20 @@ class CLI:
         self.repo, self.product_id, self.workspace_id, self.branch = repo, product_id, workspace_id, branch
 
     def call(self, *args):
-        """A read-only Tiden command; a failed one is repeated once."""
+        """A read-only Tiden command; a failed one is repeated once inside the same TIMEOUT budget."""
+        start = time.monotonic()
         try:
             return self.once(*args)
         except (SnapshotError, subprocess.TimeoutExpired):
-            pass
+            left = TIMEOUT - (time.monotonic() - start) - RETRY_DELAY
+            if left < RETRY_MIN:
+                raise
         time.sleep(RETRY_DELAY)
-        return self.once(*args)
+        return self.once(*args, timeout=left)
 
-    def once(self, *args):
+    def once(self, *args, timeout=None):
         result = subprocess.run(["tiden", *args, "--format", "json", "--workspace-id", self.workspace_id],
-                                cwd=self.repo, capture_output=True, text=True, timeout=90)
+                                cwd=self.repo, capture_output=True, text=True, timeout=timeout or TIMEOUT)
         if result.returncode:
             # CLI error text may contain tokens or response bodies. Never echo it.
             raise SnapshotError("read-only Tiden command failed: " + " ".join(args[:2]))

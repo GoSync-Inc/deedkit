@@ -52,6 +52,7 @@ PREVIEW_EMPTY = ("deletions", "testAdditions", "testModifications", "testDeletio
 PREVIEW_OTHER = ("stats", "intentSession", "blockingSessions", "hasRequirementChanges")
 TIMEOUT = 120
 RETRY_DELAY = 2  # seconds before the one retry of a read
+RETRY_MIN = 10  # a retry needs at least this many seconds left of the read's one TIMEOUT budget
 # Recovery stays inside the workflow's concurrency group; a write by hand outside it can drop sources a run adds.
 RECOVER = "rerun this job or dispatch this SHA from main (TIDEN-CI.md, main sync)"
 WINDOW = "only in a maintenance window, with the sync workflow disabled and no run in progress (TIDEN-CI.md)"
@@ -70,19 +71,22 @@ def write(cli: str, arguments: list[str], product: str | None) -> None:
 
 
 def read(cli: str, arguments: list[str]) -> dict:
-    """A read by global ID, without `--product-id`, validated like tiden_drift.tiden; a failed read is repeated once."""
+    """A read by global ID, without `--product-id`, validated like tiden_drift.tiden; a failed read is repeated once inside the same TIMEOUT budget."""
+    start = time.monotonic()
     try:
         return read_once(cli, arguments)
     except Refused:
-        pass
+        left = TIMEOUT - (time.monotonic() - start) - RETRY_DELAY
+        if left < RETRY_MIN:
+            raise
     time.sleep(RETRY_DELAY)
-    return read_once(cli, arguments)
+    return read_once(cli, arguments, left)
 
 
-def read_once(cli: str, arguments: list[str]) -> dict:
+def read_once(cli: str, arguments: list[str], timeout: float | None = None) -> dict:
     try:
         completed = subprocess.run([cli, *arguments, "--format", "json"], capture_output=True, text=True,
-                                   timeout=TIMEOUT)
+                                   timeout=timeout or TIMEOUT)
     except (OSError, subprocess.SubprocessError):
         raise Refused(f"tiden {' '.join(arguments[:2])} timed out or could not run") from None
     if completed.returncode:

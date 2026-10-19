@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
@@ -24,10 +25,11 @@ class Cli:
     'ok'), later calls succeed; every command line is logged."""
 
     def __init__(self, *script):
-        self.script, self.calls = list(script), []
+        self.script, self.calls, self.timeouts = list(script), [], []
 
     def __call__(self, command, **kwargs):
         self.calls.append(command)
+        self.timeouts.append(kwargs.get("timeout"))
         step = self.script.pop(0) if self.script else "ok"
         if step == "timeout":
             raise subprocess.TimeoutExpired(command, 1)
@@ -123,3 +125,46 @@ def test_the_retry_waits_the_configured_delay_once(monkeypatch):
     with pytest.raises(drift.Refused):
         drift_read()
     assert sleeps == [7]
+
+
+BUDGET = {"drift": 120, "sync": 120, "health": 120, "snapshot": 90}
+MODULES = {"drift": drift, "sync": tiden_sync, "health": health, "snapshot": snapshot}
+
+
+def clock(monkeypatch, *ticks):
+    """time.monotonic reads `ticks` in turn, then stays on the last one."""
+    remaining = list(ticks)
+    monkeypatch.setattr(time, "monotonic", lambda: remaining.pop(0) if len(remaining) > 1 else remaining[0])
+
+
+# spec: ANYM-355, ANYM-360, ANYM-202, ANYM-405
+@pytest.mark.parametrize("reader", ["drift", "sync", "health", "snapshot"])
+def test_the_retry_sleeps_between_the_two_calls_and_runs_inside_the_one_budget(monkeypatch, reader):
+    events = []
+    fake = Cli("exit", "ok")
+
+    def run(command, **kwargs):
+        events.append("call")
+        return fake(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(time, "sleep", lambda seconds: events.append(("sleep", seconds)))
+    monkeypatch.setattr(MODULES[reader], "RETRY_DELAY", 7)
+    clock(monkeypatch, 0, 30)
+    function, _ = READS[reader]
+    assert function() == {"ok": True}
+    assert events == ["call", ("sleep", 7), "call"]
+    assert fake.timeouts == [BUDGET[reader], BUDGET[reader] - 30 - 7]
+
+
+# spec: ANYM-355, ANYM-360, ANYM-202, ANYM-405
+@pytest.mark.parametrize("reader", ["drift", "sync", "health", "snapshot"])
+def test_a_first_attempt_that_used_the_budget_is_not_retried(monkeypatch, reader):
+    fake = Cli("timeout", "ok")
+    monkeypatch.setattr(subprocess, "run", fake)
+    monkeypatch.setattr(time, "sleep", lambda seconds: pytest.fail("slept"))
+    clock(monkeypatch, 0, BUDGET[reader] - 1)
+    function, error = READS[reader]
+    with pytest.raises((error, subprocess.TimeoutExpired)):
+        function()
+    assert len(fake.calls) == 1
