@@ -130,4 +130,7 @@ def test_telegram_collector_flow_from_catalog_to_persisted_flood_pause_across_re
     assert sleeps==[30] and events[:2]==[('sleep',30),('dialogs',)]
     assert final['high_water']==9 and final['history_before']==3 and final['window_complete'] and not final['history_exhausted']
     assert not any(read[0]=='300' for read in provider.reads)
+    # Newest-first: every older page starts below the previous one (7, 5, the flooded 5 again, then 3).
+    older=[read[2] for read in w.provider.reads+provider.reads if read[0]=='100' and read[2]]
+    assert older==[7,5,5,3] and not any(read[3] for read in w.provider.reads+provider.reads if read[2])
     assert {m for m in reader_messages() if m.startswith('chat 100')}=={f'chat 100 message {n}' for n in (3,4,5,6,9)}|{'chat 100 edited message 8'}
