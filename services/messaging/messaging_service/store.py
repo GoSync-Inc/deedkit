@@ -676,6 +676,11 @@ class Store:
             if not _available(self.files,{'sha256':row['digest'],'bytes':row['bytes']}):
                 if not _absent(self.files,{'sha256':row['digest']}):
                     row['original_residency']='missing'
+                elif row.get('original_residency')=='evicted':
+                    # A re-download is bound by the collector's history bound (ANYM-284).
+                    from .media_requests import occurrence
+                    job=occurrence(c,p,row['id'])
+                    if job:row['download_eligibility']=job['download_eligibility']
                 targets(p,[row['id']])
                 return serial({**attachment_fields(row,original_present=False),
                     'status':'unavailable',**self.dataset(c,p)})

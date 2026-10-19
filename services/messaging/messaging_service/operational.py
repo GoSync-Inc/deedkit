@@ -67,7 +67,7 @@ def collector_stop(exc, component):
     return code,detail,event
 
 
-def operations(row, history, files, now=None):
+def operations(row, history, files, now=None, *, eligibility=None):
     now=now or datetime.now(timezone.utc)
     phases=dict(row.get('operations') or {})
     lease=row.get('collector_lease_until')
@@ -92,24 +92,45 @@ def operations(row, history, files, now=None):
         full_history_verified=False, collector_running=running)
     phases['history']=phase
     counts=files['download'];errors=files.get('download_errors',{})
-    diagnostics=[]
     error_states=files.get('download_error_states',{})
-    for code,count in sorted(errors.items()):
+    ineligible={}
+    if eligibility is not None:
+        # Pending work is what the current run can download by itself: an unexpired
+        # request or the published window (ANYM-284). Other queued jobs keep their
+        # recorded code in `errors` but are reported by why they wait instead.
+        eligible=eligibility['queued'].get('eligible',{})
+        error_states={code:{state:n for state,n in {**error_states.get(code,{}),'queued':eligible.get(code,0)}.items() if n}
+            for code in set(error_states)|{code for code in eligible if code is not None}}
+        error_states={code:states for code,states in error_states.items() if states}
+        ineligible={reason:sum(eligibility['queued'].get(reason,{}).values())
+            for reason in ('outside_prefetch_window','outside_history_bounds','collection_excluded')}
+    diagnostics=[]
+    for code in sorted(errors if eligibility is None else error_states):
         states=error_states.get(code)
         if states:
             diagnostics.extend({'reason_code':code,'count':number,'job_state':state,
                 **describe(code,job_state=state)} for state,number in sorted(states.items()))
-        else:diagnostics.append({'reason_code':code,'count':count,**describe(code)})
-    storage_paused=error_states.get('paused_storage',{}).get('queued',errors.get('paused_storage',0))
-    storage_unavailable=error_states.get('storage_unavailable',{}).get('queued',errors.get('storage_unavailable',0))
+        else:diagnostics.append({'reason_code':code,'count':errors[code],**describe(code)})
+    diagnostics.extend({'reason_code':reason,'count':number,'job_state':'queued',**describe(reason)}
+        for reason,number in ineligible.items() if number)
+    fallback=errors if eligibility is None else {}
+    storage_paused=error_states.get('paused_storage',{}).get('queued',fallback.get('paused_storage',0))
+    storage_unavailable=error_states.get('storage_unavailable',{}).get('queued',fallback.get('storage_unavailable',0))
     retry_queued=sum(states.get('queued',0) for code,states in error_states.items()
         if code not in ('paused_storage','storage_unavailable','retry_exhausted'))
+    eligible_queued=sum(eligibility['queued'].get('eligible',{}).values()) if eligibility is not None else None
     phases['media']={'state':'processing' if counts['leased'] else
         'storage_unavailable' if storage_unavailable else
-        'paused_storage' if errors.get('paused_storage') else 'needs_attention' if counts['failed'] else
-        'queued' if counts['queued'] else 'idle',
+        'paused_storage' if (storage_paused if eligibility is not None else errors.get('paused_storage')) else
+        'needs_attention' if counts['failed'] else
+        'queued' if (eligible_queued if eligibility is not None else counts['queued']) else 'idle',
         'counts':counts,'errors':errors,'diagnostics':diagnostics,'independent_of_connection':True,
         'storage_paused_jobs':storage_paused,'storage_paused':bool(storage_paused),
+        'storage_paused_basis':'unknown' if eligibility is None else 'eligible_jobs',
+        'prefetch_window_days':eligibility['prefetch_days'] if eligibility is not None else None,
+        'eligible_queued_jobs':eligible_queued,
+        **{reason+'_jobs':ineligible.get(reason) for reason in
+            ('outside_prefetch_window','outside_history_bounds','collection_excluded')},
         'storage_unavailable_jobs':storage_unavailable,
         'terminal_failed_jobs':counts['failed'],'needs_attention':bool(counts['failed']),
         'retry_queued_jobs':retry_queued}

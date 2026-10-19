@@ -216,6 +216,19 @@ class CollectorState:
             self._phase(value,name,state,code,row['observed'],**extra)
             self._save_operations(c,value)
 
+    def media_policy(self,prefetch_days,history_since):
+        """Publish the window and history bound this run claims originals with (ANYM-284)."""
+        from .media_policy import validate_prefetch_days
+        validate_prefetch_days(prefetch_days)
+        if history_since is not None and (not isinstance(history_since,datetime) or history_since.tzinfo is None):
+            raise ValueError('invalid_history_since')
+        with self.archive.store.pool.connection() as c:
+            row=self._operations(c);value=row['operations']
+            value['media_policy']={'prefetch_days':prefetch_days,
+                'history_since':history_since.isoformat() if history_since else None,
+                'epoch':self.lease[1],'published_at':row['observed'].isoformat()}
+            self._save_operations(c,value)
+
     def connection_failed(self,code,detail=None):
         if code not in CONNECTION_ERRORS:code='provider_disconnected'
         # Exactly a built-in str of the fixed vocabulary; a str subclass could fake equality.

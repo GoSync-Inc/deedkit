@@ -6,6 +6,7 @@ this path never acquires the collector/capacity lock while holding either one.
 """
 from .attachment_metadata import attachment_fields, processing_phases
 from .file_index import _available,_absent
+from .media_policy import ELIGIBILITY,ELIGIBILITY_JOIN,HISTORY_BOUND,published_window
 from .policy import scope_filter, targets
 from .store import APIError, serial
 
@@ -21,11 +22,13 @@ def occurrence(c,p,attachment_id,*,lock=False):
         (j.lease_until>clock_timestamp()) AS transfer_active,m.chat,m.provider_id AS provider_message_id,
         m.revision AS message_revision,ch.provider_chat AS provider_chat_id,
         a.digest,a.filename,a.mime,a.bytes,a.id AS registered_id,
-        p.enabled AS collection_enabled,p.include_chats,p.exclude_chats,p.discover_chats
+        p.enabled AS collection_enabled,p.include_chats,p.exclude_chats,p.discover_chats,
+        '''+ELIGIBILITY+''' AS download_eligibility,'''+HISTORY_BOUND+''' AS history_bound
         FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
         JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
         JOIN account_policies p ON p.account=m.account
         LEFT JOIN attachments a ON a.id=j.id AND a.active AND a.message=m.id
+        '''+published_window('m.account')+' '+ELIGIBILITY_JOIN+'''
         WHERE j.id=%s AND NOT m.deleted AND j.state<>'superseded' AND '''+where+
         (' FOR UPDATE OF j' if lock else ''),[attachment_id,*args]).fetchone()
     return row
@@ -85,6 +88,11 @@ def request(store,c,p,attachment_id):
         result.update(request_status='failed',reason=row['error_code'] or 'retry_exhausted',
             requested_until=None)
         return serial(result)
+    if row.get('download_eligibility')=='outside_history_bounds':
+        # A request never overrides the collector's history bound (ANYM-284).
+        result.update(request_status='unavailable',reason='outside_history_bounds',requested_until=None,
+            next_action='get_sync_status_for_chat')
+        return serial(result)
     active=c.execute('SELECT %s::timestamptz>clock_timestamp() AS active',
         (row['requested_until'],)).fetchone()['active']
     if active:
@@ -109,6 +117,10 @@ def request(store,c,p,attachment_id):
     if managed and row['job_state']=='ready':
         changed=c.execute('SELECT public.queue_managed_original(%s) AS queued',(attachment_id,)).fetchone()['queued']
         if not changed:raise APIError('original_requeue_conflict',409)
+    # Without a confirmed bound the request is recorded but promises no download.
+    row.update(requested_until=until,download_eligibility='eligible' if row['history_bound']=='confirmed' else 'unknown')
+    result.update(attachment_fields(row,original_present=present))
+    if row['download_eligibility']=='unknown':result['eligibility_reason']='history_bound_unknown'
     result.update(request_status='queued',requested_until=until,
         download_request={'state':'requested','until':until},next_action='get_attachment')
     if managed:result['reason']='managed_original_evicted'

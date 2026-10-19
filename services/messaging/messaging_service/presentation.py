@@ -391,8 +391,10 @@ def render(method, result, detail):
                     'catchup_pending_chats','configured_window','last_scan_at')}
             row['operations']={name:{k:v for k,v in operation.items()
                 if k in ('state','reason_code','pending_events','collector_running','retry_at','next_action',
-                    'storage_paused','storage_paused_jobs','terminal_failed_jobs','retry_queued_jobs','needs_attention')
-                and (k not in ('storage_paused','storage_paused_jobs','terminal_failed_jobs','retry_queued_jobs','needs_attention') or v)}
+                    'storage_paused','storage_paused_jobs','terminal_failed_jobs','retry_queued_jobs','needs_attention',
+                    'storage_paused_basis','outside_prefetch_window_jobs','outside_history_bounds_jobs')
+                and (k not in ('storage_paused','storage_paused_jobs','terminal_failed_jobs','retry_queued_jobs','needs_attention',
+                    'outside_prefetch_window_jobs','outside_history_bounds_jobs') or v)}
                 for name,operation in source.get('operations',{}).items()}
             row['files']={k:v for k,v in source.get('files',{}).items()
                 if k in ('download','download_errors','download_error_states','extraction','enrichment')

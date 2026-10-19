@@ -83,6 +83,10 @@ def present_message(row,position):
             reasons={f.get('download_reason') or f.get('error_code') for f in attachments}
             if reasons & {'paused_storage','disk_reserve'}:
                 label+='; загрузка приостановлена: недостаточно места'
+            elif reasons & {'outside_prefetch_window'} and not states & {'processing','leased'}:
+                label+='; файл доступен по запросу'
+            elif reasons & {'outside_history_bounds'} and not states & {'processing','leased'}:
+                label+='; файл пока недоступен'
             elif states & {'processing','leased'}:
                 label+='; файл загружается'
             elif states & {'queued'}:

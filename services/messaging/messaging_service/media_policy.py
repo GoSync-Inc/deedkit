@@ -30,3 +30,41 @@ def configure_media_policy(cfg):
         if type(value) is not int or not lo<=value<=hi:raise ValueError('invalid_'+key)
     validate_prefetch_days(cfg.setdefault('media_prefetch_days',DEFAULT_MEDIA_PREFETCH_DAYS))
     return cfg
+
+
+# The window and history bound the account's current collector run published in
+# collector_health.operations.media_policy (ANYM-284). A record counts only when its
+# epoch is the account's lease epoch, so a run that could not publish never inherits
+# an earlier run's window. Malformed values count as unpublished, never as a cast error.
+def published_window(account):
+    return '''LEFT JOIN LATERAL (SELECT true AS published,
+        CASE WHEN jsonb_typeof(h.operations->'media_policy'->'prefetch_days')='number'
+            THEN (h.operations->'media_policy'->>'prefetch_days')::numeric END AS days,
+        CASE WHEN jsonb_typeof(h.operations->'media_policy'->'history_since')='string'
+            THEN (h.operations->'media_policy'->>'history_since')::timestamptz END AS since
+        FROM collector_health h JOIN collector_leases l ON l.account=h.account
+        WHERE h.account='''+account+''' AND h.operations->'media_policy'->'epoch'=to_jsonb(l.epoch)
+        AND (jsonb_typeof(h.operations->'media_policy'->'prefetch_days')='null' OR
+            jsonb_typeof(h.operations->'media_policy'->'prefetch_days')='number'
+            AND (h.operations->'media_policy'->>'prefetch_days') ~ '^[0-9]{1,5}$')
+        AND (jsonb_typeof(h.operations->'media_policy'->'history_since')='null' OR
+            jsonb_typeof(h.operations->'media_policy'->'history_since')='string'
+            AND pg_input_is_valid(h.operations->'media_policy'->>'history_since','timestamptz'))) mp ON true'''
+
+
+# Requires aliases j (media_jobs), m (messages), ch (chats) and the published_window
+# join (mp). A chat's history bound is confirmed only when its collector_chats row
+# records the bound this run published (NULL=NULL is a confirmed unbounded history):
+# a row a live callback created without a bound, or one left from an earlier
+# configuration, is unknown evidence and never yields outside_history_bounds.
+ELIGIBILITY_JOIN=('LEFT JOIN collector_chats ecc ON ecc.account=m.account AND ecc.provider_chat=ch.provider_chat '
+    'AND ecc.history_since IS NOT DISTINCT FROM mp.since')
+HISTORY_BOUND="CASE WHEN mp.published AND ecc.account IS NOT NULL THEN 'confirmed' ELSE 'unknown' END"
+# Mirrors Archive.claim_media: an unexpired request or the rolling window, never
+# before the run's history bound. Access policy is checked by each caller.
+ELIGIBILITY='''CASE WHEN mp.published IS NULL THEN 'unknown'
+    WHEN ecc.history_since IS NOT NULL AND m.sent_at<ecc.history_since THEN 'outside_history_bounds'
+    WHEN (mp.since IS NULL OR m.sent_at>=mp.since) AND (j.requested_until>clock_timestamp() OR
+        mp.days IS NULL OR mp.days>0 AND m.sent_at>=clock_timestamp()-mp.days*interval '1 day'
+        AND m.sent_at<=clock_timestamp()+interval '5 minutes') THEN 'eligible'
+    ELSE 'outside_prefetch_window' END'''

@@ -5,6 +5,7 @@ from .envelope import stable_id
 from .policy import scope_filter
 from .status_details import describe,freshness
 from .operational import liveness, operations
+from .media_policy import ELIGIBILITY, ELIGIBILITY_JOIN, published_window
 
 
 DOWNLOAD_STATES = ('queued', 'leased', 'ready', 'failed', 'superseded')
@@ -168,6 +169,31 @@ def _files(c, p, *, group_by_chat=False):
     return downloads, files
 
 
+def _eligibility(c, accounts):
+    """Queued originals by automatic-download eligibility under the published window.
+
+    None for an account without a current publication (basis unknown). A recorded
+    error_code is history evidence: a job that left the window keeps its code but
+    is not reported as waiting for storage (ANYM-284)."""
+    result = {r['account']: {'prefetch_days': None if r['days'] is None else int(r['days']), 'queued': {}}
+        for r in c.execute('SELECT a.id AS account,mp.days FROM accounts a '+published_window('a.id')
+            +' WHERE a.id=ANY(%s) AND mp.published', (accounts,))}
+    if not result:
+        return {}
+    for row in c.execute('''SELECT m.account,CASE WHEN NOT p.enabled OR ch.provider_chat=ANY(p.exclude_chats)
+            OR NOT (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) THEN 'collection_excluded'
+            ELSE '''+ELIGIBILITY+''' END AS eligibility,j.error_code,count(*) AS count
+        FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
+        JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
+        JOIN account_policies p ON p.account=m.account '''+published_window('m.account')+' '+ELIGIBILITY_JOIN+'''
+        LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
+        WHERE j.state='queued' AND a.id IS NULL AND NOT m.deleted AND m.account=ANY(%s)
+        GROUP BY 1,2,3''', (list(result),)):
+        codes = result[row['account']]['queued'].setdefault(row['eligibility'], {})
+        codes[row['error_code']] = row['count']
+    return result
+
+
 def get_sync_status(c, p):
     where, args = scope_filter(p, alias='c', chat_column='id')
     catalog = c.execute('SELECT c.account,c.id,a.platform FROM chats c JOIN accounts a ON a.id=c.account WHERE '+where, args).fetchall()
@@ -200,7 +226,9 @@ def get_sync_status(c, p):
         checkpoints = _checkpoints(c, p, {row['id'] for row in catalog})
         downloads, files = _files(c, p)
     conflicts = {}
+    eligibility = {}
     if sources and not scoped:
+        eligibility = _eligibility(c, [row['account'] for row in sources])
         # The archive detail code is sticky once any conflict was observed; the
         # alert follows conflicts which are still unresolved.
         conflicts = {r['account']: r for r in c.execute('''SELECT m.account,
@@ -228,7 +256,7 @@ def get_sync_status(c, p):
         row['files'] = files.get(account) or empty_files()
         row['files']['download'] = {**dict.fromkeys(DOWNLOAD_STATES, 0), **downloads.get(account, {})}
         if not scoped:
-            row['operations']=operations(row,row['history'],row['files'])
+            row['operations']=operations(row,row['history'],row['files'],eligibility=eligibility.get(account))
             row['liveness']=liveness(row['operations'])
             row['freshness']=freshness(row['history'].get('last_scan_at'),operational=row['operations'])
             if row['freshness']['scan_state']=='scan_stale':row['alerts'].append('successful_scan_older_than_5_minutes')
