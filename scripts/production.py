@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -1045,12 +1045,15 @@ CALL_STATUSES = ("waiting_for_browser", "dialing", "ringing", "connecting", "act
 # longer, so the bound is a budget: when it runs out, nothing is stopped.
 CALL_WAIT, CALL_POLL, CALL_WAITS = 15 * 60, 10, 4
 # One read stops after CALL_READ seconds; the probe process dies after CALL_LIFETIME whatever SQLite does, which
-# releases its shared lock (the service's own writes wait for it). One Docker command gets at most CALL_PROBE.
-CALL_READ, CALL_LIFETIME, CALL_PROBE = 0.25, 1, 20
+# releases its shared lock (the service's own writes wait for it). One poll's Docker commands share CALL_PROBE
+# seconds; confirming that a probe the tool gave up on is gone gets CALL_KILL seconds per command.
+CALL_READ, CALL_LIFETIME, CALL_PROBE, CALL_KILL = 0.25, 1, 20, 10
+CALL_LABEL = "io.deedkit.calls-probe"
 CALL_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # Run in a container of its own from the calls container's image: the calls state directory mounted read-only, no
 # network, its own memory and process limits, as the calls user. This host's root never opens a file there, the live
-# calls container shares none of its limits, and nothing can be written there (no journal or WAL file).
+# calls container shares none of its limits, and nothing can be written there (no journal or WAL file). `--init`
+# keeps python off PID 1, which the kernel would shield from SIGALRM's default action.
 CALLS_PROBE = r"""
 import json, os, pathlib, signal, sqlite3, sys, time
 def probe(limit, statuses):
@@ -1089,20 +1092,53 @@ class CallsUnknown(Refused):
     """Whether a call is active could not be read (a fixed category, never raw output)."""
 
 
-def docker_probe(argv, deadline):
-    """A Docker command of the calls check, never past CALL_PROBE nor much past the wait's deadline."""
+class ProbeStuck(Refused):
+    """A calls probe the tool gave up on could not be confirmed gone: no further probe or stop, inspect it."""
+
+
+# Tokens of probes whose `docker run` did not end cleanly: a start already sent can still come after the client
+# gave up, so each later probe first confirms that none of them runs.
+UNCONFIRMED = set()
+
+
+def docker_probe(argv, until):
+    """A Docker command of one poll, never past the poll's own budget `until` (time.monotonic)."""
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        raise CallsUnknown("probe_timeout")
     try:
-        return run(argv, timeout=max(5, min(CALL_PROBE, deadline - time.monotonic())))
+        return run(argv, timeout=remaining)
     except subprocess.TimeoutExpired:
         raise CallsUnknown("probe_timeout") from None
     except Refused:
         raise CallsUnknown("probe_failed") from None
 
 
-def calls_in(container, deadline):
+def stop_probes():
+    """Kill every still running probe container of UNCONFIRMED, found by its own label value (never by name: a
+    failed `docker run --name` may have met another container), and confirm none runs; otherwise ProbeStuck."""
+    def running():
+        lines = run(["docker", "ps", "-q", "--filter", "label=" + CALL_LABEL, "--format",
+                     '{{.ID}} {{.Label "' + CALL_LABEL + '"}}'], timeout=CALL_KILL).split("\n")
+        return [line.split()[0] for line in lines if len(line.split()) == 2 and line.split()[1] in UNCONFIRMED]
+    try:
+        for container in running():
+            with suppress(Refused):  # It may have ended meanwhile.
+                run(["docker", "kill", container], timeout=CALL_KILL)
+        left = running()
+    except (Refused, subprocess.TimeoutExpired):
+        left = None
+    if left != []:
+        raise ProbeStuck("a calls probe container could not be confirmed stopped; "
+                         f"inspect `docker ps --filter label={CALL_LABEL}`")
+
+
+def calls_in(container, until):
     """`<id> (<status>)` of every active call the calls container's database lists, read by CALLS_PROBE in a
     container of its own."""
-    actual = json.loads(docker_probe(["docker", "inspect", container], deadline))[0]
+    if UNCONFIRMED:
+        stop_probes()
+    actual = json.loads(docker_probe(["docker", "inspect", container], until))[0]
     env = dict(item.partition("=")[::2] for item in actual["Config"].get("Env") or [])
     directory = env.get("VOICE_DATA_DIR", "/data")
     mounts = [mount for mount in actual.get("Mounts") or [] if mount.get("Destination") == directory]
@@ -1113,20 +1149,19 @@ def calls_in(container, deadline):
     source = ("type=bind,source=" + mount["Source"] if mount["Type"] == "bind" else "type=volume,source=" + mount["Name"])
     if "," in source.partition("source=")[2]:
         raise CallsUnknown("no_data_mount")
-    name = "deedkit-calls-probe-" + uuid.uuid4().hex[:12]
+    token = uuid.uuid4().hex
     try:
         output = docker_probe([
-            "docker", "run", "--rm", "--name", name, "--pull", "never", "--network", "none", "--read-only",
+            "docker", "run", "--rm", "--init", "--name", "deedkit-calls-probe-" + token[:12], "--label",
+            f"{CALL_LABEL}={token}", "--pull", "never", "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--memory", "64m", "--memory-swap", "64m",
             "--pids-limit", "16", "--cpus", "0.5", "--user", actual["Config"].get("User") or "10001:10001",
             "--mount", source + ",target=/data,readonly", "--env", "VOICE_DATA_DIR=/data", "--entrypoint", "python",
-            actual["Image"], "-I", "-c", CALLS_PROBE, str(CALL_READ), str(CALL_LIFETIME), *CALL_STATUSES], deadline)
+            actual["Image"], "-I", "-c", CALLS_PROBE, str(CALL_READ), str(CALL_LIFETIME), *CALL_STATUSES], until)
     except CallsUnknown:
-        # The client gave up or failed; the probe container must not outlive it (the alarm ends it anyway).
-        try:
-            run(["docker", "kill", name], timeout=CALL_PROBE)
-        except (Refused, subprocess.TimeoutExpired):
-            pass
+        # The client gave up or failed; its probe container must not outlive it (its alarm ends it anyway).
+        UNCONFIRMED.add(token)
+        stop_probes()
         raise
     try:
         answer = json.loads(output[:65536])
@@ -1144,26 +1179,28 @@ def calls_in(container, deadline):
     return [f"{identity} ({status})" for identity, status in calls]
 
 
-def active_calls(settings, deadline):
-    """The active calls of every running container of a configured `calls` service, found by its Compose labels.
-    No running calls container has no active call; a configuration without a `calls` target checks nothing."""
-    found = []
+def active_calls(settings):
+    """The active calls of every running container of a configured `calls` service, found by its Compose labels,
+    in one poll of at most CALL_PROBE seconds. No running calls container has no active call; a configuration
+    without a `calls` target checks nothing."""
+    found, until = [], time.monotonic() + CALL_PROBE
     for project in settings["projects"]:
         for service in (service for service, target in project["services"].items() if target == "calls"):
             for container in docker_probe(["docker", "ps", "-q", "--filter",
                                            "label=com.docker.compose.project=" + project["name"], "--filter",
-                                           "label=com.docker.compose.service=" + service], deadline).split():
-                found += calls_in(container, deadline)
+                                           "label=com.docker.compose.service=" + service], until).split():
+                found += calls_in(container, until)
     return found
 
 
 def wait_for_calls(settings, deadline):
-    """Wait until no call is active, at most until `deadline` (time.monotonic). At the bound: CallActive with the
-    calls, or CallsUnknown with the category when the last read failed; it never proceeds on doubt."""
+    """Wait until no call is active; no poll starts after `deadline` (time.monotonic), and one poll takes at most
+    CALL_PROBE plus confirming a stuck probe gone. At the bound: CallActive with the calls, or CallsUnknown with
+    the category when the last read failed; it never proceeds on doubt. ProbeStuck ends it at once."""
     said = False
     while True:
         try:
-            calls, error = active_calls(settings, deadline), None
+            calls, error = active_calls(settings), None
         except CallsUnknown as exc:
             calls, error = None, str(exc)
         if calls == []:

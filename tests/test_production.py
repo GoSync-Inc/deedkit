@@ -3387,7 +3387,7 @@ class CallHost(Host):
         label = next((item.rpartition("=")[2] for item in argv if item.startswith("label=com.docker.compose.project=")),
                      None)
         if argv[:2] == ["docker", "run"] and p.CALLS_PROBE in argv:
-            assert 5 <= kwargs.get("timeout") <= p.CALL_PROBE
+            assert 0 < kwargs.get("timeout") <= p.CALL_PROBE
             attempted = sorted(str(path.relative_to(self.state)) for path in self.state.glob("*/*attempted.json"))
             self.events.append(("probe", self.inspected, attempted))
             return self.answer()
@@ -3553,7 +3553,7 @@ def test_calls_are_read_in_a_confined_container_of_every_configured_calls_servic
                              {"name": "second", "services": {"calls": "calls", "api": "runtime"}},
                              {"name": "stopped", "services": {"voice": "calls"}}]}
     monkeypatch.setattr(p, "time", Clock())
-    assert p.active_calls(settings, p.CALL_WAIT) == [f"{CALL} (active)", f"{OTHER_CALL} (active)"]
+    assert p.active_calls(settings) == [f"{CALL} (active)", f"{OTHER_CALL} (active)"]
     assert [argv[:2] for argv, _ in commands] == [["docker", "ps"], ["docker", "inspect"], ["docker", "run"]] * 2 + [
         ["docker", "ps"]]
     assert all(kwargs == {"timeout": p.CALL_PROBE} for _, kwargs in commands)
@@ -3561,7 +3561,8 @@ def test_calls_are_read_in_a_confined_container_of_every_configured_calls_servic
     image = probe.index(IMAGE)
     assert probe[image + 1:] == ["-I", "-c", p.CALLS_PROBE, str(p.CALL_READ), str(p.CALL_LIFETIME), *p.CALL_STATUSES]
     options = probe[2:image]
-    for flag in (["--rm"], ["--pull", "never"], ["--network", "none"], ["--read-only"], ["--cap-drop", "ALL"],
+    # --init: python as PID 1 would ignore SIGALRM's default action and outlive its lifetime.
+    for flag in (["--rm"], ["--init"], ["--pull", "never"], ["--network", "none"], ["--read-only"], ["--cap-drop", "ALL"],
                  ["--memory", "64m"], ["--pids-limit", "16"], ["--user", "10001:10001"],
                  ["--mount", "type=bind,source=/opt/personal-os-voice/data,target=/data,readonly"],
                  ["--env", "VOICE_DATA_DIR=/data"], ["--entrypoint", "python"]):
@@ -3571,28 +3572,138 @@ def test_calls_are_read_in_a_confined_container_of_every_configured_calls_servic
     assert "type=volume,source=second_calls,target=/data,readonly" in commands[5][0]
     # A configuration without a calls target checks nothing.
     commands.clear()
-    assert p.active_calls({"projects": settings["projects"][:1]}, p.CALL_WAIT) == [] and commands == []
+    assert p.active_calls({"projects": settings["projects"][:1]}) == [] and commands == []
 
 
-# spec: ANYM-442
-def test_a_probe_the_client_gave_up_on_is_killed_by_name(monkeypatch):
-    commands = []
-    def run(argv, **kwargs):
-        commands.append(argv)
+@pytest.fixture(autouse=True)
+def no_unconfirmed_probes(monkeypatch):
+    monkeypatch.setattr(p, "UNCONFIRMED", set())
+
+
+VOICE = {"projects": [{"name": "personal-os-voice", "services": {"voice": "calls"}}]}
+
+
+class ProbeDocker:
+    """Docker for one calls container `c1` and the probe containers production.py starts (fake clock).
+
+    Each `docker run` takes the next of `runs`: probe output, or `timeout` (the client gives up while its probe
+    runs), `late` (its probe starts `late_by` seconds after the client gave up) or `conflict` (the name is taken).
+    `stuck` probes survive `docker kill`; `foreign` is a running probe of another token. Every command takes
+    `step` seconds of the fake clock, at most its timeout, after which it times out."""
+
+    def __init__(self, monkeypatch, runs, *, step=0.0, stuck=False, ps_fails=False, late_by=5.0):
+        self.runs, self.step, self.stuck, self.ps_fails, self.late_by = list(runs), step, stuck, ps_fails, late_by
+        self.commands, self.started, self.probes, self.serial = [], [], {"foreign": ("f" * 32, 0.0)}, 0
+        self.clock = Clock()
+        monkeypatch.setattr(p, "time", self.clock)
+        monkeypatch.setattr(p, "run", self.run)
+
+    def running(self):
+        return {identity: token for identity, (token, since) in self.probes.items() if since <= self.clock.now}
+
+    def run(self, argv, **kwargs):
+        self.commands.append((argv, kwargs.get("timeout")))
+        self.started.append(self.clock.now)
+        if self.step > kwargs["timeout"]:
+            self.clock.now += kwargs["timeout"]
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        self.clock.now += self.step
+        if argv[:2] == ["docker", "ps"] and "label=" + p.CALL_LABEL in argv:
+            if self.ps_fails:
+                raise p.Refused("docker failed (exit 1); production was not accepted")
+            return "".join(f"{identity} {token}\n" for identity, token in self.running().items())
         if argv[:2] == ["docker", "ps"]:
             return "c1\n"
         if argv[:2] == ["docker", "inspect"]:
-            return json.dumps([{"Image": IMAGE, "Config": {}, "Mounts": [
+            return json.dumps([{"Image": IMAGE, "Config": {"User": "10001:10001"}, "Mounts": [
                 {"Type": "bind", "Source": "/srv/calls", "Destination": "/data"}]}])
         if argv[:2] == ["docker", "run"]:
-            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
-        return ""
-    monkeypatch.setattr(p, "run", run)
-    monkeypatch.setattr(p, "time", Clock())
+            outcome = self.runs.pop(0)
+            token = argv[argv.index("--label") + 1].removeprefix(p.CALL_LABEL + "=")
+            if outcome == "conflict":
+                raise p.Refused("docker failed (exit 125); production was not accepted")
+            if outcome in ("timeout", "late"):
+                self.serial += 1
+                self.probes[f"probe{self.serial}"] = (token, self.clock.now + (self.late_by if outcome == "late" else 0))
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return outcome
+        if argv[:2] == ["docker", "kill"]:
+            if not self.stuck:
+                self.probes.pop(argv[2], None)
+            return ""
+        raise AssertionError(argv)
+
+    def named(self, *names):
+        return [argv for argv, _ in self.commands if argv[:2] in [["docker", name] for name in names]]
+
+
+# spec: ANYM-442
+def test_a_probe_the_client_gave_up_on_is_killed_by_its_label_and_confirmed_gone(monkeypatch):
+    docker = ProbeDocker(monkeypatch, ["timeout"])
     with pytest.raises(p.CallsUnknown, match="probe_timeout"):
-        p.active_calls({"projects": [{"name": "personal-os-voice", "services": {"voice": "calls"}}]}, p.CALL_WAIT)
-    name = commands[2][commands[2].index("--name") + 1]
-    assert re.fullmatch(r"deedkit-calls-probe-[0-9a-f]{12}", name) and commands[3] == ["docker", "kill", name]
+        p.active_calls(VOICE)
+    [probe] = docker.named("run")
+    assert "--init" in probe and re.fullmatch(r"deedkit-calls-probe-[0-9a-f]{12}", probe[probe.index("--name") + 1])
+    # Found by its own token, killed by container ID, then listed again: only the other probe still runs.
+    assert docker.named("kill") == [["docker", "kill", "probe1"]] and docker.running() == {"foreign": "f" * 32}
+    assert [argv[:2] for argv, _ in docker.commands[3:]] == [["docker", "ps"], ["docker", "kill"], ["docker", "ps"]]
+    assert all(timeout == p.CALL_KILL for _, timeout in docker.commands[3:])
+
+
+@pytest.mark.parametrize("failure", ["survives-kill", "unlistable"])
+# spec: ANYM-442
+def test_a_probe_that_cannot_be_confirmed_gone_ends_the_wait_with_no_further_probe(monkeypatch, failure):
+    docker = ProbeDocker(monkeypatch, ["timeout", '{"calls": []}'], stuck=failure == "survives-kill",
+                         ps_fails=failure == "unlistable")
+    with pytest.raises(p.ProbeStuck, match=re.escape(f"inspect `docker ps --filter label={p.CALL_LABEL}`")):
+        p.wait_for_calls(VOICE, p.CALL_WAIT)
+    # Neither a second probe nor any wait: a stuck probe is not a call that may end.
+    assert len(docker.named("run")) == 1 and docker.clock.sleeps == []
+    assert not issubclass(p.ProbeStuck, p.CallsUnknown) and not issubclass(p.ProbeStuck, p.CallActive)
+
+
+# spec: ANYM-442
+def test_a_probe_name_another_container_holds_is_never_killed(monkeypatch):
+    docker = ProbeDocker(monkeypatch, ["conflict"])
+    with pytest.raises(p.CallsUnknown, match="probe_failed"):
+        p.active_calls(VOICE)
+    assert docker.named("kill") == [] and docker.running() == {"foreign": "f" * 32}
+
+
+# spec: ANYM-442
+def test_a_probe_that_starts_after_its_client_gave_up_is_killed_before_the_next_probe(monkeypatch):
+    docker = ProbeDocker(monkeypatch, ["late", '{"calls": []}'])
+    p.wait_for_calls(VOICE, p.CALL_WAIT)
+    # The first cleanup finds nothing yet; the next poll finds the late probe and confirms it gone before its run.
+    assert [argv[:2] if argv[1] != "kill" else argv for argv in docker.named("run", "kill")] == [
+        ["docker", "run"], ["docker", "kill", "probe1"], ["docker", "run"]]
+    assert docker.running() == {"foreign": "f" * 32}
+
+
+@pytest.mark.parametrize("step, timeouts, ended", [(6, [20, 14, 8], 18), (12, [20, 8], 20)], ids=["fits", "spent"])
+# spec: ANYM-442
+def test_one_poll_never_runs_a_docker_command_past_its_budget(monkeypatch, step, timeouts, ended):
+    docker = ProbeDocker(monkeypatch, ['{"calls": []}'], step=step)
+    if step == 6:
+        assert p.active_calls(VOICE) == []
+    else:
+        with pytest.raises(p.CallsUnknown, match="probe_timeout"):
+            p.active_calls(VOICE)
+    # Commands share the poll's CALL_PROBE seconds, no floor; a probe that never started needs no cleanup.
+    assert [timeout for _, timeout in docker.commands] == timeouts and docker.clock.now == ended
+    assert p.UNCONFIRMED == set()
+
+
+# spec: ANYM-442
+def test_no_poll_starts_after_the_deadline_and_the_last_ends_within_its_budget(monkeypatch):
+    docker = ProbeDocker(monkeypatch, [], step=12)
+    with pytest.raises(p.CallsUnknown, match="could not be read: probe_timeout"):
+        p.wait_for_calls(VOICE, p.CALL_WAIT)
+    starts = [at for (argv, _), at in zip(docker.commands, docker.started, strict=True)
+              if "label=com.docker.compose.service=voice" in argv]
+    # Every poll took its whole budget; the last started at the deadline and the refusal came one budget later.
+    assert max(starts) == p.CALL_WAIT and docker.clock.now == p.CALL_WAIT + p.CALL_PROBE
+    assert sum(docker.clock.sleeps) <= p.CALL_WAIT and docker.named("run") == []
 
 
 def waiting_apply(host, monkeypatch, refusals):

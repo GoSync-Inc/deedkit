@@ -523,10 +523,15 @@ wait and prints one stderr line, `calls check: no active call` or
 `dialing`, `ringing`, `connecting`, `active`) or an error category. Each read
 runs in a container of its own from the calls container's image: no network,
 no capabilities, read-only root, 64 MiB and 16 processes, the calls user and
-the calls state directory mounted read-only. The probe interrupts its query
-after 0.25 seconds and dies after 1 second, so the service's own writes wait at
-most that long; a probe the tool gave up on is killed by name
-(`deedkit-calls-probe-<hex>`). The host's root opens no file in the calls state
+the calls state directory mounted read-only, under `--init`. The probe
+interrupts its query after 0.25 seconds and dies after 1 second, so the
+service's own writes wait at most that long. One poll's Docker commands share
+20 seconds, so a wait lasts at most 15 minutes and one poll. A probe the tool
+gave up on is found by its `io.deedkit.calls-probe` label token, killed by
+container ID and listed again before any further probe; when that cannot be
+confirmed, apply refuses at once with `a calls probe container could not be
+confirmed stopped` (no wait, no stop): inspect
+`docker ps --filter label=io.deedkit.calls-probe`. The host's root opens no file in the calls state
 directory and makes no request to the calls service. At the bound apply refuses
 with `a call is active: ...` or, when the last read failed (busy, a hot
 journal, a missing mount, a probe timeout or output that is not IDs and
