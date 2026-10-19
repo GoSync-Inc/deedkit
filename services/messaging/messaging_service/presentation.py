@@ -183,15 +183,26 @@ def lean_conversation(state, *, shown=()):
     return result
 
 
+def _own_head(message):
+    # An outgoing message from a personal ID is the owner's; a post signed as a channel,
+    # a group or an anonymous admin carries that chat's ID instead.
+    from .whatsapp_identity import personal_id
+    sender=message.get('sender')
+    return message.get('direction')=='outgoing' and isinstance(sender,str) and (sender.isdigit() or bool(personal_id(sender)))
+
+
 def lean_chat(row):
     result={k:row[k] for k in ('id','account','title','title_basis','type','last_activity') if row.get(k) is not None}
     result['title']=result['title'][:64]
     state=row.get('conversation')
     latest=(state or {}).get('latest_known_meaningful_message')
+    kind=row.get('type')
     if latest:
         last={'id':latest['id'],'direction':latest.get('direction'),'sender_name':latest.get('sender_name'),
             'sender_name_basis':_fallback_basis(latest),
             'display_text':latest.get('display_text') or '',**forward_fields(latest,brief=True)}
+        # C8: the owner's own head names the same owner on every row of the account.
+        if kind in KNOWN_TYPES and _own_head(latest):last.update(sender_name=None,sender_name_basis=None)
     elif row.get('last_message_id'):
         last={'id':row['last_message_id'],'direction':row.get('last_message_direction'),
             'display_text':row.get('last_message_snippet') or ''}
@@ -227,12 +238,45 @@ def lean_chat(row):
         result['awaiting_reply']={k:v for k,v in hint.items() if v is not None}
     for key in ('last_message','awaiting_reply'):
         if result.get(key,{}).get('sender_name'):result[key]['sender_name']=result[key]['sender_name'][:64]
-    if state:result['conversation']=lean_queue_conversation(state,last,result.get('awaiting_reply'))
+    hint=result.get('awaiting_reply')
+    if state:result['conversation']=lean_queue_conversation(state,last,hint,kind=kind,
+        self_chat=row.get('title_basis')=='self_chat')
+    if hint and kind in KNOWN_TYPES:
+        # C6: question_mark in reasons states the question; C7: a private hint's basis is fixed.
+        if 'question_mark' in (hint.get('reasons') or ()):hint.pop('has_question',None)
+        if kind=='private' and hint.get('basis')=='last_archived_message_incoming':hint.pop('basis')
     return result
 
 
-def lean_queue_conversation(state, last, hint):
-    """Compact omits a conversation field when it equals a shown message or hint field."""
+# ANYM-408: values the row kind fixes; absent means the value named here.
+FIXED_BY_KIND={'channel_or_self_chat':{'last_turn':'not_applicable','suggested_action':'not_applicable',
+        'basis':'channel_or_self_chat'},
+    'no_observed_owner_attention':{'suggested_action':'not_applicable','basis':'no_observed_owner_attention',
+        'owner_attention':{'last_turn':'not_applicable'}}}
+TURN_OF_DIRECTION={'outgoing':'owner','incoming':'peer'}
+KNOWN_TYPES=('private','group','channel')
+
+
+def omit_fixed(result, last, hint, kind, self_chat):
+    """Rules C1-C9 of CONVERSATION.md; a row without a known type omits nothing."""
+    if kind not in KNOWN_TYPES:return result
+    if result.get('head_freshness')=='stale':result.pop('head_freshness')  # C9
+    def omit(values):
+        if all(result.get(k)==v for k,v in values.items()):
+            for k in values:result.pop(k)
+    if kind=='channel' or kind=='private' and self_chat:omit(FIXED_BY_KIND['channel_or_self_chat'])  # C1
+    elif kind=='group':
+        if result['last_turn']=='not_applicable':result.pop('last_turn')  # C2
+        if hint:omit({'owner_attention':{'last_turn':'peer'}})  # C4
+        else:omit(FIXED_BY_KIND['no_observed_owner_attention'])  # C3
+    elif kind=='private' and last and result['last_turn']==TURN_OF_DIRECTION.get(last.get('direction')):
+        # C5: the shown head's direction, or the incoming hint when the hint is the head.
+        result.pop('last_turn')
+    return result
+
+
+def lean_queue_conversation(state, last, hint, *, kind=None, self_chat=False):
+    """Compact omits a conversation field when it equals a shown message or hint field, or the row fixes it."""
     shown=[m for m in (last and last['id'],hint and hint.get('message_id')) if m]
     result=lean_conversation(state,shown=shown)
     if result.get('latest_message_id') in shown:result.pop('latest_message_id')
@@ -248,7 +292,7 @@ def lean_queue_conversation(state, last, hint):
         result['candidate_message_ids']=[m for m in result['candidate_message_ids'] if m not in stated]
         if not result['candidate_message_ids']:result.pop('candidate_message_ids')
     if hint and result['basis'] in (hint.get('confidence'),hint.get('basis')):result.pop('basis')
-    return result
+    return omit_fixed(result,last,hint,kind,self_chat)
 
 
 def lean(method, result):

@@ -75,9 +75,48 @@ two fields would carry the same fact, compact keeps the first and omits the othe
 - `sender_name` in `last_message` and `awaiting_reply` is cut to 64 characters,
   as in compact messages.
 
+Compact also omits a value that the row's type or another field of the same row
+already fixes (ANYM-408). An absent field means the value its rule names; a row
+without `type` (unknown chat type) omits nothing under these rules:
+
+- C1. On a channel row, and on a private row with `title_basis: "self_chat"`:
+  `conversation.last_turn` and `conversation.suggested_action` are
+  `"not_applicable"` and `conversation.basis` is `"channel_or_self_chat"`. They
+  are omitted together, only when all three hold; otherwise all three stay.
+- C2. On a group row: `conversation.last_turn` is `"not_applicable"`.
+- C3. On a group row without `awaiting_reply` and no owner attention observed:
+  `conversation.suggested_action` is `"not_applicable"`, `conversation.basis` is
+  `"no_observed_owner_attention"` and `conversation.owner_attention` is
+  `{"last_turn": "not_applicable"}`. Omitted together, only when all three hold
+  (an `owner_attention.last_turn` of `"unknown"` keeps all three).
+- C4. On a group row with `awaiting_reply`: an absent
+  `conversation.owner_attention` is `{"last_turn": "peer"}` (the peer wrote
+  last); any other attention object stays whole.
+- C5. On a private row without the C1 values: `conversation.last_turn` `"owner"`
+  or `"peer"` is omitted when it equals the shown head's direction (`outgoing`
+  is `owner`, `incoming` is `peer`): `last_message.direction`, or the hint's
+  incoming head when the hint is the head and `last_message` is omitted. When
+  they differ, both stay; `"unknown"` always stays.
+- C6. `awaiting_reply.has_question` is not shown: a question is `"question_mark"`
+  in `awaiting_reply.reasons` (both come from one predicate).
+- C7. On a private row: an absent `awaiting_reply.basis` is
+  `"last_archived_message_incoming"`.
+- C8. A `last_message` with `direction: "outgoing"` from the account's own
+  identity (a personal sender ID) omits `sender_name` and `sender_name_basis`:
+  the sender is the owner. An outgoing post signed as a channel, a group or an
+  anonymous admin carries that chat's ID as its sender and keeps its name.
+- C9. An absent `conversation.head_freshness` is `"stale"` (the common value).
+  `recently_verified`, `unknown`, `behind_latest_message` and
+  `invalid_observation` stay explicit; `provider_head_verified_at` still shows
+  when the head was checked.
+
+Beside a hint, an absent `conversation.basis` is the hint's `confidence`, or
+without one its `basis` (after C7). The `list_chats` tool description carries the
+same legend in short form.
+
 The remaining hint fields keep their names and meanings: `message_id`,
 `revision`, `sender_id`, `sender_name`, `sender_name_basis`, `priority`,
-`reasons`, `waiting_hours`, `incoming_count`, `basis`, `has_question`,
+`reasons`, `waiting_hours`, `incoming_count`, `basis` (group hints; C7),
 `dismissed`, `confidence` when it is not the default, and `display_text` with
 `truncated` (the hint's own text, or the head's when the hint is the head), and
 `forward_origin` (`kind`, `sender_name`) with `authorship` for a forwarded hint
