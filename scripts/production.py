@@ -61,11 +61,13 @@ REGISTRY = "ghcr.io/gosync-inc/deedkit-"
 VERIFIER = Path("/usr/local/libexec/deedkit/attest-verify")
 VERIFIER_SHA256 = "af405433c424fe20580cc86e2d96221670b0a75d6af9068ab06d309ec49344db"
 IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-# The pinned verifier's refusal lines (tools/attest-verify main.go, registry.go): the image or its attestation is not
-# there yet, or GHCR could not be read. Any other refusal is evidence that does not verify.
-VERIFIER_ABSENT = re.compile(r"attest-verify: refused: (manifest \S+ not found|no Sigstore bundle is attached to )")
-VERIFIER_UNREACHED = re.compile(r"attest-verify: refused: (registry (request|read) failed|anonymous registry token "
-                                r"for \S+: HTTP \d+|(manifest|attestation tag) \S+: HTTP \d+|bundle blob \S+: HTTP \d+)")
+# The pinned verifier's refusal lines (tools/attest-verify main.go, registry.go). Only a registry 404 for the image
+# tag proves it is not published yet. "No bundle attached" is also printed when the referrers API failed, and a bundle
+# that could not be fetched is nested in "no attached bundle verified ...", so both count as GHCR not read: retried,
+# never a reason to take an older commit. Any other refusal is evidence that does not verify.
+VERIFIER_ABSENT = re.compile(r"attest-verify: refused: manifest \S+ not found(; |$)")
+VERIFIER_UNREACHED = re.compile(r"attest-verify: refused: no Sigstore bundle is attached to |registry (request|read) "
+                                r"failed|: HTTP \d+")
 SOURCE = "https://github.com/" + REPOSITORY + ".git"
 
 
@@ -97,7 +99,7 @@ class Unreachable(Refused):
 
 
 class Unattested(Refused):
-    """The verifier found the target at the commit not published, or published without an attestation yet."""
+    """The registry has no image tag for the target at the commit: not published (yet)."""
 
 
 def run(argv, *, cwd=None, umask=-1, env=None, reason=False):
@@ -374,7 +376,8 @@ def promotable(sha):
         # A local failure is no network blip: it pauses a deploy (Refused).
         run(["git", "init", "--quiet", "--bare", "--template=", str(repository)], env=environment)
         try:
-            head = remote_main(environment)
+            # From inside the empty repository: the caller's working directory repository and its config never apply.
+            head = remote_main(environment, cwd=repository)
             # Commits only (no trees, no blobs): exactly the history of the head ls-remote named.
             run(["git", "-C", str(repository), "fetch", "--quiet", "--filter=tree:0", SOURCE, head],
                 env=environment, reason=True)
@@ -1149,9 +1152,9 @@ FETCH_FAILURES = 3
 # Changes a human applies or installs by hand, so the deployer pauses for them.
 SQL_INVENTORY = re.compile(r"\.sql$|^services/.+/migrations/")
 DEPLOY_TOOLS = ("scripts/production.py", "scripts/seamless_release.py", "tools/attest-verify/", "services/release-router/")
-def remote_main(env=None):
+def remote_main(env=None, cwd=None):
     """main's head from `git ls-remote`, which the API quota does not meter."""
-    line = run(["git", "ls-remote", SOURCE, "refs/heads/main"], env=env, reason=True).split()
+    line = run(["git", "ls-remote", SOURCE, "refs/heads/main"], cwd=cwd, env=env, reason=True).split()
     if len(line) != 2 or line[1] != "refs/heads/main" or not re.fullmatch(r"[0-9a-f]{40}", line[0]):
         raise Refused("git ls-remote returned no main commit")
     return line[0]

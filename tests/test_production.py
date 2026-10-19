@@ -2586,15 +2586,22 @@ def test_a_failed_rerun_after_the_images_were_attested_does_not_block_promotion(
 # spec: ANYM-406
 @pytest.mark.parametrize("line, refusal", [
     ("manifest deedkit-runtime:" + SHA + " not found", p.Unattested),
-    ("no Sigstore bundle is attached to ghcr.io/gosync-inc/deedkit-runtime@" + MANIFEST, p.Unattested),
+    # Also what the pinned verifier prints when the referrers API failed: never proof of absence.
+    ("no Sigstore bundle is attached to ghcr.io/gosync-inc/deedkit-runtime@" + MANIFEST, p.Unreachable),
     ("registry request failed: context deadline exceeded", p.Unreachable),
     ("anonymous registry token for deedkit-runtime: HTTP 503", p.Unreachable),
     ("manifest deedkit-runtime:" + SHA + ": HTTP 429", p.Unreachable),
+    ("no attached bundle verified for ghcr.io/gosync-inc/deedkit-runtime@" + MANIFEST + ": bundle blob "
+     + MANIFEST + ": HTTP 503", p.Unreachable),
+    ("no attached bundle verified for ghcr.io/gosync-inc/deedkit-runtime@" + MANIFEST + ": registry read failed: "
+     "unexpected EOF", p.Unreachable),
     ("no attached bundle verified for ghcr.io/gosync-inc/deedkit-runtime@" + MANIFEST + ": expected SourceRepositoryDigest",
      p.Refused),
+    ("no attached bundle verified for ghcr.io/gosync-inc/deedkit-runtime@" + MANIFEST + ": manifest deedkit-runtime:"
+     + SHA + " not found", p.Refused),
     ("manifest deedkit-runtime:" + SHA + ": Docker-Content-Digest sha256:1 differs from body digest sha256:2", p.Refused),
-], ids=["not-published", "not-attested-yet", "timeout", "token-unavailable", "rate-limited", "wrong-commit",
-        "digest-mismatch"])
+], ids=["not-published", "no-bundle-or-referrers-failed", "timeout", "token-unavailable", "rate-limited",
+        "bundle-blob-unavailable", "bundle-read-failed", "wrong-commit", "nested-not-found", "digest-mismatch"])
 def test_a_verifier_refusal_is_told_apart_as_not_published_unreachable_or_invalid(tmp_path, monkeypatch, line, refusal):
     fake_verifier(tmp_path, monkeypatch, f"#!/bin/sh\necho 'attest-verify: refused: {line}' 1>&2\nexit 1\n".encode())
     with pytest.raises(p.Refused) as refused:
@@ -2687,6 +2694,27 @@ def test_promotion_git_ignores_the_operator_environment_and_global_configuration
                         ("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", f"url.file://{other}.insteadOf"),
                         ("GIT_CONFIG_VALUE_0", p.SOURCE)):
         monkeypatch.setenv(name, value)
+    with pytest.raises(p.Refused, match="not a commit on main"):
+        p.promotable(side)
+    assert p.promotable(history[-1])["main"] == history[-1]
+
+
+# spec: ANYM-406
+def test_promotion_git_ignores_the_configuration_of_the_repository_it_runs_in(tmp_path, monkeypatch):
+    history, side = main_repository(tmp_path, monkeypatch)
+    accepting_verifier(tmp_path, monkeypatch)
+    offline(monkeypatch)
+    # The operator runs production.py from a checkout whose local config rewrites the source to a main with the side
+    # commit on it.
+    other = tmp_path / "other.git"
+    subprocess.run(["git", "clone", "--quiet", "--bare", str(tmp_path / "origin"), str(other)], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(other), "update-ref", "refs/heads/main", side], check=True, capture_output=True)
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "--quiet", str(checkout)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(checkout), "config", f"url.file://{other}.insteadOf", p.SOURCE], check=True,
+                   capture_output=True)
+    monkeypatch.chdir(checkout)
     with pytest.raises(p.Refused, match="not a commit on main"):
         p.promotable(side)
     assert p.promotable(history[-1])["main"] == history[-1]

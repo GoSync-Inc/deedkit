@@ -585,13 +585,14 @@ Otherwise it:
    existing path there must be that bare repository) and
    picks the newest first-parent commit after the current release whose
    images, every CI-published target plan A or plan B uses plus
-   `deedkit-runtime`, the verifier all accepts. A commit the verifier reports
-   as not published, or published without an attestation yet (its run still
-   runs, or failed before `publish` finished), is passed over for an older one.
-   When GHCR cannot be read, no older commit is taken: the run ends with
-   `error`. Evidence that does not verify (another commit, signer or digest)
-   pauses. A commit whose deployment was attempted is never retried, and no
-   older commit follows it;
+   `deedkit-runtime`, the verifier all accepts. A commit whose image tag the
+   registry reports not found (its run still runs, or failed before `publish`
+   pushed) is passed over for an older one. When GHCR cannot be read, or an
+   image has no attestation bundle yet (also what a failed referrers lookup
+   reports), no older commit is taken: the run ends with `error`, and the third
+   such run in a row pauses. Evidence that does not verify (another commit,
+   signer or digest) pauses. A commit whose deployment was attempted is never
+   retried, and no older commit follows it;
 3. pauses with a reason when the range changes the SQL inventory (any `*.sql`,
    `services/*/migrations/**`) or a deploy tool (`scripts/production.py`,
    `scripts/seamless_release.py`, `tools/attest-verify/**`,
