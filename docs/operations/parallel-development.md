@@ -52,3 +52,9 @@ per provider, and migration numbers are sequential with immutable checksums. `ci
   never use bare `git stash`.
 - Tiden commands use `--format json` with a `jq` projection; files over about 20k characters are
   read by range or `grep`. Whole exports never go into a session or a reviewer packet.
+- Models for code: Opus on risk paths (review-protocol.md, Codex budget); Sonnet, as a trial, on
+  small and medium cards (Effort up to 3, one lane).
+- The orchestrator, like a worker, hands off and restarts near 250k tokens.
+- Owner questions (AGENTS.md section 2 items and feature or epic acceptance only): while the owner
+  is online, one message as they arise; while the owner is away, one numbered list on waking and
+  before sleep, each item with a recommendation. Work that needs no answer keeps running.
