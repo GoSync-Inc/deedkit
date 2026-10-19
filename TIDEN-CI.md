@@ -323,15 +323,17 @@ overlap and a run in progress is never cancelled (one concurrency group), becaus
 the sync is the only automated writer of anchors and replaces whole source lists.
 GitHub keeps one waiting run and drops an older waiting one. A later run does not
 cover an earlier commit, so dispatch a dropped run again from main with its SHA
-(`gh workflow run tiden-sync.yml --ref main -f sha=<sha>`). Never repair sources
-by hand while a sync runs.
+(`gh workflow run tiden-sync.yml --ref main -f sha=<sha>`).
 
 The sync writes to Tiden since check A ran green on three pull requests. The
-agent that merged reads back the result after the sync run (AGENTS.md section 4).
-When the run failed or was dropped, the agent runs it from a main checkout,
-first with `--dry-run`, then without
-(`TIDEN_PRODUCT_ID=<id> uv run python scripts/tiden_sync.py --sha <sha>`), or
-dispatches it again by SHA.
+agent that merged waits for the sync run of its squash and reads back the result
+(AGENTS.md section 4). A failed or dropped run is recovered only by dispatching
+it again by SHA, as above, or by rerunning it, so that it joins the concurrency
+group. A local `scripts/tiden_sync.py` runs only with `--dry-run`: a local write
+or a source repair by hand is outside the group, and a B run that starts during
+it can lose anchors, since both replace whole source lists. Such a write needs a
+maintenance window agreed with the owner, with the workflow disabled and no
+run in progress for the whole operation.
 
 ## Drift watermark
 
@@ -429,9 +431,10 @@ rule and still counts as unlinked in the share. The rule does not depend on when
 a case was created: a case first published on an intent branch fails when it
 becomes active on `main`, on every run until it is linked or listed.
 
-After the `main` push run of a squash publishes its evidence, the agent that
-merged it links each new test case of the change on Tiden main and reruns a
-failed `Tiden health` run (`AGENTS.md`). The measuring command gives the same
+After the `main` push run of a squash publishes its evidence, sync B links each
+marked new test case of the change on Tiden main. The agent that merged it waits
+for that sync run, reads back the links and reruns a failed `Tiden health` run
+(`AGENTS.md`). The measuring command gives the same
 report locally, read-only, without fetching:
 
 ```sh
