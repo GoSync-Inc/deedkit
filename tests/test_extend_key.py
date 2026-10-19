@@ -294,3 +294,35 @@ def test_migration_036_adds_extend_key_audit_and_keeps_schema35_rows(schema35_st
     store.extend_key(key, 30)
     assert [str(row['key_id']) for row in extend_audit(store)] == [key]
     assert store.capabilities(token)['credential_id'] == key
+
+
+# spec: ANYM-422
+def test_migration_036_gives_up_on_a_busy_audit_log_without_stalling_requests(schema35_store):
+    store = schema35_store
+    token = store.issue_key('agent-busy', ['telegram-demo'], days=1)
+    holder = psycopg.connect(store.pool.conninfo)
+    try:
+        # An in-flight audit write holds ROW EXCLUSIVE on audit_log.
+        holder.execute("INSERT INTO audit_log(principal,operation,outcome) VALUES('agent-busy','capabilities','ok')")
+        outcome = []
+        def migrate():
+            try: store.migrate(); outcome.append('migrated')
+            except psycopg.errors.LockNotAvailable: outcome.append('lock_not_available')
+        worker = threading.Thread(target=migrate)
+        started = time.monotonic()
+        worker.start()
+        time.sleep(0.5)
+        # Queued behind the migration's lock request, a request still finishes in its 5 s budget.
+        assert store.capabilities(token)['credential_id']
+        worker.join(10)
+        assert outcome == ['lock_not_available'] and time.monotonic() - started < 5
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '35'
+    finally:
+        holder.rollback()
+        holder.close()
+    store.migrate()
+    with store.pool.connection() as c:
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '36'
+        with pytest.raises(psycopg.errors.CheckViolation), c.transaction():
+            c.execute("INSERT INTO audit_log(principal,operation,outcome) VALUES('agent-busy','not_an_operation','ok')")
