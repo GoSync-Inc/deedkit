@@ -1,8 +1,7 @@
 # DeedKit agent rules
 
 DeedKit is the product; the repo keeps its AnyMsg identities (`anymsg`, `messaging_service`,
-`ANYM-*`, package, API and database names). Tiden holds specs, queue and test evidence; module
-documents hold contracts; BACKLOG.md is navigation only.
+`ANYM-*`, package, API and database names).
 
 ## 1. Always
 
@@ -32,15 +31,18 @@ the orchestrator; never text in your own input box). Diff items:
 4. This list and section 3.
 
 And without a diff: a restore, rollback over data or other production change than
-`production.py deploy` and the task steps below; live provider actions; new secrets or
-credentials, roles, host access; deleting data, cards or records outside an accepted task, moving
+`production.py deploy` and the task steps below; live provider actions; secrets or
+credentials, roles, host access; deleting cards or records, or data outside an accepted task, moving
 cards, publishing a package, rewriting history; accepting a known risk (an open blocking or major
 finding); product direction (accepting feature or epic cards, weakening an accepted criterion).
 A standing approval holds only while all its conditions do.
 
-Inside an accepted task the agent applies its migration (verified backup first), cleans up and
-deletes, and after merge and deploy enables its feature (opt-in, gateway grants to existing
-principals, flags), reporting commands and undo; never during an active call.
+An accepted task is a card accepted per tiden-product-workflow.md whose criteria name the step;
+cardless work has none. Inside one the agent applies its migration (production.md backup gate),
+deletes the data or files the card names, and ships its owner-accepted feature enabled: after merge and deploy it
+sets the card's flag or operation opt-in and grants only what the criteria name, never send, call,
+pairing, session or allowlist changes It reports commands and undo. None of this runs
+during an active call; check read-only first.
 
 ## 3. Change paths
 
@@ -58,7 +60,7 @@ Done: the squash's `main` push run is green.
 ## 4. Product context and Tiden
 
 - First step of any task touching product code, specs or tests: `tiden intent skip`, the card
-  (`tiden spec get`) and `product-context`, then code.
+  and `product-context`, then code.
 - Spec, tests, code: the accepted card is the spec; failing tests come first. Each new test has
   `# spec: ANYM-n` (Python) or `// spec: ANYM-n` (JS, TS, Go) directly above it and its
   decorators, naming a story-level spec, or sits in `config/tiden-unlinked-tests.json`. Defects, infra and refactors
@@ -66,10 +68,9 @@ Done: the squash's `main` push run is green.
 - PR lines: `Spec: ANYM-n[, …]` (implements or keeps), `Delivers: ANYM-n` (completes), at most one
   `Tiden branch: proposal/<name>` or `review/<name>`, the only place to edit criteria. The first
   ID is primary; new files are anchored to it.
-- Check A (PR) checks markers and IDs; sync B (main push) merges the named branch. Wait for B
-  on your squash, read back, rerun a failed B (by SHA), `Tiden drift` or `Tiden health`. Tiden
-  writes by hand need a maintenance window (TIDEN-CI.md).
-- Cards, markers, commands: docs/operations/tiden-product-workflow.md.
+- Wait for sync B (main push) on your squash and read back; rerun or dispatch a failed B, `Tiden
+  drift` or `Tiden health`. Hand writes to Tiden need a maintenance window (TIDEN-CI.md). Check A,
+  cards, markers, commands: docs/operations/tiden-product-workflow.md.
 
 ## 5. Reviews
 
@@ -86,21 +87,19 @@ Done: the squash's `main` push run is green.
   3. Deployed-version compatibility: does it work against what is deployed now (other services at
      the current prod SHA, schema N-1, the host `production.py`, the installed gateway)? Name the
      breaking consumer.
-  4. Tests: do the new tests fail on the base commit (run them), and do they assert the spec
+  4. Tests: do the new tests fail on the base commit, and do they assert the spec
      criterion?
 - Cards: Opus high writes new capability, infrastructure and main-research ones; Opus medium
   defects and small improvements with clear evidence; Sonnet simple ones. Product cards get one
   Fable round, contract cards (code, CI, data, security) and operation plans Astra, small cards a
-  self-check (review-protocol.md, rounds 6-7).
+  self-check.
 
 ## 6. Working with the orchestrator
 
 - The card or brief is the plan. Decide in scope; ask only before leaving it (another task's
   files, section 2, the card's criteria, a fork without an obvious answer).
-- Run only tests of touched code and your new ones. Hot files: lanes in
-  docs/operations/parallel-development.md.
+- Run only tests of touched code and your new ones.
 - Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_*` block.
-  Wait with one background command, never poll.
 - At the token limit in your brief, at the next boundary: a handoff of at most 40 lines,
   `RESTART <path>` to the orchestrator, stop. Not with about 30 calls left: finish.
 - Budget: 1,000 words (`wc -w`). A rule change replaces or deletes words and names its incident and
