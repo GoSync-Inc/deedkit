@@ -54,6 +54,15 @@ supervisor stop line keeps its own smaller vocabulary; exception text, cause
 chains and an exception's detail value never enter the event. Other components
 keep their generic codes.
 
+Tiden groups events by exception type and stack frames, and every Telegram stop is
+raised at the same frames. A Telegram or WhatsApp collector event therefore also
+sends the Sentry-protocol `fingerprint`, `["collector-stop", <component>, <code>]`,
+built only from the validated built-in component and the code above. Each code forms
+its own Tiden issue; the same code stays one issue across other exception types or
+frames. `before_send` rebuilds the fingerprint from those two values and drops any
+incoming `fingerprint` or title; the event sets no title. Events of other components
+carry no fingerprint.
+
 Collector stop codes: `capture_overload`, `collection_disabled`,
 `collector_already_owned`, `collector_disabled`, `collector_lease_lost`,
 `disk_reserve`, `durable_capture_failed`, `live_account_required`,
@@ -69,7 +78,8 @@ Telegram only: `durable_capture_failed.capture_error`,
 `durable_capture_failed.spool_io_error`.
 
 The payload contains the release, environment, fixed component/error code,
-allowlisted exception type and public Python filenames/line numbers. Filenames are
+allowlisted exception type, public Python filenames/line numbers and, for Telegram
+and WhatsApp collector events, the `fingerprint` described above. Filenames are
 relative to the repository root (`services/messaging/messaging_service/<file>.py`),
 like Tiden component paths. Events sent before this used `messaging_service/<file>.py`;
 a recurring error may therefore appear once as a new issue under the new paths.

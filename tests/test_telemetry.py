@@ -472,3 +472,97 @@ def test_telemetry_document_lists_the_stop_vocabulary():
     # Both collectors share the stop codes; a split must be documented.
     assert listed('Collector stop codes') == telemetry.STOP_CODES['whatsapp']
     assert listed('Collector stop codes') | listed('Telegram only') == telemetry.STOP_CODES['telegram']
+
+
+def stop_event(component, text, detail, monkeypatch):
+    """The decoded envelope event of one collector stop sent through the real SDK."""
+    transport = Transport()
+    worker = reporter(transport, component)
+    monkeypatch.setattr(telemetry, '_reporter', worker)
+    try:
+        stopped(component, monkeypatch, text, detail)
+        assert transport.ready.wait(1)
+    finally:
+        worker.close()
+    return json.loads(transport.envelopes[0].decode().splitlines()[2])
+
+
+# spec: ANYM-410
+@pytest.mark.parametrize('component,text,detail,code', [
+    ('telegram', 'capture_overload', None, 'capture_overload'),
+    ('telegram', 'durable_capture_failed', None, 'durable_capture_failed'),
+    ('telegram', 'durable_capture_failed', 'spool_full', 'durable_capture_failed.spool_full'),
+    ('telegram', SECRET, None, 'collector_failed'),
+    ('whatsapp', 'provider_disconnected', None, 'provider_disconnected'),
+    ('whatsapp', SECRET, None, 'collector_failed'),
+])
+def test_collector_stop_event_carries_its_code_as_the_fingerprint(component, text, detail, code, monkeypatch):
+    event = stop_event(component, text, detail, monkeypatch)
+    assert event['fingerprint'] == ['collector-stop', component, code]
+    assert 'title' not in event
+
+
+# spec: ANYM-410
+def test_two_stop_codes_give_two_fingerprints_and_one_code_keeps_its_own(monkeypatch):
+    fingerprints = {code: stop_event('telegram', text, detail, monkeypatch)['fingerprint']
+                    for code, text, detail in [('capture_overload', 'capture_overload', None),
+                                               ('durable_capture_failed', 'durable_capture_failed', None),
+                                               ('durable_capture_failed.disk_reserve', 'durable_capture_failed', 'disk_reserve'),
+                                               ('durable_capture_failed.spool_full', 'durable_capture_failed', 'spool_full')]}
+    assert len({tuple(value) for value in fingerprints.values()}) == 4
+    # The same code under another exception type and other frames keeps one fingerprint on the wire.
+    transport = Transport()
+    client = Client('https://synthetic-key@ingest.example.test/synthetic-project',
+                    before_send=telemetry.before_send, transport=transport)
+    for exc in (error(), compile_error('store.py')):
+        event = telemetry.safe_event(exc, 'telegram', 'capture_overload')
+        event.update(event_id='e'*32, timestamp=1, environment='local-synthetic')
+        client.capture_event(event)
+    first, second = (json.loads(raw.decode().splitlines()[2]) for raw in transport.envelopes)
+    assert first['exception']['values'][0]['type'] != second['exception']['values'][0]['type']
+    assert first['exception']['values'][0]['stacktrace'] != second['exception']['values'][0]['stacktrace']
+    assert first['fingerprint'] == second['fingerprint'] == ['collector-stop', 'telegram', 'capture_overload']
+    assert first['fingerprint'] == fingerprints['capture_overload']
+
+
+def compile_error(name):
+    try:
+        exec(compile('raise ValueError(secret)', str(telemetry.ROOT / name), 'exec'), {'secret': SECRET})
+    except ValueError as exc:
+        return exc
+
+
+# spec: ANYM-410
+@pytest.mark.parametrize('injected', [
+    ['{{ default }}', SECRET], 'collector-stop', 5, [], [SECRET], ['collector-stop', 'telegram', SECRET], {'x': SECRET}])
+def test_an_injected_fingerprint_or_title_never_reaches_the_wire(injected):
+    transport = Transport()
+    client = Client('https://synthetic-key@ingest.example.test/synthetic-project',
+                    before_send=telemetry.before_send, transport=transport)
+    for component, code, expected in [('telegram', 'capture_overload', ['collector-stop', 'telegram', 'capture_overload']),
+                                      ('gateway', 'request_failed', None)]:
+        event = telemetry.safe_event(error(), component, code)
+        event.update(event_id='d'*32, timestamp=1, environment='local-synthetic', fingerprint=injected, title=SECRET)
+        client.capture_event(event)
+        sent = json.loads(transport.envelopes[-1].decode().splitlines()[2])
+        assert SECRET not in transport.envelopes[-1].decode() and 'title' not in sent
+        assert sent.get('fingerprint') == expected
+
+
+# spec: ANYM-410
+def test_unrelated_diagnostics_carry_no_fingerprint():
+    for component in telemetry.COMPONENTS - {'telegram', 'whatsapp'}:
+        assert 'fingerprint' not in telemetry.safe_event(error(), component, 'request_failed')
+    # A collector's non-stop capture still names its code, never a title.
+    event = telemetry.safe_event(error(), 'telegram', 'uncaught_exception')
+    assert event['fingerprint'] == ['collector-stop', 'telegram', 'uncaught_exception'] and 'title' not in event
+    # An invalid component or code builds no event, so no fingerprint is ever formed from it.
+    assert telemetry.safe_event(error(), 'telegram', SECRET) is None
+    assert telemetry.safe_event(error(), 'gateway', 'capture_overload') is None
+
+
+# spec: ANYM-410
+def test_telemetry_document_states_the_fingerprint_and_grouping_rule():
+    from pathlib import Path
+    text = (Path(__file__).resolve().parents[1]/'TELEMETRY.md').read_text()
+    assert '`fingerprint`' in text and '["collector-stop", <component>, <code>]' in text
