@@ -192,7 +192,7 @@ def main(argv=None):
     except SystemExit as exc:
         return int(exc.code or 0)
     except CalendarError as exc:
-        output({"error": exc.code})
+        output({"error": exc.code, **exc.details})
         return 1
     except KeyboardInterrupt:
         output({"error": "interrupted", "next_action": "inspect_run_status_before_retry"})

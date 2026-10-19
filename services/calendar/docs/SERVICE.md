@@ -67,6 +67,29 @@ uv run family-calendar service disable-write --calendar CALENDAR_REF
 
 Write opt-in gives a technical capability. The agent must have a user instruction for the specific change. Test checks do not change ordinary events.
 
+## Guardian rules
+
+A guardian rule says which adult drops a child off at, or picks them up from, an activity by default, and in which of that adult's calendars the drive will appear. Only the owner writes rules, from this CLI; agents only read them. A rule is not a write authorization: projecting drives (ANYM-433) stays a plan the agent previews and applies under a user instruction, with the usual grant, agent calendar list and write opt-in.
+
+```sh
+uv run family-calendar service guardian-rule set --dependent child --activity Dance --duty dropoff \
+  --guardian egor --source-calendar CHILD_REF --target-calendar EGOR_REF --lead-minutes 20 \
+  --title "Drive to dance" --visibility private [--copy-location] [--expected-version V]
+uv run family-calendar service guardian-rule disable --id RULE_ID [--expected-version V]
+uv run family-calendar service guardian-rule list
+```
+
+`set` creates a rule (version 1) or replaces the one for the same child, activity and duty (version +1, re-enabling a disabled rule), and records the adult as the child's guardian. The guardian must be an enabled group_admin, coordinator or adult and the child an enabled dependent (`invalid_guardian`); the source calendar must be bound to the child and the target to the guardian (`binding_required`); the lead time is 1-180 minutes (`invalid_lead_time`), the activity 1-64 and the title 1-128 characters (`invalid_rule`); a stale `--expected-version` is `version_conflict`. The title is the owner's text: the lesson's own title, description, guests and IDs are never copied, the place only with `--copy-location`. `--visibility` has no default (`visibility_required` prints both options); the command prints who will see the drive:
+
+| Target | `private` | `details` |
+|---|---|---|
+| Google | viewers of this calendar without edit rights see only busy | everyone who can see event details in this calendar sees the title and time (and place) |
+| iCloud | iCloud does not enforce private events: everyone who can see this calendar sees the title and time (and place) | the same |
+
+`disable` keeps the rule with `enabled=false` and version +1. `list` prints the rules without titles. Every `set` and `disable` writes one audit row (`guardian_rule_set`, `guardian_rule_disable`) with the rule ID only.
+
+Readiness: rules live in migration 2. The feature is off until the owner runs `migrate` (schema version 2) and then `db-roles` again, so the runtime role can read the new tables; until then every existing tool works as before. `capabilities` reports `features.guardian_projections` as `{"available": true}` or `{"available": false, "reason": "schema_not_ready" | "grants_not_ready"}`. The gateway role only reads both tables; the worker role reads rules and reads, inserts and updates projection links.
+
 ## Unified MCP
 
 The official Python MCP SDK; Streamable HTTP at `http://127.0.0.1:13232/mcp` with `Authorization: Bearer KEY`. The stdio proxy reads the key from a private file; the configuration holds only its path. For Codex use absolute paths:
@@ -102,7 +125,13 @@ Up to 31 days, 32 calendars, 500 events. Google pagination and the CalDAV REPORT
 
 `family_members` returns `availability_calendar_refs` and `availability_sources_status`
 for each member: `configured`, `unbound` or `inaccessible`. References to inaccessible
-calendars are hidden. Before searching for slots, check the sources against the owner's instruction.
+calendars are hidden. When guardian rules are ready, each dependent also gets `guardian_rules`
+(`rule_id, activity, duty, guardian_id, source_calendar_ref, target_calendar_ref, lead_minutes, title,
+visibility, copy_location, enabled, version, projection_ready, not_ready_reason`), but only for a key
+with `assignment:read` held by a group_admin, coordinator or adult of the family; dependents and helpers
+never get the key. A calendar the key cannot read is `null`. `not_ready_reason` is `disabled`,
+`target_not_visible`, `target_not_writable` (no `event:create`, provider read-only or write not enabled)
+or `source_not_visible` (the lesson calendar is not readable with details). Before searching for slots, check the sources against the owner's instruction.
 Do not include all visible calendars automatically: visibility does not mean participation in busy time.
 
 `family_slots` accepts an optional `additional_calendar_refs` — additional explicitly
@@ -149,7 +178,7 @@ Writing means guest-free events without special Google types, in three kinds. Fi
 - **An all-day event**: `all_day: true`, `start`/`end` as `YYYY-MM-DD` dates, `end` exclusive and optional (default `start` + 1 day), no `timezone` (`invalid_event` with `field_errors`; `end` not after `start`, longer than 31 days, or at the edge of the supported dates (`0001-01-01`, `9999-12-31`), is `invalid_window`). It is written as Google `start.date`/`end.date` and CalDAV `DTSTART;VALUE=DATE`/`DTEND;VALUE=DATE`, and read back as one `all_day` occurrence. Updating an all-day event with `all_day: true` keeps it all-day; a switch between timed and all-day is shown as `diff.all_day`.
 - **One occurrence of a recurring series**: `update` (title, time, location, description) or `delete` (= cancel) with the `event_ref` of an occurrence from the agenda. The preview shows `occurrence` (`series_ref` and the occurrence's `original_start`) and the field diff. Google: the instance is patched or deleted by its own ID with the instance ETag and `sendUpdates=none`; the master and the other instances are not written. CalDAV: one conditional `If-Match` PUT of the resource in which the override with the original `RECURRENCE-ID` is added or updated (a second edit updates the same override), or, for a cancel, a `STATUS:CANCELLED` override with the original `RECURRENCE-ID`. `EXDATE`, the master, other overrides, `VALARM`, `VTIMEZONE` and unknown properties are not changed. An occurrence cannot switch between timed and all-day. An occurrence (or series) that is `CANCELLED` in the provider is not brought back by an edit or cancelled twice: the step is a `version_conflict` and nothing is written.
 
-Refused with `capability_unverified`: a series-wide target (a master, or an occurrence row without `series_ref`/`original_start`, for example stored before this scope existed; a refresh re-publishes it), this-and-following (`RANGE=THISANDFUTURE`), occurrences or series with guests (`attendees`, `ATTENDEE`/`ORGANIZER`), special Google types. `capabilities` reports `occurrence_write`, `all_day_write` and `provider_write` (per provider) as true; `recurrence_write`, `future_split` and `invitations` stay false. A cancelled CALDAV override is the standard model (RFC 5545 §3.8.4.4); how iCloud and the Apple Calendar client show it is **not verified live** (owner check, ANYM-234 criterion 11). `shift_series` and `split_future` of the harness are not included in MCP. Duties `dropoff/pickup/stay_with_child` are stored separately: assigned takes a slot, proposed does not. Change/cancel by `assignment_id` and `expected_version`. The consent of another person is not asserted. There is no automatic link to the child's activity and no projections into the parents' calendars yet.
+Refused with `capability_unverified`: a series-wide target (a master, or an occurrence row without `series_ref`/`original_start`, for example stored before this scope existed; a refresh re-publishes it), this-and-following (`RANGE=THISANDFUTURE`), occurrences or series with guests (`attendees`, `ATTENDEE`/`ORGANIZER`), special Google types. `capabilities` reports `occurrence_write`, `all_day_write` and `provider_write` (per provider) as true; `recurrence_write`, `future_split` and `invitations` stay false. A cancelled CALDAV override is the standard model (RFC 5545 §3.8.4.4); how iCloud and the Apple Calendar client show it is **not verified live** (owner check, ANYM-234 criterion 11). `shift_series` and `split_future` of the harness are not included in MCP. Duties `dropoff/pickup/stay_with_child` are stored separately: assigned takes a slot, proposed does not. Change/cancel by `assignment_id` and `expected_version`. The consent of another person is not asserted. Guardian rules (section "Guardian rules") say who drives by default; there are no projections into the parents' calendars yet.
 
 ## Coverage and read errors
 

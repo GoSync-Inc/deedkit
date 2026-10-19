@@ -87,6 +87,25 @@ def parser():
     disconnect.add_argument("--connection", required=True)
     reconcile = sub.add_parser("reconcile")
     reconcile.add_argument("--operation", required=True)
+    rules = sub.add_parser("guardian-rule").add_subparsers(dest="rule_action", required=True)
+    rule = rules.add_parser("set")
+    rule.add_argument("--group", default="family")
+    rule.add_argument("--dependent", required=True)
+    rule.add_argument("--activity", required=True)
+    rule.add_argument("--duty", required=True, choices=["dropoff", "pickup"])
+    rule.add_argument("--guardian", required=True)
+    rule.add_argument("--source-calendar", required=True)
+    rule.add_argument("--target-calendar", required=True)
+    rule.add_argument("--lead-minutes", required=True, help="Travel time before drop-off or after pick-up, 1-180")
+    rule.add_argument("--title", required=True, help="Title of the projected drive; the lesson's own is never copied")
+    # No default: the owner chooses who sees the drive (visibility_required prints both consequences).
+    rule.add_argument("--visibility", choices=["private", "details"])
+    rule.add_argument("--copy-location", action="store_true")
+    rule.add_argument("--expected-version")
+    disable_rule = rules.add_parser("disable")
+    disable_rule.add_argument("--id", required=True)
+    disable_rule.add_argument("--expected-version")
+    rules.add_parser("list")
     return p
 
 
@@ -239,6 +258,25 @@ def dispatch(args, home, root, config, store):
     if args.action == "extend-agent":
         previous, new = store.extend_agent(args.id, args.days)
         return {"principal_id": args.id, "previous_expires_at": previous.isoformat(), "expires_at": new.isoformat()}
+    if args.action == "guardian-rule":
+        if args.rule_action == "set":
+            return store.guardian_rule_set(
+                args.group,
+                args.dependent,
+                args.activity,
+                args.duty,
+                args.guardian,
+                args.source_calendar,
+                args.target_calendar,
+                args.lead_minutes,
+                args.title,
+                args.visibility,
+                args.copy_location,
+                args.expected_version,
+            )
+        if args.rule_action == "disable":
+            return store.guardian_rule_disable(args.id, args.expected_version)
+        return {"guardian_rules": store.guardian_rule_list()}
     if args.action == "disconnect":
         with store.transaction() as c:
             c.execute(

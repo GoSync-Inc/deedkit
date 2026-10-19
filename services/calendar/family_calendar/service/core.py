@@ -267,7 +267,58 @@ class FamilyService:
             member["availability_sources_status"] = (
                 "unbound" if not rows else "configured" if len(refs) == len(rows) else "inaccessible"
             )
+        if self.rule_reader(p) and not self.store.guardian_readiness():
+            rules = self.store.query(
+                "SELECT * FROM guardian_rules WHERE group_id=%s ORDER BY activity,duty,id", (p["group_id"],)
+            )
+            for member in result["members"]:
+                if member["role"] == "dependent":
+                    member["guardian_rules"] = [
+                        self.rule_view(p, r) for r in rules if r["dependent_id"] == member["person_id"]
+                    ]
         return result
+
+    @staticmethod
+    def rule_reader(p):
+        """The one rule-read policy: adult roles of the rule's group holding assignment:read."""
+        return p["role"] in ("group_admin", "coordinator", "adult") and "assignment:read" in p["scopes"]
+
+    def _can(self, p, calendar_ref, scope, details=False):
+        try:
+            _, c = self.authorize(None, calendar_ref, scope, principal_id=p["id"])
+        except CalendarError:
+            return False
+        return not details or c["visibility"] == "details"
+
+    def rule_view(self, p, rule):
+        """A rule as `p` may see it: calendars it cannot read are null; not_ready_reason says why no drive is planned."""
+        visible = {
+            ref: self._can(p, ref, "agenda:read") or self._can(p, ref, "availability:read")
+            for ref in (rule["source_calendar_ref"], rule["target_calendar_ref"])
+        }
+        reason = (
+            "disabled"
+            if not rule["enabled"]
+            else "target_not_visible"
+            if not visible[rule["target_calendar_ref"]]
+            else "target_not_writable"
+            if not self._can(p, rule["target_calendar_ref"], "event:create")
+            else "source_not_visible"
+            if not self._can(p, rule["source_calendar_ref"], "agenda:read", details=True)
+            else None
+        )
+        view = {k: rule[k] for k in ("activity", "duty", "guardian_id", "lead_minutes", "title", "visibility")}
+        return dict(
+            view,
+            rule_id=rule["id"],
+            source_calendar_ref=rule["source_calendar_ref"] if visible[rule["source_calendar_ref"]] else None,
+            target_calendar_ref=rule["target_calendar_ref"] if visible[rule["target_calendar_ref"]] else None,
+            copy_location=rule["copy_location"],
+            enabled=rule["enabled"],
+            version=rule["version"],
+            projection_ready=reason is None,
+            not_ready_reason=reason,
+        )
 
     def capabilities(self, key):
         calendars = self.calendars(key)
@@ -311,8 +362,13 @@ class FamilyService:
                 "window_limit_days": 31,
                 "event_limit": 500,
                 "atomic_cross_provider": False,
+                "guardian_projections": self.guardian_projections(),
             },
         )
+
+    def guardian_projections(self):
+        reason = self.store.guardian_readiness()
+        return {"available": True} if not reason else {"available": False, "reason": reason}
 
     def agenda(self, key, calendar_refs, start, end, scope="agenda:read"):
         a, b = window(start, end)
