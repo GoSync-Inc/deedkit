@@ -512,6 +512,33 @@ seconds after start. Collectors, workers, indexer and enrichment expose no
 container-local health signal and are verified only as running. Docker does not
 restart an unhealthy container; monitor `docker ps`/`health_status` events.
 
+A plan A stop never cuts a call (ANYM-442): restarting the calls service ends
+every unfinished call as `interrupted`, and the Telegram collector carries
+Telegram call audio, so apply waits while any call is active in any running
+container of a configured `calls` service (found by its Compose labels). It
+checks after its local checks, again after the last CI check, and before each
+later project's `stop`; it polls every 10 seconds for at most 15 minutes per
+wait and prints one stderr line, `calls check: no active call` or
+`calls check: waiting for ...` with the call IDs and statuses (`waiting_for_browser`,
+`dialing`, `ringing`, `connecting`, `active`) or an error category. Each read
+runs in a container of its own from the calls container's image: no network,
+no capabilities, read-only root, 64 MiB and 16 processes, the calls user and
+the calls state directory mounted read-only. The probe interrupts its query
+after 0.25 seconds and dies after 1 second, so the service's own writes wait at
+most that long; a probe the tool gave up on is killed by name
+(`deedkit-calls-probe-<hex>`). The host's root opens no file in the calls state
+directory and makes no request to the calls service. At the bound apply refuses
+with `a call is active: ...` or, when the last read failed (busy, a hot
+journal, a missing mount, a probe timeout or output that is not IDs and
+statuses), `whether a call is active could not be read: <category>`; it never
+proceeds on doubt and never stops a service for it. A refusal at the first
+wait writes nothing (retry the same `apply` later). A refusal before a later
+project leaves `attempted.json` with some projects updated: recover it as an
+interrupted multi-project apply (above). A call that starts in the seconds
+between the last read and the `stop` is still cut; the calls service has no
+drain switch. Undo: revert the change; the hand check (read `voice.sqlite3`
+read-only for those five statuses before an apply) stays the fallback.
+
 `current.json` is written only after every selected replacement runs its prepared
 image. It records image/start verification; it is not a claim that every upstream
 provider or client is healthy. `result.json` and `current.json` also record the
@@ -556,6 +583,9 @@ ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 `promotable()` (the previous revision is no longer current `main`), does not run or
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
+Like apply, it waits for active calls ("Apply and verify") before it writes
+`rollback-attempted.json` and before each later project's `stop`; a refusal
+before a later project leaves the rollback unfinished.
 
 Under the host lock it refuses before stopping anything unless all of these
 hold: `<sha>` is `current.json`'s release with status `applied` and has a
@@ -727,9 +757,16 @@ the count. A failed `git ls-remote` or mirror fetch (any cause, the
 mirror check included) changes nothing: the run prints `fetch_failed` with
 git's last error line, exits 1 and counts it in `deploy.json`
 (`fetch_failures`); a successful fetch resets the count, and the third failure
-in a row (about 15 minutes on the timer) pauses. An error after a release step started pauses as an unknown state. When plan A failed its health wait (`unhealthy`, above), it runs
+in a row (about 15 minutes on the timer) pauses. When apply waited out an
+active call, or could not read whether one is active, before any change
+("Apply and verify"), the run ends `waiting` with that reason and keeps the
+prepared release: the next run applies it while that commit is still the
+candidate, or takes a newer attested one. `deploy.json` counts such runs in a
+row (`call_waits`); the fourth (about an hour and a half of waiting) pauses
+with the last reason, and a run that writes any other outcome there clears it. A
+`--dry-run` never waits and keeps the count. An error after a release step started pauses as an unknown state; a call refusal before a later project is one. When plan A failed its health wait (`unhealthy`, above), it runs
 `rollback` once (automatic deploys never change the SQL inventory) and pauses
-with status `rolled-back`; a failed rollback, or an apply that stopped in any
+with status `rolled-back`; a failed rollback (a call refusal there included), or an apply that stopped in any
 other state, pauses with no further action. A failed plan B pauses and leaves
 plan A applied (the serving HTTP pair is unchanged or awaits recovery
 inspection). `--dry-run` changes no release or runtime state (it may update
