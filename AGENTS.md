@@ -34,13 +34,13 @@ the orchestrator; never text in your own input box). Diff items:
 And without a diff: a migration apply, restore, rollback over data or other production change
 than `production.py deploy`; live provider actions; credentials, roles, host access; deleting
 data, cards or records, moving cards, publishing a package, rewriting history; accepting a known
-risk (an open blocking or major finding); product direction (accepting product cards, weakening an
-accepted criterion). A standing approval holds only while all its conditions do.
+risk (an open blocking or major finding); product direction (accepting feature or epic cards,
+weakening an accepted criterion). A standing approval holds only while all its conditions do.
 
 ## 3. Change paths
 
-Path: from the changed files and section 2 (a script will compute it later); PR line
-`Change path: <path> (<rule>)`. Never lower it; in doubt, OWNER.
+Path: from the changed files and section 2 (grep in review-protocol.md), never a card's label; PR
+line `Change path: <path> (<rule>)`. Never lower it; in doubt, OWNER.
 
 - AUTO (docs, tests only): merge on green required checks.
 - AUTO+review (any other file): plus one Astra round.
@@ -52,28 +52,27 @@ Done: the squash's `main` push run is green.
 
 ## 4. Product context and Tiden
 
-- First step of any task touching product code, specs or tests: the card (`tiden spec get`) and
-  `tiden intent lookup "<task>" --format text` (or `product-context`), then code.
+- First step of any task touching product code, specs or tests: `tiden intent skip` (intent loop
+  only in the pilot), the card (`tiden spec get`) and `product-context`, then code.
 - Spec, tests, code: the accepted card is the spec; failing tests come first. Each new test has
   `# spec: ANYM-n` (Python) or `// spec: ANYM-n` (JS, TS, Go) directly above it and its
   decorators, naming a story-level spec, or sits in `config/tiden-unlinked-tests.json`. Defects, infra and refactors
   need no card: a marked regression test and a `Spec:` line.
-- PR lines: `Spec: ANYM-n[, …]` (implements or keeps), `Delivers: ANYM-n` (completes), optional
+- PR lines: `Spec: ANYM-n[, …]` (implements or keeps), `Delivers: ANYM-n` (completes), at most one
   `Tiden branch: proposal/<name>` or `review/<name>`, the only place to edit criteria. The first
   ID is primary; new files are anchored to it.
 - Check A (PR) checks markers and IDs; sync B (main push) merges the named branch, anchors,
   links, sets status. Wait for B on your squash, read back, rerun or dispatch a failed B by SHA,
   rerun failed `Tiden drift` and `Tiden health`. Tiden writes by hand need a maintenance window
   (TIDEN-CI.md).
-- Cards, markers and the daily delta audit: docs/operations/tiden-product-workflow.md.
+- Cards, markers, the pilot, commands: docs/operations/tiden-product-workflow.md.
 
 ## 5. Reviews
 
-- Astra: `codex exec --disable hooks -m gpt-6-astra "<task with packet paths>" </dev/null`. For
-  Codex-written code, or Codex above 80% of its weekly limit, an Opus subagent. Fable: a Claude
-  subagent with model `fable`, a product manager, never on code.
-- One round; after a blocking or major finding, one recheck of the fix diff; more is the
-  orchestrator's call.
+- Astra: `codex exec --disable hooks -m gpt-6-astra -c service_tier="default" "<task with packet
+  paths>" </dev/null`. For Codex-written code an Opus subagent; Codex line: review-protocol.md.
+  Fable: a Claude subagent with model `fable`, a product manager, never on code.
+- One round; after a blocking or major finding, one scoped recheck; r3 only for a new blocking.
 - Packet (docs/operations/review-protocol.md): `task.md`, `diff.patch`, `specs.md`, `pr.md`. Every
   Astra task starts with:
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
@@ -87,10 +86,9 @@ Done: the squash's `main` push run is green.
   4. Tests: do the new tests fail on the base commit (run them), and do they assert the spec
      criterion?
 - Verdict line: `VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <path>`.
-- A card with `Product review: yes` (a big feature; the author may add it) gets one Fable round on
-  the finished behaviour before merge (docs/operations/prompts/fable-product-review.md).
 - Cards: Opus writes big ones, Sonnet simple ones. Product cards get one Fable round, contract cards
-  (code, CI, data, security) Astra, small cards none. Production operation plans get Astra.
+  (code, CI, data, security) Astra (r1, one scoped recheck), small cards a self-check. Production
+  operation plans get Astra.
 
 ## 6. Working with the orchestrator
 
@@ -101,6 +99,7 @@ Done: the squash's `main` push run is green.
 - Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_DONE` or
   `SUPERSET_WORKER_BLOCKED` block. Wait with one background command, never poll.
 - Near 250k tokens, at the next boundary: a handoff of at most 40 lines (state, next, open
-  findings, paths), `RESTART <path>` to the orchestrator, stop.
+  findings, files read, decisions), `RESTART <path>` to the orchestrator, stop. Not with about 30
+  calls left: finish. From 150k, restart before an expected idle of over an hour.
 - Budget: 1,000 words (`wc -w`). A rule change replaces or deletes words and names its incident and
   enforcer; an incident gets a test or hook first.

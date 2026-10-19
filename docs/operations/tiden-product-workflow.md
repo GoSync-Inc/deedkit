@@ -47,13 +47,14 @@ audits. A worker that finds work outside its task reports it to the orchestrator
    cards, Sonnet for simple ones.
 3. **Review** by kind (AGENTS.md section 5): product cards (feature, improvement, epic) one Fable
    round with the product-manager prompt; cards that set a contract in code, CI, data or security
-   Astra; small cards none. Reviewers first judge whether the card should exist and may shrink or
-   reject it.
-4. **Accept.** The owner accepts product cards (feature, improvement, product epics); the
-   orchestrator the others.
-   Record who accepted.
+   Astra r1 and at most one scoped recheck; small cards the author's self-check. Reviewers first
+   judge whether the card should exist and may shrink or reject it.
+4. **Accept.** The owner accepts feature and epic cards; the orchestrator the others
+   (improvement, defect, infra, refactor, research). Record who accepted.
 5. **Queue.** Current breakages and deadlines first; then about 70% product and 30% engineering
-   by Effort, at least one refactor when one is ready, each share by Score.
+   by Effort, at least one refactor when one is ready, each share by Score. From 10-19 no new
+   meta-research or process tooling is queued until ten product cards are delivered, unless the
+   owner asks; incident fixes are allowed.
 
 ```text
 Title: <plain words: what changes for the owner>
@@ -64,7 +65,6 @@ Category: defect | feature | improvement | infra | refactor | research
 Lane: <lane>   Expected paths: <paths>
 Depends on: <ANYM-n, or none>
 Priority: High | Medium | Low (Tiden's priority field)
-Product review: yes | no (yes for a new capability, an epic-level change or one felt in several places)
 Boundary: <what is already implemented; what remains>
 Evidence to close: <tests and checks; any separately authorized live action>
 Value: <1|2|3|5|8>   Effort: <1|2|3|5|8; 13 and 21 only before the split>   Score: <Value / Effort, two decimals>
@@ -91,24 +91,39 @@ a suspect spec is not proof that its tests cover the incident. Resolve an issue 
 matching regression test fails before and passes after the fix, never on age or a nearby green
 test, and never start a provider session or weaken redaction to diagnose one.
 
-## Daily delta audit
+## One Tiden branch per pull request (intent-loop pilot, owner 10-19)
 
-Once a day a Sonnet session, started by the orchestrator, takes the files changed on `main`
-since the last audited SHA, reads each spec anchored to them against the code, corrects stale
-text outside the criteria on a `review/<date>-delta-audit` branch, and reports criterion
-mismatches to the orchestrator as card candidates. It records the audited SHA on that branch.
-Criteria change only through a card's branch reviewed with its PR.
+A worker runs `tiden intent skip` and reads the card and `product-context` before code; it
+opens no `intent/` branch. The card's proposal or review branch carries the card and any
+criterion edit made while coding; the PR names it as `Tiden branch:`, check A reads its specs
+and sync B merges it after the squash. A PR that delivers no new card and changes no criterion
+names no branch. Each deliverable has its own branch, because B merges only the specs a PR names.
 
-## Read-only commands
+Pilot: the full intent loop (`tiden intent start`, settle, close) stays only for the large
+features of the wave, ANYM-228 and ANYM-234. After the wave the owner decides again on the
+numbers: defects that escaped, minutes lost to Tiden friction and decisions lost between
+sessions. The pilot's findings also go to Tiden's founder as feedback.
+
+Criteria change only through a card's branch reviewed with its PR; no daily delta audit runs.
+
+## Commands (CLI 0.33.0)
 
 ```sh
-tiden spec list --branch main --include-sources --format json
+tiden intent skip --reason "<why>"                                   # first Tiden call
+tiden spec get <id> --format json | jq '{title, status, content}'     # the card, once
+tiden intent lookup "<task>" --path <repo path> --output <file>       # context, once, saved
+tiden spec list --branch main --include-sources --format json         # anchors; save, then jq
 tiden branch list --format json
-tiden branch merge-preview --name <branch> --format json
+tiden branch create --name proposal/<date>-<slug> --description "<card>"   # card writers
+tiden spec create --branch <branch> --title "<t>" --type "User Story" --parent-id <id> --content-file <f>
+tiden spec update --id <id> --branch <branch> --content-file <f>      # only on the PR's branch
+tiden branch merge-preview --name <branch> --format json              # before naming it in a PR
 tiden drift status --product-id <product-id> --format json
 ```
 
-Honour pagination (`nextPageToken` empty, `totalCount` equal to the rows) and save complete JSON
+No `spec update` on main, `branch merge`, `test link-spec` or hand-written `--sources-file`:
+sync B does those. A failed read-only listing is rerun once; a write is never retried. Honour
+pagination (`nextPageToken` empty, `totalCount` equal to the rows) and save complete JSON
 before summarizing it. A CLI failure is unknown state. Bulk maintenance (snapshots, provenance,
 manual watermark advances) follows
 [the reconciliation receipt](../quality/tiden-reconciliation-2026-10-16.md#maintenance-procedures).

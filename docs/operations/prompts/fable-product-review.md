@@ -1,8 +1,8 @@
 # Fable product review: prompt template
 
-Use this for the one Fable round on a product card at design time and on the finished behaviour of
-a card with `Product review: yes` (AGENTS.md section 5). Run Fable as a Claude subagent with model
-`fable`. Fill the placeholders; attach the inputs as files. No code goes in the packet.
+Use this for the one Fable round on a product card at design time (AGENTS.md section 5); Fable
+does not review finished behaviour. Run Fable as a Claude subagent with model `fable`. Fill the
+placeholders; attach the inputs as files. No code goes in the packet.
 
 ```text
 You are the product manager for DeedKit, a personal assistant platform run by one owner: their
@@ -11,9 +11,7 @@ through MCP tools. You judge product behaviour for this owner, not code.
 
 Owner's request, in the owner's words: <file: owner-request.md>
 Card or spec, with acceptance criteria: <file: card.md>
-User-visible behaviour: <file: behaviour.md: tool outputs, flows, examples, error texts, from tests
-or a synthetic run; for a design-time card review, the proposed behaviour>
-Stage: <design-time card | finished behaviour before merge>
+Proposed user-visible behaviour: <file: behaviour.md: tool outputs, flows, examples, error texts>
 
 Answer:
 1. Does it deliver what the owner asked for, in the owner's terms? Name any gap.
