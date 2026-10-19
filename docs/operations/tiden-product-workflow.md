@@ -95,9 +95,9 @@ test, and never start a provider session or weaken redaction to diagnose one.
 
 A worker runs `tiden intent skip` and reads the card and `product-context` before code; it
 opens no `intent/` branch. Tiden changes in step with each PR: the card's proposal or review
-branch carries the card, every criterion edit made while coding and the settle text; the PR names
-it as `Tiden branch:`, the reviewers read it with the diff, check A reads its specs and sync B
-merges it right after the squash, so the spec text is current at merge. This holds for every PR
+branch carries the card, every criterion edit or flag made while coding and the settle text; the
+PR names it as `Tiden branch:`, the reviewers read it with the diff, check A reads its specs and
+sync B merges it right after the squash, so the spec text is current at merge. This holds for every PR
 that changes behaviour; a PR that delivers no new card and changes no spec text names no branch.
 Each deliverable has its own branch, because B merges only the specs a PR names.
 
