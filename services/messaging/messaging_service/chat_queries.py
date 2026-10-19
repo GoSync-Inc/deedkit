@@ -91,6 +91,8 @@ def title_sql(chat='c'):
 DEMOTIONS={'one_way_chat':-60,'provider_business_or_verified':-40,'own_account':-80,'closing_courtesy':-30,'observed_bot':-20}
 # A person's question that mentions the owner in a group outranks a demoted one-way private mailing (owner decision 2026-10-19).
 OWNER_QUESTION=40
+# Priority cursors bind the scoring formula: a position from another formula would skip rows after a deploy. Bump with any weight change.
+SCORE_FORMULA=2
 COURTESY_WORDS=('спасибо','спс','благодарю','ок','окей','хорошо','ясно','понятно','понял','поняла','принято','отлично','супер',
     'взаимно','пожалуйста','thanks','thank you','thx','ty','ok','okay','noted','got it','great','perfect','cool','appreciated',
     'terima kasih','makasih','trims','oke','siap','baik','sip','mantap','ya','iya')
@@ -166,7 +168,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         'exclude_channels':exclude_channels,'awaiting_reply':awaiting_reply,'awaiting_reply_days':awaiting_reply_days,
         'from':lower,'to':upper,'exclude_chats':exclude_chats,'exclude_senders':exclude_senders,
         'only_questions':only_questions,'only_unread':only_unread,
-        **({'exclude_likely_broadcasts':True} if exclude_likely_broadcasts else {})})
+        **({'exclude_likely_broadcasts':True} if exclude_likely_broadcasts else {}),
+        **({'score_formula':SCORE_FORMULA} if order=='priority' else {})})
     if view=='conversation':
         binding=cursor_binding(p,'chats-conversation-v1',{'archive_binding':binding})
     pos=decode_cursor(after,binding) if after and order!='id' else None

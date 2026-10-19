@@ -346,3 +346,24 @@ def test_owner_question_bonus_is_narrow(demote):
     assert 'chan' not in got
     # Every private question without a demotion still outranks the best group hint, bonus included.
     assert got['priv']['awaiting_reply_priority']>got['plain']['awaiting_reply_priority']
+
+
+# spec: ANYM-276
+def test_priority_cursor_from_another_scoring_formula_is_rejected(demote, monkeypatch):
+    s,ar,key,add,history,queue,rows=demote
+    from messaging_service import chat_queries
+    add('mailing','1',240,body='Your statement is ready. Questions?',sender='BANK')
+    add('g1','1',20,chat_type='group',body='@owner can you confirm?',sender='P1',mentions_owner=True)
+    add('g2','1',3,chat_type='group',body='@owner where is the file?',sender='P2',mentions_owner=True)
+    page=queue(order='priority',limit=1)
+    # Same formula: the cursor continues the traversal without losing a row.
+    seen=[r['provider_chat_id'] for r in page['items']]
+    while page['next_cursor']:
+        page=queue(order='priority',limit=1,after=page['next_cursor']);seen+=[r['provider_chat_id'] for r in page['items']]
+    assert sorted(seen)==['g1','g2','mailing']
+    # A cursor minted before the formula changed would drop rows whose score rose past its boundary: restart instead.
+    monkeypatch.setattr(chat_queries,'SCORE_FORMULA',1)
+    old=queue(order='priority',limit=1)['next_cursor']
+    monkeypatch.undo()
+    with pytest.raises(APIError,match='invalid_cursor'):
+        queue(order='priority',limit=1,after=old)
