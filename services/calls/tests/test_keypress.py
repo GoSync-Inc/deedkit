@@ -272,6 +272,8 @@ async def test_rejected_or_failing_keypress_sends_nothing_and_keeps_the_call(tmp
         failed=[e for e in store.get_call(cid)['events'] if e['kind']=='keypress_failed']
         assert [e['keys'] for e in failed]==['3','4','4']
         assert not keypad.playing()
+        await asyncio.sleep(0.2)
+        assert socket.media()==[]
         # Later model audio still reaches the socket, and the call is still active.
         await transport.output().queue_frame(speech(400))
         await until(lambda:len(socket.media())==10)

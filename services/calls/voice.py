@@ -100,7 +100,7 @@ class KeypadTones:
         seconds=len(audio)/(2*self.rate)
         self.pending+=len(audio)
         # A stalled sender must not hold back interruptions for long.
-        self.deadline=max(self.deadline,time.monotonic())+seconds+30
+        self.deadline=max(self.deadline,time.monotonic()+seconds+30)
         try:await self.output.queue_frame(frame)
         except BaseException:
             self.pending=max(0,self.pending-len(audio));raise
