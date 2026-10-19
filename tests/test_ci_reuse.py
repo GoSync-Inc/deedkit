@@ -27,7 +27,7 @@ GO_IDENTITIES = json.loads((ROOT / "tests/fixtures/tiden-go-identities.json").re
 
 def go_test(check):
     """The package and the name of one real top-level test of a Go check's module."""
-    module = tiden_ci.GO_MODULE.search((ROOT / tiden_ci.MODULE_REPORTS[check][2] / "go.mod").read_text()).group(1)
+    module = tiden_ci.go_module_of(ROOT, check)
     return module, next(item["title"] for item in GO_IDENTITIES
                         if item["signature"].startswith(module + "::") and "/" not in item["title"])
 
@@ -1474,10 +1474,14 @@ def without_check_rows(evidence, *names):
     (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [
         {**row, "execution": {"status": "failed", "duration": 0}} for row in rows])}, "whatsmeow report has no passing"),
     (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [
-        *rows, {**rows[0], "execution": {"status": "failed", "duration": 0}}])}, "whatsmeow report has no passing executions or a failure"),
+        *rows, {**rows[0], "id": "00000000-0000-5000-8000-000000000002", "signature": rows[0]["signature"] + "/failed",
+                "title": rows[0]["title"] + "/failed", "execution": {"status": "failed", "duration": 0}}])},
+     "whatsmeow report has no passing executions or a failure"),
     (lambda e: {"normalized-release_router.json": go_rows(e, "release_router", lambda rows: [
         {**row, "execution": {"status": "skipped", "duration": 0}} for row in rows])}, "release_router report has no passing"),
-    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: rows * 2)}, "test counts differ"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [*rows, {
+        **rows[0], "id": "00000000-0000-5000-8000-000000000001", "signature": rows[0]["signature"] + "/extra",
+        "title": rows[0]["title"] + "/extra"}])}, "test counts differ"),
     (lambda e: {"manifest.json": rewrite(e, "manifest.json", reports=[
         name for name in json.loads((e / "manifest.json").read_text())["reports"] if name != "normalized-whatsmeow.json"])},
      "does not list every required report"),
@@ -1487,9 +1491,24 @@ def without_check_rows(evidence, *names):
     (lambda e: {"ci-checks.json": json.dumps([{**row, "execution": {"status": "blocked", "duration": 0}}
                                               if row["signature"] == "deedkit-ci::whatsmeow" else row
                                               for row in json.loads((e / "ci-checks.json").read_text())]).encode()}, "check rows"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [{**rows[0], "id": []}])},
+     "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [{**rows[0], "suitePath": None}])},
+     "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [
+        {**rows[0], "execution": {"status": "passed", "duration": -1}}])}, "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [
+        {**rows[0], "execution": {**rows[0]["execution"], "output": "x"}}])}, "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [
+        {**rows[0], "fields": {**rows[0]["fields"], "output": "x"}}])}, "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "release_router", lambda rows: rows)},
+     "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [*rows, rows[0]])},
+     "whatsmeow report is unsafe or malformed"),
 ], ids=["extra-row-field", "malformed-signature", "empty-report", "not-json", "failed-rows", "one-failed-row", "only-skipped",
         "counts-differ", "unlisted-report", "no-go-check-rows", "no-release-router-row", "duplicate-check-rows",
-        "blocked-go-check-row"])
+        "blocked-go-check-row", "row-id-not-a-uuid", "suite-path-null", "negative-duration", "nested-execution-field",
+        "nested-fields-field", "other-module-rows", "duplicate-row"])
 def test_queue_evidence_with_unusable_go_results_is_refused(tmp_path, damage, reason):
     evidence = queue_evidence(tmp_path)
     data = archive(evidence, change=damage(evidence))

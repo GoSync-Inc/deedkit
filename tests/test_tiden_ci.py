@@ -2008,6 +2008,46 @@ func TestHangs(t *testing.T) {}
 
 
 # spec: ANYM-421
+def test_go_subtest_names_with_slashes_colons_or_spaces_keep_their_exact_leaf_identity(tmp_path):
+    from scripts.tiden_ci import go_results
+    module = go_module(tmp_path, "whatsmeow", "func TestSlashes(t *testing.T) {}\nfunc TestSymbols(t *testing.T) {}\n")
+    events = []
+    # `t.Run("a/b", ...)` reports `TestSlashes/a/b` with no `TestSlashes/a` event; `go test` writes a space as `_`.
+    for name in ("TestSlashes", "TestSlashes/a/b", "TestSymbols", "TestSymbols/with:colon", "TestSymbols/with_space",
+                 "TestSymbols/ünïcode"):
+        events.append({"Action": "run", "Package": module, "Test": name})
+    for name in ("TestSlashes/a/b", "TestSlashes", "TestSymbols/with:colon", "TestSymbols/with_space", "TestSymbols/ünïcode",
+                 "TestSymbols"):
+        events.append({"Action": "pass", "Package": module, "Test": name, "Elapsed": 0.01})
+    stream = tmp_path / "whatsmeow.json"
+    stream.write_text(go_stream(*events, {"Action": "pass", "Package": module}))
+    rows, counts, unexplained = go_results(stream, tmp_path, "whatsapp/whatsmeow", ATTEMPT_URL, "whatsmeow")
+    assert [row["signature"] for row in rows] == [f"{module}::TestSlashes/a/b", f"{module}::TestSymbols/with:colon",
+                                                  f"{module}::TestSymbols/with_space", f"{module}::TestSymbols/ünïcode"]
+    assert counts == Counter(passed=4) and not unexplained
+
+
+# spec: ANYM-421
+@pytest.mark.parametrize("text, module", [
+    ("module example.com/bare\n", "example.com/bare"), ('module "example.com/quoted"\n', "example.com/quoted"),
+    ("module `example.com/raw`\n", "example.com/raw"), ("module example.com/commented // note\n", "example.com/commented"),
+    ("// module example.com/not\ngo 1.26\n", None), ("go 1.26\n", None)],
+    ids=["bare", "quoted", "raw", "commented", "commented-out", "none"])
+def test_a_go_mod_module_path_is_read_bare_quoted_or_commented(tmp_path, text, module):
+    from scripts.tiden_ci import go_module_path, go_results
+    assert go_module_path(text) == module
+    if module:
+        directory = tmp_path / "whatsapp/whatsmeow"
+        directory.mkdir(parents=True)
+        (directory / "go.mod").write_text(text)
+        (directory / "x_test.go").write_text('package x\n\nimport "testing"\n\nfunc TestPasses(t *testing.T) {}\n')
+        stream = tmp_path / "whatsmeow.json"
+        stream.write_text(passing_go_stream(module))
+        rows = go_results(stream, tmp_path, "whatsapp/whatsmeow", ATTEMPT_URL, "whatsmeow")[0]
+        assert [row["signature"] for row in rows] == [f"{module}::TestPasses"]
+
+
+# spec: ANYM-421
 def test_a_go_test_stream_becomes_one_result_row_per_test_under_its_existing_go_identity(tmp_path):
     from scripts.tiden_ci import go_results, row_id
     module = go_module(tmp_path, "whatsmeow", GO_SOURCE, file="cases_test.go")
@@ -2076,6 +2116,8 @@ def test_the_real_go_suites_produce_every_existing_tiden_go_identity(tmp_path):
     assert identities and {item["signature"]: (item["title"], [{"title": item["suite"]}], item["file"])
                            for item in identities}.items() <= produced.items()
     assert {row["execution"]["status"] for row in rows} == {"passed"}
+    # Leaf-only: no row is an ancestor of another, so a new test cannot add a parent row unnoticed.
+    assert not [name for name in produced if any(other.startswith(name + "/") for other in produced)]
 
 
 def broken_go_stream(case, root, module):
@@ -2096,6 +2138,12 @@ def broken_go_stream(case, root, module):
         (root / "whatsapp/escaped").mkdir(parents=True, exist_ok=True)
         (root / "whatsapp/escaped/e_test.go").write_text('package e\n\nimport "testing"\n\nfunc TestEscaped(t *testing.T) {}\n')
         return go_stream(passing, {"Action": "pass", "Package": module + "/../escaped", "Test": "TestEscaped"})
+    if case == "unhashable-action":
+        return go_stream(passing, {"Action": [], "Package": module, "Test": "TestPasses"})
+    if case == "empty-event":
+        return go_stream(passing, {})
+    if case == "foreign-package-event":
+        return go_stream(passing, {"Action": "pass", "Package": "example.com/foreign"})
     if case == "undeclared-test":
         return go_stream(passing, {"Action": "pass", "Package": module, "Test": "TestNowhere"})
     if case == "ambiguous-test-file":
@@ -2111,7 +2159,8 @@ def broken_go_stream(case, root, module):
 # spec: ANYM-421
 @pytest.mark.parametrize("case, status", [
     ("no-test-result", "blocked"), ("non-json-line", "blocked"), ("non-object-event", "blocked"),
-    ("package-outside-module", "blocked"), ("package-escaping-module", "blocked"), ("undeclared-test", "blocked"), ("ambiguous-test-file", "blocked"),
+    ("package-outside-module", "blocked"), ("package-escaping-module", "blocked"), ("unhashable-action", "blocked"),
+    ("empty-event", "blocked"), ("foreign-package-event", "blocked"), ("undeclared-test", "blocked"), ("ambiguous-test-file", "blocked"),
     ("unexplained-package-failure", "failed")])
 def test_an_unusable_go_stream_fails_only_its_own_check(tmp_path, case, status):
     from scripts.tiden_ci import MODULE_REPORTS

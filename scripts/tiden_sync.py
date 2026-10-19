@@ -33,6 +33,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import REPOSITORY, Refused, excluded, shown, tiden  # noqa: E402
+from tiden_ci import go_module_path  # noqa: E402
 from tiden_pr_check import (anchor_map, blob, branch_status, changed, diff_tests, language,  # noqa: E402
                             listing, parse_body, story)
 
@@ -41,7 +42,6 @@ SHA = re.compile(r"[0-9a-f]{40}")
 OPEN_CHECK = re.compile(r"\[open: (?:live|measured)\]")
 # Test files whose suite CI does not publish to Tiden, so a marked test there has no identity to link yet.
 UNPUBLISHED: tuple[tuple[str, str], ...] = ()
-GO_MODULE = re.compile(r"^module[ \t]+(\S+)[ \t]*$", re.MULTILINE)
 SOURCE_FIELDS = ("sourceType", "title", "locator", "url", "repoPath", "repository", "lineStart", "lineEnd", "excerpt")
 # The merge-preview shape of CLI 0.33.0 (read 2026-10-19 from 62 open branches); empty fields may be omitted. Any
 # other key is a change this job cannot judge, so it refuses.
@@ -211,13 +211,13 @@ def identities(cli: str, product: str) -> list[dict]:
 
 def go_package(root: Path, sha: str, path: str) -> str | None:
     """The Go import path of a test file's package at `sha`, `<module>[/<package dir>]`, from the nearest go.mod above
-    it; None outside any module."""
+    it; None outside any module or when that go.mod declares no module path (never a module further up)."""
     directory = PurePosixPath(path).parent
     for parent in (directory, *directory.parents):
-        found = GO_MODULE.search(blob(root, sha, str(parent / "go.mod")) or "")
-        if found:
-            below = directory.relative_to(parent)
-            return found.group(1) + ("" if str(below) == "." else f"/{below}")
+        text = blob(root, sha, str(parent / "go.mod"))
+        if text is not None:
+            module, below = go_module_path(text), directory.relative_to(parent)
+            return module and module + ("" if str(below) == "." else f"/{below}")
     return None
 
 

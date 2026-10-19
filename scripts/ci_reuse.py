@@ -246,7 +246,9 @@ def validate(directory: Path, sha: str, producer_url: str, attempt: int, pull_re
         _, framework, _ = tiden_ci.MODULE_REPORTS.get(check, (None, check, None))
         try:
             if framework == "go":
-                counts = tiden_ci.go_row_counts(json.loads((directory / report).read_text()))
+                # The module path comes from this checkout, whose tree validation binds to the evidence's.
+                counts = tiden_ci.go_row_counts(json.loads((directory / report).read_text()),
+                                                tiden_ci.go_module_of(Path(__file__).resolve().parents[1], check))
             else:
                 _, counts = tiden_ci.normalize_junit(directory / report, directory, framework)
         except (OSError, ValueError, SyntaxError) as exc:

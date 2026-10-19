@@ -173,10 +173,14 @@ def normalize_junit(path: Path, root: Path, framework: str, source_prefix: str =
 
 
 GO_VERDICTS = {"pass": "passed", "fail": "failed", "skip": "skipped"}
+GO_ACTIONS = {"start", "run", "pause", "cont", "pass", "bench", "fail", "output", "skip", "build-output", "build-fail"}
 GO_TEST_FUNCTION = re.compile(r"^func ((?:Test|Example|Fuzz)[A-Za-z0-9_]*)\(", re.MULTILINE)
-GO_MODULE = re.compile(r"^module[ \t]+(\S+)[ \t]*$", re.MULTILINE)
-GO_SIGNATURE = re.compile(r"[A-Za-z0-9._~/-]+::(?:Test|Example|Fuzz)[^\s:]*")
+# A go.mod `module` directive: the path bare, "quoted" or `raw`, optionally followed by a // comment.
+GO_MODULE = re.compile(r"^[ \t]*module[ \t]+(?:\"([^\"\s]+)\"|`([^`\s]+)`|([^\s\"`/][^\s\"`]*))[ \t]*(?://.*)?$", re.MULTILINE)
+# `go test -json` writes test names with spaces as underscores, so a name is any run of non-space characters.
+GO_SIGNATURE = re.compile(r"[A-Za-z0-9._~/-]+::(?:Test|Example|Fuzz)\S*")
 BARE_GO_FILE = re.compile(r"[A-Za-z0-9_.-]+_test\.go")
+ROW_KEYS, EXECUTION_KEYS = {"id", "title", "signature", "execution", "suitePath", "fields"}, {"status", "duration"}
 
 
 def normalized_report(check: str) -> str:
@@ -188,6 +192,25 @@ def row_id(ci_url: str, check: str, signature: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{ci_url}/{check}/{signature}"))
 
 
+def go_module_path(text: str) -> str | None:
+    """The module path a go.mod declares, or None when it declares none."""
+    found = GO_MODULE.search(text)
+    return next((group for group in found.groups() if group), None) if found else None
+
+
+def go_module_of(root: Path, check: str) -> str:
+    """The module path of a Go module check, from its go.mod under `root`."""
+    module = go_module_path((root / MODULE_REPORTS[check][2] / "go.mod").read_text())
+    if not module:
+        raise ValueError("the Go module path is missing")
+    return module
+
+
+def in_module(package: str, module: str) -> bool:
+    return package == module or package.startswith(module + "/") and not (
+        {"", ".", ".."} & set(package[len(module) + 1:].split("/")))
+
+
 def go_results(path: Path, root: Path, module_dir: str, ci_url: str, check: str) -> tuple[list[dict], Counter, bool]:
     """Tiden result rows from one `go test -json` stream, named as Tiden CLI 0.33.0's Go reporter (`tiden run exec`)
     named them, so the existing cases and their spec links keep receiving results: signature `<Package>::<Test>`
@@ -195,31 +218,34 @@ def go_results(path: Path, root: Path, module_dir: str, ci_url: str, check: str)
     suite and the bare name of the `_test.go` file declaring the top-level test. Only names, statuses and durations
     leave; test output does not. A test that started without a verdict failed. Also returns whether a package failed
     without a failed test to explain it (a build failure, a panic after the tests). Raises ValueError for a stream
-    without any test result, a package outside the module or a test whose file cannot be named."""
+    without any test result, a malformed event, a package outside the module or a test whose file cannot be
+    named."""
     data = path.read_bytes()
     if len(data) > MAX_BYTES:
         raise ValueError("oversized go test stream")
-    found = GO_MODULE.search((root / module_dir / "go.mod").read_text())
-    if not found:
+    module = go_module_path((root / module_dir / "go.mod").read_text())
+    if not module:
         raise ValueError("the Go module path is missing")
-    module, verdicts, started, failed_packages, order = found.group(1), {}, set(), set(), []
+    verdicts, started, failed_packages, order = {}, set(), set(), []
     for line in data.splitlines():
         if not line.strip():
             continue
         event = json.loads(line)
-        if not isinstance(event, dict):
+        if not isinstance(event, dict) or not all(isinstance(event.get(key, ""), str)
+                                                   for key in ("Action", "Package", "Test", "ImportPath")) \
+                or event.get("Action") not in GO_ACTIONS:
             raise ValueError("not a go test -json event")
-        action, package, test = event.get("Action"), event.get("Package"), event.get("Test")
-        if action == "build-fail":
-            failed_packages.add(str(event.get("ImportPath") or ""))
-        if not isinstance(package, str) or not package:
+        action, package, test = event["Action"], event.get("Package", ""), event.get("Test", "")
+        if action.startswith("build-"):
+            if action == "build-fail":
+                failed_packages.add(event.get("ImportPath") or "build")
             continue
+        if not package or not in_module(package, module):
+            raise ValueError("a Go package lies outside its module")
         if not test:
             if action == "fail":
                 failed_packages.add(package)
             continue
-        if not isinstance(test, str):
-            raise ValueError("not a go test -json event")
         key = (package, test)
         if key not in verdicts and key not in started:
             order.append(key)
@@ -230,17 +256,17 @@ def go_results(path: Path, root: Path, module_dir: str, ci_url: str, check: str)
             if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool) or not 0 <= elapsed < 10**6:
                 raise ValueError("a go test -json duration is malformed")
             verdicts[key] = (GO_VERDICTS[action], int(elapsed * 1000))
-    # Like Tiden's Go reporter, a test with subtests is no case of its own: its subtests are.
-    parents = {(package, test.rsplit("/", 1)[0]) for package, test in order if "/" in test}
+    # Like Tiden's Go reporter, a test with subtests is no case of its own: its subtests are. A subtest name may
+    # itself contain `/`, so every observed name that another one extends at a `/` is an ancestor.
+    names = set(order)
+    parents = {(package, test[:index]) for package, test in order for index, char in enumerate(test)
+               if char == "/" and (package, test[:index]) in names}
     order = [key for key in order if key not in parents]
     if not order:
         raise ValueError("the go test stream has no test results")
     declared: dict[str, dict[str, list[str]]] = {}
     rows, counts = [], Counter()
     for package, test in order:
-        if package != module and (not package.startswith(module + "/")
-                                  or {"", ".", ".."} & set(package[len(module) + 1:].split("/"))):
-            raise ValueError("a Go package lies outside its module")
         if package not in declared:
             directory = root / module_dir / package[len(module) + 1:]
             files = declared[package] = {}
@@ -262,21 +288,33 @@ def go_results(path: Path, root: Path, module_dir: str, ci_url: str, check: str)
     return rows, counts, bool(failed_packages - explained)
 
 
-def go_row_counts(rows: object) -> Counter:
-    """The statuses of prepared Go result rows, refused unless every row has the shape go_results writes."""
+def go_row_counts(rows: object, module: str) -> Counter:
+    """The statuses of prepared Go result rows of `module`, refused unless every row has exactly the shape
+    go_results writes, names a package of that module and is unique."""
     if not isinstance(rows, list) or not rows or len(rows) > 10000:
         raise ValueError("Go results must contain bounded real executions")
-    counts = Counter()
+    counts, seen = Counter(), set()
     for row in rows:
-        if not isinstance(row, dict) or set(row) != {"id", "title", "signature", "execution", "suitePath", "fields"} \
-                or not isinstance(row["signature"], str) or not GO_SIGNATURE.fullmatch(row["signature"]) \
-                or row["title"] != row["signature"].split("::", 1)[1] \
-                or not isinstance(row["execution"], dict) or row["execution"].get("status") not in GO_VERDICTS.values() \
-                or not isinstance(row["fields"], dict) or not BARE_GO_FILE.fullmatch(str(row["fields"].get("file_path"))):
+        if not isinstance(row, dict) or set(row) != ROW_KEYS or not isinstance(row["signature"], str) \
+                or not GO_SIGNATURE.fullmatch(row["signature"]):
             raise ValueError("a Go result row is malformed")
-        counts[row["execution"]["status"]] += 1
+        package, test = row["signature"].split("::", 1)
+        execution, fields, suite = row["execution"], row["fields"], row["suitePath"]
+        try:
+            uuid.UUID(row["id"])
+        except (TypeError, ValueError, AttributeError):
+            raise ValueError("a Go result row is malformed") from None
+        if not in_module(package, module) or row["title"] != test or row["signature"] in seen or row["id"] in seen \
+                or not isinstance(execution, dict) or set(execution) != EXECUTION_KEYS \
+                or execution["status"] not in GO_VERDICTS.values() or type(execution["duration"]) is not int \
+                or not 0 <= execution["duration"] < 10**9 \
+                or suite != [{"title": package.rsplit("/", 1)[-1]}] \
+                or not isinstance(fields, dict) or set(fields) != {"file_path"} \
+                or not isinstance(fields["file_path"], str) or not BARE_GO_FILE.fullmatch(fields["file_path"]):
+            raise ValueError("a Go result row is malformed")
+        seen.update((row["signature"], row["id"]))
+        counts[execution["status"]] += 1
     return counts
-
 
 
 def prepare(root: Path, directory: Path, metadata: dict) -> dict:
@@ -539,10 +577,10 @@ def published_manifest(directory: Path, manifest: dict) -> dict:
         for check in GO_MODULES:
             if normalized_report(check) in manifest["reports"] and valid:
                 results = json.loads(control_file(directory, normalized_report(check)))
-                go_row_counts(results)
+                go_row_counts(results, go_module_of(Path(__file__).resolve().parents[1], check))
                 go_reports[normalized_report(check)] = [{**row, "id": row_id(ci_url, check, row["signature"])}
                                                         for row in results]
-    except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
         valid = False
     if not valid:
         raise ValueError("the publication record does not name this main push run and its merge queue evidence, "

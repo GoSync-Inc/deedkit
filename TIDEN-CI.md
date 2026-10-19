@@ -60,7 +60,9 @@ artifacts (`ci-evidence-go` 1 day, `ci-evidence` 14 days). A test that started
 without a verdict failed. A stream without test results, a malformed event, a
 package outside its module, a test whose file is missing or ambiguous, or a
 package failure that no failed test explains blocks or fails that module's check
-only, and so fails `checks / evidence`. A missing `go` fragment blocks both. Each
+only, and so fails `checks / evidence`. A missing `go` fragment blocks both.
+Reused evidence passes only with rows of exactly that shape, unique, and of the
+check's own module (read from `go.mod` in the checkout). Each
 row's ID is a UUIDv5 of the publishing run attempt, the check and the signature,
 so a main push that publishes reused queue or pull request evidence gives the Go
 rows its own IDs.
@@ -141,7 +143,7 @@ merge as checked. When the reporting job warned, the agent reruns that run with
 anchors, so neither replaces that read. Republishing always takes **Re-run all
 jobs**, the full suite: the reporting job no longer fails, so **Re-run failed
 jobs** selects nothing. A rerun of the reporting job alone gets an attempt URL
-that its `ci-evidence` does not name, so Tiden drops the thirteen check rows and
+that its `ci-evidence` does not name, so Tiden drops the fifteen check rows and
 the count check fails.
 
 CI runs on `push` only for `main`. A feature branch is verified by its pull
@@ -211,7 +213,7 @@ created during that attempt. Without them, or on any lookup error, the push run
 verifies in full. After that choice the job downloads the pinned artifact by ID
 and digest as data, extracts exactly the expected files within size limits, and
 validates them: every SHA field names the commit, the pinned attempt of a main
-queue run assembled the evidence, all thirteen checks passed, and every report
+queue run assembled the evidence, all fifteen checks passed, and every report
 holds passing executions that match the recorded counts. It reads the queue run
 and the artifact again, then uploads the evidence unchanged as this run's
 `ci-evidence` with a `publication.json` record that names this push run as
@@ -249,7 +251,7 @@ when the push run skipped `checks / verify` after such a queue run; within one
 deploy it re-reads the queue run, the pull request run and the push run.
 `tiden_ci.py publish` and `release` accept the record only when it names their
 own job's repository, run, attempt and commit. The Tiden run on `main`, its
-thirteen check row IDs and the release then carry this push run's attempt URL,
+fifteen check row IDs and the release then carry this push run's attempt URL,
 with `tested_in`, also kept in the route receipt, naming the queue run attempt,
 while executions and outcomes stay the queue run's. Queue evidence without a valid record still publishes and
 records nothing. After a reuse, rerun a `checks / tiden` whose publication warned,

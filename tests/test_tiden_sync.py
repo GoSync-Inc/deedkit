@@ -207,6 +207,25 @@ def test_a_marked_go_test_links_its_leaf_cases_by_package_and_a_test_of_another_
     assert tiden_sync.go_package(root, "HEAD", "app/x_test.go") is None
 
 
+# spec: ANYM-421
+def test_a_go_test_resolves_to_its_nearest_module_quoted_or_commented_and_never_to_an_outer_one(root, server):
+    commit(root, {"outer/go.mod": "module example.com/outer\n",
+                  "outer/inner/go.mod": "module example.com/inner // the nested module\n",
+                  "outer/quoted/go.mod": 'module "example.com/quoted"\n',
+                  "outer/broken/go.mod": "go 1.26\n"}, "modules")
+    assert tiden_sync.go_package(root, "HEAD", "outer/inner/x_test.go") == "example.com/inner"
+    assert tiden_sync.go_package(root, "HEAD", "outer/inner/pkg/x_test.go") == "example.com/inner/pkg"
+    assert tiden_sync.go_package(root, "HEAD", "outer/quoted/x_test.go") == "example.com/quoted"
+    assert tiden_sync.go_package(root, "HEAD", "outer/other/x_test.go") == "example.com/outer/other"
+    # A go.mod without a readable module path is still the boundary: never the outer module's package.
+    assert tiden_sync.go_package(root, "HEAD", "outer/broken/x_test.go") is None
+    rows = [case("example.com/inner::TestGood", "x_test.go", "TestGood"),
+            case("example.com/outer/inner::TestGood", "x_test.go", "TestGood")]
+    package = tiden_sync.go_package(root, "HEAD", "outer/inner/x_test.go")
+    assert [row["id"] for row in tiden_sync.matches(rows, "outer/inner/x_test.go", "TestGood", package)] == [
+        "t-example.com/inner::TestGood"]
+
+
 # spec: ANYM-405
 def test_node_cases_match_by_file_and_title_and_class_methods_by_class():
     rows = [case("node:web/a.test.mjs::adds_one", "web/a.test.mjs", "adds one"),
