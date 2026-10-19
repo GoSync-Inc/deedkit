@@ -282,7 +282,8 @@ def test_group_attention_uses_explicit_candidates_without_rescanning_broadcasts(
         assert 'error' not in response and not response['result'].get('isError'),response
         row=response['result']['structuredContent']['items'][0]
         # Compact states the attention target once: in the hint when it is the hint's message.
-        attention=row['conversation']['owner_attention']
+        # With a hint, owner_attention={'last_turn':'peer'} is omitted (ANYM-408 C4).
+        attention=row['conversation'].get('owner_attention',{})
         assert attention.get('target_message_id',row.get('awaiting_reply',{}).get('message_id'))==expected
 
 

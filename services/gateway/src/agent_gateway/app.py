@@ -41,6 +41,11 @@ def expiry_notice(credential):
     )
 
 
+def text_block(result):
+    """The MCP text mirror of structuredContent: one line of JSON without spaces (ANYM-408)."""
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
 def expiry_headers(credential):
     return {"X-DeedKit-Key-Expires": credential["expires_at"]} if expiry_notice(credential) else {}
 
@@ -124,7 +129,7 @@ def create_app(policy_path, public_url, *, transports=None):
         token = admitted.set(None)
         try:
             result = await dispatch.call(current_key.get(), params.name, params.arguments or {})
-            content = [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            content = [TextContent(type="text", text=text_block(result))]
             credential = admitted.get()
             notice = expiry_notice(credential)
             if not notice:
@@ -138,7 +143,7 @@ def create_app(policy_path, public_url, *, transports=None):
         except Denied as error:
             result = getattr(error, "detail", {"error": error.code})
             return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(result))],
+                content=[TextContent(type="text", text=text_block(result))],
                 structuredContent=result,
                 isError=True,
             )

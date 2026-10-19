@@ -114,9 +114,9 @@ def test_compact_queue_row_states_each_fact_once(recent_queue):
         assert 'latest_message_id' not in row['conversation'] and 'basis' not in row['conversation']
         assert len(hint['sender_name'])==64 and hint['sender_id']
     for row in groups:
-        hint,attention=row['awaiting_reply'],row['conversation']['owner_attention']
+        hint=row['awaiting_reply']
         assert row['last_message']['id']!=hint['message_id'] and hint['sent_at']
-        assert hint['basis']=='owner_mention' and attention=={'last_turn':'peer'}
+        assert hint['basis']=='owner_mention' and 'owner_attention' not in row['conversation']
         if 'confidence' in hint:
             # An unverified head makes the hint uncertain; its code is stated once, in the hint.
             assert 'basis' not in row['conversation'] and row['conversation']['suggested_action']=='unclear'
@@ -130,7 +130,7 @@ def test_compact_queue_row_states_each_fact_once(recent_queue):
         assert conversation['order_status']=='ambiguous' and len(conversation['candidate_message_ids'])==1
     # Agent-facing hint fields keep their names and meanings.
     hint=private[0]['awaiting_reply']
-    assert hint['priority']>=100 and 'private_chat' in hint['reasons'] and hint['has_question'] is True
+    assert hint['priority']>=100 and 'private_chat' in hint['reasons'] and 'question_mark' in hint['reasons']
     assert isinstance(hint['waiting_hours'],int) and hint['incoming_count']==1 and hint['revision']==1
 
 
@@ -252,3 +252,245 @@ def test_full_detail_queue_rows_match_the_pre_change_snapshot(seeded):
     full=compact_queue(s,key,detail='full',awaiting_reply_days=0)
     assert len(full['items'])==25 and 'detail' not in full
     assert masked(full)==json.loads(SNAPSHOT.read_text())
+
+
+TG_OWNER,WA_OWNER='4242','48000000000001@c.us'
+OWNER_NAMES={'fixed-tg':'Synthetic Owner','fixed-wa':'Synthetic Owner WA','queue-tg':f'{NAME} 42','queue-wa':f'{NAME} 42'}
+OWNER_IDS={TG_OWNER,WA_OWNER,'48000000000001@lid','42'}
+
+
+def build_default_list(s, now):
+    """One row of each kind a default list_chats page shows (ANYM-408 criterion 1)."""
+    ar=Archive(s)
+    ar.register('fixed-tg','telegram','Synthetic fixed text',discover=True)
+    ar.register('fixed-wa','whatsapp','Synthetic fixed text',discover=True)
+    key=s.issue_key('fixed-text',['fixed-tg','fixed-wa'])
+    def add(account, chat, mid, minutes, chat_type, direction='incoming', sender='61', name='Synthetic Peer',
+            body='Synthetic text', **metadata):
+        if direction=='outgoing' and sender=='61':sender=TG_OWNER if account=='fixed-tg' else WA_OWNER
+        if direction=='outgoing' and name=='Synthetic Peer':name=OWNER_NAMES[account]
+        at=(now-timedelta(minutes=minutes)).isoformat()
+        ar.ingest(event(account=account,platform='telegram' if account=='fixed-tg' else 'whatsapp',chat=chat,
+            chat_title='Synthetic '+chat,provider_id=mid,sender=sender,sent_at=at,updated_at=at,direction=direction,
+            body=body,sender_profile={'display_name':name,'username':''},
+            metadata={**({'chat_type':chat_type} if chat_type else {}),**metadata}))
+    def scan(account, chat, minutes):
+        with s.pool.connection() as c:
+            c.execute('''INSERT INTO collector_chats(account,provider_chat,peer_kind,initialized,last_head_scan_at)
+                VALUES(%s,%s,'user',true,%s)''',(account,chat,now-timedelta(minutes=minutes)))
+    def self_chat(account, chat):
+        from messaging_service.envelope import stable_id
+        with s.pool.connection() as c:
+            c.execute('''INSERT INTO chat_read_observations(chat,account,observed_at,basis,is_self_chat)
+                VALUES(%s,%s,clock_timestamp(),%s,true)''',
+                (stable_id('chat',account,chat),account,'telegram_dialog' if account=='fixed-tg' else 'whatsapp_cached_chat'))
+    # Channels: an outgoing post signed as the channel (stale head), an incoming post (recently verified head).
+    add('fixed-tg','-1001','1',60,'channel','outgoing',sender='-1001',name='Synthetic Channel')
+    scan('fixed-tg','-1001',30)
+    add('fixed-tg','-1002','1',59,'channel',sender='-1002',name='Synthetic Other Channel')
+    scan('fixed-tg','-1002',0)
+    # Self chats: Telegram and WhatsApp, known to the state; a WhatsApp one known only from message metadata.
+    add('fixed-tg',TG_OWNER,'1',58,'private','outgoing',is_self_chat=True)
+    self_chat('fixed-tg',TG_OWNER);scan('fixed-tg',TG_OWNER,30)
+    add('fixed-wa','48000000000001@lid','true_SELF1',57,'private','outgoing',sender='48000000000001@lid')
+    self_chat('fixed-wa','48000000000001@lid')
+    add('fixed-wa',WA_OWNER,'true_SELF2',56,'private','outgoing',is_self_chat=True)
+    # Groups: no owner attention (stale), an attention hint (recently verified), an attention tied with the owner.
+    add('fixed-tg','-200','1',55,'group')
+    scan('fixed-tg','-200',30)
+    add('fixed-tg','-201','1',54,'group',sender='62',mentions_owner=True)
+    scan('fixed-tg','-201',0)
+    # An outgoing message signed as another chat whose name is unknown keeps that chat's ID.
+    add('fixed-tg','-202','1',53,'group','outgoing',sender='-1003',name='')
+    add('fixed-wa','300@g.us','true_OUT',53,'group','outgoing')
+    add('fixed-wa','300@g.us','false_IN',53,'group',sender='63@c.us',mentions_owner=True)
+    # Private: owner last (stale), a question hint (stale), a hint (recently verified), an owner/peer tie.
+    add('fixed-tg','5001','1',52,'private',sender='5001')
+    add('fixed-tg','5001','2',51,'private','outgoing')
+    scan('fixed-tg','5001',30)
+    add('fixed-tg','5002','1',50,'private','outgoing')
+    add('fixed-tg','5002','2',49,'private',sender='5002',body='Synthetic question?')
+    scan('fixed-tg','5002',30)
+    add('fixed-tg','5003','1',48,'private','outgoing')
+    add('fixed-tg','5003','2',47,'private',sender='5003')
+    scan('fixed-tg','5003',0)
+    add('fixed-wa','5004@c.us','true_OUT',46,'private','outgoing')
+    add('fixed-wa','5004@c.us','false_IN',46,'private',sender='5004@c.us')
+    # Unknown type, marked a self chat by the read observation, with the owner's head (stale).
+    add('fixed-tg','7001','1',45,None,'outgoing')
+    self_chat('fixed-tg','7001');scan('fixed-tg','7001',30)
+    return key
+
+
+def restore(row):
+    """CONVERSATION.md "Compact queue rows", each omission rule applied in reverse."""
+    row=json.loads(json.dumps(row))
+    conversation,hint,kind=row.get('conversation',{}),row.get('awaiting_reply'),row.get('type')
+    if kind is None:return row
+    conversation.setdefault('head_freshness','stale')
+    if (kind=='channel' or kind=='private' and row.get('title_basis')=='self_chat') and 'suggested_action' not in conversation:
+        conversation.update(last_turn='not_applicable',suggested_action='not_applicable',basis='channel_or_self_chat')
+    elif kind=='group':
+        conversation.setdefault('last_turn','not_applicable')
+        if hint:conversation.setdefault('owner_attention',{'last_turn':'peer'})
+        elif 'suggested_action' not in conversation:
+            conversation.update(suggested_action='not_applicable',basis='no_observed_owner_attention',
+                owner_attention={'last_turn':'not_applicable'})
+    elif kind=='private':
+        if 'last_turn' not in conversation:
+            head=row.get('last_message')
+            conversation['last_turn']={'outgoing':'owner','incoming':'peer'}[head['direction']] if head else 'peer'
+        if hint:hint.setdefault('basis','last_archived_message_incoming')
+    if hint:
+        if 'question_mark' in hint.get('reasons',[]):hint['has_question']=True
+        conversation.setdefault('basis',hint.get('confidence') or hint['basis'])
+    head=row.get('last_message')
+    if head and head.get('direction')=='outgoing' and 'sender_name' not in head and 'sender_id' not in head:
+        head['sender_name']=OWNER_NAMES[row['account']][:64]
+    return row
+
+
+def assert_restores_full(compact, full):
+    """Every value compact omits is restored by its rule to the matching detail=full value."""
+    for row in compact:
+        source=full[row['id']]
+        restored,state=restore(row),source['conversation']
+        conversation=restored['conversation']
+        assert {k:conversation[k] for k in ('last_turn','suggested_action','basis','head_freshness')}=={
+            'last_turn':state['last_turn'],'suggested_action':state['suggested_action'],
+            'basis':state['basis']['code'],'head_freshness':state['head_freshness']},(row,state)
+        if state.get('owner_attention'):
+            assert conversation['owner_attention']['last_turn']==state['owner_attention']['last_turn'],row
+        else:assert 'owner_attention' not in conversation,row
+        hint=restored.get('awaiting_reply')
+        assert bool(hint)==bool(source.get('awaiting_reply')),row
+        if hint:
+            assert hint.get('has_question',False) is source['awaiting_reply_has_question'] is True or (
+                'has_question' not in hint and source['awaiting_reply_has_question'] is not True),row
+            assert hint['basis']==source['awaiting_reply_basis'],row
+        latest=state['latest_known_meaningful_message']
+        if 'last_message' in restored:
+            assert restored['last_message'].get('sender_name','')==(latest['sender_name'] or '')[:64],row
+            if 'sender_name' not in row['last_message'] and latest['direction']=='outgoing':
+                # Absent name and ID: the owner; absent name with an ID: that sender, name unknown.
+                assert (latest['sender'] in OWNER_IDS)==('sender_id' not in row['last_message']),row
+                assert row['last_message'].get('sender_id',latest['sender'])==latest['sender'],row
+
+
+def assert_no_fixed_text(compact, full):
+    """Compact rows carry none of the values ANYM-408 rules C1-C9 name, under their conditions."""
+    for row in compact:
+        source=full[row['id']]
+        conversation,hint,kind=row['conversation'],row.get('awaiting_reply'),row.get('type')
+        latest=source['conversation']['latest_known_meaningful_message']
+        if kind is None:continue
+        assert conversation.get('head_freshness')!='stale',row                                      # C9
+        if kind=='channel' or kind=='private' and row.get('title_basis')=='self_chat':
+            assert conversation.get('last_turn')!='not_applicable' and conversation.get('basis')!='channel_or_self_chat' \
+                and conversation.get('suggested_action')!='not_applicable',row                      # C1
+        if kind=='group':
+            assert 'last_turn' not in conversation,row                                               # C2
+            if hint:assert conversation.get('owner_attention')!={'last_turn':'peer'},row             # C4
+            else:assert conversation.get('owner_attention')!={'last_turn':'not_applicable'} and \
+                conversation.get('basis')!='no_observed_owner_attention',row                         # C3
+        elif kind=='private':
+            shown=row['last_message']['direction'] if 'last_message' in row else \
+                'incoming' if hint and latest and latest['id']==hint['message_id'] else None
+            assert conversation.get('last_turn')!={'outgoing':'owner','incoming':'peer'}.get(shown),row  # C5
+            if hint:assert 'basis' not in hint,row                                                   # C7
+        if hint:assert 'has_question' not in hint,row                                                # C6
+        head=row.get('last_message')
+        if head and latest['direction']=='outgoing' and latest['sender'] in OWNER_IDS:
+            assert 'sender_name' not in head and 'sender_name_basis' not in head,row                 # C8
+
+
+def both_details(s, key, **arguments):
+    with TestClient(create_app(s,['testserver'])) as client:
+        compact,full=(structured(rpc(client,key,'list_chats',{**arguments,'detail':detail})) for detail in ('compact','full'))
+    assert [r['id'] for r in compact['items']]==[r['id'] for r in full['items']]
+    return compact['items'],{r['id']:r for r in full['items']}
+
+
+# spec: ANYM-408
+def test_compact_rows_omit_values_fixed_by_the_row(seeded, recent_queue):
+    s,queue_key=recent_queue
+    queue,queue_full=both_details(s,queue_key,awaiting_reply=True,order='priority',limit=25)
+    assert len(queue)==25
+    key=build_default_list(s,datetime.now(timezone.utc).replace(microsecond=0))
+    rows,full=both_details(s,key)
+    assert len(rows)==14
+    for compact,source in ((queue,queue_full),(rows,full)):
+        assert_no_fixed_text(compact,source)
+        assert_restores_full(compact,source)
+    by={(r['account'],full[r['id']]['provider_chat_id']):r for r in rows}
+    # Rows outside a rule's condition keep the field.
+    signed=by['fixed-tg','-1001']
+    assert signed['last_message']['sender_name']=='Synthetic Channel' and 'last_turn' not in signed['conversation']
+    assert by['fixed-tg','-1002']['conversation']['head_freshness']=='recently_verified'
+    assert by['fixed-wa','48000000000001@lid']['conversation']['head_freshness']=='unknown'
+    labelled=by['fixed-wa',WA_OWNER]
+    # A self-chat row whose state is not fixed keeps C1's triple, and C5 then applies to it.
+    assert labelled['title_basis']=='self_chat' and 'last_turn' not in labelled['conversation']
+    assert labelled['conversation']['suggested_action']=='unclear' and 'sender_name' not in labelled['last_message']
+    unnamed=by['fixed-tg','-202']['last_message']
+    assert 'sender_name' not in unnamed and unnamed['sender_id']=='-1003'
+    assert 'sender_id' not in by['fixed-tg','5001']['last_message'] and 'sender_id' not in signed['last_message']
+    tied_group=by['fixed-wa','300@g.us']['conversation']
+    assert tied_group['owner_attention']=={'last_turn':'unknown'} and tied_group['suggested_action']=='unclear'
+    attention=by['fixed-tg','-201']['conversation']
+    assert attention['suggested_action']=='review_incoming' and attention['basis']=='explicit_owner_attention'
+    assert by['fixed-wa','5004@c.us']['conversation']['last_turn']=='unknown'
+    assert by['fixed-tg','5003']['conversation']['head_freshness']=='recently_verified'
+    unknown=by['fixed-tg','7001']
+    assert 'type' not in unknown and unknown['last_message']['sender_name']=='Synthetic Owner'
+    assert {k:unknown['conversation'][k] for k in ('last_turn','suggested_action','basis','head_freshness')}=={
+        'last_turn':'not_applicable','suggested_action':'not_applicable','basis':'channel_or_self_chat',
+        'head_freshness':'stale'}
+    # And the rules did apply where their conditions hold.
+    quiet=by['fixed-tg','-200']['conversation']
+    assert not {'last_turn','suggested_action','basis','owner_attention','head_freshness'}&set(quiet),quiet
+    assert not {'last_turn','suggested_action','basis','head_freshness'}&set(by['fixed-tg',TG_OWNER]['conversation'])
+    question=by['fixed-tg','5002']
+    assert 'question_mark' in question['awaiting_reply']['reasons'] and 'last_turn' not in question['conversation']
+    assert 'sender_name' not in by['fixed-tg','5001']['last_message']
+
+
+LEGEND=('last_turn','suggested_action','basis','owner_attention','question_mark','last_archived_message_incoming',
+    'sender_name','head_freshness','stale','confidence')
+
+
+# spec: ANYM-408
+def test_list_chats_description_explains_compact_omissions(seeded):
+    s,key,_=seeded
+    with TestClient(create_app(s,['testserver'])) as client:
+        tools={t['name']:t for t in client.post('/mcp',headers={'Authorization':'Bearer '+key,
+            'Accept':'application/json, text/event-stream'},
+            json={'jsonrpc':'2.0','id':1,'method':'tools/list'}).json()['result']['tools']}
+    description=tools['list_chats']['description']
+    catalog=json.loads((ROOT/'services/gateway/src/agent_gateway/catalog.json').read_text())
+    assert next(t for t in catalog if t['name']=='messages_list_chats')['description']==description
+    legend=description[description.index('Compact rows omit'):].split('limit defaults')[0]
+    sentences=[x.strip() for x in legend.replace('\n',' ').split('. ') if x.strip()]
+    assert all(len(x)<=160 for x in sentences),[x for x in sentences if len(x)>160]
+    for term in LEGEND:assert any(term in x for x in sentences),term
+    # One sentence per omission: absent last_turn, the group/channel pair, the group hint, question, private hint
+    # basis, the owner's head, stale freshness and conversation.basis beside a hint.
+    for rule in ('last_turn','channel_or_self_chat','no_observed_owner_attention',"owner_attention",'question_mark',
+            'last_archived_message_incoming','outgoing','stale','beside a hint'):
+        assert sum(rule in x for x in sentences)>=1,rule
+
+
+# spec: ANYM-408
+def test_rest_list_chats_keeps_archive_rows_and_mirrors_mcp_in_conversation_view(seeded, recent_queue):
+    """REST in its default archive view keeps every hint field; an explicit conversation view equals MCP (ANYM-23)."""
+    s,key=recent_queue
+    headers={'Authorization':'Bearer '+key}
+    arguments={'awaiting_reply':True,'order':'priority','limit':25}
+    with TestClient(create_app(s,['testserver'])) as client:
+        archive=client.post('/v1/list_chats',headers=headers,json=arguments).json()
+        rest=client.post('/v1/list_chats',headers=headers,json={**arguments,'view':'conversation'}).json()
+        mcp=structured(rpc(client,key,'list_chats',arguments))
+    assert archive['items'] and all('conversation' not in r for r in archive['items'])
+    assert any(r.get('awaiting_reply_has_question') for r in archive['items'])
+    assert {r['awaiting_reply_basis'] for r in archive['items'] if r['type']=='private'}=={'last_archived_message_incoming'}
+    assert masked(rest)==masked(mcp)
