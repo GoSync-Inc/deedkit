@@ -82,7 +82,7 @@ def parser():
     revoke.add_argument("--id", required=True)
     extend = sub.add_parser("extend-agent")
     extend.add_argument("--id", required=True)
-    extend.add_argument("--days", required=True, help="New lifetime from now, 1-90 days")
+    extend.add_argument("--days", required=True, help="New lifetime from now, 1-183 days")
     disconnect = sub.add_parser("disconnect")
     disconnect.add_argument("--connection", required=True)
     reconcile = sub.add_parser("reconcile")

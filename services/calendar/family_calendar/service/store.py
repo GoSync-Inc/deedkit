@@ -187,8 +187,8 @@ class Store:
         self.query("UPDATE principals SET enabled=false,version=version+1 WHERE id=%s", (principal_id,))
 
     def extend_agent(self, principal_id, days):
-        # Renew in place within the issued 90-day lifetime: same key, scopes, calendars and version.
-        if not re.fullmatch("[0-9]{1,2}", days) or not 1 <= int(days) <= 90:
+        # Renew in place for up to 183 days from now (owner 2026-10-19): same key, scopes, calendars and version.
+        if not re.fullmatch("[0-9]{1,3}", days) or not 1 <= int(days) <= 183:
             raise CalendarError("invalid_agent_lifetime")
         with self.transaction() as c:
             # now() is the transaction's instant, the same clock authentication compares against.

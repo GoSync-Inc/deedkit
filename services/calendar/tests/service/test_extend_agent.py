@@ -70,15 +70,15 @@ def test_extend_agent_sets_expiry_from_database_now_and_keeps_the_principal(hous
 
 
 # spec: ANYM-423
-def test_extend_agent_refuses_a_lifetime_outside_1_to_90_days(household, tmp_path):
+def test_extend_agent_refuses_a_lifetime_outside_1_to_183_days(household, tmp_path):
     agent(household)
     before = principal(household)
-    for days in ("0", "91", "-1", "1.5", "abc", "", "٣", "100"):
+    for days in ("0", "184", "-1", "1.5", "abc", "", "٣", "1000", "0183"):
         with pytest.raises(CalendarError, match="^invalid_agent_lifetime$"):
             extend(household, tmp_path, "agent", days)
     assert principal(household) == before
     assert audit(household) == []
-    for days in ("1", "90"):
+    for days in ("1", "90", "183"):
         household.query("UPDATE principals SET expires_at=now()+interval '1 hour' WHERE id='agent'")
         extend(household, tmp_path, "agent", days)
 
