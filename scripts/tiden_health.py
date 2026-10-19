@@ -21,7 +21,13 @@ import time
 
 REPOSITORY = "github.com/GoSync-Inc/deedkit"
 # Anchors recorded before the rename carry the former repository name, or none (as scripts/tiden_drift.py).
-ANCHOR_REPOSITORIES = {"", REPOSITORY, "github.com/GoSync-Inc/anymsg"}
+FORMER_REPOSITORY = "github.com/GoSync-Inc/anymsg"
+ANCHOR_REPOSITORIES = {"", REPOSITORY, FORMER_REPOSITORY}
+# The 2026-10-16 reconciliation kept the former repository's anchors as provenance of their recorded revision
+# (`historical_source_id`) and anchored each moved file again under the messaging module
+# (docs/quality/tiden-reconciliation-2026-10-16.md). Such an anchor is historical, not stale, while its spec also
+# anchors that moved path and the path is tracked.
+MOVED_PREFIX = "services/messaging/"
 ENVIRONMENT = "github-actions-synthetic"
 SHARE_PERCENT = 5  # an unlinked share of active cases at or above this fails, per suite and overall
 DRIFT_WAIT, TESTS_WAIT, POLL = 15 * 60, 30 * 60, 30  # deadlines in seconds from the start of the report
@@ -36,10 +42,12 @@ NO_SPEC_LIST = "config/tiden-unlinked-tests.json"
 CATEGORIES = ("missing-spec", "helper", "trivial", "duplicate", "dead-code")
 ENTRY_FIELDS = {"caseId", "externalId", "category", "reason"}
 # Fixed suites, one path rule each, in this order; anything else is unassigned and fails by itself.
-SUITES = ("root-python", "calendar", "calls-frontend", "calls", "gateway", "whatsmeow-go", "whatsapp-node", "npm",
-          "ci")
+SUITES = ("root-python", "calendar", "calls-frontend", "calls", "gateway", "release-router-go", "whatsmeow-go",
+          "whatsapp-node", "npm", "ci")
 CALLS_WITHOUT_PATH = ("s:tests.test_voice", "s:tests.test_webrtc")
 BARE_GO_TEST = re.compile(r"[^/]*_test\.go")
+# Tiden's Go reporter records bare file names, so the router's cases are told apart by their package.
+ROUTER_SIGNATURE = "s:github.com/GoSync-Inc/deedkit/services/release-router::"
 SHA = re.compile(r"[0-9a-f]{40}")
 TIMEOUT = 120
 PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
@@ -55,6 +63,9 @@ class Unknown(Exception):
 
 def suite(case: dict) -> str:
     path, external = case.get("filePath") or "", case.get("externalId") or ""
+    # The router's package signature wins over every path rule: its rows carry bare or arbitrary file names.
+    if path.startswith("services/release-router/") or external.startswith(ROUTER_SIGNATURE):
+        return "release-router-go"
     if path.startswith("tests/"):
         return "root-python"
     if path.startswith("services/calendar/"):
@@ -278,8 +289,10 @@ def drift_metric(root: Path, tiden: Tiden, target: str, main_ref: str, fetch: bo
 
 
 def anchors_metric(specs: list[dict], paths: set[str]) -> dict:
-    stale, stale_paths, anchors = [], set(), 0
+    stale, stale_paths, historical, anchors = [], set(), [], 0
     for spec in specs:
+        anchored = {source.get("repoPath") for source in spec.get("sources", []) if source.get("sourceType") == "repo_file"
+                    and (source.get("repository") or "") in ANCHOR_REPOSITORIES}
         for source in spec.get("sources", []):
             repository = source.get("repository")
             if repository is not None and not isinstance(repository, str):
@@ -289,13 +302,21 @@ def anchors_metric(specs: list[dict], paths: set[str]) -> dict:
             if not isinstance(source.get("repoPath"), str) or not source["repoPath"]:
                 raise Unknown("tiden spec list has a repo_file source without a path")
             anchors += 1
-            if source["repoPath"] not in paths:
+            metadata = source.get("metadata")
+            moved = MOVED_PREFIX + source["repoPath"]
+            if source["repoPath"] not in paths and repository == FORMER_REPOSITORY and isinstance(metadata, dict) \
+                    and isinstance(metadata.get("historical_source_id"), str) and metadata["historical_source_id"] \
+                    and moved in anchored and moved in paths:
+                historical.append(f"ANYM-{spec.get('seqNum')} source {source.get('id')}: {shown(source['repoPath'])}")
+            elif source["repoPath"] not in paths:
                 stale.append(f"ANYM-{spec.get('seqNum')} source {source.get('id')}: {shown(source['repoPath'])}")
                 stale_paths.add(source["repoPath"])
     result = metric(FAIL if stale else PASS, f"{len(stale)} of {anchors} repo_file anchors name a path not tracked "
-                    "at TARGET", numbers={"anchors": anchors, "stale": len(stale), "stale_paths": len(stale_paths)})
+                    f"at TARGET; {len(historical)} historical anchors have their moved path anchored and tracked",
+                    numbers={"anchors": anchors, "stale": len(stale), "stale_paths": len(stale_paths),
+                             "historical": len(historical)})
     # Findings are escaped and shortened for display; the JSON keeps every stale path in full.
-    result["findings"], result["paths"] = stale, sorted(stale_paths)
+    result["findings"], result["paths"], result["historical"] = stale, sorted(stale_paths), historical
     return result
 
 
@@ -543,6 +564,9 @@ def render(data: dict, code: int) -> list[str]:
         if entry.get("stale"):
             lines += ["", f"{name}: {len(entry['stale'])} stale case row(s) without a result in the evidence run are "
                       "counted, listed in tiden-health.json and never deleted."]
+        if entry.get("historical"):
+            lines += ["", f"{name}: {len(entry['historical'])} historical anchor(s) of the former repository, whose "
+                      "moved path is anchored and tracked, are provenance: listed in tiden-health.json, never stale."]
     return lines
 
 
