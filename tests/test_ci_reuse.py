@@ -21,6 +21,22 @@ PRODUCER_URL = f"https://github.com/{REPOSITORY}/actions/runs/{QUEUE_ID}/attempt
 PUSH_URL = f"https://github.com/{REPOSITORY}/actions/runs/{PUSH_ID}/attempts/1"
 PRODUCT = "11111111-2222-4333-8444-555555555555"
 CASE = '<testsuite><testcase name="{name}" file="tests/{name}.py"/><testcase name="later" file="tests/{name}.py"><skipped/></testcase></testsuite>'
+# The Go reports name real tests of the repository's Go modules (prepare reads ROOT); the streams are synthetic.
+GO_IDENTITIES = json.loads((ROOT / "tests/fixtures/tiden-go-identities.json").read_text())
+
+
+def go_test(check):
+    """The package and the name of one real top-level test of a Go check's module."""
+    module = tiden_ci.go_module_of(ROOT, check)
+    return module, next(item["title"] for item in GO_IDENTITIES
+                        if item["signature"].startswith(module + "::") and "/" not in item["title"])
+
+
+def go_stream(check, action="pass"):
+    package, test = go_test(check)
+    return "".join(json.dumps(event) + "\n" for event in (
+        {"Action": "run", "Package": package, "Test": test},
+        {"Action": action, "Package": package, "Test": test, "Elapsed": 0.01}, {"Action": action, "Package": package}))
 
 
 def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, event="merge_group", tiden_branch="",
@@ -50,6 +66,13 @@ def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, even
         (shard / "attempt").write_text(attempt + "\n")
         (shard / f"{job}.xml").write_text((shard_reports or {}).get(job) or CASE.format(name=job.replace("-", "_")))
         (shard / "outcomes.json").write_text(json.dumps({"checks": {"python": outcome}}))
+    go = fragments / "ci-evidence-go"  # the `go` job: a `go test -json` stream per Go module
+    go.mkdir()
+    (go / "source-sha").write_text(sha + "\n")
+    (go / "attempt").write_text(attempt + "\n")
+    for check in tiden_ci.GO_MODULES:
+        (go / tiden_ci.MODULE_REPORTS[check][0]).write_text(go_stream(check))
+    (go / "outcomes.json").write_text(json.dumps({"module_checks": dict.fromkeys(tiden_ci.GO_MODULES, "success")}))
     evidence = tmp_path / "queue-evidence"
     producers = {job: ("success", sha) for job in tiden_ci.FRAGMENTS}
     metadata = tiden_ci.assemble(evidence, fragments, producer_url, producers)
@@ -476,7 +499,9 @@ def test_the_push_run_publishes_the_queue_evidence_to_main_under_its_own_run_url
                                                                           "tested_in": PRODUCER_URL}
     report = next(call for call in calls if call[1:3] == ["run", "report"])
     names = sorted(Path(path).name for path in report[4:report.index("--product-id")])
-    assert names == sorted([f"normalized-{check}.xml" for check in ci_reuse.REPORT_CHECKS] + ["ci-checks-published.json"])
+    # The Go result rows go out re-identified for this push run (published-normalized-<check>.json).
+    assert names == sorted([("published-" if check in tiden_ci.GO_MODULES else "") + tiden_ci.normalized_report(check)
+                            for check in ci_reuse.REPORT_CHECKS] + ["ci-checks-published.json"])
     # Executions and outcomes are the queue run's; the thirteen check rows carry this push run's IDs.
     rows = json.loads((published / "ci-checks-published.json").read_text())
     queue_rows = json.loads((evidence / "ci-checks.json").read_text())
@@ -1407,3 +1432,151 @@ def test_within_one_deploy_a_failed_or_pending_pull_request_rerun_is_never_taken
             github.pr.runs[0] = {**github.pr.runs[0], **change}  # between preparation and application
             with pytest.raises(production.Refused, match=reason):
                 production.verify(SHA, get)
+
+
+def go_rows(evidence, check, change):
+    """The prepared Go report of `check` with `change` applied to its list of result rows."""
+    return json.dumps(change(json.loads((evidence / tiden_ci.normalized_report(check)).read_text()))).encode()
+
+
+# spec: ANYM-421
+def test_queue_and_chained_pull_request_evidence_with_go_results_is_accepted(tmp_path):
+    evidence = queue_evidence(tmp_path / "queue")
+    data = archive(evidence)
+    manifest = ci_reuse.validate(evidence, SHA, PRODUCER_URL, 2)
+    for check in tiden_ci.GO_MODULES:
+        rows = json.loads((evidence / tiden_ci.normalized_report(check)).read_text())
+        assert tiden_ci.normalized_report(check) in manifest["reports"] and rows
+        assert {row["execution"]["status"] for row in rows} == {"passed"} and rows[0]["signature"] == "::".join(go_test(check))
+    adopt(tmp_path / "queue", GitHub(artifacts=[artifact(data=data)]), data)
+    published = tmp_path / "queue" / "published"
+    assert all((published / tiden_ci.normalized_report(check)).read_bytes() == (evidence / tiden_ci.normalized_report(check)).read_bytes()
+               for check in tiden_ci.GO_MODULES)
+    chained = pr_evidence(tmp_path / "chain")
+    data = archive(chained)
+    adopt_chain(tmp_path / "chain", ChainGitHub(data), data)
+    assert all((tmp_path / "chain" / "published" / tiden_ci.normalized_report(check)).is_file() for check in tiden_ci.GO_MODULES)
+
+
+def without_check_rows(evidence, *names):
+    return json.dumps([row for row in json.loads((evidence / "ci-checks.json").read_text())
+                       if row["signature"].split("::")[1] not in names]).encode()
+
+
+# spec: ANYM-421
+@pytest.mark.parametrize("damage, reason", [
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [{**rows[0], "output": "x"}])},
+     "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [{**rows[0], "signature": "TestX"}])},
+     "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-release_router.json": b"[]"}, "release_router report is unsafe or malformed"),
+    (lambda e: {"normalized-release_router.json": b"{"}, "release_router report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [
+        {**row, "execution": {"status": "failed", "duration": 0}} for row in rows])}, "whatsmeow report has no passing"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [
+        *rows, {**rows[0], "id": "00000000-0000-5000-8000-000000000002", "signature": rows[0]["signature"] + "/failed",
+                "title": rows[0]["title"] + "/failed", "execution": {"status": "failed", "duration": 0}}])},
+     "whatsmeow report has no passing executions or a failure"),
+    (lambda e: {"normalized-release_router.json": go_rows(e, "release_router", lambda rows: [
+        {**row, "execution": {"status": "skipped", "duration": 0}} for row in rows])}, "release_router report has no passing"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [*rows, {
+        **rows[0], "id": "00000000-0000-5000-8000-000000000001", "signature": rows[0]["signature"] + "/extra",
+        "title": rows[0]["title"] + "/extra"}])}, "test counts differ"),
+    (lambda e: {"manifest.json": rewrite(e, "manifest.json", reports=[
+        name for name in json.loads((e / "manifest.json").read_text())["reports"] if name != "normalized-whatsmeow.json"])},
+     "does not list every required report"),
+    (lambda e: {"ci-checks.json": without_check_rows(e, "whatsmeow", "release_router")}, "check rows"),
+    (lambda e: {"ci-checks.json": without_check_rows(e, "release_router")}, "check rows"),
+    (lambda e: {"ci-checks.json": json.dumps(json.loads((e / "ci-checks.json").read_text()) * 2).encode()}, "check rows"),
+    (lambda e: {"ci-checks.json": json.dumps([{**row, "execution": {"status": "blocked", "duration": 0}}
+                                              if row["signature"] == "deedkit-ci::whatsmeow" else row
+                                              for row in json.loads((e / "ci-checks.json").read_text())]).encode()}, "check rows"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [{**rows[0], "id": []}])},
+     "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [{**rows[0], "suitePath": None}])},
+     "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [
+        {**rows[0], "execution": {"status": "passed", "duration": -1}}])}, "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [
+        {**rows[0], "execution": {**rows[0]["execution"], "output": "x"}}])}, "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [
+        {**rows[0], "fields": {**rows[0]["fields"], "output": "x"}}])}, "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "release_router", lambda rows: rows)},
+     "whatsmeow report is unsafe or malformed"),
+    (lambda e: {"normalized-whatsmeow.json": go_rows(e, "whatsmeow", lambda rows: [*rows, rows[0]])},
+     "whatsmeow report is unsafe or malformed"),
+], ids=["extra-row-field", "malformed-signature", "empty-report", "not-json", "failed-rows", "one-failed-row", "only-skipped",
+        "counts-differ", "unlisted-report", "no-go-check-rows", "no-release-router-row", "duplicate-check-rows",
+        "blocked-go-check-row", "row-id-not-a-uuid", "suite-path-null", "negative-duration", "nested-execution-field",
+        "nested-fields-field", "other-module-rows", "duplicate-row"])
+def test_queue_evidence_with_unusable_go_results_is_refused(tmp_path, damage, reason):
+    evidence = queue_evidence(tmp_path)
+    data = archive(evidence, change=damage(evidence))
+    with pytest.raises(ci_reuse.Refused, match=reason):
+        adopt(tmp_path, GitHub(artifacts=[artifact(data=data)]), data)
+    assert not (tmp_path / "published" / "publication.json").exists()
+
+
+# spec: ANYM-421
+@pytest.mark.parametrize("report", ["normalized-whatsmeow.json", "normalized-release_router.json"])
+def test_queue_evidence_without_a_go_report_is_refused(tmp_path, report):
+    evidence = queue_evidence(tmp_path)
+    data = archive(evidence, drop=(report,))
+    with pytest.raises(ci_reuse.Refused, match="exactly the queue run's evidence files"):
+        adopt(tmp_path, GitHub(artifacts=[artifact(data=data)]), data)
+    (evidence / report).unlink()  # beside a complete archive check, validation itself never reads a missing report as passed
+    with pytest.raises(ci_reuse.Refused, match="report is unsafe or malformed"):
+        ci_reuse.validate(evidence, SHA, PRODUCER_URL, 2)
+
+
+def published_go_ids(directory, url):
+    """The IDs of the published Go rows, beside the IDs a run with `url` gives them."""
+    found, expected = {}, {}
+    for check in tiden_ci.GO_MODULES:
+        rows = json.loads((directory / ("published-" + tiden_ci.normalized_report(check))).read_text())
+        found[check] = [row["id"] for row in rows]
+        expected[check] = [tiden_ci.row_id(url, check, row["signature"]) for row in rows]
+    return found, expected
+
+
+# spec: ANYM-421
+def test_published_go_rows_carry_this_push_run_attempts_ids(tmp_path, monkeypatch):
+    evidence, published = published_evidence(tmp_path)
+    code, calls = tiden_main(monkeypatch, published, {}, "publish")
+    assert code == 0
+    report = next(call for call in calls if call[1:3] == ["run", "report"])
+    sent = {Path(path).name for path in report[4:report.index("--product-id")]}
+    assert {"published-" + tiden_ci.normalized_report(check) for check in tiden_ci.GO_MODULES} <= sent
+    assert not {tiden_ci.normalized_report(check) for check in tiden_ci.GO_MODULES} & sent
+    found, expected = published_go_ids(published, PUSH_URL)
+    assert found == expected
+    queue_ids = {row["id"] for check in tiden_ci.GO_MODULES
+                 for row in json.loads((evidence / tiden_ci.normalized_report(check)).read_text())}
+    assert queue_ids and not queue_ids & {value for ids in found.values() for value in ids}
+    # Everything but the ID is the queue run's row, and the queue run's own report stays unchanged.
+    for check in tiden_ci.GO_MODULES:
+        name = tiden_ci.normalized_report(check)
+        original = json.loads((evidence / name).read_text())
+        assert [{**row, "id": None} for row in json.loads((published / ("published-" + name)).read_text())] == \
+            [{**row, "id": None} for row in original]
+        assert (published / name).read_bytes() == (evidence / name).read_bytes()
+    # A rerun attempt of the push run adopts the evidence again and publishes the rows under new IDs.
+    data = archive(evidence)
+    ci_reuse.adopt(pin(data), SHA, REPOSITORY, str(PUSH_ID), "2", tmp_path / "rerun", get=GitHub(artifacts=[artifact(data=data)]),
+                   fetch=lambda path: data)
+    assert tiden_main(monkeypatch, tmp_path / "rerun", {"GITHUB_RUN_ATTEMPT": "2"}, "publish")[0] == 0
+    rerun, expected = published_go_ids(tmp_path / "rerun", PUSH_URL.replace("/attempts/1", "/attempts/2"))
+    assert rerun == expected and not set(rerun["whatsmeow"]) & set(found["whatsmeow"])
+
+
+# spec: ANYM-421
+def test_chained_pull_request_go_rows_are_published_under_the_push_runs_ids(tmp_path, monkeypatch):
+    published = chain_published(tmp_path, monkeypatch)
+    assert tiden_main(monkeypatch, published, {}, "publish")[0] == 0
+    found, expected = published_go_ids(published, PUSH_URL)
+    assert found == expected
+    pull_request_ids = {row["id"] for check in tiden_ci.GO_MODULES
+                        for row in json.loads((published / tiden_ci.normalized_report(check)).read_text())}
+    assert pull_request_ids == {tiden_ci.row_id(PR_URL, check, row["signature"]) for check in tiden_ci.GO_MODULES
+                                for row in json.loads((published / tiden_ci.normalized_report(check)).read_text())}
+    assert not pull_request_ids & {value for ids in found.values() for value in ids}

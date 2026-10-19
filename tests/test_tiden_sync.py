@@ -182,7 +182,52 @@ def test_a_test_without_an_imported_case_or_an_unpersisted_link_fails_the_links_
     assert "test_missing has no imported case" in out
     assert "read-back: tests.test_new::test_new is not linked to ANYM-12" in out
     assert "unknown spec names ANYM-99, not on Tiden main" in out
-    assert "pkg/x_test.go TestGo not linked: CI publishes no Go report" in out
+    assert "pkg/x_test.go TestGo lies in no Go module" in out
+
+
+# spec: ANYM-421
+def test_a_marked_go_test_links_its_leaf_cases_by_package_and_a_test_of_another_package_does_not(root, server):
+    full_server(server)
+    package = "example.com/svc/pkg"
+    server.set(tests=[case(f"{package}::TestRoute/one", "a_test.go", "TestRoute/one"),
+                      case(f"{package}::TestRoute/two", "a_test.go", "TestRoute/two"),
+                      case(f"{package}::TestRouteMore", "a_test.go", "TestRouteMore"),
+                      case("example.com/svc::TestRoute", "b_test.go", "TestRoute"),
+                      case("example.com/svc/pkgx::TestRoute", "c_test.go", "TestRoute"),
+                      case(f"{package}::TestFlat", "a_test.go", "TestFlat")])
+    merged(root, server, {"svc/go.mod": "module example.com/svc\n\ngo 1.26\n",
+                          "svc/pkg/a_test.go": "package pkg\n\n// spec: ANYM-12\nfunc TestRoute(t *testing.T) {}\n\n"
+                                               "// spec: ANYM-12\nfunc TestFlat(t *testing.T) {}\n"}, "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert server.state()["links"] == {f"t-{package}::TestRoute/one": ["m-0012-0000-0000-0000-000000000000"],
+                                       f"t-{package}::TestRoute/two": ["m-0012-0000-0000-0000-000000000000"],
+                                       f"t-{package}::TestFlat": ["m-0012-0000-0000-0000-000000000000"]}
+    assert tiden_sync.go_package(root, "HEAD", "svc/go_test.go") == "example.com/svc"
+    assert tiden_sync.go_package(root, "HEAD", "app/x_test.go") is None
+
+
+# spec: ANYM-421
+def test_a_go_test_resolves_to_its_nearest_module_quoted_or_commented_and_never_to_an_outer_one(root, server):
+    commit(root, {"outer/go.mod": "module example.com/outer\n",
+                  "outer/inner/go.mod": "module example.com/inner // the nested module\n",
+                  "outer/quoted/go.mod": 'module "example.com/quoted"\n',
+                  "outer/broken/go.mod": "go 1.26\n",
+                  "outer/tight/go.mod": "module example.com/tight//note\n",
+                  "outer/escaped/go.mod": 'module "example.com/\\x73caped"\n'}, "modules")
+    assert tiden_sync.go_package(root, "HEAD", "outer/tight/x_test.go") == "example.com/tight"
+    assert tiden_sync.go_package(root, "HEAD", "outer/escaped/x_test.go") == "example.com/scaped"
+    assert tiden_sync.go_package(root, "HEAD", "outer/inner/x_test.go") == "example.com/inner"
+    assert tiden_sync.go_package(root, "HEAD", "outer/inner/pkg/x_test.go") == "example.com/inner/pkg"
+    assert tiden_sync.go_package(root, "HEAD", "outer/quoted/x_test.go") == "example.com/quoted"
+    assert tiden_sync.go_package(root, "HEAD", "outer/other/x_test.go") == "example.com/outer/other"
+    # A go.mod without a readable module path is still the boundary: never the outer module's package.
+    assert tiden_sync.go_package(root, "HEAD", "outer/broken/x_test.go") is None
+    rows = [case("example.com/inner::TestGood", "x_test.go", "TestGood"),
+            case("example.com/outer/inner::TestGood", "x_test.go", "TestGood")]
+    package = tiden_sync.go_package(root, "HEAD", "outer/inner/x_test.go")
+    assert [row["id"] for row in tiden_sync.matches(rows, "outer/inner/x_test.go", "TestGood", package)] == [
+        "t-example.com/inner::TestGood"]
 
 
 # spec: ANYM-405
