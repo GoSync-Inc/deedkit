@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from pipecat.frames.frames import OutputAudioRawFrame,StartFrame,InputAudioRawFrame,InterruptionFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -243,3 +244,303 @@ async def test_a_failing_final_telegram_audio_result_write_or_media_snapshot_nev
     called.clear();stops.clear()
     await calls._run('fixture',SimpleNamespace(),{'brief':{'max_duration_secs':5},'audio_probe':Probe(),'media':BrokenMedia()})
     assert called==['media'] and stops==[('fixture','disconnected')]
+
+
+class _Native:
+    """Synthetic PyTgCalls: every cleanup step records itself and fails or blocks on request."""
+    def __init__(self,log,fail=(),block=()):
+        self.log,self.fail,self.block=log,set(fail),set(block)
+        self._app=self._binding=self
+    def on_update(self):return lambda fn:fn
+    async def _step(self,name):
+        self.log.append(name)
+        if name in self.block:await asyncio.Event().wait()
+        if name in self.fail:raise RuntimeError('synthetic '+name+' failure')
+    async def start(self):pass
+    async def play(self,*args,**kwargs):await self._step('play')
+    async def record(self,*args,**kwargs):pass
+    async def get_input_call(self,*args):return SimpleNamespace(id=101)
+    async def send_frame(self,*args):pass
+    async def leave_call(self,*args):await self._step('leave_call')
+    async def stop(self,*args):await self._step('binding_stop')
+
+
+def _wire(monkeypatch,tmp_path,fail=(),block=(),run=None,swallow=False):
+    """A real VoiceService and TelegramCalls with a synthetic SDK and broker; returns (calls,service,log,new_call)."""
+    import pytgcalls
+    import telegram_audio
+    import voice
+    from core import VoiceService
+    from outbound import AgentExternalBrief
+    from test_tasks import BRIEF
+    log=[]
+    class Client:
+        def __init__(self,*args):pass
+        async def connect(self):pass
+        async def close(self):
+            log.append('broker_close')
+            if 'broker_close' in block:
+                # The real BrokerClient.close suppresses a cancellation while it joins its reader.
+                try:await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    if not swallow:raise
+            if 'broker_close' in fail:raise RuntimeError('synthetic broker_close failure')
+    def dispose(py):
+        log.append('dispose_native')
+        if 'dispose_native' in fail:raise RuntimeError('synthetic dispose_native failure')
+    async def waiting(*args,**kwargs):await asyncio.Event().wait()
+    monkeypatch.setattr(telegram_audio,'BrokerClient',Client)
+    monkeypatch.setattr(pytgcalls,'PyTgCalls',lambda *args,**kwargs:_Native(log,fail,block))
+    monkeypatch.setattr(telegram_audio,'dispose_native',dispose)
+    monkeypatch.setattr(telegram_audio,'pcm_transport',lambda send,set_input:SimpleNamespace())
+    monkeypatch.setattr(voice,'run_transport',run or waiting)
+    service=VoiceService(tmp_path/'voice')
+    calls=telegram_audio.TelegramCalls({'socket':'/fixture'},service,lambda brief:'synthetic-key',None)
+    monkeypatch.setattr(calls,'token',lambda:'fixture-token')
+    def new_call(destination):
+        brief=service.prepare(service.with_call_voice(AgentExternalBrief(
+            **{**BRIEF,'source_message_ids':[]},channel='telegram',account='telegram',destination=destination)),[])
+        return service.start(brief['id'])
+    return calls,service,log,new_call
+
+
+async def _settle():
+    for _ in range(5):await asyncio.sleep(0)
+
+
+# spec: ANYM-409
+@pytest.mark.parametrize('failing',[('broker_close',),('dispose_native',),('broker_close','dispose_native'),
+                                    ('leave_call','binding_stop','broker_close','dispose_native')])
+async def test_a_failing_release_step_never_skips_the_rest_or_the_calls_own_end_reason(monkeypatch,tmp_path,failing):
+    async def finished(*args,**kwargs):pass
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,fail=failing,run=finished)
+    call=new_call('123456')
+    await calls.dial(call)
+    await asyncio.wait_for(calls.active[call['id']]['task'],5)
+    assert log[-4:]==['leave_call','binding_stop','broker_close','dispose_native']
+    done=service.get_call(call['id'])
+    assert done['status']=='finished' and done['end_reason']=='disconnected'
+    # The call is terminal right away, so a call for a different brief is admitted.
+    assert new_call('654321')['status']=='dialing'
+    await calls._release(call['id'])
+    assert log.count('broker_close')==1
+    service.close()
+
+
+# spec: ANYM-409
+async def test_a_failing_release_keeps_the_model_error_reason(monkeypatch,tmp_path):
+    async def broken(*args,**kwargs):raise RuntimeError('synthetic model failure')
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,fail=('broker_close',),run=broken)
+    call=new_call('123456')
+    await calls.dial(call)
+    await asyncio.wait_for(calls.active[call['id']]['task'],5)
+    assert service.get_call(call['id'])['end_reason']=='model_error'
+    service.close()
+
+
+# spec: ANYM-409
+async def test_a_cancellation_during_release_is_held_until_every_step_and_service_stop_ran(monkeypatch,tmp_path):
+    async def finished(*args,**kwargs):pass
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,block=('leave_call',),run=finished)
+    call=new_call('123456')
+    await calls.dial(call)
+    task=calls.active[call['id']]['task']
+    await _settle()
+    assert log[-1]=='leave_call'
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):await task
+    assert log[-3:]==['binding_stop','broker_close','dispose_native']
+    done=service.get_call(call['id'])
+    assert done['status']=='finished' and done['end_reason']=='disconnected'
+    service.close()
+
+
+# spec: ANYM-409
+async def test_a_release_failure_in_the_dial_error_path_keeps_the_original_exception(monkeypatch,tmp_path):
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,fail=('play','broker_close','dispose_native'))
+    with pytest.raises(RuntimeError,match='synthetic play failure'):
+        await calls.dial(new_call('123456'))
+    assert log[-4:]==['leave_call','binding_stop','broker_close','dispose_native'] and not calls.active
+    # A cancellation of the dial itself also propagates unchanged.
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path/'second',fail=('broker_close',),block=('play',))
+    dialing=asyncio.create_task(calls.dial(new_call('123456')))
+    await _settle()
+    dialing.cancel()
+    with pytest.raises(asyncio.CancelledError):await dialing
+    assert log[-2:]==['broker_close','dispose_native'] and not calls.active
+    service.close()
+
+
+# spec: ANYM-409
+@pytest.mark.parametrize('how',['cancel_attempt','hangup','close'])
+async def test_a_failing_release_is_swallowed_by_cancel_attempt_hangup_and_close(monkeypatch,tmp_path,how):
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,fail=('broker_close','dispose_native'))
+    call=new_call('123456')
+    await calls.dial(call)
+    task=calls.active[call['id']]['task']
+    await _settle()
+    if how=='cancel_attempt':await calls.cancel_attempt(call['id'])
+    elif how=='hangup':await calls.hangup('101')
+    else:await calls.close()
+    assert task.done() and not calls.active
+    assert log[-4:]==['leave_call','binding_stop','broker_close','dispose_native']
+    done=service.get_call(call['id'])
+    assert done['status']=='finished' and done['end_reason']=='owner_stop'
+    service.close()
+
+
+# spec: ANYM-409
+async def test_close_releases_every_other_call_after_a_failing_release_with_a_worker_and_a_dial_task(monkeypatch,tmp_path):
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,fail=('broker_close',))
+    first=new_call('123456')
+    await calls.dial(first)
+    task=calls.active[first['id']]['task']
+    # A second call is still dialing: its state exists, with the dial task and no worker.
+    class Dialing:
+        def __init__(self):self.closed=False
+        async def close(self):self.closed=True
+    dial_task=asyncio.create_task(asyncio.Event().wait())
+    pending=SimpleNamespace(leave_call=lambda *a:asyncio.sleep(0),_binding=_Native(log))
+    client=Dialing()
+    calls.active['dialing']={'py':pending,'client':client,'user':1,'dial_task':dial_task}
+    await _settle()
+    await calls.close()
+    assert task.done() and dial_task.cancelled() and client.closed and not calls.active
+    assert service.get_call(first['id'])['end_reason']=='owner_stop'
+    service.close()
+
+
+# spec: ANYM-409
+async def test_cancel_attempt_never_swallows_its_callers_cancellation(monkeypatch,tmp_path):
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,block=('leave_call',))
+    call=new_call('123456')
+    await calls.dial(call)
+    task=calls.active[call['id']]['task']
+    await _settle()
+    caller=asyncio.create_task(calls.cancel_attempt(call['id']))
+    await _settle()
+    assert log[-1]=='leave_call' and not caller.done()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):await caller
+    await _settle()
+    assert task.done() and log[-3:]==['binding_stop','broker_close','dispose_native']
+    assert service.get_call(call['id'])['end_reason']=='owner_stop'
+    service.close()
+
+
+# spec: ANYM-409
+async def test_a_failing_runtime_health_constructor_leaves_the_call_running_with_a_no_op_stand_in(monkeypatch):
+    import voice
+    from audio_health import NoRuntimeAudioHealth
+    from test_voice import _stubbed_run_transport
+    ran=[];events=[]
+    class Service:
+        def runtime_event(self,identity,event):events.append(event)
+        def get_call(self,identity):return {'metrics':{}}
+        def result(self,identity,**kwargs):pass
+    def broken():raise RuntimeError('synthetic constructor failure')
+    async def running():ran.append(asyncio.all_tasks())
+    class Model(voice.FrameProcessor):
+        audio_health=SimpleNamespace(snapshot=lambda:{'chunks':3,'audio_ms':60.0})
+    monkeypatch.setattr(voice,'RuntimeAudioHealth',broken)
+    before=asyncio.all_tasks()
+    run=_stubbed_run_transport(monkeypatch,Service(),running)
+    monkeypatch.setattr(voice,'create_model',lambda *args,**kwargs:Model())
+    await run
+    assert len(ran)==1
+    # The health monitor task ran during the call and left nothing behind.
+    assert any('voice-audio-health-' in task.get_name() for task in ran[0])
+    assert asyncio.all_tasks()==before
+    health=[event for event in events if event['kind']=='provider_audio_health']
+    assert len(health)==1 and health[0]['runtime']=={} and health[0]['audio']=={'chunks':3,'audio_ms':60.0}
+    # Output frames still pass through the delivery probe, which feeds the stand-in.
+    from pipecat.frames.frames import OutputAudioRawFrame
+    from pipecat.processors.frame_processor import FrameDirection
+    probe=voice.AudioDeliveryProbe(NoRuntimeAudioHealth())
+    pushed=[]
+    async def push(frame,direction=FrameDirection.DOWNSTREAM):pushed.append(frame)
+    probe.push_frame=push
+    frame=OutputAudioRawFrame(audio=b'\0\0'*480,sample_rate=48000,num_channels=1)
+    await probe.process_frame(frame,FrameDirection.DOWNSTREAM)
+    assert pushed==[frame]
+
+
+# spec: ANYM-409
+async def test_a_cancellation_that_the_broker_close_swallows_still_ends_the_run_cancelled(monkeypatch,tmp_path):
+    async def finished(*args,**kwargs):pass
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,block=('broker_close',),swallow=True,run=finished)
+    call=new_call('123456')
+    await calls.dial(call)
+    task=calls.active[call['id']]['task']
+    await _settle()
+    assert log[-1]=='broker_close'
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):await task
+    assert log[-1]=='dispose_native'
+    done=service.get_call(call['id'])
+    assert done['status']=='finished' and done['end_reason']=='disconnected'
+    service.close()
+
+
+# spec: ANYM-409
+async def test_cancel_attempt_holds_its_callers_cancellation_that_the_broker_close_swallows(monkeypatch,tmp_path):
+    async def consuming(*args,**kwargs):
+        # Like the pinned WorkerRunner.run(): the cancellation ends the run without propagating.
+        try:await asyncio.Event().wait()
+        except asyncio.CancelledError:pass
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,block=('broker_close',),swallow=True,run=consuming)
+    call=new_call('123456')
+    await calls.dial(call)
+    await _settle()
+    caller=asyncio.create_task(calls.cancel_attempt(call['id']))
+    await _settle()
+    assert log[-1]=='broker_close' and not caller.done()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):await caller
+    assert log[-1]=='dispose_native'
+    assert service.get_call(call['id'])['end_reason']=='owner_stop'
+    service.close()
+
+
+# spec: ANYM-409
+async def test_a_cancellation_during_release_never_replaces_the_original_dial_failure(monkeypatch,tmp_path):
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path,fail=('play',),block=('leave_call',))
+    dialing=asyncio.create_task(calls.dial(new_call('123456')))
+    await _settle()
+    assert log[-1]=='leave_call'
+    dialing.cancel()
+    with pytest.raises(RuntimeError,match='synthetic play failure'):await dialing
+    assert log[-2:]==['broker_close','dispose_native'] and not calls.active
+    # Two distinct cancellations: the first, from setup, is the one that propagates.
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path/'second',block=('play','leave_call'))
+    dialing=asyncio.create_task(calls.dial(new_call('123456')))
+    await _settle()
+    assert log[-1]=='play'
+    dialing.cancel('original setup cancellation')
+    await _settle()
+    assert log[-1]=='leave_call'
+    dialing.cancel('second cancellation in release')
+    with pytest.raises(asyncio.CancelledError) as raised:await dialing
+    assert raised.value.args==('original setup cancellation',)
+    assert log[-2:]==['broker_close','dispose_native'] and not calls.active
+    service.close()
+
+
+# spec: ANYM-409
+async def test_cancel_attempt_inside_an_already_handled_cancellation_is_not_aborted(monkeypatch,tmp_path):
+    calls,service,log,new_call=_wire(monkeypatch,tmp_path)
+    call=new_call('123456')
+    await calls.dial(call)
+    await _settle()
+    async def enclosing():
+        try:await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # No uncancel(): the task's cancel count stays positive while its cleanup runs.
+            await calls.cancel_attempt(call['id'])
+            return 'cleaned'
+    handler=asyncio.create_task(enclosing())
+    await _settle()
+    handler.cancel()
+    assert await handler=='cleaned'
+    assert not calls.active and service.get_call(call['id'])['end_reason']=='owner_stop'
+    service.close()

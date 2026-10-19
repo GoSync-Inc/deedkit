@@ -21,6 +21,19 @@ def dispose_native(py):
     py._binding=None
 
 
+async def attempt(step):
+    """Run one cleanup step; a failure is swallowed. True when this task was cancelled meanwhile.
+
+    The cancel request count, not the exception, tells a cancellation of this task from a child task's
+    own: a step may swallow the CancelledError (BrokerClient.close does), and an earlier handled
+    cancellation leaves the count positive.
+    """
+    task=asyncio.current_task();before=task.cancelling()
+    try:await step()
+    except (Exception,asyncio.CancelledError):pass
+    return task.cancelling()>before
+
+
 class MediaDiagnostics:
     """Bounded Telegram media facts for owner diagnosis: no audio, ids or key material."""
     def __init__(self,limit=24):
@@ -186,7 +199,9 @@ class TelegramCalls:
             state['task']=asyncio.create_task(self._run(cid,transport,state),name='telegram-audio-'+cid)
             return {'provider_call_id':str(peer.id),'provider_status':'connected'}
         except (Exception,asyncio.CancelledError):
-            await self._release(cid);raise
+            # The original setup exception or cancellation propagates, whatever release does.
+            await attempt(lambda:self._release(cid))
+            raise
 
     async def _run(self,cid,transport,state):
         from voice import run_transport
@@ -199,39 +214,52 @@ class TelegramCalls:
         except TimeoutError: reason='duration_limit'
         except Exception: reason='model_error'
         finally:
-            await self._release(cid)
-            # Diagnostics are best effort: a failure here must not skip service.stop.
-            with contextlib.suppress(Exception):
-                value=self.service.get_call(cid)
-                self.service.result(cid,metrics={**value['metrics'],
-                    'telegram_audio':{**state['audio_probe'].snapshot(),'media':state['media'].snapshot()}})
-            self.service.stop(cid,reason)
+            try:await self._release(cid)
+            finally:
+                # Diagnostics are best effort: a failure here must not skip service.stop.
+                with contextlib.suppress(Exception):
+                    value=self.service.get_call(cid)
+                    self.service.result(cid,metrics={**value['metrics'],
+                        'telegram_audio':{**state['audio_probe'].snapshot(),'media':state['media'].snapshot()}})
+                self.service.stop(cid,reason)
 
     async def _release(self,cid):
         state=self.active.pop(cid,None)
         if not state:return
-        py=state['py']
-        with contextlib.suppress(Exception): await asyncio.wait_for(py.leave_call(state['user']),10)
-        with contextlib.suppress(Exception): await py._binding.stop(state['user'])
-        await state['client'].close()
-        dispose_native(py)
+        py,cancelled=state['py'],False
+        async def leave():await asyncio.wait_for(py.leave_call(state['user']),10)
+        async def stop():await py._binding.stop(state['user'])
+        async def close():await state['client'].close()
+        # Every step is attempted. A cancellation that arrives meanwhile is held until the last step
+        # has run, then re-raised, so the caller still gets to stop the call with its own reason.
+        for step in (leave,stop,close):
+            cancelled=await attempt(step) or cancelled
+        with contextlib.suppress(Exception):dispose_native(py)
+        if cancelled:raise asyncio.CancelledError
 
     async def hangup(self,sid):
+        cancelled=False
         for cid,state in list(self.active.items()):
             if state.get('provider_id')==sid:
-                await self.cancel_attempt(cid)
+                cancelled=await attempt(lambda:self.cancel_attempt(cid)) or cancelled
+        if cancelled:raise asyncio.CancelledError
 
     async def cancel_attempt(self,cid):
         state=self.active.get(cid)
         if not state:return
-        state['end_reason']='owner_stop'
-        if state.get('runner'):await state['runner'].cancel()
+        state['end_reason']='owner_stop';cancelled=False
+        if state.get('runner'):cancelled=await attempt(state['runner'].cancel)
         task=state.get('task') or state.get('dial_task')
         if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):await task
-        await self._release(cid)
+            async def joined():await task
+            # The child's own cancellation is consumed here; this task's own is held and re-raised.
+            cancelled=await attempt(joined) or cancelled
+        cancelled=await attempt(lambda:self._release(cid)) or cancelled
+        if cancelled:raise asyncio.CancelledError
 
     async def close(self):
-        for cid,state in list(self.active.items()):
-            await self.cancel_attempt(cid)
+        cancelled=False
+        for cid in list(self.active):
+            cancelled=await attempt(lambda:self.cancel_attempt(cid)) or cancelled
+        if cancelled:raise asyncio.CancelledError
