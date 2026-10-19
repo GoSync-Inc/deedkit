@@ -33,17 +33,20 @@ SECRET_FILES = ["app.dsn", "collector.dsn", "indexer.dsn", "owner.dsn", "subscri
                 "enrichment.keys", "enrichment.json", "enrichment-local.json", "file-understanding.json",
                 "cold-archive.json", "telegram.json", "telegram.credentials.json", "telegram.permit.json",
                 "whatsapp1.json", "whatsapp1.permit.json", "whatsapp2.json", "whatsapp2.permit.json"]
-# What the generated override may change; healthcheck is checked apart (only its `test`).
-OVERRIDE_KEYS = {"image", "entrypoint", "command", "ports"}
+# What the generated override may change in every application service; `ports` only for the api and
+# `healthcheck` (only its `test`) only where the service declares one.
+OVERRIDE_KEYS = {"image", "entrypoint", "command"}
+API_PORTS = [{"mode": "ingress", "host_ip": "127.0.0.1", "target": 8080, "published": "18940", "protocol": "tcp"}]
+BROWSER_ONLY = {"image", "security_opt", "mem_limit", "pids_limit"}
 
 
 class Stack:
     def __init__(self, root: Path, image: str):
         self.deploy = root / "deploy"
         self.image = image
-        # A unique project name never reuses another run's containers, networks or volumes.
-        self.project = f"deedkit-t417-{uuid.uuid4().hex[:12]}"
-        shutil.copytree(REPO / "deploy", self.deploy, ignore=shutil.ignore_patterns("private"))
+        self.project = ""
+        # Local private files and `.env` (Compose reads it from the project directory) stay out of the copy.
+        shutil.copytree(REPO / "deploy", self.deploy, ignore=shutil.ignore_patterns("private", ".env*"))
         private = self.deploy / "private"
         private.mkdir()
         for name in SECRET_DIRECTORIES:
@@ -55,6 +58,10 @@ class Stack:
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(("COMPOSE_", "PROBE_", "MESSAGING_")) and key not in {"POSTGRES_IMAGE", "PYTHON_IMAGE"}}
         self.env.update(PROBE_PUBLIC_URL="https://stack.invalid", PROBE_ALLOWED_HOSTS="stack.invalid")
+
+    def new_project(self):
+        # A unique project name per rendering never reuses another run's containers, networks or volumes.
+        self.project = f"deedkit-t417-{uuid.uuid4().hex[:12]}"
 
     def docker(self, *args, check=True, timeout=180):
         result = subprocess.run(["docker", *args], cwd=self.deploy, env=self.env, text=True,
@@ -80,7 +87,7 @@ class Stack:
                       '    command: !override ["3600"]']
             if "healthcheck" in service:
                 lines += ["    healthcheck:", '      test: !override [CMD, "true"]']
-            if service.get("ports"):
+            if name == "api":
                 lines.append("    ports: !reset []")
         path = self.deploy / "compose.test-override.yaml"
         path.write_text("\n".join(lines) + "\n")
@@ -95,6 +102,23 @@ class Stack:
 
     def network(self, name):
         return json.loads(self.docker("network", "inspect", f"{self.project}_{name}").stdout)[0]
+
+    def remove(self, files):
+        """`down --volumes`; if it fails or times out, remove what carries this project's label."""
+        try:
+            down = self.compose(files, "down", "--volumes", check=False, timeout=180)
+            if down.returncode == 0:
+                return None
+            reason = down.stderr
+        except subprocess.TimeoutExpired:
+            reason = "docker compose down timed out"
+        label = f"label=com.docker.compose.project={self.project}"
+        for kind, remove in (("ps", ["rm", "-f"]), ("network", ["network", "rm"]), ("volume", ["volume", "rm"])):
+            list_command = ["ps", "-a"] if kind == "ps" else [kind, "ls"]
+            found = self.docker(*list_command, "--filter", label, "-q", check=False).stdout.split()
+            if found:
+                self.docker(*remove, *found, check=False)
+        return reason
 
     def leftovers(self):
         label = f"label=com.docker.compose.project={self.project}"
@@ -117,6 +141,7 @@ def assert_application_bounds(name, container, declared):
     assert facts["user"] == "10001:10001", name
     assert facts["cap_drop"] == ["ALL"], name
     assert facts["no_new_privileges"], name
+    assert container["HostConfig"]["Privileged"] is False and not container["HostConfig"]["CapAdd"], name
     assert facts["pids"] == declared["pids_limit"] > 0, name
     assert facts["memory"] == int(declared["mem_limit"]) > 0, name
     assert set(facts["tmpfs"]) == {"/tmp"}, name
@@ -150,9 +175,15 @@ def assert_runtime(stack, declared, native):
     assert {name for name, joined in members.items() if f"{stack.project}_cold_archive_egress" in joined} == {"cold-archive"}
     assert stack.network("collector_egress")["Internal"] is False
     assert stack.network("cold_archive_egress")["Internal"] is False
+    profile = json.loads((stack.deploy / "chromium-seccomp.json").read_text())
     for name in ("whatsapp1", "whatsapp2"):
-        seccomp = [item for item in containers[name]["HostConfig"]["SecurityOpt"] if item.startswith("seccomp=")]
-        assert bool(seccomp) is not native, name
+        options = containers[name]["HostConfig"]["SecurityOpt"]
+        if native:
+            assert options == ["no-new-privileges:true"], name
+        else:
+            seccomp = [item for item in options if item.startswith("seccomp=")]
+            assert sorted(set(options) - set(seccomp)) == ["no-new-privileges:true"] and len(seccomp) == 1, name
+            assert seccomp[0] != "seccomp=unconfined" and json.loads(seccomp[0].split("=", 1)[1]) == profile, name
     worker = containers["subscriptions"]
     assert worker["Id"] != containers["api"]["Id"]
     assert networks_of(worker) == {f"{stack.project}_backend"}
@@ -176,11 +207,14 @@ def test_merged_compose_stack_applies_sandbox_limits_networks_and_logs():
     with tempfile.TemporaryDirectory(prefix="deedkit-compose-") as root:
         stack = Stack(Path(root), image)
         assert stack.docker("compose", "version", check=False).returncode == 0, "Docker Compose v2 is required"
-        browser = {}
+        browser, browser_declared = {}, {}
         for native in (False, True):
+            stack.new_project()
             files = BASE + ([NATIVE] if native else [])
             declared = stack.render(files)
             assert set(declared["services"]) == APPLICATIONS | {"db"}
+            # Published ports are checked on the declared files: only the api publishes one, on loopback.
+            assert {name: service["ports"] for name, service in declared["services"].items() if service.get("ports")} == {"api": API_PORTS}
             for reference in (image, declared["services"]["db"]["image"]):
                 stack.docker("image", "inspect", reference)
             tested = files + [stack.override(declared)]
@@ -190,7 +224,8 @@ def test_merged_compose_stack_applies_sandbox_limits_networks_and_logs():
                 if name == "db":
                     assert not changed
                     continue
-                assert changed <= OVERRIDE_KEYS | {"healthcheck"}, (name, changed)
+                allowed = OVERRIDE_KEYS | ({"ports"} if name == "api" else set()) | ({"healthcheck"} if "healthcheck" in service else set())
+                assert changed <= allowed, (name, changed)
                 assert merged["services"][name]["image"] == image
                 assert merged["services"][name]["entrypoint"] == ["sleep"] and merged["services"][name]["command"] == ["3600"]
                 assert not merged["services"][name].get("ports")
@@ -199,18 +234,25 @@ def test_merged_compose_stack_applies_sandbox_limits_networks_and_logs():
                         key: value for key, value in merged["services"][name]["healthcheck"].items() if key != "test"}
             assert merged["networks"] == declared["networks"] and merged["volumes"] == declared["volumes"]
             try:
+                # The stand-in image has no /data/files/.uploads, which the real image creates for the nested
+                # `file_uploads` mount. A collector (rw `files`) starts first and creates the mountpoint;
+                # otherwise the api's read-only `files` mount races with it. `up telegram` also starts db.
+                stack.compose(tested, "up", "-d", "--no-build", "--pull", "never", "telegram", timeout=300)
                 stack.compose(tested, "up", "-d", "--no-build", "--pull", "never", timeout=300)
                 containers = assert_runtime(stack, merged, native)
                 if native:
                     for name in ("whatsapp1", "whatsapp2"):
+                        r1, r2 = browser_declared["services"][name], declared["services"][name]
+                        assert {key for key in set(r1) | set(r2) if r1.get(key) != r2.get(key)} <= BROWSER_ONLY, name
+                        assert r2["security_opt"] == ["no-new-privileges:true"], name
                         before, after = sandbox_facts(browser[name]), sandbox_facts(containers[name])
                         assert {key: value for key, value in after.items() if key not in {"pids", "memory"}} == {
                             key: value for key, value in before.items() if key not in {"pids", "memory"}}
                         assert 0 < after["pids"] <= before["pids"] and 0 < after["memory"] <= before["memory"]
                 else:
-                    browser = containers
+                    browser, browser_declared = containers, declared
             finally:
-                down = stack.compose(tested, "down", "--volumes", check=False, timeout=180)
+                failure = stack.remove(tested)
                 leftovers = stack.leftovers()
-            assert down.returncode == 0, down.stderr
+            assert failure is None, failure
             assert not any(leftovers.values()), leftovers
