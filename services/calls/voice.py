@@ -166,6 +166,16 @@ def create_model(brief,key,recorder=None,input_rate=None,at=None):
             if brief.get('dialog_engine')=='gemini_live_flows' else None)
 
 
+def record_clock(service,identity,brief,llm):
+    # Best effort, like the audio diagnostics: the call keeps the exact clock line its model received.
+    try:
+        sent=llm._settings.system_instruction
+        if sent.startswith(brief['prompt']+'\n'):
+            service.runtime_event(identity,{'kind':'call_clock','text':sent[len(brief['prompt'])+1:]})
+    except Exception:
+        pass
+
+
 async def send_owner_update(worker,decision):
     # InputTextRawFrame reaches Gemini's realtime input. Updating only LLMContext
     # would leave this message local: the Live service manages remote history.
@@ -195,6 +205,7 @@ async def run_transport(transport,brief,key,state,browser=False):
     context=LLMContext()
     llm=create_model(brief,key,recorder=lambda role,text:service.transcript_chunk(identity,role,text),
                      input_rate=input_sample_rate(transport))
+    record_clock(service,identity,brief,llm)
     live_flows=brief.get('dialog_engine')=='gemini_live_flows'
     ending_tasks=[]
     # Diagnostics are best effort: a constructor failure must never stop the call before the runner starts.

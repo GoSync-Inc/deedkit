@@ -29,7 +29,8 @@ CustomVoiceId=Annotated[str|None,Field(pattern=r'^voice_[A-Za-z0-9_]{4,100}$')]
 @cache
 def _zones():
     # Area/Location keys and UTC only: localtime, posixrules and Factory are host files, not places.
-    return frozenset(z for z in available_timezones() if '/' in z or z=='UTC')
+    # Etc/GMT+N means UTC-N (POSIX sign), so an agent's "GMT+7" would land 14 hours off.
+    return frozenset(z for z in available_timezones() if '/' in z and not z.startswith('Etc/GMT') or z=='UTC')
 
 
 def _zone(value):
