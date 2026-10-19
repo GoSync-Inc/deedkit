@@ -53,7 +53,7 @@ Done: the squash's `main` push run is green.
 ## 4. Product context and Tiden
 
 - First step of any task touching product code, specs or tests: `tiden intent skip` (intent loop
-  only in the pilot), the card (`tiden spec get`) and `product-context`, then code.
+  paused), the card (`tiden spec get`) and `product-context`, then code.
 - Spec, tests, code: the accepted card is the spec; failing tests come first. Each new test has
   `# spec: ANYM-n` (Python) or `// spec: ANYM-n` (JS, TS, Go) directly above it and its
   decorators, naming a story-level spec, or sits in `config/tiden-unlinked-tests.json`. Defects, infra and refactors
@@ -65,7 +65,7 @@ Done: the squash's `main` push run is green.
   links, sets status. Wait for B on your squash, read back, rerun or dispatch a failed B by SHA,
   rerun failed `Tiden drift` and `Tiden health`. Tiden writes by hand need a maintenance window
   (TIDEN-CI.md).
-- Cards, markers, the pilot, commands: docs/operations/tiden-product-workflow.md.
+- Cards, markers, the paused loop, commands: docs/operations/tiden-product-workflow.md.
 
 ## 5. Reviews
 
@@ -73,7 +73,7 @@ Done: the squash's `main` push run is green.
   paths>" </dev/null`. For Codex-written code an Opus subagent; Codex line: review-protocol.md.
   Fable: a Claude subagent with model `fable`, a product manager, never on code.
 - One round; after a blocking or major finding, one scoped recheck; r3 only for a new blocking.
-- Packet (docs/operations/review-protocol.md): `task.md`, `diff.patch`, `specs.md`, `pr.md`. Every
+- Packet (docs/operations/review-protocol.md): `task.md`, `diff.patch`, `specs.md`, `pr.md`, `context.md`. Every
   Astra task starts with:
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
      existing path (call audio, sends, collectors, queue, backup)? Name the line.

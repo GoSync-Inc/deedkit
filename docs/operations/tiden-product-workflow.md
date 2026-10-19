@@ -91,18 +91,32 @@ a suspect spec is not proof that its tests cover the incident. Resolve an issue 
 matching regression test fails before and passes after the fix, never on age or a nearby green
 test, and never start a provider session or weaken redaction to diagnose one.
 
-## One Tiden branch per pull request (intent-loop pilot, owner 10-19)
+## One Tiden branch per pull request
 
 A worker runs `tiden intent skip` and reads the card and `product-context` before code; it
-opens no `intent/` branch. The card's proposal or review branch carries the card and any
-criterion edit made while coding; the PR names it as `Tiden branch:`, check A reads its specs
-and sync B merges it after the squash. A PR that delivers no new card and changes no criterion
-names no branch. Each deliverable has its own branch, because B merges only the specs a PR names.
+opens no `intent/` branch. Tiden changes in step with each PR: the card's proposal or review
+branch carries the card, every criterion edit or flag made while coding and the settle text; the
+PR names it as `Tiden branch:`, the reviewers read it with the diff, check A reads its specs and
+sync B merges it right after the squash, so the spec text is current at merge. This holds for every PR
+that changes behaviour; a PR that delivers no new card and changes no spec text names no branch.
+Each deliverable has its own branch, because B merges only the specs a PR names.
 
-Pilot: the full intent loop (`tiden intent start`, settle, close) stays only for the large
-features of the wave, ANYM-228 and ANYM-234. After the wave the owner decides again on the
-numbers: defects that escaped, minutes lost to Tiden friction and decisions lost between
-sessions. The pilot's findings also go to Tiden's founder as feedback.
+Every PR description carries `Spec impact:` (the `Spec:` and `Delivers:` IDs, each with its
+flags, such as a criterion deferred or not built, and the anchors it adds, or `none`) and
+`Settle text:` (`none`, or a reviewer copy of the settle text on the PR's `Tiden branch:`).
+Anything a PR missed is the backstop's: `Tiden drift` and `Tiden health` report it after the main
+push, and a follow-up PR's branch fixes it. Maintenance windows (TIDEN-CI.md) remain only for hand
+repairs that B cannot do, bulk restructuring and deletions.
+
+The intent loop is paused (owner 10-19; the pilot ended in PR #162): no PR runs `tiden intent
+start`, settle and close or uses the `start-intent` and `capture-intent` skills, and none needs a
+`Tiden intent branch:` line (CI then records a skipped route and stays green). The loop returns
+after a trial the orchestrator starts once Tiden fixes settle and close at DeedKit scale (settle
+times out reading an intent branch; close counts specs a rebase pulled in, reads main's run
+instead of the PR's and times out reading branch specs). Three feature PRs in a row that the
+orchestrator picks run the full loop as the exception, and each settles and closes without a
+timeout or an owner risk acceptance; a failure restarts the count. The orchestrator reports the
+trial's start and result in the digest, and the loop returns with that report.
 
 Criteria change only through a card's branch reviewed with its PR; no daily delta audit runs.
 

@@ -59,7 +59,8 @@ In GitHub Actions repository settings, add:
 
 A mapping must name an existing Tiden branch and always wins. Otherwise a pull
 request run uses the intent branch linked in the pull request description, as the
-intent loop requires:
+intent loop requires (paused; see
+[the product workflow](docs/operations/tiden-product-workflow.md#one-tiden-branch-per-pull-request)):
 
 ```text
 Tiden intent branch: [intent/<date>-<slug>](https://app.tiden.ai/<workspace>/products/<product>/branches/<id>)
@@ -108,8 +109,8 @@ confirmed. A main commit records no release (the release record warns), and
 promotable. The agent reads the run itself, because no Tiden check is sure to
 notice: a publication that failed after Tiden completed its run leaves a run
 that reads as passed, and the intent close reads the product's latest run,
-which may be another pull request's. On a pull request, the author reads its
-last run's reporting job before `tiden intent close`. After a merge, the agent
+which may be another pull request's. On a pull request that runs the loop, the
+author reads its last run's reporting job before `tiden intent close`. After a merge, the agent
 that merged it reads the `main` push run of the squash before reporting the
 merge as checked. When the reporting job warned, the agent reruns that run with
 **Re-run all jobs**.
@@ -572,8 +573,10 @@ messenger sessions or personal archives.
 The migration extends this same repository and product. Its behavior/proof
 matrix and intent-to-PR-to-CI procedure are in
 [platform acceptance](docs/quality/platform-acceptance.md). Local worktrees and
-uncommitted files are not GitHub App sync inputs. Link the migration PR to its
-intent branch and publish real results there before reviewing the merge. After
+uncommitted files are not GitHub App sync inputs. While the intent loop is
+paused, the migration PR names its card's `Tiden branch:` and its results reach
+Tiden through the main push run; otherwise link the migration PR to its intent
+branch and publish real results there before reviewing the merge. After
 merge, verify both main's gate and the GitHub App processing/drift state.
 
 The integrated CI includes gateway, calendar, calls and calls-frontend reports,

@@ -15,10 +15,13 @@ history.
   question 3: the production SHA, the host `production.py` SHA, the schema and the installed
   gateway (read-only `production.py status`, or from the orchestrator).
 - `diff.patch`: `git diff <merge-base>..<head>`; for a recheck, only the fix range. A criterion
-  edit on the PR's `Tiden branch:` goes in as previous and proposed text.
-- `specs.md`: the full text of the specs the PR delivers and of those whose criteria change; IDs
+  edit or settle text on the PR's `Tiden branch:` goes in as previous and proposed text.
+- `specs.md`: the full text of the specs the PR delivers, flags in `Spec impact:` or changes; IDs
   and titles for the other specs it names or touches.
 - `pr.md`: the pull request description.
+- `context.md`: the `product-context` answers the author read at the start, saved then and
+  attached unchanged, so the reviewer sees the criteria of the specs around the change, including
+  those it does not change. An author who read none (AGENTS.md section 4) says so in one line.
 
 A card has no diff: its packet holds the proposed text, the search results for similar specs (ID,
 title, status), the text of specs it references and `git ls-files -- <expected paths>`.
@@ -114,3 +117,5 @@ the never-downgraded list above or anything in AGENTS.md section 2.
   `Review record: Astra r1 1 blocking, 2 major; r2 0/0`. No findings ledger or per-finding
   machine lines are kept.
 - `Owner note:` for a product PR, what the owner will notice in daily use.
+- `Spec impact:` and `Settle text:` on every PR (tiden-product-workflow.md, One Tiden branch per
+  pull request).
