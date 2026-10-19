@@ -19,6 +19,7 @@ BYPASS = ('incoming_message', 'owner_mention', 'reply_to_owner', 'reply_to_confi
 LIMITS = {'debounce_s': (0, 600), 'max_wait_s': (1, 3600), 'batch_window_s': (0, 86400),
     'batch_count': (1, 1000), 'expect_reply_within_s': (60, 14 * 86400)}
 HELD_REASONS = ('debounce', 'batch', 'quiet_hours', 'budget')
+UNBOUND = {'policy': None, 'held_reason': None, 'next_hint_at': None, 'silence': None}
 _CLOCK = re.compile(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]')
 _ZONE = re.compile(r'[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+){0,2}')
 _EMPTY = dict(first_match_at=None, last_match_at=None, match_count=0, through_position=None,
@@ -349,7 +350,7 @@ def delivery_state(c, row):
     """Content-free policy, held state and silence timer for get_subscription."""
     binding = _binding(c, row)
     if binding is None:
-        return {'policy': None, 'held_reason': None, 'next_hint_at': None, 'silence': None}
+        return dict(UNBOUND)
     window = c.execute('SELECT * FROM subscription_hint_windows WHERE subscription=%s', (row['id'],)).fetchone()
     if window is None or window['subscription_version'] != row['version'] or row['state'] != 'active':
         window = None

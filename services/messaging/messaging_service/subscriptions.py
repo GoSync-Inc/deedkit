@@ -107,11 +107,12 @@ def _delivery_view(c, row):
     binding = c.execute('SELECT receiver FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
     counts = c.execute('''SELECT state,count(*) AS n FROM subscription_outbox WHERE subscription=%s
         GROUP BY state''', (row['id'],)).fetchall()
-    from .delivery_policy import delivery_state
+    # An unbound subscription reads no policy state, so its view needs no schema-38 column.
+    from .delivery_policy import UNBOUND, delivery_state
     return {'passive_read': True, 'ack': True, 'push': binding is not None,
         'receiver_id': str(binding['receiver']) if binding else None, 'host_wakeup': 'unverified',
         'host_turn_verified': False, 'hint_counts': {item['state']: item['n'] for item in counts},
-        **delivery_state(c, row)}
+        **(delivery_state(c, row) if binding else UNBOUND)}
 
 
 def create_subscription(store, c, p, chat_ids, *, sender_ids=None, kinds=None,
