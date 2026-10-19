@@ -407,7 +407,7 @@ start makes the metrics that need it unknown, and the others are still measured.
 | --- | --- | --- |
 | Drift | the watermark W is still behind TARGET 15 minutes after the start | W is not on `main`'s history or diverges from TARGET, or `drift status` fails |
 | Unlinked tests | the unlinked share of active cases is 5% or more in a suite or overall; a suite has case rows but none active ("not reporting"); an active case has an unassigned path; an active unlinked case is not in `config/tiden-unlinked-tests.json`; that list is missing or has an invalid entry | no usable test evidence for TARGET (below), or a listing is incomplete |
-| Stale anchors | a `repo_file` source of this repository (or the former `anymsg` name, or none) names a path not tracked at TARGET | the spec listing is incomplete, or a source has a missing or repeated ID or no type |
+| Stale anchors | a `repo_file` source of this repository (or the former `anymsg` name, or none) names a path not tracked at TARGET, unless it is historical (below) | the spec listing is incomplete, or a source has a missing or repeated ID or no type |
 | Done with open checks | a `Done` spec carries `[open: live]` or `[open: measured]` outside inline code and fenced code (text that documents the marker is not one) | the initial Done audit date in the script is not set yet, or a `Done` spec's text was not readable |
 
 Test evidence is only the Tiden run on branch `main` (by branch ID),
@@ -420,13 +420,26 @@ then shown only with its own SHA. A case is active when it has a result in that
 run (`run results --latest-only`) and linked when its `linkedRequirementCount`
 is above zero. Other case rows are stale: counted and listed in the artifact,
 never deleted. The suites are fixed in the script, one path rule each: root
-`tests/`, calendar, calls frontend, calls, gateway, whatsmeow Go (also a bare
-`*_test.go` path), WhatsApp Node, npm and CI verifications (`.github/`). Every
+`tests/`, calendar, calls frontend, calls, gateway, release router Go
+(`services/release-router/`, or an `externalId` starting with
+`s:github.com/GoSync-Inc/deedkit/services/release-router::`, since Tiden's Go
+reporter records bare file names), whatsmeow Go (also a bare `*_test.go` path),
+WhatsApp Node, npm and CI verifications (`.github/`). Every
 listing counts only when it ends with an empty `nextPageToken`, its integer
 `totalCount` equals its rows, its IDs are unique and, per spec, `sourceCount`
 equals its sources, each with a unique ID and a type. The artifact keeps every
 stale anchor path in full; the summary shortens and escapes it. CLI errors name
 the command only, never the response.
+
+A historical anchor is provenance, not staleness: the 2026-10-16 reconciliation
+kept the former repository's anchors with their receipts and anchored each moved
+file again under `services/messaging/`
+([receipt](docs/quality/tiden-reconciliation-2026-10-16.md)). An untracked
+anchor of repository `github.com/GoSync-Inc/anymsg` whose metadata has a
+non-empty `historical_source_id`, and whose spec also anchors
+`services/messaging/<its path>` tracked at TARGET, is counted as `historical`
+and listed in the artifact, never stale (owner decision 2026-10-19). Every other
+untracked anchor still fails.
 
 `config/tiden-unlinked-tests.json` is the reviewed no-spec list: per case its
 `caseId`, `externalId`, a `category` (`missing-spec`, `helper`, `trivial`,

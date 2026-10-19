@@ -565,7 +565,7 @@ def test_anchors_on_tracked_names_pass_and_moved_or_deleted_paths_are_listed(rep
                                   "ANYM-2 source source-2-1: services/deleted.py",
                                   "ANYM-3 source source-3-0: services/gone.py",
                                   "ANYM-4 source source-4-0: services/gone-too.py"]
-    assert metric["numbers"] == {"anchors": 10, "stale": 4, "stale_paths": 4}
+    assert metric["numbers"] == {"anchors": 10, "stale": 4, "stale_paths": 4, "historical": 0}
 
 
 def test_an_odd_untracked_name_is_escaped_for_display(repo, server):
@@ -612,8 +612,81 @@ def test_long_stale_paths_sharing_a_display_prefix_count_separately_and_stay_who
     long_paths = [prefix + "one.py", prefix + "two.py"]
     server.world(b, specs=[spec(1, paths=["services/app.py", *long_paths])])
     metric = measure(repo, server, b)[1]["metrics"]["stale_anchors"]
-    assert metric["numbers"] == {"anchors": 3, "stale": 2, "stale_paths": 2}
+    assert metric["numbers"] == {"anchors": 3, "stale": 2, "stale_paths": 2, "historical": 0}
     assert metric["paths"] == long_paths and all(item.endswith("...") for item in metric["findings"])
+
+
+# spec: ANYM-420
+def test_a_router_case_with_a_bare_path_belongs_to_the_router_suite_and_a_whatsmeow_one_stays():
+    router = "s:github.com/GoSync-Inc/deedkit/services/release-router::TestConfigCASRejectsStaleETagWithoutChangingRoutes"
+    whatsmeow = "s:github.com/GoSync-Inc/anymsg/whatsapp/whatsmeow::TestNativeTextValidatesBeforeSend/empty"
+    assert suite({"filePath": "router_test.go", "externalId": router}) == "release-router-go"
+    assert suite({"filePath": "services/release-router/router_test.go", "externalId": ""}) == "release-router-go"
+    assert suite({"filePath": "send_test.go", "externalId": whatsmeow}) == "whatsmeow-go"
+
+
+FORMER = "github.com/GoSync-Inc/anymsg"
+
+
+def provenance(seq, path, repository=FORMER, metadata=None, twins=("services/messaging/{path}",)):
+    """A spec as the 2026-10-16 reconciliation left it: a former-repository anchor with its provenance receipt and the
+    moved path anchored again (the live listing shape of its 2026-10-16 records)."""
+    metadata = {"historical_source_id": "179b9124-b71c-4be0-866a-b0382d97fdb9",
+                "historical_metadata_json": '{"reverse_pr":{"status":"modified"}}'} if metadata is None else metadata
+    sources = [{"id": f"source-{seq}-old", "sourceType": "repo_file", "repoPath": path, "repository": repository,
+                "metadata": metadata}]
+    sources += [{"id": f"source-{seq}-{index}", "sourceType": "repo_file", "repoPath": twin.format(path=path),
+                 "repository": "github.com/GoSync-Inc/deedkit"} for index, twin in enumerate(twins)]
+    return dict(spec(seq), sources=sources, sourceCount=len(sources))
+
+
+# spec: ANYM-420
+def test_a_historical_anchor_whose_moved_path_is_anchored_and_tracked_is_counted_historical_not_stale(repo, server):
+    commit(repo, {"services/app.py": "a", LIST: no_spec(), "services/messaging/messaging_service/policy.py": "p"}, "A")
+    b = git(repo, "rev-parse", "HEAD")
+    server.world(b, specs=[spec(1, paths=["services/app.py"]), provenance(2, "messaging_service/policy.py")])
+    data = measure(repo, server, b)[1]
+    metric = data["metrics"]["stale_anchors"]
+    assert metric["state"] == PASS and metric["findings"] == []
+    assert metric["numbers"] == {"anchors": 3, "stale": 0, "stale_paths": 0, "historical": 1}
+    assert metric["historical"] == ["ANYM-2 source source-2-old: messaging_service/policy.py"]
+    assert any("1 historical anchor(s)" in line for line in health.render(data, 0))
+
+
+# spec: ANYM-420
+@pytest.mark.parametrize("change", [
+    {"twins": ()},  # no moved twin on the spec
+    {"twins": ("services/messaging/other/{path}",)},  # a twin elsewhere is no moved path
+    {"twins": ("services/messaging/{path}x",)},  # the moved path is anchored but not tracked
+    {"metadata": {}},  # no provenance receipt
+    {"metadata": {"historical_source_id": ""}},
+    {"metadata": {"historical_source_id": 7}},
+    {"metadata": None, "repository": "github.com/GoSync-Inc/deedkit"},  # an anchor of this repository
+    {"metadata": None, "repository": None},  # an anchor without a repository
+], ids=["no-twin", "other-twin", "untracked-twin", "no-receipt", "empty-receipt", "typed-receipt", "this-repository",
+        "no-repository"])
+def test_an_untracked_anchor_without_provenance_and_a_tracked_moved_twin_is_still_stale(repo, server, change):
+    commit(repo, {"services/app.py": "a", LIST: no_spec(), "services/messaging/messaging_service/policy.py": "p",
+                  "services/messaging/other/messaging_service/policy.py": "o"}, "A")
+    b = git(repo, "rev-parse", "HEAD")
+    options = dict(change)
+    if options.get("metadata", {}) is None:
+        options["metadata"] = {"historical_source_id": "179b9124-b71c-4be0-866a-b0382d97fdb9"}
+    server.world(b, specs=[spec(1, paths=["services/app.py"]), provenance(2, "messaging_service/policy.py", **options)])
+    metric = measure(repo, server, b)[1]["metrics"]["stale_anchors"]
+    assert metric["state"] == FAIL and metric["numbers"]["historical"] == 0
+    # An untracked twin is listed as stale too.
+    assert metric["findings"][0] == "ANYM-2 source source-2-old: messaging_service/policy.py"
+
+
+# spec: ANYM-420
+def test_a_moved_twin_on_another_spec_does_not_make_an_anchor_historical(repo, server):
+    commit(repo, {"services/app.py": "a", LIST: no_spec(), "services/messaging/messaging_service/policy.py": "p"}, "A")
+    b = git(repo, "rev-parse", "HEAD")
+    server.world(b, specs=[spec(1, paths=["services/app.py", "services/messaging/messaging_service/policy.py"]),
+                           provenance(2, "messaging_service/policy.py", twins=())])
+    metric = measure(repo, server, b)[1]["metrics"]["stale_anchors"]
+    assert metric["state"] == FAIL and metric["numbers"]["stale"] == 1 and metric["numbers"]["historical"] == 0
 
 
 # Drift.
