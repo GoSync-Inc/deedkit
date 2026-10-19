@@ -63,10 +63,21 @@ class OwnerCredential:
             return False
 
 
+MAPPED = ipaddress.ip_network('::ffff:0:0/96')
+
+
+def trusted_peer(item):
+    network = ipaddress.ip_network(item)
+    if network.version == 6 and network.prefixlen >= 96 and network.subnet_of(MAPPED):
+        # An IPv4-mapped entry names the IPv4 peer it maps.
+        return ipaddress.ip_network(f'{network.network_address.ipv4_mapped}/{network.prefixlen - 96}')
+    return network
+
+
 def trusted_peers(value):
     """VOICE_TRUSTED_PEERS: comma-separated IP addresses or networks; an invalid entry stops startup."""
     try:
-        return tuple(ipaddress.ip_network(item.strip()) for item in (value or '').split(',') if item.strip())
+        return tuple(trusted_peer(item.strip()) for item in (value or '').split(',') if item.strip())
     except ValueError:
         raise ValueError('Invalid VOICE_TRUSTED_PEERS') from None
 
@@ -95,7 +106,7 @@ class VoiceBoundary:
             peer = ipaddress.ip_address(scope['client'][0])
         except (KeyError, TypeError, IndexError, ValueError):
             return False
-        peer = getattr(peer, 'ipv4_mapped', None) or peer
+        peer = getattr(peer, 'ipv4_mapped', None) or peer  # trusted_peers maps entries the same way
         return peer.is_loopback or any(peer in network for network in self.peers)
 
     async def __call__(self, scope, receive, send):
@@ -187,6 +198,9 @@ class VoiceBoundary:
 
         if hostname not in {'127.0.0.1', 'localhost', 'testserver'}:
             return await reject(403, 'Loopback host required')
+        if scope.get('root_path'):
+            # Routing strips a mount prefix the boundary would not see; the supported entry point has none.
+            return await reject(404, 'Unsupported root path')
         # Only an exact /v1/<operation> is the agent route: a dot segment would reach the panel's static files.
         agent = re.fullmatch(r'/v1/[A-Za-z0-9_]+', path) is not None
         if not agent and not self.local_peer(scope):

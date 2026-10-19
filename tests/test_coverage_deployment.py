@@ -163,6 +163,16 @@ def test_calls_overlay_passes_the_trusted_host_peer_and_keeps_loopback_publishin
     dockerfile = (ROOT / 'services/calls/Dockerfile').read_text()
     assert dockerfile.rstrip().endswith('CMD ["python", "app.py"]') and 'VOICE_BIND=0.0.0.0' in dockerfile
     assert 'proxy_headers=False' in (ROOT / 'services/calls/app.py').read_text()
+    # The launcher interpolates CALLS_TRUSTED_PEERS from calls.env, where production.md tells the operator to set it.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('deedkit_launcher', ROOT / 'scripts/deedkit.py')
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    plan = launcher.resolve({'version': 1, 'id': 'synthetic', 'exposure': {'tools': ['platform_capabilities']},
+                             'deployment': {'modules': ['calls'], 'connectors': ['calls-phone'], 'external': []}})
+    up = next(argv for argv in launcher.commands(plan, 'up') if 'deedkit-calls' in argv)
+    assert up[up.index('--env-file') + 1] == str(ROOT / 'deploy/private/calls.env')
+    assert 'CALLS_TRUSTED_PEERS' in (ROOT / 'docs/operations/production.md').read_text()
 
 
 def docker_stages():

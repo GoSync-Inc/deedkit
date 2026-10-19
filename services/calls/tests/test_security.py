@@ -351,3 +351,48 @@ async def test_the_entry_point_admits_the_transport_peer_whatever_forwarded_head
     _, status = await health('rewritten', lambda app: uvicorn.Server(uvicorn.Config(
         app, host='127.0.0.1', port=0, access_log=False, proxy_headers=True, forwarded_allow_ips='127.0.0.1')))
     assert status == 403
+
+
+# spec: ANYM-304
+async def test_ipv4_mapped_trusted_entries_admit_their_peer_in_either_form(tmp_path, monkeypatch):
+    monkeypatch.setenv('VOICE_TRUSTED_PEERS', '::ffff:192.0.2.1,::ffff:198.51.100.0/120')
+    app = create_app(tmp_path, Archive(), control_token='control-fixture')
+    try:
+        owner = (('Authorization', owner_headers(tmp_path)['Authorization']),)
+        for peer in ['::ffff:192.0.2.1', '192.0.2.1', '::ffff:198.51.100.7', '198.51.100.7']:
+            assert (await from_peer(app, peer, 'GET', '/api/health', owner))[0] == 200, peer
+        for peer in ['192.0.2.2', '::ffff:192.0.2.2', '198.51.101.7']:
+            assert (await from_peer(app, peer, 'GET', '/api/health', owner))[0] == 403, peer
+    finally:
+        app.state.service.close()
+
+
+# spec: ANYM-304
+async def test_a_mounted_calls_app_refuses_requests_before_the_agent_route_exemption(application):
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+    parent = Starlette(routes=[Mount('/v1', app=application)])
+    transport = httpx.ASGITransport(parent, client=('172.23.0.5', 4321))
+    async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1') as c:
+        for path in ['/v1/docs', '/v1/redoc', '/v1/openapi.json', '/v1/api/health']:
+            assert (await c.get(path)).status_code == 404, path
+
+
+# spec: ANYM-304
+async def test_a_trusted_host_peer_with_the_control_token_lists_the_control_tools(tmp_path, monkeypatch):
+    import httpx2
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+    monkeypatch.setenv('VOICE_TRUSTED_PEERS', '172.20.0.1')
+    app = create_app(tmp_path, Archive(), control_token='control-fixture')
+    async with app.router.lifespan_context(app):
+        for peer, admitted in [('172.20.0.1', True), ('172.20.0.5', False)]:
+            transport = httpx2.ASGITransport(app, client=(peer, 4321))
+            async with httpx2.AsyncClient(transport=transport, headers={'Authorization': 'Bearer control-fixture'}) as http:
+                if not admitted:
+                    assert (await http.post('http://testserver/control/mcp', json={})).status_code == 403
+                    continue
+                async with streamable_http_client('http://testserver/control/mcp', http_client=http) as (read, write):
+                    async with ClientSession(read, write) as client:
+                        await client.initialize()
+                        assert 'get_voice_capabilities' in {tool.name for tool in (await client.list_tools()).tools}
