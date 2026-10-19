@@ -879,10 +879,14 @@ def test_join_request_batch_of_20_cached_requesters_fits_worker_deadline_with_re
     from telethon.sessions import MemorySession
     from messaging_service.telegram_governor import RequestGovernor
     class State:
-        def cooldown_remaining(self): return 0
-        def status(self, *args): pass
+        def cooldown_remaining(self):
+            return 0
+
+        def status(self, *args):
+            pass
     clock = [0.0]
-    async def sleep(delay): clock[0] += delay
+    async def sleep(delay):
+        clock[0] += delay
     client = GroupClient()
     ids = list(range(201, 221))
     client.session = MemorySession()
@@ -928,10 +932,14 @@ def test_join_request_batch_of_20_uncached_requesters_stops_at_budget_with_real_
     from messaging_service.telegram_governor import RequestGovernor
     from messaging_service.telegram_operations import JOIN_BATCH_BUDGET_SECONDS
     class State:
-        def cooldown_remaining(self): return 0
-        def status(self, *args): pass
+        def cooldown_remaining(self):
+            return 0
+
+        def status(self, *args):
+            pass
     clock = [0.0]
-    async def sleep(delay): clock[0] += delay
+    async def sleep(delay):
+        clock[0] += delay
     client = GroupClient()  # No session cache: every requester costs a paced lookup.
     ids = [str(i) for i in range(201, 221)]
     result = asyncio.run(execute(client, job(operation, {'user_ids': ids}, provider_chat=SUPERGROUP),
@@ -941,8 +949,103 @@ def test_join_request_batch_of_20_uncached_requesters_stops_at_budget_with_real_
     assert result['outcome'] == 'unknown' and result['data']['all_applied'] is False
     assert [r['id'] for r in result['data']['results']] == ids
     assert 0 < applied < 20 and states == ['applied'] * applied + ['not_attempted'] * (20 - applied)
-    # Nothing after the stop: no lookup or mutation of a not_attempted requester.
+    # Nothing after the stop: no mutation of a not_attempted requester, no lookup past the first.
     assert [c.user_id.user_id for c in client.mutations()] == [int(i) for i in ids[:applied]]
-    assert not any(c == ('get_input_entity', int(i)) for i in ids[applied:] for c in client.calls)
+    assert not any(c == ('get_input_entity', int(i)) for i in ids[applied + 1:] for c in client.calls)
     # The last ID started inside the budget; the adapter answered well inside the worker's 30 s.
     assert clock[0] < JOIN_BATCH_BUDGET_SECONDS + 2 < 30
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+@pytest.mark.parametrize('cached', [True, False])
+def test_join_request_batch_budget_counts_from_adapter_entry(operation, cached):
+    """A slow paced group lookup spends the same budget; no mutation starts after it."""
+    from telethon.sessions import MemorySession
+    from messaging_service.telegram_governor import RequestGovernor
+    from messaging_service.telegram_operations import JOIN_BATCH_BUDGET_SECONDS
+    class State:
+        def cooldown_remaining(self):
+            return 0
+
+        def status(self, *args):
+            pass
+    clock, starts = [0.0], []
+    async def sleep(delay):
+        clock[0] += delay
+    ids = list(range(201, 221))
+    class Client(GroupClient):
+        async def get_input_entity(self, peer):
+            if peer == int(SUPERGROUP):
+                clock[0] += 12  # A 12 s group resolution before the batch.
+            return await super().get_input_entity(peer)
+        async def __call__(self, request):
+            if isinstance(request, functions.messages.HideChatJoinRequestRequest):
+                starts.append(clock[0])
+            return await super().__call__(request)
+    client = Client()
+    if cached:
+        client.session = MemorySession()
+        client.session.process_entities(types.messages.ChatInviteImporters(count=20, importers=[],
+            users=[types.User(id=i, access_hash=7, first_name='Synthetic') for i in ids]))
+    result = asyncio.run(execute(client, job(operation, {'user_ids': [str(i) for i in ids]}, provider_chat=SUPERGROUP),
+                                 governor=RequestGovernor(State(), clock=lambda: clock[0], sleep=sleep)))
+    states = [r['state'] for r in result['data']['results']]
+    applied = states.count('applied')
+    assert result['outcome'] == 'unknown' and len(states) == 20
+    assert 0 < applied < 20 and states == ['applied'] * applied + ['not_attempted'] * (20 - applied)
+    assert len(starts) == applied and all(start < JOIN_BATCH_BUDGET_SECONDS for start in starts)
+    assert clock[0] < 30
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+def test_join_request_batch_worker_scaled_slow_lookup_keeps_rows(operation):
+    """The real worker deadline with every duration scaled down: rows reach the receipt."""
+    from unittest.mock import patch
+    from telethon.sessions import MemorySession
+    from messaging_service.commands import CommandWorker
+    from messaging_service.telegram_governor import RequestGovernor
+    scale, receipt, ids = 0.02, {}, list(range(201, 221))
+    class State:
+        def cooldown_remaining(self):
+            return 0
+
+        def status(self, *args):
+            pass
+    async def scaled_sleep(delay):
+        await asyncio.sleep(delay * scale)
+    class Client(GroupClient):
+        async def get_input_entity(self, peer):
+            if peer == int(SUPERGROUP):
+                await asyncio.sleep(12 * scale)
+            return await super().get_input_entity(peer)
+    client = Client()
+    client.session = MemorySession()
+    client.session.process_entities(types.messages.ChatInviteImporters(count=20, importers=[],
+        users=[types.User(id=i, access_hash=7, first_name='Synthetic') for i in ids]))
+    candidate = job(operation, {'user_ids': [str(i) for i in ids]}, provider_chat=SUPERGROUP, mutation=True)
+    class Worker(CommandWorker):
+        def claim(self):
+            return candidate
+
+        def preflight(self, item, **kwargs):
+            pass
+
+        def finish(self, item, status, result=None, code=None):
+            receipt.update(status=status, result=result)
+    async def scenario():
+        start = time.monotonic()
+        governor = RequestGovernor(State(), clock=lambda: (time.monotonic() - start) / scale, sleep=scaled_sleep)
+        async def provider(item):
+            return await execute(client, item, governor=governor)
+        original = asyncio.wait_for
+        async def scaled_wait_for(awaitable, timeout):
+            return await original(awaitable, timeout * scale)
+        with patch('messaging_service.commands.asyncio.wait_for', scaled_wait_for):
+            await Worker(None, provider)._once()
+    asyncio.run(scenario())
+    assert receipt['status'] == 'unknown' and receipt['result'] is not None
+    rows = receipt['result']['data']['results']
+    assert len(rows) == 20 and 0 < len(client.mutations()) < 20
+    assert [r['state'] for r in rows].count('applied') == len(client.mutations())

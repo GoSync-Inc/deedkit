@@ -67,10 +67,17 @@ JOIN_REFUSALS = {'HIDE_REQUESTER_MISSING': 'no_pending_request', 'USER_ALREADY_P
 # Telethon raises a typed error per known name; its message is the generic class text.
 JOIN_REFUSAL_ERRORS = {errors.rpcerrorlist.rpc_errors_dict[name]: name for name in JOIN_REFUSALS}
 JOIN_REQUESTS_BYTES = 48000
-# No new requester starts after this many seconds of a batch. The worker cancels at 30 s
-# (commands.py); one more ID costs at most a paced lookup and a paced mutation (1 s each
-# under RequestGovernor) plus their round trips, so 20 s leaves about 10 s for that ID.
-JOIN_BATCH_BUDGET_SECONDS = 20.0
+# No batch mutation starts later than this after the adapter was entered. The worker
+# cancels at 30 s (commands.py). The check runs after the governor wait and the preflight,
+# right before the call, so only the last request's round trip (a stall stays the
+# documented unknown) and the receipt write follow it: 22 s leaves 8 s for both. An idle
+# 20-ID batch of cached requesters (group lookup + 20 mutations, 1 s apart) starts its
+# last mutation at 20 s, so it still completes.
+JOIN_BATCH_BUDGET_SECONDS = 22.0
+
+
+class JoinBatchBudgetSpent(Exception):
+    """The batch budget ran out before this mutation started; nothing was sent."""
 
 
 def reject(code):
@@ -247,6 +254,9 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             reject('operation_expired')
 
     check_expiry()
+    # The governor's clock paces the calls, so the batch budget reads the same clock.
+    clock = getattr(governor, 'clock', time.monotonic)
+    entered = clock()
     started_mutation = False
     report = job.get('_provider_phase')
     if report is not None:
@@ -280,7 +290,7 @@ async def _execute(client, job, *, verified_self=None, governor=None):
 
     check_policy()
 
-    async def rpc(fn, *, mutation=False):
+    async def rpc(fn, *, mutation=False, budget=False):
         async def guarded():
             nonlocal started_mutation
             check_expiry()
@@ -291,6 +301,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 await preflight()
             check_expiry()
             check_policy()
+            if budget and clock() - entered >= JOIN_BATCH_BUDGET_SECONDS:
+                raise JoinBatchBudgetSpent()
             if mutation:
                 started_mutation = True
                 if report is not None:
@@ -892,12 +904,9 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 if isinstance(cached, types.InputPeerUser) and cached.user_id == uid:
                     return utils.get_input_user(cached)
                 return await user_input(value)
-            # The governor's clock paces the calls, so the budget reads the same clock.
-            clock = getattr(governor, 'clock', time.monotonic)
-            started = clock()
             for index, value in enumerate(ids):
                 attempted = False
-                if clock() - started >= JOIN_BATCH_BUDGET_SECONDS:
+                if clock() - entered >= JOIN_BATCH_BUDGET_SECONDS:
                     rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index:])
                     break
 
@@ -908,7 +917,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 try:
                     # The mutation's rpc rechecks expiry, access and the trusted preflight right before it.
                     user = await requester(value)
-                    await rpc(hide, mutation=True)
+                    # A spent budget raises JoinBatchBudgetSpent: this ID and the rest are not_attempted.
+                    await rpc(hide, mutation=True, budget=True)
                     rows.append({'id': value, 'state': 'applied'})
                     continue
                 except asyncio.CancelledError:
