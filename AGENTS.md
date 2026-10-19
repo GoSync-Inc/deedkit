@@ -32,8 +32,8 @@ the orchestrator; never text in your own input box). Diff items:
 
 And without a diff: a restore, rollback over data or other production change than
 `production.py deploy` and the task steps below; live provider actions; secrets or
-credentials, roles, host access; deleting cards or records, or data outside an accepted task, moving
-cards, publishing a package, rewriting history; accepting a known risk (an open blocking or major
+credentials, roles, host access; deleting records, or data outside an accepted task; deleting or moving
+cards (agents may on the owner's quoted request); publishing a package, rewriting history; accepting a known risk (open blocking or major
 finding); product direction (accepting feature or epic cards, weakening an accepted criterion).
 A standing approval holds only while all its conditions do.
 
@@ -53,7 +53,7 @@ line `Change path: <path> (<rule>)`. Never lower it; in doubt, OWNER.
 - AUTO+review (any other file): plus one Astra round.
 - OWNER (section 2): plus the owner's words.
 
-CI and review run in parallel. Merge with
+Merge with
 `gh pr merge <n> --squash --auto`, never bypassing checks, with no open blocking or major finding.
 Done: the squash's `main` push run is green.
 
