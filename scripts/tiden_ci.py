@@ -29,9 +29,20 @@ MODULE_REPORTS = {
     "calls": ("calls.xml", "python", "services/calls"),
     "calls_frontend": ("calls-frontend.xml", "node", "services/calls/frontend"),
     "backup_restore": ("backup-restore.xml", "python", ""),
+    # Root-suite tests that cannot run in the shards: one as root under sudo, two in the enricher-test image.
+    "root_session_lock": ("root-session-lock.xml", "python", ""),
+    "enricher_audio": ("enricher-audio.xml", "python", ""),
     # `go test -json` streams of the `go` job, published as result rows (go_results), not JUnit.
     "whatsmeow": ("whatsmeow.json", "go", "whatsapp/whatsmeow"),
     "release_router": ("release-router.json", "go", "services/release-router"),
+}
+# A module that runs named root-suite nodes passes only when its report holds exactly these executions (file::name),
+# each once and passed; the shards deselect them, so assembly refuses evidence whose python.xml holds one of them.
+REQUIRED_EXECUTIONS = {
+    "root_session_lock": frozenset({"tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root"}),
+    "enricher_audio": frozenset({"tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download",
+                                 "tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model[wav]",
+                                 "tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model[ogg]"}),
 }
 GO_MODULES = tuple(name for name, (_, framework, _) in MODULE_REPORTS.items() if framework == "go")
 _VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and name not in GO_MODULES)
@@ -167,9 +178,7 @@ def normalize_junit(path: Path, root: Path, framework: str, source_prefix: str =
             # Node's built-in reporter uses classname='test' for every file.
             # File qualification prevents unrelated equal titles from colliding.
             case.set("classname", "node:" + file)
-        status = "failed" if case.find("failure") is not None or case.find("error") is not None else (
-            "skipped" if case.find("skipped") is not None else "passed")
-        counts[status] += 1
+        counts[case_status(case)] += 1
     return ET.tostring(document, encoding="utf-8", xml_declaration=True), counts
 
 
@@ -181,6 +190,18 @@ GO_MODULE_ARGUMENT = re.compile(r'"((?:[^"\\\n]|\\.)*)"|`([^`\n]*)`|(\S+)')
 GO_SIGNATURE = re.compile(r"[A-Za-z0-9._~/-]+::(?:Test|Example|Fuzz)\S*")
 BARE_GO_FILE = re.compile(r"[A-Za-z0-9_.-]+_test\.go")
 ROW_KEYS, EXECUTION_KEYS = {"id", "title", "signature", "execution", "suitePath", "fields"}, {"status", "duration"}
+
+
+def case_status(case: ET.Element) -> str:
+    return "failed" if case.find("failure") is not None or case.find("error") is not None else (
+        "skipped" if case.find("skipped") is not None else "passed")
+
+
+def executions(cases: object, root: Path) -> Counter:
+    """Each JUnit test case's `file::name` identity, its path placed as `normalize_junit` places it (xunit2 omits
+    file: its classname's path), with its status."""
+    return Counter((source_path(case.get("file") or case.get("classname", "").replace(".", "/") + ".py", root)
+                    + "::" + case.get("name", ""), case_status(case)) for case in cases)
 
 
 def normalized_report(check: str) -> str:
@@ -371,6 +392,9 @@ def prepare(root: Path, directory: Path, metadata: dict) -> dict:
                     outcome = "failure"
                 if not totals["passed"] and not totals["failed"]:
                     outcome, reason = "skipped", "No tests executed; only skipped tests"
+                if check in REQUIRED_EXECUTIONS and executions(ET.fromstring(normalized).iter("testcase"), root) != Counter(
+                        (name, "passed") for name in REQUIRED_EXECUTIONS[check]):
+                    outcome, reason = "failure", "The report does not hold exactly the required executions, each once and passed"
             except (OSError, ValueError, ET.ParseError):
                 outcome, reason = "skipped", "Missing or invalid test report; verification incomplete"
         status = "passed" if outcome == "success" else "failed" if outcome == "failure" else "blocked"
@@ -523,6 +547,9 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, 
                 (directory / path.name).write_bytes(path.read_bytes())
         present.append(job)
     checks["python"] = combined_outcome(shards)
+    required = set().union(*REQUIRED_EXECUTIONS.values())
+    if any(name in required for name, _ in executions((case for suite in suites for case in suite.iter("testcase")), source_root)):
+        raise ValueError("a shard report holds a test that only its own module check may run")
     if suites:
         merged = ET.Element("testsuites", {"name": "pytest tests"})
         merged.extend(suites)

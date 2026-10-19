@@ -67,6 +67,23 @@ row's ID is a UUIDv5 of the publishing run attempt, the check and the signature,
 so a main push that publishes reused queue or pull request evidence gives the Go
 rows its own IDs.
 
+Three root-suite cases run in `checks / verify` steps of their own instead of
+the shards (ANYM-429). Both shard command lines `--deselect` them:
+`tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root`
+needs root and runs under `sudo` as module check `deedkit-ci::root_session_lock`
+(`root-session-lock.xml`, handed back to the runner user).
+`tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download`
+and `::test_faster_whisper_decoder_compatibility_without_model` need
+faster-whisper, so they run in the `enricher-test` image with no network, a
+read-only root filesystem and the runner's uid, as module check
+`deedkit-ci::enricher_audio` (`enricher-audio.xml`). Verify builds that image in
+the background, and only the audio step waits for it
+(`AUDIO_IMAGE_WAIT_SECONDS`). Such a module passes only when its report holds
+exactly its `REQUIRED_EXECUTIONS` (scripts/tiden_ci.py), each once and passed;
+a missing, skipped, extra or duplicate case fails it. A missing report blocks
+it, and that is what happens for a tested source without the node or the target.
+Assembly refuses evidence whose shard reports hold one of these cases.
+
 The separate reporting job receives no database or messenger credentials. It
 uses Tiden CLI 0.33.0 from the official release with a pinned SHA-256 checksum.
 Fork pull requests do not receive the Tiden secret or publish evidence. Package
@@ -143,7 +160,7 @@ merge as checked. When the reporting job warned, the agent reruns that run with
 anchors, so neither replaces that read. Republishing always takes **Re-run all
 jobs**, the full suite: the reporting job no longer fails, so **Re-run failed
 jobs** selects nothing. A rerun of the reporting job alone gets an attempt URL
-that its `ci-evidence` does not name, so Tiden drops the fifteen check rows and
+that its `ci-evidence` does not name, so Tiden drops the seventeen check rows and
 the count check fails.
 
 CI runs on `push` only for `main`. A feature branch is verified by its pull
