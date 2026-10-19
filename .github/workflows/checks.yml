@@ -119,6 +119,16 @@ jobs:
             --build-arg "VERSION_REF=$revision" --label "org.opencontainers.image.revision=$revision" \
             --label org.opencontainers.image.source=https://github.com/GoSync-Inc/deedkit . </dev/null >/dev/null 2>&1 &
           finish python-image docker pull "$DEEDKIT_TEST_PYTHON_IMAGE" </dev/null >/dev/null 2>&1 &
+      - name: Start the native audio test image build in the background
+        # Only the native audio step waits for it. A tested source without the enricher-test target builds nothing.
+        run: |
+          if ! grep -Eq '^FROM[[:space:]].*[[:space:]]AS[[:space:]]+enricher-test[[:space:]]*$' Dockerfile; then
+            echo "::notice::The tested Dockerfile has no enricher-test target"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/background"
+          finish() { if "${@:2}" > "$RUNNER_TEMP/background/$1.log" 2>&1; then echo 0; else echo 1; fi > "$RUNNER_TEMP/background/$1.tmp"; mv "$RUNNER_TEMP/background/$1.tmp" "$RUNNER_TEMP/background/$1.exit"; }
+          finish enricher-test docker build --target enricher-test --tag deedkit-enricher-test:ci . </dev/null >/dev/null 2>&1 &
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with: {python-version: '3.13'}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -255,7 +265,10 @@ jobs:
           # directory joins pytest's import path; a baseline of an older revision is sharded the same way.
           mkdir -p "$RUNNER_TEMP/shard-plugin"
           cp ci-tools/scripts/python_shards.py ci-tools/scripts/python_shards.json "$RUNNER_TEMP/shard-plugin/"
-          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py tests
+          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py \
+            --deselect tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root \
+            --deselect tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download \
+            --deselect tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model tests
       - name: Isolated server backup restore with real age and PostgreSQL
         id: backup_restore
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -273,6 +286,57 @@ jobs:
             sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/ci-evidence/backup-restore.xml"
           fi
           exit "$restore_test_exit"
+      - name: Root-only session lock test under sudo
+        # Deselected from the shards. A tested source without the node writes no report, so its check is blocked.
+        id: root_session_lock
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+          ROOT_NODE: tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root
+        run: |
+          if ! "$PWD/.venv/bin/python" -m pytest --collect-only -q -p no:cacheprovider "$ROOT_NODE" >/dev/null 2>&1; then
+            echo "::notice::The tested source has no $ROOT_NODE"
+            exit 0
+          fi
+          set +e
+          sudo env PYTHONDONTWRITEBYTECODE=1 "$PWD/.venv/bin/python" -m pytest --tb=short -p no:cacheprovider -o junit_family=xunit1 \
+            --junitxml="$RUNNER_TEMP/ci-evidence/root-session-lock.xml" "$ROOT_NODE"
+          root_test_exit=$?
+          set -e
+          if test -f "$RUNNER_TEMP/ci-evidence/root-session-lock.xml"; then
+            sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/ci-evidence/root-session-lock.xml"
+          fi
+          exit "$root_test_exit"
+      - name: Native audio decoder tests in the enricher test image without network
+        # Deselected from the shards. It waits only for its own background build and fails when that failed or did not
+        # finish. A tested source without the enricher-test target writes no report, so its check is blocked.
+        id: enricher_audio
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          AUDIO_IMAGE_WAIT_SECONDS: 900
+        run: |
+          if ! grep -Eq '^FROM[[:space:]].*[[:space:]]AS[[:space:]]+enricher-test[[:space:]]*$' Dockerfile; then
+            echo "::notice::The tested Dockerfile has no enricher-test target"
+            exit 0
+          fi
+          for _ in $(seq "$AUDIO_IMAGE_WAIT_SECONDS"); do
+            test -f "$RUNNER_TEMP/background/enricher-test.exit" && break
+            sleep 1
+          done
+          if [ "$(cat "$RUNNER_TEMP/background/enricher-test.exit" 2>/dev/null)" != 0 ]; then
+            cat "$RUNNER_TEMP/background/enricher-test.log" 2>/dev/null || true
+            echo "::error::background enricher-test image build failed or did not finish"
+            exit 1
+          fi
+          set +e
+          docker run --rm --network none --read-only --tmpfs /tmp --user "$(id -u):$(id -g)" \
+            --volume "$RUNNER_TEMP/ci-evidence:/evidence" deedkit-enricher-test:ci \
+            python -m pytest --tb=short -p no:cacheprovider -o junit_family=xunit1 --junitxml=/evidence/enricher-audio.xml \
+            tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download \
+            tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model
+          audio_test_exit=$?
+          set -e
+          exit "$audio_test_exit"
       - name: Node collector tests
         id: collector
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -307,7 +371,7 @@ jobs:
           CHECK_OUTCOMES: >-
             {"build":"${{ steps.build.outcome }}","release":"${{ steps.release.outcome }}","python":"${{ steps.python.outcome }}","collector":"${{ steps.collector.outcome }}","npm":"${{ steps.npm.outcome }}","smoke":"${{ steps.smoke.outcome }}","distributions":"${{ steps.distributions.outcome }}"}
           MODULE_OUTCOMES: >-
-            {"gateway":"${{ steps.gateway.outcome }}","calendar":"${{ steps.calendar.outcome }}","calls":"${{ steps.calls.outcome }}","calls_frontend":"${{ steps.calls_frontend.outcome }}","backup_restore":"${{ steps.backup_restore.outcome }}"}
+            {"gateway":"${{ steps.gateway.outcome }}","calendar":"${{ steps.calendar.outcome }}","calls":"${{ steps.calls.outcome }}","calls_frontend":"${{ steps.calls_frontend.outcome }}","backup_restore":"${{ steps.backup_restore.outcome }}","root_session_lock":"${{ steps.root_session_lock.outcome }}","enricher_audio":"${{ steps.enricher_audio.outcome }}"}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
           TIDEN_BRANCH_OVERRIDE: ${{ inputs.tiden_branch }}
         run: |
@@ -591,7 +655,10 @@ jobs:
           # directory joins pytest's import path; a baseline of an older revision is sharded the same way.
           mkdir -p "$RUNNER_TEMP/shard-plugin"
           cp ci-tools/scripts/python_shards.py ci-tools/scripts/python_shards.json "$RUNNER_TEMP/shard-plugin/"
-          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py tests
+          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py \
+            --deselect tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root \
+            --deselect tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download \
+            --deselect tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model tests
       - name: Record the shard outcome
         if: ${{ always() }}
         env:

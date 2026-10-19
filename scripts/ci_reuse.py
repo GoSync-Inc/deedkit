@@ -265,7 +265,7 @@ def validate(directory: Path, sha: str, producer_url: str, attempt: int, pull_re
                 for check in (*tiden_ci.CHECKS, *tiden_ci.MODULE_REPORTS)]
     if not isinstance(rows, list) or [(row.get("signature"), row.get("id")) for row in rows if isinstance(row, dict)] != expected \
             or any((row.get("execution") or {}).get("status") != "passed" for row in rows):
-        raise Refused("the evidence check rows are not the queue run's passed checks: the thirteen CI and module checks and the Go module checks")
+        raise Refused(f"the evidence check rows are not the queue run's {len(expected)} passed CI and module checks")
     return manifest
 
 

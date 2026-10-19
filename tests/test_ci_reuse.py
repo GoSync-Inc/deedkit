@@ -50,6 +50,9 @@ def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, even
         (fragment / "attempt").write_text(attempt + "\n")
     for name in tiden_ci.FRAGMENTS["verify"][1][1:]:
         (verify / name).write_text(CASE.format(name=name.split(".")[0].replace("-", "_")))
+    for module, required in tiden_ci.REQUIRED_EXECUTIONS.items():  # each holds exactly its required executions
+        (verify / tiden_ci.MODULE_REPORTS[module][0]).write_text("<testsuite>" + "".join(
+            '<testcase name="{1}" file="{0}"/>'.format(*node.split("::")) for node in sorted(required)) + "</testsuite>")
     (verify / "metadata.json").write_text(json.dumps({
         "sha": sha, "git_branch": git_branch, "tiden_branch": tiden_branch, "checks": dict.fromkeys(tiden_ci.CHECKS, "success"),
         "module_checks": dict.fromkeys(tiden_ci.FRAGMENTS["verify"][0], "success"), "ci_url": "unused"}))
@@ -306,7 +309,7 @@ def producers(evidence, **load):
      "calls report"),
     (lambda e: {"normalized-python.xml": b'<!DOCTYPE x><testsuite/>'}, "python report is unsafe"),
     (lambda e: {"manifest.json": b"{"}, "not valid JSON"),
-    (lambda e: {"ci-checks.json": json.dumps(json.loads((e / "ci-checks.json").read_text())[:12]).encode()}, "thirteen"),
+    (lambda e: {"ci-checks.json": json.dumps(json.loads((e / "ci-checks.json").read_text())[:-1]).encode()}, "passed CI and module checks"),
     (lambda e: producers(e, attempt="3"), "did not produce passing evidence"),
     (lambda e: producers(e, result="failure"), "did not produce passing evidence"),
     (lambda e: producers(e, sha="b" * 40), "did not produce passing evidence"),
@@ -502,7 +505,7 @@ def test_the_push_run_publishes_the_queue_evidence_to_main_under_its_own_run_url
     # The Go result rows go out re-identified for this push run (published-normalized-<check>.json).
     assert names == sorted([("published-" if check in tiden_ci.GO_MODULES else "") + tiden_ci.normalized_report(check)
                             for check in ci_reuse.REPORT_CHECKS] + ["ci-checks-published.json"])
-    # Executions and outcomes are the queue run's; the thirteen check rows carry this push run's IDs.
+    # Executions and outcomes are the queue run's; the check rows carry this push run's IDs.
     rows = json.loads((published / "ci-checks-published.json").read_text())
     queue_rows = json.loads((evidence / "ci-checks.json").read_text())
     assert [(row["signature"], row["execution"]) for row in rows] == [(row["signature"], row["execution"]) for row in queue_rows]
