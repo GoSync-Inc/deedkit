@@ -2,7 +2,7 @@
 import re
 
 from .policy import scope_filter,targets
-from .search_query import cursor_binding,decode_cursor,encode_cursor,filter_values,valid_text
+from .search_query import cursor_binding,decode_cursor,encode_cursor,filter_values,position_text,valid_text
 from .name_variants import patterns
 from .whatsapp_identity import visible_cte,people_join
 from .sender_names import resolve
@@ -66,7 +66,7 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
             pos=decode_cursor(after,binding)
             if set(pos)!= {'rank','account','sender'} or type(pos['rank']) is not int or not 0<=pos['rank']<=7:
                 raise APIError('invalid_cursor')
-            valid_text(pos['account'],empty=False);valid_text(pos['sender'],empty=False)
+            position_text(pos['account']);position_text(pos['sender'])
             anchor=c.execute(cte+'SELECT match_rank FROM grouped WHERE account=%s AND sender_id=%s',
                 [*query_args,pos['account'],pos['sender']]).fetchone()
             if not anchor:raise APIError('not_found',404)
@@ -80,7 +80,7 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
                 pos=decode_cursor(after,binding)
                 if set(pos)!= {'rank','id'} or type(pos['rank']) is not int or not 0<=pos['rank']<=7:
                     raise APIError('invalid_cursor')
-                valid_text(pos['id'],empty=False)
+                position_text(pos['id'])
                 anchor=c.execute(cte+'SELECT match_rank FROM observed WHERE id=%s',[*query_args,pos['id']]).fetchone()
                 if not anchor:raise APIError('not_found',404)
                 if anchor['match_rank']!=pos['rank']:raise APIError('cursor_changed',409)
