@@ -459,20 +459,23 @@ when the release is recorded again. So the job records only while this commit's
 passed run is the latest completed `main` run, at least a minute after it
 completed, and then checks that the run completed last before the release's
 creation time is this commit's. Otherwise it warns: when another commit's run
-completed last it records nothing and writes no receipt, and when the release
+completed last it records nothing (receipt `state: not_attempted`), and when the release
 captured another run's gate its `tiden-release-receipt` artifact records
 `gateFromThisCommit: false`. When the commit's evidence publication was not
 verified, the job warns `Tiden release not recorded` before any Tiden call
 and records nothing. Temporarily (ANYM-411), an unavailable Tiden only warns
 `Tiden release not recorded`: a failed CLI download, or a Tiden call that exits
-non-zero, prints unparseable output or passes its timeout. The receipt records
+non-zero, prints unparseable output (for `gate check`, neither a verdict nor the
+empty output of a missing gate) or passes its timeout. The receipt records
 `state`: `not_attempted` when no create call was made, `not_verified` when one
 was sent, keeping the known release identity; an uncertain create is never
 retried. A checksum mismatch, a missing product or workspace ID, a validation
 error, a rewritten release identity and any other error still fail the job and
 with it the main run, which `production.py verify` then refuses. Every step has
-a timeout and the script ends its own work at least 30 seconds before its
-step's, so the warning and the receipt upload always run. The `production`
+a timeout. The script ends its Tiden calls by its own deadline and anything
+else, manifest validation included, by an overall deadline at least 30 seconds
+before its step's, failing the job in that case; it rewrites the receipt at
+every state change, so the warning and the receipt upload always run. The `production`
 record still fails on every Tiden error. The rule lasts until three consecutive
 automatic `Tiden health` runs (`workflow_run`, distinct TARGET SHAs, each
 upstream CI run `success`) report `## Tiden health: PASS`; a FAIL, UNKNOWN or

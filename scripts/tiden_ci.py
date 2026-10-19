@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import signal
 import subprocess
 import time
 import urllib.request
@@ -68,9 +69,12 @@ RUN_WINDOW = timedelta(minutes=10)
 GATE_SETTLE = timedelta(seconds=60)
 MAX_RUN_PAGES = 10
 CLI_TIMEOUT = 120
-# The CI release record's own deadline, at least 30 seconds inside its step's 5-minute timeout (ci.yml), so the
-# script, not the runner, ends a hang and writes the receipt.
+# The CI release record's overall deadline, at least 30 seconds inside its step's 5-minute timeout (ci.yml), so the
+# script, not the runner, ends a hang and leaves the receipt. Tiden calls end CI_RECORD_MARGIN earlier, so an
+# unavailable Tiden is classified before the overall deadline ends anything still running.
 CI_RELEASE_DEADLINE = 270
+CI_RECORD_MARGIN = 10
+RELEASE_RECEIPT = "tiden-release-receipt.json"
 # A main push run that reused the merge queue's verification of its commit (scripts/ci_reuse.py) publishes that
 # run's unchanged evidence with this record of itself as publisher, and these check rows under its own run URL.
 PUBLICATION = "publication.json"
@@ -634,6 +638,10 @@ class TidenUnavailable(RuntimeError):
     state = "not_attempted"
 
 
+class RecordDeadline(RuntimeError):
+    """The CI release record passed its overall deadline outside a Tiden call, for example in manifest validation."""
+
+
 def when(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
@@ -666,9 +674,15 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
     progress = {"state": "not_attempted", "version": version, "environment": environment, "url": url,
                 "releasedAt": released_at}
 
+    def save() -> None:
+        # Written at every state change, so even a killed or crashed record leaves an honest receipt.
+        (directory / RELEASE_RECEIPT).write_text(json.dumps(progress, indent=2))
+
+    save()
+
     def unavailable(message: str) -> TidenUnavailable:
         """The receipt keeps what is known; the exception carries its state."""
-        (directory / "tiden-release-receipt.json").write_text(json.dumps(progress, indent=2))
+        save()
         exc = TidenUnavailable(message)
         exc.state = progress["state"]
         return exc
@@ -685,6 +699,7 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
         timeout = left(label)
         if create:
             progress["state"] = "not_verified"  # Once sent, the release may exist whatever comes back.
+            save()
         try:
             return tiden(cli, arguments, product, directory, label, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -736,6 +751,7 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
     if (release.get("version"), release.get("environmentSlug"), release.get("url")) != (version, environment, url):
         raise RuntimeError("Tiden rewrote the release identity")
     progress.update(releaseId=release["id"], createdAt=release["createdAt"])
+    save()
     # A repeated create keeps the original creation time, and with it the original gate.
     created = when(release["createdAt"])
     captured = latest_main_run(created, "release-runs-captured")
@@ -743,17 +759,22 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
                 and created - when(captured["completedAt"]) >= GATE_SETTLE)
     returncode, output = run(["gate", "check", "--release", release["id"]], "release-gate")
     try:
-        gate = json.loads(output)
+        answer = json.loads(output) if output.strip() else None
     except json.JSONDecodeError:
-        gate = {}
-    if returncode and not gate:
+        answer = output
+    gate = answer if isinstance(answer, dict) else {}
+    if returncode and answer is None:
+        # Tiden exits non-zero and prints nothing when the release captured no gate.
         print("::warning title=Tiden release gate::no gate was captured for " + version)
         own_gate = None
+    elif not isinstance(gate.get("status"), str):
+        # A verdict, passed or not, always names its status; anything else is not an answer.
+        raise unavailable("Tiden release-gate printed no gate verdict; the release was not verified")
     receipt = {"state": "recorded", "releaseId": release["id"], "version": version, "environment": environment,
                "url": url, "releasedAt": released_at, "createdAt": release["createdAt"], "mainRun": ours["id"],
                "gateRun": captured.get("id"), "gateFromThisCommit": own_gate,
                "gate": gate.get("status"), "gateComputedAt": gate.get("computedAt")}
-    (directory / "tiden-release-receipt.json").write_text(json.dumps(receipt, indent=2))
+    (directory / RELEASE_RECEIPT).write_text(json.dumps(receipt, indent=2))
     if own_gate is False:
         raise ForeignGate(f"release {version} captured the main gate after run {captured.get('id')} of "
                           f"{captured.get('buildSha')}; do not use its gate for readiness")
@@ -818,7 +839,25 @@ def main() -> int:
 
 
 def release(args: argparse.Namespace, directory: Path) -> int:
-    deadline = time.monotonic() + CI_RELEASE_DEADLINE
+    if args.environment != "github-actions-synthetic":
+        return record(args, directory, None)
+
+    def expire(signum: int, frame: object) -> None:
+        # Fatal, like the hang it ends; a receipt already written is current.
+        if not (directory / RELEASE_RECEIPT).exists():
+            (directory / RELEASE_RECEIPT).write_text(json.dumps({"state": "not_attempted"}, indent=2))
+        raise RecordDeadline(f"the CI release record passed its {CI_RELEASE_DEADLINE}-second deadline")
+
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, CI_RELEASE_DEADLINE)
+    try:
+        return record(args, directory, time.monotonic() + CI_RELEASE_DEADLINE - CI_RECORD_MARGIN)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def record(args: argparse.Namespace, directory: Path, deadline: float | None) -> int:
     if args.environment == "github-actions-synthetic":
         # Only this main push run's own published evidence names the commit and its build URL.
         if args.sha or args.url or args.released_at:
@@ -839,7 +878,7 @@ def release(args: argparse.Namespace, directory: Path) -> int:
         raise ValueError("TIDEN_PRODUCT_ID is required to record a release")
     try:
         receipt = record_release(directory, sha, args.environment, url, released_at, product,
-                                 deadline=None if args.environment == "production" else deadline)
+                                 deadline=deadline)
     except TidenUnavailable as exc:
         if args.environment == "production":
             raise
