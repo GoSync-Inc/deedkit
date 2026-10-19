@@ -20,42 +20,6 @@
       "reason": "Fixture hygiene check: contract snapshot files are synthetic, have unique tool names and contain no synthetic key"
     },
     {
-      "caseId": "4f0b981b-a682-4942-b6ef-d28703352830",
-      "externalId": "s:tests.test_audio_native::test_faster_whisper_decoder_compatibility_without_model",
-      "category": "missing-spec",
-      "reason": "faster-whisper/PyAV native decoder compatibility in the enricher-test image (decodes wav/ogg to float32 of right length); no spec covers dependency compatibility"
-    },
-    {
-      "caseId": "8ebdcdbe-2248-479d-a5b7-f44797fb44e8",
-      "externalId": "s:tests.test_audio_native::test_invalid_native_audio_does_not_reach_provider",
-      "category": "missing-spec",
-      "reason": "Invalid audio fails invalid_audio before any provider call; no spec describes native audio probing/validation"
-    },
-    {
-      "caseId": "b3085d80-bfca-4b03-83ce-d4fa9cd51b5f",
-      "externalId": "s:tests.test_audio_native::test_native_duration_and_complete_provider_upload_preserve_original",
-      "category": "missing-spec",
-      "reason": "Native duration probing, OGG/Opus-to-MP3 transcoding and the exact OpenAI transcription upload with transcode/truncation metadata, original unchanged; no spec describes the audio provider contract"
-    },
-    {
-      "caseId": "c0682025-49b6-436a-91f3-05cf580c5aef",
-      "externalId": "s:tests.test_audio_native::test_native_duration_limit_rejects_before_any_provider_call",
-      "category": "missing-spec",
-      "reason": "Recording over max_audio_seconds fails audio_duration_limit before any provider call; ANYM-70 only configures the limit, enforcement is unspecified"
-    },
-    {
-      "caseId": "59f48aa1-3136-49e0-93aa-dabee80054af",
-      "externalId": "s:tests.test_audio_native::test_native_ogg_transcode_size_limit_never_submits_partial_audio",
-      "category": "missing-spec",
-      "reason": "OGG transcode exceeding max_input_bytes fails audio_transcode_size_limit and never submits partial audio; no spec describes transcoding limits"
-    },
-    {
-      "caseId": "edc31460-6c95-4482-9eab-f36338beae0b",
-      "externalId": "s:tests.test_audio_native::test_optional_cpu_package_loads_without_gpu_or_model_download",
-      "category": "missing-spec",
-      "reason": "Optional faster-whisper CPU package imports with int8 CPU compute support (image dependency smoke); no spec asserts it"
-    },
-    {
       "caseId": "5425005b-4bc4-4382-bcd0-70b918893466",
       "externalId": "s:tests.test_backup_restore_worker::test_worker_has_no_provider_or_store_initialization",
       "category": "trivial",
