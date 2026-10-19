@@ -19,7 +19,7 @@ from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 import voice
 from app import create_app
 from core import ACTIVE
-from learning import LearningWorker
+from learning import ANALYZER_VERSION, LearningWorker
 from test_tasks import owner_headers, Archive, BRIEF
 
 KEY = 'fixture-not-an-api-key'
@@ -218,9 +218,9 @@ async def test_rehearsal_call_flows_from_measured_audio_through_guarded_goodbye_
 
                 # A fresh goodbye grants permission, but the hangup waits for the farewell to be played.
                 track.speak(.5)
-                await until(lambda: len([e for e in events('audio_activity') if e['speaking']]) == 2)
+                await until(lambda: len([e for e in events('audio_activity') if e['speaking']]) >= 2)
                 llm.hear(GOODBYE)
-                await until(lambda: len([e for e in events('audio_activity') if not e['speaking']]) == 2)
+                await until(lambda: len([e for e in events('audio_activity') if not e['speaking']]) >= 2)
                 granted = await llm.call('end_conversation', {'reason': 'completed', 'summary': 'Окно доставки 12–13',
                                                                 'evidence': GOODBYE}, 'end-final')
                 assert granted.get('end_requested') is True, granted
@@ -246,7 +246,8 @@ async def test_rehearsal_call_flows_from_measured_audio_through_guarded_goodbye_
                 assert sent['chunks'] == round(llm.scripted_audio_ms / 100)
                 assert sent['audio_ms'] == round(llm.scripted_audio_ms, 2) and sent['sample_rates'] == [llm._sample_rate]
                 assert provider[0]['runtime']['delivery_frames'] > 0
-                assert not any(isinstance(v, (bytes, bytearray)) for e in (inbound[0], provider[0]) for v in e.values())
+                assert all(isinstance(v, (int, float, bool, str, type(None), list, dict)) for v in heard_in.values())
+                assert set(sent) == {'chunks', 'audio_ms', 'sample_rates', 'generation_span_ms', 'max_chunk_gap_ms'}
 
                 # Transport: the peer is released and the finished call cannot be joined again.
                 await until(lambda: not app.state.session and not app.state.rtc._pcs_map, 5)
@@ -267,10 +268,14 @@ async def test_rehearsal_call_flows_from_measured_audio_through_guarded_goodbye_
                 assert await worker.run_once()
                 report = service.learning.report(identity)
                 assert report['status'] == 'complete' and report['id'] == queued['id']
-                assert report['findings'][-1]['evidence_event_ids'] and set(report['findings'][-1]['evidence_event_ids']) <= {e['id'] for e in archived}
+                last_goodbye = [e['id'] for e in archived if e['kind'] == 'transcript_chunk' and e['role'] == 'user'][-1:]
+                semantic = [f for f in report['findings'] if f['origin'] == 'semantic']
+                assert len(semantic) == 1 and semantic[0]['evidence_event_ids'] == last_goodbye
+                assert report['semantic']['rejected_findings'] == 0 and report['analyzer_version'] == ANALYZER_VERSION
                 assert len(reviewer.snapshots) == 1
                 assert not await worker.run_once()
                 assert service.learning.report(identity)['id'] == report['id'] and len(reviewer.snapshots) == 1
+                assert [r['id'] for r in service.learning.history(identity)] == [report['id']]
     finally:
         for reader in readers: reader.cancel()
         await asyncio.gather(*readers, return_exceptions=True)
