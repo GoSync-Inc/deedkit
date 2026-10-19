@@ -960,7 +960,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
         method=request.path_params['operation']
         if method not in operations: raise APIError('not_found',404)
         try:
-            params=await request.json()
+            try: params=await request.json()
+            except (ValueError,RecursionError): raise APIError('invalid_parameters') from None
             if not isinstance(params,dict) or 'token' in params: raise APIError('invalid_parameters')
             # REST/SDK defaults remain archive-compatible; MCP defaults to the new view.
             if method in ('list_chats','search','get_messages','get_context'):

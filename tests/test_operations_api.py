@@ -62,6 +62,41 @@ def test_operation_rest_and_mcp_match_exact_payload(method):
     assert store.calls == [(method, params), (method, params)]
 
 
+# spec: ANYM-306
+@pytest.mark.parametrize('body', [b'\xff', b'\xff\xfe\x00', b'{"query": "\xc3\x28"}', b'{"query": ', b'[]', b'{"token": "x"}',
+    b'{"limit": '+b'1'*4400+b'}'])
+def test_rest_body_that_cannot_be_decoded_is_invalid_parameters_not_retryable(body):
+    store = RecordingStore()
+    with TestClient(create_app(store, ['testserver'])) as client:
+        rest = client.post('/v1/search', headers={'Authorization': 'Bearer synthetic-token'}, content=body)
+    assert rest.status_code == 400
+    assert rest.json()['error'] == 'invalid_parameters' and rest.json()['retryable'] is False
+    assert 'retry_after_seconds' not in rest.json()
+    assert store.calls == []
+
+
+# spec: ANYM-306
+def test_rest_body_nested_beyond_the_parser_recursion_limit_is_invalid_parameters():
+    store = RecordingStore()
+    with TestClient(create_app(store, ['testserver'])) as client:
+        rest = client.post('/v1/upload_file_chunk', headers={'Authorization': 'Bearer synthetic-token'}, content=b'['*12000+b']'*12000)
+    assert rest.status_code == 400 and rest.json()['error'] == 'invalid_parameters' and rest.json()['retryable'] is False
+    assert store.calls == []
+
+
+# spec: ANYM-306
+def test_decoding_error_raised_by_the_backend_after_parsing_keeps_its_retryable_code():
+    class Failing(RecordingStore):
+        def search(self, token, **params):
+            self.calls.append(('search', params))
+            raise UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'synthetic backend failure')
+    store = Failing()
+    with TestClient(create_app(store, ['testserver']), raise_server_exceptions=False) as client:
+        rest = client.post('/v1/search', headers={'Authorization': 'Bearer synthetic-token'}, json={})
+    assert rest.status_code == 503 and rest.json()['error'] == 'temporarily_unavailable' and rest.json()['retryable'] is True
+    assert len(store.calls) == 1
+
+
 @pytest.mark.parametrize('method', METHODS)
 def test_operation_arguments_reject_unknown_before_backend(method):
     store = RecordingStore()
