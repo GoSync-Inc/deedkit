@@ -1,4 +1,4 @@
-"""Synthetic subscription transport/SDK contracts, without a database or providers."""
+"""Synthetic subscription transport/SDK contracts and annotation pins; only the fetch bookkeeping test uses a database."""
 import json
 from pathlib import Path
 
