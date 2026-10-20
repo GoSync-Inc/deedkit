@@ -149,9 +149,10 @@ def test_activity_plan_previews_guardian_projection(store):
     actions = [project()] + [project(ref) for ref, *_ in extra]
     assert error(lambda: service.plan(key, actions)).code == "too_many_steps"
     assert plans(s) == before + 1
-    for bad in ({"action": "create", "calendar_ref": "cal-a", "activity": "Dance",
-                 "event": {"title": "x", "start": LESSON[0], "end": LESSON[1], "timezone": "UTC"}},
-                {"action": "project", "calendar_ref": "cal-child", "event_ref": "event-lesson", "activity": ""},
+    # ANYM-435: a create may carry an activity; in a calendar no rule reads, it projects nothing.
+    assert error(lambda: service.plan(key, [{"action": "create", "calendar_ref": "cal-a", "activity": "Dance", "event": {
+        "title": "x", "start": LESSON[0], "end": LESSON[1], "timezone": "UTC"}}])).code == "nothing_to_project"
+    for bad in ({"action": "project", "calendar_ref": "cal-child", "event_ref": "event-lesson", "activity": ""},
                 {"action": "project", "calendar_ref": "cal-child", "event_ref": "event-lesson", "activity": "x" * 65},
                 {"action": "project", "calendar_ref": "cal-child", "event_ref": "event-lesson"}):
         assert error(lambda: service.plan(key, [bad])).code == "invalid_action"

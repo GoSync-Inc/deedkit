@@ -53,6 +53,13 @@ def source_ref(prefix, *parts):
     return prefix + "-" + digest(parts)[:32]
 
 
+def created_event_ref(provider, resource_ref, uid):
+    """The event_ref the next read publishes for a single event DeedKit created (normalize_google/_icloud)."""
+    if provider == "google":
+        return source_ref("event", resource_ref, "master")
+    return source_ref("event", resource_ref, uid, "master")
+
+
 def series_ref(calendar_ref, series):
     """Public name of a recurring series: the provider's own ID or href is never shown."""
     return source_ref("series", calendar_ref, series)

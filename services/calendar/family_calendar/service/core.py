@@ -521,7 +521,7 @@ class FamilyService:
         selected = set()
         sources, source_calendars, skipped, activities, projected = [], [], [], set(), set()
         # Remote events this plan changes: one action per drive, whether by unproject or an ordinary write.
-        targets, unprojected = set(), False
+        targets, unprojected, carried = set(), False, False
         allowed = {"action", "calendar_ref", "event_ref", "event", "activity", "operation_id"}
         for action in actions:
             if not isinstance(action, dict) or set(action) - allowed:
@@ -560,7 +560,10 @@ class FamilyService:
                 skipped += skips
                 activities |= labels
                 continue
-            if "activity" in action:
+            label = action.get("activity")
+            if "activity" in action and (
+                kind != "create" or not isinstance(label, str) or not 1 <= len(label) <= 64
+            ):
                 raise CalendarError("invalid_action")
             _, cal = self.authorize(key, action.get("calendar_ref"), "plan:create")
             self.authorize(key, cal["ref"], "event:" + kind)
@@ -627,6 +630,39 @@ class FamilyService:
                     before=before,
                 )
             prepared.append(step)
+            if kind == "create" and label:
+                # A new lesson and its drives in one plan; the drives wait for the lesson's verified create.
+                if self.store.guardian_readiness():
+                    raise CalendarError("capability_unverified")
+                if not self.rule_reader(p):
+                    raise CalendarError("not_found_or_forbidden")
+                source, scope = self._source(key, cal["ref"])
+                if step["event"].get("all_day"):
+                    raise CalendarError("source_all_day")
+                a, b = (instant(step["span"][k]) for k in ("start", "end"))
+                drives, skips, labels = self._drives(
+                    key, p, source, label, None, a, b, step["event"], source_step=step["ordinal"]
+                )
+                if not drives:
+                    raise CalendarError(
+                        "nothing_to_project", details={"projections_skipped": skips, "activities": sorted(labels)}
+                    )
+                skipped += skips
+                carried = True
+            elif kind != "create" and (found := self._carry(key, p, step, action["event_ref"], cal, skipped, selected)):
+                source, scope, drives = found
+                carried = True
+            else:
+                continue
+            if source["ref"] not in [s["calendar_ref"] for s in sources]:
+                sources.append({"calendar_ref": source["ref"], "scope": scope})
+                source_calendars.append(source)
+            for linked_step, target in drives:
+                if (target["ref"], linked_step["target_id"]) in targets:
+                    raise CalendarError("duplicate_resource_action")
+                targets.add((target["ref"], linked_step["target_id"]))
+                prepared.append(dict(linked_step, ordinal=len(prepared)))
+                calendars.append(target)
         if projected and not prepared:
             raise CalendarError(
                 "nothing_to_project",
@@ -651,7 +687,7 @@ class FamilyService:
             "notifications": "none; events with guests are blocked",
             "atomic": False,
             "overlap_check": overlap_check,
-            **({"projections_skipped": skipped} if projected or unprojected else {}),
+            **({"projections_skipped": skipped} if projected or unprojected or carried else {}),
         }
 
     def _source(self, key, calendar_ref):
@@ -689,6 +725,12 @@ class FamilyService:
             raise CalendarError("projection_source_is_projection")
         start = instant(occ["start_at"])
         end = start if occ["details"].get("instant") else instant(occ["end_at"])
+        steps, skips, labels = self._drives(key, p, source, action["activity"], occ["ref"], start, end, occ["details"])
+        return source, scope, steps, skips, labels
+
+    def _drives(self, key, p, source, activity, event_ref, start, end, details, source_step=None):
+        """The linked creates for one lesson; a lesson created in the same plan has no event_ref yet and names
+        its create step instead, whose verified receipt supplies the event_ref."""
         rules = self.store.query(
             "SELECT r.*,m.enabled AS guardian_enabled,cn.provider AS target_provider,"
             "(SELECT l.state FROM projection_links l WHERE l.source_event_ref=%s AND l.rule_id=r.id "
@@ -698,11 +740,11 @@ class FamilyService:
             "JOIN memberships m ON m.group_id=r.group_id AND m.person_id=r.guardian_id "
             "JOIN calendars c ON c.ref=r.target_calendar_ref JOIN connections cn ON cn.id=c.connection_id "
             "WHERE r.group_id=%s AND r.source_calendar_ref=%s ORDER BY r.dependent_id,r.duty,r.id",
-            (occ["ref"], p["group_id"], source["ref"]),
+            (event_ref, p["group_id"], source["ref"]),
         )
         steps, skips = [], []
         for r in rules:
-            if r["activity"] != action["activity"]:
+            if r["activity"] != activity:
                 continue
             reason = (
                 "disabled"
@@ -726,8 +768,8 @@ class FamilyService:
             # Both drives end at the lesson boundary they serve.
             a, b = (start - lead, start) if r["duty"] == "dropoff" else (end - lead, end)
             event = {"title": r["title"], "start": a.isoformat(), "end": b.isoformat(), "timezone": target["timezone"]}
-            if r["copy_location"] and occ["details"].get("location"):
-                event["location"] = occ["details"]["location"]
+            if r["copy_location"] and details.get("location"):
+                event["location"] = details["location"]
             step = {
                 "action": "create",
                 "calendar_ref": target["ref"],
@@ -741,14 +783,15 @@ class FamilyService:
                     "rule_version": r["version"],
                     "duty": r["duty"],
                     "guardian_id": r["guardian_id"],
-                    "source_event_ref": occ["ref"],
+                    "source_event_ref": event_ref,
+                    **({} if source_step is None else {"source_step": source_step}),
                 },
-                "source": {"start": start.isoformat(), "end": end.isoformat(), "title": occ["details"].get("title")},
+                "source": {"start": start.isoformat(), "end": end.isoformat(), "title": details.get("title")},
                 # Worker-only: the opaque link ID is the one marker the provider event carries.
                 "projection": {"link_id": ref("link"), "source_calendar_ref": source["ref"], "visibility": r["visibility"]},
             }
             steps.append((step, target))
-        return source, scope, steps, skips, {r["activity"] for r in rules if r["enabled"]}
+        return steps, skips, {r["activity"] for r in rules if r["enabled"]}
 
     def _unproject(self, key, p, action, skips):
         """One delete per active link of a lesson occurrence or of one of p's operations; a link whose
@@ -812,6 +855,94 @@ class FamilyService:
             }
             result.append((step, target, *sources[r["source_calendar_ref"]]))
         return result
+
+    def _carry(self, key, p, step, event_ref, source, skips, selected):
+        """The linked change of each active drive of a lesson that step moves or cancels: an update to the new
+        span by the link's rule, or a delete; both conditional on the link ETag. None when the lesson has no
+        link the principal may see."""
+        if self.store.guardian_readiness() or not self.rule_reader(p):
+            return None
+        try:
+            source, scope = self._source(key, source["ref"])
+        except CalendarError:
+            return None
+        rows = self.store.query(
+            self.LINKS + "l.source_calendar_ref=%s AND l.source_event_ref=%s ORDER BY l.duty,l.id",
+            (p["group_id"], source["ref"], event_ref),
+        )
+        if not rows:
+            return None
+        kind, result = step["action"], []
+        for r in rows:
+            skip = {"rule_id": r["rule_id"], "duty": r["duty"], "guardian_id": r["guardian_id"]}
+            reason = (
+                "projection_pending"
+                if r["state"] == "pending"
+                # A repairing link names a write whose outcome is unknown: reconcile first.
+                else "outcome_unknown"
+                if r["state"] != "active"
+                else None
+                if self._can(p, r["target_calendar_ref"], "plan:create")
+                and self._can(p, r["target_calendar_ref"], "event:" + kind)
+                else "target_not_writable"
+            )
+            if not reason and kind == "update" and step["event"].get("all_day"):
+                reason = "source_all_day"
+            if reason:
+                skips.append(dict(skip, reason=reason))
+                continue
+            _, target = self.authorize(key, r["target_calendar_ref"], "event:" + kind)
+            rule = self.store.one(
+                "SELECT version,lead_minutes,copy_location FROM guardian_rules WHERE id=%s", (r["rule_id"],)
+            )
+            drive = self.store.one(
+                "SELECT ref,start_at,end_at,details FROM occurrences WHERE calendar_ref=%s AND resource_ref=%s",
+                (target["ref"], r["target_resource_ref"]),
+            )
+            if drive:
+                # The drive's cached occurrence moves with the plan: it is no overlap of its own new span.
+                selected.add(drive["ref"])
+            if kind == "update":
+                start, end = (instant(step["span"][k]) for k in ("start", "end"))
+                lead = timedelta(minutes=rule["lead_minutes"])
+            else:
+                start, end = r["source_start"], r["source_end"]
+                end = start if end - start <= timedelta(microseconds=1) else end
+            linked = {
+                "action": kind,
+                "calendar_ref": target["ref"],
+                "provider": target["provider"],
+                "resource_ref": r["target_resource_ref"],
+                "target_id": r["target_id"],
+                "expected_etag": r["etag"],
+                "link": {
+                    "rule_id": r["rule_id"],
+                    "rule_version": rule["version"] if kind == "update" else r["rule_version"],
+                    "duty": r["duty"],
+                    "guardian_id": r["guardian_id"],
+                    "source_event_ref": r["source_event_ref"],
+                    "source_step": step["ordinal"],
+                },
+                "source": {
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "title": step.get("event", {}).get("title") or r["title"],
+                },
+            }
+            if kind == "update":
+                a, b = (start - lead, start) if r["duty"] == "dropoff" else (end - lead, end)
+                event = {"start": a.isoformat(), "end": b.isoformat(), "timezone": target["timezone"]}
+                if rule["copy_location"] and "location" in step["event"]:
+                    event["location"] = step["event"]["location"]
+                linked.update(event=event, span={"start": a.isoformat(), "end": b.isoformat()})
+                if drive:
+                    linked["before"] = {
+                        "start": drive["start_at"].isoformat(),
+                        "end": drive["end_at"].isoformat(),
+                        **{k: v for k, v in drive["details"].items() if k == "location"},
+                    }
+            result.append((linked, target))
+        return source, scope, result
 
     LINKS = (
         # The guardian the drive was made for, frozen in the projecting plan; the rule may since name another.
@@ -907,6 +1038,9 @@ class FamilyService:
                             return result
         for index, step in enumerate(proposed):
             for other in proposed[index + 1 :]:
+                # A drive never overlaps the lesson it serves, in the plan as in the calendar.
+                if step["ordinal"] == other.get("link", {}).get("source_step"):
+                    continue
                 if instant(step["span"]["start"]) < instant(other["span"]["end"]) and instant(
                     step["span"]["end"]
                 ) > instant(other["span"]["start"]):

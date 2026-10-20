@@ -164,7 +164,11 @@ DESCRIPTIONS = {
     "deletes only drives DeedKit created and that are unchanged since: a drive edited by anyone is a "
     "version_conflict and stays, one already gone just closes its link, one whose outcome is unknown is listed "
     "in projections_skipped as outcome_unknown (run reconcile first); the lesson itself is never touched. "
-    "nothing_to_unproject means no live drive is left.",
+    "nothing_to_unproject means no live drive is left. create with activity adds the new lesson's drives "
+    "after it (sent only once the lesson create is verified). update or delete of a projected lesson carries "
+    "its drives in the same plan: each live drive moves by its rule or is deleted, only if unchanged since "
+    "DeedKit wrote it (else version_conflict, operation partial); drives that cannot follow are listed in "
+    "projections_skipped (projection_pending, outcome_unknown, target_not_writable, source_all_day).",
     "apply": "Execute a reviewed plan with a stable request_id. Requires caller authorization for the actual changes.",
     "operation": "Read durable receipts. Unknown results require reconciliation; never submit a replacement create.",
     "assignment": "Assign a dropoff/pickup/stay interval. Does not claim acceptance or create provider projections.",
