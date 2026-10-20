@@ -1,12 +1,17 @@
 from family_calendar.service.core import READ, WRITE
 from family_calendar.service.providers import created_event_ref, normalize_google, source_ref
 from tests.service.test_projection import WINDOW, error, household, links, steps
-from tests.service.test_projection_undo import Google, apply
+from tests.service.test_projection_undo import Google
 
 LESSON = {"title": "Swim class", "start": "2026-10-20T14:00:00+00:00", "end": "2026-10-20T15:00:00+00:00",
           "timezone": "Asia/Makassar", "location": "Pool 2"}
 MOVED = dict(LESSON, start="2026-10-20T16:00:00+00:00", end="2026-10-20T17:00:00+00:00")
 TARGETS = {"cal-child": "child", "cal-a": "private-a", "cal-b": "private-b"}
+
+
+def apply(service, key, actions, request_id):
+    plan = service.plan(key, actions, carry_projections=True)
+    return service.apply(key, plan["plan_id"], request_id)["operation_id"]
 
 
 def create(event=LESSON, activity="Dance"):
@@ -52,7 +57,7 @@ def at(event, field):
 def test_activity_create_plans_source_and_projection(store):
     s = store
     service, key, drop, pick, google = writable_lessons(s)
-    plan = service.plan(key, [create()])
+    plan = service.plan(key, carry_projections=True, actions=[create()])
     lesson, dropoff, pickup = plan["steps"]
     assert (lesson["action"], lesson["calendar_ref"], "link" in lesson) == ("create", "cal-child", False)
     assert [st["ordinal"] for st in plan["steps"]] == [0, 1, 2]
@@ -94,14 +99,14 @@ def test_activity_create_plans_source_and_projection(store):
     sync(s, google)
     assert s.one("SELECT 1 FROM occurrences WHERE ref=%s AND calendar_ref='cal-child'", (expected,))
 
-    assert error(lambda: service.plan(key, [create(activity="Chess")])).code == "nothing_to_project"
-    assert error(lambda: service.plan(key, [dict(move(expected), activity="Dance")])).code == "invalid_action"
+    assert error(lambda: service.plan(key, carry_projections=True, actions=[create(activity="Chess")])).code == "nothing_to_project"
+    assert error(lambda: service.plan(key, carry_projections=True, actions=[dict(move(expected), activity="Dance")])).code == "invalid_action"
     all_day = {"title": "Camp", "all_day": True, "start": "2026-10-22"}
-    assert error(lambda: service.plan(key, [create(all_day)])).code == "source_all_day"
+    assert error(lambda: service.plan(key, carry_projections=True, actions=[create(all_day)])).code == "source_all_day"
     s.guardian_readiness = lambda: "grants_not_ready"
-    assert error(lambda: service.plan(key, [create()])).code == "capability_unverified"
+    assert error(lambda: service.plan(key, carry_projections=True, actions=[create()])).code == "capability_unverified"
     # Ordinary writes never depend on links.
-    assert [st["action"] for st in service.plan(key, [move(expected)])["steps"]] == ["update"]
+    assert [st["action"] for st in service.plan(key, carry_projections=True, actions=[move(expected)])["steps"]] == ["update"]
     del s.guardian_readiness
 
 
@@ -111,7 +116,7 @@ def test_source_change_updates_linked_projection(store):
     service, key, drop, pick, google = writable_lessons(s)
     lesson = created(service, key, google, s)
     rows = {r["duty"]: r for r in link_rows(s)}
-    plan = service.plan(key, [move(lesson)])
+    plan = service.plan(key, carry_projections=True, actions=[move(lesson)])
     source, dropoff, pickup = plan["steps"]
     assert (source["action"], source["calendar_ref"], "link" in source) == ("update", "cal-child", False)
     stored = s.one("SELECT payload FROM plans WHERE id=%s", (plan["plan_id"],))["payload"]["steps"]
@@ -130,11 +135,11 @@ def test_source_change_updates_linked_projection(store):
 
     # A pending link (its create may be in flight) is listed, not planned.
     s.query("UPDATE projection_links SET state='pending' WHERE duty='pickup'")
-    pending = service.plan(key, [move(lesson)])
+    pending = service.plan(key, carry_projections=True, actions=[move(lesson)])
     assert [st["calendar_ref"] for st in pending["steps"]] == ["cal-child", "cal-a"]
     assert pending["projections_skipped"] == [
         {"rule_id": pick, "duty": "pickup", "guardian_id": "adult-b", "reason": "projection_pending"}]
-    cancel = service.plan(key, [{"action": "delete", "calendar_ref": "cal-child", "event_ref": lesson}])
+    cancel = service.plan(key, carry_projections=True, actions=[{"action": "delete", "calendar_ref": "cal-child", "event_ref": lesson}])
     assert [(st["action"], st["calendar_ref"]) for st in cancel["steps"]] == [("delete", "cal-child"),
                                                                                 ("delete", "cal-a")]
     assert cancel["steps"][1]["link"]["source_step"] == 0
@@ -151,7 +156,7 @@ def test_source_change_updates_linked_projection(store):
     sync(s, google)
     drive = s.one("SELECT ref FROM occurrences WHERE calendar_ref='cal-a'")["ref"]
     explicit = {"action": "delete", "calendar_ref": "cal-a", "event_ref": drive}
-    assert error(lambda: service.plan(key, [move(lesson), explicit])).code == "duplicate_resource_action"
+    assert error(lambda: service.plan(key, carry_projections=True, actions=[move(lesson), explicit])).code == "duplicate_resource_action"
 
 
 # spec: ANYM-435
@@ -206,10 +211,24 @@ def test_unwritable_link_is_skipped_with_reason(store):
     service, key, drop, pick, google = writable_lessons(s)
     lesson = created(service, key, google, s)
     s.grant("family", "adult-a", "cal-b", READ, "details")
-    plan = service.plan(key, [move(lesson)])
+    plan = service.plan(key, carry_projections=True, actions=[move(lesson)])
     assert [st["calendar_ref"] for st in plan["steps"]] == ["cal-child", "cal-a"]
     assert plan["projections_skipped"] == [
         {"rule_id": pick, "duty": "pickup", "guardian_id": "adult-b", "reason": "target_not_writable"}]
-    cancel = service.plan(key, [{"action": "delete", "calendar_ref": "cal-child", "event_ref": lesson}])
+    cancel = service.plan(key, carry_projections=True, actions=[{"action": "delete", "calendar_ref": "cal-child", "event_ref": lesson}])
     assert [st["calendar_ref"] for st in cancel["steps"]] == ["cal-child", "cal-a"]
     assert cancel["projections_skipped"][0]["reason"] == "target_not_writable"
+
+
+# spec: ANYM-435
+def test_carrying_needs_the_callers_opt_in(store):
+    """A caller that does not opt in (a gateway that predates its rule-read ceiling for carried drives) gets the
+    lesson step only, and no rule or guardian ID."""
+    s = store
+    service, key, drop, pick, google = writable_lessons(s)
+    lesson = created(service, key, google, s)
+    for action in (move(lesson), {"action": "delete", "calendar_ref": "cal-child", "event_ref": lesson}):
+        plan = service.plan(key, [action])
+        assert [st["calendar_ref"] for st in plan["steps"]] == ["cal-child"]
+        assert "projections_skipped" not in plan and drop not in str(plan) and "adult-b" not in str(plan)
+    assert error(lambda: service.plan(key, [create()])).code == "invalid_action"

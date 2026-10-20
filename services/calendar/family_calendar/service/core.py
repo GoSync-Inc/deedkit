@@ -363,6 +363,8 @@ class FamilyService:
                 "window_limit_days": 31,
                 "event_limit": 500,
                 "atomic_cross_provider": False,
+                # Plans carry drives with their lesson only for a caller that sends carry_projections (ANYM-435).
+                "carry_projections": True,
             },
             # Top level: the common gateway drops backend `features` but passes this through.
             guardian_projections=self.guardian_projections(),
@@ -511,7 +513,7 @@ class FamilyService:
         result["configured_bindings_availability"] = "verified"
         return result
 
-    def plan(self, key, actions):
+    def plan(self, key, actions, carry_projections=False):
         p = self.principal(key)
         if not isinstance(actions, list) or not 1 <= len(actions) <= 8:
             raise CalendarError("invalid_actions")
@@ -562,7 +564,7 @@ class FamilyService:
                 continue
             label = action.get("activity")
             if "activity" in action and (
-                kind != "create" or not isinstance(label, str) or not 1 <= len(label) <= 64
+                kind != "create" or not carry_projections or not isinstance(label, str) or not 1 <= len(label) <= 64
             ):
                 raise CalendarError("invalid_action")
             _, cal = self.authorize(key, action.get("calendar_ref"), "plan:create")
@@ -649,7 +651,7 @@ class FamilyService:
                     )
                 skipped += skips
                 carried = True
-            elif kind != "create" and (found := self._carry(key, p, step, action["event_ref"], cal, skipped, selected)):
+            elif kind != "create" and carry_projections and (found := self._carry(key, p, step, action["event_ref"], cal, skipped, selected)):
                 source, scope, drives = found
                 carried = True
             else:

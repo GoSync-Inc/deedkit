@@ -294,6 +294,12 @@ class Dispatch:
                 allowed_actions = self.actions(snapshot, agent, caps, args["account"])
                 if "operation" in args and args["operation"] not in allowed_actions:
                     raise Denied()
+        if module == "calendar" and tool["operation"] == "plan":
+            # Carried drives (and create with activity) are asked for only under this gateway's own rule-read
+            # ceiling, and only from a backend that declares the field; an agent never sets it itself.
+            args = {k: v for k, v in args.items() if k != "carry_projections"}
+            if rules_ceiling and (caps.get("features") or {}).get("carry_projections") is True:
+                args["carry_projections"] = True
         started = datetime.now(timezone.utc).timestamp()
         # Admission is rechecked after all local work; a cached MCP session is
         # never authority. ACK is not retried if its network outcome is unknown.

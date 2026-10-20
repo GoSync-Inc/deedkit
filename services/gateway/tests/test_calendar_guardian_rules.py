@@ -11,7 +11,7 @@ RULE = {"rule_id": "rule-synthetic", "activity": "Dance", "title": "SYNTHETIC-PR
 
 
 def gateway(tmp_path, local, backend, readiness=None, tools=("calendar_capabilities", "calendar_members"),
-            plan=None):
+            plan=None, carry=False, sent=None):
     key = tmp_path / "backend.key"
     key.write_text("backend-calendar-a")
     key.chmod(0o600)
@@ -28,10 +28,13 @@ def gateway(tmp_path, local, backend, readiness=None, tools=("calendar_capabilit
 
         async def call(self, module, operation, credential, arguments):
             if operation == "capabilities":
-                caps = {"permissions": backend, "calendars": [], "features": {"agenda": True},
+                features = {"agenda": True} | ({"carry_projections": True} if carry else {})
+                caps = {"permissions": backend, "calendars": [], "features": features,
                         "constraints": {"plan_action_limit": 8, "plan_step_limit": 16}}
                 return caps | ({"guardian_projections": readiness} if readiness else {})
             if operation == "plan":
+                if sent is not None:
+                    sent.append(arguments)
                 return plan or {"plan_id": "plan-synthetic", "steps": [], "projections_skipped": []}
             # The backend already applied its own rule-read policy for its adult key.
             return {"group_id": "family", "members": [
@@ -166,3 +169,24 @@ def test_carried_drives_never_pass_a_gateway_without_rule_read(tmp_path, carried
     else:
         # An ordinary lesson change without drives is untouched by the ceiling.
         assert asyncio.run(call)["steps"] == plan["steps"]
+
+
+# spec: ANYM-435
+@pytest.mark.parametrize(
+    ("local", "backend", "carry", "expected"),
+    [
+        (WRITER, WRITER + ["assignment:read"], True, None),
+        (WRITER + ["assignment:read"], WRITER, True, None),
+        # A backend that predates the field would refuse it as an unknown argument.
+        (WRITER + ["assignment:read"], WRITER + ["assignment:read"], False, None),
+        (WRITER + ["assignment:read"], WRITER + ["assignment:read"], True, True),
+    ],
+)
+def test_gateway_asks_for_carried_drives_only_under_its_ceiling(tmp_path, local, backend, carry, expected):
+    sent = []
+    dispatch = gateway(tmp_path, local + ["event:update"], backend + ["event:update"], tools=PLANNER,
+                       carry=carry, sent=sent, plan={"plan_id": "plan-synthetic", "steps": []})
+    lesson = {"action": "update", "calendar_ref": "cal-child", "event_ref": "event-lesson", "event": LESSON}
+    # The agent's own value never counts.
+    asyncio.run(dispatch.call("gateway-a", "calendar_plan", {"actions": [lesson], "carry_projections": True}))
+    assert sent[0].get("carry_projections") is expected

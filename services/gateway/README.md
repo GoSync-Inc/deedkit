@@ -121,9 +121,11 @@ targets and guests with `capability_unverified`, and names a missing timed field
 action (`event_ref` of a lesson occurrence, `activity` label) plans linked drives from guardian rules; the gateway
 refuses it unless `assignment:read` is in both the local grant and the backend key, the same ceiling as
 `guardian_rules` in members, and passes `plan_step_limit` (16) in constraints. An `unproject` action (the lesson's
-`calendar_ref` and `event_ref`, or an `operation_id`) plans deleting those drives and follows the same ceiling, as does a `create` with `activity`. A plan
-the backend returns with drives carried along (`link` steps or `projections_skipped`) is refused unless
-the ceiling holds. Slot requests may add explicitly reviewed
+`calendar_ref` and `event_ref`, or an `operation_id`) plans deleting those drives and follows the same ceiling, as does a `create` with `activity`. Under that
+ceiling, and only when the backend declares `features.carry_projections`, the gateway sends
+`carry_projections: true` (an agent's own value is dropped), so the backend carries drives with a moved
+or cancelled lesson; a plan returned with `link` steps or `projections_skipped` is refused unless the
+ceiling holds. Slot requests may add explicitly reviewed
 `additional_calendar_refs` to member bindings and return their exact `source_selection`.
 Pending refreshes are polled with `refresh=false`; missing or pending coverage is unknown.
 
