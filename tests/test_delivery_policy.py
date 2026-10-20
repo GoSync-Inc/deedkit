@@ -517,6 +517,9 @@ def test_recovery_settles_nothing_until_every_page_is_replayed(seeded, tmp_path,
     flush_hints(store)
     assert hints(store, sid, 'silence') == []
     assert store.get_subscription(token, sid)['delivery']['silence']['state'] == 'replied'
+    # The page that took the final match settles the range: one events hint through the reply.
+    assert [h['through_position'] for h in hints(store, sid)] == [store.get_subscription(token, sid)['matched_through']]
+    assert held(store, token, sid) == (None, None)
 
 
 # spec: ANYM-252

@@ -237,7 +237,10 @@ def _absorb(c, row, binding, window, *, limit=1000, pages=16):
     for _ in range(pages):
         if _absorb_page(c, row, binding, window, limit) < limit:
             return True
-    return False
+    # A last full page may have taken the final match: only a match still above the range defers
+    # settling, and that match keeps the subscription a recovery candidate for the next tick.
+    return c.execute('SELECT 1 FROM subscription_matches WHERE subscription=%s AND event>%s LIMIT 1',
+        (row['id'], window['through_position'])).fetchone() is None
 
 
 def _absorb_page(c, row, binding, window, limit):
