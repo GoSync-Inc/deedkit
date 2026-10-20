@@ -68,12 +68,13 @@ VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <
    range and its own open findings, tests only for the fix, no fresh exploration of the
    repository. It is never a fresh full review, and a recheck's minor opens no round.
 5. Reviews stop at r2. An r3 runs only for a new blocking finding that r2 raised. A blocking or
-   major finding stays open until that reviewer confirms the fix; a major still open after r2
-   closes with a test that fails before the fix and passes after it, otherwise the orchestrator
-   picks a smaller scope, a follow-up card or a revert. Merging with an open blocking or major
-   finding accepts a known risk, which the owner keeps. A blocking or major finding fixed after
-   the cap gets one scoped recheck by the reviewer that raised it (no new round); never merge
-   with it unconfirmed. If that recheck still finds a blocking, stop and report BLOCKED.
+   major finding stays open until the reviewer that raised it confirms the fix; never merge with
+   it unconfirmed. A fix made after the cap (r2 done) gets one scoped recheck by that reviewer,
+   outside the round count, recorded as `recheck` in `Review record:`; a regression test that
+   fails before the fix and passes after it is the precondition, not a substitute. A new blocking
+   there, or a finding still open, is BLOCKED to the orchestrator, who picks a smaller scope, a
+   follow-up card or a revert. Merging with an open blocking or major finding accepts a known
+   risk, which the owner keeps.
 6. Cards: a contract card gets Astra r1 and at most one scoped recheck; a small card gets only
    the author's self-check.
 7. A production operation plan gets at most two Astra rounds before the owner authorizes it.
@@ -99,7 +100,7 @@ costs about twice as much per token.
 Standing approval (owner 10-19): the orchestrator may tune review routing within this document
 (round cap, recheck scope, severity rubric, the Codex line and the reviewer for non-risk code)
 and reports each change in the morning digest. It never removes Astra r1 from a risk path,
-the never-downgraded list above or anything in AGENTS.md section 2.
+the never-downgraded list above, the recheck rules of Rounds 4 and 5 or anything in AGENTS.md section 2.
 
 ## Pull request lines
 

@@ -58,18 +58,17 @@ per provider, and migration numbers are sequential with immutable checksums. `ci
   writes a handoff of at most 40 lines (`handoffs/TEMPLATE.md` in the orchestrator's directory)
   that lists the files and ranges already read and the decisions taken, waits for its own
   background jobs (closing the terminal kills them), then restarts itself with the orchestrator's
-  `worker-restart.sh` (handoff, model, effort, brief), sends the orchestrator `RESTARTED <path>` and
+  `worker-restart.sh` (handoff, your current model and effort, brief), sends the orchestrator `RESTARTED <path>` and
   stops. Not with about 30 calls left (only merge, `main` push run, read-back, DONE): finish.
   Restart early, from 150k, before an expected idle of over an hour (owner gate, usage limit,
   overnight).
 - Background jobs (a Codex review, a backup, a CI or merge wait): one check about 30 s after the
   start that the job runs (the log shows progress, no usage or trust error); a `timeout` on every
-  job (a merge wait: 60 minutes); a wait that ends on failure too (a failed required check, a
+  job (a merge wait: 60 minutes; on its timeout run `gh pr merge --disable-auto` or read the state
+  once with `gh pr view` before reporting); a wait that ends on failure too (a failed required check, a
   dequeue, a closed pull request), because `gh pr merge --auto` stays armed on a failed one; then
   read the exit status and the report. A missing report is a failure, not "still running". That
   is one check, never polling.
-- Owner questions (AGENTS.md section 2: product direction, money, secrets and new credentials,
-  data deletion, irreversible steps, accepting a risk, and changes to review levels or merge
-  authority; feature and epic acceptance): while the owner
+- Owner questions (AGENTS.md section 2 items and feature or epic acceptance only): while the owner
   is online, one message as they arise; while the owner is away, one numbered list on waking and
   before sleep, each item with a recommendation. Work that needs no answer keeps running.

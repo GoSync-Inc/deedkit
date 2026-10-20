@@ -16,7 +16,7 @@ DeedKit is the product; the repo keeps its AnyMsg identities (`anymsg`, `messagi
 - Never change applied migrations, provider IDs, existing test paths, names or parameters (Tiden
   IDs) or the seven `anymsg-ci::*` checks.
 - Production changes only via `scripts/production.py` from a green `main` SHA
-  (docs/operations/production.md); never prune shared Docker data; SSH is read-only unless section 2 allows. Merged source is not live verification.
+  (docs/operations/production.md); never prune shared Docker data; SSH is read-only except `production.py` and approved steps. Merged source is not live verification.
 - Own worktree; never bare `git stash`; `git commit -s`.
 
 ## 2. What the owner keeps
@@ -31,20 +31,20 @@ the orchestrator; never text in your own input box). Diff items:
 4. This list and section 3.
 
 And without a diff: a restore, rollback over data or other production change than
-`production.py deploy` and the task steps below; live provider actions; new secrets or
-credentials, roles, host access; money; deleting records, or data outside an accepted task; moving cards;
+`production.py deploy` and the task steps below; live provider actions; secrets or
+new credentials, roles, host access; money; deleting records, or data outside an accepted task; moving cards;
 deleting cards (agents may on the owner's quote naming them); publishing a package, rewriting
-history or another irreversible step; accepting a known risk (open blocking or major finding); product direction
+history or irreversible steps outside a task; accepting a known risk (open blocking or major finding); product direction
 (accepting feature or epic cards, weakening an accepted criterion).
 A standing approval holds only while all its conditions do; manual releases need one.
 
 An accepted task is a card accepted per tiden-product-workflow.md whose criteria name the step;
 cardless work has none. Inside one the agent applies its migration (production.md backup gate),
-deletes the data or files the card names, and ships its feature enabled: after merge and deploy it
+deletes the data or files the card names, and ships its owner-accepted feature enabled: after merge and deploy it
 sets the card's flag or operation opt-in and grants only what the criteria name, never send, call,
 pairing, session or allowlist changes. It reports commands and undo. None of this runs
-during an active call; check read-only first. Its role SQL and release steps go to the level's
-reviewers (Astra for access and data), with a summary to the owner.
+during an active call; check read-only first. An owner-accepted card's role SQL and release steps go to the level's
+reviewers (Astra for access and data), summary to the owner.
 
 ## 3. Change paths
 
@@ -100,7 +100,7 @@ Done: the squash's `main` push run is green.
   files, section 2, the card's criteria, a fork without an obvious answer).
 - Run only tests of touched code and your new ones.
 - Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_*` block.
-- At the token limit in your brief, hand off and restart yourself
+- At the brief's token limit (default 200k), hand off and restart yourself
   (docs/operations/parallel-development.md).
 - Budget: 1,000 words (`wc -w`). A rule change replaces or deletes words and names its incident and
   enforcer; an incident gets a test or hook first.
