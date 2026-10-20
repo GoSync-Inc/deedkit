@@ -167,6 +167,12 @@ gateway turns a backend failure of a read-only tool into `backend_unavailable`;
 for a tool without the hint it would become `mutation_outcome_unknown`, which an
 agent must never retry. That is why these tools stay read-only.
 
+The same reasoning, decided 2026-10-19, keeps `readOnlyHint=true` on two reads that
+write bookkeeping: `calendar_agenda` and `calendar_slots` (a `sync_jobs` row and a
+provider read) and `messages_get_attachment` (the original's idle clock and a 120 s
+download grant). Tests pin the hint for these tools and for fetch and wait in the
+backend, the gateway `catalog.json` and `packages/deedkit/lib/tools.json`.
+
 `wait_for_subscription_events(subscription_id, timeout=25, limit=50)` polls those
 pages for at most 25 seconds. Every read reauthorizes and releases its connection
 before the short sleep. There are at most 32 admitted waits per API process;

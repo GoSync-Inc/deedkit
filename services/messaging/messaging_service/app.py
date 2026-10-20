@@ -941,7 +941,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
 
     @mcp.tool(structured_output=True,annotations=read)
     def fetch_subscription_events(ctx: Context,subscription_id: SubscriptionReference,limit: SubscriptionLimit=50) -> dict[str,Any]:
-        """Fetch an issued event page. Does not advance ACK or mark provider read. Requires explicit subscription-ack to issue a receipt."""
+        """Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed."""
         return call(ctx,'fetch_subscription_events',subscription_id=subscription_id,limit=limit)
 
     @mcp.tool(structured_output=True,annotations=upload_write)
@@ -951,7 +951,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
 
     @mcp.tool(structured_output=True,annotations=read)
     async def wait_for_subscription_events(ctx: Context,subscription_id: SubscriptionReference,timeout: WaitSeconds=25,limit: SubscriptionLimit=50) -> dict[str,Any]:
-        """Wait at most 25 seconds for an authorized event page. No ACK, provider polling or guarantee that a host runs a turn."""
+        """Wait at most 25 seconds for an authorized event page. No ACK, provider polling or guarantee that a host runs a turn. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed."""
         return await async_call(ctx,'wait_for_subscription_events',subscription_id=subscription_id,timeout=timeout,limit=limit)
 
     @mcp.tool(structured_output=True,annotations=upload_write)
