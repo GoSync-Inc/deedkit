@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace as NS
 
 import pytest
-from telethon import functions, types
+from telethon import errors, functions, types
 
 from messaging_service.telegram_operations import execute
 
@@ -1049,3 +1049,166 @@ def test_join_request_batch_worker_scaled_slow_lookup_keeps_rows(operation):
     rows = receipt['result']['data']['results']
     assert len(rows) == 20 and 0 < len(client.mutations()) < 20
     assert [r['state'] for r in rows].count('applied') == len(client.mutations())
+
+
+def _channel(**kwargs):
+    values = dict(id=500, title='Synthetic link chat', photo=types.ChatPhotoEmpty(), date=None, access_hash=7,
+                  megagroup=True, participants_count=12)
+    return types.Channel(**{**values, **kwargs})
+
+
+class LinkClient(Client):
+    """Synthetic invite and public-name links; joins answer from `join` (a response or an error)."""
+    def __init__(self, invite=None, entity=None, join=None):
+        super().__init__()
+        self.invite = invite if invite is not None else types.ChatInvite(
+            title='Synthetic link chat', photo=types.PhotoEmpty(0), participants_count=12, color=0, channel=True,
+            megagroup=True, request_needed=True, about='Synthetic description', participants=[
+                types.User(id=901, first_name='Synthetic member')])
+        self.public = entity if entity is not None else _channel(left=True, username='synthetic_link')
+        self.join = join if join is not None else types.Updates([], [], [_channel(left=False)],
+            datetime(2026, 10, 20, tzinfo=timezone.utc), 0)
+
+    async def get_entity(self, peer):
+        self.calls.append(('get_entity', peer))
+        if isinstance(self.public, BaseException):
+            raise self.public
+        return self.public
+
+    async def __call__(self, request):
+        self.calls.append(request)
+        if isinstance(request, functions.messages.CheckChatInviteRequest):
+            if isinstance(self.invite, BaseException):
+                raise self.invite
+            return self.invite
+        if isinstance(request, (functions.messages.ImportChatInviteRequest, functions.channels.JoinChannelRequest)):
+            if isinstance(self.join, BaseException):
+                raise self.join
+            return self.join
+        self.calls.pop()
+        return await super().__call__(request)
+
+    def joins(self):
+        return [c for c in self.calls if isinstance(c, (functions.messages.ImportChatInviteRequest,
+                                                        functions.channels.JoinChannelRequest))]
+
+
+CHECK_FIELDS = {'title', 'kind', 'member_count', 'approval_required', 'paid', 'membership', 'membership_basis'}
+EXPECTED = {'title': 'Synthetic link chat', 'kind': 'group'}
+
+
+def link_job(operation, link, **kwargs):
+    return job(operation, {'link': link}, provider_chat=None, provider_message_id=None, **kwargs)
+
+
+def link_run(client, operation, link, **kwargs):
+    return asyncio.run(execute(client, link_job(operation, link, **kwargs)))
+
+
+# spec: ANYM-243
+def test_check_chat_link_invite_projection_makes_no_join_call():
+    client = LinkClient()
+    result = link_run(client, 'check_chat_link', '+AbCd1234')
+    assert result['outcome'] == 'confirmed' and set(result['data']) == CHECK_FIELDS
+    assert result['data'] == {'title': 'Synthetic link chat', 'kind': 'group', 'member_count': 12,
+        'approval_required': True, 'paid': False, 'membership': 'not_member', 'membership_basis': 'provider_invite'}
+    assert [c.hash for c in client.calls if isinstance(c, functions.messages.CheckChatInviteRequest)] == ['AbCd1234']
+    assert client.joins() == [] and 'Synthetic description' not in str(result) and '901' not in str(result)
+
+
+# spec: ANYM-243
+@pytest.mark.parametrize('invite,membership,kind', [
+    (types.ChatInviteAlready(_channel(broadcast=True, megagroup=False)), 'member', 'channel'),
+    (types.ChatInvitePeek(_channel(), None), 'not_member', 'group'),
+    (types.ChatInvite(title='Synthetic link chat', photo=types.PhotoEmpty(0), participants_count=3, color=0,
+                      subscription_pricing=types.StarsSubscriptionPricing(period=2592000, amount=5)), 'not_member', 'group')])
+def test_check_chat_link_membership_from_invite_kind(invite, membership, kind):
+    client = LinkClient(invite=invite)
+    data = link_run(client, 'check_chat_link', '+AbCd1234')['data']
+    assert set(data) == CHECK_FIELDS and data['membership'] == membership and data['kind'] == kind
+    assert data['paid'] is (isinstance(invite, types.ChatInvite) and invite.subscription_pricing is not None)
+    assert client.joins() == [] and '500' not in str(data)
+
+
+# spec: ANYM-243
+@pytest.mark.parametrize('left,membership', [(True, 'not_member'), (False, 'member'), (None, 'unknown')])
+def test_check_chat_link_public_name_uses_left_flag(left, membership):
+    client = LinkClient(entity=_channel(left=left, broadcast=True, megagroup=False, join_request=None))
+    data = link_run(client, 'check_chat_link', '@synthetic_link')['data']
+    assert data == {'title': 'Synthetic link chat', 'kind': 'channel', 'member_count': 12, 'approval_required': None,
+                    'paid': False, 'membership': membership, 'membership_basis': 'provider_public_chat'}
+    assert ('get_entity', 'synthetic_link') in client.calls and client.joins() == []
+
+
+# spec: ANYM-243
+@pytest.mark.parametrize('link,client,code', [
+    ('+AbCd1234', LinkClient(invite=errors.InviteHashExpiredError(None)), 'invite_expired'),
+    ('+AbCd1234', LinkClient(invite=errors.InviteHashInvalidError(None)), 'invite_invalid'),
+    ('@synthetic_link', LinkClient(entity=errors.UsernameNotOccupiedError(None)), 'invite_invalid'),
+    ('@synthetic_link', LinkClient(entity=types.User(id=7, first_name='Synthetic')), 'invite_invalid'),
+    ('AbCd1234', LinkClient(), 'invalid_parameters')])
+def test_check_chat_link_refusals_are_definite(link, client, code):
+    with pytest.raises(Exception, match=code):
+        link_run(client, 'check_chat_link', link)
+    assert client.joins() == []
+
+
+# spec: ANYM-243
+@pytest.mark.parametrize('case', ['invite_joined', 'public_joined', 'pending', 'expired', 'invalid', 'full',
+                                  'too_many', 'private', 'already', 'uncertain', 'not_collected', 'unreadable'])
+def test_join_outcomes_telegram(case):
+    from telethon.errors import RPCError
+    join = {'pending': errors.InviteRequestSentError(None), 'expired': errors.InviteHashExpiredError(None),
+            'invalid': errors.InviteHashInvalidError(None), 'full': errors.UsersTooMuchError(None),
+            'too_many': errors.ChannelsTooMuchError(None), 'private': errors.ChannelPrivateError(None),
+            'already': errors.UserAlreadyParticipantError(None), 'uncertain': RPCError(None, 'TIMEOUT', 503),
+            'unreadable': types.Updates([], [], [], datetime(2026, 10, 20, tzinfo=timezone.utc), 0)}.get(case)
+    client = LinkClient(join=join)
+    link = '@synthetic_link' if case == 'public_joined' else '+AbCd1234'
+    expected = {'title': 'Synthetic link chat', 'kind': 'group'}
+    policy = {'enabled': True, 'discover_chats': case != 'not_collected', 'include_chats': [], 'exclude_chats': []}
+    refusals = {'expired': 'invite_expired', 'invalid': 'invite_invalid', 'full': 'chat_full',
+                'too_many': 'join_not_allowed', 'private': 'join_not_allowed', 'already': 'already_member'}
+    if case in refusals:
+        with pytest.raises(Exception, match=refusals[case]):
+            link_run(client, 'join_chat', link, expected_chat=expected, _policy=policy)
+        assert len(client.joins()) == 1
+        return
+    result = link_run(client, 'join_chat', link, expected_chat=expected, _policy=policy)
+    assert len(client.joins()) == 1
+    if case == 'public_joined':
+        assert isinstance(client.joins()[0], functions.channels.JoinChannelRequest)
+        assert client.joins()[0].channel == types.InputChannel(500, 7)
+    else:
+        assert client.joins()[0] == functions.messages.ImportChatInviteRequest('AbCd1234')
+    if case == 'pending':
+        assert result == {'outcome': 'confirmed', 'data': {'state': 'pending_approval', 'basis': 'provider_join_request_sent'}}
+    elif case == 'uncertain':
+        assert result['outcome'] == 'unknown'
+    elif case == 'not_collected':
+        assert result == {'outcome': 'confirmed', 'data': {'state': 'joined', 'archive': 'not_collected',
+            'next_step': "the operator adds this chat to the account's collection policy", 'basis': 'provider_joined_chat'}}
+    elif case == 'unreadable':
+        assert result['outcome'] == 'unknown'
+    else:
+        assert result == {'outcome': 'confirmed', 'data': {'state': 'joined', 'archive': 'collected',
+            'provider_chat_id': '-1000000000500', 'basis': 'provider_joined_chat'}}
+
+
+# spec: ANYM-243
+@pytest.mark.parametrize('change,code', [('title', 'operation_target_changed'), ('kind', 'operation_target_changed'),
+                                         ('member', 'already_member'), ('paid', 'join_not_allowed'),
+                                         ('missing', 'operation_target_changed')])
+def test_join_target_changed_refuses_without_join_call(change, code):
+    invite = {'member': types.ChatInviteAlready(_channel()),
+              'paid': types.ChatInvite(title='Synthetic link chat', photo=types.PhotoEmpty(0), participants_count=3,
+                  color=0, megagroup=True, subscription_pricing=types.StarsSubscriptionPricing(period=2592000, amount=5))}.get(change)
+    expected = {'title': 'Synthetic link chat', 'kind': 'group'}
+    if change == 'title':
+        expected['title'] = 'Synthetic renamed chat'
+    if change == 'kind':
+        expected['kind'] = 'channel'
+    client = LinkClient(invite=invite)
+    with pytest.raises(Exception, match=code):
+        link_run(client, 'join_chat', '+AbCd1234', **({} if change == 'missing' else {'expected_chat': expected}))
+    assert client.joins() == []

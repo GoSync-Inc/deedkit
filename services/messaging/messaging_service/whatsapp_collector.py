@@ -248,7 +248,8 @@ class NodeProvider:
                 'operation_target_invalid','operation_target_unavailable','operation_unsupported',
                 'operation_query_failed','operation_result_too_large','registered_file_invalid',
                 'history_rate_limited','history_anchor_unavailable',
-                'invalid_phone','identity_unresolved','chat_not_collected','provider_timeout','rate_limited','forbidden'):
+                'invalid_phone','identity_unresolved','chat_not_collected','provider_timeout','rate_limited','forbidden',
+                'invite_invalid','invite_expired','chat_full','join_not_allowed','already_member','operation_target_changed'):
                 from .commands import CommandRejected
                 raise CommandRejected(code)
             if code in ('send_expired','sending_disabled','send_target_invalid','link_preview_unsupported'):
@@ -325,7 +326,7 @@ class NodeProvider:
         payload={key:value for key,value in job.items() if key in (
             'operation','parameters','provider_chat','provider_message_id','expires_at',
             'source_provider_chat','source_provider_message','registered_file_path','trusted_blob_directory',
-            'file_digest','file_bytes','file_mime','file_name','known_chats','lookup_allowed')}
+            'file_digest','file_bytes','file_mime','file_name','known_chats','lookup_allowed','expected_chat')}
         if report is not None:report('started')
         if job['operation']=='open_chat_by_phone' and job.get('_archived') is not None:
             # First ask only the session store for the number's LID, then offer the

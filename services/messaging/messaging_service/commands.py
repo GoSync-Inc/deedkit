@@ -172,7 +172,7 @@ def _registered_file(store,c,p,account,parameters,*,verify=False):
 
 
 def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,parameters,
-             *,ready=False,verify_file=False,validate_parameters=True,retained_upload=False):
+             *,ready=False,verify_file=False,validate_parameters=True,retained_upload=False,saved=None):
     from .messenger_operations import validate_operation,operation_manifest,CATALOG_VERSION,ParameterError
     from .whatsapp_capabilities import account_provider
     spec=_spec(operation);account_row=_account(c,p,account)
@@ -251,8 +251,39 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
             mode in ('audio','voice','sticker') and parameters['caption']):raise APIError('unsupported_operation')
     _policy(c,account,operation,provider_chats,ready=ready)
     if operation=='open_chat_by_phone':_phone_policy(c,account,parameters['phone'])
+    if operation=='join_chat':
+        # Saved intent keeps the chat the owner confirmed; a new preview binds the key's latest check.
+        payload['expected_chat']=saved.get('expected_chat') if saved is not None else _link_check(c,p,account,parameters['link'])
     targets(p,refs)
     return payload,spec
+
+
+def _link_check(c,p,account,link):
+    """The chat a join may target: this key's latest successful check of the link key within 60 minutes."""
+    row=c.execute('''SELECT result FROM messenger_commands WHERE principal=%s AND key_id=%s AND account=%s
+        AND operation='check_chat_link' AND payload->'parameters'->>'link'=%s AND status='succeeded'
+        AND finished_at>clock_timestamp()-interval '60 minutes' ORDER BY finished_at DESC,created_at DESC LIMIT 1''',
+        (p['id'],p['key_id'],account,link)).fetchone()
+    data=(row['result'] or {}).get('data') if row else None
+    if not isinstance(data,dict):raise APIError('preview_required',409)
+    if data.get('membership')=='member':raise APIError('already_member',409)
+    if (data.get('membership')!='not_member' or not isinstance(data.get('title'),str) or
+        data.get('kind') not in ('group','channel')):raise APIError('preview_required',409)
+    count=data.get('member_count')
+    return {'title':data['title'],'kind':data['kind'],'member_count':count if type(count) is int else None}
+
+
+def _join_guard(c,account,link):
+    """An earlier join of this link key on the account, from any key, that may have happened blocks a new
+    one until a later check settles membership (member or not_member); no time limit ends it."""
+    if c.execute('''SELECT 1 FROM messenger_commands j WHERE j.account=%s AND j.operation='join_chat'
+        AND j.payload->'parameters'->>'link'=%s AND (j.status IN ('queued','dispatching') OR j.status='unknown'
+        AND NOT EXISTS (SELECT 1 FROM messenger_commands k WHERE k.account=j.account AND k.operation='check_chat_link'
+            AND k.payload->'parameters'->>'link'=%s AND k.status='succeeded'
+            AND k.result->'data'->>'membership' IN ('member','not_member')
+            AND k.started_at>coalesce(j.finished_at,j.started_at,j.created_at))) LIMIT 1''',
+        (account,link,link)).fetchone():
+        raise APIError('operation_result_unknown',409)
 
 
 def _phone_policy(c,account,phone):
@@ -370,6 +401,7 @@ def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
     if preview_digest and preview_digest!=expected:raise APIError('preview_mismatch',409)
     payload['request_input']=request_input
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('commands-account:'+account,))
+    if operation=='join_chat':_join_guard(c,account,payload['parameters']['link'])
     count=c.execute("SELECT count(*) AS n FROM messenger_commands WHERE account=%s AND created_at>clock_timestamp()-interval '1 minute'",
                     (account,)).fetchone()['n']
     if count>=60:raise APIError('rate_limited',429)
@@ -428,7 +460,7 @@ def _check_saved(store,c,p,row,*,ready=True,check_versions=True,verify_file=True
         return {key:value for key,value in payload.items() if key!='request_input'}
     current,spec=_resolve(store,c,p,row['account'],row['operation'],row['chat'] or '',row['message'] or '',
         row['expected_revision'],payload['parameters'],ready=ready,verify_file=verify_file,
-        validate_parameters=False,retained_upload=True)
+        validate_parameters=False,retained_upload=True,saved=payload)
     # A catalog release must not rewrite reviewed, persisted normalized intent.
     current['catalog_version']=payload['catalog_version']
     saved={key:value for key,value in payload.items() if key!='request_input'}
@@ -610,7 +642,8 @@ class CommandWorker:
             code=str(exc) if str(exc) in ('operation_expired','operation_disabled','operation_access_changed',
                 'operation_target_changed','sender_not_ready','attachment_unavailable','unsupported_operation',
                 'forbidden','not_found','operation_rejected','identity_unresolved','chat_not_collected',
-                'rate_limited','provider_timeout','invalid_phone') else 'operation_rejected'
+                'rate_limited','provider_timeout','invalid_phone','invite_invalid','invite_expired','chat_full',
+                'join_not_allowed','already_member') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
             if code=='rate_limited' and job['operation']=='open_chat_by_phone':

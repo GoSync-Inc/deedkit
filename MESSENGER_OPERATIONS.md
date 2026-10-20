@@ -271,6 +271,38 @@ older native adapter refuses the names as unsupported.
   timeout or crash leaves `unknown` without rows. Nothing is retried; check the
   group before a new request.
 
+## Checking and joining chat links
+
+Two account-level operations for full-account keys, each with its own account opt-in;
+the browser WhatsApp fallback supports neither:
+
+- `check_chat_link` (`groups-read`; a passive live read) takes `link`: on Telegram
+  `https://t.me/+CODE`, `https://t.me/joinchat/CODE` or a public `https://t.me/NAME` /
+  `@NAME`; on native WhatsApp `https://chat.whatsapp.com/CODE` or the bare CODE. No URL
+  is fetched; a query string, a fragment or a bare Telegram name is refused with
+  `field_errors`, and WhatsApp channel links are not yet supported. It returns `title`,
+  `kind` (`group`, `channel`), `member_count`, `approval_required`, `paid` and
+  `membership` (`member`, `not_member` or `unknown`) with `membership_basis`, never
+  members, the inviter, the description or the provider chat ID. A bad or revoked link
+  fails with `invite_invalid` or `invite_expired`.
+- `join_chat` (`groups-manage`; owner-confirmed) needs a `check_chat_link` of the same
+  link by the same key within the last 60 minutes that showed `not_member`: otherwise
+  `preview_required`, or `already_member`. Its preview names that chat
+  (`expected_chat`); the adapter checks again right before joining and refuses without
+  joining when the title or kind changed (`operation_target_changed`), the account is
+  already a member (`already_member`) or the chat is paid (`join_not_allowed`).
+- Results: `joined` or `pending_approval` (a join request was sent), both `succeeded`.
+  `invite_invalid`, `invite_expired`, `chat_full` and `join_not_allowed` fail it. Any
+  other error or a timeout is `unknown` and never retried. A joined chat reports
+  `archive: collected` with its provider chat when the collection policy collects it,
+  else `archive: not_collected` and the operator's next step.
+- While an earlier join of the same link on the account, from any key, is queued,
+  dispatching or `unknown`, a new one is refused with `operation_result_unknown` until
+  a later `check_chat_link` shows `member` or `not_member`.
+- A joined chat is visible to no existing chat-scoped key (ACCESS.md). Leave with
+  `leave_group`. Opt in only after the API, gateway and native adapter of the same
+  release are installed.
+
 ## Important platform differences
 
 - WhatsApp `delete_message` is unsupported: the upstream global-revoke behavior

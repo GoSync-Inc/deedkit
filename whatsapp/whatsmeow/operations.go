@@ -39,10 +39,11 @@ var operationFields = map[string]string{
 	"delete_contact": "user_id", "block_contact": "user_id", "unblock_contact": "user_id", "update_profile": "name status", "get_labels": "offset limit", "set_chat_labels": "label_ids",
 	"open_chat_by_phone": "phone create", "set_group_messages_admins_only": "enabled", "set_group_info_admins_only": "enabled", "set_join_approval": "enabled",
 	"list_join_requests": "limit", "approve_join_requests": "user_ids", "reject_join_requests": "user_ids",
+	"check_chat_link": "link", "join_chat": "link",
 }
-var globalOperations = wordSet("get_profile list_contacts list_blocked get_contact block_contact unblock_contact delete_contact create_group add_contact update_profile get_labels open_chat_by_phone")
+var globalOperations = wordSet("get_profile list_contacts list_blocked get_contact block_contact unblock_contact delete_contact create_group add_contact update_profile get_labels open_chat_by_phone check_chat_link join_chat")
 var groupOperations = wordSet("list_participants rename_group set_group_description add_participant remove_participant promote_participant demote_participant leave_group get_invite_link revoke_invite_link set_group_messages_admins_only set_group_info_admins_only set_join_approval list_join_requests approve_join_requests reject_join_requests")
-var readOperations = wordSet("list_join_requests chat_info list_participants get_reactions get_message_info get_profile list_contacts get_contact list_blocked get_pinned_messages get_labels")
+var readOperations = wordSet("check_chat_link list_join_requests chat_info list_participants get_reactions get_message_info get_profile list_contacts get_contact list_blocked get_pinned_messages get_labels")
 var userPattern = regexp.MustCompile(`^[0-9]{1,30}@(c\.us|lid)$`)
 var shaPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var mimePattern = regexp.MustCompile(`(?i)^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$`)
@@ -81,6 +82,16 @@ type operationRequest struct {
 	LookupAllowed         bool                       `json:"lookup_allowed"`
 	LocalOnly             bool                       `json:"local_only"`
 	LookupMillis          int64                      `json:"lookup_ms"`
+	// ExpectedChat is what the owner confirmed for join_chat (ANYM-243).
+	ExpectedChat *expectedChat `json:"expected_chat"`
+}
+
+type expectedChat struct {
+	Title string `json:"title"`
+	Kind  string `json:"kind"`
+	// MemberCount is shown in the owner's preview only; a count moves too
+	// often to refuse a join over it.
+	MemberCount *int `json:"member_count"`
 }
 
 type operationDependencies struct {
@@ -96,6 +107,8 @@ type operationDependencies struct {
 	groupSetting     func(context.Context, types.JID, string, bool) error
 	joinRequests     func(context.Context, types.JID) ([]types.GroupParticipantRequest, error)
 	joinAction       func(context.Context, types.JID, []types.JID, bool) ([]types.GroupParticipant, error)
+	linkInfo         func(context.Context, string) (*types.GroupInfo, error)
+	joinLink         func(context.Context, string) (types.JID, bool, error)
 	contacts         func(context.Context) (map[types.JID]types.ContactInfo, error)
 	contact          func(context.Context, types.JID) (types.ContactInfo, error)
 	phone            func(context.Context, types.JID) (types.JID, error)
@@ -123,6 +136,7 @@ func (d *operationDependencies) useGroupIQ(iq groupIQ) {
 	d.group, d.createGroup, d.participants, d.groupName, d.groupDescription, d.leave, d.invite = iq.info, iq.create, iq.participants, iq.setName, iq.setTopic, iq.leave, iq.invite
 	d.groupSettle = iq.settle
 	d.groupSetting, d.joinRequests, d.joinAction = iq.setSetting, iq.joinRequests, iq.joinRequestAction
+	d.linkInfo, d.joinLink = iq.linkInfo, iq.joinLink
 }
 
 func (p *Provider) operationDependencies() operationDependencies {
@@ -178,7 +192,7 @@ func groupBounded(job operationRequest) bool {
 		target, err := ParseChatID(job.ProviderChat)
 		return err == nil && target.Server == types.GroupServer
 	}
-	return job.Operation == "create_group" || groupOperations[job.Operation]
+	return job.Operation == "create_group" || job.Operation == "check_chat_link" || job.Operation == "join_chat" || groupOperations[job.Operation]
 }
 
 // runOperation answers a group operation within groupOperationDeadline even
@@ -304,7 +318,8 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 		}
 		switch err.Error() {
 		case "history_rate_limited", "history_anchor_unavailable", "operation_unsupported", "operation_invalid_parameters", "operation_disabled", "operation_expired", "operation_target_invalid", "operation_target_unavailable", "operation_result_too_large", "registered_file_invalid",
-			"invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited", "operation_query_failed", "forbidden":
+			"invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited", "operation_query_failed", "forbidden",
+			"invite_invalid", "invite_expired", "chat_full", "join_not_allowed", "already_member", "operation_target_changed":
 		default:
 			if readOperations[job.Operation] {
 				err = errors.New("operation_query_failed")
@@ -950,6 +965,8 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 			}
 		}
 		return submitted(data)
+	case "check_chat_link", "join_chat":
+		return chatLink(ctx, job, d, mutate, read, &mutating)
 	case "rename_group", "set_group_description", "add_participant", "remove_participant", "promote_participant", "demote_participant", "leave_group", "get_invite_link", "revoke_invite_link":
 		g, e := getGroup()
 		if e != nil {
@@ -1398,11 +1415,98 @@ func groupSettingValue(g *types.GroupInfo, setting string) bool {
 	return g.IsJoinApprovalRequired
 }
 
+// inviteCode is a WhatsApp group invite link or its bare code; no URL is
+// fetched, and channel links, query strings and fragments are refused.
+var inviteCode = regexp.MustCompile(`^(?:https://chat\.whatsapp\.com/)?([A-Za-z0-9]{8,64})$`)
+
+// chatLink checks or joins the group behind an invite link (ANYM-243). The
+// check reads the link and then the group itself for membership; it returns no
+// member list, inviter, description or chat ID. A join repeats the check, then
+// sends the join once: a definite IQ refusal is failed, anything else after the
+// send is unknown.
+func chatLink(ctx context.Context, job operationRequest, d operationDependencies, mutate func(string, func() error) error, read func(map[string]any, string) (any, error), mutating *bool) (any, error) {
+	var link string
+	raw, found := job.Parameters["link"]
+	if !found || decodeValue(raw, &link) != nil {
+		return nil, errors.New("operation_invalid_parameters")
+	}
+	match := inviteCode.FindStringSubmatch(link)
+	if match == nil || (job.Operation == "join_chat" && job.ExpectedChat == nil) {
+		return nil, errors.New("operation_invalid_parameters")
+	}
+	code := match[1]
+	refused := func(err error) error {
+		switch {
+		case errors.Is(err, whatsmeow.ErrInviteLinkRevoked):
+			return errors.New("invite_expired")
+		case errors.Is(err, whatsmeow.ErrInviteLinkInvalid):
+			return errors.New("invite_invalid")
+		}
+		return err
+	}
+	info, err := d.linkInfo(ctx, code)
+	if err != nil {
+		return nil, refused(err)
+	}
+	membership, basis := "unknown", "unverified"
+	if g, e := d.group(ctx, info.JID); errors.Is(e, whatsmeow.ErrNotInGroup) {
+		membership, basis = "not_member", "not_in_group"
+	} else if e == nil && g != nil && ownGroupParticipant(g, d.owner, d.ownerLID, false) {
+		membership, basis = "member", "participant_list"
+	}
+	if job.Operation == "check_chat_link" {
+		var count any
+		if info.ParticipantCount > 0 {
+			count = info.ParticipantCount
+		} else if len(info.Participants) > 0 {
+			count = len(info.Participants)
+		}
+		return read(map[string]any{"title": truncate(info.Name, 512), "kind": "group", "member_count": count, "approval_required": info.IsJoinApprovalRequired,
+			"paid": false, "membership": membership, "membership_basis": basis}, "")
+	}
+	switch {
+	case membership == "member":
+		return nil, errors.New("already_member")
+	case membership != "not_member":
+		return nil, errors.New("operation_target_unavailable")
+	case job.ExpectedChat.Kind != "group" || job.ExpectedChat.Title != truncate(info.Name, 512):
+		return nil, errors.New("operation_target_changed")
+	}
+	var joined types.JID
+	var pending bool
+	if err := mutate("", func() error { var e error; joined, pending, e = d.joinLink(ctx, code); return e }); err != nil {
+		// A definite refusal answered the join itself: nothing was joined.
+		if code := refused(err); code != err {
+			*mutating = false
+			return nil, code
+		}
+		return nil, err
+	}
+	if joined != info.JID {
+		// The receipt names another group than the one checked: unknown, never confirmed.
+		return nil, errors.New("join_receipt_mismatch")
+	}
+	if pending {
+		return operationOutput("confirmed", map[string]any{"state": "pending_approval"}, "")
+	}
+	data := map[string]any{"state": "joined", "archive": "not_collected", "next_step": "the operator adds this chat to the account's collection policy"}
+	if p, e := d.policy(); e == nil && p.Enabled && p.Allows(LegacyChatID(joined)) {
+		data = map[string]any{"state": "joined", "archive": "collected", "provider_chat": LegacyChatID(joined)}
+	}
+	return operationOutput("confirmed", data, "")
+}
+
 // ownGroupAdmin reports whether the account itself, by phone JID or LID, is an
 // administrator of the group read.
 func ownGroupAdmin(g *types.GroupInfo, owner, ownerLID types.JID) bool {
+	return ownGroupParticipant(g, owner, ownerLID, true)
+}
+
+// ownGroupParticipant reports whether the group read lists the account itself,
+// as an administrator when admin is set.
+func ownGroupParticipant(g *types.GroupInfo, owner, ownerLID types.JID, admin bool) bool {
 	for _, p := range g.Participants {
-		if !p.IsAdmin {
+		if admin && !p.IsAdmin {
 			continue
 		}
 		for _, own := range []types.JID{owner, ownerLID} {
