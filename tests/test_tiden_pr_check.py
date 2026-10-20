@@ -564,3 +564,17 @@ def test_a_test_merge_checkout_diffs_from_the_merged_base_tip_not_the_stale_even
     payload["pull_request"]["head"]["sha"] = base  # HEAD is no test merge of this pull request: the event's base
     completed = real()
     assert completed.returncode == 1 and "test tests/test_later.py:1 test_later" in completed.stdout
+
+
+# spec: ANYM-405
+def test_a_unicode_line_separator_in_a_test_file_does_not_shift_the_markers(repo, server):
+    server.set(main=[spec(12)])
+    code, out = run(repo, server, {
+        "tests/test_sep.py": "NOTE = 'a b'\n\x0c\n# spec: ANYM-12\ndef test_py():\n    pass\n",
+        "pkg/sep_test.go": "package pkg\n\n// a b\n// spec: ANYM-12\nfunc TestGo(t *testing.T) {}\n",
+        "web/sep.test.mjs": "// a b\n// spec: ANYM-12\ntest('node', () => {});\n",
+        "tests/test_crlf.py": "# spec: ANYM-12\r\ndef test_crlf():\r\n    pass\r\n",
+    }, "Spec: ANYM-12")
+    assert code == 0, out
+    assert "test_py -> ANYM-12" in out and "TestGo -> ANYM-12" in out and "node -> ANYM-12" in out
+    assert "test_crlf -> ANYM-12" in out

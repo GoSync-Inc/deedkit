@@ -125,6 +125,12 @@ def language(path: str) -> str | None:
     return None
 
 
+def source_lines(source: str) -> list[str]:
+    """The lines of a file as the parser and the Go match counter number them: split on `\\n` only. `splitlines()` also
+    splits on U+2028, U+2029, form feed and others, which shifts every later marker."""
+    return [line.removesuffix("\r") for line in source.split("\n")]
+
+
 def marker(lines: list[str], index: int, comment: str) -> tuple[tuple[int, ...], str]:
     """The marker on the line above 0-based line `index`, as (spec numbers, problem)."""
     above = lines[index - 1] if index > 0 else ""
@@ -142,7 +148,7 @@ def marker(lines: list[str], index: int, comment: str) -> tuple[tuple[int, ...],
 def python_tests(source: str) -> list[tuple[str, int, str]]:
     """(name, 0-based line of the marker's target, problem) of each module-level test and each test method of a
     `Test*` class, nested classes included; the target is the `@` line of the first decorator, else the `def`."""
-    tree, lines = ast.parse(source), source.splitlines()
+    tree, lines = ast.parse(source), source_lines(source)
     found = []
 
     def start(node) -> int:
@@ -175,7 +181,7 @@ def tests_in(path: str, source: str) -> list[tuple[str, int, str]]:
         return [(match.group(1), source.count("\n", 0, match.start()), "") for match in GO_TEST.finditer(source)
                 if match.group(1) != "TestMain"]
     found = []
-    for line, text in enumerate(source.splitlines()):
+    for line, text in enumerate(source_lines(source)):
         if NODE_SPLIT.match(text):
             found.append((f"<{text.strip()}>", line, "the test call is split before its `(`; write `test(` on one "
                                                      "line"))
@@ -201,7 +207,7 @@ def added_tests(path: str, before: str | None, after: str) -> list[Test]:
     except SyntaxError as error:
         raise Refused(f"{shown(path)} does not parse ({error.msg}, line {error.lineno})") from None
     comment = "#" if language(path) == "python" else "//"
-    lines = after.splitlines()
+    lines = source_lines(after)
     result, seen = [], set()
     for name, index, problem in new:
         if (bool(problem), name) in old or (bool(problem), name) in seen:
