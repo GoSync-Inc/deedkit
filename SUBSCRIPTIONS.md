@@ -257,8 +257,10 @@ shared principal advisory lock and a `FOR UPDATE` lock on the subscription row
 (`event_delivery.py` `dispatch_hints`). DNS validation (at most 2 s), the secret
 read and the body build run before the fence; under it the dispatcher rechecks
 eligibility, the exact receiver binding and its lease, then sends to the
-pre-validated pinned address. The hold is bounded by the 5 s TLS deadline plus
-database time, so:
+pre-validated pinned address. Because DNS runs first, a hint whose key was revoked,
+whose lease was lost or whose age expired can still resolve the receiver's registered
+hostname once before it is cancelled; no POST follows. The hold is bounded by the 5 s
+TLS deadline plus database time, so:
 
 - an operator ACL change or revocation for that principal waits up to about 5 s per
   in-flight attempt;
@@ -276,7 +278,8 @@ database time, so:
   call; unmeasured).
 
 Each pass reports every attempt's fence hold in milliseconds as the list
-`fence_hold_ms` in the JSON line the delivery worker prints. Running more than one
+`fence_hold_ms` in the JSON line the delivery worker prints: from the moment the
+principal lock is held to commit, so time spent waiting for that lock is not counted. Running more than one
 dispatcher process lowers the head-of-line delay (`FOR UPDATE SKIP LOCKED`). No
 latency incident exists. Decided (2026-10-17, ANYM-257): the fence stays; an
 unfenced send with post-send checks is rejected because a hint would still reach a

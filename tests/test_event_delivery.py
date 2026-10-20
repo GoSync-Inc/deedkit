@@ -701,19 +701,66 @@ def test_revocation_waits_for_inflight_hint_and_no_send_after(seeded, tmp_path):
         sends.append(time.monotonic())
         threads.append(threading.Thread(target=revoke))
         threads[0].start()
+        # The revocation is observed waiting on the fence before the attempt ends.
+        with store.pool.connection() as c:
+            deadline = time.monotonic() + 5
+            while not c.execute("SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted").fetchone():
+                assert time.monotonic() < deadline, 'revocation never waited on the fence'
+                time.sleep(0.02)
         time.sleep(blocked)
         ended.append(time.monotonic())
         return 204
-    stats = dispatch_hints(store, transport=transport, resolver=slow_dns)
-    threads[0].join(10)
+    try:
+        stats = dispatch_hints(store, transport=transport, resolver=slow_dns)
+    finally:
+        for thread in threads:
+            thread.join(10)
     assert not fenced_during_dns
     assert stats['delivered'] == 1 and len(sends) == 1
     # The concurrent revocation committed only after the in-flight attempt ended.
     assert revoked and revoked[0] >= ended[0] > sends[0]
     hold = stats['fence_hold_ms'][0] / 1000
-    assert blocked <= hold <= min(5, blocked) + 1
+    assert blocked <= hold <= min(5, ended[0] - sends[0]) + 1
     with store.pool.connection() as c:
         c.execute("UPDATE subscription_outbox SET state='pending',next_attempt_at=clock_timestamp(),finished_at=NULL")
     after = dispatch_hints(store, transport=lambda *a, **k: pytest.fail('hint sent after revocation'),
         resolver=lambda *a, **k: ['93.184.216.34'])
     assert after['cancelled'] == 1 and len(sends) == 1
+
+
+# spec: ANYM-257
+def test_fence_hold_excludes_waiting_for_the_principal_lock(seeded, tmp_path):
+    import threading
+    import time
+    from messaging_service.event_delivery import dispatch_hints
+    from messaging_service.policy import lock_principal
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, _ = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    emit(store)
+    match_subscriptions(store)
+    with store.authorized(token) as (_, p):
+        principal = p['id']
+    held, threads = threading.Event(), []
+    def exclusive():
+        with store.pool.connection() as c:
+            lock_principal(c, principal)
+            held.set()
+            time.sleep(1.5)
+    def resolver(*args, **kwargs):
+        # An ACL change takes the principal lock after the reservation, before the fence.
+        threads.append(threading.Thread(target=exclusive))
+        threads[0].start()
+        assert held.wait(5)
+        return ['93.184.216.34']
+    started = time.monotonic()
+    try:
+        stats = dispatch_hints(store, transport=lambda *a, **k: 204, resolver=resolver)
+    finally:
+        for thread in threads:
+            thread.join(10)
+    assert stats['delivered'] == 1
+    assert time.monotonic() - started >= 1.5
+    assert stats['fence_hold_ms'][0] < 1000

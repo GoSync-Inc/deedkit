@@ -262,7 +262,8 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
     """Leased at-least-once hints, independently reauthorized before each send."""
     from .store import bounded
     bounded(limit, 100)
-    stats = dict(delivered=0, retried=0, dead_letter=0, cancelled=0, deferred=0, fence_hold_ms=[])
+    stats = dict(delivered=0, retried=0, dead_letter=0, cancelled=0, deferred=0)
+    holds = []
     for _ in range(limit):
         lease = uuid4()
         with store.pool.connection() as c:
@@ -331,13 +332,14 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
             except ValueError:
                 unsafe = True
         with store.pool.connection() as c:
-            fenced = time.monotonic()
             # Principal lock precedes subscription lock, matching gateway ACL
             # order. The bounded TLS exchange holds this shared ACL fence so a
             # concurrent revocation cannot commit between authorization and send.
             owner = c.execute('SELECT principal,key_id FROM subscriptions WHERE id=%s',
                 (hint['subscription'],)).fetchone()
             p = _worker_identity(c, owner) if owner else None
+            # The hold starts once the principal lock is held: waiting for it is contention, not hold.
+            fenced = time.monotonic()
             row = c.execute('SELECT * FROM subscriptions WHERE id=%s FOR UPDATE',
                 (hint['subscription'],)).fetchone()
             receiver = c.execute('''SELECT r.* FROM subscription_receivers r JOIN subscription_delivery d
@@ -386,7 +388,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     WHERE id=%s AND state='leased' AND lease_token=%s''',
                     (state, error, min(3600, 2**(hint['attempts'] + 1)), state, hint['id'], lease))
         # Each attempt's fence hold, so a latency regression shows up in a measurement.
-        stats['fence_hold_ms'].append(round((time.monotonic() - fenced) * 1000))
+        holds.append(round((time.monotonic() - fenced) * 1000))
         if live:
             stats['retried' if state == 'pending' else state] += 1
-    return stats
+    return dict(stats, fence_hold_ms=holds)
