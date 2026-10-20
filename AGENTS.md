@@ -16,7 +16,7 @@ DeedKit is the product; the repo keeps its AnyMsg identities (`anymsg`, `messagi
 - Never change applied migrations, provider IDs, existing test paths, names or parameters (Tiden
   IDs) or the seven `anymsg-ci::*` checks.
 - Production changes only via `scripts/production.py` from a green `main` SHA
-  (docs/operations/production.md); never prune shared Docker data; SSH is read-only. Merged source is not live verification.
+  (docs/operations/production.md); never prune shared Docker data; SSH is read-only except `production.py` and approved steps. Merged source is not live verification.
 - Own worktree; never bare `git stash`; `git commit -s`.
 
 ## 2. What the owner keeps
@@ -32,18 +32,19 @@ the orchestrator; never text in your own input box). Diff items:
 
 And without a diff: a restore, rollback over data or other production change than
 `production.py deploy` and the task steps below; live provider actions; secrets or
-credentials, roles, host access; deleting records, or data outside an accepted task; moving cards;
+new credentials, roles, host access; money; deleting records, or data outside an accepted task; moving cards;
 deleting cards (agents may on the owner's quote naming them); publishing a package, rewriting
-history; accepting a known risk (open blocking or major finding); product direction
+history or irreversible steps outside a task; accepting a known risk (open blocking or major finding); product direction
 (accepting feature or epic cards, weakening an accepted criterion).
-A standing approval holds only while all its conditions do.
+A standing approval holds only while all its conditions do; manual releases need one.
 
 An accepted task is a card accepted per tiden-product-workflow.md whose criteria name the step;
 cardless work has none. Inside one the agent applies its migration (production.md backup gate),
 deletes the data or files the card names, and ships its owner-accepted feature enabled: after merge and deploy it
 sets the card's flag or operation opt-in and grants only what the criteria name, never send, call,
 pairing, session or allowlist changes. It reports commands and undo. None of this runs
-during an active call; check read-only first.
+during an active call; check read-only first. An owner-accepted card's role SQL and release steps go to the level's
+reviewers (Astra for access and data), summary to the owner.
 
 ## 3. Change paths
 
@@ -69,16 +70,15 @@ Done: the squash's `main` push run is green.
   `Tiden branch: proposal/<name>` or `review/<name>`, the only place to edit criteria. The first
   ID is primary; new files are anchored to it.
 - Wait for sync B (main push) on your squash and read back; rerun or dispatch a failed B, `Tiden
-  drift` or `Tiden health`. Hand writes to Tiden need a maintenance window (TIDEN-CI.md). Check A,
-  cards, markers, commands: docs/operations/tiden-product-workflow.md.
+  drift` or `Tiden health`. Hand writes to Tiden need a maintenance window (TIDEN-CI.md). Details:
+  docs/operations/tiden-product-workflow.md.
 
 ## 5. Reviews
 
 - Astra: `codex exec --disable hooks -m gpt-6-astra -c service_tier="default" "<task with packet
   paths>" </dev/null`. For Codex-written code an Opus subagent; Codex line: review-protocol.md.
   Fable: `fable` Claude subagent, a product manager, never on code.
-- One round; after a blocking or major finding, one scoped recheck; r3 only for a new blocking.
-- Packet and verdict line: docs/operations/review-protocol.md. Every Astra task starts with:
+- Packet, rounds and verdict line: docs/operations/review-protocol.md. Every Astra task starts with:
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
      existing path (call audio, sends, collectors, queue, backup)? Name the line.
   2. Data egress vs PR claims: what data leaves the process (model APIs, logs, telemetry, third
@@ -100,7 +100,7 @@ Done: the squash's `main` push run is green.
   files, section 2, the card's criteria, a fork without an obvious answer).
 - Run only tests of touched code and your new ones.
 - Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_*` block.
-- At the token limit in your brief, at the next boundary: a handoff of at most 40 lines,
-  `RESTART <path>` to the orchestrator, stop. Not with about 30 calls left: finish.
+- At the brief's token limit (default 200k), hand off and restart yourself
+  (docs/operations/parallel-development.md).
 - Budget: 1,000 words (`wc -w`). A rule change replaces or deletes words and names its incident and
   enforcer; an incident gets a test or hook first.
