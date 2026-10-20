@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -12,12 +12,14 @@ import os
 from pathlib import Path
 import posixpath
 import re
+import selectors
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import urllib.error
 import urllib.parse
@@ -102,11 +104,16 @@ class Unattested(Refused):
     """The registry has no image tag for the target at the commit: not published (yet)."""
 
 
-def run(argv, *, cwd=None, umask=-1, env=None, reason=False):
+class CallActive(Refused):
+    """A call was still active when the bounded wait before a plan A stop ran out: `deploy` tries again later."""
+
+
+
+def run(argv, *, cwd=None, umask=-1, env=None, reason=False, timeout=1800):
     # Never include command output in an exception: Compose can contain secrets. Only a tool that prints
     # nothing secret (the attestation verifier, git on the public source mirror) may pass its last stderr line on,
     # with `reason`.
-    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=1800, umask=umask, env=env)
+    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=timeout, umask=umask, env=env)
     if result.returncode:
         detail = (result.stderr.strip().splitlines() or [""])[-1][:300] if reason else ""
         raise Refused(f"{Path(argv[0]).name} failed (exit {result.returncode}){': ' + detail if detail else ''}; "
@@ -951,13 +958,20 @@ def apply(settings, sha):
             raise Refused("this release was prepared without a bound rollback snapshot; prepare it again")
         if not previous.exists() or digest(read(previous)) != item["before_file_digest"]:
             raise Refused("the before-release snapshot is missing or changed since preparation")
+    # No call is active before the last remote gate, nor after it: a call that started meanwhile is waited for before
+    # anything is written, within the same bound.
+    deadline = time.monotonic() + CALL_WAIT
+    wait_for_calls(settings, deadline)
     # Last remote gate immediately before the first mutation, under the host lock.
     evidence = promotable(sha)
+    wait_for_calls(settings, deadline)
     write(release / "attempted.json", {"sha": sha, "ci": evidence, "status": "applying"})
     started, touched = {}, []
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
         command = ["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f", item["file"]]
         services = list(project["services"])
+        if touched:
+            wait_for_calls(settings, time.monotonic() + CALL_WAIT)
         # Stop the existing owners before replacements can connect to their sessions.
         run(command + ["stop", *services])
         touched.append((project, item))
@@ -1025,6 +1039,241 @@ def unfinished(state):
                   for path in state.glob("*/" + marker) if not (path.parent / outcome).exists())
 
 
+# A plan A stop never cuts a call (production.md "Apply and verify"): restarting the calls service ends every unfinished
+# call as `interrupted`, and the Telegram collector carries Telegram call audio. ACTIVE of services/calls/core.py.
+CALL_STATUSES = ("waiting_for_browser", "dialing", "ringing", "connecting", "active")
+# A call lasts at most 600 s (core.py max_duration_secs), Twilio 40 s more; a browser call can wait for its human
+# longer, so the bound is a budget: when it runs out, nothing is stopped.
+CALL_WAIT, CALL_POLL, CALL_WAITS = 15 * 60, 10, 4
+# One read stops after CALL_READ seconds; the probe process dies after CALL_LIFETIME whatever SQLite does, which
+# releases its shared lock (the service's own writes wait for it). One poll's Docker commands share CALL_PROBE
+# seconds; confirming that a probe the tool gave up on is gone gets CALL_KILL seconds per command. The host reads at
+# most CALL_OUTPUT bytes of a probe's output.
+CALL_READ, CALL_LIFETIME, CALL_PROBE, CALL_KILL, CALL_OUTPUT = 0.25, 1, 20, 10, 65536
+CALL_LABEL = "io.deedkit.calls-probe"
+CALL_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
+# Run in a container of its own from the calls container's image: the calls state directory mounted read-only, no
+# network, its own memory and process limits, as the calls user. This host's root never opens a file there, the live
+# calls container shares none of its limits, and nothing can be written there (no journal or WAL file). `--init`
+# keeps python off PID 1, which the kernel would shield from SIGALRM's default action.
+CALLS_PROBE = r"""
+import json, os, pathlib, signal, sqlite3, sys, time
+def probe(limit, statuses):
+    directory = os.environ.get("VOICE_DATA_DIR")
+    if not directory:
+        return {"error": "no_data_directory"}
+    database = pathlib.Path(directory, "voice.sqlite3")
+    if not database.is_file():
+        return {"error": "no_database"}
+    try:
+        connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=limit)
+        try:
+            deadline = time.monotonic() + limit
+            connection.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
+            rows = connection.execute(
+                "SELECT id, json_extract(body, '$.status') FROM calls WHERE json_extract(body, '$.status') IN ("
+                + ", ".join("?" * len(statuses)) + ") ORDER BY id LIMIT 20", statuses).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        name = getattr(exc, "sqlite_errorname", "")
+        return {"error": next((category for prefix, category in (
+            ("SQLITE_BUSY", "busy"), ("SQLITE_LOCKED", "busy"), ("SQLITE_INTERRUPT", "interrupted"),
+            ("SQLITE_READONLY", "read_only_recovery_needed"), ("SQLITE_CANTOPEN", "cannot_open"))
+            if name.startswith(prefix)), "no_calls_table" if "no such table" in str(exc) else "sqlite_error")}
+    return {"calls": [[str(identity), str(status)] for identity, status in rows]}
+# The process ends here at the latest, even inside one SQLite step: SIGALRM's default action terminates it.
+signal.alarm(int(sys.argv[2]))
+print(json.dumps(probe(float(sys.argv[1]), sys.argv[3:])))
+"""
+CALL_ERRORS = {"no_data_directory", "no_database", "busy", "interrupted", "read_only_recovery_needed", "cannot_open",
+               "no_calls_table", "sqlite_error"}
+
+
+class CallsUnknown(Refused):
+    """Whether a call is active could not be read (a fixed category, never raw output)."""
+
+
+class ProbeStuck(Refused):
+    """A calls probe the tool gave up on could not be confirmed gone: no further probe or stop, inspect it."""
+
+
+# Tokens of probes whose `docker create` or `docker start` did not end cleanly: Docker can still act on a request
+# after the tool gave up, so each later probe first confirms that none of them can run.
+UNCONFIRMED = set()
+
+
+def docker_probe(argv, until):
+    """A Docker command of one poll, never past the poll's own budget `until` (time.monotonic)."""
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        raise CallsUnknown("probe_timeout")
+    try:
+        return run(argv, timeout=remaining)
+    except subprocess.TimeoutExpired:
+        raise CallsUnknown("probe_timeout") from None
+    except Refused:
+        raise CallsUnknown("probe_failed") from None
+
+
+def probe_output(argv, until):
+    """The stdout of a probe's `docker start --attach`, never past `until` and never more than CALL_OUTPUT bytes held
+    (more is malformed); stderr is discarded. A failed probe is probe_failed."""
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        raise CallsUnknown("probe_timeout")
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    stdout, output = process.stdout, b""
+    assert stdout is not None
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(stdout, selectors.EVENT_READ)
+            while True:
+                remaining = until - time.monotonic()
+                if remaining <= 0:
+                    raise CallsUnknown("probe_timeout")
+                if selector.select(remaining):
+                    if not (chunk := os.read(stdout.fileno(), CALL_OUTPUT + 1)):
+                        break
+                    output += chunk
+                    if len(output) > CALL_OUTPUT:
+                        raise CallsUnknown("malformed_probe_output")
+        if process.wait(timeout=max(until - time.monotonic(), 0.001)):
+            raise CallsUnknown("probe_failed")
+    except subprocess.TimeoutExpired:
+        raise CallsUnknown("probe_timeout") from None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        stdout.close()
+    try:
+        return output.decode()
+    except UnicodeDecodeError:
+        raise CallsUnknown("malformed_probe_output") from None
+
+
+def stop_probes():
+    """Remove every probe container of UNCONFIRMED in any state, found by its own label value (never by name: a
+    failed `docker create --name` may have met another container), and confirm none is left that could still run. A
+    removed container never starts, so a `docker start` the tool gave up on cannot run it later; one whose creation
+    the tool gave up on and that Docker creates later is never started. Otherwise ProbeStuck."""
+    def owned():
+        rows = [line.split("\t") for line in run([
+            "docker", "ps", "--all", "--no-trunc", "--filter", "label=" + CALL_LABEL, "--format",
+            '{{.ID}}\t{{.State}}\t{{.Label "' + CALL_LABEL + '"}}'], timeout=CALL_KILL).splitlines() if line]
+        if not all(len(row) == 3 and CONTAINER_ID.fullmatch(row[0]) for row in rows):
+            raise Refused("unexpected probe listing")  # never taken for "none left"
+        # A container Docker is removing, or failed to remove, never starts again.
+        return [identity for identity, status, token in rows if token in UNCONFIRMED and status not in (
+            "removing", "dead")]
+    try:
+        for container in owned():
+            with suppress(Refused):  # It may have ended and been removed meanwhile.
+                run(["docker", "rm", "--force", container], timeout=CALL_KILL)
+        left = owned()
+    except (Refused, subprocess.TimeoutExpired):
+        left = None
+    if left != []:
+        raise ProbeStuck("a calls probe container could not be confirmed stopped; "
+                         f"inspect `docker ps --all --filter label={CALL_LABEL}`")
+
+
+def calls_in(container, until):
+    """`<id> (<status>)` of every active call the calls container's database lists, read by CALLS_PROBE in a
+    container of its own."""
+    if UNCONFIRMED:
+        stop_probes()
+    actual = json.loads(docker_probe(["docker", "inspect", container], until))[0]
+    env = dict(item.partition("=")[::2] for item in actual["Config"].get("Env") or [])
+    directory = env.get("VOICE_DATA_DIR", "/data")
+    mounts = [mount for mount in actual.get("Mounts") or [] if mount.get("Destination") == directory]
+    if len(mounts) != 1 or mounts[0].get("Type") not in ("bind", "volume") or not IMAGE_DIGEST.fullmatch(
+            actual.get("Image", "")):
+        raise CallsUnknown("no_data_mount")
+    mount = mounts[0]
+    source = ("type=bind,source=" + mount["Source"] if mount["Type"] == "bind" else "type=volume,source=" + mount["Name"])
+    if "," in source.partition("source=")[2]:
+        raise CallsUnknown("no_data_mount")
+    token = uuid.uuid4().hex
+    # Created first, so the container that may run has a known ID before it starts; a creation or start that did not
+    # end cleanly leaves the token to stop_probes, here and before every later probe.
+    UNCONFIRMED.add(token)
+    try:
+        container = docker_probe([
+            "docker", "create", "--rm", "--init", "--name", "deedkit-calls-probe-" + token[:12], "--label",
+            f"{CALL_LABEL}={token}", "--pull", "never", "--network", "none", "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--memory", "64m", "--memory-swap", "64m",
+            "--pids-limit", "16", "--cpus", "0.5", "--user", actual["Config"].get("User") or "10001:10001",
+            "--mount", source + ",target=/data,readonly", "--env", "VOICE_DATA_DIR=/data", "--entrypoint", "python",
+            actual["Image"], "-I", "-c", CALLS_PROBE, str(CALL_READ), str(CALL_LIFETIME), *CALL_STATUSES], until).strip()
+        if not CONTAINER_ID.fullmatch(container):
+            raise CallsUnknown("probe_failed")
+        output = probe_output(["docker", "start", "--attach", container], until)
+    except CallsUnknown:
+        # The tool gave up or failed; its probe container must not outlive it (its alarm ends it anyway).
+        stop_probes()
+        raise
+    # It ran to its end, and `--rm` removes it.
+    UNCONFIRMED.discard(token)
+    try:
+        answer = json.loads(output)
+    except ValueError:
+        raise CallsUnknown("malformed_probe_output") from None
+    # Exactly the shape CALLS_PROBE prints: nothing else is passed on or taken for "no call".
+    if not isinstance(answer, dict) or len(answer) != 1:
+        raise CallsUnknown("malformed_probe_output")
+    if "error" in answer:
+        raise CallsUnknown(answer["error"] if isinstance(answer["error"], str) and answer["error"] in CALL_ERRORS
+                           else "malformed_probe_output")
+    calls = answer.get("calls")
+    if not isinstance(calls, list) or len(calls) > 20 or not all(
+            isinstance(call, list) and len(call) == 2 and isinstance(call[0], str) and CALL_ID.fullmatch(call[0])
+            and call[1] in CALL_STATUSES for call in calls):
+        raise CallsUnknown("malformed_probe_output")
+    return [f"{identity} ({status})" for identity, status in calls]
+
+
+def active_calls(settings):
+    """The active calls of every running container of a configured `calls` service, found by its Compose labels,
+    in one poll of at most CALL_PROBE seconds. No running calls container has no active call; a configuration
+    without a `calls` target checks nothing."""
+    found, until = [], time.monotonic() + CALL_PROBE
+    for project in settings["projects"]:
+        for service in (service for service, target in project["services"].items() if target == "calls"):
+            for container in docker_probe(["docker", "ps", "-q", "--filter",
+                                           "label=com.docker.compose.project=" + project["name"], "--filter",
+                                           "label=com.docker.compose.service=" + service], until).split():
+                found += calls_in(container, until)
+    return found
+
+
+def wait_for_calls(settings, deadline):
+    """Wait until no call is active; no poll starts at or after `deadline` (time.monotonic), and one poll takes at
+    most CALL_PROBE plus confirming probes the tool gave up on gone. At the bound: CallActive with the calls, or
+    CallsUnknown with the category when the last read failed, `wait_expired` when the bound passed before this wait
+    could poll; it never proceeds on doubt. ProbeStuck ends it at once."""
+    said, calls, error = False, None, "wait_expired"
+    while time.monotonic() < deadline:
+        try:
+            calls, error = active_calls(settings), None
+        except CallsUnknown as exc:
+            calls, error = None, str(exc)
+        if calls == []:
+            if not said:
+                print("calls check: no active call", file=sys.stderr, flush=True)
+            return
+        if not said:
+            print("calls check: waiting for " + ("the calls database (" + error + ")" if error is not None else
+                                                 "a call to end: " + ", ".join(calls or [])), file=sys.stderr, flush=True)
+            said = True
+        time.sleep(max(0, min(CALL_POLL, deadline - time.monotonic())))
+    if error is not None:
+        raise CallsUnknown("whether a call is active could not be read: " + error)
+    raise CallActive("a call is active: " + ", ".join(calls or []))
+
+
 def rollback(settings, sha):
     """Return the current release's selected services to the images and configuration that ran before it, or
     those of a release whose apply failed its health wait (`unhealthy`), which never became current.
@@ -1082,10 +1331,13 @@ def rollback(settings, sha):
             if not present:
                 raise Refused("a previous image is no longer present on this host")
         plan.append((project, before, previous))
+    wait_for_calls(settings, time.monotonic() + CALL_WAIT)
     write(release / "rollback-attempted.json", {"sha": sha, "status": "rolling-back", "started_at": now()})
-    for project, before, previous in plan:
+    for index, (project, before, previous) in enumerate(plan):
         command = ["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f", str(before)]
         services = list(project["services"])
+        if index:
+            wait_for_calls(settings, time.monotonic() + CALL_WAIT)
         # Stop the release's owners before the previous ones can connect to their sessions.
         run(command + ["stop", *services])
         run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps",
@@ -1181,21 +1433,30 @@ def free_lock(directory, stack):
 
 
 def rollback_snapshots(directory, current):
-    """The `*.before.json` files of the current applied release: each project its rollback record names must have one,
-    and a release without that record must have at least one, or its rollback target is unknown."""
+    """The services of each tool-written `<project>.before.json` of the current applied release, one per project its
+    rollback record names (a receipt without that record: per project of its prepared.json). Each must be there with
+    its `services`, or the rollback target is unknown. Other files there, such as an operator's copy of another
+    configuration, are not rollback targets."""
     release = directory / current["sha"]
-    snapshots = [path for path in directory_entries(release) if path.name.endswith(".before.json")]
+    entries = {path.name: path for path in directory_entries(release)}
     projects = (current.get("rollback") or {}).get("projects")
-    names = [project.get("name") for project in projects] if isinstance(projects, list) else []
-    missing = [name for name in names if not isinstance(name, str) or not present(release / f"{name}.before.json")]
-    if missing or not snapshots:
-        raise Refused(f"the rollback snapshot of {release} is missing; no image is removed")
-    return snapshots
+    if not isinstance(projects, list) and "prepared.json" in entries:
+        prepared = load(entries["prepared.json"])
+        projects = prepared.get("projects") if isinstance(prepared, dict) else None
+    names = [project.get("name") if isinstance(project, dict) else None
+             for project in (projects if isinstance(projects, list) else [])]
+    snapshots = [load(entries[f"{name}.before.json"]) if isinstance(name, str) and f"{name}.before.json" in entries
+                 else None for name in names]
+    # Every service entry, too: one that is not a mapping would leave its image unprotected (Astra r2 F6).
+    if not snapshots or not all(isinstance(snapshot, dict) and isinstance(snapshot.get("services"), dict) and all(
+            isinstance(unit, dict) for unit in snapshot["services"].values()) for snapshot in snapshots):
+        raise Refused(f"the rollback snapshot of {release} is missing or malformed; no image is removed")
+    return [snapshot["services"] for snapshot in snapshots if snapshot]
 
 
 def state_images(directory, keep, revisions, *, label, idle):
     """The images one state still needs: its current release, the images a rollback restored, the current release's
-    `*.before.json` (the rollback target), every preparation neither applied nor attempted, the HTTP serving and retained
+    `<project>.before.json` (the rollback target), every preparation neither applied nor attempted, the HTTP serving and retained
     generations, and images an operator protected. Unless the state is `idle` (its deploy lock was free), the images
     tagged with the revision of any release directory without a result: a preparation may be pulling them now."""
     current = load(directory / "current.json") if present(directory / "current.json") else {}
@@ -1206,8 +1467,8 @@ def state_images(directory, keep, revisions, *, label, idle):
         for image in services.values():
             keep(image, "restored by the rollback of " + current["sha"] + label)
     if current.get("status") == "applied":
-        for before in rollback_snapshots(directory, current):
-            for unit in load(before)["services"].values():
+        for services in rollback_snapshots(directory, current):
+            for unit in services.values():
                 keep(unit.get("image"), "rollback target of the current release" + label)
     if present(directory / "http-current.json"):
         # Read one level deep: each HTTP receipt nests its predecessor, and those before it are retired.
@@ -1512,12 +1773,18 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record):
             tzinfo=timezone.utc)
         failures = last.get("fetch_failures", {"count": 0})["count"]
         misses = last.get("unreachable", {"count": 0})["count"]
-        if type(failures) is not int or failures < 0 or type(misses) is not int or misses < 0:
+        waits = last.get("call_waits", {"count": 0})["count"]
+        if any(type(count) is not int or count < 0 for count in (failures, misses, waits)):
             raise ValueError("fetch failure count")
     except (ValueError, TypeError, AttributeError, KeyError):
         return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it")
     if auto and started and (datetime.now(timezone.utc) - started).total_seconds() < DEPLOY_INTERVAL:
         return {"status": "waiting", "reason": "less than 20 minutes since the last deploy started"}
+    if "call_waits" in last:
+        # Waits for calls count only in a row: this run carries the count on only when it waits again.
+        last = {key: value for key, value in last.items() if key != "call_waits"}
+        if not dry_run:
+            write(state / "deploy.json", last)
     if blocked := unfinished(state):
         return halt("an apply or rollback is unfinished: " + ", ".join(blocked) + "; inspect it before any recovery")
     # An HTTP attempt that neither serves nor failed before admission has an unknown router or retirement outcome.
@@ -1638,6 +1905,13 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record):
             apply(settings, candidate)
         except Exception as exc:
             message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+            if isinstance(exc, (CallActive, CallsUnknown)) and not (release / "attempted.json").exists():
+                # Nothing was stopped: the prepared release waits for a later run; the fourth wait in a row pauses.
+                if waits + 1 >= CALL_WAITS:
+                    return finish(**halt(f"plan A of {candidate} waited {waits + 1} runs in a row for calls: {message}; "
+                                         "inspect the calls service"))
+                return finish("waiting", reason=message + "; nothing changed, the next run retries",
+                              call_waits={"count": waits + 1, "at": now(), "reason": message})
             if not (release / "attempted.json").exists():
                 # A network or quota error before preparation started or after it finished changed nothing.
                 if transient(exc) and ((release / "prepared.json").exists() or not release.exists()):
