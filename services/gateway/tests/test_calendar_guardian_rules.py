@@ -100,3 +100,24 @@ def test_project_follows_the_gateway_assignment_ceiling(tmp_path, local, backend
             asyncio.run(call)
     caps = asyncio.run(dispatch.call("gateway-a", "calendar_capabilities", {}))
     assert caps["constraints"] == {"plan_action_limit": 8, "plan_step_limit": 16}
+
+
+# spec: ANYM-434
+@pytest.mark.parametrize(
+    ("local", "backend", "allowed"),
+    [
+        (WRITER, WRITER + ["assignment:read"], False),
+        (WRITER + ["assignment:read"], WRITER, False),
+        (WRITER + ["assignment:read"], WRITER + ["assignment:read"], True),
+    ],
+)
+def test_unproject_follows_the_gateway_assignment_ceiling(tmp_path, local, backend, allowed):
+    from agent_gateway.policy import Denied
+
+    dispatch = gateway(tmp_path, local, backend, tools=PLANNER)
+    call = dispatch.call("gateway-a", "calendar_plan", {"actions": [{"action": "unproject", "operation_id": "op-1"}]})
+    if allowed:
+        assert asyncio.run(call)["plan_id"] == "plan-synthetic"
+    else:
+        with pytest.raises(Denied):
+            asyncio.run(call)
