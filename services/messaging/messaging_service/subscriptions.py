@@ -107,9 +107,12 @@ def _delivery_view(c, row):
     binding = c.execute('SELECT receiver FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
     counts = c.execute('''SELECT state,count(*) AS n FROM subscription_outbox WHERE subscription=%s
         GROUP BY state''', (row['id'],)).fetchall()
+    # An unbound subscription reads no policy state, so its view needs no schema-38 column.
+    from .delivery_policy import UNBOUND, delivery_state
     return {'passive_read': True, 'ack': True, 'push': binding is not None,
         'receiver_id': str(binding['receiver']) if binding else None, 'host_wakeup': 'unverified',
-        'host_turn_verified': False, 'hint_counts': {item['state']: item['n'] for item in counts}}
+        'host_turn_verified': False, 'hint_counts': {item['state']: item['n'] for item in counts},
+        **(delivery_state(c, row) if binding else UNBOUND)}
 
 
 def create_subscription(store, c, p, chat_ids, *, sender_ids=None, kinds=None,
@@ -403,6 +406,14 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 missing_evidence=missing_evidence+%s,last_matched_at=clock_timestamp()
                 WHERE id=%s''', (position, reason, Jsonb(gap) if gap else None, missing, row['id']))
             if newly_matched:
-                from .event_delivery import enqueue_hint
-                enqueue_hint(c, row, position)
+                from .delivery_policy import after_match
+                try:
+                    # The hint step cannot undo or block the matches and frontier above:
+                    # a failure rolls back only the savepoint and a later tick reopens the range.
+                    with c.transaction():
+                        after_match(c, row, position)
+                except Exception as error:
+                    from .telemetry import capture
+                    capture(error, 'subscription_hint_failed')
+                    print(json.dumps({'error': 'subscription_hint_failed'}), flush=True)
     return stats

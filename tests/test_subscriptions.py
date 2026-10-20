@@ -355,3 +355,64 @@ def test_no_push_or_reply_preset_claimed(seeded):
     assert capabilities['ack'] and capabilities['ack_permission'] == 'subscription-ack'
     assert capabilities['push'] == 'operator_registered_signed_hints'
     assert capabilities['native_reply_preset'] and not capabilities['verified_host']
+
+
+# spec: ANYM-252
+def test_debounce_flushes_at_max_wait(seeded, tmp_path):
+    from datetime import timedelta
+    from uuid import uuid4
+    from messaging_service.delivery_policy import flush_hints
+    from messaging_service.event_delivery import register_receiver
+    store, _, _ = seeded
+    token = key(store)
+    sid = create(store, token)['subscription_id']
+    secret = tmp_path / 'receiver.key'
+    secret.write_bytes(b'synthetic receiver secret bytes 0123456789')
+    secret.chmod(0o600)
+    with store.authorized(token) as (_, p):
+        key_id = str(p['key_id'])
+    rid = str(uuid4())
+    register_receiver(store, rid, 'subscriber', key_id, 'https://hooks.example.test/wake', str(secret),
+        resolver=lambda *a, **k: ['93.184.216.34'])
+    store.configure_subscription_delivery(token, sid, 1, rid, {'debounce_s': 30, 'max_wait_s': 300})
+
+    def elapse(seconds):
+        # Durable deadlines move back by the simulated interval; the database clock stays real.
+        step = timedelta(seconds=seconds)
+        with store.pool.connection() as c:
+            c.execute('''UPDATE subscription_hint_windows SET first_match_at=first_match_at-%s,
+                last_match_at=last_match_at-%s,due_at=due_at-%s WHERE subscription=%s''', (step, step, step, sid))
+            c.execute('UPDATE subscription_outbox SET created_at=created_at-%s WHERE subscription=%s', (step, sid))
+
+    def hints():
+        with store.pool.connection() as c:
+            return [row['through_position'] for row in c.execute('''SELECT through_position FROM subscription_outbox
+                WHERE subscription=%s AND kind='events' ORDER BY created_at,id''', (sid,)).fetchall()]
+
+    # Matches at 0, 5 and 10 s: one hint at 40 s, 30 s after the last match.
+    events = []
+    for second in (0, 5, 10):
+        if second:
+            elapse(5)
+        events.append(emit(store))
+        match_subscriptions(store)
+    elapse(29)
+    flush_hints(store)
+    assert hints() == []
+    elapse(1)
+    flush_hints(store)
+    assert hints() == [events[-1]]
+    # One match every 5 s for 10 minutes: a hint at least every 300 s.
+    elapse(3600)
+    emitted_at = []
+    for tick in range(122):
+        emit(store)
+        match_subscriptions(store)
+        flush_hints(store)
+        if len(hints()) > 1 + len(emitted_at):
+            emitted_at.append(tick * 5)
+        elapse(5)
+    # Each hint comes at most 300 s after the first match it covers (tick 0, then the tick after
+    # the previous hint). Real test runtime adds to the simulated clock, so it may come early.
+    assert len(emitted_at) == 2 and 270 <= emitted_at[0] <= 300
+    assert all(later - first <= 300 for first, later in zip([0] + [t + 5 for t in emitted_at], emitted_at))

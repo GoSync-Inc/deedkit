@@ -9,6 +9,7 @@ import signal
 import threading
 
 from .store import Store
+from .delivery_policy import flush_hints
 from .subscriptions import match_subscriptions
 from .telemetry import configure, capture
 
@@ -47,6 +48,12 @@ def main():
                 if args.once:
                     raise RuntimeError('subscription_match_failed') from None
                 print(json.dumps({'error': 'subscription_match_failed'}), flush=True)
+            try:
+                # Held hints and silence timers fire from durable rows, independent of matching.
+                flush_hints(store)
+            except Exception as error:
+                capture(error, 'subscription_hint_failed')
+                print(json.dumps({'error': 'subscription_hint_failed'}), flush=True)
             stop.wait(args.interval)
     finally:
         store.close()

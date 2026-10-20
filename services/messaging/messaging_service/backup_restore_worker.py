@@ -34,7 +34,7 @@ def restored_schema_version(store,manifest_version):
         row=connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()
     actual=row.get('value') if row else None
     if (not isinstance(actual,str) or not actual.isascii() or not actual.isdigit() or len(actual)>3 or
-            int(actual) not in range(2,38) or type(manifest_version) is not int or int(actual)!=manifest_version):
+            int(actual) not in range(2,39) or type(manifest_version) is not int or int(actual)!=manifest_version):
         raise ValueError('restored_schema_mismatch')
     return int(actual)
 
@@ -59,6 +59,9 @@ def assert_quarantined(store, version):
         predicates['subscription_outbox'] = "state IN ('pending','leased') OR lease_token IS NOT NULL OR lease_until IS NOT NULL"
         predicates['subscription_receipts'] = 'true'
     if version >= 33:predicates['attachment_backup_fences'] = 'ended_at IS NULL'
+    if version >= 37:
+        predicates['subscription_hint_windows'] = ("due_at IS NOT NULL OR silence_due_at IS NOT NULL OR "
+            "silence_state IS DISTINCT FROM 'cancelled'")
     with store.pool.connection() as connection:
         if connection.execute('SELECT current_database() AS name').fetchone()['name'] != DATABASE:
             raise ValueError('not_restore_database')

@@ -53,6 +53,7 @@ V33_TABLES={'attachment_residency':'digest','attachment_eviction_journal':'id','
 V34_TABLES={'attachment_understanding':'attachment','file_understanding_profiles':'account,kind'}
 V35_TABLES={'attachment_cold_copies':'digest'}
 V37_TABLES={'collector_account_roles':'role_name'}
+V38_TABLES={'subscription_hint_windows':'subscription'}
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
@@ -62,7 +63,7 @@ V15_TABLES={'message_metadata':'message','attachment_enrichment':'attachment','e
 def database_manifest(c):
     tables={}
     version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
-    if version not in range(2,38): raise ValueError('unsupported_backup_schema')
+    if version not in range(2,39): raise ValueError('unsupported_backup_schema')
     for name,order in {**TABLES,**(V3_TABLES if version>=3 else {}),**(V4_TABLES if version>=4 else {}),
                        **(V5_TABLES if version>=5 else {}),**(V6_TABLES if version>=6 else {}),
                        **(V8_TABLES if version>=8 else {}),**(V9_TABLES if version>=9 else {}),
@@ -74,7 +75,8 @@ def database_manifest(c):
                        **(V29_TABLES if version>=29 else {}),**(V32_TABLES if version>=32 else {}),
                        **(V33_TABLES if version>=33 else {}),**(V34_TABLES if version>=34 else {}),
                        **(V35_TABLES if version>=35 else {}),
-                       **(V37_TABLES if version>=37 else {})}.items():
+                       **(V37_TABLES if version>=37 else {}),
+                       **(V38_TABLES if version>=38 else {})}.items():
         query=sql.SQL('SELECT row_to_json(t) AS record FROM {} t ORDER BY {}').format(
             sql.Identifier(name),sql.SQL(',').join(sql.Identifier(part) for part in order.split(',')))
         sha=hashlib.sha256(); count=0
@@ -211,7 +213,7 @@ def create_snapshot(store,destination,dump_command,recovery_config=None,*,captur
 def verify_bundle(directory,*,blob_root=None):
     from .recovery_state import read_manifest,verify_recovery
     directory=Path(directory); manifest=read_manifest(directory)
-    if manifest.get('format') not in (1,2) or manifest.get('schema_version') not in range(2,38): raise ValueError('unsupported_backup')
+    if manifest.get('format') not in (1,2) or manifest.get('schema_version') not in range(2,39): raise ValueError('unsupported_backup')
     verify_recovery(directory,manifest)
     if (directory/'database.dump').is_symlink(): raise ValueError('invalid_backup_file')
     fd=os.open(directory/'database.dump',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
@@ -304,6 +306,11 @@ def quarantine_restore(store):
             c.execute('UPDATE subscription_receivers SET enabled=false')
             c.execute("UPDATE subscription_outbox SET state='cancelled',lease_token=NULL,lease_until=NULL,finished_at=clock_timestamp(),error_code='restored_disabled' WHERE state IN ('pending','leased')")
             c.execute('DELETE FROM subscription_receipts')
+        if version>=38:
+            # Held hints and silence timers never fire from a restored snapshot.
+            c.execute("""UPDATE subscription_hint_windows SET first_match_at=NULL,last_match_at=NULL,match_count=0,
+                through_position=NULL,reasons='{}',due_at=NULL,held_reason=NULL,silence_state='cancelled',
+                silence_due_at=NULL,silence_held_reason=NULL,updated_at=clock_timestamp()""")
         if version>=29:
             # Upload staging is transient and excluded from original blob backups.
             c.execute("UPDATE file_uploads SET state='expired'")

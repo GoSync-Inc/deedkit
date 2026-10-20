@@ -287,7 +287,19 @@ class Store:
                     'source_scope_change':'masked_access_changed_recreate_required',
                     'ack':True,'ack_permission':'subscription-ack','push':'operator_registered_signed_hints','wait_max_seconds':25,'verified_host':False,'native_reply_preset':True,
                     'provider_polling':False,'start_boundary':'committed_archive_frontier',
-                    'existing_update_consumers_unchanged':True},
+                    'existing_update_consumers_unchanged':True,
+                    'delivery_policy':{'tool':'configure_subscription_delivery','argument':'delivery_policy',
+                        'changes':'hint_timing_only','changes_matches_ack_or_reads':False,'requires_receiver':True,
+                        'bounds':{'debounce_s':[0,600],'max_wait_s':[1,3600],'batch_window_s':[0,86400],
+                            'batch_count':[1,1000],'expect_reply_within_s':[60,1209600],'quiet_windows':[1,4]},
+                        'debounce_and_batch_exclusive':True,'max_wait_default':'max(300,debounce_s)',
+                        'quiet_hours':'iana_timezone_weekday_windows_held_not_dropped',
+                        'quiet_bypass':['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send','silence'],
+                        'silence_timer':'reply_to_send_subscriptions_only','silence_hint_kind':'silence',
+                        'key_budget':{'setting':'SUBSCRIPTION_MAX_HINTS_PER_HOUR','default':20,'bounds':[1,1000],
+                            'scope':'every_hint_of_the_key','applies_without_policy':True,'over_budget':'coalesced_never_dropped'},
+                        'held_reasons':['debounce','batch','quiet_hours','budget'],'clock':'database_utc',
+                        'idempotency':'one_hint_per_subscription_version_window'}},
                 'events':{'fetch':'fetch_subscription_events','ack':'ack_subscription_events','wait':'wait_for_subscription_events','wait_max_seconds':25,'test':'test_subscription','delivery':'operator_registered_signed_hints','host_turn_verified':False},
                 'feedback':{'implemented':True,'write_permission':'feedback-write','ownership':'exact_credential','external_delivery':False},
                 'sending':{'implemented':True,'wait_max_seconds':25,'approval_mode':'acting_agent_obtains_exact_owner_confirmation',
@@ -797,10 +809,10 @@ class Store:
         with self.authorized(token, 'ack_subscription_events') as (c, p):
             return ack_subscription_events(self, c, p, subscription_id, receipt, version)
 
-    def configure_subscription_delivery(self, token, subscription_id, version, receiver_id):
+    def configure_subscription_delivery(self, token, subscription_id, version, receiver_id, delivery_policy=None):
         from .event_delivery import configure_subscription_delivery
         with self.authorized(token, 'configure_subscription_delivery') as (c, p):
-            return configure_subscription_delivery(self, c, p, subscription_id, version, receiver_id)
+            return configure_subscription_delivery(self, c, p, subscription_id, version, receiver_id, delivery_policy)
 
     def test_subscription(self, token, subscription_id, request_id):
         from .event_delivery import test_subscription
@@ -848,8 +860,8 @@ class Store:
             c.execute("SET LOCAL statement_timeout='180s'")
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
-            if version>37: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql')]:
+            if version>38: raise RuntimeError('database_newer_than_runtime')
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:

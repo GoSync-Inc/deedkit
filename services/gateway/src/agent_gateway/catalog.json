@@ -4087,7 +4087,7 @@
       "subscription-write"
     ],
     "required_manifest": true,
-    "description": "Select an operator-registered receiver ID for signed hints; null disables. Never accepts URLs or grants access.",
+    "description": "Select an operator-registered receiver ID for signed hints; null disables. Optional delivery_policy times hints only (debounce or batch, quiet hours, expected-reply silence timer). Never accepts URLs or grants access.",
     "inputSchema": {
       "properties": {
         "subscription_id": {
@@ -4115,6 +4115,17 @@
           ],
           "default": null,
           "title": "Receiver Id"
+        },
+        "delivery_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeliveryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -4122,6 +4133,130 @@
         "version"
       ],
       "type": "object",
+      "$defs": {
+        "DeliveryPolicy": {
+          "additionalProperties": false,
+          "properties": {
+            "debounce_s": {
+              "maximum": 600,
+              "minimum": 0,
+              "title": "Debounce S",
+              "type": "integer"
+            },
+            "max_wait_s": {
+              "maximum": 3600,
+              "minimum": 1,
+              "title": "Max Wait S",
+              "type": "integer"
+            },
+            "batch_window_s": {
+              "maximum": 86400,
+              "minimum": 0,
+              "title": "Batch Window S",
+              "type": "integer"
+            },
+            "batch_count": {
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Batch Count",
+              "type": "integer"
+            },
+            "quiet_hours": {
+              "$ref": "#/$defs/QuietHours"
+            },
+            "quiet_bypass": {
+              "items": {
+                "enum": [
+                  "incoming_message",
+                  "owner_mention",
+                  "reply_to_owner",
+                  "reply_to_confirmed_send",
+                  "silence"
+                ],
+                "type": "string"
+              },
+              "maxItems": 5,
+              "minItems": 1,
+              "title": "Quiet Bypass",
+              "type": "array"
+            },
+            "expect_reply_within_s": {
+              "maximum": 1209600,
+              "minimum": 60,
+              "title": "Expect Reply Within S",
+              "type": "integer"
+            }
+          },
+          "title": "DeliveryPolicy",
+          "type": "object"
+        },
+        "QuietHours": {
+          "additionalProperties": false,
+          "properties": {
+            "timezone": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Timezone",
+              "type": "string"
+            },
+            "windows": {
+              "items": {
+                "$ref": "#/$defs/QuietWindow"
+              },
+              "maxItems": 4,
+              "minItems": 1,
+              "title": "Windows",
+              "type": "array"
+            }
+          },
+          "required": [
+            "timezone",
+            "windows"
+          ],
+          "title": "QuietHours",
+          "type": "object"
+        },
+        "QuietWindow": {
+          "additionalProperties": false,
+          "properties": {
+            "days": {
+              "items": {
+                "enum": [
+                  "mon",
+                  "tue",
+                  "wed",
+                  "thu",
+                  "fri",
+                  "sat",
+                  "sun"
+                ],
+                "type": "string"
+              },
+              "maxItems": 7,
+              "minItems": 1,
+              "title": "Days",
+              "type": "array"
+            },
+            "start": {
+              "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$",
+              "title": "Start",
+              "type": "string"
+            },
+            "end": {
+              "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$",
+              "title": "End",
+              "type": "string"
+            }
+          },
+          "required": [
+            "days",
+            "start",
+            "end"
+          ],
+          "title": "QuietWindow",
+          "type": "object"
+        }
+      },
       "title": "configure_subscription_deliveryArguments",
       "additionalProperties": false
     },

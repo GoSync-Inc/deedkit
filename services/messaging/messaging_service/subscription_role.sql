@@ -19,3 +19,5 @@ GRANT SELECT,INSERT ON subscription_matches TO messaging_subscriptions;
 -- Atomically enqueue opaque references only; no endpoint/secret access or egress.
 GRANT SELECT ON subscription_delivery TO messaging_subscriptions;
 GRANT SELECT,INSERT ON subscription_outbox TO messaging_subscriptions;
+-- Schema 38: durable held hints and silence timers (debounce, batch, quiet hours, budget).
+GRANT SELECT,INSERT,UPDATE ON subscription_hint_windows TO messaging_subscriptions;

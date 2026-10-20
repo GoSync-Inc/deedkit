@@ -54,6 +54,10 @@ GRANT SELECT(id,principal,key_id,enabled) ON subscription_receivers TO messaging
 GRANT SELECT,INSERT,UPDATE,DELETE ON subscription_delivery TO messaging_gateway;
 GRANT SELECT,INSERT ON subscription_outbox TO messaging_gateway;
 GRANT UPDATE(state,finished_at,error_code) ON subscription_outbox TO messaging_gateway;
+-- Schema 38: inspect held hints; a same-receiver reconfiguration carries them to its version.
+GRANT SELECT ON subscription_hint_windows TO messaging_gateway;
+GRANT UPDATE(subscription_version,due_at,silence_state,silence_fired_at,silence_due_at,
+    silence_held_reason,updated_at) ON subscription_hint_windows TO messaging_gateway;
 GRANT SELECT,INSERT ON agent_feedback TO messaging_gateway;
 -- Managed originals and descriptions are separate from immutable receipts.
 GRANT SELECT ON attachment_residency,attachment_eviction_journal,

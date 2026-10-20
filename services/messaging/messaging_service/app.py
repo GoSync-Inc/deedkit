@@ -9,14 +9,14 @@ import logging
 import time
 from urllib.parse import urlsplit
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypedDict
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic import AfterValidator, Field, StrictBool, StrictInt, StrictStr, ValidationError
+from pydantic import AfterValidator, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
@@ -65,6 +65,27 @@ SubscriptionOrigins = Annotated[list[EventOrigin], Field(min_length=1,max_length
 SubscriptionLimit = Annotated[StrictInt, Field(ge=1,le=100)]
 SubscriptionVersion = Annotated[StrictInt, Field(ge=1,le=9007199254740991)]
 SubscriptionPosition = Annotated[StrictInt, Field(ge=0,le=9007199254740991)]
+# Hint timing only (delivery_policy.py validates again): never changes matches, ACK or passive reads.
+LocalClock = Annotated[StrictStr, Field(pattern=r'^(?:[01][0-9]|2[0-3]):[0-5][0-9]$')]
+class QuietWindow(TypedDict):
+    __pydantic_config__ = ConfigDict(extra='forbid')
+    days: Annotated[list[Literal['mon','tue','wed','thu','fri','sat','sun']], Field(min_length=1,max_length=7)]
+    start: LocalClock
+    end: LocalClock
+class QuietHours(TypedDict):
+    __pydantic_config__ = ConfigDict(extra='forbid')
+    timezone: Annotated[StrictStr, Field(min_length=1,max_length=64)]
+    windows: Annotated[list[QuietWindow], Field(min_length=1,max_length=4)]
+class DeliveryPolicy(TypedDict, total=False):
+    __pydantic_config__ = ConfigDict(extra='forbid')
+    debounce_s: Annotated[StrictInt, Field(ge=0,le=600)]
+    max_wait_s: Annotated[StrictInt, Field(ge=1,le=3600)]
+    batch_window_s: Annotated[StrictInt, Field(ge=0,le=86400)]
+    batch_count: Annotated[StrictInt, Field(ge=1,le=1000)]
+    quiet_hours: QuietHours
+    quiet_bypass: Annotated[list[Literal['incoming_message','owner_mention','reply_to_owner',
+        'reply_to_confirmed_send','silence']], Field(min_length=1,max_length=5)]
+    expect_reply_within_s: Annotated[StrictInt, Field(ge=60,le=1209600)]
 
 
 def subscription_expiry(value):
@@ -934,9 +955,10 @@ def create_app(store: Store, allowed_hosts: list[str]):
         return await async_call(ctx,'wait_for_subscription_events',subscription_id=subscription_id,timeout=timeout,limit=limit)
 
     @mcp.tool(structured_output=True,annotations=upload_write)
-    def configure_subscription_delivery(ctx: Context,subscription_id: SubscriptionReference,version: SubscriptionVersion,receiver_id: ReceiverReference | None=None) -> dict[str,Any]:
-        """Select an operator-registered receiver ID for signed hints; null disables. Never accepts URLs or grants access."""
-        return call(ctx,'configure_subscription_delivery',subscription_id=subscription_id,version=version,receiver_id=receiver_id)
+    def configure_subscription_delivery(ctx: Context,subscription_id: SubscriptionReference,version: SubscriptionVersion,receiver_id: ReceiverReference | None=None,delivery_policy: DeliveryPolicy | None=None) -> dict[str,Any]:
+        """Select an operator-registered receiver ID for signed hints; null disables. Optional delivery_policy times hints only (debounce or batch, quiet hours, expected-reply silence timer). Never accepts URLs or grants access."""
+        # An omitted policy keeps the schema-37 payload, so existing audit records and callers are unchanged.
+        return call(ctx,'configure_subscription_delivery',subscription_id=subscription_id,version=version,receiver_id=receiver_id,**({} if delivery_policy is None else {'delivery_policy':delivery_policy}))
 
     @mcp.tool(structured_output=True,annotations=upload_write)
     def test_subscription(ctx: Context,subscription_id: SubscriptionReference,request_id: RequestReference) -> dict[str,Any]:
@@ -971,6 +993,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
             if method in ('list_chats','search','get_messages','get_context'):
                 params.setdefault('view','archive')
             params=validate_arguments(models,method,params)
+            # An omitted delivery policy keeps the schema-37 payload (same rule as the MCP tool).
+            if method=='configure_subscription_delivery' and params.get('delivery_policy') is None: params.pop('delivery_policy',None)
             arguments,detail=options(method,params)
             result=render(method,await invoke(method,bearer(request.headers),arguments),detail)
         except (json.JSONDecodeError, TypeError): raise APIError('invalid_parameters') from None

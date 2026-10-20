@@ -18,7 +18,8 @@ from .operational import TELEMETRY_STOP_CODES as STOP_CODES
 
 COMPONENTS = {'gateway', 'telegram', 'whatsapp', 'indexer', 'enricher', 'subscriptions'}
 CODES = {'request_failed', 'tool_failed', 'collector_failed', 'indexer_failed',
-         'enrichment_failed', 'subscription_match_failed', 'uncaught_exception', 'setup_check'}
+         'enrichment_failed', 'subscription_match_failed', 'subscription_hint_failed',
+         'uncaught_exception', 'setup_check'}
 # Tiden run environments; an unknown slug would silently create a duplicate (TIDEN-CI.md).
 ENVIRONMENTS = {'production', 'local-synthetic'}
 ROOT = Path(__file__).resolve().parent

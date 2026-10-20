@@ -290,7 +290,7 @@ def preflight_disk(config,receipt,docker_root):
 def make_proof(receipt,facts,run):
     if (not isinstance(facts,dict) or set(facts)!={'v','status','schema_version','manifest_sha256','checks'} or
             type(facts['v']) is not int or facts['v']!=1 or facts['status']!='verified' or
-            type(facts['schema_version']) is not int or facts['schema_version'] not in range(2,38) or
+            type(facts['schema_version']) is not int or facts['schema_version'] not in range(2,39) or
             facts['manifest_sha256']!=receipt['wire']['snapshot_sha256'] or not isinstance(facts['checks'],dict) or
             set(facts['checks'])!=r2.CHECKS or any(v is not True for v in facts['checks'].values())):
         raise ValueError('invalid_helper_result')
