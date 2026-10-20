@@ -814,7 +814,10 @@ class FamilyService:
         return result
 
     LINKS = (
-        "SELECT l.*,r.guardian_id,o.details->>'title' AS title FROM projection_links l "
+        # The guardian the drive was made for, frozen in the projecting plan; the rule may since name another.
+        "SELECT l.*,coalesce((SELECT p.payload->'steps'->l.ordinal->'link'->>'guardian_id' FROM operations op "
+        "JOIN plans p ON p.id=op.plan_id WHERE op.id=l.operation_id),r.guardian_id) AS guardian_id,"
+        "o.details->>'title' AS title FROM projection_links l "
         "JOIN guardian_rules r ON r.id=l.rule_id "
         "LEFT JOIN occurrences o ON o.ref=l.source_event_ref AND o.calendar_ref=l.source_calendar_ref "
         "WHERE r.group_id=%s AND l.state<>'removed' AND "

@@ -179,10 +179,13 @@
             "allOf": [
               {
                 "else": {
-                  "not": {
-                    "required": [
-                      "operation_id"
-                    ]
+                  "properties": {
+                    "calendar_ref": {
+                      "type": "string"
+                    },
+                    "operation_id": {
+                      "type": "null"
+                    }
                   },
                   "required": [
                     "calendar_ref"
@@ -199,19 +202,49 @@
                   ]
                 },
                 "then": {
-                  "anyOf": [
+                  "oneOf": [
                     {
+                      "properties": {
+                        "operation_id": {
+                          "type": "string"
+                        },
+                        "calendar_ref": {
+                          "type": "null"
+                        },
+                        "event_ref": {
+                          "type": "null"
+                        }
+                      },
                       "required": [
                         "operation_id"
                       ]
                     },
                     {
+                      "properties": {
+                        "calendar_ref": {
+                          "type": "string"
+                        },
+                        "event_ref": {
+                          "type": "string"
+                        },
+                        "operation_id": {
+                          "type": "null"
+                        }
+                      },
                       "required": [
                         "calendar_ref",
                         "event_ref"
                       ]
                     }
-                  ]
+                  ],
+                  "properties": {
+                    "event": {
+                      "type": "null"
+                    },
+                    "activity": {
+                      "type": "null"
+                    }
+                  }
                 }
               }
             ],

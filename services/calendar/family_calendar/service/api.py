@@ -62,8 +62,31 @@ class Action(Strict):
         json_schema_extra={
             "allOf": [{
                 "if": {"properties": {"action": {"const": "unproject"}}, "required": ["action"]},
-                "then": {"anyOf": [{"required": ["operation_id"]}, {"required": ["calendar_ref", "event_ref"]}]},
-                "else": {"required": ["calendar_ref"], "not": {"required": ["operation_id"]}},
+                "then": {
+                    "properties": {"event": {"type": "null"}, "activity": {"type": "null"}},
+                    "oneOf": [
+                        {
+                            "properties": {
+                                "operation_id": {"type": "string"},
+                                "calendar_ref": {"type": "null"},
+                                "event_ref": {"type": "null"},
+                            },
+                            "required": ["operation_id"],
+                        },
+                        {
+                            "properties": {
+                                "calendar_ref": {"type": "string"},
+                                "event_ref": {"type": "string"},
+                                "operation_id": {"type": "null"},
+                            },
+                            "required": ["calendar_ref", "event_ref"],
+                        },
+                    ],
+                },
+                "else": {
+                    "properties": {"calendar_ref": {"type": "string"}, "operation_id": {"type": "null"}},
+                    "required": ["calendar_ref"],
+                },
             }]
         }
     )

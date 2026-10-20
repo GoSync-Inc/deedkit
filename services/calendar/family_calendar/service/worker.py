@@ -91,6 +91,8 @@ class Worker:
                             with self.store.transaction() as c:
                                 if claim:
                                     self._claim(c, step, cal, intent, args)
+                                elif step["action"] != "create" and self._links_writable(c):
+                                    self._hold(c, step, cal)
                                 c.execute(
                                     "UPDATE operation_steps SET state='sending',intent=%s WHERE operation_id=%s AND ordinal=%s",
                                     (Jsonb(intent), *args),
@@ -129,14 +131,14 @@ class Worker:
                             # Any verified DeedKit delete of a drive, unproject or ordinary, ends its link.
                             c.execute(
                                 "UPDATE projection_links SET state='removed',updated_at=now() "
-                                "WHERE target_calendar_ref=%s AND target_id=%s AND state='active'",
+                                "WHERE target_calendar_ref=%s AND target_id=%s AND state IN ('active','repairing')",
                                 (cal["ref"], step["target_id"]),
                             )
                         else:
                             # A verified DeedKit update of a drive keeps its link on the new version.
                             c.execute(
-                                "UPDATE projection_links SET etag=%s,updated_at=now() "
-                                "WHERE target_calendar_ref=%s AND target_id=%s AND state='active'",
+                                "UPDATE projection_links SET state='active',etag=%s,updated_at=now() "
+                                "WHERE target_calendar_ref=%s AND target_id=%s AND state IN ('active','repairing')",
                                 (receipt.get("etag"), cal["ref"], step["target_id"]),
                             )
                     self.store.query(
@@ -169,6 +171,18 @@ class Worker:
                                 "WHERE operation_id=%s AND ordinal=%s AND state='pending'",
                                 args,
                             )
+                        elif (
+                            step["action"] != "create"
+                            and current != "prepared"
+                            and not ambiguous
+                            and self._links_writable(c)
+                        ):
+                            # An admitted write to a drive that definitely did not apply gives its hold back.
+                            c.execute(
+                                "UPDATE projection_links SET state='active',updated_at=now() "
+                                "WHERE target_calendar_ref=%s AND target_id=%s AND state='repairing'",
+                                (step["calendar_ref"], step["target_id"]),
+                            )
                     self._finish(operation_id, state if ambiguous or not completed else "partial", e.code)
                     return
                 except Exception:
@@ -198,6 +212,24 @@ class Worker:
             "SELECT coalesce(has_table_privilege(to_regclass('projection_links'),'SELECT') "
             "AND has_table_privilege(to_regclass('projection_links'),'UPDATE'),false) AS ok"
         ).fetchone()["ok"]
+
+    @staticmethod
+    def _hold(c, step, cal):
+        """While a write to a drive is in flight its link is `repairing`: no second write or undo of that drive
+        is admitted until the first one is verified, definitely failed or reconciled."""
+        link = c.execute(
+            "SELECT id,state FROM projection_links WHERE target_calendar_ref=%s AND target_id=%s "
+            "AND state<>'removed' FOR UPDATE",
+            (cal["ref"], step["target_id"]),
+        ).fetchone()
+        if link is None:
+            if step.get("link"):
+                # Closed since the plan, though the drive still reads at the planned version: not ours to delete.
+                raise CalendarError("version_conflict")
+            return
+        if link["state"] != "active":
+            raise CalendarError("outcome_unknown")
+        c.execute("UPDATE projection_links SET state='repairing',updated_at=now() WHERE id=%s", (link["id"],))
 
     @staticmethod
     def _claim(c, step, cal, intent, args):

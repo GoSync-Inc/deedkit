@@ -21,11 +21,12 @@ def unproject(event_ref="event-lesson", calendar_ref="cal-child", operation_id=N
 
 class Google:
     """A mock Google Calendar: DELETE cancels as Google does, `reject` refuses creates in a calendar, `crash`
-    drops the answer of one (method, calendar) write and every request after it until `down` is cleared."""
+    drops the answer of one (method, calendar) write and every request after it until `down` is cleared,
+    `stall` times one (method, calendar) write out before Google applies it."""
 
     def __init__(self, s):
         self.s, self.events, self.requests = s, {}, []
-        self.reject, self.crash, self.down = set(), set(), False
+        self.reject, self.crash, self.stall, self.down = set(), set(), set(), False
 
     def handle(self, request):
         if self.down:
@@ -33,6 +34,9 @@ class Google:
         parts = request.url.path.split("/")
         cal = parts[parts.index("calendars") + 1]
         self.requests.append((request.method, cal))
+        if (request.method, cal) in self.stall:
+            self.stall.discard((request.method, cal))
+            raise httpx.ReadTimeout("stalled")
         if request.method == "POST":
             if cal in self.reject:
                 return httpx.Response(400)
@@ -240,7 +244,7 @@ def test_unproject_reconcile_verifies_without_resend(store):
     google.crash.add(("DELETE", "private-a"))
     undo = apply(service, key, [unproject()], "request-undo-crash")
     assert google.run(undo)["state"] == "unknown"
-    assert [row["state"] for row in links(s)] == ["active"] and google.sent("DELETE") == 1
+    assert [row["state"] for row in links(s)] == ["repairing"] and google.sent("DELETE") == 1
     google.down = False
     assert google.run(undo, reconcile=True)["state"] == "verified"
     assert [row["state"] for row in links(s)] == ["removed"] and google.sent("DELETE") == 1
@@ -312,3 +316,71 @@ def test_ordinary_write_does_not_depend_on_the_link_table(schema_one):  # noqa: 
                              "busy": True, "details": {"title": drive["summary"]}}],
         }], "complete")
     assert google.events["private-a", "provider-errand"]["status"] == "cancelled"
+
+
+# spec: ANYM-434
+def test_unknown_undo_admits_no_second_delete_before_reconcile(store):
+    s = store
+    service, key, drop, pick = household(s)
+    s.guardian_rule_disable(pick)
+    google = Google(s)
+    projected(service, key, google)
+    # The DELETE times out before Google applies it: the drive still reads at the planned version.
+    google.stall.add(("DELETE", "private-a"))
+    first, queued = (apply(service, key, [unproject()], f"request-undo-{n}") for n in ("first", "queued"))
+    assert google.run(first)["state"] == "unknown"
+    assert [row["state"] for row in links(s)] == ["repairing"] and google.sent("DELETE") == 1
+    # An undo admitted before the uncertainty is refused before any send; a fresh one plans nothing.
+    assert google.run(queued) == {"state": "failed", "error": "outcome_unknown"} and google.sent("DELETE") == 1
+    nothing = error(lambda: service.plan(key, [unproject()]))
+    assert nothing.code == "nothing_to_unproject"
+    assert [x["reason"] for x in nothing.details["projections_skipped"]] == ["outcome_unknown"]
+    # An ordinary write to the drive waits for reconcile too.
+    [link] = s.query("SELECT target_id FROM projection_links")
+    s.publish_window("cal-a", *WINDOW, [{
+        "resource_ref": "res-drive", "target": link["target_id"], "etag": '"1"', "payload": {},
+        "occurrences": [{"ref": "event-drive", "start": "2026-10-20T09:40:00Z", "end": "2026-10-20T10:00:00Z",
+                         "busy": True, "details": {"title": "Drive to dance"}}],
+    }], "complete")
+    ordinary = apply(service, key, [{"action": "delete", "calendar_ref": "cal-a", "event_ref": "event-drive"}],
+                     "request-ordinary")
+    assert google.run(ordinary) == {"state": "failed", "error": "outcome_unknown"} and google.sent("DELETE") == 1
+    # Reconcile reads: the drive is still there, so the step needs attention and nothing is resent.
+    assert google.run(first, reconcile=True)["state"] == "needs_attention"
+    assert [row["state"] for row in links(s)] == ["repairing"] and google.sent("DELETE") == 1
+
+
+# spec: ANYM-434
+def test_definitely_failed_undo_gives_the_link_back(store):
+    s = store
+    service, key, drop, pick = household(s)
+    s.guardian_rule_disable(pick)
+    google = Google(s)
+    projected(service, key, google)
+    [link] = s.query("SELECT target_id FROM projection_links")
+    undo = apply(service, key, [unproject()], "request-undo-raced")
+    # The guardian edits the drive between our fresh read and the DELETE: If-Match refuses it (412).
+    real = google.handle
+
+    def edit_first(request):
+        if request.method == "DELETE":
+            google.events["private-a", link["target_id"]]["etag"] = '"7"'
+        return real(request)
+
+    google.handle = edit_first
+    assert google.run(undo) == {"state": "conflict", "error": "version_conflict"}
+    assert [(row["state"], row["etag"]) for row in links(s)] == [("active", '"1"')]
+    google.handle = real
+
+
+# spec: ANYM-434
+def test_undo_preview_names_the_guardian_the_drive_was_made_for(store):
+    s = store
+    service, key, drop, pick = household(s)
+    google = Google(s)
+    projected(service, key, google)
+    # The pick-up rule now names adult-a and cal-a; the live drive in cal-b was made for adult-b.
+    s.guardian_rule_set("family", "child", "Dance", "pickup", "adult-a", "cal-child", "cal-a", 15,
+                        "Collect from dance", "details", True)
+    [_, pickup] = service.plan(key, [unproject()])["steps"]
+    assert (pickup["calendar_ref"], pickup["link"]["guardian_id"], pickup["link"]["rule_version"]) == ("cal-b", "adult-b", 1)

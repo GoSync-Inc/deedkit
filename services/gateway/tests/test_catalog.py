@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import pytest
 
-from agent_gateway.catalog import CATALOG, load_catalog, arguments
+from agent_gateway.catalog import CATALOG, InvalidArguments, load_catalog, arguments
 
 
 def test_duplicate_catalog_names_and_reserved_name_rejected():
@@ -94,9 +94,17 @@ def test_calendar_plan_declares_unproject_by_lesson_or_operation():
     plan = CATALOG["calendar_plan"]
     action = plan["inputSchema"]["$defs"]["Action"]
     assert action["properties"]["operation_id"]["anyOf"][0] == {"type": "string"}
-    [rule] = action["allOf"]
-    assert rule["if"]["properties"]["action"] == {"const": "unproject"}
-    assert rule["then"] == {"anyOf": [{"required": ["operation_id"]}, {"required": ["calendar_ref", "event_ref"]}]}
-    assert rule["else"] == {"required": ["calendar_ref"], "not": {"required": ["operation_id"]}}
     for phrase in ("unproject", "operation_id", "version_conflict", "outcome_unknown", "nothing_to_unproject"):
         assert phrase in plan["description"]
+    lesson = {"action": "unproject", "calendar_ref": "cal-child", "event_ref": "event-lesson"}
+    for valid in (lesson, {"action": "unproject", "operation_id": "op-1"},
+                  {"action": "delete", "calendar_ref": "cal-a", "event_ref": "event-a"}):
+        assert arguments(plan, {"actions": [valid]})["actions"] == [valid]
+    for invalid in (dict(lesson, operation_id="op-1"), {"action": "unproject", "calendar_ref": "cal-child"},
+                    {"action": "unproject", "operation_id": None}, {"action": "unproject"},
+                    dict(lesson, activity="Dance"), dict(lesson, event={"start": "2026-10-20T10:00:00Z"}),
+                    {"action": "delete", "calendar_ref": None, "event_ref": "event-a"},
+                    {"action": "delete", "event_ref": "event-a"},
+                    {"action": "delete", "calendar_ref": "cal-a", "event_ref": "event-a", "operation_id": "op-1"}):
+        with pytest.raises(InvalidArguments):
+            arguments(plan, {"actions": [invalid]})
