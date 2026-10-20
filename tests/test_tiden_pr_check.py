@@ -588,7 +588,7 @@ def test_line_breaks_follow_each_language_so_no_marker_authorizes_an_unrelated_t
         "web/ls.test.mjs": "// spec: ANYM-12\nconst x = 1; test('unmarked', () => {});\n",
     }, "Spec: ANYM-12")
     assert code == 1
-    assert "tests/test_cr.py:5 test_unmarked: no marker" in out
+    assert "tests/test_cr.py:4 test_unmarked: no marker" in out
     assert "web/ls.test.mjs:3 unmarked: no marker" in out and "-> ANYM-12" not in out
     code, out = run(repo, server, {
         "tests/test_cr_ok.py": "A = 1\rB = 2\r# spec: ANYM-12\rdef test_cr_ok():\r    pass\r",
