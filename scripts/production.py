@@ -1447,9 +1447,10 @@ def rollback_snapshots(directory, current):
              for project in (projects if isinstance(projects, list) else [])]
     snapshots = [load(entries[f"{name}.before.json"]) if isinstance(name, str) and f"{name}.before.json" in entries
                  else None for name in names]
-    if not snapshots or not all(isinstance(snapshot, dict) and isinstance(snapshot.get("services"), dict)
-                                for snapshot in snapshots):
-        raise Refused(f"the rollback snapshot of {release} is missing; no image is removed")
+    # Every service entry, too: one that is not a mapping would leave its image unprotected (Astra r2 F6).
+    if not snapshots or not all(isinstance(snapshot, dict) and isinstance(snapshot.get("services"), dict) and all(
+            isinstance(unit, dict) for unit in snapshot["services"].values()) for snapshot in snapshots):
+        raise Refused(f"the rollback snapshot of {release} is missing or malformed; no image is removed")
     return [snapshot["services"] for snapshot in snapshots if snapshot]
 
 
@@ -1468,8 +1469,7 @@ def state_images(directory, keep, revisions, *, label, idle):
     if current.get("status") == "applied":
         for services in rollback_snapshots(directory, current):
             for unit in services.values():
-                keep(unit.get("image") if isinstance(unit, dict) else None, "rollback target of the current release"
-                     + label)
+                keep(unit.get("image"), "rollback target of the current release" + label)
     if present(directory / "http-current.json"):
         # Read one level deep: each HTTP receipt nests its predecessor, and those before it are retired.
         serving = load(directory / "http-current.json")

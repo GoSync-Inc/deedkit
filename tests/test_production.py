@@ -4000,4 +4000,21 @@ def test_retention_reads_only_the_tool_written_snapshots_of_the_releases_project
     assert [item["image"] for item in report["candidates"]] == [image_id("3")]
     # A named snapshot without its services is no known rollback target: nothing is removed, never a bare KeyError.
     p.write(release / "synthetic.before.json", {"runner": {"image": image_id("2")}})
-    assert p.retain_images(settings) == {"skipped": f"the rollback snapshot of {release} is missing; no image is removed"}
+    assert p.retain_images(settings) == {"skipped": f"the rollback snapshot of {release} is missing or malformed; no image is removed"}
+
+
+@pytest.mark.parametrize("entry", ["image-string", "list", "null"])
+# spec: ANYM-439
+def test_a_snapshot_service_entry_that_is_not_a_mapping_removes_nothing(tmp_path, monkeypatch, entry):
+    settings = retention_settings(tmp_path)
+    state = Path(settings["state_directory"])
+    released(state, "1" * 40, image_id("1"), image_id("2"))
+    release = state / ("1" * 40)
+    unit = {"image-string": image_id("2"), "list": [image_id("2")], "null": None}[entry]
+    # Astra r2 F6: such an entry left the rollback image unprotected, and retention removed it.
+    p.write(release / "synthetic.before.json", {"services": {"api": unit, "db": {"image": "postgres"}}})
+    p.CONFIG_DIRECTORY.mkdir(parents=True)
+    store = Images(monkeypatch, [runtime("1"), runtime("2")])
+    assert p.retain_images(settings) == {
+        "skipped": f"the rollback snapshot of {release} is missing or malformed; no image is removed"}
+    assert store.removals() == [] and image_id("2") in store.references

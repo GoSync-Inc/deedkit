@@ -655,7 +655,7 @@ CI-published targets are considered. Kept, with reasons:
   the images of `current.json` and those a rollback restored, of the current
   release's `<project>.before.json` for each project its rollback record names (the
   one previous release `rollback` restores; other files there are ignored, and a
-  missing one or one without `services` removes nothing), of
+  missing one, or one whose `services` are not all mappings, removes nothing), of
   every `prepared.json` without `result.json` or `http-attempted.json`, of every
   `http-prepared.json` without `http-attempted.json`, of `http-current.json` and
   its one `previous` generation (older nested generations are retired), and the
