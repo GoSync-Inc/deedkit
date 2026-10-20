@@ -8,6 +8,8 @@ an acknowledged request without proof of its effect is only ``submitted``.
 import asyncio
 from datetime import datetime, timezone
 import hashlib
+import inspect
+import json
 import math
 import os
 from pathlib import Path
@@ -16,7 +18,7 @@ import secrets
 import stat
 import time
 
-from telethon import functions, types, utils
+from telethon import errors, functions, types, utils
 
 
 MAX_ORIGINAL_BYTES = 32 * 1024 * 1024
@@ -48,7 +50,34 @@ PARAMETERS = {
     'revoke_invite_link': set(), 'add_contact': {'phone', 'first_name', 'last_name'},
     'delete_contact': {'user_id'}, 'block_contact': {'user_id'},
     'unblock_contact': {'user_id'}, 'update_profile': {'first_name', 'last_name', 'bio'},
+    'set_group_messages_admins_only': {'enabled'}, 'set_group_info_admins_only': {'enabled'},
+    'set_slow_mode': {'seconds'}, 'list_join_requests': {'limit'},
+    'approve_join_requests': {'user_ids'}, 'reject_join_requests': {'user_ids'},
 }
+# ANYM-242: each setter owns one value; the default rights flag it changes, or slow mode.
+GROUP_SETTERS = {'set_group_messages_admins_only': ('messages_admins_only', 'enabled', 'send_messages'),
+                 'set_group_info_admins_only': ('info_admins_only', 'enabled', 'change_info'),
+                 'set_slow_mode': ('slow_mode_seconds', 'seconds', None)}
+SLOW_MODE_SECONDS = (0, 10, 30, 60, 300, 900, 3600)
+BANNED_RIGHTS_FIELDS = tuple(inspect.signature(types.ChatBannedRights.__init__).parameters)[1:]
+# Definite per-ID refusals of HideChatJoinRequest; any other error leaves that ID unknown.
+JOIN_REFUSALS = {'HIDE_REQUESTER_MISSING': 'no_pending_request', 'USER_ALREADY_PARTICIPANT': 'already_participant',
+                 'INPUT_USER_DEACTIVATED': 'user_unavailable', 'USER_ID_INVALID': 'user_unavailable',
+                 'USER_CHANNELS_TOO_MUCH': 'too_many_chats', 'CHANNELS_TOO_MUCH': 'too_many_chats'}
+# Telethon raises a typed error per known name; its message is the generic class text.
+JOIN_REFUSAL_ERRORS = {errors.rpcerrorlist.rpc_errors_dict[name]: name for name in JOIN_REFUSALS}
+JOIN_REQUESTS_BYTES = 48000
+# No batch mutation starts later than this after the adapter was entered. The worker
+# cancels at 30 s (commands.py). The check runs after the governor wait and the preflight,
+# right before the call, so only the last request's round trip (a stall stays the
+# documented unknown) and the receipt write follow it: 22 s leaves 8 s for both. An idle
+# 20-ID batch of cached requesters (group lookup + 20 mutations, 1 s apart) starts its
+# last mutation at 20 s, so it still completes.
+JOIN_BATCH_BUDGET_SECONDS = 22.0
+
+
+class JoinBatchBudgetSpent(Exception):
+    """The batch budget ran out before this mutation started; nothing was sent."""
 
 
 def reject(code):
@@ -99,6 +128,35 @@ def safe_text(value, maximum):
         return None
     return ''.join(c for c in value[:maximum] if
         (ord(c) >= 32 or c in '\n\r\t') and ord(c) != 127 and not 0xD800 <= ord(c) <= 0xDFFF)
+
+
+def utf16_text(value, maximum):
+    """safe_text bounded to maximum UTF-16 code units."""
+    text, units, out = safe_text(value, maximum), 0, []
+    if text is None:
+        return None
+    for c in text:
+        units += 2 if ord(c) > 0xFFFF else 1
+        if units > maximum:
+            break
+        out.append(c)
+    return ''.join(out)
+
+
+def group_settings(entity, details):
+    """Group restrictions as the provider reported them; None where it gave no value."""
+    rights = getattr(entity, 'default_banned_rights', None)
+    rights = rights if isinstance(rights, types.ChatBannedRights) else None
+    slow = getattr(details, 'slowmode_seconds', None)
+    return {'messages_admins_only': bool(rights.send_messages) if rights else None,
+            'info_admins_only': bool(rights.change_info) if rights else None,
+            'slow_mode_seconds': (slow if type(slow) is int else 0) if getattr(entity, 'megagroup', False) else None,
+            'join_approval': None}
+
+
+def group_admin(entity, right):
+    rights = getattr(entity, 'admin_rights', None)
+    return getattr(entity, 'creator', False) is True or bool(rights and getattr(rights, right, False))
 
 
 def safe_int(value):
@@ -196,6 +254,9 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             reject('operation_expired')
 
     check_expiry()
+    # The governor's clock paces the calls, so the batch budget reads the same clock.
+    clock = getattr(governor, 'clock', time.monotonic)
+    entered = clock()
     started_mutation = False
     report = job.get('_provider_phase')
     if report is not None:
@@ -229,7 +290,7 @@ async def _execute(client, job, *, verified_self=None, governor=None):
 
     check_policy()
 
-    async def rpc(fn, *, mutation=False):
+    async def rpc(fn, *, mutation=False, budget=False):
         async def guarded():
             nonlocal started_mutation
             check_expiry()
@@ -240,6 +301,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 await preflight()
             check_expiry()
             check_policy()
+            if budget and clock() - entered >= JOIN_BATCH_BUDGET_SECONDS:
+                raise JoinBatchBudgetSpent()
             if mutation:
                 started_mutation = True
                 if report is not None:
@@ -316,8 +379,21 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             integer(parameters['limit'], 1, 100)
         if 'offset' in parameters:
             integer(parameters['offset'], 0, 100000)
-        if 'seconds' in parameters:
+        if 'seconds' in parameters and operation != 'set_slow_mode':
             integer(parameters['seconds'], 1, 2**31 - 1)
+        if operation == 'set_slow_mode' and (type(parameters.get('seconds')) is not int or
+                parameters['seconds'] not in SLOW_MODE_SECONDS):
+            reject('invalid_parameters')
+        if operation in GROUP_SETTERS and operation != 'set_slow_mode' and type(parameters.get('enabled')) is not bool:
+            reject('invalid_parameters')
+        if operation in ('approve_join_requests', 'reject_join_requests'):
+            users = parameters.get('user_ids')
+            if not isinstance(users, list) or not 1 <= len(users) <= 20 or len(set(map(str, users))) != len(users):
+                reject('invalid_parameters')
+            for value in users:
+                if not isinstance(value, str):
+                    reject('invalid_parameters')
+                number_id(value)
         if 'multiple' in parameters and type(parameters['multiple']) is not bool:
             reject('invalid_parameters')
         if operation == 'send_file':
@@ -413,13 +489,14 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                         'existing_only': True, 'revoked': getattr(invite, 'revoked', None)}
             entities = getattr(full, 'chats', None) or getattr(full, 'users', None) or []
             observed = next((e for e in entities if peer_id(e) == str(chat)), None)
+            settings = group_settings(observed, details) if (channel or basic_chat) and observed is not None else None
             return {'outcome': 'confirmed', 'provider_chat_id': str(chat),
                     'title': safe_text(getattr(observed, 'title', None), 512),
                     'username': safe_text(getattr(observed, 'username', None), 128),
                     'description': safe_text(getattr(details, 'about', None), 2048),
                     'participant_count': safe_int(getattr(details, 'participants_count', None)),
                     'is_forum': bool(getattr(observed, 'forum', False)),
-                    'basis': 'live_provider_observation'}
+                    'group_settings': settings, 'basis': 'live_provider_observation'}
 
         if operation == 'list_participants':
             limit, offset = min(parameters.get('limit', 50), MAX_PROFILE_PAGE), parameters.get('offset', 0)
@@ -745,6 +822,119 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 reject('invite_link_unavailable')
             return accepted(await invoke(functions.messages.EditExportedChatInviteRequest(peer,
                 link, revoked=True), mutation=True))
+
+        if operation in GROUP_SETTERS or operation in ('list_join_requests', 'approve_join_requests', 'reject_join_requests'):
+            if channel is None and basic_chat is None:
+                reject('unsupported_operation')
+
+        async def group_state():
+            full = await invoke(functions.channels.GetFullChannelRequest(channel) if channel else
+                functions.messages.GetFullChatRequest(basic_chat))
+            entity = next((e for e in getattr(full, 'chats', None) or [] if peer_id(e) == str(chat)), None)
+            if entity is None:
+                reject('provider_reference_mismatch')
+            return entity, group_settings(entity, getattr(full, 'full_chat', None))
+
+        if operation in GROUP_SETTERS:
+            field, key, flag = GROUP_SETTERS[operation]
+            value = parameters[key]
+            entity, state = await group_state()
+            if (isinstance(entity, types.Channel) and not entity.megagroup) or (flag is None and channel is None):
+                reject('unsupported_operation')
+            # Both default rights and slow mode need the ban right; refuse before any mutation.
+            if not group_admin(entity, 'ban_users'):
+                reject('forbidden')
+            previous = state[field]
+            if previous is None:
+                reject('unsupported_operation')
+            if previous == value:
+                return {'outcome': 'confirmed', key: value, 'previous': previous, 'changed': False}
+            if flag is None:
+                request = functions.channels.ToggleSlowModeRequest(channel, value)
+            else:
+                # The freshly read rights with only the owned flag changed; until_date and the rest stay.
+                read = entity.default_banned_rights
+                rights = types.ChatBannedRights(**{name: getattr(read, name) for name in BANNED_RIGHTS_FIELDS})
+                setattr(rights, flag, value)
+                request = functions.messages.EditChatDefaultBannedRightsRequest(peer, rights)
+            await invoke(request, mutation=True)
+            _, state = await group_state()
+            if state[field] == value:
+                return {'outcome': 'confirmed', key: value, 'previous': previous, 'changed': True}
+            return {'outcome': 'submitted', key: value, 'previous': previous, 'changed': True,
+                    'basis': 'provider_request_returned', 'effect_verified': False}
+
+        if operation == 'list_join_requests':
+            limit = parameters.get('limit', 50)
+            response = await invoke(functions.messages.GetChatInviteImportersRequest(peer, offset_date=None,
+                offset_user=types.InputUserEmpty(), limit=limit, requested=True))
+            users = {u.id: u for u in getattr(response, 'users', None) or [] if isinstance(u, types.User)}
+            importers = [i for i in getattr(response, 'importers', None) or []
+                         if isinstance(i, types.ChatInviteImporter) and safe_int(i.user_id)][:limit]
+            rows, size = [], 0
+            for item in importers:
+                user = users.get(item.user_id)
+                name = ' '.join(filter(None, (safe_text(getattr(user, 'first_name', None), 64),
+                                              safe_text(getattr(user, 'last_name', None), 64)))) or None
+                row = {'id': str(item.user_id), 'name': name, 'note': utf16_text(item.about, 200),
+                       'requested_at': int(item.date.timestamp()) if isinstance(item.date, datetime) else None}
+                # Bounded so the receipt stays under the result budget; the rest is has_more.
+                size += len(json.dumps(row, ensure_ascii=False).encode())
+                if size > JOIN_REQUESTS_BYTES:
+                    break
+                rows.append(row)
+            count = safe_int(getattr(response, 'count', None))
+            return {'outcome': 'confirmed', 'requests': rows, 'untrusted': ['name', 'note'],
+                    'has_more': len(rows) < len(importers) or (count is not None and count > len(rows))}
+
+        if operation in ('approve_join_requests', 'reject_join_requests'):
+            approved, ids, rows = operation == 'approve_join_requests', parameters['user_ids'], []
+
+            async def requester(value):
+                # A requester cached in the session file (list_join_requests stores it) resolves
+                # locally without a paced call, so 20 IDs fit the worker's 30 s; only an uncached
+                # one costs a paced lookup.
+                uid = number_id(value)
+                try:
+                    cached = await utils.maybe_async(client.session.get_input_entity(types.PeerUser(uid)))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    cached = None
+                if isinstance(cached, types.InputPeerUser) and cached.user_id == uid:
+                    return utils.get_input_user(cached)
+                return await user_input(value)
+            for index, value in enumerate(ids):
+                attempted = False
+                if clock() - entered >= JOIN_BATCH_BUDGET_SECONDS:
+                    rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index:])
+                    break
+
+                async def hide():
+                    nonlocal attempted
+                    attempted = True
+                    return await client(functions.messages.HideChatJoinRequestRequest(peer, user, approved=approved))
+                try:
+                    # The mutation's rpc rechecks expiry, access and the trusted preflight right before it.
+                    user = await requester(value)
+                    # A spent budget raises JoinBatchBudgetSpent: this ID and the rest are not_attempted.
+                    await rpc(hide, mutation=True, budget=True)
+                    rows.append({'id': value, 'state': 'applied'})
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    code = JOIN_REFUSAL_ERRORS.get(type(error))
+                    if attempted and code:
+                        rows.append({'id': value, 'state': 'refused', 'reason': JOIN_REFUSALS[code],
+                                     'provider_code': code[:64]})
+                        continue
+                rows.append({'id': value, 'state': 'unknown' if attempted else 'not_attempted'})
+                rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index + 1:])
+                break
+            settled = all(row['state'] in ('applied', 'refused') for row in rows)
+            return {'outcome': 'confirmed' if settled else 'unknown', 'results': rows,
+                    'all_applied': all(row['state'] == 'applied' for row in rows)}
 
         if operation == 'add_contact':
             if 'phone' not in parameters or 'first_name' not in parameters:

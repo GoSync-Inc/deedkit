@@ -350,6 +350,87 @@ func (g groupIQ) invite(ctx context.Context, jid types.JID, reset bool) (string,
 	return whatsmeow.InviteLinkPrefix + code, nil
 }
 
+// Group settings an ANYM-242 setter changes.
+const (
+	groupSettingAnnounce     = "announce"
+	groupSettingLocked       = "locked"
+	groupSettingJoinApproval = "join_approval"
+)
+
+// setSetting sends the node of the pinned SetGroupAnnounce (group.go:414),
+// SetGroupLocked (group.go:404) or SetGroupJoinApprovalMode (group.go:1064).
+func (g groupIQ) setSetting(ctx context.Context, jid types.JID, setting string, on bool) error {
+	pick := func(yes, no string) string {
+		if on {
+			return yes
+		}
+		return no
+	}
+	var node waBinary.Node
+	switch setting {
+	case groupSettingAnnounce:
+		node = waBinary.Node{Tag: pick("announcement", "not_announcement")}
+	case groupSettingLocked:
+		node = waBinary.Node{Tag: pick("locked", "unlocked")}
+	case groupSettingJoinApproval:
+		node = waBinary.Node{Tag: "membership_approval_mode", Content: []waBinary.Node{{Tag: "group_join", Attrs: waBinary.Attrs{"state": pick("on", "off")}}}}
+	default:
+		return fmt.Errorf("unknown group setting %q", setting)
+	}
+	_, err := g.query(ctx, groupIQSet, jid, node)
+	return err
+}
+
+// joinRequests transcribes the pinned GetGroupRequestParticipants (group.go:258).
+func (g groupIQ) joinRequests(ctx context.Context, jid types.JID) ([]types.GroupParticipantRequest, error) {
+	res, err := g.query(ctx, groupIQGet, jid, waBinary.Node{Tag: "membership_approval_requests"})
+	if err != nil {
+		return nil, err
+	}
+	node, ok := res.GetOptionalChildByTag("membership_approval_requests")
+	if !ok {
+		return nil, &whatsmeow.ElementMissingError{Tag: "membership_approval_requests", In: "response to group request participants query"}
+	}
+	children := node.GetChildrenByTag("membership_approval_request")
+	out := make([]types.GroupParticipantRequest, len(children))
+	for i, child := range children {
+		ag := child.AttrGetter()
+		out[i] = types.GroupParticipantRequest{JID: ag.JID("jid"), RequestedAt: ag.UnixTime("request_time")}
+	}
+	return out, nil
+}
+
+// joinRequestAction transcribes the pinned UpdateGroupRequestParticipants
+// (group.go:288): one approve or reject node for every requested JID.
+func (g groupIQ) joinRequestAction(ctx context.Context, jid types.JID, changes []types.JID, approve bool) ([]types.GroupParticipant, error) {
+	action := "reject"
+	if approve {
+		action = "approve"
+	}
+	content := make([]waBinary.Node, len(changes))
+	for i, participant := range changes {
+		content[i] = waBinary.Node{Tag: "participant", Attrs: waBinary.Attrs{"jid": participant}}
+	}
+	res, err := g.query(ctx, groupIQSet, jid, waBinary.Node{Tag: "membership_requests_action", Content: []waBinary.Node{{Tag: action, Content: content}}})
+	if err != nil {
+		return nil, err
+	}
+	node, ok := res.GetOptionalChildByTag("membership_requests_action")
+	if !ok {
+		return nil, &whatsmeow.ElementMissingError{Tag: "membership_requests_action", In: "response to group request participants update"}
+	}
+	answered, ok := node.GetOptionalChildByTag(action)
+	if !ok {
+		return nil, &whatsmeow.ElementMissingError{Tag: action, In: "response to group request participants update"}
+	}
+	children := answered.GetChildrenByTag("participant")
+	out := make([]types.GroupParticipant, len(children))
+	for i, child := range children {
+		out[i] = parseGroupParticipant(&child)
+	}
+	return out, nil
+}
+
 // parseGroupParticipant transcribes the pinned, unexported parseParticipant.
 func parseGroupParticipant(child *waBinary.Node) types.GroupParticipant {
 	ag := child.AttrGetter()

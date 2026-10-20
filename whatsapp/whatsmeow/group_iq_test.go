@@ -73,7 +73,7 @@ func iqResult(children ...waBinary.Node) *waBinary.Node {
 
 func syntheticGroupNode() waBinary.Node {
 	return waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"id": "15550000000-123456789", "subject": "Synthetic"}, Content: []waBinary.Node{
-		{Tag: "participant", Attrs: waBinary.Attrs{"jid": types.NewJID("15551234567", types.DefaultUserServer), "lid": types.NewJID("111", types.HiddenUserServer)}},
+		{Tag: "participant", Attrs: waBinary.Attrs{"jid": types.NewJID("15551234567", types.DefaultUserServer), "lid": types.NewJID("111", types.HiddenUserServer), "type": "admin"}},
 		{Tag: "description", Attrs: waBinary.Attrs{"id": testTopicID, "t": "1700000000"}, Content: []waBinary.Node{{Tag: "body", Content: []byte("Old")}}},
 	}}
 }
@@ -89,6 +89,11 @@ func syntheticReply(_ int, q whatsmeow.DangerousInfoQuery) (*waBinary.Node, erro
 		return iqResult(waBinary.Node{Tag: content.Tag, Content: []waBinary.Node{{Tag: "participant", Attrs: waBinary.Attrs{"jid": types.NewJID("15551234567", types.DefaultUserServer)}}}}), nil
 	case "invite":
 		return iqResult(waBinary.Node{Tag: "invite", Attrs: waBinary.Attrs{"code": "SYNTHETIC"}}), nil
+	case "membership_approval_requests":
+		return iqResult(waBinary.Node{Tag: "membership_approval_requests", Content: []waBinary.Node{{Tag: "membership_approval_request", Attrs: waBinary.Attrs{"jid": types.NewJID("15551234567", types.DefaultUserServer), "request_time": "1700000000"}}}}), nil
+	case "membership_requests_action":
+		action := content.Content.([]waBinary.Node)[0]
+		return iqResult(waBinary.Node{Tag: "membership_requests_action", Content: []waBinary.Node{{Tag: action.Tag, Content: action.Content}}}), nil
 	}
 	return iqResult(), nil
 }
@@ -103,6 +108,10 @@ func groupOperationParams(op string) map[string]any {
 		return map[string]any{"description": "Description"}
 	case "add_participant", "remove_participant", "promote_participant", "demote_participant":
 		return map[string]any{"user_id": operationsChat}
+	case "set_group_messages_admins_only", "set_group_info_admins_only", "set_join_approval":
+		return map[string]any{"enabled": true}
+	case "approve_join_requests", "reject_join_requests":
+		return map[string]any{"user_ids": []string{operationsChat}}
 	}
 	return map[string]any{}
 }
@@ -113,10 +122,13 @@ func groupOperationDeps(t *testing.T, r *recordingIQ) operationDependencies {
 	d.settings = func(context.Context, types.JID) (types.LocalChatSettings, error) {
 		return types.LocalChatSettings{}, nil
 	}
+	// The synthetic group's administrator (ANYM-242 setters need an admin).
+	d.ownerLID = types.NewJID("111", types.HiddenUserServer)
 	return d
 }
 
-var groupOperationNames = []string{"list_participants", "chat_info", "create_group", "rename_group", "set_group_description", "add_participant", "remove_participant", "promote_participant", "demote_participant", "leave_group", "get_invite_link", "revoke_invite_link"}
+var groupOperationNames = []string{"list_participants", "chat_info", "create_group", "rename_group", "set_group_description", "add_participant", "remove_participant", "promote_participant", "demote_participant", "leave_group", "get_invite_link", "revoke_invite_link",
+	"set_group_messages_admins_only", "set_group_info_admins_only", "set_join_approval", "list_join_requests", "approve_join_requests", "reject_join_requests"}
 
 func groupJob(op string) operationRequest {
 	chat := operationsGroup
@@ -128,7 +140,10 @@ func groupJob(op string) operationRequest {
 
 // Golden nodes transcribed from the pinned group.go (f16f9ca30d6a): getGroupInfo,
 // CreateGroup with default ReqCreateGroup options, SetGroupName, SetGroupTopic,
-// UpdateGroupParticipants, LeaveGroup and GetGroupInviteLink.
+// UpdateGroupParticipants, LeaveGroup and GetGroupInviteLink; for ANYM-242
+// SetGroupAnnounce, SetGroupLocked, SetGroupJoinApprovalMode,
+// GetGroupRequestParticipants and UpdateGroupRequestParticipants. A setter
+// reads the group again to confirm its change.
 func goldenGroupQueries(op string) []whatsmeow.DangerousInfoQuery {
 	group, _ := ParseChatID(operationsGroup)
 	user, _ := ParseChatID(operationsChat)
@@ -162,6 +177,16 @@ func goldenGroupQueries(op string) []whatsmeow.DangerousInfoQuery {
 		return []whatsmeow.DangerousInfoQuery{read, q("get", group, waBinary.Node{Tag: "invite"})}
 	case "revoke_invite_link":
 		return []whatsmeow.DangerousInfoQuery{read, q("set", group, waBinary.Node{Tag: "invite"})}
+	case "set_group_messages_admins_only":
+		return []whatsmeow.DangerousInfoQuery{read, q("set", group, waBinary.Node{Tag: "announcement"}), read}
+	case "set_group_info_admins_only":
+		return []whatsmeow.DangerousInfoQuery{read, q("set", group, waBinary.Node{Tag: "locked"}), read}
+	case "set_join_approval":
+		return []whatsmeow.DangerousInfoQuery{read, q("set", group, waBinary.Node{Tag: "membership_approval_mode", Content: []waBinary.Node{{Tag: "group_join", Attrs: waBinary.Attrs{"state": "on"}}}}), read}
+	case "list_join_requests":
+		return []whatsmeow.DangerousInfoQuery{q("get", group, waBinary.Node{Tag: "membership_approval_requests"})}
+	case "approve_join_requests", "reject_join_requests":
+		return []whatsmeow.DangerousInfoQuery{read, q("set", group, waBinary.Node{Tag: "membership_requests_action", Content: []waBinary.Node{{Tag: strings.TrimSuffix(op, "_join_requests"), Content: []waBinary.Node{participant}}}})}
 	}
 	return nil
 }
@@ -246,7 +271,7 @@ func TestGroupOperationsUseNoReplayIQ(t *testing.T) {
 		}
 	})
 	t.Run("no library group helper", func(t *testing.T) {
-		helpers := regexp.MustCompile(`\.(CreateGroup|SetGroupName|SetGroupDescription|SetGroupTopic|UpdateGroupParticipants|LeaveGroup|GetGroupInviteLink|GetGroupInfo|SendIQ)\b`)
+		helpers := regexp.MustCompile(`\.(CreateGroup|SetGroupName|SetGroupDescription|SetGroupTopic|UpdateGroupParticipants|LeaveGroup|GetGroupInviteLink|GetGroupInfo|SetGroupAnnounce|SetGroupLocked|SetGroupJoinApprovalMode|GetGroupRequestParticipants|UpdateGroupRequestParticipants|SendIQ)\b`)
 		files, _ := filepath.Glob("*.go")
 		for _, file := range files {
 			if strings.HasSuffix(file, "_test.go") {
@@ -676,7 +701,7 @@ func TestGroupIQPhaseOutcomes(t *testing.T) {
 			if r.count() != step+1 {
 				t.Fatalf("%s step %d: %d sends, want exactly one per query", op, step, r.count())
 			}
-			change := op == "create_group" || step == 1
+			change := op == "create_group" || step >= 1
 			switch {
 			case change:
 				data := operationResult(t, result, err, "unknown")
@@ -832,7 +857,7 @@ func TestGroupOperationDeadline(t *testing.T) {
 			if elapsed := time.Since(started); elapsed > 2*time.Second {
 				t.Fatalf("%s step %d answered after %s", op, step, elapsed)
 			}
-			change := op == "create_group" || step == 1
+			change := op == "create_group" || step >= 1
 			if change {
 				if data := operationResult(t, result, err, "unknown"); data["code"] != "provider_operation_uncertain" {
 					t.Fatalf("%s: %#v", op, data)

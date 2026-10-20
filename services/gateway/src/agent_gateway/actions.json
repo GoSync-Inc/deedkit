@@ -5,6 +5,9 @@
   "add_participant": [
     "groups-manage"
   ],
+  "approve_join_requests": [
+    "groups-manage"
+  ],
   "archive_chat": [
     "chat-manage"
   ],
@@ -63,6 +66,9 @@
   "list_contacts": [
     "contacts-read"
   ],
+  "list_join_requests": [
+    "groups-read"
+  ],
   "list_participants": [
     "groups-read"
   ],
@@ -88,6 +94,9 @@
     "message-pin"
   ],
   "promote_participant": [
+    "groups-manage"
+  ],
+  "reject_join_requests": [
     "groups-manage"
   ],
   "remove_participant": [
@@ -119,6 +128,18 @@
     "chat-manage"
   ],
   "set_group_description": [
+    "groups-manage"
+  ],
+  "set_group_info_admins_only": [
+    "groups-manage"
+  ],
+  "set_group_messages_admins_only": [
+    "groups-manage"
+  ],
+  "set_join_approval": [
+    "groups-manage"
+  ],
+  "set_slow_mode": [
     "groups-manage"
   ],
   "star_message": [

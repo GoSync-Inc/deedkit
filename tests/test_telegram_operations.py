@@ -653,3 +653,399 @@ def test_missing_trusted_collection_policy_fails_closed_before_provider_call():
     with pytest.raises(Exception, match='operation_access_changed'):
         asyncio.run(execute(client, candidate))
     assert client.calls == []
+
+
+SUPERGROUP = '-1000000000100'
+
+
+class GroupClient(Client):
+    """Synthetic group whose restrictions change only through the requests that own them."""
+    def __init__(self, *, admin=True, megagroup=True, apply=True):
+        super().__init__()
+        self.rights = types.ChatBannedRights(until_date=datetime(2038, 1, 1, tzinfo=timezone.utc), send_messages=False,
+            change_info=False, send_media=True, send_polls=True, invite_users=True, pin_messages=False)
+        self.slow, self.admin, self.megagroup, self.apply = 0, admin, megagroup, apply
+        self.hide = {}
+
+    def entity(self, basic=False):
+        admin = types.ChatAdminRights(ban_users=True) if self.admin else None
+        if basic:
+            return types.Chat(id=100, title='Synthetic', photo=types.ChatPhotoEmpty(), participants_count=3, date=None,
+                              version=1, admin_rights=admin, default_banned_rights=self.rights)
+        return types.Channel(id=100, title='Synthetic', photo=types.ChatPhotoEmpty(), date=None, megagroup=self.megagroup,
+                             access_hash=1, admin_rights=admin, default_banned_rights=self.rights)
+
+    async def __call__(self, request):
+        self.calls.append(request)
+        if isinstance(request, functions.channels.GetFullChannelRequest):
+            return NS(full_chat=NS(slowmode_seconds=self.slow or None, about=''), chats=[self.entity()], users=[])
+        if isinstance(request, functions.messages.GetFullChatRequest):
+            return NS(full_chat=NS(about=''), chats=[self.entity(basic=True)], users=[])
+        if isinstance(request, functions.messages.EditChatDefaultBannedRightsRequest) and self.apply:
+            self.rights = request.banned_rights
+        if isinstance(request, functions.channels.ToggleSlowModeRequest) and self.apply:
+            self.slow = request.seconds
+        if isinstance(request, functions.messages.HideChatJoinRequestRequest):
+            outcome = self.hide.get(request.user_id.user_id)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if outcome == 'hang':
+                await asyncio.sleep(30)
+        self.calls.pop()  # The base client records it again.
+        return await super().__call__(request)
+
+    def mutations(self):
+        return [c for c in self.calls if isinstance(c, (functions.messages.EditChatDefaultBannedRightsRequest,
+            functions.channels.ToggleSlowModeRequest, functions.messages.HideChatJoinRequestRequest))]
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation,flag', [('set_group_messages_admins_only', 'send_messages'),
+                                            ('set_group_info_admins_only', 'change_info')])
+@pytest.mark.parametrize('chat', [SUPERGROUP, '-100'])
+def test_group_settings_telegram_owned_flag_confirmed_from_read_back(operation, flag, chat):
+    client = GroupClient()
+    result = run(client, operation, {'enabled': True}, provider_chat=chat)
+    assert result == {'outcome': 'confirmed', 'data': {'enabled': True, 'previous': False, 'changed': True}}
+    (request,) = client.mutations()
+    expected = types.InputPeerChannel(100, 1) if chat == SUPERGROUP else types.InputPeerChat(100)
+    assert request.peer == expected and getattr(request.banned_rights, flag) is True
+    # Turning it off again sends the opposite polarity.
+    assert run(client, operation, {'enabled': False}, provider_chat=chat)['data'] == {
+        'enabled': False, 'previous': True, 'changed': True}
+    assert getattr(client.mutations()[-1].banned_rights, flag) is False
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation,parameters', [('set_group_messages_admins_only', {'enabled': False}),
+    ('set_group_info_admins_only', {'enabled': False}), ('set_slow_mode', {'seconds': 0})])
+def test_group_settings_telegram_already_in_state_makes_no_mutation(operation, parameters):
+    client = GroupClient()
+    result = run(client, operation, parameters, provider_chat=SUPERGROUP)
+    assert result['outcome'] == 'confirmed' and result['data']['changed'] is False
+    assert result['data']['previous'] == next(iter(parameters.values()))
+    assert client.mutations() == []
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation,parameters', [('set_group_messages_admins_only', {'enabled': True}),
+    ('set_group_info_admins_only', {'enabled': True}), ('set_slow_mode', {'seconds': 30})])
+def test_group_settings_telegram_not_admin_refuses_before_mutation(operation, parameters):
+    client = GroupClient(admin=False)
+    with pytest.raises(Exception, match='^forbidden$'):
+        run(client, operation, parameters, provider_chat=SUPERGROUP)
+    assert client.mutations() == []
+
+
+# spec: ANYM-242
+def test_group_settings_telegram_slow_mode_supergroups_only():
+    client = GroupClient()
+    assert run(client, 'set_slow_mode', {'seconds': 60}, provider_chat=SUPERGROUP)['data'] == {
+        'seconds': 60, 'previous': 0, 'changed': True}
+    assert run(client, 'set_slow_mode', {'seconds': 0}, provider_chat=SUPERGROUP)['data'] == {
+        'seconds': 0, 'previous': 60, 'changed': True}
+    assert [c.seconds for c in client.mutations()] == [60, 0]
+    assert all(c.channel == types.InputChannel(100, 1) for c in client.mutations())
+    for chat, candidate in (('-100', GroupClient()), (SUPERGROUP, GroupClient(megagroup=False))):
+        with pytest.raises(Exception, match='^unsupported_operation$'):
+            run(candidate, 'set_slow_mode', {'seconds': 10}, provider_chat=chat)
+        assert candidate.mutations() == []
+    for seconds in (45, 1, True, None):
+        with pytest.raises(Exception, match='^invalid_parameters$'):
+            run(GroupClient(), 'set_slow_mode', {'seconds': seconds}, provider_chat=SUPERGROUP)
+    with pytest.raises(Exception, match='^unsupported_operation$'):
+        run(GroupClient(), 'set_join_approval', {'enabled': True}, provider_chat=SUPERGROUP)
+
+
+# spec: ANYM-242
+def test_group_settings_telegram_unmatched_read_back_is_submitted():
+    client = GroupClient(apply=False)
+    result = run(client, 'set_group_messages_admins_only', {'enabled': True}, provider_chat=SUPERGROUP)
+    assert result['outcome'] == 'submitted' and result['data']['changed'] is True
+    assert result['data']['effect_verified'] is False and len(client.mutations()) == 1
+
+
+# spec: ANYM-242
+def test_group_settings_telegram_chat_info_reports_group_settings():
+    client = GroupClient()
+    client.slow = 300
+    assert run(client, 'chat_info', provider_chat=SUPERGROUP)['data']['group_settings'] == {
+        'messages_admins_only': False, 'info_admins_only': False, 'slow_mode_seconds': 300, 'join_approval': None}
+    assert run(client, 'chat_info', provider_chat='-100')['data']['group_settings']['slow_mode_seconds'] is None
+    client.responses[functions.users.GetFullUserRequest] = NS(full_user=NS(about=None), users=[])
+    assert run(client, 'chat_info', provider_chat='100')['data']['group_settings'] is None
+
+
+# spec: ANYM-242
+def test_default_rights_keep_unowned_flags():
+    client = GroupClient()
+    before = client.rights
+    run(client, 'set_group_info_admins_only', {'enabled': True}, provider_chat=SUPERGROUP)
+    (request,) = client.mutations()
+    after = request.banned_rights
+    assert after is not before and after.change_info is True
+    for name in ('until_date', 'view_messages', 'send_messages', 'send_media', 'send_polls', 'invite_users',
+                 'pin_messages', 'send_plain', 'manage_topics'):
+        assert getattr(after, name) == getattr(before, name), name
+
+
+# spec: ANYM-242
+def test_join_requests_projection():
+    client = GroupClient()
+    date = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    client.responses[functions.messages.GetChatInviteImportersRequest] = types.messages.ChatInviteImporters(count=3,
+        importers=[types.ChatInviteImporter(user_id=200, date=date, requested=True, about='😀' * 150),
+                   types.ChatInviteImporter(user_id=201, date=date, requested=True)],
+        users=[types.User(id=200, first_name='Synthetic', last_name='Requester', phone='0000', username='fixture')])
+    result = run(client, 'list_join_requests', {'limit': 2}, provider_chat=SUPERGROUP)
+    request = client.calls[-1]
+    assert request.requested is True and request.limit == 2 and request.link is None
+    data = result['data']
+    assert result['outcome'] == 'confirmed' and set(data) == {'requests', 'has_more', 'untrusted'}
+    assert data['has_more'] is True and data['untrusted'] == ['name', 'note']
+    assert data['requests'] == [
+        {'id': '200', 'requested_at': int(date.timestamp()), 'name': 'Synthetic Requester', 'note': '😀' * 100},
+        {'id': '201', 'requested_at': int(date.timestamp()), 'name': None, 'note': None}]
+    assert client.mutations() == []
+
+
+def batch(client, operation, ids, **kwargs):
+    return run(client, operation, {'user_ids': [str(i) for i in ids]}, provider_chat=SUPERGROUP, **kwargs)
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+def test_join_request_batch_partial_refusal_is_settled(operation):
+    from telethon.errors import HideRequesterMissingError
+    client = GroupClient()
+    client.hide[202] = HideRequesterMissingError(None)
+    result = batch(client, operation, [201, 202, 203])
+    assert result['outcome'] == 'confirmed'
+    assert result['data'] == {'all_applied': False, 'results': [
+        {'id': '201', 'state': 'applied'},
+        {'id': '202', 'state': 'refused', 'reason': 'no_pending_request', 'provider_code': 'HIDE_REQUESTER_MISSING'},
+        {'id': '203', 'state': 'applied'}]}
+    assert [(c.user_id.user_id, c.approved) for c in client.mutations()] == [
+        (201, operation == 'approve_join_requests'), (202, operation == 'approve_join_requests'),
+        (203, operation == 'approve_join_requests')]
+    assert all(c.peer == types.InputPeerChannel(100, 1) for c in client.mutations())
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+@pytest.mark.parametrize('failure', ['503', '500', 'local'])
+def test_join_request_batch_uncertain_error_stops(operation, failure):
+    from telethon.errors import RPCError, ServerError
+    client = GroupClient()
+    client.hide[202] = {'503': RPCError(None, 'TIMEOUT', 503), '500': ServerError(None, 'INTERNAL', 500),
+                        'local': ConnectionError('synthetic')}[failure]
+    result = batch(client, operation, [201, 202, 203])
+    assert result['outcome'] == 'unknown'
+    assert result['data'] == {'all_applied': False, 'results': [{'id': '201', 'state': 'applied'},
+        {'id': '202', 'state': 'unknown'}, {'id': '203', 'state': 'not_attempted'}]}
+    assert [c.user_id.user_id for c in client.mutations()] == [201, 202]
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+@pytest.mark.parametrize('change', ['access', 'expiry'])
+def test_join_request_batch_recheck_failure_stops_without_provider_call(operation, change):
+    from messaging_service.commands import CommandRejected
+    client = GroupClient()
+    candidate = job(operation, {'user_ids': ['201', '202', '203']}, provider_chat=SUPERGROUP)
+
+    async def preflight():
+        if client.mutations():
+            if change == 'expiry':
+                candidate['expires_at'] = time.time() - 1
+            else:
+                raise CommandRejected('operation_access_changed')
+    candidate['_preflight'] = preflight
+    result = asyncio.run(execute(client, candidate))
+    assert result['outcome'] == 'unknown'
+    assert result['data']['results'] == [{'id': '201', 'state': 'applied'}, {'id': '202', 'state': 'not_attempted'},
+                                         {'id': '203', 'state': 'not_attempted'}]
+    assert [c.user_id.user_id for c in client.mutations()] == [201]
+    # Before any request, a failed recheck refuses the whole batch.
+    first = GroupClient()
+    with pytest.raises(CommandRejected, match='operation_expired'):
+        asyncio.run(execute(first, job(operation, {'user_ids': ['201']}, provider_chat=SUPERGROUP, expires_at=1)))
+    assert first.mutations() == []
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+def test_join_request_batch_of_20_cached_requesters_fits_worker_deadline_with_real_governor(operation):
+    from telethon.sessions import MemorySession
+    from messaging_service.telegram_governor import RequestGovernor
+    class State:
+        def cooldown_remaining(self):
+            return 0
+
+        def status(self, *args):
+            pass
+    clock = [0.0]
+    async def sleep(delay):
+        clock[0] += delay
+    client = GroupClient()
+    ids = list(range(201, 221))
+    client.session = MemorySession()
+    # list_join_requests stores the requesters in the session file like this.
+    client.session.process_entities(types.messages.ChatInviteImporters(count=20, importers=[],
+        users=[types.User(id=i, access_hash=7, first_name='Synthetic') for i in ids]))
+    result = asyncio.run(execute(client, job(operation, {'user_ids': [str(i) for i in ids]}, provider_chat=SUPERGROUP),
+                                 governor=RequestGovernor(State(), clock=lambda: clock[0], sleep=sleep)))
+    assert result['outcome'] == 'confirmed' and result['data']['all_applied'] is True
+    assert [c.user_id for c in client.mutations()] == [types.InputUser(i, 7) for i in ids]
+    assert not any(c[0] == 'get_input_entity' and c[1] in ids for c in client.calls if isinstance(c, tuple))
+    # One paced group lookup and 20 paced mutations, inside the worker's 30 s.
+    assert clock[0] == 20.0 and clock[0] < 30
+
+
+class LookupFailure(GroupClient):
+    async def get_input_entity(self, peer):
+        if peer == 201:
+            raise ValueError('synthetic unresolved requester')
+        return await super().get_input_entity(peer)
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+@pytest.mark.parametrize('failure', ['lookup', 'revoked'])
+def test_join_request_batch_first_id_failure_still_returns_rows(operation, failure):
+    from messaging_service.commands import CommandRejected
+    client = LookupFailure() if failure == 'lookup' else GroupClient()
+    candidate = job(operation, {'user_ids': ['201', '202']}, provider_chat=SUPERGROUP)
+    async def preflight():
+        if failure == 'revoked' and ('get_input_entity', 201) in client.calls:
+            raise CommandRejected('operation_access_changed')
+    candidate['_preflight'] = preflight
+    result = asyncio.run(execute(client, candidate))
+    assert result == {'outcome': 'unknown', 'data': {'all_applied': False, 'results': [
+        {'id': '201', 'state': 'not_attempted'}, {'id': '202', 'state': 'not_attempted'}]}}
+    assert client.mutations() == []
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+def test_join_request_batch_of_20_uncached_requesters_stops_at_budget_with_real_governor(operation):
+    from messaging_service.telegram_governor import RequestGovernor
+    from messaging_service.telegram_operations import JOIN_BATCH_BUDGET_SECONDS
+    class State:
+        def cooldown_remaining(self):
+            return 0
+
+        def status(self, *args):
+            pass
+    clock = [0.0]
+    async def sleep(delay):
+        clock[0] += delay
+    client = GroupClient()  # No session cache: every requester costs a paced lookup.
+    ids = [str(i) for i in range(201, 221)]
+    result = asyncio.run(execute(client, job(operation, {'user_ids': ids}, provider_chat=SUPERGROUP),
+                                 governor=RequestGovernor(State(), clock=lambda: clock[0], sleep=sleep)))
+    states = [r['state'] for r in result['data']['results']]
+    applied = states.count('applied')
+    assert result['outcome'] == 'unknown' and result['data']['all_applied'] is False
+    assert [r['id'] for r in result['data']['results']] == ids
+    assert 0 < applied < 20 and states == ['applied'] * applied + ['not_attempted'] * (20 - applied)
+    # Nothing after the stop: no mutation of a not_attempted requester, no lookup past the first.
+    assert [c.user_id.user_id for c in client.mutations()] == [int(i) for i in ids[:applied]]
+    assert not any(c == ('get_input_entity', int(i)) for i in ids[applied + 1:] for c in client.calls)
+    # The last ID started inside the budget; the adapter answered well inside the worker's 30 s.
+    assert clock[0] < JOIN_BATCH_BUDGET_SECONDS + 2 < 30
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+@pytest.mark.parametrize('cached', [True, False])
+def test_join_request_batch_budget_counts_from_adapter_entry(operation, cached):
+    """A slow paced group lookup spends the same budget; no mutation starts after it."""
+    from telethon.sessions import MemorySession
+    from messaging_service.telegram_governor import RequestGovernor
+    from messaging_service.telegram_operations import JOIN_BATCH_BUDGET_SECONDS
+    class State:
+        def cooldown_remaining(self):
+            return 0
+
+        def status(self, *args):
+            pass
+    clock, starts = [0.0], []
+    async def sleep(delay):
+        clock[0] += delay
+    ids = list(range(201, 221))
+    class Client(GroupClient):
+        async def get_input_entity(self, peer):
+            if peer == int(SUPERGROUP):
+                clock[0] += 12  # A 12 s group resolution before the batch.
+            return await super().get_input_entity(peer)
+        async def __call__(self, request):
+            if isinstance(request, functions.messages.HideChatJoinRequestRequest):
+                starts.append(clock[0])
+            return await super().__call__(request)
+    client = Client()
+    if cached:
+        client.session = MemorySession()
+        client.session.process_entities(types.messages.ChatInviteImporters(count=20, importers=[],
+            users=[types.User(id=i, access_hash=7, first_name='Synthetic') for i in ids]))
+    result = asyncio.run(execute(client, job(operation, {'user_ids': [str(i) for i in ids]}, provider_chat=SUPERGROUP),
+                                 governor=RequestGovernor(State(), clock=lambda: clock[0], sleep=sleep)))
+    states = [r['state'] for r in result['data']['results']]
+    applied = states.count('applied')
+    assert result['outcome'] == 'unknown' and len(states) == 20
+    assert 0 < applied < 20 and states == ['applied'] * applied + ['not_attempted'] * (20 - applied)
+    assert len(starts) == applied and all(start < JOIN_BATCH_BUDGET_SECONDS for start in starts)
+    assert clock[0] < 30
+
+
+# spec: ANYM-242
+@pytest.mark.parametrize('operation', ['approve_join_requests', 'reject_join_requests'])
+def test_join_request_batch_worker_scaled_slow_lookup_keeps_rows(operation):
+    """The real worker deadline with every duration scaled down: rows reach the receipt."""
+    from unittest.mock import patch
+    from telethon.sessions import MemorySession
+    from messaging_service.commands import CommandWorker
+    from messaging_service.telegram_governor import RequestGovernor
+    scale, receipt, ids = 0.02, {}, list(range(201, 221))
+    class State:
+        def cooldown_remaining(self):
+            return 0
+
+        def status(self, *args):
+            pass
+    async def scaled_sleep(delay):
+        await asyncio.sleep(delay * scale)
+    class Client(GroupClient):
+        async def get_input_entity(self, peer):
+            if peer == int(SUPERGROUP):
+                await asyncio.sleep(12 * scale)
+            return await super().get_input_entity(peer)
+    client = Client()
+    client.session = MemorySession()
+    client.session.process_entities(types.messages.ChatInviteImporters(count=20, importers=[],
+        users=[types.User(id=i, access_hash=7, first_name='Synthetic') for i in ids]))
+    candidate = job(operation, {'user_ids': [str(i) for i in ids]}, provider_chat=SUPERGROUP, mutation=True)
+    class Worker(CommandWorker):
+        def claim(self):
+            return candidate
+
+        def preflight(self, item, **kwargs):
+            pass
+
+        def finish(self, item, status, result=None, code=None):
+            receipt.update(status=status, result=result)
+    async def scenario():
+        start = time.monotonic()
+        governor = RequestGovernor(State(), clock=lambda: (time.monotonic() - start) / scale, sleep=scaled_sleep)
+        async def provider(item):
+            return await execute(client, item, governor=governor)
+        original = asyncio.wait_for
+        async def scaled_wait_for(awaitable, timeout):
+            return await original(awaitable, timeout * scale)
+        with patch('messaging_service.commands.asyncio.wait_for', scaled_wait_for):
+            await Worker(None, provider)._once()
+    asyncio.run(scenario())
+    assert receipt['status'] == 'unknown' and receipt['result'] is not None
+    rows = receipt['result']['data']['results']
+    assert len(rows) == 20 and 0 < len(client.mutations()) < 20
+    assert [r['state'] for r in rows].count('applied') == len(client.mutations())

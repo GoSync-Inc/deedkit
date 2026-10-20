@@ -35,6 +35,12 @@ _page = {'limit': _field('integer', default=50, minimum=1, maximum=100),
 _user = {'user_id': _field('contact_id', required=True)}
 _title = {'title': _field('string', required=True, maximum=128, nonempty=True)}
 _duration = {'seconds': _field('integer', default=86400, minimum=1, maximum=2147483647)}
+_enabled = {'enabled': _field('boolean', required=True)}
+_users = {'user_ids': _field('contact_ids', required=True)}
+SLOW_MODE_SECONDS = [0, 10, 30, 60, 300, 900, 3600]
+RIGHTS_RACE = ('Changes only this restriction; on Telegram an administrator edit made between the read and the '
+    'write can be overwritten.')
+BATCH_LIMITATION = ('One row per ID: applied, refused, unknown or not_attempted; an uncertain ID is never retried.')
 OPERATIONS = {
     'chat_info': _spec('read-live'),
     'list_participants': _spec('groups-read', fields=_page),
@@ -103,6 +109,15 @@ OPERATIONS = {
     'get_invite_link': _spec('groups-manage', mutation=True,
         limitation='Sensitive invitation link; WhatsApp may create/export a link. Telegram reads existing invite only.'),
     'revoke_invite_link': _spec('groups-manage', mutation=True),
+    'set_group_messages_admins_only': _spec('groups-manage', mutation=True, fields=_enabled, limitation=RIGHTS_RACE),
+    'set_group_info_admins_only': _spec('groups-manage', mutation=True, fields=_enabled, limitation=RIGHTS_RACE),
+    'set_slow_mode': _spec('groups-manage', mutation=True, platforms=('telegram',),
+        fields={'seconds': _field('slow_mode_seconds', required=True)}, limitation='Supergroups only; 0 turns slow mode off.'),
+    'set_join_approval': _spec('groups-manage', mutation=True, platforms=('whatsapp',), fields=_enabled),
+    'list_join_requests': _spec('groups-read', fields={'limit': _field('integer', default=50, minimum=1, maximum=100)},
+        limitation='First page of pending requests; names and notes are untrusted requester text.'),
+    'approve_join_requests': _spec('groups-manage', mutation=True, fields=_users, limitation=BATCH_LIMITATION),
+    'reject_join_requests': _spec('groups-manage', mutation=True, fields=_users, limitation=BATCH_LIMITATION),
     'add_contact': _spec('contacts-manage', 'account', mutation=True, full_account=True,
         fields={
             'phone': _field('phone', required=True),
@@ -137,13 +152,16 @@ def operation_spec(name):
 # Address book and label operations need a verified provider-side equivalent.
 # A local name update/empty cache is not a successful remote operation.
 NATIVE_UNSUPPORTED=frozenset(('add_contact','delete_contact','get_labels','set_chat_labels'))
+# ANYM-242: native adapter only on WhatsApp; the browser fallback never substitutes another action.
+GROUP_ADMIN_OPERATIONS=('set_group_messages_admins_only','set_group_info_admins_only','set_slow_mode',
+    'set_join_approval','list_join_requests','approve_join_requests','reject_join_requests')
 
 
 def _supported(platform, name, spec, provider=None):
     if platform not in spec['platforms']:return False
     if platform!='whatsapp':return True
     if provider=='whatsmeow':return name not in NATIVE_UNSUPPORTED
-    return name not in ('delete_message','request_chat_history','open_chat_by_phone')
+    return name not in ('delete_message','request_chat_history','open_chat_by_phone')+GROUP_ADMIN_OPERATIONS
 
 
 def _fields(platform, name, spec):
@@ -188,6 +206,8 @@ def operation_manifest(platform, *, provider=None):
             row['limitation']='Archived attachment or own destination-bound uploaded SHA-256 original only; 32 MiB bound. Sticker requires existing WebP. Audio/voice/sticker captions are unsupported; no implicit conversion.'
         elif platform=='whatsapp' and provider=='whatsmeow' and name=='forward_message':
             row['limitation']='Authorized retained ordinary content only; control, view-once and poll replay are unsupported.'
+        elif platform=='whatsapp' and provider!='whatsmeow' and name in GROUP_ADMIN_OPERATIONS and platform in spec['platforms']:
+            row['limitation']='Unsupported here: native WhatsApp (whatsmeow) accounts only.'
         elif name == 'open_chat_by_phone' and not row['supported']:
             row['limitation'] = 'Unsupported here: native WhatsApp (whatsmeow) accounts only.'
         elif platform == 'whatsapp' and name == 'delete_message':
@@ -242,6 +262,7 @@ def parameter_format(platform, kind):
         'phone_number': 'international number with its country code, such as +49 151 1234-5678 or 0049 (151) 12345678; '
             'spaces, dashes, dots and parentheses are ignored; 7-15 digits, no national trunk 0',
         'file_mode': 'one of ' + ', '.join(_modes(platform)),
+        'slow_mode_seconds': 'one of ' + ', '.join(map(str, SLOW_MODE_SECONDS)) + ' seconds; 0 turns slow mode off',
         'poll_options': '2-10 unique non-blank strings of at most 100 UTF-16 code units',
         'poll_indices': 'up to 20 unique integers from 0 to 9 (zero-based option positions)',
         'label_ids': 'up to 20 unique label IDs of 1-64 letters, digits, _ or -, from get_labels'}.get(kind)
@@ -275,6 +296,9 @@ def _problem(platform, descriptor, value, field):
     if kind == 'phone_number':
         if not isinstance(value, str): return fail('type', 'string')
         return None if phone_digits(value)[0] else fail('format', parameter_format(platform, kind))
+    if kind == 'slow_mode_seconds':
+        if type(value) is not int: return fail('type', 'integer')
+        return None if value in SLOW_MODE_SECONDS else fail('enum', allowed=SLOW_MODE_SECONDS)
     if kind == 'file_mode':
         if not isinstance(value, str): return fail('type', 'string')
         return None if value in _modes(platform) else fail('enum', allowed=_modes(platform))

@@ -538,7 +538,7 @@ def test_catalog_covers_explicit_families_and_provider_differences():
     whatsapp = {row['operation']: row for row in operation_manifest('whatsapp')}
     families = {
         'read-live': ['chat_info', 'get_reactions', 'get_message_info', 'get_pinned_messages', 'request_chat_history'],
-        'groups-read': ['list_participants', 'list_topics'],
+        'groups-read': ['list_participants', 'list_topics', 'list_join_requests'],
         'profile-read': ['get_profile'], 'contacts-read': ['list_contacts', 'get_contact', 'list_blocked', 'get_labels'],
         'send': ['send_file', 'forward_message', 'send_poll', 'send_contact', 'send_location', 'open_chat_by_phone'],
         'message-edit': ['edit_message'], 'message-delete': ['delete_message'],
@@ -548,7 +548,9 @@ def test_catalog_covers_explicit_families_and_provider_differences():
                         'star_message', 'unstar_message', 'set_chat_labels'],
         'groups-manage': ['create_group', 'rename_group', 'set_group_description', 'add_participant',
                           'remove_participant', 'promote_participant', 'demote_participant', 'leave_group',
-                          'get_invite_link', 'revoke_invite_link'],
+                          'get_invite_link', 'revoke_invite_link', 'set_group_messages_admins_only',
+                          'set_group_info_admins_only', 'set_slow_mode', 'set_join_approval',
+                          'approve_join_requests', 'reject_join_requests'],
         'contacts-manage': ['add_contact', 'delete_contact', 'block_contact', 'unblock_contact'],
         'profile-manage': ['update_profile'],
     }
