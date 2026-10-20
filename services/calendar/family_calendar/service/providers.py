@@ -433,6 +433,9 @@ class Providers:
         if step["action"] == "create" and cal["provider"] == "icloud":
             target = cal["target"].rstrip("/") + "/" + target + ".ics"
         old = await self.read(cal, target)
+        if step["action"] == "delete" and step.get("link") and (not old or old.get("status") == "cancelled"):
+            # Unproject of a drive already gone (404 or cancelled): nothing to send.
+            return {"action": "delete", "target": target, "absent": True, "resource_ref": source_ref("res", cal["ref"], target)}
         if step["action"] == "create" and old:
             raise CalendarError("version_conflict")
         if step["action"] != "create":

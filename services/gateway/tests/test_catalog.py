@@ -70,7 +70,7 @@ def test_calendar_plan_describes_all_day_and_occurrence_scope_without_series_or_
     assert event["required"] == ["start"] and event["properties"]["all_day"]["anyOf"][0] == {"type": "boolean"}
     assert not {"attendees", "recurrence", "rrule", "range", "scope", "guests"} & set(event["properties"])
     action = plan["inputSchema"]["$defs"]["Action"]["properties"]
-    assert set(action) == {"action", "calendar_ref", "event_ref", "event", "activity"}
+    assert set(action) == {"action", "calendar_ref", "event_ref", "event", "activity", "operation_id"}
     for phrase in ("all-day", "one occurrence", "this-and-following", "capability_unverified"):
         assert phrase in plan["description"]
     assert "guest-free single-event" not in plan["description"]
@@ -80,8 +80,23 @@ def test_calendar_plan_describes_all_day_and_occurrence_scope_without_series_or_
 def test_calendar_plan_declares_project_with_a_bounded_activity_label():
     plan = CATALOG["calendar_plan"]
     action = plan["inputSchema"]["$defs"]["Action"]
-    assert action["properties"]["action"]["enum"] == ["create", "update", "delete", "project"]
+    assert action["properties"]["action"]["enum"] == ["create", "update", "delete", "project", "unproject"]
     assert action["properties"]["activity"]["anyOf"][0] == {"maxLength": 64, "minLength": 1, "type": "string"}
-    assert action["required"] == ["action", "calendar_ref"] and action["additionalProperties"] is False
+    assert action["required"] == ["action"] and action["additionalProperties"] is False
+    # Every action but unproject still requires calendar_ref.
+    assert action["allOf"][0]["else"]["required"] == ["calendar_ref"]
     for phrase in ("project", "projections_skipped", "nothing_to_project", "16 steps", "too_many_steps", "private"):
+        assert phrase in plan["description"]
+
+
+# spec: ANYM-434
+def test_calendar_plan_declares_unproject_by_lesson_or_operation():
+    plan = CATALOG["calendar_plan"]
+    action = plan["inputSchema"]["$defs"]["Action"]
+    assert action["properties"]["operation_id"]["anyOf"][0] == {"type": "string"}
+    [rule] = action["allOf"]
+    assert rule["if"]["properties"]["action"] == {"const": "unproject"}
+    assert rule["then"] == {"anyOf": [{"required": ["operation_id"]}, {"required": ["calendar_ref", "event_ref"]}]}
+    assert rule["else"] == {"required": ["calendar_ref"], "not": {"required": ["operation_id"]}}
+    for phrase in ("unproject", "operation_id", "version_conflict", "outcome_unknown", "nothing_to_unproject"):
         assert phrase in plan["description"]

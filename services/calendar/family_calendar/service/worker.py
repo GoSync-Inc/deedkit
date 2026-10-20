@@ -43,6 +43,8 @@ class Worker:
             for step in plan["payload"]["steps"]:
                 ordinal = step["ordinal"]
                 args = (operation_id, ordinal)
+                # A linked create reserves its link; a linked delete (unproject) closes an existing one.
+                claim = step.get("link") and step["action"] == "create"
                 row = self.store.one(
                     "SELECT * FROM operation_steps WHERE operation_id=%s AND ordinal=%s", args
                 )
@@ -80,27 +82,31 @@ class Worker:
                         if plan["expires_at"] < datetime.now(timezone.utc):
                             raise CalendarError("plan_expired")
                         intent = await self.providers.prepare(cal, step)
-                        # Revalidate after the read/prepare and immediately before durable admission to send.
-                        self.service.validate_plan(plan, op["principal_id"])
-                        with self.store.transaction() as c:
-                            if step.get("link"):
-                                self._claim(c, step, cal, intent, args)
-                            c.execute(
-                                "UPDATE operation_steps SET state='sending',intent=%s WHERE operation_id=%s AND ordinal=%s",
-                                (Jsonb(intent), *args),
+                        if intent.get("absent"):
+                            # The fresh read found our drive already gone: the link closes without a write.
+                            receipt = {"deleted": True, "absent": True, "resource_ref": intent["resource_ref"]}
+                        else:
+                            # Revalidate after the read/prepare and immediately before durable admission to send.
+                            self.service.validate_plan(plan, op["principal_id"])
+                            with self.store.transaction() as c:
+                                if claim:
+                                    self._claim(c, step, cal, intent, args)
+                                c.execute(
+                                    "UPDATE operation_steps SET state='sending',intent=%s WHERE operation_id=%s AND ordinal=%s",
+                                    (Jsonb(intent), *args),
+                                )
+                            self.store.query(
+                                "UPDATE operations SET lease_until=now()+interval '2 minutes' WHERE id=%s",
+                                (operation_id,),
                             )
-                        self.store.query(
-                            "UPDATE operations SET lease_until=now()+interval '2 minutes' WHERE id=%s",
-                            (operation_id,),
-                        )
-                        # A timed-out write can still have changed availability.
-                        self.store.query(
-                            "UPDATE coverage SET status='stale' WHERE calendar_ref=%s", (cal["ref"],)
-                        )
-                        await self.providers.mutate(cal, intent)
-                        receipt = await self.providers.verify(cal, intent)
-                        if not receipt:
-                            raise CalendarError("unknown_result")
+                            # A timed-out write can still have changed availability.
+                            self.store.query(
+                                "UPDATE coverage SET status='stale' WHERE calendar_ref=%s", (cal["ref"],)
+                            )
+                            await self.providers.mutate(cal, intent)
+                            receipt = await self.providers.verify(cal, intent)
+                            if not receipt:
+                                raise CalendarError("unknown_result")
                     else:
                         self._finish(operation_id, "partial" if completed else "failed", row["error"])
                         return
@@ -109,12 +115,29 @@ class Worker:
                             "UPDATE operation_steps SET state='verified',receipt=%s,error=NULL WHERE operation_id=%s AND ordinal=%s",
                             (Jsonb(receipt), *args),
                         )
-                        if step.get("link"):
+                        if claim:
                             # Also the reconcile path: the claim admitted with the send becomes the live link.
                             c.execute(
                                 "UPDATE projection_links SET state='active',etag=%s,updated_at=now() "
                                 "WHERE operation_id=%s AND ordinal=%s AND state='pending'",
                                 (receipt.get("etag"), *args),
+                            )
+                        elif not self._links_writable(c):
+                            # Before migration 2 and its grants no link exists: ordinary writes never depend on it.
+                            pass
+                        elif step["action"] == "delete":
+                            # Any verified DeedKit delete of a drive, unproject or ordinary, ends its link.
+                            c.execute(
+                                "UPDATE projection_links SET state='removed',updated_at=now() "
+                                "WHERE target_calendar_ref=%s AND target_id=%s AND state='active'",
+                                (cal["ref"], step["target_id"]),
+                            )
+                        else:
+                            # A verified DeedKit update of a drive keeps its link on the new version.
+                            c.execute(
+                                "UPDATE projection_links SET etag=%s,updated_at=now() "
+                                "WHERE target_calendar_ref=%s AND target_id=%s AND state='active'",
+                                (receipt.get("etag"), cal["ref"], step["target_id"]),
                             )
                     self.store.query(
                         "UPDATE coverage SET status='stale' WHERE calendar_ref=%s", (cal["ref"],)
@@ -138,7 +161,7 @@ class Worker:
                             "UPDATE operation_steps SET state=%s,error=%s WHERE operation_id=%s AND ordinal=%s",
                             (state, e.code, *args),
                         )
-                        if step.get("link") and not ambiguous:
+                        if claim and not ambiguous:
                             # A definite failure releases the claim (no DELETE grant) so the lesson can be projected
                             # again; an ambiguous one keeps it until reconcile.
                             c.execute(
@@ -168,6 +191,13 @@ class Worker:
                     self._finish(operation_id, "unknown", "unknown_result")
                     return
             self._finish(operation_id, "verified", None)
+
+    @staticmethod
+    def _links_writable(c):
+        return c.execute(
+            "SELECT coalesce(has_table_privilege(to_regclass('projection_links'),'SELECT') "
+            "AND has_table_privilege(to_regclass('projection_links'),'UPDATE'),false) AS ok"
+        ).fetchone()["ok"]
 
     @staticmethod
     def _claim(c, step, cal, intent, args):

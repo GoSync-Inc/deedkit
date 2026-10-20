@@ -120,7 +120,8 @@ an `update`/`delete` with the `event_ref` of one occurrence of a series; the bac
 targets and guests with `capability_unverified`, and names a missing timed field in `field_errors`. A `project`
 action (`event_ref` of a lesson occurrence, `activity` label) plans linked drives from guardian rules; the gateway
 refuses it unless `assignment:read` is in both the local grant and the backend key, the same ceiling as
-`guardian_rules` in members, and passes `plan_step_limit` (16) in constraints. Slot requests may add explicitly reviewed
+`guardian_rules` in members, and passes `plan_step_limit` (16) in constraints. An `unproject` action (the lesson's
+`calendar_ref` and `event_ref`, or an `operation_id`) plans deleting those drives and follows the same ceiling. Slot requests may add explicitly reviewed
 `additional_calendar_refs` to member bindings and return their exact `source_selection`.
 Pending refreshes are polled with `refresh=false`; missing or pending coverage is unknown.
 

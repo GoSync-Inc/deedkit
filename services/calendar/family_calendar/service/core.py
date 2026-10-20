@@ -520,12 +520,29 @@ class FamilyService:
         touched = set()
         selected = set()
         sources, source_calendars, skipped, activities, projected = [], [], [], set(), set()
+        # Remote events this plan changes: one action per drive, whether by unproject or an ordinary write.
+        targets, unprojected = set(), False
+        allowed = {"action", "calendar_ref", "event_ref", "event", "activity", "operation_id"}
         for action in actions:
-            if not isinstance(action, dict) or set(action) - {"action", "calendar_ref", "event_ref", "event", "activity"}:
+            if not isinstance(action, dict) or set(action) - allowed:
                 raise CalendarError("invalid_action")
             kind = action.get("action")
-            if kind not in ("create", "update", "delete", "project"):
+            if kind not in ("create", "update", "delete", "project", "unproject"):
                 raise CalendarError("unsupported_action")
+            if kind == "unproject":
+                unprojected = True
+                for step, cal, source, scope in self._unproject(key, p, action, skipped):
+                    if (cal["ref"], step["target_id"]) in targets:
+                        raise CalendarError("duplicate_resource_action")
+                    targets.add((cal["ref"], step["target_id"]))
+                    if source["ref"] not in [s["calendar_ref"] for s in sources]:
+                        sources.append({"calendar_ref": source["ref"], "scope": scope})
+                        source_calendars.append(source)
+                    prepared.append(dict(step, ordinal=len(prepared)))
+                    calendars.append(cal)
+                continue
+            if "operation_id" in action or not isinstance(action.get("calendar_ref"), str):
+                raise CalendarError("invalid_action")
             if kind == "project":
                 label = action.get("activity")
                 if not isinstance(label, str) or not 1 <= len(label) <= 64 or "event" in action:
@@ -571,9 +588,10 @@ class FamilyService:
                 )
                 if not row:
                     raise CalendarError("not_found_or_forbidden")
-                if row["resource_ref"] in touched:
+                if row["resource_ref"] in touched or (cal["ref"], row["target"]) in targets:
                     raise CalendarError("duplicate_resource_action")
                 touched.add(row["resource_ref"])
+                targets.add((cal["ref"], row["target"]))
                 selected.add(action["event_ref"])
                 details = row["details"]
                 if details.get("guests") or details.get("special"):
@@ -614,6 +632,8 @@ class FamilyService:
                 "nothing_to_project",
                 details={"projections_skipped": skipped, "activities": sorted(activities)},
             )
+        if unprojected and not prepared:
+            raise CalendarError("nothing_to_unproject", details={"projections_skipped": skipped})
         if len(prepared) > 16:
             raise CalendarError("too_many_steps")
         overlap_check = self._overlap_check(key, p, prepared, selected)
@@ -631,7 +651,7 @@ class FamilyService:
             "notifications": "none; events with guests are blocked",
             "atomic": False,
             "overlap_check": overlap_check,
-            **({"projections_skipped": skipped} if projected else {}),
+            **({"projections_skipped": skipped} if projected or unprojected else {}),
         }
 
     def _source(self, key, calendar_ref):
@@ -729,6 +749,76 @@ class FamilyService:
             }
             steps.append((step, target))
         return source, scope, steps, skips, {r["activity"] for r in rules if r["enabled"]}
+
+    def _unproject(self, key, p, action, skips):
+        """One delete per active link of a lesson occurrence or of one of p's operations; a link whose
+        outcome is unknown is skipped. Source authority rests on the link's stored source calendar."""
+        if self.store.guardian_readiness():
+            raise CalendarError("capability_unverified")
+        if not self.rule_reader(p):
+            raise CalendarError("not_found_or_forbidden")
+        if "operation_id" in action:
+            if set(action) != {"action", "operation_id"}:
+                raise CalendarError("invalid_action")
+            if not self.store.one(
+                "SELECT 1 FROM operations WHERE id=%s AND principal_id=%s", (action["operation_id"], p["id"])
+            ):
+                raise CalendarError("not_found_or_forbidden")
+            rows = self.store.query(
+                self.LINKS + "l.operation_id=%s ORDER BY l.ordinal,l.id", (p["group_id"], action["operation_id"])
+            )
+        else:
+            if set(action) != {"action", "calendar_ref", "event_ref"} or not isinstance(action["event_ref"], str):
+                raise CalendarError("invalid_action")
+            # Checked before the lookup, so a calendar the principal cannot read reveals no link.
+            self._source(key, action["calendar_ref"])
+            rows = self.store.query(
+                self.LINKS + "l.source_calendar_ref=%s AND l.source_event_ref=%s ORDER BY l.duty,l.id",
+                (p["group_id"], action["calendar_ref"], action["event_ref"]),
+            )
+        sources = {ref: self._source(key, ref) for ref in {r["source_calendar_ref"] for r in rows}}
+        result = []
+        for r in rows:
+            skip = {"rule_id": r["rule_id"], "duty": r["duty"], "guardian_id": r["guardian_id"]}
+            if r["state"] != "active":
+                # A pending or repairing link may name a write whose outcome is unknown: reconcile first.
+                skips.append(dict(skip, reason="outcome_unknown"))
+                continue
+            if not (self._can(p, r["target_calendar_ref"], "plan:create") and self._can(
+                p, r["target_calendar_ref"], "event:delete"
+            )):
+                skips.append(dict(skip, reason="target_not_writable"))
+                continue
+            _, target = self.authorize(key, r["target_calendar_ref"], "event:delete")
+            start, end = r["source_start"], r["source_end"]
+            # An instant lesson is stored with the smallest span the CHECK allows; it ends at its start.
+            end = start if end - start <= timedelta(microseconds=1) else end
+            step = {
+                "action": "delete",
+                "calendar_ref": target["ref"],
+                "provider": target["provider"],
+                "resource_ref": r["target_resource_ref"],
+                "target_id": r["target_id"],
+                "expected_etag": r["etag"],
+                "link": {
+                    "rule_id": r["rule_id"],
+                    "rule_version": r["rule_version"],
+                    "duty": r["duty"],
+                    "guardian_id": r["guardian_id"],
+                    "source_event_ref": r["source_event_ref"],
+                },
+                # The stored span: the lesson may since be moved, cancelled or gone.
+                "source": {"start": start.isoformat(), "end": end.isoformat(), "title": r["title"]},
+            }
+            result.append((step, target, *sources[r["source_calendar_ref"]]))
+        return result
+
+    LINKS = (
+        "SELECT l.*,r.guardian_id,o.details->>'title' AS title FROM projection_links l "
+        "JOIN guardian_rules r ON r.id=l.rule_id "
+        "LEFT JOIN occurrences o ON o.ref=l.source_event_ref AND o.calendar_ref=l.source_calendar_ref "
+        "WHERE r.group_id=%s AND l.state<>'removed' AND "
+    )
 
     def _overlap_check(self, key, principal, prepared, selected):
         """Advisory cached evidence within current read grants, never permission

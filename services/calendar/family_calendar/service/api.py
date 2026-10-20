@@ -57,11 +57,22 @@ class EventInput(Strict):
 
 
 class Action(Strict):
-    action: Literal["create", "update", "delete", "project"]
-    calendar_ref: str
+    # unproject names a lesson (calendar_ref + event_ref) or an operation; every other action keeps calendar_ref.
+    model_config = ConfigDict(
+        json_schema_extra={
+            "allOf": [{
+                "if": {"properties": {"action": {"const": "unproject"}}, "required": ["action"]},
+                "then": {"anyOf": [{"required": ["operation_id"]}, {"required": ["calendar_ref", "event_ref"]}]},
+                "else": {"required": ["calendar_ref"], "not": {"required": ["operation_id"]}},
+            }]
+        }
+    )
+    action: Literal["create", "update", "delete", "project", "unproject"]
+    calendar_ref: str | None = None
     event_ref: str | None = None
     event: EventInput | None = None
     activity: str | None = Field(default=None, min_length=1, max_length=64)
+    operation_id: str | None = None
 
 
 class Plan(Strict):
@@ -125,7 +136,12 @@ DESCRIPTIONS = {
     "activity into the guardian's Google calendar: drop-off ends at the lesson start, pick-up at its end; the "
     "rule's title, the place only if the rule copies it, no description or guests, private when the rule says so. "
     "Rules that get no drive are listed in projections_skipped with a reason; nothing_to_project names the "
-    "activity labels. One project counts as one of the 8 actions; a plan holds at most 16 steps (too_many_steps).",
+    "activity labels. One project counts as one of the 8 actions; a plan holds at most 16 steps (too_many_steps). "
+    "unproject (calendar_ref and event_ref of the lesson, or the operation_id of your projecting operation) "
+    "deletes only drives DeedKit created and that are unchanged since: a drive edited by anyone is a "
+    "version_conflict and stays, one already gone just closes its link, one whose outcome is unknown is listed "
+    "in projections_skipped as outcome_unknown (run reconcile first); the lesson itself is never touched. "
+    "nothing_to_unproject means no live drive is left.",
     "apply": "Execute a reviewed plan with a stable request_id. Requires caller authorization for the actual changes.",
     "operation": "Read durable receipts. Unknown results require reconciliation; never submit a replacement create.",
     "assignment": "Assign a dropoff/pickup/stay interval. Does not claim acceptance or create provider projections.",
@@ -156,7 +172,7 @@ HINTS = {
 
 
 # Errors whose fixed-shape details the agent needs to choose its next action.
-PUBLIC_DETAILS = {"nothing_to_project"}
+PUBLIC_DETAILS = {"nothing_to_project", "nothing_to_unproject"}
 
 
 def failure(code, field_errors=None, details=None):

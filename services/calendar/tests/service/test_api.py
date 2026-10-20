@@ -244,3 +244,36 @@ def test_project_refusal_names_skipped_rules_in_both_transports(store):
         )
         result = r.json()["result"]
         assert result["isError"] is True and result["structuredContent"] == expected
+
+
+# spec: ANYM-434
+def test_unproject_refusal_names_skipped_links_in_both_transports(store):
+    from family_calendar.service.api import create_app
+    from tests.service.test_projection import household
+
+    _, key, drop, pick = household(store)
+    store.guardian_rule_disable(pick)
+    store.query("INSERT INTO projection_links(id,rule_id,rule_version,duty,source_calendar_ref,source_event_ref,"
+                "source_start,source_end,target_calendar_ref,target_id,state) VALUES ('link-x',%s,1,'dropoff',"
+                "'cal-child','event-lesson','2026-10-20T10:00:00Z','2026-10-20T11:00:00Z','cal-a','t1','pending')",
+                (drop,))
+    expected = {
+        "error": "nothing_to_unproject",
+        "projections_skipped": [
+            {"rule_id": drop, "duty": "dropoff", "guardian_id": "adult-a", "reason": "outcome_unknown"},
+        ],
+    }
+    action = {"action": "unproject", "calendar_ref": "cal-child", "event_ref": "event-lesson"}
+    c = TestClient(create_app(store, port=13232), base_url="http://127.0.0.1:13232")
+    with c:
+        h = {"Authorization": "Bearer " + key}
+        r = c.post("/v1/plan", json={"actions": [action]}, headers=h)
+        assert (r.status_code, r.json()) == (409, expected)
+        r = c.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "family_plan", "arguments": {"actions": [action]}}},
+            headers={**h, "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18"},
+        )
+        result = r.json()["result"]
+        assert result["isError"] is True and result["structuredContent"] == expected
