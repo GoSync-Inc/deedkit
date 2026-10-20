@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import REPOSITORY, Refused, excluded, shown, tiden  # noqa: E402
 from tiden_ci import go_module_path  # noqa: E402
 from tiden_pr_check import (anchor_map, blob, branch_status, changed, diff_tests, language,  # noqa: E402
-                            listing, parse_body, story)
+                            listing, parse_body, preview_numbers, story)
 
 SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -44,12 +44,6 @@ OPEN_CHECK = re.compile(r"\[open: (?:live|measured)\]")
 # Test files whose suite CI does not publish to Tiden, so a marked test there has no identity to link yet.
 UNPUBLISHED: tuple[tuple[str, str], ...] = ()
 SOURCE_FIELDS = ("sourceType", "title", "locator", "url", "repoPath", "repository", "lineStart", "lineEnd", "excerpt")
-# The merge-preview shape of CLI 0.33.0 (read 2026-10-19 from 62 open branches); empty fields may be omitted. Any
-# other key is a change this job cannot judge, so it refuses.
-PREVIEW_CHANGES = ("additions", "modifications")
-PREVIEW_EMPTY = ("deletions", "testAdditions", "testModifications", "testDeletions", "componentAdditions",
-                 "componentModifications", "componentDeletions")
-PREVIEW_OTHER = ("stats", "intentSession", "blockingSessions", "hasRequirementChanges")
 TIMEOUT = 120
 RETRY_DELAY = 2  # seconds before the one retry of a read
 RETRY_MIN = 10  # a retry needs at least this many seconds left of the read's one TIMEOUT budget
@@ -135,47 +129,6 @@ def pull_request(gh: str, repository: str, number: int) -> dict:
     return value
 
 
-def preview_number(item: object) -> int:
-    """The one spec number of a merge-preview addition or modification: its own `seqNum` and that of every nested
-    object (a modification may carry the main and branch copies) must agree."""
-    if not isinstance(item, dict):
-        raise StepFailed("merge", "the merge preview has a change that is not an object")
-    copies = [item, *(value for value in item.values() if isinstance(value, dict))]
-    numbers = [copy["seqNum"] for copy in copies if "seqNum" in copy]  # a present null counts, an absent key not
-    if not all(type(number) is int for number in numbers):  # before the set: 50.0 and True would equal an int
-        raise StepFailed("merge", "the merge preview has a change without exactly one spec number")
-    found = set(numbers)
-    if len(found) != 1:
-        raise StepFailed("merge", "the merge preview has a change without exactly one spec number")
-    return found.pop()
-
-
-def preview_numbers(preview: dict, name: str) -> set[int]:
-    """The specs a merge preview changes; anything but additions and modifications of specs refuses."""
-    unknown = sorted(set(preview) - {*PREVIEW_CHANGES, *PREVIEW_EMPTY, *PREVIEW_OTHER})
-    if unknown:
-        raise StepFailed("merge", f"the preview of {name} has unknown fields ({', '.join(map(shown, unknown))})")
-    lists = {key: preview.get(key, []) for key in (*PREVIEW_CHANGES, *PREVIEW_EMPTY)}
-    if not all(isinstance(value, list) for value in lists.values()):
-        raise StepFailed("merge", f"the merge preview of {name} is malformed")
-    other = [key for key in PREVIEW_EMPTY if lists[key]]
-    stats = preview.get("stats", {})
-    if not isinstance(stats, dict) or not all(type(value) is int for value in stats.values()):
-        raise StepFailed("merge", f"the merge preview of {name} has malformed stats")
-    other += [f"stats.{key}" for key, value in stats.items() if value and key not in PREVIEW_CHANGES]
-    other += [f"stats.{key}" for key in PREVIEW_CHANGES if stats.get(key, len(lists[key])) != len(lists[key])]
-    if preview.get("intentSession") is not None:
-        other.append("intentSession")
-    if preview.get("blockingSessions") not in (None, 0, []):
-        other.append("blockingSessions")
-    if not isinstance(preview.get("hasRequirementChanges", True), bool):
-        other.append("hasRequirementChanges")
-    if other:
-        raise StepFailed("merge", f"the preview of {name} holds more than spec changes ({', '.join(other)}); "
-                                  f"merge it by hand {WINDOW}, then {RECOVER}")
-    return {preview_number(item) for key in PREVIEW_CHANGES for item in lists[key]}
-
-
 def merge(cli: str, product: str, name: str, named: list[int], report, dry: bool = False) -> bool:
     """Merge the branch; true only for a dry run that would have merged it."""
     try:
@@ -191,7 +144,13 @@ def merge(cli: str, product: str, name: str, named: list[int], report, dry: bool
         preview = tiden(cli, ["branch", "merge-preview", "--name", name], product, retry=True)
     except Refused as error:
         raise StepFailed("merge", str(error)) from None
-    numbers = preview_numbers(preview, name)
+    try:
+        numbers, forbidden = preview_numbers(preview, name)
+    except Refused as error:
+        raise StepFailed("merge", str(error)) from None
+    if forbidden:
+        raise StepFailed("merge", f"the preview of {name} holds more than spec changes ({', '.join(forbidden)}); "
+                                  f"merge it by hand {WINDOW}, then {RECOVER}")
     stray = sorted(numbers - set(named))
     if stray or not numbers:
         raise StepFailed("merge", f"the preview of {name} changes " + (
