@@ -525,18 +525,24 @@ runs in a container of its own from the calls container's image: no network,
 no capabilities, read-only root, 64 MiB and 16 processes, the calls user and
 the calls state directory mounted read-only, under `--init`. The probe
 interrupts its query after 0.25 seconds and dies after 1 second, so the
-service's own writes wait at most that long. One poll's Docker commands share
-20 seconds, so a wait lasts at most 15 minutes and one poll. A probe the tool
-gave up on is found by its `io.deedkit.calls-probe` label token, killed by
-container ID and listed again before any further probe; when that cannot be
-confirmed, apply refuses at once with `a calls probe container could not be
-confirmed stopped` (no wait, no stop): inspect
-`docker ps --filter label=io.deedkit.calls-probe`. The host's root opens no file in the calls state
+service's own writes wait at most that long. The probe container is created
+first (`docker create`, so its ID is known) and then started with
+`docker start --attach`; the host keeps at most 64 KiB of its output and takes
+only the exact answer the probe prints. One poll's Docker commands share 20
+seconds and no poll starts at or after the bound, so a wait lasts at most 15
+minutes, one poll and the cleanup below (10 seconds per command). A probe whose
+creation or start the tool gave up on is found by its `io.deedkit.calls-probe`
+label token in any state (`docker ps --all`), removed by container ID and listed
+again before any further probe: a removed container can never start, however
+late Docker receives the start. When that cannot be confirmed, apply refuses at
+once with `a calls probe container could not be confirmed stopped` (no wait, no
+stop): inspect `docker ps --all --filter label=io.deedkit.calls-probe`. The host's root opens no file in the calls state
 directory and makes no request to the calls service. At the bound apply refuses
 with `a call is active: ...` or, when the last read failed (busy, a hot
 journal, a missing mount, a probe timeout or output that is not IDs and
-statuses), `whether a call is active could not be read: <category>`; it never
-proceeds on doubt and never stops a service for it. A refusal at the first
+statuses), `whether a call is active could not be read: <category>`, or
+`wait_expired` when the bound passed before that check could poll (for example
+during the last CI check); it never proceeds on doubt and never stops a service for it. A refusal at the first
 wait writes nothing (retry the same `apply` later). A refusal before a later
 project leaves `attempted.json` with some projects updated: recover it as an
 interrupted multi-project apply (above). A call that starts in the seconds
@@ -647,7 +653,9 @@ CI-published targets are considered. Kept, with reasons:
   `/var/lib/deedkit-production` and its subdirectories with a `current.json` or
   `http-current.json`, and the `state_directory` of every `/etc/deedkit/*.json`):
   the images of `current.json` and those a rollback restored, of the current
-  release's `*.before.json` (the one previous release `rollback` restores), of
+  release's `<project>.before.json` for each project its rollback record names (the
+  one previous release `rollback` restores; other files there are ignored, and a
+  missing one or one without `services` removes nothing), of
   every `prepared.json` without `result.json` or `http-attempted.json`, of every
   `http-prepared.json` without `http-attempted.json`, of `http-current.json` and
   its one `previous` generation (older nested generations are retired), and the
