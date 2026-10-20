@@ -322,7 +322,9 @@ bookkeeping a merge needs (AGENTS.md section 4):
   holds more than spec changes (deletions, test or component changes, conflicts,
   an intent session, blocking sessions). A named ID the preview does not change
   passes only as a spec on Tiden main. A preview of an unknown or malformed shape
-  is not checked (below), as sync B's step `merge` refuses the same shapes;
+  is not checked (below), as sync B's step `merge` refuses the same shapes; a
+  forbidden class is judged first, so a preview with one fails even when a spec
+  number in it is malformed;
 - every test the pull request adds has a `# spec: ANYM-n` or `// spec: ANYM-n`
   marker directly above it and its decorators, or is in the reviewed `NO_SPEC`
   list; existing tests need none;

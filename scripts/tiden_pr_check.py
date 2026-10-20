@@ -13,7 +13,7 @@ Tiden main and the body names no spec, when an added test has no marker and is n
 an existing story-level spec on Tiden main or the named branch, or when the named branch is not an open proposal or
 review branch, or when that open branch's merge preview changes a spec the body does not name, changes no spec or
 holds more than spec changes (one preview parser, shared with the main sync). A failed read or an unknown or
-malformed preview is a refusal, not a verdict. It prints the anchor matches for the job summary. The main-push sync
+malformed preview is a refusal, not a verdict, except that a forbidden class is judged before the spec numbers. It prints the anchor matches for the job summary. The main-push sync
 (scripts/tiden_sync.py) later anchors, links and merges from the same lines and markers.
 """
 from __future__ import annotations
