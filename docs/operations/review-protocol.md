@@ -71,7 +71,9 @@ VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <
    major finding stays open until that reviewer confirms the fix; a major still open after r2
    closes with a test that fails before the fix and passes after it, otherwise the orchestrator
    picks a smaller scope, a follow-up card or a revert. Merging with an open blocking or major
-   finding accepts a known risk, which the owner keeps.
+   finding accepts a known risk, which the owner keeps. A blocking or major finding fixed after
+   the cap gets one scoped recheck by the reviewer that raised it (no new round); never merge
+   with it unconfirmed. If that recheck still finds a blocking, stop and report BLOCKED.
 6. Cards: a contract card gets Astra r1 and at most one scoped recheck; a small card gets only
    the author's self-check.
 7. A production operation plan gets at most two Astra rounds before the owner authorizes it.
