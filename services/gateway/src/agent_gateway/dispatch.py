@@ -275,10 +275,12 @@ class Dispatch:
             raise Denied()
         if not self.implemented(tool, snapshot, agent, caps, args.get("account")):
             raise Denied()
+        rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
         if (module == "calendar" and tool["operation"] == "plan"
-                and any(isinstance(a, dict) and a.get("action") in ("project", "unproject")
+                and any(isinstance(a, dict) and (a.get("action") in ("project", "unproject")
+                                                 or (a.get("action") == "create" and "activity" in a))
                         for a in args.get("actions", []))
-                and "assignment:read" not in set(agent["grants"].get(module, [])) & set(caps["permissions"])):
+                and not rules_ceiling):
             # A projection and its undo are planned from guardian rules: the assignment ceiling of rules in members.
             raise Denied()
         allowed_actions = self.actions(snapshot, agent, caps) if module == "messaging" else []
@@ -317,6 +319,12 @@ class Dispatch:
             raise
         if module == "calls":
             receipt_reference(tool["operation"], result)
+        if (module == "calendar" and tool["operation"] == "plan" and not rules_ceiling and isinstance(result, dict)
+                and ("projections_skipped" in result
+                     or any(isinstance(st, dict) and "link" in st for st in result.get("steps") or []))):
+            # A lesson change the backend carried to its drives shows rule IDs past this gateway's ceiling;
+            # the stored plan is never applied through it and expires.
+            raise Denied()
         if module == "calendar" and tool["operation"] in {"calendars", "capabilities"}:
             result = dict(result)
             if "constraints" in result:

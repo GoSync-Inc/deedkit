@@ -10,7 +10,8 @@ from test_policy import config
 RULE = {"rule_id": "rule-synthetic", "activity": "Dance", "title": "SYNTHETIC-PRIVATE-RULE"}
 
 
-def gateway(tmp_path, local, backend, readiness=None, tools=("calendar_capabilities", "calendar_members")):
+def gateway(tmp_path, local, backend, readiness=None, tools=("calendar_capabilities", "calendar_members"),
+            plan=None):
     key = tmp_path / "backend.key"
     key.write_text("backend-calendar-a")
     key.chmod(0o600)
@@ -31,7 +32,7 @@ def gateway(tmp_path, local, backend, readiness=None, tools=("calendar_capabilit
                         "constraints": {"plan_action_limit": 8, "plan_step_limit": 16}}
                 return caps | ({"guardian_projections": readiness} if readiness else {})
             if operation == "plan":
-                return {"plan_id": "plan-synthetic", "steps": [], "projections_skipped": []}
+                return plan or {"plan_id": "plan-synthetic", "steps": [], "projections_skipped": []}
             # The backend already applied its own rule-read policy for its adult key.
             return {"group_id": "family", "members": [
                 {"person_id": "adult-a", "role": "group_admin", "label": "A"},
@@ -121,3 +122,47 @@ def test_unproject_follows_the_gateway_assignment_ceiling(tmp_path, local, backe
     else:
         with pytest.raises(Denied):
             asyncio.run(call)
+
+
+CEILINGS = [
+    (WRITER, WRITER + ["assignment:read"], False),
+    (WRITER + ["assignment:read"], WRITER, False),
+    (WRITER + ["assignment:read"], WRITER + ["assignment:read"], True),
+]
+LESSON = {"title": "Swim class", "start": "2026-10-20T14:00:00+00:00", "end": "2026-10-20T15:00:00+00:00",
+          "timezone": "UTC"}
+
+
+# spec: ANYM-435
+@pytest.mark.parametrize(("local", "backend", "allowed"), CEILINGS)
+def test_activity_create_follows_the_gateway_assignment_ceiling(tmp_path, local, backend, allowed):
+    from agent_gateway.policy import Denied
+
+    dispatch = gateway(tmp_path, local, backend, tools=PLANNER)
+    action = {"action": "create", "calendar_ref": "cal-child", "event": LESSON, "activity": "Dance"}
+    call = dispatch.call("gateway-a", "calendar_plan", {"actions": [action]})
+    if allowed:
+        assert asyncio.run(call)["plan_id"] == "plan-synthetic"
+    else:
+        with pytest.raises(Denied):
+            asyncio.run(call)
+
+
+# spec: ANYM-435
+@pytest.mark.parametrize("carried", [True, False])
+def test_carried_drives_never_pass_a_gateway_without_rule_read(tmp_path, carried):
+    from agent_gateway.policy import Denied
+
+    lesson = {"action": "update", "calendar_ref": "cal-child", "event_ref": "event-lesson", "event": LESSON}
+    linked = {"action": "update", "calendar_ref": "cal-a", "link": {"rule_id": "rule-synthetic"}}
+    plan = {"plan_id": "plan-synthetic", "steps": [dict(lesson, ordinal=0)] + ([linked] if carried else [])}
+    # The backend reads rules for its key; this gateway's ceiling does not.
+    dispatch = gateway(tmp_path, WRITER + ["event:update"], WRITER + ["event:update", "assignment:read"],
+                       tools=PLANNER, plan=plan)
+    call = dispatch.call("gateway-a", "calendar_plan", {"actions": [lesson]})
+    if carried:
+        with pytest.raises(Denied):
+            asyncio.run(call)
+    else:
+        # An ordinary lesson change without drives is untouched by the ceiling.
+        assert asyncio.run(call)["steps"] == plan["steps"]
