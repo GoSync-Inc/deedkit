@@ -1125,7 +1125,7 @@ func TestChatInfoGroupSettings(t *testing.T) {
 
 // spec: ANYM-242
 func TestJoinRequestsProjectionStaysWithinReceiptBudget(t *testing.T) {
-	long := strings.Repeat("名", 300) + strings.Repeat("<\"& ", 53)
+	long := strings.Repeat("名", 300) + strings.Repeat("<\"&\u2028", 53)
 	for _, limit := range []int{50, 100} {
 		r := &recordingIQ{reply: func(int, whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
 			requests := make([]waBinary.Node, 100)
