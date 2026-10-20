@@ -669,3 +669,51 @@ def test_budget_applies_without_policy(seeded, tmp_path, monkeypatch):
             FROM subscription_outbox WHERE state='pending'""").fetchall()
     assert [(row['attempts'], row['later']) for row in waiting] == [(0, True), (0, True)]
     assert all(store.get_subscription_events(token, sid)['items'] for sid in sids)
+
+
+# spec: ANYM-257
+def test_revocation_waits_for_inflight_hint_and_no_send_after(seeded, tmp_path):
+    import threading
+    import time
+    from psycopg.errors import LockNotAvailable
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, _ = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    emit(store)
+    match_subscriptions(store)
+    blocked, fenced_during_dns, sends, ended, revoked, threads = 1.0, [], [], [], [], []
+    def slow_dns(*args, **kwargs):
+        # A lookup up to the 2 s DNS bound runs before the fence: the subscription row is free.
+        try:
+            with store.pool.connection() as c:
+                c.execute('SELECT 1 FROM subscriptions WHERE id=%s FOR UPDATE NOWAIT', (sid,))
+        except LockNotAvailable:
+            fenced_during_dns.append(True)
+        time.sleep(2)
+        return ['93.184.216.34']
+    def revoke():
+        store.revoke(token)
+        revoked.append(time.monotonic())
+    def transport(*args, **kwargs):
+        sends.append(time.monotonic())
+        threads.append(threading.Thread(target=revoke))
+        threads[0].start()
+        time.sleep(blocked)
+        ended.append(time.monotonic())
+        return 204
+    stats = dispatch_hints(store, transport=transport, resolver=slow_dns)
+    threads[0].join(10)
+    assert not fenced_during_dns
+    assert stats['delivered'] == 1 and len(sends) == 1
+    # The concurrent revocation committed only after the in-flight attempt ended.
+    assert revoked and revoked[0] >= ended[0] > sends[0]
+    hold = stats['fence_hold_ms'][0] / 1000
+    assert blocked <= hold <= min(5, blocked) + 1
+    with store.pool.connection() as c:
+        c.execute("UPDATE subscription_outbox SET state='pending',next_attempt_at=clock_timestamp(),finished_at=NULL")
+    after = dispatch_hints(store, transport=lambda *a, **k: pytest.fail('hint sent after revocation'),
+        resolver=lambda *a, **k: ['93.184.216.34'])
+    assert after['cancelled'] == 1 and len(sends) == 1
