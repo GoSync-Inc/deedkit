@@ -2457,7 +2457,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Fetch an issued event page. Does not advance ACK or mark provider read. Requires explicit subscription-ack to issue a receipt.",
+      "description": "Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed.",
       "inputSchema": {
         "properties": {
           "subscription_id": {
@@ -2541,7 +2541,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Wait at most 25 seconds for an authorized event page. No ACK, provider polling or guarantee that a host runs a turn.",
+      "description": "Wait at most 25 seconds for an authorized event page. No ACK, provider polling or guarantee that a host runs a turn. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed.",
       "inputSchema": {
         "properties": {
           "subscription_id": {

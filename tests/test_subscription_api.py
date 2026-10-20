@@ -1,5 +1,6 @@
-"""Synthetic subscription transport/SDK contracts, without a database or providers."""
+"""Synthetic subscription transport/SDK contracts and annotation pins; only the fetch bookkeeping test uses a database."""
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -212,3 +213,110 @@ def test_python_uncertain_subscription_creation_never_retries():
         with pytest.raises(AnyMsgError,match='request_failed'):
             client.create_subscription(chat_ids=['chat_synthetic'])
     assert len(seen)==1
+
+
+READ_ONLY_TOOLS=('list_subscriptions','get_subscription','get_subscription_events',
+    'fetch_subscription_events','wait_for_subscription_events','get_attachment')
+
+
+def consumption_state(store,sid):
+    with store.pool.connection() as c:
+        subscription=c.execute('''SELECT version,state,updated_at,matched_through,expires_at
+            FROM subscriptions WHERE id=%s''',(sid,)).fetchone()
+        consumption=c.execute('''SELECT acked_through,version,updated_at
+            FROM subscription_consumption WHERE subscription=%s''',(sid,)).fetchone()
+        receipts=c.execute('SELECT count(*) AS n FROM subscription_receipts WHERE subscription=%s',(sid,)).fetchone()['n']
+    return subscription,consumption,receipts
+
+
+# spec: ANYM-257
+def test_fetch_is_read_only_for_consumption(seeded):
+    from messaging_service.subscriptions import match_subscriptions
+    from tests.test_event_delivery import call,emit,identity,subscription
+    store,_,_=seeded
+    acking=identity(store,'acking-reader')
+    plain_permissions=['read','subscription-write']
+    plain=store.issue_key('plain-reader',['telegram-demo'],permissions=plain_permissions,
+        key_permissions=plain_permissions)
+    acking_sid,plain_sid=subscription(store,acking),subscription(store,plain)
+    first,second=emit(store),emit(store)
+    match_subscriptions(store)
+    empty_sid=subscription(store,acking)
+    # An empty page never gets a receipt, even for a key that may ACK.
+    empty=call(store,acking,'fetch_subscription_events',empty_sid)
+    assert empty['items']==[] and empty['receipt'] is None
+    empty_before=consumption_state(store,empty_sid)
+
+    # Without subscription-ack: pages are returned, no receipt row is written and nothing is consumed.
+    page=call(store,plain,'fetch_subscription_events',plain_sid)
+    assert [e['event_id'] for e in page['items']]==[first,second]
+    assert page['receipt'] is None and page['ack_available'] is False
+    baseline=consumption_state(store,plain_sid)
+    assert baseline[1]['version']==1 and baseline[2]==0
+    for _ in range(3):
+        again=call(store,plain,'fetch_subscription_events',plain_sid)
+        assert again['items']==page['items'] and again['receipt'] is None
+    assert consumption_state(store,plain_sid)==baseline
+
+    # With subscription-ack: exactly one receipt per non-empty page, a retry sees the same events from the
+    # same position, and no fetch moves acked_through, the ACK version or the subscription version.
+    page=call(store,acking,'fetch_subscription_events',acking_sid,limit=1)
+    assert [e['event_id'] for e in page['items']]==[first] and page['receipt'] and page['ack_available']
+    acking_baseline=consumption_state(store,acking_sid)
+    assert acking_baseline[2]==1
+    retry=call(store,acking,'fetch_subscription_events',acking_sid,limit=1)
+    assert retry['items']==page['items'] and retry['acked_through']==page['acked_through']
+    assert retry['ack_version']==page['ack_version'] and retry['next_after']==page['next_after']
+    assert retry['receipt']!=page['receipt']
+    after=consumption_state(store,acking_sid)
+    assert after[0]==acking_baseline[0] and after[1]==acking_baseline[1] and after[2]==2
+    for _ in range(130):
+        call(store,acking,'fetch_subscription_events',acking_sid)
+    final=consumption_state(store,acking_sid)
+    assert final[0]==acking_baseline[0] and final[1]==acking_baseline[1] and final[2]==128
+
+    # Neither the other key's subscription nor the event-less one changed.
+    assert consumption_state(store,plain_sid)==baseline
+    assert consumption_state(store,empty_sid)==empty_before
+    assert empty_before[2]==0 and empty_before[1]['version']==1
+
+
+# spec: ANYM-257
+def test_state_writing_reads_stay_read_only_in_backend_gateway_and_client():
+    root=Path(__file__).resolve().parents[1]
+    catalog={row['name']:row for row in json.loads(
+        (root/'services/gateway/src/agent_gateway/catalog.json').read_text())}
+    client={row['name']:row['read_only'] for row in json.loads(
+        (root/'packages/deedkit/lib/tools.json').read_text())}
+    with TestClient(create_app(RecordingStore(),['testserver'])) as http:
+        listed=http.post('/mcp',headers={'Authorization':'Bearer synthetic-token',
+            'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
+            'method':'tools/list','params':{}}).json()['result']['tools']
+    backend={tool['name']:tool for tool in listed}
+    read={'readOnlyHint':True,'destructiveHint':False,'openWorldHint':False}
+    for name in READ_ONLY_TOOLS:
+        assert backend[name]['annotations']==read,name
+        assert catalog['messages_'+name]['annotations']==backend[name]['annotations'],name
+        assert client['messages_'+name] is True,name
+    for name in ('create_subscription','update_subscription','ack_subscription_events',
+            'configure_subscription_delivery'):
+        assert backend[name]['annotations']['readOnlyHint'] is False,name
+        assert catalog['messages_'+name]['annotations']==backend[name]['annotations'],name
+        assert client['messages_'+name] is False,name
+
+
+# spec: ANYM-257
+def test_receipt_issuing_reads_say_so_and_gateway_text_equals_backend():
+    root=Path(__file__).resolve().parents[1]
+    catalog={row['name']:row for row in json.loads(
+        (root/'services/gateway/src/agent_gateway/catalog.json').read_text())}
+    with TestClient(create_app(RecordingStore(),['testserver'])) as http:
+        listed=http.post('/mcp',headers={'Authorization':'Bearer synthetic-token',
+            'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
+            'method':'tools/list','params':{}}).json()['result']['tools']
+    backend={tool['name']:tool for tool in listed}
+    for name in ('fetch_subscription_events','wait_for_subscription_events'):
+        text=backend[name]['description']
+        assert catalog['messages_'+name]['description']==text,name
+        for phrase in ('short-lived receipt','safe to retry','oldest receipt','128','fails closed'):
+            assert phrase in text.lower(),(name,phrase)
