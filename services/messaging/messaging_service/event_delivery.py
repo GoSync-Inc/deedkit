@@ -260,6 +260,7 @@ def _transport(endpoint, body, headers, *, resolved, timeout=5):
 
 def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses):
     """Leased at-least-once hints, independently reauthorized before each send."""
+    from .policy import lock_principal
     from .store import bounded
     bounded(limit, 100)
     stats = dict(delivered=0, retried=0, dead_letter=0, cancelled=0, deferred=0)
@@ -337,9 +338,11 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
             # concurrent revocation cannot commit between authorization and send.
             owner = c.execute('SELECT principal,key_id FROM subscriptions WHERE id=%s',
                 (hint['subscription'],)).fetchone()
-            p = _worker_identity(c, owner) if owner else None
+            if owner:
+                lock_principal(c, owner['principal'], shared=True)
             # The hold starts once the principal lock is held: waiting for it is contention, not hold.
             fenced = time.monotonic()
+            p = _worker_identity(c, owner) if owner else None
             row = c.execute('SELECT * FROM subscriptions WHERE id=%s FOR UPDATE',
                 (hint['subscription'],)).fetchone()
             receiver = c.execute('''SELECT r.* FROM subscription_receivers r JOIN subscription_delivery d

@@ -729,11 +729,18 @@ def test_revocation_waits_for_inflight_hint_and_no_send_after(seeded, tmp_path):
 
 
 # spec: ANYM-257
-def test_fence_hold_excludes_waiting_for_the_principal_lock(seeded, tmp_path):
+def test_fence_hold_excludes_waiting_for_the_principal_lock(seeded, tmp_path, monkeypatch):
     import threading
     import time
+    from messaging_service import event_delivery
     from messaging_service.event_delivery import dispatch_hints
     from messaging_service.policy import lock_principal
+    identity_read = event_delivery._worker_identity
+    def slow_identity(*args):
+        # The authorization read runs under the fence and counts toward its hold.
+        time.sleep(1)
+        return identity_read(*args)
+    monkeypatch.setattr(event_delivery, '_worker_identity', slow_identity)
     store, _, _ = seeded
     token = identity(store)
     sid = subscription(store, token)
@@ -762,5 +769,5 @@ def test_fence_hold_excludes_waiting_for_the_principal_lock(seeded, tmp_path):
         for thread in threads:
             thread.join(10)
     assert stats['delivered'] == 1
-    assert time.monotonic() - started >= 1.5
-    assert stats['fence_hold_ms'][0] < 1000
+    assert time.monotonic() - started >= 2.5
+    assert 1000 <= stats['fence_hold_ms'][0] < 2000
