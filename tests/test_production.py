@@ -3709,8 +3709,8 @@ def test_a_probe_the_client_gave_up_on_is_killed_by_its_label_and_confirmed_gone
                if argv[1] == "ps")
 
 
-@pytest.mark.parametrize("failure", ["survives-kill", "unlistable"])
 # spec: ANYM-442
+@pytest.mark.parametrize("failure", ["survives-kill", "unlistable"])
 def test_a_probe_that_cannot_be_confirmed_gone_ends_the_wait_with_no_further_probe(monkeypatch, failure):
     docker = ProbeDocker(monkeypatch, ["timeout", '{"calls": []}'], stuck=failure == "survives-kill",
                          ps_fails=failure == "unlistable")
@@ -3721,9 +3721,9 @@ def test_a_probe_that_cannot_be_confirmed_gone_ends_the_wait_with_no_further_pro
     assert not issubclass(p.ProbeStuck, p.CallsUnknown) and not issubclass(p.ProbeStuck, p.CallActive)
 
 
+# spec: ANYM-442
 @pytest.mark.parametrize("listing", ["abcdef123456\n", f"{'1' * 64}\trunning\n", "1\trunning\ttoken\n"],
                          ids=["quiet-ids", "no-token", "short-id"])
-# spec: ANYM-442
 def test_a_probe_listing_it_cannot_parse_is_never_taken_for_none_left(monkeypatch, listing):
     # `docker ps -q` ignores --format and prints bare IDs: such rows must not read as "no probe of ours runs".
     docker = ProbeDocker(monkeypatch, ["timeout", '{"calls": []}'], listing=listing)
@@ -3761,8 +3761,8 @@ def test_a_probe_whose_creation_the_tool_gave_up_on_is_removed_before_any_start(
     assert docker.named("start") == [["docker", "start", "--attach", f"{2:064x}"]] and docker.running() == FOREIGN
 
 
-@pytest.mark.parametrize("step, timeouts, ended", [(4, [20, 16, 12, 8], 16), (12, [20, 8], 20)], ids=["fits", "spent"])
 # spec: ANYM-442
+@pytest.mark.parametrize("step, timeouts, ended", [(4, [20, 16, 12, 8], 16), (12, [20, 8], 20)], ids=["fits", "spent"])
 def test_one_poll_never_runs_a_docker_command_past_its_budget(monkeypatch, step, timeouts, ended):
     docker = ProbeDocker(monkeypatch, ['{"calls": []}'], step=step)
     if step == 4:
@@ -3787,8 +3787,8 @@ def test_no_poll_starts_after_the_deadline_and_the_last_ends_within_its_budget(m
     assert sum(docker.clock.sleeps) <= p.CALL_WAIT and docker.named("create") == []
 
 
-@pytest.mark.parametrize("entry", ["expired", "overslept"])
 # spec: ANYM-442
+@pytest.mark.parametrize("entry", ["expired", "overslept"])
 def test_a_wait_whose_deadline_passed_starts_no_poll(monkeypatch, entry):
     docker = ProbeDocker(monkeypatch, [f'{{"calls": [["{CALL}", "active"]]}}', '{"calls": []}'])
     if entry == "expired":
@@ -3822,10 +3822,10 @@ def test_a_last_ci_check_that_outlasts_the_wait_bound_stops_nothing(tmp_path, mo
     assert host.mutations() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
 
 
+# spec: ANYM-442
 @pytest.mark.parametrize("answer", ['{"calls": [], "brief": "synthetic private text"}', '{"error": {"brief": "x"}}',
                                     '{"error": ["busy"]}', "{}"],
                          ids=["extra-top-level", "error-object", "error-list", "empty"])
-# spec: ANYM-442
 def test_only_the_exact_probe_answer_shape_is_taken(tmp_path, monkeypatch, answer):
     host = CallHost(tmp_path, monkeypatch, answers=(answer,))
     host.prepared(RELEASES[0])
@@ -3835,6 +3835,7 @@ def test_only_the_exact_probe_answer_shape_is_taken(tmp_path, monkeypatch, answe
     assert host.mutations() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
 
 
+# spec: ANYM-442
 @pytest.mark.parametrize("script, category", [
     ("import sys; sys.stdout.write('x' * 70000)", "malformed_probe_output"),
     ("import sys; sys.stdout.write('{\"calls\": []}' + ' ' * 70000 + 'synthetic private text')",
@@ -3843,7 +3844,6 @@ def test_only_the_exact_probe_answer_shape_is_taken(tmp_path, monkeypatch, answe
     ("import sys; print('{\"calls\": []}'); sys.exit(3)", "probe_failed"),
     ("import time; print('{\"calls\": []}', flush=True); time.sleep(30)", "probe_timeout"),
 ], ids=["oversized", "valid-then-oversized", "not-text", "failed", "never-ends"])
-# spec: ANYM-442
 def test_probe_output_is_bounded_in_size_and_time_and_a_failed_probe_is_no_answer(script, category):
     import time
     assert p.probe_output([sys.executable, "-c", "print('{\"calls\": []}')"], time.monotonic() + 10) == '{"calls": []}\n'
@@ -3953,8 +3953,8 @@ def test_a_rollback_that_meets_a_call_before_a_later_project_never_stops_it(tmp_
     assert p.unfinished(host.state) == [RELEASES[1]]
 
 
-@pytest.mark.parametrize("between", ["fetch-failed", "ghcr-unreachable"])
 # spec: ANYM-442
+@pytest.mark.parametrize("between", ["fetch-failed", "ghcr-unreachable"])
 def test_a_run_with_another_outcome_between_call_waits_restarts_their_count(tmp_path, monkeypatch, between):
     host = Deployer(tmp_path, monkeypatch)
     waiting_apply(host, monkeypatch, [p.CallActive(f"a call is active: {CALL} (active)") for _ in range(4)])
@@ -3977,8 +3977,8 @@ def test_a_run_with_another_outcome_between_call_waits_restarts_their_count(tmp_
     assert outcome["status"] == "waiting" and outcome["call_waits"]["count"] == 1 and host.paused() is None
 
 
-@pytest.mark.parametrize("record", ["rollback-record", "prepared-projects"])
 # spec: ANYM-439
+@pytest.mark.parametrize("record", ["rollback-record", "prepared-projects"])
 def test_retention_reads_only_the_tool_written_snapshots_of_the_releases_projects(tmp_path, monkeypatch, record):
     settings = retention_settings(tmp_path)
     state = Path(settings["state_directory"])
@@ -4003,8 +4003,8 @@ def test_retention_reads_only_the_tool_written_snapshots_of_the_releases_project
     assert p.retain_images(settings) == {"skipped": f"the rollback snapshot of {release} is missing or malformed; no image is removed"}
 
 
-@pytest.mark.parametrize("entry", ["image-string", "list", "null"])
 # spec: ANYM-439
+@pytest.mark.parametrize("entry", ["image-string", "list", "null"])
 def test_a_snapshot_service_entry_that_is_not_a_mapping_removes_nothing(tmp_path, monkeypatch, entry):
     settings = retention_settings(tmp_path)
     state = Path(settings["state_directory"])
