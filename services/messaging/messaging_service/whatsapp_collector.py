@@ -248,7 +248,8 @@ class NodeProvider:
                 'operation_target_invalid','operation_target_unavailable','operation_unsupported',
                 'operation_query_failed','operation_result_too_large','registered_file_invalid',
                 'history_rate_limited','history_anchor_unavailable',
-                'invalid_phone','identity_unresolved','chat_not_collected','provider_timeout','rate_limited','forbidden'):
+                'invalid_phone','identity_unresolved','chat_not_collected','provider_timeout','rate_limited','forbidden',
+                'invite_invalid','invite_expired','chat_full','join_not_allowed','already_member','operation_target_changed'):
                 from .commands import CommandRejected
                 raise CommandRejected(code)
             if code in ('send_expired','sending_disabled','send_target_invalid','link_preview_unsupported'):

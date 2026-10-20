@@ -580,3 +580,257 @@ def test_join_request_batch_worker_first_id_revoked_keeps_rows(operator,operatio
     assert receipt['status']=='unknown' and client.mutations()==[]
     assert receipt['result']['data']=={'all_applied':False,'results':[
         {'id':'201','state':'not_attempted'},{'id':'202','state':'not_attempted'}]}
+
+
+LINK='https://t.me/+AbCd1234'
+JOINED_CHAT='-1000000000500'
+
+
+def link_data(membership='not_member',title='Synthetic link chat'):
+    return {'title':title,'kind':'group','member_count':12,'approval_required':True,'paid':False,
+            'membership':membership,'membership_basis':'provider_invite'}
+
+
+def link_check(s,key,state,membership='not_member',request_id='synthetic-check-0001',title='Synthetic link chat'):
+    # The worker answers the check directly, so a queued join is never claimed by it.
+    from psycopg.types.json import Jsonb
+    queued=s.execute_messenger_operation(key,account='command-fixture',operation='check_chat_link',
+                                         parameters={'link':LINK},request_id=request_id)
+    with s.pool.connection() as c:
+        c.execute('''UPDATE messenger_commands SET status='succeeded',result=%s,started_at=clock_timestamp(),
+            finished_at=clock_timestamp() WHERE id=%s''',
+            (Jsonb({'outcome':'confirmed','data':link_data(membership,title)}),queued['operation_id']))
+    return s.get_messenger_operation(key,queued['operation_id'])
+
+
+def join_queue(s,key,request_id='synthetic-join-0001'):
+    args={'account':'command-fixture','operation':'join_chat','parameters':{'link':LINK}}
+    draft=s.preview_messenger_operation(key,**args)
+    return s.execute_messenger_operation(key,**args,request_id=request_id,preview_digest=draft['preview_digest'])
+
+
+def link_keys(s):
+    perms=['read','groups-read','groups-manage']
+    return s.issue_key('command-agent',['command-fixture'],permissions=perms),s.issue_key('command-agent',['command-fixture'],permissions=perms)
+
+
+# spec: ANYM-243
+def test_join_requires_fresh_check(operator):
+    s,_,key,state=operator
+    s.set_messenger_operations('command-fixture',['check_chat_link','join_chat'])
+    args={'account':'command-fixture','operation':'join_chat','parameters':{'link':LINK}}
+    with pytest.raises(APIError,match='preview_required'):s.preview_messenger_operation(key,**args)
+    other,_=link_keys(s)
+    link_check(s,other,state,request_id='synthetic-check-other')
+    with pytest.raises(APIError,match='preview_required'):s.preview_messenger_operation(key,**args)
+    link_check(s,key,state,'member',request_id='synthetic-check-0001')
+    with pytest.raises(APIError,match='already_member'):s.preview_messenger_operation(key,**args)
+    receipt=link_check(s,key,state,request_id='synthetic-check-0002')
+    assert receipt['status']=='succeeded'
+    with s.pool.connection() as c:
+        c.execute("UPDATE messenger_commands SET finished_at=clock_timestamp()-interval '61 minutes' WHERE operation='check_chat_link'")
+    with pytest.raises(APIError,match='preview_required'):s.preview_messenger_operation(key,**args)
+    link_check(s,key,state,request_id='synthetic-check-0003')
+    draft=s.preview_messenger_operation(key,**args)
+    assert draft['parameters']=={'link':'+AbCd1234'}
+    assert draft['expected_chat']=={'title':'Synthetic link chat','kind':'group','member_count':12}
+    with pytest.raises(APIError,match='preview_required'):
+        s.execute_messenger_operation(key,**args,request_id='synthetic-join-0001')
+    # A later check naming another chat changes the digest the owner confirmed.
+    link_check(s,key,state,request_id='synthetic-check-0004',title='Synthetic renamed chat')
+    with pytest.raises(APIError,match='preview_mismatch'):
+        s.execute_messenger_operation(key,**args,request_id='synthetic-join-0001',preview_digest=draft['preview_digest'])
+    assert join_queue(s,key)['status']=='queued'
+
+
+# spec: ANYM-243
+def test_join_target_changed(operator):
+    from messaging_service.commands import CommandWorker
+    from messaging_service.telegram_operations import execute
+    from test_telegram_operations import LinkClient
+    from telethon.tl import types
+    s,_,key,state=operator
+    s.set_messenger_operations('command-fixture',['check_chat_link','join_chat'])
+    link_check(s,key,state)
+    queued=join_queue(s,key)
+    client=LinkClient(invite=types.ChatInvite(title='Synthetic renamed chat',photo=types.PhotoEmpty(0),
+                                              participants_count=12,color=0,megagroup=True))
+    async def provider(job):return await execute(client,job)
+    assert asyncio.run(CommandWorker(state,provider).once())
+    receipt=s.get_messenger_operation(key,queued['operation_id'])
+    assert receipt['status']=='failed' and receipt['error_code']=='operation_target_changed' and client.joins()==[]
+
+
+# spec: ANYM-243
+@pytest.mark.parametrize('change',['opt_in','permission','expiry'])
+def test_join_dispatch_rechecks_access(operator,change):
+    from messaging_service.commands import CommandWorker
+    s,_,key,state=operator
+    s.set_messenger_operations('command-fixture',['check_chat_link','join_chat'])
+    link_check(s,key,state)
+    queued=join_queue(s,key)
+    if change=='opt_in':s.set_messenger_operations('command-fixture',['check_chat_link'])
+    if change=='permission':s.set_key_permissions(s.capabilities(key)['credential_id'],['read','groups-read'])
+    if change=='expiry':
+        with s.pool.connection() as c:
+            c.execute("UPDATE messenger_commands SET expires_at=clock_timestamp()-interval '1 second' WHERE id=%s",
+                      (queued['operation_id'],))
+    calls=[]
+    async def provider(job):calls.append(job);return {'outcome':'confirmed','data':{'state':'joined'}}
+    asyncio.run(CommandWorker(state,provider).once())
+    with s.pool.connection() as c:
+        row=c.execute('SELECT status FROM messenger_commands WHERE id=%s',(queued['operation_id'],)).fetchone()
+    assert calls==[] and row['status'] in ('failed','expired','cancelled')
+
+
+# spec: ANYM-243
+def test_unknown_join_guard(operator):
+    s,_,key,state=operator
+    s.set_messenger_operations('command-fixture',['check_chat_link','join_chat'])
+    other,_=link_keys(s)
+    link_check(s,key,state)
+    first=join_queue(s,key)
+    link_check(s,other,state,request_id='synthetic-check-other-1')
+    with pytest.raises(APIError,match='operation_result_unknown'):join_queue(s,other,'synthetic-join-other-1')
+    with s.pool.connection() as c:
+        c.execute("UPDATE messenger_commands SET status='dispatching' WHERE id=%s",(first['operation_id'],))
+    with pytest.raises(APIError,match='operation_result_unknown'):join_queue(s,other,'synthetic-join-other-2')
+    with s.pool.connection() as c:
+        c.execute("""UPDATE messenger_commands SET status='unknown',error_code='operation_result_unknown',
+            finished_at=clock_timestamp() WHERE id=%s""",(first['operation_id'],))
+    with pytest.raises(APIError,match='operation_result_unknown'):join_queue(s,other,'synthetic-join-other-3')
+    # A check from before the join ended (other-1) and a later unknown one keep the guard, with no time limit.
+    link_check(s,key,state,'unknown',request_id='synthetic-check-0002')
+    with s.pool.connection() as c:
+        c.execute("UPDATE messenger_commands SET finished_at=finished_at-interval '30 days' WHERE id=%s",(first['operation_id'],))
+        c.execute("UPDATE messenger_commands SET started_at=clock_timestamp()-interval '31 days' WHERE operation='check_chat_link'")
+    with pytest.raises(APIError,match='operation_result_unknown'):join_queue(s,other,'synthetic-join-other-4')
+    # A later check by any key that settles membership ends it.
+    link_check(s,key,state,request_id='synthetic-check-0003')
+    assert join_queue(s,other,'synthetic-join-other-5')['status']=='queued'
+    # The same request_id still returns its own receipt.
+    assert join_queue(s,key)['operation_id']==first['operation_id']
+
+
+# spec: ANYM-243
+def test_join_guard_concurrent_keys(operator):
+    import threading
+    s,_,_,state=operator
+    s.set_messenger_operations('command-fixture',['check_chat_link','join_chat'])
+    keys=link_keys(s)
+    drafts=[]
+    for n,token in enumerate(keys):
+        link_check(s,token,state,request_id='synthetic-check-con-%d'%n)
+        drafts.append(s.preview_messenger_operation(token,account='command-fixture',operation='join_chat',
+                                                    parameters={'link':LINK}))
+    barrier=threading.Barrier(2);results=[]
+    def submit(n):
+        barrier.wait()
+        try:results.append(s.execute_messenger_operation(keys[n],account='command-fixture',operation='join_chat',
+                parameters={'link':LINK},request_id='synthetic-join-con-%d'%n,preview_digest=drafts[n]['preview_digest'])['status'])
+        except APIError as exc:results.append(exc.code)
+    threads=[threading.Thread(target=submit,args=(n,)) for n in range(2)]
+    for t in threads:t.start()
+    for t in threads:t.join(10)
+    assert sorted(results)==['operation_result_unknown','queued']
+
+
+# spec: ANYM-243
+def test_join_guard_after_restart(operator):
+    from messaging_service.commands import CommandWorker
+    s,_,key,state=operator
+    s.set_messenger_operations('command-fixture',['check_chat_link','join_chat'])
+    other,_=link_keys(s)
+    link_check(s,key,state)
+    first=join_queue(s,key)
+    calls=[]
+    async def crash(job):
+        calls.append(job)
+        # The provider joined; the process dies before the receipt is written.
+        with s.pool.connection() as c:
+            c.execute("UPDATE messenger_commands SET lease_epoch=0 WHERE id=%s",(first['operation_id'],))
+        raise SystemExit
+    with pytest.raises(SystemExit):asyncio.run(CommandWorker(state,crash).once())
+    assert len(calls)==1
+    link_check(s,other,state,request_id='synthetic-check-other-1')
+    receipt=s.get_messenger_operation(key,first['operation_id'])
+    assert receipt['status']=='unknown'
+    with pytest.raises(APIError,match='operation_result_unknown'):join_queue(s,other,'synthetic-join-other-1')
+    assert len(calls)==1
+
+
+def unreadable(s,token,chat):
+    try:return not s.get_messages(token,chat)['items']
+    except APIError as exc:return exc.code=='not_found'
+
+
+def joined_by_worker(s,key,state,client):
+    from messaging_service.commands import CommandWorker
+    from messaging_service.telegram_operations import execute
+    s.set_messenger_operations('command-fixture',['check_chat_link','join_chat'])
+    link_check(s,key,state)
+    queued=join_queue(s,key)
+    async def provider(job):return await execute(client,job)
+    assert asyncio.run(CommandWorker(state,provider).once())
+    return s.get_messenger_operation(key,queued['operation_id'])
+
+
+# spec: ANYM-243
+def test_join_scope_chat_scoped_key(operator):
+    from test_telegram_operations import LinkClient
+    s,archive,key,state=operator
+    scoped=s.issue_key('scoped-agent',['command-fixture'],chats=[stable_id('chat','command-fixture','100')],
+                       permissions=['read','read-live','groups-read','groups-manage'])
+    joined=stable_id('chat','command-fixture',JOINED_CHAT)
+    def scoped_cannot_reach():
+        assert unreadable(s,scoped,joined)
+        with pytest.raises(APIError,match='not_found'):
+            s.preview_messenger_operation(scoped,account='command-fixture',operation='list_participants',chat_id=joined)
+        assert all(r['chat_id']!=joined for r in s.search(scoped,'Joined synthetic')['items'])
+    scoped_cannot_reach()
+    receipt=joined_by_worker(s,key,state,LinkClient())
+    assert receipt['status']=='succeeded' and receipt['result']['data']['archive']=='collected'
+    archive.ingest(event(account='command-fixture',chat=JOINED_CHAT,provider_id='5',body='Joined synthetic text'))
+    scoped_cannot_reach()
+    assert not unreadable(s,key,joined)
+
+
+# spec: ANYM-243
+def test_join_scope_collection_policy(operator):
+    from test_telegram_operations import LinkClient
+    s,_,key,state=operator
+    with s.pool.connection() as c:
+        c.execute('UPDATE account_policies SET exclude_chats=%s WHERE account=%s',([JOINED_CHAT],'command-fixture'))
+    receipt=joined_by_worker(s,key,state,LinkClient())
+    data=receipt['result']['data']
+    assert receipt['status']=='succeeded' and data['state']=='joined' and data['archive']=='not_collected'
+    assert 'provider_chat_id' not in data and 'collection policy' in data['next_step']
+    assert unreadable(s,key,stable_id('chat','command-fixture',JOINED_CHAT))
+
+
+# spec: ANYM-243
+def test_failed_join_preserves_send_and_collection(operator):
+    from messaging_service.commands import CommandWorker
+    from messaging_service.telegram_operations import execute
+    from test_telegram_operations import LinkClient
+    from telethon import errors
+    s,archive,key,state=operator
+    s.set_messenger_operations('command-fixture',['check_chat_link','join_chat','send_reaction'])
+    link_check(s,key,state)
+    failed=join_queue(s,key)
+    client=LinkClient(join=errors.InviteHashExpiredError(None))
+    async def provider(job):
+        if job['operation']=='join_chat':return await execute(client,job)
+        return {'outcome':'confirmed','data':{}}
+    worker=CommandWorker(state,provider)
+    assert asyncio.run(worker.once())
+    assert s.get_messenger_operation(key,failed['operation_id'])['error_code']=='invite_expired'
+    # A malformed link is refused before queueing.
+    with pytest.raises(APIError,match='invalid_operation_parameters'):
+        s.preview_messenger_operation(key,account='command-fixture',operation='join_chat',parameters={'link':'bare_name'})
+    sent=queue(s,key,operation='send_reaction',parameters={'emoji':'👍'},expected_revision=1)
+    assert asyncio.run(worker.once())
+    assert s.get_messenger_operation(key,sent['operation_id'])['status']=='succeeded'
+    archive.ingest(event(account='command-fixture',chat='100',provider_id='3',body='Still collected synthetic text'))
+    assert any(m['body']=='Still collected synthetic text' for m in
+               s.get_messages(key,stable_id('chat','command-fixture','100'))['items'])

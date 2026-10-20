@@ -26,7 +26,7 @@ MAX_PROFILE_PAGE = 50
 READ_OPERATIONS = frozenset({
     'chat_info', 'list_participants', 'get_reactions', 'get_message_info',
     'list_topics', 'get_profile', 'list_contacts', 'get_contact', 'list_blocked',
-    'get_invite_link',
+    'get_invite_link', 'check_chat_link',
 })
 PARAMETERS = {
     'chat_info': set(), 'list_participants': {'limit', 'offset'},
@@ -53,6 +53,7 @@ PARAMETERS = {
     'set_group_messages_admins_only': {'enabled'}, 'set_group_info_admins_only': {'enabled'},
     'set_slow_mode': {'seconds'}, 'list_join_requests': {'limit'},
     'approve_join_requests': {'user_ids'}, 'reject_join_requests': {'user_ids'},
+    'check_chat_link': {'link'}, 'join_chat': {'link'},
 }
 # ANYM-242: each setter owns one value; the default rights flag it changes, or slow mode.
 GROUP_SETTERS = {'set_group_messages_admins_only': ('messages_admins_only', 'enabled', 'send_messages'),
@@ -74,6 +75,26 @@ JOIN_REQUESTS_BYTES = 48000
 # 20-ID batch of cached requesters (group lookup + 20 mutations, 1 s apart) starts its
 # last mutation at 20 s, so it still completes.
 JOIN_BATCH_BUDGET_SECONDS = 22.0
+
+
+# ANYM-243: the normalized link key (messenger_operations.chat_link_key), and the definite refusals of
+# a join: the provider applied nothing, so they fail the receipt; any other error after the call is unknown.
+CHAT_LINK = re.compile(r'\+[A-Za-z0-9_-]{8,64}|@[a-z][a-z0-9_]{4,31}', re.ASCII)
+JOIN_CHAT_REFUSALS = ((errors.InviteHashExpiredError, 'invite_expired'), (errors.InviteHashInvalidError, 'invite_invalid'),
+    (errors.InviteHashEmptyError, 'invite_invalid'), (errors.UsersTooMuchError, 'chat_full'),
+    (errors.ChannelsTooMuchError, 'join_not_allowed'), (errors.ChannelPrivateError, 'join_not_allowed'),
+    (errors.UserAlreadyParticipantError, 'already_member'))
+JOIN_NEXT_STEP = "the operator adds this chat to the account's collection policy"
+
+
+def link_chat(chat, membership, basis):
+    """The check projection of a chat: never its ID, members, inviter or description."""
+    approval = getattr(chat, 'join_request', None) if isinstance(chat, types.Channel) else None
+    return {'title': safe_text(getattr(chat, 'title', None), 255),
+            'kind': 'channel' if isinstance(chat, types.Channel) and chat.broadcast else 'group',
+            'member_count': safe_int(getattr(chat, 'participants_count', None)),
+            'approval_required': approval if approval is None else bool(approval), 'paid': False,
+            'membership': membership, 'membership_basis': basis}
 
 
 class JoinBatchBudgetSpent(Exception):
@@ -446,10 +467,13 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             bounded_text(parameters.get('title'), 128)
         if operation == 'list_topics' and parameters.get('offset', 0) != 0:
             reject('unsupported_operation')
+        if operation in ('check_chat_link', 'join_chat') and (not isinstance(parameters.get('link'), str) or
+                not CHAT_LINK.fullmatch(parameters['link'])):
+            reject('invalid_parameters')
 
         account_only = {'list_contacts', 'list_blocked', 'get_contact', 'get_profile',
                         'add_contact', 'delete_contact', 'block_contact', 'unblock_contact',
-                        'update_profile', 'create_group'}
+                        'update_profile', 'create_group', 'check_chat_link', 'join_chat'}
         chat = None if operation in account_only else number_id(job.get('provider_chat'), marked=True)
         message_operations = {'get_reactions', 'get_message_info', 'edit_message', 'delete_message',
                               'send_reaction', 'vote_poll', 'pin_message', 'unpin_message', 'mark_read'}
@@ -472,6 +496,72 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         peer = await input_peer(chat) if chat is not None else None
         channel = utils.get_input_channel(peer) if isinstance(peer, types.InputPeerChannel) else None
         basic_chat = peer.chat_id if isinstance(peer, types.InputPeerChat) else None
+
+        if operation in ('check_chat_link', 'join_chat'):
+            link = parameters['link']
+            if link[0] == '+':
+                try:
+                    invite = await invoke(functions.messages.CheckChatInviteRequest(link[1:]))
+                except errors.InviteHashExpiredError:
+                    reject('invite_expired')
+                except (errors.InviteHashInvalidError, errors.InviteHashEmptyError):
+                    reject('invite_invalid')
+                if isinstance(invite, types.ChatInvite):
+                    target = None
+                    observed = {'title': safe_text(invite.title, 255),
+                                'kind': 'channel' if invite.broadcast else 'group',
+                                'member_count': safe_int(invite.participants_count),
+                                'approval_required': bool(invite.request_needed),
+                                'paid': invite.subscription_pricing is not None,
+                                'membership': 'not_member', 'membership_basis': 'provider_invite'}
+                elif (isinstance(invite, (types.ChatInviteAlready, types.ChatInvitePeek)) and
+                        isinstance(invite.chat, (types.Chat, types.Channel))):
+                    target = invite.chat
+                    observed = link_chat(target, 'member' if isinstance(invite, types.ChatInviteAlready) else 'not_member',
+                                         'provider_invite')
+                else:
+                    reject('provider_reference_mismatch')
+            else:
+                try:
+                    target = await rpc(lambda: client.get_entity(link[1:]))
+                except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError, ValueError):
+                    reject('invite_invalid')
+                if not isinstance(target, types.Channel):
+                    reject('invite_invalid')  # A user or bot name is not a chat link.
+                observed = link_chat(target, {True: 'not_member', False: 'member'}.get(target.left, 'unknown'),
+                                     'provider_public_chat')
+            if operation == 'check_chat_link':
+                return {'outcome': 'confirmed', **observed}
+            # The digest the owner confirmed names this chat; the link must still lead to it.
+            expected = job.get('expected_chat')
+            if not isinstance(expected, dict) or (observed['title'], observed['kind']) != (
+                    expected.get('title'), expected.get('kind')):
+                reject('operation_target_changed')
+            if observed['membership'] == 'member':
+                reject('already_member')
+            if observed['paid']:
+                reject('join_not_allowed')
+            if observed['membership'] != 'not_member':
+                reject('operation_target_changed')
+            request = (functions.messages.ImportChatInviteRequest(link[1:]) if link[0] == '+' else
+                       functions.channels.JoinChannelRequest(utils.get_input_channel(target)))
+            try:
+                response = await invoke(request, mutation=True)
+            except errors.InviteRequestSentError:
+                return {'outcome': 'confirmed', 'state': 'pending_approval', 'basis': 'provider_join_request_sent'}
+            except tuple(kind for kind, _ in JOIN_CHAT_REFUSALS) as error:
+                started_mutation = False  # A definite refusal: the provider joined nothing.
+                reject(next(code for kind, code in JOIN_CHAT_REFUSALS if isinstance(error, kind)))
+            joined = [c for c in getattr(response, 'chats', [])[:100] if isinstance(c, (types.Chat, types.Channel)) and
+                      (target is None or utils.get_peer_id(c) == utils.get_peer_id(target))]
+            if len(joined) != 1 or peer_id(joined[0]) is None:
+                return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
+            provider = peer_id(joined[0])
+            if allowed_provider_id(provider):
+                return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'collected', 'provider_chat_id': provider,
+                        'basis': 'provider_joined_chat'}
+            return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'not_collected', 'next_step': JOIN_NEXT_STEP,
+                    'basis': 'provider_joined_chat'}
 
         if operation in ('chat_info', 'get_invite_link'):
             if channel:

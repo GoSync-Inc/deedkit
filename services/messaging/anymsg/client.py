@@ -31,7 +31,7 @@ SAFE_ERROR_CODES = frozenset({
     'formatting_too_complex','unsupported_message_formatting',
     'lossy_formatting_requires_confirmation','message_too_long','preview_required','preview_mismatch',
     'unsupported_operation','invalid_operation_parameters','operation_disabled','operation_not_ready',
-    'operation_target_changed','operation_access_changed','operation_result_unknown',
+    'operation_target_changed','operation_access_changed','operation_result_unknown','already_member',
     'operation_expired','operation_rejected','invalid_operation_result',
     'reply_target_changed','invalid_subscription','subscription_limit','subscription_conflict','subscription_closed',
     'subscription_access_changed','invalid_subscription_state',

@@ -152,3 +152,52 @@ def test_group_admin_catalog_support():
             validate_operation('whatsapp', name, {'enabled': True}, provider='webjs')
     assert 'overwritten' in telegram['set_group_messages_admins_only']['limitation']
     assert telegram['set_slow_mode']['parameters_schema']['seconds']['format'].startswith('one of 0, 10')
+
+
+# spec: ANYM-243
+def test_chat_link_validation():
+    from messaging_service.messenger_operations import ParameterError
+    def errors(platform, parameters, operation='check_chat_link'):
+        with pytest.raises(ParameterError, match='^invalid_operation_parameters$') as failure:
+            validate_operation(platform, operation, parameters, provider='whatsmeow')
+        return failure.value.field_errors
+    def key(platform, link, operation='check_chat_link'):
+        return validate_operation(platform, operation, {'link': link}, provider='whatsmeow')['link']
+    assert key('telegram', 'https://t.me/+AbCd_123-xyz') == '+AbCd_123-xyz'
+    assert key('telegram', 'https://t.me/joinchat/AbCd1234') == '+AbCd1234'
+    assert key('telegram', 'https://t.me/Synthetic_Channel', 'join_chat') == '@synthetic_channel'
+    assert key('telegram', '@Synthetic_Channel') == '@synthetic_channel'
+    bare = errors('telegram', {'link': 'Synthetic_Channel'})
+    assert bare[0]['field'] == 'link' and bare[0]['reason'] == 'format'
+    assert 'https://t.me/+CODE' in bare[0]['expected'] and '@NAME' in bare[0]['expected']
+    for link in ('https://t.me/+AbCd1234?start=1', 'https://t.me/name_x#frag', 'https://t.me/+short',
+                 'https://t.me/1abcde', 'http://t.me/+AbCd1234', 'https://example.com/+AbCd1234'):
+        assert errors('telegram', {'link': link})[0]['reason'] == 'format', link
+    assert key('whatsapp', 'https://chat.whatsapp.com/AbCd1234EfGh') == 'AbCd1234EfGh'
+    assert key('whatsapp', 'AbCd1234EfGh', 'join_chat') == 'AbCd1234EfGh'
+    channel = errors('whatsapp', {'link': 'https://whatsapp.com/channel/0029AbCd1234'})
+    assert channel[0]['reason'] == 'format' and 'not yet supported' in channel[0]['expected']
+    assert errors('whatsapp', {'link': 'https://chat.whatsapp.com/AbCd1234?x=1'})[0]['reason'] == 'format'
+    assert errors('whatsapp', {'link': 'AbCd_1234'})[0]['reason'] == 'format'
+    assert errors('telegram', {})[0]['reason'] == 'required'
+    assert errors('telegram', {'link': 5})[0]['reason'] == 'type'
+    assert errors('telegram', {'link': '@name_x', 'chat_id': 'x'})[0] == {
+        'field': 'chat_id', 'reason': 'unknown_field', 'expected': 'only link'}
+
+
+# spec: ANYM-243
+def test_chat_link_catalog():
+    check, join = operation_spec('check_chat_link'), operation_spec('join_chat')
+    assert (check['permission'], check['target'], check['full_account'], check['mutation']) == (
+        'groups-read', 'account', True, False)
+    assert (join['permission'], join['target'], join['full_account'], join['mutation']) == (
+        'groups-manage', 'account', True, True)
+    telegram = {r['operation']: r for r in operation_manifest('telegram')}
+    native = {r['operation']: r for r in operation_manifest('whatsapp', provider='whatsmeow')}
+    browser = {r['operation']: r for r in operation_manifest('whatsapp', provider='webjs')}
+    for name in ('check_chat_link', 'join_chat'):
+        assert telegram[name]['supported'] and native[name]['supported'] and not browser[name]['supported']
+        assert 'native' in browser[name]['limitation']
+        with pytest.raises(ValueError, match='unsupported_operation'):
+            validate_operation('whatsapp', name, {'link': 'AbCd1234EfGh'}, provider='webjs')
+    assert 'check_chat_link' in telegram['join_chat']['limitation']

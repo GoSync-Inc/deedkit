@@ -40,6 +40,10 @@ _users = {'user_ids': _field('contact_ids', required=True)}
 SLOW_MODE_SECONDS = [0, 10, 30, 60, 300, 900, 3600]
 RIGHTS_RACE = ('Changes only this restriction; on Telegram an administrator edit made between the read and the '
     'write can be overwritten.')
+_link = {'link': _field('chat_link', required=True)}
+JOIN_LIMITATION = ('Needs a check_chat_link of this link by the same key within 60 minutes showing not_member; '
+    'pending_approval is not a join. A joined chat is visible to no chat-scoped key and to full-account keys '
+    'only when the collection policy collects it. Leave with leave_group.')
 BATCH_LIMITATION = ('One row per ID: applied, refused, unknown or not_attempted; an uncertain ID is never retried.')
 OPERATIONS = {
     'chat_info': _spec('read-live'),
@@ -118,6 +122,10 @@ OPERATIONS = {
         limitation='First page of pending requests; names and notes are untrusted requester text.'),
     'approve_join_requests': _spec('groups-manage', mutation=True, fields=_users, limitation=BATCH_LIMITATION),
     'reject_join_requests': _spec('groups-manage', mutation=True, fields=_users, limitation=BATCH_LIMITATION),
+    'check_chat_link': _spec('groups-read', 'account', full_account=True, fields=_link,
+        limitation='Passive live read of an invite or public link; no member list, inviter or description.'),
+    'join_chat': _spec('groups-manage', 'account', mutation=True, full_account=True, fields=_link,
+        limitation=JOIN_LIMITATION),
     'add_contact': _spec('contacts-manage', 'account', mutation=True, full_account=True,
         fields={
             'phone': _field('phone', required=True),
@@ -155,13 +163,15 @@ NATIVE_UNSUPPORTED=frozenset(('add_contact','delete_contact','get_labels','set_c
 # ANYM-242: native adapter only on WhatsApp; the browser fallback never substitutes another action.
 GROUP_ADMIN_OPERATIONS=('set_group_messages_admins_only','set_group_info_admins_only','set_slow_mode',
     'set_join_approval','list_join_requests','approve_join_requests','reject_join_requests')
+# ANYM-243: likewise native only; the browser fallback never joins through another path.
+CHAT_LINK_OPERATIONS=('check_chat_link','join_chat')
 
 
 def _supported(platform, name, spec, provider=None):
     if platform not in spec['platforms']:return False
     if platform!='whatsapp':return True
     if provider=='whatsmeow':return name not in NATIVE_UNSUPPORTED
-    return name not in ('delete_message','request_chat_history','open_chat_by_phone')+GROUP_ADMIN_OPERATIONS
+    return name not in ('delete_message','request_chat_history','open_chat_by_phone')+GROUP_ADMIN_OPERATIONS+CHAT_LINK_OPERATIONS
 
 
 def _fields(platform, name, spec):
@@ -206,7 +216,7 @@ def operation_manifest(platform, *, provider=None):
             row['limitation']='Archived attachment or own destination-bound uploaded SHA-256 original only; 32 MiB bound. Sticker requires existing WebP. Audio/voice/sticker captions are unsupported; no implicit conversion.'
         elif platform=='whatsapp' and provider=='whatsmeow' and name=='forward_message':
             row['limitation']='Authorized retained ordinary content only; control, view-once and poll replay are unsupported.'
-        elif platform=='whatsapp' and provider!='whatsmeow' and name in GROUP_ADMIN_OPERATIONS and platform in spec['platforms']:
+        elif platform=='whatsapp' and provider!='whatsmeow' and name in GROUP_ADMIN_OPERATIONS+CHAT_LINK_OPERATIONS and platform in spec['platforms']:
             row['limitation']='Unsupported here: native WhatsApp (whatsmeow) accounts only.'
         elif name == 'open_chat_by_phone' and not row['supported']:
             row['limitation'] = 'Unsupported here: native WhatsApp (whatsmeow) accounts only.'
@@ -241,6 +251,18 @@ def phone_digits(value):
     return (text, None) if 7 <= len(text) <= 15 else (None, None)
 
 
+def chat_link_key(platform, value):
+    """The normalized link key (Telegram +CODE or lowercase @name; WhatsApp CODE), or None. No URL is fetched."""
+    if not isinstance(value, str) or len(value) > 128: return None
+    if platform == 'telegram':
+        code = re.fullmatch(r'https://t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]{8,64})', value, re.ASCII)
+        if code: return '+' + code.group(1)
+        name = re.fullmatch(r'(?:https://t\.me/|@)([A-Za-z][A-Za-z0-9_]{4,31})', value, re.ASCII)
+        return '@' + name.group(1).lower() if name else None
+    code = re.fullmatch(r'(?:https://chat\.whatsapp\.com/)?([A-Za-z0-9]{8,64})', value, re.ASCII)
+    return code.group(1) if code else None
+
+
 def _modes(platform):
     return ['document', 'photo', 'video', 'audio', 'voice'] + (['video_note'] if platform == 'telegram' else ['sticker'])
 
@@ -262,6 +284,11 @@ def parameter_format(platform, kind):
         'phone_number': 'international number with its country code, such as +49 151 1234-5678 or 0049 (151) 12345678; '
             'spaces, dashes, dots and parentheses are ignored; 7-15 digits, no national trunk 0',
         'file_mode': 'one of ' + ', '.join(_modes(platform)),
+        'chat_link': ('https://t.me/+CODE, https://t.me/joinchat/CODE (CODE 8-64 letters, digits, _ or -), '
+            'https://t.me/NAME or @NAME (NAME 5-32 letters, digits or _, starting with a letter); '
+            'no query string or fragment' if platform == 'telegram' else
+            'https://chat.whatsapp.com/CODE or bare CODE (8-64 letters or digits); no query string or fragment; '
+            'WhatsApp channel links are not yet supported'),
         'slow_mode_seconds': 'one of ' + ', '.join(map(str, SLOW_MODE_SECONDS)) + ' seconds; 0 turns slow mode off',
         'poll_options': '2-10 unique non-blank strings of at most 100 UTF-16 code units',
         'poll_indices': 'up to 20 unique integers from 0 to 9 (zero-based option positions)',
@@ -296,6 +323,12 @@ def _problem(platform, descriptor, value, field):
     if kind == 'phone_number':
         if not isinstance(value, str): return fail('type', 'string')
         return None if phone_digits(value)[0] else fail('format', parameter_format(platform, kind))
+    if kind == 'chat_link':
+        if not isinstance(value, str): return fail('type', 'string')
+        if chat_link_key(platform, value): return None
+        if platform == 'whatsapp' and re.match(r'https://(www\.)?whatsapp\.com/channel/', value):
+            return fail('format', 'WhatsApp channel links are not yet supported; ' + parameter_format(platform, kind))
+        return fail('format', parameter_format(platform, kind))
     if kind == 'slow_mode_seconds':
         if type(value) is not int: return fail('type', 'integer')
         return None if value in SLOW_MODE_SECONDS else fail('enum', allowed=SLOW_MODE_SECONDS)
@@ -345,7 +378,8 @@ def validate_operation(platform, operation, parameters, *, provider=None):
             else: value = parameters[name]
             problem = _problem(platform, descriptor, value, name)
             if problem: errors.extend(problem)
-            else: output[name] = phone_digits(value)[0] if descriptor['type'] == 'phone_number' else value
+            else: output[name] = (phone_digits(value)[0] if descriptor['type'] == 'phone_number' else
+                chat_link_key(platform, value) if descriptor['type'] == 'chat_link' else value)
         # Only a bounded identifier name is returned; the submitted value never is.
         allowed = 'only ' + ', '.join(fields) if fields else 'no parameters'
         for name in parameters:

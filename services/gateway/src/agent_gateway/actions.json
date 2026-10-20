@@ -17,6 +17,9 @@
   "chat_info": [
     "read-live"
   ],
+  "check_chat_link": [
+    "groups-read"
+  ],
   "create_group": [
     "groups-manage"
   ],
@@ -56,6 +59,9 @@
   ],
   "get_reactions": [
     "read-live"
+  ],
+  "join_chat": [
+    "groups-manage"
   ],
   "leave_group": [
     "groups-manage"
