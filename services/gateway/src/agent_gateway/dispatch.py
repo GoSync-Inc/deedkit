@@ -25,6 +25,7 @@ CALENDAR_CONSTRAINTS = {
     "cache_max_age_seconds",
     "refresh_wait_seconds",
     "plan_action_limit",
+    "plan_step_limit",
     "plan_ttl_seconds",
     "atomic_cross_provider",
     "availability_sources",
@@ -273,6 +274,11 @@ class Dispatch:
                 and "cursor-write" not in (set(agent["grants"].get(module, [])) & set(caps["permissions"]))):
             raise Denied()
         if not self.implemented(tool, snapshot, agent, caps, args.get("account")):
+            raise Denied()
+        if (module == "calendar" and tool["operation"] == "plan"
+                and any(isinstance(a, dict) and a.get("action") == "project" for a in args.get("actions", []))
+                and "assignment:read" not in set(agent["grants"].get(module, [])) & set(caps["permissions"])):
+            # A projection is planned from guardian rules: the same assignment ceiling as rules in members.
             raise Denied()
         allowed_actions = self.actions(snapshot, agent, caps) if module == "messaging" else []
         if tool["operation"] == "get_messenger_operation":

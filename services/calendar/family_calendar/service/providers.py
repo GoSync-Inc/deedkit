@@ -30,6 +30,8 @@ from .store import digest, instant
 
 # Occurrences published for one calendar window; the same limit as agenda/slots responses.
 EVENT_LIMIT = 500
+# Private extended property of a projected Google event; its value is the random link ID only.
+LINK_PROPERTY = "deedkitLink"
 # dateutil (behind recurring_ical_events) walks and caches every rule instance from
 # DTSTART up to the window end, even for a narrow window. Bound that work before
 # expansion: per resource for memory, per calendar window for CPU.
@@ -423,6 +425,8 @@ class Providers:
         return times
 
     async def prepare(self, cal, step):
+        if step.get("projection") and cal["provider"] != "google":
+            raise CalendarError("provider_not_supported")
         target = step["target_id"]
         event = step.get("event", {})
         occurrence = step.get("occurrence")
@@ -460,6 +464,12 @@ class Providers:
             )
             if step["action"] == "create":
                 desired["id"] = target
+            projection = step.get("projection")
+            if projection:
+                # The one marker: an opaque random link ID, nothing derived from the child or the lesson.
+                desired["extendedProperties"] = {"private": {LINK_PROPERTY: projection["link_id"]}}
+                if projection["visibility"] == "private":
+                    desired["visibility"] = "private"
             intent["desired"] = desired
         elif occurrence:
             if step["action"] == "delete":

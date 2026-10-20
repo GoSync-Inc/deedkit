@@ -213,3 +213,34 @@ def test_plan_error_names_the_missing_field_in_both_transports(household):
         ).json()["result"]
     assert rest.json() == mcp["structuredContent"] == expected and mcp["isError"] is True
     assert rest.status_code == 409
+
+
+# spec: ANYM-433
+def test_project_refusal_names_skipped_rules_in_both_transports(store):
+    from family_calendar.service.api import create_app
+    from tests.service.test_projection import household, project
+
+    _, key, drop, pick = household(store)
+    store.guardian_rule_disable(drop)
+    store.guardian_rule_disable(pick)
+    expected = {
+        "error": "nothing_to_project",
+        "projections_skipped": [
+            {"rule_id": drop, "duty": "dropoff", "guardian_id": "adult-a", "reason": "disabled"},
+            {"rule_id": pick, "duty": "pickup", "guardian_id": "adult-b", "reason": "disabled"},
+        ],
+        "activities": [],
+    }
+    c = TestClient(create_app(store, port=13232), base_url="http://127.0.0.1:13232")
+    with c:
+        h = {"Authorization": "Bearer " + key}
+        r = c.post("/v1/plan", json={"actions": [project()]}, headers=h)
+        assert (r.status_code, r.json()) == (409, expected)
+        r = c.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "family_plan", "arguments": {"actions": [project()]}}},
+            headers={**h, "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18"},
+        )
+        result = r.json()["result"]
+        assert result["isError"] is True and result["structuredContent"] == expected
