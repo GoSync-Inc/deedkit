@@ -1347,3 +1347,50 @@ func TestJoinOutcomes(t *testing.T) {
 		}
 	}
 }
+
+// spec: ANYM-243
+func TestJoinUnverifiedReceiptIsUnknown(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		node waBinary.Node
+	}{
+		{"no jid", waBinary.Node{Tag: "group"}},
+		{"jid of wrong type", waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"jid": "not-a-jid"}}},
+		{"user jid", waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"jid": types.NewJID("111", types.DefaultUserServer)}}},
+		{"another group", waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"jid": types.NewJID("15550000000-000000000", types.GroupServer)}}},
+		{"pending without jid", waBinary.Node{Tag: "membership_approval_request"}},
+		{"pending for another group", waBinary.Node{Tag: "membership_approval_request", Attrs: waBinary.Attrs{"jid": types.NewJID("15550000000-000000000", types.GroupServer)}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			node := c.node
+			r := &recordingIQ{reply: linkReply(nil, func() (*waBinary.Node, error) { return iqResult(node), nil })}
+			result, err := runOperation(context.Background(), groupJob("join_chat"), groupOperationDeps(t, r))
+			if data := operationResult(t, result, err, "unknown"); !reflect.DeepEqual(data, map[string]any{"code": "provider_operation_uncertain"}) || joinQueries(r) != 1 {
+				t.Fatalf("%#v joins=%d", data, joinQueries(r))
+			}
+		})
+	}
+}
+
+// spec: ANYM-243
+func TestJoinRefusalsSurviveTheWireSanitizer(t *testing.T) {
+	for _, code := range []string{"invite_invalid", "invite_expired", "chat_full", "join_not_allowed", "already_member", "operation_target_changed"} {
+		if got := safeError(errors.New(code)); got != code {
+			t.Fatalf("%s crosses the lane as %s", code, got)
+		}
+	}
+}
+
+// spec: ANYM-243
+func TestJoinFrameFromPythonKeepsConfirmedChat(t *testing.T) {
+	// The params Python's NodeProvider serializes for join_chat (test_messenger_commands.py).
+	frame := `{"operation":"join_chat","expires_at":1792464303.716908,"parameters":{"link":"https://chat.whatsapp.com/` + testInviteCode + `"},` +
+		`"provider_chat":null,"provider_message_id":null,"expected_chat":{"kind":"group","title":"Linked","member_count":12}}`
+	var job operationRequest
+	if err := decodeStrict(json.RawMessage(frame), &job); err != nil || job.ExpectedChat == nil {
+		t.Fatalf("%v %#v", err, job.ExpectedChat)
+	}
+	if job.ExpectedChat.Title != "Linked" || job.ExpectedChat.Kind != "group" || job.ExpectedChat.MemberCount == nil || *job.ExpectedChat.MemberCount != 12 {
+		t.Fatalf("%#v", job.ExpectedChat)
+	}
+}

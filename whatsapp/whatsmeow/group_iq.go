@@ -454,14 +454,19 @@ func (g groupIQ) joinLink(ctx context.Context, code string) (jid types.JID, pend
 	if err != nil {
 		return types.EmptyJID, false, inviteError(err)
 	}
-	if node, ok := res.GetOptionalChildByTag("membership_approval_request"); ok {
-		return node.AttrGetter().JID("jid"), true, nil
+	node, pending := res.GetOptionalChildByTag("membership_approval_request")
+	if !pending {
+		var ok bool
+		if node, ok = res.GetOptionalChildByTag("group"); !ok {
+			return types.EmptyJID, false, &whatsmeow.ElementMissingError{Tag: "group", In: "response to group link join query"}
+		}
 	}
-	node, ok := res.GetOptionalChildByTag("group")
-	if !ok {
-		return types.EmptyJID, false, &whatsmeow.ElementMissingError{Tag: "group", In: "response to group link join query"}
+	// An unreadable receipt is not a join the caller may confirm.
+	ag := node.AttrGetter()
+	if jid = ag.JID("jid"); !ag.OK() || jid.Server != types.GroupServer || jid.User == "" {
+		return types.EmptyJID, false, errors.New("join_receipt_unreadable")
 	}
-	return node.AttrGetter().JID("jid"), false, nil
+	return jid, pending, nil
 }
 
 // inviteError maps the invite IQ codes as the pinned helpers do.

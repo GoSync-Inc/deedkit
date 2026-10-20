@@ -326,7 +326,7 @@ class NodeProvider:
         payload={key:value for key,value in job.items() if key in (
             'operation','parameters','provider_chat','provider_message_id','expires_at',
             'source_provider_chat','source_provider_message','registered_file_path','trusted_blob_directory',
-            'file_digest','file_bytes','file_mime','file_name','known_chats','lookup_allowed')}
+            'file_digest','file_bytes','file_mime','file_name','known_chats','lookup_allowed','expected_chat')}
         if report is not None:report('started')
         if job['operation']=='open_chat_by_phone' and job.get('_archived') is not None:
             # First ask only the session store for the number's LID, then offer the

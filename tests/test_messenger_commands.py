@@ -834,3 +834,41 @@ def test_failed_join_preserves_send_and_collection(operator):
     archive.ingest(event(account='command-fixture',chat='100',provider_id='3',body='Still collected synthetic text'))
     assert any(m['body']=='Still collected synthetic text' for m in
                s.get_messages(key,stable_id('chat','command-fixture','100'))['items'])
+
+
+class NativeLane:
+    """Synthetic native pipe: keeps every serialized frame and answers with one frame."""
+    def __init__(self,answer):self.frames,self.answer,self.reader=[],answer,None
+    def write(self,data):
+        import json
+        frame=json.loads(data);self.frames.append(frame)
+        self.reader.feed_data(json.dumps({'id':frame['id'],**self.answer}).encode()+b'\n')
+    async def drain(self):pass
+
+
+# spec: ANYM-243
+@pytest.mark.parametrize('code',['invite_invalid','invite_expired','chat_full','join_not_allowed',
+                                 'already_member','operation_target_changed'])
+def test_native_join_carries_confirmed_chat_and_definite_refusal(operator,tmp_path,code):
+    from types import SimpleNamespace
+    from messaging_service.commands import CommandWorker
+    from messaging_service.whatsapp_collector import NodeProvider
+    s,_,key,state=operator
+    s.set_messenger_operations('command-fixture',['check_chat_link','join_chat'])
+    link_check(s,key,state)
+    queued=join_queue(s,key)
+    lane=NativeLane({'error':code})
+    native=NodeProvider({'events_directory':str(tmp_path/'events')},tmp_path/'unused',None)
+    native.process,native.send_writer=SimpleNamespace(returncode=None),lane
+    async def provider(job):
+        native.send_reader=lane.reader=asyncio.StreamReader()
+        async with native.send_gate:return await native.execute_operation(job)
+    assert asyncio.run(CommandWorker(state,provider).once())
+    (frame,)=lane.frames
+    assert frame['method']=='messenger_operation'
+    assert frame['params']['expected_chat']=={'title':'Synthetic link chat','kind':'group','member_count':12}
+    receipt=s.get_messenger_operation(key,queued['operation_id'])
+    assert receipt['status']=='failed' and receipt['error_code']==code
+    # A definite refusal leaves no unknown-join guard behind.
+    link_check(s,key,state,request_id='synthetic-check-0002')
+    assert join_queue(s,key,'synthetic-join-0002')['status']=='queued'

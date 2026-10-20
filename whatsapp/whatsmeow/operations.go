@@ -1482,11 +1482,15 @@ func chatLink(ctx context.Context, job operationRequest, d operationDependencies
 		}
 		return nil, err
 	}
+	if joined != info.JID {
+		// The receipt names another group than the one checked: unknown, never confirmed.
+		return nil, errors.New("join_receipt_mismatch")
+	}
 	if pending {
 		return operationOutput("confirmed", map[string]any{"state": "pending_approval"}, "")
 	}
 	data := map[string]any{"state": "joined", "archive": "not_collected", "next_step": "the operator adds this chat to the account's collection policy"}
-	if p, e := d.policy(); e == nil && p.Enabled && !joined.IsEmpty() && p.Allows(LegacyChatID(joined)) {
+	if p, e := d.policy(); e == nil && p.Enabled && p.Allows(LegacyChatID(joined)) {
 		data = map[string]any{"state": "joined", "archive": "collected", "provider_chat": LegacyChatID(joined)}
 	}
 	return operationOutput("confirmed", data, "")
