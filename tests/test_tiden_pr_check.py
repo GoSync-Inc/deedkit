@@ -578,3 +578,21 @@ def test_a_unicode_line_separator_in_a_test_file_does_not_shift_the_markers(repo
     assert code == 0, out
     assert "test_py -> ANYM-12" in out and "TestGo -> ANYM-12" in out and "node -> ANYM-12" in out
     assert "test_crlf -> ANYM-12" in out
+
+
+# spec: ANYM-405
+def test_line_breaks_follow_each_language_so_no_marker_authorizes_an_unrelated_test(repo, server):
+    server.set(main=[spec(12)])
+    code, out = run(repo, server, {
+        "tests/test_cr.py": "A = 1\rB = 2\rC = 3\ndef test_unmarked():\n    pass\n# spec: ANYM-12\n",
+        "web/ls.test.mjs": "// spec: ANYM-12\nconst x = 1; test('unmarked', () => {});\n",
+    }, "Spec: ANYM-12")
+    assert code == 1
+    assert "tests/test_cr.py:5 test_unmarked: no marker" in out
+    assert "web/ls.test.mjs:3 unmarked: no marker" in out and "-> ANYM-12" not in out
+    code, out = run(repo, server, {
+        "tests/test_cr_ok.py": "A = 1\rB = 2\r# spec: ANYM-12\rdef test_cr_ok():\r    pass\r",
+        "web/ls_ok.test.mjs": "const x = 1; // spec: ANYM-12 test('ok', () => {});\n",
+    }, "Spec: ANYM-12")
+    assert code == 0, out
+    assert "test_cr_ok -> ANYM-12" in out and "ok -> ANYM-12" in out
