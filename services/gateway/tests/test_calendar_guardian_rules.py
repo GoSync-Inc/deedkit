@@ -28,7 +28,7 @@ def gateway(tmp_path, local, backend, readiness=None, tools=("calendar_capabilit
 
         async def call(self, module, operation, credential, arguments):
             if operation == "capabilities":
-                features = {"agenda": True} | ({"carry_projections": True} if carry else {})
+                features = {"agenda": True} | ({"carry_projections": True, "projection_status": True} if carry else {})
                 caps = {"permissions": backend, "calendars": [], "features": features,
                         "constraints": {"plan_action_limit": 8, "plan_step_limit": 16}}
                 return caps | ({"guardian_projections": readiness} if readiness else {})
@@ -36,6 +36,9 @@ def gateway(tmp_path, local, backend, readiness=None, tools=("calendar_capabilit
                 if sent is not None:
                     sent.append(arguments)
                 return plan or {"plan_id": "plan-synthetic", "steps": [], "projections_skipped": []}
+            if operation == "agenda":
+                sent.append(arguments)
+                return {"events": [], "coverage": [], "required_sources_complete": True}
             # The backend already applied its own rule-read policy for its adult key.
             return {"group_id": "family", "members": [
                 {"person_id": "adult-a", "role": "group_admin", "label": "A"},
@@ -190,3 +193,24 @@ def test_gateway_asks_for_carried_drives_only_under_its_ceiling(tmp_path, local,
     # The agent's own value never counts.
     asyncio.run(dispatch.call("gateway-a", "calendar_plan", {"actions": [lesson], "carry_projections": True}))
     assert sent[0].get("carry_projections") is expected
+
+
+# spec: ANYM-436
+@pytest.mark.parametrize(
+    ("local", "backend", "declared", "expected"),
+    [
+        (["agenda:read"], ["agenda:read", "assignment:read"], True, None),
+        (["agenda:read", "assignment:read"], ["agenda:read"], True, None),
+        # A backend that predates the field would refuse it as an unknown argument.
+        (["agenda:read", "assignment:read"], ["agenda:read", "assignment:read"], False, None),
+        (["agenda:read", "assignment:read"], ["agenda:read", "assignment:read"], True, True),
+    ],
+)
+def test_gateway_asks_for_drive_links_only_under_its_ceiling(tmp_path, local, backend, declared, expected):
+    sent = []
+    dispatch = gateway(tmp_path, local, backend, tools=("calendar_capabilities", "calendar_agenda"),
+                       carry=declared, sent=sent)
+    window = {"calendar_refs": ["cal-a"], "start": "2026-10-20T00:00:00Z", "end": "2026-10-21T00:00:00Z"}
+    # The agent's own value never counts.
+    asyncio.run(dispatch.call("gateway-a", "calendar_agenda", window | {"projection_status": True}))
+    assert sent[0].get("projection_status") is expected
