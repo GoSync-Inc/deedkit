@@ -53,7 +53,8 @@ def rule_findings(call):
             if evidence:
                 add('missing_result','Ответ без найденной цитаты',f"Поле {answer['field']}: цитата не найдена в финальных репликах.",evidence,
                     'Подтвердить точную цитату собеседника; не представлять ответ как проверенный факт.')
-    reconnects=[e for e in call['events'] if e['kind']=='media_session' and e.get('ended_by')=='handover']
+    # A reconnect is an admitted new media session, not an attempt that timed out.
+    reconnects=[e for e in call['events'] if e['kind']=='keypress_handover' and e.get('outcome')=='resumed']
     if reconnects:
         # ANYM-451: said in plain words, not a fault by itself.
         add('keypress_handover','Звонок переподключался, чтобы отправить клавишу',

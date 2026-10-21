@@ -23,12 +23,14 @@ ACTIVE={"waiting_for_browser","dialing","ringing","connecting","active"}
 INBOUND_KEYS=('input_active_ms','input_frames','input_pcm_ms','input_zero_frames')
 
 
-def inbound_audio_verdict(events,connected):
+def inbound_audio_verdict(events,connected,generation=1):
     """One plain verdict from the inbound_audio counters (ANYM-426): energy at or above RMS 400, not speech.
     A call reconnected to send a key (ANYM-451) has one media session per generation: the verdict is
-    call-level over every session's last counters; a single-session call reads its last event as before."""
+    call-level over every session's last counters; a single-session call reads its last event as before. The call's
+    generation counts admitted sessions, so one that never wrote its final counters makes the verdict unknown."""
     if not connected:return {'heard':None,'reason':None}
-    sessions=max([e['generation'] for e in events if e.get('kind')=='media_session' and type(e.get('generation')) is int] or [1])
+    sessions=max([e['generation'] for e in events if e.get('kind')=='media_session' and type(e.get('generation')) is int]+
+                 [generation if type(generation) is int else 1])
     audios=[e for e in events if e.get('kind')=='inbound_audio']
     if sessions<=1:
         parts=[next((e.get('audio') for e in reversed(audios)),None)]
@@ -411,11 +413,11 @@ class VoiceService:
             value['events']=[json.loads(r[0]) for r in self.db.execute('SELECT body FROM voice_events WHERE call_id=? ORDER BY seq',(identity,))]
         return value
 
-    def _save_call(self,v):
+    def _save_call(self,v,report=True):
         body={k:x for k,x in v.items() if k!='events'}
         body['event_storage']=1
         self.db.execute("UPDATE calls SET body=? WHERE id=?",(json.dumps(body,ensure_ascii=False),v["id"]))
-        if hasattr(self,'learning') and v['status'] not in ACTIVE:
+        if report and hasattr(self,'learning') and v['status'] not in ACTIVE:
             self.learning.enqueue(v)
         self.db.commit()
 
@@ -575,7 +577,8 @@ class VoiceService:
             v=self.get_call(identity)
             v.update(values)
             self._event(v,{'kind':'provider_status',**values})
-            self._save_call(v)
+            # One post-call report per call (ANYM-451): a status that arrives after the terminal save only records it.
+            self._save_call(v,report=False)
             return v
 
     def stop(self,identity,reason="owner_stop"):
@@ -583,7 +586,7 @@ class VoiceService:
             v=self.get_call(identity)
             if v["status"] in ACTIVE:
                 # A diagnostic failure must never change how the call ends (ANYM-409 isolation).
-                try:v['inbound_audio']=inbound_audio_verdict(v['events'],v['status']=='active')
+                try:v['inbound_audio']=inbound_audio_verdict(v['events'],v['status']=='active',v.get('generation',1))
                 except Exception:v['inbound_audio']={'heard':None,'reason':'unknown'}
                 # Derived in this terminal save, so the first analysis snapshot has them; a failure changes nothing else.
                 try:
@@ -1214,23 +1217,29 @@ class VoiceService:
             v=self.get_call(identity)
         presses=[{k:p[k] for k in ('keys','dtmf_path','note') if p.get(k) is not None} for p in v.get('keypresses',[])]
         sent=next((p['keys'] for p in reversed(presses) if p['dtmf_path']=='out_of_band'),'')
-        state={'collected_fields':[f for f in v['brief']['success_fields'] if f in v['answers']],
-               'owner_decisions':[{'decision_id':d['id'],'status':d['status'],'question':d['question'],
+        # Recorded values and each decision's exact scope stay here even when history drops the turns they came from.
+        state={'collected_fields':{f:v['answers'][f].get('value') for f in v['brief']['success_fields'] if f in v['answers']},
+               'owner_decisions':[{'decision_id':d['id'],'status':d['status'],'round':d.get('round'),'question':d['question'],
+                                   'options':d.get('options'),'conditions':d.get('conditions',{}),
                                    **({'owner_answer':d['answer']} if d['status']=='answered' else {})}
                                   for d in v['decisions'] if d['status'] in {'pending','answered'}],
                'key_presses':presses}
-        turns,tails=[],{'user':[],'assistant':[]}
+        # A turn sits where its first chunk was said; its final text replaces the chunks, so nothing repeats.
+        labels={'user':'counterparty','assistant':'you'}
+        turns,tails,open_at=[],{'user':[],'assistant':[]},{}
         for e in v['events']:
             role=e.get('role')
             if role not in tails:
                 continue
             if e['kind']=='transcript':
-                turns.append(('counterparty' if role=='user' else 'you')+': '+e['text']);tails[role]=[]
+                line=labels[role]+': '+e['text']
+                if role in open_at:turns[open_at.pop(role)]=line
+                else:turns.append(line)
+                tails[role]=[]
             elif e['kind']=='transcript_chunk':
                 tails[role].append(e['text'])
-        for role,label in (('user','counterparty'),('assistant','you')):
-            if tails[role]:
-                turns.append(label+' (unfinished): '+''.join(tails[role]))
+                if role not in open_at:open_at[role]=len(turns);turns.append(None)
+                turns[open_at[role]]=labels[role]+' (unfinished): '+''.join(tails[role])
         kept,size=[],0
         for line in reversed(turns):
             if size+len(line)+1>RESUME_HISTORY_CHARS:
@@ -1354,13 +1363,14 @@ class VoiceService:
                     'followup':v['brief'].get('followup'),'approval_fields':v['brief'].get('approval_fields',[]),
                     'events':[e for e in v['events'] if e['kind'] in {'transcript','tool','owner_decision'}]}
 
-    def finish_consultation(self,identity,consultation_id,status,advice=None):
+    def finish_consultation(self,identity,consultation_id,status,advice=None,generation=None):
         with self.lock:
             v=self.get_call(identity)
             q=next(q for q in v.get('consultations',[]) if q['id']==consultation_id)
             if q['status']!='pending':
                 return v['tool_results'][q['tool_call_id']]
-            if v['status']!='active' or v.get('close_requested') or q['conditions']!=self._conditions(v):
+            # Advice that returns to a retired media session (ANYM-451) is obsolete, never the call's answer.
+            if v['status']!='active' or v.get('close_requested') or q['conditions']!=self._conditions(v) or not self._current(v,generation,'consult_supervisor'):
                 status,advice='obsolete',None
             result={'consultation_id':consultation_id,'status':status,'advice_only':True,
                     'external_action_authorized':False,'next_action':'ask_owner'}

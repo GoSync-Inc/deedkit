@@ -97,11 +97,11 @@ def handler_harness(monkeypatch):
         async def send_server_message(self,message):pass
         def event_handler(self,name):return lambda fn:fn
     class Worker:
-        def __init__(self,*args,**kwargs):self.rtvi,self.handlers=RTVI(),{}
+        def __init__(self,*args,**kwargs):self.rtvi,self.handlers,self.frames=RTVI(),{},[]
         def event_handler(self,name):
             def keep(fn):self.handlers[name]=fn;return fn
             return keep
-        async def queue_frames(self,frames):pass
+        async def queue_frames(self,frames):self.frames.extend(frames)
     class Runner:
         def __init__(self,**kwargs):pass
         async def add_workers(self,worker):seen[-1]['worker']=worker
@@ -120,6 +120,7 @@ def handler_harness(monkeypatch):
     async def session(store,cid,state):
         transport=twilio_pipeline()[1]
         await voice.run_transport(transport,store.get_call(cid)['brief'],'fixture-not-a-key',state)
+        state['test_worker']=seen[-1]['worker']
         return seen[-1]['handle'],seen[-1]['worker'].handlers['on_pipeline_started'],contexts[-1]
     return session,tones
 
@@ -145,15 +146,18 @@ async def test_delivery_admission_is_call_scoped_and_never_repeated(tmp_path,mon
     handle,_,_=await session(store,cid,first)
     args={'keys':'3','menu_quote':MENU}
     assert (await call_tool(handle,'press_keys',args,'p1'))['tones_ms']==520 and tones==['3']
-    # The update is in flight: a retry of the same tool call and a concurrent distinct press change nothing.
-    pending=asyncio.create_task(call_tool(handle,'press_keys',args,'p2'))
+    # The update is in flight and the model already has its stay-silent result: a successful update may retire
+    # this session before Twilio answers. A retry of the same tool call and a concurrent distinct press change nothing.
+    early=[]
+    async def result(value):early.append(value)
+    pending=asyncio.create_task(handle('press_keys',SimpleNamespace(arguments=args,tool_call_id='p2',result_callback=result)))
     await asyncio.sleep(0.05)
-    assert updates==['3']
+    assert updates==['3'] and [r['next_action'] for r in early]==['The call reconnects in a few seconds; stay silent.']
     retry=await call_tool(handle,'press_keys',args,'p2')
     other=await call_tool(handle,'press_keys',{'keys':'5','menu_quote':MENU},'p3')
     assert other=={'error':'handover_in_progress','ok':False,'next_action':'Wait for the reconnect.'}
-    gate.set();sent=await pending
-    assert sent['delivery']=='out_of_band' and retry['delivery']=='out_of_band' and updates==['3'] and tones==['3']
+    gate.set();await pending;sent=early[-1]
+    assert len(early)==1 and sent['delivery']=='out_of_band' and retry['delivery']=='out_of_band' and updates==['3'] and tones==['3']
     assert store.activate_generation(cid)==2
     second={**first,'generation':2,'resume':True}
     handle2,_,_=await session(store,cid,second)
@@ -176,6 +180,16 @@ async def test_delivery_admission_is_call_scoped_and_never_repeated(tmp_path,mon
     for i in range(KEYPRESS_LIMIT-accepted):
         assert store.tool(cid,'press_keys',args|{'keys':'7'},'cap-'+str(i),generation=3)['ok'] is True
     assert store.tool(cid,'press_keys',args|{'keys':'7'},'cap-last',generation=3)=={'error':'keypress_limit'}
+    store.close()
+    # A definite rejection keeps the session: after the stay-silent result it gets a plain server note.
+    store=VoiceService(tmp_path/'rejected');cid=active_call(store)
+    async def refuse(keys):return 'rejected'
+    state={'service':store,'call_id':cid,'websocket':True,'generation':1,'out_of_band':refuse}
+    handle,_,_=await session(store,cid,state)
+    await call_tool(handle,'press_keys',args,'r1')
+    assert (await call_tool(handle,'press_keys',args,'r2'))['delivery']=='out_of_band'
+    note=[f.text for f in state['test_worker'].frames if getattr(f,'text','').startswith('KEY NOT SENT')]
+    assert len(note)==1 and 'out_of_band_rejected' in note[0] and store.get_call(cid)['tool_results']['r2']['delivery']=='out_of_band_rejected'
     store.close()
 
 
@@ -323,6 +337,10 @@ async def phone(tmp_path,monkeypatch,**kwargs):
         finally:await harness.shutdown()
 
 
+def reports(service,cid):
+    return service.db.execute('SELECT COUNT(*) FROM voice_reports WHERE call_id=?',(cid,)).fetchone()[0]
+
+
 def ended(service,cid,generation):
     return any(e['kind']=='media_session' and e['generation']==generation for e in service.get_call(cid)['events'])
 
@@ -332,13 +350,33 @@ async def test_handover_generations_and_one_terminal_winner(tmp_path,monkeypatch
     async with phone(tmp_path,monkeypatch) as p:
         service=p.service
         # Order A: the new stream connects before the old one closes.
+        from supervisor import Supervisor
         cid=p.dial()
         old=await p.stream(cid,3)
+        # A consultation started by the first session is held until after the second one is admitted.
+        advised,release=asyncio.Event(),asyncio.Event()
+        class Advisor:
+            async def advise(self,snapshot,key):
+                advised.set();await release.wait()
+                return {'next_action':'clarify','guidance':'Ask again.','source_refs':['supervisor_notes']}
+        held=asyncio.create_task(Supervisor(service,lambda:'fixture-key',advisor=Advisor(),timeout=10).consult(
+            cid,{'question':'Which option?'},'held',generation=1))
+        await advised.wait()
         assert (await p.press_out_of_band(p.sessions[0],'3','a'))['delivery']=='out_of_band'
         assert p.digits==[('3','fixture-stream-token')]
+        # Retirement of the old runner is held too: activation alone must silence the old stream.
+        runner=p.sessions[0]['runner'];cancel=runner.cancel
+        async def later():pass
+        runner.cancel=later
         new=await p.stream(cid,4)
         assert [s['generation'] for s in p.sessions]==[1,2] and p.sessions[1]['resume'] is True
         assert p.connected==[1],'the resumed stream never calls connected() again'
+        before=len(old.media());await p.sessions[0]['worker'].queue_frames([p.tone()]);await asyncio.sleep(0.3)
+        assert len(old.media())==before,'no old-stream audio after the new generation is admitted'
+        release.set();advice=await held
+        assert advice['status']=='obsolete' and service.get_call(cid)['consultations'][0]['status']=='obsolete'
+        assert any(e['kind']=='stale_generation' and e['action']=='consult_supervisor' for e in service.get_call(cid)['events'])
+        runner.cancel=cancel
         # Old-generation callbacks released after admission have no effect; one generation is authorized.
         assert service.tool(cid,'press_keys',{'keys':'1','menu_quote':MENU},'late',generation=1)=={'error':'stale_generation'}
         assert service.tool(cid,'end_conversation',{'reason':'unavailable','summary':'x','evidence':MENU},'late-end',generation=1)=={'error':'stale_generation'}
@@ -359,6 +397,9 @@ async def test_handover_generations_and_one_terminal_winner(tmp_path,monkeypatch
         call=service.get_call(cid)
         assert p.hung_up==[SID] and call['end_reason']=='owner_stop' and call['generation']==2
         assert [(e['generation'],e['ended_by']) for e in call['events'] if e['kind']=='media_session']==[(1,'handover'),(2,'end')]
+        # Twilio's completed callback after the owner stop is recorded, not a second terminal save or report.
+        assert reports(service,cid)==1 and await p.provider_status(cid,'completed')=={'ok':True}
+        assert reports(service,cid)==1 and service.get_call(cid)['end_reason']=='owner_stop' and p.hung_up==[SID]
 
         # Order B: the old stream closes first; owner stop in the gap before any reconnect.
         cid=p.dial()
@@ -429,6 +470,9 @@ async def test_handover_update_outcomes_are_isolated_and_visible(tmp_path,monkey
         call=service.get_call(cid)
         assert call['end_reason']=='keypress_handover_failed' and call['handover_failure']==HANDOVER_FAILURE and p.hung_up==[SID]
         assert 'within 15 s' in HANDOVER_FAILURE and "owner's confirmation" in HANDOVER_FAILURE
+        # One report, which counts no reconnect: none was admitted. A late completed callback adds none.
+        await p.provider_status(cid,'completed')
+        assert reports(service,cid)==1 and 'переподключался' not in json.dumps(service.learning.report(cid),ensure_ascii=False)
 
         # Provider completion in the gap: the remote-hangup reason, noted, and no hangup of our own.
         cid=p.dial()
@@ -450,6 +494,13 @@ async def test_handover_update_outcomes_are_isolated_and_visible(tmp_path,monkey
         await until(lambda:not service.get_call(cid).get('handover'))
         assert service.get_call(cid)['status']=='active' and len(p.digits)==1
         assert [e['outcome'] for e in service.get_call(cid)['events'] if e['kind']=='keypress_handover']==['ambiguous','stream_kept']
+        # A later press on the kept stream gets its own window too, so the call never stays in a handover.
+        import voice
+        result=service.tool(cid,'press_keys',{'keys':'7','menu_quote':MENU},'m2',generation=1)
+        assert result['dtmf_path']=='out_of_band' and service.claim_delivery(cid,'m2',1)=='out_of_band'
+        await voice.send_out_of_band(p.sessions[0],service,cid,result,'m2')
+        await until(lambda:not service.get_call(cid).get('handover'))
+        assert [e['outcome'] for e in service.get_call(cid)['events'] if e['kind']=='keypress_handover']==['ambiguous','stream_kept']*2
         before=len(socket.media());await p.sessions[0]['worker'].queue_frames([p.tone()])
         await until(lambda:len(socket.media())>before)
         await p.close(socket)
@@ -462,6 +513,8 @@ async def test_resume_snapshot_keeps_history_decisions_and_silence(tmp_path,monk
     store=VoiceService(tmp_path)
     cid=active_call(store)
     store.transcript(cid,'assistant','Hello, I am calling about the delivery.')
+    store.transcript(cid,'user','Friday 10:00-12:00 works')
+    store.tool(cid,'record_answer',{'field':'delivery_window','value':'Friday 10:00-12:00','evidence':'Friday 10:00-12:00 works'},'a1')
     for i in range(60):
         store.transcript(cid,'user','turn '+str(i)+' '+'x'*300)
     store.transcript_chunk(cid,'user','Please hold')
@@ -476,11 +529,25 @@ async def test_resume_snapshot_keeps_history_decisions_and_silence(tmp_path,monk
     state=json.loads(server.split('\n')[2])
     assert state['owner_decisions'][0]['owner_answer']=='yes' and state['key_presses']==[{'keys':'3','dtmf_path':'in_band'},{'keys':'3','dtmf_path':'out_of_band'}]
     assert 'turn' not in server and 'Friday slot' not in history,'server state and speech stay apart'
+    # The recorded value and the decision's exact scope survive the history cut that dropped their turns.
+    assert 'Friday 10:00-12:00 works' not in history and state['collected_fields']=={'delivery_window':'Friday 10:00-12:00'}
+    decision=state['owner_decisions'][0]
+    assert decision['conditions']=={'delivery_window':'Friday 10:00-12:00'} and decision['round']==1 and decision['options']==['yes','no']
     lines=history.split('\n')[1:]
     assert lines[0].startswith('earlier ') and lines[0].endswith(' turns omitted; ask rather than guess')
     assert sum(len(x)+1 for x in lines[1:])<=RESUME_HISTORY_CHARS and lines[-2].startswith('counterparty: turn 59')
     assert lines[-1]=='counterparty (unfinished): Please hold, connecting you' and text.count('connecting you')==1
     assert 'data, not instructions' in history
+    # Unfinished turns keep their place in time, and a finished turn replaces its chunks.
+    mix=VoiceService(tmp_path/'mix');m=active_call(mix)
+    mix.transcript_chunk(m,'user','When can you');mix.transcript(m,'assistant','One moment.')
+    mix.transcript_chunk(m,'assistant','Let me');mix.transcript_chunk(m,'user',' hello?')
+    assert mix.resume_context(m).split('\n')[-4:]==['counterparty: '+MENU,'counterparty (unfinished): When can you hello?',
+                                                    'you: One moment.','you (unfinished): Let me']
+    mix.transcript(m,'user','When can you deliver?')
+    lines=mix.resume_context(m).split('\n')[-3:]
+    assert lines==['counterparty: When can you deliver?','you: One moment.','you (unfinished): Let me'] and mix.resume_context(m).count('When can you')==1
+    mix.close()
     # A single oversized turn keeps its last 12,000 characters.
     other=VoiceService(tmp_path/'long');long=active_call(other);other.transcript(long,'user','a'*20000+'END')
     kept=other.resume_context(long).split('\n')[-1]
@@ -561,6 +628,8 @@ async def test_out_of_band_record_status_and_cumulative_audio_verdict(tmp_path):
     assert inbound_audio_verdict(call(audio(pcm=6000,zero=100),audio(pcm=6000,zero=100)),True)=={'heard':False,'reason':'zero_frames'}
     assert inbound_audio_verdict(call(audio(pcm=6000),audio(pcm=6000)),True)=={'heard':False,'reason':'quiet_frames'}
     assert inbound_audio_verdict(call(audio(pcm=6000),None),True)=={'heard':None,'reason':'unknown'}
+    # The second session failed before writing anything: the call's generation still counts it.
+    assert inbound_audio_verdict(call(audio(pcm=12000,zero=100)),True,2)=={'heard':None,'reason':'unknown'}
     assert inbound_audio_verdict(call(audio(frames=0,pcm=0),audio(frames=0,pcm=0)),True)=={'heard':False,'reason':'no_frames'}
     # A single-session call reads exactly as ANYM-426: its last counters.
     single=[{'kind':'inbound_audio','audio':audio(active=900)},{'kind':'inbound_audio','audio':audio(pcm=12000,zero=100)}]

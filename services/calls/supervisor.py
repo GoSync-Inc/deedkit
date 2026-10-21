@@ -50,7 +50,7 @@ class Supervisor:
         self.advisor,self.timeout=advisor or GeminiAdvisor(),timeout
         self._locks={}
 
-    async def consult(self,identity,arguments,tool_call_id):
+    async def consult(self,identity,arguments,tool_call_id,generation=None):
         # Concurrent retries share one provider request; the durable tool cache survives the request.
         token=(identity,tool_call_id)
         lock=self._locks.setdefault(token,asyncio.Lock())
@@ -73,9 +73,9 @@ class Supervisor:
                 except TimeoutError:
                     status='timeout'
                 except asyncio.CancelledError:
-                    self.service.finish_consultation(identity,consultation_id,'interrupted')
+                    self.service.finish_consultation(identity,consultation_id,'interrupted',generation=generation)
                     raise
                 except Exception:
                     # SDK payloads can contain secrets. Persist only a neutral failure status.
                     advice=None
-            return self.service.finish_consultation(identity,consultation_id,status,advice)
+            return self.service.finish_consultation(identity,consultation_id,status,advice,generation=generation)

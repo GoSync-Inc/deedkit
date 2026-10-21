@@ -116,8 +116,11 @@ class KeypadTwilioSerializer(TwilioFrameSerializer):
     """Twilio media: no `clear` while keypad tones are queued or in flight. Audio ahead of the tones is
     already sent then, and Pipecat still drains the interruptible speech queued after them."""
     keypad=None
+    # ANYM-451: False once a newer media session of the call was admitted; this stream then sends nothing more.
+    authority=None
 
     async def serialize(self,frame):
+        if self.authority is not None and not self.authority():return None
         if isinstance(frame,InterruptionFrame) and self.keypad is not None:
             holding=False
             with contextlib.suppress(Exception):holding=self.keypad.playing()
@@ -293,16 +296,20 @@ def record_clock(service,identity,brief,llm):
         pass
 
 
+async def send_server_note(worker,text):
+    frame=InputTextRawFrame(text=text)
+    # Gemini forwards this frame; the assistant aggregator otherwise treats it as spoken text.
+    frame.append_to_context=False
+    await worker.queue_frames([frame])
+
+
 async def send_owner_update(worker,decision):
     # InputTextRawFrame reaches Gemini's realtime input. Updating only LLMContext
     # would leave this message local: the Live service manages remote history.
     text='OWNER DECISION FROM LOCAL INTERFACE: '+json.dumps({
         'decision_id':decision['id'],'round':decision.get('round'),'conditions':decision.get('conditions',{}),
         'question':decision['question'],'answer':decision['answer']},ensure_ascii=False)
-    frame=InputTextRawFrame(text=text)
-    # Gemini forwards this frame; the assistant aggregator otherwise treats it as spoken text.
-    frame.append_to_context=False
-    await worker.queue_frames([frame])
+    await send_server_note(worker,text)
 
 
 async def report_error(state,rtvi,frame=None):
@@ -345,7 +352,7 @@ async def run_transport(transport,brief,key,state,browser=False):
             if not service.authorized(identity,generation,name):
                 result={'error':'stale_generation'}
             else:
-                result=await state['supervisor'].consult(identity,dict(params.arguments),params.tool_call_id)
+                result=await state['supervisor'].consult(identity,dict(params.arguments),params.tool_call_id,generation=generation)
         else:
             result=service.tool(identity,name,dict(params.arguments),params.tool_call_id,generation=generation)
         if name=='press_keys':
@@ -354,7 +361,14 @@ async def run_transport(transport,brief,key,state,browser=False):
             # call without a result.
             path=service.claim_delivery(identity,params.tool_call_id,generation) if result.get('ok') else None
             if path=='out_of_band':
+                # The stay-silent result goes first: a successful update may retire this session before Twilio
+                # answers. Only a definite rejection keeps the session, and then it is told plainly.
+                await params.result_callback(result)
                 result=await send_out_of_band(state,service,identity,result,params.tool_call_id)
+                if result.get('delivery')=='out_of_band_rejected' and service.authorized(identity,generation,name):
+                    await send_server_note(worker,'KEY NOT SENT (server message, not speech): '+json.dumps(result,ensure_ascii=False))
+                await worker.rtvi.send_server_message({'kind':'tool','name':name,'result':result})
+                return
             elif path:
                 result=service.press_delivered(identity,params.tool_call_id,await deliver_keys(keypad,service,identity,result))
             await params.result_callback(result)
@@ -401,7 +415,7 @@ async def run_transport(transport,brief,key,state,browser=False):
             await worker.rtvi.send_server_message({'kind':'flow','flow':snapshot})
         async def dispatch(name,args,tool_call_id):
             if name=='consult_supervisor' and state.get('supervisor'):
-                result=await state['supervisor'].consult(identity,args,tool_call_id)
+                result=await state['supervisor'].consult(identity,args,tool_call_id,generation=generation)
             else:
                 result=service.tool(identity,name,args,tool_call_id)
             await worker.rtvi.send_server_message({'kind':'tool','name':name,'result':result})

@@ -613,13 +613,16 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
             async def out_of_band(keys):
                 nonlocal timer
                 outcome=await outbound.send_digits(identity,keys)
-                if outcome!='rejected' and timer is None:timer=asyncio.create_task(keep_stream())
+                # A kept stream may press again later: each reservation gets its own window.
+                if outcome!='rejected' and (timer is None or timer.done()):timer=asyncio.create_task(keep_stream())
                 return outcome
             state['out_of_band']=out_of_band
             from pipecat.serializers.twilio import TwilioFrameSerializer
             from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport,FastAPIWebsocketParams
             from voice import KeypadTwilioSerializer,run_transport
             serializer=KeypadTwilioSerializer(stream_sid=start['streamSid'],params=TwilioFrameSerializer.InputParams(auto_hang_up=False))
+            # Activation of a newer stream revokes this one's output at once, before its runner is retired.
+            serializer.authority=lambda:session.get('state') is state
             transport=FastAPIWebsocketTransport(websocket=socket,params=FastAPIWebsocketParams(
                 audio_in_enabled=True,audio_out_enabled=True,audio_out_sample_rate=8000,
                 audio_out_end_silence_secs=0,serializer=serializer))
