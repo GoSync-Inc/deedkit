@@ -25,7 +25,7 @@ import unicodedata
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import Refused, excluded, shown  # noqa: E402
 from tiden_pr_check import (  # noqa: E402
-    anchor_map, blob, changed, git, listing, parse_body, validate_listing)
+    anchor_map, anchor_paths, blob, changed, git, listing, parse_body, validate_listing)  # noqa: F401 (anchor_paths is a shared binding the card names)
 
 TITLE_LIMIT = 120
 FOOTER = "Flags are suggestions; the author checks every disposition (docs/operations/tiden-product-workflow.md)."

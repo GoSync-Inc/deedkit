@@ -119,7 +119,7 @@ def test_anchor_match_follows_the_workflow_rule(fork, server, tmp_path, capsys):
 # spec: ANYM-357
 def test_reuses_the_check_a_matcher(fork, server, capsys):
     # the script loads check A and drift as top-level modules; these are those objects, not copies
-    for module, names in (("tiden_pr_check", ("changed", "anchor_map", "listing", "parse_body", "validate_listing")),
+    for module, names in (("tiden_pr_check", ("changed", "anchor_map", "anchor_paths", "listing", "parse_body", "validate_listing")),
                           ("tiden_drift", ("excluded", "shown"))):
         for name in names:
             assert getattr(spec_impact, name) is getattr(sys.modules[module], name), name
@@ -166,16 +166,16 @@ def test_body_marks_named_and_anchor_only(fork, server, tmp_path, capsys):
 
 
 FLAG_BASE = {
-    "pkg/mod.py": "def f1():\n    a = 1\n    return a\n\n\ndef f2():\n    return 2\n\n\n@deco\ndef f3():\n    return 3\n",
+    "pkg/mod.py": "def f1():\n    a = 1\n    return a\n\n\ndef f2():\n    return 2\n\n\n@deco\ndef f3():\n    return 3\n\n\ndef gone():\n    return 9\n",
     "notes.js": "// notes\n", "ui/[id].js": "// ui\n// u2\n  function unrelated() {}\n", "ui/i.js": "// i\n// i2\n",
-    "srv/send.go": "package srv\n\nfunc (p *Provider) SendText() {\n\tx := 1\n\t_ = x\n}\n\n"
+    "srv/send.go": "package srv\n\nfunc (p *Provider) Third() {\n\tz := 1\n\t_ = z\n}\n\nfunc (p *Provider) SendText() {\n\tx := 1\n\t_ = x\n}\n\n"
                    "func (p *Provider) Other() {\n\ty := 1\n\t_ = y\n}\n"}
 FLAG_CHANGE = {
     "pkg/mod.py": "def f1():\n    a = 2\n    return a\n\n\ndef f2():\n    return 2\n\n\n@deco2\ndef f3():\n    return 3\n\n\n"
-                  "class Added:\n    pass\n",
+                  "class Added:\n    pass\n\n\ndef added_fn():\n    return 4\n",
     "notes.js": "// notes\nfunction jsThing() {}\n", "ui/[id].js": "// ui\n// u2\n  function unrelated() {}\nfunction bracketFn() {}\n",
     "ui/i.js": "// i\n// i2\nfunction otherFn() {}\n",
-    "srv/send.go": "package srv\n\nfunc (p *Provider) SendText() {\n\tx := 2\n\t_ = x\n}\n\n"
+    "srv/send.go": "package srv\n\nfunc (p *Provider) Third(n int) {\n\tz := 1\n\t_ = z\n}\n\nfunc (p *Provider) SendText() {\n\tx := 2\n\t_ = x\n}\n\n"
                    "func (p *Provider) Other() {\n\ty := 1\n\t_ = y\n}\n"}
 
 
@@ -203,6 +203,9 @@ def test_flag_suggestions(tmp_path, server, capsys):
         spec(29, sources=ui, content=criteria_of("bracketFn exists")),
         spec(30, sources=mod, content=criteria_of("Added is a class")),
         spec(31, sources=mod, content=criteria_of("f3 stays decorated")),
+        spec(32, sources=mod, content=criteria_of("added_fn exists")),
+        spec(33, sources=mod, content=criteria_of("gone is removed")),
+        spec(35, sources=go, content=criteria_of("Third takes a count")),
         spec(34, sources=go, content=criteria_of("send.go stays small")),
         spec(36, sources=ui, content=criteria_of("unrelated stays"))])
     code, out = impact(server, root, "main", capsys)
@@ -210,8 +213,8 @@ def test_flag_suggestions(tmp_path, server, capsys):
     flagged = {int(line[5:line.index(":")]) for line in lines_of(out) if line.endswith("(flagged)")}
     # 21 a body-only change in a Python function, 31 a decorator change, 30 an added class, 24 no label so the whole
     # text names the path, 34 the basename, 26 and 29 a declaration of a non-Python file ([id].js is a literal name, not
-    # a pattern, so ui/i.js's hunk is never read against it; 36 names an indented declaration, so no hunk header shows it; only a foreign hunk read against this file would), 27 a Go method whose name only the hunk header or its declaration shows; 28's method is unchanged
-    assert flagged == {21, 24, 26, 27, 29, 30, 31, 34}, out
+    # a pattern, so ui/i.js's hunk is never read against it; 36 names an indented declaration, so no hunk header shows it; only a foreign hunk read against this file would), 27 a Go method whose name only the hunk header shows; 28's method is unchanged; 32 an added and 33 a removed Python function; 35 a Go receiver method whose declaration line changed
+    assert flagged == {21, 24, 26, 27, 29, 30, 31, 32, 33, 34, 35}, out
     assert "symbols: header-only: notes.js, srv/send.go, ui/[id].js, ui/i.js" in out.splitlines()
     code, out = impact(server, root, "main", capsys, "--flag", "ANYM-22")
     assert code == 0 and "ANYM-22: <disposition> — Spec 22 [anchor only] (flagged)" in out
