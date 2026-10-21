@@ -23,6 +23,8 @@ Answer:
 5. Missing scenarios: edge cases of real use (empty, many, repeated, concurrent, offline, a
    different messenger or account) the card or behaviour does not cover.
 6. What to cut: scope that adds cost without value to the owner.
+7. The card's `How others solve it`: is adopt | adapt | build right and sized to the task? Should
+   the card be split?
 
 Do not review code style, tests or implementation. Do not ask for more process.
 Write the report to <report path>: findings ranked by impact on the owner, each with severity

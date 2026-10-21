@@ -77,7 +77,7 @@ Done: the squash's `main` push run is green.
 
 - Astra: `codex exec --disable hooks -m gpt-6-astra -c service_tier="default" "<task with packet
   paths>" </dev/null`. For Codex-written code an Opus subagent; Codex line: review-protocol.md.
-  Fable: `fable` Claude subagent, a product manager, never on code.
+  Fable: `fable` subagent, product manager, never on code.
 - Packet, rounds and verdict line: docs/operations/review-protocol.md. Every Astra task starts with:
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
      existing path (call audio, sends, collectors, queue, backup)? Name the line.
@@ -89,10 +89,10 @@ Done: the squash's `main` push run is green.
      breaking consumer.
   4. Tests: do the new tests fail on the base commit, and do they assert the spec
      criterion?
-- Cards: Opus high writes new capability, infrastructure and main-research ones; Opus medium
-  defects and small improvements with clear evidence; Sonnet simple ones. Product cards get one
-  Fable round, contract cards (code, CI, data, security) and operation plans Astra, small cards a
-  self-check.
+- Cards: Opus high writes new capability, infrastructure and main research; Opus medium defects
+  and small improvements with clear evidence; Sonnet simple ones. Product cards get one Fable
+  round (research note, split), contract cards (code, CI, data, security) and operation plans
+  Astra, small cards self-check.
 
 ## 6. Working with the orchestrator
 
