@@ -436,7 +436,7 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
             raise APIError('not_found', 404)
         targets(p, [pending['id']])
         return serial({**attachment_fields(pending), 'message_id': pending['message'], 'text': '', 'offset': offset,
-            'content_chars': 0, 'next_offset': None, 'empty_reason': 'attachment_not_downloaded'})
+            'content_chars': 0, 'next_offset': None, 'empty_reason': 'attachment_not_downloaded', **store.dataset(c, p)})
     if not _retained_readable(store,c,row):
         raise APIError('attachment_unavailable', 409)
     automatic = content is None

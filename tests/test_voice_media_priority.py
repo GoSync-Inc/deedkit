@@ -19,6 +19,7 @@ def test_reading_an_undownloaded_attachment_names_the_download_call(archive):
     assert result['next_action']=='request_file_download'
     status=s.get_attachment(key,fid)
     assert (result['reason'],result['next_action'])==(status['reason'],status['next_action'])
+    assert result['synthetic']==status['synthetic'] and result['coverage']==status['coverage']
     with s.pool.connection() as c:
         assert c.execute('SELECT requested_until FROM media_jobs WHERE id=%s',(fid,)).fetchone()['requested_until'] is None
     s.set_access('archive-reader',chats=[])
