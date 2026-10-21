@@ -237,7 +237,9 @@ def test_a_changed_rule_target_keeps_the_drive_in_its_link_calendar(store):
     s = store
     service, key, drop, pick, google = writable_lessons(s)
     lesson = created(service, key, google, s)
-    s.query("UPDATE guardian_rules SET target_calendar_ref='cal-a',version=version+1 WHERE id=%s", (pick,))
+    # The owner retargets the rule to a calendar this agent cannot see; the drive still lives in cal-b.
+    s.query("UPDATE guardian_rules SET target_calendar_ref='cal-ib',version=version+1 WHERE id=%s", (pick,))
+    s.query("DELETE FROM agent_calendars WHERE calendar_ref='cal-ib'")
     moved(google)
     sync(s, google)
     plan = service.plan(key, [project(lesson)])
@@ -293,3 +295,31 @@ def test_agenda_reads_no_lesson_before_its_own_read(store, monkeypatch):
                             or real(statement, args))
     assert statuses(service, key) == {"dropoff": "unknown", "pickup": "unknown"}
     assert not [x for x, args in seen if "o.ref=l.source_event_ref" in x or "occurrences" in x and "cal-child" in args]
+
+
+# spec: ANYM-436
+def test_reconcile_of_an_unadmitted_repair_keeps_the_other_claim(store):
+    s = store
+    service, key, drop, pick, google = writable_lessons(s)
+    lesson = created(service, key, google, s)
+    old = live(s, "pickup")[0]
+    del google.events["private-b", old["target_id"]]
+    sync(s, google)
+    plan = service.plan(key, [project(lesson)])
+    replacement = planned(s, plan)[0]["target_id"]
+    first = service.apply(key, plan["plan_id"], "request-repair-a")["operation_id"]
+    second = service.apply(key, plan["plan_id"], "request-repair-b")["operation_id"]
+    google.crash.add(("POST", "private-b"))
+    assert google.run(first)["state"] == "unknown"
+    google.down = False
+    assert google.run(second)["error"] == "version_conflict"
+    # The second becomes reconcilable (as a partial plan would) and re-enters while the calendar is busy.
+    s.query("UPDATE operations SET state='partial' WHERE id=%s", (second,))
+    with s.transaction() as c:
+        c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (s.lock_key("calendar", "cal-b"),))
+        assert google.run(second, reconcile=True)["error"] == "resource_busy"
+    rows = live(s, "pickup")
+    assert [(r["id"], r["state"], r["target_id"]) for r in rows] == [(old["id"], "repairing", replacement)]
+    assert google.run(first, reconcile=True)["state"] == "verified"
+    rows = live(s, "pickup")
+    assert [(r["id"], r["state"], r["target_id"]) for r in rows] == [(old["id"], "active", replacement)]

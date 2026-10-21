@@ -888,8 +888,10 @@ class FamilyService:
                 if r["claim"] == "repairing"
                 else DRIFT_SKIP.get(drift or "", "already_projected")
                 if r["claim"] and drift not in ("source_moved", "projection_missing")
-                # _source already proved source details through event:read or agenda:read.
-                else {"source_not_visible": None}.get(ready := self.rule_view(p, r)["not_ready_reason"], ready)
+                # _source already proved source details through event:read or agenda:read. A live link is fixed in
+                # its own calendar, so the rule's current target is not consulted for it.
+                else (None if link else {"source_not_visible": None}.get(
+                    ready := self.rule_view(p, r)["not_ready_reason"], ready))
                 or (
                     None
                     if self._can(p, tcal, "plan:create") and self._can(p, tcal, "event:" + kind)

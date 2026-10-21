@@ -7,6 +7,8 @@ from .core import FamilyService
 from .providers import created_event_ref
 from .store import instant
 
+# Step states whose intent was durably admitted to send: only their own failure may undo a link change.
+ADMITTED = ("sending", "unknown", "needs_attention")
 AMBIGUOUS = {"unknown_result", "write_unknown", "provider_unavailable"}
 
 
@@ -189,7 +191,7 @@ class Worker:
                     )["state"]
                     # Read-back may fail after a successful send (including loss of authorization).
                     # Only a definite conditional conflict proves this request did not apply.
-                    ambiguous = current in ("sending", "unknown", "needs_attention") and e.code not in (
+                    ambiguous = current in ADMITTED and e.code not in (
                         "version_conflict",
                         "write_rejected",
                     )
@@ -201,9 +203,10 @@ class Worker:
                             "UPDATE operation_steps SET state=%s,error=%s WHERE operation_id=%s AND ordinal=%s",
                             (state, e.code, *args),
                         )
-                        if repair and not ambiguous and current != "prepared":
+                        if repair and not ambiguous and current in ADMITTED:
                             # A definite failure of the admitted repair gives the link its old target back (still
-                            # missing there); before admission the link is another operation's or untouched.
+                            # missing there); a step never admitted (prepared, or already conflict/failed when a
+                            # reconcile re-enters it) leaves the link to whoever holds it.
                             c.execute(
                                 self.REPAIRED + "state='active',target_id=previous_target_id,"
                                 "target_resource_ref=%s,previous_target_id=NULL "
@@ -220,7 +223,7 @@ class Worker:
                             )
                         elif (
                             step["action"] != "create"
-                            and current != "prepared"
+                            and current in ADMITTED
                             and not ambiguous
                             and self._links_writable(c)
                         ):
