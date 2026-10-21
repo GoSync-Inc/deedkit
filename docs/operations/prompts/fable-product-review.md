@@ -23,8 +23,12 @@ Answer:
 5. Missing scenarios: edge cases of real use (empty, many, repeated, concurrent, offline, a
    different messenger or account) the card or behaviour does not cover.
 6. What to cut: scope that adds cost without value to the owner.
-7. The card's `How others solve it`: is adopt | adapt | build right and sized to the task? Should
-   the card be split?
+7. The one question about approach, in the owner's terms: is the card's `How others solve it`
+   (adopt | adapt | build) right, i.e. does it avoid rebuilding what a standard tool already does?
+   Below the study threshold (new module, infrastructure mechanism, external integration, over
+   ~300 lines) one line is enough; above it a missing or bare `build` is a finding. Should the
+   card be split (more than one owner-visible outcome, or Effort above 8)? The round covers the
+   children of a split; they need no round of their own.
 
 Do not review code style, tests or implementation. Do not ask for more process.
 Write the report to <report path>: findings ranked by impact on the owner, each with severity

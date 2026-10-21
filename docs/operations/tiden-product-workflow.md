@@ -48,8 +48,8 @@ audits. A worker that finds work outside its task reports it to the orchestrator
 3. **Review** by kind (AGENTS.md section 5): product cards (feature, improvement, epic) one Fable
    round with the product-manager prompt, which also checks `How others solve it` (adopt | adapt |
    build, sized to the task) and whether the card should be split; cards that set a contract in
-   code, CI, data or security Astra r1 and at most one scoped recheck, and Astra also reads the
-   research of a main-research card; small cards the author's self-check. Reviewers first
+   code, CI, data or security Astra r1 and at most one scoped recheck; small cards the author's
+   self-check. Reviewers first
    judge whether the card should exist and may shrink or reject it.
 4. **Accept.** The owner accepts feature and epic cards; the orchestrator the others
    (improvement, defect, infra, refactor, research). Record who accepted.

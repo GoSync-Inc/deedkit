@@ -89,8 +89,8 @@ Done: the squash's `main` push run is green.
      breaking consumer.
   4. Tests: do the new tests fail on the base commit, and do they assert the spec
      criterion?
-- Cards: Opus high writes new capability, infrastructure and main research; Opus medium defects
-  and small improvements with clear evidence; Sonnet simple ones. Product cards get one Fable
+- Cards: Opus high writes new capability, infrastructure and main-research ones; Opus medium defects
+  and small improvements with clear evidence; Sonnet simple ones. Product cards: one Fable
   round (research note, split), contract cards (code, CI, data, security) and operation plans
   Astra, small cards self-check.
 
