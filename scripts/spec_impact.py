@@ -36,7 +36,9 @@ LABELS = ("Title", "Problem", "Desired behavior", "Category", "Lane", "Expected 
 CRITERIA = re.compile(r"^[ \t]*(?:#+[ \t]*)?Acceptance criteria\b.*$", re.IGNORECASE)
 SECTION_END = re.compile(rf"^(?:#|[ \t]*(?:{'|'.join(LABELS)})[ \t]*:)", re.IGNORECASE)
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
-DECLARATION = re.compile(r"\b(?:def|class|function|func|fn|type|interface|struct|enum|const|let|var)\s+([A-Za-z_]\w*)")
+# A Go method has its receiver between `func` and the name.
+DECLARATION = re.compile(r"\b(?:def|class|function|fn|type|interface|struct|enum|const|let|var)\s+([A-Za-z_]\w*)"
+                         r"|\bfunc\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)")
 
 
 def criteria(content: str) -> str:
@@ -59,9 +61,13 @@ def title(spec: dict | None) -> str:
     return " ".join(text.split())[:TITLE_LIMIT] or "(untitled)"
 
 
+def declared(text: str) -> set[str]:
+    return {name for pair in DECLARATION.findall(text) for name in pair if name}
+
+
 def hunks(root: Path, base: str, head: str, path: str) -> list[tuple[range, range, str]]:
     """(old lines, new lines, header text) of each hunk of one file, 1-based."""
-    text = git(root, "diff", "-U0", "--no-renames", base, head, "--", path).decode("utf-8", errors="replace")
+    text = git(root, "diff", "-U0", "--no-renames", base, head, "--", f":(literal){path}").decode("utf-8", errors="replace")
     found = []
     for line in text.split("\n"):
         match = HUNK.match(line)
@@ -97,13 +103,13 @@ def symbols(root: Path, base: str, head: str, path: str) -> tuple[set[str], bool
         return found, False
     found = set()
     for _, _, context in marks:
-        found.update(DECLARATION.findall(context))
+        found |= declared(context)
     for revision, source in ((old, "-"), (new, "+")):
         lines = (revision or "").split("\n")
         for old_range, new_range, _ in marks:
             for number in (old_range if source == "-" else new_range):
                 if 0 < number <= len(lines):
-                    found.update(DECLARATION.findall(lines[number - 1]))
+                    found |= declared(lines[number - 1])
     return found, True
 
 
@@ -155,7 +161,7 @@ def build(args: argparse.Namespace) -> list[str]:
     for path in paths:
         found, partial = symbols(root, base, args.head, path)
         names |= found
-        if partial and not path.endswith(".py"):
+        if partial:
             header_only.append(path)
     out = []
     for number in listed:

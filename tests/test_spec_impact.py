@@ -58,7 +58,8 @@ def fork_specs():
             spec(5, sources=[anchor("BACKLOG.md")]), spec(6, sources=[anchor("tests/test_x.py")]),
             spec(7, sources=[anchor("app/base_only.py")]),
             spec(8, sources=[anchor("app/core.py", repository="github.com/other/repo")]),
-            spec(9, sources=[anchor("app/core.py", repository="")]), spec(10, sources=[anchor("app/other.py")])]
+            spec(9, sources=[anchor("app/core.py", repository="")]), spec(10, sources=[anchor("app/other.py")]),
+            spec(11, sources=[anchor("app/new.py", repository="github.com/GoSync-Inc/anymsg")])]
 
 
 # spec: ANYM-357
@@ -72,8 +73,10 @@ def test_reads_tiden_main_or_exits_2(fork, server, tmp_path, capsys):
         "a short count": {"requirements": listing[:1], "pagination": {"nextPageToken": "", "totalCount": 2}},
         "no metadata": {"requirements": listing},
         "a page cursor": {"requirements": listing, "pagination": {"nextPageToken": "x", "totalCount": len(listing)}},
-        "a duplicate number": {"requirements": [listing[0], listing[0]],
+        "a duplicate number": {"requirements": [listing[0], {**listing[1], "seqNum": listing[0]["seqNum"]}],
                                "pagination": {"nextPageToken": "", "totalCount": 2}},
+        "a duplicate id": {"requirements": [listing[0], {**listing[1], "id": listing[0]["id"]}],
+                           "pagination": {"nextPageToken": "", "totalCount": 2}},
     }
     for name, value in broken.items():
         server.set(listing=value)
@@ -93,14 +96,18 @@ def test_reads_tiden_main_or_exits_2(fork, server, tmp_path, capsys):
 
 
 # spec: ANYM-357
-def test_anchor_match_follows_the_workflow_rule(fork, server, capsys):
+def test_anchor_match_follows_the_workflow_rule(fork, server, tmp_path, capsys):
     server.set(main=fork_specs())
     code, out = impact(server, fork, "main", capsys)
     assert code == 0, out
     # the modified, added, renamed-away and deleted paths and a legacy empty repository match; BACKLOG.md and tests do
     # not, nor another repository, the file only main changed, or an unchanged file
-    assert lines_of(out) == [f"ANYM-{number}: <disposition> — Spec {number} [anchor only]" for number in (1, 2, 3, 4, 9)]
+    assert lines_of(out) == [f"ANYM-{number}: <disposition> — Spec {number} [anchor only]"
+                             for number in (1, 2, 3, 4, 9, 11)]
     assert out.rstrip().endswith(FOOTER)
+    # the same list from a saved listing, diffed from the merge base and not from the moved tip of main
+    again = impact(server, fork, "main", capsys, "--specs", saved(tmp_path, server.state()["main"]))
+    assert again == (0, out) and "ANYM-7" not in out
     # a deletion-only change lists the spec of the deleted file and has no unanchored file
     git(fork, "checkout", "-q", "-b", "deletion", "topic")
     commit(fork, {"app/other.py": None}, "delete")
@@ -111,16 +118,18 @@ def test_anchor_match_follows_the_workflow_rule(fork, server, capsys):
 
 # spec: ANYM-357
 def test_reuses_the_check_a_matcher(fork, server, capsys):
-    for name in ("changed", "anchor_map", "listing", "parse_body", "validate_listing"):
-        assert getattr(spec_impact, name).__module__.rsplit(".", 1)[-1] == "tiden_pr_check", name
-    assert spec_impact.excluded.__module__.rsplit(".", 1)[-1] == "tiden_drift"
+    # the script loads check A and drift as top-level modules; these are those objects, not copies
+    for module, names in (("tiden_pr_check", ("changed", "anchor_map", "listing", "parse_body", "validate_listing")),
+                          ("tiden_drift", ("excluded", "shown"))):
+        for name in names:
+            assert getattr(spec_impact, name) is getattr(sys.modules[module], name), name
     server.set(main=fork_specs())
     report = []
     base = git(fork, "merge-base", "main", "HEAD")
     pr_check.check(fork, base, "HEAD", "Spec: ANYM-1", str(server.cli), "product", report.append)
     check_a = {int(number) for row in report if row.startswith("- app/") for number in re.findall(r"ANYM-(\d+)", row)}
     code, out = impact(server, fork, "main", capsys)
-    assert code == 0 and check_a == {1, 2, 9}
+    assert code == 0 and check_a == {1, 2, 9, 11}
     # check A's surviving-path matches plus the deleted or renamed-away paths, which only this script adds
     assert {int(line[5:line.index(":")]) for line in lines_of(out)} == check_a | {3, 4}
 
@@ -137,7 +146,8 @@ def test_body_marks_named_and_anchor_only(fork, server, tmp_path, capsys):
     assert lines_of(out) == [
         "ANYM-1: <disposition> — Spec 1 [named (Delivers)]", "ANYM-2: <disposition> — Spec 2 [named (Spec)]",
         "ANYM-3: <disposition> — Spec 3 [anchor only]", "ANYM-4: <disposition> — Spec 4 [anchor only]",
-        "ANYM-9: <disposition> — Spec 9 [anchor only]", "ANYM-20: <disposition> — Spec 20 [named (Spec)]",
+        "ANYM-9: <disposition> — Spec 9 [anchor only]", "ANYM-11: <disposition> — Spec 11 [anchor only]",
+        "ANYM-20: <disposition> — Spec 20 [named (Spec)]",
         "ANYM-40: <disposition> — Spec 40 [named (Spec)]", "ANYM-77: <disposition> — (unknown) [named (Spec)]"]
     # the one surviving code file without an anchor goes to the primary spec, the first of Delivers
     assert "Unanchored: 1 file(s); sync B anchors them to ANYM-1: app/renamed.py" in out
@@ -155,9 +165,22 @@ def test_body_marks_named_and_anchor_only(fork, server, tmp_path, capsys):
     assert code == 0 and "Unanchored" not in out and "ANYM-1: <disposition> — Spec 1 [named (Spec)]" in out
 
 
-FLAG_BASE = {"pkg/mod.py": "def f1():\n    a = 1\n    return a\n\n\ndef f2():\n    return 2\n", "notes.js": "// notes\n"}
-FLAG_CHANGE = {"pkg/mod.py": "def f1():\n    a = 2\n    return a\n\n\ndef f2():\n    return 2\n",
-               "notes.js": "// notes\nfunction jsThing() {}\n"}
+FLAG_BASE = {
+    "pkg/mod.py": "def f1():\n    a = 1\n    return a\n\n\ndef f2():\n    return 2\n\n\n@deco\ndef f3():\n    return 3\n",
+    "notes.js": "// notes\n", "ui/[id].js": "// ui\n// u2\n  function unrelated() {}\n", "ui/i.js": "// i\n// i2\n",
+    "srv/send.go": "package srv\n\nfunc (p *Provider) SendText() {\n\tx := 1\n\t_ = x\n}\n\n"
+                   "func (p *Provider) Other() {\n\ty := 1\n\t_ = y\n}\n"}
+FLAG_CHANGE = {
+    "pkg/mod.py": "def f1():\n    a = 2\n    return a\n\n\ndef f2():\n    return 2\n\n\n@deco2\ndef f3():\n    return 3\n\n\n"
+                  "class Added:\n    pass\n",
+    "notes.js": "// notes\nfunction jsThing() {}\n", "ui/[id].js": "// ui\n// u2\n  function unrelated() {}\nfunction bracketFn() {}\n",
+    "ui/i.js": "// i\n// i2\nfunction otherFn() {}\n",
+    "srv/send.go": "package srv\n\nfunc (p *Provider) SendText() {\n\tx := 2\n\t_ = x\n}\n\n"
+                   "func (p *Provider) Other() {\n\ty := 1\n\t_ = y\n}\n"}
+
+
+def criteria_of(text):
+    return f"Problem: x\nAcceptance criteria:\n- {text}\nCategory: infra"
 
 
 # spec: ANYM-357
@@ -166,25 +189,46 @@ def test_flag_suggestions(tmp_path, server, capsys):
     commit(root, FLAG_BASE, "base")
     git(root, "checkout", "-q", "-b", "topic")
     commit(root, FLAG_CHANGE, "topic")
-    mod, notes = [anchor("pkg/mod.py")], [anchor("notes.js")]
+    mod, notes, go, ui = [anchor("pkg/mod.py")], [anchor("notes.js")], [anchor("srv/send.go")], [anchor("ui/[id].js")]
     server.set(main=[
-        spec(21, sources=mod, content="Problem: x\nAcceptance criteria:\n- f1 returns a value\nCategory: infra"),
-        spec(22, sources=mod, content="Acceptance criteria:\n- the retry works\nCategory: infra"),
+        spec(21, sources=mod, content=criteria_of("f1 returns a value")),
+        spec(22, sources=mod, content=criteria_of("the retry works")),
         spec(23, sources=mod, content="Problem: f1 is broken\nAcceptance criteria:\n- prose only\nCategory: infra\n"
                                       "Boundary: f1 handles it"),
         spec(24, sources=mod, content="The module pkg/mod.py must stay small."),
         spec(25, sources=mod, content="Acceptance criteria:\n- f2 is untouched\n"),
-        spec(26, sources=notes, content="## Acceptance criteria\n- jsThing exists\n## Boundary\nnothing")])
+        spec(26, sources=notes, content="## Acceptance criteria\n- jsThing exists\n## Boundary\nnothing"),
+        spec(27, sources=go, content=criteria_of("SendText keeps its signature")),
+        spec(28, sources=go, content=criteria_of("Other keeps its signature")),
+        spec(29, sources=ui, content=criteria_of("bracketFn exists")),
+        spec(30, sources=mod, content=criteria_of("Added is a class")),
+        spec(31, sources=mod, content=criteria_of("f3 stays decorated")),
+        spec(34, sources=go, content=criteria_of("send.go stays small")),
+        spec(36, sources=ui, content=criteria_of("unrelated stays"))])
     code, out = impact(server, root, "main", capsys)
     assert code == 0, out
     flagged = {int(line[5:line.index(":")]) for line in lines_of(out) if line.endswith("(flagged)")}
-    # 21: a body-only change inside f1; 24: no label, so the whole text names the path; 26: a symbol of a non-Python file
-    assert flagged == {21, 24, 26}, out
-    assert "symbols: header-only: notes.js" in out and "pkg/mod.py" not in re.findall(r"header-only: (.*)", out)
+    # 21 a body-only change in a Python function, 31 a decorator change, 30 an added class, 24 no label so the whole
+    # text names the path, 34 the basename, 26 and 29 a declaration of a non-Python file ([id].js is a literal name, not
+    # a pattern, so ui/i.js's hunk is never read against it; 36 names an indented declaration, so no hunk header shows it; only a foreign hunk read against this file would), 27 a Go method whose name only the hunk header or its declaration shows; 28's method is unchanged
+    assert flagged == {21, 24, 26, 27, 29, 30, 31, 34}, out
+    assert "symbols: header-only: notes.js, srv/send.go, ui/[id].js, ui/i.js" in out.splitlines()
     code, out = impact(server, root, "main", capsys, "--flag", "ANYM-22")
     assert code == 0 and "ANYM-22: <disposition> — Spec 22 [anchor only] (flagged)" in out
     code, out = impact(server, root, "main", capsys, "--flag", "ANYM-23", "--flag", "ANYM-99")
     assert code == 2 and out.startswith("Refused: ") and not lines_of(out)
+    # a criterion on the PR's Tiden branch counts, and a spec named only there is listed and flagged
+    server.set(branches=[{"name": "main", "status": "open"}, {"name": "proposal/x", "status": "open"}],
+               branch_specs={"proposal/x": [{**spec(40, branch=True), "content": criteria_of("f1 is gone")}]})
+    body = tmp_path / "body.md"
+    body.write_text("Spec: ANYM-40\nTiden branch: proposal/x\n")
+    code, out = impact(server, root, "main", capsys, "--body-file", str(body))
+    assert code == 0 and "ANYM-40: <disposition> — Spec 40 [named (Spec)] (flagged)" in out
+    # an unparsable Python revision is disclosed as header-only, not analysed silently
+    git(root, "checkout", "-q", "-b", "broken", "topic")
+    commit(root, {"pkg/mod.py": "def f1(:\n"}, "broken")
+    code, out = impact(server, root, "topic", capsys)
+    assert code == 0 and "symbols: header-only: pkg/mod.py" in out.splitlines()
 
 
 # spec: ANYM-357
