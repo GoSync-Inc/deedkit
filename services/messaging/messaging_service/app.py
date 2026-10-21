@@ -744,6 +744,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
         and source message/revision. Follow next_offset; truncated means extraction was capped.
         Without content, a voice note returns its model transcript (content=enriched in the reply);
         if not ready, empty_reason says whether to wait. Other files return extracted text.
+        A file not downloaded yet returns empty_reason=attachment_not_downloaded, its download
+        status and next_action; request_file_download moves it ahead and transcription follows.
         Text/OCR may be incomplete or inaccurate. Original download uses separate download permission.
         """
         return call(ctx,'get_file_text',detail=detail,attachment_id=attachment_id,offset=offset,limit=limit,content=content)

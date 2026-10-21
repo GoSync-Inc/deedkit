@@ -428,7 +428,15 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
         JOIN + ' ' + ENRICH_JOIN + ' WHERE a.id=%s AND ' + CURRENT + ' AND ' + scope,
         [offset + 1, limit, attachment_id, *args]).fetchone()
     if not row:
-        raise APIError('not_found', 404)
+        # A known original that is not downloaded names the call that fetches it; a read never fetches (ANYM-455).
+        from .attachment_metadata import attachment_fields
+        from .media_requests import occurrence
+        pending = occurrence(c, p, attachment_id)
+        if not pending:
+            raise APIError('not_found', 404)
+        targets(p, [pending['id']])
+        return serial({**attachment_fields(pending), 'message_id': pending['message'], 'text': '', 'offset': offset,
+            'content_chars': 0, 'next_offset': None, 'empty_reason': 'attachment_not_downloaded'})
     if not _retained_readable(store,c,row):
         raise APIError('attachment_unavailable', 409)
     automatic = content is None

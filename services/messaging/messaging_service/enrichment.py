@@ -230,13 +230,16 @@ class EnrichmentWorker:
                 if not eligible:continue
                 condition={'audio':"(a.mime LIKE 'audio/%%' OR a.mime='application/ogg')",'image':"a.mime LIKE 'image/%%'",
                     'document':"a.mime NOT LIKE 'audio/%%' AND a.mime<>'application/ogg' AND a.mime NOT LIKE 'image/%%' AND f.state='ready' AND f.source_revision=m.revision AND f.source_digest=a.digest AND length(f.text_content)>0"}[kind]
+                # A note downloaded on request today is as fresh as one sent today (ANYM-455).
+                fresh="m.sent_at>=clock_timestamp()-interval '1 day'"+(" OR r.updated_at>=clock_timestamp()-interval '1 day'" if kind=='audio' else '')
+                residency=' LEFT JOIN attachment_residency r ON r.digest=a.digest' if kind=='audio' else ''
                 row=c.execute('''SELECT e.*,a.message,a.mime,a.bytes,m.account,m.sent_at,coalesce(f.text_content,'') AS source_text,
                     coalesce(f.truncated,false) AS source_truncated,
-                    m.sent_at>=clock_timestamp()-interval '1 day' AS fresh,
+                    '''+fresh+''' AS fresh,
                     coalesce(pc.last_started_at,'epoch'::timestamptz) AS last_started_at
                     FROM attachment_enrichment e
                     JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
-                    LEFT JOIN attachment_text f ON f.attachment=a.id
+                    LEFT JOIN attachment_text f ON f.attachment=a.id'''+residency+'''
                     LEFT JOIN processing_control pc ON pc.account=m.account AND pc.kind=%s AND pc.profile_hash=%s
                     WHERE '''+PROCESSABLE_ORIGINAL+''' AND (pc.pause_reason IS NULL OR pc.paused_until<=clock_timestamp()) AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
                     AND m.account=ANY(%s) AND '''+condition+''' AND e.next_due<=clock_timestamp()
