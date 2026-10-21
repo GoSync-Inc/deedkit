@@ -354,24 +354,35 @@ def test_conversation_state_reads_the_catchup_marker_and_account_cooldown(dialog
 
 
 # spec: ANYM-454
-def test_failed_health_read_leaves_the_transaction_usable_and_keeps_the_marker(dialogue_archive):
+@pytest.mark.parametrize('savepoint', [True, False])
+def test_failed_health_read_leaves_the_transaction_usable_and_keeps_the_marker(dialogue_archive, savepoint):
+    from contextlib import nullcontext
     from messaging_service.conversation_state import collector_facts
+    import psycopg
 
     class FailingHealth:
         def __init__(self, c):
             self.c = c
 
         def execute(self, sql, *args):
-            return self.c.execute('SELECT 1/0' if 'collector_health' in sql else sql, *args)
+            # A real server-side error: the query reaches PostgreSQL (no placeholders, so no parameters).
+            return self.c.execute('SELECT 1/0') if 'collector_health' in sql else self.c.execute(sql, *args)
 
         def transaction(self):
-            return self.c.transaction()
+            return self.c.transaction() if savepoint else nullcontext()
 
     s, *_ = dialogue_archive
     with s.pool.connection() as c:
-        facts = collector_facts(FailingHealth(c), {'chat_ids': None}, 'dialogue-wa', {'wa_progress': {'catchup_progress_at': 5.0}})
+        c.execute('SELECT 1')  # the caller's transaction is already open, as in the queue
+        row = {'wa_progress': {'catchup_progress_at': 5.0}}
+        facts = collector_facts(FailingHealth(c), {'chat_ids': None}, 'dialogue-wa', row)
         assert facts == {'catchup_progress_at': 5.0}
-        assert c.execute('SELECT 1 AS one').fetchone()['one'] == 1
+        if savepoint:
+            assert c.execute('SELECT 1 AS one').fetchone()['one'] == 1
+        else:  # without the savepoint the failed statement poisons the transaction (the r1 B1 defect)
+            with pytest.raises(psycopg.errors.InFailedSqlTransaction):
+                c.execute('SELECT 1')
+        c.rollback()
 
 
 # spec: ANYM-454
