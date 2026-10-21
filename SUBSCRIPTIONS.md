@@ -521,7 +521,9 @@ deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS
   continue (also in opt-in telemetry, code only). `--once` diagnostics never prune.
 - **Closed and expired definitions** keep their references: they match nothing new, so
   their budget does not matter, and every quarantine closes all definitions. Deleting
-  them is the sibling story's.
+  them is the sibling story's. A definition whose `expires_at` has passed, or is less than
+  a minute away, counts as expired before the matcher stores the state: selection and
+  the batch (under the row lock) both skip it.
 - **Quarantine hold:** quarantine restore sets `retention_hold` on every definition it
   closes. Held subscriptions are skipped by every pruning path; the hold is a table
   column, so backups carry it. Restored matches and consumption stay exactly as
@@ -536,7 +538,10 @@ deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS
 - **Activation:** nothing is pruned until the operator enables retention, after every
   serving messaging API runs a floor-aware reader (one that returns `retention_gap`):
   `python -m messaging_service set-subscription-retention --enable` (or `--disable`;
-  stored as `probe_metadata` `subscription_retention`, refused below schema 40). An
+  stored as `probe_metadata` `subscription_retention`, refused below schema 40). Each batch rereads the activation under a
+  shared advisory lock that the switch takes exclusively, so `--disable` waits for
+  in-flight batches and, once it returns, no batch deletes or moves a floor; floors
+  already moved stay. An
   older reader would silently skip the pruned prefix for a passive `after` below the
   floor.
 - **Roles:** the worker role gains `SELECT` on `probe_metadata` and `subscription_consumption`,

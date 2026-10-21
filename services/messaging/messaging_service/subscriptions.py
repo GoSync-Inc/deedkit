@@ -427,6 +427,21 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
 
 
 RETENTION_BATCH = 500
+# A deadline this close counts as passed: a batch's statements are bounded far below it, so
+# nothing is deleted after expires_at even when the matcher has not marked the row expired yet.
+RETENTION_EXPIRY_MARGIN = '1 minute'
+# Shared by each batch, exclusive by the operator's switch: a disable waits for in-flight batches.
+RETENTION_LOCK = 'subscription-retention'
+
+
+def lock_retention(c, *, shared):
+    """Advisory, so the worker needs no UPDATE right on probe_metadata just for a row lock."""
+    if not shared:
+        c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', (RETENTION_LOCK,))
+        return True
+    # A queued disable makes this fail at once, so batches never starve the operator.
+    return c.execute('SELECT pg_try_advisory_xact_lock_shared(hashtextextended(%s,0)) AS locked',
+        (RETENTION_LOCK,)).fetchone()['locked']
 
 
 def acked_retention_days():
@@ -456,9 +471,11 @@ def prune_subscriptions(store, *, max_subscriptions=16):
                 CROSS JOIN LATERAL (SELECT m.matched_at FROM subscription_matches m WHERE m.subscription=s.id
                     AND m.event>s.retention_floor AND m.event<=sc.acked_through ORDER BY m.event LIMIT 1) oldest
                 WHERE NOT s.retention_hold AND s.state NOT IN ('closed','expired')
+                    AND (s.expires_at IS NULL OR s.expires_at>clock_timestamp()+%s::interval)
                     AND oldest.matched_at<clock_timestamp()-make_interval(days=>%s)
                     AND EXISTS(SELECT FROM probe_metadata WHERE name='subscription_retention' AND value='enabled')
-                ORDER BY oldest.matched_at,s.id LIMIT %s''', (days, max_subscriptions)).fetchall()
+                ORDER BY oldest.matched_at,s.id LIMIT %s''',
+                (RETENTION_EXPIRY_MARGIN, days, max_subscriptions)).fetchall()
     except errors.UndefinedColumn:
         # Schema before 40: the migration precedes this worker, so nothing is pruned meanwhile.
         return stats
@@ -482,16 +499,24 @@ def prune_subscriptions(store, *, max_subscriptions=16):
 
 
 def _prune_batch(c, candidate, days):
-    """One transaction. Returns rows deleted, or None when the subscription is busy or held."""
+    """One transaction. Returns rows deleted, or None when retention is off or the subscription
+    is busy, held or past its deadline."""
     # Bounds well under one matcher pass; a contended subscription waits for the next pass.
     c.execute("SET LOCAL lock_timeout='100ms'")
     c.execute("SET LOCAL statement_timeout='1s'")
+    # The activation is reread under the shared lock: once --disable returns, no batch deletes.
+    if not lock_retention(c, shared=True) or not c.execute('''SELECT EXISTS(SELECT FROM probe_metadata
+            WHERE name='subscription_retention' AND value='enabled') AS enabled''').fetchone()['enabled']:
+        return None
     # The matcher's order: the shared principal lock, then the subscription row.
     lock_principal(c, candidate['principal'], shared=True)
-    row = c.execute('''SELECT id,state,retention_floor,retention_hold FROM subscriptions WHERE id=%s
-        FOR UPDATE SKIP LOCKED''', (candidate['id'],)).fetchone()
+    row = c.execute('''SELECT id,state,retention_floor,retention_hold,
+        expires_at IS NOT NULL AND expires_at<=clock_timestamp()+%s::interval AS lapsed
+        FROM subscriptions WHERE id=%s FOR UPDATE SKIP LOCKED''',
+        (RETENTION_EXPIRY_MARGIN, candidate['id'])).fetchone()
     # A quarantine closes every definition: terminal ones keep their references (ANYM-446 F2).
-    if row is None or row['retention_hold'] or row['state'] in ('closed', 'expired'):
+    # A passed deadline is terminal before the matcher stores 'expired'.
+    if row is None or row['retention_hold'] or row['lapsed'] or row['state'] in ('closed', 'expired'):
         return None
     # ACK and fetch hold the subscription row, so acked_through cannot move under this batch.
     consumption = c.execute('SELECT acked_through FROM subscription_consumption WHERE subscription=%s',
