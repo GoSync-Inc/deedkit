@@ -53,6 +53,12 @@ def rule_findings(call):
             if evidence:
                 add('missing_result','Ответ без найденной цитаты',f"Поле {answer['field']}: цитата не найдена в финальных репликах.",evidence,
                     'Подтвердить точную цитату собеседника; не представлять ответ как проверенный факт.')
+    reconnects=[e for e in call['events'] if e['kind']=='media_session' and e.get('ended_by')=='handover']
+    if reconnects:
+        # ANYM-451: said in plain words, not a fault by itself.
+        add('keypress_handover','Звонок переподключался, чтобы отправить клавишу',
+            f'Звонок переподключался {len(reconnects)} раз(а), чтобы отправить клавишу через телефонного провайдера.',reconnects,
+            'Проверить, что меню приняло клавишу и разговор продолжился.',severity='low')
     turns=[e for e in call['events'] if e['kind']=='transcript' and e['role']=='assistant']
     for i in range(2,len(turns)):
         group=turns[i-2:i+1]

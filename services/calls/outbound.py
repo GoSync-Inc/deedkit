@@ -104,11 +104,14 @@ class TwilioCalls:
         except Exception:
             return {'connected':False,'error':'twilio_unavailable'}
 
+    def _stream(self,call_id,token):
+        ws=self.config['public_url'].rstrip('/').replace('https://','wss://',1)+'/provider/twilio/media/'+call_id
+        return '<Connect><Stream url="'+escape(ws,{'"':'&quot;'})+'"><Parameter name="attempt_token" value="'+escape(token,{'"':'&quot;'})+'"/></Stream></Connect><Hangup/>'
+
     async def dial(self,call):
         b=call['brief']; await self.preflight(b)
         base=self.config['public_url'].rstrip('/')
-        ws=base.replace('https://','wss://',1)+'/provider/twilio/media/'+call['id']
-        twiml='<Response><Connect><Stream url="'+escape(ws,{'"':'&quot;'})+'"><Parameter name="attempt_token" value="'+escape(call['stream_token'],{'"':'&quot;'})+'"/></Stream></Connect><Hangup/></Response>'
+        twiml='<Response>'+self._stream(call['id'],call['stream_token'])+'</Response>'
         wa=b['channel']=='whatsapp'
         data={'To':('whatsapp:' if wa else '')+b['destination'],
               'From':self.config.get('sip_from','assistant') if b['channel']=='sip' else ('whatsapp:' if wa else '')+self.config['whatsapp_from' if wa else 'phone_from'],
@@ -138,6 +141,16 @@ class TwilioCalls:
         r=await self.http.post(self._root()+'/Calls/'+sid+'.json',data={'Status':'completed'},auth=self._auth())
         if r.status_code not in {200,404}: raise ServiceError('provider_hangup_unconfirmed')
 
+    async def send_digits(self,call,token,keys):
+        """Out-of-band DTMF (ANYM-451): Twilio plays the digits as RFC 2833 events, then reconnects the same call
+        to the same media URL and token. ServiceError: rejected before acceptance; anything else is ambiguous."""
+        sid=call.get('provider_call_id') or ''
+        if not re.fullmatch(r'CA[0-9a-fA-F]{32}',sid) or not re.fullmatch(r'[0-9*#]{1,3}',keys): raise ServiceError('invalid_provider_id')
+        twiml='<Response><Play digits="w'+keys+'"/>'+self._stream(call['id'],token)+'</Response>'
+        r=await self.http.post(self._root()+'/Calls/'+sid+'.json',data={'Twiml':twiml},auth=self._auth(),timeout=10)
+        if 400<=r.status_code<500: raise ServiceError('provider_rejected')
+        if r.status_code!=200: raise httpx.ReadError('ambiguous_provider_response')
+
     def signature_valid(self,url,params,signature):
         import base64
         value=url+''.join(k+v for k in sorted(params) for v in sorted(set(params.getlist(k) if hasattr(params,'getlist') else [params[k]])))
@@ -152,7 +165,7 @@ class Outbound:
     def __init__(self,service,key,settings,providers,model_key=None):
         self.service,self.key,self.settings,self.providers=service,key,settings,providers
         self.model_key=model_key
-        self.lock=asyncio.Lock(); self.tasks={};self.runtime_stop=None
+        self.lock=asyncio.Lock(); self.tasks={};self.runtime_stop=None;self.stopping={}
         service.db.execute('CREATE TABLE IF NOT EXISTS outbound_attempts (call_id TEXT PRIMARY KEY, token TEXT NOT NULL)')
         service.db.execute('CREATE TABLE IF NOT EXISTS cap_raises (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, '
                            'principal TEXT NOT NULL, owner_instruction TEXT NOT NULL, extra_units INTEGER NOT NULL)')
@@ -325,7 +338,26 @@ class Outbound:
                 self.service.provider_update(call['id'],**receipt)
             except Exception:self.service.provider_update(call['id'],provider_status='reconciliation_required')
 
+    async def send_digits(self,cid,keys):
+        """One Twilio call update for an out-of-band press: accepted, rejected or ambiguous. Never retried."""
+        call=self.service.get_call(cid); provider=self.providers.get(call['brief'].get('account'))
+        row=self.service.db.execute('SELECT token FROM outbound_attempts WHERE call_id=?',(cid,)).fetchone()
+        if not row or not provider or not hasattr(provider,'send_digits'): return 'rejected'
+        try: await provider.send_digits(call,row[0],keys)
+        except ServiceError: return 'rejected'
+        except Exception: return 'ambiguous'
+        return 'accepted'
+
     async def stop(self,cid,reason='owner_stop'):
+        # One terminal winner (ANYM-451): a concurrent stop waits for the first one, and a cancelled
+        # caller never cuts a hangup in half.
+        if cid not in self.stopping:
+            task=self.stopping[cid]=asyncio.ensure_future(self._stop(cid,reason))
+            task.add_done_callback(lambda done:self.stopping.pop(cid,None) if self.stopping.get(cid) is done else None)
+        await asyncio.shield(self.stopping[cid])
+        return self.service.get_call(cid)
+
+    async def _stop(self,cid,reason):
         call=self.service.get_call(cid); provider=self.providers.get(call['brief'].get('account'))
         if call['status'] in ACTIVE and provider and hasattr(provider,'cancel_attempt'):
             await provider.cancel_attempt(cid)

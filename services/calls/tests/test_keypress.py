@@ -49,9 +49,9 @@ def test_press_keys_validates_bounds_and_runs_once(tmp_path):
     assert press(store,cid,'1','extra',approved=True)=={'error':'invalid_tool_arguments'}
     unheard=press(store,cid,'*#','unheard',quote='Press star then pound')
     assert unheard['ok'] is True and unheard['keys']=='*#' and unheard['evidence_found'] is False
-    # Twenty accepted presses per call; refused ones do not count.
+    # Twenty accepted presses per call; refused ones do not count. Alternating keys stay in-band (ANYM-451).
     for i in range(18):
-        assert press(store,cid,'1','press-'+str(i+2))['ok'] is True
+        assert press(store,cid,'12'[i%2],'press-'+str(i+2))['ok'] is True
     assert press(store,cid,'1','press-21')=={'error':'keypress_limit'}
     store.stop(cid)
     assert press(store,cid,'1','after-stop')=={'error':'call_not_active'}

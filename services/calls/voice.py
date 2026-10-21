@@ -21,7 +21,7 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.workers.runner import WorkerRunner
 
-from core import KEYPAD_CHANNELS, TOOL_MODELS, call_clock
+from core import KEYPAD_CHANNELS, RESUME_RULES, TOOL_MODELS, call_clock
 from audio_health import NoRuntimeAudioHealth, RuntimeAudioHealth
 from audio_probe import PCMProbe, diagnostics
 from call_errors import record_model_error
@@ -64,7 +64,8 @@ DESCRIPTIONS={
     'request_owner_decision':'Save an asynchronous owner question. Reuses a pending round; after an answer starts a NEW round. Do not hold the counterparty waiting. Pending is never approval. Only the owner channel can respond.',
     'consult_supervisor':'Ask a separate contextual adviser one concrete question. Waits at most six seconds. Guidance has no approval authority; timeout or obsolete advice means clarify or escalate.',
     'finish_task':'Summarize collected information. Returns missing fields or pending decisions. In social mode this saves notes and does not imply the conversation is finished. Does not execute any external action.',
-    'press_keys':'Press phone keypad keys (in-band tones) to choose an option in an automated menu. Phone, SIP and browser rehearsal calls only. '
+    'press_keys':'Press phone keypad keys to choose an option in an automated menu: in-band tones first; pressing the same key again lets the server '
+                 'resend it through the phone provider, which briefly reconnects the call. Phone, SIP and browser rehearsal calls only. '
                  'A menu choice of at most three keys; quote the menu prompt you heard. Never key in a PIN, password, one-time code, card, account or reference number; '
                  'never choose an option that pays, subscribes, consents, confirms or cancels anything. After pressing, stay silent and wait for the menu to react.',
     'end_conversation':'After a short spoken goodbye, end as completed, needs_owner, refused or unavailable. In social mode completed requires the latest explicit human goodbye quoted in evidence; collected notes are not a reason to stop. Criticism of audio or voice is not a refusal. needs_owner preserves a pending owner question for later; do not wait on the line. For refusal/unavailability quote the human exactly. No automatic callback is scheduled.',
@@ -147,6 +148,26 @@ async def deliver_keys(keypad,service,identity,result):
         with contextlib.suppress(Exception):
             service.runtime_event(identity,{'kind':'keypress_failed','keys':result['keys']})
         return {'error':'keypress_unavailable'}
+
+
+async def send_out_of_band(state,service,identity,result,tool_call_id):
+    """One provider update for an out-of-band press (ANYM-451). Shielded: an interruption that cancels the tool call
+    never leaves the update's outcome unrecorded. A failure is ambiguous, never retried."""
+    async def update():
+        try:outcome=await state['out_of_band'](result['keys']) if state.get('out_of_band') else 'rejected'
+        except Exception:outcome='ambiguous'
+        return service.handover_result(identity,tool_call_id,outcome)
+    return await asyncio.shield(asyncio.ensure_future(update()))
+
+
+RESUME_FALLBACK='CALL RESUMED (server message, not speech). The phone provider reconnected this same call after a key press; '+RESUME_RULES
+
+
+def resume_message(service,identity):
+    try:return service.resume_context(identity)
+    except Exception:
+        with contextlib.suppress(Exception):service.runtime_event(identity,{'kind':'handover_context_failed'})
+        return RESUME_FALLBACK
 
 
 def tool_schemas(handler):
@@ -247,13 +268,15 @@ def input_sample_rate(transport):
 TRANSCRIPTION_LANGUAGES={'ru':'ru-RU','en':'en-US','id':'id-ID'}
 
 
-def create_model(brief,key,recorder=None,input_rate=None,at=None):
+def create_model(brief,key,recorder=None,input_rate=None,at=None,silent=False):
     # The local time is read when the call starts; the brief's prompt and snapshot stay unchanged.
+    # silent: a session resumed after a handover takes its first context without answering it (ANYM-451).
     brief={**brief,'prompt':brief['prompt']+'\n'+call_clock(brief,at or datetime.now(timezone.utc))}
     if brief.get('dialog_engine')=='grok_realtime':
         from grok_voice import AuditedGrok
-        return AuditedGrok(brief,key,recorder,input_rate=input_rate or PipelineParams().audio_in_sample_rate)
+        return AuditedGrok(brief,key,recorder,input_rate=input_rate or PipelineParams().audio_in_sample_rate,silent_start=silent)
     return AuditedGemini(api_key=key,recorder=recorder,external_tts=bool(brief.get('custom_voice_id')),
+        inference_on_context_initialization=not silent,
         live_flows=brief.get('dialog_engine')=='gemini_live_flows',settings=GeminiLiveLLMService.Settings(
         model=brief['model'],system_instruction=brief['prompt'],voice=brief['voice']),
         # Every Gemini engine gets the brief's language as a transcription hint; a legacy language gets none.
@@ -296,9 +319,11 @@ async def run_voice(connection,brief,key,state):
 
 async def run_transport(transport,brief,key,state,browser=False):
     service,identity=state['service'],state['call_id']
+    # A phone call's media session number (ANYM-451): only the newest one may act on the call.
+    generation,resume=state.get('generation'),bool(state.get('resume'))
     context=LLMContext()
-    llm=create_model(brief,key,recorder=lambda role,text:service.transcript_chunk(identity,role,text),
-                     input_rate=input_sample_rate(transport))
+    llm=create_model(brief,key,recorder=lambda role,text:service.transcript_chunk(identity,role,text,generation=generation),
+                     input_rate=input_sample_rate(transport),silent=resume)
     with contextlib.suppress(Exception):
         llm.hint_failed=lambda:service.runtime_event(identity,{'kind':'language_hint_failed'})
         # Grok builds its hint in the constructor; Gemini reports through hint_failed on connection.
@@ -314,20 +339,26 @@ async def run_transport(transport,brief,key,state,browser=False):
     if not live_flows:
         # Best effort too: without a keypad a press answers keypress_unavailable; the call goes on.
         with contextlib.suppress(Exception):keypad=keypad_for(transport,brief.get('channel','browser'))
-    pressed={}
 
     async def handle(name,params):
         if name=='consult_supervisor' and state.get('supervisor'):
-            result=await state['supervisor'].consult(identity,dict(params.arguments),params.tool_call_id)
+            if not service.authorized(identity,generation,name):
+                result={'error':'stale_generation'}
+            else:
+                result=await state['supervisor'].consult(identity,dict(params.arguments),params.tool_call_id)
         else:
-            result=service.tool(identity,name,dict(params.arguments),params.tool_call_id)
+            result=service.tool(identity,name,dict(params.arguments),params.tool_call_id,generation=generation)
         if name=='press_keys':
-            # Tones once per provider tool call. The model gets its result before anything else is awaited,
-            # so an interruption from the still-talking menu cannot cancel the call without a result.
-            if params.tool_call_id not in pressed:
-                pressed[params.tool_call_id]=await deliver_keys(keypad,service,identity,result)
-            await params.result_callback(pressed[params.tool_call_id])
-            await worker.rtvi.send_server_message({'kind':'tool','name':name,'result':pressed[params.tool_call_id]})
+            # Delivery once per call and tool call, whichever session asks (ANYM-451). The model gets its result
+            # before anything else is awaited, so an interruption from the still-talking menu cannot cancel the
+            # call without a result.
+            path=service.claim_delivery(identity,params.tool_call_id,generation) if result.get('ok') else None
+            if path=='out_of_band':
+                result=await send_out_of_band(state,service,identity,result,params.tool_call_id)
+            elif path:
+                result=service.press_delivered(identity,params.tool_call_id,await deliver_keys(keypad,service,identity,result))
+            await params.result_callback(result)
+            await worker.rtvi.send_server_message({'kind':'tool','name':name,'result':result})
             return
         await worker.rtvi.send_server_message({'kind':'tool','name':name,'result':result})
         await params.result_callback(result)
@@ -384,7 +415,8 @@ async def run_transport(transport,brief,key,state,browser=False):
         state['flow']=flow
 
     async def owner_update(decision):
-        await send_owner_update(worker,decision)
+        if service.authorized(identity,generation,'owner_answer'):
+            await send_owner_update(worker,decision)
 
     state['owner_update']=owner_update
 
@@ -394,7 +426,7 @@ async def run_transport(transport,brief,key,state,browser=False):
         await report_error(state,worker.rtvi,frame)
 
     async def begin():
-        service.connected(identity)
+        if not resume:service.connected(identity)
         # Telegram start timing (ANYM-450): the durable call is active from here; best effort.
         if 'start_timing' in state:
             with contextlib.suppress(Exception):state['start_timing'].mark('call_active')
@@ -404,7 +436,8 @@ async def run_transport(transport,brief,key,state,browser=False):
             'dialog_engine':brief.get('dialog_engine','gemini_live')})
         if live_flows:
             await flow.initialize(flow.nodes['discussion'])
-        context.add_message({'role':'user','content':('Begin the browser rehearsal now. The human plays the counterparty. ' if browser else
+        context.add_message({'role':'user','content':resume_message(service,identity) if resume else
+                            ('Begin the browser rehearsal now. The human plays the counterparty. ' if browser else
                             'The counterparty has answered this real call. ')+'Introduce yourself and ask the first relevant question.'})
         await worker.queue_frames([LLMRunFrame()])
         if keypad:
@@ -424,12 +457,12 @@ async def run_transport(transport,brief,key,state,browser=False):
 
     @user.event_handler('on_user_turn_message_added')
     async def user_message(aggregator,message):
-        service.transcript(identity,'user',message.content)
+        service.transcript(identity,'user',message.content,generation=generation)
         await worker.rtvi.send_server_message({'kind':'transcript','role':'user','text':message.content})
 
     @assistant.event_handler('on_assistant_turn_stopped')
     async def assistant_message(aggregator,message):
-        service.transcript(identity,'assistant',message.content,message.interrupted)
+        service.transcript(identity,'assistant',message.content,message.interrupted,generation=generation)
         await worker.rtvi.send_server_message({'kind':'transcript','role':'assistant','text':message.content,'interrupted':message.interrupted})
 
     health_task=asyncio.create_task(runtime_health.monitor(),name='voice-audio-health-'+identity)
@@ -443,7 +476,12 @@ async def run_transport(transport,brief,key,state,browser=False):
             service.runtime_event(identity,{'kind':'provider_audio_health','audio':llm.audio_health.snapshot(),
                                             'runtime':runtime_health.snapshot()})
         with contextlib.suppress(Exception):
-            service.runtime_event(identity,{'kind':'inbound_audio','audio':inbound_audio.snapshot()})
+            service.runtime_event(identity,{'kind':'inbound_audio','audio':inbound_audio.snapshot(),
+                                            **({'generation':generation} if generation is not None else {})})
+        if generation is not None:
+            with contextlib.suppress(Exception):
+                service.runtime_event(identity,{'kind':'media_session','generation':generation,'started_at':state.get('started_at'),
+                                                'ended_by':service.media_ended_by(identity,generation)})
         for task in ending_tasks:
             task.cancel()
         if ending_tasks:
