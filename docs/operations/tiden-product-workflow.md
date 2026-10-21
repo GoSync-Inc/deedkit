@@ -104,6 +104,9 @@ Each deliverable has its own branch, because B merges only the specs a PR names.
 Every PR description carries `Spec impact:` (the `Spec:` and `Delivers:` IDs, each with its
 flags, such as a criterion deferred or not built, and the anchors it adds, or `none`) and
 `Settle text:` (`none`, or a reviewer copy of the settle text on the PR's `Tiden branch:`).
+`scripts/spec_impact.py <base> --body-file <body>` builds the `Spec impact:` list: the specs anchored to the
+changed files and those the body names, each marked `named (Delivers)`, `named (Spec)` or `anchor only`. It
+suggests flags; the author still checks every listed spec and flags it by hand when needed.
 Anything a PR missed is the backstop's: `Tiden drift` and `Tiden health` report it after the main
 push, and a follow-up PR's branch fixes it. Maintenance windows (TIDEN-CI.md) remain only for hand
 repairs that B cannot do, bulk restructuring and deletions.

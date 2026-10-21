@@ -272,7 +272,12 @@ def diff_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Test]
 
 def listing(cli: str, product: str, branch: str) -> dict[int, dict]:
     """Specs of one Tiden branch by number, validated as complete; each keeps its sources."""
-    value = tiden(cli, ["spec", "list", "--branch", branch, "--include-sources"], product, retry=True)
+    return validate_listing(tiden(cli, ["spec", "list", "--branch", branch, "--include-sources"], product, retry=True),
+                            branch)
+
+
+def validate_listing(value: dict, branch: str) -> dict[int, dict]:
+    """The completeness rules of `listing`, for a listing already read (a saved file included)."""
     specs, pagination = value.get("requirements"), value.get("pagination")
     if (not isinstance(specs, list) or not isinstance(pagination, dict) or pagination.get("nextPageToken") != ""
             or type(pagination.get("totalCount")) is not int or pagination["totalCount"] != len(specs)):
