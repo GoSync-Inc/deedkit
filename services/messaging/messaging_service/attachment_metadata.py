@@ -126,6 +126,9 @@ def attachment_fields(row, *, original_present=None):
         download_retry_scheduled=bool(detail and detail.get('retry_scheduled')))
     for key in ('attempts','next_due','download_eligibility'):
         if key in row:item[key]=row[key]
+    kind=(mime or '').split(';',1)[0].lower()
+    if enrichment=='ready' and (kind.startswith('audio/') or kind=='application/ogg'):
+        item['transcript_ready']=True  # get_file_text returns it by default (ANYM-453).
     if eligibility=='unknown':item['eligibility_reason']='history_bound_unknown'
     source={}
     for name,aliases in {'account':('account',),'chat':('chat',),'message_id':('message_id','message'),

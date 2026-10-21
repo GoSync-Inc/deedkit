@@ -81,8 +81,16 @@ extracted text or the ASR transcript. Model derivatives carry an explicit
 untrusted/generated label. Optional enrichment
 is a separate disabled-by-default worker; this extraction worker invokes no model.
 
-`get_file_text(attachment_id, offset=0, limit=4000, content='extracted')` returns a
+`get_file_text(attachment_id, offset=0, limit=4000, content=None)` returns a
 character page, `next_offset`, source provenance and overlapping PDF page / XLSX sheet and cell spans.
+An omitted `content` reads a voice note (`audio/*` or `application/ogg` without extracted
+text) through its model transcript and reports `content='enriched'`; any other file
+reads `content='extracted'`. When that transcript is not ready, the reply has empty text,
+`enrichment_status` and an `empty_reason` from the timestamp-segment vocabulary
+(`processing_pending`, `processing_paused`, `processing_worker_unavailable`,
+`processing_failed` with `failure_reason`, or `processing_not_configured`, which only
+the owner can change). Explicit `content` values keep their meaning.
+Message rows mark a voice note whose transcript is ready with `transcript_ready: true`.
 `content='enriched'` pages the model transcript/text up to 1,000,000 stored characters;
 raw extraction has the same configurable ceiling. Each response page is at most 8,000 characters.
 `get_attachment` and `request_file_download` expose the same current extraction
@@ -231,7 +239,10 @@ request, model invocation or duplicate caption index is needed.
 `matched_content` identifies the excerpt source (`extracted`, `enriched`, or
 `message_context`); `match_sources` lists the matching sources. `extracted`
 includes indexed filenames as well as parser output. File passages are preferred
-for the excerpt when both a file and its caption match.
+for the excerpt when both a file and its caption match. A voice note without
+extracted text shows its ready transcript as the excerpt when the query is empty
+or matches only the name; such hits carry `excerpt_source: "transcript"` and keep
+their `matched_content`.
 
 A caption match includes `message_context={message_id,revision,field:"body"}`
 in both compact and full replies. It does not mean that OCR, transcription or
