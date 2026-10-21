@@ -11,8 +11,10 @@ and every test the diff adds carries `# spec: ANYM-n` (Python) or `// spec: ANYM
 directly above its definition, above its decorators. The check fails when a changed code file has no source anchor on
 Tiden main and the body names no spec, when an added test has no marker and is not in NO_SPEC, when a named ID is not
 an existing story-level spec on Tiden main or the named branch, or when the named branch is not an open proposal or
-review branch. It prints the anchor matches for the job summary. The main-push sync (scripts/tiden_sync.py) later
-anchors, links and merges from the same lines and markers.
+review branch, or when that open branch's merge preview changes a spec the body does not name, changes no spec or
+holds more than spec changes (one preview parser, shared with the main sync). A failed read or an unknown or
+malformed preview is a refusal, not a verdict, except that a forbidden class is judged before the spec numbers. It prints the anchor matches for the job summary. The main-push sync
+(scripts/tiden_sync.py) later anchors, links and merges from the same lines and markers.
 """
 from __future__ import annotations
 
@@ -52,6 +54,12 @@ NODE_NAME = re.compile(r"\s*(?:'([^'\\\x00-\x1f\x7f]+)'|\"([^\"\\\x00-\x1f\x7f]+
 GO_TEST = re.compile(rf"^[ \t]*func\s+(Test(?![a-z])\w*)\s*(?:{COMMENT}\s*)*\(", re.MULTILINE)
 # Story-level means a leaf that holds criteria: not an Epic and without child specs.
 CONTAINER_TYPES = {"Epic"}
+# The merge-preview shape of CLI 0.33.0 (read 2026-10-19 from 62 open branches); empty fields may be omitted. Any
+# other key is a change this job cannot judge, so it refuses. The main sync (tiden_sync.py) uses the same parser.
+PREVIEW_CHANGES = ("additions", "modifications")
+PREVIEW_EMPTY = ("deletions", "testAdditions", "testModifications", "testDeletions", "componentAdditions",
+                 "componentModifications", "componentDeletions")
+PREVIEW_OTHER = ("stats", "intentSession", "blockingSessions", "hasRequirementChanges")
 # Tests that verify no spec, as `<path>::<test>` patterns with the reason; widening it is a reviewed code change.
 NO_SPEC: tuple[tuple[str, str], ...] = ()
 TIMEOUT = 120
@@ -309,6 +317,70 @@ def branch_status(cli: str, product: str, name: str) -> str | None:
     return statuses[0] if statuses else None
 
 
+def preview_number(item: object) -> int:
+    """The one spec number of a merge-preview addition or modification: its own `seqNum` and that of every nested
+    object (a modification may carry the main and branch copies) must agree."""
+    if not isinstance(item, dict):
+        raise Refused("the merge preview has a change that is not an object")
+    copies = [item, *(value for value in item.values() if isinstance(value, dict))]
+    numbers = [copy["seqNum"] for copy in copies if "seqNum" in copy]  # a present null counts, an absent key not
+    if not all(type(number) is int for number in numbers):  # before the set: 50.0 and True would equal an int
+        raise Refused("the merge preview has a change without exactly one spec number")
+    found = set(numbers)
+    if len(found) != 1:
+        raise Refused("the merge preview has a change without exactly one spec number")
+    return found.pop()
+
+
+def preview_numbers(preview: dict, name: str) -> tuple[set[int], list[str]]:
+    """The specs a merge preview changes, and the forbidden change classes it holds (anything but additions and
+    modifications of specs). A forbidden preview returns no numbers; an unknown or malformed shape refuses."""
+    unknown = sorted(set(preview) - {*PREVIEW_CHANGES, *PREVIEW_EMPTY, *PREVIEW_OTHER})
+    if unknown:
+        raise Refused(f"the preview of {name} has unknown fields ({', '.join(map(shown, unknown))})")
+    lists = {key: preview.get(key, []) for key in (*PREVIEW_CHANGES, *PREVIEW_EMPTY)}
+    if not all(isinstance(value, list) for value in lists.values()):
+        raise Refused(f"the merge preview of {name} is malformed")
+    other = [key for key in PREVIEW_EMPTY if lists[key]]
+    stats = preview.get("stats", {})
+    if not isinstance(stats, dict) or not all(type(value) is int for value in stats.values()):
+        raise Refused(f"the merge preview of {name} has malformed stats")
+    other += [f"stats.{key}" for key, value in stats.items() if value and key not in PREVIEW_CHANGES]
+    other += [f"stats.{key}" for key in PREVIEW_CHANGES if stats.get(key, len(lists[key])) != len(lists[key])]
+    if preview.get("intentSession") is not None:
+        other.append("intentSession")
+    if preview.get("blockingSessions") not in (None, 0, []):
+        other.append("blockingSessions")
+    if not isinstance(preview.get("hasRequirementChanges", True), bool):
+        other.append("hasRequirementChanges")
+    if other:
+        return set(), other
+    return {preview_number(item) for key in PREVIEW_CHANGES for item in lists[key]}, []
+
+
+def preview_problems(cli: str, product: str, lines: Lines, main: dict[int, dict], known: dict[int, dict],
+                     failures: list[str]) -> set[int]:
+    """Compare the named open branch's merge preview with the body: what sync B's merge step would refuse after the
+    squash fails here, before it. Returns the specs the preview changes (empty when it is forbidden or changes none);
+    a failed read or an unknown or malformed shape raises Refused, which the job reports as not checked."""
+    branch = lines.branch
+    numbers, forbidden = preview_numbers(tiden(cli, ["branch", "merge-preview", "--name", branch], product, retry=True),
+                                         branch)
+    if forbidden:
+        failures.append(f"the preview of {branch} holds more than spec changes ({', '.join(forbidden)})")
+        return numbers
+    stray = sorted(numbers - set(lines.named))
+    if stray:
+        failures.append(f"the preview of {branch} changes " + ", ".join(f"ANYM-{number}" for number in stray)
+                        + ", which the body does not name")
+    elif not numbers:
+        failures.append(f"the preview of {branch} changes no spec")
+    for number in lines.named:
+        if number in known and number not in numbers and number not in main:  # unknown IDs fail once, in check()
+            failures.append(f"ANYM-{number} (named by the body) is not a spec on Tiden main or {branch}")
+    return numbers
+
+
 def check(root: Path, base: str, head: str, body: str, cli: str, product: str, report) -> int:
     failures: list[str] = []
     lines = parse_body(body)
@@ -321,12 +393,14 @@ def check(root: Path, base: str, head: str, body: str, cli: str, product: str, r
     main = listing(cli, product, "main")
     anchors = anchor_map(main)
     known = main
+    previewed: set[int] | None = None
     if lines.branch:
         status = branch_status(cli, product, lines.branch)
         if status != "open":
             failures.append(f"`Tiden branch: {lines.branch}` is {'missing' if status is None else status}, not open")
         else:
             known = {**main, **listing(cli, product, lines.branch)}
+            previewed = preview_problems(cli, product, lines, main, known, failures)
 
     report("## Tiden PR check")
     report(f"Changed files {len(paths)}, code files {len(code)}, added tests {len(tests)}.")
@@ -336,6 +410,11 @@ def check(root: Path, base: str, head: str, body: str, cli: str, product: str, r
             for number in lines.named))
     if lines.branch:
         report(f"Tiden branch: {lines.branch}")
+    if previewed:
+        report("Branch preview: " + ", ".join(f"ANYM-{number}" for number in sorted(previewed)))
+        for number in lines.named:
+            if number not in previewed and number in main:
+                report(f"- ANYM-{number}: named, not changed by {lines.branch}")
     unanchored = [path for path in code if path not in anchors]
     for path in code:
         found = anchors.get(path)

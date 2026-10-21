@@ -316,6 +316,15 @@ bookkeeping a merge needs (AGENTS.md section 4):
 - the body lines `Spec:`, `Delivers:` and `Tiden branch:` are well formed, name
   story-level specs that exist on Tiden main or on the named branch, and the
   named branch is open;
+- the merge preview of that open branch (read-only `branch merge-preview`) changes
+  every spec the sync would merge and nothing the body does not name: it fails
+  when the preview changes a spec the body does not name, changes no spec, or
+  holds more than spec changes (deletions, test or component changes, conflicts,
+  an intent session, blocking sessions). A named ID the preview does not change
+  passes only as a spec on Tiden main. A preview of an unknown or malformed shape
+  is not checked (below), as sync B's step `merge` refuses the same shapes; a
+  forbidden class is judged first, so a preview with one fails even when a spec
+  number in it is malformed;
 - every test the pull request adds has a `# spec: ANYM-n` or `// spec: ANYM-n`
   marker directly above it and its decorators, or is in the reviewed `NO_SPEC`
   list; existing tests need none;
@@ -345,7 +354,7 @@ push run that production promotion requires. For the merged
 pull request named by `(#n)` in the commit subject, it:
 
 1. merges the body's `Tiden branch:` when its preview holds only the named
-   specs;
+   specs (check A applies the same rule, with the same parser, before the merge);
 2. links each marked test the commit adds to its specs (a Go test,
    `// spec: ANYM-n` above `func TestX`, links the cases whose signature is
    `<module path>[/<package dir>]::TestX` or starts with `<that>::TestX/`, the

@@ -1,12 +1,14 @@
 """The Tiden PR check against temporary Git repositories and a fake Tiden CLI; it never calls Tiden."""
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
 import pytest
 
 import scripts.tiden_pr_check as pr_check
+import scripts.tiden_sync as tiden_sync
 from tiden_fake import READS, SECRET, Server, anchor, commit, git, repository, spec
 
 ROOT_SCRIPT = str(Path(__file__).resolve().parents[1] / "scripts/tiden_pr_check.py")
@@ -115,6 +117,7 @@ def test_unknown_epic_and_parent_ids_fail(repo, server):
 # spec: ANYM-405
 def test_a_card_on_the_named_open_branch_counts_and_a_closed_branch_fails(repo, server):
     server.set(main=[spec(12)], branch_specs={"proposal/x": [spec(50, status="Backlog", branch=True)]},
+               previews={"proposal/x": {"additions": [{"seqNum": 50}], "modifications": []}},
                branches=[{"name": "main", "status": "open"}, {"name": "proposal/x", "status": "open"},
                          {"name": "review/y", "status": "merged"}])
     code, out = run(repo, server, {"tests/test_x.py": "# spec: ANYM-50\ndef test_x():\n    pass\n"},
@@ -125,6 +128,136 @@ def test_a_card_on_the_named_open_branch_counts_and_a_closed_branch_fails(repo, 
                     "Delivers: ANYM-50\nTiden branch: review/y\n")
     assert code == 1 and "`Tiden branch: review/y` is merged, not open" in out
     assert "ANYM-50 (named by the body) is not a spec on Tiden main or review/y" in out
+
+
+BRANCHES = [{"name": "main", "status": "open"}, {"name": "proposal/x", "status": "open"},
+            {"name": "review/y", "status": "merged"}]
+
+
+def previewed(server, preview, branch_numbers=(50, 51)):
+    """Tiden main holds ANYM-12; proposal/x holds the given cards and its merge preview is `preview`."""
+    server.set(main=[spec(12)], branches=BRANCHES, previews={"proposal/x": preview},
+               branch_specs={"proposal/x": [spec(number, status="Backlog", branch=True) for number in branch_numbers]})
+
+
+def run_main(repo, server, body, monkeypatch, capsys):
+    """Commit a docs change and run the command line on `body`; its output and exit code are what CI shows."""
+    root, _ = repo
+    base = git(root, "rev-parse", "HEAD")
+    commit(root, {"README.md": "text\n"}, "change")
+    body_file = root.parent / "body.md"
+    body_file.write_text(body)
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.setenv("TIDEN_PRODUCT_ID", "product")
+    monkeypatch.setattr(sys, "argv", ["tiden_pr_check.py", "--root", str(root), "--base", base, "--body-file",
+                                      str(body_file), "--cli", str(server.cli)])
+    code = pr_check.main()
+    return code, capsys.readouterr().out
+
+
+# spec: ANYM-445
+def test_a_named_branch_whose_preview_changes_an_unnamed_spec_or_nothing_fails_before_the_merge(repo, server):
+    previewed(server, {"additions": [{"seqNum": 50}, {"seqNum": 51}], "modifications": []})
+    code, out = run(repo, server, {"README.md": "text\n"}, "Delivers: ANYM-50\nTiden branch: proposal/x")
+    assert code == 1 and "Passed." not in out
+    assert "the preview of proposal/x changes ANYM-51, which the body does not name" in out
+    previewed(server, {"additions": [{"seqNum": 52}], "modifications": [{"branch": {"seqNum": 51}}]}, (50, 51, 52))
+    code, out = run(repo, server, {"README.md": "more\n"}, "Delivers: ANYM-50\nTiden branch: proposal/x")
+    assert code == 1 and "changes ANYM-51, ANYM-52, which the body does not name" in out
+    previewed(server, {"additions": [], "modifications": []})
+    code, out = run(repo, server, {"README.md": "again\n"}, "Spec: ANYM-12\nTiden branch: proposal/x")
+    assert code == 1 and "the preview of proposal/x changes no spec" in out
+    assert not server.writes()
+
+
+# spec: ANYM-445
+def test_named_specs_the_branch_does_not_change_pass_only_when_they_are_on_main(repo, server):
+    previewed(server, {"additions": [{"seqNum": 50}], "modifications": []})
+    code, out = run(repo, server, {"README.md": "text\n"}, "Delivers: ANYM-50\nSpec: ANYM-12\nTiden branch: proposal/x")
+    assert code == 0, out
+    assert "ANYM-12: named, not changed by proposal/x" in out and "Branch preview: ANYM-50" in out
+    code, out = run(repo, server, {"README.md": "more\n"}, "Delivers: ANYM-50\nSpec: ANYM-51\nTiden branch: proposal/x")
+    assert code == 1
+    assert out.count("ANYM-51 (named by the body) is not a spec on Tiden main or proposal/x") == 1
+    code, out = run(repo, server, {"README.md": "again\n"}, "Delivers: ANYM-50\nSpec: ANYM-99\nTiden branch: proposal/x")
+    assert code == 1
+    assert out.count("ANYM-99 (named by the body) is not a spec on Tiden main or proposal/x") == 1
+    assert not server.writes()
+
+
+# spec: ANYM-445
+@pytest.mark.parametrize("preview, kind, text", [
+    ({"additions": [{"seqNum": 50}], "testAdditions": [{"id": "t"}]}, "verdict", "testAdditions"),
+    ({"additions": [{"seqNum": 50}], "deletions": [{"seqNum": 12}]}, "verdict", "deletions"),
+    ({"additions": [{"seqNum": 51}], "deletions": [{"seqNum": 12}]}, "verdict", "(deletions)"),
+    ({"additions": [{"seqNum": 50}], "stats": {"conflicts": 1}}, "verdict", "conflicts"),
+    ({"additions": [{"seqNum": 50}], "blockingSessions": [{"sessionId": "s"}]}, "verdict", "blocking"),
+    ({"additions": [{"seqNum": 50}], "componentAdditions": [{"name": "c"}]}, "verdict", "componentAdditions"),
+    ({"additions": [{"seqNum": 50}], "componentModifications": [{"name": "c"}]}, "verdict", "componentModifications"),
+    ({"additions": [{"seqNum": 50}], "testModifications": [{"id": "t"}]}, "verdict", "testModifications"),
+    ({"additions": [{"seqNum": 50}], "testDeletions": [{"id": "t"}]}, "verdict", "testDeletions"),
+    ({"additions": [{"seqNum": 50}], "stats": {"additions": 1, "conflicts": 2}}, "verdict", "stats.conflicts"),
+    ({"additions": [{"seqNum": 50}], "stats": {"additions": 2}}, "verdict", "stats.additions"),
+    ({"additions": [{"seqNum": 50}], "intentSession": {"id": "s"}}, "verdict", "intentSession"),
+    ({"additions": [{"seqNum": 50}], "hasRequirementChanges": "yes"}, "verdict", "hasRequirementChanges"),
+    ({"additions": [{"seqNum": 50}], "specMoves": [{"seqNum": 12}]}, "refused", "the preview of proposal/x has unknown fields (specMoves)"),
+    ({"additions": None, "modifications": []}, "refused", "the merge preview of proposal/x is malformed"),
+    ({"additions": [{"seqNum": 50}], "stats": {"conflicts": "0"}}, "refused",
+     "the merge preview of proposal/x has malformed stats"),
+    ({"additions": [{"title": "no number"}], "modifications": []}, "refused",
+     "the merge preview has a change without exactly one spec number"),
+    ({"modifications": [{"seqNum": 50, "branch": {"seqNum": 99}}]}, "refused",
+     "the merge preview has a change without exactly one spec number"),
+    ({"modifications": [{"seqNum": "50"}]}, "refused", "the merge preview has a change without exactly one spec number"),
+    ({"additions": ["50"]}, "refused", "the merge preview has a change that is not an object"),
+])
+def test_a_forbidden_preview_is_a_verdict_and_a_malformed_preview_is_not_checked(
+        repo, server, monkeypatch, capsys, preview, kind, text):
+    previewed(server, preview)
+    code, out = run_main(repo, server, "Delivers: ANYM-50\nTiden branch: proposal/x", monkeypatch, capsys)
+    assert code == 1 and "Passed." not in out
+    if kind == "verdict":
+        assert "the preview of proposal/x holds more than spec changes (" in out and text in out
+        assert "problem(s):" in out and "Refused:" not in out and "does not name" not in out
+    else:
+        assert f"Refused: {text}" in out and "problem(s):" not in out
+    assert not server.writes()
+
+
+# spec: ANYM-445
+@pytest.mark.parametrize("fault, reason", [
+    ({"branch merge-preview": "exit"}, "Refused: tiden branch merge-preview exited 3"),
+    ({"branch merge-preview": "garbage"}, "Refused: tiden branch merge-preview returned malformed JSON"),
+    ({}, "Refused: tiden branch merge-preview returned no object"),
+])
+def test_a_failing_or_malformed_merge_preview_refuses_without_a_verdict_and_no_branch_reads_none(
+        repo, server, monkeypatch, capsys, fault, reason):
+    previewed(server, [])
+    server.set(fault=fault)
+    code, out = run_main(repo, server, "Delivers: ANYM-50\nTiden branch: proposal/x", monkeypatch, capsys)
+    assert code == 1 and reason in out and "Passed." not in out and "problem(s):" not in out
+    assert SECRET not in out and not server.writes()
+    server.set(fault={"branch merge-preview": "exit"}, log=[])
+    for body in ("Spec: ANYM-12", "Spec: ANYM-12\nTiden branch: review/y"):
+        code, out = run_main(repo, server, body, monkeypatch, capsys)
+        assert code == (1 if "review/y" in body else 0), out
+    assert ("branch", "merge-preview") not in server.calls() and not server.writes()
+
+
+# spec: ANYM-445
+def test_the_check_and_the_sync_share_one_preview_parser():
+    scripts = Path(pr_check.__file__).resolve().parent
+    sources = [path.read_text(encoding="utf-8") for path in sorted(scripts.rglob("*.py"))]
+    for name in ("preview_number", "preview_numbers"):
+        assert sum(len(re.findall(rf"^def {name}\(", text, re.MULTILINE)) for text in sources) == 1
+    for name in ("PREVIEW_CHANGES", "PREVIEW_EMPTY", "PREVIEW_OTHER"):
+        assert sum(len(re.findall(rf"^{name}\s*=", text, re.MULTILINE)) for text in sources) == 1
+        assert re.search(rf"^{name}\s*=", Path(pr_check.__file__).read_text(encoding="utf-8"), re.MULTILINE)
+    # tiden_sync loads the script as the top-level module `tiden_pr_check`, the test as `scripts.tiden_pr_check`
+    assert tiden_sync.preview_numbers.__module__.rsplit(".", 1)[-1] == "tiden_pr_check"
+    assert not re.search(r"^\s*(?:import|from)\s+(?:scripts\.)?tiden_sync\b",
+                         Path(pr_check.__file__).read_text(encoding="utf-8"), re.MULTILINE)
 
 
 # spec: ANYM-405
