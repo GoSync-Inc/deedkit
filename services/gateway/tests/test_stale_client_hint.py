@@ -160,3 +160,41 @@ def test_hint_failure_keeps_the_original_error(tmp_path, monkeypatch):
         tools = rpc(client, "tools/list").json()["result"]["tools"]
         assert tools[0]["description"] == CATALOG["platform_capabilities"]["description"]
         assert capabilities(client)["tools"] == ["platform_capabilities"]
+
+
+def prepare_app(tmp_path):
+    def backend(request):
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json={"permissions": ["calls:prepare"],
+                                            "tool_manifest": {"names": ["prepare_call"]}})
+        return httpx.Response(200, json={"synthetic": True})
+
+    return configured(tmp_path, backend, module="calls", tools=["calls_prepare_call"], grants=["calls:prepare"])[0]
+
+
+def assert_nested_failure_keeps_the_original_shape(tmp_path, brief):
+    rest, mcp = post_both(prepare_app(tmp_path), "calls_prepare_call", {"brief": brief})
+    body = rest.json()
+    assert rest.status_code == 422 and mcp["isError"] and mcp["structuredContent"] == body
+    assert set(body) == {"error", "next_action", "field_errors"} and body["next_action"] == "check_parameters"
+    return body
+
+
+# spec: ANYM-452
+def test_nested_required_fields_get_no_stale_hint(tmp_path):
+    body = assert_nested_failure_keeps_the_original_shape(tmp_path, {})
+    assert {"field": "brief/goal", "reason": "required"} in body["field_errors"]
+
+
+# spec: ANYM-452
+def test_nested_unknown_fields_get_no_stale_hint(tmp_path):
+    brief = {"goal": "Ask about opening hours", "counterparty": "Clinic", "success_fields": ["hours"]}
+    body = assert_nested_failure_keeps_the_original_shape(tmp_path, {**brief, "voice_style": "warm"})
+    assert body["field_errors"] == [{"field": "brief/voice_style", "reason": "unknown_field"}]
+
+
+# spec: ANYM-452
+def test_nested_unsafe_key_redacted_to_its_parent_gets_no_stale_hint(tmp_path):
+    brief = {"goal": "Ask about opening hours", "counterparty": "Clinic", "success_fields": ["hours"]}
+    body = assert_nested_failure_keeps_the_original_shape(tmp_path, {**brief, "unsafe key": 1})
+    assert body["field_errors"] == [{"field": "brief", "reason": "unknown_field"}]
