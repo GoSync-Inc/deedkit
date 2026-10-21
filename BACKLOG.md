@@ -18,37 +18,39 @@ not another work queue.
 The crosswalk preserves all 57 historical identifiers. Specification numbers are
 unique in this product. DK-40 and DK-41 retain their existing identities in the
 open implementation branches below; their presence is not a merged-code claim.
+Cards marked "was N" were unbuilt Backlog cards; on 2026-10-21 the owner had them recreated
+as new specs on `proposal/2026-10-21-*` branches, so they are off Tiden main until work starts.
 
 | Historical ID | Tiden specification(s) | Topic |
 | --- | --- | --- |
 | DK-02 | 222 | Operational restore, originals integrity and receiver capacity |
 | DK-03 | 223 | Retain file evidence and expire eligible originals after 30 idle days |
-| DK-04 | 224 | Execute durable fair history waves with restart recovery |
+| DK-04 | 456 (was 224) | Execute durable fair history waves with restart recovery |
 | DK-05 | 225 | Recover historical exhausted media jobs within bounded retry policy |
-| DK-06 | 226 | Classify and audit contradictory source observations |
+| DK-06 | 457 (was 226) | Classify and audit contradictory source observations |
 | DK-07 | 227 | Accept native WhatsApp rollout and rollback on the intended installation |
 | DK-10 | 228 | Integrate a host receiver and prove an idle-agent turn |
-| DK-11 | 229 | Provide a compact incoming overview across selected chats |
+| DK-11 | 458 (was 229) | Provide a compact incoming overview across selected chats |
 | DK-12 | 230 | Version independent file titles, summaries and AI artifacts |
-| DK-13 | 231 | Measure local and API file understanding quality and cost |
+| DK-13 | 459 (was 231) | Measure local and API file understanding quality and cost |
 | DK-14 | 232 | Evaluate hybrid retrieval against a measured baseline |
-| DK-15 | 233 | Persist calendar incremental sync cursors |
+| DK-15 | 460 (was 233) | Persist calendar incremental sync cursors |
 | DK-16 | 234 | Establish Google and service recurrence parity |
 | DK-17 | 235 | Project guardian assignments and family activity safely |
 | DK-18 | 236 | Accept multiple Google and mixed Google/iCloud grants and privacy |
 | DK-19 | 237 | Accept calendar isolation, vault/database restore and independent operation |
-| DK-20 | 238 | Persist calls control, owner notifications and follow-up scheduling |
+| DK-20 | 461 (was 238) | Persist calls control, owner notifications and follow-up scheduling |
 | DK-21 | 239 | Accept authorized live voice behavior and acoustic quality |
-| DK-22 | 240 | Expand bounded passive rich message observations |
-| DK-23 | 241 | Add scoped profile pictures and permitted profile updates |
+| DK-22 | 462 (was 240) | Expand bounded passive rich message observations |
+| DK-23 | 463 (was 241) | Add scoped profile pictures and permitted profile updates |
 | DK-24 | 242 | Add typed group restrictions and admission operations |
 | DK-25 | 243 | Add scoped join, invitation, channel and forum operations |
-| DK-26 | 244 | Add bounded scheduling, albums and richer media actions |
-| DK-27 | 245 | Evaluate expiring server-managed message approvals |
+| DK-26 | 464 (was 244) | Add bounded scheduling, albums and richer media actions |
+| DK-27 | 465 (was 245) | Evaluate expiring server-managed message approvals |
 | DK-28 | 246 | Extend native WhatsApp capabilities one reviewed operation at a time |
 | DK-29 | 247 | Publish a verified package release with registry receipts |
-| DK-30 | 248 | Add authenticated bounded MCP discovery notifications |
-| DK-31 | 249 | Record disposition of historical telemetry and subscription reviews |
+| DK-30 | 466 (was 248) | Add authenticated bounded MCP discovery notifications |
+| DK-31 | 467 (was 249) | Record disposition of historical telemetry and subscription reviews |
 | DK-33 | 250 | Accept deployed agent-audit behavior on the intended installation |
 | DK-35 | 251 | Establish owner-selected calendar sources and primary/duplicate mapping |
 | DK-36 | 252 | Define silence timers, quiet hours, debounce and delivery batching |
