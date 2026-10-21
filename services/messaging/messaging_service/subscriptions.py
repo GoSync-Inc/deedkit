@@ -260,6 +260,13 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50):
     state = _view(c, row)
     if row['state'] == 'access_changed':
         return {'subscription': state, 'items': [], 'has_more': False, 'scope_masked': True}
+    # Pruned references never become an empty complete page: the gap names the floor to resume from.
+    floor = row.get('retention_floor', 0)
+    if after < floor:
+        state['gap'] = {'reason': 'retention_gap', 'after': after, 'through': floor,
+            'recoverable': False, 'floor': floor}
+        return {'subscription': state, 'items': [], 'has_more': True, 'next_after': floor,
+            'consumption': 'passive_read_no_ack', 'scope_masked': False}
     events = c.execute('''SELECT e.id,e.kind,e.origin,e.revision,e.created_at,
         jsonb_strip_nulls(jsonb_build_object(
             'message',e.snapshot->'message','account',e.snapshot->'account','chat',e.snapshot->'chat',
@@ -417,3 +424,92 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     capture(error, 'subscription_hint_failed')
                     print(json.dumps({'error': 'subscription_hint_failed'}), flush=True)
     return stats
+
+
+RETENTION_BATCH = 500
+
+
+def acked_retention_days():
+    """Checked at worker startup, so an invalid value fails before any deletion."""
+    return _bound_setting('SUBSCRIPTION_ACKED_RETENTION_DAYS', 7, 1, 366)
+
+
+def prune_subscriptions(store, *, max_subscriptions=16):
+    """One bounded pass deleting old ACKed match references; never raises for a single batch.
+
+    Only references at or below the consumer's acked_through and older than the retention window
+    are deleted, as a contiguous prefix above the floor, and the floor moves in the same
+    transaction. Held (quarantine-restored), closed or expired and passive-only subscriptions are
+    never touched. Nothing is pruned until an operator enables retention (probe_metadata
+    'subscription_retention'), after every serving reader reports retention_gap.
+    """
+    from psycopg import errors
+    from .store import bounded
+    bounded(max_subscriptions, 128)
+    days = acked_retention_days()
+    stats = {'pruned': 0, 'pruned_subscriptions': 0, 'retention_skipped': 0, 'retention_failed': 0}
+    try:
+        with store.pool.connection() as c:
+            # The oldest retained ACKed reference is one primary-key probe per subscription.
+            candidates = c.execute('''SELECT s.id,s.principal FROM subscriptions s
+                JOIN subscription_consumption sc ON sc.subscription=s.id
+                CROSS JOIN LATERAL (SELECT m.matched_at FROM subscription_matches m WHERE m.subscription=s.id
+                    AND m.event>s.retention_floor AND m.event<=sc.acked_through ORDER BY m.event LIMIT 1) oldest
+                WHERE NOT s.retention_hold AND s.state NOT IN ('closed','expired')
+                    AND oldest.matched_at<clock_timestamp()-make_interval(days=>%s)
+                    AND EXISTS(SELECT FROM probe_metadata WHERE name='subscription_retention' AND value='enabled')
+                ORDER BY oldest.matched_at,s.id LIMIT %s''', (days, max_subscriptions)).fetchall()
+    except errors.UndefinedColumn:
+        # Schema before 40: the migration precedes this worker, so nothing is pruned meanwhile.
+        return stats
+    for candidate in candidates:
+        try:
+            with store.pool.connection() as c:
+                deleted = _prune_batch(c, candidate, days)
+        except Exception as error:
+            # The batch rolled back alone (deletion and floor together); matching continues.
+            from .telemetry import capture
+            capture(error, 'subscription_retention_failed')
+            print(json.dumps({'error': 'subscription_retention_failed', 'class': type(error).__name__}), flush=True)
+            stats['retention_failed'] += 1
+            continue
+        if deleted is None:
+            stats['retention_skipped'] += 1
+        elif deleted:
+            stats['pruned'] += deleted
+            stats['pruned_subscriptions'] += 1
+    return stats
+
+
+def _prune_batch(c, candidate, days):
+    """One transaction. Returns rows deleted, or None when the subscription is busy or held."""
+    # Bounds well under one matcher pass; a contended subscription waits for the next pass.
+    c.execute("SET LOCAL lock_timeout='100ms'")
+    c.execute("SET LOCAL statement_timeout='1s'")
+    # The matcher's order: the shared principal lock, then the subscription row.
+    lock_principal(c, candidate['principal'], shared=True)
+    row = c.execute('''SELECT id,state,retention_floor,retention_hold FROM subscriptions WHERE id=%s
+        FOR UPDATE SKIP LOCKED''', (candidate['id'],)).fetchone()
+    # A quarantine closes every definition: terminal ones keep their references (ANYM-446 F2).
+    if row is None or row['retention_hold'] or row['state'] in ('closed', 'expired'):
+        return None
+    # ACK and fetch hold the subscription row, so acked_through cannot move under this batch.
+    consumption = c.execute('SELECT acked_through FROM subscription_consumption WHERE subscription=%s',
+        (row['id'],)).fetchone()
+    if consumption is None:
+        return 0
+    refs = c.execute('''SELECT event,matched_at<clock_timestamp()-make_interval(days=>%s) AS expired
+        FROM subscription_matches WHERE subscription=%s AND event>%s AND event<=%s ORDER BY event LIMIT %s''',
+        (days, row['id'], row['retention_floor'], consumption['acked_through'], RETENTION_BATCH)).fetchall()
+    # A contiguous prefix only: a newer reference stops the batch, so nothing above the floor is missing.
+    through = None
+    for ref in refs:
+        if not ref['expired']:
+            break
+        through = ref['event']
+    if through is None:
+        return 0
+    deleted = c.execute('DELETE FROM subscription_matches WHERE subscription=%s AND event>%s AND event<=%s',
+        (row['id'], row['retention_floor'], through)).rowcount
+    c.execute('UPDATE subscriptions SET retention_floor=%s WHERE id=%s', (through, row['id']))
+    return deleted

@@ -413,9 +413,13 @@ def drop_role(store, role):
 
 def feed_state(store):
     with store.pool.connection() as c:
-        return {table: c.execute(sql.SQL('SELECT * FROM {} ORDER BY 1,2').format(sql.Identifier(table))).fetchall()
-                for table in ('events', 'consumers', 'deliveries', 'subscriptions', 'subscription_matches',
-                              'subscription_consumption', 'feed_counter')}
+        state = {table: c.execute(sql.SQL('SELECT * FROM {} ORDER BY 1,2').format(sql.Identifier(table))).fetchall()
+                 for table in ('events', 'consumers', 'deliveries', 'subscriptions', 'subscription_matches',
+                               'subscription_consumption', 'feed_counter')}
+    # Schema 40 adds retention columns at their pre-retention values (floor 0, no hold).
+    for row in state['subscriptions']:
+        assert row.pop('retention_floor', 0) == 0 and row.pop('retention_hold', False) is False
+    return state
 
 
 # spec: ANYM-254
@@ -447,7 +451,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '39'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '40'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:

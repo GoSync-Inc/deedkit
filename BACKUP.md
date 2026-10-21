@@ -246,3 +246,9 @@ removes page receipts, while preserving consumed positions, historical hints
 and feedback. Closed subscriptions, revoked API keys and disabled collectors
 still require explicit reviewed reconfiguration before any restored runtime
 may resume work. The dispatcher must stay stopped during a restore drill.
+From schema 40 quarantine also sets `retention_hold` on every closed definition, so
+subscription pruning never touches restored matches or consumption until the
+operator runs `release-retention-hold` ([SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#event-retention)).
+An older restore quarantined at its own schema has no hold after migration 40, but its
+definitions are closed and acknowledged-event retention never prunes closed ones; rerun
+quarantine after migrating it to set the hold for later pruning paths.
