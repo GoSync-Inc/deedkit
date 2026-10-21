@@ -471,7 +471,8 @@ async def test_handover_update_outcomes_are_isolated_and_visible(tmp_path,monkey
     outcome={'raise':None}
     async def send():
         if outcome['raise']:raise outcome['raise']
-    async with phone(tmp_path,monkeypatch,handover_secs=0.5,send=send) as p:
+    # A window wide enough that a loaded host closes the socket inside it.
+    async with phone(tmp_path,monkeypatch,handover_secs=2,send=send) as p:
         service=p.service
         # Rejected before acceptance: the original stream keeps working and the model is told plainly.
         outcome['raise']=ServiceError('provider_rejected')
