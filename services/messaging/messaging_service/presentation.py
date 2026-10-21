@@ -13,11 +13,11 @@ CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','ord
 FILE_FIELDS = ('attachment_id','id','message_id','account','chat','revision','sha256','mime',
     'bytes','display_name','download_status','extraction_status','enrichment_status',
     'truncated','error_code','title','document_type','snippet','match_type',
-    'matched_content','match_sources','message_context','processing_profile','error_detail','attempts','next_due')
+    'matched_content','match_sources','message_context','excerpt_source','transcript_ready','processing_profile','error_detail','attempts','next_due')
 
 
 TRANSCRIPT_BODY_CHARS = 2000
-LEAN_FILE_FIELDS = ('id','display_name','mime','bytes','download_status','extraction_status','error_code')
+LEAN_FILE_FIELDS = ('id','display_name','mime','bytes','download_status','extraction_status','error_code','transcript_ready')
 
 
 def options(method, arguments):

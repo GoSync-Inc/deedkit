@@ -459,7 +459,7 @@ class Store:
                 before=before,direction=direction,filename=filename,search_language=search_language,
                 include_coverage=include_coverage)
 
-    def get_file_text(self,token,attachment_id,offset=0,limit=4000,content='extracted'):
+    def get_file_text(self,token,attachment_id,offset=0,limit=4000,content=None):
         from .file_index import get_file_text
         with self.authorized(token,'get_file_text') as (c,p):
             return get_file_text(self,c,p,attachment_id,offset=offset,limit=limit,content=content)
