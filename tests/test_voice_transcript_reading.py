@@ -114,3 +114,26 @@ def test_message_row_says_transcript_ready(seeded):
         assert files['voice-note']['transcript_ready'] is True, (detail, view)
         assert 'transcript_ready' not in files['voice-pending'], (detail, view)
     assert attachments(full['items'])['voice-note']['transcript_ready'] is True
+
+
+# spec: ANYM-453
+def test_voice_excerpt_with_empty_ready_extraction_and_dual_matches(seeded):
+    s, _, b = seeded
+    voice(s)
+    voice(s, 'voice-dual', filename='meeting.ogg', transcript='Synthetic meeting notes')
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_text SET state='ready',error_code=NULL WHERE attachment='voice-note'")
+    hit = search(s, b, 'voice-memo.ogg')['items'][0]
+    assert hit['excerpt'].startswith(TRANSCRIPT[:40]) and hit['excerpt_source'] == 'transcript'
+    # The transcript also matches the name: the existing snippet is kept.
+    dual = search(s, b, 'meeting', query_mode='exact')['items'][0]
+    assert dual['attachment_id'] == 'voice-dual' and 'excerpt_source' not in dual
+
+
+# spec: ANYM-453
+def test_failed_transcript_keeps_its_reason_under_a_paused_profile(seeded):
+    s, _, b = seeded
+    voice(s, state='failed', error_code='provider_rejected')
+    profile(s, paused=True)
+    page = text(s, b, 'voice-note')
+    assert page['empty_reason'] == 'processing_failed' and page['failure_reason'] == 'provider_rejected'

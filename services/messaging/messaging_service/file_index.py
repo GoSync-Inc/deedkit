@@ -267,9 +267,11 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
     raw_preview = "left(a.filename,1024)||' '||left(f.display_name,1024)||' '||left(f.text_content,32000)"
     enriched_preview = "coalesce(e.title,'')||' '||coalesce(e.summary,'')||' '||coalesce(e.metadata->>'document_type','')||' '||left(coalesce(e.text_content,''),32000)"
     base_raw = plan.predicate('f', text_sql=raw_text)
-    # A voice note without extracted text shows its transcript, not its name (ANYM-453).
-    voice_excerpt = '(' + VOICE + " AND " + ENRICH_READY + " AND f.text_content='' AND " + base_raw + ')'
     base_enriched = '(' + ENRICH_READY + ' AND ' + plan.predicate('e', text_sql=ENRICH_TEXT) + ')'
+    # A voice note without extracted text shows its transcript, not its name (ANYM-453).
+    # Only a name match: when the transcript matches too, the existing snippet stays.
+    voice_excerpt = ('(' + VOICE + " AND " + ENRICH_READY + " AND f.text_content='' AND " + base_raw +
+        (' AND NOT ' + base_enriched if query else '') + ')')
     base_understanding = '(' + UNDERSTANDING_READY + ' AND ' + plan.predicate('u',text_sql=UNDERSTANDING_TEXT) + ')'
     # A caption describes this occurrence only, not bytes shared with another
     # message. Never copy it into the context-free extraction cache.
@@ -319,8 +321,9 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
             ') candidates ORDER BY rank DESC,content ASC,start_offset ASC LIMIT 1) hit ON true')
         predicate = '(' + base_raw + ' OR ' + base_enriched + ' OR ' + base_understanding + ' OR hit.content IS NOT NULL OR ' + base_context + ')'
         rank = 'greatest(' + plan.rank('f') + ',coalesce(CASE WHEN ' + ENRICH_READY + ' THEN ' + plan.rank('e') + ' ELSE 0 END,0),coalesce(CASE WHEN '+UNDERSTANDING_READY+' THEN '+plan.rank('u')+' ELSE 0 END,0),coalesce(hit.rank,0),' + plan.rank('m') + ')'
-        voice_excerpt = '(hit.content IS NULL AND ' + voice_excerpt + ')'
-        snippet_text = '(CASE WHEN hit.content IS NOT NULL THEN hit.passage WHEN ' + voice_excerpt + ' THEN left(e.text_content,32000) WHEN ' + base_raw + ' THEN ' + raw_preview + ' WHEN ' + base_enriched + ' THEN ' + enriched_preview + ' WHEN '+base_understanding+' THEN '+UNDERSTANDING_TEXT+' ELSE m.body END)'
+        # Empty ready extraction still has a filename-header chunk; it is not file content.
+        voice_excerpt = "(coalesce(hit.content,'extracted')='extracted' AND " + voice_excerpt + ')'
+        snippet_text = '(CASE WHEN ' + voice_excerpt + ' THEN left(e.text_content,32000) WHEN hit.content IS NOT NULL THEN hit.passage WHEN ' + base_raw + ' THEN ' + raw_preview + ' WHEN ' + base_enriched + ' THEN ' + enriched_preview + ' WHEN '+base_understanding+' THEN '+UNDERSTANDING_TEXT+' ELSE m.body END)'
         match = 'coalesce(hit.match_type,CASE WHEN ' + base_raw + ' THEN ' + plan.match_type('f') + ' WHEN ' + base_enriched + ' THEN ' + plan.match_type('e') + ' WHEN '+base_understanding+' THEN '+plan.match_type('u')+' ELSE ' + plan.match_type('m') + ' END)'
         source = "coalesce(hit.content,CASE WHEN " + base_raw + " THEN 'extracted' WHEN " + base_enriched + " THEN 'enriched' WHEN "+base_understanding+" THEN 'understanding' ELSE 'message_context' END)"
         extra_columns = source + ' AS matched_content,hit.start_offset AS chunk_start,hit.end_offset AS chunk_end'
@@ -436,7 +439,8 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
     row['content'] = content
     if automatic and content == 'enriched' and row['enrichment_state'] != 'ready':
         # The reply says whether waiting helps; only the owner enables transcription.
-        reason = _processing_reason(row) or 'processing_failed'
+        # The attachment's own failure outranks a profile pause another job caused.
+        reason = 'processing_failed' if failure else _processing_reason(row) or 'processing_failed'
         row['empty_reason'] = reason
         if reason == 'processing_failed':
             row['failure_reason'] = failure
