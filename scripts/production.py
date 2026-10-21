@@ -1,6 +1,26 @@
 #!/usr/bin/env python3
 """Verified, explicit production promotion. No provider credentials or migrations."""
+# ruff: noqa: E402
 from __future__ import annotations
+
+import os
+import sys
+
+# `self-test` (ANYM-443, production.md "Deploy tool updates") checks a tool before `deploy` switches to it. It never
+# reaches the network, starts a process, takes a lock or writes: this guard is installed before any other import.
+GUARDED = __name__ == "__main__" and sys.argv[1:2] == ["self-test"]
+if GUARDED:
+    def refuse_side_effects(event, args, *, refused=frozenset((
+            "socket.connect", "socket.bind", "socket.sendto", "socket.sendmsg", "socket.getaddrinfo",
+            "socket.gethostbyname", "socket.gethostbyaddr", "subprocess.Popen", "os.system", "os.exec",
+            "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty", "os.kill", "os.killpg", "fcntl.flock",
+            "fcntl.lockf", "os.mkdir", "os.rename", "os.remove", "os.rmdir", "os.chmod", "os.chown", "os.symlink",
+            "os.link", "os.truncate", "os.utime", "os.mkfifo", "os.mknod", "shutil.rmtree", "shutil.copyfile",
+            "shutil.move", "ctypes.dlopen")),
+            writing=os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC):
+        if event in refused or event == "open" and isinstance(args[2], int) and args[2] & writing:
+            raise PermissionError(f"self-test refused {event}")
+    sys.addaudithook(refuse_side_effects)
 
 import argparse
 from contextlib import ExitStack, contextmanager, suppress
@@ -8,7 +28,6 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
-import os
 from pathlib import Path
 import posixpath
 import re
@@ -17,7 +36,6 @@ import shlex
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -109,13 +127,14 @@ class CallActive(Refused):
 
 
 
-def run(argv, *, cwd=None, umask=-1, env=None, reason=False, timeout=1800):
+def run(argv, *, cwd=None, umask=-1, env=None, reason=False, timeout=1800, binary=False):
     # Never include command output in an exception: Compose can contain secrets. Only a tool that prints
     # nothing secret (the attestation verifier, git on the public source mirror) may pass its last stderr line on,
     # with `reason`.
-    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=timeout, umask=umask, env=env)
+    result = subprocess.run(argv, cwd=cwd, text=not binary, capture_output=True, timeout=timeout, umask=umask, env=env)
     if result.returncode:
-        detail = (result.stderr.strip().splitlines() or [""])[-1][:300] if reason else ""
+        stderr = result.stderr.decode(errors="replace") if binary else result.stderr
+        detail = (stderr.strip().splitlines() or [""])[-1][:300] if reason else ""
         raise Refused(f"{Path(argv[0]).name} failed (exit {result.returncode}){': ' + detail if detail else ''}; "
                       "production was not accepted")
     return result.stdout
@@ -716,12 +735,7 @@ def names_revision(image, sha, dockerfile, recipe=None):
                  or "DEEDKIT_SOURCE_SHA=" + sha in (config.get("Env") or [])))
 
 
-def published(target, sha):
-    """Resolve `ghcr.io/gosync-inc/deedkit-<target>:<sha>` to one digest and verify its attestation, tokenless.
-
-    The pinned verifier (tools/attest-verify) runs with an empty environment, so no GitHub or registry
-    credential can reach it; any refusal stops the target before a pull (ANYM-301 B2).
-    """
+def check_verifier():
     try:
         info = VERIFIER.lstat()
         content = VERIFIER.read_bytes() if stat.S_ISREG(info.st_mode) else b""
@@ -730,6 +744,15 @@ def published(target, sha):
     if (info is None or not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid())
             or info.st_mode & 0o022 or hashlib.sha256(content).hexdigest() != VERIFIER_SHA256):
         raise Refused(f"the attestation verifier {VERIFIER} is missing, writable by others or not the pinned build")
+
+
+def published(target, sha):
+    """Resolve `ghcr.io/gosync-inc/deedkit-<target>:<sha>` to one digest and verify its attestation, tokenless.
+
+    The pinned verifier (tools/attest-verify) runs with an empty environment, so no GitHub or registry
+    credential can reach it; any refusal stops the target before a pull (ANYM-301 B2).
+    """
+    check_verifier()
     try:
         output = run([str(VERIFIER), "--image", REGISTRY + target, "--sha", sha], env={"PATH": "/usr/bin:/bin"},
                      reason=True)
@@ -1631,13 +1654,18 @@ def retain_images(settings, *, held=()):
 # Continuous deployment (production.md "Continuous deployment"): one command that deploys the newest green main
 # commit, or pauses for a human. A human creates or removes the pause file; `deploy` only creates it.
 PAUSE = Path("/etc/deedkit/autodeploy.pause")
+CONFIG, HTTP_CONFIG = "/etc/deedkit/production.json", "/etc/deedkit/http-production.json"
 DEPLOY_INTERVAL = 20 * 60
 # Consecutive runs whose `git ls-remote` or mirror fetch failed before the deployer pauses (about 15 minutes on the
 # timer): a network blip heals by itself, a broken mirror or a refused access does not.
 FETCH_FAILURES = 3
-# Changes a human applies or installs by hand, so the deployer pauses for them.
+# Changes a human applies or installs by hand, so the deployer pauses for them; but `deploy` installs the pair of
+# TOOL_FILES itself on a host with the self-updating layout ("Deploy tool updates" below).
 SQL_INVENTORY = re.compile(r"\.sql$|^services/.+/migrations/")
-DEPLOY_TOOLS = ("scripts/production.py", "scripts/seamless_release.py", "tools/attest-verify/", "services/release-router/")
+UNITS = ("deploy/deedkit-autodeploy.service", "deploy/deedkit-autodeploy.timer")
+DEPLOY_TOOLS = ("scripts/production.py", "scripts/seamless_release.py", "tools/attest-verify/", "services/release-router/",
+                *UNITS)
+SYSTEMD_DIRECTORY = Path("/etc/systemd/system")
 def remote_main(env=None, cwd=None):
     """main's head from `git ls-remote`, which the API quota does not meter."""
     line = run(["git", "ls-remote", SOURCE, "refs/heads/main"], cwd=cwd, env=env, reason=True).split()
@@ -1675,24 +1703,357 @@ def blob(path):
     return hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest()
 
 
-def pause_reasons(mirror, base, candidate, installed):
-    """Why `base..candidate` needs a human: SQL inventory changes, and deploy tools that are not installed yet."""
+def range_changes(mirror, base, candidate, installed):
+    """The SQL inventory files `base..candidate` changes, and its deploy tools that are not installed yet."""
     paths = [path for path in run(["git", "-C", str(mirror), "diff", "--name-only", "--no-renames", "-z", base,
                                    candidate]).split("\0") if path]
-    reasons = []
-    if sql := [path for path in paths if SQL_INVENTORY.search(path)]:
-        reasons.append("the SQL inventory changed (" + ", ".join(sql[:5]) + "); migrate by hand (production.md)")
+    sql = [path for path in paths if SQL_INVENTORY.search(path)]
     tools = [path for path in paths if path in DEPLOY_TOOLS or path.startswith(tuple(t for t in DEPLOY_TOOLS if t[-1] == "/"))]
     def current_tool(path):
-        # The running tool is the candidate's when its installed file has the candidate's content.
+        # The running tool is the candidate's when its installed file has the candidate's content; a unit this host
+        # does not install (no timer) needs no install.
         if path in installed:
+            if path in UNITS and not os.path.lexists(installed[path]):
+                return True
             return run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{path}"]).strip() == blob(installed[path])
         # The verifier is the candidate's when it matches the pin of the installed (the candidate's) production.py.
         return (path.startswith("tools/attest-verify/") and current_tool("scripts/production.py") and VERIFIER.exists()
                 and hashlib.sha256(VERIFIER.read_bytes()).hexdigest() == VERIFIER_SHA256)
-    if pending := [path for path in tools if not current_tool(path)]:
+    return sql, [path for path in tools if not current_tool(path)]
+
+
+def pause_text(sql, pending):
+    reasons = []
+    if sql:
+        reasons.append("the SQL inventory changed (" + ", ".join(sql[:5]) + "); migrate by hand (production.md)")
+    if pending:
         reasons.append("deploy tools changed (" + ", ".join(pending[:5]) + "); install them by hand (production.md)")
     return reasons
+
+
+def pause_reasons(mirror, base, candidate, installed):
+    """Why `base..candidate` needs a human: SQL inventory changes, and deploy tools that are not installed yet."""
+    return pause_text(*range_changes(mirror, base, candidate, installed))
+
+
+# Deploy tool updates (ANYM-443, production.md "Deploy tool updates"). Each installed tool pair has its own directory
+# TOOL_ROOT/releases/<sha>/ with a tool.json; `current` points at one of them and the documented paths production.py
+# and seamless_release.py point into `current/`, so Python takes both modules from one directory (sys.path[0] is the
+# script's resolved directory). From a range whose only pause is that pair, `deploy` installs the candidate's pair:
+# stage, self-test, `activating`, switch `current`, self-test through the documented path, `active`.
+TOOL_ROOT = Path("/usr/local/lib/deedkit")
+TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": "seamless_release.py"}
+TOOL_PYTHON = "/usr/bin/python3"
+SELF_TEST_TIMEOUT = 60
+# The running module, resolved at import: after a switch the documented path already names the next tool.
+RUNNING = Path(__file__).resolve()
+TOOL_STATUSES = ("activating", "active", "reverted", "not-activated", "rolled-back")
+
+
+def tool_path(path, kind):
+    """`path` itself, no symlink followed: of `kind`, operator-owned and not writable by group or others."""
+    info = path.lstat()
+    if stat.S_IFMT(info.st_mode) != kind or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise Refused(f"{path} must be a {'directory' if kind == stat.S_IFDIR else 'file'} only the operator owns "
+                      "and writes")
+
+
+def tool_record(directory, sha=None):
+    """The tool.json of `directory`, which must name the git blob ids of the two files beside it."""
+    try:
+        tool = json.loads((directory / "tool.json").read_text())
+        blobs = {path: blob(directory / name) for path, name in TOOL_FILES.items()}
+    except (OSError, ValueError) as exc:
+        raise Refused(f"cannot read the tool files of {directory}: {type(exc).__name__}") from exc
+    if (not isinstance(tool, dict) or set(tool) != {"sha", "blobs", "installed_at"} or tool["blobs"] != blobs
+            or not RELEASE_DIRECTORY.fullmatch(str(tool["sha"])) or sha not in (None, tool["sha"])
+            or not isinstance(tool["installed_at"], str)):
+        raise Refused(f"{directory / 'tool.json'} does not name this release and the blob ids of its files")
+    return tool
+
+
+def tool_release(sha):
+    """The checked release TOOL_ROOT/releases/<sha>: its two files and tool.json, an optional bytecode cache, no
+    symlink, all of them the operator's alone."""
+    directory = TOOL_ROOT / "releases" / sha
+    try:
+        tool_path(directory, stat.S_IFDIR)
+        names = set(os.listdir(directory))
+        required = {*TOOL_FILES.values(), "tool.json"}
+        if not required <= names or names - required - {"__pycache__"}:
+            raise Refused(f"{directory} must hold exactly production.py, seamless_release.py and tool.json")
+        for name in names:
+            tool_path(directory / name, stat.S_IFDIR if name == "__pycache__" else stat.S_IFREG)
+        if "__pycache__" in names:
+            for name in os.listdir(directory / "__pycache__"):
+                tool_path(directory / "__pycache__" / name, stat.S_IFREG)
+    except OSError as exc:
+        raise Refused(f"cannot check {directory}: {type(exc).__name__}") from exc
+    return tool_record(directory, sha)
+
+
+def current_tool_sha():
+    """The release `current` points at, or None when it is no `releases/<sha>` symlink."""
+    try:
+        match = re.fullmatch(r"releases/([0-9a-f]{40})", os.readlink(TOOL_ROOT / "current"))
+    except OSError:
+        return None
+    return match and match[1]
+
+
+def installed_tool():
+    """The tool `current` points at, its whole layout checked, or None on a host without the self-updating layout (no
+    `current`): that host keeps the pause for every tool change."""
+    current = TOOL_ROOT / "current"
+    try:
+        if not os.path.lexists(current):
+            return None
+        releases = TOOL_ROOT / "releases"
+        tool_path(TOOL_ROOT, stat.S_IFDIR)
+        tool_path(releases, stat.S_IFDIR)
+        links = {"current": None, **{name: "current/" + name for name in TOOL_FILES.values()}}
+        for name, target in links.items():
+            info = (TOOL_ROOT / name).lstat()
+            if not stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid() or target not in (
+                    None, os.readlink(TOOL_ROOT / name)):
+                raise Refused(f"{TOOL_ROOT / name} must be the operator's symlink to {target or 'releases/<sha>'}")
+        extra = [entry.path for directory in (TOOL_ROOT, releases) for entry in os.scandir(directory)
+                 if entry.is_symlink() and not (directory == TOOL_ROOT and entry.name in links)]
+        if extra:
+            raise Refused(f"unexpected symlinks in the tool layout: {', '.join(sorted(extra)[:5])}")
+    except OSError as exc:
+        raise Refused(f"cannot check the tool layout in {TOOL_ROOT}: {type(exc).__name__}") from exc
+    if (sha := current_tool_sha()) is None:
+        raise Refused(f"{current} must point at releases/<40-character sha>")
+    return tool_release(sha)
+
+
+def fsync_directory(directory):
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def point_current(sha):
+    """Switch `current` to releases/<sha> with one rename(2)."""
+    link = TOOL_ROOT / f".current-{uuid.uuid4().hex}"
+    os.symlink(f"releases/{sha}", link)
+    try:
+        os.replace(link, TOOL_ROOT / "current")
+    except BaseException:
+        link.unlink(missing_ok=True)
+        raise
+    fsync_directory(TOOL_ROOT)
+
+
+def stage_tool(sha, files, blobs):
+    """releases/<sha>.staging-<random>, every file written to a temporary name, synced, then renamed into place."""
+    staging = TOOL_ROOT / "releases" / f"{sha}.staging-{uuid.uuid4().hex}"
+    staging.mkdir(mode=0o700)
+    record = json.dumps({"sha": sha, "blobs": blobs, "installed_at": now()}, indent=2) + "\n"
+    for name, content in {**files, "tool.json": record.encode()}.items():
+        temporary = staging / (name + ".tmp")
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o644)
+        temporary.replace(staging / name)
+    staging.chmod(0o755)
+    fsync_directory(staging)
+    return staging
+
+
+def self_test_error(script, configs, sha):
+    """None when `script self-test` exits 0 and prints exactly its one ok line for `sha`, else its error line: the
+    refusal or the exception, the last line it wrote to stderr. The host's Python, no bytecode written, no environment
+    but PATH, not isolated (`-I` would leave the script's directory off sys.path)."""
+    try:
+        result = subprocess.run([TOOL_PYTHON, "-B", "-E", "-s", str(script), "self-test", "--config", str(configs[0]),
+                                 "--http-config", str(configs[1])], capture_output=True, text=True, cwd="/",
+                                timeout=SELF_TEST_TIMEOUT, env={"PATH": "/usr/bin:/bin"})
+    except subprocess.TimeoutExpired:
+        return f"the self-test did not finish within {SELF_TEST_TIMEOUT} seconds"
+    except OSError as exc:
+        return f"the self-test could not start: {type(exc).__name__}"
+    with suppress(ValueError):
+        if (result.returncode == 0 and not result.stderr and result.stdout.count("\n") == 1
+                and json.loads(result.stdout) == {"self_test": "ok", "sha": sha}):
+            return None
+    lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+    return (lines[-1] if lines else f"exit {result.returncode} without the ok line for {sha}")[:300]
+
+
+def retain_tools(current, previous):
+    """After an update: the release it replaced and the one installed before that stay, older ones are removed."""
+    releases, older = TOOL_ROOT / "releases", []
+    for name in sorted(os.listdir(releases)):
+        if RELEASE_DIRECTORY.fullmatch(name) and name not in (current, previous):
+            with suppress(Refused):  # a directory that is no checked release is not this tool's to remove
+                older.append((tool_release(name)["installed_at"], name))
+    removed = [name for _, name in sorted(older, reverse=True)[1:]]
+    for name in removed:
+        shutil.rmtree(releases / name)
+    return removed
+
+
+def tool_update_receipt(state):
+    """tool-update.json of the plan A state, or None; Refused when it is malformed."""
+    path = state / "tool-update.json"
+    if not path.exists():
+        return None
+    try:
+        update = read(path)
+        if (update.get("status") not in TOOL_STATUSES or not RELEASE_DIRECTORY.fullmatch(str(update.get("from")))
+                or not RELEASE_DIRECTORY.fullmatch(str(update.get("to")))):
+            raise ValueError("tool update receipt")
+    except (OSError, ValueError, AttributeError) as exc:
+        raise Refused(f"the tool update receipt {path} is malformed; inspect it") from exc
+    return update
+
+
+def reconcile_tool(settings, configs, s, *, dry_run, halt):
+    """An update that stopped between `activating` and `active`: accepted only by the self-test through the documented
+    path, closed when `current` still names the previous tool, otherwise a pause. None when nothing is left open."""
+    state = Path(settings["state_directory"])
+    if (update := tool_update_receipt(state)) is None or update["status"] != "activating":
+        return None
+    old, new = update["from"], update["to"]
+    if dry_run:
+        return {"status": "plan", "steps": [f"reconcile the tool update {old} -> {new}"]}
+    at = current_tool_sha()
+    if at == new:
+        if (error := self_test_error(TOOL_ROOT / "production.py", configs, new)) is None:
+            s.durable_write(state / "tool-update.json", {**update, "status": "active", "activated_at": now()})
+            return None
+        point_current(old)
+        s.durable_write(state / "tool-update.json", {**update, "status": "reverted", "reason": error})
+        return halt(f"the self-test of tool {new} after its switch failed: {error}; {TOOL_ROOT / 'current'} points at "
+                    f"{old} again")
+    if at == old:
+        s.durable_write(state / "tool-update.json", {**update, "status": "not-activated", "closed_at": now()})
+        return None
+    return halt(f"the tool update {old} -> {new} is unresolved: {TOOL_ROOT / 'current'} names neither; inspect it, "
+                f"the previous tool is python3 {TOOL_ROOT / 'releases' / old / 'production.py'}")
+
+
+def update_tool(settings, configs, s, mirror, candidate, base, tool, *, dry_run, halt):
+    """Install the candidate's tool pair (production.md "Deploy tool updates"). The run then ends `tool-updated`, and
+    the next one deploys with the new tool."""
+    state, old = Path(settings["state_directory"]), tool["sha"]
+    receipt = state / "tool-update.json"
+    # Forward only, from the commit whose images the verifier accepted, each file checked against its git blob id.
+    if not on_main(mirror, old, candidate):
+        return halt(f"the candidate {candidate} does not descend from the installed tool {old}; install the tool by "
+                    "hand (production.md)", sha=candidate)
+    files, blobs = {}, {}
+    for path, name in TOOL_FILES.items():
+        blobs[path] = run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{path}"]).strip()
+        files[name] = run(["git", "-C", str(mirror), "cat-file", "blob", f"{candidate}:{path}"], binary=True)
+        if hashlib.sha1(b"blob %d\0" % len(files[name]) + files[name]).hexdigest() != blobs[path]:
+            return halt(f"{path} of {candidate} does not match its git blob id; the tool is not updated", sha=candidate)
+    last = tool_update_receipt(state)
+    if last and last["status"] == "rolled-back" and last.get("blobs") == blobs:
+        return halt(f"the tool of {last['to']} was rolled back (tool-rollback); install a changed tool by hand or merge "
+                    "one", sha=candidate)
+    if dry_run:
+        return {"status": "plan", "sha": candidate, "base": base, "steps": [f"would update tool {candidate}"]}
+    target, staged = TOOL_ROOT / "releases" / candidate, None
+    try:
+        for leftover in (TOOL_ROOT / "releases").glob("*.staging-*"):
+            shutil.rmtree(leftover)  # an interrupted update's; rmtree never follows a symlink
+        if os.path.lexists(target):
+            # From an interrupted update: reused only when it is exactly the candidate's pair.
+            try:
+                if tool_release(candidate)["blobs"] != blobs:
+                    raise Refused("its blob ids are not the candidate's")
+            except Refused as exc:
+                return halt(f"{target} exists but is not the candidate's tool: {exc}; inspect it", sha=candidate)
+            script = target / "production.py"
+        else:
+            staged = stage_tool(candidate, files, blobs)
+            script = staged / "production.py"
+        if error := self_test_error(script, configs, candidate):
+            if staged:
+                shutil.rmtree(staged)
+            return halt(f"the self-test of tool {candidate} failed: {error}; the installed tool {old} is unchanged",
+                        sha=candidate)
+        if staged:
+            staged.rename(target)
+            fsync_directory(TOOL_ROOT / "releases")
+        update = {"from": old, "to": candidate, "at": now(), "status": "activating"}
+        s.durable_write(receipt, update)
+        point_current(candidate)
+        if error := self_test_error(TOOL_ROOT / "production.py", configs, candidate):
+            point_current(old)
+            s.durable_write(receipt, {**update, "status": "reverted", "reason": error})
+            return halt(f"the self-test of tool {candidate} after its switch failed: {error}; {TOOL_ROOT / 'current'} "
+                        f"points at {old} again", sha=candidate)
+        s.durable_write(receipt, {**update, "status": "active", "activated_at": now()})
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        return halt(f"the tool update {old} -> {candidate} stopped: {message}; inspect {TOOL_ROOT} and {receipt}",
+                    sha=candidate)
+    try:
+        removed = retain_tools(candidate, old)
+    except Exception as exc:
+        removed = "not finished: " + (str(exc) if isinstance(exc, Refused) else type(exc).__name__)
+    outcome = {"status": "tool-updated", "sha": candidate, "base": base, "finished_at": now(),
+               "tool_update": {"from": old, "to": candidate, "removed": removed}}
+    write(state / "deploy.json", outcome)
+    return outcome
+
+
+def tool_rollback(settings, http, s):
+    """Point `current` back at the tool the last update replaced, and pause autodeploy (production.md)."""
+    state = Path(settings["state_directory"])
+    with host_locks(settings, http, s):
+        tool, update = installed_tool(), tool_update_receipt(state)
+        if tool is None or not update or update["status"] != "active" or update["to"] != tool["sha"]:
+            raise Refused("no active tool update to roll back; switch current by hand (production.md)")
+        tool_release(update["from"])
+        reason = (f"tool rolled back from {update['to']} to {update['from']}; remove this file to resume, a changed "
+                  "tool installs itself again")
+        PAUSE.write_text(json.dumps({"status": "tool-rolled-back", "reason": reason, "at": now()}) + "\n")
+        PAUSE.chmod(0o600)
+        point_current(update["from"])
+        s.durable_write(state / "tool-update.json",
+                        {**update, "status": "rolled-back", "rolled_back_at": now(), "blobs": tool["blobs"]})
+        return {"status": "tool-rolled-back", "from": update["to"], "to": update["from"]}
+
+
+def self_test(config_path, http_path):
+    """This tool's check before `deploy` runs it (production.md "Deploy tool updates"): both modules from this
+    directory, its tool.json, both configurations and the current receipts read with this code, the verifier and its
+    pin. It runs under the guard at the top of this file."""
+    if not GUARDED:
+        raise Refused("self-test must be the first argument")
+    directory = RUNNING.parent
+    s = http_release_tool()
+    if Path(s.__file__).resolve().parent != directory:
+        raise Refused("seamless_release.py was not imported from the directory of production.py")
+    tool = tool_record(directory)
+    settings = config(config_path)
+    http = s.validate_settings(config(http_path))
+    state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
+    for path in (state / "current.json", http_state / "http-current.json", state / "deploy.json"):
+        try:
+            receipt = read(path) if path.name != "deploy.json" or path.exists() else {}
+            if path.name == "deploy.json":
+                deploy_counts(receipt)
+            elif (receipt.get("status") not in ("applied", "serving", "serving-retirement-pending")
+                  or not RELEASE_DIRECTORY.fullmatch(str(receipt.get("sha")))):
+                raise ValueError("receipt")
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+            raise Refused(f"the receipt {path} is missing or malformed") from exc
+    tool_update_receipt(state)
+    try:
+        check_verifier()
+    except Refused as exc:
+        raise Refused(f"{exc}; install the verifier first") from exc
+    return {"self_test": "ok", "sha": tool["sha"]}
 
 
 def configuration_drift(settings, http, current, serving):
@@ -1709,11 +2070,21 @@ def configuration_drift(settings, http, current, serving):
     return None
 
 
-def deploy(settings, http, *, auto=False, dry_run=False, attested=None):
+@contextmanager
+def host_locks(settings, http, s):
+    """The global, HTTP and plan A locks `deploy` holds for its whole run."""
+    state = Path(settings["state_directory"])
+    with ExitStack() as held:
+        held.enter_context(s.locks(http))
+        if state.resolve() not in (s.GLOBAL_LOCK.resolve(), Path(http["state_directory"]).resolve()):
+            held.enter_context(lock(state))
+        yield
+
+
+def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=(CONFIG, HTTP_CONFIG)):
     """Deploy the newest green main commit with plan A and then plan B, or pause with a reason (production.md)."""
     if PAUSE.exists():
         return {"status": "paused", "reason": PAUSE.read_text()[:1000].strip()}
-    state = Path(settings["state_directory"])
     def halt(reason, status="halted", **fields):
         # The pause stops every later run until a human removes it; nothing is retried.
         outcome = {"status": status, "reason": reason, "at": now(), **fields}
@@ -1725,9 +2096,7 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None):
     s = http_release_tool()
     with ExitStack() as held:
         try:
-            held.enter_context(s.locks(http))
-            if state.resolve() not in (s.GLOBAL_LOCK.resolve(), Path(http["state_directory"]).resolve()):
-                held.enter_context(lock(state))
+            held.enter_context(host_locks(settings, http, s))
         except Busy as exc:
             return {"status": "busy", "reason": str(exc)}
         except Exception as exc:
@@ -1736,15 +2105,16 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None):
         # A candidate is taken only when every image plan A or plan B pulls is attested, so publication that is still
         # running or failed for one target never starts a release that stops halfway.
         targets = sorted(set(published_targets(settings)) | set(published_targets(http)) | {PROOF_TARGET})
-        return deploy_locked(settings, http, s, auto=auto, dry_run=dry_run, halt=halt, attested=attested or (
-            lambda sha: [published(target, sha) for target in targets]))
+        return deploy_locked(settings, http, s, auto=auto, dry_run=dry_run, halt=halt, configs=configs,
+                             attested=attested or (lambda sha: [published(target, sha) for target in targets]))
 
 
-def deploy_locked(settings, http, s, *, auto, dry_run, attested, halt):
+def deploy_locked(settings, http, s, *, auto, dry_run, attested, halt, configs):
     state = Path(settings["state_directory"])
     record = {}
     try:
-        return deploy_steps(settings, http, s, auto=auto, dry_run=dry_run, attested=attested, halt=halt, record=record)
+        return deploy_steps(settings, http, s, auto=auto, dry_run=dry_run, attested=attested, halt=halt, record=record,
+                            configs=configs)
     except Exception as exc:
         # Every failure the steps do not classify themselves ends here: a pause, unless nothing changed yet
         # and it was the network.
@@ -1765,17 +2135,27 @@ def serving_settled(receipt):
                                                  and receipt.get("previous") is None)
 
 
-def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record):
+def deploy_counts(last):
+    """The start and the failure counts of a deploy.json; ValueError, TypeError, AttributeError or KeyError when it is
+    malformed."""
+    started = last.get("started_at") and datetime.strptime(last["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc)
+    failures = last.get("fetch_failures", {"count": 0})["count"]
+    misses = last.get("unreachable", {"count": 0})["count"]
+    waits = last.get("call_waits", {"count": 0})["count"]
+    if any(type(count) is not int or count < 0 for count in (failures, misses, waits)):
+        raise ValueError("fetch failure count")
+    return started, failures, misses, waits
+
+
+def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs):
     state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
+    # A tool update that stopped between `activating` and `active` is settled before anything else.
+    if reconciled := reconcile_tool(settings, configs, s, dry_run=dry_run, halt=halt):
+        return reconciled
     try:
         last = read(state / "deploy.json") if (state / "deploy.json").exists() else {}
-        started = last.get("started_at") and datetime.strptime(last["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc)
-        failures = last.get("fetch_failures", {"count": 0})["count"]
-        misses = last.get("unreachable", {"count": 0})["count"]
-        waits = last.get("call_waits", {"count": 0})["count"]
-        if any(type(count) is not int or count < 0 for count in (failures, misses, waits)):
-            raise ValueError("fetch failure count")
+        started, failures, misses, waits = deploy_counts(last)
     except (ValueError, TypeError, AttributeError, KeyError):
         return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it")
     if auto and started and (datetime.now(timezone.utc) - started).total_seconds() < DEPLOY_INTERVAL:
@@ -1845,12 +2225,12 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record):
                     + "; inspect seamless_release.py status --sha <sha>")
     if drift := configuration_drift(settings, http, current, serving):
         return halt(drift + "; apply the next release by hand")
-    installed = {"scripts/production.py": __file__, "scripts/seamless_release.py": s.__file__}
+    installed = {"scripts/production.py": RUNNING, "scripts/seamless_release.py": s.__file__,
+                 **{path: SYSTEMD_DIRECTORY / Path(path).name for path in UNITS}}
     if serving["sha"] != base:
         # Plan A is ahead of the HTTP pair: a deploy whose HTTP release stopped before any change, or plan A applied
         # by hand.
-        candidate = base
-        reasons = pause_reasons(mirror, serving["sha"], base, installed)
+        candidate, since = base, serving["sha"]
     else:
         candidate = None
         for sha in run(["git", "-C", str(mirror), "rev-list", "--first-parent", f"{base}..{head}"]).split():
@@ -1876,7 +2256,18 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record):
             if "unreachable" in last and not dry_run:
                 write(state / "deploy.json", {key: value for key, value in last.items() if key != "unreachable"})
             return {"status": "waiting", "reason": "no newer main commit has attested images yet", "sha": base}
-        reasons = pause_reasons(mirror, base, candidate, installed)
+        since = base
+    sql, pending = range_changes(mirror, since, candidate, installed)
+    if (reasons := pause_text(sql, pending)) and not sql and set(pending) <= TOOL_FILES.keys():
+        # Only the tool pair waits for an install: the self-updating layout installs it, when this run is its tool.
+        try:
+            tool = installed_tool()
+        except Refused as exc:
+            tool = reasons.append(f"the tool does not update itself: {exc}")
+        if tool and [blob(RUNNING), blob(s.__file__)] != [tool["blobs"][path] for path in TOOL_FILES]:
+            tool = reasons.append(f"the tool does not update itself: this run is not {TOOL_ROOT / 'current'}")
+        if tool:
+            return update_tool(settings, configs, s, mirror, candidate, base, tool, dry_run=dry_run, halt=halt)
     if reasons:
         return halt("; ".join(reasons), sha=candidate)
     if dry_run:
@@ -1975,11 +2366,11 @@ def http_release_tool():
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["verify", "prepare", "prepare-router", "apply", "rollback", "status",
-                                           "images", "check-image", "deploy"])
+                                           "images", "check-image", "deploy", "self-test", "tool-rollback"])
     parser.add_argument("--sha")
     parser.add_argument("--target", choices=sorted(BUILDS))
-    parser.add_argument("--config", default="/etc/deedkit/production.json")
-    parser.add_argument("--http-config", default="/etc/deedkit/http-production.json", help="deploy: seamless_release.py's")
+    parser.add_argument("--config", default=CONFIG)
+    parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy: seamless_release.py's")
     parser.add_argument("--auto", action="store_true", help="deploy: at most one deploy start per 20 minutes (timer)")
     parser.add_argument("--dry-run", action="store_true", help="deploy: print the plan or pause reason, change nothing")
     parser.add_argument("--remove", action="store_true", help="images: remove the listed candidates")
@@ -1994,11 +2385,19 @@ def main(argv=None):
             result = {"sha": sha, "image": build_image(source, sha, args.target, check=True)}
         elif args.action == "verify":
             result = verify(args.sha or "")
+        elif args.action == "self-test":
+            print(json.dumps(self_test(args.config, args.http_config)))
+            return
+        elif args.action == "tool-rollback":
+            if os.geteuid() != 0:
+                raise Refused("tool-rollback requires the production host operator")
+            s = http_release_tool()
+            result = tool_rollback(config(args.config), s.validate_settings(config(args.http_config)), s)
         elif args.action == "deploy":
             if os.geteuid() != 0:
                 raise Refused("deploy requires the production host operator")
             result = deploy(config(args.config), http_release_tool().validate_settings(config(args.http_config)),
-                            auto=args.auto, dry_run=args.dry_run)
+                            auto=args.auto, dry_run=args.dry_run, configs=(args.config, args.http_config))
             # One line per run for the journal; a new pause, an error or a failed fetch exits 1, so the timer unit shows failed.
             print(json.dumps(result, sort_keys=True))
             if result["status"] in ("halted", "rolled-back", "error", "fetch_failed"):

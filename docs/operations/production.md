@@ -68,8 +68,11 @@ read it back, and only then delete the ruleset, so `main` is never unprotected.
 Keep administration behind the existing Tailscale/OpenSSH route. CI needs no SSH
 key, tailnet enrollment, provider token or production database access.
 
-Install a reviewed copy of `scripts/production.py` as
-`/usr/local/lib/deedkit/production.py`, owned by root and writable only by root.
+Install reviewed copies of `scripts/production.py` and
+`scripts/seamless_release.py` from one `main` commit in the self-updating
+layout ("Deploy tool updates" below): `/usr/local/lib/deedkit/production.py`
+and `seamless_release.py` are symlinks into `current/`, `current` points at
+`releases/<sha>/`, everything owned by root and writable only by root.
 Use Python 3.12+, Git, Docker and Compose v2 on the Linux host. Do not execute
 the deployment tool from an unreviewed feature branch on the host.
 
@@ -738,10 +741,14 @@ Otherwise it:
 3. pauses with a reason when the range changes the SQL inventory (any `*.sql`,
    `services/*/migrations/**`) or a deploy tool (`scripts/production.py`,
    `scripts/seamless_release.py`, `tools/attest-verify/**`,
-   `services/release-router/**`) that is not installed yet (the installed tool
-   file equals the candidate's; the verifier matches the installed pin), or
+   `services/release-router/**`, `deploy/deedkit-autodeploy.service` and
+   `.timer`) that is not installed yet (the running tool file, or the unit in
+   `/etc/systemd/system/`, equals the candidate's; a host without the unit
+   installs none; the verifier matches the installed pin), or
    when the configuration changed since the current release (the plan A
-   settings digest, each project's Compose document, the HTTP settings digest);
+   settings digest, each project's Compose document, the HTTP settings digest).
+   When the only such change is the `production.py`/`seamless_release.py`
+   pair, the self-updating layout installs it instead ("Deploy tool updates");
 4. runs `prepare` + `apply` (plan A), then `seamless_release.py prepare` +
    `promote` (plan B), all at that one SHA with every guard of those steps;
    when plan A is ahead of the HTTP release, it runs plan B only;
@@ -786,6 +793,101 @@ inspection). `--dry-run` changes no release or runtime state (it may update
 the source mirror and take the locks). `status` shows `deploy.json` and the pause reason. To resume after
 a pause, fix the cause (migrate, install the tools, inspect the state), then
 remove the pause file.
+
+### Deploy tool updates
+
+```text
+/usr/local/lib/deedkit/
+  production.py -> current/production.py
+  seamless_release.py -> current/seamless_release.py
+  current -> releases/<sha>
+  releases/<sha>/{production.py,seamless_release.py,tool.json}
+```
+
+Python takes `sys.path[0]` from the resolved script, so both modules always
+come from one release directory, and every documented command and the unit
+keep working. `tool.json` is `{"sha", "blobs": {"scripts/production.py": <git
+blob id>, "scripts/seamless_release.py": <id>}, "installed_at"}`. A host
+without `current` never updates its tool and keeps the pause of step 3. With
+it, `deploy` checks the layout with `lstat` (no symlink followed): every
+directory and file root-owned and not group/other-writable, `current` and the
+two compatibility links the only symlinks, `current` exactly `releases/<40-hex
+sha>`, the release holding only the two files, `tool.json` and an optional
+`__pycache__`, and `tool.json` naming that sha and the blob ids of its files.
+Anything else pauses; the reason ends "the tool does not update itself: ...".
+
+When the only pause of the range is the tool pair, the run is the tool
+`current` names, and every earlier check passed (no unfinished attempt,
+configuration unchanged, candidate attested), `deploy` installs the
+candidate's pair; an SQL, verifier, router or unit change in the same range
+pauses as above without installing. `--dry-run` reports `would update tool
+<sha>` and changes nothing; no other command updates the tool. In order:
+
+1. Forward only: the candidate must descend from the installed `tool.json` sha
+   (`merge-base --is-ancestor`); both files are read from the source mirror at
+   the candidate (`git cat-file blob`, the attested commit) and each must hash
+   to `git rev-parse <candidate>:<path>`. A pair `tool-rollback` rolled back is
+   not installed again.
+2. Stage `releases/<sha>.staging-<random>` (temporary names, fsync, rename) and
+   run its self-test: `/usr/bin/python3 -B -E -s <staging>/production.py
+   self-test --config <plan A> --http-config <plan B>`, PATH only, 60 seconds.
+   The new code imports both modules from its directory, checks its
+   `tool.json`, loads and validates both configurations, reads `current.json`,
+   `http-current.json` and `deploy.json`, and checks the verifier against its
+   pin ("install the verifier first" when the candidate pins another build).
+   An audit hook installed before any other import refuses every connect,
+   process, lock and write. It prints one line `{"self_test": "ok", "sha":
+   ...}`; any other exit or output removes the staging directory and pauses
+   with its last error line.
+3. Rename it to `releases/<sha>` (an existing one from an interrupted run is
+   reused only when its `tool.json` and blob ids are the candidate's), write
+   `<plan A state>/tool-update.json` `{from, to, at, status: "activating"}`
+   (fsynced), switch `current` with one `rename(2)`, and run the same self-test
+   through `/usr/local/lib/deedkit/production.py`. A pass records `active`; a
+   failure switches `current` back to `from`, records `reverted` and pauses.
+4. End the run `tool-updated` (exit 0; `deploy.json` keeps `sha`, `base` and
+   adds `tool_update`, no `started_at`), so the next timer run, about 5 minutes
+   later, deploys with the new tool. The replaced release and the one installed
+   before it stay; older checked releases are removed.
+
+Every `deploy` starts by settling a `tool-update.json` left `activating`:
+`current` at `to` runs the self-test (pass: `active`; fail: back to `from` and
+a pause), `current` at `from` closes it `not-activated`, anything else pauses
+and names the previous tool, `python3 /usr/local/lib/deedkit/releases/<from>/production.py`.
+
+Undo: `sudo python3 /usr/local/lib/deedkit/production.py tool-rollback`
+(under every lock `deploy` takes) points `current` at the `from` of the active
+update, records `rolled-back` and pauses autodeploy ("tool rolled back"); by
+hand it is `ln -sfn releases/<from> current.new && mv -T current.new current`
+in `/usr/local/lib/deedkit`. Still installed by hand: the verifier
+(`tools/attest-verify`), the release router and the systemd units. A defect
+both the CI tests and the self-test miss acts as it would installed by hand;
+the fail-closed pauses apply and `tool-rollback` is the undo. Nothing new
+leaves the host: the files come over the existing git fetch, and the receipts
+hold SHAs, blob ids, times and the self-test's error line.
+
+Bootstrap, once, by hand, from the `main` commit the next release deploys,
+with the timer paused (`<mirror>` is `<plan A state>/deploy-source.git`):
+
+```sh
+sha=<40-character main sha>; root=/usr/local/lib/deedkit; release=$root/releases/$sha
+sudo install -d -o root -g root -m 0755 $root/releases $release
+for f in production.py seamless_release.py; do
+  sudo git -C <mirror> cat-file blob $sha:scripts/$f | sudo tee $release/$f >/dev/null
+done
+printf '{"sha": "%s", "blobs": {"scripts/production.py": "%s", "scripts/seamless_release.py": "%s"}, "installed_at": "%s"}\n' \
+  $sha $(sudo git -C <mirror> rev-parse $sha:scripts/production.py) \
+  $(sudo git -C <mirror> rev-parse $sha:scripts/seamless_release.py) $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  | sudo tee $release/tool.json >/dev/null
+sudo chmod 0644 $release/*
+sudo python3 -B -E -s $release/production.py self-test     # {"self_test": "ok", "sha": "<sha>"}
+for f in production.py seamless_release.py; do sudo mv $root/$f $root/$f.before-$sha; done
+sudo ln -s releases/$sha $root/current
+for f in production.py seamless_release.py; do sudo ln -s current/$f $root/$f; done
+sudo python3 -B -E -s $root/production.py self-test
+```
+
+Its undo: remove the three links and move the two `.before-<sha>` files back.
 
 ### Timer
 
