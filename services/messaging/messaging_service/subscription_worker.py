@@ -10,7 +10,7 @@ import threading
 
 from .store import Store
 from .delivery_policy import flush_hints
-from .subscriptions import match_subscriptions
+from .subscriptions import acked_retention_days, match_subscriptions, prune_subscriptions
 from .telemetry import configure, capture
 
 
@@ -28,6 +28,8 @@ def main():
         parser.error('batch-size must be between 1 and 1000')
     if not 1 <= args.max_subscriptions <= 100:
         parser.error('max-subscriptions must be between 1 and 100')
+    # An out-of-bounds retention window fails startup instead of pruning with a wrong one.
+    acked_retention_days()
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
@@ -36,6 +38,13 @@ def main():
                   'http://localhost')
     try:
         while not stop.is_set():
+            if not args.once:
+                # Retention first frees match budget; its failures never stop matching or hints.
+                try:
+                    prune_subscriptions(store, max_subscriptions=args.max_subscriptions)
+                except Exception as error:
+                    capture(error, 'subscription_retention_failed')
+                    print(json.dumps({'error': 'subscription_retention_failed'}), flush=True)
             try:
                 result = match_subscriptions(store, batch_size=args.batch_size,
                                              max_subscriptions=args.max_subscriptions)

@@ -34,7 +34,7 @@ def restored_schema_version(store,manifest_version):
         row=connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()
     actual=row.get('value') if row else None
     if (not isinstance(actual,str) or not actual.isascii() or not actual.isdigit() or len(actual)>3 or
-            int(actual) not in range(2,40) or type(manifest_version) is not int or int(actual)!=manifest_version):
+            int(actual) not in range(2,41) or type(manifest_version) is not int or int(actual)!=manifest_version):
         raise ValueError('restored_schema_mismatch')
     return int(actual)
 
@@ -53,6 +53,7 @@ def assert_quarantined(store, version):
         predicates['account_policies'] += " OR operations_enabled IS DISTINCT FROM '{}'::text[]"
         predicates['messenger_commands'] = "status IN ('queued','dispatching')"
     if version >= 26:predicates['subscriptions'] = "state <> 'closed'"
+    if version >= 40:predicates['subscriptions'] += ' OR NOT retention_hold'
     if version >= 29:predicates['file_uploads'] = "state <> 'expired'"
     if version >= 32:
         predicates['subscription_receivers'] = 'enabled'

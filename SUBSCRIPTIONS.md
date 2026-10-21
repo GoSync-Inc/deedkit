@@ -3,7 +3,7 @@
 Current delivery work and priority: [BACKLOG.md](BACKLOG.md), DK-08–DK-10.
 This document is the API and delivery contract.
 
-Status: since **schema 32** (current schema 39) DeedKit implements persistent structural subscriptions, passive
+Status: since **schema 32** (current schema 40) DeedKit implements persistent structural subscriptions, passive
 inspection, independent fetch/ACK, bounded long polling, native wake selectors,
 operator-registered signed hints and private feedback. Schema 38 adds hint timing:
 debounce or batch windows, quiet hours, expected-reply silence timers and a per-key
@@ -96,9 +96,9 @@ Operator bounds are `SUBSCRIPTION_MAX_DEFINITIONS` (default 64 per key, includin
 closed definitions; 1–1000) and `SUBSCRIPTION_MAX_MATCHES` (default 10,000 references
 per subscription; 1–1,000,000). Set the match bound on the worker and the definition
 bound on the API. Raising a match budget resumes retained events without provider
-polling. Today nothing deletes match rows or outbox rows; a subscription at its
-match bound stops with `match_budget` and needs the operator. The agreed
-retention contract is in [Event retention](#event-retention-specified-not-implemented).
+polling. Old ACKed references are pruned (see [Event retention](#event-retention));
+a passive-only subscription at its match bound stops with `match_budget` and needs
+the operator. Outbox rows are not deleted.
 Listing has no continuation cursor yet; keep the default definition
 bound within one 100-item page or manage known IDs individually.
 
@@ -487,39 +487,77 @@ turn. A relay `accepted` row plus the run's own `fetch_subscription_events` and
 `ack_subscription_events` (ACK position advanced in `get_subscription`) is the
 host-turn evidence the live acceptance of ANYM-228 records.
 
-## Event retention (specified, not implemented)
+## Event retention
 
-Status: specified (ANYM-257, decided 2026-10-17 by the orchestrator under the owner's
-delegation); implementation pending. Until then the behavior is the one described
-under [Running the matcher](#running-the-matcher): nothing deletes match rows or
-terminal outbox rows, only receipts are pruned (lazily, on fetch), and closed
-definitions count toward `SUBSCRIPTION_MAX_DEFINITIONS`. The contract below is what
-the implementation must deliver; retention may lose events only with an explicit gap.
+Status: acknowledged-event retention is implemented since **schema 40** (ANYM-446, the
+first half of the ANYM-257 contract decided 2026-10-17 by the orchestrator under the
+owner's delegation). Terminal outbox rows and closed definitions are still never
+deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS`
+(sibling story, not built). Retention may lose events only with an explicit gap.
 
-- **Explicit-ACK subscriptions:** match references at or below `acked_through` and
-  older than `SUBSCRIPTION_ACKED_RETENTION_DAYS` (default 7, bounds 1–366) are
-  deleted and stop counting toward `SUBSCRIPTION_MAX_MATCHES`.
-- **Passive-only subscriptions** (never fetched): nothing is deleted. The
-  `match_budget` stop stays operator-visible, because deleting would silently break
-  the `after` positions these subscribers keep themselves.
-- **Pruned positions:** an `after` below the retained floor returns a
-  `retention_gap` carrying the floor, never an empty complete page.
-- **Terminal outbox rows** (`delivered`, `cancelled`, `dead_letter`): deleted after
-  30 days; per-state counts remain as counters on `get_subscription`.
-- **Closed, expired and `access_changed` definitions:** after 30 days their
-  matches, receipts, outbox rows and consumption are deleted; a masked tombstone
-  (ID, state, version, `closed_at`) remains, and tombstones older than 30 days stop
-  counting toward `SUBSCRIPTION_MAX_DEFINITIONS`.
-- **Mechanics:** pruning runs as bounded batches in the subscription worker under
-  the same locks. Quarantine restore and backup manifests carry the retention floor.
-
-The implementation needs a migration (floor column, indexes) and irreversible
-deletion, so it is a separate owner-level change.
+- **Explicit-ACK subscriptions** that are not closed or expired: match references at or below `acked_through` whose
+  `matched_at` is older than `SUBSCRIPTION_ACKED_RETENTION_DAYS` (default 7, 1–366; set
+  it on the subscription worker, where a value outside the bounds fails startup) are
+  deleted and stop counting toward `SUBSCRIPTION_MAX_MATCHES`, so a `match_budget`
+  stop resumes on the next pass. A reference above `acked_through` is never deleted,
+  at any age. `matched_event_count` counts retained references only.
+- **Passive-only subscriptions** (never fetched with `subscription-ack`): nothing is
+  deleted. The `match_budget` stop stays operator-visible, because deleting would
+  silently break the `after` positions these subscribers keep themselves.
+- **Retained floor:** each subscription keeps the highest pruned position (0 when
+  nothing was pruned). `get_subscription_events` with an `after` below it returns no
+  items, `has_more: true`, `next_after` = floor and, in `subscription.gap`,
+  `{reason: 'retention_gap', after, through: floor, recoverable: false, floor}`;
+  resume with `after` = floor. An `after` at or above the floor reads as before.
+  `fetch_subscription_events` and `wait_for_subscription_events` read from
+  `acked_through`, which is never below the floor.
+- **Mechanics:** before each matching pass the subscription worker prunes at most 16
+  subscriptions, one transaction of at most 500 references each, oldest first. A batch
+  takes the shared principal lock and the subscription row with `SKIP LOCKED` (the
+  matcher's order; ACK and fetch hold the same row), runs with `lock_timeout` 100 ms
+  and `statement_timeout` 1 s, deletes a contiguous prefix above the floor and moves
+  the floor in the same transaction. A failed batch rolls back alone and is logged as
+  `subscription_retention_failed` with its error class only; matching and hints
+  continue (also in opt-in telemetry, code only). `--once` diagnostics never prune.
+- **Closed and expired definitions** keep their references: they match nothing new, so
+  their budget does not matter, and every quarantine closes all definitions. Deleting
+  them is the sibling story's.
+- **Quarantine hold:** quarantine restore sets `retention_hold` on every definition it
+  closes. Held subscriptions are skipped by every pruning path; the hold is a table
+  column, so backups carry it. Restored matches and consumption stay exactly as
+  restored until the operator releases the hold:
+  `python -m messaging_service release-retention-hold --subscription-ids <uuid>...`
+  (or `--all-subscriptions`). A schema-38 or 39 restore is quarantined without a hold
+  column and migrates to `retention_hold=false`; its definitions are closed, so this
+  story never prunes them. The sibling story must not delete such closed definitions
+  without the operator's release either: a closed definition left by a quarantine is
+  indistinguishable from an ordinary one after migration 40, so before it ships the
+  operator reruns `quarantine-restore` on any legacy restore kept beyond the migration.
+- **Activation:** nothing is pruned until the operator enables retention, after every
+  serving messaging API runs a floor-aware reader (one that returns `retention_gap`):
+  `python -m messaging_service set-subscription-retention --enable` (or `--disable`;
+  stored as `probe_metadata` `subscription_retention`, refused below schema 40). An
+  older reader would silently skip the pruned prefix for a passive `after` below the
+  floor.
+- **Roles:** the worker role gains `SELECT` on `probe_metadata` and `subscription_consumption`,
+  `UPDATE(retention_floor)` on `subscriptions` and `DELETE` on `subscription_matches`.
+  Migration 40 grants them to an existing `messaging_subscriptions`; reapply
+  `subscription_role.sql` for a new install.
+- **Rollout:** a verified backup, then migration 40 (docs/operations/production.md
+  backup gate), then the release with the floor-aware API and worker, then
+  `set-subscription-retention --enable` once that release is healthy. A worker on an
+  older schema or without the activation prunes nothing.
+- **Rollback:** once pruning has run, the messaging API must stay at a floor-aware
+  version. Before any rollback of messaging below this release, run
+  `set-subscription-retention --disable`; the pre-retention reader still does not report
+  gaps for subscriptions already pruned, so roll back only with that known loss of the
+  gap signal or restore the pre-migration backup instead.
 
 ## Remaining extensions and verification boundaries
 
 Coalescing across subscriptions of different keys, stream resource notifications,
-automatic retention and text/model relevance predicates are not implemented. Without a
+retention of outbox rows and closed definitions, and text/model relevance predicates
+are not implemented. Without a
 policy a hint is eligible after each bounded matcher pass, within the per-key budget;
 retry/delivery progress remains separate from event ACK.
 There is no arbitrary agent URL registration, provider polling on demand, remote

@@ -15,7 +15,8 @@ def main():
     parser.add_argument('command',choices=['serve','init','migrate','issue-key','revoke-key',
         'replay','snapshot','verify-restore','quarantine-restore','register-account',
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
-        'set-messenger-operations','extend-key','set-feedback-status'])
+        'set-messenger-operations','extend-key','set-feedback-status','release-retention-hold',
+        'set-subscription-retention'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -51,6 +52,8 @@ def main():
     parser.add_argument('--spec',help='set-feedback-status: ANYM-<n>')
     parser.add_argument('--duplicate-of',help='set-feedback-status: a feedback UUID of the same key')
     parser.add_argument('--note',help='set-feedback-status: at most 280 characters, no control characters')
+    parser.add_argument('--subscription-ids',nargs='+',help='release-retention-hold: subscription UUIDs')
+    parser.add_argument('--all-subscriptions',action='store_true',help='release-retention-hold: every held subscription')
     args=parser.parse_args()
     if args.command == 'serve':
         configure('gateway')
@@ -135,6 +138,14 @@ def main():
                 parser.error('set-feedback-status requires --id and --status')
             print(json.dumps(store.set_feedback_status(args.feedback_ids,args.status,fixed_in=args.fixed_in,
                 spec_ref=args.spec,duplicate_of=args.duplicate_of,note=args.note)))
+        elif args.command=='release-retention-hold':
+            if bool(args.subscription_ids)==args.all_subscriptions:
+                parser.error('release-retention-hold requires exactly one of --subscription-ids or --all-subscriptions')
+            print(json.dumps(store.release_retention_hold(args.subscription_ids)))
+        elif args.command=='set-subscription-retention':
+            if not (args.enable or args.disable):
+                parser.error('set-subscription-retention requires --enable or --disable')
+            print(json.dumps(store.set_subscription_retention(args.enable)))
         elif args.command=='set-access':
             if not args.principal:parser.error('set-access requires --principal')
             result=store.set_access(args.principal,accounts=args.accounts if args.accounts is not None else UNSET,

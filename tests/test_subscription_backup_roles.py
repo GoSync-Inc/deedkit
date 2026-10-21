@@ -29,7 +29,7 @@ def test_schema26_manifest_includes_definitions_sources_and_exact_match_referenc
     _, definition, event = _subscription(store, 'synthetic-manifest-subscriber')
     match_subscriptions(store)
     with store.pool.connection() as connection:
-        assert connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '39'
+        assert connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '40'
         manifest = database_manifest(connection)
     assert len(manifest) == 66
     assert all(manifest[name]['rows'] == 1 for name in (
@@ -176,7 +176,7 @@ def test_dedicated_matcher_role_matches_without_credentials_or_provider_mutation
             'INSERT INTO subscriptions SELECT * FROM subscriptions WHERE false',
             'DELETE FROM subscriptions', 'UPDATE subscriptions SET key_id=key_id',
             'UPDATE subscriptions SET selector=selector', 'DELETE FROM subscription_sources',
-            "UPDATE subscription_sources SET sender_ids='{}'", 'DELETE FROM subscription_matches',
+            "UPDATE subscription_sources SET sender_ids='{}'",
             'UPDATE subscription_matches SET matched_at=clock_timestamp()',
         )
         for statement in forbidden:
