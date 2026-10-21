@@ -31,7 +31,8 @@ SETUP = """CREATE TABLE synthetic_existing (id text PRIMARY KEY,
  tags text[] CONSTRAINT synthetic_existing_tags_check CHECK(tags <@ ARRAY['a','b']::text[]),
  rank integer CONSTRAINT synthetic_existing_rank_check CHECK(rank IN (-1, 2)),
  "Mode" text CONSTRAINT synthetic_existing_mode_check CHECK("Mode" IN ('x','y')),
- level text CONSTRAINT synthetic_existing_level_check CHECK(level IN ('a')));
+ level text CONSTRAINT synthetic_existing_level_check CHECK(level IN ('a')),
+ day date CONSTRAINT synthetic_existing_day_check CHECK(day IN ('2026-01-01','2026-01-02')));
 CREATE SEQUENCE synthetic_sequence;
 INSERT INTO synthetic_existing VALUES ('synthetic-1','b','{a}');"""
 EXISTING = {'messages', 'audit_log', 'synthetic_existing'}
@@ -82,6 +83,10 @@ ALTER TABLE synthetic_existing ADD CONSTRAINT synthetic_existing_mode_check CHEC
     'widen-singleton': """ALTER TABLE synthetic_existing DROP CONSTRAINT synthetic_existing_level_check;
 ALTER TABLE synthetic_existing ADD CONSTRAINT synthetic_existing_level_check CHECK(level IN ('a','b')) NOT VALID;
 """,
+    'widen-date': """ALTER TABLE synthetic_existing DROP CONSTRAINT synthetic_existing_day_check;
+ALTER TABLE synthetic_existing ADD CONSTRAINT synthetic_existing_day_check
+ CHECK(day IN ('2026-01-01','2026-01-02','2026-01-03')) NOT VALID;
+""",
     'precondition': PRECONDITION,
     'comment': "COMMENT ON TABLE messages IS 'synthetic';\nCOMMENT ON COLUMN messages.body IS 'synthetic body';\n",
 }
@@ -110,6 +115,8 @@ COUNTEREXAMPLES = {
     'narrowed-numeric': (ALLOWED['widen-numeric'].replace('(2, -1, 3)', '(-1, 3)'), 'expand', True),
     'narrowed-quoted-column': (ALLOWED['widen-quoted-column'].replace("('x','y','z')", "('x','z')"), 'expand', True),
     'narrowed-singleton': (ALLOWED['widen-singleton'].replace("('a','b')", "('b')"), 'expand', True),
+    'narrowed-date': (ALLOWED['widen-date'].replace("('2026-01-01','2026-01-02',", "('2026-01-02',"), 'expand',
+                      True),
     'widened-other-column': (ALLOWED['widen-singleton'].replace('(level IN', '("Mode" IN'), 'expand', True),
 }
 # PostgreSQL continues this E-string across the escaped newline and the escaped quote, closes it after b and runs the
@@ -305,10 +312,12 @@ def array(c):
 
 
 def value(text, kind, type_):
-    """A literal's value as the column compares it: a Decimal for a numeric type, the string for a text type."""
+    """A literal's value as the column compares it: a Decimal for a numeric type, the string for a text type, and
+    for any other type (date, ...) the type with the canonical text pg_get_constraintdef prints for the stored value."""
     type_ = type_ or ('numeric' if kind == 'number' else None)
     if type_ in NUMERIC_TYPES: return ('number', Decimal(text))
     if type_ in TEXT_TYPES and kind == 'string': return ('text', text)
+    if type_ and kind == 'string' and not type_.endswith('[]'): return (type_, text)
     raise rollout.Manual('a literal the catalog check cannot compare')
 
 
