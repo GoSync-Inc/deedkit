@@ -124,7 +124,7 @@ State of each prerequisite, checked against the code. Paths are in
 Keep the example disabled (`enabled: false` in `enrichment.codex.example.json`)
 until the missing and partly done controls, isolated deployment and owner login are complete,
 or the owner accepts the open items. Whether to build them is decided under
-ANYM-231. Start with a small representative set and measure quality, attempts,
+ANYM-459. Start with a small representative set and measure quality, attempts,
 latency and shared usage before enabling all accounts/files. Nothing
 automatically changes the live audio profile.
 
