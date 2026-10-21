@@ -311,7 +311,7 @@ Normal pull requests record their actual tested merge SHA.
 
 The `checks / Tiden PR check` job runs `scripts/tiden_pr_check.py` (check A,
 ANYM-405) on every pull request run. It reads only from Tiden and checks the
-bookkeeping a merge needs (AGENTS.md section 4):
+bookkeeping a merge needs (harness process.md section 4):
 
 - the body lines `Spec:`, `Delivers:` and `Tiden branch:` are well formed, name
   story-level specs that exist on Tiden main or on the named branch, and the
@@ -390,7 +390,7 @@ sync of its TARGET by this title (ANYM-438).
 
 The sync writes to Tiden since check A ran green on three pull requests. The
 agent that merged waits for the sync run of its squash and reads back the result
-(AGENTS.md section 4). A failed or dropped run is recovered only by dispatching
+(harness process.md section 4). A failed or dropped run is recovered only by dispatching
 it again by SHA, as above, or by rerunning it, so that it joins the concurrency
 group. A local `scripts/tiden_sync.py` runs only with `--dry-run`: a local write
 or a source repair by hand is outside the group, and a B run that starts during
@@ -439,7 +439,7 @@ is a reviewed code change to the checker and its test, never a data edit.
 
 The agent that merged a pull request checks that the `Tiden drift` run on its
 squash commit, or a later one, is green before it reports the merge as checked
-(AGENTS.md); a red run names the files to anchor.
+(harness process.md section 4); a red run names the files to anchor.
 
 ## Tiden health
 
@@ -550,7 +550,7 @@ becomes active on `main`, on every run until it is linked or listed.
 After the `main` push run of a squash publishes its evidence, sync B links each
 marked new test case of the change on Tiden main. The agent that merged it waits
 for that sync run, reads back the links and reruns a failed `Tiden health` run
-(`AGENTS.md`). The measuring command gives the same
+(harness process.md section 4). The measuring command gives the same
 report locally, read-only, without fetching:
 
 ```sh

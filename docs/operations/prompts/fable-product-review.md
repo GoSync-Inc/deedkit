@@ -1,6 +1,6 @@
 # Fable product review: prompt template
 
-Use this for the one Fable round on a product card at design time (AGENTS.md section 5); Fable
+Use this for the one Fable round on a product card at design time (harness process.md section 5); Fable
 does not review finished behaviour. Run Fable as a Claude subagent with model `fable`. Fill the
 placeholders; attach the inputs as files. No code goes in the packet.
 
