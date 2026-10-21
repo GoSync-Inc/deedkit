@@ -492,7 +492,10 @@ class WhatsAppCollector(TelegramCollector):
                 progress['head']=target
                 if not reached and target>head: progress['gap']=True
                 progress.pop('catchup_before',None);progress.pop('catchup_head',None)
+                # ANYM-454: progress marker for list_chats; written in the same atomic checkpoint.
+                if before:progress['catchup_progress_at']=time.time()
             elif points:
+                if points[0]!=before:progress['catchup_progress_at']=time.time()
                 progress['catchup_before']=points[0];progress['catchup_head']=target
             if not progress.get('catchup_before') and not progress.get('history_exhausted') and progress.get('history_before'):
                 old=await self.provider.page(chat,limit=self.batch_size,before=progress['history_before'])

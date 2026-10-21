@@ -3,13 +3,28 @@
 A database read is not a provider synchronization. Source timestamps retain their
 observed resolution, and neither hash IDs nor ingest order resolve WhatsApp ties.
 """
-from datetime import datetime, timedelta
+import math
+from datetime import datetime, timedelta, timezone
 
 from .policy import scope_filter
 
 
 HEAD_FRESHNESS = timedelta(minutes=5)
 HEAD_LIMIT = 64
+CATCHUP_WINDOW = timedelta(minutes=30)
+CLOCK_SKEW = timedelta(minutes=5)  # the collector stamps with its own clock
+# ANYM-454: what an agent does next for each reason a conversation block is unclear. Reading a chat
+# cannot refresh a stale head (the collector does), hence answer_with_caveat rather than a retry.
+# CONVERSATION.md and the list_chats description list exactly these pairs (tests pin all three).
+NEXT_STEP = {
+    'provider_head_stale':'answer_with_caveat', 'provider_head_not_verified':'answer_with_caveat',
+    'history_has_gaps':'answer_with_caveat', 'ambiguous_message_order':'answer_with_caveat',
+    'ambiguous_attention_reply_order':'answer_with_caveat', 'head_candidates_truncated':'answer_with_caveat',
+    'message_revision_changed_during_read':'reread_now', 'message_version_conflict':'reread_now',
+    'rate_limited':'wait_for_provider_cooldown', 'provider_temporarily_unavailable':'wait_for_provider_cooldown',
+    'provider_unavailable':'check_provider_access', 'provider_chat_error':'check_provider_access',
+    'unclassified_latest_message':'get_context', 'chat_type_unknown':'get_context',
+    'no_archived_messages':'wait_for_history'}
 
 
 def _instant(value):
@@ -55,8 +70,78 @@ def _unstable(messages):
     return None
 
 
+def _marker(value, as_of):
+    """A checkpoint epoch as an instant; a malformed or future value reads as absent."""
+    if type(value) not in (int, float) or not math.isfinite(value) or value<=0:
+        return None
+    try:
+        at=datetime.fromtimestamp(value, timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+    return at if at<=as_of+CLOCK_SKEW else None
+
+
+def retry_after(collector, as_of):
+    """Whole seconds until the account's rate limit ends, when the collector recorded it."""
+    until=(collector or {}).get('cooldown_until')
+    if not isinstance(until, datetime):
+        return None
+    seconds=math.ceil((until-as_of).total_seconds())
+    return seconds if seconds>0 else None
+
+
+def catchup_state(history, collector, as_of):
+    """Where a WhatsApp catch-up stands: moving, queued, stalled (with cause) or unknown."""
+    collector=collector or {}
+    progress=_marker(collector.get('catchup_progress_at'), as_of)
+    attempt=_instant(history.get('last_attempt_at'))
+    cause=history.get('last_error_code')
+    if not cause and retry_after(collector, as_of):
+        cause='rate_limited'
+    elif not cause and collector.get('status')=='degraded':
+        cause=collector.get('detail_code')
+    if progress is None:
+        state='queued' if attempt is None else 'unknown'
+    elif as_of-progress<=CATCHUP_WINDOW:
+        state='moving'
+    elif cause or attempt is not None and attempt>progress:
+        state='stalled'
+    else:
+        state='queued'
+    result={'state':state, 'last_progress_at':progress}
+    if state=='stalled' and cause:
+        result['cause']=cause
+    return result
+
+
+def _annotate(result, platform, history, collector, as_of):
+    """Advisory fields only: a failure here drops the field and never the row."""
+    if result['suggested_action']=='unclear':
+        code=result['basis']['code']
+        try:
+            step=NEXT_STEP.get(code, 'get_context')
+            result['next_step']=step
+            if 'owner_attention' in result:
+                result['owner_attention']['next_step']=step
+        except Exception:
+            pass
+        if code=='rate_limited' and 'next_step' in result:
+            try:
+                wait=retry_after(collector, as_of)
+                if wait:
+                    result['retry_after_s']=wait
+            except Exception:
+                pass
+    if platform=='whatsapp' and 'catchup_pending' in (history.get('gaps') or ()):
+        try:
+            result['catchup']=catchup_state(history, collector, as_of)
+        except Exception:
+            pass
+    return result
+
+
 def derive_state(messages, *, platform, chat_type, as_of, history,
-        self_chat=False, attention=None, truncated=False, meaningful_fallback=None):
+        self_chat=False, attention=None, truncated=False, meaningful_fallback=None, collector=None):
     """Derive from newest-first messages selected with the shared order resolver.
 
     The argument contains the actual authorized chat head, never a context page.
@@ -150,7 +235,7 @@ def derive_state(messages, *, platform, chat_type, as_of, history,
     elif chat_type not in ('private',):
         result['suggested_action']='unclear'
         result['basis']['code']='chat_type_unknown'
-    return result
+    return _annotate(result, platform, history, collector, as_of)
 
 
 def provider_reply_matches(reply_metadata, target='m', provider_chat='ch.provider_chat'):
@@ -223,6 +308,17 @@ def group_thread_query(projection, *, account='c.account',chat='c.id',
     return sql
 
 
+def collector_facts(c,account,row):
+    """Collector-side facts for next_step and catch-up; None when they cannot be read."""
+    try:
+        health=c.execute('SELECT status,detail_code,cooldown_until FROM collector_health WHERE account=%s',
+            (account,)).fetchone() or {}
+        progress=(row or {}).get('wa_progress')
+        return {**health,'catchup_progress_at':progress.get('catchup_progress_at') if isinstance(progress,dict) else None}
+    except Exception:
+        return None
+
+
 def conversation_state(c,p,account,chat,*,titles=None):
     """Resolve the actual archive head only after checking exact account/chat ACL."""
     from .store import APIError
@@ -281,10 +377,11 @@ def conversation_state(c,p,account,chat,*,titles=None):
         enrich(c,attention,p,titles=titles);decorate_messages(c,p,attention)
     coverage_rows=rows(c,p,[chat],[account])
     covered=coverage_history(coverage_rows[0]) if coverage_rows else {}
+    collector=collector_facts(c,account,coverage_rows[0] if coverage_rows else None)
     result=derive_state(observed, platform=info['platform'], chat_type=info['chat_type'],
         as_of=info['as_of'],history=covered,self_chat=info['self_chat'] or
             any(m.get('is_self_chat') is True for m in observed) or
             info['platform']=='telegram' and info['provider_chat']=='777000',
-        attention=attention,truncated=truncated,meaningful_fallback=fallback)
+        attention=attention,truncated=truncated,meaningful_fallback=fallback,collector=collector)
     result.update(account=account,chat_id=chat)
     return result

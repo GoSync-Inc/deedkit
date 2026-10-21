@@ -643,6 +643,14 @@ def create_app(store: Store, allowed_hosts: list[str]):
         A question is question_mark in reasons. A private hint's basis: last_archived_message_incoming.
         sender_name on an outgoing head without sender_id: the owner. head_freshness: stale.
         Without conversation.basis beside a hint, the hint's confidence, else its basis, gives the reason.
+        next_step: provider_head_stale, provider_head_not_verified, history_has_gaps -> answer_with_caveat.
+        next_step: ambiguous_message_order, ambiguous_attention_reply_order, head_candidates_truncated -> answer_with_caveat.
+        next_step: message_revision_changed_during_read, message_version_conflict -> reread_now.
+        next_step: rate_limited, provider_temporarily_unavailable -> wait_for_provider_cooldown.
+        next_step: provider_unavailable, provider_chat_error -> check_provider_access.
+        next_step: unclassified_latest_message, chat_type_unknown, any other code -> get_context.
+        next_step: no_archived_messages -> wait_for_history.
+        retry_after_s: seconds left of a rate limit. catchup (WhatsApp, beside coverage): state moving, queued, stalled or unknown.
         Rows without type omit nothing.
         limit defaults to 25 (maximum 100); continue with next_cursor.
         """
