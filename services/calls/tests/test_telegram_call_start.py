@@ -294,6 +294,38 @@ async def test_raw_start_timing_leaves_no_copy_in_the_analysis_request(monkeypat
 
 
 # spec: ANYM-450
+@pytest.mark.parametrize('field',['media','inbound_start'])
+async def test_a_result_field_named_like_a_diagnostic_still_reaches_the_analysis(monkeypatch,tmp_path,field):
+    from core import BriefInput,VoiceService
+    from google import genai
+    import learning
+    service=VoiceService(tmp_path/'voice')
+    brief=service.prepare(BriefInput(goal='Confirm the delivery medium',counterparty='Vendor',
+                                     success_fields=[field],approval_fields=[field]),[])
+    call=service.start(brief['id'])
+    service.connected(call['id'])
+    service.transcript(call['id'],'user','Delivery is by email.')
+    assert service.tool(call['id'],'record_answer',{'field':field,'value':'email','evidence':'Delivery is by email.'},'t1')['ok']
+    service.stop(call['id'],'counterparty_hangup')
+    snapshot=_reports(service,call)[0]['snapshot']
+    sent=[]
+    class Models:
+        async def generate_content(self,model,contents,config):
+            sent.append(json.loads(contents));raise RuntimeError('stop after capturing the request')
+    class Client:
+        def __init__(self,**kwargs):
+            async def aclose():pass
+            self.aio=SimpleNamespace(models=Models(),aclose=aclose)
+    monkeypatch.setattr(genai,'Client',Client)
+    with pytest.raises(RuntimeError):
+        await learning.GeminiReviewer().review(snapshot,'synthetic-key')
+    # Answers and owner decision conditions are user-named data, not diagnostics.
+    assert sent[0]['answers']==snapshot['answers'] and field in snapshot['answers']
+    assert sent[0]['decisions'][0]['conditions']==snapshot['decisions'][0]['conditions']
+    service.close()
+
+
+# spec: ANYM-450
 def test_a_failed_start_timing_constructor_or_boundary_reads_as_unavailable():
     from audio_probe import diagnostics
     from telegram_audio import start_snapshot

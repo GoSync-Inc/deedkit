@@ -332,18 +332,23 @@ class Learning:
 SERVER_ONLY_AUDIO={'input_frames','input_zero_frames','input_max_rms','first_active_input_ms','input_sample_rates','media','start'}
 SERVER_ONLY_START={'peer_connected_at','input_ready_ms','call_active_ms','pre_ready_frames','inbound_start','inbound_start_unavailable'}
 SERVER_ONLY_EVENTS={'inbound_audio','language_hint_failed'}
+SERVER_ONLY_KEYS=SERVER_ONLY_START|{'media'}
 
 
 def without_start(value):
-    # Raw start timing and media diagnostics leave no copy at any depth: top level, events or metrics.
-    if isinstance(value,dict):return {k:without_start(v) for k,v in value.items() if k not in SERVER_ONLY_START|{'media'}}
+    # Metrics are system diagnostics only, so raw start timing and media leave no copy at any depth there.
+    if isinstance(value,dict):return {k:without_start(v) for k,v in value.items() if k not in SERVER_ONLY_KEYS}
     if isinstance(value,list):return [without_start(v) for v in value]
     return value
 
 
 def analysis_view(snapshot):
-    view=without_start(snapshot)
-    view['events']=[e for e in view.get('events',[]) if not isinstance(e,dict) or e.get('kind') not in SERVER_ONLY_EVENTS]
+    # Top level and events are stripped at their own level only: answers, decision conditions and tool
+    # results below them carry user-named fields (a result field may be called 'media'), kept as they are.
+    view={k:v for k,v in snapshot.items() if k not in SERVER_ONLY_KEYS}
+    view['events']=[{k:v for k,v in e.items() if k not in SERVER_ONLY_KEYS} if isinstance(e,dict) else e
+                    for e in snapshot.get('events',[]) if not isinstance(e,dict) or e.get('kind') not in SERVER_ONLY_EVENTS]
+    if 'metrics' in view:view['metrics']=without_start(view['metrics'])
     metrics=view.get('metrics')
     if isinstance(metrics,dict) and isinstance(metrics.get('telegram_audio'),dict):
         view['metrics']={**metrics,'telegram_audio':{k:v for k,v in metrics['telegram_audio'].items() if k not in SERVER_ONLY_AUDIO}}
