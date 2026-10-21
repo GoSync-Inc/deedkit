@@ -27,8 +27,8 @@ Answer:
    (adopt | adapt | build) right, i.e. does it avoid rebuilding what a standard tool already does?
    Below the study threshold (new module, infrastructure mechanism, external integration, over
    ~300 lines) one line is enough; above it a missing or bare `build` is a finding. Should the
-   card be split (more than one owner-visible outcome, or Effort above 8)? The round covers the
-   children of a split; they need no round of their own.
+   card be split (more than one owner-visible outcome, or Effort above 8)? If their criteria partition
+   the parent's, the round covers the children of a split.
 
 Do not review code style, tests or implementation. Do not ask for more process.
 Write the report to <report path>: findings ranked by impact on the owner, each with severity
