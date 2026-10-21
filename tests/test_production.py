@@ -2,8 +2,10 @@
 import contextlib
 import copy
 import hashlib
+import importlib.util
 import json
 import os
+import py_compile
 from pathlib import Path
 import re
 import stat
@@ -26,8 +28,8 @@ CHECK_SPACE, RETAIN_IMAGES, PROMOTABLE = p.check_space, p.retain_images, p.promo
 
 @pytest.fixture(autouse=True)
 def no_host_state(tmp_path, monkeypatch):
-    """No test reads this machine's production state, /etc/deedkit or containerd directory."""
-    for name in ("HOST_STATE", "CONFIG_DIRECTORY", "CONTAINERD_ROOT"):
+    """No test reads this machine's production state, /etc/deedkit, containerd, tool or systemd directory."""
+    for name in ("HOST_STATE", "CONFIG_DIRECTORY", "CONTAINERD_ROOT", "TOOL_ROOT", "SYSTEMD_DIRECTORY"):
         monkeypatch.setattr(p, name, tmp_path / "absent" / name.lower())
 
 
@@ -4018,3 +4020,577 @@ def test_a_snapshot_service_entry_that_is_not_a_mapping_removes_nothing(tmp_path
     assert p.retain_images(settings) == {
         "skipped": f"the rollback snapshot of {release} is missing or malformed; no image is removed"}
     assert store.removals() == [] and image_id("2") in store.references
+
+
+# Deploy tool updates (ANYM-443): a synthetic tool layout under tmp, the fake mirror serving the candidate's tool files,
+# and the real self-test run as a separate process with the CI Python against synthetic configurations.
+TOOL = {path: (ROOT / path).read_bytes() for path in ("scripts/production.py", "scripts/seamless_release.py")}
+SYNTHETIC_VALUES = ("https://example.invalid/deedkit", "legacy-api:8080", "legacy-gateway:13240", "synthetic-router",
+                    "synthetic-frontend", "synthetic-policy-secret")
+
+
+class Died(BaseException):
+    """The deploy process killed at a boundary: no `except Exception` sees it."""
+
+
+def tree(path):
+    """Every entry below `path` with its mode and bytes or link target: what byte-identical compares."""
+    found = {}
+    for directory, names, files in os.walk(path):
+        for name in names + files:
+            entry = Path(directory) / name
+            info = entry.lstat()
+            found[str(entry.relative_to(path))] = (info.st_mode, os.readlink(entry) if stat.S_ISLNK(info.st_mode)
+                                                   else entry.read_bytes() if stat.S_ISREG(info.st_mode) else None)
+    return found
+
+
+def candidate_tool(verifier, *, pin=None, inject=b"", seamless=b""):
+    """The candidate's production.py (synthetic verifier path and pin, optional code before `main()`) and its
+    seamless_release.py (optional code appended)."""
+    source = re.sub(rb'(?m)^VERIFIER = Path\(".*"\)$', b'VERIFIER = Path("%s")' % str(verifier).encode(),
+                    TOOL["scripts/production.py"])
+    source = re.sub(rb'(?m)^VERIFIER_SHA256 = ".*"$', b'VERIFIER_SHA256 = "%s"' % (
+        pin or hashlib.sha256(verifier.read_bytes()).hexdigest()).encode(), source)
+    marker = b'\nif __name__ == "__main__":\n    main()\n'
+    assert source.endswith(marker)
+    return {"scripts/production.py": source[:-len(marker)] + inject + marker,
+            "scripts/seamless_release.py": TOOL["scripts/seamless_release.py"] + seamless}
+
+
+def git_blob(content):
+    return hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest()
+
+
+def install_release(root, sha, files, installed_at="2026-10-20T00:00:00Z"):
+    release = root / "releases" / sha
+    release.mkdir(parents=True)
+    for path, content in files.items():
+        (release / Path(path).name).write_bytes(content)
+    (release / "tool.json").write_text(json.dumps({"sha": sha, "blobs": {path: git_blob(content) for path, content
+                                                                         in files.items()},
+                                                   "installed_at": installed_at}))
+    for entry in [release, *release.iterdir()]:
+        entry.chmod(0o755 if entry.is_dir() else 0o644)
+
+
+class ToolHost(Deployer):
+    """`Deployer` on a host with the self-updating layout: the bootstrapped tool at BASE is this checkout's pair (the
+    running code), the candidate NEWEST changes scripts/production.py."""
+
+    def __init__(self, tmp_path, monkeypatch, *, changes=None, tool_sha=BASE, candidate=NEWEST, **options):
+        super().__init__(tmp_path, monkeypatch, changes=changes or {NEWER: ["scripts/production.py"]}, **options)
+        self.monkeypatch, self.candidate, self.p = monkeypatch, candidate, p
+        self.verifier = fake_verifier(tmp_path, monkeypatch)
+        self.tool = tmp_path / "tool"
+        self.tool.mkdir(mode=0o755)
+        (self.tool / "releases").mkdir(mode=0o755)
+        monkeypatch.setattr(p, "TOOL_ROOT", self.tool)
+        monkeypatch.setattr(p, "TOOL_PYTHON", sys.executable)
+        install_release(self.tool, tool_sha, TOOL, "2026-10-20T01:00:00Z")
+        os.symlink(f"releases/{tool_sha}", self.tool / "current")
+        for name in ("production.py", "seamless_release.py"):
+            os.symlink(f"current/{name}", self.tool / name)
+        (tmp_path / "compose.json").write_text("{}")
+        router, policy = tmp_path / "router", tmp_path / "policy.json"
+        router.mkdir(mode=0o700)
+        policy.write_text(json.dumps({"keys": {"agent": "synthetic-policy-secret"}}))
+        policy.chmod(0o600)
+        self.http = {"version": 1, "state_directory": str(self.http_state), "projects": [
+            {"name": "messages", "directory": str(tmp_path), "files": [str(policy)], "services": {"api": "runtime"}},
+            {"name": "gateway", "directory": str(tmp_path), "files": [str(policy)], "services": {"gateway": "gateway"}}],
+            "http_release": {"api": {"project": "messages", "service": "api"},
+                             "gateway": {"project": "gateway", "service": "gateway"}, "gateway_policy": str(policy),
+                             "gateway_public_url": "https://example.invalid/deedkit",
+                             "router": {"container": "synthetic-router", "image": IMAGE, "network": "synthetic-frontend",
+                                        "directory": str(router), "config_file": str(router / "router.json"),
+                                        "admin_socket": str(router / "admin.sock"), "listen": 8080},
+                             "legacy": {"api": "legacy-api:8080", "gateway": "legacy-gateway:13240"}}}
+        p.write(self.http_state / "http-current.json",
+                {"sha": BASE, "status": "serving", "config_digest": p.digest(self.http)})
+        self.configs = (tmp_path / "plan-a.json", tmp_path / "plan-b.json")
+        for path, value in zip(self.configs, (self.settings, self.http)):
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+        self.serve(candidate_tool(self.verifier))
+
+    def serve(self, files, sha=None):
+        """The fake mirror's tool files at the candidate commit."""
+        self.files = files
+        for path, content in files.items():
+            self.blobs[f"{sha or self.candidate}:{path}"] = git_blob(content)
+
+    def run(self, argv, **kwargs):
+        command = argv[3:]
+        if command[:2] == ["cat-file", "blob"]:
+            self.git.append(argv)
+            assert kwargs.get("binary") is True
+            sha, path = command[2].split(":", 1)
+            return self.files[path]
+        if command[:2] == ["merge-base", "--is-ancestor"] and command[2] not in self.history:
+            raise p.Refused("git failed (exit 1); production was not accepted")
+        return super().run(argv, **kwargs)
+
+    def deploy(self, **options):
+        return self.p.deploy(self.settings, self.http, attested=self.attested, configs=self.configs, **options)
+
+    def restart(self):
+        """The next timer run: the production.py `current` names is loaded anew and runs, with the harness's patches
+        (not the module's own functions) and exception classes carried over."""
+        script = (self.tool / "current" / "production.py").resolve()
+        spec = importlib.util.spec_from_file_location(f"installed_tool_{script.parent.name}", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for name, value in vars(p).items():
+            if isinstance(value, type) and issubclass(value, BaseException) and value.__module__ == p.__name__:
+                setattr(module, name, value)
+        for target, name, _ in self.monkeypatch._setattr:
+            if target is p and getattr(getattr(p, name), "__module__", None) != p.__name__:
+                setattr(module, name, getattr(p, name))
+        self.monkeypatch.setattr(self.s, "__file__", str(script.parent / "seamless_release.py"))
+        self.p = module
+
+    def current_tool(self):
+        return os.readlink(self.tool / "current")
+
+    def receipt(self):
+        path = self.state / "tool-update.json"
+        return p.read(path) if path.exists() else None
+
+
+# spec: ANYM-443
+def test_a_tool_only_range_installs_the_candidates_pair_and_the_next_run_deploys_with_it(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    order, test, write, switch = [], p.self_test_error, host.s.durable_write, p.point_current
+    def watched():
+        return (tree(host.tool / "releases"), tree(host.state), tree(host.http_state),
+                [path.read_bytes() for path in host.configs])
+    def self_test(script, configs, sha):
+        before = watched()
+        error = test(script, configs, sha)
+        # The self-test writes nothing: release, configuration and state trees stay byte-identical.
+        assert watched() == before and error is None
+        order.append("self-test " + ("staging" if ".staging-" in str(script) else str(script.relative_to(host.tool))))
+        return error
+    monkeypatch.setattr(p, "self_test_error", self_test)
+    monkeypatch.setattr(host.s, "durable_write", lambda path, value: (order.append(value["status"]), write(path, value)))
+    monkeypatch.setattr(p, "point_current", lambda sha: (order.append("switch " + sha[:1]), switch(sha)))
+    outcome = host.deploy()
+    assert order == ["self-test staging", "activating", "switch 2", "self-test production.py", "active"]
+    assert outcome["status"] == "tool-updated" and outcome["sha"] == NEWEST and outcome["base"] == BASE
+    assert outcome["tool_update"] == {"from": BASE, "to": NEWEST, "removed": []}
+    assert p.read(host.state / "deploy.json") == outcome and "started_at" not in outcome
+    assert host.steps == [] and host.paused() is None and host.current_tool() == f"releases/{NEWEST}"
+    release = host.tool / "releases" / NEWEST
+    assert {name: (release / name).read_bytes() for name in ("production.py", "seamless_release.py")} == {
+        Path(path).name: content for path, content in host.files.items()}
+    assert p.read(release / "tool.json")["blobs"] == {path: git_blob(content) for path, content in host.files.items()}
+    assert stat.S_IMODE(release.stat().st_mode) == 0o755 and stat.S_IMODE((release / "tool.json").stat().st_mode) == 0o644
+    assert host.receipt()["status"] == "active" and (host.tool / "releases" / BASE).is_dir()
+    assert not list((host.tool / "releases").glob("*.staging-*"))
+    # The command line ends this run with exit 0; the next timer run is the new tool, and it deploys.
+    host.restart()
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed" and outcome["sha"] == NEWEST
+    assert [step for step, sha in host.steps] == ["prepare", "apply", "seamless prepare", "seamless promote"]
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("other", ["services/messaging/messaging_service/migrations/039_synthetic.sql",
+                                   "services/release-router/main.go", "tools/attest-verify/main.go",
+                                   "deploy/deedkit-autodeploy.service", "deploy/deedkit-autodeploy.timer"])
+def test_a_tool_change_with_an_sql_router_verifier_or_unit_change_pauses_and_installs_nothing(tmp_path, monkeypatch,
+                                                                                              other):
+    host = ToolHost(tmp_path, monkeypatch, changes={NEWER: ["scripts/production.py"], NEWEST: [other]})
+    systemd = tmp_path / "systemd"
+    systemd.mkdir()
+    for unit in p.UNITS:
+        (systemd / Path(unit).name).write_text("[Unit]\nDescription=installed before\n")
+    monkeypatch.setattr(p, "SYSTEMD_DIRECTORY", systemd)
+    before = tree(host.tool)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and other in outcome["reason"] and "scripts/production.py" in outcome["reason"]
+    assert tree(host.tool) == before and host.receipt() is None and host.steps == []
+
+
+# spec: ANYM-443
+def test_a_changed_autodeploy_unit_pauses_until_the_installed_unit_is_the_candidates(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["deploy/deedkit-autodeploy.service"]})
+    # A host without the timer installs no unit: nothing to wait for.
+    assert host.deploy()["status"] == "deployed"
+    (tmp_path / "timer").mkdir()
+    host = Deployer(tmp_path / "timer", monkeypatch, changes={NEWER: ["deploy/deedkit-autodeploy.service"]})
+    systemd = tmp_path / "systemd"
+    systemd.mkdir()
+    installed = systemd / "deedkit-autodeploy.service"
+    installed.write_text("[Unit]\nDescription=the previous unit\n")
+    monkeypatch.setattr(p, "SYSTEMD_DIRECTORY", systemd)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "deploy/deedkit-autodeploy.service" in outcome["reason"]
+    p.PAUSE.unlink()
+    host.blobs[f"{NEWEST}:deploy/deedkit-autodeploy.service"] = p.blob(installed)
+    assert host.deploy()["status"] == "deployed"
+
+
+# spec: ANYM-443
+def test_a_dry_run_reports_the_tool_update_and_changes_nothing(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    def trees():  # a dry run takes the locks: their files appear
+        return tree(host.tool), {name: entry for name, entry in tree(host.state).items() if name != "deploy.lock"}
+    before = trees()
+    assert host.deploy(dry_run=True) == {"status": "plan", "sha": NEWEST, "base": BASE,
+                                         "steps": [f"would update tool {NEWEST}"]}
+    assert trees() == before and host.paused() is None
+
+
+def break_layout(host, case):
+    release = host.tool / "releases" / BASE
+    if case == "current is a directory":
+        (host.tool / "current").unlink()
+        (host.tool / "current").mkdir(mode=0o755)
+    elif case == "current outside releases":
+        (host.tool / "current").unlink()
+        os.symlink(str(release), host.tool / "current")
+    elif case == "a compatibility path is a file":
+        (host.tool / "production.py").unlink()
+        (host.tool / "production.py").write_bytes(TOOL["scripts/production.py"])
+    elif case == "a symlink inside the release":
+        (release / "tool.json").rename(release / "tool.real.json")
+        os.symlink("tool.real.json", release / "tool.json")
+    elif case == "an extra symlink in releases":
+        os.symlink(BASE, host.tool / "releases" / ("9" * 40))
+    elif case == "a group-writable file":
+        (release / "production.py").chmod(0o664)
+    elif case == "a group-writable parent":
+        (host.tool / "releases").chmod(0o775)
+    elif case == "another owner":
+        host.monkeypatch.setattr(p.os, "geteuid", lambda: os.getuid() + 1)
+    elif case == "tool.json names other blob ids":
+        record = p.read(release / "tool.json")
+        record["blobs"]["scripts/seamless_release.py"] = "f" * 40
+        (release / "tool.json").write_text(json.dumps(record))
+
+
+LAYOUT_CASES = ["current is a directory", "current outside releases", "a compatibility path is a file",
+                "a symlink inside the release", "an extra symlink in releases", "a group-writable file",
+                "a group-writable parent", "another owner", "tool.json names other blob ids"]
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("case", LAYOUT_CASES)
+def test_the_layout_check_refuses_anything_but_the_documented_layout(tmp_path, monkeypatch, case):
+    host = ToolHost(tmp_path, monkeypatch)
+    assert p.installed_tool()["sha"] == BASE
+    break_layout(host, case)
+    with pytest.raises(p.Refused):
+        p.installed_tool()
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("case", [case for case in LAYOUT_CASES if case != "another owner"] + ["no layout"])
+def test_a_refused_or_missing_layout_or_another_running_tool_keeps_the_hand_install_pause(tmp_path, monkeypatch, case):
+    host = ToolHost(tmp_path, monkeypatch)
+    if case == "no layout":
+        monkeypatch.setattr(p, "TOOL_ROOT", tmp_path / "absent")
+    else:
+        break_layout(host, case)
+    before = tree(host.tool)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "install them by hand" in outcome["reason"]
+    assert ("does not update itself" in outcome["reason"]) is (case != "no layout")
+    assert tree(host.tool) == before and host.receipt() is None
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("case", ["blob bytes", "older commit", "another branch", "verifier pin"])
+def test_a_candidate_that_is_not_the_attested_forward_pair_or_needs_another_verifier_pauses(tmp_path, monkeypatch,
+                                                                                             case):
+    options = {"older commit": {"tool_sha": NEWEST, "candidate": NEWER, "green": (NEWER,)},
+               "another branch": {"tool_sha": "9" * 40}}.get(case, {})
+    host = ToolHost(tmp_path, monkeypatch, **options)
+    if case == "blob bytes":
+        host.files = {**host.files, "scripts/production.py": host.files["scripts/production.py"] + b"# tampered\n"}
+    if case == "verifier pin":
+        host.serve(candidate_tool(host.verifier, pin="c" * 64))
+    before = tree(host.tool)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.paused() == outcome["reason"]
+    assert {"blob bytes": "does not match its git blob id", "older commit": "does not descend from the installed tool",
+            "another branch": "does not descend from the installed tool",
+            "verifier pin": "install the verifier first"}[case] in outcome["reason"]
+    # Nothing is written outside a staging directory, and that is removed.
+    assert tree(host.tool) == before and host.receipt() is None and host.steps == []
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("case", ["syntax", "configuration", "network", "write", "process"])
+def test_a_failed_self_test_leaves_the_installed_tool_and_its_files_unchanged(tmp_path, monkeypatch, case):
+    host = ToolHost(tmp_path, monkeypatch)
+    listener = __import__("socket").create_server(("127.0.0.1", 0))
+    written = tmp_path / "written-by-the-self-test"
+    inject = {"syntax": b"def broken(:\n",
+              "network": b"__import__('socket').socket().connect(('127.0.0.1', %d))\n"
+                         % listener.getsockname()[1],
+              "write": b"open(%r, 'w').close()\n" % str(written).encode(),
+              "process": b"__import__('subprocess').run(['/bin/echo'], capture_output=True)\n"}.get(case, b"")
+    seamless = b"\ndef validate_settings(settings):\n    raise Refused('synthetic: this configuration is refused')\n" \
+        if case == "configuration" else b""
+    host.serve(candidate_tool(host.verifier, inject=inject, seamless=seamless))
+    before = tree(host.tool)
+    outcome = host.deploy()
+    listener.close()
+    assert outcome["status"] == "halted" and f"the self-test of tool {NEWEST} failed" in outcome["reason"]
+    assert {"syntax": "SyntaxError", "configuration": "synthetic: this configuration is refused",
+            "network": "self-test refused socket.connect", "write": "self-test refused open",
+            "process": "self-test refused subprocess.Popen"}[case] in outcome["reason"]
+    assert tree(host.tool) == before and host.receipt() is None and not written.exists()
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("receipt", ["current.json", "http-current.json", "deploy.json"])
+def test_the_self_test_refuses_a_malformed_receipt(tmp_path, monkeypatch, receipt):
+    host = ToolHost(tmp_path, monkeypatch)
+    install_release(host.tool, NEWEST, host.files)
+    script = host.tool / "releases" / NEWEST / "production.py"
+    assert p.self_test_error(script, host.configs, NEWEST) is None
+    assert p.self_test_error(script, host.configs, NEWER) is not None  # the ok line names another release
+    path = {"current.json": host.state, "http-current.json": host.http_state, "deploy.json": host.state}[receipt]
+    path = path / receipt
+    path.write_text({"current.json": '{"status": "applied"}', "http-current.json": "not json",
+                     "deploy.json": '{"fetch_failures": {"count": -1}}'}[receipt])
+    error = p.self_test_error(script, host.configs, NEWEST)
+    assert error == f"promotion refused: the receipt {path} is missing or malformed"
+
+
+# spec: ANYM-443
+def test_the_self_test_runs_only_as_the_first_argument_under_its_guard(tmp_path, monkeypatch, capsys):
+    host = ToolHost(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit):
+        p.main(["self-test", "--config", str(host.configs[0]), "--http-config", str(host.configs[1])])
+    assert "self-test must be the first argument" in capsys.readouterr().err
+    install_release(host.tool, NEWEST, host.files)
+    script = host.tool / "releases" / NEWEST / "production.py"
+    result = subprocess.run([sys.executable, "-B", "-E", "-s", str(script), "--config", str(host.configs[0]),
+                             "self-test", "--http-config", str(host.configs[1])], capture_output=True, text=True,
+                            env={"PATH": "/usr/bin:/bin"}, timeout=60)
+    assert result.returncode == 1 and "self-test must be the first argument" in result.stderr
+
+
+BOUNDARIES = ["staged", "renamed", "activating", "switched", "before active"]
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("boundary", BOUNDARIES)
+def test_a_deploy_killed_at_any_boundary_of_the_update_ends_in_an_accepted_tool(tmp_path, monkeypatch, boundary):
+    host = ToolHost(tmp_path, monkeypatch)
+    calls = {"self-test": 0, "write": 0, "switch": 0}
+    test, write, switch = p.self_test_error, host.s.durable_write, p.point_current
+    death = {"staged": ("self-test", 1), "renamed": ("write", 1), "activating": ("switch", 1),
+             "switched": ("self-test", 2), "before active": ("write", 2)}[boundary]
+    def counted(name, function):
+        def call(*args):
+            calls[name] += 1
+            if (name, calls[name]) == death:
+                raise Died(boundary)
+            return function(*args)
+        return call
+    monkeypatch.setattr(p, "self_test_error", counted("self-test", test))
+    monkeypatch.setattr(host.s, "durable_write", counted("write", write))
+    monkeypatch.setattr(p, "point_current", counted("switch", switch))
+    with pytest.raises(Died):
+        host.deploy()
+    for module, name, original in ((p, "self_test_error", test), (host.s, "durable_write", write),
+                                   (p, "point_current", switch)):
+        monkeypatch.setattr(module, name, original)
+    # Release steps run only with an accepted tool: never while the receipt is `activating`.
+    accepted, prepare = [], p.prepare
+    monkeypatch.setattr(p, "prepare", lambda settings, sha: (accepted.append(host.receipt()["status"]),
+                                                             prepare(settings, sha)))
+    outcomes = []
+    for _ in range(3):
+        host.restart()
+        outcomes.append(host.deploy()["status"])
+        if outcomes[-1] == "deployed":
+            break
+    expected = ["tool-updated", "deployed"] if boundary in ("staged", "renamed", "activating") else ["deployed"]
+    assert outcomes == expected and accepted == ["active"] and host.paused() is None
+    assert host.current_tool() == f"releases/{NEWEST}" and host.receipt()["status"] == "active"
+    assert not list((host.tool / "releases").glob("*.staging-*"))
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("when", ["in the run", "in the next run"])
+def test_a_failed_self_test_after_the_switch_restores_the_previous_tool(tmp_path, monkeypatch, when):
+    host = ToolHost(tmp_path, monkeypatch)
+    test, calls = p.self_test_error, []
+    def failing(script, configs, sha):
+        calls.append(script)
+        if when == "in the next run" and len(calls) == 2:
+            raise Died("after the switch")
+        return test(script, configs, sha) if len(calls) == 1 else "synthetic: the switched tool fails"
+    monkeypatch.setattr(p, "self_test_error", failing)
+    if when == "in the next run":
+        with pytest.raises(Died):
+            host.deploy()
+        assert host.current_tool() == f"releases/{NEWEST}" and host.receipt()["status"] == "activating"
+        host.restart()
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "synthetic: the switched tool fails" in outcome["reason"]
+    assert f"points at {BASE} again" in outcome["reason"] and host.current_tool() == f"releases/{BASE}"
+    assert host.receipt()["status"] == "reverted" and host.steps == []
+
+
+# spec: ANYM-443
+def test_tool_rollback_restores_the_previous_pair_pauses_and_the_rolled_back_pair_is_not_installed_again(
+        tmp_path, monkeypatch, capsys):
+    host = ToolHost(tmp_path, monkeypatch)
+    with pytest.raises(p.Refused, match="no active tool update"):
+        p.tool_rollback(host.settings, host.http, host.s)
+    assert host.deploy()["status"] == "tool-updated"
+    with p.lock(host.state), pytest.raises(p.Busy):
+        p.tool_rollback(host.settings, host.http, host.s)
+    assert p.tool_rollback(host.settings, host.http, host.s) == {"status": "tool-rolled-back", "from": NEWEST,
+                                                                  "to": BASE}
+    assert host.current_tool() == f"releases/{BASE}" and host.receipt()["status"] == "rolled-back"
+    assert host.paused().startswith(f"tool rolled back from {NEWEST} to {BASE}")
+    assert host.deploy()["status"] == "paused"
+    p.PAUSE.unlink()
+    host.restart()
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and f"the tool of {NEWEST} was rolled back" in outcome["reason"]
+    assert host.current_tool() == f"releases/{BASE}" and host.steps == []
+    # A fixed pair in a later commit installs itself again.
+    p.PAUSE.unlink()
+    fixed = "3" * 40
+    host.history.append(fixed)
+    host.green.add(fixed)
+    host.changes[fixed], host.candidate = ["scripts/production.py"], fixed
+    host.serve(candidate_tool(host.verifier, inject=b"# the fixed tool\n"))
+    assert host.deploy()["status"] == "tool-updated" and host.current_tool() == f"releases/{fixed}"
+
+
+# spec: ANYM-443
+def test_after_an_update_exactly_two_previous_releases_are_kept(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    older = {"3" * 40: "2026-10-19T12:00:00Z", "4" * 40: "2026-10-19T00:00:00Z", "5" * 40: "2026-10-17T00:00:00Z"}
+    for sha, installed_at in older.items():
+        install_release(host.tool, sha, TOOL, installed_at)
+    (host.tool / "releases" / ("6" * 40)).mkdir()  # no tool.json: not identified as a release, kept
+    # BASE replaced "4" * 40; the activation history, not the install time, names the release before the previous one.
+    p.write(host.state / "tool-update.json", {"from": "4" * 40, "to": BASE, "at": "2026-10-20T01:00:00Z",
+                                              "status": "active", "accepted": ["4" * 40, "5" * 40]})
+    outcome = host.deploy()
+    assert outcome["status"] == "tool-updated" and sorted(outcome["tool_update"]["removed"]) == ["3" * 40, "5" * 40]
+    assert sorted(path.name for path in (host.tool / "releases").iterdir()) == [BASE, NEWEST, "4" * 40, "6" * 40]
+
+
+# spec: ANYM-443
+def test_retention_keeps_the_accepted_releases_and_not_a_newer_reverted_candidate(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    before, reverted = "4" * 40, "3" * 40
+    install_release(host.tool, before, TOOL, "2026-10-19T00:00:00Z")
+    install_release(host.tool, reverted, TOOL, "2026-10-20T02:00:00Z")  # staged after BASE, reverted after its switch
+    p.write(host.state / "tool-update.json", {"from": BASE, "to": reverted, "at": "2026-10-20T02:00:00Z",
+                                              "status": "reverted", "reason": "synthetic", "accepted": [BASE, before]})
+    outcome = host.deploy()
+    assert outcome["status"] == "tool-updated" and outcome["tool_update"]["removed"] == [reverted]
+    assert sorted(path.name for path in (host.tool / "releases").iterdir()) == sorted([BASE, NEWEST, before])
+    assert host.receipt()["status"] == "active" and host.receipt()["accepted"] == [BASE, before]
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("pause", ["kept", "removed"])
+def test_a_run_waiting_for_the_locks_while_the_tool_is_rolled_back_deploys_nothing(tmp_path, monkeypatch, pause):
+    host = ToolHost(tmp_path, monkeypatch)
+    assert host.deploy()["status"] == "tool-updated"
+    host.restart()
+    take = host.p.host_locks
+    def rolled_back_first(settings, http, s):
+        # tool-rollback runs between this run's pause check and its locks.
+        assert p.tool_rollback(settings, http, s)["status"] == "tool-rolled-back"
+        if pause == "removed":
+            p.PAUSE.unlink()
+        return take(settings, http, s)
+    monkeypatch.setattr(host.p, "host_locks", rolled_back_first)
+    outcome = host.deploy()
+    assert outcome["status"] == ("paused" if pause == "kept" else "error")
+    assert pause == "kept" or f"this run is not the tool {host.tool / 'current'} names ({BASE})" in outcome["reason"]
+    assert host.steps == [] and host.current_tool() == f"releases/{BASE}"
+
+
+# spec: ANYM-443
+def test_a_reused_release_runs_its_verified_source_and_not_a_stale_bytecode_cache(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    install_release(host.tool, NEWEST, host.files)  # an interrupted update left the candidate's release
+    stub = tmp_path / "stub" / "seamless_release.py"
+    stub.parent.mkdir()
+    stub.write_text("def validate_settings(settings):\n    raise SystemExit('the stale cache ran')\n")
+    cache = host.tool / "releases" / NEWEST / "__pycache__"
+    cache.mkdir(mode=0o755)
+    compiled = cache / f"seamless_release.{sys.implementation.cache_tag}.pyc"
+    py_compile.compile(str(stub), cfile=str(compiled), doraise=True,
+                       invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+    compiled.chmod(0o644)
+    outcome = host.deploy()
+    assert outcome["status"] == "tool-updated" and not cache.exists()
+    assert host.current_tool() == f"releases/{NEWEST}" and host.receipt()["status"] == "active"
+
+
+# spec: ANYM-443
+def test_the_run_after_an_update_executes_the_installed_candidates_code(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    host.serve(candidate_tool(host.verifier, inject=b"def deploy(*args, **kwargs):\n"
+                                                    b"    return {'status': 'the candidate ran'}\n"))
+    assert host.deploy()["status"] == "tool-updated"
+    host.restart()
+    assert host.deploy() == {"status": "the candidate ran"}
+
+
+# spec: ANYM-443
+def test_tool_update_receipts_pause_and_journal_line_hold_no_configuration_value(tmp_path, monkeypatch, capsys):
+    host = ToolHost(tmp_path, monkeypatch)
+    seamless = b"\ndef validate_settings(settings):\n    raise Refused('synthetic refusal')\n"
+    host.serve(candidate_tool(host.verifier, seamless=seamless))
+    failed = host.deploy()
+    p.PAUSE.unlink()
+    host.serve(candidate_tool(host.verifier))
+    updated = host.deploy()
+    install_release(host.tool, NEWER, host.files)
+    output = subprocess.run([sys.executable, "-B", "-E", "-s", str(host.tool / "releases" / NEWER / "production.py"),
+                             "self-test", "--config", str(host.configs[0]), "--http-config", str(host.configs[1])],
+                            capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, timeout=60)
+    texts = [json.dumps(failed), json.dumps(updated), output.stdout + output.stderr,
+             (host.state / "tool-update.json").read_text(), (host.state / "deploy.json").read_text()]
+    assert failed["status"] == "halted" and updated["status"] == "tool-updated"
+    assert not [value for value in SYNTHETIC_VALUES for text in texts if value in text]
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("path", ["scripts/production.py", "scripts/seamless_release.py"])
+def test_both_tool_files_parse_and_compile_as_python_3_12_without_warnings(path):
+    import ast
+    import warnings
+    source = (ROOT / path).read_text()
+    ast.parse(source, filename=path, feature_version=(3, 12))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # an invalid escape (SyntaxWarning) would make the self-test print to stderr
+        compile(source, path, "exec", dont_inherit=True)
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("status", ["malformed", "elsewhere"])
+def test_an_unresolved_or_malformed_tool_update_pauses_before_any_other_step(tmp_path, monkeypatch, status):
+    host = ToolHost(tmp_path, monkeypatch)
+    receipt = host.state / "tool-update.json"
+    if status == "malformed":
+        receipt.write_text('{"status": "activating"}')
+    else:
+        install_release(host.tool, NEWER, TOOL)
+        (host.tool / "current").unlink()
+        os.symlink(f"releases/{NEWER}", host.tool / "current")
+        p.write(receipt, {"from": BASE, "to": NEWEST, "at": "2026-10-21T00:00:00Z", "status": "activating"})
+    assert host.deploy(dry_run=True)["status"] == "plan" and host.paused() is None
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.git == [] and host.steps == []
+    assert ("malformed" in outcome["reason"]) if status == "malformed" else (
+        f"python3 {host.tool}/releases/{BASE}/production.py" in outcome["reason"])
