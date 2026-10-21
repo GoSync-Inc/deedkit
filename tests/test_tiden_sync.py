@@ -270,6 +270,28 @@ def test_a_marker_added_in_a_comment_elsewhere_in_the_package_links_no_unmarked_
 
 
 # spec: ANYM-421
+def test_a_marked_comment_example_that_was_already_there_links_no_unmarked_go_test(root, server):
+    full_server(server)
+    package = "example.com/svc/pkg"
+    example = "package pkg\n\n/* %s\n// spec: ANYM-12\nfunc TestRoute(t *testing.T) {}\n*/\n"
+    commit(root, {"svc/go.mod": "module example.com/svc\n\ngo 1.26\n", "svc/pkg/a_test.go": example % "Documentation example",
+                  "svc/pkg/b_test.go": "package pkg\n\nfunc TestRoute(t *testing.T) {}\n"}, "base")
+    server.set(tests=[case(f"{package}::TestRoute/one", "b_test.go", "TestRoute/one")])
+    merged(root, server, {"svc/pkg/a_test.go": example % "Updated example"}, "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert not server.state().get("links")
+
+
+# spec: ANYM-421
+def test_go_declarations_ignore_comments_and_literals_and_keep_line_numbers():
+    source = ("package p\n/* func TestA(t *testing.T) {} */\nvar s = \"func TestB(\" // func TestC(\nvar r = `\n"
+              "func TestD(x`\nvar q = '\"'\nfunc TestReal(t *testing.T) {}\nvar e = \"a\\\"b\"\nfunc TestMain(m *testing.M) {}\n")
+    assert tiden_sync.go_declarations(source) == [("TestReal", 6)]
+    assert tiden_sync.go_code(source).count("\n") == source.count("\n")
+
+
+# spec: ANYM-421
 def test_kept_go_test_rechecks_stop_inside_one_test_when_the_budget_runs_out(root, server, monkeypatch):
     full_server(server)
     package = "example.com/svc/pkg"

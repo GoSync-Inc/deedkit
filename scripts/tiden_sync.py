@@ -35,8 +35,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import REPOSITORY, Refused, excluded, shown, tiden  # noqa: E402
 from tiden_ci import go_module_path  # noqa: E402
-from tiden_pr_check import (Test, anchor_map, blob, branch_status, changed, diff_tests, language,  # noqa: E402
-                            listing, marker, parse_body, preview_numbers, source_lines, story, tests_in)
+from tiden_pr_check import (GO_TEST, Test, anchor_map, blob, branch_status, changed, diff_tests, language,  # noqa: E402
+                            listing, marker, parse_body, preview_numbers, source_lines, story)
 
 SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -223,22 +223,54 @@ def linked(cli: str, test: str) -> set[str]:
     return {link["requirementId"] for link in links}
 
 
+def go_code(source: str) -> str:
+    """The Go source with every comment and string, rune or raw-string literal blanked (newlines kept), so a
+    declaration found in it is executable code and not text that only looks like one."""
+    out, i, n = [], 0, len(source)
+    while i < n:
+        two, ch = source[i:i + 2], source[i]
+        if two == "//":
+            end = source.find("\n", i)
+            end = n if end < 0 else end
+        elif two == "/*":
+            end = source.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+        elif ch in "\"'`":
+            end = i + 1
+            while end < n and source[end] != ch and (ch == "`" or source[end] != "\n"):
+                end += 2 if source[end] == "\\" and ch != "`" else 1
+            end = min(end + 1, n)
+        else:
+            out.append(ch)
+            i += 1
+            continue
+        out.append("".join(c if c == "\n" else " " for c in source[i:end]))
+        i = end
+    return "".join(out)
+
+
+def go_declarations(source: str) -> list[tuple[str, int]]:
+    """(name, 0-based line) of each executable `func TestX` of one Go file."""
+    code = go_code(source)
+    return [(match.group(1), code.count("\n", 0, match.start())) for match in GO_TEST.finditer(code)
+            if match.group(1) != "TestMain"]
+
+
 def kept_go_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Test]:
-    """Marked Go tests that a changed file had before and still has: a table-driven one gains subtests when a row is
-    added, and each new subtest is a case of its own that only a link makes covered."""
+    """Marked Go tests that a changed file had before and still has, with the very same marker: a table-driven one
+    gains subtests when a row is added, and each new subtest is a case of its own that only a link makes covered.
+    Only executable declarations count, so a marker in a comment or string never claims a test."""
     found = []
     for path in paths:
         before, after = (blob(root, ref, path) if language(path) == "go" else None for ref in (base, head))
         if before is None or after is None:
             continue
-        old_lines, lines, now = source_lines(before, "go"), source_lines(after, "go"), tests_in(path, after)
-        # The scanner also sees declarations in comments and strings, so only a name found once, with the very same
-        # marker at the base, is a test this commit did not just claim for a spec.
-        was = {name: marker(old_lines, index, "//") for name, index, _ in tests_in(path, before)
-               if [other for other, _, _ in tests_in(path, before)].count(name) == 1}
-        for name, index, _ in now:
+        old_lines, lines = source_lines(before, "go"), source_lines(after, "go")
+        was = {name: marker(old_lines, index, "//") for name, index in go_declarations(before)}
+        now = go_declarations(after)
+        for name, index in now:
             specs, problem = marker(lines, index, "//")
-            if not problem and [other for other, _, _ in now].count(name) == 1 and was.get(name) == (specs, ""):
+            if not problem and [other for other, _ in now].count(name) == 1 and was.get(name) == (specs, ""):
                 found.append(Test(path, name, index + 1, specs))
     return found
 
@@ -282,12 +314,14 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
         if not cases:
             missing.append(f"{shown(test.path)} {shown(test.name)} has no imported case on Tiden main")
             continue
+        stopped = False
         for case in cases:
-            if id(test) in old and time.monotonic() > deadline:
-                report(f"links: {shown(test.path)} {shown(test.name)} not rechecked further: the kept-test time budget "
-                       "is spent.")
-                break
             for number in test.specs:
+                if id(test) in old and time.monotonic() > deadline:
+                    report(f"links: {shown(test.path)} {shown(test.name)} not rechecked further: the kept-test time "
+                           "budget is spent.")
+                    stopped = True
+                    break
                 spec = main[number]["id"]
                 try:
                     if spec in linked(cli, case["id"]):
@@ -304,6 +338,8 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
                     missing.append(f"{shown(case.get('signature', case['id']))} -> ANYM-{number}: {error}")
                     continue
                 report(f"links: {shown(case.get('signature', case['id']))} -> ANYM-{number}.")
+            if stopped:
+                break
     if missing:
         raise StepFailed("links", "; ".join(missing))
 
