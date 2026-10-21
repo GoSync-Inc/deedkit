@@ -3,7 +3,8 @@ class CalendarError(Exception):
 
     `field_errors` names the input fields at fault, as [{"field": path, "reason": fixed word}].
     `details` carries fixed, owner-facing text for local CLI errors; the API relays it only for
-    the codes in api.PUBLIC_DETAILS (nothing_to_project: rule IDs, duties, reasons, activity labels).
+    the codes in api.PUBLIC_DETAILS (nothing_to_project: rule IDs, duties, reasons, activity labels;
+    nothing_to_unproject: rule IDs, duties, reasons).
     """
 
     def __init__(self, code: str, field_errors: list | None = None, details: dict | None = None):

@@ -376,7 +376,8 @@ func (p *Provider) handle(ctx context.Context, r request, emit func(any) error) 
 var safeErrors = map[string]bool{}
 
 func init() {
-	for _, code := range []string{"provider_operation_uncertain", "operation_invalid_parameters", "operation_target_unavailable", "operation_result_too_large", "operation_query_failed", "registered_file_invalid", "link_preview_unsupported", "owner_terminal_required", "session_already_owned"} {
+	for _, code := range []string{"provider_operation_uncertain", "operation_invalid_parameters", "operation_target_unavailable", "operation_result_too_large", "operation_query_failed", "registered_file_invalid", "link_preview_unsupported", "owner_terminal_required", "session_already_owned",
+		"invite_invalid", "invite_expired", "chat_full", "join_not_allowed", "already_member", "operation_target_changed"} {
 		safeErrors[code] = true
 	}
 }

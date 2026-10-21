@@ -431,6 +431,54 @@ func (g groupIQ) joinRequestAction(ctx context.Context, jid types.JID, changes [
 	return out, nil
 }
 
+// linkInfo transcribes the pinned GetGroupInfoFromLink (group.go:490): it reads
+// the group behind an invite code without joining and without touching the
+// group cache.
+func (g groupIQ) linkInfo(ctx context.Context, code string) (*types.GroupInfo, error) {
+	res, err := g.query(ctx, groupIQGet, types.GroupServerJID, waBinary.Node{Tag: "invite", Attrs: waBinary.Attrs{"code": code}})
+	if err != nil {
+		return nil, inviteError(err)
+	}
+	node, ok := res.GetOptionalChildByTag("group")
+	if !ok {
+		return nil, &whatsmeow.ElementMissingError{Tag: "group", In: "response to group link info query"}
+	}
+	return g.parse(&node)
+}
+
+// joinLink sends the node of the pinned JoinGroupWithLink (group.go:512) once
+// and keeps the reply kind the helper hides: a membership_approval_request
+// child means the join waits for an administrator (ANYM-243).
+func (g groupIQ) joinLink(ctx context.Context, code string) (jid types.JID, pending bool, err error) {
+	res, err := g.query(ctx, groupIQSet, types.GroupServerJID, waBinary.Node{Tag: "invite", Attrs: waBinary.Attrs{"code": code}})
+	if err != nil {
+		return types.EmptyJID, false, inviteError(err)
+	}
+	node, pending := res.GetOptionalChildByTag("membership_approval_request")
+	if !pending {
+		var ok bool
+		if node, ok = res.GetOptionalChildByTag("group"); !ok {
+			return types.EmptyJID, false, &whatsmeow.ElementMissingError{Tag: "group", In: "response to group link join query"}
+		}
+	}
+	// An unreadable receipt is not a join the caller may confirm.
+	ag := node.AttrGetter()
+	if jid = ag.JID("jid"); !ag.OK() || jid.Server != types.GroupServer || jid.User == "" {
+		return types.EmptyJID, false, errors.New("join_receipt_unreadable")
+	}
+	return jid, pending, nil
+}
+
+// inviteError maps the invite IQ codes as the pinned helpers do.
+func inviteError(err error) error {
+	if errors.Is(err, whatsmeow.ErrIQGone) {
+		return wrapGroupError(whatsmeow.ErrInviteLinkRevoked, err)
+	} else if errors.Is(err, whatsmeow.ErrIQNotAcceptable) {
+		return wrapGroupError(whatsmeow.ErrInviteLinkInvalid, err)
+	}
+	return err
+}
+
 // parseGroupParticipant transcribes the pinned, unexported parseParticipant.
 func parseGroupParticipant(child *waBinary.Node) types.GroupParticipant {
 	ag := child.AttrGetter()

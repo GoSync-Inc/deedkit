@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import pytest
 
-from agent_gateway.catalog import CATALOG, load_catalog, arguments
+from agent_gateway.catalog import CATALOG, InvalidArguments, load_catalog, arguments
 
 
 def test_duplicate_catalog_names_and_reserved_name_rejected():
@@ -70,7 +70,7 @@ def test_calendar_plan_describes_all_day_and_occurrence_scope_without_series_or_
     assert event["required"] == ["start"] and event["properties"]["all_day"]["anyOf"][0] == {"type": "boolean"}
     assert not {"attendees", "recurrence", "rrule", "range", "scope", "guests"} & set(event["properties"])
     action = plan["inputSchema"]["$defs"]["Action"]["properties"]
-    assert set(action) == {"action", "calendar_ref", "event_ref", "event", "activity"}
+    assert set(action) == {"action", "calendar_ref", "event_ref", "event", "activity", "operation_id"}
     for phrase in ("all-day", "one occurrence", "this-and-following", "capability_unverified"):
         assert phrase in plan["description"]
     assert "guest-free single-event" not in plan["description"]
@@ -80,8 +80,31 @@ def test_calendar_plan_describes_all_day_and_occurrence_scope_without_series_or_
 def test_calendar_plan_declares_project_with_a_bounded_activity_label():
     plan = CATALOG["calendar_plan"]
     action = plan["inputSchema"]["$defs"]["Action"]
-    assert action["properties"]["action"]["enum"] == ["create", "update", "delete", "project"]
+    assert action["properties"]["action"]["enum"] == ["create", "update", "delete", "project", "unproject"]
     assert action["properties"]["activity"]["anyOf"][0] == {"maxLength": 64, "minLength": 1, "type": "string"}
-    assert action["required"] == ["action", "calendar_ref"] and action["additionalProperties"] is False
+    assert action["required"] == ["action"] and action["additionalProperties"] is False
+    # Every action but unproject still requires calendar_ref.
+    assert action["allOf"][0]["else"]["required"] == ["calendar_ref"]
     for phrase in ("project", "projections_skipped", "nothing_to_project", "16 steps", "too_many_steps", "private"):
         assert phrase in plan["description"]
+
+
+# spec: ANYM-434
+def test_calendar_plan_declares_unproject_by_lesson_or_operation():
+    plan = CATALOG["calendar_plan"]
+    action = plan["inputSchema"]["$defs"]["Action"]
+    assert action["properties"]["operation_id"]["anyOf"][0] == {"type": "string"}
+    for phrase in ("unproject", "operation_id", "version_conflict", "outcome_unknown", "nothing_to_unproject"):
+        assert phrase in plan["description"]
+    lesson = {"action": "unproject", "calendar_ref": "cal-child", "event_ref": "event-lesson"}
+    for valid in (lesson, {"action": "unproject", "operation_id": "op-1"},
+                  {"action": "delete", "calendar_ref": "cal-a", "event_ref": "event-a"}):
+        assert arguments(plan, {"actions": [valid]})["actions"] == [valid]
+    for invalid in (dict(lesson, operation_id="op-1"), {"action": "unproject", "calendar_ref": "cal-child"},
+                    {"action": "unproject", "operation_id": None}, {"action": "unproject"},
+                    dict(lesson, activity="Dance"), dict(lesson, event={"start": "2026-10-20T10:00:00Z"}),
+                    {"action": "delete", "calendar_ref": None, "event_ref": "event-a"},
+                    {"action": "delete", "event_ref": "event-a"},
+                    {"action": "delete", "calendar_ref": "cal-a", "event_ref": "event-a", "operation_id": "op-1"}):
+        with pytest.raises(InvalidArguments):
+            arguments(plan, {"actions": [invalid]})

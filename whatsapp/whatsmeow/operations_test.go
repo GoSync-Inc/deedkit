@@ -1125,7 +1125,7 @@ func TestChatInfoGroupSettings(t *testing.T) {
 
 // spec: ANYM-242
 func TestJoinRequestsProjectionStaysWithinReceiptBudget(t *testing.T) {
-	long := strings.Repeat("名", 300) + strings.Repeat("<\"& ", 53)
+	long := strings.Repeat("名", 300) + strings.Repeat("<\"&\u2028", 53)
 	for _, limit := range []int{50, 100} {
 		r := &recordingIQ{reply: func(int, whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
 			requests := make([]waBinary.Node, 100)
@@ -1149,5 +1149,248 @@ func TestJoinRequestsProjectionStaysWithinReceiptBudget(t *testing.T) {
 		if rows[0].(map[string]any)["name"] != truncate(long, 512) {
 			t.Fatal("a fitting row lost its name")
 		}
+	}
+}
+
+// linkReply answers the synthetic invite link, overriding the membership read
+// and the join reply.
+func linkReply(membership func() (*waBinary.Node, error), join func() (*waBinary.Node, error)) func(int, whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+	return func(n int, q whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) {
+		content := q.Content.([]waBinary.Node)[0]
+		if content.Tag == "query" && q.To.User == testLinkedGroupID && membership != nil {
+			return membership()
+		}
+		if content.Tag == "invite" && q.Type == "set" && join != nil {
+			return join()
+		}
+		return syntheticReply(n, q)
+	}
+}
+
+// memberOfLinkedGroup answers the linked group's read with the account listed.
+func memberOfLinkedGroup() (*waBinary.Node, error) {
+	node := syntheticLinkedGroupNode()
+	node.Content = append(node.Content.([]waBinary.Node), waBinary.Node{Tag: "participant", Attrs: waBinary.Attrs{"jid": types.NewJID("111", types.HiddenUserServer)}})
+	return iqResult(node), nil
+}
+
+func joinQueries(r *recordingIQ) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, q := range r.calls {
+		if content := q.Content.([]waBinary.Node)[0]; content.Tag == "invite" && q.Type == "set" {
+			n++
+		}
+	}
+	return n
+}
+
+// spec: ANYM-243
+func TestCheckChatLinkMembership(t *testing.T) {
+	cases := []struct {
+		name       string
+		membership func() (*waBinary.Node, error)
+		want       string
+	}{
+		{"not in group", nil, "not_member"},
+		{"listed", memberOfLinkedGroup, "member"},
+		{"read failed", func() (*waBinary.Node, error) {
+			return nil, &whatsmeow.IQError{Code: 500, Text: "internal-server-error"}
+		}, "unknown"},
+		{"listed without the account", func() (*waBinary.Node, error) { return iqResult(syntheticLinkedGroupNode()), nil }, "unknown"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := &recordingIQ{reply: linkReply(c.membership, nil)}
+			result, err := runOperation(context.Background(), groupJob("check_chat_link"), groupOperationDeps(t, r))
+			data := operationResult(t, result, err, "confirmed")
+			if data["membership"] != c.want || joinQueries(r) != 0 {
+				t.Fatalf("membership=%v joins=%d", data["membership"], joinQueries(r))
+			}
+		})
+	}
+}
+
+// spec: ANYM-243
+func TestCheckChatLinkProjection(t *testing.T) {
+	r := &recordingIQ{reply: syntheticReply}
+	result, err := runOperation(context.Background(), groupJob("check_chat_link"), groupOperationDeps(t, r))
+	data := operationResult(t, result, err, "confirmed")
+	want := map[string]any{"title": "Linked", "kind": "group", "member_count": 7, "approval_required": true, "paid": false, "membership": "not_member", "membership_basis": "not_in_group"}
+	if !reflect.DeepEqual(data, want) {
+		t.Fatalf("projection %#v", data)
+	}
+}
+
+// spec: ANYM-243
+func TestCheckChatLinkRefusals(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		code string
+	}{{&whatsmeow.IQError{Code: 406, Text: "not-acceptable"}, "invite_invalid"}, {&whatsmeow.IQError{Code: 410, Text: "gone"}, "invite_expired"}} {
+		for _, op := range []string{"check_chat_link", "join_chat"} {
+			r := &recordingIQ{reply: func(int, whatsmeow.DangerousInfoQuery) (*waBinary.Node, error) { return nil, c.err }}
+			if _, err := runOperation(context.Background(), groupJob(op), groupOperationDeps(t, r)); err == nil || err.Error() != c.code {
+				t.Fatalf("%s %v: %v", op, c.err, err)
+			}
+			if joinQueries(r) != 0 {
+				t.Fatalf("%s joined", op)
+			}
+		}
+	}
+	for _, link := range []string{"short", "https://whatsapp.com/channel/0029Va", "https://chat.whatsapp.com/SyntheticInvite22Chars?x=1", "Synthetic-Invite"} {
+		job := groupJob("check_chat_link")
+		job.Parameters["link"], _ = json.Marshal(link)
+		r := &recordingIQ{reply: syntheticReply}
+		if _, err := runOperation(context.Background(), job, groupOperationDeps(t, r)); err == nil || err.Error() != "operation_invalid_parameters" || r.count() != 0 {
+			t.Fatalf("%q: %v calls=%d", link, err, r.count())
+		}
+	}
+	job := groupJob("check_chat_link")
+	job.Parameters["link"], _ = json.Marshal("https://chat.whatsapp.com/" + testInviteCode)
+	r := &recordingIQ{reply: syntheticReply}
+	result, err := runOperation(context.Background(), job, groupOperationDeps(t, r))
+	operationResult(t, result, err, "confirmed")
+}
+
+// spec: ANYM-243
+func TestJoinOutcomes(t *testing.T) {
+	linked := types.NewJID(testLinkedGroupID, types.GroupServer)
+	t.Run("joined and collected", func(t *testing.T) {
+		r := &recordingIQ{reply: syntheticReply}
+		result, err := runOperation(context.Background(), groupJob("join_chat"), groupOperationDeps(t, r))
+		data := operationResult(t, result, err, "confirmed")
+		want := map[string]any{"state": "joined", "archive": "collected", "provider_chat": LegacyChatID(linked)}
+		if !reflect.DeepEqual(data, want) || joinQueries(r) != 1 {
+			t.Fatalf("%#v joins=%d", data, joinQueries(r))
+		}
+	})
+	t.Run("joined but not collected", func(t *testing.T) {
+		r := &recordingIQ{reply: syntheticReply}
+		d := groupOperationDeps(t, r)
+		allowed := d.policy
+		d.policy = func() (Policy, error) {
+			p, err := allowed()
+			p.ExcludeChats = append(p.ExcludeChats, LegacyChatID(linked))
+			return p, err
+		}
+		result, err := runOperation(context.Background(), groupJob("join_chat"), d)
+		data := operationResult(t, result, err, "confirmed")
+		want := map[string]any{"state": "joined", "archive": "not_collected", "next_step": "the operator adds this chat to the account's collection policy"}
+		if !reflect.DeepEqual(data, want) {
+			t.Fatalf("%#v", data)
+		}
+	})
+	t.Run("pending approval", func(t *testing.T) {
+		r := &recordingIQ{reply: linkReply(nil, func() (*waBinary.Node, error) {
+			return iqResult(waBinary.Node{Tag: "membership_approval_request", Attrs: waBinary.Attrs{"jid": linked}}), nil
+		})}
+		result, err := runOperation(context.Background(), groupJob("join_chat"), groupOperationDeps(t, r))
+		data := operationResult(t, result, err, "confirmed")
+		if !reflect.DeepEqual(data, map[string]any{"state": "pending_approval"}) {
+			t.Fatalf("%#v", data)
+		}
+	})
+	t.Run("already member", func(t *testing.T) {
+		r := &recordingIQ{reply: linkReply(memberOfLinkedGroup, nil)}
+		if _, err := runOperation(context.Background(), groupJob("join_chat"), groupOperationDeps(t, r)); err == nil || err.Error() != "already_member" || joinQueries(r) != 0 {
+			t.Fatalf("%v joins=%d", err, joinQueries(r))
+		}
+	})
+	t.Run("membership unknown", func(t *testing.T) {
+		r := &recordingIQ{reply: linkReply(func() (*waBinary.Node, error) {
+			return nil, &whatsmeow.IQError{Code: 500, Text: "internal-server-error"}
+		}, nil)}
+		if _, err := runOperation(context.Background(), groupJob("join_chat"), groupOperationDeps(t, r)); err == nil || err.Error() != "operation_target_unavailable" || joinQueries(r) != 0 {
+			t.Fatalf("%v joins=%d", err, joinQueries(r))
+		}
+	})
+	for _, expected := range []*expectedChat{{Title: "Renamed", Kind: "group"}, {Title: "Linked", Kind: "channel"}, nil} {
+		r := &recordingIQ{reply: syntheticReply}
+		job := groupJob("join_chat")
+		job.ExpectedChat = expected
+		_, err := runOperation(context.Background(), job, groupOperationDeps(t, r))
+		want := "operation_target_changed"
+		if expected == nil {
+			want = "operation_invalid_parameters"
+		}
+		if err == nil || err.Error() != want || joinQueries(r) != 0 {
+			t.Fatalf("%#v: %v joins=%d", expected, err, joinQueries(r))
+		}
+	}
+	for _, c := range []struct {
+		name string
+		join func() (*waBinary.Node, error)
+		code string
+	}{
+		{"revoked between check and join", func() (*waBinary.Node, error) { return nil, &whatsmeow.IQError{Code: 410, Text: "gone"} }, "invite_expired"},
+		{"invalid", func() (*waBinary.Node, error) { return nil, &whatsmeow.IQError{Code: 406, Text: "not-acceptable"} }, "invite_invalid"},
+	} {
+		r := &recordingIQ{reply: linkReply(nil, c.join)}
+		if _, err := runOperation(context.Background(), groupJob("join_chat"), groupOperationDeps(t, r)); err == nil || err.Error() != c.code || joinQueries(r) != 1 {
+			t.Fatalf("%s: %v joins=%d", c.name, err, joinQueries(r))
+		}
+	}
+	for _, c := range []struct {
+		name string
+		join func() (*waBinary.Node, error)
+	}{
+		{"503", func() (*waBinary.Node, error) { return nil, &whatsmeow.IQError{Code: 503, Text: "service-unavailable"} }},
+		{"dropped", func() (*waBinary.Node, error) { return nil, &whatsmeow.DisconnectedError{Action: "info query"} }},
+		{"unreadable", func() (*waBinary.Node, error) { return iqResult(), nil }},
+	} {
+		r := &recordingIQ{reply: linkReply(nil, c.join)}
+		result, err := runOperation(context.Background(), groupJob("join_chat"), groupOperationDeps(t, r))
+		if data := operationResult(t, result, err, "unknown"); data["code"] != "provider_operation_uncertain" || joinQueries(r) != 1 {
+			t.Fatalf("%s: %#v joins=%d", c.name, data, joinQueries(r))
+		}
+	}
+}
+
+// spec: ANYM-243
+func TestJoinUnverifiedReceiptIsUnknown(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		node waBinary.Node
+	}{
+		{"no jid", waBinary.Node{Tag: "group"}},
+		{"jid of wrong type", waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"jid": "not-a-jid"}}},
+		{"user jid", waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"jid": types.NewJID("111", types.DefaultUserServer)}}},
+		{"another group", waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"jid": types.NewJID("15550000000-000000000", types.GroupServer)}}},
+		{"pending without jid", waBinary.Node{Tag: "membership_approval_request"}},
+		{"pending for another group", waBinary.Node{Tag: "membership_approval_request", Attrs: waBinary.Attrs{"jid": types.NewJID("15550000000-000000000", types.GroupServer)}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			node := c.node
+			r := &recordingIQ{reply: linkReply(nil, func() (*waBinary.Node, error) { return iqResult(node), nil })}
+			result, err := runOperation(context.Background(), groupJob("join_chat"), groupOperationDeps(t, r))
+			if data := operationResult(t, result, err, "unknown"); !reflect.DeepEqual(data, map[string]any{"code": "provider_operation_uncertain"}) || joinQueries(r) != 1 {
+				t.Fatalf("%#v joins=%d", data, joinQueries(r))
+			}
+		})
+	}
+}
+
+// spec: ANYM-243
+func TestJoinRefusalsSurviveTheWireSanitizer(t *testing.T) {
+	for _, code := range []string{"invite_invalid", "invite_expired", "chat_full", "join_not_allowed", "already_member", "operation_target_changed"} {
+		if got := safeError(errors.New(code)); got != code {
+			t.Fatalf("%s crosses the lane as %s", code, got)
+		}
+	}
+}
+
+// spec: ANYM-243
+func TestJoinFrameFromPythonKeepsConfirmedChat(t *testing.T) {
+	// The params Python's NodeProvider serializes for join_chat (test_messenger_commands.py).
+	frame := `{"operation":"join_chat","expires_at":1792464303.716908,"parameters":{"link":"https://chat.whatsapp.com/` + testInviteCode + `"},` +
+		`"provider_chat":null,"provider_message_id":null,"expected_chat":{"kind":"group","title":"Linked","member_count":12}}`
+	var job operationRequest
+	if err := decodeStrict(json.RawMessage(frame), &job); err != nil || job.ExpectedChat == nil {
+		t.Fatalf("%v %#v", err, job.ExpectedChat)
+	}
+	if job.ExpectedChat.Title != "Linked" || job.ExpectedChat.Kind != "group" || job.ExpectedChat.MemberCount == nil || *job.ExpectedChat.MemberCount != 12 {
+		t.Fatalf("%#v", job.ExpectedChat)
 	}
 }

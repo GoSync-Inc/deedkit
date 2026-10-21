@@ -1417,7 +1417,8 @@ def retention_state(tmp_path, monkeypatch, *, releases, current, prepared=(), co
         (state / sha).mkdir()
         p.write(state / sha / "prepared.json", {"sha": sha, "images": {"runtime": image}})
     sha, image, before = current
-    p.write(state / "current.json", p.read(state / sha / "result.json"))
+    p.write(state / "current.json", p.read(state / sha / "result.json") | {
+        "rollback": {"version": 1, "projects": [{"name": "synthetic"}]}})
     p.write(state / sha / "synthetic.before.json", {"services": {"api": {"image": before}, "db": {"image": "postgres:pinned"}}})
     calls = []
     def run(argv, **kwargs):
@@ -1542,7 +1543,7 @@ class Images:
 def released(state, sha, image, before):
     """One applied release as prepare and apply leave it: receipts, Compose snapshots and current.json."""
     (state / sha).mkdir(parents=True)
-    p.write(state / sha / "prepared.json", {"sha": sha, "images": {"runtime": image}})
+    p.write(state / sha / "prepared.json", {"sha": sha, "images": {"runtime": image}, "projects": [{"name": "synthetic"}]})
     p.write(state / sha / "synthetic.json", {"services": {"api": {"image": image}}})
     p.write(state / sha / "synthetic.before.json", {"services": {"api": {"image": before}, "db": {"image": "postgres"}}})
     result = {"sha": sha, "images": {"runtime": image}, "status": "applied", "applied_at": "2026-10-20T00:00:00Z"}
@@ -3218,3 +3219,802 @@ def test_a_full_containerd_image_store_stops_both_preparations_before_any_fetch(
     with pytest.raises(p.Refused, match="containerd"):
         getattr(p, preparation)(settings, SHA)
     assert calls == [] and list(Path(settings["state_directory"]).iterdir()) == []
+
+
+CALL = "5c1d6f0e-7a2b-4c3d-9e8f-0a1b2c3d4e5f"
+OTHER_CALL = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+
+
+def calls_database(directory, statuses, *, rows=0):
+    """A synthetic calls database the way services/calls/core.py writes it (journal mode DELETE)."""
+    import sqlite3
+    database = sqlite3.connect(directory / "voice.sqlite3")
+    database.execute("PRAGMA journal_mode=DELETE")
+    database.execute("CREATE TABLE calls (id TEXT PRIMARY KEY, brief_id TEXT UNIQUE NOT NULL, body TEXT NOT NULL)")
+    database.executemany("INSERT INTO calls VALUES (?, ?, ?)", [
+        (identity, "brief-" + identity, json.dumps({"status": status, "brief": {"goal": "synthetic"}}))
+        for identity, status in statuses.items()] + [
+        (f"row-{index}", f"brief-row-{index}", json.dumps({"status": "finished"})) for index in range(rows)])
+    database.commit()
+    return database
+
+
+@pytest.fixture
+def calls_dir(tmp_path):
+    directory = tmp_path / "calls"
+    directory.mkdir()
+    return directory
+
+
+def calls_probe(directory, limit="0.25", lifetime="1", *, code=0):
+    # The probe as its container runs it: `python -I -c`, its own environment, nothing from this process.
+    result = subprocess.run([sys.executable, "-I", "-c", p.CALLS_PROBE, limit, lifetime, *p.CALL_STATUSES],
+                            env={"VOICE_DATA_DIR": str(directory)}, capture_output=True, text=True, timeout=60)
+    assert result.returncode == code, result.stderr
+    return json.loads(result.stdout) if code == 0 else result.stdout
+
+
+# spec: ANYM-442
+def test_the_calls_probe_reads_only_active_calls_and_changes_nothing(calls_dir):
+    identities = {status: f"{index:08x}-0000-4000-8000-000000000000" for index, status in enumerate(p.CALL_STATUSES)}
+    calls_database(calls_dir, {**{identity: status for status, identity in identities.items()},
+                              OTHER_CALL: "finished", CALL: "interrupted"}).close()
+    before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in calls_dir.iterdir()}
+    assert calls_probe(calls_dir) == {"calls": sorted([identity, status] for status, identity in identities.items())}
+    assert {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in calls_dir.iterdir()} == before
+
+
+# spec: ANYM-442
+def test_the_calls_probe_reports_a_locked_slow_or_unrecovered_database_by_category(calls_dir):
+    assert calls_probe(calls_dir) == {"error": "no_database"}
+    database = calls_database(calls_dir, {CALL: "active"}, rows=3000)
+    # Past its read limit it stops and releases the shared lock instead of holding the service's writes.
+    assert calls_probe(calls_dir, limit="0") == {"error": "interrupted"}
+    database.execute("BEGIN EXCLUSIVE")
+    assert calls_probe(calls_dir) == {"error": "busy"}
+    database.rollback()
+    database.close()
+    # A writer that died mid-transaction leaves a hot journal; a read-only reader never recovers it.
+    crash = ("import os, sqlite3, sys; db = sqlite3.connect(sys.argv[1], isolation_level=None);"
+             "db.execute('PRAGMA cache_size=1'); db.execute('BEGIN');"
+             "db.execute('UPDATE calls SET body = body || ?', ('y' * 5000,)); os._exit(0)")
+    subprocess.run([sys.executable, "-I", "-c", crash, str(calls_dir / "voice.sqlite3")], check=True, timeout=60)
+    assert (calls_dir / "voice.sqlite3-journal").exists()
+    before = {path.name: path.read_bytes() for path in calls_dir.iterdir()}
+    assert calls_probe(calls_dir) == {"error": "read_only_recovery_needed"}
+    assert {path.name: path.read_bytes() for path in calls_dir.iterdir()} == before
+    empty = calls_dir / "empty"
+    empty.mkdir()
+    import sqlite3
+    sqlite3.connect(empty / "voice.sqlite3").close()
+    assert calls_probe(empty) == {"error": "no_calls_table"}
+
+
+# spec: ANYM-442
+def test_the_calls_probe_dies_at_its_lifetime_even_inside_a_sqlite_wait(calls_dir):
+    database = calls_database(calls_dir, {CALL: "active"})
+    database.execute("BEGIN EXCLUSIVE")
+    # SQLite would wait 5 s for the lock; the process ends at 1 s by SIGALRM and releases everything.
+    assert calls_probe(calls_dir, limit="5", lifetime="1", code=-14) == ""
+    database.rollback()
+
+
+# spec: ANYM-442
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the permission bits that stand in for a read-only mount")
+@pytest.mark.parametrize("sidecars", [False, True], ids=["wal-without-sidecars", "wal-with-sidecars"])
+def test_a_wal_database_on_a_read_only_mount_is_read_or_refused_and_never_written(calls_dir, sidecars):
+    # The probe's container mounts the calls state directory read-only; permission bits stand in for that here.
+    database = calls_database(calls_dir, {CALL: "active"})
+    database.execute("PRAGMA journal_mode=WAL")
+    database.execute("UPDATE calls SET body = body")
+    database.commit()
+    if not sidecars:
+        database.close()
+    try:
+        for item in calls_dir.iterdir():
+            item.chmod(0o400)
+        calls_dir.chmod(0o500)
+        before = {item.name: item.read_bytes() for item in calls_dir.iterdir()}
+        assert calls_probe(calls_dir) == ({"calls": [[CALL, "active"]]} if sidecars else
+                                         {"error": "read_only_recovery_needed"})
+        assert {item.name: item.read_bytes() for item in calls_dir.iterdir()} == before
+    finally:
+        calls_dir.chmod(0o700)
+        if sidecars:
+            database.close()
+
+
+class Clock:
+    """time for production.py: a monotonic clock that only `sleep` moves."""
+
+    def __init__(self):
+        self.now, self.sleeps = 0.0, []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class CallHost(Host):
+    """Host with the host's second kind of project: `personal-os-voice`, whose `voice` service is the calls target.
+    Each project runs its own container; the probe container (`docker create`, then `docker start --attach`) answers from `answers` in turn (the last
+    one repeats). Pulls carry each target's own recipe labels. Time is a fake clock."""
+
+    def __init__(self, tmp_path, monkeypatch, answers=((),)):
+        super().__init__(tmp_path, monkeypatch)
+        self.voice_file = tmp_path / "voice.json"
+        self.voice_file.write_text(json.dumps({"name": "personal-os-voice", "services": {
+            "voice": {"image": "old", "build": {"context": "/unused"}, "environment": {"VOICE_DATA_DIR": "/data"},
+                      "volumes": [{"source": "/existing", "target": "/data"}]}}}))
+        self.voice = {"name": "personal-os-voice", "directory": str(tmp_path), "files": [str(self.voice_file)],
+                      "services": {"voice": "calls"}}
+        self.settings["projects"].append(self.voice)
+        self.containers = {"synthetic": self.container, "personal-os-voice": self.voice_container("voice0", OLD_IMAGE)}
+        self.answers, self.events = list(answers), []
+        self.clock = Clock()
+        monkeypatch.setattr(p, "time", self.clock)
+        monkeypatch.setattr(p, "promotable", self.promotable)
+        monkeypatch.setattr(p, "probe_output", self.probe_output)
+
+    def voice_container(self, identity, image):
+        return {"Id": identity, "Image": image, "State": {"Running": True},
+                "Config": {"Env": ["VOICE_DATA_DIR=/data", "SYNTHETIC=literal"], "User": "10001:10001"},
+                "Mounts": [{"Type": "bind", "Source": str(self.root / "voice-data"), "Destination": "/data"}]}
+
+    def promotable(self, sha):
+        self.events.append("promotable")
+        return {"sha": sha, "run_id": 12}
+
+    def target_image(self, reference):
+        """The CI image a pulled reference names: each target carries its own build recipe labels."""
+        target = reference.removeprefix(p.REGISTRY).partition("@")[0]
+        identity = self.image(self.main) if target == "runtime" else "sha256:" + hashlib.sha256(
+            f"ci {target} {self.main}".encode()).hexdigest()
+        return identity, ImageStore.image("c", target, revision=self.main, source=self.main) | {"Id": identity}
+
+    def published(self, target, sha):
+        reference = verified_image(target, "", "sha256:" + hashlib.sha256(sha.encode()).hexdigest())["reference"]
+        return verified_image(target, self.target_image(reference)[0], reference.partition("@")[2])
+
+    def answer(self):
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer if isinstance(answer, str) else json.dumps({"calls": [list(call) for call in answer]})
+
+    def probe_output(self, argv, until):
+        """The probe's `docker start --attach`: a failed or timed out start is what probe_output makes of it."""
+        assert argv == ["docker", "start", "--attach", "e" * 64] and 0 < until - self.clock.now <= p.CALL_PROBE
+        attempted = sorted(str(path.relative_to(self.state)) for path in self.state.glob("*/*attempted.json"))
+        self.events.append(("probe", self.inspected, attempted))
+        try:
+            return self.answer()
+        except p.Refused:
+            raise p.CallsUnknown("probe_failed") from None
+        except subprocess.TimeoutExpired:
+            raise p.CallsUnknown("probe_timeout") from None
+
+    def run(self, argv, **kwargs):
+        label = next((item.rpartition("=")[2] for item in argv if item.startswith("label=com.docker.compose.project=")),
+                     None)
+        if argv[:2] == ["docker", "create"] and p.CALLS_PROBE in argv:
+            assert 0 < kwargs.get("timeout") <= p.CALL_PROBE
+            return "e" * 64 + "\n"
+        if argv[:2] == ["docker", "ps"] and "label=" + p.CALL_LABEL in argv:
+            return ""  # A probe the tool gave up on is gone.
+        if argv[:2] in (["docker", "pull"], ["docker", "tag"]) or argv[:3] == ["docker", "image", "inspect"] and "@" in argv[-1]:
+            self.calls.append(argv)
+            identity, image = self.target_image(argv[-2] if argv[1] == "tag" else argv[-1])
+            if argv[1] == "pull":
+                self.images[identity] = image
+            if argv[1] == "tag":
+                self.tags[argv[-1]] = identity
+            return identity if argv[1] == "image" else ""
+        if argv[:2] == ["docker", "compose"]:
+            self.calls.append(argv)
+            if "config" in argv:
+                return json.dumps(json.loads(Path(argv[argv.index("-f") + 1]).read_text())).replace("$$", "$")
+            name = argv[argv.index("--project-name") + 1]
+            container = self.containers[name]
+            if "stop" in argv:
+                self.events.append(("stop", name))
+                container["State"] = {"Running": False}
+            if "up" in argv:
+                self.serial += 1
+                image = json.loads(Path(argv[argv.index("-f") + 1]).read_text())["services"][argv[-1]]["image"]
+                self.containers[name] = container = (
+                    self.voice_container(f"voice{self.serial}", image) if name == "personal-os-voice" else
+                    {"Id": f"{name}{self.serial}", "Image": image, "State": {"Running": True}})
+                if name == "synthetic":
+                    self.container = container
+            if "ps" in argv:
+                return container["Id"] + "\n"
+            return ""
+        if argv[:2] == ["docker", "ps"] and label:
+            self.calls.append(argv)
+            container = self.containers[label]
+            return container["Id"] + "\n" if "--all" in argv or container["State"].get("Running") else ""
+        if argv[:2] == ["docker", "inspect"]:
+            self.calls.append(argv)
+            [container] = [item for item in self.containers.values() if item["Id"] == argv[2]]
+            self.inspected = argv[2]
+            return json.dumps([container])
+        return super().run(argv, **kwargs)
+
+    def prepared(self, sha):
+        self.main = sha
+        p.prepare(self.settings, sha)
+        self.events.clear()
+
+    def stops(self):
+        return [event for event in self.events if event[0] == "stop"]
+
+
+# spec: ANYM-442
+def test_apply_waits_for_an_active_call_and_stops_nothing_before_it_ends(tmp_path, monkeypatch, capsys):
+    host = CallHost(tmp_path, monkeypatch, answers=([(CALL, "active")], [(CALL, "active")], ()))
+    host.prepared(RELEASES[0])
+    assert p.apply(host.settings, RELEASES[0])["status"] == "applied"
+    # Two polls while the call runs, the last remote gate, a second check, then the marker and the first stop.
+    assert host.events[:7] == ["promotable", ("probe", "voice0", []), ("probe", "voice0", []),
+                               ("probe", "voice0", []), "promotable", ("probe", "voice0", []), ("stop", "synthetic")]
+    assert host.clock.sleeps == [p.CALL_POLL, p.CALL_POLL]
+    # Before the second project's stop it checks again, with the marker written.
+    assert host.events[7:] == [("probe", "voice0", [f"{RELEASES[0]}/attempted.json"]), ("stop", "personal-os-voice")]
+    assert f"calls check: waiting for a call to end: {CALL} (active)" in capsys.readouterr().err
+
+
+# spec: ANYM-442
+def test_a_call_starting_during_the_last_ci_check_is_waited_for_before_anything_is_written(tmp_path, monkeypatch):
+    host = CallHost(tmp_path, monkeypatch, answers=((), [(CALL, "ringing")], ()))
+    host.prepared(RELEASES[0])
+    p.apply(host.settings, RELEASES[0])
+    assert host.events[:6] == ["promotable", ("probe", "voice0", []), "promotable", ("probe", "voice0", []),
+                               ("probe", "voice0", []), ("stop", "synthetic")]
+
+
+# spec: ANYM-442
+def test_a_call_that_outlasts_the_bound_refuses_apply_before_any_change(tmp_path, monkeypatch, capsys):
+    host = CallHost(tmp_path, monkeypatch, answers=([(CALL, "waiting_for_browser")],))
+    host.prepared(RELEASES[0])
+    host.calls.clear()
+    with pytest.raises(p.CallActive, match=re.escape(f"a call is active: {CALL} (waiting_for_browser)")):
+        p.apply(host.settings, RELEASES[0])
+    # It waited out the bound, never longer, then stopped nothing and wrote nothing in the release.
+    assert host.clock.now == p.CALL_WAIT and host.events.count("promotable") == 1
+    assert host.mutations() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
+    assert capsys.readouterr().err.count("calls check: waiting") == 1
+
+
+# spec: ANYM-442
+def test_a_call_starting_before_a_later_project_is_waited_for_and_never_cut(tmp_path, monkeypatch):
+    host = CallHost(tmp_path, monkeypatch, answers=((), (), [(CALL, "connecting")]))
+    host.prepared(RELEASES[0])
+    with pytest.raises(p.CallActive, match=CALL):
+        p.apply(host.settings, RELEASES[0])
+    # The first project was replaced; the calls project was never stopped. The attempt stays unfinished.
+    assert host.stops() == [("stop", "synthetic")] and host.clock.now == p.CALL_WAIT
+    assert (host.state / RELEASES[0] / "attempted.json").exists()
+    assert not (host.state / RELEASES[0] / "result.json").exists()
+    assert p.unfinished(host.state) == [RELEASES[0]]
+
+
+# spec: ANYM-442
+def test_rollback_waits_for_a_call_and_refuses_before_any_change_at_the_bound(tmp_path, monkeypatch):
+    host = CallHost(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.prepared(sha)
+        p.apply(host.settings, sha)
+    host.events.clear()
+    host.answers = [[(CALL, "active")]]
+    with pytest.raises(p.CallActive, match=CALL):
+        p.rollback(host.settings, RELEASES[1])
+    assert host.stops() == [] and not (host.state / RELEASES[1] / "rollback-attempted.json").exists()
+    host.events.clear()
+    host.answers = [[(CALL, "active")], (), ()]
+    assert p.rollback(host.settings, RELEASES[1])["status"] == "rolled-back"
+    applied = [f"{sha}/attempted.json" for sha in RELEASES[:2]]
+    assert host.events == [("probe", "voice4", applied), ("probe", "voice4", applied), ("stop", "synthetic"),
+                           ("probe", "voice4", sorted([*applied, f"{RELEASES[1]}/rollback-attempted.json"])),
+                           ("stop", "personal-os-voice")]
+
+
+# spec: ANYM-442
+@pytest.mark.parametrize("answer, category", [
+    ('{"error": "busy"}', "busy"),
+    ('{"error": "read_only_recovery_needed"}', "read_only_recovery_needed"),
+    ('{"error": "/data/voice.sqlite3: no such file"}', "malformed_probe_output"),
+    ("Traceback (most recent call last):", "malformed_probe_output"),
+    ('{"calls": [["not-a-uuid", "active"]]}', "malformed_probe_output"),
+    (f'{{"calls": [["{CALL}", "on_hold"]]}}', "malformed_probe_output"),
+    (f'{{"calls": [["{CALL}", "active", "+15550100"]]}}', "malformed_probe_output"),
+    ('{"calls": {"brief": "synthetic"}}', "malformed_probe_output"),
+    (p.Refused("docker failed (exit 1); production was not accepted"), "probe_failed"),
+    (subprocess.TimeoutExpired("docker", 20), "probe_timeout"),
+], ids=["busy", "hot-journal", "raw-error", "not-json", "non-uuid", "unknown-status", "extra-field", "not-a-list",
+        "exec-failed", "exec-timeout"])
+def test_an_unreadable_or_untrusted_probe_answer_is_never_taken_for_no_call(tmp_path, monkeypatch, answer, category):
+    host = CallHost(tmp_path, monkeypatch, answers=(answer,))
+    host.prepared(RELEASES[0])
+    with pytest.raises(p.CallsUnknown) as refused:
+        p.apply(host.settings, RELEASES[0])
+    # Only the fixed category reaches the refusal, never the probe's own text.
+    assert str(refused.value) == "whether a call is active could not be read: " + category
+    assert host.mutations() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
+
+
+# spec: ANYM-442
+def test_calls_are_read_in_a_confined_container_of_every_configured_calls_service(monkeypatch):
+    commands = []
+    running = {("personal-os-voice", "voice"): "c1", ("second", "calls"): "c2", ("stopped", "voice"): ""}
+    def run(argv, **kwargs):
+        commands.append((argv, kwargs))
+        if argv[:2] == ["docker", "ps"]:
+            project, service = (item.rpartition("=")[2] for item in argv if item.startswith("label="))
+            return running[project, service] + "\n"
+        if argv[:2] == ["docker", "inspect"]:
+            mount = ({"Type": "bind", "Source": "/opt/personal-os-voice/data", "Destination": "/data"} if argv[2] == "c1"
+                     else {"Type": "volume", "Name": "second_calls", "Destination": "/state"})
+            return json.dumps([{"Image": IMAGE, "Mounts": [mount], "Config": {
+                "User": "10001:10001", "Env": ["SECRET_KEY=synthetic"] + (["VOICE_DATA_DIR=/state"] if argv[2] == "c2" else [])}}])
+        assert argv[:2] == ["docker", "create"]
+        return ("b" if "type=bind" in " ".join(argv) else "d") * 64 + "\n"
+    def start(argv, until):
+        commands.append((argv, {"timeout": until}))
+        assert argv[:3] == ["docker", "start", "--attach"]
+        return json.dumps({"calls": [[CALL if argv[3] == "b" * 64 else OTHER_CALL, "active"]]})
+    monkeypatch.setattr(p, "run", run)
+    monkeypatch.setattr(p, "probe_output", start)
+    settings = {"projects": [{"name": "personal-os-probe", "services": {"telegram": "runtime"}},
+                             {"name": "personal-os-voice", "services": {"voice": "calls"}},
+                             {"name": "second", "services": {"calls": "calls", "api": "runtime"}},
+                             {"name": "stopped", "services": {"voice": "calls"}}]}
+    monkeypatch.setattr(p, "time", Clock())
+    assert p.active_calls(settings) == [f"{CALL} (active)", f"{OTHER_CALL} (active)"]
+    # Created first, then started by its ID, so the container that may run is known before it starts.
+    assert [argv[:2] for argv, _ in commands] == [["docker", "ps"], ["docker", "inspect"], ["docker", "create"],
+                                                  ["docker", "start"]] * 2 + [["docker", "ps"]]
+    assert commands[3][0] == ["docker", "start", "--attach", "b" * 64]
+    assert all(kwargs == {"timeout": p.CALL_PROBE} for _, kwargs in commands)
+    probe = commands[2][0]
+    image = probe.index(IMAGE)
+    assert probe[image + 1:] == ["-I", "-c", p.CALLS_PROBE, str(p.CALL_READ), str(p.CALL_LIFETIME), *p.CALL_STATUSES]
+    options = probe[2:image]
+    # --init: python as PID 1 would ignore SIGALRM's default action and outlive its lifetime.
+    for flag in (["--rm"], ["--init"], ["--pull", "never"], ["--network", "none"], ["--read-only"], ["--cap-drop", "ALL"],
+                 ["--memory", "64m"], ["--pids-limit", "16"], ["--user", "10001:10001"],
+                 ["--mount", "type=bind,source=/opt/personal-os-voice/data,target=/data,readonly"],
+                 ["--env", "VOICE_DATA_DIR=/data"], ["--entrypoint", "python"]):
+        assert any(options[i:i + len(flag)] == flag for i in range(len(options))), flag
+    # Nothing of the calls container's environment reaches the probe.
+    assert not any("SECRET" in item for item in probe)
+    assert "type=volume,source=second_calls,target=/data,readonly" in commands[6][0]
+    # A configuration without a calls target checks nothing.
+    commands.clear()
+    assert p.active_calls({"projects": settings["projects"][:1]}) == [] and commands == []
+
+
+@pytest.fixture(autouse=True)
+def no_unconfirmed_probes(monkeypatch):
+    monkeypatch.setattr(p, "UNCONFIRMED", set())
+
+
+VOICE = {"projects": [{"name": "personal-os-voice", "services": {"voice": "calls"}}]}
+
+
+class ProbeDocker:
+    """Docker for one calls container `c1` and the probe containers production.py creates and starts (fake clock).
+
+    Each probe takes the next of `runs`: its output, or `timeout` (the tool gives up while its probe runs), `late`
+    (its start reaches Docker `late_by` seconds after the tool gave up; a container removed by then never runs),
+    `create-timeout` (the tool gives up on `docker create`, which Docker creates anyway) or `conflict` (the name is
+    taken). `stuck` probes survive `docker rm --force`; `foreign` is a running probe of another token; `listing`, when
+    set, is what the probe listing prints. Every command takes `step` seconds of the fake clock, at most its timeout,
+    after which it times out."""
+
+    def __init__(self, monkeypatch, runs, *, step=0.0, stuck=False, ps_fails=False, late_by=5.0, listing=None):
+        self.runs, self.step, self.stuck, self.ps_fails, self.late_by = list(runs), step, stuck, ps_fails, late_by
+        self.listing, self.commands, self.started, self.serial = listing, [], [], 0
+        # Probe containers: ID -> (token, the time it runs from, None while it is only created).
+        self.probes = {"f" * 64: ("f" * 32, 0.0)}
+        self.clock = Clock()
+        monkeypatch.setattr(p, "time", self.clock)
+        monkeypatch.setattr(p, "run", self.run)
+        monkeypatch.setattr(p, "probe_output", self.start)
+
+    def running(self):
+        return {identity: token for identity, (token, since) in self.probes.items()
+                if since is not None and since <= self.clock.now}
+
+    def take(self, argv, timeout):
+        self.commands.append((argv, timeout))
+        self.started.append(self.clock.now)
+        if self.step > timeout:
+            self.clock.now += timeout
+            raise subprocess.TimeoutExpired(argv, timeout)
+        self.clock.now += self.step
+
+    def run(self, argv, **kwargs):
+        self.take(argv, kwargs["timeout"])
+        if argv[:2] == ["docker", "ps"] and "label=" + p.CALL_LABEL in argv:
+            if self.ps_fails:
+                raise p.Refused("docker failed (exit 1); production was not accepted")
+            if self.listing is not None:
+                return self.listing
+            return "".join(f"{identity}\t{'running' if identity in self.running() else 'created'}\t{token}\n"
+                           for identity, (token, _) in self.probes.items())
+        if argv[:2] == ["docker", "ps"]:
+            return "c1\n"
+        if argv[:2] == ["docker", "inspect"]:
+            return json.dumps([{"Image": IMAGE, "Config": {"User": "10001:10001"}, "Mounts": [
+                {"Type": "bind", "Source": "/srv/calls", "Destination": "/data"}]}])
+        if argv[:2] == ["docker", "create"]:
+            token = argv[argv.index("--label") + 1].removeprefix(p.CALL_LABEL + "=")
+            if self.runs[0] == "conflict":
+                self.runs.pop(0)
+                raise p.Refused("docker failed (exit 125); production was not accepted")
+            self.serial += 1
+            identity = f"{self.serial:064x}"
+            self.probes[identity] = (token, None)
+            if self.runs[0] == "create-timeout":
+                self.runs.pop(0)
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return identity + "\n"
+        if argv[:3] == ["docker", "rm", "--force"]:
+            if not self.stuck:
+                self.probes.pop(argv[3], None)
+            return ""
+        raise AssertionError(argv)
+
+    def start(self, argv, until):
+        """probe_output of `docker start --attach <ID>`."""
+        assert argv[:3] == ["docker", "start", "--attach"]
+        if until <= self.clock.now:
+            raise p.CallsUnknown("probe_timeout")
+        identity, outcome = argv[3], self.runs.pop(0)
+        token = self.probes[identity][0]
+        try:
+            self.take(argv, until - self.clock.now)
+        except subprocess.TimeoutExpired:
+            outcome = "timeout"
+        if outcome in ("timeout", "late"):
+            self.probes[identity] = (token, self.clock.now + (self.late_by if outcome == "late" else 0))
+            raise p.CallsUnknown("probe_timeout")
+        del self.probes[identity]  # It ran to its end, and --rm removed it.
+        return outcome
+
+    def named(self, *names):
+        return [argv for argv, _ in self.commands if argv[:2] in [["docker", name] for name in names]]
+
+
+FOREIGN = {"f" * 64: "f" * 32}
+FIRST = f"{1:064x}"
+
+
+# spec: ANYM-442
+def test_a_probe_the_client_gave_up_on_is_killed_by_its_label_and_confirmed_gone(monkeypatch):
+    docker = ProbeDocker(monkeypatch, ["timeout"])
+    with pytest.raises(p.CallsUnknown, match="probe_timeout"):
+        p.active_calls(VOICE)
+    [probe] = docker.named("create")
+    assert "--init" in probe and re.fullmatch(r"deedkit-calls-probe-[0-9a-f]{12}", probe[probe.index("--name") + 1])
+    assert docker.named("start") == [["docker", "start", "--attach", FIRST]]
+    # Found by its own token in every state, removed by container ID, then listed again: only the other probe is left.
+    assert docker.named("rm") == [["docker", "rm", "--force", FIRST]] and docker.running() == FOREIGN
+    assert [argv[:2] for argv, _ in docker.commands[4:]] == [["docker", "ps"], ["docker", "rm"], ["docker", "ps"]]
+    assert all(timeout == p.CALL_KILL and "--all" in argv and "-q" not in argv for argv, timeout in docker.commands[4:]
+               if argv[1] == "ps")
+
+
+# spec: ANYM-442
+@pytest.mark.parametrize("failure", ["survives-kill", "unlistable"])
+def test_a_probe_that_cannot_be_confirmed_gone_ends_the_wait_with_no_further_probe(monkeypatch, failure):
+    docker = ProbeDocker(monkeypatch, ["timeout", '{"calls": []}'], stuck=failure == "survives-kill",
+                         ps_fails=failure == "unlistable")
+    with pytest.raises(p.ProbeStuck, match=re.escape(f"inspect `docker ps --all --filter label={p.CALL_LABEL}`")):
+        p.wait_for_calls(VOICE, p.CALL_WAIT)
+    # Neither a second probe nor any wait: a stuck probe is not a call that may end.
+    assert len(docker.named("create")) == 1 and docker.clock.sleeps == []
+    assert not issubclass(p.ProbeStuck, p.CallsUnknown) and not issubclass(p.ProbeStuck, p.CallActive)
+
+
+# spec: ANYM-442
+@pytest.mark.parametrize("listing", ["abcdef123456\n", f"{'1' * 64}\trunning\n", "1\trunning\ttoken\n"],
+                         ids=["quiet-ids", "no-token", "short-id"])
+def test_a_probe_listing_it_cannot_parse_is_never_taken_for_none_left(monkeypatch, listing):
+    # `docker ps -q` ignores --format and prints bare IDs: such rows must not read as "no probe of ours runs".
+    docker = ProbeDocker(monkeypatch, ["timeout", '{"calls": []}'], listing=listing)
+    with pytest.raises(p.ProbeStuck):
+        p.wait_for_calls(VOICE, p.CALL_WAIT)
+    assert len(docker.named("create")) == 1 and docker.named("rm") == [] and docker.clock.sleeps == []
+
+
+# spec: ANYM-442
+def test_a_probe_name_another_container_holds_is_never_killed(monkeypatch):
+    docker = ProbeDocker(monkeypatch, ["conflict"])
+    with pytest.raises(p.CallsUnknown, match="probe_failed"):
+        p.active_calls(VOICE)
+    assert docker.named("rm") == [] and docker.running() == FOREIGN
+
+
+# spec: ANYM-442
+def test_a_probe_that_starts_after_its_client_gave_up_is_killed_before_the_next_probe(monkeypatch):
+    # Its start reaches Docker only after the next poll began (Sol r3 N1): its container is removed by ID before
+    # that poll, so whenever the start comes, there is nothing left to run.
+    docker = ProbeDocker(monkeypatch, ["late", '{"calls": []}'], late_by=11)
+    p.wait_for_calls(VOICE, p.CALL_WAIT)
+    assert [argv if argv[1] == "rm" else argv[:2] for argv in docker.named("create", "start", "rm")] == [
+        ["docker", "create"], ["docker", "start"], ["docker", "rm", "--force", FIRST], ["docker", "create"],
+        ["docker", "start"]]
+    docker.clock.now = 60
+    assert FIRST not in docker.probes and docker.running() == FOREIGN
+
+
+# spec: ANYM-442
+def test_a_probe_whose_creation_the_tool_gave_up_on_is_removed_before_any_start(monkeypatch):
+    docker = ProbeDocker(monkeypatch, ["create-timeout", '{"calls": []}'])
+    p.wait_for_calls(VOICE, p.CALL_WAIT)
+    assert docker.named("rm") == [["docker", "rm", "--force", FIRST]]
+    assert docker.named("start") == [["docker", "start", "--attach", f"{2:064x}"]] and docker.running() == FOREIGN
+
+
+# spec: ANYM-442
+@pytest.mark.parametrize("step, timeouts, ended", [(4, [20, 16, 12, 8], 16), (12, [20, 8], 20)], ids=["fits", "spent"])
+def test_one_poll_never_runs_a_docker_command_past_its_budget(monkeypatch, step, timeouts, ended):
+    docker = ProbeDocker(monkeypatch, ['{"calls": []}'], step=step)
+    if step == 4:
+        assert p.active_calls(VOICE) == []
+    else:
+        with pytest.raises(p.CallsUnknown, match="probe_timeout"):
+            p.active_calls(VOICE)
+    # Commands share the poll's CALL_PROBE seconds, no floor; a probe that never was created needs no cleanup.
+    assert [timeout for _, timeout in docker.commands] == timeouts and docker.clock.now == ended
+    assert p.UNCONFIRMED == set()
+
+
+# spec: ANYM-442
+def test_no_poll_starts_after_the_deadline_and_the_last_ends_within_its_budget(monkeypatch):
+    docker = ProbeDocker(monkeypatch, [], step=12)
+    with pytest.raises(p.CallsUnknown, match="could not be read: probe_timeout"):
+        p.wait_for_calls(VOICE, p.CALL_WAIT)
+    starts = [at for (argv, _), at in zip(docker.commands, docker.started, strict=True)
+              if "label=com.docker.compose.service=voice" in argv]
+    # Every poll took its whole budget; none started at or after the deadline, and the refusal came at it.
+    assert max(starts) < p.CALL_WAIT and docker.clock.now == p.CALL_WAIT
+    assert sum(docker.clock.sleeps) <= p.CALL_WAIT and docker.named("create") == []
+
+
+# spec: ANYM-442
+@pytest.mark.parametrize("entry", ["expired", "overslept"])
+def test_a_wait_whose_deadline_passed_starts_no_poll(monkeypatch, entry):
+    docker = ProbeDocker(monkeypatch, [f'{{"calls": [["{CALL}", "active"]]}}', '{"calls": []}'])
+    if entry == "expired":
+        # Sol r3 F2: entered after the bound, it refused only after a poll that could still let the stop through.
+        docker.clock.now = 960
+        with pytest.raises(p.CallsUnknown, match="could not be read: wait_expired$"):
+            p.wait_for_calls(VOICE, p.CALL_WAIT)
+        assert docker.commands == []
+    else:
+        sleep = docker.clock.sleep
+        docker.clock.sleep = lambda seconds: sleep(seconds + p.CALL_WAIT)  # the host slept far longer than asked
+        with pytest.raises(p.CallActive, match=CALL):
+            p.wait_for_calls(VOICE, p.CALL_WAIT)
+        assert len(docker.named("create")) == 1
+
+
+# spec: ANYM-442
+def test_a_last_ci_check_that_outlasts_the_wait_bound_stops_nothing(tmp_path, monkeypatch):
+    host = CallHost(tmp_path, monkeypatch)
+    host.prepared(RELEASES[0])
+    gate = host.promotable
+    def slow(sha):
+        result = gate(sha)
+        if host.events.count("promotable") == 2:  # the last remote gate, after the first wait
+            host.clock.now += 950
+        return result
+    monkeypatch.setattr(p, "promotable", slow)
+    with pytest.raises(p.CallsUnknown, match="could not be read: wait_expired$"):
+        p.apply(host.settings, RELEASES[0])
+    assert [event[0] for event in host.events if event != "promotable"] == ["probe"]
+    assert host.mutations() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
+
+
+# spec: ANYM-442
+@pytest.mark.parametrize("answer", ['{"calls": [], "brief": "synthetic private text"}', '{"error": {"brief": "x"}}',
+                                    '{"error": ["busy"]}', "{}"],
+                         ids=["extra-top-level", "error-object", "error-list", "empty"])
+def test_only_the_exact_probe_answer_shape_is_taken(tmp_path, monkeypatch, answer):
+    host = CallHost(tmp_path, monkeypatch, answers=(answer,))
+    host.prepared(RELEASES[0])
+    with pytest.raises(p.CallsUnknown) as refused:
+        p.apply(host.settings, RELEASES[0])
+    assert str(refused.value) == "whether a call is active could not be read: malformed_probe_output"
+    assert host.mutations() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
+
+
+# spec: ANYM-442
+@pytest.mark.parametrize("script, category", [
+    ("import sys; sys.stdout.write('x' * 70000)", "malformed_probe_output"),
+    ("import sys; sys.stdout.write('{\"calls\": []}' + ' ' * 70000 + 'synthetic private text')",
+     "malformed_probe_output"),
+    ("import sys; sys.stdout.buffer.write(b'\\xff')", "malformed_probe_output"),
+    ("import sys; print('{\"calls\": []}'); sys.exit(3)", "probe_failed"),
+    ("import time; print('{\"calls\": []}', flush=True); time.sleep(30)", "probe_timeout"),
+], ids=["oversized", "valid-then-oversized", "not-text", "failed", "never-ends"])
+def test_probe_output_is_bounded_in_size_and_time_and_a_failed_probe_is_no_answer(script, category):
+    import time
+    assert p.probe_output([sys.executable, "-c", "print('{\"calls\": []}')"], time.monotonic() + 10) == '{"calls": []}\n'
+    started = time.monotonic()
+    with pytest.raises(p.CallsUnknown, match=f"^{category}$"):
+        p.probe_output([sys.executable, "-c", script], time.monotonic() + 3)
+    assert time.monotonic() - started < 6
+
+
+def waiting_apply(host, monkeypatch, refusals):
+    """`deploy`'s apply refuses before any change while `refusals` lasts, as apply does at the bound."""
+    step = p.apply
+    def apply(settings, sha):
+        if refusals:
+            host.steps.append(("apply", sha))
+            raise refusals.pop(0)
+        return step(settings, sha)
+    monkeypatch.setattr(p, "apply", apply)
+
+
+# spec: ANYM-442
+def test_deploy_waits_while_a_call_is_active_and_later_applies_the_same_prepared_release(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    waiting_apply(host, monkeypatch, [p.CallActive(f"a call is active: {CALL} (active)")])
+    outcome = host.deploy()
+    assert outcome["status"] == "waiting" and host.paused() is None
+    assert outcome["reason"] == f"a call is active: {CALL} (active); nothing changed, the next run retries"
+    assert outcome["call_waits"]["count"] == 1 and p.read(host.state / "deploy.json") == outcome
+    assert not (host.state / NEWEST / "attempted.json").exists() and (host.state / NEWEST / "prepared.json").exists()
+    outcome = host.deploy()
+    assert host.steps == [("prepare", NEWEST), ("apply", NEWEST), ("apply", NEWEST), ("seamless prepare", NEWEST),
+                          ("seamless promote", NEWEST)]
+    assert outcome["status"] == "deployed" and "call_waits" not in p.read(host.state / "deploy.json")
+
+
+# spec: ANYM-442
+def test_a_newer_attested_commit_replaces_a_release_that_waited_for_a_call(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, green=(NEWER,))
+    waiting_apply(host, monkeypatch, [p.CallActive(f"a call is active: {CALL} (active)")])
+    assert host.deploy()["status"] == "waiting"
+    host.green.add(NEWEST)
+    assert host.deploy()["status"] == "deployed"
+    assert host.steps == [("prepare", NEWER), ("apply", NEWER), ("prepare", NEWEST), ("apply", NEWEST),
+                          ("seamless prepare", NEWEST), ("seamless promote", NEWEST)]
+
+
+# spec: ANYM-442
+def test_the_fourth_consecutive_wait_for_calls_pauses_and_a_dry_run_keeps_the_count(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    unknown = "whether a call is active could not be read: busy"
+    waiting_apply(host, monkeypatch, [p.CallsUnknown(unknown) for _ in range(4)])
+    for count in (1, 2, 3):
+        outcome = host.deploy()
+        assert outcome["status"] == "waiting" and outcome["call_waits"]["count"] == count and host.paused() is None
+        assert host.deploy(dry_run=True)["status"] == "plan"
+        assert p.read(host.state / "deploy.json")["call_waits"]["count"] == count
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.paused() == outcome["reason"]
+    assert outcome["reason"] == (f"plan A of {NEWEST} waited 4 runs in a row for calls: {unknown}; "
+                                 "inspect the calls service")
+    assert not (host.state / NEWEST / "attempted.json").exists()
+
+
+# spec: ANYM-442
+def test_a_call_refusal_after_plan_a_started_pauses_as_an_unknown_state(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    def refused(sha):
+        raise p.CallActive(f"a call is active: {CALL} (active)")
+    host.fail_apply = refused
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "stopped in an unknown state" in outcome["reason"]
+    assert (host.state / NEWEST / "attempted.json").exists() and not (host.state / NEWEST / "result.json").exists()
+    assert host.paused() == outcome["reason"] and "call_waits" not in outcome
+
+
+# spec: ANYM-442
+@pytest.mark.parametrize("refusal", [p.CallActive(f"a call is active: {CALL} (active)"),
+                                     p.CallsUnknown("whether a call is active could not be read: busy")],
+                         ids=["call-active", "calls-unknown"])
+def test_an_automatic_rollback_that_meets_a_call_pauses_with_no_further_step(tmp_path, monkeypatch, refusal):
+    host = Deployer(tmp_path, monkeypatch)
+    def unhealthy(sha):
+        p.write(host.state / sha / "result.json", {"sha": sha, "status": "unhealthy"})
+        raise p.Refused("a replacement failed its health wait")
+    def waited(sha):
+        raise refusal
+    host.fail_apply, host.fail_rollback = unhealthy, waited
+    outcome = host.deploy()
+    assert host.steps == [("prepare", NEWEST), ("apply", NEWEST), ("rollback", NEWEST)]
+    assert outcome["status"] == "halted" and host.paused() == outcome["reason"]
+    assert outcome["reason"] == (f"plan A of {NEWEST} failed its health wait and its rollback failed: {refusal}; "
+                                 "production state is unknown, inspect it")
+
+
+# spec: ANYM-442
+def test_a_rollback_that_meets_a_call_before_a_later_project_never_stops_it(tmp_path, monkeypatch):
+    host = CallHost(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.prepared(sha)
+        p.apply(host.settings, sha)
+    host.events.clear()
+    host.answers = [(), [(CALL, "active")]]
+    with pytest.raises(p.CallActive, match=CALL):
+        p.rollback(host.settings, RELEASES[1])
+    assert host.stops() == [("stop", "synthetic")] and host.clock.now == p.CALL_WAIT
+    assert (host.state / RELEASES[1] / "rollback-attempted.json").exists()
+    assert p.unfinished(host.state) == [RELEASES[1]]
+
+
+# spec: ANYM-442
+@pytest.mark.parametrize("between", ["fetch-failed", "ghcr-unreachable"])
+def test_a_run_with_another_outcome_between_call_waits_restarts_their_count(tmp_path, monkeypatch, between):
+    host = Deployer(tmp_path, monkeypatch)
+    waiting_apply(host, monkeypatch, [p.CallActive(f"a call is active: {CALL} (active)") for _ in range(4)])
+    for count in (1, 2, 3):
+        assert host.deploy()["call_waits"]["count"] == count
+    main = p.remote_main
+    if between == "fetch-failed":
+        def unreadable():
+            raise p.Unreachable("main could not be read: git failed (exit 128)")
+        monkeypatch.setattr(p, "remote_main", unreadable)
+    else:
+        host.unreached.add(NEWEST)
+    outcome = host.deploy()
+    assert outcome["status"] == ("fetch_failed" if between == "fetch-failed" else "error")
+    # Astra r1 F4: the failed run copied the count on, and the next wait paused as the fourth in a row.
+    assert "call_waits" not in p.read(host.state / "deploy.json")
+    monkeypatch.setattr(p, "remote_main", main)
+    host.unreached.clear()
+    outcome = host.deploy()
+    assert outcome["status"] == "waiting" and outcome["call_waits"]["count"] == 1 and host.paused() is None
+
+
+# spec: ANYM-439
+@pytest.mark.parametrize("record", ["rollback-record", "prepared-projects"])
+def test_retention_reads_only_the_tool_written_snapshots_of_the_releases_projects(tmp_path, monkeypatch, record):
+    settings = retention_settings(tmp_path)
+    state = Path(settings["state_directory"])
+    released(state, "1" * 40, image_id("1"), image_id("2"))
+    release = state / ("1" * 40)
+    if record == "rollback-record":
+        p.write(state / "current.json", p.read(state / "current.json") | {
+            "rollback": {"version": 1, "projects": [{"name": "synthetic"}]}})
+    else:
+        p.write(release / "prepared.json", p.read(release / "prepared.json") | {"projects": [{"name": "synthetic"}]})
+    # An operator's copy of another configuration next to the receipts (production 10-20: runner.before.json made
+    # every report fail with KeyError and retention skip itself).
+    p.write(release / "runner.before.json", {"runner": {"image": image_id("3")}})
+    p.CONFIG_DIRECTORY.mkdir(parents=True)
+    Images(monkeypatch, [runtime("1"), runtime("2"), runtime("3")])
+    report = p.images_report(settings)
+    kept = {item["image"]: item["reasons"] for item in report["keep"]}
+    assert kept[image_id("2")] == ["rollback target of the current release"]
+    assert [item["image"] for item in report["candidates"]] == [image_id("3")]
+    # A named snapshot without its services is no known rollback target: nothing is removed, never a bare KeyError.
+    p.write(release / "synthetic.before.json", {"runner": {"image": image_id("2")}})
+    assert p.retain_images(settings) == {"skipped": f"the rollback snapshot of {release} is missing or malformed; no image is removed"}
+
+
+# spec: ANYM-439
+@pytest.mark.parametrize("entry", ["image-string", "list", "null"])
+def test_a_snapshot_service_entry_that_is_not_a_mapping_removes_nothing(tmp_path, monkeypatch, entry):
+    settings = retention_settings(tmp_path)
+    state = Path(settings["state_directory"])
+    released(state, "1" * 40, image_id("1"), image_id("2"))
+    release = state / ("1" * 40)
+    unit = {"image-string": image_id("2"), "list": [image_id("2")], "null": None}[entry]
+    # Astra r2 F6: such an entry left the rollback image unprotected, and retention removed it.
+    p.write(release / "synthetic.before.json", {"services": {"api": unit, "db": {"image": "postgres"}}})
+    p.CONFIG_DIRECTORY.mkdir(parents=True)
+    store = Images(monkeypatch, [runtime("1"), runtime("2")])
+    assert p.retain_images(settings) == {
+        "skipped": f"the rollback snapshot of {release} is missing or malformed; no image is removed"}
+    assert store.removals() == [] and image_id("2") in store.references

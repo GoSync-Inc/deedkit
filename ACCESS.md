@@ -27,6 +27,11 @@ pasted into conversations or saved in tracked Git files.
 | `feedback-write` together with `read` | A local private feedback record with verified source references; no external sending |
 | `capabilities` | Available to any valid key, including one without operational permissions |
 
+A chat the account joins later (`join_chat`, ANYM-243) is visible to no existing
+chat-scoped key: `--chats` lists stay exact. A key with all chats of the account sees
+it only once the account's collection policy collects it. A join changes no key,
+grant or policy; rejoining a chat that is already archived keeps its existing grants.
+
 By default a new principal gets read/download/cursor-write in the explicitly specified accounts.
 `review-write` is granted separately and lets a key create marks only together with `read`;
 reading marks is part of `read`. Details: [REVIEWS.md](REVIEWS.md).

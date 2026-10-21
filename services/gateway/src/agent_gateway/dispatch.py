@@ -276,9 +276,10 @@ class Dispatch:
         if not self.implemented(tool, snapshot, agent, caps, args.get("account")):
             raise Denied()
         if (module == "calendar" and tool["operation"] == "plan"
-                and any(isinstance(a, dict) and a.get("action") == "project" for a in args.get("actions", []))
+                and any(isinstance(a, dict) and a.get("action") in ("project", "unproject")
+                        for a in args.get("actions", []))
                 and "assignment:read" not in set(agent["grants"].get(module, [])) & set(caps["permissions"])):
-            # A projection is planned from guardian rules: the same assignment ceiling as rules in members.
+            # A projection and its undo are planned from guardian rules: the assignment ceiling of rules in members.
             raise Denied()
         allowed_actions = self.actions(snapshot, agent, caps) if module == "messaging" else []
         if tool["operation"] == "get_messenger_operation":
