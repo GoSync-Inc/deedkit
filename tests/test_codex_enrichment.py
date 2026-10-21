@@ -147,3 +147,14 @@ def test_subscription_semantics_survive_worker_revalidation(monkeypatch,tmp_path
     again=normalize_result(result)
     assert again['metadata']['text_kind']=='model_analysis'
     assert again['metadata']['prompt_version']=='codex-file-description-v1'
+
+
+# spec: ANYM-311
+def test_codex_example_stays_disabled_and_the_doc_lists_the_open_blockers():
+    root=Path(__file__).resolve().parents[1]
+    assert json.loads((root/'enrichment.codex.example.json').read_text())['enabled'] is False
+    doc=' '.join((root/'CODEX_ENRICHMENT.md').read_text().split())
+    assert '`enabled: false`' in doc
+    for blocker in ('Global and per-account daily counters are shared','sums every profile and provider',
+                    'fixed 30 minutes','Per-file retries of errors that do not pause'):
+        assert blocker in doc,blocker
