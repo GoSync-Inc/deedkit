@@ -34,7 +34,7 @@ inline code or a fenced block is ignored, so a spec may document the marker; TID
 Main holds maintained behaviour and its known defects. New future-only requirements go on a
 proposal branch per deliverable increment, which stays open until implemented; a current defect
 goes on a review branch. Never delete and recreate a spec to simulate a move; no supported
-relocation preserves identity (CLI 0.33.0).
+relocation preserves identity (CLI 0.36.0).
 
 ## Card intake
 
@@ -123,7 +123,7 @@ trial's start and result in the digest, and the loop returns with that report.
 
 Criteria change only through a card's branch reviewed with its PR; no daily delta audit runs.
 
-## Commands (CLI 0.33.0)
+## Commands (CLI 0.36.0)
 
 ```sh
 tiden intent skip --reason "<why>"                                   # first Tiden call

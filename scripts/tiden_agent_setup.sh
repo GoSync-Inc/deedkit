@@ -4,8 +4,8 @@
 # as an argument and never writes it into the checkout. No hooks are installed.
 set -eu
 
-version=0.33.0
-checksum=3f6b650c4cabd58ce4149d9106325cbd36d1472cccc9c63ca03137668b80e4a6
+version=0.36.0
+checksum=166995cd41353986931dc26b2fce256a5bc517fda8eef217ffd6c723873b5527
 base_url=${TIDEN_BASE_URL:-https://app.tiden.ai}
 # Product identifiers are not credentials; the CI reporting job uses the same ones.
 workspace=${TIDEN_WORKSPACE_ID:-1dc18e09-4a09-4d74-8300-cd4302622357}

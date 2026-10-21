@@ -51,8 +51,8 @@ jobs:
       # The report calls the CLI by its path; a workflow_run job writes nothing to GITHUB_PATH or GITHUB_ENV.
       - name: Install pinned Tiden CLI with integrity check
         run: |
-          curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.33.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
-          echo "3f6b650c4cabd58ce4149d9106325cbd36d1472cccc9c63ca03137668b80e4a6  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
+          curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.36.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
+          echo "166995cd41353986931dc26b2fce256a5bc517fda8eef217ffd6c723873b5527  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
           mkdir "$RUNNER_TEMP/tiden-bin"
           tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
       - name: Measure drift, unlinked tests, stale anchors and Done specs with open checks
