@@ -22,12 +22,12 @@ REGISTRY = "ghcr.io/gosync-inc"
 TARGETS = ("runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "calls", "backup")
 WORKFLOW = production.REPOSITORY + "/.github/workflows/ci.yml"
 SOURCE = "https://github.com/" + production.REPOSITORY
-ABSENT = ("manifest unknown", "name unknown", "not found")
+ABSENT = ("manifest unknown", "name unknown")  # the registry's MANIFEST_UNKNOWN / NAME_UNKNOWN error codes
 MANIFESTS = {"application/vnd.docker.distribution.manifest.v2+json", "application/vnd.oci.image.manifest.v1+json"}
 # A network or API failure that says nothing about the image: a read retries it ATTEMPTS times, waiting BACKOFF,
 # 2*BACKOFF, ... seconds in between. Anything else (404, "no attestations found", a policy mismatch) is final.
-TRANSIENT = re.compile(r"HTTP(?: status:)? (?:429|5\d\d)|rate limit|Bad Gateway|Service Unavailable|Gateway Time-?out"
-                       r"|Too Many Requests|\bEOF\b|connection (?:reset|refused)|broken pipe|timeout|timed out"
+TRANSIENT = re.compile(r"(?:HTTP(?: status:)?|status code|StatusCode:) (?:429|5\d\d)|rate limit|Internal Server Error"
+                       r"|Bad Gateway|Service Unavailable|Gateway Time-?out|Too Many Requests|\bEOF\b|connection (?:reset|refused)|broken pipe|timeout|timed out"
                        r"|TLS handshake|no such host|temporary failure|Sigstore verifier", re.IGNORECASE)
 ATTEMPTS, BACKOFF = 4, 5
 
@@ -115,7 +115,8 @@ class Registry:
         """The raw manifest and its digest, or None when the tag does not exist."""
         result = read(["skopeo", "inspect", *self.tls, "--raw", "docker://" + reference])
         if result.returncode:
-            if any(marker in result.stderr.lower() for marker in ABSENT):
+            # A failure that is still transient after the retries never proves absence, whatever its body says.
+            if not transient(result) and any(marker in result.stderr.lower() for marker in ABSENT):
                 return None
             raise Refused(f"cannot read {reference}: {result.stderr.strip()[-400:]}")
         raw = result.stdout.encode()

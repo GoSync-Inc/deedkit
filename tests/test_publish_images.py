@@ -451,6 +451,9 @@ TRANSIENT_FAILURES = [
     'pinging container registry ghcr.io: Get "https://ghcr.io/v2/": EOF',
     "read tcp 10.1.0.4:443: connection reset by peer",
     "net/http: TLS handshake timeout",
+    # gh's OCI client (go-containerregistry) and skopeo (containers/image) word a registry 5xx this way.
+    "Error: failed to fetch remote image: GET https://ghcr.io/v2/: unexpected status code 500 Internal Server Error",
+    "reading manifest " + SHA + ": StatusCode: 503, Service Unavailable: backend not found",
 ]
 
 
@@ -469,7 +472,7 @@ def gh_attestation(monkeypatch, outcomes):
 
 # spec: ANYM-300
 @pytest.mark.parametrize("stderr", TRANSIENT_FAILURES, ids=["api-502", "api-429", "rate-limit", "sigstore", "eof",
-                                                            "reset", "tls-timeout"])
+                                                            "reset", "tls-timeout", "oci-500", "skopeo-503"])
 def test_attestation_check_retries_a_transient_failure_with_backoff(monkeypatch, stderr):
     calls, delays = gh_attestation(monkeypatch, [(1, stderr), (1, stderr), (0, ""), (1, stderr), (0, "")])
     assert pi.attested("ghcr.io/gosync-inc/deedkit-backup", "sha256:" + "1" * 64, SHA) == "complete"
@@ -478,11 +481,12 @@ def test_attestation_check_retries_a_transient_failure_with_backoff(monkeypatch,
 
 
 # spec: ANYM-300
+@pytest.mark.parametrize("stderr", [TRANSIENT_FAILURES[0], TRANSIENT_FAILURES[7]], ids=["api-502", "oci-500"])
 @pytest.mark.parametrize("bundle", [False, True], ids=["api", "registry-bundle"])
-def test_attestation_check_refuses_when_a_transient_failure_persists(monkeypatch, bundle):
-    failures = [(1, TRANSIENT_FAILURES[0])] * pi.ATTEMPTS
+def test_attestation_check_refuses_when_a_transient_failure_persists(monkeypatch, bundle, stderr):
+    failures = [(1, stderr)] * pi.ATTEMPTS
     calls, delays = gh_attestation(monkeypatch, [(0, "")] * bundle + failures)
-    with pytest.raises(pi.Refused, match="could not be verified.*502"):
+    with pytest.raises(pi.Refused, match="could not be verified.*50[02]"):
         pi.attested("ghcr.io/gosync-inc/deedkit-backup", "sha256:" + "1" * 64, SHA)
     assert len(calls) == bundle + pi.ATTEMPTS and delays == [pi.BACKOFF * 2 ** n for n in range(pi.ATTEMPTS - 1)]
 
@@ -538,3 +542,24 @@ def test_registry_reads_retry_a_transient_network_failure_and_nothing_else(monke
     with pytest.raises(pi.Refused, match="EOF"):
         registry.manifest(reference)
     assert len(calls) == 5 + pi.ATTEMPTS
+
+
+# spec: ANYM-300
+@pytest.mark.parametrize("stderr", [
+    TRANSIENT_FAILURES[8],
+    'pinging container registry ghcr.io: Get "https://ghcr.io/v2/": EOF (manifest unknown)',
+    "Error: 404 page not found",
+], ids=["503-backend-not-found", "eof-manifest-unknown", "bare-not-found"])
+def test_an_unreadable_registry_never_reads_an_existing_tag_as_absent(tmp_path, monkeypatch, stderr):
+    class Unreadable(FakeRegistry):
+        manifest = pi.Registry.manifest  # skopeo, whose every lookup fails with this stderr
+
+    registry = Unreadable()
+    published(registry, "runtime")
+    exported(tmp_path, "runtime", salt="rebuilt")  # a rebuilt archive: pushing it would move the tag
+    monkeypatch.setattr(pi, "run", lambda argv, check=True: subprocess.CompletedProcess(argv, 1, "", stderr))
+    monkeypatch.setattr(pi.time, "sleep", lambda _: None)
+    before = dict(registry.tags)
+    with pytest.raises(pi.Refused, match="cannot read"):
+        pi.publish_one(registry, "runtime", SHA, tmp_path, never_attested)
+    assert registry.pushes == [] and registry.tags == before
