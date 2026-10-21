@@ -284,11 +284,25 @@ def test_a_marked_comment_example_that_was_already_there_links_no_unmarked_go_te
 
 
 # spec: ANYM-421
+def test_a_marker_line_inside_a_block_comment_before_a_real_declaration_links_nothing(root, server):
+    full_server(server)
+    package = "example.com/svc/pkg"
+    text = "package pkg\n\n/* %s\n// spec: ANYM-12\n*/ func TestRoute(t *testing.T) {}\n"
+    commit(root, {"svc/go.mod": "module example.com/svc\n\ngo 1.26\n", "svc/pkg/a_test.go": text % "Documentation example"},
+           "base")
+    server.set(tests=[case(f"{package}::TestRoute/one", "a_test.go", "TestRoute/one")])
+    merged(root, server, {"svc/pkg/a_test.go": text % "Updated example"}, "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert not server.state().get("links")
+
+
+# spec: ANYM-421
 def test_go_declarations_ignore_comments_and_literals_and_keep_line_numbers():
     source = ("package p\n/* func TestA(t *testing.T) {} */\nvar s = \"func TestB(\" // func TestC(\nvar r = `\n"
               "func TestD(x`\nvar q = '\"'\nfunc TestReal(t *testing.T) {}\nvar e = \"a\\\"b\"\nfunc TestMain(m *testing.M) {}\n")
     assert tiden_sync.go_declarations(source) == [("TestReal", 6)]
-    assert tiden_sync.go_code(source).count("\n") == source.count("\n")
+    assert tiden_sync.go_scan(source)[0].count("\n") == source.count("\n")
 
 
 # spec: ANYM-421

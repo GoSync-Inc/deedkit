@@ -223,15 +223,18 @@ def linked(cli: str, test: str) -> set[str]:
     return {link["requirementId"] for link in links}
 
 
-def go_code(source: str) -> str:
+def go_scan(source: str) -> tuple[str, set[int]]:
     """The Go source with every comment and string, rune or raw-string literal blanked (newlines kept), so a
-    declaration found in it is executable code and not text that only looks like one."""
-    out, i, n = [], 0, len(source)
+    declaration found in it is executable code and not text that only looks like one; and the 0-based lines that
+    begin with a real `//` comment, so a marker inside a block comment or a literal is not one."""
+    out, comments, i, n, line = [], set(), 0, len(source), 0
     while i < n:
         two, ch = source[i:i + 2], source[i]
         if two == "//":
             end = source.find("\n", i)
             end = n if end < 0 else end
+            if not source[source.rfind("\n", 0, i) + 1:i].strip():
+                comments.add(line)
         elif two == "/*":
             end = source.find("*/", i + 2)
             end = n if end < 0 else end + 2
@@ -242,36 +245,48 @@ def go_code(source: str) -> str:
             end = min(end + 1, n)
         else:
             out.append(ch)
+            line += ch == "\n"
             i += 1
             continue
         out.append("".join(c if c == "\n" else " " for c in source[i:end]))
+        line += source.count("\n", i, end)
         i = end
-    return "".join(out)
+    return "".join(out), comments
 
 
 def go_declarations(source: str) -> list[tuple[str, int]]:
     """(name, 0-based line) of each executable `func TestX` of one Go file."""
-    code = go_code(source)
+    code = go_scan(source)[0]
     return [(match.group(1), code.count("\n", 0, match.start())) for match in GO_TEST.finditer(code)
             if match.group(1) != "TestMain"]
+
+
+def go_markers(source: str) -> dict[str, tuple[int, ...]]:
+    """Name -> spec numbers of each executable Go test declared once whose marker is a real `//` comment line."""
+    lines, comments = source_lines(source, "go"), go_scan(source)[1]
+    found = go_declarations(source)
+    result = {}
+    for name, index in found:
+        specs, problem = marker(lines, index, "//")
+        if not problem and index - 1 in comments and [other for other, _ in found].count(name) == 1:
+            result[name] = specs
+    return result
 
 
 def kept_go_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Test]:
     """Marked Go tests that a changed file had before and still has, with the very same marker: a table-driven one
     gains subtests when a row is added, and each new subtest is a case of its own that only a link makes covered.
-    Only executable declarations count, so a marker in a comment or string never claims a test."""
+    Only executable declarations with a real `//` marker line count, so a marker in a comment or string never claims
+    a test."""
     found = []
     for path in paths:
         before, after = (blob(root, ref, path) if language(path) == "go" else None for ref in (base, head))
         if before is None or after is None:
             continue
-        old_lines, lines = source_lines(before, "go"), source_lines(after, "go")
-        was = {name: marker(old_lines, index, "//") for name, index in go_declarations(before)}
-        now = go_declarations(after)
-        for name, index in now:
-            specs, problem = marker(lines, index, "//")
-            if not problem and [other for other, _ in now].count(name) == 1 and was.get(name) == (specs, ""):
-                found.append(Test(path, name, index + 1, specs))
+        was, lines = go_markers(before), go_declarations(after)
+        for name, specs in go_markers(after).items():
+            if was.get(name) == specs:
+                found.append(Test(path, name, next(index for other, index in lines if other == name) + 1, specs))
     return found
 
 
