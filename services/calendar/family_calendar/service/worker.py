@@ -124,12 +124,21 @@ class Worker:
                             "UPDATE operation_steps SET state='verified',receipt=%s,error=NULL WHERE operation_id=%s AND ordinal=%s",
                             (Jsonb(receipt), *args),
                         )
-                        if repair:
-                            c.execute(
-                                self.REPAIRED + "state='active',etag=%s,updated_at=now() "
-                                "WHERE id=%s AND state='repairing' AND target_id=%s",
-                                (receipt.get("etag"), step["projection"]["link_id"], step["target_id"]),
-                            )
+                        if repair and not c.execute(
+                            # The drive is placed at the lesson's current span, which the link records with it.
+                            self.REPAIRED + "state='active',etag=%s,source_start=%s,source_end=%s,rule_version=%s,"
+                            "updated_at=now() WHERE id=%s AND state='repairing' AND target_id=%s RETURNING id",
+                            (
+                                receipt.get("etag"),
+                                step["source"]["start"],
+                                self._source_end(step),
+                                step["link"]["rule_version"],
+                                step["projection"]["link_id"],
+                                step["target_id"],
+                            ),
+                        ).fetchone():
+                            # A replacement no link tracks is never reported done.
+                            raise CalendarError("unknown_result")
                         elif claim:
                             # Also the reconcile path: the claim admitted with the send becomes the live link.
                             c.execute(
@@ -192,15 +201,16 @@ class Worker:
                             "UPDATE operation_steps SET state=%s,error=%s WHERE operation_id=%s AND ordinal=%s",
                             (state, e.code, *args),
                         )
-                        if repair and not ambiguous:
-                            # A definite failure gives the link its old target back (still missing there).
+                        if repair and not ambiguous and current != "prepared":
+                            # A definite failure of the admitted repair gives the link its old target back (still
+                            # missing there); before admission the link is another operation's or untouched.
                             c.execute(
                                 self.REPAIRED + "state='active',target_id=previous_target_id,"
                                 "target_resource_ref=%s,previous_target_id=NULL "
                                 "WHERE id=%s AND state='repairing' AND target_id=%s",
                                 (repair["resource_ref"], step["projection"]["link_id"], step["target_id"]),
                             )
-                        elif claim and not ambiguous:
+                        elif claim and not repair and not ambiguous:
                             # A definite failure releases the claim (no DELETE grant) so the lesson can be projected
                             # again; an ambiguous one keeps it until reconcile.
                             c.execute(

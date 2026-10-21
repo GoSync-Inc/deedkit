@@ -389,6 +389,8 @@ class FamilyService:
             raise CalendarError("invalid_calendar_refs")
         coverage = []
         events = []
+        # Before migration 2 and its grants no link exists: agenda never reads the new tables then.
+        projection_status = projection_status and not self.store.guardian_readiness()
         for calendar_ref in calendar_refs:
             p, cal = self.authorize(key, calendar_ref, scope)
             cov = self.store.one("SELECT * FROM coverage WHERE calendar_ref=%s", (calendar_ref,))
@@ -437,7 +439,10 @@ class FamilyService:
                     event.update(event_ref=e["ref"], **e["details"])
                     # Links are rule data: only for a caller that opts in under its rule-read ceiling (ANYM-436).
                     link = projection_status and self.rule_reader(p) and self.store.one(
-                        self.LINKS + "l.target_calendar_ref=%s AND l.target_resource_ref=%s",
+                        # Link only: the lesson is read in _drift, after its own authorization and freshness.
+                        "SELECT l.* FROM projection_links l JOIN guardian_rules r ON r.id=l.rule_id "
+                        "WHERE r.group_id=%s AND l.state<>'removed' AND l.target_calendar_ref=%s "
+                        "AND l.target_resource_ref=%s",
                         (p["group_id"], calendar_ref, e["resource_ref"]),
                     )
                     if link:
@@ -866,6 +871,12 @@ class FamilyService:
             )
             drift = self._drift(p, link) if link else None
             kind = "update" if drift == "source_moved" else "create"
+            # A live link's drive stays in the calendar it was placed in, even after the rule names another.
+            tcal = link["target_calendar_ref"] if link else r["target_calendar_ref"]
+            tprovider = (
+                self.store.one("SELECT provider FROM connections cn JOIN calendars c ON c.connection_id=cn.id "
+                               "WHERE c.ref=%s", (tcal,)) or {}
+            ).get("provider") if link else r["target_provider"]
             reason = (
                 "disabled"
                 if not r["enabled"]
@@ -881,16 +892,15 @@ class FamilyService:
                 else {"source_not_visible": None}.get(ready := self.rule_view(p, r)["not_ready_reason"], ready)
                 or (
                     None
-                    if self._can(p, r["target_calendar_ref"], "plan:create")
-                    and self._can(p, r["target_calendar_ref"], "event:" + kind)
+                    if self._can(p, tcal, "plan:create") and self._can(p, tcal, "event:" + kind)
                     else "target_not_writable"
                 )
-                or (None if r["target_provider"] == "google" else "provider_not_supported")
+                or (None if tprovider == "google" else "provider_not_supported")
             )
             if reason:
                 skips.append({"rule_id": r["id"], "duty": r["duty"], "guardian_id": r["guardian_id"], "reason": reason})
                 continue
-            _, target = self.authorize(key, r["target_calendar_ref"], "event:" + kind)
+            _, target = self.authorize(key, tcal, "event:" + kind)
             lead = timedelta(minutes=r["lead_minutes"])
             # Both drives end at the lesson boundary they serve.
             a, b = (start - lead, start) if r["duty"] == "dropoff" else (end - lead, end)

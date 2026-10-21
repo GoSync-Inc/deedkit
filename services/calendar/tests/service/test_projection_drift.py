@@ -182,3 +182,114 @@ def test_competing_repairs_create_one_replacement(store):
     assert [(r["id"], r["state"], r["target_id"]) for r in rows] == [(old["id"], "active", replacement)]
     assert [t for (c, t), e in google.events.items() if c == "private-b" and e.get("status") != "cancelled"] == [
         replacement]
+
+
+# spec: ANYM-436
+def test_two_applies_of_one_repair_plan_keep_the_replacement(store):
+    s = store
+    service, key, drop, pick, google = writable_lessons(s)
+    lesson = created(service, key, google, s)
+    old = live(s, "pickup")[0]
+    del google.events["private-b", old["target_id"]]
+    sync(s, google)
+    plan = service.plan(key, [project(lesson)])
+    replacement = planned(s, plan)[0]["target_id"]
+    first = service.apply(key, plan["plan_id"], "request-repair-a")["operation_id"]
+    second = service.apply(key, plan["plan_id"], "request-repair-b")["operation_id"]
+    google.crash.add(("POST", "private-b"))
+    assert google.run(first)["state"] == "unknown"
+    google.down = False
+    # The second finds the first's replacement before admission: it never touches the first's claim.
+    assert google.run(second)["error"] == "version_conflict"
+    rows = live(s, "pickup")
+    assert [(r["id"], r["state"], r["target_id"]) for r in rows] == [(old["id"], "repairing", replacement)]
+    assert google.run(first, reconcile=True)["state"] == "verified"
+    rows = live(s, "pickup")
+    assert [(r["id"], r["state"], r["target_id"]) for r in rows] == [(old["id"], "active", replacement)]
+    sync(s, google)
+    assert statuses(service, key)["pickup"] == "in_sync"
+
+
+# spec: ANYM-436
+def test_a_drive_only_absent_from_the_window_is_never_replaced(store):
+    s = store
+    service, key, drop, pick, google = writable_lessons(s)
+    lesson = created(service, key, google, s)
+    old = live(s, "pickup")[0]
+    # Moved to another day in Google's app: the window read misses it, Google still has it by its ID.
+    drive = google.events.pop(("private-b", old["target_id"]))
+    sync(s, google)
+    edit(drive, start=dict(drive["start"], dateTime="2026-10-22T10:00:00+00:00"),
+         end=dict(drive["end"], dateTime="2026-10-22T10:15:00+00:00"))
+    google.events["private-b", old["target_id"]] = drive
+    plan = service.plan(key, [project(lesson)])
+    assert [(st["action"], st["link"]["duty"]) for st in plan["steps"]] == [("create", "pickup")]
+    operation_id = service.apply(key, plan["plan_id"], "request-repair-moved")["operation_id"]
+    posts = google.sent("POST")
+    assert google.run(operation_id) == {"state": "failed", "error": "projection_edited"}
+    assert google.sent("POST") == posts
+    kept = live(s, "pickup")
+    assert [(r["id"], r["state"], r["target_id"]) for r in kept] == [(old["id"], "active", old["target_id"])]
+
+
+# spec: ANYM-436
+def test_a_changed_rule_target_keeps_the_drive_in_its_link_calendar(store):
+    s = store
+    service, key, drop, pick, google = writable_lessons(s)
+    lesson = created(service, key, google, s)
+    s.query("UPDATE guardian_rules SET target_calendar_ref='cal-a',version=version+1 WHERE id=%s", (pick,))
+    moved(google)
+    sync(s, google)
+    plan = service.plan(key, [project(lesson)])
+    assert [(st["action"], st["link"]["duty"], st["calendar_ref"]) for st in planned(s, plan)] == [
+        ("update", "dropoff", "cal-a"), ("update", "pickup", "cal-b")]
+    assert google.run(service.apply(key, plan["plan_id"], "request-moved")["operation_id"])["state"] == "verified"
+    old = live(s, "pickup")[0]
+    del google.events["private-b", old["target_id"]]
+    sync(s, google)
+    plan = service.plan(key, [project(lesson)])
+    assert [(st["action"], st["calendar_ref"]) for st in planned(s, plan)] == [("create", "cal-b")]
+    replacement = planned(s, plan)[0]["target_id"]
+    assert google.run(service.apply(key, plan["plan_id"], "request-repair")["operation_id"])["state"] == "verified"
+    row = live(s, "pickup")[0]
+    assert (row["target_calendar_ref"], row["target_id"]) == ("cal-b", replacement)
+    assert ("private-b", replacement) in google.events
+    sync(s, google)
+    assert statuses(service, key) == {"dropoff": "in_sync", "pickup": "in_sync"}
+    undo = service.plan(key, [{"action": "unproject", "calendar_ref": "cal-child", "event_ref": lesson}])
+    assert [(st["link"]["duty"], st["calendar_ref"], st["target_id"]) for st in planned(s, undo)][1] == (
+        "pickup", "cal-b", replacement)
+
+
+# spec: ANYM-436
+def test_one_repair_fixes_a_moved_lesson_and_a_missing_drive(store):
+    s = store
+    service, key, drop, pick, google = writable_lessons(s)
+    lesson = created(service, key, google, s)
+    old = live(s, "pickup")[0]
+    del google.events["private-b", old["target_id"]]
+    moved(google)
+    sync(s, google)
+    plan = service.plan(key, [project(lesson)])
+    assert [(st["action"], st["link"]["duty"]) for st in plan["steps"]] == [("update", "dropoff"), ("create", "pickup")]
+    assert google.run(service.apply(key, plan["plan_id"], "request-both")["operation_id"])["state"] == "verified"
+    assert {(r["duty"], r["source_start"].isoformat()) for r in link_rows(s) if r["state"] == "active"} == {
+        ("dropoff", MOVED["start"]), ("pickup", MOVED["start"])}
+    sync(s, google)
+    assert statuses(service, key) == {"dropoff": "in_sync", "pickup": "in_sync"}
+    assert error(lambda: service.plan(key, [project(lesson)])).code == "nothing_to_project"
+
+
+# spec: ANYM-436
+def test_agenda_reads_no_lesson_before_its_own_read(store, monkeypatch):
+    s = store
+    service, key, drop, pick, google = writable_lessons(s)
+    created(service, key, google, s)
+    s.query("UPDATE coverage SET status='stale' WHERE calendar_ref='cal-child'")
+    seen = []
+    for name in ("one", "query"):
+        real = getattr(s, name)
+        monkeypatch.setattr(s, name, lambda statement, args=(), real=real: seen.append((statement, args))
+                            or real(statement, args))
+    assert statuses(service, key) == {"dropoff": "unknown", "pickup": "unknown"}
+    assert not [x for x, args in seen if "o.ref=l.source_event_ref" in x or "occurrences" in x and "cal-child" in args]
