@@ -11,7 +11,7 @@ ALTER TABLE agent_feedback
  ADD COLUMN status_note text CONSTRAINT agent_feedback_status_note_check
   CHECK(length(status_note) BETWEEN 1 AND 280 AND status_note !~ '[\x01-\x1f\x7f]'),
  ADD COLUMN fixed_in text CONSTRAINT agent_feedback_fixed_in_check CHECK(length(fixed_in)<=80 AND
-  fixed_in ~ '^(deedkit@[0-9a-f]{40}|anymsg@(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.]+)?)$'),
+  fixed_in ~ '^(deedkit@[0-9a-f]{40}|anymsg@(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?)$'),
  ADD COLUMN spec_ref text CONSTRAINT agent_feedback_spec_ref_check CHECK(spec_ref ~ '^ANYM-[1-9][0-9]{0,5}$'),
  ADD COLUMN duplicate_of uuid REFERENCES agent_feedback(id) ON DELETE SET NULL,
  ADD COLUMN status_changed_at timestamptz,

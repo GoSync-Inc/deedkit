@@ -14,7 +14,8 @@ REF_KINDS = ('message_ids', 'chat_ids', 'subscription_ids')
 # `verified` and `reopened` (ANYM-344), so the operator command refuses them.
 STATUSES = ('received', 'accepted', 'declined', 'duplicate', 'fixed', 'verify_requested', 'verified', 'reopened')
 AGENT_VERDICTS = ('verified', 'reopened')
-FIXED_IN = re.compile(r'deedkit@[0-9a-f]{40}|anymsg@(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.]{1,32})?')
+# SemVer 2.0 (semver.org regex, ASCII classes); migration 039 holds the same pattern and the 80-character bound.
+FIXED_IN = re.compile(r'deedkit@[0-9a-f]{40}|anymsg@(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?')
 SPEC_REF = re.compile(r'ANYM-[1-9][0-9]{0,5}')
 UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
@@ -160,7 +161,7 @@ def _status_errors(ids, status, fixed_in, spec_ref, duplicate_of, note):
         errors.append('status_reserved_for_reporting_agent')
     elif status not in STATUSES:
         errors.append('invalid_status')
-    if fixed_in is not None and not (isinstance(fixed_in, str) and FIXED_IN.fullmatch(fixed_in)):
+    if fixed_in is not None and not (isinstance(fixed_in, str) and len(fixed_in) <= 80 and FIXED_IN.fullmatch(fixed_in)):
         errors.append('invalid_fixed_in')
     if spec_ref is not None and not (isinstance(spec_ref, str) and SPEC_REF.fullmatch(spec_ref)):
         errors.append('invalid_spec_ref')

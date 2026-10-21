@@ -102,30 +102,104 @@ def test_feedback_status_migration(schema38_store):
         store.migrate()
 
 
-# spec: ANYM-343
-def test_feedback_status_backup_round_trip(seeded, tmp_path):
+def disposition(store):
+    with store.pool.connection() as c:
+        rows = c.execute('''SELECT id,status,status_note,fixed_in,spec_ref,duplicate_of,status_changed_at
+            FROM agent_feedback ORDER BY id''').fetchall()
+        audit = c.execute('''SELECT principal,key_id,actor,outcome,resource_ids FROM audit_log
+            WHERE operation='set_feedback_status' ORDER BY resource_ids''').fetchall()
+    return rows, audit
+
+
+def populated(seeded):
     store, *_ = seeded
     with store.pool.connection() as c:
         c.execute("UPDATE attachment_residency SET state='resident',eviction_id=NULL,evicted_at=NULL")
         c.execute('DELETE FROM attachment_eviction_journal')
         c.execute('DELETE FROM attachment_backup_fences')
     token = identity(store)
-    first, second = submit(store, token, 1), submit(store, token, 2)
+    first, second, third = submit(store, token, 1), submit(store, token, 2), submit(store, token, 3)
     store.set_feedback_status([first], 'verify_requested', spec_ref='ANYM-274', fixed_in=DEPLOYED, note='Please re-check')
     store.set_feedback_status([second], 'duplicate', duplicate_of=first)
-    # Unit stub only; real pg_dump/pg_restore run in the deployment restore drill.
+    store.set_feedback_status([third], 'fixed', spec_ref='ANYM-277', fixed_in='anymsg@1.2.3-rc.1+build.7')
+    return store, second
+
+
+# spec: ANYM-343
+def test_feedback_status_backup_round_trip(seeded, tmp_path):
+    """Real PG18 pg_dump and pg_restore of populated dispositions into a separate disposable database."""
+    import os
+    import subprocess
+    from psycopg.conninfo import conninfo_to_dict
+    container = os.environ.get('ANYMSG_TEST_POSTGRES_CONTAINER')
+    if not container:
+        if os.environ.get('CI'):
+            pytest.fail('CI must provide the isolated PostgreSQL container for the restore drill')
+        pytest.skip('isolated PostgreSQL container unavailable locally')
+    source, _ = populated(seeded)
+    values = conninfo_to_dict(source.pool.conninfo)
+    assert values['dbname'] == 'messaging_probe_test'
+    container_dsn = make_conninfo(host='127.0.0.1', port=5432, user=values['user'], dbname='messaging_probe_test')
+    docker = ['docker', 'exec', '-i', '-e', 'PGPASSWORD=' + values['password'], container]
+    create_snapshot(source, tmp_path / 'capture', [*docker, 'pg_dump', '--format=custom', '--dbname=' + container_dsn])
+    manifest = verify_bundle(tmp_path / 'capture')
+    assert manifest['schema_version'] == 39 and manifest['tables']['agent_feedback']['rows'] == 3
+    name = 'anymsg_feedback_' + uuid4().hex + '_restore_test'
+    restored = None
+    created = False
+    try:
+        with psycopg.connect(source.pool.conninfo, autocommit=True) as owner:
+            owner.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(name)))
+        created = True
+        subprocess.run([*docker, 'pg_restore', '--dbname=' + make_conninfo(container_dsn, dbname=name),
+            '--exit-on-error', '--no-owner', '--no-acl'],
+            input=(tmp_path / 'capture/database.dump').read_bytes(), check=True, capture_output=True)
+        restored = Store(make_conninfo(source.pool.conninfo, dbname=name), tmp_path / 'capture/files', 'http://testserver')
+        assert verify_snapshot(restored, tmp_path / 'capture')['status'] == 'verified'
+        rows, audit = disposition(restored)
+        assert (rows, audit) == disposition(source)
+        assert {row['status'] for row in rows} == {'verify_requested', 'duplicate', 'fixed'}
+        assert any(row['duplicate_of'] for row in rows) and len(audit) == 3
+    finally:
+        if restored is not None:
+            restored.close()
+        if created:
+            with psycopg.connect(source.pool.conninfo, autocommit=True) as owner:
+                owner.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(name)))
+
+
+# spec: ANYM-343
+def test_feedback_status_manifest_covers_disposition(seeded, tmp_path):
+    store, second = populated(seeded)
+    # Unit stub dump: the manifest alone must notice a changed disposition.
     create_snapshot(store, tmp_path / 'snapshot', [sys.executable, '-c', 'print("synthetic dump")'])
-    manifest = verify_bundle(tmp_path / 'snapshot')
-    assert manifest['schema_version'] == 39 and manifest['tables']['agent_feedback']['rows'] == 2
     assert verify_snapshot(store, tmp_path / 'snapshot')['status'] == 'verified'
     with store.pool.connection() as c:
         before = database_manifest(c)['agent_feedback']
     store.set_feedback_status([second], 'declined')
     with store.pool.connection() as c:
         assert database_manifest(c)['agent_feedback'] != before
-    # The manifest covers the disposition columns, so a restore that lost them is refused.
     with pytest.raises(RuntimeError, match='database_mismatch'):
         verify_snapshot(store, tmp_path / 'snapshot')
+
+
+# spec: ANYM-343
+def test_fixed_in_follows_semver_in_the_command_and_the_database(seeded):
+    store, *_ = seeded
+    fid = submit(store, identity(store), 1)
+    accepted = ['anymsg@0.9.19', 'anymsg@1.2.3-rc.1', 'anymsg@1.2.3-rc-1', 'anymsg@1.2.3+build.7',
+                'anymsg@1.2.3-0.alpha.01a+001', 'anymsg@10.20.30-x-y-z.--', MERGED]
+    refused = ['anymsg@1.2.3-..', 'anymsg@1.2.3-01', 'anymsg@1.2.3-', 'anymsg@1.2.3+', 'anymsg@1.2.3+a..b',
+               'anymsg@01.2.3', 'anymsg@1.2', 'anymsg@1.2.3-rc.1' + '.x' * 40, 'deedkit@' + 'A' * 40, 'v1.2.3']
+    for value in accepted:
+        assert store.set_feedback_status([fid], 'fixed', spec_ref='ANYM-274', fixed_in=value)['updated'] == 1
+    for value in refused:
+        with pytest.raises(ValueError, match='invalid_fixed_in'):
+            store.set_feedback_status([fid], 'fixed', spec_ref='ANYM-274', fixed_in=value)
+        # The migration CHECK refuses the same value on the owner connection.
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with store.pool.connection() as c:
+                c.execute('UPDATE agent_feedback SET fixed_in=%s WHERE id=%s', (value, fid))
 
 
 # spec: ANYM-343
