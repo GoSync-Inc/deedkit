@@ -564,3 +564,35 @@ def test_a_test_merge_checkout_diffs_from_the_merged_base_tip_not_the_stale_even
     payload["pull_request"]["head"]["sha"] = base  # HEAD is no test merge of this pull request: the event's base
     completed = real()
     assert completed.returncode == 1 and "test tests/test_later.py:1 test_later" in completed.stdout
+
+
+# spec: ANYM-405
+def test_a_unicode_line_separator_in_a_test_file_does_not_shift_the_markers(repo, server):
+    server.set(main=[spec(12)])
+    code, out = run(repo, server, {
+        "tests/test_sep.py": "NOTE = 'a b'\n\x0c\n# spec: ANYM-12\ndef test_py():\n    pass\n",
+        "pkg/sep_test.go": "package pkg\n\n// a b\n// spec: ANYM-12\nfunc TestGo(t *testing.T) {}\n",
+        "web/sep.test.mjs": "// a b\n// spec: ANYM-12\ntest('node', () => {});\n",
+        "tests/test_crlf.py": "# spec: ANYM-12\r\ndef test_crlf():\r\n    pass\r\n",
+    }, "Spec: ANYM-12")
+    assert code == 0, out
+    assert "test_py -> ANYM-12" in out and "TestGo -> ANYM-12" in out and "node -> ANYM-12" in out
+    assert "test_crlf -> ANYM-12" in out
+
+
+# spec: ANYM-405
+def test_line_breaks_follow_each_language_so_no_marker_authorizes_an_unrelated_test(repo, server):
+    server.set(main=[spec(12)])
+    code, out = run(repo, server, {
+        "tests/test_cr.py": "A = 1\rB = 2\rC = 3\ndef test_unmarked():\n    pass\n# spec: ANYM-12\n",
+        "web/ls.test.mjs": "// spec: ANYM-12\nconst x = 1; test('unmarked', () => {});\n",
+    }, "Spec: ANYM-12")
+    assert code == 1
+    assert "tests/test_cr.py:4 test_unmarked: no marker" in out
+    assert "web/ls.test.mjs:3 unmarked: no marker" in out and "-> ANYM-12" not in out
+    code, out = run(repo, server, {
+        "tests/test_cr_ok.py": "A = 1\rB = 2\r# spec: ANYM-12\rdef test_cr_ok():\r    pass\r",
+        "web/ls_ok.test.mjs": "const x = 1; // spec: ANYM-12 test('ok', () => {});\n",
+    }, "Spec: ANYM-12")
+    assert code == 0, out
+    assert "test_cr_ok -> ANYM-12" in out and "ok -> ANYM-12" in out
