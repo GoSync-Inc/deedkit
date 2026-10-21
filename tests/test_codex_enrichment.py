@@ -153,8 +153,8 @@ def test_subscription_semantics_survive_worker_revalidation(monkeypatch,tmp_path
 def test_codex_example_stays_disabled_and_the_doc_lists_the_open_blockers():
     root=Path(__file__).resolve().parents[1]
     assert json.loads((root/'enrichment.codex.example.json').read_text())['enabled'] is False
-    doc=(root/'CODEX_ENRICHMENT.md').read_text()
+    doc=' '.join((root/'CODEX_ENRICHMENT.md').read_text().split())
     assert '`enabled: false`' in doc
-    for blocker in ('Global and per-account daily counters are shared','`profile_max_jobs_per_day`',
+    for blocker in ('Global and per-account daily counters are shared','sums every profile and provider',
                     'fixed 30 minutes','Per-file retries of errors that do not pause'):
         assert blocker in doc,blocker
