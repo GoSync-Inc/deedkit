@@ -42,6 +42,7 @@ SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 SHA = re.compile(r"[0-9a-f]{40}")
 OPEN_CHECK = re.compile(r"\[open: (?:live|measured)\]")
 # Test files whose suite CI does not publish to Tiden, so a marked test there has no identity to link yet.
+KEPT_SECONDS = 600  # the time kept tests may spend on link reads, so the later steps still run
 UNPUBLISHED: tuple[tuple[str, str], ...] = ()
 SOURCE_FIELDS = ("sourceType", "title", "locator", "url", "repoPath", "repository", "lineStart", "lineEnd", "excerpt")
 TIMEOUT = 120
@@ -230,10 +231,11 @@ def kept_go_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Te
         before, after = (blob(root, ref, path) if language(path) == "go" else None for ref in (base, head))
         if before is None or after is None:
             continue
-        old, lines = {name for name, _, _ in tests_in(path, before)}, source_lines(after, "go")
-        for name, index, _ in tests_in(path, after):
+        old, lines, now = {name for name, _, _ in tests_in(path, before)}, source_lines(after, "go"), tests_in(path, after)
+        for name, index, _ in now:
             specs, problem = marker(lines, index, "//")
-            if name in old and not problem:
+            # The scanner also sees declarations in comments and strings, so a name found twice is not told apart.
+            if name in old and not problem and [other for other, _, _ in now].count(name) == 1:
                 found.append(Test(path, name, index + 1, specs))
     return found
 
@@ -244,7 +246,7 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
     cases and their spec is on main, and otherwise left alone."""
     marked = [test for test in tests if test.specs]
     marked += [test for test in kept or [] if test.specs]
-    old = {id(test) for test in kept or []}
+    old, deadline = {id(test) for test in kept or []}, time.monotonic() + KEPT_SECONDS
     if not marked:
         report("links: no marked test added.")
         return
@@ -257,6 +259,9 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
         reason = next((why for pattern, why in UNPUBLISHED if fnmatchcase(PurePosixPath(test.path).name, pattern)), None)
         if reason:
             report(f"links: {shown(test.path)} {shown(test.name)} not linked: {reason}.")
+            continue
+        if id(test) in old and time.monotonic() > deadline:
+            report(f"links: {shown(test.path)} {shown(test.name)} not rechecked: the kept-test time budget is spent.")
             continue
         unknown = [number for number in test.specs if number not in main]
         if unknown and id(test) in old:

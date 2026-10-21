@@ -226,6 +226,35 @@ def test_new_subtests_of_an_existing_marked_go_test_are_linked_when_its_file_cha
 
 
 # spec: ANYM-421
+def test_a_marked_comment_copy_of_an_unmarked_go_test_links_nothing(root, server):
+    full_server(server)
+    package = "example.com/svc/pkg"
+    old = "package pkg\n\nfunc TestRoute(t *testing.T) {}\n"
+    commit(root, {"svc/go.mod": "module example.com/svc\n\ngo 1.26\n", "svc/pkg/a_test.go": old}, "base")
+    server.set(tests=[case(f"{package}::TestRoute/one", "a_test.go", "TestRoute/one")])
+    merged(root, server, {"svc/pkg/a_test.go": old + "\n/* example\n// spec: ANYM-12\nfunc TestRoute(t *testing.T) {}\n*/\n"},
+           "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert not server.state().get("links")
+
+
+# spec: ANYM-421
+def test_kept_go_tests_stop_being_rechecked_when_their_time_budget_is_spent(root, server, monkeypatch):
+    full_server(server)
+    package = "example.com/svc/pkg"
+    old = "package pkg\n\n// spec: ANYM-12\nfunc TestRoute(t *testing.T) {}\n"
+    commit(root, {"svc/go.mod": "module example.com/svc\n\ngo 1.26\n", "svc/pkg/a_test.go": old}, "base")
+    server.set(tests=[case(f"{package}::TestRoute/one", "a_test.go", "TestRoute/one")])
+    merged(root, server, {"svc/pkg/a_test.go": old + "\n"}, "Spec: ANYM-12")
+    monkeypatch.setattr(tiden_sync, "KEPT_SECONDS", -1)
+    code, out = run(root, server)
+    assert code == 0, out
+    assert "time budget is spent" in out
+    assert not server.state().get("links")
+
+
+# spec: ANYM-421
 def test_a_go_test_resolves_to_its_nearest_module_quoted_or_commented_and_never_to_an_outer_one(root, server):
     commit(root, {"outer/go.mod": "module example.com/outer\n",
                   "outer/inner/go.mod": "module example.com/inner // the nested module\n",
