@@ -328,11 +328,15 @@ class Learning:
 
 
 # Inbound audio diagnostics (#111) stay on the server: the external analyzer never receives them.
-SERVER_ONLY_AUDIO={'input_frames','input_zero_frames','input_max_rms','first_active_input_ms','input_sample_rates','media'}
+# Telegram start timing (ANYM-450) too: the analyzer gets only late_inbound_ms and summary_missing.
+SERVER_ONLY_AUDIO={'input_frames','input_zero_frames','input_max_rms','first_active_input_ms','input_sample_rates','media','start'}
+SERVER_ONLY_START={'peer_connected_at','input_ready_ms','call_active_ms','pre_ready_frames','inbound_start','inbound_start_unavailable'}
+SERVER_ONLY_EVENTS={'inbound_audio','language_hint_failed'}
 
 
 def analysis_view(snapshot):
-    view={**snapshot,'events':[e for e in snapshot.get('events',[]) if e.get('kind')!='inbound_audio']}
+    view={k:v for k,v in snapshot.items() if k not in SERVER_ONLY_START}
+    view['events']=[e for e in snapshot.get('events',[]) if e.get('kind') not in SERVER_ONLY_EVENTS]
     metrics=snapshot.get('metrics')
     if isinstance(metrics,dict) and isinstance(metrics.get('telegram_audio'),dict):
         view['metrics']={**metrics,'telegram_audio':{k:v for k,v in metrics['telegram_audio'].items() if k not in SERVER_ONLY_AUDIO}}

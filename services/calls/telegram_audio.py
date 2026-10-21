@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from core import ACTIVE, ServiceError
-from audio_probe import PCMProbe, diagnostics
+from audio_probe import PCMProbe, StartTiming, diagnostics
 from telegram_broker import BrokerClient
 
 
@@ -92,6 +92,18 @@ def observe_media(py,media):
         py._app.confirm_call=confirm_call
 
 
+def observe_start(state,audio,ready):
+    try:state['start_timing'].frame(audio,ready)
+    except Exception:
+        # Recorded as unavailable, never as "no frame"; the frame itself still goes on.
+        with contextlib.suppress(Exception):state['start_timing'].failed=True
+
+
+def start_snapshot(state):
+    try:return state['start_timing'].snapshot()
+    except Exception:return {'inbound_start':None,'inbound_start_unavailable':True}
+
+
 async def broker_status(socket,token):
     import json
     writer=None
@@ -163,7 +175,8 @@ class TelegramCalls:
         py=PyTgCalls(client,workers=2)
         state={'service':self.service,'call_id':cid,'brief':call['brief'],'supervisor':self.supervisor,
                'client':client,'py':py,'user':user,'input':None,'dial_task':asyncio.current_task(),
-               'audio_probe':diagnostics(PCMProbe),'media':diagnostics(MediaDiagnostics)}
+               'audio_probe':diagnostics(PCMProbe),'media':diagnostics(MediaDiagnostics),
+               'start_timing':diagnostics(StartTiming)}
         self.active[cid]=state
         @py.on_update()
         async def updates(py,update):
@@ -171,14 +184,15 @@ class TelegramCalls:
             if isinstance(update,StreamFrames) and update.direction==Direction.INCOMING and update.device in {Device.MICROPHONE,Device.SPEAKER}:
                 from pipecat.frames.frames import InputAudioRawFrame
                 target=state.get('input')
-                if target:
-                    for frame in update.frames:
-                        # PyTgCalls wraps NTgCalls' raw `data` as public `frame`.
-                        audio=frame.frame
-                        if len(audio)<=48000:
-                            # A diagnostic failure must never skip the frame (same isolation as InboundAudioProbe).
-                            with contextlib.suppress(Exception): state['audio_probe'].input(audio)
-                            await target.push_audio_frame(InputAudioRawFrame(audio=audio,sample_rate=48000,num_channels=1))
+                for frame in update.frames:
+                    # PyTgCalls wraps NTgCalls' raw `data` as public `frame`.
+                    audio=frame.frame
+                    # Start timing sees every frame before the readiness gate (ANYM-450); best effort.
+                    observe_start(state,audio,target is not None)
+                    if target and len(audio)<=48000:
+                        # A diagnostic failure must never skip the frame (same isolation as InboundAudioProbe).
+                        with contextlib.suppress(Exception): state['audio_probe'].input(audio)
+                        await target.push_audio_frame(InputAudioRawFrame(audio=audio,sample_rate=48000,num_channels=1))
             elif isinstance(update,ChatUpdate) and update.status & ChatUpdate.Status.DISCARDED_CALL:
                 state['end_reason']='counterparty_hangup'
                 if state.get('runner'): await state['runner'].cancel()
@@ -189,13 +203,18 @@ class TelegramCalls:
             observe_media(py,state['media'])
             await asyncio.wait_for(py.play(user,MediaStream(ExternalMedia.AUDIO,AudioParameters(48000,1)),
                                            config=CallConfig(timeout=30)),45)
+            # play() returns once NTgCalls reports the call CONNECTED.
+            with contextlib.suppress(Exception):state['start_timing'].mark('peer_connected')
             await py.record(user,RecordStream(audio=True,audio_parameters=AudioParameters(48000,1)))
             peer=await py._app.get_input_call(user)
             state['provider_id']=str(peer.id)
             async def send(audio):
                 await py.send_frame(user,Device.MICROPHONE,audio)
                 with contextlib.suppress(Exception): state['audio_probe'].output(audio)
-            transport=pcm_transport(send,lambda value:state.update(input=value))
+            def input_ready(value):
+                state['input']=value
+                with contextlib.suppress(Exception):state['start_timing'].mark('input_ready')
+            transport=pcm_transport(send,input_ready)
             state['task']=asyncio.create_task(self._run(cid,transport,state),name='telegram-audio-'+cid)
             return {'provider_call_id':str(peer.id),'provider_status':'connected'}
         except (Exception,asyncio.CancelledError):
@@ -220,7 +239,8 @@ class TelegramCalls:
                 with contextlib.suppress(Exception):
                     value=self.service.get_call(cid)
                     self.service.result(cid,metrics={**value['metrics'],
-                        'telegram_audio':{**state['audio_probe'].snapshot(),'media':state['media'].snapshot()}})
+                        'telegram_audio':{**state['audio_probe'].snapshot(),'media':state['media'].snapshot(),
+                                          'start':start_snapshot(state)}})
                 self.service.stop(cid,reason)
 
     async def _release(self,cid):

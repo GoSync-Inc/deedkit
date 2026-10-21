@@ -20,7 +20,8 @@ class AuditedGrok(GrokRealtimeLLMService):
                 audio=events.AudioConfiguration(input=events.AudioInput(
                     format=events.PCMAudioFormat(rate=input_rate),
                     transcription=events.InputAudioTranscription(
-                        language_hint=brief['language']))))))
+                        # A legacy brief language outside ru/en/id gets no hint (ANYM-450).
+                        language_hint=brief.get('language') if brief.get('language') in ('ru', 'en', 'id') else None))))))
 
     async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
         if direction == FrameDirection.DOWNSTREAM:

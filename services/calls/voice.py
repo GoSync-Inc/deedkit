@@ -162,8 +162,9 @@ def tool_schemas(handler):
 
 class AuditedGemini(GeminiLiveLLMService):
     """Pinned Pipecat 1.12 hooks: capture provider text before sentence/turn buffering."""
-    def __init__(self,*args,recorder=None,external_tts=False,live_flows=False,transcription_language=None,**kwargs):
+    def __init__(self,*args,recorder=None,external_tts=False,live_flows=False,transcription_language=None,hint_failed=None,**kwargs):
         self.recorder=recorder
+        self.hint_failed=hint_failed
         self.external_tts=external_tts
         self.live_flows=live_flows
         self.transcription_language=transcription_language
@@ -173,13 +174,18 @@ class AuditedGemini(GeminiLiveLLMService):
 
     async def _connection_task_handler(self,config):
         # Pinned Pipecat 1.12 builds empty transcription configs. Add the
-        # rehearsal's language hint at every connection, including resume.
+        # brief's language hint at every connection, including resume.
         if self.transcription_language:
-            from google.genai.types import AudioTranscriptionConfig
-            for field in ('input_audio_transcription','output_audio_transcription'):
-                transcription=getattr(config,field) or AudioTranscriptionConfig()
-                setattr(config,field,transcription.model_copy(update={
-                    'language_codes':[self.transcription_language]}))
+            try:
+                from google.genai.types import AudioTranscriptionConfig
+                hinted={}
+                for field in ('input_audio_transcription','output_audio_transcription'):
+                    transcription=getattr(config,field) or AudioTranscriptionConfig()
+                    hinted[field]=transcription.model_copy(update={'language_codes':[self.transcription_language]})
+                for field,value in hinted.items():setattr(config,field,value)
+            except Exception:
+                # A local failure connects with the existing config (ANYM-450); best effort to record it.
+                with contextlib.suppress(Exception):self.hint_failed()
         return await super()._connection_task_handler(config)
 
     async def push_frame(self,frame,direction=FrameDirection.DOWNSTREAM):
@@ -238,6 +244,9 @@ def input_sample_rate(transport):
     return transport.input()._params.audio_in_sample_rate or PipelineParams().audio_in_sample_rate
 
 
+TRANSCRIPTION_LANGUAGES={'ru':'ru-RU','en':'en-US','id':'id-ID'}
+
+
 def create_model(brief,key,recorder=None,input_rate=None,at=None):
     # The local time is read when the call starts; the brief's prompt and snapshot stay unchanged.
     brief={**brief,'prompt':brief['prompt']+'\n'+call_clock(brief,at or datetime.now(timezone.utc))}
@@ -247,8 +256,8 @@ def create_model(brief,key,recorder=None,input_rate=None,at=None):
     return AuditedGemini(api_key=key,recorder=recorder,external_tts=bool(brief.get('custom_voice_id')),
         live_flows=brief.get('dialog_engine')=='gemini_live_flows',settings=GeminiLiveLLMService.Settings(
         model=brief['model'],system_instruction=brief['prompt'],voice=brief['voice']),
-        transcription_language={'ru':'ru-RU','en':'en-US','id':'id-ID'}[brief['language']]
-            if brief.get('dialog_engine')=='gemini_live_flows' else None)
+        # Every Gemini engine gets the brief's language as a transcription hint; a legacy language gets none.
+        transcription_language=TRANSCRIPTION_LANGUAGES.get(brief.get('language')))
 
 
 def record_clock(service,identity,brief,llm):
@@ -290,6 +299,7 @@ async def run_transport(transport,brief,key,state,browser=False):
     context=LLMContext()
     llm=create_model(brief,key,recorder=lambda role,text:service.transcript_chunk(identity,role,text),
                      input_rate=input_sample_rate(transport))
+    with contextlib.suppress(Exception):llm.hint_failed=lambda:service.runtime_event(identity,{'kind':'language_hint_failed'})
     record_clock(service,identity,brief,llm)
     live_flows=brief.get('dialog_engine')=='gemini_live_flows'
     ending_tasks=[]
@@ -382,6 +392,9 @@ async def run_transport(transport,brief,key,state,browser=False):
 
     async def begin():
         service.connected(identity)
+        # Telegram start timing (ANYM-450): the durable call is active from here; best effort.
+        if 'start_timing' in state:
+            with contextlib.suppress(Exception):state['start_timing'].mark('call_active')
         await worker.rtvi.send_server_message({'kind':'session','call_id':identity,'model':brief['model'],
             'voice':brief['grok_voice'] if brief.get('dialog_engine')=='grok_realtime' else brief.get('custom_voice_id') or brief['voice'],
             'voice_style':brief.get('voice_style','neutral'),

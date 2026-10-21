@@ -33,6 +33,19 @@ def inbound_audio_verdict(events,connected):
     return {'heard':False,'reason':'zero_frames' if audio['input_zero_frames']==audio['input_frames'] else 'quiet_frames'}
 
 
+def late_inbound_ms(metrics):
+    """Telegram start (ANYM-450): ms from peer connect to the first active inbound frame when over 3 s; energy, not speech."""
+    start=((metrics or {}).get('telegram_audio') or {}).get('start')
+    if not isinstance(start,dict) or start.get('inbound_start_unavailable'):return None
+    first=(start.get('inbound_start') or {}).get('first_active_ms')
+    return first if type(first) in (int,float) and first>3000 else None
+
+
+def mark_summary_missing(v):
+    # Orthogonal to outcome (ANYM-450): only finish_task/end_conversation save a summary, a rejected one saves none.
+    if not (isinstance(v.get('summary'),str) and v['summary'].strip()):v['summary_missing']=True
+
+
 GeminiVoice=Literal["Kore","Puck","Charon","Fenrir","Aoede","Leda","Orus","Zephyr"]
 GrokVoice=Literal['eve','ara','rex','sal','leo']
 VOICES,GROK_VOICES=list(get_args(GeminiVoice)),list(get_args(GrokVoice))
@@ -350,6 +363,8 @@ class VoiceService:
                 self.db.execute('UPDATE calls SET body=? WHERE id=?',(json.dumps(value),identity))
             if value["status"] in ACTIVE:
                 value.update(status="interrupted",ended_at=now(),end_reason="service_restart")
+                try:mark_summary_missing(value)
+                except Exception:pass
                 for consultation in value.get('consultations',[]):
                     if consultation['status']=='pending':
                         consultation.update(status='interrupted',ended_at=now())
@@ -544,6 +559,13 @@ class VoiceService:
                 # A diagnostic failure must never change how the call ends (ANYM-409 isolation).
                 try:v['inbound_audio']=inbound_audio_verdict(v['events'],v['status']=='active')
                 except Exception:v['inbound_audio']={'heard':None,'reason':'unknown'}
+                # Derived in this terminal save, so the first analysis snapshot has them; a failure changes nothing else.
+                try:
+                    late=late_inbound_ms(v.get('metrics'))
+                    if late is not None:v['late_inbound_ms']=late
+                except Exception:pass
+                try:mark_summary_missing(v)
+                except Exception:pass
                 v.update(status="failed" if reason=="model_error" else "finished",ended_at=now(),end_reason=reason)
                 if v['outcome']=='needs_summary' and any(d['status']=='answered' for d in v['decisions']):
                     v['outcome']='followup_ready'

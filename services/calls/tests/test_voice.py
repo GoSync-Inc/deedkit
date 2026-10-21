@@ -41,6 +41,88 @@ async def test_flows_transcription_language_reaches_actual_google_setup(tmp_path
     store.close()
 
 
+def _google_setup(monkeypatch,sent):
+    from google.genai import _common, _live_converters, types
+    from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
+    async def connect(self,config):
+        sent.append(_common.convert_to_dict(_live_converters._LiveConnectParameters_to_mldev(
+            api_client=self._client._api_client,from_object=types.LiveConnectParameters(
+                model=self._settings.model,config=config).model_dump(exclude_none=True))))
+    monkeypatch.setattr(GeminiLiveLLMService,'_connection_task_handler',connect)
+    return lambda:types.LiveConnectConfig(response_modalities=['AUDIO'],
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig())
+
+
+async def _serialized_setups(monkeypatch,model):
+    """The provider setup as serialized on the first connection and on a reconnection."""
+    if hasattr(model,'_send_session_update'):
+        wire=[]
+        async def capture(event):wire.append(event.model_dump(exclude_none=True))
+        model.send_client_event=capture
+        for _ in range(2):await model._send_session_update()
+        return [event['session']['audio']['input']['transcription'].get('language_hint') for event in wire]
+    sent=[];config=_google_setup(monkeypatch,sent)
+    for _ in range(2):await model._connection_task_handler(config())
+    return [[setup['setup'][d].get('language_codes') for d in ('inputAudioTranscription','outputAudioTranscription')]
+            for setup in sent]
+
+
+# spec: ANYM-450
+@pytest.mark.parametrize('engine',['gemini_live','gemini_live_flows','grok_realtime'])
+@pytest.mark.parametrize('language,code',[('ru','ru-RU'),('en','en-US'),('id','id-ID'),('de',None)])
+async def test_every_engine_gets_the_brief_language(tmp_path,monkeypatch,engine,language,code):
+    from core import CallVoice
+    from voice import create_model
+    store=VoiceService(tmp_path)
+    selected=BriefInput(goal='Delivery',counterparty='Vendor',language=language if code else 'ru',success_fields=['window'],
+                        **({'dialog_engine':engine} if engine=='gemini_live_flows' else {}))
+    if engine=='grok_realtime':
+        store.set_call_voice(CallVoice(provider='grok_realtime',grok_voice='rex'));selected=store.with_call_voice(selected)
+    brief=store.prepare(selected,[])
+    assert brief.get('dialog_engine','gemini_live')==engine
+    if not code:
+        # 'de' stands for a legacy record outside ru/en/id: the hint is skipped without a crash. The call
+        # clock's greeting table has its own language lookup (#175) and is outside this case.
+        import voice
+        brief={**brief,'language':language};monkeypatch.setattr(voice,'call_clock',lambda b,at:'')
+    setups=await _serialized_setups(monkeypatch,create_model(brief,'fixture-not-a-key'))
+    if engine=='grok_realtime':assert setups==[language if code else None]*2
+    else:assert setups==[[[code]]*2 if code else [None,None]]*2
+    store.close()
+
+
+# spec: ANYM-450
+async def test_a_failing_language_hint_connects_with_the_existing_config_and_is_recorded(tmp_path,monkeypatch):
+    from google.genai import types
+    import voice
+    store=VoiceService(tmp_path)
+    brief=store.prepare(BriefInput(goal='Delivery',counterparty='Vendor',success_fields=['window']),[])
+    model=voice.create_model(brief,'fixture-not-a-key')
+    failed=[];model.hint_failed=lambda:failed.append(True)
+    def broken(self,**kwargs):raise RuntimeError('synthetic hint failure')
+    sent=[];config=_google_setup(monkeypatch,sent)
+    monkeypatch.setattr(types.AudioTranscriptionConfig,'model_copy',broken)
+    await model._connection_task_handler(config())
+    # The connection still goes out with the existing, unhinted transcription config.
+    assert len(sent)==1 and sent[0]['setup']['inputAudioTranscription']=={} and failed==[True]
+    store.close()
+    # run_transport wires the callback to a runtime event on the call.
+    events=[]
+    class Service:
+        def runtime_event(self,identity,event):events.append(event['kind'])
+        def get_call(self,identity):return {'metrics':{}}
+        def result(self,identity,**kwargs):pass
+    class Model(voice.FrameProcessor):
+        audio_health=SimpleNamespace(snapshot=lambda:{})
+    model=Model()
+    async def fail_hint():model.hint_failed()
+    running=_stubbed_run_transport(monkeypatch,Service(),fail_hint)
+    monkeypatch.setattr(voice,'create_model',lambda *args,**kwargs:model)
+    await running
+    assert events[0]=='language_hint_failed'
+
+
 async def test_each_schema_handler_calls_its_own_scoped_tool_and_returns_result():
     voice=importlib.import_module('voice')
     seen=[]

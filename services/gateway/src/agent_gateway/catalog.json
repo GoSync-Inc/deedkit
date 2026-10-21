@@ -3607,7 +3607,7 @@
     "scopes": [
       "calls:read"
     ],
-    "description": "Read-only. Lifecycle of one owned call: status, outcome, collected answers, owner decisions, start time, channel, destination with the owner's instruction and the destination's origin, end reason and dial/provider state, and for a call that connected and ended, inbound_audio {heard, reason}: heard true when inbound audio energy reached the threshold (not proof of speech), false with reason no_frames, zero_frames or quiet_frames when none did, null when too short to tell or unknown. Use it to follow a running call or an uncertain dial.",
+    "description": "Read-only. Lifecycle of one owned call: status, outcome, collected answers, owner decisions, start time, channel, destination with the owner's instruction and the destination's origin, end reason and dial/provider state, and for a call that connected and ended, inbound_audio {heard, reason}: heard true when inbound audio energy reached the threshold (not proof of speech), false with reason no_frames, zero_frames or quiet_frames when none did, null when too short to tell or unknown. late_inbound_ms (Telegram): ms from connect to the first inbound audio energy when over 3 s, timing of energy, not of speech (a silent person shows it too). summary_missing: true when the call ended without a saved summary, whatever the outcome. Use it to follow a running call or an uncertain dial.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
