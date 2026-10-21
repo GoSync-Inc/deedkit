@@ -1,6 +1,6 @@
 # Agent access and audit
 
-Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 38. Setup is done by the operator through the local CLI
+Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 39. Setup is done by the operator through the local CLI
 or SSH with the owner DSN. There are no remote MCP/REST methods for managing keys and permissions.
 Provider sessions, the owner DSN and the backup decryption key are not given to agents.
 
@@ -84,6 +84,27 @@ key ID and the previous and new `expires_at`; `list-keys` shows the new date. It
 operator audit row `extend_key` (principal and public key ID, never the token or digest) in the
 same transaction, so a failed audit write leaves the expiry unchanged. Agents cannot extend
 their own keys. After a suspected leak, rotate with `issue-key` and `revoke-key` instead.
+
+Since schema 39 the maintainer records what happened to agent feedback (SUBSCRIPTIONS.md,
+feedback status) through the local operator container only; it is not an MCP tool, REST route
+or gateway action, and no agent key reaches it:
+
+```sh
+anymsg set-feedback-status --id <uuid>... --status <status> [--spec ANYM-<n>] \
+    [--fixed-in deedkit@<40-hex sha>|anymsg@<semver>] [--duplicate-of <uuid>] [--note <text>]
+```
+
+`--status` is `received`, `accepted`, `declined`, `duplicate`, `fixed` or `verify_requested`;
+`verified` and `reopened` belong to the reporting agent and are refused. `accepted`, `fixed`
+and `verify_requested` require `--spec`; `fixed` and `verify_requested` require `--fixed-in`
+(only they accept it); `duplicate` requires `--duplicate-of` or `--spec`, and only it accepts
+`--duplicate-of`, which must be another item of the same key. Set `fixed` once every card of
+the report is merged (the merge SHA) and `verify_requested` once that SHA is deployed (the
+production.md receipt), never earlier: merged source is not live behavior. A call takes 1–100
+IDs and replaces the whole disposition of each (omitted fields become empty) in one
+transaction bounded like a submission; any refusal, including an unknown ID (reported by
+count only), changes nothing. It prints the count and the IDs and writes one operator audit
+row `set_feedback_status` per item (principal, key ID and feedback ID; never the note).
 
 Any change to accounts, chats, operations or enabled increases the scope version:
 old receipts and download grants stop working. The same consumer starts

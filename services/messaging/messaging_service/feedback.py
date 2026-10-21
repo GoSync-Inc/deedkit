@@ -5,10 +5,19 @@ import json
 import re
 from psycopg.types.json import Jsonb
 from .field_errors import field_error, one_per_field
-from .policy import OPERATION_PERMISSIONS, scope_filter, targets
+from .policy import OPERATION_PERMISSIONS, audit, scope_filter, targets
 
 
 REF_KINDS = ('message_ids', 'chat_ids', 'subscription_ids')
+# Disposition vocabulary (ANYM-343); migration 039 holds the same CHECK. `fixed` = merged to main,
+# `verify_requested` = deployed: merged source is not live behavior. The reporting agent owns
+# `verified` and `reopened` (ANYM-344), so the operator command refuses them.
+STATUSES = ('received', 'accepted', 'declined', 'duplicate', 'fixed', 'verify_requested', 'verified', 'reopened')
+AGENT_VERDICTS = ('verified', 'reopened')
+# SemVer 2.0 (semver.org regex, ASCII classes); migration 039 holds the same pattern and the 80-character bound.
+FIXED_IN = re.compile(r'deedkit@[0-9a-f]{40}|anymsg@(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?')
+SPEC_REF = re.compile(r'ANYM-[1-9][0-9]{0,5}')
+UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 
 def _invalid(errors):
@@ -125,13 +134,83 @@ def submit_feedback(store, c, p, request_id, category, description, *, operation
     return {'feedback_id': str(row['id']), 'status': 'recorded', 'external_delivery': False}
 
 
-def list_feedback(store, c, p, *, limit=50):
+def list_feedback(store, c, p, *, limit=50, status=None):
     from .store import bounded, serial
     bounded(limit)
-    rows = c.execute('''SELECT id,category,description,operation,created_at FROM agent_feedback
-        WHERE principal=%s AND key_id=%s ORDER BY created_at DESC,id DESC LIMIT %s''',
-        (p['id'], p['key_id'], limit + 1)).fetchall()
+    if status is not None and status not in STATUSES:
+        raise _invalid([('status', 'enum', None, STATUSES)])
+    rows = c.execute('''SELECT id,category,description,operation,created_at,status,status_note,fixed_in,
+        spec_ref,duplicate_of,status_changed_at FROM agent_feedback
+        WHERE principal=%s AND key_id=%s AND (%s::text IS NULL OR status=%s)
+        ORDER BY created_at DESC,id DESC LIMIT %s''',
+        (p['id'], p['key_id'], status, status, limit + 1)).fetchall()
     # Source references are validated on submission, then omitted from listing so
     # a later policy change cannot leak formerly authorized source identifiers.
     targets(p, [str(row['id']) for row in rows[:limit]])
     return serial({'items': rows[:limit], 'has_more': len(rows) > limit, 'external_delivery': False})
+
+
+def _status_errors(ids, status, fixed_in, spec_ref, duplicate_of, note):
+    """Operator-side refusal codes, never an input value."""
+    errors = []
+    if not isinstance(ids, (list, tuple)) or not 1 <= len(ids) <= 100:
+        errors.append('feedback_ids_1_to_100')
+    elif not all(isinstance(value, str) and UUID.fullmatch(value) for value in ids):
+        errors.append('invalid_feedback_id')
+    if status in AGENT_VERDICTS:
+        errors.append('status_reserved_for_reporting_agent')
+    elif status not in STATUSES:
+        errors.append('invalid_status')
+    if fixed_in is not None and not (isinstance(fixed_in, str) and len(fixed_in) <= 80 and FIXED_IN.fullmatch(fixed_in)):
+        errors.append('invalid_fixed_in')
+    if spec_ref is not None and not (isinstance(spec_ref, str) and SPEC_REF.fullmatch(spec_ref)):
+        errors.append('invalid_spec_ref')
+    if duplicate_of is not None and not (isinstance(duplicate_of, str) and UUID.fullmatch(duplicate_of)):
+        errors.append('invalid_duplicate_of')
+    if note is not None and not (isinstance(note, str) and 1 <= len(note) <= 280 and note.strip() and
+            not any(ord(ch) < 32 or ord(ch) == 127 for ch in note)):
+        errors.append('invalid_status_note')
+    if status in ('accepted', 'fixed', 'verify_requested') and spec_ref is None:
+        errors.append('spec_ref_required')
+    if status in ('fixed', 'verify_requested') and fixed_in is None:
+        errors.append('fixed_in_required')
+    if status not in ('fixed', 'verify_requested') and fixed_in is not None:
+        errors.append('fixed_in_only_for_fixed_or_verify_requested')
+    if status == 'duplicate' and duplicate_of is None and spec_ref is None:
+        errors.append('duplicate_of_or_spec_ref_required')
+    if status != 'duplicate' and duplicate_of is not None:
+        errors.append('duplicate_of_only_for_duplicate')
+    return errors
+
+
+def set_feedback_status(c, ids, status, *, fixed_in=None, spec_ref=None, duplicate_of=None, note=None):
+    """Operator-only disposition (ANYM-343) on the owner connection, never an agent key or MCP tool.
+
+    A call replaces the whole disposition of every named item atomically, or changes nothing.
+    """
+    errors = _status_errors(ids, status, fixed_in, spec_ref, duplicate_of, note)
+    if errors:
+        raise ValueError(','.join(errors))
+    ids = sorted({value.lower() for value in ids})
+    # The same 5 s bound as an agent submission's statements, so a status change never holds
+    # agent_feedback row locks longer than a submission does.
+    c.execute("SET LOCAL transaction_timeout='5s'")
+    rows = c.execute('SELECT id,principal,key_id FROM agent_feedback WHERE id=ANY(%s::uuid[]) ORDER BY id FOR UPDATE',
+        (ids,)).fetchall()
+    if len(rows) != len(ids):
+        raise ValueError('unknown_feedback: %d of %d IDs' % (len(ids) - len(rows), len(ids)))
+    if duplicate_of is not None:
+        duplicate_of = duplicate_of.lower()
+        if duplicate_of in ids:
+            raise ValueError('duplicate_of_names_an_updated_item')
+        target = c.execute('SELECT key_id FROM agent_feedback WHERE id=%s', (duplicate_of,)).fetchone()
+        if target is None or any(row['key_id'] != target['key_id'] for row in rows):
+            raise ValueError('duplicate_of_not_same_key')
+    changed = c.execute('''UPDATE agent_feedback SET status=%s,status_note=%s,fixed_in=%s,spec_ref=%s,
+        duplicate_of=%s,status_changed_at=clock_timestamp() WHERE id=ANY(%s::uuid[]) RETURNING id''',
+        (status, note, fixed_in, spec_ref, duplicate_of, ids)).fetchall()
+    # One content-free operator audit row per item: the fixed operation code and the feedback ID only.
+    for row in rows:
+        audit(c, {'id': row['principal'], 'key_id': row['key_id'], '_audit_targets': [str(row['id'])]},
+            'set_feedback_status', 'ok')
+    return {'updated': len(changed), 'status': status, 'feedback_ids': sorted(str(row['id']) for row in changed)}

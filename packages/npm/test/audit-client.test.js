@@ -142,3 +142,18 @@ for(const method of ['ackSubscriptionEvents','configureSubscriptionDelivery','te
       error.code==='transport_error' && !String(error).includes('private'));
     assert.equal(calls,1);
   });
+
+// spec: ANYM-343
+test('listFeedback forwards a status filter and rejects an unknown status before transport',async()=>{
+  const seen=[];
+  const client=new AnyMsgClient({...options,fetch:async(url,request)=>{
+    seen.push(JSON.parse(request.body));return Response.json({items:[{id:'synthetic',status:'verify_requested',
+      fixed_in:'deedkit@'+'b'.repeat(40),spec_ref:'ANYM-274',status_note:null,duplicate_of:null,
+      status_changed_at:'2026-10-21T00:00:00Z'}],has_more:false});
+  }});
+  const page=await client.listFeedback({limit:5,status:'verify_requested'});
+  assert.equal(page.items[0].status,'verify_requested');
+  for(const status of ['planned','',null,7,['fixed']])
+    assert.throws(()=>client.listFeedback({status}),TypeError);
+  assert.deepEqual(seen,[{limit:5,status:'verify_requested'}]);
+});

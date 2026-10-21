@@ -214,3 +214,19 @@ def test_python_audit_uncertain_mutations_never_retry(operation):
         with pytest.raises(AnyMsgError, match='request_failed'):
             getattr(client, operation)(**METHODS[operation])
     assert seen == ['/v1/' + operation]
+
+
+# spec: ANYM-343
+def test_python_list_feedback_forwards_status_filter_and_rejects_unknown_status():
+    seen = []
+    def transport(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={'items': [{'id': 'synthetic', 'status': 'verify_requested',
+            'fixed_in': 'deedkit@' + 'b' * 40, 'spec_ref': 'ANYM-274', 'status_note': None,
+            'duplicate_of': None, 'status_changed_at': '2026-10-21T00:00:00Z'}], 'has_more': False})
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(transport)) as client:
+        assert client.list_feedback(limit=5, status='verify_requested')['items'][0]['status'] == 'verify_requested'
+        for status in ('planned', '', 7, ['fixed']):
+            with pytest.raises(ValueError, match='invalid_parameters'):
+                client.list_feedback(status=status)
+    assert seen == [{'limit': 5, 'status': 'verify_requested'}]

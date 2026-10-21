@@ -139,9 +139,10 @@ _SUBSCRIPTION_FIELDS = {
     'configure_subscription_delivery': ({'subscription_id','version'}, {'subscription_id','version','receiver_id','delivery_policy'}),
     'test_subscription': ({'subscription_id','request_id'}, {'subscription_id','request_id'}),
 }
+_FEEDBACK_STATUSES = ('received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened')
 _FEEDBACK_FIELDS = {
     'submit_feedback': ({'request_id','category','description'}, {'request_id','category','description','operation','refs'}),
-    'list_feedback': (set(), {'limit'}),
+    'list_feedback': (set(), {'limit','status'}),
 }
 _SUBSCRIPTION_KINDS = frozenset({'message.created','message.edited','message.deleted','message.status',
     'attachment.ready','file.text.ready','file.transcript.ready','file.description.ready','file.processing.failed'})
@@ -218,6 +219,7 @@ def _feedback_parameters(operation, parameters):
     for name,value in parameters.items():
         if name=='request_id':valid=_request_id(value)
         elif name=='limit':valid=type(value) is int and 1<=value<=100
+        elif name=='status':valid=isinstance(value,str) and value in _FEEDBACK_STATUSES
         elif name=='category':valid=isinstance(value,str) and value in ('bug','feature','quality','other')
         elif name=='description':
             valid=isinstance(value,str) and 1<=len(value)<=4000 and bool(value.strip()) and not any(
@@ -570,6 +572,6 @@ class Client:
         return self.call('submit_feedback',dict(request_id=request_id,category=category,
             description=description,operation=operation,refs=refs))
 
-    def list_feedback(self, *, limit=50):
-        """Read only this credential's private feedback, without former source references."""
-        return self.call('list_feedback',{'limit':limit})
+    def list_feedback(self, *, limit=50, status=None):
+        """Read only this credential's private feedback and its status, without former source references."""
+        return self.call('list_feedback',{'limit':limit,**({} if status is None else {'status':status})})

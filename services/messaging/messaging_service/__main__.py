@@ -15,7 +15,7 @@ def main():
     parser.add_argument('command',choices=['serve','init','migrate','issue-key','revoke-key',
         'replay','snapshot','verify-restore','quarantine-restore','register-account',
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
-        'set-messenger-operations','extend-key'])
+        'set-messenger-operations','extend-key','set-feedback-status'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -45,6 +45,12 @@ def main():
     parser.add_argument('--exclude-chats',nargs='*',default=[])
     parser.add_argument('--discover-chats',action='store_true')
     parser.add_argument('--synthetic',action='store_true')
+    parser.add_argument('--id',nargs='+',dest='feedback_ids',help='set-feedback-status: 1-100 feedback UUIDs')
+    parser.add_argument('--status',help='set-feedback-status: received, accepted, declined, duplicate, fixed or verify_requested')
+    parser.add_argument('--fixed-in',help='set-feedback-status: deedkit@<40-hex SHA> or anymsg@<semver>')
+    parser.add_argument('--spec',help='set-feedback-status: ANYM-<n>')
+    parser.add_argument('--duplicate-of',help='set-feedback-status: a feedback UUID of the same key')
+    parser.add_argument('--note',help='set-feedback-status: at most 280 characters, no control characters')
     args=parser.parse_args()
     if args.command == 'serve':
         configure('gateway')
@@ -124,6 +130,11 @@ def main():
             if not args.key_id or args.key_file or args.days is None:
                 parser.error('extend-key requires --key-id and --days, never --key-file')
             print(json.dumps(store.extend_key(args.key_id,args.days)))
+        elif args.command=='set-feedback-status':
+            if not args.feedback_ids or not args.status:
+                parser.error('set-feedback-status requires --id and --status')
+            print(json.dumps(store.set_feedback_status(args.feedback_ids,args.status,fixed_in=args.fixed_in,
+                spec_ref=args.spec,duplicate_of=args.duplicate_of,note=args.note)))
         elif args.command=='set-access':
             if not args.principal:parser.error('set-access requires --principal')
             result=store.set_access(args.principal,accounts=args.accounts if args.accounts is not None else UNSET,

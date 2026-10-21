@@ -3,7 +3,7 @@
 Current delivery work and priority: [BACKLOG.md](BACKLOG.md), DK-08–DK-10.
 This document is the API and delivery contract.
 
-Status: since **schema 32** (current schema 38) DeedKit implements persistent structural subscriptions, passive
+Status: since **schema 32** (current schema 39) DeedKit implements persistent structural subscriptions, passive
 inspection, independent fetch/ACK, bounded long polling, native wake selectors,
 operator-registered signed hints and private feedback. Schema 38 adds hint timing:
 debounce or batch windows, quiet hours, expected-reply silence timers and a per-key
@@ -317,6 +317,32 @@ is valid but not found or not permitted stays `not_found`. Through the common ga
 the gateway's own schema check returns `invalid_arguments` with `field_errors`, and it relays the
 backend's `invalid_feedback` `field_errors` after rechecking the shape and vocabulary (a malformed list is
 dropped, never partly relayed).
+
+### Feedback status (schema 39)
+
+Each feedback item carries the maintainer's disposition, so an agent can see what happened to
+a report instead of filing it again. `list_feedback` returns per item `status`, `status_note`
+(at most 280 characters), `fixed_in`, `spec_ref` (`ANYM-<n>`, the card that removes the
+reported failure), `duplicate_of` (a feedback ID of the same key) and `status_changed_at`
+(database time). `list_feedback(status=...)` returns only items with that status; another
+value is rejected (`invalid_parameters`, or `invalid_feedback` from the backend, with
+`field_errors`). Ordering stays `created_at DESC, id DESC`; references stay omitted.
+
+| Status | Meaning |
+|---|---|
+| `received` | Default for every new and existing item: not triaged yet |
+| `accepted` | Planned: `spec_ref` names the card |
+| `declined` | Will not be done; `status_note` says why |
+| `duplicate` | Same report as `duplicate_of`, or already covered by `spec_ref` |
+| `fixed` | Merged to main: `fixed_in` = `deedkit@<40-hex merge SHA>`. Not yet live |
+| `verify_requested` | Deployed: `fixed_in` = the deployed `deedkit@<sha>`. Please re-check and report |
+| `verified`, `reopened` | Reserved for the reporting agent's verdict (ANYM-344); the operator cannot set them |
+
+Merged source is not live behavior, so `fixed` and `verify_requested` are separate steps. When
+one report needs several cards, the item names the primary card and stays `accepted` (with a
+note) until every card is merged (`fixed`) or deployed (`verify_requested`). Only the
+maintainer sets a status, with the operator command `set-feedback-status` (ACCESS.md); the
+agent-facing database role can insert only the submission fields and cannot update feedback.
 
 ## Schema 38: hint timing policy
 

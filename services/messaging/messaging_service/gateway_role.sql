@@ -58,7 +58,11 @@ GRANT UPDATE(state,finished_at,error_code) ON subscription_outbox TO messaging_g
 GRANT SELECT ON subscription_hint_windows TO messaging_gateway;
 GRANT UPDATE(subscription_version,due_at,silence_state,silence_fired_at,silence_due_at,
     silence_held_reason,updated_at) ON subscription_hint_windows TO messaging_gateway;
-GRANT SELECT,INSERT ON agent_feedback TO messaging_gateway;
+-- Schema 39: submission columns only; disposition fields are the operator's (ANYM-343).
+GRANT SELECT ON agent_feedback TO messaging_gateway;
+REVOKE INSERT,UPDATE ON agent_feedback FROM messaging_gateway;
+GRANT INSERT(principal,key_id,request_id,request_hash,category,description,operation,refs)
+    ON agent_feedback TO messaging_gateway;
 -- Managed originals and descriptions are separate from immutable receipts.
 GRANT SELECT ON attachment_residency,attachment_eviction_journal,
     attachment_understanding,file_understanding_profiles TO messaging_gateway;
