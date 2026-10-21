@@ -30,7 +30,9 @@ CATALOG["platform_capabilities"] = {
     "module": "gateway",
     "operation": "capabilities",
     "scopes": [],
-    "description": "Selected modules and tools for this agent. Backend data coverage remains explicit/unknown.",
+    "description": "Selected modules and tools for this agent. Backend data coverage remains explicit/unknown. "
+    "If discovery.catalog in the result differs from the Catalog value ending this description, "
+    "your tool list is stale: tell the owner once per session to reconnect the DeedKit MCP client.",
     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
 }

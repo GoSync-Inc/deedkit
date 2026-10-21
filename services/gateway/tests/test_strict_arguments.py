@@ -120,7 +120,12 @@ def test_dial_without_destination_source_names_the_field_over_both_transports(tm
     requests = []
     rest, mcp = post_both(calls_app(tmp_path, requests), "calls_dial_call", DIAL)
     expected = {"error": "invalid_arguments", "next_action": "check_parameters",
-                "field_errors": [{"field": "destination_source", "reason": "required"}]}
+                "field_errors": [{"field": "destination_source", "reason": "required"}],
+                "tool_fields": {  # ANYM-452: the current fields are added; a missing field alone is not "stale"
+                    "required": [{"name": "brief_id", "type": "string"},
+                                 {"name": "destination_source", "type": "string",
+                                  "values": ["owner_named", "agent_found"]}],
+                    "optional": ["owner_instruction", "authorization_reference", "destination_evidence"]}}
     assert rest.status_code == 422 and rest.json() == expected
     assert mcp["isError"] and mcp["structuredContent"] == expected
     assert "/v1/dial_call" not in requests

@@ -17,6 +17,12 @@ BACKEND_ERROR_CODES = frozenset({
 REQUEST_ID = re.compile(r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\Z")
 
 
+CATALOG_DIGITS = 12
+STALE_OWNER_HINT = "Your DeedKit tool list may be out of date; reconnect the DeedKit MCP client."
+MAX_FIELD_NAMES = 64
+MAX_FIELD_VALUES = 8
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -25,9 +31,12 @@ def digest(value):
 
 def discovery(visible, actions, revision):
     """Fingerprint the effective reviewed schemas, including narrowed action enums."""
+    tools_sha256 = digest([public(CATALOG[name], actions) for name in sorted(visible)])
     return {
         "tool_count": len(visible),
-        "tools_sha256": digest([public(CATALOG[name], actions) for name in sorted(visible)]),
+        "tools_sha256": tools_sha256,
+        # The digest is taken before the "Catalog:" sentence exists, so a host can compare it with its cached list.
+        "catalog": tools_sha256[:CATALOG_DIGITS],
         "policy_revision": revision,
         "notifications_supported": False,
         "next_action": NEXT_DISCOVERY_ACTION,
@@ -141,6 +150,75 @@ def reviewed_field_errors(operation, value):
             if any(not any(v == p and type(v) is type(p) for p in permitted) for v in entry["allowed"]):
                 return None
     return entries
+
+
+def _field_type(schema, node):
+    kind = _node(schema, node).get("type")
+    return kind if isinstance(kind, str) and kind else "any"
+
+
+def _field_values(schema, node):
+    values = _node(schema, node).get("enum")
+    if (isinstance(values, list) and 0 < len(values) <= MAX_FIELD_VALUES
+            and all(isinstance(v, (str, int)) and not isinstance(v, bool) and len(str(v)) <= 64 for v in values)):
+        return list(values)
+    return None
+
+
+def tool_fields(tool):
+    """The top-level fields of a tool's packaged input schema: required with type (and short enums), then optional names."""
+    schema = tool["inputSchema"]
+    properties = schema.get("properties", {})
+    required = [name for name in schema.get("required", []) if name in properties][:MAX_FIELD_NAMES]
+    names = [name for name in properties if name not in required][:MAX_FIELD_NAMES - len(required)]
+    fields = []
+    for name in required:
+        values = _field_values(schema, properties[name])
+        fields.append({"name": name, "type": _field_type(schema, properties[name]),
+                       **({"values": values} if values else {})})
+    return {"required": fields, "optional": names}
+
+
+def stale_arguments_hint(tool, detail):
+    """An `invalid_arguments` body plus the tool's current fields when it names a missing or unknown top-level field.
+
+    An unknown field also says the tool list is likely stale. Any failure while building the hint returns `detail`.
+    """
+    try:
+        properties = tool["inputSchema"].get("properties", {})
+        entries = detail["field_errors"]
+        unknown = any(e["reason"] == "unknown_field"
+                      and (e["field"] == "$" or "/" not in e["field"] and e["field"] not in properties)
+                      for e in entries)
+        missing = any(e["reason"] == "required" and "/" not in e["field"] for e in entries)
+        if not (unknown or missing):
+            return detail
+        hinted = {**detail, "tool_fields": tool_fields(tool)}
+        if unknown:
+            hinted.update(tool_list_stale="likely", owner_hint=STALE_OWNER_HINT)
+        return hinted
+    except Exception:  # noqa: BLE001 - a hint must never replace the original error
+        return detail
+
+
+def unknown_tool_denial():
+    """The admission denial of a tool this key cannot call, with the same once-only refresh hint for every cause."""
+    return {"error": "not_found_or_forbidden", "next_action": "refresh_tool_list_once",
+            "hint": "If the tool is still absent after a refresh, this key does not have it; do not ask again."}
+
+
+def catalog_note(found):
+    return " Catalog: " + found["catalog"]
+
+
+def with_catalog(tool, found):
+    """The `platform_capabilities` listing with the key's catalog value appended; any other tool, or a failure, is unchanged."""
+    if tool["name"] != "platform_capabilities":
+        return tool
+    try:
+        return {**tool, "description": tool["description"] + catalog_note(found)}
+    except Exception:  # noqa: BLE001 - the listing must stay valid without the hint
+        return tool
 
 
 def consumption_failure(status, value, header_request_id=None, operation=None):

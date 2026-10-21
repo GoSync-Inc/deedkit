@@ -6,7 +6,7 @@ from platform_contracts import Capability, safe_error
 from .adapters.calls import receipt_reference
 
 from .catalog import arguments, CATALOG, InvalidArguments
-from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, unavailable
+from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, stale_arguments_hint, unavailable, unknown_tool_denial
 from .policy import Denied, key_from_file
 
 CALENDAR_CONSTRAINTS = {
@@ -218,14 +218,21 @@ class Dispatch:
         return self.policy.authorize_agent(*self.authenticate(key), name)
 
     async def call(self, key, name, values):
-        snapshot, agent, tool = self.admit(key, name)
+        try:
+            snapshot, agent, tool = self.admit(key, name)
+        except Denied as error:
+            # One body for a nonexistent name, a tool outside the profile and one of an undeployed module.
+            if error.code == "not_found_or_forbidden" and error.status == 403:
+                error.detail = unknown_tool_denial()
+            raise
         try:
             args = arguments(tool, values)
         except InvalidArguments as error:
             denied = Denied("invalid_arguments", 422)
             if error.field_errors:
-                denied.detail = {"error": "invalid_arguments", "field_errors": error.field_errors,
-                                 "next_action": "check_parameters"}
+                denied.detail = stale_arguments_hint(tool, {
+                    "error": "invalid_arguments", "field_errors": error.field_errors,
+                    "next_action": "check_parameters"})
             raise denied from None
         except ValueError:
             raise Denied("invalid_arguments", 422) from None
