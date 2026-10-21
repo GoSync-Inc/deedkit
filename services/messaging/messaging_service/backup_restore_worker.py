@@ -59,7 +59,7 @@ def assert_quarantined(store, version):
         predicates['subscription_outbox'] = "state IN ('pending','leased') OR lease_token IS NOT NULL OR lease_until IS NOT NULL"
         predicates['subscription_receipts'] = 'true'
     if version >= 33:predicates['attachment_backup_fences'] = 'ended_at IS NULL'
-    if version >= 37:
+    if version >= 38:
         predicates['subscription_hint_windows'] = ("due_at IS NOT NULL OR silence_due_at IS NOT NULL OR "
             "silence_state IS DISTINCT FROM 'cancelled'")
     with store.pool.connection() as connection:

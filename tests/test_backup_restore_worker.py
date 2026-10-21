@@ -80,6 +80,23 @@ def test_quarantine_assertion_uses_actual_text_array_policy_type():
     assert any('attachment_backup_fences' in q for q in queries)
 
 
+# spec: ANYM-252
+@pytest.mark.parametrize('version,checked',[(37,False),(38,True)])
+def test_quarantine_checks_hint_windows_only_from_the_schema_that_creates_them(version,checked):
+    from messaging_service import backup_restore_worker as worker
+    queries=[]
+    class Connection:
+        def execute(self,query):
+            queries.append(query)
+            return SimpleNamespace(fetchone=lambda:{'name':worker.DATABASE} if 'current_database' in query else None)
+    class Lease:
+        def __enter__(self):return Connection()
+        def __exit__(self,*args):pass
+    worker.assert_quarantined(SimpleNamespace(pool=SimpleNamespace(connection=Lease)),version)
+    assert any('subscription_hint_windows' in q for q in queries) is checked
+    assert any('attachment_backup_fences' in q for q in queries)
+
+
 @pytest.mark.parametrize('unsafe_table',['account_policies','api_keys','collector_leases','source_status','outgoing_messages',
  'messenger_commands','subscriptions','file_uploads','subscription_receivers','subscription_outbox','subscription_receipts','attachment_backup_fences'])
 def test_each_unsafe_restored_authority_prevents_quarantine_acceptance(unsafe_table):
