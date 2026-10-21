@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -15,7 +16,7 @@ from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 import pytest
 
-from messaging_service import subscription_worker
+from messaging_service import subscription_worker, subscriptions
 from messaging_service.backup import create_snapshot, database_manifest, quarantine_restore, verify_bundle, verify_snapshot
 from messaging_service.store import Store
 from messaging_service.subscriptions import match_subscriptions, prune_subscriptions
@@ -447,6 +448,127 @@ def test_closed_or_expired_subscription_keeps_its_acked_references(seeded, state
     with store.pool.connection() as c:
         c.execute('UPDATE subscriptions SET state=%s WHERE id=%s', (state, sid))
     assert prune_subscriptions(store)['pruned'] == 0 and refs(store, sid) == events and floor(store, sid) == 0
+
+
+# spec: ANYM-446
+@pytest.mark.parametrize('state', ['active', 'paused'])
+def test_subscription_past_its_deadline_keeps_its_acked_references_before_the_matcher_marks_it(seeded, state):
+    store, _, _ = seeded
+    token, sid, events = acked_subscription(store, name='retention-deadline-reader')
+    ack(store, token, sid)
+    age(store, sid, events, '30 days')
+    # The stored state lags the deadline until the matcher refreshes it, and pruning runs first.
+    for deadline in ('-1 second', '30 seconds'):
+        with store.pool.connection() as c:
+            c.execute('UPDATE subscriptions SET state=%s,expires_at=clock_timestamp()+%s::interval WHERE id=%s',
+                (state, deadline, sid))
+        assert prune_subscriptions(store)['pruned'] == 0 and refs(store, sid) == events and floor(store, sid) == 0
+    with store.pool.connection() as c:
+        c.execute("UPDATE subscriptions SET expires_at=clock_timestamp()+interval '1 day' WHERE id=%s", (sid,))
+    assert prune_subscriptions(store)['pruned'] == 3 and floor(store, sid) == events[-1]
+
+
+# spec: ANYM-446
+def test_deadline_crossed_after_selection_is_rechecked_under_the_row_lock(seeded, monkeypatch):
+    store, _, _ = seeded
+    token, sid, events = acked_subscription(store, name='retention-deadline-race-reader')
+    ack(store, token, sid)
+    age(store, sid, events, '30 days')
+    batch = subscriptions._prune_batch
+
+    def lapse_then_prune(c, candidate, days):
+        with store.pool.connection() as other:
+            other.execute("UPDATE subscriptions SET expires_at=clock_timestamp()-interval '1 second' WHERE id=%s", (sid,))
+        return batch(c, candidate, days)
+
+    monkeypatch.setattr(subscriptions, '_prune_batch', lapse_then_prune)
+    stats = prune_subscriptions(store)
+    assert stats['pruned'] == 0 and stats['retention_skipped'] == 1 and stats['retention_failed'] == 0
+    assert refs(store, sid) == events and floor(store, sid) == 0
+
+
+# spec: ANYM-446
+def test_deadline_crossed_while_the_worker_stalls_after_the_locked_check_rolls_the_batch_back(seeded, monkeypatch, capsys):
+    store, _, _ = seeded
+    token, sid, events = acked_subscription(store, name='retention-deadline-stall-reader')
+    ack(store, token, sid)
+    age(store, sid, events, '30 days')
+    # Scaled down: the deadline is outside the margin at the locked read and passes during the stall.
+    monkeypatch.setattr(subscriptions, 'RETENTION_EXPIRY_MARGIN', '2 seconds')
+    monkeypatch.setattr(subscriptions, 'RETENTION_TRANSACTION_TIMEOUT', '1s', raising=False)
+    with store.pool.connection() as c:
+        c.execute("UPDATE subscriptions SET expires_at=clock_timestamp()+interval '3 seconds' WHERE id=%s", (sid,))
+    batch = subscriptions._prune_batch
+
+    class Stalling:
+        def __init__(self, c):
+            self.c = c
+
+        def execute(self, query, *args):
+            result = self.c.execute(query, *args)
+            if 'FOR UPDATE SKIP LOCKED' in query:
+                # The batch acts on this decision after the pause; the client is idle, no statement runs.
+                row = result.fetchone()
+                assert row['lapsed'] is False
+                threading.Event().wait(3.5)
+                return SimpleNamespace(fetchone=lambda: row)
+            return result
+
+    monkeypatch.setattr(subscriptions, '_prune_batch', lambda c, candidate, days: batch(Stalling(c), candidate, days))
+    stats = prune_subscriptions(store)
+    assert stats['pruned'] == 0 and stats['retention_failed'] == 1
+    assert 'TransactionTimeout' in capsys.readouterr().out
+    assert refs(store, sid) == events and floor(store, sid) == 0
+    # Matching continues on a fresh connection and stores the expiry.
+    match_subscriptions(store)
+    assert store.get_subscription(token, sid)['state'] == 'expired'
+
+
+# spec: ANYM-446
+def test_disable_after_candidate_selection_stops_every_later_batch(seeded, monkeypatch):
+    store, _, _ = seeded
+    token, sid, events = acked_subscription(store, name='retention-disable-reader')
+    ack(store, token, sid)
+    age(store, sid, events, '30 days')
+    batch = subscriptions._prune_batch
+
+    def disable_then_prune(c, candidate, days):
+        assert store.set_subscription_retention(False) == {'subscription_retention': 'disabled'}
+        return batch(c, candidate, days)
+
+    monkeypatch.setattr(subscriptions, '_prune_batch', disable_then_prune)
+    stats = prune_subscriptions(store)
+    assert stats['pruned'] == 0 and stats['retention_failed'] == 0
+    assert refs(store, sid) == events and floor(store, sid) == 0
+
+
+# spec: ANYM-446
+def test_disable_waits_for_an_in_flight_batch_and_returns_after_its_commit(seeded):
+    store, _, _ = seeded
+    token, sid, events = acked_subscription(store, name='retention-inflight-reader')
+    ack(store, token, sid)
+    age(store, sid, events, '30 days')
+    with store.pool.connection() as c:
+        candidate = c.execute('SELECT id,principal FROM subscriptions WHERE id=%s', (sid,)).fetchone()
+    disabled = []
+    waiter = threading.Thread(target=lambda: disabled.append(store.set_subscription_retention(False)))
+    with store.pool.connection() as c:
+        assert subscriptions._prune_batch(c, candidate, 7) == 3
+        waiter.start()
+        waiter.join(1)
+        # The batch read the switch under its lock: the operator's disable cannot return before it commits.
+        assert waiter.is_alive() and not disabled
+    waiter.join(10)
+    assert disabled == [{'subscription_retention': 'disabled'}]
+    assert refs(store, sid) == [] and floor(store, sid) == events[-1]
+    # After disable returned, a batch for an already-selected candidate deletes nothing.
+    later = [emit(store) for _ in range(2)]
+    match_subscriptions(store)
+    ack(store, token, sid)
+    age(store, sid, later, '30 days')
+    with store.pool.connection() as c:
+        assert subscriptions._prune_batch(c, candidate, 7) is None
+    assert refs(store, sid) == later and floor(store, sid) == events[-1]
 
 
 # spec: ANYM-446

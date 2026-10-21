@@ -514,14 +514,16 @@ deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS
 - **Mechanics:** before each matching pass the subscription worker prunes at most 16
   subscriptions, one transaction of at most 500 references each, oldest first. A batch
   takes the shared principal lock and the subscription row with `SKIP LOCKED` (the
-  matcher's order; ACK and fetch hold the same row), runs with `lock_timeout` 100 ms
-  and `statement_timeout` 1 s, deletes a contiguous prefix above the floor and moves
+  matcher's order; ACK and fetch hold the same row), runs with `lock_timeout` 100 ms,
+  `statement_timeout` 1 s and `transaction_timeout` 4 s (client pauses included), deletes a contiguous prefix above the floor and moves
   the floor in the same transaction. A failed batch rolls back alone and is logged as
   `subscription_retention_failed` with its error class only; matching and hints
   continue (also in opt-in telemetry, code only). `--once` diagnostics never prune.
 - **Closed and expired definitions** keep their references: they match nothing new, so
   their budget does not matter, and every quarantine closes all definitions. Deleting
-  them is the sibling story's.
+  them is the sibling story's. A definition whose `expires_at` has passed, or is less than
+  a minute away, counts as expired before the matcher stores the state: selection and
+  the batch (under the row lock) both skip it.
 - **Quarantine hold:** quarantine restore sets `retention_hold` on every definition it
   closes. Held subscriptions are skipped by every pruning path; the hold is a table
   column, so backups carry it. Restored matches and consumption stay exactly as
@@ -536,7 +538,10 @@ deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS
 - **Activation:** nothing is pruned until the operator enables retention, after every
   serving messaging API runs a floor-aware reader (one that returns `retention_gap`):
   `python -m messaging_service set-subscription-retention --enable` (or `--disable`;
-  stored as `probe_metadata` `subscription_retention`, refused below schema 40). An
+  stored as `probe_metadata` `subscription_retention`, refused below schema 40). Each batch rereads the activation under a
+  shared advisory lock that the switch takes exclusively, so `--disable` waits for
+  in-flight batches and, once it returns, no batch deletes or moves a floor; floors
+  already moved stay. An
   older reader would silently skip the pruned prefix for a passive `after` below the
   floor.
 - **Roles:** the worker role gains `SELECT` on `probe_metadata` and `subscription_consumption`,

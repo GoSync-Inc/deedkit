@@ -875,7 +875,10 @@ class Store:
 
     def set_subscription_retention(self, enabled):
         # Operator CLI only (ANYM-446): enable after every serving reader reports retention_gap.
+        from .subscriptions import lock_retention
         with self.pool.connection() as c:
+            # Waits for in-flight pruning batches; every later batch reads this value.
+            lock_retention(c, shared=False)
             version = int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version < 40:
                 raise RuntimeError('subscription_retention_needs_schema_40')
