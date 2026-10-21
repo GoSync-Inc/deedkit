@@ -974,7 +974,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
     @mcp.tool(structured_output=True,annotations=read)
     def list_feedback(ctx: Context,limit: SubscriptionLimit=50,status: FeedbackStatus | None=None) -> dict[str,Any]:
         """List this exact credential's private feedback with its maintainer status (fixed = merged, verify_requested = deployed: re-check), without former source references."""
-        return call(ctx,'list_feedback',limit=limit,status=status)
+        return call(ctx,'list_feedback',limit=limit,**({} if status is None else {'status':status}))
 
     async def rest(request):
         operations={'capabilities','list_chats','search','get_messages','get_context',
@@ -996,6 +996,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
             params=validate_arguments(models,method,params)
             # An omitted delivery policy keeps the schema-37 payload (same rule as the MCP tool).
             if method=='configure_subscription_delivery' and params.get('delivery_policy') is None: params.pop('delivery_policy',None)
+            # An omitted status filter keeps the schema-38 payload (same rule as the MCP tool).
+            if method=='list_feedback' and params.get('status') is None: params.pop('status',None)
             arguments,detail=options(method,params)
             result=render(method,await invoke(method,bearer(request.headers),arguments),detail)
         except (json.JSONDecodeError, TypeError): raise APIError('invalid_parameters') from None
