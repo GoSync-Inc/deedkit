@@ -1886,14 +1886,21 @@ def self_test_error(script, configs, sha):
     return (lines[-1] if lines else f"exit {result.returncode} without the ok line for {sha}")[:300]
 
 
-def retain_tools(current, previous):
-    """After an update: the release it replaced and the one installed before that stay, older ones are removed."""
-    releases, older = TOOL_ROOT / "releases", []
+def accepted_tools(update, current):
+    """The accepted tools from the last tool-update.json, `current` first, then the ones it replaced. A release is
+    accepted by its `active` record, never by its install time: a reverted or abandoned candidate is none."""
+    history = [*([update["to"]] if update and update["status"] == "active" else []), *(update or {}).get("accepted", [])]
+    return history if history[:1] == [current] else [current]
+
+
+def retain_tools(keep):
+    """After an update: the releases in `keep` (the new tool, the one it replaced and the one before that) stay, other
+    checked releases are removed."""
+    releases, removed = TOOL_ROOT / "releases", []
     for name in sorted(os.listdir(releases)):
-        if RELEASE_DIRECTORY.fullmatch(name) and name not in (current, previous):
+        if RELEASE_DIRECTORY.fullmatch(name) and name not in keep:
             with suppress(Refused):  # a directory that is no checked release is not this tool's to remove
-                older.append((tool_release(name)["installed_at"], name))
-    removed = [name for _, name in sorted(older, reverse=True)[1:]]
+                removed.append(tool_release(name)["sha"])
     for name in removed:
         shutil.rmtree(releases / name)
     return removed
@@ -1907,7 +1914,9 @@ def tool_update_receipt(state):
     try:
         update = read(path)
         if (update.get("status") not in TOOL_STATUSES or not RELEASE_DIRECTORY.fullmatch(str(update.get("from")))
-                or not RELEASE_DIRECTORY.fullmatch(str(update.get("to")))):
+                or not RELEASE_DIRECTORY.fullmatch(str(update.get("to")))
+                or not isinstance(accepted := update.get("accepted", []), list)
+                or not all(RELEASE_DIRECTORY.fullmatch(str(sha)) for sha in accepted)):
             raise ValueError("tool update receipt")
     except (OSError, ValueError, AttributeError) as exc:
         raise Refused(f"the tool update receipt {path} is malformed; inspect it") from exc
@@ -1960,7 +1969,7 @@ def update_tool(settings, configs, s, mirror, candidate, base, tool, *, dry_run,
                     "one", sha=candidate)
     if dry_run:
         return {"status": "plan", "sha": candidate, "base": base, "steps": [f"would update tool {candidate}"]}
-    target, staged = TOOL_ROOT / "releases" / candidate, None
+    target, staged, history = TOOL_ROOT / "releases" / candidate, None, accepted_tools(last, old)
     try:
         for leftover in (TOOL_ROOT / "releases").glob("*.staging-*"):
             shutil.rmtree(leftover)  # an interrupted update's; rmtree never follows a symlink
@@ -1971,6 +1980,9 @@ def update_tool(settings, configs, s, mirror, candidate, base, tool, *, dry_run,
                     raise Refused("its blob ids are not the candidate's")
             except Refused as exc:
                 return halt(f"{target} exists but is not the candidate's tool: {exc}; inspect it", sha=candidate)
+            # Its bytecode cache is not covered by the blob ids, and `-B` still reads it: the source runs instead.
+            if (target / "__pycache__").exists():
+                shutil.rmtree(target / "__pycache__")
             script = target / "production.py"
         else:
             staged = stage_tool(candidate, files, blobs)
@@ -1983,7 +1995,7 @@ def update_tool(settings, configs, s, mirror, candidate, base, tool, *, dry_run,
         if staged:
             staged.rename(target)
             fsync_directory(TOOL_ROOT / "releases")
-        update = {"from": old, "to": candidate, "at": now(), "status": "activating"}
+        update = {"from": old, "to": candidate, "at": now(), "status": "activating", "accepted": history[:2]}
         s.durable_write(receipt, update)
         point_current(candidate)
         if error := self_test_error(TOOL_ROOT / "production.py", configs, candidate):
@@ -1997,7 +2009,7 @@ def update_tool(settings, configs, s, mirror, candidate, base, tool, *, dry_run,
         return halt(f"the tool update {old} -> {candidate} stopped: {message}; inspect {TOOL_ROOT} and {receipt}",
                     sha=candidate)
     try:
-        removed = retain_tools(candidate, old)
+        removed = retain_tools([candidate, *history[:2]])
     except Exception as exc:
         removed = "not finished: " + (str(exc) if isinstance(exc, Refused) else type(exc).__name__)
     outcome = {"status": "tool-updated", "sha": candidate, "base": base, "finished_at": now(),
@@ -2070,6 +2082,18 @@ def configuration_drift(settings, http, current, serving):
     return None
 
 
+def stale_tool(s):
+    """Why this run is not the tool `current` names on a host with a checked self-updating layout, or None. A refused
+    or missing layout is left to the range check, which pauses for it when the tool changes."""
+    try:
+        tool = installed_tool()
+    except Refused:
+        return None
+    if tool and [blob(RUNNING), blob(s.__file__)] != [tool["blobs"][path] for path in TOOL_FILES]:
+        return f"this run is not the tool {TOOL_ROOT / 'current'} names ({tool['sha']})"
+    return None
+
+
 @contextmanager
 def host_locks(settings, http, s):
     """The global, HTTP and plan A locks `deploy` holds for its whole run."""
@@ -2102,6 +2126,11 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=
         except Exception as exc:
             return halt("deploy could not take the host locks: " + (str(exc) if isinstance(exc, Refused)
                                                                      else type(exc).__name__))
+        # tool-rollback or another run may have paused or switched the tool while this run waited for the locks.
+        if PAUSE.exists():
+            return {"status": "paused", "reason": PAUSE.read_text()[:1000].strip()}
+        if stale := stale_tool(s):
+            return {"status": "error", "reason": stale + "; nothing changed, the next run uses it"}
         # A candidate is taken only when every image plan A or plan B pulls is attested, so publication that is still
         # running or failed for one target never starts a release that stops halfway.
         targets = sorted(set(published_targets(settings)) | set(published_targets(http)) | {PROOF_TARGET})

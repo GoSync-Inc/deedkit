@@ -2,8 +2,10 @@
 import contextlib
 import copy
 import hashlib
+import importlib.util
 import json
 import os
+import py_compile
 from pathlib import Path
 import re
 import stat
@@ -4078,7 +4080,7 @@ class ToolHost(Deployer):
 
     def __init__(self, tmp_path, monkeypatch, *, changes=None, tool_sha=BASE, candidate=NEWEST, **options):
         super().__init__(tmp_path, monkeypatch, changes=changes or {NEWER: ["scripts/production.py"]}, **options)
-        self.monkeypatch, self.candidate = monkeypatch, candidate
+        self.monkeypatch, self.candidate, self.p = monkeypatch, candidate, p
         self.verifier = fake_verifier(tmp_path, monkeypatch)
         self.tool = tmp_path / "tool"
         self.tool.mkdir(mode=0o755)
@@ -4130,12 +4132,23 @@ class ToolHost(Deployer):
         return super().run(argv, **kwargs)
 
     def deploy(self, **options):
-        return p.deploy(self.settings, self.http, attested=self.attested, configs=self.configs, **options)
+        return self.p.deploy(self.settings, self.http, attested=self.attested, configs=self.configs, **options)
 
     def restart(self):
-        """The next timer run: the tool `current` names runs."""
-        self.monkeypatch.setattr(p, "RUNNING", (self.tool / "current" / "production.py").resolve())
-        self.monkeypatch.setattr(self.s, "__file__", str((self.tool / "current" / "seamless_release.py").resolve()))
+        """The next timer run: the production.py `current` names is loaded anew and runs, with the harness's patches
+        (not the module's own functions) and exception classes carried over."""
+        script = (self.tool / "current" / "production.py").resolve()
+        spec = importlib.util.spec_from_file_location(f"installed_tool_{script.parent.name}", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for name, value in vars(p).items():
+            if isinstance(value, type) and issubclass(value, BaseException) and value.__module__ == p.__name__:
+                setattr(module, name, value)
+        for target, name, _ in self.monkeypatch._setattr:
+            if target is p and getattr(getattr(p, name), "__module__", None) != p.__name__:
+                setattr(module, name, getattr(p, name))
+        self.monkeypatch.setattr(self.s, "__file__", str(script.parent / "seamless_release.py"))
+        self.p = module
 
     def current_tool(self):
         return os.readlink(self.tool / "current")
@@ -4274,17 +4287,11 @@ def test_the_layout_check_refuses_anything_but_the_documented_layout(tmp_path, m
 
 
 # spec: ANYM-443
-@pytest.mark.parametrize("case", [case for case in LAYOUT_CASES if case != "another owner"] + ["no layout",
-                                                                                              "another running tool"])
+@pytest.mark.parametrize("case", [case for case in LAYOUT_CASES if case != "another owner"] + ["no layout"])
 def test_a_refused_or_missing_layout_or_another_running_tool_keeps_the_hand_install_pause(tmp_path, monkeypatch, case):
     host = ToolHost(tmp_path, monkeypatch)
     if case == "no layout":
         monkeypatch.setattr(p, "TOOL_ROOT", tmp_path / "absent")
-    elif case == "another running tool":
-        copy_ = tmp_path / "copy" / "production.py"
-        copy_.parent.mkdir()
-        copy_.write_bytes(TOOL["scripts/production.py"] + b"# an operator's copy\n")
-        monkeypatch.setattr(p, "RUNNING", copy_)
     else:
         break_layout(host, case)
     before = tree(host.tool)
@@ -4465,13 +4472,78 @@ def test_tool_rollback_restores_the_previous_pair_pauses_and_the_rolled_back_pai
 # spec: ANYM-443
 def test_after_an_update_exactly_two_previous_releases_are_kept(tmp_path, monkeypatch):
     host = ToolHost(tmp_path, monkeypatch)
-    older = {"3" * 40: "2026-10-18T00:00:00Z", "4" * 40: "2026-10-19T00:00:00Z", "5" * 40: "2026-10-17T00:00:00Z"}
+    older = {"3" * 40: "2026-10-19T12:00:00Z", "4" * 40: "2026-10-19T00:00:00Z", "5" * 40: "2026-10-17T00:00:00Z"}
     for sha, installed_at in older.items():
         install_release(host.tool, sha, TOOL, installed_at)
     (host.tool / "releases" / ("6" * 40)).mkdir()  # no tool.json: not identified as a release, kept
+    # BASE replaced "4" * 40; the activation history, not the install time, names the release before the previous one.
+    p.write(host.state / "tool-update.json", {"from": "4" * 40, "to": BASE, "at": "2026-10-20T01:00:00Z",
+                                              "status": "active", "accepted": ["4" * 40, "5" * 40]})
     outcome = host.deploy()
     assert outcome["status"] == "tool-updated" and sorted(outcome["tool_update"]["removed"]) == ["3" * 40, "5" * 40]
     assert sorted(path.name for path in (host.tool / "releases").iterdir()) == [BASE, NEWEST, "4" * 40, "6" * 40]
+
+
+# spec: ANYM-443
+def test_retention_keeps_the_accepted_releases_and_not_a_newer_reverted_candidate(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    before, reverted = "4" * 40, "3" * 40
+    install_release(host.tool, before, TOOL, "2026-10-19T00:00:00Z")
+    install_release(host.tool, reverted, TOOL, "2026-10-20T02:00:00Z")  # staged after BASE, reverted after its switch
+    p.write(host.state / "tool-update.json", {"from": BASE, "to": reverted, "at": "2026-10-20T02:00:00Z",
+                                              "status": "reverted", "reason": "synthetic", "accepted": [BASE, before]})
+    outcome = host.deploy()
+    assert outcome["status"] == "tool-updated" and outcome["tool_update"]["removed"] == [reverted]
+    assert sorted(path.name for path in (host.tool / "releases").iterdir()) == sorted([BASE, NEWEST, before])
+    assert host.receipt()["status"] == "active" and host.receipt()["accepted"] == [BASE, before]
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("pause", ["kept", "removed"])
+def test_a_run_waiting_for_the_locks_while_the_tool_is_rolled_back_deploys_nothing(tmp_path, monkeypatch, pause):
+    host = ToolHost(tmp_path, monkeypatch)
+    assert host.deploy()["status"] == "tool-updated"
+    host.restart()
+    take = host.p.host_locks
+    def rolled_back_first(settings, http, s):
+        # tool-rollback runs between this run's pause check and its locks.
+        assert p.tool_rollback(settings, http, s)["status"] == "tool-rolled-back"
+        if pause == "removed":
+            p.PAUSE.unlink()
+        return take(settings, http, s)
+    monkeypatch.setattr(host.p, "host_locks", rolled_back_first)
+    outcome = host.deploy()
+    assert outcome["status"] == ("paused" if pause == "kept" else "error")
+    assert pause == "kept" or f"this run is not the tool {host.tool / 'current'} names ({BASE})" in outcome["reason"]
+    assert host.steps == [] and host.current_tool() == f"releases/{BASE}"
+
+
+# spec: ANYM-443
+def test_a_reused_release_runs_its_verified_source_and_not_a_stale_bytecode_cache(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    install_release(host.tool, NEWEST, host.files)  # an interrupted update left the candidate's release
+    stub = tmp_path / "stub" / "seamless_release.py"
+    stub.parent.mkdir()
+    stub.write_text("def validate_settings(settings):\n    raise SystemExit('the stale cache ran')\n")
+    cache = host.tool / "releases" / NEWEST / "__pycache__"
+    cache.mkdir(mode=0o755)
+    compiled = cache / f"seamless_release.{sys.implementation.cache_tag}.pyc"
+    py_compile.compile(str(stub), cfile=str(compiled), doraise=True,
+                       invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+    compiled.chmod(0o644)
+    outcome = host.deploy()
+    assert outcome["status"] == "tool-updated" and not cache.exists()
+    assert host.current_tool() == f"releases/{NEWEST}" and host.receipt()["status"] == "active"
+
+
+# spec: ANYM-443
+def test_the_run_after_an_update_executes_the_installed_candidates_code(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    host.serve(candidate_tool(host.verifier, inject=b"def deploy(*args, **kwargs):\n"
+                                                    b"    return {'status': 'the candidate ran'}\n"))
+    assert host.deploy()["status"] == "tool-updated"
+    host.restart()
+    assert host.deploy() == {"status": "the candidate ran"}
 
 
 # spec: ANYM-443

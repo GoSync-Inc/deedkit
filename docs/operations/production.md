@@ -840,17 +840,26 @@ pauses as above without installing. `--dry-run` reports `would update tool
    ...}`; any other exit or output removes the staging directory and pauses
    with its last error line.
 3. Rename it to `releases/<sha>` (an existing one from an interrupted run is
-   reused only when its `tool.json` and blob ids are the candidate's), write
-   `<plan A state>/tool-update.json` `{from, to, at, status: "activating"}`
-   (fsynced), switch `current` with one `rename(2)`, and run the same self-test
+   reused only when its `tool.json` and blob ids are the candidate's, and its
+   `__pycache__` is removed before its self-test: `-B` still reads bytecode the
+   blob ids do not cover), write `<plan A state>/tool-update.json` `{from, to,
+   at, status: "activating", accepted}` (fsynced; `accepted` lists `from` and
+   the tool it replaced), switch `current` with one `rename(2)`, and run the same self-test
    through `/usr/local/lib/deedkit/production.py`. A pass records `active`; a
    failure switches `current` back to `from`, records `reverted` and pauses.
 4. End the run `tool-updated` (exit 0; `deploy.json` keeps `sha`, `base` and
    adds `tool_update`, no `started_at`), so the next timer run, about 5 minutes
-   later, deploys with the new tool. The replaced release and the one installed
-   before it stay; older checked releases are removed.
+   later, deploys with the new tool. The replaced release and the one it
+   replaced stay, as `tool-update.json` records them (an `active` record, never
+   an install time: a reverted or abandoned candidate counts as none); other
+   checked releases are removed.
 
-Every `deploy` starts by settling a `tool-update.json` left `activating`:
+Once it holds its locks, `deploy` checks the pause file again and, on a host
+with a checked layout, that it runs the pair `current` names; a run that
+waited while `tool-rollback` or another run switched the tool ends `paused`,
+or `error` ("this run is not the tool ... names"; nothing changed, the next
+run uses it). Every `deploy` then starts by settling a `tool-update.json` left
+`activating`:
 `current` at `to` runs the self-test (pass: `active`; fail: back to `from` and
 a pause), `current` at `from` closes it `not-activated`, anything else pauses
 and names the previous tool, `python3 /usr/local/lib/deedkit/releases/<from>/production.py`.
