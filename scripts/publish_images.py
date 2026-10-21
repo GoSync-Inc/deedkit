@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import production  # noqa: E402
@@ -23,6 +24,12 @@ WORKFLOW = production.REPOSITORY + "/.github/workflows/ci.yml"
 SOURCE = "https://github.com/" + production.REPOSITORY
 ABSENT = ("manifest unknown", "name unknown", "not found")
 MANIFESTS = {"application/vnd.docker.distribution.manifest.v2+json", "application/vnd.oci.image.manifest.v1+json"}
+# A network or API failure that says nothing about the image: a read retries it ATTEMPTS times, waiting BACKOFF,
+# 2*BACKOFF, ... seconds in between. Anything else (404, "no attestations found", a policy mismatch) is final.
+TRANSIENT = re.compile(r"HTTP(?: status:)? (?:429|5\d\d)|rate limit|Bad Gateway|Service Unavailable|Gateway Time-?out"
+                       r"|Too Many Requests|\bEOF\b|connection (?:reset|refused)|broken pipe|timeout|timed out"
+                       r"|TLS handshake|no such host|temporary failure|Sigstore verifier", re.IGNORECASE)
+ATTEMPTS, BACKOFF = 4, 5
 
 
 class Refused(RuntimeError):
@@ -36,6 +43,21 @@ def run(argv, *, check=True):
         raise Refused(f"{argv[0]} {argv[1]} did not finish within 30 minutes") from exc
     if check and result.returncode:
         raise Refused(f"{argv[0]} {argv[1]} failed (exit {result.returncode}): {result.stderr.strip()[-400:]}")
+    return result
+
+
+def transient(result):
+    return bool(result.returncode and TRANSIENT.search(result.stderr or ""))
+
+
+def read(argv):
+    """A read-only command, retried with backoff while it fails transiently; returns the last result."""
+    result = run(argv, check=False)
+    for attempt in range(ATTEMPTS - 1):
+        if not transient(result):
+            break
+        time.sleep(BACKOFF * 2 ** attempt)
+        result = run(argv, check=False)
     return result
 
 
@@ -91,7 +113,7 @@ class Registry:
 
     def manifest(self, reference):
         """The raw manifest and its digest, or None when the tag does not exist."""
-        result = run(["skopeo", "inspect", *self.tls, "--raw", "docker://" + reference], check=False)
+        result = read(["skopeo", "inspect", *self.tls, "--raw", "docker://" + reference])
         if result.returncode:
             if any(marker in result.stderr.lower() for marker in ABSENT):
                 return None
@@ -103,7 +125,10 @@ class Registry:
         return "sha256:" + hashlib.sha256(raw).hexdigest(), manifest
 
     def config(self, reference, manifest):
-        raw = run(["skopeo", "inspect", *self.tls, "--config", "--raw", "docker://" + reference]).stdout.encode()
+        result = read(["skopeo", "inspect", *self.tls, "--config", "--raw", "docker://" + reference])
+        if result.returncode:
+            raise Refused(f"cannot read the config of {reference}: {result.stderr.strip()[-400:]}")
+        raw = result.stdout.encode()
         if "sha256:" + hashlib.sha256(raw).hexdigest() != manifest["config"]["digest"]:
             raise Refused(f"config of {reference} does not match its manifest")
         return json.loads(raw)
@@ -118,15 +143,19 @@ def attested(name, digest, sha):
 
     "complete" when GitHub's attestation API and the registry (the bundle `push-to-registry`
     attaches) both verify, "github" when only the API does (the attachment was interrupted),
-    "none" otherwise.
+    "none" otherwise. A network or API failure is retried and, if it persists, refuses: it never reads as "none".
     """
     flags = ["--repo", production.REPOSITORY, "--signer-workflow", WORKFLOW, "--source-ref", "refs/heads/main",
              "--source-digest", sha, "--deny-self-hosted-runners", "--format", "json"]
     subject = f"oci://{name}@{digest}"
-    if run(["gh", "attestation", "verify", subject, *flags], check=False).returncode:
-        return "none"
-    if run(["gh", "attestation", "verify", subject, "--bundle-from-oci", *flags], check=False).returncode:
-        return "github"
+    for where, extra, missing in (("GitHub", [], "none"), ("the registry", ["--bundle-from-oci"], "github")):
+        result = read(["gh", "attestation", "verify", subject, *extra, *flags])
+        stderr = (result.stderr or "").strip()[-400:]
+        if transient(result):
+            raise Refused(f"the attestation of {subject} in {where} could not be verified: {stderr}")
+        if result.returncode:
+            print(f"{subject}: no valid attestation in {where}: {stderr}", file=sys.stderr)
+            return missing
     return "complete"
 
 
