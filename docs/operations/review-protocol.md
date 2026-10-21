@@ -18,6 +18,8 @@ history.
   edit or settle text on the PR's `Tiden branch:` goes in as previous and proposed text.
 - `specs.md`: the full text of the specs the PR delivers, flags in `Spec impact:` or changes; IDs
   and titles for the other specs it names or touches.
+  `scripts/spec_impact.py --body-file <body>` lists them with a mark and a flag suggestion; both only help the
+  author choose. An unflagged `named (Spec)` line whose criteria the PR changed still gets its full text.
 - `pr.md`: the pull request description.
 - `context.md`: the `product-context` answers the author read at the start, saved then and
   attached unchanged, so the reviewer sees the criteria of the specs around the change, including
