@@ -31,6 +31,7 @@ import json
 from pathlib import Path
 import posixpath
 import re
+import resource
 import selectors
 import shlex
 import shutil
@@ -1726,6 +1727,11 @@ MIGRATION = re.compile(r"services/messaging/messaging_service/migrations/([0-9]{
 CLASSIFIER = "services/messaging/messaging_service/migration_rollout.py"
 CLASSES = ("expand", "manual", "no header")
 CLASSIFY_TIMEOUT = 30
+# Bounds of the classifier child: the bytes it gets (migration texts and its source), the stdout read back and its
+# address space. Beyond any of them every added migration is `manual`.
+CLASSIFY_INPUT_LIMIT = 4 << 20
+CLASSIFY_OUTPUT_LIMIT = 64 << 10
+CLASSIFY_MEMORY = 512 << 20
 # The candidate's classifier gets the migration texts on stdin and prints one class per text. The candidate is an
 # attested main commit (or the current release), the same trust the tool self-update gives its production.py; the
 # audit hook is no sandbox, it only stops a faulty classifier from opening files, importing, starting processes or
@@ -1743,6 +1749,14 @@ print(json.dumps([module["rollout_class"](text) for text in data["texts"]]))
 """
 
 
+def classifier_limits():
+    """In the classifier child before exec: its address space and the size of a file it writes (its stdout). A limit
+    the platform refuses is skipped; the output and input bounds still hold."""
+    for limit, value in ((resource.RLIMIT_AS, CLASSIFY_MEMORY), (resource.RLIMIT_FSIZE, CLASSIFY_OUTPUT_LIMIT + 1)):
+        with suppress(ValueError, OSError):
+            resource.setrlimit(limit, (value, value))
+
+
 def migration_classes(mirror, base, candidate, sql):
     """`<file> <class>` for each migration `base..candidate` adds (ANYM-444): the class the candidate's classifier
     gives the candidate's bytes, `expand`, `manual` or `no header`. It only names; whatever fails here is `manual`."""
@@ -1753,14 +1767,25 @@ def migration_classes(mirror, base, candidate, sql):
                                        "-z", base, candidate]).split("\0") if MIGRATION.fullmatch(path)]
     except Refused:
         return []
+    objects = [f"{candidate}:{path}" for path in added + [CLASSIFIER]]
     try:
-        texts = [run(["git", "-C", str(mirror), "cat-file", "blob", f"{candidate}:{path}"], binary=True).decode()
-                 for path in added]
-        source = run(["git", "-C", str(mirror), "cat-file", "blob", f"{candidate}:{CLASSIFIER}"], binary=True).decode()
-        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", CLASSIFY], capture_output=True, text=True,
-                                input=json.dumps({"source": source, "texts": texts}), timeout=CLASSIFY_TIMEOUT)
-        classes = json.loads(result.stdout) if result.returncode == 0 else None
-    except (Refused, OSError, ValueError, subprocess.SubprocessError):
+        # Sizes first: nothing over the input limit is read, and then no process starts.
+        if sum(int(run(["git", "-C", str(mirror), "cat-file", "-s", obj])) for obj in objects) > CLASSIFY_INPUT_LIMIT:
+            raise ValueError("over the classifier input limit")
+        blobs = [run(["git", "-C", str(mirror), "cat-file", "blob", obj], binary=True) for obj in objects]
+        if sum(map(len, blobs)) > CLASSIFY_INPUT_LIMIT:
+            raise ValueError("over the classifier input limit")
+        *texts, source = [data.decode() for data in blobs]
+        with tempfile.TemporaryFile() as out:
+            result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", CLASSIFY], stdout=out,
+                                    stderr=subprocess.DEVNULL, input=json.dumps({"source": source, "texts": texts}).encode(),
+                                    timeout=CLASSIFY_TIMEOUT, preexec_fn=classifier_limits)
+            out.seek(0)
+            output = out.read(CLASSIFY_OUTPUT_LIMIT + 1)
+        if result.returncode or len(output) > CLASSIFY_OUTPUT_LIMIT:
+            raise ValueError("the classifier failed or printed too much")
+        classes = json.loads(output)
+    except Exception:  # Refused, OSError, a timeout, a limit, RecursionError of deep JSON: all name `manual`
         classes = None
     if not (isinstance(classes, list) and len(classes) == len(added) and all(c in CLASSES for c in classes)):
         classes = ["manual"] * len(added)

@@ -13,15 +13,21 @@ HEADER_FROM = 41
 HEADERS = {'-- rollout: expand': 'expand', '-- rollout: manual': 'manual'}
 # SET LOCAL bounds: a lock wait no longer than a request's 5 s statement timeout, and the 180 s that migrate() sets.
 TIMEOUT_LIMITS_MS = {'lock_timeout': 5000, 'statement_timeout': 180000}
-TOKEN = re.compile(r"""(?P<space>\s+)|(?P<line>--[^\n]*)|(?P<block>/\*)|(?P<estring>[eE]'(?:[^'\\]|\\.|'')*')
-    |(?P<string>'(?:[^']|'')*')|(?P<dollar>\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$)|(?P<ident>"(?:[^"]|"")+")
-    |(?P<number>(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)|(?P<word>[A-Za-z_][A-Za-z0-9_$]*)
-    |(?P<cast>::)|(?P<punct>[(),;.\[\]])|(?P<op>[-+*/<>=~!@#%^&|`?]+)""", re.X)
+# Tokens end where PostgreSQL's scanner (scan.l) ends them: its ASCII whitespace, a line comment ends at \n or \r.
+# Quotes are scanned by hand in tokens(). Whatever the scanner reads otherwise (U&, B, X and N strings, a string
+# continued after a newline, a number with trailing junk, any other character) is Untokenizable, never re-tokenized.
+TOKEN = re.compile(r"""(?P<space>[ \t\n\r\f]+)|(?P<line>--[^\n\r]*)|(?P<block>/\*)
+    |(?P<dollar>\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$)|(?P<number>(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)
+    |(?P<word>[A-Za-z_][A-Za-z0-9_$]*)|(?P<cast>::)|(?P<punct>[(),;.\[\]])|(?P<op>[-+*/<>=~!@#%^&|`?]+)""", re.X)
+PREFIXED = re.compile(r"""[uU]&['"]|[bBxXnN]'""")
+JUNK = re.compile(r'[A-Za-z0-9_$.]')
+# What may stand between a closed string and a quote that PostgreSQL would read as its continuation.
+CONTINUATION = re.compile(r'(?:[ \t\n\r\f]|--[^\n\r]*)*')
 # Words that end a column type: the column's options follow.
 COLUMN_OPTIONS = {'not', 'null', 'default', 'check', 'primary', 'unique', 'references', 'constraint', 'generated',
                   'collate', 'deferrable', 'initially', 'compression', 'storage'}
 SERIAL = {'serial', 'serial2', 'serial4', 'serial8', 'smallserial', 'bigserial'}
-NEW_TABLE_DEFAULTS = {'now', 'clock_timestamp', 'gen_random_uuid'}
+NEW_TABLE_DEFAULTS = {'now', 'gen_random_uuid'}
 TEMPLATE = ('begin if not ( select convalidated from pg_constraint where conrelid = $s :: regclass and conname = $s ) '
             'then raise exception $s ; end if ; end').split()
 
@@ -34,10 +40,38 @@ class Manual(Exception):
     pass
 
 
+def closing(text, at, quote, escapes=False):
+    """The index after the quote that ends the literal whose body starts at `at`, as PostgreSQL ends it: a doubled
+    quote is part of the body and, with `escapes` (E'...'), a backslash takes the next character, a newline too."""
+    end = -1
+    while True:
+        if end < at: end = text.find(quote, at)
+        slash = text.find('\\', at, end if end >= 0 else len(text)) if escapes else -1
+        if slash >= 0: at = slash + 2
+        elif end < 0: raise Untokenizable(at)
+        elif text.startswith(quote, end + 1): at = end + 2
+        else: return end + 1
+
+
 def tokens(text):
     """(kind, value) pairs; words are lower-cased, quotes and comments resolved. Anything else is Untokenizable."""
     found, at = [], 0
     while at < len(text):
+        if PREFIXED.match(text, at): raise Untokenizable(at)
+        if text.startswith(("'", "e'", "E'"), at):
+            escapes = text[at] != "'"
+            start = at + 1 + escapes
+            at = closing(text, start, "'", escapes)
+            if text.startswith("'", CONTINUATION.match(text, at).end()): raise Untokenizable(at)
+            body = text[start:at - 1]
+            found.append(('estring', body) if escapes else ('string', body.replace("''", "'")))
+            continue
+        if text.startswith('"', at):
+            end = closing(text, at + 1, '"')
+            if end == at + 2: raise Untokenizable(at)  # a zero-length identifier
+            found.append(('ident', text[at + 1:end - 1].replace('""', '"')))
+            at = end
+            continue
         match = TOKEN.match(text, at)
         if not match:
             raise Untokenizable(at)
@@ -54,11 +88,9 @@ def tokens(text):
             if end < 0: raise Untokenizable(at)
             found.append(('dollar', text[at:end]))
             at = end + len(value)
-        elif kind == 'op' and ('--' in value or '/*' in value):
+        elif kind == 'op' and ('--' in value or '/*' in value) or kind == 'number' and JUNK.match(text, at):
             raise Untokenizable(at)
         elif kind == 'word': found.append(('word', value.lower()))
-        elif kind == 'ident': found.append(('ident', value[1:-1].replace('""', '"')))
-        elif kind == 'string': found.append(('string', value[1:-1].replace("''", "'")))
         elif kind not in ('space', 'line'): found.append((kind, value))
     return found
 
@@ -177,8 +209,7 @@ def references(c):
 
 
 def new_column(c):
-    """A column of a table this file creates: literal, now(), clock_timestamp() or gen_random_uuid() defaults and
-    any constraint."""
+    """A column of a table this file creates: literal, now() or gen_random_uuid() defaults and any constraint."""
     c.name()
     column_type(c)
     while not c.done():
@@ -211,21 +242,47 @@ def create_table(c, state):
     for element in split(elements):
         e = Cursor(element)
         if e.peek()[0] == 'word' and e.peek()[1] in ('constraint', 'primary', 'unique', 'check', 'foreign', 'exclude'):
-            continue  # a table constraint of the new table, which may reference any table
-        if e.peek() == ('word', 'like'): raise Manual('LIKE')
-        new_column(e)
+            table_constraint(e)
+        elif e.peek() == ('word', 'like'): raise Manual('LIKE')
+        else: new_column(e)
     state['created'].add(table)
 
 
+def table_constraint(e):
+    """`[CONSTRAINT c] CHECK (…) [NO INHERIT] | PRIMARY KEY (…) | UNIQUE (…) | FOREIGN KEY (…) REFERENCES …` of a new
+    table, which may reference any table, then only deferral words; EXCLUDE, INCLUDE, WITH and the rest are manual."""
+    if e.word('constraint'): e.name()
+    kind = e.expect('check', 'primary', 'unique', 'foreign')
+    if kind in ('primary', 'foreign'): e.expect('key')
+    e.group()
+    if kind == 'check' and e.word('no'): e.expect('inherit')
+    if kind == 'foreign':
+        e.expect('references')
+        references(e)
+    while not e.done():
+        if e.word('not'): e.expect('deferrable')
+        elif e.word('initially'): e.expect('deferred', 'immediate')
+        else: e.expect('deferrable')
+
+
 def create_index(c, state):
+    """`CREATE [UNIQUE] INDEX [name] ON <new table> [USING btree] (<column> [ASC|DESC], …)` and nothing else."""
     c.expect('create')
     c.word('unique')
     c.expect('index')
     if c.word('if'): c.expect('not'), c.expect('exists')
+    if c.peek() == ('word', 'concurrently'): raise Manual('CONCURRENTLY')
     if c.peek() != ('word', 'on'): c.name()
     c.expect('on')
-    if c.name() not in state['created']: raise Manual('an index on a table this file does not create')
-    # The rest (method, keys, INCLUDE, WHERE) only reads the new, still empty table.
+    if c.peek() == ('word', 'only') or c.name() not in state['created']:
+        raise Manual('an index on a table this file does not create')
+    if c.word('using'): c.expect('btree')
+    for key in split(c.group()):
+        k = Cursor(key)
+        if k.next()[0] not in ('word', 'ident'): raise Manual('not a plain column')
+        k.word('asc', 'desc')
+        k.end()
+    c.end()
 
 
 def existing(state, table):
@@ -261,8 +318,11 @@ def widened(c, table, constraint):
     c.expect('not'), c.expect('valid')
     c.end()
     check.name()
+    # The kinds the CI catalog check compares: numbers or strings in an IN list, strings in a text[].
+    kinds = ('string', 'number')
     if check.word('in'): values = check.group()
     elif check.take('op', '<@'):
+        kinds = ('string',)
         check.expect('array')
         values = check.group('[', ']')
         if not check.take('cast', '::'): raise Manual('no text[] cast')
@@ -272,7 +332,7 @@ def widened(c, table, constraint):
     check.end()
     for value in split(values):
         item = Cursor(value)
-        if literal(item, cast=False)[0] not in ('string', 'number') or not item.done(): raise Manual('not a literal')
+        if literal(item, cast=False)[0] not in kinds or not item.done(): raise Manual('not a literal')
 
 
 def alter_table(c, state, following):
@@ -308,7 +368,8 @@ def set_local(c):
     c.expect('set'), c.expect('local')
     setting = c.expect(*TIMEOUT_LIMITS_MS)
     if not (c.take('op', '=') or c.word('to')): raise Manual('no value')
-    if not c.word('default'):
+    # `DEFAULT` only resets lock_timeout (036, 038); a statement_timeout reset to the role's value has no bound here.
+    if not (setting == 'lock_timeout' and c.word('default')):
         kind, value = c.next()
         match = re.fullmatch(r'([0-9]+)(ms|s)', value) if kind == 'string' else None
         if not match or not 0 < int(match[1]) * (1000 if match[2] == 's' else 1) <= TIMEOUT_LIMITS_MS[setting]:

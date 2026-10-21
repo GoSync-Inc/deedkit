@@ -8,6 +8,7 @@ import os
 import py_compile
 from pathlib import Path
 import re
+import resource
 import stat
 import subprocess
 import sys
@@ -2369,7 +2370,9 @@ class Deployer:
                              if "--diff-filter=A" not in command or path not in self.modified) + "\0"
         if command[:2] == ["cat-file", "blob"] and command[2] in self.contents:
             return self.contents[command[2]]
-        if command[:2] == ["cat-file", "blob"]:
+        if command[:2] == ["cat-file", "-s"] and command[2] in self.contents:
+            return f"{len(self.contents[command[2]])}\n"
+        if command[:2] in (["cat-file", "blob"], ["cat-file", "-s"]):
             raise p.Refused("git failed (exit 128); production was not accepted")
         return ""  # clone and fetch of the blobless mirror
 
@@ -2500,6 +2503,52 @@ def test_a_failing_classifier_names_the_migrations_manual_and_pauses_the_same(tm
     outcome = host.deploy()
     assert outcome["status"] == "halted" and host.steps == [] and host.paused() == outcome["reason"]
     assert outcome["reason"].endswith("; added migrations: 041_synthetic_expand.sql manual")
+
+
+ONE_EXPAND = {"041_synthetic_expand.sql": b"-- rollout: expand\nALTER TABLE messages ADD COLUMN synthetic_note text;\n"}
+NO_ADDRESS_LIMIT = sys.platform == "darwin" or not hasattr(resource, "RLIMIT_AS")
+
+
+def classified(tmp_path, monkeypatch, files, classifier):
+    """The pause reason of a range adding `files`, classified by `classifier`, and the argv of each process run."""
+    host, started, real = migration_host(tmp_path, monkeypatch, files, classifier=classifier), [], subprocess.run
+    def recording(argv, *args, **kwargs):
+        started.append(argv)
+        return real(argv, *args, **kwargs)
+    monkeypatch.setattr(p.subprocess, "run", recording)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.steps == [] and host.paused() == outcome["reason"]
+    assert outcome["reason"].startswith("the SQL inventory changed (") and "; migrate by hand (production.md)" in \
+        outcome["reason"]
+    return outcome["reason"], host, [argv for argv in started if p.CLASSIFY in argv]
+
+
+# spec: ANYM-444
+@pytest.mark.parametrize("classifier", [
+    b"import sys\nsys.stdout.write(' ' * (1 << 20))\ndef rollout_class(text):\n    return 'expand'\n",
+    b"import sys\nsys.stdout.write('[' * 10000 + ']' * 10000)\nsys.stdout.flush()\nraise SystemExit(0)\n",
+    pytest.param(b"def rollout_class(text):\n    return bytearray(1 << 30) and 'expand'\n",
+                 marks=pytest.mark.skipif(NO_ADDRESS_LIMIT, reason="RLIMIT_AS is not enforced on this platform"))],
+    ids=["huge-stdout", "nested-json", "memory-hog"])
+def test_a_classifier_beyond_its_output_or_memory_bound_names_the_migrations_manual(tmp_path, monkeypatch, classifier):
+    reason, _, started = classified(tmp_path, monkeypatch, ONE_EXPAND, classifier)
+    assert reason.endswith("; added migrations: 041_synthetic_expand.sql manual") and len(started) == 1
+
+
+# spec: ANYM-444
+def test_migrations_over_the_input_bound_are_manual_and_no_classifier_starts(tmp_path, monkeypatch):
+    files = dict(ONE_EXPAND)
+    files["042_synthetic_large.sql"] = b"-- rollout: expand\n" + b"-- synthetic padding\n" * (p.CLASSIFY_INPUT_LIMIT // 21)
+    reason, host, started = classified(tmp_path, monkeypatch, files, None)
+    assert reason.endswith("; added migrations: 041_synthetic_expand.sql manual, 042_synthetic_large.sql manual")
+    assert started == [] and not [argv for argv in host.git if argv[3:5] == ["cat-file", "blob"]]
+
+
+# spec: ANYM-444
+def test_a_classifier_flooding_stderr_still_names_its_class(tmp_path, monkeypatch):
+    classifier = b"import sys\nsys.stderr.write('x' * (1 << 20))\ndef rollout_class(text):\n    return 'expand'\n"
+    reason, _, started = classified(tmp_path, monkeypatch, ONE_EXPAND, classifier)
+    assert reason.endswith("; added migrations: 041_synthetic_expand.sql expand") and len(started) == 1
 
 
 def test_deploy_continues_when_the_changed_deploy_tools_are_the_installed_ones(tmp_path, monkeypatch):

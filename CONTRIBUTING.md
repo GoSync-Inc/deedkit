@@ -46,17 +46,20 @@ Every messaging migration numbered 041 or later starts with `-- rollout: expand`
 means old code keeps working, and `classify` in
 `services/messaging/messaging_service/migration_rollout.py` allows it only when every
 statement is one of: `SET LOCAL lock_timeout|statement_timeout` to `'<n>ms'`/`'<n>s'`
-(above 0, at most 5 s and 180 s) or `DEFAULT`; `CREATE TABLE` of a new table (defaults: a
-literal, `now()`, `clock_timestamp()`, `gen_random_uuid()`; any constraint or reference);
-`CREATE [UNIQUE] INDEX` on a table the file creates; `ALTER TABLE ... ADD COLUMN <name> <type>
+(above 0, at most 5 s and 180 s), or `lock_timeout` to `DEFAULT`; `CREATE TABLE` of a new table
+(defaults: a literal, `now()`, `gen_random_uuid()`; column constraints, references and
+`CHECK`/`PRIMARY KEY`/`UNIQUE`/`FOREIGN KEY` table constraints); `CREATE [UNIQUE] INDEX [name] ON
+<table the file creates> [USING btree] (<column> [ASC|DESC], ...)`; `ALTER TABLE ... ADD COLUMN <name> <type>
 [NULL] [DEFAULT <literal>]` (`NOT NULL` only with a literal default, no constraint, generated
 or identity column); a `DROP CONSTRAINT c` directly followed by `ADD CONSTRAINT c CHECK (<col>
 IN (<literals>)) NOT VALID` or `CHECK (<col> <@ ARRAY[<literals>]::text[]) NOT VALID`; 036's
 `DO` precondition template; `COMMENT ON ... IS '<literal>'`. Anything else (transaction control,
 DML, functions, triggers, other `DO` blocks, grants, drops, renames, type/default/nullability
-changes) is `manual`. `tests/test_migration_rollout.py` also applies a declared `expand` to
-PostgreSQL and fails unless the catalog only gained those kinds of change (a widened list must be
-a superset). Nothing runs a migration because of its class: `deploy` only names it in its pause.
+changes), and any text not lexed exactly as PostgreSQL does (U&, B, X or N strings, a string
+continued after a newline, an unclosed quote or comment), is `manual`.
+`tests/test_migration_rollout.py` never executes a declared `expand` that `classify` rejects; it
+applies the others to PostgreSQL and fails unless the catalog only gained those kinds of change
+(row security included; a widened list must be a superset of numbers or strings). Nothing runs a migration because of its class: `deploy` only names it in its pause.
 Keep source revisions, original provider IDs and acknowledgement semantics stable.
 Do not rename or move existing tests.
 

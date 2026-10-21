@@ -1,7 +1,7 @@
 """Rollout class of messaging migrations (ANYM-444): a positive language checked before execution, a header rule,
 and a real-PostgreSQL catalog check of every declared `expand`. Synthetic SQL only, in a disposable database."""
+from decimal import Decimal
 from pathlib import Path
-import re
 from uuid import uuid4
 
 import psycopg
@@ -18,10 +18,20 @@ MIGRATIONS = {int(path.name[:3]): path for path in SOURCE.joinpath('migrations')
 # The catalog database is built through 035, so 036 is checked against exactly its predecessors.
 BASE = 35
 SYNTHETIC = f'{rollout.HEADER_FROM:03d}_synthetic.sql'
+
+
+def source(path):
+    """A migration file as deploy reads its blob: UTF-8 bytes, no newline translation."""
+    return path.read_bytes().decode()
+
+
 # Pre-existing objects the synthetic files change: built after the predecessors, before the snapshot.
 SETUP = """CREATE TABLE synthetic_existing (id text PRIMARY KEY,
  kind text CONSTRAINT synthetic_existing_kind_check CHECK(kind IN ('a','b')),
- tags text[] CONSTRAINT synthetic_existing_tags_check CHECK(tags <@ ARRAY['a','b']::text[]));
+ tags text[] CONSTRAINT synthetic_existing_tags_check CHECK(tags <@ ARRAY['a','b']::text[]),
+ rank integer CONSTRAINT synthetic_existing_rank_check CHECK(rank IN (-1, 2)),
+ "Mode" text CONSTRAINT synthetic_existing_mode_check CHECK("Mode" IN ('x','y')),
+ level text CONSTRAINT synthetic_existing_level_check CHECK(level IN ('a')));
 CREATE SEQUENCE synthetic_sequence;
 INSERT INTO synthetic_existing VALUES ('synthetic-1','b','{a}');"""
 EXISTING = {'messages', 'audit_log', 'synthetic_existing'}
@@ -43,14 +53,14 @@ ALLOWED = {
  weight numeric(6,2) DEFAULT -1.5,
  tags text[] NOT NULL DEFAULT '{}'::text[],
  created_at timestamptz NOT NULL DEFAULT now(),
- seen_at timestamptz DEFAULT clock_timestamp(),
  CONSTRAINT synthetic_notes_unique UNIQUE(message,note),
- FOREIGN KEY(note) REFERENCES synthetic_existing(id)
+ CONSTRAINT synthetic_notes_weight CHECK(weight > -100) NO INHERIT,
+ FOREIGN KEY(note) REFERENCES synthetic_existing(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 );
 """,
     'create-index': """CREATE TABLE synthetic_marks (name text, rank integer NOT NULL DEFAULT 0);
-CREATE UNIQUE INDEX synthetic_marks_name ON synthetic_marks(name) WHERE name IS NOT NULL;
-CREATE INDEX ON synthetic_marks USING btree (lower(name), rank);
+CREATE UNIQUE INDEX synthetic_marks_name ON synthetic_marks(name);
+CREATE INDEX ON synthetic_marks USING btree (name DESC, "rank");
 """,
     'add-column': """ALTER TABLE messages ADD COLUMN synthetic_note text;
 ALTER TABLE messages ADD COLUMN synthetic_rank integer NOT NULL DEFAULT 0,
@@ -62,6 +72,15 @@ ALTER TABLE synthetic_existing ADD CONSTRAINT synthetic_existing_kind_check CHEC
     'widen-array': """ALTER TABLE synthetic_existing DROP CONSTRAINT synthetic_existing_tags_check;
 ALTER TABLE synthetic_existing ADD CONSTRAINT synthetic_existing_tags_check
  CHECK (tags <@ ARRAY['a','b','c']::text[]) NOT VALID;
+""",
+    'widen-numeric': """ALTER TABLE synthetic_existing DROP CONSTRAINT synthetic_existing_rank_check;
+ALTER TABLE synthetic_existing ADD CONSTRAINT synthetic_existing_rank_check CHECK(rank IN (2, -1, 3)) NOT VALID;
+""",
+    'widen-quoted-column': """ALTER TABLE synthetic_existing DROP CONSTRAINT synthetic_existing_mode_check;
+ALTER TABLE synthetic_existing ADD CONSTRAINT synthetic_existing_mode_check CHECK("Mode" IN ('x','y','z')) NOT VALID;
+""",
+    'widen-singleton': """ALTER TABLE synthetic_existing DROP CONSTRAINT synthetic_existing_level_check;
+ALTER TABLE synthetic_existing ADD CONSTRAINT synthetic_existing_level_check CHECK(level IN ('a','b')) NOT VALID;
 """,
     'precondition': PRECONDITION,
     'comment': "COMMENT ON TABLE messages IS 'synthetic';\nCOMMENT ON COLUMN messages.body IS 'synthetic body';\n",
@@ -86,7 +105,18 @@ COUNTEREXAMPLES = {
     'insert': ("INSERT INTO synthetic_existing VALUES ('synthetic-2','a','{}');\n", 'manual', True),
     'function': ("CREATE FUNCTION public.synthetic_one() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;\n",
                  'manual', True),
+    'row-level-security': ("ALTER TABLE messages ENABLE ROW LEVEL SECURITY;\n", 'manual', True),
+    'force-row-level-security': ("ALTER TABLE messages FORCE ROW LEVEL SECURITY;\n", 'manual', True),
+    'narrowed-numeric': (ALLOWED['widen-numeric'].replace('(2, -1, 3)', '(-1, 3)'), 'expand', True),
+    'narrowed-quoted-column': (ALLOWED['widen-quoted-column'].replace("('x','y','z')", "('x','z')"), 'expand', True),
+    'narrowed-singleton': (ALLOWED['widen-singleton'].replace("('a','b')", "('b')"), 'expand', True),
+    'widened-other-column': (ALLOWED['widen-singleton'].replace('(level IN', '("Mode" IN'), 'expand', True),
 }
+# PostgreSQL continues this E-string across the escaped newline and the escaped quote, closes it after b and runs the
+# ALTER (Astra r1); a lexer without the escaped newline sees a string up to the quote in the trailing comment.
+HIDDEN_RLS = "ALTER TABLE messages ENABLE ROW LEVEL SECURITY;"
+HIDDEN = ("CREATE TABLE synthetic_t(x text);\nCREATE INDEX synthetic_i ON synthetic_t ((E'a\\\n\\'b'::text));\n"
+          + HIDDEN_RLS + " -- '\n")
 # More text `classify` must call manual: transaction control, other changes, and what it cannot tokenize.
 MANUAL = {
     'begin': "BEGIN;\nALTER TABLE messages ADD COLUMN synthetic_note text;",
@@ -144,6 +174,36 @@ MANUAL = {
     'parameter': "SET LOCAL lock_timeout=$1;",
     'psql-meta': "\\i synthetic.sql",
     'psql-variable': "SET LOCAL lock_timeout=:timeout;",
+    'clock-timestamp-default': "CREATE TABLE synthetic_t (seen_at timestamptz DEFAULT clock_timestamp());",
+    'statement-timeout-default': "SET LOCAL statement_timeout=DEFAULT;",
+    'index-expression': "CREATE TABLE synthetic_t (name text);\nCREATE INDEX ON synthetic_t (lower(name));",
+    'index-where': "CREATE TABLE synthetic_t (name text);\nCREATE INDEX ON synthetic_t (name) WHERE name <> '';",
+    'index-include': "CREATE TABLE synthetic_t (name text, n int);\nCREATE INDEX ON synthetic_t (name) INCLUDE (n);",
+    'index-with': "CREATE TABLE synthetic_t (name text);\nCREATE INDEX ON synthetic_t (name) WITH (fillfactor=50);",
+    'index-opclass': "CREATE TABLE synthetic_t (name text);\nCREATE INDEX ON synthetic_t (name text_pattern_ops);",
+    'index-nulls': "CREATE TABLE synthetic_t (name text);\nCREATE INDEX ON synthetic_t (name NULLS FIRST);",
+    'index-method': "CREATE TABLE synthetic_t (name text);\nCREATE INDEX ON synthetic_t USING hash (name);",
+    'index-concurrently': "CREATE TABLE synthetic_t (name text);\nCREATE INDEX CONCURRENTLY ON synthetic_t (name);",
+    'table-exclude': "CREATE TABLE synthetic_t (n int, EXCLUDE USING btree (n WITH =));",
+    'table-unique-include': "CREATE TABLE synthetic_t (n int, m int, UNIQUE (n) INCLUDE (m));",
+    'table-constraint-tail': "CREATE TABLE synthetic_t (n int, PRIMARY KEY (n) WITH (fillfactor=50));",
+    # Lexing as PostgreSQL does: these hide a statement, or are forms the language leaves out.
+    'escape-string-hides-a-statement': EXPAND + HIDDEN,
+    'escape-string-hides-a-select': EXPAND + HIDDEN.replace(HIDDEN_RLS, 'SELECT 1;'),
+    'carriage-return-ends-a-comment': "ALTER TABLE messages ADD COLUMN synthetic_note text; -- c\rSELECT 1;",
+    'nested-comment-still-open': "/* a /* b */ COMMENT ON TABLE messages IS 'x'; */ SELECT 1;",
+    'string-continued': "COMMENT ON TABLE messages IS 'a'\n'b';",
+    'escape-string-continued': "COMMENT ON TABLE messages IS E'a' -- c\n'\\'; SELECT 1; --';",
+    'unicode-string': "COMMENT ON TABLE messages IS U&'d\\0061ta';",
+    'unicode-identifier': "COMMENT ON TABLE U&\"m\\0065ssages\" IS 'x';",
+    'bit-string': "ALTER TABLE messages ADD COLUMN synthetic_bits bit(2) DEFAULT B'01';",
+    'hex-string': "ALTER TABLE messages ADD COLUMN synthetic_bits bit(8) DEFAULT X'1F';",
+    'national-string': "COMMENT ON TABLE messages IS N'x';",
+    'number-junk': "ALTER TABLE messages ADD COLUMN synthetic_rank integer DEFAULT 0x10;",
+    'unicode-space': "COMMENT ON TABLE messages IS 'x';",
+    'vertical-tab': "COMMENT ON TABLE messages\vIS 'x';",
+    'zero-length-identifier': 'COMMENT ON TABLE "" IS \'x\';',
+    'tagged-dollar-quote': "DO $a$ BEGIN PERFORM 1; $$ END $$; $a$;",
 }
 
 
@@ -160,7 +220,8 @@ def snapshot(c):
     public = "JOIN pg_namespace n ON n.oid=c.relnamespace AND n.nspname='public'"
     return {
         'relations': {row[0]: row[1:] for row in rows(f"""SELECT c.relname, c.relkind, c.relacl::text, c.relowner,
-            c.reloptions::text, c.relfilenode, t.relname FROM pg_class c {public}
+            c.reloptions::text, c.relfilenode, c.relrowsecurity, c.relforcerowsecurity, c.relpersistence,
+            c.relreplident, t.relname FROM pg_class c {public}
             LEFT JOIN pg_index x ON x.indexrelid=c.oid LEFT JOIN pg_class t ON t.oid=x.indrelid""")},
         'columns': {row[:2]: row[2:] for row in rows(f"""SELECT c.relname, a.attname, format_type(a.atttypid,a.atttypmod),
             a.attnotnull, pg_get_expr(d.adbin,d.adrelid), a.attgenerated, a.attidentity, a.attacl::text
@@ -194,16 +255,99 @@ def snapshot(c):
     }
 
 
-LIST = re.compile(r"CHECK \(\((\w+) (= ANY \(ARRAY\[(.*)\]\)|<@ ARRAY\[(.*)\])\)\)( NOT VALID)?")
+NUMERIC_TYPES = {'smallint', 'integer', 'bigint', 'numeric', 'real', 'double precision'}
+TEXT_TYPES = {'text', 'character varying', 'character', 'bpchar', 'name'}
+
+
+def cast_type(c):
+    """The type after `::`, its words joined and `[]` for an array; a type modifier is dropped."""
+    words = []
+    while c.peek()[0] in ('word', 'ident'): words.append(c.next()[1])
+    if not words: raise rollout.Manual('no type')
+    if c.peek() == ('punct', '('): c.group()
+    array = c.peek() == ('punct', '[')
+    if array and c.group('[', ']'): raise rollout.Manual('array bound')
+    return ' '.join(words) + '[]' * array
+
+
+def operand(c):
+    """(text, kind, type) of a literal as pg_get_constraintdef prints it: 2, 1.5, 'a'::text, '-1'::integer,
+    (1)::bigint or ('-2'::integer)::numeric; the outermost cast is its type."""
+    if c.take('punct', '('):
+        text, kind, type_ = operand(c)
+        if not c.take('punct', ')'): raise rollout.Manual('unbalanced')
+    else:
+        negative = c.take('op', '-')
+        kind, text = c.next()
+        if kind not in ('string', 'number') or negative and kind != 'number': raise rollout.Manual('not a literal')
+        text, type_ = ('-' if negative else '') + text, None
+    while c.take('cast', '::'): type_ = cast_type(c)
+    return text, kind, type_
+
+
+def array(c):
+    """The operands of `ARRAY[…]` or `(ARRAY[…])::type[]`; an outer cast types every element."""
+    if c.take('punct', '('):
+        items = array(c)
+        if not c.take('punct', ')'): raise rollout.Manual('unbalanced')
+    else:
+        c.expect('array')
+        items = []
+        for part in rollout.split(c.group('[', ']')):
+            element = rollout.Cursor(part)
+            items.append(operand(element))
+            element.end()
+    while c.take('cast', '::'):
+        type_ = cast_type(c)
+        if not type_.endswith('[]'): raise rollout.Manual('not an array type')
+        items = [(text, kind, type_[:-2]) for text, kind, _ in items]
+    return items
+
+
+def value(text, kind, type_):
+    """A literal's value as the column compares it: a Decimal for a numeric type, the string for a text type."""
+    type_ = type_ or ('numeric' if kind == 'number' else None)
+    if type_ in NUMERIC_TYPES: return ('number', Decimal(text))
+    if type_ in TEXT_TYPES and kind == 'string': return ('text', text)
+    raise rollout.Manual('a literal the catalog check cannot compare')
+
+
+def column(c):
+    """A column reference with its casts: `kind`, `"Mode"`, `(v)::text`."""
+    if c.take('punct', '('):
+        name = column(c)
+        if not c.take('punct', ')'): raise rollout.Manual('unbalanced')
+    else:
+        kind, text = c.next()
+        if kind not in ('word', 'ident'): raise rollout.Manual('not a column')
+        name = (text,)
+    while c.take('cast', '::'): name += (cast_type(c),)
+    return name
 
 
 def values(definition):
-    """(column, form, values) of `CHECK ((c = ANY (ARRAY['a'::text, …])))` or `CHECK ((c <@ ARRAY[…]))`, or None."""
-    match = LIST.fullmatch(definition)
-    if not match: return None
-    items = match[3] if match[3] is not None else match[4]
-    found = re.findall(r"'((?:[^']|'')*)'::text", items)
-    return (match[1], match[3] is None, set(found)) if ', '.join(f"'{v}'::text" for v in found) == items else None
+    """(column, form, values) of a pg_get_constraintdef value list, or None: `CHECK ((c = ANY (ARRAY[…])))`, the
+    singleton `CHECK ((c = 'a'::text))` (form `any`, one value) or `CHECK ((c <@ ARRAY[…]))`, optionally NOT VALID."""
+    try:
+        c = rollout.Cursor(rollout.tokens(definition))
+        c.expect('check')
+        outer = rollout.Cursor(c.group())
+        if c.word('not'): c.expect('valid')
+        c.end()
+        e = rollout.Cursor(outer.group())
+        outer.end()
+        name = column(e)
+        if e.take('op', '<@'): form, items = 'contained', array(e)
+        elif not e.take('op', '='): return None
+        elif e.word('any'):
+            inner = rollout.Cursor(e.group())
+            form, items = 'any', array(inner)
+            inner.end()
+        else: form, items = 'any', [operand(e)]
+        e.end()
+        return name, form, {value(*item) for item in items}
+    except (rollout.Manual, rollout.Untokenizable, ArithmeticError):
+        return None
 
 
 def catalog_problems(before, after):
@@ -255,7 +399,7 @@ def catalog(database):
         with psycopg.connect(make_conninfo(dsn, dbname=name), row_factory=dict_row) as c:
             c.execute(SOURCE.joinpath('schema.sql').read_text())
             for version in sorted(v for v in MIGRATIONS if v <= BASE):
-                c.execute(MIGRATIONS[version].read_text())
+                c.execute(source(MIGRATIONS[version]))
                 if version == 17:
                     from messaging_service.chat_evidence import backfill
                     backfill(c)
@@ -266,28 +410,58 @@ def catalog(database):
             owner.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(name)))
 
 
+def prepare(c, upto, setup):
+    """The migrations after BASE through `upto`, then `setup`, inside the check's transaction."""
+    for version in sorted(v for v in MIGRATIONS if BASE < v <= upto):
+        c.execute(source(MIGRATIONS[version]))
+    if setup: c.execute(setup)
+
+
 def check(c, text, *, upto, setup=''):
-    """`classify` of `text` with the real table inventory, and the catalog problems of applying it after the
-    migrations through `upto` and `setup`."""
+    """`classify` of `text` with the real table inventory after the migrations through `upto` and `setup` and, only
+    for `expand`, the catalog problems of applying it. A `manual` text is never executed: (verdict, None)."""
     try:
-        for version in sorted(v for v in MIGRATIONS if BASE < v <= upto):
-            c.execute(MIGRATIONS[version].read_text())
-        if setup: c.execute(setup)
-        before = snapshot(c)
+        prepare(c, upto, setup)
         verdict = rollout.classify(text, tables(c))
+        if verdict != 'expand': return verdict, None
+        before = snapshot(c)
         c.execute(text)
         return verdict, catalog_problems(before, snapshot(c))
     finally:
         c.rollback()
 
 
-def rollout_failures(c, name, text, *, setup='', apply=True):
-    """What fails CI for migration file `name`: the header rule and, for a declared expand, classify and the catalog."""
+def catalog_only(c, text, *, upto, setup=''):
+    """The catalog check on its own: the problems of deliberately applying synthetic `text`, never classified."""
+    try:
+        prepare(c, upto, setup)
+        before = snapshot(c)
+        c.execute(text)
+        return catalog_problems(before, snapshot(c))
+    finally:
+        c.rollback()
+
+
+def rollout_failures(c, name, text, *, setup=''):
+    """What fails CI for migration file `name`: the header rule and, for a declared expand, classify (before any
+    execution) and then the catalog check."""
     if problem := rollout.header_problem(name, text): return [problem]
     if rollout.header(text) != 'expand': return []
-    if not apply: return [] if rollout.classify(text) == 'expand' else [f'{name}: classify says manual']
     verdict, problems = check(c, text, upto=int(name[:3]) - 1, setup=setup)
-    return ([f'{name}: classify says manual'] if verdict != 'expand' else []) + problems
+    return problems if verdict == 'expand' else [f'{name}: classify says manual']
+
+
+class Recording:
+    """The catalog connection, recording every text sent to `execute`."""
+    def __init__(self, connection):
+        self.connection, self.executed = connection, []
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def execute(self, query, *args, **kwargs):
+        self.executed.append(query)
+        return self.connection.execute(query, *args, **kwargs)
 
 
 # spec: ANYM-444
@@ -303,10 +477,10 @@ def test_each_allowed_form_classifies_expand_and_passes_the_catalog_check(catalo
 def test_a_declared_expand_counterexample_fails_the_rollout_check(catalog, example):
     text, verdict, catalog_rejects = COUNTEREXAMPLES[example]
     assert rollout.classify(EXPAND + text, EXISTING) == verdict
-    assert rollout_failures(catalog, SYNTHETIC, EXPAND + text, setup=SETUP, apply=catalog_rejects is not None)
+    assert rollout_failures(catalog, SYNTHETIC, EXPAND + text, setup=SETUP)
     if catalog_rejects:
         # The catalog check rejects it on its own, independent of classify.
-        assert check(catalog, text, upto=rollout.HEADER_FROM - 1, setup=SETUP)[1]
+        assert catalog_only(catalog, text, upto=rollout.HEADER_FROM - 1, setup=SETUP)
 
 
 # spec: ANYM-444
@@ -329,8 +503,43 @@ COMMENT ON COLUMN "messages"."body" IS E'a \\' COMMIT;';
 
 
 # spec: ANYM-444
+def test_statement_boundaries_are_the_ones_postgresql_scans():
+    split = rollout.statements("SELECT $a$ ; $$ ; $a$; SELECT ';'; SELECT \"a;b\"; SELECT E'\\';\\\n';"
+                               " /* ; /* ; */ ; */ SELECT 1 -- ;\r; SELECT e'x' -- c\n;")
+    assert [len(statement) for statement in split] == [2, 2, 2, 2, 2, 2]
+    assert split[0][1] == ('dollar', ' ; $$ ; ') and split[3][1] == ('estring', "\\';\\\n")
+    assert rollout.classify(EXPAND + "/* outer /* inner */ COMMIT; */ COMMENT ON TABLE messages IS E'a\\\nb';\n",
+                            EXISTING) == 'expand'
+
+
+# spec: ANYM-444
+@pytest.mark.parametrize('body', [HIDDEN, HIDDEN.replace(HIDDEN_RLS, 'SELECT 1;')], ids=['row-security', 'select'])
+def test_an_escape_string_continued_across_a_newline_hides_no_statement_from_classify(catalog, body):
+    assert rollout.classify(EXPAND + body, EXISTING) == rollout.classify(EXPAND + body) == 'manual'
+    try:
+        # PostgreSQL runs the statement after the E-string: the ALTER turns on row security of messages.
+        catalog.execute(body)
+        row = catalog.execute("SELECT relrowsecurity FROM pg_class WHERE relname='messages'").fetchone()
+        assert row['relrowsecurity'] is (body == HIDDEN)
+    finally:
+        catalog.rollback()
+    if body == HIDDEN:
+        assert 'relation messages changed or was rewritten' in catalog_only(catalog, body, upto=rollout.HEADER_FROM - 1)
+
+
+# spec: ANYM-444
+@pytest.mark.parametrize('body', [COUNTEREXAMPLES['commit-after-column'][0], HIDDEN], ids=['commit', 'hidden'])
+def test_a_declared_expand_file_that_classify_rejects_never_reaches_execute(catalog, body):
+    recording, text = Recording(catalog), EXPAND + body
+    assert rollout_failures(recording, SYNTHETIC, text, setup=SETUP) == [f'{SYNTHETIC}: classify says manual']
+    assert SETUP in recording.executed and not [query for query in recording.executed if body in str(query)]
+    assert catalog.execute("SELECT to_regclass('synthetic_existing') IS NULL AS gone").fetchone()['gone']
+    catalog.rollback()
+
+
+# spec: ANYM-444
 def test_036_classifies_expand_and_passes_the_catalog_check_after_035(catalog):
-    text = MIGRATIONS[36].read_text()
+    text = source(MIGRATIONS[36])
     assert rollout.classify(text) == 'expand'
     assert check(catalog, text, upto=BASE) == ('expand', [])
 
@@ -339,7 +548,7 @@ def test_036_classifies_expand_and_passes_the_catalog_check_after_035(catalog):
 def test_applied_migrations_need_no_header_and_every_later_one_declares_its_class():
     assert rollout.HEADER_FROM == 41 and 40 in MIGRATIONS
     for version, path in MIGRATIONS.items():
-        text = path.read_text()
+        text = source(path)
         assert rollout.classify(text) in ('expand', 'manual')  # terminates on every real file, as the pause needs
         if version < rollout.HEADER_FROM:
             assert rollout.header_problem(path.name, text) is None
@@ -355,10 +564,10 @@ def test_applied_migrations_need_no_header_and_every_later_one_declares_its_clas
 def test_every_migration_from_041_passes_the_header_rule_and_a_declared_expand_both_checks(catalog):
     for version in sorted(v for v in MIGRATIONS if v >= rollout.HEADER_FROM):
         path = MIGRATIONS[version]
-        assert rollout_failures(catalog, path.name, path.read_text()) == []
+        assert rollout_failures(catalog, path.name, source(path)) == []
     # The same check fails a file that breaks the rule or claims expand for a non-expand body.
     assert rollout_failures(catalog, SYNTHETIC, ALLOWED['add-column'])
-    assert rollout_failures(catalog, SYNTHETIC, EXPAND + "INSERT INTO messages_synthetic VALUES (1);", apply=False)
+    assert rollout_failures(catalog, SYNTHETIC, EXPAND + "INSERT INTO messages_synthetic VALUES (1);")
 
 
 # spec: ANYM-444
