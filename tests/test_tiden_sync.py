@@ -208,6 +208,24 @@ def test_a_marked_go_test_links_its_leaf_cases_by_package_and_a_test_of_another_
 
 
 # spec: ANYM-421
+def test_new_subtests_of_an_existing_marked_go_test_are_linked_when_its_file_changes(root, server):
+    full_server(server)
+    package = "example.com/svc/pkg"
+    old = "package pkg\n\n// spec: ANYM-12\nfunc TestRoute(t *testing.T) {}\n\nfunc TestPlain(t *testing.T) {}\n"
+    commit(root, {"svc/go.mod": "module example.com/svc\n\ngo 1.26\n", "svc/pkg/a_test.go": old}, "base")
+    server.set(tests=[case(f"{package}::TestRoute/one", "a_test.go", "TestRoute/one"),
+                      case(f"{package}::TestRoute/two", "a_test.go", "TestRoute/two"),
+                      case(f"{package}::TestPlain/one", "a_test.go", "TestPlain/one"),
+                      case(f"{package}::TestGone", "a_test.go", "TestGone")])
+    merged(root, server, {"svc/pkg/a_test.go": old.replace("{}\n\nfunc TestPlain", "{ /* two rows */ }\n\nfunc TestPlain")},
+           "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert server.state()["links"] == {f"t-{package}::TestRoute/one": ["m-0012-0000-0000-0000-000000000000"],
+                                       f"t-{package}::TestRoute/two": ["m-0012-0000-0000-0000-000000000000"]}
+
+
+# spec: ANYM-421
 def test_a_go_test_resolves_to_its_nearest_module_quoted_or_commented_and_never_to_an_outer_one(root, server):
     commit(root, {"outer/go.mod": "module example.com/outer\n",
                   "outer/inner/go.mod": "module example.com/inner // the nested module\n",

@@ -35,8 +35,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import REPOSITORY, Refused, excluded, shown, tiden  # noqa: E402
 from tiden_ci import go_module_path  # noqa: E402
-from tiden_pr_check import (anchor_map, blob, branch_status, changed, diff_tests, language,  # noqa: E402
-                            listing, parse_body, preview_numbers, story)
+from tiden_pr_check import (Test, anchor_map, blob, branch_status, changed, diff_tests, language,  # noqa: E402
+                            listing, marker, parse_body, preview_numbers, source_lines, story, tests_in)
 
 SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -222,9 +222,29 @@ def linked(cli: str, test: str) -> set[str]:
     return {link["requirementId"] for link in links}
 
 
+def kept_go_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Test]:
+    """Marked Go tests that a changed file had before and still has: a table-driven one gains subtests when a row is
+    added, and each new subtest is a case of its own that only a link makes covered."""
+    found = []
+    for path in paths:
+        before, after = (blob(root, ref, path) if language(path) == "go" else None for ref in (base, head))
+        if before is None or after is None:
+            continue
+        old, lines = {name for name, _, _ in tests_in(path, before)}, source_lines(after, "go")
+        for name, index, _ in tests_in(path, after):
+            specs, problem = marker(lines, index, "//")
+            if name in old and not problem:
+                found.append(Test(path, name, index + 1, specs))
+    return found
+
+
 def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry: bool = False,
-         packages: dict[str, str | None] | None = None) -> None:
+         packages: dict[str, str | None] | None = None, kept: list | None = None) -> None:
+    """Links the cases of each marked added test; `kept` are marked tests that existed before, linked when they have
+    cases and their spec is on main, and otherwise left alone."""
     marked = [test for test in tests if test.specs]
+    marked += [test for test in kept or [] if test.specs]
+    old = {id(test) for test in kept or []}
     if not marked:
         report("links: no marked test added.")
         return
@@ -239,15 +259,21 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
             report(f"links: {shown(test.path)} {shown(test.name)} not linked: {reason}.")
             continue
         unknown = [number for number in test.specs if number not in main]
+        if unknown and id(test) in old:
+            continue
         if unknown:
             missing.append(f"{shown(test.name)} names " + ", ".join(f"ANYM-{number}" for number in unknown)
                            + ", not on Tiden main")
             continue
         package = (packages or {}).get(test.path)
         if language(test.path) == "go" and not package:
+            if id(test) in old:
+                continue
             missing.append(f"{shown(test.path)} {shown(test.name)} lies in no Go module")
             continue
         cases = matches(rows, test.path, test.name, package)
+        if not cases and id(test) in old:
+            continue
         if not cases:
             missing.append(f"{shown(test.path)} {shown(test.name)} has no imported case on Tiden main")
             continue
@@ -382,6 +408,7 @@ def sync(root: Path, sha: str, number: int, body: str, cli: str, product: str, r
     paths = changed(root, parent, sha)
     code = [path for path in paths if not excluded(path)]
     tests = diff_tests(root, parent, sha, paths)
+    kept = kept_go_tests(root, parent, sha, paths)
     report(f"Pull request #{number}, commit {sha}: {len(code)} code file(s), {len(tests)} added test(s); named "
            + (", ".join(f"ANYM-{n}" for n in lines.named) or "no spec")
            + (f"; branch {lines.branch}" if lines.branch else "") + ".")
@@ -401,8 +428,8 @@ def sync(root: Path, sha: str, number: int, body: str, cli: str, product: str, r
     if unknown:
         failures.append(StepFailed("resolve", ", ".join(f"ANYM-{n}" for n in unknown) + " not on Tiden main"))
     steps = (("links", lambda: link(cli, product, tests, main, report, dry,
-                                   {test.path: go_package(root, sha, test.path) for test in tests
-                                    if language(test.path) == "go"})),
+                                   {test.path: go_package(root, sha, test.path) for test in (*tests, *kept)
+                                    if language(test.path) == "go"}, kept)),
              ("anchors", lambda: anchor(cli, product, code, lines.named[0] if lines.named else None, main, sha, number,
                                         report, dry)),
              ("status", lambda: settle_status(cli, product, lines.delivers, main, report, dry)))
