@@ -11,6 +11,15 @@ class AuditedGrok(GrokRealtimeLLMService):
     def __init__(self, brief, key, recorder=None, *, input_rate=16000):
         self.recorder = recorder
         self.audio_health = ProviderAudioHealth()
+        # A legacy brief language outside ru/en/id gets no hint; a local failure building the hint
+        # keeps the unhinted setup and is reported by run_transport (ANYM-450).
+        transcription = events.InputAudioTranscription()
+        self.hint_unavailable = False
+        if brief.get('language') in ('ru', 'en', 'id'):
+            try:
+                transcription = events.InputAudioTranscription(language_hint=brief['language'])
+            except Exception:
+                self.hint_unavailable = True
         # xAI takes the frame bytes as they are, so the declared rate must equal the
         # transport's frames; undeclared, it assumes 24 kHz (ANYM-359).
         super().__init__(api_key=key, settings=self.Settings(
@@ -19,8 +28,7 @@ class AuditedGrok(GrokRealtimeLLMService):
                 voice=brief['grok_voice'],
                 audio=events.AudioConfiguration(input=events.AudioInput(
                     format=events.PCMAudioFormat(rate=input_rate),
-                    transcription=events.InputAudioTranscription(
-                        language_hint=brief['language']))))))
+                    transcription=transcription)))))
 
     async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
         if direction == FrameDirection.DOWNSTREAM:
