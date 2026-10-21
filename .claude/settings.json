@@ -104,7 +104,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cat \"$HOME/agent-harness/process.md\" 2>/dev/null || echo 'HARNESS MISSING: git clone https://github.com/egerev/agent-harness ~/agent-harness'"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/harness.sh\""
           }
         ]
       }

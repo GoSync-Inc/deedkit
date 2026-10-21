@@ -1,8 +1,10 @@
 # DeedKit agent rules
 
 Process: harness egerev/agent-harness @ 0.1.0, ~/agent-harness; this file adds project rules.
-Harness `process.md` is loaded by the SessionStart hook in `.claude/settings.json`; each section
-below adds to the harness section with the same number.
+Claude Code loads harness process.md through the SessionStart hook (`.claude/hooks/harness.sh`:
+merged `origin/main`, else the pinned copy). Codex and cloud agents read the pinned copy
+docs/harness/process.md first. If no harness text is in context, stop and report BLOCKED. Each
+section below adds to the harness section with the same number.
 
 DeedKit is the product; the repo keeps its AnyMsg identities (`anymsg`, `messaging_service`,
 `ANYM-*`, package, API and database names).
