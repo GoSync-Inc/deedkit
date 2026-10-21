@@ -254,15 +254,21 @@ counts are visible through `get_subscription`.
 rechecked under a lock that keeps a revocation from committing until the send ends,
 because a sent hint cannot be recalled. Each attempt takes, in one transaction, the
 shared principal advisory lock and a `FOR UPDATE` lock on the subscription row
-(`event_delivery.py` `dispatch_hints`). As built, both are held through DNS
-validation (at most 2 s) and the pinned TLS exchange (5 s deadline), so:
+(`event_delivery.py` `dispatch_hints`). DNS validation (at most 2 s), the secret
+read and the body build run before the fence; under it the dispatcher rechecks
+eligibility, the exact receiver binding and its lease, then sends to the
+pre-validated pinned address. Because DNS runs first, a hint whose key was revoked,
+whose lease was lost or whose age expired can still resolve the receiver's registered
+hostname once before it is cancelled; no POST follows. The hold is bounded by the 5 s
+TLS deadline plus database time, so:
 
-- an operator ACL change or revocation for that principal waits up to about 7 s per
+- an operator ACL change or revocation for that principal waits up to about 5 s per
   in-flight attempt;
 - an agent `update_subscription`, `configure_subscription_delivery` or ACK on that
   subscription waits likewise, and the matcher skips the locked row;
 - attempts in one dispatcher pass are serial (up to 16), so one slow receiver can
-  delay other subscriptions' hints by up to about 16 × 7 s per pass;
+  delay other subscriptions' hints by up to about 16 × 7 s per pass (DNS plus TLS;
+  only the TLS part holds the fence);
 - reads of that subscription row wait as well (`get_subscription`,
   `get_subscription_events`, `fetch`, `wait`, `list_subscriptions`), and while a
   revocation for the principal is queued behind an attempt, PostgreSQL queues every
@@ -271,13 +277,13 @@ validation (at most 2 s) and the pinned TLS exchange (5 s deadline), so:
   (`Store.identity_digest` takes the shared lock on each
   call; unmeasured).
 
-Running more than one dispatcher process lowers the head-of-line delay
-(`FOR UPDATE SKIP LOCKED`). No latency incident or measurement exists. Decided
-(2026-10-17, ANYM-257): the fence stays; DNS validation, the secret read and the
-body build move before the lock so the hold is bounded by the 5 s transport
-deadline plus database time, and the dispatcher records each fence hold in its
-statistics. Neither change is built yet; an unfenced send with post-send checks is
-rejected because a hint would still reach a receiver after revocation.
+Each pass reports every attempt's fence hold in milliseconds as the list
+`fence_hold_ms` in the JSON line the delivery worker prints: from the moment the
+principal lock is held to commit, so time spent waiting for that lock is not counted. Running more than one
+dispatcher process lowers the head-of-line delay (`FOR UPDATE SKIP LOCKED`). No
+latency incident exists. Decided (2026-10-17, ANYM-257): the fence stays; an
+unfenced send with post-send checks is rejected because a hint would still reach a
+receiver after revocation.
 
 Schema-32 backup manifests include consumption, hashed receipts, receiver
 registrations, bindings, outbox and local feedback. Quarantine disables receivers,

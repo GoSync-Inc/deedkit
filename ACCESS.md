@@ -175,7 +175,7 @@ issuing a receipt (and creating the initial consumption row) is bookkeeping that
 changes no consumption, provider state or other key's data. The exact meaning,
 including lifecycle checks on every subscription read, is in
 [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#schema-32-explicit-consumption-and-registered-hints).
-A revocation or ACL change waits for a hint attempt in flight (about 7 s as built),
+A revocation or ACL change waits for a hint attempt in flight (about 5 s: its TLS exchange),
 and new requests of that principal queue behind the waiting revocation; see its
 revocation fence there.
 

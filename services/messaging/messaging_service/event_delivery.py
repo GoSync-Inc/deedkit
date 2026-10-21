@@ -260,9 +260,11 @@ def _transport(endpoint, body, headers, *, resolved, timeout=5):
 
 def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses):
     """Leased at-least-once hints, independently reauthorized before each send."""
+    from .policy import lock_principal
     from .store import bounded
     bounded(limit, 100)
     stats = dict(delivered=0, retried=0, dead_letter=0, cancelled=0, deferred=0)
+    holds = []
     for _ in range(limit):
         lease = uuid4()
         with store.pool.connection() as c:
@@ -309,13 +311,37 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
             c.execute("""UPDATE subscription_outbox SET state='leased',lease_token=%s,attempts=attempts+1,
                 admitted_at=coalesce(admitted_at,clock_timestamp()),
                 lease_until=clock_timestamp()+interval '1 minute' WHERE id=%s""", (lease, hint['id']))
-        state, error = 'pending', 'receiver_unavailable'
+        # DNS validation, the secret read and the body build run before the fence, so the
+        # fence hold is bounded by the transport deadline plus database time. Registrations
+        # are immutable; the fence rechecks the exact binding. The body carries the hint's
+        # version, which the fence requires to equal the locked subscription's.
+        state, error, prepared, unsafe = 'pending', 'receiver_unavailable', None, False
+        with store.pool.connection() as c:
+            registered = c.execute('SELECT endpoint,secret_file FROM subscription_receivers WHERE id=%s AND enabled',
+                (hint['receiver'],)).fetchone()
+        if registered is not None:
+            try:
+                prepared = (validate_endpoint(registered['endpoint'], resolver=resolver),
+                    _secret(registered['secret_file']), json.dumps(dict(hint_id=str(hint['id']),
+                    subscription_id=str(hint['subscription']), subscription_version=hint['subscription_version'],
+                    through=hint['through_position'], kind=hint['kind'], host_turn_verified=False),
+                    sort_keys=True, separators=(',', ':')).encode())
+            except (OSError, TimeoutError):
+                # Includes ssl.SSLCertVerificationError, which is also a ValueError:
+                # a certificate problem can be transient and keeps the bounded retry budget.
+                pass
+            except ValueError:
+                unsafe = True
         with store.pool.connection() as c:
             # Principal lock precedes subscription lock, matching gateway ACL
             # order. The bounded TLS exchange holds this shared ACL fence so a
             # concurrent revocation cannot commit between authorization and send.
             owner = c.execute('SELECT principal,key_id FROM subscriptions WHERE id=%s',
                 (hint['subscription'],)).fetchone()
+            if owner:
+                lock_principal(c, owner['principal'], shared=True)
+            # The hold starts once the principal lock is held: waiting for it is contention, not hold.
+            fenced = time.monotonic()
             p = _worker_identity(c, owner) if owner else None
             row = c.execute('SELECT * FROM subscriptions WHERE id=%s FOR UPDATE',
                 (hint['subscription'],)).fetchone()
@@ -326,46 +352,46 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 row = _state(c, row, p)
             eligible = (p is not None and row is not None and row['state'] == 'active' and
                 row['version'] == hint['subscription_version'] and receiver is not None and
-                receiver['principal'] == p['id'] and receiver['key_id'] == p['key_id'])
+                receiver['principal'] == p['id'] and receiver['key_id'] == p['key_id'] and
+                (registered is None or (receiver['endpoint'], receiver['secret_file']) ==
+                 (registered['endpoint'], registered['secret_file'])))
             live = c.execute("""SELECT 1 FROM subscription_outbox WHERE id=%s AND state='leased'
                 AND lease_token=%s AND lease_until>clock_timestamp() FOR UPDATE""", (hint['id'], lease)).fetchone()
-            if not live:
-                continue
-            if not eligible:
-                state, error = 'cancelled', 'access_or_configuration_changed'
-            # The retry age starts at admission: waiting for a budget slot or quiet hours never expires a hint.
-            elif hint['attempts'] >= 8 or c.execute("SELECT %s<clock_timestamp()-interval '7 days' AS expired",
-                    (hint['admitted_at'] or now,)).fetchone()['expired']:
-                state, error = 'dead_letter', 'delivery_budget_exhausted'
-            else:
-                try:
-                    resolved = validate_endpoint(receiver['endpoint'], resolver=resolver)
-                    secret = _secret(receiver['secret_file'])
-                    body = json.dumps(dict(hint_id=str(hint['id']), subscription_id=str(row['id']),
-                        subscription_version=row['version'], through=hint['through_position'], kind=hint['kind'],
-                        host_turn_verified=False), sort_keys=True, separators=(',', ':')).encode()
-                    timestamp = str(int(time.time()))
-                    headers = {'Content-Type': 'application/json', 'X-DeedKit-Hint-ID': str(hint['id']),
-                        'X-DeedKit-Timestamp': timestamp, 'X-DeedKit-Signature': 'sha256=' +
-                        hmac.new(secret, timestamp.encode() + b'.' + body, hashlib.sha256).hexdigest()}
-                    status = transport(receiver['endpoint'], body, headers, resolved=resolved, timeout=5)
-                    if type(status) is int and 200 <= status < 300:
-                        state, error = 'delivered', None
-                    elif type(status) is int and 300 <= status < 400:
-                        state, error = 'dead_letter', 'redirect_rejected'
-                except (OSError, TimeoutError):
-                    # Includes ssl.SSLCertVerificationError, which is also a ValueError:
-                    # a certificate problem can be transient and keeps the bounded retry budget.
-                    pass
-                except ValueError:
+            if live:
+                if not eligible:
+                    state, error = 'cancelled', 'access_or_configuration_changed'
+                # The retry age starts at admission: waiting for a budget slot or quiet hours never expires a hint.
+                elif hint['attempts'] >= 8 or c.execute("SELECT %s<clock_timestamp()-interval '7 days' AS expired",
+                        (hint['admitted_at'] or now,)).fetchone()['expired']:
+                    state, error = 'dead_letter', 'delivery_budget_exhausted'
+                elif unsafe:
                     state, error = 'dead_letter', 'unsafe_receiver_configuration'
+                elif prepared is not None:
+                    resolved, secret, body = prepared
+                    try:
+                        timestamp = str(int(time.time()))
+                        headers = {'Content-Type': 'application/json', 'X-DeedKit-Hint-ID': str(hint['id']),
+                            'X-DeedKit-Timestamp': timestamp, 'X-DeedKit-Signature': 'sha256=' +
+                            hmac.new(secret, timestamp.encode() + b'.' + body, hashlib.sha256).hexdigest()}
+                        status = transport(receiver['endpoint'], body, headers, resolved=resolved, timeout=5)
+                        if type(status) is int and 200 <= status < 300:
+                            state, error = 'delivered', None
+                        elif type(status) is int and 300 <= status < 400:
+                            state, error = 'dead_letter', 'redirect_rejected'
+                    except (OSError, TimeoutError):
+                        pass
+                    except ValueError:
+                        state, error = 'dead_letter', 'unsafe_receiver_configuration'
                 if state == 'pending' and hint['attempts'] + 1 >= 8:
                     state, error = 'dead_letter', 'delivery_budget_exhausted'
-            c.execute('''UPDATE subscription_outbox SET state=%s,
-                error_code=%s,lease_token=NULL,lease_until=NULL,
-                next_attempt_at=clock_timestamp()+(%s*interval '1 second'),
-                finished_at=CASE WHEN %s='pending' THEN NULL ELSE clock_timestamp() END
-                WHERE id=%s AND state='leased' AND lease_token=%s''',
-                (state, error, min(3600, 2**(hint['attempts'] + 1)), state, hint['id'], lease))
-        stats['retried' if state == 'pending' else state] += 1
-    return stats
+                c.execute('''UPDATE subscription_outbox SET state=%s,
+                    error_code=%s,lease_token=NULL,lease_until=NULL,
+                    next_attempt_at=clock_timestamp()+(%s*interval '1 second'),
+                    finished_at=CASE WHEN %s='pending' THEN NULL ELSE clock_timestamp() END
+                    WHERE id=%s AND state='leased' AND lease_token=%s''',
+                    (state, error, min(3600, 2**(hint['attempts'] + 1)), state, hint['id'], lease))
+        # Each attempt's fence hold, so a latency regression shows up in a measurement.
+        holds.append(round((time.monotonic() - fenced) * 1000))
+        if live:
+            stats['retried' if state == 'pending' else state] += 1
+    return dict(stats, fence_hold_ms=holds)
