@@ -19,7 +19,7 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from anymsg import AnyMsg, UnconfiguredArchive
-from core import ACTIVE, MODEL, GROK_MODEL, GROK_VOICES, PROMPT_VERSION, VOICES, BriefInput, CallVoice, ServiceError, VoiceService
+from core import ACTIVE, HANDOVER_SECS, MODEL, GROK_MODEL, GROK_VOICES, PROMPT_VERSION, VOICES, BriefInput, CallVoice, ServiceError, VoiceService, now
 from control import control_key, create_control
 from agent_api import AgentAPI, AgentRegistry
 from learning import LearningWorker, ANALYZER_MODEL
@@ -183,9 +183,11 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
             return
         # UI disconnect cleanup can race the model error callback. Keep the
         # failure already observed instead of reclassifying it as owner_stop.
-        if session.get('end_reason')=='model_error':reason='model_error'
-        session['end_reason'] = reason
-        runner = session.get('runner')
+        # A phone call keeps its current media session's state apart (ANYM-451).
+        live=session.get('state',session)
+        if live.get('end_reason')=='model_error':reason='model_error'
+        live['end_reason'] = reason
+        runner = live.get('runner')
         if runner:
             await runner.cancel()
         await app.state.rtc.close()
@@ -437,8 +439,9 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
     async def decide(identity: str, decision_id: str, body: OwnerDecision):
         async with lock:
             decision=service.decide(identity,decision_id,body.answer)
-            if session.get('call_id') == identity and session.get('owner_update'):
-                await session['owner_update'](decision)
+            live=session.get('state',session)
+            if session.get('call_id') == identity and live.get('owner_update'):
+                await live['owner_update'](decision)
             return decision
 
     @app.post('/api/offer')
@@ -571,7 +574,9 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
             provider.signature_valid(url,{},socket.headers.get('x-twilio-signature')) for url in urls):
             await socket.close(code=1008);return
         await socket.accept()
-        reason='media_disconnected';joined=False
+        reason='media_disconnected';joined=retired=False;state=timer=None
+        loop=asyncio.get_running_loop()
+        def remaining():return max(0,session.get('deadline',0)-loop.time())
         try:
             for _ in range(2):
                 raw=await asyncio.wait_for(socket.receive_text(),5)
@@ -583,27 +588,66 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
             if value.get('event')!='start' or not re.fullmatch(r'MZ[0-9a-fA-F]{32}',start.get('streamSid','')) or start.get('mediaFormat')!={'encoding':'audio/x-mulaw','sampleRate':8000,'channels':1} or start.get('accountSid')!=provider.config['account_sid'] or not outbound.valid_stream(identity,token,sid):
                 await socket.close(code=1008);return
             async with lock:
-                if session:await socket.close(code=1008);return
+                previous=None
+                if session:
+                    # Only the stream of a pending out-of-band handover may join a running call (ANYM-451).
+                    generation=service.activate_generation(identity) if session.get('call_id')==identity and session.get('websocket') else None
+                    if not generation:await socket.close(code=1008);return
+                    previous=session.get('state')
                 call=service.get_call(identity)
-                session.update(call_id=identity,service=service,brief=call['brief'],supervisor=supervisor,websocket=True)
-                session['task']=asyncio.current_task();joined=True
+                if previous is None:
+                    generation=call.get('generation',1)
+                    session.update(call_id=identity,service=service,brief=call['brief'],supervisor=supervisor,websocket=True,
+                                   deadline=loop.time()+call['brief']['max_duration_secs'])
+                state={'call_id':identity,'service':service,'brief':call['brief'],'supervisor':supervisor,'websocket':True,
+                       'generation':generation,'resume':previous is not None,'started_at':now(),'resumed':asyncio.Event()}
+                session.update(state=state,task=asyncio.current_task());joined=True
+            if previous is not None:
+                # The old session lost its authority on activation; its audio stops too, and its own
+                # cleanup sees it was replaced.
+                previous['resumed'].set()
+                if previous.get('runner'):previous['retiring']=asyncio.create_task(previous['runner'].cancel())
+            async def keep_stream():
+                await asyncio.sleep(HANDOVER_SECS)
+                service.cancel_handover(identity,generation)
+            async def out_of_band(keys):
+                nonlocal timer
+                outcome=await outbound.send_digits(identity,keys)
+                # A kept stream may press again later: each reservation gets its own window.
+                if outcome!='rejected' and (timer is None or timer.done()):timer=asyncio.create_task(keep_stream())
+                return outcome
+            state['out_of_band']=out_of_band
             from pipecat.serializers.twilio import TwilioFrameSerializer
             from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport,FastAPIWebsocketParams
             from voice import KeypadTwilioSerializer,run_transport
             serializer=KeypadTwilioSerializer(stream_sid=start['streamSid'],params=TwilioFrameSerializer.InputParams(auto_hang_up=False))
+            # Activation of a newer stream revokes this one's output at once, before its runner is retired.
+            serializer.authority=lambda:session.get('state') is state
             transport=FastAPIWebsocketTransport(websocket=socket,params=FastAPIWebsocketParams(
                 audio_in_enabled=True,audio_out_enabled=True,audio_out_sample_rate=8000,
                 audio_out_end_silence_secs=0,serializer=serializer))
             key=model_key(call['brief'])
             if not key:raise ServiceError('model_key_required')
-            await asyncio.wait_for(run_transport(transport,call['brief'],key,session),call['brief']['max_duration_secs'])
-            reason=session.get('end_reason',reason)
+            # One deadline for the whole call: a reconnected stream gets only the time left.
+            await asyncio.wait_for(run_transport(transport,call['brief'],key,state),remaining())
+            reason=state.get('end_reason',reason)
+            if timer:timer.cancel();timer=None
+            if session.get('state') is not state:retired=True
+            elif service.handover_pending(identity,generation):
+                # The provider replaced this stream to send the key: wait for the reconnect, not longer.
+                try:
+                    await asyncio.wait_for(state['resumed'].wait(),min(HANDOVER_SECS,remaining()))
+                    retired=True
+                except TimeoutError:
+                    reason='duration_limit' if remaining()<=0 else 'keypress_handover_failed'
+                    service.cancel_handover(identity,generation,'timed_out')
         except asyncio.CancelledError:
-            reason=session.get('end_reason','owner_stop');raise
+            reason=(state or {}).get('end_reason','owner_stop');raise
         except TimeoutError:reason='duration_limit'
         except Exception:reason='media_error'
         finally:
-            if joined:
+            if timer:timer.cancel()
+            if joined and not retired and session.get('state') is state:
                 await outbound.stop(identity,reason)
                 if session.get('call_id')==identity:session.clear()
             with contextlib.suppress(Exception):await socket.close()
