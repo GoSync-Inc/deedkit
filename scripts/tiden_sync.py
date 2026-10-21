@@ -35,13 +35,14 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import REPOSITORY, Refused, excluded, shown, tiden  # noqa: E402
 from tiden_ci import go_module_path  # noqa: E402
-from tiden_pr_check import (anchor_map, blob, branch_status, changed, diff_tests, language,  # noqa: E402
-                            listing, parse_body, preview_numbers, story)
+from tiden_pr_check import (GO_TEST, Test, anchor_map, blob, branch_status, changed, diff_tests, language,  # noqa: E402
+                            listing, marker, parse_body, preview_numbers, source_lines, story)
 
 SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 SHA = re.compile(r"[0-9a-f]{40}")
 OPEN_CHECK = re.compile(r"\[open: (?:live|measured)\]")
 # Test files whose suite CI does not publish to Tiden, so a marked test there has no identity to link yet.
+KEPT_SECONDS = 600  # the time kept tests may spend on link reads, so the later steps still run
 UNPUBLISHED: tuple[tuple[str, str], ...] = ()
 SOURCE_FIELDS = ("sourceType", "title", "locator", "url", "repoPath", "repository", "lineStart", "lineEnd", "excerpt")
 TIMEOUT = 120
@@ -222,9 +223,80 @@ def linked(cli: str, test: str) -> set[str]:
     return {link["requirementId"] for link in links}
 
 
+def go_scan(source: str) -> tuple[str, set[int]]:
+    """The Go source with every comment and string, rune or raw-string literal blanked (newlines kept), so a
+    declaration found in it is executable code and not text that only looks like one; and the 0-based lines that
+    begin with a real `//` comment, so a marker inside a block comment or a literal is not one."""
+    out, comments, i, n, line = [], set(), 0, len(source), 0
+    while i < n:
+        two, ch = source[i:i + 2], source[i]
+        if two == "//":
+            end = source.find("\n", i)
+            end = n if end < 0 else end
+            if not source[source.rfind("\n", 0, i) + 1:i].strip():
+                comments.add(line)
+        elif two == "/*":
+            end = source.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+        elif ch in "\"'`":
+            end = i + 1
+            while end < n and source[end] != ch and (ch == "`" or source[end] != "\n"):
+                end += 2 if source[end] == "\\" and ch != "`" else 1
+            end = min(end + 1, n)
+        else:
+            out.append(ch)
+            line += ch == "\n"
+            i += 1
+            continue
+        out.append("".join(c if c == "\n" else " " for c in source[i:end]))
+        line += source.count("\n", i, end)
+        i = end
+    return "".join(out), comments
+
+
+def go_declarations(source: str) -> list[tuple[str, int]]:
+    """(name, 0-based line) of each executable `func TestX` of one Go file."""
+    code = go_scan(source)[0]
+    return [(match.group(1), code.count("\n", 0, match.start())) for match in GO_TEST.finditer(code)
+            if match.group(1) != "TestMain"]
+
+
+def go_markers(source: str) -> dict[str, tuple[int, ...]]:
+    """Name -> spec numbers of each executable Go test declared once whose marker is a real `//` comment line."""
+    lines, comments = source_lines(source, "go"), go_scan(source)[1]
+    found = go_declarations(source)
+    result = {}
+    for name, index in found:
+        specs, problem = marker(lines, index, "//")
+        if not problem and index - 1 in comments and [other for other, _ in found].count(name) == 1:
+            result[name] = specs
+    return result
+
+
+def kept_go_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Test]:
+    """Marked Go tests that a changed file had before and still has, with the very same marker: a table-driven one
+    gains subtests when a row is added, and each new subtest is a case of its own that only a link makes covered.
+    Only executable declarations with a real `//` marker line count, so a marker in a comment or string never claims
+    a test."""
+    found = []
+    for path in paths:
+        before, after = (blob(root, ref, path) if language(path) == "go" else None for ref in (base, head))
+        if before is None or after is None:
+            continue
+        was, lines = go_markers(before), go_declarations(after)
+        for name, specs in go_markers(after).items():
+            if was.get(name) == specs:
+                found.append(Test(path, name, next(index for other, index in lines if other == name) + 1, specs))
+    return found
+
+
 def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry: bool = False,
-         packages: dict[str, str | None] | None = None) -> None:
+         packages: dict[str, str | None] | None = None, kept: list | None = None) -> None:
+    """Links the cases of each marked added test; `kept` are marked tests that existed before, linked when they have
+    cases and their spec is on main, and otherwise left alone."""
     marked = [test for test in tests if test.specs]
+    marked += [test for test in kept or [] if test.specs]
+    old, deadline = {id(test) for test in kept or []}, time.monotonic() + KEPT_SECONDS
     if not marked:
         report("links: no marked test added.")
         return
@@ -239,20 +311,34 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
             report(f"links: {shown(test.path)} {shown(test.name)} not linked: {reason}.")
             continue
         unknown = [number for number in test.specs if number not in main]
+        if unknown and id(test) in old:
+            continue
         if unknown:
             missing.append(f"{shown(test.name)} names " + ", ".join(f"ANYM-{number}" for number in unknown)
                            + ", not on Tiden main")
             continue
         package = (packages or {}).get(test.path)
         if language(test.path) == "go" and not package:
+            if id(test) in old:
+                continue
             missing.append(f"{shown(test.path)} {shown(test.name)} lies in no Go module")
             continue
         cases = matches(rows, test.path, test.name, package)
+        if id(test) in old:  # a test of the same name in a build-excluded or other file of the package is not this one
+            cases = [case for case in cases if case.get("filePath") == PurePosixPath(test.path).name]
+        if not cases and id(test) in old:
+            continue
         if not cases:
             missing.append(f"{shown(test.path)} {shown(test.name)} has no imported case on Tiden main")
             continue
+        stopped = False
         for case in cases:
             for number in test.specs:
+                if id(test) in old and time.monotonic() > deadline:
+                    report(f"links: {shown(test.path)} {shown(test.name)} not rechecked further: the kept-test time "
+                           "budget is spent.")
+                    stopped = True
+                    break
                 spec = main[number]["id"]
                 try:
                     if spec in linked(cli, case["id"]):
@@ -269,6 +355,8 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
                     missing.append(f"{shown(case.get('signature', case['id']))} -> ANYM-{number}: {error}")
                     continue
                 report(f"links: {shown(case.get('signature', case['id']))} -> ANYM-{number}.")
+            if stopped:
+                break
     if missing:
         raise StepFailed("links", "; ".join(missing))
 
@@ -382,6 +470,7 @@ def sync(root: Path, sha: str, number: int, body: str, cli: str, product: str, r
     paths = changed(root, parent, sha)
     code = [path for path in paths if not excluded(path)]
     tests = diff_tests(root, parent, sha, paths)
+    kept = kept_go_tests(root, parent, sha, paths)
     report(f"Pull request #{number}, commit {sha}: {len(code)} code file(s), {len(tests)} added test(s); named "
            + (", ".join(f"ANYM-{n}" for n in lines.named) or "no spec")
            + (f"; branch {lines.branch}" if lines.branch else "") + ".")
@@ -401,8 +490,8 @@ def sync(root: Path, sha: str, number: int, body: str, cli: str, product: str, r
     if unknown:
         failures.append(StepFailed("resolve", ", ".join(f"ANYM-{n}" for n in unknown) + " not on Tiden main"))
     steps = (("links", lambda: link(cli, product, tests, main, report, dry,
-                                   {test.path: go_package(root, sha, test.path) for test in tests
-                                    if language(test.path) == "go"})),
+                                   {test.path: go_package(root, sha, test.path) for test in (*tests, *kept)
+                                    if language(test.path) == "go"}, kept)),
              ("anchors", lambda: anchor(cli, product, code, lines.named[0] if lines.named else None, main, sha, number,
                                         report, dry)),
              ("status", lambda: settle_status(cli, product, lines.delivers, main, report, dry)))

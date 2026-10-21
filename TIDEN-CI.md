@@ -358,7 +358,9 @@ pull request named by `(#n)` in the commit subject, it:
 2. links each marked test the commit adds to its specs (a Go test,
    `// spec: ANYM-n` above `func TestX`, links the cases whose signature is
    `<module path>[/<package dir>]::TestX` or starts with `<that>::TestX/`, the
-   module path read from the nearest `go.mod` at the commit);
+   module path read from the nearest `go.mod` at the commit); a marked Go test
+   that already existed in a changed file is linked the same way, so subtests
+   added by a new table row are covered, and is skipped when it has no case;
 3. anchors each unanchored changed code file to the primary spec;
 4. sets each `Delivers:` spec to Done, or to Review while it has an open live or
    measured check;
