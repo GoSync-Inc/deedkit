@@ -1722,18 +1722,64 @@ def range_changes(mirror, base, candidate, installed):
     return sql, [path for path in tools if not current_tool(path)]
 
 
-def pause_text(sql, pending):
+MIGRATION = re.compile(r"services/messaging/messaging_service/migrations/([0-9]{3}_[A-Za-z0-9_]+\.sql)")
+CLASSIFIER = "services/messaging/messaging_service/migration_rollout.py"
+CLASSES = ("expand", "manual", "no header")
+CLASSIFY_TIMEOUT = 30
+# The candidate's classifier gets the migration texts on stdin and prints one class per text; it may not open a
+# file, import an uncached module, start a process or reach the network.
+CLASSIFY = """import json, re, sys
+data = json.loads(sys.stdin.read())
+def refuse(event, args):
+    if event.split(".")[0] in ("open", "import", "socket", "subprocess", "os", "shutil", "ctypes", "fcntl", "urllib",
+                               "http", "sqlite3", "pty", "signal", "syslog", "resource", "mmap"):
+        raise PermissionError(event)
+sys.addaudithook(refuse)
+module = {"__name__": "migration_rollout"}
+exec(compile(data["source"], "migration_rollout.py", "exec"), module)
+print(json.dumps([module["rollout_class"](text) for text in data["texts"]]))
+"""
+
+
+def migration_classes(mirror, base, candidate, sql):
+    """`<file> <class>` for each migration `base..candidate` adds (ANYM-444): the class the candidate's classifier
+    gives the candidate's bytes, `expand`, `manual` or `no header`. It only names; whatever fails here is `manual`."""
+    if not any(MIGRATION.fullmatch(path) for path in sql):
+        return []
+    try:
+        added = [path for path in run(["git", "-C", str(mirror), "diff", "--name-only", "--no-renames", "--diff-filter=A",
+                                       "-z", base, candidate]).split("\0") if MIGRATION.fullmatch(path)]
+    except Refused:
+        return []
+    try:
+        texts = [run(["git", "-C", str(mirror), "cat-file", "blob", f"{candidate}:{path}"], binary=True).decode()
+                 for path in added]
+        source = run(["git", "-C", str(mirror), "cat-file", "blob", f"{candidate}:{CLASSIFIER}"], binary=True).decode()
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", CLASSIFY], capture_output=True, text=True,
+                                input=json.dumps({"source": source, "texts": texts}), timeout=CLASSIFY_TIMEOUT)
+        classes = json.loads(result.stdout) if result.returncode == 0 else None
+    except (Refused, OSError, ValueError, subprocess.SubprocessError):
+        classes = None
+    if not (isinstance(classes, list) and len(classes) == len(added) and all(c in CLASSES for c in classes)):
+        classes = ["manual"] * len(added)
+    return [f"{MIGRATION.fullmatch(path)[1]} {kind}" for path, kind in zip(added, classes)]
+
+
+def pause_text(sql, pending, classes=()):
     reasons = []
     if sql:
-        reasons.append("the SQL inventory changed (" + ", ".join(sql[:5]) + "); migrate by hand (production.md)")
+        reasons.append("the SQL inventory changed (" + ", ".join(sql[:5]) + "); migrate by hand (production.md)"
+                       + ("; added migrations: " + ", ".join(classes) if classes else ""))
     if pending:
         reasons.append("deploy tools changed (" + ", ".join(pending[:5]) + "); install them by hand (production.md)")
     return reasons
 
 
 def pause_reasons(mirror, base, candidate, installed):
-    """Why `base..candidate` needs a human: SQL inventory changes, and deploy tools that are not installed yet."""
-    return pause_text(*range_changes(mirror, base, candidate, installed))
+    """Why `base..candidate` needs a human: SQL inventory changes, each added migration's class, and deploy tools
+    that are not installed yet."""
+    sql, pending = range_changes(mirror, base, candidate, installed)
+    return pause_text(sql, pending, migration_classes(mirror, base, candidate, sql))
 
 
 # Deploy tool updates (ANYM-443, production.md "Deploy tool updates"). Each installed tool pair has its own directory
@@ -2287,7 +2333,7 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
             return {"status": "waiting", "reason": "no newer main commit has attested images yet", "sha": base}
         since = base
     sql, pending = range_changes(mirror, since, candidate, installed)
-    if (reasons := pause_text(sql, pending)) and not sql and set(pending) <= TOOL_FILES.keys():
+    if (reasons := pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
         # Only the tool pair waits for an install: the self-updating layout installs it, when this run is its tool.
         try:
             tool = installed_tool()

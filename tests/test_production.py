@@ -2272,7 +2272,7 @@ class Deployer:
         self.history, self.changes = [BASE, *history], changes or {}
         self.green, self.unreached = set(green), set()
         self.steps, self.requests, self.git = [], [], []
-        self.blobs, self.git_failures = {}, {}
+        self.blobs, self.git_failures, self.contents, self.modified = {}, {}, {}, set()
         self.current(BASE)
         p.write(self.http_state / "http-current.json",
                 {"sha": BASE, "status": "serving", "config_digest": p.digest(self.http)})
@@ -2365,7 +2365,12 @@ class Deployer:
         if command[:1] == ["diff"]:
             old, new = command[-2:]
             commits = self.history[self.history.index(old) + 1:self.history.index(new) + 1]
-            return "\0".join(path for sha in commits for path in self.changes.get(sha, ())) + "\0"
+            return "\0".join(path for sha in commits for path in self.changes.get(sha, ())
+                             if "--diff-filter=A" not in command or path not in self.modified) + "\0"
+        if command[:2] == ["cat-file", "blob"] and command[2] in self.contents:
+            return self.contents[command[2]]
+        if command[:2] == ["cat-file", "blob"]:
+            raise p.Refused("git failed (exit 128); production was not accepted")
         return ""  # clone and fetch of the blobless mirror
 
     def deploy(self, **options):
@@ -2432,6 +2437,69 @@ def test_documentation_about_migrations_is_not_an_sql_inventory_change(tmp_path,
     host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["guide/migrations/synthetic-layout.md",
                                                             "services/messaging/migration-notes.md"]})
     assert host.deploy()["status"] == "deployed"
+
+
+MIGRATION_DIRECTORY = "services/messaging/messaging_service/migrations/"
+ROLLOUT = ROOT / "services/messaging/messaging_service/migration_rollout.py"
+
+
+def migration_host(tmp_path, monkeypatch, files, *, classifier=None, others=()):
+    """A range NEWER..NEWEST that adds `files` (name: bytes) and changes `others`; the mirror holds their bytes."""
+    host = Deployer(tmp_path, monkeypatch, changes={NEWER: [MIGRATION_DIRECTORY + name for name in files] + ["README.md"],
+                                                    NEWEST: list(others)})
+    host.contents = {f"{NEWEST}:{MIGRATION_DIRECTORY}{name}": data for name, data in files.items()}
+    host.contents[f"{NEWEST}:{p.CLASSIFIER}"] = ROLLOUT.read_bytes() if classifier is None else classifier
+    return host
+
+
+# spec: ANYM-444
+def test_the_sql_pause_names_the_class_the_candidate_classifier_gives_each_added_migration(tmp_path, monkeypatch):
+    files = {"041_synthetic_expand.sql": b"-- rollout: expand\nALTER TABLE messages ADD COLUMN synthetic_note text;\n",
+             "042_synthetic_manual.sql": b"-- rollout: manual\nINSERT INTO probe_metadata VALUES ('marker-7f3a','x');\n",
+             "043_synthetic_claim.sql": b"-- rollout: expand\nUPDATE messages SET body='marker-9c1e';\n",
+             "044_synthetic_bare.sql": b"ALTER TABLE messages ADD COLUMN synthetic_rank integer;\n"}
+    edited = MIGRATION_DIRECTORY + "039_feedback_status.sql"
+    host = migration_host(tmp_path, monkeypatch, files, others=[edited])
+    host.modified = {edited}
+    outcome = host.deploy()
+    paths = ", ".join([MIGRATION_DIRECTORY + name for name in files] + [edited])
+    # The pause is the one before ANYM-444; its reason adds only file names and classes, never file contents.
+    assert outcome["status"] == "halted" and outcome["sha"] == NEWEST and host.steps == []
+    assert outcome["reason"] == (f"the SQL inventory changed ({paths}); migrate by hand (production.md); added "
+                                 "migrations: 041_synthetic_expand.sql expand, 042_synthetic_manual.sql manual, "
+                                 "043_synthetic_claim.sql manual, 044_synthetic_bare.sql no header")
+    assert host.paused() == outcome["reason"] and "marker" not in outcome["reason"]
+    assert [argv[3:] for argv in host.git if argv[3:5] == ["cat-file", "blob"]][-1] == \
+        ["cat-file", "blob", f"{NEWEST}:{p.CLASSIFIER}"]
+    assert p.pause_reasons(host.state, BASE, NEWEST, {}) == [outcome["reason"]]
+
+
+# spec: ANYM-444
+@pytest.mark.parametrize("path", ["services/calendar/family_calendar/service/schema.sql",
+                                  "services/messaging/messaging_service/gateway_role.sql",
+                                  "services/messaging/messaging_service/schema.sql"])
+def test_a_schema_or_role_file_pauses_exactly_as_before(tmp_path, monkeypatch, path):
+    host = migration_host(tmp_path, monkeypatch, {}, others=[path])
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.steps == [] and host.paused() == outcome["reason"]
+    assert outcome["reason"] == f"the SQL inventory changed ({path}); migrate by hand (production.md)"
+    assert not [argv for argv in host.git if "cat-file" in argv or "--diff-filter=A" in argv]
+
+
+# spec: ANYM-444
+@pytest.mark.parametrize("classifier", [b"raise RuntimeError('synthetic')\n",
+                                        b"def rollout_class(text):\n    return open('/etc/hosts').read()\n",
+                                        b"def rollout_class(text):\n    return 'expand; deploy anyway'\n",
+                                        b"import json.tool\ndef rollout_class(text):\n    return 'expand'\n", None],
+                         ids=["raises", "opens-a-file", "other-text", "imports", "missing"])
+def test_a_failing_classifier_names_the_migrations_manual_and_pauses_the_same(tmp_path, monkeypatch, classifier):
+    files = {"041_synthetic_expand.sql": b"-- rollout: expand\nALTER TABLE messages ADD COLUMN synthetic_note text;\n"}
+    host = migration_host(tmp_path, monkeypatch, files, classifier=classifier)
+    if classifier is None:
+        del host.contents[f"{NEWEST}:{p.CLASSIFIER}"]
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.steps == [] and host.paused() == outcome["reason"]
+    assert outcome["reason"].endswith("; added migrations: 041_synthetic_expand.sql manual")
 
 
 def test_deploy_continues_when_the_changed_deploy_tools_are_the_installed_ones(tmp_path, monkeypatch):
@@ -4122,7 +4190,7 @@ class ToolHost(Deployer):
 
     def run(self, argv, **kwargs):
         command = argv[3:]
-        if command[:2] == ["cat-file", "blob"]:
+        if command[:2] == ["cat-file", "blob"] and command[2].split(":", 1)[1] in self.files:
             self.git.append(argv)
             assert kwargs.get("binary") is True
             sha, path = command[2].split(":", 1)
