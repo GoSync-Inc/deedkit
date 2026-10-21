@@ -514,8 +514,8 @@ deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS
 - **Mechanics:** before each matching pass the subscription worker prunes at most 16
   subscriptions, one transaction of at most 500 references each, oldest first. A batch
   takes the shared principal lock and the subscription row with `SKIP LOCKED` (the
-  matcher's order; ACK and fetch hold the same row), runs with `lock_timeout` 100 ms
-  and `statement_timeout` 1 s, deletes a contiguous prefix above the floor and moves
+  matcher's order; ACK and fetch hold the same row), runs with `lock_timeout` 100 ms,
+  `statement_timeout` 1 s and `transaction_timeout` 4 s (client pauses included), deletes a contiguous prefix above the floor and moves
   the floor in the same transaction. A failed batch rolls back alone and is logged as
   `subscription_retention_failed` with its error class only; matching and hints
   continue (also in opt-in telemetry, code only). `--once` diagnostics never prune.

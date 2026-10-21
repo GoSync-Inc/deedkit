@@ -427,9 +427,12 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
 
 
 RETENTION_BATCH = 500
-# A deadline this close counts as passed: a batch's statements are bounded far below it, so
-# nothing is deleted after expires_at even when the matcher has not marked the row expired yet.
+# A deadline this close counts as passed. The server ends a batch's transaction, client pauses
+# included, well before it, so nothing is deleted after expires_at even when the matcher has not
+# marked the row expired yet.
 RETENTION_EXPIRY_MARGIN = '1 minute'
+# Under the pool's 5 s statement_timeout, so a stalled batch ends before a --disable waiting on it.
+RETENTION_TRANSACTION_TIMEOUT = '4s'
 # Shared by each batch, exclusive by the operator's switch: a disable waits for in-flight batches.
 RETENTION_LOCK = 'subscription-retention'
 
@@ -501,6 +504,8 @@ def prune_subscriptions(store, *, max_subscriptions=16):
 def _prune_batch(c, candidate, days):
     """One transaction. Returns rows deleted, or None when retention is off or the subscription
     is busy, held or past its deadline."""
+    # Set first, so it bounds the expiry read through COMMIT: a stalled batch is rolled back.
+    c.execute("SELECT set_config('transaction_timeout',%s,true)", (RETENTION_TRANSACTION_TIMEOUT,))
     # Bounds well under one matcher pass; a contended subscription waits for the next pass.
     c.execute("SET LOCAL lock_timeout='100ms'")
     c.execute("SET LOCAL statement_timeout='1s'")

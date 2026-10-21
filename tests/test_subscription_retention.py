@@ -488,6 +488,43 @@ def test_deadline_crossed_after_selection_is_rechecked_under_the_row_lock(seeded
 
 
 # spec: ANYM-446
+def test_deadline_crossed_while_the_worker_stalls_after_the_locked_check_rolls_the_batch_back(seeded, monkeypatch, capsys):
+    store, _, _ = seeded
+    token, sid, events = acked_subscription(store, name='retention-deadline-stall-reader')
+    ack(store, token, sid)
+    age(store, sid, events, '30 days')
+    # Scaled down: the deadline is outside the margin at the locked read and passes during the stall.
+    monkeypatch.setattr(subscriptions, 'RETENTION_EXPIRY_MARGIN', '2 seconds')
+    monkeypatch.setattr(subscriptions, 'RETENTION_TRANSACTION_TIMEOUT', '1s', raising=False)
+    with store.pool.connection() as c:
+        c.execute("UPDATE subscriptions SET expires_at=clock_timestamp()+interval '3 seconds' WHERE id=%s", (sid,))
+    batch = subscriptions._prune_batch
+
+    class Stalling:
+        def __init__(self, c):
+            self.c = c
+
+        def execute(self, query, *args):
+            result = self.c.execute(query, *args)
+            if 'FOR UPDATE SKIP LOCKED' in query:
+                # The batch acts on this decision after the pause; the client is idle, no statement runs.
+                row = result.fetchone()
+                assert row['lapsed'] is False
+                threading.Event().wait(3.5)
+                return SimpleNamespace(fetchone=lambda: row)
+            return result
+
+    monkeypatch.setattr(subscriptions, '_prune_batch', lambda c, candidate, days: batch(Stalling(c), candidate, days))
+    stats = prune_subscriptions(store)
+    assert stats['pruned'] == 0 and stats['retention_failed'] == 1
+    assert 'TransactionTimeout' in capsys.readouterr().out
+    assert refs(store, sid) == events and floor(store, sid) == 0
+    # Matching continues on a fresh connection and stores the expiry.
+    match_subscriptions(store)
+    assert store.get_subscription(token, sid)['state'] == 'expired'
+
+
+# spec: ANYM-446
 def test_disable_after_candidate_selection_stops_every_later_batch(seeded, monkeypatch):
     store, _, _ = seeded
     token, sid, events = acked_subscription(store, name='retention-disable-reader')
