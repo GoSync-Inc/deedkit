@@ -300,6 +300,11 @@ class Dispatch:
             args = {k: v for k, v in args.items() if k != "carry_projections"}
             if rules_ceiling and (caps.get("features") or {}).get("carry_projections") is True:
                 args["carry_projections"] = True
+        if module == "calendar" and tool["operation"] == "agenda":
+            # Drive links in agenda are rule data: asked for only under the same ceiling (ANYM-436).
+            args = {k: v for k, v in args.items() if k != "projection_status"}
+            if rules_ceiling and (caps.get("features") or {}).get("projection_status") is True:
+                args["projection_status"] = True
         started = datetime.now(timezone.utc).timestamp()
         # Admission is rechecked after all local work; a cached MCP session is
         # never authority. ACK is not retried if its network outcome is unknown.

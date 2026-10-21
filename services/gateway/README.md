@@ -125,7 +125,8 @@ refuses it unless `assignment:read` is in both the local grant and the backend k
 ceiling, and only when the backend declares `features.carry_projections`, the gateway sends
 `carry_projections: true` (an agent's own value is dropped), so the backend carries drives with a moved
 or cancelled lesson; a plan returned with `link` steps or `projections_skipped` is refused unless the
-ceiling holds. Slot requests may add explicitly reviewed
+ceiling holds. Likewise `calendar_agenda` gets `projection_status: true` (drift status of linked drives) only
+under that ceiling and when the backend declares `features.projection_status`. Slot requests may add explicitly reviewed
 `additional_calendar_refs` to member bindings and return their exact `source_selection`.
 Pending refreshes are polled with `refresh=false`; missing or pending coverage is unknown.
 

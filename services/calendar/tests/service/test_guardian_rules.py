@@ -434,3 +434,24 @@ def test_projection_tables_role_privileges(schema_one, roles):
     # One claim per (occurrence, rule) while pending, active or repairing.
     with pytest.raises(psycopg.errors.UniqueViolation):
         worker.query(link, ("link-2", rule_id, "dk2"))
+
+
+# spec: ANYM-436
+def test_agenda_projection_status_keeps_schema_one_and_missing_grants(schema_one, roles):
+    from family_calendar.service.providers import normalize_google
+
+    apply_roles, connect = roles
+    s = family(schema_one)
+    s.grant("family", "adult-a", "cal-a", READ + WRITE, "details")
+    key = s.agent("agent", "family", "adult-a", READ + WRITE, ["cal-a"])
+    event = {"id": "dentist", "etag": '"v1"', "summary": "Dentist",
+             "start": {"dateTime": "2026-10-20T08:00:00Z"}, "end": {"dateTime": "2026-10-20T09:00:00Z"}}
+    s.publish_window("cal-a", W0, W1, [normalize_google("cal-a", event, "Asia/Makassar")], "complete")
+    apply_roles()
+    service = FamilyService(connect("gateway"))
+    # Schema 1, then schema 2 before db-roles: an opted-in agenda reads no new table and answers as before.
+    for migrate in (True, False):
+        plain = service.agenda(key, ["cal-a"], W0, W1)
+        assert plain["events"] and service.agenda(key, ["cal-a"], W0, W1, projection_status=True) == plain
+        if migrate:
+            s.migrate()

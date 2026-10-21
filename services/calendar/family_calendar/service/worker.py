@@ -7,6 +7,8 @@ from .core import FamilyService
 from .providers import created_event_ref
 from .store import instant
 
+# Step states whose intent was durably admitted to send: only their own failure may undo a link change.
+ADMITTED = ("sending", "unknown", "needs_attention")
 AMBIGUOUS = {"unknown_result", "write_unknown", "provider_unavailable"}
 
 
@@ -46,6 +48,8 @@ class Worker:
                 args = (operation_id, ordinal)
                 # A linked create reserves its link; a linked delete (unproject) closes an existing one.
                 claim = step.get("link") and step["action"] == "create"
+                # A re-create of a drive gone outside DeedKit takes over its existing link (ANYM-436).
+                repair = claim and (step.get("projection") or {}).get("repair_of")
                 row = self.store.one(
                     "SELECT * FROM operation_steps WHERE operation_id=%s AND ordinal=%s", args
                 )
@@ -92,7 +96,9 @@ class Worker:
                             # Revalidate after the read/prepare and immediately before durable admission to send.
                             self.service.validate_plan(plan, op["principal_id"])
                             with self.store.transaction() as c:
-                                if claim:
+                                if repair:
+                                    self._repair(c, step, intent)
+                                elif claim:
                                     self._claim(c, step, cal, intent, args)
                                 elif step["action"] != "create" and self._links_writable(c):
                                     self._hold(c, step, cal)
@@ -120,7 +126,22 @@ class Worker:
                             "UPDATE operation_steps SET state='verified',receipt=%s,error=NULL WHERE operation_id=%s AND ordinal=%s",
                             (Jsonb(receipt), *args),
                         )
-                        if claim:
+                        if repair and not c.execute(
+                            # The drive is placed at the lesson's current span, which the link records with it.
+                            self.REPAIRED + "state='active',etag=%s,source_start=%s,source_end=%s,rule_version=%s,"
+                            "updated_at=now() WHERE id=%s AND state='repairing' AND target_id=%s RETURNING id",
+                            (
+                                receipt.get("etag"),
+                                step["source"]["start"],
+                                self._source_end(step),
+                                step["link"]["rule_version"],
+                                step["projection"]["link_id"],
+                                step["target_id"],
+                            ),
+                        ).fetchone():
+                            # A replacement no link tracks is never reported done.
+                            raise CalendarError("unknown_result")
+                        elif claim:
                             # Also the reconcile path: the claim admitted with the send becomes the live link.
                             c.execute(
                                 "UPDATE projection_links SET state='active',etag=%s,updated_at=now() "
@@ -170,7 +191,7 @@ class Worker:
                     )["state"]
                     # Read-back may fail after a successful send (including loss of authorization).
                     # Only a definite conditional conflict proves this request did not apply.
-                    ambiguous = current in ("sending", "unknown", "needs_attention") and e.code not in (
+                    ambiguous = current in ADMITTED and e.code not in (
                         "version_conflict",
                         "write_rejected",
                     )
@@ -182,7 +203,17 @@ class Worker:
                             "UPDATE operation_steps SET state=%s,error=%s WHERE operation_id=%s AND ordinal=%s",
                             (state, e.code, *args),
                         )
-                        if claim and not ambiguous:
+                        if repair and not ambiguous and current in ADMITTED:
+                            # A definite failure of the admitted repair gives the link its old target back (still
+                            # missing there); a step never admitted (prepared, or already conflict/failed when a
+                            # reconcile re-enters it) leaves the link to whoever holds it.
+                            c.execute(
+                                self.REPAIRED + "state='active',target_id=previous_target_id,"
+                                "target_resource_ref=%s,previous_target_id=NULL "
+                                "WHERE id=%s AND state='repairing' AND target_id=%s",
+                                (repair["resource_ref"], step["projection"]["link_id"], step["target_id"]),
+                            )
+                        elif claim and not repair and not ambiguous:
                             # A definite failure releases the claim (no DELETE grant) so the lesson can be projected
                             # again; an ambiguous one keeps it until reconcile.
                             c.execute(
@@ -192,7 +223,7 @@ class Worker:
                             )
                         elif (
                             step["action"] != "create"
-                            and current != "prepared"
+                            and current in ADMITTED
                             and not ambiguous
                             and self._links_writable(c)
                         ):
@@ -266,6 +297,26 @@ class Worker:
             raise CalendarError("source_unverified")
         event_ref = created_event_ref(source["provider"], row["receipt"]["resource_ref"], source["target_id"])
         return dict(step, link=dict(step["link"], source_event_ref=event_ref))
+
+    REPAIRED = "UPDATE projection_links SET "
+
+    @staticmethod
+    def _repair(c, step, intent):
+        """Take the link over from its gone drive in the admission transaction: only from `active` on its old
+        target, so of two competing repairs the second fails before any send."""
+        link = step["link"]
+        rule = c.execute("SELECT enabled,version FROM guardian_rules WHERE id=%s", (link["rule_id"],)).fetchone()
+        if not rule or not rule["enabled"] or rule["version"] != link["rule_version"]:
+            raise CalendarError("rule_changed")
+        old = step["projection"]["repair_of"]
+        if not c.execute(
+            "UPDATE projection_links SET state='repairing',previous_target_id=target_id,target_id=%s,"
+            "target_resource_ref=%s,rule_version=%s "
+            "WHERE id=%s AND state='active' AND target_id=%s RETURNING id",
+            (step["target_id"], intent.get("resource_ref"), link["rule_version"], step["projection"]["link_id"],
+             old["target_id"]),
+        ).fetchone():
+            raise CalendarError("projection_pending")
 
     @staticmethod
     def _claim(c, step, cal, intent, args):

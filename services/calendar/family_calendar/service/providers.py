@@ -445,6 +445,13 @@ class Providers:
             return {"action": "delete", "target": target, "absent": True, "resource_ref": source_ref("res", cal["ref"], target)}
         if step["action"] == "create" and old:
             raise CalendarError("version_conflict")
+        repair_of = (step.get("projection") or {}).get("repair_of")
+        if repair_of:
+            # Absent from a read window is not deleted: the old drive is read by its ID, and one that still
+            # exists (moved or restored) is never replaced; a failed read raises before any write.
+            gone = await self.read(cal, repair_of["target_id"])
+            if gone and gone.get("status") != "cancelled":
+                raise CalendarError("projection_edited")
         if step["action"] != "create":
             if not old or old.get("etag") != step["expected_etag"]:
                 raise CalendarError("version_conflict")

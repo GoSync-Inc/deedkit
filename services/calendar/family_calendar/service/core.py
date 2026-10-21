@@ -41,6 +41,13 @@ def wall_time(value, zone):
     return t
 
 
+# A live link that `project` leaves alone, by its drift status (ANYM-436); moved and missing drives are planned.
+DRIFT_SKIP = {
+    "in_sync": "already_projected",
+    "unknown": "already_projected",
+    "projection_edited": "projection_edited",
+    "source_cancelled": "use_unproject",
+}
 EVENT_WRITE = (
     "guest-free single event, all-day event (date range, exclusive end), or one occurrence of a "
     "recurring series (update or cancel, chosen by its event_ref); series, this-and-following and "
@@ -365,6 +372,8 @@ class FamilyService:
                 "atomic_cross_provider": False,
                 # Plans carry drives with their lesson only for a caller that sends carry_projections (ANYM-435).
                 "carry_projections": True,
+                # Agenda marks linked drives with their drift only for a caller that sends projection_status (ANYM-436).
+                "projection_status": True,
             },
             # Top level: the common gateway drops backend `features` but passes this through.
             guardian_projections=self.guardian_projections(),
@@ -374,14 +383,16 @@ class FamilyService:
         reason = self.store.guardian_readiness()
         return {"available": True} if not reason else {"available": False, "reason": reason}
 
-    def agenda(self, key, calendar_refs, start, end, scope="agenda:read"):
+    def agenda(self, key, calendar_refs, start, end, scope="agenda:read", projection_status=False):
         a, b = window(start, end)
         if not calendar_refs or len(calendar_refs) > 32 or len(set(calendar_refs)) != len(calendar_refs):
             raise CalendarError("invalid_calendar_refs")
         coverage = []
         events = []
+        # Before migration 2 and its grants no link exists: agenda never reads the new tables then.
+        projection_status = projection_status and not self.store.guardian_readiness()
         for calendar_ref in calendar_refs:
-            _, cal = self.authorize(key, calendar_ref, scope)
+            p, cal = self.authorize(key, calendar_ref, scope)
             cov = self.store.one("SELECT * FROM coverage WHERE calendar_ref=%s", (calendar_ref,))
             complete = bool(
                 cov
@@ -426,6 +437,21 @@ class FamilyService:
                     )
                 if cal["visibility"] == "details":
                     event.update(event_ref=e["ref"], **e["details"])
+                    # Links are rule data: only for a caller that opts in under its rule-read ceiling (ANYM-436).
+                    link = projection_status and self.rule_reader(p) and self.store.one(
+                        # Link only: the lesson is read in _drift, after its own authorization and freshness.
+                        "SELECT l.* FROM projection_links l JOIN guardian_rules r ON r.id=l.rule_id "
+                        "WHERE r.group_id=%s AND l.state<>'removed' AND l.target_calendar_ref=%s "
+                        "AND l.target_resource_ref=%s",
+                        (p["group_id"], calendar_ref, e["resource_ref"]),
+                    )
+                    if link:
+                        event["projection"] = {
+                            "link_id": link["id"],
+                            "duty": link["duty"],
+                            "status": self._drift(p, link),
+                            "operation_id": link["operation_id"],
+                        }
                 events.append(event)
         if len(events) > 500:
             raise CalendarError("coverage_incomplete")
@@ -557,6 +583,18 @@ class FamilyService:
                     sources.append({"calendar_ref": source["ref"], "scope": scope})
                     source_calendars.append(source)
                 for step, cal in steps:
+                    if step["action"] == "update":
+                        # A reprojected drive moves: its cached occurrence is no overlap of its new span.
+                        if (cal["ref"], step["target_id"]) in targets:
+                            raise CalendarError("duplicate_resource_action")
+                        targets.add((cal["ref"], step["target_id"]))
+                        selected.update(
+                            o["ref"]
+                            for o in self.store.query(
+                                "SELECT ref FROM occurrences WHERE calendar_ref=%s AND resource_ref=%s",
+                                (cal["ref"], step["resource_ref"]),
+                            )
+                        )
                     prepared.append(dict(step, ordinal=len(prepared)))
                     calendars.append(cal)
                 skipped += skips
@@ -692,6 +730,54 @@ class FamilyService:
             **({"projections_skipped": skipped} if projected or unprojected or carried else {}),
         }
 
+    def _fresh(self, calendar_ref, start, end, after=None):
+        """Complete coverage of [start, end] read in the last 5 minutes (SERVICE.md), and after `after`."""
+        cov = self.store.one("SELECT * FROM coverage WHERE calendar_ref=%s", (calendar_ref,))
+        since = datetime.now(timezone.utc) - timedelta(minutes=5)
+        return bool(
+            cov
+            and cov["status"] == "complete"
+            and cov["start_at"] <= start
+            and cov["end_at"] >= end
+            and cov["checked_at"] > (max(since, after) if after else since)
+        )
+
+    def _details(self, p, calendar_ref):
+        return self._can(p, calendar_ref, "agenda:read", details=True) or self._can(
+            p, calendar_ref, "event:read", details=True
+        )
+
+    def _drift(self, p, link):
+        """A link's status as p may know it: from fresh coverage only, and about the lesson only through p's own
+        details read of its calendar (authorized apart from the drive); anything else is `unknown`."""
+        target, source = link["target_calendar_ref"], link["source_calendar_ref"]
+        if link["state"] != "active" or not link["target_resource_ref"] or not self._details(p, target):
+            return "unknown"
+        drive = self.store.one(
+            "SELECT r.etag FROM occurrences o JOIN resources r ON r.ref=o.resource_ref "
+            "WHERE o.calendar_ref=%s AND o.resource_ref=%s LIMIT 1",
+            (target, link["target_resource_ref"]),
+        )
+        if not drive:
+            lead = self.store.one("SELECT lead_minutes FROM guardian_rules WHERE id=%s", (link["rule_id"],))
+            # Gone only in a complete read, after the link's last write, of the span the drive can occupy.
+            start = link["source_start"] - timedelta(minutes=lead["lead_minutes"])
+            return "projection_missing" if self._fresh(target, start, link["source_end"], link["updated_at"]) else "unknown"
+        if drive["etag"] != link["etag"]:
+            return "projection_edited"
+        if not self._details(p, source) or not self._fresh(source, link["source_start"], link["source_end"]):
+            return "unknown"
+        occ = self.store.one(
+            "SELECT start_at,end_at FROM occurrences WHERE ref=%s AND calendar_ref=%s",
+            (link["source_event_ref"], source),
+        )
+        if not occ:
+            # A cancelled occurrence is never published, so cancelled and deleted read alike.
+            return "source_cancelled"
+        if (occ["start_at"], occ["end_at"]) == (link["source_start"], link["source_end"]):
+            return "in_sync"
+        return "source_moved" if self._fresh(source, occ["start_at"], occ["end_at"]) else "unknown"
+
     def _source(self, key, calendar_ref):
         """The lesson's calendar as the principal reads it with details, and the scope that grants it."""
         for scope in ("event:read", "agenda:read"):
@@ -716,7 +802,37 @@ class FamilyService:
             (action.get("event_ref"), source["ref"]),
         )
         if not occ:
-            raise CalendarError("not_found_or_forbidden")
+            # A lesson gone since it was projected still names its links: they point to unproject.
+            gone = self.store.query(
+                self.LINKS + "l.source_calendar_ref=%s AND l.source_event_ref=%s AND r.activity=%s "
+                "ORDER BY l.duty,l.id",
+                (p["group_id"], source["ref"], action.get("event_ref"), action["activity"]),
+            ) if isinstance(action.get("event_ref"), str) else []
+            if not gone:
+                raise CalendarError("not_found_or_forbidden")
+            skips = [
+                {
+                    "rule_id": r["rule_id"],
+                    "duty": r["duty"],
+                    "guardian_id": r["guardian_id"],
+                    "reason": "projection_pending"
+                    if r["state"] == "pending"
+                    else "outcome_unknown"
+                    if r["state"] != "active"
+                    else {"projection_edited": "projection_edited", "unknown": "already_projected"}.get(
+                        self._drift(p, r), "use_unproject"
+                    ),
+                }
+                for r in gone
+            ]
+            labels = {
+                r["activity"]
+                for r in self.store.query(
+                    "SELECT activity FROM guardian_rules WHERE group_id=%s AND source_calendar_ref=%s AND enabled",
+                    (p["group_id"], source["ref"]),
+                )
+            }
+            return source, scope, [], skips, labels
         if occ["details"].get("all_day"):
             raise CalendarError("source_all_day")
         # Projecting a drive would chain links; any link naming this event as its target refuses it.
@@ -748,6 +864,19 @@ class FamilyService:
         for r in rules:
             if r["activity"] != activity:
                 continue
+            # A live link is planned again only to fix drift: a moved lesson or a drive gone (ANYM-436).
+            link = r["claim"] == "active" and self.store.one(
+                self.LINKS + "l.rule_id=%s AND l.source_event_ref=%s AND l.state='active'",
+                (p["group_id"], r["id"], event_ref),
+            )
+            drift = self._drift(p, link) if link else None
+            kind = "update" if drift == "source_moved" else "create"
+            # A live link's drive stays in the calendar it was placed in, even after the rule names another.
+            tcal = link["target_calendar_ref"] if link else r["target_calendar_ref"]
+            tprovider = (
+                self.store.one("SELECT provider FROM connections cn JOIN calendars c ON c.connection_id=cn.id "
+                               "WHERE c.ref=%s", (tcal,)) or {}
+            ).get("provider") if link else r["target_provider"]
             reason = (
                 "disabled"
                 if not r["enabled"]
@@ -755,23 +884,64 @@ class FamilyService:
                 if not r["guardian_enabled"]
                 else "projection_pending"
                 if r["claim"] == "pending"
-                else "already_projected"
-                if r["claim"]
-                # _source already proved source details through event:read or agenda:read.
-                else {"source_not_visible": None}.get(ready := self.rule_view(p, r)["not_ready_reason"], ready)
-                or (None if self._can(p, r["target_calendar_ref"], "plan:create") else "target_not_writable")
-                or (None if r["target_provider"] == "google" else "provider_not_supported")
+                else "outcome_unknown"
+                if r["claim"] == "repairing"
+                else DRIFT_SKIP.get(drift or "", "already_projected")
+                if r["claim"] and drift not in ("source_moved", "projection_missing")
+                # _source already proved source details through event:read or agenda:read. A live link is fixed in
+                # its own calendar, so the rule's current target is not consulted for it.
+                else (None if link else {"source_not_visible": None}.get(
+                    ready := self.rule_view(p, r)["not_ready_reason"], ready))
+                or (
+                    None
+                    if self._can(p, tcal, "plan:create") and self._can(p, tcal, "event:" + kind)
+                    else "target_not_writable"
+                )
+                or (None if tprovider == "google" else "provider_not_supported")
             )
             if reason:
                 skips.append({"rule_id": r["id"], "duty": r["duty"], "guardian_id": r["guardian_id"], "reason": reason})
                 continue
-            _, target = self.authorize(key, r["target_calendar_ref"], "event:create")
+            _, target = self.authorize(key, tcal, "event:" + kind)
             lead = timedelta(minutes=r["lead_minutes"])
             # Both drives end at the lesson boundary they serve.
             a, b = (start - lead, start) if r["duty"] == "dropoff" else (end - lead, end)
             event = {"title": r["title"], "start": a.isoformat(), "end": b.isoformat(), "timezone": target["timezone"]}
             if r["copy_location"] and details.get("location"):
                 event["location"] = details["location"]
+            if kind == "update":
+                # Reproject: the drive moves to the lesson's new span, conditional on the link ETag.
+                drive = self.store.one(
+                    "SELECT start_at,end_at,details FROM occurrences WHERE calendar_ref=%s AND resource_ref=%s",
+                    (target["ref"], link["target_resource_ref"]),
+                )
+                del event["title"]
+                step = {
+                    "action": "update",
+                    "calendar_ref": target["ref"],
+                    "provider": target["provider"],
+                    "event": event,
+                    "span": {"start": a.isoformat(), "end": b.isoformat()},
+                    "resource_ref": link["target_resource_ref"],
+                    "target_id": link["target_id"],
+                    "expected_etag": link["etag"],
+                    "reproject": True,
+                    "link": {
+                        "rule_id": r["id"],
+                        "rule_version": r["version"],
+                        "duty": r["duty"],
+                        "guardian_id": link["guardian_id"],
+                        "source_event_ref": event_ref,
+                    },
+                    "source": {"start": start.isoformat(), "end": end.isoformat(), "title": details.get("title")},
+                    "before": {
+                        "start": drive["start_at"].isoformat(),
+                        "end": drive["end_at"].isoformat(),
+                        **{k: v for k, v in drive["details"].items() if k == "location"},
+                    },
+                }
+                steps.append((step, target))
+                continue
             step = {
                 "action": "create",
                 "calendar_ref": target["ref"],
@@ -792,6 +962,15 @@ class FamilyService:
                 # Worker-only: the opaque link ID is the one marker the provider event carries.
                 "projection": {"link_id": ref("link"), "source_calendar_ref": source["ref"], "visibility": r["visibility"]},
             }
+            if link:
+                # Re-create a drive gone outside DeedKit, with a new client ID on the same link row; the worker
+                # takes the link over from its old target at admission, or fails projection_pending.
+                step["link"]["guardian_id"] = link["guardian_id"]
+                step["reproject"] = True
+                step["projection"].update(
+                    link_id=link["id"],
+                    repair_of={"target_id": link["target_id"], "resource_ref": link["target_resource_ref"]},
+                )
             steps.append((step, target))
         return steps, skips, {r["activity"] for r in rules if r["enabled"]}
 
