@@ -298,6 +298,19 @@ def test_a_marker_line_inside_a_block_comment_before_a_real_declaration_links_no
 
 
 # spec: ANYM-421
+def test_a_kept_go_test_never_links_a_case_imported_from_another_file_of_the_package(root, server):
+    full_server(server)
+    package = "example.com/svc/pkg"
+    old = "package pkg\n\n// spec: ANYM-12\nfunc TestRoute(t *testing.T) {}\n"
+    commit(root, {"svc/go.mod": "module example.com/svc\n\ngo 1.26\n", "svc/pkg/a_test.go": old}, "base")
+    server.set(tests=[case(f"{package}::TestRoute/unix_only", "b_test.go", "TestRoute/unix_only")])
+    merged(root, server, {"svc/pkg/a_test.go": old + "\n"}, "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert not server.state().get("links")
+
+
+# spec: ANYM-421
 def test_go_declarations_ignore_comments_and_literals_and_keep_line_numbers():
     source = ("package p\n/* func TestA(t *testing.T) {} */\nvar s = \"func TestB(\" // func TestC(\nvar r = `\n"
               "func TestD(x`\nvar q = '\"'\nfunc TestReal(t *testing.T) {}\nvar e = \"a\\\"b\"\nfunc TestMain(m *testing.M) {}\n")

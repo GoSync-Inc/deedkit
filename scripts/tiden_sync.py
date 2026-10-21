@@ -324,6 +324,8 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
             missing.append(f"{shown(test.path)} {shown(test.name)} lies in no Go module")
             continue
         cases = matches(rows, test.path, test.name, package)
+        if id(test) in old:  # a test of the same name in a build-excluded or other file of the package is not this one
+            cases = [case for case in cases if case.get("filePath") == PurePosixPath(test.path).name]
         if not cases and id(test) in old:
             continue
         if not cases:
