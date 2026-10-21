@@ -67,6 +67,16 @@ from the schema, never from the submitted value, and an unknown key is named onl
 identifier. Other rejections (non-finite numbers, a non-object body) keep the bare
 `{"error": "invalid_arguments"}`.
 
+When a rejection has a top-level `required` or `unknown_field` entry, the body adds
+`tool_fields: {required: [{name, type, values?}], optional: [name]}`: the tool's top-level properties from
+the packaged catalog schema (at most 64 names; `values` only for enums of at most 8 values), so a caller with an
+old tool list can retry at once. An `unknown_field` entry also adds `tool_list_stale: "likely"` and an
+`owner_hint` line to relay once (reconnect the DeedKit MCP client); a missing required field alone does not.
+Nested failures keep the shape above. Calling a tool this key cannot call (nonexistent, outside the profile or
+of an undeployed module) returns one identical `not_found_or_forbidden` body with
+`next_action: "refresh_tool_list_once"` and a `hint`: if the tool is still absent after a refresh, the key does
+not have it.
+
 A messaging consumption rejection (for example `invalid_feedback`) relays the backend's `field_errors` only when
 the whole list passes `platform_contracts.field_errors.validated` and the tool's reviewed schema: at most 20
 entries, one per field; each `field` a declared path of that tool's input schema (or `arguments`); a `reason`
@@ -83,6 +93,13 @@ also change the hash. A host can cache its registered tools; after an authorized
 profile expansion, compare a fresh list with the host registration and reconnect
 when they differ. Cached tool visibility never bypasses current call authorization.
 This diagnostic does not claim that a particular host has refreshed its registration.
+
+Client discovery: `discovery.catalog` is the first 12 hex digits of `tools_sha256` for the key's own list. The
+`platform_capabilities` description in `tools/list` ends with `Catalog: <c>` (the digest is computed without
+that sentence). An agent compares the `catalog` in a `platform_capabilities` result with the one in its
+cached description; if they differ, its tool list is stale and the owner should reconnect the DeedKit MCP
+client. Hosts should also reconnect after a DeedKit release or a profile change. The server `instructions`
+say the same.
 
 Module capabilities preserve the backend `principal` and add `backend_principal`
 and `gateway_principal`; platform `principal` remains the gateway identity.
