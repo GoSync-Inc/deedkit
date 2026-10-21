@@ -4,6 +4,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
 from .core import FamilyService
+from .providers import created_event_ref
 from .store import instant
 
 AMBIGUOUS = {"unknown_result", "write_unknown", "provider_unavailable"}
@@ -81,6 +82,8 @@ class Worker:
                     elif row["state"] == "prepared":
                         if plan["expires_at"] < datetime.now(timezone.utc):
                             raise CalendarError("plan_expired")
+                        if claim and step["link"].get("source_step") is not None:
+                            step = self._created_source(plan, step, operation_id)
                         intent = await self.providers.prepare(cal, step)
                         if intent.get("absent"):
                             # The fresh read found our drive already gone: the link closes without a write.
@@ -133,6 +136,22 @@ class Worker:
                                 "UPDATE projection_links SET state='removed',updated_at=now() "
                                 "WHERE target_calendar_ref=%s AND target_id=%s AND state IN ('active','repairing')",
                                 (cal["ref"], step["target_id"]),
+                            )
+                        elif step.get("link"):
+                            # A drive moved with its lesson: the link records the lesson's new span and the rule
+                            # version that placed it.
+                            c.execute(
+                                "UPDATE projection_links SET state='active',etag=%s,source_start=%s,source_end=%s,"
+                                "rule_version=%s,updated_at=now() "
+                                "WHERE target_calendar_ref=%s AND target_id=%s AND state IN ('active','repairing')",
+                                (
+                                    receipt.get("etag"),
+                                    step["source"]["start"],
+                                    self._source_end(step),
+                                    step["link"]["rule_version"],
+                                    cal["ref"],
+                                    step["target_id"],
+                                ),
                             )
                         else:
                             # A verified DeedKit update of a drive keeps its link on the new version.
@@ -232,6 +251,23 @@ class Worker:
         c.execute("UPDATE projection_links SET state='repairing',updated_at=now() WHERE id=%s", (link["id"],))
 
     @staticmethod
+    def _source_end(step):
+        # An instant lesson keeps the smallest span CHECK(source_end>source_start) allows, as occurrences do.
+        return max(instant(step["source"]["end"]), instant(step["source"]["start"]) + timedelta(microseconds=1))
+
+    def _created_source(self, plan, step, operation_id):
+        """A drive of a lesson created in the same plan names the lesson by the create's verified receipt."""
+        source = plan["payload"]["steps"][step["link"]["source_step"]]
+        row = self.store.one(
+            "SELECT state,receipt FROM operation_steps WHERE operation_id=%s AND ordinal=%s",
+            (operation_id, source["ordinal"]),
+        )
+        if row["state"] != "verified" or not (row["receipt"] or {}).get("resource_ref"):
+            raise CalendarError("source_unverified")
+        event_ref = created_event_ref(source["provider"], row["receipt"]["resource_ref"], source["target_id"])
+        return dict(step, link=dict(step["link"], source_event_ref=event_ref))
+
+    @staticmethod
     def _claim(c, step, cal, intent, args):
         """Reserve the (lesson, rule) link in the admission transaction; checked only before a fresh send."""
         link = step["link"]
@@ -251,8 +287,7 @@ class Worker:
                     step["projection"]["source_calendar_ref"],
                     link["source_event_ref"],
                     step["source"]["start"],
-                    # An instant lesson keeps the smallest span CHECK(source_end>source_start) allows, as occurrences do.
-                    max(instant(step["source"]["end"]), instant(step["source"]["start"]) + timedelta(microseconds=1)),
+                    Worker._source_end(step),
                     cal["ref"],
                     intent["target"],
                     intent.get("resource_ref"),
