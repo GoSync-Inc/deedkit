@@ -751,7 +751,9 @@ Otherwise it:
    range adds (`041_x.sql expand`, `manual` or `no header`; ANYM-444,
    CONTRIBUTING.md): the candidate's `migration_rollout.py` classifies the
    file, both read from the mirror at the candidate (a blob fetch), in an
-   isolated Python process; any failure there names the file `manual`. The
+   isolated Python process (`-I -S -B`, an audit hook, 30 s; the candidate is
+   attested main, trusted like a tool self-update, so the hook is no sandbox);
+   any failure there names the file `manual`. The
    class changes nothing else: the run pauses and you migrate by hand.
    When the only such change is the `production.py`/`seamless_release.py`
    pair, the self-updating layout installs it instead ("Deploy tool updates");

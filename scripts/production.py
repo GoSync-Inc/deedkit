@@ -1726,8 +1726,10 @@ MIGRATION = re.compile(r"services/messaging/messaging_service/migrations/([0-9]{
 CLASSIFIER = "services/messaging/messaging_service/migration_rollout.py"
 CLASSES = ("expand", "manual", "no header")
 CLASSIFY_TIMEOUT = 30
-# The candidate's classifier gets the migration texts on stdin and prints one class per text; it may not open a
-# file, import an uncached module, start a process or reach the network.
+# The candidate's classifier gets the migration texts on stdin and prints one class per text. The candidate is an
+# attested main commit (or the current release), the same trust the tool self-update gives its production.py; the
+# audit hook is no sandbox, it only stops a faulty classifier from opening files, importing, starting processes or
+# reaching the network.
 CLASSIFY = """import json, re, sys
 data = json.loads(sys.stdin.read())
 def refuse(event, args):
