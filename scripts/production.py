@@ -31,6 +31,7 @@ import json
 from pathlib import Path
 import posixpath
 import re
+import resource
 import selectors
 import shlex
 import shutil
@@ -1722,18 +1723,90 @@ def range_changes(mirror, base, candidate, installed):
     return sql, [path for path in tools if not current_tool(path)]
 
 
-def pause_text(sql, pending):
+MIGRATION = re.compile(r"services/messaging/messaging_service/migrations/([0-9]{3}_[A-Za-z0-9_]+\.sql)")
+CLASSIFIER = "services/messaging/messaging_service/migration_rollout.py"
+CLASSES = ("expand", "manual", "no header")
+CLASSIFY_TIMEOUT = 30
+# Bounds of the classifier child: the bytes it gets (migration texts and its source), the stdout read back and its
+# address space. Beyond any of them every added migration is `manual`.
+CLASSIFY_INPUT_LIMIT = 4 << 20
+CLASSIFY_OUTPUT_LIMIT = 64 << 10
+CLASSIFY_MEMORY = 512 << 20
+# The candidate's classifier gets the migration texts on stdin and prints one class per text. The candidate is an
+# attested main commit (or the current release), the same trust the tool self-update gives its production.py; the
+# audit hook is no sandbox, it only stops a faulty classifier from opening files, importing, starting processes or
+# reaching the network.
+CLASSIFY = """import json, re, sys
+data = json.loads(sys.stdin.read())
+def refuse(event, args):
+    if event.split(".")[0] in ("open", "import", "socket", "subprocess", "os", "shutil", "ctypes", "fcntl", "urllib",
+                               "http", "sqlite3", "pty", "signal", "syslog", "resource", "mmap"):
+        raise PermissionError(event)
+sys.addaudithook(refuse)
+module = {"__name__": "migration_rollout"}
+exec(compile(data["source"], "migration_rollout.py", "exec"), module)
+print(json.dumps([module["rollout_class"](text) for text in data["texts"]]))
+"""
+
+
+def classifier_limits():
+    """In the classifier child before exec: its address space and the size of a file it writes (its stdout). A limit
+    the platform refuses is skipped; the output and input bounds still hold."""
+    for limit, value in ((resource.RLIMIT_AS, CLASSIFY_MEMORY), (resource.RLIMIT_FSIZE, CLASSIFY_OUTPUT_LIMIT + 1)):
+        with suppress(ValueError, OSError):
+            resource.setrlimit(limit, (value, value))
+
+
+def migration_classes(mirror, base, candidate, sql):
+    """`<file> <class>` for each migration `base..candidate` adds (ANYM-444): the class the candidate's classifier
+    gives the candidate's bytes, `expand`, `manual` or `no header`. It only names; whatever fails here is `manual`."""
+    if not any(MIGRATION.fullmatch(path) for path in sql):
+        return []
+    try:
+        added = [path for path in run(["git", "-C", str(mirror), "diff", "--name-only", "--no-renames", "--diff-filter=A",
+                                       "-z", base, candidate]).split("\0") if MIGRATION.fullmatch(path)]
+    except Refused:
+        return []
+    objects = [f"{candidate}:{path}" for path in added + [CLASSIFIER]]
+    try:
+        # Sizes first: nothing over the input limit is read, and then no process starts.
+        if sum(int(run(["git", "-C", str(mirror), "cat-file", "-s", obj])) for obj in objects) > CLASSIFY_INPUT_LIMIT:
+            raise ValueError("over the classifier input limit")
+        blobs = [run(["git", "-C", str(mirror), "cat-file", "blob", obj], binary=True) for obj in objects]
+        if sum(map(len, blobs)) > CLASSIFY_INPUT_LIMIT:
+            raise ValueError("over the classifier input limit")
+        *texts, source = [data.decode() for data in blobs]
+        with tempfile.TemporaryFile() as out:
+            result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", CLASSIFY], stdout=out,
+                                    stderr=subprocess.DEVNULL, input=json.dumps({"source": source, "texts": texts}).encode(),
+                                    timeout=CLASSIFY_TIMEOUT, preexec_fn=classifier_limits)
+            out.seek(0)
+            output = out.read(CLASSIFY_OUTPUT_LIMIT + 1)
+        if result.returncode or len(output) > CLASSIFY_OUTPUT_LIMIT:
+            raise ValueError("the classifier failed or printed too much")
+        classes = json.loads(output)
+    except Exception:  # Refused, OSError, a timeout, a limit, RecursionError of deep JSON: all name `manual`
+        classes = None
+    if not (isinstance(classes, list) and len(classes) == len(added) and all(c in CLASSES for c in classes)):
+        classes = ["manual"] * len(added)
+    return [f"{MIGRATION.fullmatch(path)[1]} {kind}" for path, kind in zip(added, classes)]
+
+
+def pause_text(sql, pending, classes=()):
     reasons = []
     if sql:
-        reasons.append("the SQL inventory changed (" + ", ".join(sql[:5]) + "); migrate by hand (production.md)")
+        reasons.append("the SQL inventory changed (" + ", ".join(sql[:5]) + "); migrate by hand (production.md)"
+                       + ("; added migrations: " + ", ".join(classes) if classes else ""))
     if pending:
         reasons.append("deploy tools changed (" + ", ".join(pending[:5]) + "); install them by hand (production.md)")
     return reasons
 
 
 def pause_reasons(mirror, base, candidate, installed):
-    """Why `base..candidate` needs a human: SQL inventory changes, and deploy tools that are not installed yet."""
-    return pause_text(*range_changes(mirror, base, candidate, installed))
+    """Why `base..candidate` needs a human: SQL inventory changes, each added migration's class, and deploy tools
+    that are not installed yet."""
+    sql, pending = range_changes(mirror, base, candidate, installed)
+    return pause_text(sql, pending, migration_classes(mirror, base, candidate, sql))
 
 
 # Deploy tool updates (ANYM-443, production.md "Deploy tool updates"). Each installed tool pair has its own directory
@@ -2287,7 +2360,7 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
             return {"status": "waiting", "reason": "no newer main commit has attested images yet", "sha": base}
         since = base
     sql, pending = range_changes(mirror, since, candidate, installed)
-    if (reasons := pause_text(sql, pending)) and not sql and set(pending) <= TOOL_FILES.keys():
+    if (reasons := pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
         # Only the tool pair waits for an install: the self-updating layout installs it, when this run is its tool.
         try:
             tool = installed_tool()

@@ -41,6 +41,25 @@ their own test commands; the full list CI runs is in
 
 Keep applied SQL migrations unchanged. Add a new migration for schema changes,
 update backup table inventory/restore ceilings and check roles/ACL and repeat migration.
+Every messaging migration numbered 041 or later starts with `-- rollout: expand` or
+`-- rollout: manual` (ANYM-444; 001-040 keep no header and count as manual). `expand`
+means old code keeps working, and `classify` in
+`services/messaging/messaging_service/migration_rollout.py` allows it only when every
+statement is one of: `SET LOCAL lock_timeout|statement_timeout` to `'<n>ms'`/`'<n>s'`
+(above 0, at most 5 s and 180 s), or `lock_timeout` to `DEFAULT`; `CREATE TABLE` of a new table
+(defaults: a literal, `now()`, `gen_random_uuid()`; column constraints, references and
+`CHECK`/`PRIMARY KEY`/`UNIQUE`/`FOREIGN KEY` table constraints); `CREATE [UNIQUE] INDEX [name] ON
+<table the file creates> [USING btree] (<column> [ASC|DESC], ...)`; `ALTER TABLE ... ADD COLUMN <name> <type>
+[NULL] [DEFAULT <literal>]` (`NOT NULL` only with a literal default, no constraint, generated
+or identity column); a `DROP CONSTRAINT c` directly followed by `ADD CONSTRAINT c CHECK (<col>
+IN (<literals>)) NOT VALID` or `CHECK (<col> <@ ARRAY[<literals>]::text[]) NOT VALID`; 036's
+`DO` precondition template; `COMMENT ON ... IS '<literal>'`. Anything else (transaction control,
+DML, functions, triggers, other `DO` blocks, grants, drops, renames, type/default/nullability
+changes), and any text not lexed exactly as PostgreSQL does (U&, B, X or N strings, a string
+continued after a newline, an unclosed quote or comment), is `manual`.
+`tests/test_migration_rollout.py` never executes a declared `expand` that `classify` rejects; it
+applies the others to PostgreSQL and fails unless the catalog only gained those kinds of change
+(row security included; a widened list must be a superset of numbers or strings). Nothing runs a migration because of its class: `deploy` only names it in its pause.
 Keep source revisions, original provider IDs and acknowledgement semantics stable.
 Do not rename or move existing tests.
 

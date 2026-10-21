@@ -747,6 +747,15 @@ Otherwise it:
    installs none; the verifier matches the installed pin), or
    when the configuration changed since the current release (the plan A
    settings digest, each project's Compose document, the HTTP settings digest).
+   An SQL pause also names the rollout class of each messaging migration the
+   range adds (`041_x.sql expand`, `manual` or `no header`; ANYM-444,
+   CONTRIBUTING.md): the candidate's `migration_rollout.py` classifies the
+   file, both read from the mirror at the candidate (a blob fetch), in an
+   isolated Python process (`-I -S -B`, an audit hook, 30 s, 512 MiB of address
+   space, 4 MiB of input, 64 KiB of output, stderr discarded; the candidate is
+   attested main, trusted like a tool self-update, so the hook is no sandbox);
+   any failure there names the file `manual`. The
+   class changes nothing else: the run pauses and you migrate by hand.
    When the only such change is the `production.py`/`seamless_release.py`
    pair, the self-updating layout installs it instead ("Deploy tool updates");
 4. runs `prepare` + `apply` (plan A), then `seamless_release.py prepare` +
