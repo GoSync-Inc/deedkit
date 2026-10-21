@@ -255,6 +255,44 @@ def test_kept_go_tests_stop_being_rechecked_when_their_time_budget_is_spent(root
 
 
 # spec: ANYM-421
+def test_a_marker_added_in_a_comment_elsewhere_in_the_package_links_no_unmarked_go_test(root, server):
+    full_server(server)
+    package = "example.com/svc/pkg"
+    commit(root, {"svc/go.mod": "module example.com/svc\n\ngo 1.26\n",
+                  "svc/pkg/a_test.go": "package pkg\n\n/* example\nfunc TestRoute(t *testing.T) {}\n*/\n",
+                  "svc/pkg/b_test.go": "package pkg\n\nfunc TestRoute(t *testing.T) {}\n"}, "base")
+    server.set(tests=[case(f"{package}::TestRoute/one", "b_test.go", "TestRoute/one")])
+    merged(root, server, {"svc/pkg/a_test.go": "package pkg\n\n/* example\n// spec: ANYM-12\nfunc TestRoute(t *testing.T) {}\n*/\n"},
+           "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert not server.state().get("links")
+
+
+# spec: ANYM-421
+def test_kept_go_test_rechecks_stop_inside_one_test_when_the_budget_runs_out(root, server, monkeypatch):
+    full_server(server)
+    package = "example.com/svc/pkg"
+    old = "package pkg\n\n// spec: ANYM-12\nfunc TestRoute(t *testing.T) {}\n"
+    commit(root, {"svc/go.mod": "module example.com/svc\n\ngo 1.26\n", "svc/pkg/a_test.go": old}, "base")
+    server.set(tests=[case(f"{package}::TestRoute/one", "a_test.go", "TestRoute/one"),
+                      case(f"{package}::TestRoute/two", "a_test.go", "TestRoute/two")])
+    merged(root, server, {"svc/pkg/a_test.go": old + "\n"}, "Spec: ANYM-12")
+    clock, write = [0.0], tiden_sync.write
+
+    def slow_write(*arguments):
+        clock[0] += 1000
+        return write(*arguments)
+
+    monkeypatch.setattr(tiden_sync.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(tiden_sync, "write", slow_write)
+    code, out = run(root, server)
+    assert code == 0, out
+    assert "time budget is spent" in out
+    assert server.state()["links"] == {f"t-{package}::TestRoute/one": ["m-0012-0000-0000-0000-000000000000"]}
+
+
+# spec: ANYM-421
 def test_a_go_test_resolves_to_its_nearest_module_quoted_or_commented_and_never_to_an_outer_one(root, server):
     commit(root, {"outer/go.mod": "module example.com/outer\n",
                   "outer/inner/go.mod": "module example.com/inner // the nested module\n",

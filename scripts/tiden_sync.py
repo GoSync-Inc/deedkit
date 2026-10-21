@@ -231,11 +231,14 @@ def kept_go_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Te
         before, after = (blob(root, ref, path) if language(path) == "go" else None for ref in (base, head))
         if before is None or after is None:
             continue
-        old, lines, now = {name for name, _, _ in tests_in(path, before)}, source_lines(after, "go"), tests_in(path, after)
+        old_lines, lines, now = source_lines(before, "go"), source_lines(after, "go"), tests_in(path, after)
+        # The scanner also sees declarations in comments and strings, so only a name found once, with the very same
+        # marker at the base, is a test this commit did not just claim for a spec.
+        was = {name: marker(old_lines, index, "//") for name, index, _ in tests_in(path, before)
+               if [other for other, _, _ in tests_in(path, before)].count(name) == 1}
         for name, index, _ in now:
             specs, problem = marker(lines, index, "//")
-            # The scanner also sees declarations in comments and strings, so a name found twice is not told apart.
-            if name in old and not problem and [other for other, _, _ in now].count(name) == 1:
+            if not problem and [other for other, _, _ in now].count(name) == 1 and was.get(name) == (specs, ""):
                 found.append(Test(path, name, index + 1, specs))
     return found
 
@@ -260,9 +263,6 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
         if reason:
             report(f"links: {shown(test.path)} {shown(test.name)} not linked: {reason}.")
             continue
-        if id(test) in old and time.monotonic() > deadline:
-            report(f"links: {shown(test.path)} {shown(test.name)} not rechecked: the kept-test time budget is spent.")
-            continue
         unknown = [number for number in test.specs if number not in main]
         if unknown and id(test) in old:
             continue
@@ -283,6 +283,10 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
             missing.append(f"{shown(test.path)} {shown(test.name)} has no imported case on Tiden main")
             continue
         for case in cases:
+            if id(test) in old and time.monotonic() > deadline:
+                report(f"links: {shown(test.path)} {shown(test.name)} not rechecked further: the kept-test time budget "
+                       "is spent.")
+                break
             for number in test.specs:
                 spec = main[number]["id"]
                 try:
