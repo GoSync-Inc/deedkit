@@ -46,6 +46,7 @@ FeedbackDescription = Annotated[StrictStr,Field(min_length=1,max_length=4000,pat
 # A field error relays at most MAX_ALLOWED (50) of them; test_field_errors_messaging checks the gateway copy.
 FeedbackOperation = Annotated[StrictStr,Field(min_length=1,max_length=128,pattern=r'^[a-z][a-z0-9_]*$',
     json_schema_extra={'enum':sorted(OPERATION_PERMISSIONS)})]
+FeedbackStatus = Literal['received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened']
 Detail = Literal['compact','full']
 MessageDetail = Literal['compact','full','transcript']
 ConversationView = Literal['archive','conversation']
@@ -971,9 +972,9 @@ def create_app(store: Store, allowed_hosts: list[str]):
         return call(ctx,'submit_feedback',request_id=request_id,category=category,description=description,operation=operation,refs=refs)
 
     @mcp.tool(structured_output=True,annotations=read)
-    def list_feedback(ctx: Context,limit: SubscriptionLimit=50) -> dict[str,Any]:
-        """List this exact credential's private feedback without exposing former source references."""
-        return call(ctx,'list_feedback',limit=limit)
+    def list_feedback(ctx: Context,limit: SubscriptionLimit=50,status: FeedbackStatus | None=None) -> dict[str,Any]:
+        """List this exact credential's private feedback with its maintainer status (fixed = merged, verify_requested = deployed: re-check), without former source references."""
+        return call(ctx,'list_feedback',limit=limit,status=status)
 
     async def rest(request):
         operations={'capabilities','list_chats','search','get_messages','get_context',

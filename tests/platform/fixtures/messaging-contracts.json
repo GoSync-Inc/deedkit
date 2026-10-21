@@ -2952,7 +2952,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "List this exact credential's private feedback without exposing former source references.",
+      "description": "List this exact credential's private feedback with its maintainer status (fixed = merged, verify_requested = deployed: re-check), without former source references.",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -2961,6 +2961,28 @@
             "minimum": 1,
             "title": "Limit",
             "type": "integer"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "received",
+                  "accepted",
+                  "declined",
+                  "duplicate",
+                  "fixed",
+                  "verify_requested",
+                  "verified",
+                  "reopened"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Status"
           }
         },
         "type": "object",

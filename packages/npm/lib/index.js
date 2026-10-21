@@ -139,9 +139,10 @@ const SUBSCRIPTION_FIELDS = Object.freeze({
   configure_subscription_delivery: [['subscription_id','version'],['subscription_id','version','receiver_id']],
   test_subscription: [['subscription_id','request_id'],['subscription_id','request_id']],
 });
+const FEEDBACK_STATUSES = Object.freeze(['received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened']);
 const FEEDBACK_FIELDS = Object.freeze({
   submit_feedback: [['request_id','category','description'],['request_id','category','description','operation','refs']],
-  list_feedback: [[],['limit']],
+  list_feedback: [[],['limit','status']],
 });
 const SUBSCRIPTION_KINDS = new Set(['message.created','message.edited','message.deleted',
   'message.status','attachment.ready','file.text.ready','file.transcript.ready',
@@ -273,6 +274,7 @@ function feedbackArguments(method,args) {
     let valid;
     if (key==='request_id') valid=requestId(value);
     else if (key==='limit') valid=Number.isSafeInteger(value) && value>=1 && value<=100;
+    else if (key==='status') valid=typeof value==='string' && FEEDBACK_STATUSES.includes(value);
     else if (key==='category') valid=typeof value==='string' && ['bug','feature','quality','other'].includes(value);
     else if (key==='description') valid=typeof value==='string' && [...value].length>=1 &&
       [...value].length<=4000 && value.trim().length>0 && !/[\x00-\x08\x0b-\x1f\x7f]/.test(value);

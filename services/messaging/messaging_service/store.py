@@ -824,10 +824,17 @@ class Store:
         with self.authorized(token, 'submit_feedback') as (c, p):
             return submit_feedback(self, c, p, request_id, category, description, operation=operation, refs=refs)
 
-    def list_feedback(self, token, *, limit=50):
+    def list_feedback(self, token, *, limit=50, status=None):
         from .feedback import list_feedback
         with self.authorized(token, 'list_feedback') as (c, p):
-            return list_feedback(self, c, p, limit=limit)
+            return list_feedback(self, c, p, limit=limit, status=status)
+
+    def set_feedback_status(self, ids, status, *, fixed_in=None, spec_ref=None, duplicate_of=None, note=None):
+        # Operator CLI only (ANYM-343): no operation permission, MCP tool, REST route or gateway action.
+        from .feedback import set_feedback_status
+        with self.pool.connection() as c:
+            return set_feedback_status(c, ids, status, fixed_in=fixed_in, spec_ref=spec_ref,
+                duplicate_of=duplicate_of, note=note)
 
     def ack_updates(self, token, consumer, receipt, expected_version):
         with self.authorized(token,'ack_updates') as (c, p):
@@ -860,8 +867,8 @@ class Store:
             c.execute("SET LOCAL statement_timeout='180s'")
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
-            if version>38: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql')]:
+            if version>39: raise RuntimeError('database_newer_than_runtime')
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
