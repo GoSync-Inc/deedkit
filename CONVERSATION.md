@@ -72,6 +72,8 @@ two fields would carry the same fact, compact keeps the first and omits the othe
   dismissed attention), `last_message.id`;
 - compact omits `owner_attention.suggested_action` when it equals
   `conversation.suggested_action`;
+- compact omits `owner_attention.next_step` when it equals `conversation.next_step`;
+  `next_step` itself stays when `basis` is omitted (see "Why a row is unclear");
 - `sender_name` in `last_message` and `awaiting_reply` is cut to 64 characters,
   as in compact messages.
 
@@ -230,3 +232,49 @@ meaningful message, exact source IDs/revisions, `last_turn`, `suggested_action`,
 The transcript and structured messages use the same normalized view. Conversation
 content, filenames and derived media text remain untrusted data. The view lowers
 interpretation risk; it cannot guarantee a client's reasoning is correct.
+
+## Why a row is unclear
+
+A `conversation` block with `suggested_action: "unclear"` (and `owner_attention` on a
+group) carries `next_step`: one code for what to do, so the agent acts without
+guessing and without asking the owner. Reading a chat does not refresh a stale
+provider head (the collector does), so a stale head is answered with a caveat, not
+a retry. Rows that are not unclear have no `next_step`. A code missing from this
+table gives `get_context`, never an error. `basis` stays the reason; compact omits
+it when `awaiting_reply.confidence` already states it.
+
+| basis code | meaning | next_step |
+|---|---|---|
+| `provider_head_stale` | the newest messages were last confirmed more than 5 minutes ago; newer ones may exist | `answer_with_caveat` |
+| `provider_head_not_verified` | no head scan, a scan before the newest message, or a scan time in the future | `answer_with_caveat` |
+| `history_has_gaps` | older messages may be missing (`catchup_pending`, `catchup_gap`); the latest is readable | `answer_with_caveat` |
+| `ambiguous_message_order` | several messages share the latest time; who spoke last is unknown | `answer_with_caveat` |
+| `ambiguous_attention_reply_order` | a group attention message and the owner's reply share a time | `answer_with_caveat` |
+| `head_candidates_truncated` | more messages share the latest time than one read returns | `answer_with_caveat` |
+| `message_revision_changed_during_read` | the chat changed while being read | `reread_now` |
+| `message_version_conflict` | two versions of a head message conflict | `reread_now` |
+| `rate_limited` | the provider asked us to wait | `wait_for_provider_cooldown` |
+| `provider_temporarily_unavailable` | the provider failed briefly | `wait_for_provider_cooldown` |
+| `provider_unavailable` | the account or peer cannot be read | `check_provider_access` |
+| `provider_chat_error` | the provider reported an error for this chat | `check_provider_access` |
+| `unclassified_latest_message` | the latest item is not a normal message | `get_context` |
+| `chat_type_unknown` | the chat type is not known yet | `get_context` |
+| `no_archived_messages` | nothing archived yet | `wait_for_history` |
+
+`retry_after_s` sits beside `next_step: wait_for_provider_cooldown` for `rate_limited`
+when the account's collector recorded its backoff: whole seconds until it ends.
+
+A WhatsApp chat with `catchup_pending` in `coverage.gaps` also carries
+`catchup: {state, last_progress_at, cause?}` beside `coverage`. `last_progress_at`
+is when the catch-up cursor last moved older (or finished); `state` is:
+
+- `moving`: progress within the last 30 minutes (a fixed window; the scan interval is
+  the collector's private setting, so with a longer interval a moving chat can read
+  `queued` between scans);
+- `queued`: no attempt on this chat since its last progress, or never attempted;
+- `stalled`: past the window, and either an attempt moved nothing or a chat or
+  account collector error is recorded (`cause`, for example `rate_limited`);
+- `unknown`: no progress marker yet (rows from before it was written) or an
+  unreadable one.
+
+There is no ETA. Telegram rows show `history_has_gaps` and `answer_with_caveat` only.

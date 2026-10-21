@@ -127,11 +127,14 @@ class WhatsAppState(CollectorState):
         attempted={r['provider_chat']:r['progress'].get('last_attempt_at',0) for r in rows}
         return sorted(dialogs,key=lambda d:attempted.get(d[0],0))
 
-    def checkpoint_wa(self,chat,progress):
+    def checkpoint_wa(self,chat,progress,catchup_moved=False):
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)
-            c.execute('UPDATE whatsapp_checkpoints SET progress=%s,last_scan_at=clock_timestamp() WHERE account=%s AND provider_chat=%s',
-                (Jsonb(progress),self.account,chat))
+            # ANYM-454: the catch-up progress marker uses the database clock, like last_attempt_at, in this one UPDATE.
+            c.execute("""UPDATE whatsapp_checkpoints SET progress=%s::jsonb||CASE WHEN %s THEN jsonb_build_object(
+                'catchup_progress_at',extract(epoch FROM clock_timestamp())) ELSE '{}'::jsonb END,
+                last_scan_at=clock_timestamp() WHERE account=%s AND provider_chat=%s""",
+                (Jsonb(progress),catchup_moved,self.account,chat))
             c.execute('UPDATE collector_chats SET last_error_code=NULL WHERE account=%s AND provider_chat=%s',
                 (self.account,chat))
             if not progress.get('gap') and not progress.get('catchup_before'):
@@ -476,6 +479,7 @@ class WhatsAppCollector(TelegramCollector):
         return sorted(points)
     async def sync_chat(self,chat,kind,title):
         progress=await asyncio.to_thread(self.state.begin_attempt,chat,kind)
+        catchup_moved=False
         head=progress.get('head')
         if not head:
             page=await self.provider.page(chat,limit=self.batch_size)
@@ -492,7 +496,9 @@ class WhatsAppCollector(TelegramCollector):
                 progress['head']=target
                 if not reached and target>head: progress['gap']=True
                 progress.pop('catchup_before',None);progress.pop('catchup_head',None)
+                if before:catchup_moved=True
             elif points:
+                if points[0]!=before:catchup_moved=True
                 progress['catchup_before']=points[0];progress['catchup_head']=target
             if not progress.get('catchup_before') and not progress.get('history_exhausted') and progress.get('history_before'):
                 old=await self.provider.page(chat,limit=self.batch_size,before=progress['history_before'])
@@ -500,7 +506,7 @@ class WhatsAppCollector(TelegramCollector):
                 if old_points:progress['history_before']=min(progress['history_before'],old_points[0])
                 progress['history_exhausted']=old['exhausted'] and not old['pending']
         # A failure during any page above leaves the last committed checkpoint.
-        await asyncio.to_thread(self.state.checkpoint_wa,chat,progress)
+        await asyncio.to_thread(self.state.checkpoint_wa,chat,progress,catchup_moved)
         return bool(progress.get('gap'))
     async def sync_once(self):
         await asyncio.to_thread(self.state.phase,'history','scanning','history_scan')

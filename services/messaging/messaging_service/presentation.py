@@ -160,6 +160,8 @@ def lean_conversation(state, *, shown=()):
     result={'last_turn':state['last_turn'],'suggested_action':state['suggested_action'],
         'basis':state['basis']['code'],'head_freshness':state['head_freshness']}
     if state.get('provider_head_verified_at'):result['provider_head_verified_at']=state['provider_head_verified_at']
+    for key in ('next_step','retry_after_s'):
+        if state.get(key):result[key]=state[key]
     if state.get('order_status')=='ambiguous':
         result['order_status']='ambiguous'
         result['candidate_message_ids']=[m['message_id'] for m in state['basis'].get('evidence',[])]
@@ -176,11 +178,13 @@ def lean_conversation(state, *, shown=()):
     if attention:
         target=attention.get('target_message') or {}
         result['owner_attention']={'last_turn':attention['last_turn'],'suggested_action':attention['suggested_action'],
+            **({'next_step':attention['next_step']} if attention.get('next_step') else {}),
             **({'target_message_id':target['id']} if target.get('id') else {}),
             **({'truncated':True} if attention.get('truncated') else {})}
     coverage=state.get('coverage') or {}
     problems={k:coverage[k] for k in ('gaps','last_error_code') if coverage.get(k)}
     if problems:result['coverage']=problems
+    if state.get('catchup'):result['catchup']=state['catchup']
     return result
 
 
@@ -292,6 +296,7 @@ def lean_queue_conversation(state, last, hint, *, kind=None, self_chat=False):
         target=hint['message_id'] if hint else last and last['id']
         if target and attention.get('target_message_id')==target:attention.pop('target_message_id')
         if attention['suggested_action']==result['suggested_action']:attention.pop('suggested_action')
+        if attention.get('next_step')==result.get('next_step'):attention.pop('next_step',None)
     if 'candidate_message_ids' in result:
         # Tied candidates list only the IDs not already stated by the hint or the attention target.
         stated={hint and hint['message_id'],(attention or {}).get('target_message_id')}
