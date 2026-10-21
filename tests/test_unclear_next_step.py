@@ -255,7 +255,7 @@ def test_catchup_shows_beside_coverage_in_compact_rows():
 
 
 # spec: ANYM-454
-@pytest.mark.parametrize('marker', ['soon', True, float('nan'), float('inf'), -1, {}, [1],
+@pytest.mark.parametrize('marker', ['soon', True, float('nan'), float('inf'), -1, {}, [1], 10**400,
     (NOW + timedelta(days=1)).timestamp()])
 def test_malformed_catchup_marker_reads_as_absent(marker):
     result = state([message('x', 'outgoing')], history={**CATCHUP['history'], 'last_attempt_at': NOW},
@@ -316,6 +316,8 @@ def test_sync_chat_records_catchup_progress_when_the_cursor_moves(wa):
     moved = w.state.progress('123@c.us', 'user')
     assert moved['catchup_before'] < started['catchup_before']
     assert moved['catchup_progress_at'] >= started['catchup_progress_at']
+    # Same (database) clock as the attempt stamp: a pass stamps its progress after it began.
+    assert moved['catchup_progress_at'] >= moved['last_attempt_at']
     for _ in range(6):
         asyncio.run(w.sync_once())
     done = w.state.progress('123@c.us', 'user')
@@ -349,3 +351,39 @@ def test_conversation_state_reads_the_catchup_marker_and_account_cooldown(dialog
     assert limited['catchup'] == {'state': 'unknown', 'last_progress_at': None}
     assert limited['next_step'] == 'wait_for_provider_cooldown'
     assert 60 < limited['retry_after_s'] <= 90
+
+
+# spec: ANYM-454
+def test_failed_health_read_leaves_the_transaction_usable_and_keeps_the_marker(dialogue_archive):
+    from messaging_service.conversation_state import collector_facts
+
+    class FailingHealth:
+        def __init__(self, c):
+            self.c = c
+
+        def execute(self, sql, *args):
+            return self.c.execute('SELECT 1/0' if 'collector_health' in sql else sql, *args)
+
+        def transaction(self):
+            return self.c.transaction()
+
+    s, *_ = dialogue_archive
+    with s.pool.connection() as c:
+        facts = collector_facts(FailingHealth(c), {'chat_ids': None}, 'dialogue-wa', {'wa_progress': {'catchup_progress_at': 5.0}})
+        assert facts == {'catchup_progress_at': 5.0}
+        assert c.execute('SELECT 1 AS one').fetchone()['one'] == 1
+
+
+# spec: ANYM-454
+def test_chat_restricted_reader_gets_no_account_wide_health(dialogue_archive):
+    from messaging_service.conversation_state import collector_facts
+    s, *_ = dialogue_archive
+    with s.pool.connection() as c:
+        c.execute("""INSERT INTO collector_health(account,status,detail_code,cooldown_until)
+            VALUES('dialogue-wa','degraded','rate_limited',clock_timestamp()+interval '90 seconds')
+            ON CONFLICT(account) DO UPDATE SET status='degraded',detail_code='rate_limited',
+            cooldown_until=excluded.cooldown_until""")
+        row = {'wa_progress': {'catchup_progress_at': 7.0}}
+        assert collector_facts(c, {'chat_ids': ['some-chat']}, 'dialogue-wa', row) == {'catchup_progress_at': 7.0}
+        open_facts = collector_facts(c, {'chat_ids': None}, 'dialogue-wa', row)
+        assert open_facts['status'] == 'degraded' and open_facts['catchup_progress_at'] == 7.0

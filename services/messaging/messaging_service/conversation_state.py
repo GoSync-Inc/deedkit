@@ -12,7 +12,7 @@ from .policy import scope_filter
 HEAD_FRESHNESS = timedelta(minutes=5)
 HEAD_LIMIT = 64
 CATCHUP_WINDOW = timedelta(minutes=30)
-CLOCK_SKEW = timedelta(minutes=5)  # the collector stamps with its own clock
+CLOCK_SKEW = timedelta(minutes=5)  # as_of is the read transaction's start; a marker may be a moment newer
 # ANYM-454: what an agent does next for each reason a conversation block is unclear. Reading a chat
 # cannot refresh a stale head (the collector does), hence answer_with_caveat rather than a retry.
 # CONVERSATION.md and the list_chats description list exactly these pairs (tests pin all three).
@@ -72,9 +72,9 @@ def _unstable(messages):
 
 def _marker(value, as_of):
     """A checkpoint epoch as an instant; a malformed or future value reads as absent."""
-    if type(value) not in (int, float) or not math.isfinite(value) or value<=0:
-        return None
     try:
+        if type(value) not in (int, float) or not math.isfinite(value) or value<=0:
+            return None
         at=datetime.fromtimestamp(value, timezone.utc)
     except (ValueError, OverflowError, OSError):
         return None
@@ -308,15 +308,23 @@ def group_thread_query(projection, *, account='c.account',chat='c.id',
     return sql
 
 
-def collector_facts(c,account,row):
-    """Collector-side facts for next_step and catch-up; None when they cannot be read."""
+def collector_facts(c,p,account,row):
+    """Collector-side facts for next_step and catch-up; the advisory read never poisons the page.
+
+    A chat-restricted principal gets no account-wide health (as sync_status), only its chat's marker.
+    """
+    progress=(row or {}).get('wa_progress')
+    facts={'catchup_progress_at':progress.get('catchup_progress_at') if isinstance(progress,dict) else None}
+    if p.get('chat_ids') is not None:
+        return facts
     try:
-        health=c.execute('SELECT status,detail_code,cooldown_until FROM collector_health WHERE account=%s',
-            (account,)).fetchone() or {}
-        progress=(row or {}).get('wa_progress')
-        return {**health,'catchup_progress_at':progress.get('catchup_progress_at') if isinstance(progress,dict) else None}
+        # A savepoint: a failed SELECT must not leave the queue's transaction aborted.
+        with c.transaction():
+            health=c.execute('SELECT status,detail_code,cooldown_until FROM collector_health WHERE account=%s',
+                (account,)).fetchone()
+        return {**(health or {}),**facts}
     except Exception:
-        return None
+        return facts
 
 
 def conversation_state(c,p,account,chat,*,titles=None):
@@ -377,7 +385,7 @@ def conversation_state(c,p,account,chat,*,titles=None):
         enrich(c,attention,p,titles=titles);decorate_messages(c,p,attention)
     coverage_rows=rows(c,p,[chat],[account])
     covered=coverage_history(coverage_rows[0]) if coverage_rows else {}
-    collector=collector_facts(c,account,coverage_rows[0] if coverage_rows else None)
+    collector=collector_facts(c,p,account,coverage_rows[0] if coverage_rows else None)
     result=derive_state(observed, platform=info['platform'], chat_type=info['chat_type'],
         as_of=info['as_of'],history=covered,self_chat=info['self_chat'] or
             any(m.get('is_self_chat') is True for m in observed) or
