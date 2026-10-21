@@ -100,8 +100,12 @@ def observe_start(state,audio,ready):
 
 
 def start_snapshot(state):
-    try:return state['start_timing'].snapshot()
-    except Exception:return {'inbound_start':None,'inbound_start_unavailable':True}
+    # A failed StartTiming constructor leaves NoDiagnostics, whose empty snapshot is unavailable too.
+    try:
+        value=state['start_timing'].snapshot()
+        if 'inbound_start' in value:return value
+    except Exception:pass
+    return {'inbound_start':None,'inbound_start_unavailable':True}
 
 
 async def broker_status(socket,token):

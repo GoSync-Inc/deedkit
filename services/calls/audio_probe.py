@@ -101,9 +101,12 @@ class StartTiming:
         self.failed=False
 
     def mark(self,boundary):
+        # A boundary that could not be read leaves later offsets without an origin: unavailable, not "no frame".
         if self.at[boundary] is None:
-            self.at[boundary]=self.clock()
-            if boundary=='peer_connected':self.peer_connected_at=datetime.now(timezone.utc).isoformat()
+            try:
+                self.at[boundary]=self.clock()
+                if boundary=='peer_connected':self.peer_connected_at=datetime.now(timezone.utc).isoformat()
+            except Exception:self.failed=True
 
     def frame(self,audio,ready):
         # A failed measurement is recorded as unavailable, never read as "no frame".

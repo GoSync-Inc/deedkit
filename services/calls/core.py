@@ -217,17 +217,20 @@ GREETINGS={'id':('Halo',[(4,11,'Selamat pagi'),(11,15,'Selamat siang'),(15,18,'S
 
 def call_clock(b, at):
     """Counterparty time for the call start; the saved prompt is written earlier and never carries a time."""
-    neutral,bands=GREETINGS[b['language']]
+    # A legacy language outside the bands gets the time without a greeting word (ANYM-450): never a crash.
+    neutral,bands=GREETINGS.get(b.get('language'),(None,()))
     # A zone the host can no longer load reads as unknown: the clock must never stop a call from starting.
     try:local=at.astimezone(ZoneInfo(b['timezone'])) if b.get('timezone') else None
     except (ZoneInfoNotFoundError,ValueError,OSError):local=None
     if local is None:
+        if neutral is None:return "The counterparty's local time is unknown: use no morning, afternoon or evening greeting."
         return (f"The counterparty's local time is unknown: greet with '{neutral}' and use no morning, "
                 'afternoon or evening greeting.')
     head=f"Counterparty local time at call start: {local:%A %Y-%m-%d %H:%M} ({b['timezone']}). "
     for start,end,greeting in bands:
         if start<=local.hour<end:
             return head+f"If you greet by time of day, a time-of-day greeting must be '{greeting}'; never another one."
+    if neutral is None:return head+'Use no time-of-day greeting.'
     return head+f"It is night there: greet with '{neutral}' and use no time-of-day greeting."
 
 

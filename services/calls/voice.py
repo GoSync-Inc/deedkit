@@ -299,7 +299,10 @@ async def run_transport(transport,brief,key,state,browser=False):
     context=LLMContext()
     llm=create_model(brief,key,recorder=lambda role,text:service.transcript_chunk(identity,role,text),
                      input_rate=input_sample_rate(transport))
-    with contextlib.suppress(Exception):llm.hint_failed=lambda:service.runtime_event(identity,{'kind':'language_hint_failed'})
+    with contextlib.suppress(Exception):
+        llm.hint_failed=lambda:service.runtime_event(identity,{'kind':'language_hint_failed'})
+        # Grok builds its hint in the constructor; Gemini reports through hint_failed on connection.
+        if getattr(llm,'hint_unavailable',False):llm.hint_failed()
     record_clock(service,identity,brief,llm)
     live_flows=brief.get('dialog_engine')=='gemini_live_flows'
     ending_tasks=[]

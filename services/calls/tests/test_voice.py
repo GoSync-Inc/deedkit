@@ -81,11 +81,8 @@ async def test_every_engine_gets_the_brief_language(tmp_path,monkeypatch,engine,
         store.set_call_voice(CallVoice(provider='grok_realtime',grok_voice='rex'));selected=store.with_call_voice(selected)
     brief=store.prepare(selected,[])
     assert brief.get('dialog_engine','gemini_live')==engine
-    if not code:
-        # 'de' stands for a legacy record outside ru/en/id: the hint is skipped without a crash. The call
-        # clock's greeting table has its own language lookup (#175) and is outside this case.
-        import voice
-        brief={**brief,'language':language};monkeypatch.setattr(voice,'call_clock',lambda b,at:'')
+    # 'de' stands for a legacy record outside ru/en/id: no hint and no crash, call clock included.
+    if not code:brief={**brief,'language':language}
     setups=await _serialized_setups(monkeypatch,create_model(brief,'fixture-not-a-key'))
     if engine=='grok_realtime':assert setups==[language if code else None]*2
     else:assert setups==[[[code]]*2 if code else [None,None]]*2
@@ -121,6 +118,38 @@ async def test_a_failing_language_hint_connects_with_the_existing_config_and_is_
     monkeypatch.setattr(voice,'create_model',lambda *args,**kwargs:model)
     await running
     assert events[0]=='language_hint_failed'
+
+
+# spec: ANYM-450
+async def test_a_failing_grok_hint_keeps_the_unhinted_setup_and_is_recorded(tmp_path,monkeypatch):
+    from core import CallVoice
+    from grok_voice import events
+    import voice
+    original=events.InputAudioTranscription
+    def fail_only_hint(**kwargs):
+        if kwargs.get('language_hint'):raise RuntimeError('synthetic local hint failure')
+        return original(**kwargs)
+    monkeypatch.setattr(events,'InputAudioTranscription',fail_only_hint)
+    store=VoiceService(tmp_path)
+    store.set_call_voice(CallVoice(provider='grok_realtime',grok_voice='rex'))
+    brief=store.prepare(store.with_call_voice(BriefInput(goal='Delivery',counterparty='Vendor',success_fields=['window'])),[])
+    model=voice.create_model(brief,'fixture-not-a-key')
+    assert model.hint_unavailable and await _serialized_setups(monkeypatch,model)==[None,None]
+    store.close()
+    # run_transport records the constructor-time failure as a runtime event on the call.
+    events_seen=[]
+    class Service:
+        def runtime_event(self,identity,event):events_seen.append(event['kind'])
+        def get_call(self,identity):return {'metrics':{}}
+        def result(self,identity,**kwargs):pass
+    class Model(voice.FrameProcessor):
+        audio_health=SimpleNamespace(snapshot=lambda:{})
+        hint_unavailable=True
+    async def nothing():pass
+    running=_stubbed_run_transport(monkeypatch,Service(),nothing)
+    monkeypatch.setattr(voice,'create_model',lambda *args,**kwargs:Model())
+    await running
+    assert events_seen[0]=='language_hint_failed'
 
 
 async def test_each_schema_handler_calls_its_own_scoped_tool_and_returns_result():

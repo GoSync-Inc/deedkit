@@ -259,6 +259,59 @@ async def test_analysis_gets_only_late_inbound_and_summary_missing(monkeypatch,t
 
 
 # spec: ANYM-450
+@pytest.mark.parametrize('location',['top','events','metrics','telegram_audio'])
+async def test_raw_start_timing_leaves_no_copy_in_the_analysis_request(monkeypatch,location):
+    from google import genai
+    import learning
+    raw={'peer_connected_at':'synthetic','input_ready_ms':1.0,'call_active_ms':2.0,'pre_ready_frames':2,
+         'inbound_start':{'first_active_ms':4000},'inbound_start_unavailable':True,'media':{'library_versions':['synthetic']}}
+    snapshot={'events':[{'kind':'transcript','role':'user','text':'Hello'}],'metrics':{'kept':1},
+              'late_inbound_ms':4000,'summary_missing':True}
+    if location=='top':snapshot.update(raw)
+    elif location=='events':snapshot['events'].append({'kind':'runtime_diagnostic','note':'kept',**raw})
+    elif location=='metrics':snapshot['metrics'].update(raw)
+    else:snapshot['metrics']['telegram_audio']={'input_active_ms':0,'start':dict(raw),**raw}
+    local=json.loads(json.dumps(snapshot))
+    sent=[]
+    class Models:
+        async def generate_content(self,model,contents,config):
+            sent.append(contents);raise RuntimeError('stop after capturing the request')
+    class Client:
+        def __init__(self,**kwargs):
+            async def aclose():pass
+            self.aio=SimpleNamespace(models=Models(),aclose=aclose)
+    monkeypatch.setattr(genai,'Client',Client)
+    with pytest.raises(RuntimeError):
+        await learning.GeminiReviewer().review(snapshot,'synthetic-key')
+    request=json.loads(sent[0])
+    for key in raw:assert key not in sent[0],key
+    assert request['late_inbound_ms']==4000 and request['summary_missing'] is True
+    assert request['events'][0]['text']=='Hello' and request['metrics']['kept']==1
+    if location=='events':assert request['events'][1]=={'kind':'runtime_diagnostic','note':'kept'}
+    if location=='telegram_audio':assert request['metrics']['telegram_audio']=={'input_active_ms':0}
+    # The authorized local record keeps everything.
+    assert snapshot==local
+
+
+# spec: ANYM-450
+def test_a_failed_start_timing_constructor_or_boundary_reads_as_unavailable():
+    from audio_probe import diagnostics
+    from telegram_audio import start_snapshot
+    def broken():raise RuntimeError('synthetic constructor failure')
+    assert start_snapshot({'start_timing':diagnostics(broken)})=={'inbound_start':None,'inbound_start_unavailable':True}
+    times=iter([RuntimeError('synthetic boundary failure'),105.0])
+    def clock():
+        value=next(times)
+        if isinstance(value,Exception):raise value
+        return value
+    timing=StartTiming(clock=clock)
+    timing.mark('peer_connected')
+    timing.frame(TONE,True)
+    value=start_snapshot({'start_timing':timing})
+    assert value['inbound_start_unavailable'] is True and value['inbound_start'] is None
+
+
+# spec: ANYM-450
 async def test_the_pipeline_begin_hook_marks_call_active_after_the_durable_call_is_active(monkeypatch):
     import voice
     from telegram_audio import pcm_transport

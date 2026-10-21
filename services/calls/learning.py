@@ -334,10 +334,17 @@ SERVER_ONLY_START={'peer_connected_at','input_ready_ms','call_active_ms','pre_re
 SERVER_ONLY_EVENTS={'inbound_audio','language_hint_failed'}
 
 
+def without_start(value):
+    # Raw start timing and media diagnostics leave no copy at any depth: top level, events or metrics.
+    if isinstance(value,dict):return {k:without_start(v) for k,v in value.items() if k not in SERVER_ONLY_START|{'media'}}
+    if isinstance(value,list):return [without_start(v) for v in value]
+    return value
+
+
 def analysis_view(snapshot):
-    view={k:v for k,v in snapshot.items() if k not in SERVER_ONLY_START}
-    view['events']=[e for e in snapshot.get('events',[]) if e.get('kind') not in SERVER_ONLY_EVENTS]
-    metrics=snapshot.get('metrics')
+    view=without_start(snapshot)
+    view['events']=[e for e in view.get('events',[]) if not isinstance(e,dict) or e.get('kind') not in SERVER_ONLY_EVENTS]
+    metrics=view.get('metrics')
     if isinstance(metrics,dict) and isinstance(metrics.get('telegram_audio'),dict):
         view['metrics']={**metrics,'telegram_audio':{k:v for k,v in metrics['telegram_audio'].items() if k not in SERVER_ONLY_AUDIO}}
     return view
