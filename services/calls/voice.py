@@ -163,6 +163,8 @@ async def send_out_of_band(state,service,identity,result,tool_call_id):
     return await asyncio.shield(asyncio.ensure_future(update()))
 
 
+# How long a press's result may take to reach the model before its out-of-band update starts anyway.
+RESULT_SECS=2
 RESUME_FALLBACK='CALL RESUMED (server message, not speech). The phone provider reconnected this same call after a key press; '+RESUME_RULES
 
 
@@ -362,9 +364,13 @@ async def run_transport(transport,brief,key,state,browser=False):
             path=service.claim_delivery(identity,params.tool_call_id,generation) if result.get('ok') else None
             if path=='out_of_band':
                 # The stay-silent result goes first: a successful update may retire this session before Twilio
-                # answers. Only a definite rejection keeps the session, and then it is told plainly.
-                await params.result_callback(result)
-                result=await send_out_of_band(state,service,identity,result,params.tool_call_id)
+                # answers. Only a definite rejection keeps the session, and then it is told plainly. Result and
+                # update run as one task: an interruption or a failed callback never strands the claimed press.
+                async def notify_then_update(stay_silent):
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(params.result_callback(stay_silent),RESULT_SECS)
+                    return await send_out_of_band(state,service,identity,stay_silent,params.tool_call_id)
+                result=await asyncio.shield(asyncio.ensure_future(notify_then_update(result)))
                 if result.get('delivery')=='out_of_band_rejected' and service.authorized(identity,generation,name):
                     await send_server_note(worker,'KEY NOT SENT (server message, not speech): '+json.dumps(result,ensure_ascii=False))
                 await worker.rtvi.send_server_message({'kind':'tool','name':name,'result':result})

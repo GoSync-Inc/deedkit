@@ -1379,7 +1379,8 @@ class VoiceService:
             q.update(status=status,ended_at=now(),result=result)
             v['tool_results'][q['tool_call_id']]=result
             self._event(v,{'kind':'supervisor_answer','consultation_id':consultation_id,'result':result})
-            self._save_call(v)
+            # Advice that lands after the call ended is bookkeeping, not a second post-call report (ANYM-451).
+            self._save_call(v,report=False)
             return result
 
     def result(self,identity,metrics=None,review=None):

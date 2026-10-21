@@ -191,6 +191,26 @@ async def test_delivery_admission_is_call_scoped_and_never_repeated(tmp_path,mon
     note=[f.text for f in state['test_worker'].frames if getattr(f,'text','').startswith('KEY NOT SENT')]
     assert len(note)==1 and 'out_of_band_rejected' in note[0] and store.get_call(cid)['tool_results']['r2']['delivery']=='out_of_band_rejected'
     store.close()
+    # An interruption that cancels the press, or a failing result callback, never strands the claimed press:
+    # the update still runs once and its outcome is recorded.
+    for n,broken in enumerate((False,True)):
+        store=VoiceService(tmp_path/('cancel'+str(n)));cid=active_call(store);sent=[]
+        async def accept(keys):sent.append(keys);return 'accepted'
+        state={'service':store,'call_id':cid,'websocket':True,'generation':1,'out_of_band':accept}
+        handle,_,_=await session(store,cid,state)
+        await call_tool(handle,'press_keys',args,'c1')
+        async def slow(value):
+            await asyncio.sleep(0.05)
+            if broken:raise RuntimeError('callback failed')
+        task=asyncio.create_task(handle('press_keys',SimpleNamespace(arguments=args,tool_call_id='c2',result_callback=slow)))
+        await asyncio.sleep(0.01)
+        if not broken:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):await task
+        else:await task
+        await until(lambda:store.get_call(cid)['handover'] and store.get_call(cid)['handover']['state']=='accepted')
+        assert sent==['3'] and await call_tool(handle,'press_keys',args,'c2')==store.get_call(cid)['tool_results']['c2'] and sent==['3']
+        store.close()
 
 
 def signature(url,params=None):
@@ -377,6 +397,11 @@ async def test_handover_generations_and_one_terminal_winner(tmp_path,monkeypatch
         assert advice['status']=='obsolete' and service.get_call(cid)['consultations'][0]['status']=='obsolete'
         assert any(e['kind']=='stale_generation' and e['action']=='consult_supervisor' for e in service.get_call(cid)['events'])
         runner.cancel=cancel
+        # A second held consultation completes only after the owner stop: recorded, not a second report.
+        advised.clear();release.clear()
+        late=asyncio.create_task(Supervisor(service,lambda:'fixture-key',advisor=Advisor(),timeout=10).consult(
+            cid,{'question':'And now?'},'late-advice',generation=2))
+        await advised.wait()
         # Old-generation callbacks released after admission have no effect; one generation is authorized.
         assert service.tool(cid,'press_keys',{'keys':'1','menu_quote':MENU},'late',generation=1)=={'error':'stale_generation'}
         assert service.tool(cid,'end_conversation',{'reason':'unavailable','summary':'x','evidence':MENU},'late-end',generation=1)=={'error':'stale_generation'}
@@ -397,8 +422,9 @@ async def test_handover_generations_and_one_terminal_winner(tmp_path,monkeypatch
         call=service.get_call(cid)
         assert p.hung_up==[SID] and call['end_reason']=='owner_stop' and call['generation']==2
         assert [(e['generation'],e['ended_by']) for e in call['events'] if e['kind']=='media_session']==[(1,'handover'),(2,'end')]
-        # Twilio's completed callback after the owner stop is recorded, not a second terminal save or report.
+        # Twilio's completed callback and the held advice after the owner stop are recorded, not a second report.
         assert reports(service,cid)==1 and await p.provider_status(cid,'completed')=={'ok':True}
+        release.set();assert (await late)['status']=='obsolete'
         assert reports(service,cid)==1 and service.get_call(cid)['end_reason']=='owner_stop' and p.hung_up==[SID]
 
         # Order B: the old stream closes first; owner stop in the gap before any reconnect.
