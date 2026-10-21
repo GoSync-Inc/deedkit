@@ -2,7 +2,8 @@
 
 # DeedKit: Claude Code notes
 
-AGENTS.md (imported above) is the rulebook; this file adds verified project facts.
+AGENTS.md (imported above) and harness `process.md` (SessionStart hook) are the rulebook; this
+file adds verified project facts.
 Path rules live in `.claude/rules/`. `ANYMSG_*` environment names keep their
 compatibility meaning too. Every service keeps its own lockfile, environment,
 process and state.
@@ -64,5 +65,4 @@ uv run python scripts/smoke.py --dsn-file <file>      # synthetic MCP/HTTP drill
 - Python and npm versions must equal `messaging_service.__version__` (check_release.py).
 - A new whatsmeow source file must be added to `NATIVE_SOURCES` in
   `services/messaging/hatch_build.py` (sdist allowlist).
-- Tiden skills (`product-context`, ...) come from the tiden CLI, not git; a new
-  worktree may need `tiden skill install --agent claude-code --global`.
+- Tiden skills and the skill map: harness `skills.md`.
