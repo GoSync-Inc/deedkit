@@ -838,7 +838,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read bounded derived text (max8000 characters/page), indexing status, original SHA256\nand source message/revision. Follow next_offset; truncated means extraction was capped.\nWithout content, a voice note returns its model transcript (content=enriched in the reply);\nif not ready, empty_reason says whether to wait. Other files return extracted text.\nText/OCR may be incomplete or inaccurate. Original download uses separate download permission.\n",
+    "description": "Read bounded derived text (max8000 characters/page), indexing status, original SHA256\nand source message/revision. Follow next_offset; truncated means extraction was capped.\nWithout content, a voice note returns its model transcript (content=enriched in the reply);\nif not ready, empty_reason says whether to wait. Other files return extracted text. A file not downloaded yet returns empty_reason=attachment_not_downloaded, its download status and next_action; request_file_download moves it ahead and transcription follows.\nText/OCR may be incomplete or inaccurate. Original download uses separate download permission.\n",
     "inputSchema": {
       "properties": {
         "attachment_id": {

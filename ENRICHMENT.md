@@ -295,7 +295,8 @@ An independently administered Ollama daemon still needs its own CPU/memory and
 request cancellation limits: worker subprocess limits do not bound that daemon.
 
 Within each modality, fresh messages from the last 24 hours precede historical
-backlog; least-recently-started account/profile scopes alternate before older
+backlog (audio also counts a note whose original became resident or was touched in
+the last 24 hours as fresh, so an old note downloaded on request is not starved, ANYM-455); least-recently-started account/profile scopes alternate before older
 work. The worker compares candidates across modalities instead of always
 exhausting the first configured modality. This does not yet introduce a public
 on-demand job-priority API. Local native children exit after every file; Ollama

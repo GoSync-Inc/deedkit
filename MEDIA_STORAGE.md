@@ -375,6 +375,10 @@ does not promise completion or bypass any collection, retry or storage limit.
 If a provider cooldown outlasts the one-hour request window, the response is
 `deferred` with `next_due`/`retry_after_seconds`; no demand lease is created.
 Request again after that time instead of repeatedly polling or resetting backoff.
+`get_file_text` on such a known but undownloaded attachment returns no text and
+`empty_reason: attachment_not_downloaded` with the same download status, reason and
+`next_action` as `get_attachment`; the read itself fetches nothing. After
+`request_file_download`, a voice note is transcribed automatically (ANYM-455).
 
 Pending responses retain the full declared name, MIME, size, source message and
 download reason. Download, text extraction and enrichment have independent
