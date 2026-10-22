@@ -13,5 +13,6 @@
   "media_live_disk_reserve_bytes": null,
   "media_live_max_bytes": 33554432,
   "media_live_window_seconds": 86400,
+  "media_backfill": true,
   "max_dialogs": 2000
 }
