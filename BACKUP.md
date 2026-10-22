@@ -2,9 +2,10 @@
 
 An operator mechanism, not available through MCP/REST. It does not preserve the personal Core,
 other applications or provider history that has not been received yet. The automatic job,
-encrypted delivery to a second VM and retention are configured on a synthetic deployment.
-Both VMs belong to the same provider account; a copy of the recovery key separate from it and
-independent cloud storage remain open items until final acceptance.
+encrypted delivery to a second VM and retention are configured. The receiver VM is reachable
+only over the private tailnet and relays to object storage at a separate provider. The owner keeps
+an offline copy of the recovery key outside every provider account: when the only copy lived on
+the receiver, losing that VM (2026-10-22) left every earlier backup undecryptable.
 
 ## Contents and consistency
 
@@ -177,6 +178,12 @@ channel. Password login and SSH agent are not used. The receiver checks framing,
 the age header, size and SHA256, writes with fsync and does not replace an existing ID.
 Redelivery of the same ID/hash returns the earlier receipt. It checks
 the integrity of the ciphertext but cannot check decryption without the recovery key.
+
+The receiver has no public SSH: its provider firewall has no inbound rules, `from=` in each
+authorized_keys line holds the producer's tailnet address, and `runner.json` `transfer.host`
+and the pinned `known_hosts` name the receiver's tailnet address. When one receiver serves
+several projects, each gets its own upload user, forced-command config, state directory,
+recovery key and R2 bucket (R2 tokens are scoped to buckets, not prefixes).
 
 On a delivery error the same encrypted package and journal are kept; a retry
 does not take a new snapshot and does not stop the collectors again. The error
