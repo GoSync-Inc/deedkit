@@ -287,7 +287,7 @@ def test_migration_036_adds_extend_key_audit_and_keeps_schema35_rows(schema35_st
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '41'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '42'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=35 ORDER BY version').fetchall() == migrations
         assert c.execute('SELECT * FROM audit_log ORDER BY id').fetchall() == audit_before
         assert {row['operation'] for row in audit_before} <= {'issue_key', 'revoke_key', 'capabilities'}
@@ -323,6 +323,6 @@ def test_migration_036_gives_up_on_a_busy_audit_log_without_stalling_requests(sc
         holder.close()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '41'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '42'
         with pytest.raises(psycopg.errors.CheckViolation), c.transaction():
             c.execute("INSERT INTO audit_log(principal,operation,outcome) VALUES('agent-busy','not_an_operation','ok')")

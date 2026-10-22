@@ -281,14 +281,32 @@ and `chat_types=['private']`. Exclusions are per request; a stored mute is
 from recipient delivery/read receipts. `read_state` is observed, stale or unknown;
 `read_state_observed_at` and `read_state_basis` explain it. Counts remain visible
 when stale; the current boolean and `read_by_owner` then stay unknown. A snapshot
-is fresh for at most five minutes and cannot predate the latest incoming message.
+cannot predate the latest incoming message. It is fresh for five minutes, or, since
+schema 42 (ANYM-275), for up to 24 hours while continuity is proven: the collector's
+receiving period began before the snapshot under the same lease epoch, that lease is
+unexpired, the capture heartbeat is under a minute old, the live capture spool is
+drained and no update gap was recorded since: a whatsmeow app-state sync error,
+disconnect or reconnect, a Telethon auto-reconnect or any (channel) difference fetch,
+a failed read-state write, or a
+newly quarantined or invalid capture. A restart, disconnect, takeover or expired
+lease starts over, and the five-minute rule applies. A later owner read arrives as a passive event and
+replaces the snapshot, so a continuously received snapshot stays true.
 Telegram's inbox boundary can establish `read_by_owner` for the hinted message;
-inbox read updates flow through the existing durable collector. WhatsApp uses
-cached chat counts from catalog scans; it cannot establish exact per-message
-owner reads, so `read_by_owner` stays unknown. There is no extra account session,
+inbox read updates flow through the existing durable collector. WhatsApp keeps each
+passive source apart (`read_state_basis`): the owner's app-state mark-read
+(`whatsapp_app_state_read`) is an exact 0 at its action time, a mark-unread only
+sets `read_state_marked_unread`; a history-sync `unreadCount`
+(`whatsapp_history_sync`) is stamped no later than the conversation's newest
+message; an own-device read receipt (`whatsapp_owner_receipt`) is evidence for
+exactly the listed messages (resolved through the session's local LID/phone
+mapping), so `read_by_owner` is true for the hinted message only when the receipt
+names it. A receipt never sets or adjusts a count: one newer than
+the count's baseline turns it into null with `read_state_count_basis:
+stale_since_baseline`, and receipts alone give `partial`. whatsapp-web.js uses
+cached chat counts from catalog scans. There is no extra account session,
 provider polling or implicit mark-read action. `only_unread` includes chats with
-a fresh positive count; `read_state_unknown_total` reports excluded unknown/stale
-candidates. It is not an exhaustive unread inbox.
+a fresh positive count or a fresh marked-unread flag; `read_state_unknown_total`
+reports excluded unknown/stale candidates. It is not an exhaustive unread inbox.
 
 `dismiss_reply(chat_id, message_id, expected_revision)` requires `read` and
 `cursor-write`. It hides the exact current hint for this credential until the

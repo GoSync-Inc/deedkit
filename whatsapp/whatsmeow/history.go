@@ -299,8 +299,45 @@ func (p *Provider) captureHistory(data *waHistorySync.HistorySync) error {
 				return err
 			}
 		}
+		if err = p.captureHistoryReadState(chat, conv); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// captureHistoryReadState keeps the provider's unread count or mark-unread flag
+// of a synced conversation (ANYM-275). It is stamped with the conversation's
+// newest message time, never the sync time, so it never looks fresher than it is.
+func (p *Provider) captureHistoryReadState(chat types.JID, conv *waHistorySync.Conversation) error {
+	if conv.UnreadCount == nil && conv.MarkedAsUnread == nil {
+		return nil
+	}
+	var newest uint64
+	for _, item := range conv.GetMessages() {
+		if at := item.GetMessage().GetMessageTimestamp(); at > newest && at <= maxEnvelopeUnix {
+			newest = at
+		}
+	}
+	if newest == 0 {
+		newest = conv.GetConversationTimestamp()
+	}
+	if newest == 0 || newest > maxEnvelopeUnix {
+		return nil
+	}
+	policy, err := p.policy()
+	if err != nil {
+		return err
+	}
+	if !policy.Allows(LegacyChatID(chat)) {
+		return nil
+	}
+	// An absent count stays unknown; a zero is never derived from partial history.
+	observation := map[string]any{"unread_count": nil, "marked_unread": conv.GetMarkedAsUnread()}
+	if conv.UnreadCount != nil {
+		observation["unread_count"] = conv.GetUnreadCount()
+	}
+	return p.Capture.readState(LegacyChatID(chat), "whatsapp_history_sync", time.Unix(int64(newest), 0), observation, true)
 }
 func (p *Provider) historyWorker(ctx context.Context) {
 	ticker := time.NewTicker(3 * time.Second)
