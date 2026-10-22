@@ -189,3 +189,95 @@ def test_a_stalled_archive_write_frees_the_lease_fence_at_the_deadline(worker, m
         return asyncio.get_running_loop().time() - began, await asyncio.to_thread(lease_row_free)
     elapsed, free = asyncio.run(timed_out())  # asyncio.run then waits for the stalled thread itself
     assert elapsed < 2.5 and free  # the deadline plus STORE_GRACE, not the 3 s stall; the server ended the fence
+
+
+# spec: ANYM-477
+def test_a_stalled_live_read_preflight_frees_the_lease_fence_at_the_deadline(history, monkeypatch):
+    import time
+    import messaging_service.commands as commands
+    from messaging_service.commands import CommandWorker
+    s, key, state = history
+    request(s, key)
+    for name in ('LIVE_SEARCH_TIMEOUT', 'LIVE_EXECUTION_TIMEOUT'): monkeypatch.setattr(commands, name, 1.0)
+    monkeypatch.setattr(commands, 'LIVE_FOREGROUND_RESERVE', 0)
+    saved = commands._check_saved
+    def stalls(*args, **kwargs):
+        # Only the worker's preflight (verify_file, no ready flag): its client stalls while it holds the lease row.
+        if 'verify_file' in kwargs and 'ready' not in kwargs: time.sleep(3)
+        return saved(*args, **kwargs)
+    monkeypatch.setattr(commands, '_check_saved', stalls)
+    async def never(job): raise AssertionError('no provider request after a failed preflight')
+    def fence_and_renew():
+        # What the next send claim and the lease renewal take, right after the live deadline.
+        with s.pool.connection() as c:
+            c.execute("SET LOCAL lock_timeout='500ms'")
+            state.archive.fence(c, state.account, state.lease)
+        began = time.monotonic(); state.archive.renew(state.account, *state.lease)
+        return time.monotonic() - began
+    async def scenario():
+        worker = CommandWorker(state, never)
+        began = asyncio.get_running_loop().time()
+        assert await worker.once()
+        return asyncio.get_running_loop().time() - began, await asyncio.to_thread(fence_and_renew)
+    elapsed, renewal = asyncio.run(scenario())  # asyncio.run then waits for the stalled thread itself
+    assert elapsed < 2 and renewal < 1
+
+
+# spec: ANYM-477
+def test_the_default_anchor_survives_the_worker_preflight_for_the_retry(worker, monkeypatch):
+    from messaging_service.commands import CommandWorker
+    w, store, _ = worker
+    asyncio.run(w.sync_once())
+    w.state.phase('connection', 'connected', 'provider_ready')
+    store.set_messenger_operations(w.account, ['request_chat_history'])
+    key = store.issue_key('history-retry', [w.account], permissions=['read', 'read-live'])
+    chat_id = stable_id('chat', w.account, '100')
+    oldest = min((r['provider_id'] for r in rows(store, 'messages', f"chat='{chat_id}'")), key=int)
+    receipt = store.execute_messenger_operation(key, account=w.account, operation='request_chat_history', chat_id=chat_id,
+                                                parameters={'count': 10}, request_id='synthetic-history-retry-1')
+    apply = CollectorState.apply
+    def fails_once(self, capture, *args, **kwargs):
+        if capture['envelope']['provider_id'] == '40': raise RuntimeError('synthetic transient failure')
+        return apply(self, capture, *args, **kwargs)
+    monkeypatch.setattr(CollectorState, 'apply', fails_once)
+    page = [hit(41, 'older synthetic', day=1), hit(40, 'older synthetic', day=1)]  # one second
+    async def provider(job):
+        return await execute(Resolving(types.messages.Messages(page, [], [GROUP], [PERSON, MEMBER, OWNER])), job)
+    w.provider.execute_operation = provider
+    async def scenario():
+        commands = CommandWorker(w.state, w.execute_operation)
+        assert await commands.once()
+        await asyncio.gather(*list(commands.settling))
+    asyncio.run(scenario())
+    data = store.get_messenger_operation(key, receipt['operation_id'])['result']['data']
+    # The provider's preflight replaces the job payload; the retry still names the default anchor it used.
+    assert data['not_stored'] == 1
+    assert data['retry_parameters'] == {'count': 10, 'before_message': stable_id('msg', w.account, '100', oldest)}
+
+
+# spec: ANYM-477
+def test_a_stalled_live_read_policy_read_frees_the_lease_fence_at_the_deadline(worker, monkeypatch):
+    import threading
+    import time
+    w, store, _ = worker
+    asyncio.run(w.sync_once())
+    fence = Archive.fence
+    def stalled(c, account, lease):
+        fence(c, account, lease)
+        # The collector's policy read stalls on the client while its transaction holds the lease row.
+        if threading.current_thread() is not threading.main_thread(): time.sleep(3)
+    monkeypatch.setattr(Archive, 'fence', staticmethod(stalled))
+    async def never(job): raise AssertionError('no provider request after the deadline')
+    w.provider.execute_operation = never
+    def lease_row_free():
+        with store.pool.connection() as c:
+            c.execute("SET LOCAL lock_timeout='500ms'")
+            return bool(c.execute('SELECT 1 FROM collector_leases WHERE account=%s FOR UPDATE', (w.account,)).fetchone())
+    async def timed_out():
+        began = asyncio.get_running_loop().time()
+        job = {'operation': 'search_messages_live', 'platform': 'telegram', 'mutation': False, '_deadline': began + 1}
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(w.execute_operation(job), 1)
+        return asyncio.get_running_loop().time() - began, await asyncio.to_thread(lease_row_free)
+    elapsed, free = asyncio.run(timed_out())
+    assert elapsed < 2 and free
