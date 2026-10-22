@@ -292,6 +292,55 @@ def test_actual_history_capture_uses_archive_backfill_origin(native_fixture_bina
     assert normalized['envelope']['origin'] == 'backfill'
 
 
+# spec: ANYM-471
+def test_actual_go_album_photo_and_template_are_archived_with_content(native_fixture_binary, tmp_path, seeded):
+    from messaging_service.archive import Archive
+    store = seeded[0]
+    archive = Archive(store)
+    archive.register('wa-native-test', 'whatsapp', 'Synthetic native', include_chats=['123@c.us'])
+    _, photo = _normalize_fixture(native_fixture_binary, tmp_path, {
+        'kind': 'album_photo', 'text': 'site visit', 'mime': 'image/jpeg', 'bytes': 2048})
+    envelope = photo['envelope']
+    assert envelope['metadata']['message_kind'] == 'photo' and envelope['body'] == 'site visit'
+    assert envelope['media'] == [{'provider_id': 'false_123@c.us_fixture123',
+        'filename': 'false_123@c.us_fixture123.bin', 'mime': 'image/jpeg', 'bytes': 2048}]
+    message = archive.ingest(envelope)['message']
+    with store.pool.connection() as c:
+        jobs = c.execute('SELECT id FROM media_jobs WHERE message=%s', (message,)).fetchall()
+    assert len(jobs) == 1
+    _, template = _normalize_fixture(native_fixture_binary, tmp_path, {
+        'kind': 'template', 'text': 'Check-in at 14:00', 'id': 'fixture124'})
+    envelope = template['envelope']
+    assert envelope['metadata']['message_kind'] == 'text'
+    assert envelope['metadata']['provider_message_type'] == 'template'
+    assert envelope['body'] == 'Check-in at 14:00' and envelope['media'] == []
+    assert archive.ingest(envelope)['outcome'] == 'created'
+
+
+# spec: ANYM-471
+def test_actual_go_document_after_sender_key_event_is_created_without_conflict(native_fixture_binary, tmp_path, seeded):
+    from messaging_service.archive import Archive
+    store = seeded[0]
+    archive = Archive(store)
+    archive.register('wa-native-test', 'whatsapp', 'Synthetic native', include_chats=['123@c.us'])
+    source = _private_json(tmp_path / 'sender-key.json', {'synthetic': True, 'chat': '123@c.us',
+        'sender': '123@c.us', 'owner': '999@c.us', 'id': 'fixture125', 'timestamp': 1700000000, 'kind': 'sender_key'})
+    answer = subprocess.run([str(native_fixture_binary), '--normalize-fixture', str(source)],
+        text=True, capture_output=True, timeout=10)
+    assert answer.returncode == 0, answer.stderr
+    assert json.loads(answer.stdout) is None
+    _, document = _normalize_fixture(native_fixture_binary, tmp_path, {'kind': 'document', 'id': 'fixture125',
+        'text': '', 'filename': 'report.pdf', 'mime': 'application/pdf', 'bytes': 4096})
+    envelope = document['envelope']
+    assert envelope['metadata']['message_kind'] == 'document'
+    result = archive.ingest(envelope)
+    assert result['outcome'] == 'created'
+    assert archive.ingest(envelope)['outcome'] == 'duplicate'
+    with store.pool.connection() as c:
+        jobs = c.execute('SELECT id FROM media_jobs WHERE message=%s', (result['message'],)).fetchall()
+    assert len(jobs) == 1
+
+
 def test_actual_go_round_video_is_archived_as_video_with_one_media_job(native_fixture_binary, tmp_path, seeded):
     from messaging_service.archive import Archive
     store = seeded[0]

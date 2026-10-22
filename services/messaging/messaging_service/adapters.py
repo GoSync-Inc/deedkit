@@ -214,6 +214,9 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
     kind='system' if service else {'chat':'text','image':'photo','video':'video','gif':'video','ptv':'video',
         'ptt':'voice','audio':'audio','document':'document','sticker':'sticker','location':'location',
         'vcard':'contact','multi_vcard':'contact','poll_creation':'poll'}.get(native_type,'unknown')
+    # Business messages are text only when they carry visible text; header media is not fetched.
+    if native_type in ('template','interactive','buttons','list','product','group_invite') and not service and event.get('body'):
+        kind='text'
     if native_type is None and event.get('mediaKind'):
         kind='video' if event['mediaKind']=='animation' else event['mediaKind'] if event['mediaKind']!='other' else 'unknown'
     body=event.get('body') or ''

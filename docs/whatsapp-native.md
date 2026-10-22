@@ -34,6 +34,14 @@ Both providers capture a round video (PTV, native type `ptv`) as a video
 attachment with its duration and a media job; its original downloads with the
 WhatsApp Video keys. On the native adapter a view-once round video, like other
 view-once media, is not retained, also after a reload from its capture cache.
+The native adapter does not capture the sender-key part that whatsmeow emits
+as a separate event before a group message, so the message that follows is
+archived with its content. An album photo or video (`associatedChildMessage`)
+is captured as its own photo or video with a media job; the album parent and a
+message history notice are service events. Template, interactive, buttons,
+list, product and group invite messages keep their visible text (header media
+is not fetched). A business placeholder masked from linked devices stays an
+empty `unknown` message of native type `placeholder` (ANYM-471).
 An exhausted local cache is not a complete WhatsApp history.
 
 The account-specific operation manifest reflects the selected provider after
