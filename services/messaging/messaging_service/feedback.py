@@ -207,22 +207,37 @@ def _status_errors(ids, status, fixed_in, spec_ref, duplicate_of, note):
     return errors
 
 
-def set_feedback_status(c, ids, status, *, fixed_in=None, spec_ref=None, duplicate_of=None, note=None):
+def set_feedback_status(c, ids, status, *, fixed_in=None, spec_ref=None, duplicate_of=None, note=None,
+                        unchanged_since=None, not_after=None):
     """Operator-only disposition (ANYM-343) on the owner connection, never an agent key or MCP tool.
 
-    A call replaces the whole disposition of every named item atomically, or changes nothing.
+    A call replaces the whole disposition of every named item atomically, or changes nothing. With
+    `unchanged_since` (ANYM-473) it changes nothing when any named item's disposition changed after that time,
+    so a plan read from an export never overwrites a newer disposition; an item never set passes. With `not_after`
+    it changes nothing once the database clock is past that time, so a call whose reply was lost commits by
+    not_after plus the 5 s bound or never.
     """
     errors = _status_errors(ids, status, fixed_in, spec_ref, duplicate_of, note)
     if errors:
         raise ValueError(','.join(errors))
+    if unchanged_since is not None:
+        unchanged_since = _timestamp(unchanged_since, 'invalid_unchanged_since')
+    if not_after is not None:
+        not_after = _timestamp(not_after, 'invalid_not_after')
     ids = sorted({value.lower() for value in ids})
     # The same 5 s bound as an agent submission's statements, so a status change never holds
     # agent_feedback row locks longer than a submission does.
     c.execute("SET LOCAL transaction_timeout='5s'")
-    rows = c.execute('SELECT id,principal,key_id FROM agent_feedback WHERE id=ANY(%s::uuid[]) ORDER BY id FOR UPDATE',
-        (ids,)).fetchall()
+    rows = c.execute('SELECT id,principal,key_id,status_changed_at FROM agent_feedback WHERE id=ANY(%s::uuid[]) '
+        'ORDER BY id FOR UPDATE', (ids,)).fetchall()
     if len(rows) != len(ids):
         raise ValueError('unknown_feedback: %d of %d IDs' % (len(ids) - len(rows), len(ids)))
+    if unchanged_since is not None:
+        changed = sum(row['status_changed_at'] is not None and row['status_changed_at'] > unchanged_since for row in rows)
+        if changed:
+            raise ValueError('changed_since_plan: %d of %d IDs' % (changed, len(ids)))
+    if not_after is not None and c.execute('SELECT clock_timestamp() > %s AS late', (not_after,)).fetchone()['late']:
+        raise ValueError('not_after_passed')
     if duplicate_of is not None:
         duplicate_of = duplicate_of.lower()
         if duplicate_of in ids:

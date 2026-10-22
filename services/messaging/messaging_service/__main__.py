@@ -52,6 +52,8 @@ def main():
     parser.add_argument('--spec',help='set-feedback-status: ANYM-<n>')
     parser.add_argument('--duplicate-of',help='set-feedback-status: a feedback UUID of the same key')
     parser.add_argument('--note',help='set-feedback-status: at most 280 characters, no control characters')
+    parser.add_argument('--unchanged-since',help='set-feedback-status: ISO 8601 time with an offset; change nothing if any item changed after it')
+    parser.add_argument('--not-after',help='set-feedback-status: ISO 8601 time with an offset; change nothing once the database clock is past it')
     parser.add_argument('--since',help='export-feedback: ISO 8601 time with an offset; submissions created since then')
     parser.add_argument('--changed-since',help='export-feedback: ISO 8601 time with an offset; dispositions changed since then')
     parser.add_argument('--page',help='export-feedback: next_page of the same export')
@@ -141,7 +143,8 @@ def main():
             if not args.feedback_ids or not args.status:
                 parser.error('set-feedback-status requires --id and --status')
             print(json.dumps(store.set_feedback_status(args.feedback_ids,args.status,fixed_in=args.fixed_in,
-                spec_ref=args.spec,duplicate_of=args.duplicate_of,note=args.note)))
+                spec_ref=args.spec,duplicate_of=args.duplicate_of,note=args.note,
+                **{name:value for name,value in (('unchanged_since',args.unchanged_since),('not_after',args.not_after)) if value})))
         elif args.command=='export-feedback':
             print(json.dumps(store.export_feedback(since=args.since,changed_since=args.changed_since,page=args.page,
                 overlap=args.overlap,limit=args.limit)))
