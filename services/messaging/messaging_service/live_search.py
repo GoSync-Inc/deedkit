@@ -6,12 +6,16 @@ its admission slots are its own (never the send waits of send_wait.py).
 """
 import asyncio
 import hashlib
+import logging
 import math
 import re
 import threading
 import uuid
 
 from .store import APIError
+
+
+log = logging.getLogger(__name__)
 
 
 MODES = ('off', 'auto', 'on')
@@ -42,15 +46,21 @@ def validate(live, wait_s, request_id):
 
 
 def accounts_in_scope(c, p, arguments):
-    """Accounts of the named chats, else the key's accounts narrowed by account/accounts."""
-    chat = arguments.get('chat') or ''; chats = arguments.get('chats')
-    named = [chat] if chat else chats or None  # chats=[] is refused as unsupported_filter, never an empty scope
-    if named is not None:
-        return c.execute('''SELECT DISTINCT a.id,a.platform FROM chats ch JOIN accounts a ON a.id=ch.account
-            WHERE ch.id=ANY(%s) AND a.id=ANY(%s) ORDER BY a.id''', (list(named), p['accounts'])).fetchall()
+    """Accounts the archive search can match: named chats, account/accounts and chat types ANDed as in filters()."""
+    from .message_queries import CHAT_TYPES
     wanted = set(p['accounts'])
     if arguments.get('account'): wanted &= {arguments['account']}
     if arguments.get('accounts') is not None: wanted &= set(arguments['accounts'])
+    chat = arguments.get('chat') or ''; chats = arguments.get('chats')
+    named = [chat] if chat else chats or None  # chats=[] is refused as unsupported_filter, never an empty scope
+    if named is not None:
+        # A named chat skips the channel default, never an explicit chat_types or exclude_channels.
+        types = arguments.get('chat_types')
+        if arguments.get('exclude_channels'): types = [t for t in (CHAT_TYPES if types is None else types) if t != 'channel']
+        typed = '' if types is None else " AND coalesce(ch.chat_type,'unknown')=ANY(%s)"
+        return c.execute('''SELECT DISTINCT a.id,a.platform FROM chats ch JOIN accounts a ON a.id=ch.account
+            WHERE ch.id=ANY(%s) AND a.id=ANY(%s)''' + typed + ' ORDER BY a.id',
+            (list(named), sorted(wanted), *([list(types)] if types is not None else []))).fetchall()
     return c.execute('SELECT id,platform FROM accounts WHERE id=ANY(%s) ORDER BY id', (sorted(wanted),)).fetchall()
 
 
@@ -234,11 +244,18 @@ async def search(store, token, arguments, *, live='off', wait_s=None, request_id
     if live == 'off': return first
     evidence = first['result_evidence']; evidence.pop('suggested_call', None)
     paged = bool(arguments.get('after') or arguments.get('before'))
-    if live == 'auto' and (paged or evidence.get('empty_reason') not in THIN):
+    # A continuation page goes on to the plan, which says first_page_only (S3.1).
+    if live == 'auto' and not paged and evidence.get('empty_reason') not in THIN:
         evidence['live'] = []
         return first
-    entries, queue = await run(store.live_search_plan, token, arguments, paged=paged,
-                               request_id=request_id or uuid.uuid4().hex)
+    try:
+        entries, queue = await run(store.live_search_plan, token, arguments, paged=paged,
+                                   request_id=request_id or uuid.uuid4().hex)
+    except APIError: raise  # the caller's current authorization
+    except Exception as error:
+        log.warning('live_search_plan_failed exception_type=%s', type(error).__name__)
+        evidence['live'] = []; evidence['live_wait'] = 'failed'
+        return first
     pending = []
     for item in queue:
         try:

@@ -635,9 +635,15 @@ class Store:
                 order=order,before=before,direction=direction,search_language=search_language,
                 fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
                 chat_types=chat_types,include_channels=include_channels)
-            # ANYM-478: a thin archive answer names the call that may find more.
-            suggest(c,p,{'account':account,'accounts':accounts,'chat':chat,'chats':chats,'chat_types':chat_types},
-                result['result_evidence'])
+            # ANYM-478: a thin archive answer names the call that may find more; the hint is optional, so its
+            # failure (in a savepoint) never costs the archive answer.
+            try:
+                with c.transaction():
+                    suggest(c,p,{'account':account,'accounts':accounts,'chat':chat,'chats':chats,'chat_types':chat_types,
+                        'exclude_channels':exclude_channels},result['result_evidence'])
+            except Exception as error:
+                import logging
+                logging.getLogger(__name__).warning('search_suggestion_failed exception_type=%s',type(error).__name__)
             return result
 
     def live_search_plan(self,token,arguments,*,paged,request_id):

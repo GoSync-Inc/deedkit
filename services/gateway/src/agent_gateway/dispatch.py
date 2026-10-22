@@ -455,8 +455,9 @@ class Dispatch:
                 error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                            phase="operation", read_only=True)
             raise
-        if live_denied and isinstance(result, dict) and isinstance(result.get("result_evidence"), dict):
-            evidence = result["result_evidence"]
+        if live_denied and isinstance(result, dict):
+            # detail=transcript moves live and suggested_call from result_evidence to the top level.
+            evidence = result["result_evidence"] if isinstance(result.get("result_evidence"), dict) else result
             if (evidence.get("suggested_call") or {}).get("tool") == "messages_search":
                 evidence.pop("suggested_call")
             if live_requested:

@@ -135,7 +135,7 @@ def test_a_continuation_page_never_queues_a_live_search(live):
     result = run(s, key, {'query': 'synthetic', 'limit': 1, 'after': first['next_cursor']}, live='on')
     assert [e['state'] for e in result['result_evidence']['live']] == ['first_page_only']
     auto = run(s, key, {'query': 'needle', 'after': first['next_cursor']}, live='auto')
-    assert auto['result_evidence']['live'] == []
+    assert [e['state'] for e in auto['result_evidence']['live']] == ['first_page_only']
     assert queued(s) == 0
 
 
@@ -296,3 +296,34 @@ def test_the_live_search_receipt_counts_new_archive_rows():
                                 store_live_hits=store)
     answer = asyncio.run(TelegramCollector.execute_operation(collector, {'operation': 'search_messages_live'}))
     assert answer['data']['stored_new'] == 3
+
+
+# spec: ANYM-478
+def test_a_named_chat_keeps_the_archive_account_and_chat_type_filters(live):
+    s, _, _, _, _ = live
+    key = s.issue_key('live-agent-both', [ACCOUNT, SECOND], permissions=['read', 'read-live'])
+    with s.pool.connection() as c:
+        c.execute("UPDATE chats SET chat_type='channel' WHERE id=%s", (chat('100'),))
+    named = {'query': 'needle', 'chat': chat('100')}
+    for extra in ({'accounts': []}, {'account': SECOND}, {'accounts': [SECOND]},
+                  {'exclude_channels': True}, {'chat_types': ['private']}):
+        result = run(s, key, {**named, **extra}, live='on', wait_s=0)
+        assert result['result_evidence']['live'] == [] and 'items' in result, extra
+    assert queued(s) == 0
+    result = run(s, key, {**named, 'chat_types': ['channel']}, live='on', wait_s=0)
+    assert [e['account'] for e in result['result_evidence']['live']] == [ACCOUNT] and queued(s) == 1
+
+
+# spec: ANYM-478
+def test_a_failing_live_plan_or_hint_keeps_the_archive_answer(live, monkeypatch):
+    s, _, key, _, _ = live
+    def plan_fails(*args, **kwargs): raise RuntimeError('synthetic planning failure')
+    def hint_fails(c, *args): c.execute('SELECT 1/0')
+    monkeypatch.setattr(live_search, 'plan', plan_fails)
+    result = run(s, key, {'query': 'synthetic'}, live='on')
+    assert result['items'] and result['result_evidence']['live'] == []
+    assert result['result_evidence']['live_wait'] == 'failed'
+    monkeypatch.setattr(live_search, 'suggest', hint_fails)
+    thin = s.search(key, 'needle')
+    assert thin['items'] == [] and thin['result_evidence']['empty_reason'] in live_search.THIN
+    assert 'suggested_call' not in thin['result_evidence'] and queued(s) == 0

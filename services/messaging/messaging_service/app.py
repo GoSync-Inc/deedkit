@@ -785,7 +785,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
         return call(ctx,'search_people',query=query,accounts=accounts,chats=chats,after=after,limit=limit,
                     transliterate=transliterate,group_by_sender=group_by_sender)
 
-    @mcp.tool(structured_output=True, annotations=read)
+    # ANYM-478: live may ask Telegram itself, so search is open-world.
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True))
     async def search(ctx: Context, query: str='', account: str='', chat: str='', sender: str='',
                from_time: str='', to_time: str='', after: str='', limit: int=20,
                accounts: list[StrictStr] | None=None, chats: list[StrictStr] | None=None,

@@ -462,7 +462,7 @@
   {
     "annotations": {
       "destructiveHint": false,
-      "openWorldHint": false,
+      "openWorldHint": true,
       "readOnlyHint": true
     },
     "description": "Search archived text across chosen accounts/chats/sender IDs. Lists use OR within each\ndimension, AND between dimensions; [] matches nothing. Exact account-scoped sender IDs,\nnot a merged person directory. query_mode: all words (all), phrase, or web (quotes/OR/-word).\nUTC range [from_time,to_time). order asc/desc; use next_cursor as after with unchanged\nfilters/order. before is an exclusive chronological boundary, incompatible with after.\nConversation view hides known system events unless include_system=true.\norder=relevance ranks hits, not dialogue turns. Preserve supplied order, inspect ambiguity.\ndirection: incoming/outgoing or empty. detail=transcript returns only the numbered transcript.\nChannels are excluded unless include_channels=true, chat_types lists channel, or chat/chats is set.\nchat_types: private/group/channel/unknown (null type = unknown), ANDed with exclude_channels.\nlive (Telegram, first page only): on also searches Telegram itself; auto only when the archive\nanswer is thin (empty_reason history_loading/history_not_scanned/history_has_gaps/\nno_matches_in_partial_archive). It waits once up to wait_s (0-20, default 15), then rereads the\narchive; result_evidence.live has per account state, stored_new and the provider hits. Supported:\nquery (all/phrase), one chat, chat_types/channels, from_time/to_time; anything else gives\nunsupported_filter. Keep one request_id per intent: a repeat queues no new provider request.\nNeeds read-live and the account's search_messages_live opt-in. live=off makes no provider calls.\nNo ACK or semantic task extraction.\n",
@@ -698,7 +698,6 @@
           "type": "boolean"
         },
         "live": {
-          "default": "off",
           "enum": [
             "off",
             "auto",
@@ -718,11 +717,9 @@
               "type": "null"
             }
           ],
-          "default": null,
           "title": "Wait S"
         },
         "request_id": {
-          "default": "",
           "title": "Request Id",
           "type": "string"
         }
