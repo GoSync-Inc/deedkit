@@ -189,7 +189,8 @@ class TelethonProvider:
         self.live_budgets={**LIVE_BUDGETS,'search':(budget['burst'],float(budget['refill_seconds']),budget['daily'])}
 
     def bind_state(self,state):
-        self.governor=RequestGovernor(state,budgets=getattr(self,'live_budgets',None))
+        self.governor=RequestGovernor(state,budgets=getattr(self,'live_budgets',None),
+            bound=bounded_state if isinstance(state,CollectorState) else None)
         self.read_gap_state=state
         if '_read_gap_tasks' in self.__dict__:return
         # Telethon 1.x can lose updates inside one connection: its auto-reconnect does

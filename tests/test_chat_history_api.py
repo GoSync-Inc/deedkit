@@ -281,3 +281,48 @@ def test_a_stalled_live_read_policy_read_frees_the_lease_fence_at_the_deadline(w
         return asyncio.get_running_loop().time() - began, await asyncio.to_thread(lease_row_free)
     elapsed, free = asyncio.run(timed_out())
     assert elapsed < 2 and free
+
+
+# spec: ANYM-475
+def test_a_stalled_cooldown_write_frees_the_lease_fence_and_the_pause_still_holds(worker, monkeypatch):
+    import threading
+    import time
+    from telethon.errors import FloodError
+    from messaging_service.telegram_collector import bounded_state
+    from messaging_service.telegram_governor import ProviderRateLimited, RequestGovernor
+    w, store, _ = worker
+    asyncio.run(w.sync_once())
+    stall = threading.Event()
+    fence = Archive.fence
+    def stalled(c, account, lease):
+        fence(c, account, lease)
+        # The cooldown write stalls on the client while its transaction holds the lease row.
+        if stall.is_set() and threading.current_thread() is not threading.main_thread(): time.sleep(6)
+    monkeypatch.setattr(Archive, 'fence', staticmethod(stalled))
+    governor = RequestGovernor(w.state, interval=0); governor.bound = bounded_state  # as bind_state does
+    async def flooded():
+        stall.set()
+        raise FloodError(None, 'FLOOD')  # an account-wide 420 answer without its own wait
+    async def provider(job): return await governor.scoped_call(flooded, 'live_search', 'search')
+    w.provider.execute_operation = provider
+    def lease_row_free():
+        with store.pool.connection() as c:
+            c.execute("SET LOCAL lock_timeout='500ms'")
+            return bool(c.execute('SELECT 1 FROM collector_leases WHERE account=%s FOR UPDATE', (w.account,)).fetchone())
+    def persisted():
+        with store.pool.connection() as c:
+            return c.execute('SELECT cooldown_until>clock_timestamp() AS paused FROM collector_health WHERE account=%s',
+                             (w.account,)).fetchone()['paused']
+    async def scenario():
+        began = asyncio.get_running_loop().time()
+        job = {'operation': 'search_messages_live', 'platform': 'telegram', 'mutation': False, '_deadline': began + 1}
+        with pytest.raises((TimeoutError, ProviderRateLimited)):
+            await asyncio.wait_for(w.execute_operation(job), 1)
+        elapsed, free = asyncio.get_running_loop().time() - began, await asyncio.to_thread(lease_row_free)
+        stall.clear()
+        # The unwritten pause still refuses reads, and the next admission writes it.
+        refused = await governor.admit('search', 1)
+        return elapsed, free, refused, getattr(governor, 'unrecorded', 0), await asyncio.to_thread(persisted)
+    elapsed, free, refused, unrecorded, paused = asyncio.run(scenario())
+    assert elapsed < 4 and free
+    assert refused > 0 and unrecorded == 0 and paused
