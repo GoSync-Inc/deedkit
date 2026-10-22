@@ -308,7 +308,8 @@ the browser WhatsApp fallback supports neither:
 `search_messages_live` asks Telegram itself, so it finds messages the archive
 never collected. It runs only on Telegram accounts (others get
 `unsupported_operation`), needs `read-live`, the account opt-in and, through the
-gateway, the `search_messages_live` action grant. It writes nothing to the archive.
+gateway, the `search_messages_live` action grant. Its hits are archived (below),
+so a following archive search finds them too.
 
 - Scope: an empty `chat_id` searches every chat of the account and needs a
   full-account key; a `chat_id` searches that archived chat. A chat-scoped key
@@ -321,6 +322,15 @@ gateway, the `search_messages_live` action grant. It writes nothing to the archi
   `sender`, `text`), `next_cursor`, `provider_total_approx` and
   `basis: live_provider_search`. Hits in chats the collection policy excludes are
   dropped. A long receipt shortens hit texts, never drops hits.
+- Archive: each hit is committed like a history page, origin `backfill`: new
+  messages are inserted, stored ones follow the usual edit, deletion and conflict
+  rules, a chat not yet catalogued enters the catalog, and media jobs are created
+  as for history. Each hit then carries `stored: true` and `message_id`, or
+  `stored: false` with `reason` `outside_history_window` (older than the
+  collector's `history_since`) or `not_stored` (the archive commit failed; the
+  search answer stands). Checkpoints and history coverage do not move. Default
+  subscriptions (origin `live`) get no events; `get_updates` without an origin
+  filter shows them as backfill.
 - Paging: one provider request per call, never automatic. Pass `next_cursor` with
   the same account, `chat_id` and parameters; any other combination gets
   `invalid_cursor` before any provider request. The cursor is a random token; its
