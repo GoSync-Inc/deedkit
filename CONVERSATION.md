@@ -148,7 +148,7 @@ Direct Store calls, which have no presentation level, always include it.
 | `provider_contact` | +10 | the sender is an observed provider contact |
 | `waiting_age`, `waiting_age_capped` | +1 to +19, +20 | square root of waiting hours; capped after about 17 days |
 | `owner_question` | +40 | a group message that mentions the owner (basis `owner_mention`) with question punctuation, from a sender that is not an observed bot, a provider business/verified sender or another account of the key |
-| `owner_request` | +63 | the same group owner mention without question punctuation (ANYM-427); exclusive with `owner_question` |
+| `owner_request` | +63 | the same group owner mention without question punctuation and not a closing courtesy (ANYM-427); exclusive with `owner_question` |
 | `one_way_chat` | -60 | private chat in which no meaningful owner message is archived |
 | `provider_business_or_verified` | -40 | the provider stated a business/verified (WhatsApp `VerifiedName`) or verified/support (Telegram) sender |
 | `own_account` | -80 | the sender ID is a recent outgoing sender of another account of the key |

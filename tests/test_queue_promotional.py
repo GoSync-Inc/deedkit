@@ -88,6 +88,10 @@ def test_promotional_filter_cursor_scope_and_errors(demote):
             {'promotional':'none'}):
         with pytest.raises(APIError,match='invalid_filter'):queue(**bad)
     with pytest.raises(APIError,match='invalid_filter'):s.list_chats(key,promotional='only')
+    # Unknown modes fail schema validation on MCP before the queue rules.
+    with TestClient(create_app(s,['testserver'])) as client:
+        bad=rpc(client,key,'list_chats',{'awaiting_reply':True,'promotional':'none'}).json()
+    assert bad['error']['data']['field_errors']==[{'field':'promotional','reason':'enum','allowed':['exclude','include','only']}]
     # Outside the queue the default changes nothing.
     assert 'excluded_promotional_total' not in s.list_chats(key,include_coverage=False,limit=100)
 
@@ -118,6 +122,8 @@ def test_owner_request_is_narrow(demote):
         add(chat,'1',5,chat_type='group',body=body,sender=sender or 'S'+chat,**{'mentions_owner':True,**metadata})
     add('o2','1',500,direction='outgoing',sender=OWNER_SENDER,account='demote-tg2',body='Synthetic owner message')
     group('plain')
+    # Mention evidence is metadata; a closing courtesy that mentions the owner is not a request.
+    group('thanks',body='thanks')
     group('bot',sender_is_bot=True)
     group('business',sender_is_business_or_verified=True)
     group('own',sender=OWNER_SENDER)
@@ -127,11 +133,26 @@ def test_owner_request_is_narrow(demote):
     history('privreq');add('privreq','1',5,body='please send the file',sender='Sprivreq',mentions_owner=True)
     got=rows()
     assert components(got['plain'])['owner_request']==63
-    for chat in ('bot','business','own','reply_only','priv','privreq'):
+    assert components(got['thanks'])['closing_courtesy']==-30
+    for chat in ('thanks','bot','business','own','reply_only','priv','privreq'):
         assert 'owner_request' not in components(got[chat]),chat
     # Every private question without a demotion still outranks every group row; a private request is unchanged.
     assert got['priv']['awaiting_reply_priority']>got['plain']['awaiting_reply_priority']
     assert set(components(got['privreq']))=={'private_chat','waiting_age'}
+
+
+# spec: ANYM-427
+def test_muted_promotional_rows_are_neither_shown_nor_counted(demote):
+    s,ar,key,add,history,queue,rows=demote
+    promotional_fixture(add,history)
+    bank=next(r for r in queue(promotional='only')['items'] if r['provider_chat_id']=='bank')
+    s.mute_reply_source(key,chat_id=bank['id'])
+    default=queue()
+    assert default['excluded_promotional_total']==1 and default['muted_total']==0
+    # include_muted returns muted rows; the promotional choice still applies to them.
+    assert 'bank' not in [r['provider_chat_id'] for r in queue(include_muted=True)['items']]
+    shown={r['provider_chat_id']:r for r in queue(include_muted=True,promotional='only')['items']}
+    assert shown['bank']['awaiting_reply_muted']=='chat' and shown['bank']['awaiting_reply_likely_promotional'] is True
 
 
 OWNER_SENDER='OWNER2'

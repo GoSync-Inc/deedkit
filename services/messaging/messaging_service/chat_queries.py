@@ -245,7 +245,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         ('question_mark','CASE WHEN attention.question THEN 25 END'),
         ('provider_contact','CASE WHEN attention.known_contact THEN 10 END'),
         ('owner_question',f"CASE WHEN {person_mention} AND attention.question THEN {OWNER_QUESTION} END"),
-        ('owner_request',f"CASE WHEN {person_mention} AND NOT attention.question THEN {OWNER_REQUEST} END"),
+        # A closing courtesy ("@owner thanks") is not a request (ANYM-427).
+        ('owner_request',f"CASE WHEN {person_mention} AND NOT attention.question AND NOT coalesce(attention.courtesy,false) THEN {OWNER_REQUEST} END"),
         ('waiting_age_capped',f'CASE WHEN {waiting}>=20 THEN 20 END'),
         ('waiting_age',f'CASE WHEN {waiting} BETWEEN 1 AND 19 THEN {waiting} END'),
         demotion('one_way_chat',"c.chat_type='private' AND own_last.sent_at IS NULL"),
