@@ -45,7 +45,7 @@ and the allowed accounts. When access is limited by chats, account-wide timestam
 and degradation reasons are hidden (`coverage=chat_scope_only`): they may depend
 on other people's conversations. An empty chat list does not reveal even account labels.
 
-Since ANYM-SPEC `capabilities` also describes the caller's own key and accounts, for chat-scoped
+Since ANYM-470 `capabilities` also describes the caller's own key and accounts, for chat-scoped
 keys too, with no other account, chat or field becoming visible:
 
 - `expires_at`: the calling key's own expiry, ISO 8601 UTC with a `Z` suffix

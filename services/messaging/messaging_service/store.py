@@ -207,7 +207,7 @@ class Store:
             dataset=self.dataset(c,p)
             from .operational import self_provider_id
             # Same visible accounts as before; each adds the owner's ID its collector
-            # verified at connect, or null (ANYM-SPEC). Never derived from messages.
+            # verified at connect, or null (ANYM-470). Never derived from messages.
             accounts = c.execute('''SELECT a.id,a.platform,a.label,a.synthetic,
                 h.operations->'identity'->'self_provider_id' AS self_provider_id FROM accounts a
                 LEFT JOIN collector_health h ON h.account=a.id WHERE a.id=ANY(%s) ORDER BY a.id''',

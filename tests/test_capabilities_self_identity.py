@@ -1,4 +1,4 @@
-"""capabilities shows the key's own expiry and each visible account's verified owner ID (ANYM-SPEC)."""
+"""capabilities shows the key's own expiry and each visible account's verified owner ID (ANYM-470)."""
 import asyncio
 from types import SimpleNamespace
 
@@ -37,7 +37,7 @@ def accounts(caps):
     return {row['id']: row['self_provider_id'] for row in caps['accounts']}
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_chat_scoped_key_over_several_chats_in_two_accounts_sees_each_owner_id_and_its_expiry(seeded):
     store, _, _ = seeded
     verify(store, 'telegram-demo', 'telegram', '123456789')
@@ -58,7 +58,7 @@ def test_chat_scoped_key_over_several_chats_in_two_accounts_sees_each_owner_id_a
     assert caps['expires_at'] == key_expiry(store, token) and caps['expires_at'].endswith('Z')
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_account_scoped_key_sees_the_same_fields_and_null_for_an_unverified_account(seeded):
     store, token, _ = seeded
     verify(store, 'telegram-demo', 'telegram', '123456789')
@@ -68,7 +68,7 @@ def test_account_scoped_key_sees_the_same_fields_and_null_for_an_unverified_acco
     assert caps['expires_at'] == key_expiry(store, token)
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_extend_key_shows_on_the_next_capabilities_call(seeded):
     store, token, _ = seeded
     before = store.capabilities(token)['expires_at']
@@ -77,7 +77,7 @@ def test_extend_key_shows_on_the_next_capabilities_call(seeded):
     assert after > before and after == key_expiry(store, token)
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_empty_chat_list_shows_no_account_and_no_owner_id(seeded):
     store, _, _ = seeded
     verify(store, 'telegram-demo', 'telegram', '123456789')
@@ -85,14 +85,14 @@ def test_empty_chat_list_shows_no_account_and_no_owner_id(seeded):
     assert caps['accounts'] == [] and '123456789' not in str(caps)
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_a_key_without_an_expiry_cannot_exist(seeded):
     store, token, _ = seeded
     with pytest.raises(psycopg.errors.NotNullViolation), store.pool.connection() as c:
         c.execute('UPDATE api_keys SET expires_at=NULL WHERE id=%s', (store.capabilities(token)['credential_id'],))
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 @pytest.mark.parametrize('platform,value', [('telegram', '15550000001@c.us'), ('telegram', '0123'),
     ('telegram', 123456789), ('whatsapp', '123456789'), ('whatsapp', '15550000001@lid'), (None, None)])
 def test_a_malformed_or_missing_id_is_not_written_and_the_connect_still_counts(seeded, platform, value):
@@ -105,7 +105,7 @@ def test_a_malformed_or_missing_id_is_not_written_and_the_connect_still_counts(s
     assert accounts(store.capabilities(token))[account] is None
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_only_a_connected_phase_records_the_id(seeded):
     store, token, _ = seeded
     archive = Archive(store)
@@ -117,7 +117,7 @@ def test_only_a_connected_phase_records_the_id(seeded):
     assert accounts(store.capabilities(token))['telegram-demo'] == '123456789'
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_collector_records_the_verified_id_on_connect_and_sync_status_does_not_echo_it(worker):  # noqa: F811
     w, store, key = worker
     w.provider.self_provider_id = lambda: '4242424242'
@@ -129,7 +129,7 @@ def test_collector_records_the_verified_id_on_connect_and_sync_status_does_not_e
     assert 'identity' not in source['operations'] and '4242424242' not in str(source)
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_providers_report_only_the_identity_they_verified(tmp_path):
     telegram = TelethonProvider.__new__(TelethonProvider)
     telegram.verified_self = None
@@ -160,7 +160,7 @@ def set_operations(store, account, expression, *args):
         c.execute('UPDATE collector_health SET operations='+expression+' WHERE account=%s', (*args, account))
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_whatsmeow_provider_reports_the_verified_id_like_the_webjs_provider(tmp_path):
     from messaging_service.whatsapp_collector import WhatsmeowProvider
     native = WhatsmeowProvider({'expected_wid': '15550000001@c.us', 'native_executable': str(tmp_path/'native')},
@@ -172,7 +172,7 @@ def test_whatsmeow_provider_reports_the_verified_id_like_the_webjs_provider(tmp_
     assert native.self_provider_id() is None
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_a_reconnect_rewrites_the_same_id_and_a_failed_identity_check_keeps_the_last_verified_one(seeded):
     store, token, _ = seeded
     state = lease_state(store, 'telegram-demo', 'fixture')
@@ -187,7 +187,7 @@ def test_a_reconnect_rewrites_the_same_id_and_a_failed_identity_check_keeps_the_
     assert accounts(store.capabilities(token))['telegram-demo'] == '123456789'
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_a_collector_that_lost_its_lease_cannot_write_an_id(seeded):
     store, token, _ = seeded
     stale = lease_state(store, 'telegram-demo', 'old-owner')
@@ -210,7 +210,7 @@ def pad_to(store, account, target):
     assert health(store, account)['size'] == target
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_near_the_16_kib_limit_the_connect_is_saved_without_the_id(seeded):
     store, token, _ = seeded
     state = lease_state(store, 'telegram-demo', 'fixture')
@@ -223,7 +223,7 @@ def test_near_the_16_kib_limit_the_connect_is_saved_without_the_id(seeded):
     assert accounts(store.capabilities(token))['telegram-demo'] is None
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_a_stored_id_never_makes_a_later_phase_write_fail(seeded):
     store, token, _ = seeded
     state = lease_state(store, 'telegram-demo', 'fixture')
@@ -237,7 +237,7 @@ def test_a_stored_id_never_makes_a_later_phase_write_fail(seeded):
     assert accounts(store.capabilities(token))['telegram-demo'] is None
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 @pytest.mark.parametrize('stored', ['{"self_provider_id": 123456789}', '{"self_provider_id": {"id": "1"}}',
     '"123456789"', '{"self_provider_id": "15550000001@c.us"}'])
 def test_a_malformed_stored_id_reads_as_null(seeded, stored):
@@ -247,7 +247,7 @@ def test_a_malformed_stored_id_reads_as_null(seeded, stored):
     assert accounts(store.capabilities(token))['telegram-demo'] is None
 
 
-# spec: ANYM-SPEC
+# spec: ANYM-470
 def test_two_keys_of_one_principal_each_see_their_own_expiry(seeded):
     store, _, _ = seeded
     short = store.issue_key('agent-c', ['telegram-demo'], days=3)

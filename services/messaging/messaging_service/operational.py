@@ -84,7 +84,7 @@ def self_provider_id(platform, value):
 def operations(row, history, files, now=None, *, eligibility=None):
     now=now or datetime.now(timezone.utc)
     phases=dict(row.get('operations') or {})
-    # The owner's verified ID is returned only by capabilities (ANYM-SPEC).
+    # The owner's verified ID is returned only by capabilities (ANYM-470).
     phases.pop('identity',None)
     lease=row.get('collector_lease_until')
     running=lease is not None and lease>now

@@ -911,7 +911,7 @@ class TelegramCollector:
         return receipt
 
     def verified_self_id(self):
-        # The owner's ID the provider has just verified; capabilities shows it (ANYM-SPEC).
+        # The owner's ID the provider has just verified; capabilities shows it (ANYM-470).
         # Advisory: a provider without it, or any failure here, records no ID.
         try:
             reader=getattr(self.provider,'self_provider_id',None)

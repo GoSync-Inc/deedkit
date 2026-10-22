@@ -200,7 +200,7 @@ class CollectorState:
     def _save_operations(self,c,value):
         if 'identity' in value:
             # The optional verified ID never costs a phase write its 16 KiB budget
-            # (018): over the limit the row is saved without it (ANYM-SPEC).
+            # (018): over the limit the row is saved without it (ANYM-470).
             try:
                 with c.transaction():
                     c.execute('UPDATE collector_health SET operations=%s,updated_at=clock_timestamp() WHERE account=%s',
@@ -228,7 +228,7 @@ class CollectorState:
             self._phase(value,name,state,code,row['observed'],**extra)
             if connected and self_provider_id is not None:
                 # Only the ID the provider just verified against the configured one; a
-                # malformed value is dropped, never a reason to fail the connect (ANYM-SPEC).
+                # malformed value is dropped, never a reason to fail the connect (ANYM-470).
                 platform=c.execute('SELECT platform FROM accounts WHERE id=%s',(self.account,)).fetchone()
                 verified=verified_self_id(platform and platform['platform'],self_provider_id)
                 if verified:value['identity']={'self_provider_id':verified,'verified_at':row['observed'].isoformat()}
