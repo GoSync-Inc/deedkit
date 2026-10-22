@@ -18,6 +18,16 @@ from .incoming_formatting import known as known_formatting, unknown as unknown_f
 # The retry-exhausted sweep has no selective index: one Archive (a collector)
 # runs it on its first media claim for an account, then at most once per this.
 MEDIA_SWEEP_SECONDS = 60
+# Out-of-window originals the background backfill fetches by itself: voice notes, then
+# small files. Larger ones stay available on an explicit request.
+BACKFILL_VOICE_MIMES = ('audio/ogg','audio/opus')
+BACKFILL_VOICE_BYTES = 32*1024**2
+BACKFILL_SMALL_BYTES = 1024**2
+BACKFILL_CANDIDATES = 16
+# 0 voice note, 1 small file, 2 any other original.
+MEDIA_TIER = '''CASE WHEN j.descriptor->>'mime'=ANY(%(voice_mimes)s)
+        AND (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(voice_max)s THEN 0
+    WHEN (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(small_max)s THEN 1 ELSE 2 END'''
 
 
 class Archive:
@@ -262,10 +272,11 @@ class Archive:
             return {'outcome':outcome,'message':mid}
 
     def claim_media(self,owner,*,account=None,ttl=120,collector_lease=None,since=None,writer=None,
-                    live_writer=None,live_window_seconds=86400,media_prefetch_days=None):
+                    live_writer=None,live_window_seconds=86400,media_prefetch_days=None,backfill=False):
         from .storage_admission import StorageAdmission
         from .media_policy import validate_prefetch_days
         validate_prefetch_days(media_prefetch_days)
+        if type(backfill) is not bool: raise ValueError('invalid_backfill')
         if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',owner) or not 10<=ttl<=600: raise ValueError('invalid_worker')
         if live_writer is not None and (writer is None or
                 live_writer.root.resolve()!=writer.root.resolve() or
@@ -274,6 +285,10 @@ class Archive:
                 type(live_window_seconds) is not int or not 600<=live_window_seconds<=7*86400):
             raise ValueError('invalid_live_media_policy')
         live_max=live_writer.max_bytes if live_writer is not None else None
+        tiers={'voice_mimes':list(BACKFILL_VOICE_MIMES),'voice_max':BACKFILL_VOICE_BYTES,'small_max':BACKFILL_SMALL_BYTES}
+        # Backfill reaches out-of-window voice notes and small files of a bounded window
+        # (days>0). Its few candidates are chosen before the shared storage locks are taken.
+        backfill_ids=self._backfill_candidates(account,since,media_prefetch_days,tiers) if backfill and media_prefetch_days else []
         with self._media_sweep(account) as sweep, self.store.pool.connection() as c:
             from .file_lifecycle import lifecycle_lock
             lifecycle_lock(c)
@@ -304,6 +319,7 @@ class Archive:
                     AND wm.sent_at>=greatest(%(now)s-%(days)s::integer*interval '1 day',
                         coalesce(%(since)s::timestamptz,'-infinity'))'''
                     +(' AND NOT wm.deleted' if account is None else ' AND wm.account=%(account)s')+'))')
+                if backfill_ids:arms.append('SELECT unnest(%(backfill_ids)s::text[])')
                 candidates=' AND j.id=ANY(ARRAY('+' UNION ALL '.join(arms)+'))'
             # A cached generic plan of this repeated statement would not see the window bounds.
             c.execute("SET LOCAL plan_cache_mode=force_custom_plan")
@@ -313,21 +329,25 @@ class Archive:
                 CROSS JOIN LATERAL (SELECT COALESCE(%(live_max)s::bigint IS NOT NULL AND
                     (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(live_max)s::bigint AND
                     m.sent_at>=%(now)s-%(live_window)s*interval '1 second' AND
-                    m.sent_at<=%(now)s+interval '5 minutes',false) AS live_media) priority
+                    m.sent_at<=%(now)s+interval '5 minutes',false) AS live_media,
+                    COALESCE(j.requested_until>clock_timestamp(),false) AS requested,'''+MEDIA_TIER+''' AS tier) priority
                 WHERE p.enabled AND (%(account)s::text IS NULL OR j.account=%(account)s) AND j.attempts<5 AND
                 NOT m.deleted AND NOT(ch.provider_chat=ANY(p.exclude_chats)) AND
                 (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
                 (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s) AND
                 (%(days)s::integer IS NULL OR j.requested_until>clock_timestamp() OR
                     (%(days)s::integer>0 AND m.sent_at>=%(now)s-%(days)s*interval '1 day'
-                        AND m.sent_at<=%(now)s+interval '5 minutes')) AND
+                        AND m.sent_at<=%(now)s+interval '5 minutes') OR
+                    (j.id=ANY(%(backfill_ids)s::text[]) AND priority.tier<2)) AND
                 ((j.state='queued' AND j.next_due<=clock_timestamp()) OR
                  (j.state='leased' AND j.lease_until<clock_timestamp()))'''+candidates+'''
-                ORDER BY COALESCE(j.requested_until>clock_timestamp(),false) DESC,priority.live_media DESC,
-                    CASE WHEN priority.live_media THEN m.sent_at END DESC,j.next_due,j.id
+                ORDER BY priority.requested DESC,j.id=ANY(%(backfill_ids)s::text[]),priority.live_media DESC,
+                    CASE WHEN priority.live_media THEN m.sent_at END DESC,
+                    CASE WHEN NOT priority.requested THEN priority.tier END,
+                    CASE WHEN NOT priority.requested THEN m.sent_at END DESC,j.next_due,j.id
                 FOR UPDATE OF j SKIP LOCKED LIMIT 1''',
                 {'live_max':live_max,'live_window':live_window_seconds,'account':account,'since':since,
-                    'days':media_prefetch_days,'now':now}).fetchone()
+                    'days':media_prefetch_days,'now':now,'backfill_ids':backfill_ids,**tiers}).fetchone()
             if not job: return None
             expires=c.execute("SELECT clock_timestamp()+%s*interval '1 second' AS at",(ttl,)).fetchone()['at']
             reservation=None
@@ -349,6 +369,23 @@ class Archive:
             claimed['_live_media']=job['_live_media']
             if reservation is not None:claimed['_storage_reservation']=reservation
             return claimed
+
+    def _backfill_candidates(self,account,since,days,tiers):
+        # Read-only and lock-free: one bounded pass over the due queue that the
+        # claim below re-checks under its locks and fences.
+        with self.store.pool.connection() as c:
+            return [r['id'] for r in c.execute('''SELECT j.id FROM media_jobs j
+                JOIN account_policies p ON p.account=j.account
+                JOIN messages m ON m.id=j.message AND m.account=j.account
+                JOIN chats ch ON ch.id=m.chat AND ch.account=j.account
+                CROSS JOIN LATERAL (SELECT '''+MEDIA_TIER+''' AS tier) priority
+                WHERE j.state='queued' AND j.next_due<=clock_timestamp() AND j.attempts<5 AND
+                (%(account)s::text IS NULL OR j.account=%(account)s) AND p.enabled AND NOT m.deleted AND
+                NOT(ch.provider_chat=ANY(p.exclude_chats)) AND (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
+                (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s) AND
+                m.sent_at<clock_timestamp()-%(days)s*interval '1 day' AND priority.tier<2
+                ORDER BY priority.tier,m.sent_at DESC,j.id LIMIT %(limit)s''',
+                {'account':account,'since':since,'days':days,'limit':BACKFILL_CANDIDATES,**tiers})]
 
     @contextmanager
     def _media_sweep(self,account):

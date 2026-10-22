@@ -214,6 +214,18 @@ phase still counts it as a lease until the sweep. Expired storage reservations
 are still reclaimed on every claim. `tests/test_media_claim_performance.py`
 checks the plans with 30,000 and 60,000 dormant jobs.
 
+Claims run in this order: explicit requests, then live originals (newest first), then
+voice notes (`audio/ogg`, `audio/opus`, at most 32 MiB), then other files of at most
+1 MiB, then everything else. Within each group the newest message comes first. The
+Telegram collector also backfills dormant out-of-window jobs on its own
+(`media_backfill`, default `true`). This covers voice notes and files of at most 1 MiB
+from a bounded window (`media_prefetch_days` from 1 to 36500), inside `history_since`.
+Backfill runs only when no window job is due, takes at most one original every 15
+seconds, and waits 10 minutes once nothing is left. Each claim first reads at most 16
+candidates without the storage locks and then checks them again under those locks.
+Larger dormant originals still wait for an explicit request. Set `media_backfill: false`
+to turn backfill off. WhatsApp collectors never backfill.
+
 Message capture and original downloads have separate disk budgets. Collector
 `disk_reserve_bytes` retains the capture/spool floor (default 1 GiB).
 `media_disk_reserve_bytes` controls the original-file floor (default the larger
