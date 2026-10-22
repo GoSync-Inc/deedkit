@@ -5,9 +5,36 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Identity, permitted accounts, source coverage and unavailable features.",
+    "description": "Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter.",
     "inputSchema": {
-      "properties": {},
+      "properties": {
+        "detail": {
+          "default": "summary",
+          "enum": [
+            "summary",
+            "full"
+          ],
+          "title": "Detail",
+          "type": "string"
+        },
+        "sections": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 16,
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sections"
+        }
+      },
       "type": "object",
       "title": "capabilitiesArguments",
       "additionalProperties": false

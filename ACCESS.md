@@ -72,6 +72,25 @@ keys too, with no other account, chat or field becoming visible:
   stored value failing the format). It is never guessed from messages, and `get_sync_status`
   does not return it.
 
+Since ANYM-270, `capabilities` takes `detail` (`summary` or `full`) and `sections`:
+
+- MCP (direct and the gateway's `messages_capabilities`) returns `detail=summary` by default:
+  service, version, principal, `credential_id`, permissions, accounts (`id`, `platform`,
+  `label`), `chat_scope` as `all_in_permitted_accounts` plus `chat_count`, `tool_manifest.version`,
+  the section names and a `next_action`. Through the gateway the summary names
+  `gateway_principal`, `backend_principal` and `gateway_tool_count` and leaves out backend
+  permissions, as `full` does.
+- REST (`POST /v1/capabilities`, the gateway's `/v1/messages_capabilities`) and the Python and
+  npm clients still return the full payload when `detail` is omitted, so existing callers
+  and a gateway of either version keep working.
+- `sections=[names]` returns only those blocks with today's keys: `identity`, `accounts`,
+  `coverage`, `tool_manifest`, `search_options`, `sending`, `file_uploads`, `subscriptions`
+  (with `events`), `feedback`, `messenger_operations` (per-account `supported_by_account`; through
+  the gateway the `gateway_actions*` fields), `limits` (with `unavailable`). Every key of `full`
+  is in exactly one section. An unknown name returns `invalid_filter`.
+- `detail=full` is the previous payload unchanged. Every view is cut from the same scoped
+  payload, so no section shows an account, chat or operation outside the key's scope.
+
 ## Operator commands
 
 The commands require `DATABASE_URL_FILE` with the owner DSN. Below are placeholders, not real

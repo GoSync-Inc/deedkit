@@ -8,6 +8,7 @@ from .adapters.calls import receipt_reference
 from .catalog import arguments, CATALOG, InvalidArguments
 from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, stale_arguments_hint, unavailable, unknown_tool_denial
 from .policy import Denied, key_from_file
+from .sections import capabilities_view
 
 PLAIN_PATH = "/mcp"
 MODULE_PATH = "/mcp/modules/"
@@ -529,4 +530,6 @@ class Dispatch:
             if module == "messaging":
                 result.update(self.usable_actions(snapshot, agent, caps))
             result["gateway_policy_revision"] = snapshot["revision"]
+            if module == "messaging":
+                result = capabilities_view(result, args)
         return result

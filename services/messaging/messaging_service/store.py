@@ -34,6 +34,36 @@ class APIError(Exception):
         super().__init__(code)
 
 
+# capabilities sections (ANYM-270): each key of the full payload sits in exactly one
+# named block, with today's shape; summary is the short index an agent reads first.
+CAPABILITY_SECTIONS={
+    'identity':('service','version','principal','scope_version','credential_id','permissions','expires_at','key_permission_ceiling',
+                'key_permission_version','chat_scope','auth_mode'),
+    'accounts':('accounts',),'coverage':('synthetic','sources','coverage'),
+    'tool_manifest':('tool_manifest','available'),'search_options':('search_options',),'sending':('sending',),
+    'file_uploads':('file_uploads',),'subscriptions':('subscriptions','events'),'feedback':('feedback',),
+    'messenger_operations':('messenger_operations',),'limits':('limits','unavailable')}
+
+
+def capability_view(full, detail='full', sections=None):
+    """`full` unchanged, only the named `sections`, or the summary index."""
+    if sections is not None:
+        if not sections or any(name not in CAPABILITY_SECTIONS for name in sections):raise APIError('invalid_filter')
+        return {key:full[key] for name in CAPABILITY_SECTIONS if name in sections
+                for key in CAPABILITY_SECTIONS[name] if key in full}
+    if detail=='full':return full
+    if detail!='summary':raise APIError('invalid_filter')
+    scope=full['chat_scope']
+    return {'service':full['service'],'version':full['version'],'principal':full['principal'],
+        'credential_id':full['credential_id'],'permissions':full['permissions'],
+        'accounts':[{k:a[k] for k in ('id','platform','label')} for a in full['accounts']],
+        'chat_scope':{'all_in_permitted_accounts':scope['all_in_permitted_accounts'],
+                      'chat_count':None if scope['chat_ids'] is None else len(scope['chat_ids'])},
+        'tool_manifest':{'version':full['tool_manifest']['version']},
+        'detail':'summary','sections':list(CAPABILITY_SECTIONS),
+        'next_action':'call capabilities again with sections=[names] for those blocks or detail=full for everything'}
+
+
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -218,7 +248,8 @@ class Store:
         targets(p,[row['id']])
         return row
 
-    def capabilities(self, token):
+    def capabilities(self, token, detail='full', sections=None):
+        # Python callers keep today's payload; MCP asks for the summary by default (ANYM-270).
         with self.authorized(token,'capabilities') as (c, p):
             from .messenger_operations import CATALOG_VERSION,OPERATIONS,operation_manifest
             from .commands import manifest
@@ -260,7 +291,7 @@ class Store:
             if any(spec['permission'] in p['permissions'] for spec in OPERATIONS.values()):
                 available.extend(operation_tools)
             else:available.append('list_messenger_operations')
-            return {'service': 'anymsg', 'version': __version__, **dataset,
+            return capability_view({'service': 'anymsg', 'version': __version__, **dataset,
                 'tool_manifest':{'version':__version__,'names':sorted(OPERATION_PERMISSIONS.keys()-{'download'}),
                     'discovery_action':'refresh_connection_if_tools_list_differs',
                     'rest_fallback':'POST /v1/{tool_name} with the same bearer and JSON parameters'},
@@ -371,7 +402,7 @@ class Store:
                            'review_sources':20, 'context_reviews':5,'send_text_utf16_units':4000,
                            'format_source_utf16_units':16000,'http_json_body_bytes':16384,
                            'upload_chunk_http_json_body_bytes':360448,
-                           'send_queue_ttl_seconds':600,'send_per_account_per_minute':60}}
+                           'send_queue_ttl_seconds':600,'send_per_account_per_minute':60}},detail,sections)
 
     def preview_message(self,token,account,chat_id,text,reply_to='',format='plain',
                         link_preview=False,allow_lossy=False):
