@@ -15,7 +15,7 @@ def main():
     parser.add_argument('command',choices=['serve','init','migrate','issue-key','revoke-key',
         'replay','snapshot','verify-restore','quarantine-restore','register-account',
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
-        'set-messenger-operations','extend-key','set-feedback-status','release-retention-hold',
+        'set-messenger-operations','extend-key','set-feedback-status','export-feedback','release-retention-hold',
         'set-subscription-retention'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
@@ -52,6 +52,10 @@ def main():
     parser.add_argument('--spec',help='set-feedback-status: ANYM-<n>')
     parser.add_argument('--duplicate-of',help='set-feedback-status: a feedback UUID of the same key')
     parser.add_argument('--note',help='set-feedback-status: at most 280 characters, no control characters')
+    parser.add_argument('--since',help='export-feedback: ISO 8601 time with an offset; submissions created since then')
+    parser.add_argument('--changed-since',help='export-feedback: ISO 8601 time with an offset; dispositions changed since then')
+    parser.add_argument('--page',help='export-feedback: next_page of the same export')
+    parser.add_argument('--overlap',type=int,help='export-feedback: minutes before --since/--changed-since, 2-1440 (default 10)')
     parser.add_argument('--subscription-ids',nargs='+',help='release-retention-hold: subscription UUIDs')
     parser.add_argument('--all-subscriptions',action='store_true',help='release-retention-hold: every held subscription')
     args=parser.parse_args()
@@ -138,6 +142,9 @@ def main():
                 parser.error('set-feedback-status requires --id and --status')
             print(json.dumps(store.set_feedback_status(args.feedback_ids,args.status,fixed_in=args.fixed_in,
                 spec_ref=args.spec,duplicate_of=args.duplicate_of,note=args.note)))
+        elif args.command=='export-feedback':
+            print(json.dumps(store.export_feedback(since=args.since,changed_since=args.changed_since,page=args.page,
+                overlap=args.overlap,limit=args.limit)))
         elif args.command=='release-retention-hold':
             if bool(args.subscription_ids)==args.all_subscriptions:
                 parser.error('release-retention-hold requires exactly one of --subscription-ids or --all-subscriptions')

@@ -18,6 +18,7 @@ import threading
 from collections import OrderedDict
 from uuid import UUID
 
+from psycopg.errors import TransactionTimeout
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from . import __version__
@@ -120,27 +121,44 @@ class Store:
     def access(self, operation, resolve_identity):
         failure = None
         p = None
-        with self.pool.connection() as c:
-            with c.transaction():
-                try:
-                    with c.transaction():
-                        p = resolve_identity(c)
-                        permission = OPERATION_PERMISSIONS[operation] if operation else None
-                        if permission and permission not in p['permissions']:
-                            raise APIError('forbidden', 403)
-                        yield c, p
-                except Exception as error:
-                    # Roll back the attempted action, but commit its denial audit
-                    # outside the savepoint. Successful mutations + audit commit
-                    # atomically; a broken audit sink never becomes silent success.
-                    from .error_details import classified
-                    code=classified(error)
-                    failure = APIError(code,503) if code in ('query_timeout','service_busy','service_unavailable') else error
-                    p = p or getattr(error, 'audit_identity', None)
-                if operation:
-                    outcome = 'ok' if failure is None else ('denied' if isinstance(failure, APIError) else 'error')
-                    audit(c, p, operation, outcome,
-                          failure.code if isinstance(failure, APIError) else ('operation_failed' if failure else None))
+        late = None
+        try:
+            with self.pool.connection() as c:
+                with c.transaction():
+                    try:
+                        with c.transaction():
+                            p = resolve_identity(c)
+                            permission = OPERATION_PERMISSIONS[operation] if operation else None
+                            if permission and permission not in p['permissions']:
+                                raise APIError('forbidden', 403)
+                            yield c, p
+                    except Exception as error:
+                        # Roll back the attempted action, but commit its denial audit
+                        # outside the savepoint. Successful mutations + audit commit
+                        # atomically; a broken audit sink never becomes silent success.
+                        from .error_details import classified
+                        code=classified(error)
+                        failure = APIError(code,503) if code in ('query_timeout','service_busy','service_unavailable') else error
+                        p = p or getattr(error, 'audit_identity', None)
+                        # transaction_timeout ends the server session (ANYM-265): nothing was committed, and the
+                        # failure is audited on a fresh connection instead of the closed one.
+                        late = isinstance(error, TransactionTimeout) and c.closed
+                    if operation:
+                        outcome = 'ok' if failure is None else ('denied' if isinstance(failure, APIError) else 'error')
+                        entry = (p, operation, outcome,
+                                 failure.code if isinstance(failure, APIError) else ('operation_failed' if failure else None))
+                        if not late:
+                            audit(c, *entry)
+        except TransactionTimeout:
+            # The audit write or the commit ran past transaction_timeout: the server rolled the whole
+            # transaction back and closed the session, so the timeout is audited on a fresh connection.
+            if not operation:
+                raise
+            failure, late = APIError('query_timeout', 503), True
+            entry = (p, operation, 'denied', 'query_timeout')
+        if late and operation:
+            with self.pool.connection() as fresh:
+                audit(fresh, *entry)
         if failure is not None:
             failure.operation=operation
             if isinstance(failure,APIError) and operation:failure.audited=True
@@ -867,6 +885,12 @@ class Store:
         from .feedback import list_feedback
         with self.authorized(token, 'list_feedback') as (c, p):
             return list_feedback(self, c, p, limit=limit, status=status)
+
+    def export_feedback(self, **options):
+        # Operator CLI only (ANYM-265): every principal's feedback, read-only; no MCP tool, REST route or gateway action.
+        from .feedback import export_feedback
+        with self.pool.connection() as c, c.transaction():
+            return export_feedback(c, **options)
 
     def set_feedback_status(self, ids, status, *, fixed_in=None, spec_ref=None, duplicate_of=None, note=None):
         # Operator CLI only (ANYM-343): no operation permission, MCP tool, REST route or gateway action.
