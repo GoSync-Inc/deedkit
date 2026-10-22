@@ -97,6 +97,10 @@ OWNER_QUESTION=40
 OWNER_REQUEST=63
 # ANYM-427: a one-way non-contact private chat whose incoming messages fall on this many UTC days is likely promotional.
 PROMOTIONAL_DAYS=3
+# Read-state freshness (ANYM-275): the longest a continuously received observation stays current,
+# and the heartbeat age that still proves the collector is receiving (capture progress every 15 s).
+READ_STATE_MAX_AGE_HOURS=24
+READ_STATE_HEARTBEAT_SECONDS=60
 PROMOTIONAL=('exclude','include','only')
 # Priority cursors bind the scoring formula: a position from another formula would skip rows after a deploy. Bump with any weight change.
 SCORE_FORMULA=3
@@ -230,8 +234,20 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     # The muted count reads the queue without the chat-mute exclusion.
     unmuted_pending=pending
     if mutes and not include_dismissed and not include_muted:pending=pending[:-1]+' AND NOT '+chat_muted+')'
-    fresh="(ro.observed_at>=CURRENT_TIMESTAMP-interval '5 minutes' AND ro.observed_at>=incoming.sent_at AND ro.unread_count IS NOT NULL)"
-    unread='CASE WHEN '+fresh+' THEN ro.unread_count>0 END'
+    # An observation is current while nothing newer arrived and it has a count (or the owner's
+    # marked-unread flag), and it is at most 5 minutes old or the collector has received every
+    # update since it under one live lease epoch (ANYM-275): a later owner read would have replaced it.
+    # A schema before 42 (rollback drill) has none of these columns: keep the 5-minute rule there.
+    read_sources=c.execute("SELECT to_regclass('public.owner_message_reads') IS NOT NULL AS x").fetchone()['x']
+    continuous=f"""(ro.observed_at>=CURRENT_TIMESTAMP-interval '{READ_STATE_MAX_AGE_HOURS} hours' AND EXISTS(
+      SELECT 1 FROM collector_health rh JOIN collector_leases rl ON rl.account=rh.account AND rl.epoch=rh.receiving_epoch
+      WHERE rh.account=c.account AND rl.expires_at>CURRENT_TIMESTAMP AND rh.receiving_since<=ro.observed_at
+        AND rh.receiving_heartbeat_at>=CURRENT_TIMESTAMP-interval '{READ_STATE_HEARTBEAT_SECONDS} seconds'
+        AND rh.receiving_backlog_since IS NULL AND (rh.receiving_gap_at IS NULL OR rh.receiving_gap_at<ro.observed_at)))""" if read_sources else 'false'
+    marked=' OR ro.marked_unread IS TRUE' if read_sources else ''
+    fresh=("(ro.observed_at>=incoming.sent_at AND (ro.unread_count IS NOT NULL"+marked+")"
+        " AND (ro.observed_at>=CURRENT_TIMESTAMP-interval '5 minutes' OR "+continuous+"))")
+    unread='CASE WHEN '+fresh+' THEN ro.unread_count>0'+marked+' END'
     # Waiting points grow with the square root of hours (1h=1, 1d=4, 4d=9) up to
     # 20 at about 17 days, so recent requests differ before a day has passed.
     waited="greatest(0,extract(epoch FROM (score_clock.at-attention.sent_at))/3600)"
@@ -416,10 +432,13 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         last.snippet AS last_message_snippet,ro.unread_count AS provider_unread_count,ro.unread_count AS unread_count,
         '''+unread+''' AS provider_unread,ro.observed_at AS read_state_observed_at,ro.basis AS read_state_basis,
         CASE WHEN '''+fresh+''' THEN 'observed' WHEN ro.observed_at IS NULL THEN 'unknown' ELSE 'stale' END AS read_state,
-        CASE WHEN '''+fresh+''' AND attention.id IS NOT NULL THEN
+        CASE '''+('''WHEN attention.id IS NOT NULL AND EXISTS(SELECT 1 FROM owner_message_reads omr
+            WHERE omr.chat=c.id AND omr.provider_id=attention.provider_id) THEN true
+          ''' if read_sources else '')+'''WHEN '''+fresh+''' AND attention.id IS NOT NULL THEN
           CASE WHEN ro.read_inbox_max_id IS NOT NULL AND attention.provider_id ~ '^[0-9]{1,18}$'
             THEN attention.provider_id::bigint<=ro.read_inbox_max_id
-          END END AS read_by_owner,
+          END END AS read_by_owner,'''+('ro.count_basis AS read_state_count_basis,ro.marked_unread AS read_state_marked_unread,'
+            if read_sources else 'NULL::text AS read_state_count_basis,NULL::boolean AS read_state_marked_unread,')+'''
         NULL::boolean AS muted,NULL::boolean AS archived,'''+pending+''' AS awaiting_reply,
         '''+(muted_flag if include_muted and ranked else 'NULL::text')+''' AS awaiting_reply_muted,
         '''+(f'''(SELECT sz.snoozed_until FROM reply_snoozes sz WHERE sz.key_id={key} AND sz.chat=c.id

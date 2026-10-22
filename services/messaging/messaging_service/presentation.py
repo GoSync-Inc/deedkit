@@ -224,6 +224,12 @@ def lean_chat(row):
         result['read_state']=row['read_state']
         for key in ('unread_count','read_by_owner'):
             if row['read_state']=='observed' and row.get(key) is not None:result[key]=row[key]
+        # An own-device receipt for the hinted message is message-level evidence at any chat state;
+        # count_basis says why a chat has no count, marked_unread is the owner's flag (ANYM-275).
+        if row.get('read_by_owner') is True:result['read_by_owner']=True
+        if row.get('read_state_count_basis') in ('partial','stale_since_baseline'):
+            result['count_basis']=row['read_state_count_basis']
+        if row['read_state']=='observed' and row.get('read_state_marked_unread') is True:result['marked_unread']=True
     if row.get('awaiting_reply'):
         hint={'message_id':row.get('awaiting_reply_message_id'),'revision':row.get('awaiting_reply_revision'),
             'sent_at':row.get('awaiting_reply_sent_at'),

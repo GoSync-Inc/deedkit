@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,10 +29,13 @@ import (
 func init() { sql.Register("sqlite3", &sqlite.Driver{}) }
 
 type CaptureStore struct {
-	db              *sql.DB
-	Config          Config
-	Owner           types.JID
-	OwnerLID        types.JID
+	db       *sql.DB
+	Config   Config
+	Owner    types.JID
+	OwnerLID types.JID
+	// Alias returns the locally known LID for a phone JID or the reverse, or an
+	// empty JID. It reads the session store only, never the network (ANYM-275).
+	Alias           func(types.JID) types.JID
 	mu              sync.Mutex
 	MaxEntries      int
 	MaxSpoolBytes   int64
@@ -678,7 +682,15 @@ func (s *CaptureStore) Dialogs(limit int, policy Policy) ([]any, error) {
 	}
 	return out, rows.Err()
 }
+func ownerReadReceipt(e *events.Receipt) bool {
+	return e.IsFromMe && (e.Type == types.ReceiptTypeRead || e.Type == types.ReceiptTypeReadSelf)
+}
 func (s *CaptureStore) StoreReceipt(e *events.Receipt) error {
+	if ownerReadReceipt(e) {
+		// The owner's own device read these messages: owner-read evidence,
+		// never delivery evidence for an outgoing message (ANYM-275).
+		return s.storeOwnerRead(e)
+	}
 	state := map[types.ReceiptType]string{types.ReceiptTypeDelivered: "delivered", types.ReceiptTypeRead: "read", types.ReceiptTypePlayed: "played"}[e.Type]
 	if state == "" {
 		return nil
@@ -691,26 +703,7 @@ func (s *CaptureStore) StoreReceipt(e *events.Receipt) error {
 	for _, id := range e.MessageIDs {
 		// Receipts can reference incoming messages on sibling devices. Only an
 		// already captured outgoing ID may become outgoing delivery evidence.
-		rows, err := s.db.Query("SELECT message_id,raw FROM capture WHERE chat=? AND length(raw)>0 ORDER BY seq DESC LIMIT 1000", chat)
-		if err != nil {
-			return err
-		}
-		var found string
-		for rows.Next() {
-			var candidate string
-			var raw []byte
-			if err = rows.Scan(&candidate, &raw); err != nil {
-				rows.Close()
-				return err
-			}
-			m, err := unmarshalMessage(raw)
-			if err == nil && m.Info.ID == id && m.Info.IsFromMe {
-				found = candidate
-				break
-			}
-		}
-		err = rows.Err()
-		rows.Close()
+		found, err := s.capturedMessage(chat, id, true)
 		if err != nil {
 			return err
 		}
@@ -723,6 +716,111 @@ func (s *CaptureStore) StoreReceipt(e *events.Receipt) error {
 		}
 	}
 	return nil
+}
+
+// capturedMessage returns the capture ID of a retained message with this
+// provider ID and direction, or "" when none is retained. A group capture ID
+// carries a sender suffix (LegacyMessageID), so it matches by prefix there.
+func (s *CaptureStore) capturedMessage(chat, id string, fromMe bool) (string, error) {
+	var found string
+	key := fmt.Sprintf("%t_%s_%s", fromMe, chat, id)
+	err := s.db.QueryRow("SELECT message_id FROM capture WHERE chat=? AND (message_id=? OR substr(message_id,1,?)=?) AND length(raw)>0 ORDER BY seq DESC LIMIT 1",
+		chat, key, len(key)+1, key+"_").Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return found, err
+}
+
+// readChat returns the chat ID the captures of this JID are kept under: the JID
+// itself, else its locally known LID/PN alias, or "" when neither has captures.
+func (s *CaptureStore) readChat(jid types.JID) (string, error) {
+	candidates := []types.JID{jid.ToNonAD()}
+	if s.Alias != nil {
+		if alt := s.Alias(jid.ToNonAD()); !alt.IsEmpty() {
+			candidates = append(candidates, alt.ToNonAD())
+		}
+	}
+	for _, j := range candidates {
+		var one int
+		err := s.db.QueryRow("SELECT 1 FROM capture WHERE chat=? LIMIT 1", LegacyChatID(j)).Scan(&one)
+		if err == nil {
+			return LegacyChatID(j), nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+// Owner read state (ANYM-275) is passive provider evidence. None of these
+// paths sends a receipt, marks a chat read or calls the provider.
+func (s *CaptureStore) readState(chat, basis string, at time.Time, observation map[string]any, deferExport bool) error {
+	stamp := at.UTC().Format(time.RFC3339Nano)
+	observation["observed_at"] = stamp
+	observation["basis"] = basis
+	value := map[string]any{"kind": "owner_read_state", "account": s.Config.Account, "chat": chat, "observed_at": stamp, "observation": observation}
+	return s.append(chat, fmt.Sprintf("read:%s:%d", basis, at.UnixNano()), at.Unix(), nil, value, deferExport)
+}
+
+func validReadTime(at time.Time) bool { return at.Unix() > 0 && at.Unix() <= maxEnvelopeUnix }
+
+// storeOwnerRead keeps exactly the captured incoming IDs an own-device receipt
+// lists. It is not a chat watermark: it never carries a count and never
+// implies that earlier or unlisted messages are read. A receipt whose messages
+// are not retained still invalidates an older count (empty ID list).
+func (s *CaptureStore) storeOwnerRead(e *events.Receipt) error {
+	if !validReadTime(e.Timestamp) {
+		return nil
+	}
+	chat, err := s.readChat(e.Chat)
+	if err != nil || chat == "" {
+		return err
+	}
+	seen := map[string]bool{}
+	ids := []string{}
+	for _, id := range e.MessageIDs {
+		found, err := s.capturedMessage(chat, id, false)
+		if err != nil {
+			return err
+		}
+		if found != "" && !seen[found] {
+			seen[found] = true
+			ids = append(ids, found)
+		}
+	}
+	sort.Strings(ids)
+	return s.readState(chat, "whatsapp_owner_receipt", e.Timestamp, map[string]any{"unread_count": nil, "read_message_ids": ids}, false)
+}
+
+// StoreMarkChatAsRead records the owner's app-state mark-read (a whole-chat
+// zero at the action time) or mark-unread (a flag, not a count).
+func (s *CaptureStore) StoreMarkChatAsRead(e *events.MarkChatAsRead) error {
+	if e.Action == nil || !validReadTime(e.Timestamp) {
+		return nil
+	}
+	observation := map[string]any{"unread_count": 0, "marked_unread": false}
+	if !e.Action.GetRead() {
+		observation = map[string]any{"unread_count": nil, "marked_unread": true}
+	}
+	chat, err := s.readChat(e.JID)
+	if err != nil {
+		return err
+	}
+	if chat == "" {
+		chat = LegacyChatID(e.JID)
+	}
+	return s.readState(chat, "whatsapp_app_state_read", e.Timestamp, observation, false)
+}
+
+// StoreReadStateGap marks that app-state updates may have been missed, so an
+// older read observation can no longer count on continuity.
+func (s *CaptureStore) StoreReadStateGap(at time.Time, reason string) error {
+	stamp := at.UTC().Format(time.RFC3339Nano)
+	value := map[string]any{"kind": "read_state_gap", "account": s.Config.Account, "observed_at": stamp, "reason": reason}
+	// The digest leaves observed_at out; the local raw stamp keeps each gap a capture of its own.
+	return s.append("", fmt.Sprintf("gap:%s:%d", reason, at.UnixNano()), at.Unix(), []byte(stamp), value, false)
 }
 
 // ReceiptObservations returns only receipt evidence actually retained by this

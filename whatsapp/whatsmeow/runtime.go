@@ -33,6 +33,9 @@ type Provider struct {
 	workers     sync.WaitGroup
 	failureOnce sync.Once
 	failure     atomic.Value // first failure code (string)
+	// A read-state gap that could not be written yet (ANYM-275).
+	readGapPending atomic.Bool
+	connectedOnce  atomic.Bool
 	// Orders group cache refreshes across operations (ANYM-431).
 	groupRefresh groupRefresher
 }
@@ -101,6 +104,89 @@ func (p *Provider) owner() types.JID {
 	}
 	return types.EmptyJID
 }
+
+// handleReadEvent stores receipt and owner read-state evidence (ANYM-275).
+// It only records what the provider already delivered and never calls the client.
+func (p *Provider) handleReadEvent(value any) bool {
+	if !p.identityOK() {
+		p.fail("whatsapp_identity_mismatch")
+		return false
+	}
+	chat := types.EmptyJID
+	switch e := value.(type) {
+	case *events.Receipt:
+		chat = e.Chat
+	case *events.MarkChatAsRead:
+		chat = e.JID
+	}
+	p.flushReadGap()
+	if !chat.IsEmpty() {
+		policy, err := p.policy()
+		if err != nil {
+			p.fail(safeError(err))
+			return false
+		}
+		if !policy.Allows(LegacyChatID(chat)) {
+			return true
+		}
+	}
+	var err error
+	delivery := false
+	switch e := value.(type) {
+	case *events.Receipt:
+		delivery = !ownerReadReceipt(e)
+		err = p.Capture.StoreReceipt(e)
+	case *events.MarkChatAsRead:
+		err = p.Capture.StoreMarkChatAsRead(e)
+	case *events.AppStateSyncError:
+		err = p.Capture.StoreReadStateGap(time.Now(), "app_state_sync_error")
+	}
+	if err == nil {
+		return true
+	}
+	if delivery || spoolBackpressure(err) {
+		p.captureFailure(err)
+		return false
+	}
+	// Read state is metadata: a failed write must never stop capture or sends.
+	// It ends read-state continuity instead.
+	p.readGap("read_state_write_failed")
+	return true
+}
+
+// readGap records that read events may be missing; when even that write fails
+// it is retried before the next read event, so continuity is never kept by error.
+func (p *Provider) readGap(reason string) {
+	if p.Capture.StoreReadStateGap(time.Now(), reason) != nil {
+		p.readGapPending.Store(true)
+	}
+}
+func (p *Provider) flushReadGap() {
+	if p.readGapPending.Load() && p.Capture.StoreReadStateGap(time.Now(), "read_state_write_failed") == nil {
+		p.readGapPending.Store(false)
+	}
+}
+
+// localAlias maps a phone JID to its LID or the reverse from the session's
+// local mapping table only; an unknown or failed lookup is an empty JID.
+func localAlias(lids store.LIDStore) func(types.JID) types.JID {
+	return func(j types.JID) types.JID {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		var alt types.JID
+		var err error
+		switch j.Server {
+		case types.HiddenUserServer:
+			alt, err = lids.GetPNForLID(ctx, j)
+		case types.DefaultUserServer:
+			alt, err = lids.GetLIDForPN(ctx, j)
+		}
+		if err != nil {
+			return types.EmptyJID
+		}
+		return alt
+	}
+}
 func (p *Provider) identityOK() bool { return LegacyChatID(p.owner()) == p.Config.ExpectedWID }
 func (p *Provider) start(ctx context.Context) (result any, err error) {
 	defer func() {
@@ -152,6 +238,7 @@ func (p *Provider) start(ctx context.Context) (result any, err error) {
 	}
 	p.Capture.Owner = dev.ID.ToNonAD()
 	p.Capture.OwnerLID = dev.GetLID()
+	p.Capture.Alias = localAlias(dev.LIDs)
 	p.Client.EnableAutoReconnect = true
 	child, cancel := context.WithCancel(ctx)
 	p.cancel = cancel
@@ -164,6 +251,10 @@ func (p *Provider) start(ctx context.Context) (result any, err error) {
 				return false
 			}
 			p.ready.Store(true)
+			if p.connectedOnce.Swap(true) {
+				// An automatic reconnect does not prove that no update was lost (ANYM-275).
+				p.readGap("provider_reconnected")
+			}
 			select {
 			case connected <- struct{}{}:
 			default:
@@ -176,6 +267,8 @@ func (p *Provider) start(ctx context.Context) (result any, err error) {
 			return false
 		case *events.Disconnected:
 			p.ready.Store(false)
+			// Updates sent while disconnected may never arrive (ANYM-275).
+			p.readGap("provider_disconnected")
 		case *events.Message:
 			if !p.identityOK() {
 				p.fail("whatsapp_identity_mismatch")
@@ -195,22 +288,8 @@ func (p *Provider) start(ctx context.Context) (result any, err error) {
 				p.captureFailure(err)
 				return false
 			}
-		case *events.Receipt:
-			if !p.identityOK() {
-				p.fail("whatsapp_identity_mismatch")
-				return false
-			}
-			policy, err := p.policy()
-			if err != nil {
-				p.fail(safeError(err))
-				return false
-			}
-			if policy.Allows(LegacyChatID(e.Chat)) {
-				if err = p.Capture.StoreReceipt(e); err != nil {
-					p.captureFailure(err)
-					return false
-				}
-			}
+		case *events.Receipt, *events.MarkChatAsRead, *events.AppStateSyncError:
+			return p.handleReadEvent(e)
 		}
 		return true
 	})
