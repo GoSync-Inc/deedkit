@@ -1,5 +1,6 @@
 """Single-owner outbound pacing; the provider's required pause lives in PostgreSQL."""
 import asyncio
+import contextvars
 import re
 import time
 
@@ -12,6 +13,8 @@ UNKNOWN_FLOOD_SECONDS=60
 # In memory: a collector restart resets them (MESSENGER_OPERATIONS.md).
 # ANYM-477: agent-requested chat history has its own scope, so its pause and budget never touch search.
 LIVE_BUDGETS={'search':(3,10.0,100),'chat_history':(3,10.0,300)}
+# The deadline-bound CollectorState of the live read running in this task (release-042 B1).
+LIVE_STATE=contextvars.ContextVar('live_state',default=None)
 
 
 class ProviderRateLimited(Exception):
@@ -52,6 +55,14 @@ class RequestGovernor:
         self.scoped={}  # scope -> monotonic end of a method-scoped FloodWait
         self.budgets={scope:LiveBudget(*limits,clock=clock,wall=wall) for scope,limits in (budgets or LIVE_BUDGETS).items()}
 
+    @property
+    def state(self):
+        live=LIVE_STATE.get()
+        return live if live is not None and getattr(live,'account',None)==getattr(self._state,'account',None) else self._state
+
+    @state.setter
+    def state(self,value):self._state=value
+
     async def wait(self):
         # Re-read after waking: another operation/operator may extend the pause.
         # Cancellation interrupts sleep immediately; no provider/lease is opened here.
@@ -73,7 +84,8 @@ class RequestGovernor:
 
     async def _record(self,seconds):
         # Commit BEFORE releasing the shared gate or propagating the error.
-        recording=asyncio.create_task(asyncio.to_thread(self.state.defer,seconds))
+        # Never deadline-bound: a cooldown is recorded even after a live read's deadline; it is always awaited.
+        recording=asyncio.create_task(asyncio.to_thread(self._state.defer,seconds))
         try:await asyncio.shield(recording)
         except asyncio.CancelledError:
             # to_thread cancellation does not stop its SQL. Wait for the

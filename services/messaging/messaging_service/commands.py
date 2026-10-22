@@ -12,6 +12,7 @@ import re
 import stat
 import time
 
+import psycopg
 from psycopg.types.json import Jsonb
 
 from .envelope import canonical, stable_id
@@ -571,8 +572,14 @@ class CommandWorker:
     def preflight(self,job,*,verify_file=True):
         """Repeat authorization immediately before provider mutation or RPC."""
         st=self.state;store=st.archive.store
+        pool=store.pool
+        if job.get('_db_deadline') is not None:
+            # A live read (release-042 B1): the server ends this transaction, and frees the lease fence it
+            # holds, at the read's deadline, even when the awaiting caller has timed out and this thread stalls.
+            from .telegram_collector import DeadlinePool
+            pool=DeadlinePool(store.pool,job['_db_deadline'])
         try:
-            with store.pool.connection() as c:
+            with pool.connection() as c:
                 st.archive.fence(c,st.account,st.lease)
                 row=c.execute("SELECT * FROM messenger_commands WHERE id=%s AND account=%s AND status='dispatching' AND lease_epoch=%s",
                               (job['id'],st.account,st.lease[1])).fetchone()
@@ -596,7 +603,10 @@ class CommandWorker:
                     payload.update(registered_file_path=str(root/payload['file_digest']),trusted_blob_directory=str(root))
                 job.update(payload)
                 return job
-        except (APIError,OSError,ValueError,KeyError) as exc:
+        except Exception as exc:
+            if job.get('_db_deadline') is not None and isinstance(exc,(TimeoutError,psycopg.Error)):
+                raise CommandRejected('provider_timeout') from None
+            if not isinstance(exc,(APIError,OSError,ValueError,KeyError)):raise
             raise CommandRejected(exc.code if isinstance(exc,APIError) else 'operation_target_changed') from None
 
     def finish(self,job,status,result=None,code=None):
@@ -700,6 +710,8 @@ class CommandWorker:
         loop=asyncio.get_running_loop();end=loop.time()+max(0.0,LIVE_SEARCH_TIMEOUT-LIVE_FOREGROUND_RESERVE)
         deadline=min(end,loop.time()+LIVE_EXECUTION_TIMEOUT)
         def left():return max(0.0,deadline-loop.time())
+        # loop.time() is time.monotonic(), the clock of DeadlinePool.
+        if live:job['_db_deadline']=deadline
         async def settle(*args):
             if not live:return await finish_durably(self.finish,*args)
             # One tracked attempt off the foreground path: no receipt commit holds up the send loop.
