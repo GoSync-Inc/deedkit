@@ -23,7 +23,7 @@ test('all five subscription helpers preserve exact selection and expose the mani
     assert.deepEqual(await client[method](args),{synthetic:true});
     assert.ok(tools.includes(operation));
   }
-  assert.equal(tools.length,41);
+  assert.equal(tools.length,46);
   assert.deepEqual(seen,Object.values(methods).map(([operation,args])=>[
     `https://archive.example/base/v1/${operation}`,args]));
   assert.equal(tools.includes('ack_subscription_events'),true);

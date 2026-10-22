@@ -272,8 +272,8 @@ Priority cursors retain a scoring timestamp and bind all filters.
 Additional query filters: `exclude_chats` (archive chat IDs), `exclude_senders`
 (provider sender IDs within selected accounts), `only_questions`, `only_unread`,
 `exclude_likely_broadcasts` (opt-in: one-way chats and provider business/verified
-senders; `excluded_likely_broadcasts_total`) and `chat_types=['private']`. Exclusions are per request, not a stored global
-mute policy. Select accounts when the same provider sender ID is ambiguous.
+senders; `excluded_likely_broadcasts_total`) and `chat_types=['private']`. Exclusions are per request; a stored mute is
+`mute_reply_source` (below). Select accounts when the same provider sender ID is ambiguous.
 
 `unread_count`/`provider_unread_count` is a timestamped chat observation, separate
 from recipient delivery/read receipts. `read_state` is observed, stale or unknown;
@@ -295,3 +295,56 @@ their own queue. Historical backfill older than the incoming head does not reope
 it. Repeating the same exact dismissal is safe; a changed target returns
 `reply_target_changed`, requiring a fresh queue read. Dismissal does not send,
 mark source messages read, change archive ACKs or assert the request was fulfilled.
+
+Since schema 41 the queue has stored controls (ANYM-281). None of them touches a
+provider, sends or marks read; the write tools need `read` and `cursor-write`,
+`list_reply_dismissals` needs `read`, and each call is audited under its own name
+without content.
+
+- `dismiss_reply` takes an optional `reason` (`no_reply_needed`, `spam_or_mailing`,
+  `handled_elsewhere`, `other`) and `note` (1-200 characters without control
+  characters, stored and returned as untrusted text). A bad value returns
+  `invalid_filter` and changes nothing. `spam_or_mailing` adds
+  `suggest: "mute_reply_source"` to the response.
+- `snooze_reply(chat_id, message_id, expected_revision, until, note?)` hides the
+  exact hint for this credential until `until` (RFC 3339 with an offset, in the
+  future, at most 90 days ahead, else `invalid_date_range`) or the next meaningful
+  incoming, whichever comes first. A due snooze returns the row even when the hint
+  is older than `awaiting_reply_days`, with `snoozed_until` on the hint and
+  `snooze_due` in its reasons. A dismissal or snooze replaces this credential's
+  previous one for the chat.
+- `restore_reply(chat_id, message_id, expected_revision)` removes this credential's
+  dismissal or snooze of the chat when it names that message and revision and
+  returns `restored: true` with the removed entry (`kind`, `reason`, `note`,
+  `snoozed_until`, `active`); otherwise `restored: false`. The row is then whatever
+  the queue computes. Mutes are untouched.
+- `mute_reply_source` takes `chat_id`, or `account` plus the hint's exact
+  `sender_id`, with optional `reason` and `note`. A chat mute keeps the chat out
+  of the queue, including rows created by later messages. A sender mute skips that
+  sender's messages within the account when the queue chooses a hint: a private
+  chat with only that peer leaves the queue, and a group stays only when another
+  participant's owner attention remains, which becomes the hint. Repeating a mute
+  updates its reason and note. An agent (principal) holds at most 1,000 mutes
+  (`mute_limit_reached`). One mute matches one ID: two accounts, or a WhatsApp
+  sender seen as both a phone and a LID identity, need one mute each.
+  `unmute_reply_source` with the same target removes it (`unmuted: true|false`).
+- `list_reply_dismissals(kind, after, limit)` lists `dismissed` or `snoozed`
+  entries of this credential, or `muted` entries of its principal (limit 1-100,
+  default 20). Items carry `target`, chat ID and title, sender ID and name,
+  `reason`, `note`, `created_at` and `snoozed_until`; dismissals and snoozes add
+  `message_id` and `revision` (the arguments of `restore_reply`), the hint's
+  snippet and `active` (whether the entry still hides the chat's current hint).
+  Only chats the scope can read now are listed; a narrowed scope hides entries
+  without deleting them.
+
+While the agent has a mute, `list_chats(awaiting_reply=true)` reports `muted_total`, the
+rows mutes removed within the scope and the request's other filters (absent means none). `include_muted=true` returns
+them with `awaiting_reply.muted` set to `chat` or `sender`; a sender-muted row
+shows the muted sender's hint, which cannot be dismissed or snoozed until it is
+unmuted. Dismiss and snooze targets are chosen with the principal's sender mutes
+applied, so a hint from a muted sender returns `reply_target_changed`.
+
+Restore and unmute keep no request results. A retry after an uncertain response
+restates the same state and also removes an entry for the same hint or target
+that another request made in between. After an uncertain result, read
+`list_reply_dismissals` instead of retrying.

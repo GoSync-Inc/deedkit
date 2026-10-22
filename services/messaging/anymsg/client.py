@@ -450,9 +450,33 @@ class Client:
     def search(self, query, **filters):
         return self.call("search",{"query":query,**filters})
 
-    def dismiss_reply(self, *, chat_id, message_id, expected_revision):
+    def dismiss_reply(self, *, chat_id, message_id, expected_revision, reason=None, note=None):
         """Dismiss an exact hint for this key, without changing provider read state."""
-        return self.call('dismiss_reply',dict(chat_id=chat_id,message_id=message_id,expected_revision=expected_revision))
+        return self.call('dismiss_reply',dict(chat_id=chat_id,message_id=message_id,expected_revision=expected_revision,
+            **{k:v for k,v in dict(reason=reason,note=note).items() if v is not None}))
+
+    def snooze_reply(self, *, chat_id, message_id, expected_revision, until, note=None):
+        """Hide an exact hint for this key until `until` (RFC 3339) or a new meaningful incoming."""
+        return self.call('snooze_reply',dict(chat_id=chat_id,message_id=message_id,expected_revision=expected_revision,
+            until=until,**({} if note is None else {'note':note})))
+
+    def restore_reply(self, *, chat_id, message_id, expected_revision):
+        """Undo this key's dismissal or snooze of the exact hint. After an uncertain result, list instead of retrying."""
+        return self.call('restore_reply',dict(chat_id=chat_id,message_id=message_id,expected_revision=expected_revision))
+
+    def mute_reply_source(self, *, chat_id=None, account=None, sender_id=None, reason=None, note=None):
+        """Keep a chat, or a sender within one account, out of this agent's reply queue until unmuted."""
+        return self.call('mute_reply_source',{k:v for k,v in dict(chat_id=chat_id,account=account,sender_id=sender_id,
+            reason=reason,note=note).items() if v is not None})
+
+    def unmute_reply_source(self, *, chat_id=None, account=None, sender_id=None):
+        """Remove this agent's mute of the chat, or of the sender within the account."""
+        return self.call('unmute_reply_source',{k:v for k,v in dict(chat_id=chat_id,account=account,
+            sender_id=sender_id).items() if v is not None})
+
+    def list_reply_dismissals(self, *, kind='dismissed', after='', limit=20):
+        """List this key's dismissals or snoozes, or this agent's mutes, in chats it can read now."""
+        return self.call('list_reply_dismissals',dict(kind=kind,after=after,limit=limit))
 
     def preview_message(self,*,account,chat_id,text,reply_to='',format='plain',
                         link_preview=False,allow_lossy=False):

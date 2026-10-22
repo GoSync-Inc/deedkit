@@ -125,7 +125,8 @@ call with `view="conversation"` returns the same compact rows as MCP.
 The remaining hint fields keep their names and meanings: `message_id`,
 `revision`, `sender_id`, `sender_name`, `sender_name_basis`, `priority`,
 `reasons`, `waiting_hours`, `incoming_count`, `basis` (group hints; C7),
-`dismissed`, `confidence` when it is not the default, and `display_text` with
+`dismissed`, `muted` (`chat` or `sender`, only with `include_muted=true`),
+`snoozed_until` (a due snooze; SEARCH.md), `confidence` when it is not the default, and `display_text` with
 `truncated` (the hint's own text, or the head's when the hint is the head), and
 `forward_origin` (`kind`, `sender_name`) with `authorship` for a forwarded hint
 message; `last_message` carries the same pair for a forwarded head. The

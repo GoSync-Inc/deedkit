@@ -22,6 +22,8 @@ OPERATION_PERMISSIONS = {
     'get_context': 'read', 'get_updates': 'read',
     'get_attachment': 'download', 'download': 'download', 'request_file_download':'download',
     'ack_updates': 'cursor-write', 'dismiss_reply':'cursor-write',
+    'snooze_reply':'cursor-write', 'restore_reply':'cursor-write', 'mute_reply_source':'cursor-write',
+    'unmute_reply_source':'cursor-write', 'list_reply_dismissals':'read',
     'get_reviews': 'read', 'record_review': 'review-write',
     'search_people': 'read', 'search_files': 'read', 'get_file_text': 'read',
     'get_file_occurrences':'read', 'get_file_segments':'read', 'get_sync_status':'read',
@@ -42,7 +44,7 @@ AUDIT_OPERATIONS = frozenset(OPERATION_PERMISSIONS) | {
     'set_key_permissions', 'set_operations', 'messenger_dispatch', 'extend_key', 'set_feedback_status',
 }
 AUDIT_CODES = frozenset({
-    'unauthorized', 'forbidden', 'not_found', 'invalid_limit', 'invalid_query',
+    'unauthorized', 'forbidden', 'not_found', 'invalid_limit', 'invalid_query', 'mute_limit_reached',
     'invalid_utc_date', 'invalid_date_range', 'invalid_filter', 'invalid_consumer',
     'consumer_limit', 'invalid_version', 'invalid_receipt', 'stale_ack',
     'attachment_unavailable', 'invalid_host', 'invalid_origin', 'rate_limited',

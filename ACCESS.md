@@ -1,6 +1,6 @@
 # Agent access and audit
 
-Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 40. Setup is done by the operator through the local CLI
+Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 41. Setup is done by the operator through the local CLI
 or SSH with the owner DSN. There are no remote MCP/REST methods for managing keys and permissions.
 Provider sessions, the owner DSN and the backup decryption key are not given to agents.
 
@@ -111,6 +111,12 @@ key ID and the previous and new `expires_at`; `list-keys` shows the new date. It
 operator audit row `extend_key` (principal and public key ID, never the token or digest) in the
 same transaction, so a failed audit write leaves the expiry unchanged. Agents cannot extend
 their own keys. After a suspected leak, rotate with `issue-key` and `revoke-key` instead.
+
+Reply-queue dismissals and snoozes belong to one key (SEARCH.md): `extend-key` keeps them,
+and a rotation (`issue-key` plus `revoke-key`) drops them. Since schema 41 reply-queue mutes
+(`mute_reply_source`) belong to the principal: every key of the principal shares them, a
+rotation keeps them, and another principal never sees or is affected by them. Entries for
+chats outside the current scope stay stored but hidden until the scope widens again.
 
 Since schema 39 the maintainer records what happened to agent feedback (SUBSCRIPTIONS.md,
 feedback status) through the local operator container only; it is not an MCP tool, REST route
