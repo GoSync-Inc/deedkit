@@ -30,6 +30,7 @@ THIN = frozenset(('history_loading', 'history_not_scanned', 'history_has_gaps', 
 HISTORY_STATES = frozenset(('gaps', 'loading', 'not_scanned'))
 HISTORY_CHATS = 5
 LIVE_CHAT_TYPES = ('private', 'group', 'channel')
+PLAN_DEGRADED = frozenset(('query_timeout', 'service_busy', 'service_unavailable'))  # store.access 503 codes
 SEARCH_SUGGESTION = {'tool': 'messages_search', 'args': {'live': 'on'}}
 
 
@@ -251,8 +252,9 @@ async def search(store, token, arguments, *, live='off', wait_s=None, request_id
     try:
         entries, queue = await run(store.live_search_plan, token, arguments, paged=paged,
                                    request_id=request_id or uuid.uuid4().hex)
-    except APIError: raise  # the caller's current authorization
     except Exception as error:
+        # Authorization and argument errors stay the caller's; a database failure only costs the live part.
+        if isinstance(error, APIError) and error.code not in PLAN_DEGRADED: raise
         log.warning('live_search_plan_failed exception_type=%s', type(error).__name__)
         evidence['live'] = []; evidence['live_wait'] = 'failed'
         return first

@@ -323,6 +323,13 @@ def test_a_failing_live_plan_or_hint_keeps_the_archive_answer(live, monkeypatch)
     result = run(s, key, {'query': 'synthetic'}, live='on')
     assert result['items'] and result['result_evidence']['live'] == []
     assert result['result_evidence']['live_wait'] == 'failed'
+    def plan_times_out(c, *args, **kwargs): c.execute('SET LOCAL statement_timeout = 1'); c.execute('SELECT pg_sleep(1)')
+    monkeypatch.setattr(live_search, 'plan', plan_times_out)
+    result = run(s, key, {'query': 'synthetic'}, live='on')
+    assert result['items'] and result['result_evidence']['live_wait'] == 'failed'
+    def plan_forbidden(*args, **kwargs): raise APIError('forbidden', 403)
+    monkeypatch.setattr(live_search, 'plan', plan_forbidden)
+    with pytest.raises(APIError, match='forbidden'): run(s, key, {'query': 'synthetic'}, live='on')
     monkeypatch.setattr(live_search, 'suggest', hint_fails)
     thin = s.search(key, 'needle')
     assert thin['items'] == [] and thin['result_evidence']['empty_reason'] in live_search.THIN
