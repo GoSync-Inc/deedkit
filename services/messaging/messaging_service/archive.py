@@ -341,7 +341,8 @@ class Archive:
                     (j.id=ANY(%(backfill_ids)s::text[]) AND priority.tier<2)) AND
                 ((j.state='queued' AND j.next_due<=clock_timestamp()) OR
                  (j.state='leased' AND j.lease_until<clock_timestamp()))'''+candidates+'''
-                ORDER BY priority.requested DESC,j.id=ANY(%(backfill_ids)s::text[]),priority.live_media DESC,
+                ORDER BY priority.requested DESC,CASE WHEN NOT priority.requested THEN j.id=ANY(%(backfill_ids)s::text[]) END,
+                    priority.live_media DESC,
                     CASE WHEN priority.live_media THEN m.sent_at END DESC,
                     CASE WHEN NOT priority.requested THEN priority.tier END,
                     CASE WHEN NOT priority.requested THEN m.sent_at END DESC,j.next_due,j.id
@@ -379,12 +380,13 @@ class Archive:
                 JOIN messages m ON m.id=j.message AND m.account=j.account
                 JOIN chats ch ON ch.id=m.chat AND ch.account=j.account
                 CROSS JOIN LATERAL (SELECT '''+MEDIA_TIER+''' AS tier) priority
-                WHERE j.state='queued' AND j.next_due<=clock_timestamp() AND j.attempts<5 AND
+                WHERE ((j.state='queued' AND j.next_due<=clock_timestamp()) OR
+                    (j.state='leased' AND j.lease_until<clock_timestamp())) AND j.attempts<5 AND
                 (%(account)s::text IS NULL OR j.account=%(account)s) AND p.enabled AND NOT m.deleted AND
                 NOT(ch.provider_chat=ANY(p.exclude_chats)) AND (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
                 (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s) AND
                 m.sent_at<clock_timestamp()-%(days)s*interval '1 day' AND priority.tier<2
-                ORDER BY priority.tier,m.sent_at DESC,j.id LIMIT %(limit)s''',
+                ORDER BY priority.tier,m.sent_at DESC,j.next_due,j.id LIMIT %(limit)s''',
                 {'account':account,'since':since,'days':days,'limit':BACKFILL_CANDIDATES,**tiers})]
 
     @contextmanager

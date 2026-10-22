@@ -223,7 +223,8 @@ from a bounded window (`media_prefetch_days` from 1 to 36500), inside `history_s
 Backfill runs only when no window job is due, takes at most one original every 15
 seconds, and waits 10 minutes once nothing is left. Each claim first reads at most 16
 candidates without the storage locks and then checks them again under those locks.
-Larger dormant originals still wait for an explicit request. Set `media_backfill: false`
+A backfilled original whose lease expired is claimed again by backfill. Requests keep
+their own due order. Larger dormant originals still wait for an explicit request. Set `media_backfill: false`
 to turn backfill off. WhatsApp collectors never backfill.
 
 Message capture and original downloads have separate disk budgets. Collector
