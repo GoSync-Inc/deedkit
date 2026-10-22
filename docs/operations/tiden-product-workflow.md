@@ -32,6 +32,11 @@ GitHub.
 `scripts/spec_impact.py <base> --body-file <body>` builds the `Spec impact:` list (harness
 `tiden.md`). Maintenance windows are in TIDEN-CI.md.
 
+## Agent feedback
+
+Agent feedback becomes product work through the owner-started private triage in
+[feedback-triage.md](feedback-triage.md): one ledger, clusters per card, a dispositions file.
+
 ## Commands
 
 Bulk maintenance (snapshots, provenance, manual watermark advances) follows

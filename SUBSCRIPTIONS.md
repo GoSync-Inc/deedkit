@@ -317,7 +317,10 @@ send messages, create external issues or forward reports to a third party. A sub
 transaction ends within 60 seconds or is aborted and not stored (its failure is audited as
 `query_timeout`). The maintainer reads every principal's feedback for triage only through the
 operator command `export-feedback` (ACCESS.md); it is not an MCP tool, REST route or gateway
-action.
+action. One exception to "not forwarded" (owner decision D1, ANYM-264): an owner-run triage
+session on the owner's workstation reads the exported text, so that text reaches that session's
+model provider. Only that session reads raw text; nothing derived from it goes to Tiden, GitHub
+or another sink (docs/operations/feedback-triage.md).
 
 A rejected `submit_feedback` names what to fix. Over REST and MCP the schema check
 returns `invalid_parameters` with the existing `fields` list plus `field_errors`; the
