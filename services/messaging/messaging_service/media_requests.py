@@ -12,6 +12,11 @@ from .store import APIError, serial
 
 PER_KEY_LIMIT=32
 GLOBAL_LIMIT=128
+# A cold restore the worker has not finished by then yields to the provider.
+COLD_RESTORE_STALL_SECONDS=900
+# Failures that say nothing against the stored copy; a later request retries R2.
+COLD_RETRY={'cold_unavailable','cold_restore_stalled','disk_reserve','cold_size_limit','cold_restore_failed',
+    'private_cold_identity_required'}
 
 
 def occurrence(c,p,attachment_id,*,lock=False):
@@ -32,6 +37,25 @@ def occurrence(c,p,attachment_id,*,lock=False):
         WHERE j.id=%s AND NOT m.deleted AND j.state<>'superseded' AND '''+where+
         (' FOR UPDATE OF j' if lock else ''),[attachment_id,*args]).fetchone()
     return row
+
+
+def cold_copy(c,digest,size):
+    """Restore state of the cold copy (ANYM-350), or None without one or without the grant.
+
+    A gateway whose role predates the restore grant keeps the provider path.
+    """
+    granted=c.execute("""SELECT CASE WHEN to_regclass('public.attachment_cold_copies') IS NULL THEN false
+        ELSE has_table_privilege('public.attachment_cold_copies','SELECT')
+         AND has_column_privilege('public.attachment_cold_copies','restore_state','UPDATE')
+         AND has_column_privilege('public.attachment_cold_copies','restore_attachment','UPDATE')
+         AND has_column_privilege('public.attachment_cold_copies','restore_requested_at','UPDATE')
+         AND has_column_privilege('public.attachment_cold_copies','restore_finished_at','UPDATE')
+         AND has_column_privilege('public.attachment_cold_copies','restore_error','UPDATE') END AS ok""").fetchone()['ok']
+    if not granted:return None
+    return c.execute('''SELECT (state='verified' AND ciphertext_sha256 IS NOT NULL AND verified_at IS NOT NULL) AS verified,
+        restore_state,restore_error,(restore_state='requested' AND restore_requested_at<=
+         clock_timestamp()-make_interval(secs=>%s)) AS stalled
+        FROM attachment_cold_copies WHERE digest=%s AND bytes=%s''',(COLD_RESTORE_STALL_SECONDS,digest,size)).fetchone()
 
 
 def request(store,c,p,attachment_id):
@@ -75,6 +99,24 @@ def request(store,c,p,attachment_id):
     if row['job_state']=='ready' and not managed:
         result.update(request_status='unavailable',reason='original_not_registered',requested_until=None)
         return serial(result)
+    fallback=False
+    if managed:
+        cold=cold_copy(c,row['digest'],row['bytes'])
+        result['rehydration_source']='provider'
+        if cold and cold['restore_state']=='requested' and cold['stalled']:
+            # The worker missed its window: record it and ask the provider now.
+            c.execute("""UPDATE attachment_cold_copies SET restore_state='failed',restore_error='cold_restore_stalled',
+                restore_finished_at=clock_timestamp() WHERE digest=%s""",(row['digest'],))
+            cold.update(restore_state='failed',restore_error='cold_restore_stalled');fallback=True
+        if cold and cold['restore_state']=='failed' and cold['restore_error']:result['cold_failure']=cold['restore_error']
+        if cold and cold['verified'] and row['job_state']=='ready':
+            if cold['restore_state']=='requested':
+                result.update(request_status='coalesced',reason='managed_original_evicted',rehydration_source='cold_archive',
+                    requested_until=row['requested_until'],next_action='get_attachment')
+                return serial(result)
+            active=c.execute('SELECT %s::timestamptz>clock_timestamp() AS active',(row['requested_until'],)).fetchone()['active']
+            if not fallback and (cold['restore_state']=='idle' or (not active and cold['restore_error'] in COLD_RETRY)):
+                return cold_request(c,p,attachment_id,row,result)
     if (not row['collection_enabled'] or row['provider_chat_id'] in row['exclude_chats'] or
             not (row['discover_chats'] or row['provider_chat_id'] in row['include_chats'])):
         result.update(request_status='blocked',reason='collection_disabled',requested_until=None,
@@ -95,7 +137,7 @@ def request(store,c,p,attachment_id):
         return serial(result)
     active=c.execute('SELECT %s::timestamptz>clock_timestamp() AS active',
         (row['requested_until'],)).fetchone()['active']
-    if active:
+    if active and not fallback:
         result.update(request_status='coalesced',requested_until=row['requested_until'])
         return serial(result)
     deferred=c.execute('''SELECT %s::timestamptz>=clock_timestamp()+interval '1 hour' AS deferred,
@@ -123,4 +165,31 @@ def request(store,c,p,attachment_id):
     result.update(request_status='queued',requested_until=until,
         download_request={'state':'requested','until':until},next_action='get_attachment')
     if managed:result['reason']='managed_original_evicted'
+    return serial(result)
+
+
+def cold_request(c,p,attachment_id,row,result):
+    """Queue a restore from the verified R2 copy; no collector job is queued.
+
+    The demand window opens only when the provider path would accept this
+    request, so the worker's fallback never bypasses collection policy, the
+    attempt cap, cooldown or history bounds.
+    """
+    outstanding=c.execute("""SELECT count(*) AS total FROM attachment_cold_copies WHERE restore_state='requested'
+        AND restore_requested_at>clock_timestamp()-make_interval(secs=>%s)""",(COLD_RESTORE_STALL_SECONDS,)).fetchone()['total']
+    if outstanding>=GLOBAL_LIMIT:raise APIError('media_request_limit',429)
+    provider=(row['collection_enabled'] and row['provider_chat_id'] not in row['exclude_chats'] and
+        (row['discover_chats'] or row['provider_chat_id'] in row['include_chats']) and row['attempts']<5 and
+        row.get('download_eligibility')!='outside_history_bounds' and not c.execute(
+        "SELECT %s::timestamptz>=clock_timestamp()+interval '1 hour' AS deferred",(row['next_due'],)).fetchone()['deferred'])
+    until=None
+    if provider:
+        until=c.execute('''UPDATE media_jobs SET requested_until=clock_timestamp()+interval '1 hour',
+            request_key_digest=%s WHERE id=%s RETURNING requested_until''',(p['key_digest'],attachment_id)).fetchone()['requested_until']
+    c.execute('''UPDATE attachment_cold_copies SET restore_state='requested',restore_attachment=%s,
+        restore_requested_at=clock_timestamp(),restore_finished_at=NULL,restore_error=NULL WHERE digest=%s''',
+        (attachment_id if provider else None,row['digest']))
+    result.pop('cold_failure',None)
+    result.update(request_status='queued',reason='managed_original_evicted',rehydration_source='cold_archive',
+        requested_until=until,download_request={'state':'requested','until':until},next_action='get_attachment')
     return serial(result)

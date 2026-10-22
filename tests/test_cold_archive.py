@@ -426,3 +426,218 @@ def test_oversized_plaintext_fails_verification_without_stalling(env,archive,key
     s,cloud,archiver,_=env;blob=idle(archive,payload=b'Synthetic small original')
     place(cloud,blob.digest,encrypt(os.urandom(3*1024**2),keys['backup'][1],keys['cold'][1]))
     with pytest.raises(cold().ColdVerifyFailed):archiver().verify(blob.digest,blob.bytes,{})
+
+
+def evicted_copy(env,archive,*,mid='lifecycle-1',payload=b'Synthetic retained contract'):
+    """An original with a read-back verified cold copy, then evicted (schema 35)."""
+    s,cloud,archiver,_=env;fid,blob=processed(archive,mid=mid,payload=payload)
+    assert archiver().run_once(apply=True)['archived']==1 and evict(s)['evicted']==1
+    assert not (s.files/blob.digest).exists()
+    return fid,blob
+
+
+def restorer(env,**changes):
+    worker=env[2](**changes)
+    return cold().ColdRestorer(worker.store,worker.config,worker.transport,reserve_bytes=changes.get('reserve_bytes',0))
+
+
+def job_state(s,fid):
+    with s.pool.connection() as c:return c.execute('SELECT state FROM media_jobs WHERE id=%s',(fid,)).fetchone()['state']
+
+
+def resident(s,digest):
+    with s.pool.connection() as c:
+        return c.execute('SELECT state FROM attachment_residency WHERE digest=%s',(digest,)).fetchone()['state']=='resident'
+
+
+# spec: ANYM-350
+def test_rehydrate_prefers_cold_archive(env,archive):
+    ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    first=s.request_file_download(key,fid)
+    assert first['request_status']=='queued' and first['rehydration_source']=='cold_archive'
+    assert first['reason']=='managed_original_evicted' and 'cold_failure' not in first
+    again=s.request_file_download(key,fid)
+    assert again['request_status']=='coalesced' and again['rehydration_source']=='cold_archive'
+    # No collector job: the provider is never asked while R2 can answer.
+    assert job_state(s,fid)=='ready' and ar.claim_media('fixture') is None
+    report=restorer(env).run_once()
+    assert report=={'restored':1,'restored_bytes':blob.bytes,'failed':0,'provider_fallback':0,'reasons':{}}
+    data=(s.files/blob.digest).read_bytes()
+    assert hashlib.sha256(data).hexdigest()==blob.digest and resident(s,blob.digest)
+    assert copy(s,blob.digest)['restore_state']=='idle' and copy(s,blob.digest)['state']=='verified'
+    assert job_state(s,fid)=='ready' and ar.claim_media('fixture') is None
+    assert s.request_file_download(key,fid)['request_status']=='ready'
+    assert not [p for p in s.files.iterdir() if p.name.startswith('.pending-')]
+
+
+# spec: ANYM-350
+@pytest.mark.parametrize('failure',['missing','different','truncated','unavailable'])
+def test_rehydrate_falls_back_to_provider_on_cold_failure(env,archive,failure):
+    ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    assert s.request_file_download(key,fid)['rehydration_source']=='cold_archive'
+    (cloud/failure).write_text('') if failure=='unavailable' else (cloud/'tamper').write_text(failure)
+    report=restorer(env).run_once()
+    assert report['restored']==0 and report['failed']==1 and report['provider_fallback']==1
+    assert not (s.files/blob.digest).exists() and not resident(s,blob.digest)
+    assert not [p for p in s.files.iterdir() if p.name.startswith('.pending-')]
+    row=copy(s,blob.digest);code=row['restore_error']
+    assert row['restore_state']=='failed'
+    if failure=='unavailable':
+        # Nothing is known against the stored copy: it stays verified.
+        assert code=='cold_unavailable' and row['state']=='verified'
+    else:
+        assert code in {'cold_object_missing','cold_ciphertext_mismatch','cold_verify_failed'}
+        assert row['state']=='failed' and row['verified_at'] is None
+    # The provider path ran inside the request's demand window.
+    assert job_state(s,fid)=='queued'
+    after=s.request_file_download(key,fid)
+    assert after['rehydration_source']=='provider' and after['cold_failure']==code
+    assert after['request_status']=='coalesced'
+    job=ar.claim_media('fixture');assert job['id']==fid
+
+
+# spec: ANYM-350
+def test_rehydrate_without_cold_copy_uses_provider(archive):
+    from messaging_service.file_lifecycle import LifecycleWorker
+    ar,s,key,_=archive;fid,blob=processed(archive)
+    # Evicted before schema 35: no copy row, the provider path is unchanged.
+    assert LifecycleWorker(s).run_once(apply=True)['evicted']==1
+    result=s.request_file_download(key,fid)
+    assert result['request_status']=='queued' and result['reason']=='managed_original_evicted'
+    assert result['rehydration_source']=='provider' and 'cold_failure' not in result
+    assert s.request_file_download(key,fid)['request_status']=='coalesced'
+    assert ar.claim_media('fixture')['id']==fid
+
+
+# spec: ANYM-350
+def test_stalled_cold_restore_falls_back_to_provider(env,archive):
+    ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    assert s.request_file_download(key,fid)['rehydration_source']=='cold_archive'
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_cold_copies SET restore_requested_at=clock_timestamp()-interval '15 minutes 1 second' WHERE digest=%s",(blob.digest,))
+    # The worker no longer picks a stalled restore.
+    assert restorer(env).run_once()['restored']==0 and calls(cloud).count('get_object')==1
+    result=s.request_file_download(key,fid)
+    assert result['request_status']=='queued' and result['rehydration_source']=='provider'
+    assert result['cold_failure']=='cold_restore_stalled'
+    assert ar.claim_media('fixture')['id']==fid
+    assert copy(s,blob.digest)['restore_state']=='failed' and copy(s,blob.digest)['state']=='verified'
+
+
+# spec: ANYM-350
+def test_outstanding_cold_restores_are_globally_bounded(env,archive,monkeypatch):
+    from messaging_service import media_requests
+    from messaging_service.store import APIError
+    _,_,key,_=archive;s,_,_,_=env
+    one,_=evicted_copy(env,archive,mid='bound-1',payload=b'Synthetic bounded first')
+    two,_=evicted_copy(env,archive,mid='bound-2',payload=b'Synthetic bounded second')
+    monkeypatch.setattr(media_requests,'GLOBAL_LIMIT',1)
+    assert s.request_file_download(key,one)['rehydration_source']=='cold_archive'
+    with pytest.raises(APIError,match='media_request_limit'):s.request_file_download(key,two)
+    assert copy(s,_digest_of(s,two))['restore_state']=='idle'
+
+
+def _digest_of(s,fid):
+    with s.pool.connection() as c:return c.execute('SELECT digest FROM attachments WHERE id=%s',(fid,)).fetchone()['digest']
+
+
+# spec: ANYM-350
+@pytest.mark.parametrize('limit',['disk_reserve','cold_size_limit'])
+def test_restore_honors_disk_reserve_and_object_size_bound(env,archive,limit):
+    import shutil as disk
+    ar,_,key,_=archive;s,_,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid)
+    changes={'reserve_bytes':disk.disk_usage(s.files).free+1} if limit=='disk_reserve' else {'max_object_bytes':blob.bytes-1}
+    report=restorer(env,**changes).run_once()
+    assert report['reasons']=={limit:1} and report['provider_fallback']==1
+    assert not (s.files/blob.digest).exists()
+    assert not [p for p in s.files.iterdir() if p.name.startswith('.pending-')]
+    # A local limit says nothing against the copy.
+    assert copy(s,blob.digest)['state']=='verified' and copy(s,blob.digest)['restore_error']==limit
+
+
+# spec: ANYM-350
+def test_least_privilege_gateway_queues_and_cold_role_restores(env,archive):
+    from contextlib import contextmanager
+    from copy import copy as clone
+    from uuid import uuid4
+    from psycopg import sql
+    _,_,key,_=archive;s,_,_,_=env;fid,blob=evicted_copy(env,archive)
+    roles={kind:kind+'_'+uuid4().hex for kind in ('messaging_gateway','messaging_cold_archive')}
+    class RestrictedPool:
+        def __init__(self,role):self.role=role
+        @contextmanager
+        def connection(self):
+            with s.pool.connection() as c:
+                c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(self.role)))
+                yield c
+    root=Path(__file__).resolve().parents[1]/'services/messaging/messaging_service'
+    for kind,role in roles.items():
+        with s.pool.connection() as c:
+            c.execute((root/(kind.removeprefix('messaging_')+'_role.sql')).read_text().replace(kind,role))
+    gateway=clone(s);gateway.pool=RestrictedPool(roles['messaging_gateway'])
+    worker=restorer(env);worker.store=clone(s);worker.store.pool=RestrictedPool(roles['messaging_cold_archive'])
+    try:
+        with s.pool.connection() as c:
+            c.execute(sql.SQL('REVOKE SELECT,UPDATE ON attachment_cold_copies FROM {}').format(sql.Identifier(roles['messaging_gateway'])))
+        # A gateway role from before the restore grant keeps the provider path.
+        old=gateway.request_file_download(key,fid)
+        assert old['request_status']=='queued' and old['rehydration_source']=='provider'
+        with s.pool.connection() as c:
+            c.execute("UPDATE media_jobs SET state='ready',requested_until=NULL WHERE id=%s",(fid,))
+            c.execute((root/'gateway_role.sql').read_text().replace('messaging_gateway',roles['messaging_gateway']))
+        assert gateway.request_file_download(key,fid)['rehydration_source']=='cold_archive'
+        assert worker.run_once()['restored']==1 and resident(s,blob.digest)
+    finally:
+        for role in roles.values():
+            with s.pool.connection() as c:
+                c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
+                c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
+# spec: ANYM-350
+def test_restore_drill_rehydrates_from_cold(env,archive,tmp_path):
+    """Restore a backup point into an isolated files directory, then rehydrate from cold/.
+
+    The disposable test database stands in for the restored database (the dump
+    is a stub; pg_restore itself is the BACKUP.md drill); the CAS is a fresh
+    directory filled only from the bundle.
+    """
+    from copy import copy as clone
+    from messaging_service.backup import create_snapshot,verify_bundle,verify_snapshot
+    from messaging_service.blobs import Blob,BlobWriter
+    _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    create_snapshot(s,tmp_path/'point',[sys.executable,'-c','print("synthetic dump")'])
+    manifest=verify_bundle(tmp_path/'point')
+    [absent]=[item for item in manifest['absent_blobs'] if item['digest']==blob.digest]
+    assert absent['cold_object_key']=='synthetic-owner/v1/cold/'+blob.digest+'.age'
+    isolated=tmp_path/'restored-files';writer=BlobWriter(isolated,reserve_bytes=0)
+    for item in manifest['blobs']:
+        with (tmp_path/'point/files'/item['digest']).open('rb') as source:
+            writer.write(iter(lambda:source.read(1024**2),b''),expected_bytes=item['bytes'],expected_sha256=item['digest'])
+    target=clone(s);target.files=isolated
+    assert verify_snapshot(target,tmp_path/'point')['status']=='verified'
+    assert s.request_file_download(key,fid)['rehydration_source']=='cold_archive'
+    worker=restorer(env);worker.store=target
+    assert worker.run_once()['restored']==1
+    writer.verify(Blob(blob.digest,blob.bytes))
+    assert hashlib.sha256((isolated/blob.digest).read_bytes()).hexdigest()==absent['digest']
+    assert not (s.files/blob.digest).exists()
+
+
+# spec: ANYM-350
+def test_compose_runs_cold_restore_with_the_cold_key_and_writable_cas():
+    import yaml
+    from scripts.production import validate_argv
+    root=Path(__file__).resolve().parents[1]
+    services=yaml.safe_load((root/'deploy/compose.file-lifecycle.yaml').read_text())['services']
+    service,archive_service=services['cold-restore'],services['cold-archive']
+    validate_argv(service['command'])
+    assert service['command'][:4]==['python','-m','messaging_service.cold_archive','--restore']
+    assert service['profiles']==archive_service['profiles'] and service['image']==archive_service['image']
+    assert 'files:/data' in service['volumes']
+    secrets=[v for v in service['volumes'] if isinstance(v,dict)]
+    assert secrets==[v for v in archive_service['volumes'] if v['target']!='/data'] and all(v['read_only'] for v in secrets)
+    assert service['user']=='10001:10001' and service['read_only'] and service['cap_drop']==['ALL']
+    from messaging_service.cold_archive import main
+    with pytest.raises(SystemExit):main(['--restore','--apply','--config','/nonexistent','--dsn-file','/nonexistent'])

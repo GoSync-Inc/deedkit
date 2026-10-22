@@ -270,7 +270,7 @@ class ColdArchiver:
             raise ColdVerifyFailed('cold_ciphertext_mismatch')
         return {'key':key,**observed}
 
-    def _decrypt_check(self,reader,stored,identity,digest,size):
+    def _decrypt_check(self,reader,stored,identity,digest,size,sink=None):
         failures=[];cipher={}
         with tempfile.TemporaryFile() as errors:
             process=subprocess.Popen([self.config['age'],'-d','-i','/dev/fd/'+str(identity)],stdin=subprocess.PIPE,
@@ -301,6 +301,8 @@ class ColdArchiver:
                     if count>size:
                         # Too much plaintext already disproves the copy; never block on it.
                         process.kill();break
+                    # Restores stream plaintext only into the CAS writer's private temporary file.
+                    if sink is not None:sink(chunk)
                 try:failed=process.wait(timeout=60)
                 except subprocess.TimeoutExpired:raise ColdUnavailable(UNAVAILABLE) from None
                 thread.join(timeout=60)
@@ -417,6 +419,93 @@ class ColdArchiver:
         return result
 
 
+class ColdRestorer(ColdArchiver):
+    """Restore requested evicted originals from their verified R2 copies (ANYM-350).
+
+    The gateway queues a restore (media_requests.cold_request). The ciphertext
+    must match its recorded size and SHA-256 and decrypt to the CAS digest; the
+    plaintext goes only through BlobWriter. Any failure publishes nothing and
+    hands the request to the provider path while its demand window is open.
+    """
+    def __init__(self,store,config,transport=None,*,reserve_bytes=1024**3):
+        super().__init__(store,config,transport);self.reserve_bytes=reserve_bytes
+
+    def _due(self,limit):
+        from .media_requests import COLD_RESTORE_STALL_SECONDS
+        # Older requests belong to the gateway's stalled-restore fallback.
+        with self.store.pool.connection() as c:
+            return c.execute('''SELECT digest,bytes,object_key,ciphertext_bytes,ciphertext_sha256,restore_attachment
+                FROM attachment_cold_copies WHERE restore_state='requested' AND state='verified'
+                  AND restore_requested_at>clock_timestamp()-make_interval(secs=>%s)
+                ORDER BY restore_requested_at,digest LIMIT %s''',(COLD_RESTORE_STALL_SECONDS,limit)).fetchall()
+
+    def _fetch(self,row):
+        from .blobs import BlobSink,BlobWriter
+        digest,size=row['digest'],row['bytes']
+        writer=BlobWriter(self.store.files,max_bytes=self.config['max_object_bytes'],reserve_bytes=self.reserve_bytes)
+        with BlobSink(writer,size,digest) as sink:
+            with self.transport.get(digest) as (key,stored,reader):
+                if key!=row['object_key'] or stored!=row['ciphertext_bytes']:raise ColdVerifyFailed('cold_ciphertext_mismatch')
+                with identity_descriptor(self.config['identity_file']) as identity:
+                    observed=self._decrypt_check(reader,stored,identity,digest,size,sink=sink.push)
+            if observed['sha256']!=row['ciphertext_sha256']:raise ColdVerifyFailed('cold_ciphertext_mismatch')
+            # Published only now: ciphertext and plaintext both match the record.
+            return sink.finish()
+
+    def _restore_one(self,row):
+        from .file_lifecycle import is_managed_evicted,register_resident_original
+        digest,size=row['digest'],row['bytes']
+        with self.store.pool.connection() as c:
+            lifecycle_lock(c)
+            if not is_managed_evicted(c,digest,size):
+                # Already resident again (provider or an earlier restore).
+                c.execute('''UPDATE attachment_cold_copies SET restore_state='idle',restore_error=NULL,
+                    restore_finished_at=clock_timestamp() WHERE digest=%s AND restore_state='requested' ''',(digest,))
+                return False
+        reason=None;disproved=False
+        try:self._fetch(row)
+        except ColdVerifyFailed as error:
+            reason=str(error) if re.fullmatch('[a-z_]{1,64}',str(error)) else VERIFY_FAILED;disproved=True
+        except ColdUnavailable:reason=UNAVAILABLE
+        except ValueError as error:
+            reason={'media_size_limit':'cold_size_limit','private_cold_identity_required':'private_cold_identity_required'}.get(
+                str(error),VERIFY_FAILED)
+            disproved=reason==VERIFY_FAILED
+        except RuntimeError as error:reason='disk_reserve' if str(error)=='disk_reserve' else 'cold_restore_failed'
+        except OSError:reason='cold_restore_failed'
+        with self.store.pool.connection() as c:
+            lifecycle_lock(c)
+            if reason is None:
+                register_resident_original(c,digest,size)
+                c.execute('''UPDATE attachment_cold_copies SET restore_state='idle',restore_error=NULL,
+                    restore_finished_at=clock_timestamp() WHERE digest=%s''',(digest,))
+                return None
+            # A disproved copy no longer counts as verified; it is never used again
+            # until the archiver re-proves it from a resident original.
+            c.execute('''UPDATE attachment_cold_copies SET restore_state='failed',restore_error=%s,
+                restore_finished_at=clock_timestamp(),state=CASE WHEN %s THEN 'failed' ELSE state END,
+                error_code=CASE WHEN %s THEN %s ELSE error_code END,
+                verified_at=CASE WHEN %s THEN NULL ELSE verified_at END WHERE digest=%s''',
+                (reason,disproved,disproved,reason,disproved,digest))
+            queued=False
+            if row['restore_attachment']:
+                queued=c.execute('SELECT public.queue_managed_original(%s) AS queued',(row['restore_attachment'],)).fetchone()['queued']
+        return reason,queued
+
+    def run_once(self,*,limit=16):
+        if type(limit) is not int or not 1<=limit<=1000:raise ValueError('invalid_cold_restore_limit')
+        result={'restored':0,'restored_bytes':0,'failed':0,'provider_fallback':0,'reasons':{}}
+        for row in self._due(limit):
+            outcome=self._restore_one(row)
+            if outcome is False:continue
+            if outcome is None:
+                result['restored']+=1;result['restored_bytes']+=row['bytes'];continue
+            reason,queued=outcome
+            result['failed']+=1;result['provider_fallback']+=int(bool(queued))
+            result['reasons'][reason]=result['reasons'].get(reason,0)+1
+        return result
+
+
 def status(store,config=None):
     """Operator summary; no keys, paths or object names."""
     with store.pool.connection() as c:
@@ -446,11 +535,15 @@ def main(argv=None):
     parser.add_argument('--limit',type=int,default=200)
     parser.add_argument('--interval-seconds',type=int,help='repeat until SIGTERM/SIGINT; omit for one pass')
     parser.add_argument('--status',action='store_true')
+    parser.add_argument('--restore',action='store_true',help='restore requested evicted originals from R2 (ANYM-350)')
     args=parser.parse_args(argv)
     if not args.dsn_file:parser.error('--dsn-file or DATABASE_URL_FILE is required')
     if not 1<=args.limit<=10000:parser.error('invalid_cold_archive_limit')
-    if args.interval_seconds is not None and not 60<=args.interval_seconds<=7*86400:parser.error('invalid_interval')
-    if args.status and (args.apply or args.interval_seconds):parser.error('status is a separate one-shot operation')
+    # Restores answer explicit requests, so they poll often; archive passes are daily.
+    low,high=(5,3600) if args.restore else (60,7*86400)
+    if args.interval_seconds is not None and not low<=args.interval_seconds<=high:parser.error('invalid_interval')
+    if args.status and (args.apply or args.interval_seconds or args.restore):parser.error('status is a separate one-shot operation')
+    if args.restore and (args.apply or not 1<=args.limit<=1000):parser.error('restore runs only requested items; limit 1-1000')
     try:config=load_config(args.config)
     except (OSError,ValueError):
         print(json.dumps({'status':'error','error_code':'invalid_cold_archive_config'}),flush=True);return 1
@@ -461,14 +554,17 @@ def main(argv=None):
     try:
         if args.status:
             print(json.dumps(status(store,config)),flush=True);return 0
-        archiver=ColdArchiver(store,config)
+        archiver=ColdRestorer(store,config) if args.restore else ColdArchiver(store,config)
         while not stopped.is_set():
-            try:result=archiver.run_once(apply=args.apply,limit=args.limit)
+            try:result=archiver.run_once(limit=args.limit) if args.restore else archiver.run_once(apply=args.apply,limit=args.limit)
             except Exception:
                 # Never print SQL, DSNs, paths, keys or arbitrary exception text.
                 print(json.dumps({'status':'error','error_code':'cold_archive_failed'}),flush=True)
                 if args.interval_seconds is None:return 1
-            else:print(json.dumps(result),flush=True)
+            else:
+                # An idle restore poll prints nothing, so the log keeps real events.
+                if not args.restore or result['restored'] or result['failed'] or args.interval_seconds is None:
+                    print(json.dumps(result),flush=True)
             if args.interval_seconds is None:break
             stopped.wait(args.interval_seconds)
         return 0

@@ -88,5 +88,56 @@ services:
     logging:
       driver: json-file
       options: {max-size: 5m, max-file: "2"}
+  # Restores requested evicted originals from <prefix>/cold/ (ANYM-350): get
+  # through the same `cold` forced command, check the recorded ciphertext,
+  # decrypt with the cold identity and publish through the CAS writer. On any
+  # failure it publishes nothing and hands the request to the provider path.
+  cold-restore:
+    profiles: [cold-archive]
+    image: anymsg-backup:${MESSAGING_VERSION:-0.9.9}
+    init: true
+    restart: unless-stopped
+    depends_on:
+      db: {condition: service_healthy}
+    command: [python, -m, messaging_service.cold_archive, --restore, --config, /run/secrets/cold_archive,
+      --dsn-file, /run/secrets/database_url, --interval-seconds, "10", --limit, "16"]
+    environment:
+      PROBE_FILES: /data/files
+      HOME: /tmp
+    volumes:
+      - type: bind
+        source: ./private/cold-archive.dsn
+        target: /run/secrets/database_url
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./private/cold-archive.json
+        target: /run/secrets/cold_archive
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./private/cold-archive-identity
+        target: /run/secrets/cold_identity
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./private/cold-archive-ssh
+        target: /run/secrets/cold_ssh
+        read_only: true
+        bind: {create_host_path: false}
+      - files:/data
+    networks: [backend, cold_archive_egress]
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 32
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}
 networks:
   cold_archive_egress: {}

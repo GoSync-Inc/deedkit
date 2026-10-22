@@ -70,3 +70,8 @@ GRANT SELECT ON attachment_residency,attachment_eviction_journal,
     attachment_understanding,file_understanding_profiles TO messaging_gateway;
 GRANT EXECUTE ON FUNCTION public.touch_original(text,bigint) TO messaging_gateway;
 GRANT EXECUTE ON FUNCTION public.queue_managed_original(text) TO messaging_gateway;
+-- Cold-first rehydration (ANYM-350): queue a restore of a verified R2 copy.
+-- Without these grants the request path keeps the provider re-download.
+GRANT SELECT ON attachment_cold_copies TO messaging_gateway;
+GRANT UPDATE(restore_state,restore_attachment,restore_requested_at,restore_finished_at,restore_error)
+    ON attachment_cold_copies TO messaging_gateway;
