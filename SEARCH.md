@@ -215,6 +215,43 @@ outstanding deliveries are dropped and the position is kept. ACK order remains c
 not the original timestamp of a backfilled message.
 
 
+## Live Telegram search inside `search` (ANYM-478)
+
+`search` takes `live`: `off` (default), `auto` or `on`. With `off` nothing changes and no provider is
+asked; a thin answer (`empty_reason` `history_loading`, `history_not_scanned`, `history_has_gaps` or
+`no_matches_in_partial_archive`) only adds `result_evidence.suggested_call`:
+`{tool: "messages_search", args: {live: "on"}}` when a Telegram account is in scope, otherwise, for
+WhatsApp chats that still load or have gaps, `messages_execute_messenger_operation` with
+`request_chat_history` and up to 5 `chat_ids`. Existing `next_action` values are unchanged.
+
+`on` runs a live search for the first page; `auto` only when the archive answer is thin. Per permitted
+Telegram account in scope the call queues one `search_messages_live` operation, waits once up to
+`wait_s` (0-20 s, default 15) for all of them, then reads the archive again with the key's current
+authorization, so hits the collector archived appear as normal rows. `result_evidence.live` lists per
+account `state`, `stored_new` and the provider `hits`:
+
+| state | meaning |
+|---|---|
+| `done` | the live search finished; `hits`, `stored_new`, `next_cursor`, `operation_id` |
+| `pending` | not finished within `wait_s`; read it with `get_messenger_operation(operation_id)` |
+| `rate_limited` | the account's live search budget; `retry_after` seconds |
+| `unavailable` | `reason`: `session_unavailable` (no connected collector), a provider error, or `operation_queue_failed` |
+| `not_permitted` | the key lacks `read-live`, the chat or account is outside its scope, or (gateway) the `search_messages_live` action is not granted |
+| `not_enabled` | the account has not opted in to `search_messages_live` |
+| `unsupported_filter` | `fields` names what live search cannot apply |
+| `first_page_only` | `after`/`before` continue the archive only |
+| `not_supported_by_provider` | a WhatsApp account whose chats in scope still load; see its `suggested_call` |
+
+Live search applies `query` (`query_mode` `all` or `phrase`), at most one chat (`chat` or `chats` of
+length 1), `chat_types` / `include_channels` / `exclude_channels` (channels only when asked for, as in
+the archive) and `from_time` / `to_time`. `web` and `exact` modes, `fuzzy`, `sender`/`senders`,
+`direction`, several chats and `chats: []` give `unsupported_filter`. Keep one `request_id` per intent:
+the same id maps to the same operation per account, so a repeat after a lost response asks the provider
+nothing new. A failure to queue or a provider error never fails or empties the archive answer. At most 8
+calls wait at once (separate from send waits); a busy server returns the operations as `pending` with
+`result_evidence.live_wait: "busy"`. `live` other than `off` needs `read-live` and, through the
+gateway, the `search_messages_live` action; MCP clients reconnect after the release to see the fields.
+
 ## Coverage and diagnostics
 
 Version0.9.2 adds result_evidence, per-chat sync evidence and exact provider ID resolution. Inspect `result_evidence` and call `get_sync_status(chat_id=...)` before interpreting empty or partial results. The archive never substitutes a search error with no matches.
