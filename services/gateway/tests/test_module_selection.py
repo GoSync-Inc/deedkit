@@ -267,6 +267,10 @@ def test_selection_cleared_by_another_principals_request_after_revision(gateway)
         assert client.post("/v1/messages_search", json={"query": "x"},
                            headers={"Authorization": "Bearer gateway-b"}).status_code == 200
         assert app.state.dispatch.selections == {}
+        call(client, "platform_select_modules", {"modules": ["calls"]}, key="b")
+        write()
+        assert mcp(client, "ping", key="b").status_code == 200
+        assert app.state.dispatch.selections == {}
 
 
 # spec: ANYM-271

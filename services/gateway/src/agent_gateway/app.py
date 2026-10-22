@@ -269,7 +269,10 @@ def create_app(policy_path, public_url, *, transports=None):
                     key = auth[7:]
                     if len(key) > 512 or not key or any(c.isspace() for c in key):
                         raise Denied("unauthorized", 401)
-                    credential = dispatch.credential(policy.authenticate(key)[1])
+                    snapshot, agent = policy.authenticate(key)
+                    credential = dispatch.credential(agent)
+                    # Any authenticated request that sees a new policy revision clears module selections.
+                    dispatch.selected(agent, snapshot["revision"], None)
                 # A module path is the same endpoint; a malformed one fails here, before any backend.
                 route = Route.parse(request.url.path)
                 if request.method == "GET" and route:
