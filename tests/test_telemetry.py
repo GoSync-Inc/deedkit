@@ -251,7 +251,7 @@ def test_gateway_reports_unexpected_errors_only(channel, unexpected, monkeypatch
         public_url = 'http://testserver'
         def authenticate(self, token): return 'synthetic'
         def audit_boundary(self, code): pass
-        def capabilities(self, token):
+        def capabilities(self, token, detail='full', sections=None):
             if unexpected:
                 raise RuntimeError(SECRET)
             raise APIError('not_found',404)

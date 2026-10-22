@@ -18,7 +18,7 @@ from platform_contracts.release import ReleaseRuntime
 
 from .catalog import CATALOG, public
 from .diagnostics import with_catalog
-from .dispatch import Dispatch, admitted
+from .dispatch import Dispatch, Route, admitted
 from .http_clients import Clients
 from .policy import Denied, Policy
 from .release import messaging_dial_url
@@ -26,6 +26,8 @@ from .release import messaging_dial_url
 current_key = ContextVar("deedkit_key", default="")
 # The holder's own expiry at the boundary's admission check; a later admission wins.
 current_credential = ContextVar("deedkit_credential", default=None)
+# The MCP connection path (`/mcp` or `/mcp/modules/...`) of this request; None outside MCP (ANYM-271).
+current_route = ContextVar("deedkit_route", default=None)
 HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff"}
 NORMAL_BODY_LIMIT = 65536
 UPLOAD_BODY_LIMIT = 360448
@@ -51,11 +53,19 @@ def expiry_headers(credential):
     return {"X-DeedKit-Key-Expires": credential["expires_at"]} if expiry_notice(credential) else {}
 
 
+def mcp_route(path):
+    """`Route.parse` for checks that only ask whether a path is an MCP endpoint."""
+    try:
+        return Route.parse(path)
+    except Denied:
+        return None
+
+
 def is_chunk_call(path, body):
     """Only one reviewed tool can use the larger envelope; never batches/other RPCs."""
     if path == "/v1/" + UPLOAD_CHUNK_TOOL:
         return True
-    if path.rstrip("/") != "/mcp":
+    if mcp_route(path) is None:
         return False
 
     def unique(pairs):
@@ -119,7 +129,7 @@ def create_app(policy_path, public_url, *, transports=None):
     async def list_tools(context, params):
         if params and params.cursor:
             raise ValueError("catalog_cursors_not_supported")
-        snapshot, agent, visible, details = await dispatch.discover(current_key.get())
+        snapshot, agent, visible, details = await dispatch.discover(current_key.get(), current_route.get())
         actions = details["actions"]
         return ListToolsResult(
             tools=[Tool(**with_catalog(public(CATALOG[n], actions), details["discovery"])) for n in visible],
@@ -129,7 +139,7 @@ def create_app(policy_path, public_url, *, transports=None):
     async def call_tool(context, params):
         token = admitted.set(None)
         try:
-            result = await dispatch.call(current_key.get(), params.name, params.arguments or {})
+            result = await dispatch.call(current_key.get(), params.name, params.arguments or {}, current_route.get())
             content = [TextContent(type="text", text=text_block(result))]
             credential = admitted.get()
             notice = expiry_notice(credential)
@@ -205,6 +215,9 @@ def create_app(policy_path, public_url, *, transports=None):
 
         try:
             value = await request.json()
+            if name == "messages_capabilities" and isinstance(value, dict):
+                # REST and the SDKs keep the full payload; MCP defaults to the summary (ANYM-270).
+                value.setdefault("detail", "full")
             result = await dispatch.call(current_key.get(), name, value)
             return JSONResponse(result, headers=headers())
         except Denied as error:
@@ -259,8 +272,13 @@ def create_app(policy_path, public_url, *, transports=None):
                     key = auth[7:]
                     if len(key) > 512 or not key or any(c.isspace() for c in key):
                         raise Denied("unauthorized", 401)
-                    credential = dispatch.credential(policy.authenticate(key)[1])
-                if request.method == "GET" and request.url.path.rstrip("/") == "/mcp":
+                    snapshot, agent = policy.authenticate(key)
+                    credential = dispatch.credential(agent)
+                    # Any authenticated request that sees a new policy revision clears module selections.
+                    dispatch.selected(agent, snapshot["revision"], None)
+                # A module path is the same endpoint; a malformed one fails here, before any backend.
+                route = Route.parse(request.url.path)
+                if request.method == "GET" and route:
                     return await JSONResponse(
                         {"error": "server_notifications_not_supported"},
                         status_code=405,
@@ -269,8 +287,7 @@ def create_app(policy_path, public_url, *, transports=None):
                 if request.method == "POST":
                     limit = NORMAL_BODY_LIMIT
                     chunk_route = request.url.path == "/v1/" + UPLOAD_CHUNK_TOOL
-                    mcp_route = request.url.path.rstrip("/") == "/mcp"
-                    if chunk_route or mcp_route:
+                    if chunk_route or route:
                         try:
                             snapshot, agent = policy.authenticate(key)
                             credential = dispatch.credential(agent)
@@ -313,10 +330,15 @@ def create_app(policy_path, public_url, *, transports=None):
                         return await original_receive()
 
                     receive = replay
+                if route and route.modules is not None:
+                    # The SDK transport serves `/mcp`; plain `/mcp` requests pass through untouched.
+                    scope = dict(scope, path="/mcp", raw_path=b"/mcp")
                 token, held = current_key.set(key), current_credential.set(credential)
+                routed = current_route.set(route)
                 try:
                     await app(scope, receive, protected_send)
                 finally:
+                    current_route.reset(routed)
                     current_credential.reset(held)
                     current_key.reset(token)
             except Denied as error:

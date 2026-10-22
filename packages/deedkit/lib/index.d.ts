@@ -70,7 +70,8 @@ export type ToolName =
   | 'messages_update_subscription'
   | 'messages_upload_file_chunk'
   | 'messages_wait_for_subscription_events'
-  | 'platform_capabilities';
+  | 'platform_capabilities'
+  | 'platform_select_modules';
 
 export interface ToolCatalogEntry {
   readonly name: ToolName;

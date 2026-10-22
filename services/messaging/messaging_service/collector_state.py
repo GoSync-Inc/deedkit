@@ -247,6 +247,17 @@ class CollectorState:
                 'epoch':self.lease[1],'published_at':row['observed'].isoformat()}
             self._save_operations(c,value)
 
+    def disk_floors(self,floors):
+        """Publish this run's disk floors per volume; cold restores keep above them (ANYM-350)."""
+        if (type(floors) is not dict or not 1<=len(floors)<=8 or
+                any(type(k) is not str or not re.fullmatch(r'fs:[0-9]{1,20}',k) or
+                    type(v) is not int or not 0<=v<=100*1024**3 for k,v in floors.items())):
+            raise ValueError('invalid_disk_floors')
+        with self.archive.store.pool.connection() as c:
+            row=self._operations(c);value=row['operations']
+            value['disk_floors']={'volumes':floors,'epoch':self.lease[1],'published_at':row['observed'].isoformat()}
+            self._save_operations(c,value)
+
     def connection_failed(self,code,detail=None):
         if code not in CONNECTION_ERRORS:code='provider_disconnected'
         # Exactly a built-in str of the fixed vocabulary; a str subclass could fake equality.

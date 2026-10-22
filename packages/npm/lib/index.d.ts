@@ -167,11 +167,18 @@ export declare class AnyMsgError extends Error {
   readonly requestId: string | null;
   readonly retryable: boolean;
 }
+export type CapabilitySection = 'identity' | 'accounts' | 'coverage' | 'tool_manifest' | 'search_options'
+  | 'sending' | 'file_uploads' | 'subscriptions' | 'feedback' | 'messenger_operations' | 'limits';
+export interface CapabilitiesArgs {
+  detail?: 'summary' | 'full';
+  sections?: CapabilitySection[];
+}
 export declare class AnyMsgClient {
   constructor(options: {baseUrl: string; token: string; timeoutMs?: number;
     maxResponseBytes?: number; fetch?: typeof globalThis.fetch});
   call<T = Record<string, unknown>>(method: string, arguments_?: Arguments, options?: {signal?: AbortSignal}): Promise<T>;
-  capabilities(args?: Arguments): Promise<Record<string, unknown>>;
+  /** Full payload by default over REST; detail 'summary' is the short index, sections only those blocks. */
+  capabilities(args?: CapabilitiesArgs): Promise<Record<string, unknown>>;
   prepareFileUpload(args: FileUploadPreparation, options?: {signal?: AbortSignal}): Promise<FileUploadStatus>;
   uploadFileChunk(args: FileUploadChunk, options?: {signal?: AbortSignal}): Promise<FileUploadStatus>;
   getFileUpload(args: {upload_id:string}, options?: {signal?: AbortSignal}): Promise<FileUploadStatus>;

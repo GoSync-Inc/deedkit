@@ -135,3 +135,16 @@ def test_local_reply_dismissal_preserves_target_and_safe_conflict():
         with pytest.raises(AnyMsgError,match='reply_target_changed'):
             client.dismiss_reply(chat_id='chat_synthetic',message_id='msg_synthetic',expected_revision=3)
     assert seen==[('/v1/dismiss_reply',{'chat_id':'chat_synthetic','message_id':'msg_synthetic','expected_revision':3})]
+
+
+# spec: ANYM-270
+def test_capabilities_sends_detail_and_sections_only_when_given():
+    bodies=[]
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200,json={'service':'anymsg'})
+    with Client('https://archive.example','synthetic-token',transport=httpx.MockTransport(handler)) as client:
+        client.capabilities()
+        client.capabilities(detail='summary')
+        client.capabilities(sections=('search_options','sending'))
+    assert bodies==[{},{'detail':'summary'},{'sections':['search_options','sending']}]

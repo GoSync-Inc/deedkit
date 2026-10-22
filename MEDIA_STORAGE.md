@@ -64,9 +64,9 @@ uses the existing bounded collector queue and checks the retained digest. It
 does not guarantee that Telegram or WhatsApp can supply an old original.
 Failed/exhausted requests, ACLs, provider cooldowns and storage limits still
 apply. An original evicted under schema 35 also has a verified encrypted copy in
-R2. Request-time rehydration from that copy before the provider is the next
-increment (ANYM-297 part 2); until it ships, `request_file_download` still uses
-the provider queue, and the cold copy is the operator's recovery source.
+R2, and `request_file_download` restores it from that copy first
+([Cold-first rehydration](#cold-first-rehydration-anym-350)); the provider queue
+is the second source.
 
 Backup fences are durable, without automatic expiry, from capture through
 confirmed delivery. Pending captures from older runtimes must be reconciled
@@ -154,7 +154,7 @@ once. The pass never deletes anything, here or in R2.
   result of a stopped archive, never data loss. A dry run uploads nothing.
 - **Status.** `--status` prints copy counts and bytes by state, failure codes
   and the number of due originals without a verified copy.
-- **Manual retrieval.** Until part 2 automates it, an operator can send the
+- **Manual retrieval.** Outside the request path, an operator can send the
   line `{"v":1,"op":"get","digest":"<sha256>"}` over the cold SSH key. The reply
   is one JSON line with `bytes`, followed by exactly that many ciphertext
   bytes. Decrypt them with the cold or the backup recovery identity, and check
@@ -178,6 +178,93 @@ the copy catalog. Copy [the example](deploy/cold-archive.example.json) to
 profile of `deploy/compose.file-lifecycle.yaml` in dry run, inspect the report,
 then add `--apply`. Keep eviction in dry run until the cold-archive status shows
 verified copies for the due originals. The overlay mounts the CAS read-only.
+
+### Cold-first rehydration (ANYM-350)
+
+An authorized `request_file_download` for a managed-evicted original whose
+copy is `verified` queues a cold restore instead of a collector job and answers
+`rehydration_source: cold_archive`. Repeated requests coalesce on the queued
+restore (`poll_after_seconds: 10`); at most 128 restores (`media_request_limit`)
+are outstanding. A request whose provider fallback would be admitted counts
+against the provider demand quotas (32 per key, 128 global) at once, so a
+fallback never exceeds them. The `cold-restore` service of the same profile
+polls every 10 seconds: it fetches
+the object through the receiver's `cold get`, checks the recorded ciphertext
+size and SHA-256, decrypts with the cold identity and streams the plaintext only
+into `BlobWriter` with the expected SHA-256 and size. Only then is the original
+published and re-registered resident; text, ASR and descriptions are untouched.
+
+- **Capacity.** Before any R2 read the worker takes the collectors' storage
+  admission lock and requires free space minus their media reservations and
+  pending uploads, minus the object, to stay above the larger of
+  `restore_disk_reserve_bytes` (default and minimum 10 GiB) and the highest
+  floor any collector publishes for that volume. Each collector publishes the
+  max of its media, live-media and capture-spool floors per volume in
+  `collector_health.operations.disk_floors` at start and again each heartbeat;
+  the cold role reads that column and the collector leases
+  (`cold_archive_role.sql`, which also exposes the rest of the operations JSON,
+  including the identity's self id). Admission fails closed: while any
+  collector holds a live lease without a floor for its current epoch, or the
+  grants are missing, the restore waits as `disk_reserve` and capture is
+  untouched. An object over `max_object_bytes` is
+  refused the same way. In the same transaction the admitted restore leases its
+  bytes: a copy whose `restore_finished_at` lies in the future (one transfer
+  timeout ahead) holds a lease, and the gateway's 15-minute provider hand-over
+  keeps that time, so a stalled restore still counts until its lease ends.
+  Collector admission and file uploads count every live lease once their role
+  may read `attachment_cold_copies` (`collector_role.sql`). The lease ends with
+  the restore and lapses by itself after a crash; `BlobWriter` stops the
+  restore at the same floor and when the lease ends, which fails the restore
+  over to the provider.
+
+- **Fallback.** A missing, different or truncated object or an R2 or receiver
+  error publishes nothing, records `restore_error` on the copy and queues the
+  provider re-download while the request's demand window is open. The next
+  response reports `rehydration_source: provider` and `cold_failure: <code>`.
+  When the provider path refused the request (no fallback was reserved), the
+  answer carries the provider's refusal with `rehydration_source: none`. An object that
+  does not match its record also turns the copy `failed`, so it never
+  authorizes another eviction or restore until the archiver proves it again.
+  An R2 outage leaves the copy `verified`; a later request tries R2 again,
+  also after the provider job failed or ran out of attempts.
+- **Local limits.** `disk_reserve` and `cold_size_limit` queue nothing at the
+  provider, which would write to the same disk. For 5 minutes a request answers
+  `request_status: unavailable` with that reason and `retry_after_seconds`;
+  afterwards a request tries R2 again.
+- **Worker presence.** The worker holds a session advisory lock while it runs;
+  a second worker claims nothing. Without a worker a request goes to the
+  provider at once (`cold_failure: cold_worker_unavailable`), and a gateway that
+  lacks the restore grant reports `cold_failure: cold_first_inactive`.
+- **Stall.** A restore the worker has not finished within 15 minutes goes to the
+  provider on the next request
+  (`cold_failure: cold_restore_stalled`). Each worker step is conditioned on the
+  request generation it claimed, so a late result never overwrites a newer
+  request or the fallback: a late success makes the original resident and
+  leaves the provider hand-over standing.
+- **Interrupted publication.** A verified original already in the CAS whose
+  registration did not commit is registered resident by the next worker pass,
+  whatever the request's age and without reading R2 again. Each pass walks all
+  candidates in pages; it changes residency only, and a file that cannot be
+  read is skipped (`reconcile_skipped`) without holding up due restores.
+- **Unchanged.** An original evicted without a verified copy, and a gateway
+  whose role lacks the restore grant, keep the provider path. The demand window
+  opens only when the provider path itself would accept the request (collection
+  policy, attempt cap, cooldown, history bounds); otherwise a cold restore still
+  runs, without a provider fallback.
+- **Activation.** In this order: re-run `cold_archive_role.sql` (read the
+  eviction journal, `media_reservations` and `file_uploads`; execute
+  `register_resident_original` and `queue_managed_original`), start
+  `cold-restore`, then re-run `gateway_role.sql` (SELECT on `attachment_cold_copies` and UPDATE of its
+  `restore_*` columns). The `cold-restore` service mounts the CAS writable and
+  reuses the archiver's DSN, configuration, identity and SSH key.
+- **Restore drill.** Restore a backup point into an isolated database and files
+  directory ([BACKUP_R2.md](BACKUP_R2.md#cold-archive-of-originals)), start
+  `python -m messaging_service.cold_archive --restore --interval-seconds 10
+  --config <config> --dsn-file <isolated dsn> --files <isolated files>`, then
+  request one evicted original with a key issued in the restored database; the original's SHA-256 must equal its digest in `absent_blobs`.
+  `tests/test_cold_archive.py::test_restore_drill_rehydrates_from_cold` proves
+  this with a real `pg_dump`/`pg_restore` into a second database and a fake
+  `cold/`.
 
 ## Download admission and prefetch
 

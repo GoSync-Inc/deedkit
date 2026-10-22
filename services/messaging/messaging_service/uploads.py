@@ -14,7 +14,7 @@ import stat
 
 from .blobs import Blob, BlobWriter
 from .policy import targets
-from .storage_admission import StorageAdmission, STREAM_WORKSPACE_BYTES, volume_key
+from .storage_admission import StorageAdmission, STREAM_WORKSPACE_BYTES, restore_reserved, volume_key
 from .store import APIError, serial
 
 MAX_BYTES=32*1024**2
@@ -140,7 +140,7 @@ def prepare(store,c,p,account,chat_id,filename,mime,bytes,sha256,request_id):
         (p['key_id'],STREAM_WORKSPACE_BYTES,volume)).fetchone()
     if active['total']>=32 or active['own']>=4:raise APIError('upload_limit',409)
     media=c.execute('SELECT coalesce(sum(reserved_bytes),0) AS bytes FROM media_reservations WHERE volume_key=%s AND expires_at>clock_timestamp()',
-        (volume,)).fetchone()['bytes']
+        (volume,)).fetchone()['bytes']+restore_reserved(c)
     if shutil.disk_usage(root).free-media-active['reserved']-2*bytes-STREAM_WORKSPACE_BYTES<RESERVE_BYTES:
         raise APIError('upload_capacity',409)
     row=c.execute('''INSERT INTO file_uploads(principal,key_id,account,chat,filename,mime,bytes,sha256,volume_key,request_id)

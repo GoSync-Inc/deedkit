@@ -5,9 +5,36 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Identity, permitted accounts, source coverage and unavailable features.",
+    "description": "Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter.",
     "inputSchema": {
-      "properties": {},
+      "properties": {
+        "detail": {
+          "default": "summary",
+          "enum": [
+            "summary",
+            "full"
+          ],
+          "title": "Detail",
+          "type": "string"
+        },
+        "sections": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 16,
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sections"
+        }
+      },
       "type": "object",
       "title": "capabilitiesArguments",
       "additionalProperties": false
@@ -4941,6 +4968,49 @@
       "destructiveHint": false,
       "openWorldHint": false,
       "readOnlyHint": true
+    }
+  },
+  {
+    "name": "platform_select_modules",
+    "module": "gateway",
+    "operation": "select_modules",
+    "scopes": [],
+    "description": "Narrow this key's DeedKit tool list on this connection path to the named modules; it never adds a tool or a right. Takes effect at the next tools/list: refresh the connection if the list differs. Shared by every connection of this key; REST calls ignore it. To widen again, select all modules; a policy change or gateway restart clears it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "modules": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "calendar",
+              "calls",
+              "messaging"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "title": "Modules"
+        }
+      },
+      "required": [
+        "modules"
+      ],
+      "title": "select_modulesArguments",
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "additionalProperties": true,
+      "title": "select_modulesDictOutput"
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
     }
   }
 ]

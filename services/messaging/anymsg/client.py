@@ -372,8 +372,12 @@ class Client:
         except httpx.HTTPError:
             raise AnyMsgError("request_failed") from None
 
-    def capabilities(self):
-        return self.call("capabilities")
+    def capabilities(self, *, detail=None, sections=None):
+        """Full payload by default; detail="summary" is the short index, sections=[names] only those blocks."""
+        parameters = {} if detail is None else {"detail": detail}
+        if sections is not None:
+            parameters["sections"] = list(sections)
+        return self.call("capabilities", parameters)
 
     def request_file_download(self, *, attachment_id):
         """Prioritize one existing original; poll get_attachment without requesting again.
