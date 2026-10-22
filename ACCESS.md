@@ -45,6 +45,22 @@ and the allowed accounts. When access is limited by chats, account-wide timestam
 and degradation reasons are hidden (`coverage=chat_scope_only`): they may depend
 on other people's conversations. An empty chat list does not reveal even account labels.
 
+Since ANYM-SPEC `capabilities` also describes the caller's own key and accounts, for chat-scoped
+keys too, with no other account, chat or field becoming visible:
+
+- `expires_at`: the calling key's own expiry, ISO 8601 UTC with a `Z` suffix
+  (`2026-11-13T14:15:53.242375Z`), read on every call, so `extend-key` shows at once. The type is
+  string or null; DeedKit keys always expire (`api_keys.expires_at` is `NOT NULL`), so it is
+  always a string. Through the gateway it is the gateway's backend messaging key.
+- `accounts[].self_provider_id`: the account owner's own provider user ID for each account in
+  `accounts`. Telegram: the logged-in user's numeric ID as a decimal string, the form of a
+  message `sender` and of a private chat's `provider_chat_id`. WhatsApp (whatsmeow and
+  whatsapp-web.js): the phone-number ID `<digits>@c.us`, never a LID. The account's collector
+  records it only after the provider confirmed the configured identity (`expected_user_id`,
+  `expected_wid`) at connect; a reconnect rewrites it. It is `null` until such a connect after
+  this release, for synthetic accounts and for accounts without a collector; it is never guessed
+  from messages. `get_sync_status` does not return it.
+
 ## Operator commands
 
 The commands require `DATABASE_URL_FILE` with the owner DSN. Below are placeholders, not real

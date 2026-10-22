@@ -9,6 +9,7 @@ import stat
 from psycopg.types.json import Jsonb
 
 from .operational import CAPTURE_STOP_DETAILS,OVERLOAD_STOP_DETAILS,CONNECTION_ERRORS,TERMINAL,PHASE_STATES,PHASE_REASONS
+from .operational import self_provider_id as verified_self_id
 
 from .envelope import canonical,utc,validate,stable_id,MAX_ENVELOPE
 from .spool import DurableSpool
@@ -207,13 +208,20 @@ class CollectorState:
             'changed_at':observed.isoformat() if changed else previous.get('changed_at'),
             'observed_at':observed.isoformat(),**extra}
 
-    def phase(self,name,state,code):
+    def phase(self,name,state,code,*,self_provider_id=None):
         if state not in PHASE_STATES.get(name,set()) or code not in PHASE_REASONS:
             raise ValueError('invalid_operational_state')
         with self.archive.store.pool.connection() as c:
             row=self._operations(c);value=row['operations']
-            extra={'retry_at':None,'retry_attempts':0} if name=='connection' and state=='connected' else {}
+            connected=name=='connection' and state=='connected'
+            extra={'retry_at':None,'retry_attempts':0} if connected else {}
             self._phase(value,name,state,code,row['observed'],**extra)
+            if connected and self_provider_id is not None:
+                # Only the ID the provider just verified against the configured one; a
+                # malformed value is dropped, never a reason to fail the connect (ANYM-SPEC).
+                platform=c.execute('SELECT platform FROM accounts WHERE id=%s',(self.account,)).fetchone()
+                verified=verified_self_id(platform and platform['platform'],self_provider_id)
+                if verified:value['identity']={'self_provider_id':verified,'verified_at':row['observed'].isoformat()}
             self._save_operations(c,value)
 
     def media_policy(self,prefetch_days,history_since):

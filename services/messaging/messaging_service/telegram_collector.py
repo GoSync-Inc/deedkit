@@ -157,6 +157,11 @@ class TelethonProvider:
 
     async def disconnect(self): await self.client.disconnect()
 
+    def self_provider_id(self):
+        # Set by connect() only after get_me() matched expected_user_id.
+        me=self.verified_self
+        return str(me.id) if me is not None and type(getattr(me,'id',None)) is int else None
+
     async def wait_disconnected(self): await self.client.disconnected
 
     async def send_text(self,job):
@@ -905,6 +910,14 @@ class TelegramCollector:
             self.fail('durable_capture_failed')
         return receipt
 
+    def verified_self_id(self):
+        # The owner's ID the provider has just verified; capabilities shows it (ANYM-SPEC).
+        # Advisory: a provider without it, or any failure here, records no ID.
+        try:
+            reader=getattr(self.provider,'self_provider_id',None)
+            return reader() if callable(reader) else None
+        except Exception:return None
+
     async def connect_provider(self):
         # A persisted provider pause is not a hung connection: honor it outside
         # the network timeout while run() still watches heartbeat and shutdown.
@@ -919,7 +932,8 @@ class TelegramCollector:
             try:
                 await asyncio.to_thread(self.state.phase,'connection','connecting','collector_starting')
                 await asyncio.wait_for(self.provider.connect(),self.connect_timeout)
-                await asyncio.to_thread(self.state.phase,'connection','connected','provider_ready')
+                await asyncio.to_thread(self.state.phase,'connection','connected','provider_ready',
+                    self_provider_id=self.verified_self_id())
                 await asyncio.to_thread(self.state.phase,'live_capture','receiving','capture_ready')
                 return
             except ProviderRateLimited:

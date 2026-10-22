@@ -103,7 +103,8 @@ class Store:
         # READ COMMITTED rechecks after a concurrent operator changed access.
         # clock_timestamp also rejects credentials that expired while waiting.
         row = c.execute('''SELECT p.*, k.digest AS key_digest,k.id AS key_id,
-            k.permissions AS key_permissions,k.permission_version AS key_permission_version FROM api_keys k
+            k.permissions AS key_permissions,k.permission_version AS key_permission_version,
+            k.expires_at AS key_expires_at FROM api_keys k
             JOIN principals p ON p.id=k.principal
             WHERE k.digest=%s AND NOT k.revoked AND k.expires_at>clock_timestamp() AND p.enabled''',
             (key_digest,)).fetchone()
@@ -204,8 +205,16 @@ class Store:
             from .messenger_operations import CATALOG_VERSION,OPERATIONS,operation_manifest
             from .commands import manifest
             dataset=self.dataset(c,p)
-            accounts = c.execute('SELECT id,platform,label,synthetic FROM accounts WHERE id=ANY(%s) ORDER BY id',
-                                 ([r['id'] for r in dataset['sources']],)).fetchall()
+            from .operational import self_provider_id
+            # Same visible accounts as before; each adds the owner's ID its collector
+            # verified at connect, or null (ANYM-SPEC). Never derived from messages.
+            accounts = c.execute('''SELECT a.id,a.platform,a.label,a.synthetic,
+                h.operations->'identity'->'self_provider_id' AS self_provider_id FROM accounts a
+                LEFT JOIN collector_health h ON h.account=a.id WHERE a.id=ANY(%s) ORDER BY a.id''',
+                ([r['id'] for r in dataset['sources']],)).fetchall()
+            for account in accounts:
+                account['self_provider_id']=self_provider_id(account['platform'],account['self_provider_id'])
+            expires_at=p['key_expires_at']
             supported_by_account={}
             for account in accounts:
                 # Same rows as list_messenger_operations: supported, plus what this key
@@ -236,6 +245,7 @@ class Store:
                     'rest_fallback':'POST /v1/{tool_name} with the same bearer and JSON parameters'},
                 'principal': p['id'], 'scope_version': p['scope_version'], 'accounts': accounts,
                 'credential_id':str(p['key_id']), 'permissions':p['permissions'],
+                'expires_at':expires_at.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ') if expires_at else None,
                 'key_permission_ceiling':p['key_permissions'] if p['key_permissions'] is not None else sorted(LEGACY_PERMISSIONS),
                 'key_permission_version':p['key_permission_version'],
                 'chat_scope':{'all_in_permitted_accounts':p['chat_ids'] is None,'chat_ids':p['chat_ids']},
