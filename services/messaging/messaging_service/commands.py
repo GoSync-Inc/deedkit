@@ -589,10 +589,13 @@ class CommandWorker:
     def finish_live(self,job,status,result,code,budget):
         """Record a live read's receipt in one attempt bounded by the budget left (ANYM-475).
 
-        The fence holds the lease row every send claim needs, so the pool wait and each statement
-        get only what is left of one deadline, recomputed before every wait. Nothing is retried: the
-        row stays dispatching, and claim or the receipt read reports it unknown after the lease
-        changes or the operation expires."""
+        It takes no lease fence: the fence locks the lease row every send claim needs, and a
+        commit can stall while holding it. The UPDATE checks ownership without a lock and writes
+        only a dispatching row of this lease; a new owner's recovery serializes on the command row
+        and rechecks its status, so neither overwrites the other's outcome. The pool wait and each
+        statement get only what is left of one deadline. Nothing is retried: the row stays
+        dispatching, and claim or the receipt read reports it unknown after the lease changes or
+        the operation expires. A lost lease stops the collector at its next fenced step."""
         import psycopg
         from psycopg_pool import PoolTimeout
         st=self.state;end=time.monotonic()+budget
@@ -605,13 +608,12 @@ class CommandWorker:
             c.execute("SELECT set_config('lock_timeout',%s,true),set_config('statement_timeout',%s,true)",(ms,ms))
         try:
             with st.archive.store.pool.connection(timeout=left()) as c:
-                # COMMIT does not wait for the WAL flush while the fence is held; a crash may lose
-                # this receipt, and the row then reads unknown like any receipt not written in time.
-                c.execute("SELECT set_config('synchronous_commit','off',true)")
-                bound(c);st.archive.fence(c,st.account,st.lease)
                 bound(c);c.execute('''UPDATE messenger_commands SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
-                    WHERE id=%s AND status='dispatching' AND lease_epoch=%s''',
-                    (status,Jsonb(result) if result is not None else None,code,job['id'],st.lease[1]))
+                    WHERE id=%s AND account=%s AND status='dispatching' AND lease_epoch=%s AND EXISTS(
+                        SELECT 1 FROM collector_leases WHERE account=%s AND owner=%s AND epoch=%s
+                        AND expires_at>clock_timestamp())''',
+                    (status,Jsonb(result) if result is not None else None,code,job['id'],st.account,st.lease[1],
+                     st.account,st.lease[0],st.lease[1]))
         except (psycopg.OperationalError,PoolTimeout,TimeoutError) as exc:
             log.warning('live_search receipt_unrecorded %s',type(exc).__name__)
 

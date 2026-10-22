@@ -341,8 +341,6 @@ gateway, the `search_messages_live` action grant. It writes nothing to the archi
   after the claim, so a queued send starts within 15 seconds. A receipt not written
   by then leaves the operation `dispatching` (log line `live_search
   receipt_unrecorded`); it reads `unknown` once it expires or the collector restarts.
-  The receipt's commit does not wait for the disk flush, so a database crash in the
-  next fraction of a second may lose it; the operation then reads `unknown` the same way.
 - Data: the query goes only to Telegram. The operation row keeps the parameters
   and the receipt like every other operation, so both reach backups. The log line
   `live_search` holds counts, duration and FloodWait seconds, never the query or

@@ -159,18 +159,56 @@ def test_fence_and_receipt_waits_share_one_deadline(live, monkeypatch, caplog):
 
 
 # spec: ANYM-475
-def test_live_receipt_commit_does_not_wait_for_the_wal_flush(live, monkeypatch):
-    from messaging_service.archive import Archive as Fenced
+def test_send_claim_proceeds_while_a_live_receipt_is_held(live):
+    import threading
+    import time
     from messaging_service.commands import CommandWorker
+    from messaging_service.outgoing import OutgoingWorker
     s, _, key, state = live
-    operation, seen, fence = search(s, key)['operation_id'], [], Fenced.fence
-    def observed(c, account, lease):
-        seen.append(c.execute('SHOW synchronous_commit').fetchone()['synchronous_commit']); fence(c, account, lease)
-    monkeypatch.setattr(Fenced, 'fence', staticmethod(observed))
-    async def found(job):return {'outcome': 'confirmed', 'data': {'hits': [], 'next_cursor': None, 'provider_total_approx': 0}}
-    assert asyncio.run(CommandWorker(state, found).once())
-    # claim and preflight keep the durable default; only the receipt transaction turns it off
-    assert seen[0] == 'on' and seen[-1] == 'off' and seen.count('off') == 1
+    operation = search(s, key)['operation_id']
+    worker = CommandWorker(state, None); job = worker.claim()
+    holder = s.pool.getconn()
+    holder.execute('SELECT 1 FROM messenger_commands WHERE id=%s FOR UPDATE', (job['id'],))
+    found = {'outcome': 'confirmed', 'data': {'hits': []}}
+    receipt = threading.Thread(target=worker.finish_live, args=(job, 'succeeded', found, None, 5))
+    receipt.start(); time.sleep(0.3)  # the receipt now waits inside its transaction
+    try:
+        started = time.monotonic(); OutgoingWorker(state, None).claim(); took = time.monotonic() - started
+    finally:holder.rollback()
+    receipt.join(); s.pool.putconn(holder)
+    assert took < 1  # the receipt holds no lock a send claim needs
     assert s.get_messenger_operation(key, operation)['status'] == 'succeeded'
-    with s.pool.connection() as c:  # transaction-local: nothing leaks to pooled connections
-        assert c.execute('SHOW synchronous_commit').fetchone()['synchronous_commit'] == 'on'
+
+
+# spec: ANYM-475
+def test_a_late_receipt_and_new_owner_recovery_never_overwrite_each_other(live):
+    import threading
+    import time
+    from messaging_service.commands import CommandWorker
+    s, archive, key, state = live
+    found = {'outcome': 'confirmed', 'data': {'hits': []}}
+    def take_over():
+        archive.release(ACCOUNT, *state.lease)
+        lease = ('synthetic-new-worker', archive.acquire(ACCOUNT, 'synthetic-new-worker'))
+        return CollectorState(archive, ACCOUNT, lease), lease
+    def receipt(operation):
+        row = s.get_messenger_operation(key, operation)
+        return row['status'], row.get('result')
+    # Recovery first: the old owner's receipt changes nothing.
+    first = search(s, key)['operation_id']; old = CommandWorker(state, None); job = old.claim()
+    new_state, lease = take_over()
+    assert CommandWorker(new_state, None).claim() is None
+    old.finish_live(job, 'succeeded', found, None, 5)
+    assert receipt(first) == ('unknown', None)
+    archive.release(ACCOUNT, *lease)
+    # Receipt and recovery race on the command row: exactly one outcome lands, never dispatching.
+    state = CollectorState(archive, ACCOUNT, ('synthetic-live-worker', archive.acquire(ACCOUNT, 'synthetic-live-worker')))
+    second = search(s, key, 'synthetic-live-0002')['operation_id']; old = CommandWorker(state, None); job = old.claim()
+    holder = s.pool.getconn()
+    holder.execute('SELECT 1 FROM messenger_commands WHERE id=%s FOR UPDATE', (job['id'],))
+    late = threading.Thread(target=old.finish_live, args=(job, 'succeeded', found, None, 5)); late.start(); time.sleep(0.2)
+    new_state, lease = take_over()
+    recovery = threading.Thread(target=CommandWorker(new_state, None).claim); recovery.start(); time.sleep(0.2)
+    holder.rollback(); late.join(); recovery.join(); s.pool.putconn(holder)
+    assert receipt(second) in (('succeeded', found), ('unknown', None))
+    archive.release(ACCOUNT, *lease)
