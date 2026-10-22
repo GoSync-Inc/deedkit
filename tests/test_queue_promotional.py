@@ -1,9 +1,12 @@
 """ANYM-427: repeated one-way mailings from non-contacts leave the reply queue by default; a group owner request outranks them."""
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from starlette.testclient import TestClient
 
 from messaging_service.app import create_app
 from messaging_service.store import APIError
+from test_archive import event
 from test_client_contract import rpc
 from test_queue_demotion import components, demote, structured  # noqa: F401  (demote is a fixture)
 
@@ -156,3 +159,52 @@ def test_muted_promotional_rows_are_neither_shown_nor_counted(demote):
 
 
 OWNER_SENDER='OWNER2'
+
+
+def utc_hours_ago(days_back, minute):
+    """Hours from now to `minute` past UTC midnight `days_back` days ago."""
+    now=datetime.now(timezone.utc)
+    at=now.replace(hour=0,minute=0,second=0,microsecond=0)-timedelta(days=days_back)+timedelta(minutes=minute)
+    return (now-at).total_seconds()/3600
+
+
+def promotional_chats(queue):
+    return sorted(r['provider_chat_id'] for r in queue(promotional='only',awaiting_reply_days=0,limit=100)['items'])
+
+
+# spec: ANYM-427
+def test_the_day_count_uses_distinct_utc_days_of_all_meaningful_history(demote):
+    s,ar,key,add,history,queue,rows=demote
+    def mail(chat, mid, hours, body='Your statement is ready.', **metadata):
+        return add(chat,mid,hours,body=body,sender='M'+chat,**metadata)
+    # Many messages on only two UTC days are not a mailing.
+    for n in range(4):mail('twodays',f'a{n}',utc_hours_ago(1,60+n));mail('twodays',f'b{n}',utc_hours_ago(2,60+n))
+    # One minute either side of a UTC midnight are two days; with a third that is a mailing.
+    mail('midnight','1',utc_hours_ago(2,-1));mail('midnight','2',utc_hours_ago(2,1));mail('midnight','3',1)
+    # Two days outside the 14-day attention window still count, next to a recent third.
+    mail('old','1',24*40);mail('old','2',24*30);mail('old','3',2)
+    # A day holding only an empty, service, system or deleted message does not count.
+    noise={'empty':{'body':''},'service':{'is_service':True},'system':{'message_kind':'system'},'deleted':{}}
+    for chat,changes in noise.items():
+        chat='noise_'+chat;mail(chat,'2',utc_hours_ago(9,60));mail(chat,'3',2)
+        if changes:mail(chat,'1',utc_hours_ago(5,60),**changes)
+    # The delete reuses the created message's exact time, as a provider tombstone does.
+    at=(datetime.now(timezone.utc)-timedelta(hours=utc_hours_ago(5,60))).isoformat()
+    for deleted,updated in ((False,at),(True,datetime.now(timezone.utc).isoformat())):
+        ar.ingest(event(account='demote-tg',chat='noise_deleted',provider_id='1',sent_at=at,updated_at=updated,
+            deleted=deleted,body='Your statement is ready.',sender='Mnoise_deleted',metadata={'chat_type':'private'}))
+    assert promotional_chats(queue)==['midnight','old']
+    kept=[r['provider_chat_id'] for r in queue(limit=100)['items']]
+    assert {'twodays',*('noise_'+n for n in noise)}<=set(kept) and 'old' not in kept and 'midnight' not in kept
+
+
+# spec: ANYM-427
+def test_the_promotional_count_ignores_the_broadcast_filter_in_the_muted_hint_choice(demote):
+    s,ar,key,add,history,queue,rows=demote
+    # An older unmuted human hint and a newer business hint from a muted sender, two UTC days.
+    add('mixed','1',30,body='Hello, are you there?',sender='Human')
+    add('mixed','2',2,body='Sale today only',sender='Shop',sender_is_business_or_verified=True)
+    s.mute_reply_source(key,account='demote-tg',sender_id='Shop')
+    plain=queue(include_muted=True)
+    filtered=queue(include_muted=True,exclude_likely_broadcasts=True)
+    assert plain.get('excluded_promotional_total',0)==filtered.get('excluded_promotional_total',0)

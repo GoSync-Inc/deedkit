@@ -257,12 +257,17 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     score='('+'+'.join(f'coalesce({sql},0)' for _,sql in components)+')'
     broadcast="(c.chat_type='private' AND own_last.sent_at IS NULL OR coalesce(attention.business,false))"
     # ANYM-427: one-way private chat from a non-contact that is a business or verified sender or writes on several UTC days.
-    # The day count stops at PROMOTIONAL_DAYS, so a long mailing history costs no more than three days of it.
+    # Each step seeks the latest meaningful incoming message before the UTC day of the step before it
+    # (message_reply_order), so the day count reads PROMOTIONAL_DAYS index probes, not the mailing history.
+    day_walk="'infinity'::timestamptz"
+    for step in range(PROMOTIONAL_DAYS):
+        before=day_walk if not step else f"date_trunc('day',{day_walk} AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+        day_walk=f'''(SELECT pm{step}.sent_at FROM messages pm{step} LEFT JOIN message_metadata pmd{step}
+          ON pmd{step}.message=pm{step}.id AND pmd{step}.revision=pm{step}.revision
+          WHERE pm{step}.account=c.account AND pm{step}.chat=c.id AND pm{step}.direction='incoming'
+          AND pm{step}.sent_at<{before} AND {meaningful(f'pm{step}',f'pmd{step}')} ORDER BY pm{step}.sent_at DESC LIMIT 1)'''
     likely_promotional=f'''(c.chat_type='private' AND own_last.sent_at IS NULL AND NOT coalesce(attention.known_contact,false)
-        AND (coalesce(attention.business,false) OR (SELECT count(*) FROM (SELECT DISTINCT (pm.sent_at AT TIME ZONE 'UTC')::date
-          FROM messages pm LEFT JOIN message_metadata pmd ON pmd.message=pm.id AND pmd.revision=pm.revision
-          WHERE pm.account=c.account AND pm.chat=c.id AND pm.direction='incoming' AND {meaningful('pm','pmd')}
-          LIMIT {PROMOTIONAL_DAYS}) days)>={PROMOTIONAL_DAYS}))'''
+        AND (coalesce(attention.business,false) OR {day_walk} IS NOT NULL))'''
     promotional_filter={'exclude':'NOT '+likely_promotional,'only':likely_promotional}.get(promotional) if awaiting_reply else None
     if awaiting_reply:clauses.append(pending)
     if only_questions:clauses.append('attention.question')
@@ -335,15 +340,17 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     # Rank 1 is the hint a sender mute skipped, read only for the muted count and view.
     # The skipping hint ranks first only while it meets the request's own row filters,
     # so a row the mute removed stays counted and visible under those filters.
-    ranked=ranked_args=None
-    if mutes and awaiting_reply:
+    ranked=ranked_args=None;skipping_lookup=attention_lookup
+    def ranked_for(broadcasts=exclude_likely_broadcasts,promotional_rows=promotional_filter):
         kept=[unmuted_pending,*(['attention.question'] if only_questions else []),
             *(['(attention.sender IS NULL OR NOT attention.sender=ANY(%s))'] if exclude_senders is not None else []),
-            *(['NOT '+broadcast] if exclude_likely_broadcasts else []),*([promotional_filter] if promotional_filter else [])]
-        ranked_args=[exclude_senders] if exclude_senders is not None else []
+            *(['NOT '+broadcast] if broadcasts else []),*([promotional_rows] if promotional_rows else [])]
         kept=re.sub(r'\battention\.','e.',' AND '.join(kept))
-        ranked=('SELECT * FROM ((SELECT e.*,0 AS mute_rank FROM ('+attention_lookup+') e WHERE '+kept+') UNION ALL (SELECT r.*,1 FROM ('+
+        return ('SELECT * FROM ((SELECT e.*,0 AS mute_rank FROM ('+skipping_lookup+') e WHERE '+kept+') UNION ALL (SELECT r.*,1 FROM ('+
             attention_for('true')+') r)) ranked ORDER BY mute_rank LIMIT 1')
+    if mutes and awaiting_reply:
+        ranked_args=[exclude_senders] if exclude_senders is not None else []
+        ranked=ranked_for()
     if include_muted and ranked:attention_lookup=ranked
     muted_flag=f"CASE WHEN {chat_muted} THEN 'chat' WHEN attention.mute_rank=1 THEN 'sender' END"
     def base_for(attention_lookup):return f''' FROM chats c JOIN accounts a ON a.id=c.account
@@ -364,12 +371,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     excluded=None
     if exclude_likely_broadcasts:
         # Counted in the caller's scope and filters only, then removed from the rows, the totals and the cursor.
-        excluded=c.execute('SELECT count(*) AS n'+base+' AND '.join([*clauses,broadcast,*([unread+' IS TRUE'] if only_unread else [])]),[*base_args,*args]).fetchone()['n']
+        excluded=c.execute('SELECT count(*) AS n'+(base_for(ranked_for(promotional_rows=None)) if attention_lookup is ranked else base)+' AND '.join([*clauses,broadcast,*([unread+' IS TRUE'] if only_unread else [])]),[*base_args,*args]).fetchone()['n']
         clauses.append('NOT '+broadcast)
     excluded_promotional=None
     if promotional=='exclude' and awaiting_reply:
-        # Counted before the broadcast filter, so each total is what its own filter removes (ANYM-427).
-        excluded_promotional=c.execute('SELECT count(*) AS n'+base+' AND '.join([*(v for v in clauses if v!='NOT '+broadcast),
+        # Counted before the broadcast filter, also in the muted hint choice, so each total is what its own filter removes (ANYM-427).
+        excluded_promotional=c.execute('SELECT count(*) AS n'+(base_for(ranked_for(broadcasts=False)) if attention_lookup is ranked else base)+' AND '.join([*(v for v in clauses if v!='NOT '+broadcast),
             likely_promotional,*([unread+' IS TRUE'] if only_unread else [])]),[*base_args,*args]).fetchone()['n']
     if promotional_filter:clauses.append(promotional_filter)
     totals=c.execute('SELECT count(*) AS n,count(*) FILTER(WHERE '+unread+' IS NULL) AS unknown'+base+
