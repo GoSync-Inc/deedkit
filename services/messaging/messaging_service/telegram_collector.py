@@ -224,7 +224,10 @@ class TelethonProvider:
 
     async def record_read_gap(self):
         try:await asyncio.to_thread(self.read_gap_state.update_gap)
-        except Exception as exc:logging.getLogger(__name__).warning('read_state_gap_failed: %s',type(exc).__name__)
+        except Exception as exc:
+            # Kept until the collector writes it, before any new continuity heartbeat.
+            self.read_gap_pending=True
+            logging.getLogger(__name__).warning('read_state_gap_failed: %s',type(exc).__name__)
 
     async def rpc(self,operation,phase):
         governor=getattr(self,'governor',None)
@@ -780,6 +783,13 @@ class TelegramCollector:
         def apply(item):
             nonlocal last,count
             self.state.apply(item);last=item;count+=1
+        if getattr(self.provider,'read_gap_pending',False):
+            # A lost gap write (ANYM-275): persist it first; while it fails, no heartbeat below.
+            self.provider.read_gap_pending=False
+            try:await asyncio.to_thread(self.state.update_gap)
+            except BaseException:
+                self.provider.read_gap_pending=True
+                raise
         for spool in spools:await asyncio.to_thread(spool.drain,apply,100)
         # History pages were applied inline when fetched. Replaying them is
         # idempotent and is neither live progress nor live backlog.

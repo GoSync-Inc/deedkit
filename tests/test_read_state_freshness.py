@@ -328,6 +328,31 @@ def test_telegram_auto_reconnect_ends_continuity():
 
 
 # spec: ANYM-275
+def test_failed_telegram_gap_write_is_kept_until_written(live, tmp_path):
+    import asyncio
+    from messaging_service.collector_state import CaptureSpool
+    from messaging_service.telegram_collector import TelegramCollector, TelethonProvider
+    s, ar, state, row = live
+    failures = [RuntimeError('synthetic'), RuntimeError('synthetic')]
+    class Flaky:
+        # The real state, with update_gap failing while failures remain.
+        def __getattr__(self, name): return getattr(state, name)
+        def update_gap(self, *args):
+            if failures: raise failures.pop(0)
+            return state.update_gap(*args)
+    provider = object.__new__(TelethonProvider)
+    provider.read_gap_state = Flaky()
+    worker = TelegramCollector(ar, 'fresh-test', provider, CaptureSpool(tmp_path / 'captures', reserve_bytes=0), writer=object())
+    worker.state = Flaky()
+    asyncio.run(provider.record_read_gap())
+    assert row()['read_state'] == 'observed'
+    # The retry fails too: no heartbeat restores continuity, and the gap stays pending.
+    with pytest.raises(RuntimeError):
+        asyncio.run(worker.drain_captures([worker.spool]))
+    asyncio.run(worker.drain_captures([worker.spool]))
+    assert row()['read_state'] == 'stale' and not provider.read_gap_pending
+
+# spec: ANYM-275
 def test_receipt_without_retained_messages_invalidates_the_count(wa):
     s, message, read, row, reads = wa
     message('A', 10)
