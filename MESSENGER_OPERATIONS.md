@@ -337,10 +337,12 @@ gateway, the `search_messages_live` action grant. It writes nothing to the archi
   account like any FloodWait.
 - Failures: without a running session `session_unavailable`; 8 seconds after the
   collector claims it (checks, waits and request) `provider_timeout`. Both are safe
-  to repeat with a new request ID. The receipt gets one attempt that ends 14 seconds
-  after the claim, so a queued send starts within 15 seconds. A receipt not written
-  by then leaves the operation `dispatching` (log line `live_search
-  receipt_unrecorded`); it reads `unknown` once it expires or the collector restarts.
+  to repeat with a new request ID. The receipt is written in one attempt off the send
+  path, holding no lock sends need, with its waits ending 14 seconds after the claim,
+  so a queued send starts within 15 seconds. A receipt not written by then leaves the
+  operation `dispatching` (log line `live_search receipt_unrecorded`); it reads
+  `unknown` once it expires or the collector restarts. Known limit: a database that
+  stalls every commit delays sends as well, live search or not.
 - Data: the query goes only to Telegram. The operation row keeps the parameters
   and the receipt like every other operation, so both reach backups. The log line
   `live_search` holds counts, duration and FloodWait seconds, never the query or

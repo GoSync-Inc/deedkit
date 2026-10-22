@@ -79,8 +79,12 @@ def run(client, value, governor=None):
 
 
 def once(worker):
-    """One worker turn; a live receipt is written inside it."""
-    return asyncio.run(worker._once())
+    """One worker turn, then the live receipt it writes off the foreground path."""
+    async def turn():
+        active = await worker._once()
+        await asyncio.gather(*list(worker.settling))
+        return active
+    return asyncio.run(turn())
 
 
 def governed():
@@ -275,6 +279,42 @@ def test_next_send_opportunity_follows_a_hung_search_within_the_deadline(monkeyp
     asyncio.run(scenario())
     # Preflight 0.1 s + hung request to the 0.15 s execution deadline + a stuck receipt to 0.3 s + 0.25 s pacing.
     assert marks['send'] - marks['claimed'] < 0.65 and finished == ['provider_timeout']
+
+
+# spec: ANYM-475
+def test_a_slow_receipt_commit_does_not_hold_up_the_send_loop(monkeypatch):
+    import time
+    import messaging_service.commands as commands
+    import messaging_service.outgoing as outgoing
+    from messaging_service.telegram_collector import TelegramCollector
+    monkeypatch.setattr(commands, 'LIVE_SEARCH_TIMEOUT', 0.3); monkeypatch.setattr(commands, 'LIVE_FOREGROUND_RESERVE', 0)
+    monkeypatch.setattr(commands, 'LIVE_EXECUTION_TIMEOUT', 0.15)
+    marks, finished, jobs = {}, [], [{'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}]
+    class Sends:
+        def __init__(self, *args):pass
+        async def once(self):
+            if 'claimed' in marks and 'send' not in marks:marks['send'] = time.monotonic()
+            return False
+    class Worker(CommandWorker):
+        def claim(self):
+            if jobs:marks['claimed'] = time.monotonic(); return jobs.pop()
+        def preflight(self, job, *, verify_file=True):return job
+        # A COMMIT no timeout interrupts: it outlasts the whole budget.
+        def finish_live(self, job, status, result, code, budget):time.sleep(1.0); finished.append(code)
+    class State:
+        def cooldown_remaining(self):return 0
+    monkeypatch.setattr(outgoing, 'OutgoingWorker', Sends); monkeypatch.setattr(commands, 'CommandWorker', Worker)
+    collector = TelegramCollector.__new__(TelegramCollector)
+    collector.state, collector.provider = State(), SimpleNamespace()
+    async def found(job):return {'outcome': 'confirmed', 'data': {'hits': []}}
+    collector.execute_operation = found
+    async def scenario():
+        loop = asyncio.create_task(collector.outgoing_loop())
+        while 'send' not in marks:await asyncio.sleep(0.02)
+        loop.cancel()
+    asyncio.run(scenario())
+    # The next send turn follows the 0.25 s pacing, not the 1 s commit.
+    assert marks['send'] - marks['claimed'] < 0.6 and finished == [None]
 
 
 # spec: ANYM-475

@@ -112,9 +112,9 @@ def test_a_receipt_stuck_on_a_lock_frees_the_send_claim_within_the_deadline(live
     worker = Worker(state, found)
     async def scenario():
         try:
-            assert await worker.once(); await asyncio.sleep(0.2)  # a receipt off the foreground path has the fence by now
+            assert await worker.once(); await asyncio.sleep(0.2)  # the receipt is waiting on the row by now
             await asyncio.to_thread(OutgoingWorker(state, None).claim)  # the real send claim takes the same fence
-            marks['send'] = time.monotonic()
+            marks['send'] = time.monotonic(); await asyncio.gather(*list(worker.settling))  # the receipt runs out its budget
         finally:blocker.rollback()
         assert not await worker.once()  # the worker keeps running
     with caplog.at_level('WARNING', logger='anymsg.live_search'):asyncio.run(scenario())
@@ -146,9 +146,9 @@ def test_fence_and_receipt_waits_share_one_deadline(live, monkeypatch, caplog):
         return {'outcome': 'confirmed', 'data': {'hits': [], 'next_cursor': None, 'provider_total_approx': 0}}
     async def scenario():
         try:
-            assert await Worker(state, found).once(); await asyncio.sleep(0.2)
+            worker = Worker(state, found); assert await worker.once(); await asyncio.sleep(0.2)
             await asyncio.to_thread(OutgoingWorker(state, None).claim)
-            marks['send'] = time.monotonic()
+            marks['send'] = time.monotonic(); await asyncio.gather(*list(worker.settling))
         finally:row_holder.rollback(); lease_holder.rollback()
     with caplog.at_level('WARNING', logger='anymsg.live_search'):asyncio.run(scenario())
     s.pool.putconn(lease_holder); s.pool.putconn(row_holder)
@@ -211,4 +211,26 @@ def test_a_late_receipt_and_new_owner_recovery_never_overwrite_each_other(live):
     recovery = threading.Thread(target=CommandWorker(new_state, None).claim); recovery.start(); time.sleep(0.2)
     holder.rollback(); late.join(); recovery.join(); s.pool.putconn(holder)
     assert receipt(second) in (('succeeded', found), ('unknown', None))
+    archive.release(ACCOUNT, *lease)
+
+
+# spec: ANYM-475
+def test_new_owner_recovery_skips_a_row_a_receipt_holds(live):
+    import time
+    from messaging_service.commands import CommandWorker
+    s, archive, key, state = live
+    operation = search(s, key)['operation_id']; CommandWorker(state, None).claim()
+    archive.release(ACCOUNT, *state.lease)
+    lease = ('synthetic-new-worker', archive.acquire(ACCOUNT, 'synthetic-new-worker'))
+    new_state = CollectorState(archive, ACCOUNT, lease)
+    holder = s.pool.getconn()  # stands in for a receipt's open transaction on the command row
+    holder.execute('SELECT 1 FROM messenger_commands WHERE id=%s FOR UPDATE', (operation,))
+    try:
+        started = time.monotonic(); CommandWorker(new_state, None).claim(); took = time.monotonic() - started
+    finally:holder.rollback(); s.pool.putconn(holder)
+    assert took < 1  # recovery never waits on the row while it holds the send fence
+    assert s.get_messenger_operation(key, operation)['status'] == 'unknown'  # read as unknown meanwhile
+    CommandWorker(new_state, None).claim()  # a later claim recovers it
+    with s.pool.connection() as c:
+        assert c.execute('SELECT status FROM messenger_commands WHERE id=%s', (operation,)).fetchone()['status'] == 'unknown'
     archive.release(ACCOUNT, *lease)

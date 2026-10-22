@@ -510,6 +510,11 @@ def status(store,c,p,operation_id):
 class CommandWorker:
     def __init__(self,state,execute,gate=None):
         self.state,self.execute,self.gate=state,execute,gate
+        self.settling,self.unsettled=set(),None
+
+    def _settled(self,task):
+        self.settling.discard(task)
+        if not task.cancelled() and task.exception() is not None:self.unsettled=task.exception()
 
     def _identity(self,c,row):
         lock_principal(c,row['principal'],shared=True)
@@ -525,9 +530,11 @@ class CommandWorker:
         st=self.state;store=st.archive.store
         with store.pool.connection() as c:
             st.archive.fence(c,st.account,st.lease)
+            # A row locked by a live receipt is skipped, not waited for under the fence; a later claim recovers it.
             c.execute("""UPDATE messenger_commands SET status='unknown',error_code='operation_result_unknown',
-                finished_at=clock_timestamp() WHERE account=%s AND status='dispatching'
-                AND (lease_epoch IS DISTINCT FROM %s OR expires_at<=clock_timestamp())""",(st.account,st.lease[1]))
+                finished_at=clock_timestamp() WHERE id IN (SELECT id FROM messenger_commands WHERE account=%s
+                AND status='dispatching' AND (lease_epoch IS DISTINCT FROM %s OR expires_at<=clock_timestamp())
+                FOR UPDATE SKIP LOCKED)""",(st.account,st.lease[1]))
             row=c.execute("""SELECT * FROM messenger_commands WHERE account=%s AND status='queued'
                 ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED""",(st.account,)).fetchone()
             if not row:return None
@@ -591,8 +598,9 @@ class CommandWorker:
 
         It takes no lease fence: the fence locks the lease row every send claim needs, and a
         commit can stall while holding it. The UPDATE checks ownership without a lock and writes
-        only a dispatching row of this lease; a new owner's recovery serializes on the command row
-        and rechecks its status, so neither overwrites the other's outcome. The pool wait and each
+        only a dispatching row of this lease; a new owner's recovery skips the row while the receipt
+        holds it and otherwise rechecks its status, so neither overwrites the other's outcome. It
+        runs off the foreground path (see settle in _once). The pool wait and each
         statement get only what is left of one deadline. Nothing is retried: the row stays
         dispatching, and claim or the receipt read reports it unknown after the lease changes or
         the operation expires. A lost lease stops the collector at its next fenced step."""
@@ -662,6 +670,7 @@ class CommandWorker:
                 WHERE id=%s''',(status,Jsonb(result) if result is not None else None,code,row['id']))
 
     async def once(self):
+        if self.unsettled is not None:raise self.unsettled
         if await asyncio.to_thread(self.state.cooldown_remaining)>0:return False
         if self.gate is not None:
             async with self.gate:return await self._once()
@@ -679,7 +688,9 @@ class CommandWorker:
         def left():return max(0.0,deadline-loop.time())
         async def settle(*args):
             if not live:return await finish_durably(self.finish,*args)
-            await asyncio.to_thread(self.finish_live,*args,max(0.0,end-loop.time()))
+            # One tracked attempt off the foreground path: no receipt commit holds up the send loop.
+            task=asyncio.create_task(asyncio.to_thread(self.finish_live,*args,max(0.0,end-loop.time())))
+            self.settling.add(task);task.add_done_callback(self._settled)
         try:
             if not live:await asyncio.to_thread(self.preflight,job)
             else:
