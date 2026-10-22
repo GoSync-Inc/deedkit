@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
@@ -454,13 +455,23 @@ func (p *Provider) requestHistory(ctx context.Context, raw json.RawMessage, poli
 	if !fresh.Allows(v.Chat) {
 		return nil, errors.New("chat_excluded")
 	}
-	send, done := context.WithTimeout(ctx, 10*time.Second)
+	// The change phase starts here: after a deadline answer no request may
+	// leave, and a dropped one is never written again (ANYM-441).
+	if !startChange(ctx) {
+		return nil, errors.New("operation_target_unavailable")
+	}
+	send, done := context.WithTimeout(whatsmeow.WithoutFrameRetry(ctx), 10*time.Second)
 	defer done()
-	_, err = p.Client.SendPeerMessage(send, p.Client.BuildHistorySyncRequest(anchor, v.Count))
-	if err != nil {
+	if err = sendHistoryRequest(send, p.Client, anchor, v.Count); err != nil {
 		return nil, errors.New("history_request_unknown")
 	}
 	return map[string]any{"requested": true, "count": v.Count, "pending": true, "coverage": "partial", "retry": "explicit_only"}, nil
+}
+
+// sendHistoryRequest is the peer send of requestHistory; tests replace it.
+var sendHistoryRequest = func(ctx context.Context, c *whatsmeow.Client, anchor *types.MessageInfo, count int) error {
+	_, err := c.SendPeerMessage(ctx, c.BuildHistorySyncRequest(anchor, count))
+	return err
 }
 
 func (s *CaptureStore) historyAnchor(chat string) (*types.MessageInfo, error) {

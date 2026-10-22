@@ -35,3 +35,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
+
+replace go.mau.fi/whatsmeow => github.com/GoSync-Inc/whatsmeow v0.0.0-20261022114855-fa2ca87d4bd8
