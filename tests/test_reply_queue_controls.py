@@ -422,6 +422,40 @@ def test_due_snooze_does_not_revive_a_superseded_hint(inbox):
 
 
 # spec: ANYM-281
+@pytest.mark.parametrize('view', ['archive', 'conversation'])
+def test_due_group_snooze_reads_only_messages_since_its_hint(inbox, view):
+    from messaging_service.chat_queries import list_chats
+    from test_reply_queue_scale import QueueMeasured
+    from test_search_performance import scans, visited
+    s, ar, key, add, queue = inbox
+    group = {'metadata': {'chat_type': 'group', 'mentions_owner': True}}
+    first = add('500', 1, 1, **group)
+    chat = chat_of('500')
+    # A dense older history of owner mentions before the snoozed hint.
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            SELECT 'dense-'||n,m.account,m.chat,(100000+n)::text,m.sender,m.body,
+                m.sent_at-interval '1 day'-n*interval '1 hour','incoming'
+            FROM messages m CROSS JOIN generate_series(1,300) n WHERE m.id=%s''', (first,))
+        c.execute('''INSERT INTO message_metadata(message,revision,metadata)
+            SELECT 'dense-'||n,1,md.metadata FROM message_metadata md CROSS JOIN generate_series(1,300) n
+            WHERE md.message=%s''', (first,))
+        until = (c.execute('SELECT clock_timestamp() AS t').fetchone()['t']+timedelta(days=30)).isoformat()
+    s.snooze_reply(key, chat, first, 1, until)
+    add('500', 2, 5, **group)
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET sent_at=sent_at-interval '20 days' WHERE chat=%s", (chat,))
+        c.execute("UPDATE reply_snoozes SET snoozed_until=CURRENT_TIMESTAMP-interval '1 minute' WHERE chat=%s", (chat,))
+        c.execute('ANALYZE messages')
+    with s.authorized(key, 'list_chats') as (c, p):
+        measured = QueueMeasured(c)
+        page = list_chats(s, measured, p, awaiting_reply=True, include_coverage=False, view=view)
+    assert page['items'] == []
+    # The due snooze moves the bound back to its own hint, never over the older history.
+    assert visited(measured.plans[0]['Plan'], {'messages'}) < 100, scans(measured.plans[0]['Plan'])
+
+
+# spec: ANYM-281
 def test_muted_rows_stay_counted_under_row_filters(inbox):
     s, ar, key, add, queue = inbox
     plain = add('300', 1, 1, sender='43', body='Synthetic plain note')
@@ -491,45 +525,58 @@ def test_reply_controls_serialize_with_key_changes(inbox):
 
 
 # spec: ANYM-281
-def test_restore_quarantine_keeps_reply_controls(database, tmp_path):
-    from psycopg.conninfo import make_conninfo
-    from messaging_service.backup import database_manifest, quarantine_restore
+def test_reply_controls_backup_round_trip(inbox, tmp_path):
+    """Real PG18 pg_dump and pg_restore of populated reply controls into a separate disposable database."""
+    import os
+    import subprocess
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+    from messaging_service.backup import create_snapshot, quarantine_restore, verify_bundle, verify_snapshot
     from messaging_service.store import Store
-    base_dsn = database.pool.conninfo
+    container = os.environ.get('ANYMSG_TEST_POSTGRES_CONTAINER')
+    if not container:
+        if os.environ.get('CI'):
+            pytest.fail('CI must provide the isolated PostgreSQL container for the restore drill')
+        pytest.skip('isolated PostgreSQL container unavailable locally')
+    s, ar, key, add, queue = inbox
+    mids = [add('100', 1, 1), add('200', 1, 2, sender='77')]
+    with s.pool.connection() as c:
+        until = (c.execute('SELECT clock_timestamp() AS t').fetchone()['t']+timedelta(days=1)).isoformat()
+    s.dismiss_reply(key, chat_of('100'), mids[0], 1, reason='spam_or_mailing', note='Synthetic note')
+    s.snooze_reply(key, chat_of('200'), mids[1], 1, until, note='Synthetic later')
+    s.mute_reply_source(key, account='controls-test', sender_id='77', reason='other')
+    def controls(store):
+        with store.pool.connection() as c:
+            return [c.execute(f'SELECT * FROM {table} ORDER BY 1,2').fetchall()
+                for table in ('reply_dismissals', 'reply_snoozes', 'reply_mutes')]
+    values = conninfo_to_dict(s.pool.conninfo)
+    assert values['dbname'] == 'messaging_probe_test'
+    container_dsn = make_conninfo(host='127.0.0.1', port=5432, user=values['user'], dbname='messaging_probe_test')
+    docker = ['docker', 'exec', '-i', '-e', 'PGPASSWORD=' + values['password'], container]
+    create_snapshot(s, tmp_path / 'capture', [*docker, 'pg_dump', '--format=custom', '--dbname=' + container_dsn])
+    manifest = verify_bundle(tmp_path / 'capture')
+    assert manifest['schema_version'] == 41
+    assert [manifest['tables'][t]['rows'] for t in ('reply_dismissals', 'reply_snoozes', 'reply_mutes')] == [1, 1, 1]
     name = 'anymsg_reply_' + uuid4().hex + '_restore_test'
     restored = None
     created = False
     try:
-        with psycopg.connect(base_dsn, autocommit=True) as owner:
+        with psycopg.connect(s.pool.conninfo, autocommit=True) as owner:
             owner.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(name)))
         created = True
-        restored = Store(make_conninfo(base_dsn, dbname=name), tmp_path / 'synthetic-originals', 'http://testserver')
-        restored.migrate()
-        restored.seed()
-        ar = Archive(restored)
-        ar.register('controls-test', 'telegram', 'Synthetic controls', discover=True)
-        key = restored.issue_key('controls-agent', ['controls-test'])
-        at = datetime.now(timezone.utc).isoformat()
-        mids = [ar.ingest(event(account='controls-test', chat=chat, provider_id='1', sender=sender, sent_at=at,
-            updated_at=at, metadata={'chat_type': 'private'}))['message'] for chat, sender in (('100', '42'), ('200', '77'))]
-        with restored.pool.connection() as c:
-            until = (c.execute('SELECT clock_timestamp() AS t').fetchone()['t']+timedelta(days=1)).isoformat()
-        restored.dismiss_reply(key, chat_of('100'), mids[0], 1, reason='spam_or_mailing', note='Synthetic note')
-        restored.snooze_reply(key, chat_of('200'), mids[1], 1, until, note='Synthetic later')
-        restored.mute_reply_source(key, account='controls-test', sender_id='77', reason='other')
-        with restored.pool.connection() as c:
-            before = database_manifest(c)
-        assert [before[t]['rows'] for t in ('reply_dismissals', 'reply_snoozes', 'reply_mutes')] == [1, 1, 1]
+        subprocess.run([*docker, 'pg_restore', '--dbname=' + make_conninfo(container_dsn, dbname=name),
+            '--exit-on-error', '--no-owner', '--no-acl'],
+            input=(tmp_path / 'capture/database.dump').read_bytes(), check=True, capture_output=True)
+        restored = Store(make_conninfo(s.pool.conninfo, dbname=name), tmp_path / 'capture/files', 'http://testserver')
+        assert verify_snapshot(restored, tmp_path / 'capture')['status'] == 'verified'
+        source = controls(s)
+        assert controls(restored) == source and [len(rows) for rows in source] == [1, 1, 1]
+        assert (source[0][0]['reason'], source[0][0]['note']) == ('spam_or_mailing', 'Synthetic note')
+        # Quarantine revokes keys and disables accounts but keeps the controls.
         quarantine_restore(restored)
-        with restored.pool.connection() as c:
-            after = database_manifest(c)
-            kept = c.execute('SELECT reason,note FROM reply_dismissals').fetchone()
-        for table in ('reply_dismissals', 'reply_snoozes', 'reply_mutes'):
-            assert after[table] == before[table]
-        assert kept == {'reason': 'spam_or_mailing', 'note': 'Synthetic note'}
+        assert controls(restored) == source
     finally:
         if restored is not None:
             restored.close()
         if created:
-            with psycopg.connect(base_dsn, autocommit=True) as owner:
+            with psycopg.connect(s.pool.conninfo, autocommit=True) as owner:
                 owner.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(name)))

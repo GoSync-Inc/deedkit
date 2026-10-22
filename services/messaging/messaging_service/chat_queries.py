@@ -194,11 +194,14 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             f" AND sz.revision={message}.revision AND sz.snoozed_until{'<=' if due else '>'}CURRENT_TIMESTAMP)")
     if snoozes and awaiting_reply_days:
         # A due snooze returns its hint even when it is older than the age window,
-        # only while it still names the chat's latest candidate: a due snooze lifts
-        # the window for the whole chat, so a newer hint stays the target.
+        # only while it still names the chat's latest candidate. The lookup's lower
+        # bound moves back to the snoozed message (a private chat only while no newer
+        # incoming arrived), so a newer hint stays the target and the bound stays an
+        # index condition over the messages since that hint.
         age=f'({age} OR {snooze_of("attention","c.id",True)})'
-        attention_age=(f'({attention_age} OR EXISTS(SELECT 1 FROM reply_snoozes sz WHERE sz.key_id={key}'
-            ' AND sz.chat=m.chat AND sz.snoozed_until<=CURRENT_TIMESTAMP))')
+        attention_age=(f"m.sent_at>=least(CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days',"
+            f'(SELECT sm.sent_at FROM reply_snoozes sz JOIN messages sm ON sm.id=sz.message WHERE sz.key_id={key}'
+            " AND sz.chat=c.id AND sz.snoozed_until<=CURRENT_TIMESTAMP AND (c.chat_type='group' OR sz.incoming_head=incoming.id)))")
     sender_skip=(f'NOT EXISTS(SELECT 1 FROM reply_mutes rm WHERE rm.principal={principal} AND rm.account=m.account'
         ' AND rm.sender=m.sender)') if mutes else 'true'
     chat_muted=f'EXISTS(SELECT 1 FROM reply_mutes rc WHERE rc.principal={principal} AND rc.chat=c.id)'
