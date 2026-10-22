@@ -253,3 +253,31 @@ def test_the_default_anchor_survives_the_worker_preflight_for_the_retry(worker, 
     # The provider's preflight replaces the job payload; the retry still names the default anchor it used.
     assert data['not_stored'] == 1
     assert data['retry_parameters'] == {'count': 10, 'before_message': stable_id('msg', w.account, '100', oldest)}
+
+
+# spec: ANYM-477
+def test_a_stalled_live_read_policy_read_frees_the_lease_fence_at_the_deadline(worker, monkeypatch):
+    import threading
+    import time
+    w, store, _ = worker
+    asyncio.run(w.sync_once())
+    fence = Archive.fence
+    def stalled(c, account, lease):
+        fence(c, account, lease)
+        # The collector's policy read stalls on the client while its transaction holds the lease row.
+        if threading.current_thread() is not threading.main_thread(): time.sleep(3)
+    monkeypatch.setattr(Archive, 'fence', staticmethod(stalled))
+    async def never(job): raise AssertionError('no provider request after the deadline')
+    w.provider.execute_operation = never
+    def lease_row_free():
+        with store.pool.connection() as c:
+            c.execute("SET LOCAL lock_timeout='500ms'")
+            return bool(c.execute('SELECT 1 FROM collector_leases WHERE account=%s FOR UPDATE', (w.account,)).fetchone())
+    async def timed_out():
+        began = asyncio.get_running_loop().time()
+        job = {'operation': 'search_messages_live', 'platform': 'telegram', 'mutation': False, '_deadline': began + 1}
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(w.execute_operation(job), 1)
+        return asyncio.get_running_loop().time() - began, await asyncio.to_thread(lease_row_free)
+    elapsed, free = asyncio.run(timed_out())
+    assert elapsed < 2 and free

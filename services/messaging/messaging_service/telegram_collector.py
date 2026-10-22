@@ -1019,11 +1019,12 @@ class TelegramCollector:
             await asyncio.sleep(.25 if active else 1)
 
     async def execute_operation(self,job):
-        job['_policy']=await asyncio.to_thread(self.state.policy)
-        # A live read's governor state calls (cooldown, status, FloodWait) take the lease fence too, so they
-        # get its deadline on the server as well (release-042 B1); other callers keep the shared state.
-        bound=LIVE_STATE.set(bounded_state(self.state,job['_deadline'])) if job.get('_deadline') is not None else None
+        # A live read's policy read and governor state calls (cooldown, status) take the lease fence too, so
+        # they get its deadline on the server as well (release-042 B1); other callers keep the shared state.
+        live=bounded_state(self.state,job['_deadline']) if job.get('_deadline') is not None else None
+        bound=LIVE_STATE.set(live) if live is not None else None
         try:
+            job['_policy']=await asyncio.to_thread((live or self.state).policy)
             if job.get('operation')=='request_chat_history': return await self.chat_history(job)
             if job.get('operation')!='search_messages_live': return await self.provider.execute_operation(job)
             job['_live_hits']=found=[]
