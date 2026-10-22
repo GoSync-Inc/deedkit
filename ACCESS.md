@@ -51,15 +51,26 @@ keys too, with no other account, chat or field becoming visible:
 - `expires_at`: the calling key's own expiry, ISO 8601 UTC with a `Z` suffix
   (`2026-11-13T14:15:53.242375Z`), read on every call, so `extend-key` shows at once. The type is
   string or null; DeedKit keys always expire (`api_keys.expires_at` is `NOT NULL`), so it is
-  always a string. Through the gateway it is the gateway's backend messaging key.
+  always a string. Through the gateway it is the gateway's backend messaging key; the caller's
+  own gateway key expiry is `platform_capabilities.credential.expires_at`, so a gateway client
+  warns on the earlier of the two.
 - `accounts[].self_provider_id`: the account owner's own provider user ID for each account in
   `accounts`. Telegram: the logged-in user's numeric ID as a decimal string, the form of a
   message `sender` and of a private chat's `provider_chat_id`. WhatsApp (whatsmeow and
-  whatsapp-web.js): the phone-number ID `<digits>@c.us`, never a LID. The account's collector
+  whatsapp-web.js): the phone-number ID `<digits>@c.us`, never a LID; a WhatsApp private chat's
+  `provider_chat_id` may be `<digits>@c.us` or `<digits>@lid`, so a peer check accepts the
+  peer's LID form ([WHATSAPP_IDENTITIES.md](WHATSAPP_IDENTITIES.md)). Each chat's account is the
+  `account` of its chat record.
+  It is the last ID the account's collector verified at a successful connect: the collector
   records it only after the provider confirmed the configured identity (`expected_user_id`,
-  `expected_wid`) at connect; a reconnect rewrites it. It is `null` until such a connect after
-  this release, for synthetic accounts and for accounts without a collector; it is never guessed
-  from messages. `get_sync_status` does not return it.
+  `expected_wid`). It stays after a disconnect or a failed identity check, a re-pair overwrites
+  it at the next verified connect without touching archived senders, and a restore returns the
+  snapshot's value. It is not proof of a live session nor of who wrote the archived history:
+  check it on each session start and never cache a proof across a re-pair.
+  `null` means never verified (no verified connect since this release; synthetic accounts never
+  have one), cured by one collector reconnect, or not storable (the 16 KiB operations limit, a
+  stored value failing the format). It is never guessed from messages, and `get_sync_status`
+  does not return it.
 
 ## Operator commands
 
