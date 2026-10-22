@@ -373,7 +373,7 @@ class Client:
             raise AnyMsgError("request_failed") from None
 
     def capabilities(self, *, detail=None, sections=None):
-        """Full payload by default; detail="summary" is the short index, sections=[names] only those blocks."""
+        """The short summary by default; detail="full" is the whole payload, sections=[names] only those blocks."""
         parameters = {} if detail is None else {"detail": detail}
         if sections is not None:
             parameters["sections"] = list(sections)

@@ -71,8 +71,7 @@ def test_capabilities_full_matches_previous_payload(seeded):
     assert masked(full)==json.loads(SNAPSHOT.read_text())
     headers={'Authorization':'Bearer '+key}
     with TestClient(create_app(s,['testserver'])) as client:
-        # REST and the SDKs keep today's payload without arguments; MCP asks for it by name.
-        assert client.post('/v1/capabilities',headers=headers,json={}).json()==full
+        assert client.post('/v1/capabilities',headers=headers,json={'detail':'full'}).json()==full
         assert structured(rpc(client,key,'capabilities',{'detail':'full'}))==full
     assert s.capabilities(key)==full
 
@@ -140,3 +139,13 @@ def test_capabilities_operations_section_lists_only_operations_the_key_may_use(s
     # A key over the whole account keeps every supported operation in the section.
     assert (s.capabilities(whole,sections=['messenger_operations'])['messenger_operations']
             ==s.capabilities(whole,detail='full')['messenger_operations'])
+
+
+# spec: ANYM-270
+def test_rest_capabilities_default_to_summary(seeded):
+    s,_,_=seeded
+    key=all_permissions_key(s)
+    with TestClient(create_app(s,['testserver'])) as client:
+        rest=client.post('/v1/capabilities',headers={'Authorization':'Bearer '+key},json={}).json()
+        assert rest==structured(rpc(client,key,'capabilities',{}))
+    assert rest['detail']=='summary' and len(json.dumps(rest))<=1500

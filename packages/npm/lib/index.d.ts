@@ -177,7 +177,7 @@ export declare class AnyMsgClient {
   constructor(options: {baseUrl: string; token: string; timeoutMs?: number;
     maxResponseBytes?: number; fetch?: typeof globalThis.fetch});
   call<T = Record<string, unknown>>(method: string, arguments_?: Arguments, options?: {signal?: AbortSignal}): Promise<T>;
-  /** Full payload by default over REST; detail 'summary' is the short index, sections only those blocks. */
+  /** The short summary by default; detail 'full' is the whole payload, sections only those blocks. */
   capabilities(args?: CapabilitiesArgs): Promise<Record<string, unknown>>;
   prepareFileUpload(args: FileUploadPreparation, options?: {signal?: AbortSignal}): Promise<FileUploadStatus>;
   uploadFileChunk(args: FileUploadChunk, options?: {signal?: AbortSignal}): Promise<FileUploadStatus>;
