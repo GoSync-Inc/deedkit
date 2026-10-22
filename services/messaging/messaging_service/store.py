@@ -228,6 +228,8 @@ class Store:
             if 'read' in p['permissions']:
                 features['review-write']=['record_review']
                 features['cursor-write'].append('dismiss_reply')
+                features['cursor-write'].extend(['snooze_reply','restore_reply','mute_reply_source','unmute_reply_source'])
+                features['read'].append('list_reply_dismissals')
                 features['read'].extend(['list_subscriptions','get_subscription','get_subscription_events','fetch_subscription_events','wait_for_subscription_events','list_feedback'])
                 features['subscription-ack']=['ack_subscription_events']
                 features['feedback-write']=['submit_feedback']
@@ -433,7 +435,8 @@ class Store:
     def list_chats(self, token, after='', limit=25, *, accounts=None,query='',chat_types=None,
                    order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
                    include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
-                   only_questions=False,only_unread=False,view='archive',exclude_likely_broadcasts=False):
+                   only_questions=False,only_unread=False,view='archive',exclude_likely_broadcasts=False,
+                   include_muted=False):
         from .chat_queries import list_chats
         from .message_queries import hint_forward_origin
         with self.authorized(token,'list_chats') as (c,p):
@@ -442,14 +445,39 @@ class Store:
                 from_time=from_time,to_time=to_time,include_coverage=include_coverage,
                 awaiting_reply_days=awaiting_reply_days,exclude_chats=exclude_chats,exclude_senders=exclude_senders,
                 only_questions=only_questions,only_unread=only_unread,view=view,
-                exclude_likely_broadcasts=exclude_likely_broadcasts)
+                exclude_likely_broadcasts=exclude_likely_broadcasts,include_muted=include_muted)
             hint_forward_origin(c,result['items'])
             return result
 
-    def dismiss_reply(self,token,chat_id,message_id,expected_revision):
+    def dismiss_reply(self,token,chat_id,message_id,expected_revision,reason=None,note=None):
         from .reply_state import dismiss
         with self.authorized(token,'dismiss_reply') as (c,p):
-            return dismiss(self,c,p,chat_id,message_id,expected_revision)
+            return dismiss(self,c,p,chat_id,message_id,expected_revision,reason,note)
+
+    def snooze_reply(self,token,chat_id,message_id,expected_revision,until,note=None):
+        from .reply_state import snooze
+        with self.authorized(token,'snooze_reply') as (c,p):
+            return snooze(self,c,p,chat_id,message_id,expected_revision,until,note)
+
+    def restore_reply(self,token,chat_id,message_id,expected_revision):
+        from .reply_state import restore
+        with self.authorized(token,'restore_reply') as (c,p):
+            return restore(self,c,p,chat_id,message_id,expected_revision)
+
+    def mute_reply_source(self,token,chat_id=None,account=None,sender_id=None,reason=None,note=None):
+        from .reply_state import mute
+        with self.authorized(token,'mute_reply_source') as (c,p):
+            return mute(self,c,p,chat_id,account,sender_id,reason,note)
+
+    def unmute_reply_source(self,token,chat_id=None,account=None,sender_id=None):
+        from .reply_state import unmute
+        with self.authorized(token,'unmute_reply_source') as (c,p):
+            return unmute(self,c,p,chat_id,account,sender_id)
+
+    def list_reply_dismissals(self,token,kind='dismissed',after='',limit=20):
+        from .reply_state import list_entries
+        with self.authorized(token,'list_reply_dismissals') as (c,p):
+            return list_entries(self,c,p,kind,after,limit)
 
     def search_people(self,token,query='',*,accounts=None,chats=None,after='',limit=20,
                       transliterate=False,group_by_sender=False):
@@ -903,8 +931,8 @@ class Store:
             c.execute("SET LOCAL statement_timeout='180s'")
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
-            if version>40: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql')]:
+            if version>41: raise RuntimeError('database_newer_than_runtime')
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:

@@ -101,7 +101,7 @@ test('typed action definitions retain required identities and optional reviewed 
     assert.deepEqual(body.split('|').map(member=>member.trim()),members.map(member=>`'${member}'`),name);
   }
   const methodArguments={
-    dismissReply:'args: {chat_id: string; message_id: string; expected_revision: number}',
+    dismissReply:'args: {chat_id: string; message_id: string; expected_revision: number; reason?: ReplyReason; note?: string}',
     previewMessage:'args: MessageDraft',sendMessage:'args: MessageAction',
     getSendStatus:'args: {send_id:string}',listMessengerOperations:'args: {account:string}',
     previewMessengerOperation:'args: MessengerOperationPreview',

@@ -133,18 +133,18 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
         include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
         only_questions=False,only_unread=False,selected_chat=None,include_dismissed=False,
-        view='archive',exclude_likely_broadcasts=False):
+        view='archive',exclude_likely_broadcasts=False,include_muted=False):
     from .store import APIError,bounded,date_bound,serial
     bounded(limit);valid_text(after,4096);valid_text(query,200)
     options(view)
     if order=='last_activity_desc':order='activity'
     if order not in ('id','activity','priority') or any(type(v) is not bool for v in
-            (exclude_channels,awaiting_reply,include_coverage,only_questions,only_unread,exclude_likely_broadcasts)):
+            (exclude_channels,awaiting_reply,include_coverage,only_questions,only_unread,exclude_likely_broadcasts,include_muted)):
         raise APIError('invalid_filter')
     if type(awaiting_reply_days) is not int or not 0<=awaiting_reply_days<=365:
         raise APIError('invalid_filter')
     if awaiting_reply and order=='id':order='activity'
-    if (order=='priority' or exclude_likely_broadcasts) and not awaiting_reply:raise APIError('invalid_filter')
+    if (order=='priority' or exclude_likely_broadcasts or include_muted) and not awaiting_reply:raise APIError('invalid_filter')
     c.execute('SET LOCAL jit=off')
     accounts=filter_values(accounts);chat_types=filter_values(chat_types)
     exclude_chats=filter_values(exclude_chats);exclude_senders=filter_values(exclude_senders)
@@ -169,6 +169,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         'from':lower,'to':upper,'exclude_chats':exclude_chats,'exclude_senders':exclude_senders,
         'only_questions':only_questions,'only_unread':only_unread,
         **({'exclude_likely_broadcasts':True} if exclude_likely_broadcasts else {}),
+        **({'include_muted':True} if include_muted else {}),
         **({'score_formula':SCORE_FORMULA} if order=='priority' else {})})
     if view=='conversation':
         binding=cursor_binding(p,'chats-conversation-v1',{'archive_binding':binding})
@@ -181,13 +182,35 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         if score_at is None or score_at>now:raise APIError('invalid_cursor')
     age='true' if not awaiting_reply_days else f"attention.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days'"
     attention_age='true' if not awaiting_reply_days else f"m.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days'"
+    # ANYM-281: the key's snoozes and the principal's mutes. Literals, because the
+    # fragments sit inside laterals whose argument order the callers share.
+    key=sql_literal(str(p['key_id']))+'::uuid';principal=sql_literal(p['id'])
+    queue=awaiting_reply or include_dismissed
+    snoozes=queue and c.execute('SELECT EXISTS(SELECT 1 FROM reply_snoozes WHERE key_id=%s) AS x',(p['key_id'],)).fetchone()['x']
+    mutes=queue and c.execute('SELECT EXISTS(SELECT 1 FROM reply_mutes WHERE principal=%s) AS x',(p['id'],)).fetchone()['x']
+    def snooze_of(message,chat,due):
+        return (f"EXISTS(SELECT 1 FROM reply_snoozes sz WHERE sz.key_id={key} AND sz.chat={chat} AND sz.message={message}.id"
+            f" AND sz.revision={message}.revision AND sz.snoozed_until{'<=' if due else '>'}CURRENT_TIMESTAMP)")
+    if snoozes and awaiting_reply_days:
+        # A due snooze returns its hint even when it is older than the age window.
+        age=f'({age} OR {snooze_of("attention","c.id",True)})'
+        attention_age=f'({attention_age} OR {snooze_of("m","m.chat",True)})'
+    sender_skip=(f'NOT EXISTS(SELECT 1 FROM reply_mutes rm WHERE rm.principal={principal} AND rm.account=m.account'
+        ' AND rm.sender=m.sender)') if mutes else 'true'
+    chat_muted=f'EXISTS(SELECT 1 FROM reply_mutes rc WHERE rc.principal={principal} AND rc.chat=c.id)'
     # A key dismisses this exact owner-attention item. Unrelated group chatter
     # cannot reopen it when the same credential switches API representations.
     incoming_head="CASE WHEN c.chat_type='group' THEN attention.id ELSE incoming.id END"
     dismissed='(d.message=attention.id AND d.revision=attention.revision AND d.incoming_head=('+incoming_head+'))'
     pending="(attention.id IS NOT NULL AND NOT coalesce(ro.is_self_chat,false) AND NOT coalesce(a.platform='telegram' AND c.provider_chat='777000',false) AND NOT coalesce(attention.is_self_chat,false) AND "+age
-    if not include_dismissed:pending+=' AND NOT coalesce('+dismissed+',false)'
+    snoozed=snooze_of('attention','c.id',False)[:-1]+' AND sz.incoming_head=('+incoming_head+'))'
+    if not include_dismissed:
+        pending+=' AND NOT coalesce('+dismissed+',false)'
+        if snoozes:pending+=' AND NOT '+snoozed
     pending+=')'
+    # The muted count reads the queue without the chat-mute exclusion.
+    unmuted_pending=pending
+    if mutes and not include_dismissed and not include_muted:pending=pending[:-1]+' AND NOT '+chat_muted+')'
     fresh="(ro.observed_at>=CURRENT_TIMESTAMP-interval '5 minutes' AND ro.observed_at>=incoming.sent_at AND ro.unread_count IS NOT NULL)"
     unread='CASE WHEN '+fresh+' THEN ro.unread_count>0 END'
     # Waiting points grow with the square root of hours (1h=1, 1d=4, 4d=9) up to
@@ -218,9 +241,11 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         # skips the attention, head and owner-thread lookups for quiet chats,
         # which are most of a large catalogue, before both the count and page.
         # OFFSET 0 keeps it a chat filter instead of a semi-join after them.
-        clauses.append(f'''EXISTS(SELECT 1 FROM messages recent WHERE recent.account=c.account
+        clauses.append(f'''(EXISTS(SELECT 1 FROM messages recent WHERE recent.account=c.account
             AND recent.chat=c.id AND recent.direction='incoming' AND NOT recent.deleted
-            AND recent.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days' OFFSET 0)''')
+            AND recent.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days' OFFSET 0)'''+(
+            f''' OR EXISTS(SELECT 1 FROM reply_snoozes sz WHERE sz.key_id={key} AND sz.chat=c.id
+            AND sz.snoozed_until<=CURRENT_TIMESTAMP)''' if snoozes else '')+')')
     for bound,op in [(lower,'>='),(upper,'<')]:
         if bound:clauses.append('last.sent_at'+op+'%s');args.append(bound)
     after_owner=f'''(own_last.sent_at IS NULL OR m.sent_at>own_last.sent_at OR
@@ -263,16 +288,26 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     owner_sql=f'''SELECT m.sent_at,m.id,{number('m')} AS numeric_id FROM messages m
         LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
         WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND {meaningful()}'''
-    attention_sql=select_message+" AND m.direction='incoming' AND "+attention_after+' AND '+attention_age+' AND '+attention_filter
-    if view!='conversation':
-        attention_sql+=" AND m.sent_at>=coalesce(own_last.sent_at,'-infinity'::timestamptz)"
-    else:
-        attention_sql+=" AND m.sent_at>=CASE WHEN c.chat_type='private' THEN coalesce(own_last.sent_at,'-infinity'::timestamptz) ELSE '-infinity'::timestamptz END"
-    attention_lookup=latest_sql(attention_sql)
-    if view=='conversation':
-        attention_lookup='SELECT * FROM (('+attention_lookup+') UNION ALL ('+group_thread_query(
-            message_projection,enabled="c.chat_type='group'",criteria=attention_age,limit=1)+')) owner_attention'
-    base=f''' FROM chats c JOIN accounts a ON a.id=c.account
+    def attention_for(skip):
+        # A sender mute skips that sender's messages when choosing the hint (ANYM-281).
+        criteria=attention_age+(' AND '+skip if skip!='true' else '')
+        attention_sql=select_message+" AND m.direction='incoming' AND "+attention_after+' AND '+criteria+' AND '+attention_filter
+        if view!='conversation':
+            attention_sql+=" AND m.sent_at>=coalesce(own_last.sent_at,'-infinity'::timestamptz)"
+        else:
+            attention_sql+=" AND m.sent_at>=CASE WHEN c.chat_type='private' THEN coalesce(own_last.sent_at,'-infinity'::timestamptz) ELSE '-infinity'::timestamptz END"
+        lookup=latest_sql(attention_sql)
+        if view=='conversation':
+            lookup='SELECT * FROM (('+lookup+') UNION ALL ('+group_thread_query(
+                message_projection,enabled="c.chat_type='group'",criteria=criteria,limit=1)+')) owner_attention'
+        return lookup
+    attention_lookup=attention_for(sender_skip)
+    # Rank 1 is the hint a sender mute skipped, read only for the muted count and view.
+    ranked=('SELECT * FROM ((SELECT e.*,0 AS mute_rank FROM ('+attention_lookup+') e) UNION ALL (SELECT r.*,1 FROM ('+
+        attention_for('true')+') r)) ranked ORDER BY mute_rank LIMIT 1') if mutes and awaiting_reply else None
+    if include_muted and ranked:attention_lookup=ranked
+    muted_flag=f"CASE WHEN {chat_muted} THEN 'chat' WHEN attention.mute_rank=1 THEN 'sender' END"
+    def base_for(attention_lookup):return f''' FROM chats c JOIN accounts a ON a.id=c.account
       CROSS JOIN (SELECT %s::timestamptz AS at,%s::jsonb AS owners) score_clock
       LEFT JOIN LATERAL ({latest_sql(last_sql,both_directions=True)}) last ON true
       LEFT JOIN LATERAL ({latest_sql(owner_sql)}) own_last ON true
@@ -281,6 +316,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
       LEFT JOIN sender_profiles sp ON sp.account=c.account AND sp.chat=c.id AND sp.sender=attention.sender
       LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
       LEFT JOIN reply_dismissals d ON d.key_id=%s AND d.chat=c.id WHERE '''
+    base=base_for(attention_lookup)
     base_args=[score_at,owner_senders(c,p),p['key_id']]
     # A first queue page counts the same filtered rows it sorts, in one pass.
     inline_totals=awaiting_reply and not only_unread and not after
@@ -293,6 +329,11 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         ' AND '.join(clauses),[*base_args,*args]).fetchone() if awaiting_reply and not inline_totals else None
     if only_unread:clauses.append(unread+' IS TRUE')
     total=c.execute('SELECT count(*) AS n'+base+' AND '.join(clauses),[*base_args,*args]).fetchone()['n'] if awaiting_reply and only_unread else (totals['n'] if totals else None)
+    # Reported only while the principal has a mute, so other queue responses keep their shape.
+    muted_total=None
+    if ranked:
+        muted_total=c.execute('SELECT count(*) AS n'+base_for(ranked)+' AND '.join([*(unmuted_pending if v==pending else v for v in clauses),
+            '('+chat_muted+' OR attention.mute_rank=1)']),[*base_args,*args]).fetchone()['n']
     if after:
         cid=valid_text(after,empty=False) if order=='id' else position_text(pos.get('id'))
         if not c.execute('SELECT 1 FROM chats c WHERE c.id=%s AND '+scope,[cid,*scope_filter(p,'c',chat_column='id')[1]]).fetchone():raise APIError('not_found',404)
@@ -326,6 +367,10 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             THEN attention.provider_id::bigint<=ro.read_inbox_max_id
           END END AS read_by_owner,
         NULL::boolean AS muted,NULL::boolean AS archived,'''+pending+''' AS awaiting_reply,
+        '''+(muted_flag if include_muted and ranked else 'NULL::text')+''' AS awaiting_reply_muted,
+        '''+(f'''(SELECT sz.snoozed_until FROM reply_snoozes sz WHERE sz.key_id={key} AND sz.chat=c.id
+          AND sz.message=attention.id AND sz.revision=attention.revision AND sz.incoming_head=({incoming_head})
+          AND sz.snoozed_until<=CURRENT_TIMESTAMP)''' if snoozes else 'NULL::timestamptz')+''' AS awaiting_reply_snoozed_until,
         attention.basis AS awaiting_reply_basis,attention.id AS awaiting_reply_message_id,
         attention.revision AS awaiting_reply_revision,attention.provider_id AS awaiting_reply_provider_message_id,
         attention.sent_at AS awaiting_reply_sent_at,attention.snippet AS awaiting_reply_snippet,
@@ -359,6 +404,9 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     titles=labels(c,p,[(row['account'],row['id']) for row in private if row['id'] not in selves])
     # Compute run counts only for the returned page, never for every chat.
     for row in items:
+        if row['awaiting_reply'] and row.get('awaiting_reply_snoozed_until'):
+            # The agent asked to be reminded; the row is back for that reason (ANYM-281).
+            row['awaiting_reply_priority_reasons']=[*row['awaiting_reply_priority_reasons'],'snooze_due']
         if row['awaiting_reply']:
             if view=='conversation' and row['type']=='group':
                 row['awaiting_reply_incoming_count']=c.execute('''SELECT threads.n FROM chats c
@@ -380,6 +428,9 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             for key in tuple(row):
                 if key.startswith('awaiting_reply_'):row[key]=None
         for key in ('_own_sent_at','_own_numeric_id','_platform'):row.pop(key,None)
+        # Rows without a mute or a due snooze keep their earlier shape.
+        for key in ('awaiting_reply_muted','awaiting_reply_snoozed_until'):
+            if row.get(key) is None:row.pop(key,None)
         if not include_dismissed:row.pop('_incoming_head',None)
         if view=='conversation':
             state=conversation_state(c,p,row['account'],row['id'],titles=titles)
@@ -407,6 +458,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     return serial({'items':items,'next_cursor':cursor,'order':order,'awaiting_reply_total':total,
         **({'view':view,'conversation_view_version':1} if view=='conversation' else {}),
         'awaiting_reply_days':awaiting_reply_days if awaiting_reply else None,
+        **({'muted_total':muted_total} if muted_total is not None else {}),
         **({'excluded_likely_broadcasts_total':excluded} if exclude_likely_broadcasts else {}),
         'read_state_unknown_total':totals['unknown'] if totals else None,
         'only_unread_notice':'unknown_or_stale_read_state_excluded' if only_unread else None,
