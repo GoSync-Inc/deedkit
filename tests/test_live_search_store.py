@@ -4,6 +4,7 @@ from datetime import datetime,timezone
 from types import SimpleNamespace as NS
 
 from telethon import types
+from telethon._updates import EntityCache
 
 from messaging_service.envelope import stable_id
 from messaging_service.messenger_operations import validate_operation
@@ -12,22 +13,30 @@ from messaging_service.telegram_operations import execute
 from test_collectors import message,worker  # noqa: F401  (worker is a fixture)
 
 PERSON=types.User(100,access_hash=5,first_name='Fixture')
+MEMBER=types.User(11,access_hash=6,first_name='Synthetic',last_name='Member')
+OWNER=types.User(500,access_hash=7,first_name='Owner',is_self=True)
 GROUP=types.Chat(22,'Synthetic group',None,3,datetime.fromtimestamp(0,timezone.utc),1)
 DOCUMENT=types.Document(id=200,access_hash=0,file_reference=b'reference',date=datetime(2026,10,2,tzinfo=timezone.utc),
     mime_type='application/octet-stream',size=4,dc_id=1,attributes=[types.DocumentAttributeFilename('test.bin')])
 
 
-def hit(number,text='zebra hit',*,peer=None,sender=7,day=2,edited=None,media=None):
+def hit(number,text='zebra hit',*,peer=None,sender=None,day=2,edited=None,media=None):
     return types.Message(number,peer or types.PeerUser(100),datetime(2026,10,day,12,tzinfo=timezone.utc),text,
-        from_id=types.PeerUser(sender),edit_date=edited,media=media)
+        from_id=types.PeerUser(sender) if sender else None,edit_date=edited,media=media)
 
 
-def search(w,*messages):
+class Client:
+    """Fake Telethon client: one canned answer; the owner is user 500."""
+    def __init__(self,response):self.response,self._self_id,self._mb_entity_cache=response,500,EntityCache()
+    async def __call__(self,request):return self.response
+
+
+def search(w,*messages,after=None):
     """One global live search answered by a fake client on the collector's own operation path."""
     async def provider(job):
-        response=types.messages.Messages(list(messages),[],[GROUP],[PERSON])
-        async def client(request):return response
-        return await execute(client,job)
+        answer=await execute(Client(types.messages.Messages(list(messages),[],[GROUP],[PERSON,MEMBER,OWNER])),job)
+        if after:after()
+        return answer
     w.provider.execute_operation=provider
     job={'operation':'search_messages_live','mutation':False,'expires_at':4e9,'account':w.account,'chat_id':'',
          'provider_chat':None,'parameters':validate_operation('telegram','search_messages_live',{'query':'zebra'})}
@@ -129,10 +138,31 @@ def test_hits_do_not_advance_coverage_and_reach_only_unfiltered_updates(worker):
 
 
 # spec: ANYM-476
-def test_an_archive_failure_marks_the_hit_and_keeps_the_search_answer(worker):
+def test_an_archive_failure_marks_the_hit_keeps_the_answer_and_queues_nothing(worker):
     w,store,_=worker
     def broken(*args):raise OSError('synthetic archive failure')
-    w.state.catalog=broken
+    w.state.apply=broken
     found=search(w,hit(80))
     assert [(h['provider_id'],h['stored'],h['reason']) for h in found]==[('80',False,'not_stored')]
     assert rows(store,'messages',f"id='{stable_id('msg',w.account,'100','80')}'")==[]
+    assert not list(w.spool.path.rglob('*.json'))
+
+
+# spec: ANYM-476
+def test_a_chat_excluded_before_the_commit_reports_not_stored(worker):
+    w,store,_=worker
+    def exclude():w.archive.register(w.account,'telegram','Synthetic collector',exclude_chats=['100'],discover=True)
+    found=search(w,hit(81),after=exclude)
+    assert [(h['stored'],h['reason']) for h in found]==[(False,'not_stored')]
+    assert rows(store,'messages',f"id='{stable_id('msg',w.account,'100','81')}'")==[]
+
+
+# spec: ANYM-476
+def test_saved_messages_and_sender_names_match_an_initialized_history_page(worker):
+    w,store,_=worker
+    found=search(w,hit(82,peer=types.PeerUser(500)),hit(83,peer=types.PeerChat(22),sender=11))
+    assert all(h['stored'] for h in found)
+    [note]=rows(store,'messages',f"id='{stable_id('msg',w.account,'500','82')}'")
+    assert note['direction']=='outgoing'
+    [profile]=rows(store,'sender_profiles',"sender='11'")
+    assert profile['display_name']=='Synthetic Member'

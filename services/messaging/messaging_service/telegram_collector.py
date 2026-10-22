@@ -985,22 +985,26 @@ class TelegramCollector:
         return answer
 
     async def store_live_hits(self,found):
-        """ANYM-476: archive live search hits as backfill through the history page commit.
+        """ANYM-476: archive live search hits as backfill through the history page commit's archive apply.
 
-        Checkpoints and coverage stay with the history traversal. A hit that cannot be stored is
-        reported in its receipt and never fails the search or the collector."""
+        No spool: a hit that cannot be stored is reported in its receipt and is not replayed, so it never
+        reaches the drain loop, fails the search or stops the collector. A rerun stores it again.
+        Checkpoints and coverage stay with the history traversal."""
         stored=skipped=failed=0
         for message,hit,chat_type,title in found:
-            if not self.in_window([message]):
+            if message is not None and not self.in_window([message]):
                 hit.update(stored=False,reason='outside_history_window'); skipped+=1; continue
-            chat=str(message.chat_id);invalid=self.invalid_messages
+            outcome=None
             try:
-                kind=peer_kind(message)
+                if message is None: raise ValueError('uninitialized_message')
+                chat=str(message.chat_id);kind=peer_kind(message)
                 await asyncio.to_thread(self.state.catalog,chat,kind,title or chat,chat_type,self.history_since)
-                await self.commit_page([message],chat,title or '',kind,'backfill')
+                e=telegram_message(self.account,message,chat_title=title or '',origin='backfill',
+                    verified_self=getattr(self.provider,'verified_self',None))
+                outcome=(await asyncio.to_thread(self.state.apply,{'kind':'message','peer_kind':kind,'envelope':e}))['outcome']
             except Exception as exc:
-                log.warning('live_search_store_failed error=%s',type(exc).__name__); invalid=None
-            if invalid is None or self.invalid_messages>invalid:
+                log.warning('live_search_store_failed error=%s',type(exc).__name__)
+            if outcome in (None,'excluded'):
                 hit.update(stored=False,reason='not_stored'); failed+=1; continue
             hit.update(stored=True,message_id=stable_id('msg',self.account,chat,str(message.id))); stored+=1
         if found: log.info('live_search_store stored=%d outside_window=%d not_stored=%d',stored,skipped,failed)

@@ -1235,6 +1235,7 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
             continue
     raw = [m for m in (getattr(response, 'messages', None) or [])[:limit] if isinstance(m, types.Message)]
     hits, kept = [], job.get('_live_hits')
+    known = {int(key): entity for key, entity in entities.items()}
     for message in raw:
         try:
             provider_chat = str(utils.get_peer_id(message.peer_id))
@@ -1258,6 +1259,12 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
                      'text': safe_text(message.message, LIVE_TEXT) or ''})
         if kept is not None:
             # ANYM-476: the collector archives these after the request; the receipt never carries them.
+            # Initialized as iter_messages does for a history page: cached sender and chat, outgoing
+            # Saved Messages. It uses only this response's entities, never the network.
+            try:
+                message._finish_init(client, known, None)
+            except Exception:
+                message = None
             kept.append((message, hits[-1], kind, entity_name(entity)))
     next_cursor = None
     if len(raw) >= limit and raw and not isinstance(response, types.messages.Messages):
