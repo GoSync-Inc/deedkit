@@ -45,12 +45,22 @@ CAPABILITY_SECTIONS={
     'messenger_operations':('messenger_operations',),'limits':('limits','unavailable')}
 
 
-def capability_view(full, detail='full', sections=None):
-    """`full` unchanged, only the named `sections`, or the summary index."""
+def capability_view(full, detail='full', sections=None, permitted=None):
+    """`full` unchanged, only the named `sections`, or the summary index. A section lists
+    an account's operations only where `permitted` (the key may use them there) names them."""
     if sections is not None:
         if not sections or any(name not in CAPABILITY_SECTIONS for name in sections):raise APIError('invalid_filter')
-        return {key:full[key] for name in CAPABILITY_SECTIONS if name in sections
+        result={key:full[key] for name in CAPABILITY_SECTIONS if name in sections
                 for key in CAPABILITY_SECTIONS[name] if key in full}
+        if 'messenger_operations' in result:
+            block=dict(result['messenger_operations']);accounts={}
+            for account,row in block['supported_by_account'].items():
+                allowed=set((permitted or {}).get(account,()))
+                operations=[name for name in row['operations'] if name in allowed]
+                accounts[account]={**row,'operations':operations,'count':len(operations),
+                    'available_operations':[name for name in row['available_operations'] if name in allowed]}
+            block['supported_by_account']=accounts;result['messenger_operations']=block
+        return result
     if detail=='full':return full
     if detail!='summary':raise APIError('invalid_filter')
     scope=full['chat_scope']
@@ -265,12 +275,13 @@ class Store:
             for account in accounts:
                 account['self_provider_id']=self_provider_id(account['platform'],account['self_provider_id'])
             expires_at=p['key_expires_at']
-            supported_by_account={}
+            supported_by_account={};permitted={}
             for account in accounts:
                 # Same rows as list_messenger_operations: supported, plus what this key
                 # can use now (key permitted and opted in for the account).
                 listed=manifest(c,p,account['id'])
                 supported=[row['operation'] for row in listed['items']]
+                permitted[account['id']]=[row['operation'] for row in listed['items'] if row['key_permitted']]
                 supported_by_account[account['id']]={'provider':listed['provider'],'count':len(supported),
                     'operations':supported,'available_operations':[row['operation'] for row in listed['items'] if row['available']]}
             features={'read':['search','history','context','updates','reviews','search_people','search_files','get_file_text','get_file_occurrences','get_sync_status','get_file_segments','resolve_reference','preview_message'], 'download':['attachment','request_file_download'], 'cursor-write':['ack'], 'send':['send_message','get_send_status']}
@@ -402,7 +413,7 @@ class Store:
                            'review_sources':20, 'context_reviews':5,'send_text_utf16_units':4000,
                            'format_source_utf16_units':16000,'http_json_body_bytes':16384,
                            'upload_chunk_http_json_body_bytes':360448,
-                           'send_queue_ttl_seconds':600,'send_per_account_per_minute':60}},detail,sections)
+                           'send_queue_ttl_seconds':600,'send_per_account_per_minute':60}},detail,sections,permitted)
 
     def preview_message(self,token,account,chat_id,text,reply_to='',format='plain',
                         link_preview=False,allow_lossy=False):

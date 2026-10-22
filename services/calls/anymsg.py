@@ -6,6 +6,10 @@ from urllib.parse import urlsplit
 import httpx
 
 
+class ArchiveArgumentsRejected(ValueError):
+    """A messaging API from before an argument answered 400 to it (ANYM-270)."""
+
+
 class AnyMsg:
     allowed = {"capabilities", "search", "get_context"}
 
@@ -29,6 +33,8 @@ class AnyMsg:
             raise ValueError("archive_operation_not_allowed")
         r=await self.http.post(self.base+"/v1/"+operation,json=arguments,
                                headers={"Authorization":"Bearer "+self._token})
+        if r.status_code==400 and operation=="capabilities" and arguments:
+            raise ArchiveArgumentsRejected("archive_read_failed")
         if r.status_code != 200 or len(r.content)>1024*1024:
             raise ValueError("archive_read_failed")
         v=r.json()
@@ -37,7 +43,9 @@ class AnyMsg:
         return v
 
     async def capabilities(self):
-        v=await self.call("capabilities",{})
+        # Full payload by name (ANYM-270); a messaging API from before `detail` rejects it.
+        try:v=await self.call("capabilities",{"detail":"full"})
+        except ArchiveArgumentsRejected:v=await self.call("capabilities",{})
         return {k:v.get(k) for k in ("version","coverage","accounts","synthetic")}
 
     async def search(self,query,account="",chat=""):

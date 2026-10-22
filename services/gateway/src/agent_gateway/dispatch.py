@@ -182,7 +182,7 @@ class Dispatch:
         credential = key_from_file(binding["key_file"], binding["key_sha256"])
         try:
             async with asyncio.timeout(timeout):
-                result = await self.clients.call(module, "capabilities", credential, {})
+                result = await self.full_capabilities(module, credential)
         except TimeoutError:
             error = Denied("backend_unavailable", 503)
             error.detail = {"error": "backend_unavailable", "reason": "capabilities_timeout"}
@@ -191,6 +191,18 @@ class Dispatch:
         if not isinstance(permissions, list) or not all(isinstance(p, str) for p in permissions):
             raise Denied("backend_capability_contract_unavailable", 503)
         return result
+
+    async def full_capabilities(self, module, credential):
+        """Messaging is asked for its full payload by name (ANYM-270); a backend from before
+        `detail` rejects the argument, so it is asked once more with none, as before."""
+        if module != "messaging":
+            return await self.clients.call(module, "capabilities", credential, {})
+        try:
+            return await self.clients.call(module, "capabilities", credential, {"detail": "full"})
+        except Denied as error:
+            if error.code != "backend_denied" or (getattr(error, "detail", None) or {}).get("error") != "invalid_parameters":
+                raise
+        return await self.clients.call(module, "capabilities", credential, {})
 
     def selected(self, agent, revision, route):
         """The modules an MCP route may use: its path's modules narrowed by the principal's selection; None = all."""

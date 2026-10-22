@@ -1,8 +1,12 @@
 """messages_capabilities over the gateway: a summary by default over MCP, named sections, full over REST (ANYM-270)."""
 import json
 
+import httpx
+import pytest
 from starlette.testclient import TestClient
 
+from agent_gateway.app import create_app
+from test_action_ceiling import setup
 from test_capability_actions import HEADERS, capabilities
 from test_transport import rpc
 
@@ -38,5 +42,41 @@ def test_gateway_capabilities_summary_sections_and_full(tmp_path):
         assert error and "invalid_filter" in json.dumps(bad)
         response = client.post("/v1/messages_capabilities", json={"sections": ["unknown"]}, headers=HEADERS)
         assert response.status_code == 400 and response.json()["error"] == "invalid_filter"
-        # The backend is still asked for its full payload with no arguments.
         assert seen == []
+
+
+def recording_app(tmp_path, old_backend):
+    """The gateway against a messaging backend that records each capabilities body; an old
+    backend (before `detail`) rejects the argument as c8edbe6 does."""
+    _, value, path, _ = setup(tmp_path, SUPPORTED)
+    value["profiles"]["reader"]["tools"].append("messages_capabilities")
+    value["revision"] += 1
+    path.write_text(json.dumps(value))
+    bodies = []
+
+    def backend(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if old_backend and body:
+            return httpx.Response(400, json={"error": "invalid_parameters", "fields": sorted(body)})
+        return httpx.Response(200, json={
+            "permissions": value["principals"][0]["grants"]["messaging"], "chat_scope": {"chat_ids": None},
+            "messenger_operations": {"supported_by_account": SUPPORTED}})
+    return create_app(path, "http://testserver", transports={"messaging": httpx.MockTransport(backend)}), bodies
+
+
+# spec: ANYM-270
+@pytest.mark.parametrize("old_backend", [False, True])
+def test_gateway_reads_full_backend_capabilities_by_name(tmp_path, old_backend):
+    app, bodies = recording_app(tmp_path, old_backend)
+    with TestClient(app) as client:
+        for arguments in ({}, {"detail": "full"}, {"sections": ["messenger_operations"]}):
+            bodies.clear()
+            result, error = call(client, arguments)
+            assert not error, result
+            # One request naming the full payload; an old backend gets one more with none, as before.
+            assert bodies == ([{"detail": "full"}, {}] if old_backend else [{"detail": "full"}])
+        assert result == {"gateway_actions": ["rename_group"], "gateway_actions_scope": "messenger_operations",
+                          "gateway_actions_by_account": {"synthetic": ["rename_group"]},
+                          "gateway_actions_excluded_by_account": {},
+                          "gateway_actions_basis": "granted_supported_and_available_for_account"}

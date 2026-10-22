@@ -114,3 +114,29 @@ def test_capabilities_sections_stay_inside_chat_scope(seeded):
     summary=s.capabilities(b,detail='summary')
     assert summary['accounts']==[] and s.capabilities(b,sections=['accounts'])=={'accounts':[]}
     assert s.capabilities(b,sections=['messenger_operations'])['messenger_operations']['supported_by_account']=={}
+
+
+# spec: ANYM-270
+def test_capabilities_operations_section_lists_only_operations_the_key_may_use(seeded):
+    from messaging_service.messenger_operations import operation_manifest
+    s,_,_=seeded
+    whole=s.issue_key('agent-whole',['telegram-demo'],permissions=sorted(PERMISSIONS))
+    scoped=s.issue_key('agent-scoped',['telegram-demo'],chats=['telegram-demo-chat'],permissions=sorted(PERMISSIONS))
+    account=next(a for a in s.capabilities(scoped)['accounts'] if a['id']=='telegram-demo')
+    full_account={row['operation'] for row in operation_manifest(account['platform']) if row['full_account']}
+    listed=s.capabilities(scoped,detail='full')['messenger_operations']['supported_by_account']['telegram-demo']
+    # full keeps the previous payload, which lists them; the precondition makes the check below bite.
+    assert full_account & set(listed['operations'])
+    headers={'Authorization':'Bearer '+scoped}
+    with TestClient(create_app(s,['testserver'])) as client:
+        views=[s.capabilities(scoped,sections=['messenger_operations']),
+               structured(rpc(client,scoped,'capabilities',{'sections':['messenger_operations']})),
+               client.post('/v1/capabilities',headers=headers,json={'sections':['messenger_operations']}).json()]
+    for view in views:
+        row=view['messenger_operations']['supported_by_account']['telegram-demo']
+        assert not full_account & set(row['operations']) and not full_account & set(row['available_operations'])
+        assert row['count']==len(row['operations'])>0 and set(row['operations'])<set(listed['operations'])
+    assert views[0]==views[1]==views[2]
+    # A key over the whole account keeps every supported operation in the section.
+    assert (s.capabilities(whole,sections=['messenger_operations'])['messenger_operations']
+            ==s.capabilities(whole,detail='full')['messenger_operations'])
