@@ -1369,7 +1369,8 @@ async def chat_history(client, job, parameters, governor, rpc, referenced_peers,
             same = str(utils.get_peer_id(message.peer_id)) == str(chat)
         except (TypeError, ValueError):
             same = False
-        if not isinstance(message, types.Message) or not same or (until is not None and (moment is None or moment >= until)):
+        # Service messages (joins, titles, calls) are history as iter_messages returns them.
+        if not isinstance(message, (types.Message, types.MessageService)) or not same or (until is not None and (moment is None or moment >= until)):
             continue
         kept.append(message)
         if found is not None:

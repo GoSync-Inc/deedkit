@@ -29,6 +29,16 @@ from .storage_admission import MEDIA_RESERVE_BYTES
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy,validate_prefetch_days
 
 log=logging.getLogger(__name__)
+# Seconds before a live read's deadline in which no archive write starts (ANYM-477).
+STORE_MARGIN=0.5
+
+
+async def finished(fn,*args):
+    """Run fn in a thread; on cancellation wait for it, so its transaction ends before the caller does."""
+    task=asyncio.ensure_future(asyncio.to_thread(fn,*args))
+    try: return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.wait({task}); task.exception(); raise
 
 
 class ProviderUnavailable(Exception): pass
@@ -982,7 +992,7 @@ class TelegramCollector:
         if job.get('operation')!='search_messages_live': return await self.provider.execute_operation(job)
         job['_live_hits']=found=[]
         answer=await self.provider.execute_operation(job)
-        await self.store_live_hits(found)
+        await self.store_live_hits(found,deadline=job.get('_deadline'))
         return answer
 
     async def chat_history(self,job):
@@ -993,8 +1003,19 @@ class TelegramCollector:
             job['provider_message_id']=await asyncio.to_thread(self.oldest_archived,job.get('chat_id'))
         job['_history']=found=[]
         answer=await self.provider.execute_operation(job)
-        created=await self.store_live_hits(found,label='chat_history')
-        if isinstance(answer.get('data'),dict): answer['data']['stored_new']=created
+        created=await self.store_live_hits(found,label='chat_history',deadline=job.get('_deadline'))
+        data=answer.get('data')
+        if isinstance(data,dict):
+            data['stored_new']=created
+            missed=sum(1 for _,hit,_,_ in found if not hit.get('stored'))
+            if missed:
+                # A later default request starts below the oldest archived message and would skip these,
+                # so the receipt names the request that loads this page again (a rerun adds no duplicates).
+                data['not_stored']=missed
+                retry={k:v for k,v in parameters.items() if k in ('count','before_message','around_message','from_time','to_time')}
+                if job.get('provider_message_id') and not any(k in retry for k in ('before_message','around_message','from_time','to_time')):
+                    retry['before_message']=stable_id('msg',self.account,str(job.get('provider_chat')),str(job['provider_message_id']))
+                data['retry_parameters']=retry
         return answer
 
     def oldest_archived(self,chat):
@@ -1003,24 +1024,31 @@ class TelegramCollector:
                 ORDER BY length(provider_id),provider_id LIMIT 1''',(self.account,chat)).fetchone()
         return row['provider_id'] if row else None
 
-    async def store_live_hits(self,found,*,label='live_search'):
+    async def store_live_hits(self,found,*,label='live_search',deadline=None):
         """ANYM-476: archive live search hits as backfill through the history page commit's archive apply.
 
         No spool: a hit that cannot be stored is reported in its receipt and is not replayed, so it never
         reaches the drain loop, fails the search or stops the collector. A rerun stores it again.
-        Checkpoints and coverage stay with the history traversal. Returns the number of new messages."""
+        Checkpoints and coverage stay with the history traversal. Returns the number of new messages.
+
+        A live read's deadline (loop time) bounds it: no write starts in its last STORE_MARGIN seconds,
+        and a cancelled read waits for the write in flight, so no archive transaction holding the lease
+        fence outlives the read's receipt or overlaps the next send claim (Astra r1 F1, ANYM-477)."""
+        loop=asyncio.get_running_loop()
         stored=skipped=failed=created=0
         for message,hit,chat_type,title in found:
             if message is not None and not self.in_window([message]):
                 hit.update(stored=False,reason='outside_history_window'); skipped+=1; continue
+            if deadline is not None and deadline-loop.time()<STORE_MARGIN:
+                hit.update(stored=False,reason='deadline'); failed+=1; continue
             outcome=None
             try:
                 if message is None: raise ValueError('uninitialized_message')
                 chat=str(message.chat_id);kind=peer_kind(message)
-                await asyncio.to_thread(self.state.catalog,chat,kind,title or chat,chat_type,self.history_since)
+                await finished(self.state.catalog,chat,kind,title or chat,chat_type,self.history_since)
                 e=telegram_message(self.account,message,chat_title=title or '',origin='backfill',
                     verified_self=getattr(self.provider,'verified_self',None))
-                outcome=(await asyncio.to_thread(self.state.apply,{'kind':'message','peer_kind':kind,'envelope':e}))['outcome']
+                outcome=(await finished(self.state.apply,{'kind':'message','peer_kind':kind,'envelope':e}))['outcome']
             except Exception as exc:
                 log.warning('%s_store_failed error=%s',label,type(exc).__name__)
             if outcome in (None,'excluded'):

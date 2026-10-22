@@ -220,3 +220,81 @@ def test_worker_bounds_telegram_history_as_a_live_read_and_keeps_whatsapp_a_muta
     status, result, code = durable[-1]
     assert status == 'unknown' and result['data'] == {'requested': True, 'count': 10, 'pending': True,
                                                       'delivery': 'via_phone', 'search_again_after_s': 60}
+
+
+def collector(apply):
+    """A TelegramCollector with no database: catalog is a no-op, apply is the synthetic archive write."""
+    from messaging_service.telegram_collector import TelegramCollector
+    c = TelegramCollector.__new__(TelegramCollector)
+    c.account, c.history_since = ACCOUNT, None
+    c.provider = SimpleNamespace(verified_self=None)
+    c.state = SimpleNamespace(catalog=lambda *a: None, apply=apply, policy=lambda: POLICY)
+    return c
+
+
+def owner_client(value):
+    """The fake client with the account id a real one has after login, so messages initialize."""
+    from telethon._updates import EntityCache
+    client = Client(value)
+    client._self_id, client._mb_entity_cache = 500, EntityCache()
+    return client
+
+
+def history_hits(*numbers):
+    value = job({'count': 10}, anchor='41')
+    value['_history'] = found = []
+    run(owner_client(page([message(n) for n in numbers])), value)
+    return found
+
+
+# spec: ANYM-477
+def test_service_messages_of_the_page_are_kept_for_the_archive():
+    from messaging_service.adapters import telegram_message
+    service = types.MessageService(id=40, peer_id=types.PeerChat(22), date=datetime.fromtimestamp(WHEN, timezone.utc),
+                                   action=types.MessageActionChatEditTitle('synthetic title'))
+    value = job({'count': 10}, anchor='41')
+    value['_history'] = found = []
+    data = run(owner_client(page([service, message(39)])), value)['data']
+    assert data['fetched'] == 2 and [m.id for m, *_ in found] == [40, 39]
+    assert telegram_message(ACCOUNT, found[0][0], origin='backfill')['provider_id'] == '40'
+
+
+# spec: ANYM-477
+def test_a_timed_out_read_waits_for_its_archive_write_and_starts_no_other():
+    import time
+    active, started = [], []
+    def apply(capture):
+        started.append(1); active.append(1); time.sleep(.2); active.pop()
+        return {'outcome': 'created'}
+    c, found = collector(apply), history_hits(40, 39, 38)
+    async def timed_out():
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(c.store_live_hits(found, label='chat_history'), .05)
+        return list(active)
+    still = asyncio.run(timed_out())
+    # The receipt is written only after this returns: no write may still hold the lease fence.
+    assert still == [] and len(started) == 1
+    started.clear()
+    async def near_deadline():
+        return await c.store_live_hits(found, label='chat_history', deadline=asyncio.get_running_loop().time() + .1)
+    assert asyncio.run(near_deadline()) == 0 and started == []
+    assert {hit['reason'] for _, hit, *_ in found} == {'deadline'}
+
+
+# spec: ANYM-477
+def test_a_message_not_stored_is_reported_with_the_request_that_reloads_its_page():
+    def apply(capture):
+        if capture['envelope']['provider_id'] == '39': raise RuntimeError('synthetic transient failure')
+        return {'outcome': 'created'}
+    c = collector(apply)
+    c.oldest_archived = lambda chat: '41'
+    async def provider(value):
+        return await execute(owner_client(page([message(n) for n in (40, 39, 38)])), value)
+    c.provider.execute_operation = provider
+    value = job({'count': 10})
+    data = asyncio.run(c.chat_history(value))['data']
+    assert data['fetched'] == 3 and data['stored_new'] == 2 and data['not_stored'] == 1
+    assert data['retry_parameters'] == {'count': 10, 'before_message': stable_id('msg', ACCOUNT, '-22', '41')}
+    complete = collector(lambda capture: {'outcome': 'created'})
+    complete.oldest_archived, complete.provider.execute_operation = (lambda chat: '41'), provider
+    assert 'not_stored' not in asyncio.run(complete.chat_history(job({'count': 10})))['data']
