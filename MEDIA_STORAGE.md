@@ -196,18 +196,22 @@ published and re-registered resident; text, ASR and descriptions are untouched.
 
 - **Capacity.** Before any R2 read the worker takes the collectors' storage
   admission lock and requires free space minus their media reservations and
-  pending uploads, minus the object, to stay above
-  `restore_disk_reserve_bytes` (default and minimum 10 GiB, the collectors'
-  default media floor; set it to at least the collectors'
-  `media_disk_reserve_bytes`). An object over `max_object_bytes` is refused the
-  same way. In the same transaction the admitted restore leases its bytes
-  (`restore_error: cold_restoring` until `restore_finished_at`, one transfer
-  timeout ahead); collector admission and file uploads count every live lease
-  once their role may read `attachment_cold_copies` (`collector_role.sql`).
-  The lease ends with the restore and lapses by itself after a crash;
-  `BlobWriter` also stops the restore at the same floor. The worker cannot read
-  the collectors' configured floor, so a capture floor above
-  `restore_disk_reserve_bytes` needs that value raised to match.
+  pending uploads, minus the object, to stay above the larger of
+  `restore_disk_reserve_bytes` (default and minimum 10 GiB) and the highest
+  floor any collector publishes for that volume. Each collector publishes the
+  max of its media, live-media and capture-spool floors per volume in
+  `collector_health.operations.disk_floors`; the cold role reads that column
+  (`cold_archive_role.sql`, which also exposes the rest of the operations JSON,
+  including the identity's self id). An object over `max_object_bytes` is
+  refused the same way. In the same transaction the admitted restore leases its
+  bytes: a copy whose `restore_finished_at` lies in the future (one transfer
+  timeout ahead) holds a lease, and the gateway's 15-minute provider hand-over
+  keeps that time, so a stalled restore still counts until its lease ends.
+  Collector admission and file uploads count every live lease once their role
+  may read `attachment_cold_copies` (`collector_role.sql`). The lease ends with
+  the restore and lapses by itself after a crash; `BlobWriter` stops the
+  restore at the same floor and when the lease ends, which fails the restore
+  over to the provider.
 
 - **Fallback.** A missing, different or truncated object or an R2 or receiver
   error publishes nothing, records `restore_error` on the copy and queues the
