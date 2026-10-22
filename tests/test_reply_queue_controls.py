@@ -448,6 +448,11 @@ def test_due_group_snooze_reads_only_messages_since_its_hint(inbox, view):
         c.execute("UPDATE reply_snoozes SET snoozed_until=CURRENT_TIMESTAMP-interval '1 minute' WHERE chat=%s", (chat,))
         c.execute('ANALYZE messages')
     with s.authorized(key, 'list_chats') as (c, p):
+        # A small chat in the shared test database otherwise legitimately favours a
+        # bulk scan for the unbounded latest-incoming lookup; the regression is the
+        # ordered attention walk over the whole older history.
+        c.execute('SET LOCAL enable_bitmapscan=off')
+        c.execute('SET LOCAL enable_seqscan=off')
         measured = QueueMeasured(c)
         page = list_chats(s, measured, p, awaiting_reply=True, include_coverage=False, view=view)
     assert page['items'] == []
