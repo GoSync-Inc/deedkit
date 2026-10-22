@@ -352,6 +352,55 @@ def test_failed_telegram_gap_write_is_kept_until_written(live, tmp_path):
     asyncio.run(worker.drain_captures([worker.spool]))
     assert row()['read_state'] == 'stale' and not provider.read_gap_pending
 
+def _gap_race(tmp_path, during):
+    """A collector whose first gap write fails while `during` ('drain' or 'heartbeat') runs."""
+    import asyncio
+    import time
+    from messaging_service.collector_state import CaptureSpool
+    from messaging_service.telegram_collector import TelegramCollector, TelethonProvider
+    events, failures = [], [RuntimeError('synthetic')]
+    provider = object.__new__(TelethonProvider)
+    worker = None
+    def fail_gap_now():
+        # From the drain's worker thread: the gap write fails on the event loop meanwhile.
+        future = asyncio.run_coroutine_threadsafe(provider.record_read_gap(), worker.loop)
+        if during == 'drain': future.result(5)
+        else: time.sleep(0.2)
+    class State:
+        def update_gap(self, *args):
+            if failures:
+                failures.pop(0); events.append('gap_failed'); raise RuntimeError('synthetic')
+            events.append('gap')
+        def apply(self, item):
+            if during == 'drain' and not events: fail_gap_now()
+        def capture_progress(self, last, count, pending, **health):
+            if during == 'heartbeat' and not events: fail_gap_now()
+            events.append('heartbeat')
+    provider.read_gap_state = State()
+    spool = CaptureSpool(tmp_path / 'captures', reserve_bytes=0)
+    spool.put({'kind':'read_state_gap', 'account':'fresh-test',
+        'observed_at':datetime.now(timezone.utc).isoformat(), 'reason':'provider_reconnected'})
+    worker = TelegramCollector(None, 'fresh-test', provider, spool, writer=object())
+    worker.state = provider.read_gap_state
+    async def scenario():
+        worker.loop = asyncio.get_running_loop()
+        await worker.drain_captures([spool])
+        await asyncio.sleep(0.05)
+        worker._next_capture_status = 0
+        await worker.drain_captures([spool])
+    asyncio.run(scenario())
+    return events
+
+
+# spec: ANYM-275
+def test_gap_write_failing_during_a_drain_is_written_before_its_heartbeat(tmp_path):
+    assert _gap_race(tmp_path, 'drain') == ['gap_failed', 'gap', 'heartbeat', 'heartbeat']
+
+
+# spec: ANYM-275
+def test_gap_write_waits_for_a_running_heartbeat_and_is_retried_before_the_next(tmp_path):
+    assert _gap_race(tmp_path, 'heartbeat') == ['heartbeat', 'gap_failed', 'gap', 'heartbeat']
+
 # spec: ANYM-275
 def test_receipt_without_retained_messages_invalidates_the_count(wa):
     s, message, read, row, reads = wa

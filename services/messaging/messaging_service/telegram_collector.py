@@ -2,7 +2,8 @@
 import asyncio
 from collections import deque
 import copy
-from contextlib import contextmanager,suppress
+from contextlib import contextmanager,nullcontext,suppress
+from functools import cached_property
 from datetime import datetime,timedelta,timezone
 import errno
 import json
@@ -222,12 +223,18 @@ class TelethonProvider:
         except RuntimeError:return
         self._read_gap_tasks.add(task);task.add_done_callback(self._read_gap_tasks.discard)
 
+    @cached_property
+    def read_gap_lock(self):
+        # Orders gap writes with the collector's continuity heartbeat (ANYM-275).
+        return asyncio.Lock()
+
     async def record_read_gap(self):
-        try:await asyncio.to_thread(self.read_gap_state.update_gap)
-        except Exception as exc:
-            # Kept until the collector writes it, before any new continuity heartbeat.
-            self.read_gap_pending=True
-            logging.getLogger(__name__).warning('read_state_gap_failed: %s',type(exc).__name__)
+        async with self.read_gap_lock:
+            try:await asyncio.to_thread(self.read_gap_state.update_gap)
+            except Exception as exc:
+                # Kept until the collector writes it, before any new continuity heartbeat.
+                self.read_gap_pending=True
+                logging.getLogger(__name__).warning('read_state_gap_failed: %s',type(exc).__name__)
 
     async def rpc(self,operation,phase):
         governor=getattr(self,'governor',None)
@@ -783,13 +790,8 @@ class TelegramCollector:
         def apply(item):
             nonlocal last,count
             self.state.apply(item);last=item;count+=1
-        if getattr(self.provider,'read_gap_pending',False):
-            # A lost gap write (ANYM-275): persist it first; while it fails, no heartbeat below.
-            self.provider.read_gap_pending=False
-            try:await asyncio.to_thread(self.state.update_gap)
-            except BaseException:
-                self.provider.read_gap_pending=True
-                raise
+        gap_lock=getattr(self.provider,'read_gap_lock',None) or nullcontext()
+        async with gap_lock:await self.flush_read_gap()
         for spool in spools:await asyncio.to_thread(spool.drain,apply,100)
         # History pages were applied inline when fetched. Replaying them is
         # idempotent and is neither live progress nor live backlog.
@@ -807,8 +809,11 @@ class TelegramCollector:
             skipped,self.rejected_messages=getattr(self,'rejected_messages',[]),[]
             if skipped:extra['rejected_messages']=skipped
             try:
-                await asyncio.to_thread(self.state.capture_progress,last,count,await asyncio.to_thread(pending,spools),
-                    quarantined=min(20000,quarantined),invalid=invalid,**extra)
+                # A gap write waits for this heartbeat; one that failed meanwhile is written first.
+                async with gap_lock:
+                    await self.flush_read_gap()
+                    await asyncio.to_thread(self.state.capture_progress,last,count,await asyncio.to_thread(pending,spools),
+                        quarantined=min(20000,quarantined),invalid=invalid,**extra)
             except BaseException:
                 # Skipped items have no spool record to replay; keep their counts for the retry.
                 self.invalid_messages+=invalid
@@ -816,6 +821,15 @@ class TelegramCollector:
                 self.rejected_messages=[*skipped,*self.rejected_messages][-20:]
                 raise
             self._next_capture_status=time.monotonic()+15
+
+    async def flush_read_gap(self):
+        # A lost gap write (ANYM-275): persist it before any heartbeat; while it fails, none.
+        if not getattr(self.provider,'read_gap_pending',False):return
+        self.provider.read_gap_pending=False
+        try:await asyncio.to_thread(self.state.update_gap)
+        except BaseException:
+            self.provider.read_gap_pending=True
+            raise
 
     async def renew_lease(self):
         """Renew ownership, retrying transient faults only while the lease is still ours.
