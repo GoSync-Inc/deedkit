@@ -301,7 +301,7 @@ def test_a_message_not_stored_is_reported_with_the_request_that_reloads_its_page
     data = asyncio.run(c.chat_history(job({'count': 10})))['data']
     assert data['fetched'] == 3 and data['stored_new'] == 2 and data['not_stored'] == 1 and applied == ['40', '38']
     retry = data['retry_parameters']
-    assert retry == {'count': 10, 'from_time': datetime.fromtimestamp(WHEN + 39 * 60, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    assert retry == {'count': 100, 'from_time': datetime.fromtimestamp(WHEN + 39 * 60, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
                      'to_time': datetime.fromtimestamp(WHEN + 39 * 60 + 1, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}
     # The archive changed (oldest is now 38) and the failure has passed: the retry loads 39 itself.
     oldest[0], failing = '38', set()
@@ -310,3 +310,44 @@ def test_a_message_not_stored_is_reported_with_the_request_that_reloads_its_page
     complete = collector(lambda capture: {'outcome': 'created'})
     complete.oldest_archived, complete.provider.execute_operation = (lambda chat: '41'), provider
     assert 'not_stored' not in asyncio.run(complete.chat_history(job({'count': 10})))['data']
+
+
+class Paging(Client):
+    """A fake Telegram history: the exclusive offset_id/offset_date first, then the page limit."""
+    def __init__(self, messages):
+        super().__init__()
+        self.messages, self._self_id, self._mb_entity_cache = messages, 500, __import__('telethon._updates', fromlist=['EntityCache']).EntityCache()
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        newest = sorted(self.messages, key=lambda m: m.id, reverse=True)
+        kept = [m for m in newest if (not request.offset_id or m.id < request.offset_id)
+                and (request.offset_date is None or m.date < request.offset_date)]
+        return page(kept[request.add_offset:][:request.limit])
+
+
+# spec: ANYM-477
+def test_a_same_second_page_is_retried_from_its_own_anchor():
+    applied, failing = [], {'40'}
+    def apply(capture):
+        number = capture['envelope']['provider_id']
+        if number in failing: raise RuntimeError('synthetic transient failure')
+        applied.append(number)
+        return {'outcome': 'created'}
+    history = [message(n) for n in (41, 40, 39)]  # one second; 41 is archived already
+    c = collector(apply)
+    c.oldest_archived = lambda chat: '41'
+    async def provider(value):
+        return await execute(Paging(history), value)
+    c.provider.execute_operation = provider
+    for parameters, anchor in (({'count': 1}, '41'), ({'count': 1, 'before_message': M1}, '41')):
+        failing, applied[:] = {'40'}, []
+        data = asyncio.run(c.chat_history(job(parameters, anchor=anchor)))['data']
+        assert data['not_stored'] == 1 and applied == []
+        retry = data['retry_parameters']
+        assert retry['count'] == 1 and 'from_time' not in retry
+        # The failure has passed: the retry's own anchor reaches 40, not the newer 41 of the same second.
+        failing = set()
+        resolved = '41'  # commands._resolve maps before_message to its provider message
+        asyncio.run(c.chat_history(job(retry, anchor=resolved)))
+        assert applied == ['40']

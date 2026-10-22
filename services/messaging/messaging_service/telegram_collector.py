@@ -1042,14 +1042,22 @@ class TelegramCollector:
             missed=sum(1 for _,hit,_,_ in found if not hit.get('stored'))
             if missed:
                 # A later default request starts below the oldest archived message and would skip these,
-                # so the receipt names a time range holding them, independent of the archive's state
-                # (a rerun adds no duplicates).
+                # so the receipt names the request that loads this page again (a rerun adds no duplicates):
+                # the request's own anchor, the default anchor it used, or for a chat with no archived
+                # message a time range over the messages not stored at the largest page.
                 data['not_stored']=missed
-                dates=[m.date for m,hit,_,_ in found if m is not None and not hit.get('stored') and m.date]
-                if dates:
-                    data['retry_parameters']={'count':parameters.get('count',50),
-                        'from_time':min(dates).strftime('%Y-%m-%dT%H:%M:%SZ'),
-                        'to_time':(max(dates)+timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%SZ')}
+                anchors=('before_message','around_message','from_time','to_time')
+                if any(k in parameters for k in anchors):
+                    data['retry_parameters']={k:v for k,v in parameters.items() if k in ('count',*anchors)}
+                elif job.get('provider_message_id'):
+                    data['retry_parameters']={'count':parameters.get('count',50),'before_message':
+                        stable_id('msg',self.account,str(job.get('provider_chat')),str(job['provider_message_id']))}
+                else:
+                    dates=[m.date for m,hit,_,_ in found if m is not None and not hit.get('stored') and m.date]
+                    if dates:
+                        data['retry_parameters']={'count':100,
+                            'from_time':min(dates).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                            'to_time':(max(dates)+timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%SZ')}
         return answer
 
     def oldest_archived(self,chat):
