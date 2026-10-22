@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from copy import copy
 import hashlib
 import json
+from datetime import timedelta
 from pathlib import Path
 import sys
 from uuid import uuid4
@@ -422,3 +423,54 @@ def test_cli_set_feedback_status_forwards_ids_and_fields(cli, capsys):
             invoke(*arguments)
         assert failure.value.code == 2
     assert [call[0] for call in calls] == ['set_feedback_status', 'close', 'close', 'close']
+
+
+# spec: ANYM-473
+def test_set_feedback_status_unchanged_since_refuses_a_newer_disposition(seeded):
+    store, *_ = seeded
+    token = identity(store)
+    first, second, untouched = submit(store, token, 1), submit(store, token, 2), submit(store, token, 3)
+    store.set_feedback_status([first], 'accepted', spec_ref='ANYM-274')
+    with store.pool.connection() as c:
+        plan = c.execute('SELECT clock_timestamp() AS t').fetchone()['t'].isoformat()
+    store.set_feedback_status([second], 'declined', note='Changed after the plan')
+    before, audited = feedback_rows(store), len(status_audit(store))
+    with pytest.raises(ValueError) as failure:
+        store.set_feedback_status([first, second, untouched], 'declined', unchanged_since=plan)
+    assert str(failure.value) == 'changed_since_plan: 1 of 3 IDs'
+    assert feedback_rows(store) == before and len(status_audit(store)) == audited
+    with pytest.raises(ValueError, match='invalid_unchanged_since'):
+        store.set_feedback_status([first], 'declined', unchanged_since='2026-10-22T10:00:00')
+    # Changed at or before the plan, or never set: the conditional call writes as an unconditional one does.
+    assert store.set_feedback_status([first, untouched], 'declined', unchanged_since=plan)['updated'] == 2
+    assert {str(row['id']): row['status'] for row in feedback_rows(store)} == \
+        {first: 'declined', second: 'declined', untouched: 'declined'}
+
+
+# spec: ANYM-473
+def test_set_feedback_status_not_after_refuses_a_late_call(seeded):
+    store, *_ = seeded
+    token = identity(store)
+    first, second = submit(store, token, 1), submit(store, token, 2)
+    with store.pool.connection() as c:
+        now = c.execute('SELECT clock_timestamp() AS t').fetchone()['t']
+    before = feedback_rows(store)
+    with pytest.raises(ValueError) as failure:
+        store.set_feedback_status([first, second], 'declined', not_after=(now - timedelta(seconds=1)).isoformat())
+    assert str(failure.value) == 'not_after_passed'
+    assert feedback_rows(store) == before and status_audit(store) == []
+    with pytest.raises(ValueError, match='invalid_not_after'):
+        store.set_feedback_status([first], 'declined', not_after='tomorrow')
+    assert store.set_feedback_status([first, second], 'declined',
+        not_after=(now + timedelta(minutes=15)).isoformat())['updated'] == 2
+
+
+# spec: ANYM-473
+def test_cli_set_feedback_status_forwards_unchanged_since_and_not_after(cli):
+    invoke, calls = cli
+    ids = ['00000000-0000-4000-8000-000000000001']
+    invoke('set-feedback-status', '--id', *ids, '--status', 'declined', '--unchanged-since', '2026-10-22T10:00:00+00:00',
+           '--not-after', '2026-10-22T10:15:00+00:00')
+    assert calls[0] == ('set_feedback_status', ids, 'declined', {'fixed_in': None, 'spec_ref': None,
+        'duplicate_of': None, 'note': None, 'unchanged_since': '2026-10-22T10:00:00+00:00',
+        'not_after': '2026-10-22T10:15:00+00:00'})

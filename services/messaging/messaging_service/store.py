@@ -892,12 +892,13 @@ class Store:
         with self.pool.connection() as c, c.transaction():
             return export_feedback(c, **options)
 
-    def set_feedback_status(self, ids, status, *, fixed_in=None, spec_ref=None, duplicate_of=None, note=None):
+    def set_feedback_status(self, ids, status, *, fixed_in=None, spec_ref=None, duplicate_of=None, note=None,
+                            unchanged_since=None, not_after=None):
         # Operator CLI only (ANYM-343): no operation permission, MCP tool, REST route or gateway action.
         from .feedback import set_feedback_status
         with self.pool.connection() as c:
             return set_feedback_status(c, ids, status, fixed_in=fixed_in, spec_ref=spec_ref,
-                duplicate_of=duplicate_of, note=note)
+                duplicate_of=duplicate_of, note=note, unchanged_since=unchanged_since, not_after=not_after)
 
     def ack_updates(self, token, consumer, receipt, expected_version):
         with self.authorized(token,'ack_updates') as (c, p):

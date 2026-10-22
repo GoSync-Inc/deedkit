@@ -71,3 +71,28 @@ exact `set-feedback-status` commands for the operator container) and `dispositio
 (`id`, `status`, `spec_ref`, `duplicate_of`, `fixed_in`, `note`), the file that the owner, or
 the sync tool with the owner's confirmation, applies. A card created from feedback names the
 feedback IDs it covers.
+
+## Sync after triage and after a deploy (ANYM-473)
+
+`scripts/feedback_sync.py` runs on the orchestrator machine (Tiden token, `gh`, git, the owner's
+SSH); production holds no Tiden token. Both actions read every disposition first (the full
+`export-feedback --changed-since` inventory) and only print the plan; `--apply` writes.
+
+```sh
+python3 scripts/feedback_sync.py apply --dispositions <state>/dispositions/<time>.json [--apply]
+python3 scripts/feedback_sync.py follow [--apply]   # after receipt_watch.py reports LIVE
+```
+
+- `apply` applies the permitted transitions of a dispositions file and reports the rest.
+- `follow` moves each item with a `spec_ref`: card Done and its delivering commit (the one merged
+  pull request whose body has `Delivers: ANYM-n`) LIVE: `verify_requested` at the live plan A SHA;
+  Done and merged only: `fixed` at that commit; on main, not Done: `received` to `accepted`.
+- A status never moves down; `verified` and `reopened` never change; `follow` never touches
+  `declined` or `duplicate` and keeps the first live SHA of `verify_requested`.
+- Every write is `set-feedback-status --unchanged-since <head - 10 s> --not-after <head + 15 min>`,
+  so a disposition changed after the plan is never overwritten and a lost call commits by its
+  bound or never. Production must run a release with both options before the first `--apply`.
+- State in `~/.deedkit/feedback-sync` (mode 0700): `audit.jsonl` (one line per call, no note
+  text) and `pending.json`. A call with an unknown outcome stops the run and blocks writes until a
+  later inventory shows it landed or, read after its bound plus 10 s, that it can no longer land.
+  There is no manual override. Exit 0 done, 1 refused or stopped, 2 usage.
