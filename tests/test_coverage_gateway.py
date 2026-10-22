@@ -537,7 +537,8 @@ def test_catalog_covers_explicit_families_and_provider_differences():
     telegram = {row['operation']: row for row in operation_manifest('telegram')}
     whatsapp = {row['operation']: row for row in operation_manifest('whatsapp')}
     families = {
-        'read-live': ['chat_info', 'get_reactions', 'get_message_info', 'get_pinned_messages', 'request_chat_history'],
+        'read-live': ['chat_info', 'get_reactions', 'get_message_info', 'get_pinned_messages', 'request_chat_history',
+                      'search_messages_live'],
         'groups-read': ['list_participants', 'list_topics', 'list_join_requests', 'check_chat_link'],
         'profile-read': ['get_profile'], 'contacts-read': ['list_contacts', 'get_contact', 'list_blocked', 'get_labels'],
         'send': ['send_file', 'forward_message', 'send_poll', 'send_contact', 'send_location', 'open_chat_by_phone'],
@@ -565,7 +566,7 @@ def test_catalog_covers_explicit_families_and_provider_differences():
     for name in ['get_profile', 'list_contacts', 'get_contact', 'list_blocked', 'add_contact',
                  'delete_contact', 'block_contact', 'unblock_contact', 'update_profile', 'create_group']:
         assert telegram[name]['full_account'] and whatsapp[name]['full_account']
-    for name in ['list_topics', 'vote_poll']:
+    for name in ['list_topics', 'vote_poll', 'search_messages_live']:
         assert telegram[name]['supported'] and not whatsapp[name]['supported']
     for name in ['get_pinned_messages', 'pin_chat', 'unpin_chat', 'star_message', 'unstar_message',
                  'get_labels', 'set_chat_labels']:

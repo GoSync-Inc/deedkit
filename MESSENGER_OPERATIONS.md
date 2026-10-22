@@ -303,6 +303,50 @@ the browser WhatsApp fallback supports neither:
   `leave_group`. Opt in only after the API, gateway and native adapter of the same
   release are installed.
 
+## Live Telegram search
+
+`search_messages_live` asks Telegram itself, so it finds messages the archive
+never collected. It runs only on Telegram accounts (others get
+`unsupported_operation`), needs `read-live`, the account opt-in and, through the
+gateway, the `search_messages_live` action grant. It writes nothing to the archive.
+
+- Scope: an empty `chat_id` searches every chat of the account and needs a
+  full-account key; a `chat_id` searches that archived chat. A chat-scoped key
+  naming a chat outside its list gets `forbidden`, whether the chat exists or not.
+- Parameters: `query` (1-256 characters, required), `chat_types` (1-3 of
+  `private`, `group`, `channel`), `filter` (`documents`, `photos`, `links`,
+  `voice`), `from_time` (inclusive) and `to_time` (exclusive) as ISO 8601 with a
+  UTC offset, `limit` (1-50, default 20) and `cursor`.
+- Result: `hits` (`chat`, `chat_title`, `chat_type`, `provider_id`, `time`,
+  `sender`, `text`), `next_cursor`, `provider_total_approx` and
+  `basis: live_provider_search`. Hits in chats the collection policy excludes are
+  dropped. A long receipt shortens hit texts, never drops hits.
+- Paging: one provider request per call, never automatic. Pass `next_cursor` with
+  the same account, `chat_id` and parameters; any other combination gets
+  `invalid_cursor`. A cursor names its offset chat by a token kept in collector
+  memory, so it stops working after a collector restart.
+- Budget per account: 3 requests at once, then one per 10 seconds, 100 per UTC
+  day. Over it the call fails with `rate_limited` and `result.data.retry_after`
+  before any provider request. The budget lives in memory; a collector restart
+  resets it.
+- FloodWait: a wait of up to 3600 seconds pauses only live search on that account;
+  sends and collection go on. A longer wait, or another 420 answer, pauses the
+  account like any FloodWait.
+- Failures: without a running session `session_unavailable`; past 15 seconds
+  `provider_timeout`. Both are safe to repeat with a new request ID.
+- Data: the query goes only to Telegram. The operation row keeps the parameters
+  and the receipt like every other operation, so both reach backups. The log line
+  `live_search` holds counts, duration and FloodWait seconds, never the query or
+  hits.
+
+Roll out the API and collectors first, then the gateway, then the policy that
+names the action: an older gateway rejects a policy with an unknown action. Roll
+back in the reverse order. Enable per account (the list replaces the current one):
+
+```sh
+python -m messaging_service set-messenger-operations --account account-demo --operations chat_info search_messages_live
+```
+
 ## Important platform differences
 
 - WhatsApp `delete_message` is unsupported: the upstream global-revoke behavior
