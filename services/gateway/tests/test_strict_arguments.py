@@ -11,6 +11,7 @@ from platform_contracts.field_errors import REASONS
 from test_diagnostics import configured, HEADERS
 
 
+FEEDBACK_HINT = "a tool name from tools/list, with or without the messages_ prefix"
 SEND = {"account": "account-1", "chat_id": "chat-1", "text": "Synthetic", "request_id": "request-1"}
 ACK = {"subscription_id": "subscription-1", "receipt": "r" * 43, "version": 1}
 
@@ -182,10 +183,12 @@ def test_non_schema_rejections_and_valid_calls_keep_their_existing_shape():
     assert arguments(CATALOG["calls_dial_call"], {**DIAL, "destination_source": "owner_named"})["destination_source"] == "owner_named"
 
 
-def messaging_app(tmp_path, name):
+def messaging_app(tmp_path, name, requests=None):
     def backend(request):
         if request.url.path == "/v1/capabilities":
             return httpx.Response(200, json={"permissions": ["read", "feedback-write"], "tool_manifest": {"names": [name.removeprefix("messages_")]}})
+        if requests is not None:
+            requests.append((request.url.path, json.loads(request.content)))
         return httpx.Response(200, json={"synthetic": True})
 
     return configured(tmp_path, backend, module="messaging", tools=[name], grants=["read", "feedback-write"])[0]
@@ -203,12 +206,17 @@ def test_feedback_field_errors_match_the_card_example_over_both_transports(tmp_p
 # spec: ANYM-295
 def test_feedback_operation_of_another_module_names_the_messaging_operations(tmp_path):
     # Regression (Grok feedback 2026-10-19): operation=calls_dial_call passed the schema, then the backend
-    # refused it as "a documented operation name" without saying which names are documented.
-    enum = CATALOG["messages_submit_feedback"]["inputSchema"]["properties"]["operation"]["anyOf"][0]["enum"]
-    assert {"search", "send_message", "submit_feedback"} <= set(enum) and not [n for n in enum if n.startswith("calls_")]
+    # refused it as "a documented operation name" without saying what is accepted. ANYM-342: a catalog tool of
+    # any module is accepted and an unknown name is refused at the gateway with the tool-list hint.
+    assert "enum" not in CATALOG["messages_submit_feedback"]["inputSchema"]["properties"]["operation"]["anyOf"][0]
     values = {"request_id": "synthetic-request", "category": "bug", "description": "x", "operation": "calls_dial_call"}
+    requests = []
+    rest, mcp = post_both(messaging_app(tmp_path, "messages_submit_feedback", requests), "messages_submit_feedback", values)
+    assert rest.status_code == 200 and not mcp["isError"] and len(requests) == 2
+    values["operation"] = "calls_dial"
     rest, mcp = post_both(messaging_app(tmp_path, "messages_submit_feedback"), "messages_submit_feedback", values)
-    assert rest.status_code == 422 and rest.json()["field_errors"] == [{"field": "operation", "reason": "enum", "allowed": enum}]
+    assert rest.status_code == 422 and rest.json()["field_errors"] == [
+        {"field": "operation", "reason": "enum", "expected": FEEDBACK_HINT}]
     assert mcp["isError"] and mcp["structuredContent"] == rest.json()
 
 
@@ -244,3 +252,45 @@ def test_nested_fields_follow_the_reviewed_schema_order():
         arguments(CATALOG["messages_submit_feedback"], {"request_id": "synthetic-request", "category": "bug", "description": "x",
                                                       "refs": {"message_ids": ["", 23], "chat_ids": [False]}})
     assert [e["field"] for e in caught.value.field_errors] == ["refs/chat_ids/0", "refs/message_ids/0", "refs/message_ids/1"]
+
+
+FEEDBACK = {"request_id": "synthetic-request", "category": "bug", "description": "x"}
+
+
+# spec: ANYM-342
+@pytest.mark.parametrize("operation", ["messages_search", "search", "calendar_slots", "platform_capabilities", "calls_get_call_status"])
+def test_feedback_operation_checked_against_catalog(tmp_path, operation):
+    requests = []
+    app = messaging_app(tmp_path, "messages_submit_feedback", requests)
+    rest, mcp = post_both(app, "messages_submit_feedback", {**FEEDBACK, "operation": operation})
+    assert rest.status_code == 200 and not mcp["isError"]
+    # Both transports relay the name unchanged, even though the calendar and calls modules are not deployed.
+    assert [path for path, _ in requests] == ["/v1/submit_feedback"] * 2
+    assert [body["operation"] for _, body in requests] == [operation] * 2
+
+
+# spec: ANYM-342
+@pytest.mark.parametrize("operation", ["calendar_nonexistent", "messages_nonexistent", "nonexistent", "messages_messages_search"])
+def test_feedback_operation_unknown_field_error(tmp_path, operation):
+    requests = []
+    app = messaging_app(tmp_path, "messages_submit_feedback", requests)
+    rest, mcp = post_both(app, "messages_submit_feedback", {**FEEDBACK, "operation": operation})
+    expected = [{"field": "operation", "reason": "enum", "expected": FEEDBACK_HINT}]
+    assert rest.status_code == 422 and rest.json()["error"] == "invalid_arguments" and rest.json()["field_errors"] == expected
+    assert mcp["isError"] and mcp["structuredContent"] == rest.json()
+    assert operation not in rest.text and operation not in json.dumps(mcp)
+    assert requests == []
+
+
+# spec: ANYM-342
+def test_feedback_operation_legacy_bare_download_is_still_relayed(tmp_path):
+    # `download` was accepted before the catalog check but is no gateway tool; a recorded request stays replayable.
+    requests = []
+    app = messaging_app(tmp_path, "messages_submit_feedback", requests)
+    rest, mcp = post_both(app, "messages_submit_feedback", {**FEEDBACK, "operation": "download"})
+    assert rest.status_code == 200 and not mcp["isError"]
+    assert [body["operation"] for _, body in requests] == ["download"] * 2
+    rest, _ = post_both(messaging_app(tmp_path, "messages_submit_feedback"), "messages_submit_feedback",
+                        {**FEEDBACK, "operation": "messages_download"})
+    assert rest.status_code == 422
+

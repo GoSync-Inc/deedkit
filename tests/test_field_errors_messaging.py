@@ -47,7 +47,7 @@ def test_feedback_backend_names_every_failing_field_once(seeded):
     assert rejected(store, token, request_id='short', description='x' * 4001, operation='nope') == [
         {'field': 'request_id', 'reason': 'min_length', 'expected': '8–128 characters: letters, digits and _ . : -'},
         {'field': 'description', 'reason': 'max_length', 'expected': '1–4000 characters'},
-        {'field': 'operation', 'reason': 'enum', 'expected': 'a documented operation name'}]
+        {'field': 'operation', 'reason': 'enum', 'expected': 'a tool name from tools/list, with or without the messages_ prefix'}]
     assert rejected(store, token, description='')[0]['reason'] == 'min_length'
     assert rejected(store, token, description='bad\x01')[0] == {'field': 'description', 'reason': 'pattern',
         'expected': 'no control characters except newline and tab'}
@@ -118,17 +118,18 @@ def test_boundary_rejections_carry_field_errors_over_rest_and_mcp(args, expected
 # spec: ANYM-295
 def test_feedback_operation_schema_lists_exactly_the_names_the_backend_accepts():
     # Regression (Grok feedback 2026-10-19): operation=calls_dial_call passed the schema, then the backend
-    # refused it as "a documented operation name" without saying which names are documented.
-    allowed = sorted(OPERATION_PERMISSIONS)
+    # refused it without saying which names are accepted. ANYM-342: any tool name as listed is accepted, so the
+    # schema carries the shape only; the gateway checks the name against its catalog.
     catalog = json.loads((pathlib.Path(__file__).resolve().parents[1] / 'services/gateway/src/agent_gateway/catalog.json').read_text())
     gateway = next(t for t in catalog if t['name'] == 'messages_submit_feedback')['inputSchema']['properties']['operation']
-    assert gateway['anyOf'][0]['enum'] == allowed
+    assert 'enum' not in gateway['anyOf'][0]
     store = Store()
     with TestClient(create_app(store, ['testserver'])) as client:
         listed = client.post('/mcp', headers={**HEADERS, 'Accept': 'application/json, text/event-stream'},
             json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})
         tool = next(t for t in listed.json()['result']['tools'] if t['name'] == 'submit_feedback')
     assert tool['inputSchema']['properties']['operation'] == gateway
+    assert 'with or without the messages_ prefix' in tool['description']
 
 
 # spec: ANYM-295
@@ -203,7 +204,7 @@ def test_every_hint_literal_of_the_feedback_and_argument_checks_is_in_the_shared
             if isinstance(node, ast.Tuple) and len(node.elts) >= 3 and isinstance(node.elts[0], ast.Constant) and (
                     reasons := {n.value for n in ast.walk(node.elts[1]) if isinstance(n, ast.Constant) and isinstance(n.value, str)}) and reasons <= shared.REASONS:
                 found.update(n.value for n in ast.walk(node.elts[2]) if isinstance(n, ast.Constant) and isinstance(n.value, str))
-    assert {'8–128 characters: letters, digits and _ . : -', 'a documented operation name', 'at most 8 KiB',
+    assert {'8–128 characters: letters, digits and _ . : -', 'a tool name from tools/list, with or without the messages_ prefix', 'at most 8 KiB',
             'no control characters except newline and tab', 'string'} <= found
     assert [hint for hint in sorted(found) if not shared.hint(hint)] == []
     assert shared.hint('at most 9007199254740991') and not shared.hint('at most 90071992547409910')

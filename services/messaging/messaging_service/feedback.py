@@ -19,6 +19,10 @@ AGENT_VERDICTS = ('verified', 'reopened')
 # SemVer 2.0 (semver.org regex, ASCII classes); migration 039 holds the same pattern and the 80-character bound.
 FIXED_IN = re.compile(r'deedkit@[0-9a-f]{40}|anymsg@(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?')
 SPEC_REF = re.compile(r'ANYM-[1-9][0-9]{0,5}')
+# ANYM-342: `operation` names the tool as the agent sees it. Messaging keeps no copy of the other modules' tool
+# lists (the gateway checks those against its catalog), so another module's tool is accepted by shape alone.
+GATEWAY_PREFIX = 'messages_'
+OTHER_MODULE_TOOL = re.compile(r'(calendar|calls|platform)_[a-z0-9_]{1,120}')
 UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 # A submission transaction ends within this bound or is aborted, never committed late (ANYM-265). The export
 # overlap minimum (2 minutes) exceeds it plus the 5 s statements that authorize the key before it starts.
@@ -26,6 +30,15 @@ SUBMIT_TRANSACTION_TIMEOUT = '60s'
 OVERLAP_MINUTES = (2, 10, 1440)  # minimum, default, maximum
 SUBMISSION_FIELDS = ('id', 'request_id', 'category', 'description', 'operation', 'created_at', 'principal', 'key_id')
 DISPOSITION_FIELDS = ('id', 'status', 'status_note', 'fixed_in', 'spec_ref', 'duplicate_of', 'status_changed_at')
+
+
+def canonical_operation(name):
+    """The stored form of an `operation`, or None: messaging operations bare, other modules' tools as given."""
+    if name in OPERATION_PERMISSIONS:
+        return name
+    if name.startswith(GATEWAY_PREFIX) and name[len(GATEWAY_PREFIX):] in OPERATION_PERMISSIONS:
+        return name[len(GATEWAY_PREFIX):]
+    return name if OTHER_MODULE_TOOL.fullmatch(name) else None
 
 
 def _invalid(errors):
@@ -117,9 +130,11 @@ def submit_feedback(store, c, p, request_id, category, description, *, operation
         errors.append(('description', 'blank', 'text with a non-space character'))
     elif any(ord(ch) < 32 and ch not in '\n\t' or ord(ch) == 127 for ch in description):
         errors.append(('description', 'pattern', 'no control characters except newline and tab'))
-    if operation is not None and (not isinstance(operation, str) or operation not in OPERATION_PERMISSIONS):
-        errors.append(('operation', 'type' if not isinstance(operation, str) else 'enum',
-            'string' if not isinstance(operation, str) else 'a documented operation name'))
+    if operation is not None:
+        if not isinstance(operation, str):
+            errors.append(('operation', 'type', 'string'))
+        elif (operation := canonical_operation(operation)) is None:
+            errors.append(('operation', 'enum', 'a tool name from tools/list, with or without the messages_ prefix'))
     if errors:
         raise _invalid(errors)
     refs = _validate_refs(c, p, refs)

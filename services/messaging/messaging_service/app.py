@@ -27,7 +27,6 @@ from .security_logging import redact_library_logs
 from . import __version__
 from .error_details import payload,classified
 from .field_errors import field_error,pydantic_field_errors
-from .policy import OPERATION_PERMISSIONS
 from .presentation import options, render
 from .telemetry import capture as capture_error
 from .uploads import UPLOAD_BODY_BYTES
@@ -42,10 +41,9 @@ RequestReference = Annotated[StrictStr, Field(min_length=8,max_length=128,patter
 FeedbackReference = Annotated[StrictStr, Field(min_length=1,max_length=256,pattern=r'^[^\x00-\x1f\x7f]+$')]
 FeedbackReferences = dict[Literal['message_ids','chat_ids','subscription_ids'],Annotated[list[FeedbackReference],Field(max_length=32)]]
 FeedbackDescription = Annotated[StrictStr,Field(min_length=1,max_length=4000,pattern=r'^[^\x00-\x08\x0b-\x1f\x7f]+$')]
-# The backend accepts only these names (feedback.py); the schema lists them so a client sees them before a call.
-# A field error relays at most MAX_ALLOWED (50) of them; test_field_errors_messaging checks the gateway copy.
-FeedbackOperation = Annotated[StrictStr,Field(min_length=1,max_length=128,pattern=r'^[a-z][a-z0-9_]*$',
-    json_schema_extra={'enum':sorted(OPERATION_PERMISSIONS)})]
+# A tool name as tools/list shows it (feedback.py canonical_operation, ANYM-342). The name list is not repeated
+# here: the gateway owns the catalog, so the schema carries the shape only.
+FeedbackOperation = Annotated[StrictStr,Field(min_length=1,max_length=129,pattern=r'^[a-z][a-z0-9_]*$')]
 FeedbackStatus = Literal['received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened']
 Detail = Literal['compact','full']
 MessageDetail = Literal['compact','full','transcript']
@@ -1057,7 +1055,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
 
     @mcp.tool(structured_output=True,annotations=upload_write)
     def submit_feedback(ctx: Context,request_id: RequestReference,category: Literal['bug','feature','quality','other'],description: FeedbackDescription,operation: FeedbackOperation | None=None,refs: FeedbackReferences | None=None) -> dict[str,Any]:
-        """Record bounded private feedback for this credential. Reference only visible sources; no raw secrets, external messages or automatic issue publishing."""
+        """Record bounded private feedback for this credential. `operation` is the tool name as listed, with or without the messages_ prefix. Reference only visible sources; no raw secrets, external messages or automatic issue publishing."""
         return call(ctx,'submit_feedback',request_id=request_id,category=category,description=description,operation=operation,refs=refs)
 
     @mcp.tool(structured_output=True,annotations=read)

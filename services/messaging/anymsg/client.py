@@ -227,7 +227,7 @@ def _feedback_parameters(operation, parameters):
         elif name=='operation':
             # The server's current catalog is authoritative; future operations
             # can be referenced without an SDK upgrade.
-            valid=value is None or isinstance(value,str) and bool(re.fullmatch(r'[a-z][a-z0-9_]{0,63}',value))
+            valid=value is None or isinstance(value,str) and bool(re.fullmatch(r'[a-z][a-z0-9_]{0,128}',value))
         else:
             valid=value is None or isinstance(value,dict) and not value.keys()-{'message_ids','chat_ids','subscription_ids'}
             if valid and value is not None:

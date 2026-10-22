@@ -5,7 +5,9 @@ from starlette.testclient import TestClient
 from messaging_service.app import create_app
 from anymsg import Client
 import httpx
+from tests.test_event_delivery import call as feedback_call, identity
 from tests.test_subscription_api import RecordingStore, rpc
+from messaging_service.store import APIError
 
 CASES = [
     ('fetch_subscription_events', {'subscription_id':'synthetic-sub','limit':4}),
@@ -99,3 +101,68 @@ def test_send_wait_failure_after_enqueue_keeps_send_id(monkeypatch):
         rest=c.post('/v1/send_message',headers={'Authorization':'Bearer synthetic-token'},json=args)
     assert rest.status_code==200
     assert rest.json()=={'send_id':'synthetic-send','status':'queued','wait_timed_out':True,'wait_error':'send_wait_busy'}
+
+
+def submitted(store, token, request_id, operation):
+    return feedback_call(store, token, 'submit_feedback', request_id, 'bug', 'Synthetic report', operation=operation)['feedback_id']
+
+
+# spec: ANYM-342
+def test_feedback_operation_accepts_gateway_prefix(seeded):
+    store, _, _ = seeded
+    token = identity(store)
+    first = submitted(store, token, 'synthetic-prefixed', 'messages_search')
+    # The other spelling of the same name is the same request, not a conflict.
+    assert submitted(store, token, 'synthetic-prefixed', 'search') == first
+    assert submitted(store, token, 'synthetic-bare', 'search') != first
+    assert [item['operation'] for item in feedback_call(store, token, 'list_feedback')['items']] == ['search', 'search']
+
+
+# spec: ANYM-342
+def test_feedback_operation_other_modules(seeded):
+    store, _, _ = seeded
+    token = identity(store)
+    for index, name in enumerate(('calendar_slots', 'calls_get_call_status', 'platform_capabilities')):
+        submitted(store, token, 'synthetic-module-%d' % index, name)
+    stored = {item['operation'] for item in feedback_call(store, token, 'list_feedback')['items']}
+    assert stored == {'calendar_slots', 'calls_get_call_status', 'platform_capabilities'}
+    for index, name in enumerate(('messages_nonexistent', 'Search', 'calendar_', 'messages_', 'calls_Dial', 'calls_' + 'a' * 121)):
+        with pytest.raises(APIError, match='invalid_feedback'):
+            submitted(store, token, 'synthetic-bad-%d' % index, name)
+
+
+# spec: ANYM-342
+def test_feedback_operation_unknown_field_error(seeded):
+    store, _, _ = seeded
+    token = identity(store)
+    with pytest.raises(APIError, match='invalid_feedback') as failure:
+        submitted(store, token, 'synthetic-unknown', 'messages_nonexistent-canary')
+    assert failure.value.field_errors == [{'field': 'operation', 'reason': 'enum',
+        'expected': 'a tool name from tools/list, with or without the messages_ prefix'}]
+    assert 'canary' not in json.dumps(failure.value.field_errors)
+
+
+# spec: ANYM-342
+@pytest.mark.parametrize('prefix', ['calendar_', 'calls_', 'platform_'])
+def test_feedback_operation_longest_name_passes_every_boundary(prefix):
+    # Card item 1: prefix plus 1-120 characters, so the schema bound is 129 (calendar_ / platform_ + 120).
+    args = dict(request_id='synthetic-request', category='bug', description='ok', operation=prefix + 'a' * 120)
+    store = Store()
+    with TestClient(create_app(store, ['testserver'])) as c:
+        rest = c.post('/v1/submit_feedback', headers={'Authorization': 'Bearer synthetic-token'}, json=args)
+        mcp = rpc(c, 'submit_feedback', args)
+        too_long = c.post('/v1/submit_feedback', headers={'Authorization': 'Bearer synthetic-token'},
+            json={**args, 'operation': 'a' * 130})
+    assert rest.status_code == 200 and mcp.json()['result']['structuredContent'] == rest.json()
+    assert [call[1]['operation'] for call in store.calls] == [args['operation']] * 2
+    assert too_long.status_code == 400
+
+
+# spec: ANYM-342
+def test_feedback_operation_legacy_download_stays_accepted(seeded):
+    # `download` was a valid bare operation before ANYM-342 although it has no gateway tool; rows and replays keep working.
+    store, _, _ = seeded
+    token = identity(store)
+    first = submitted(store, token, 'synthetic-download', 'download')
+    assert submitted(store, token, 'synthetic-download', 'download') == first
+    assert [item['operation'] for item in feedback_call(store, token, 'list_feedback')['items']] == ['download']

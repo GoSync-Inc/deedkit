@@ -71,6 +71,24 @@ class InvalidArguments(ValueError):
         self.field_errors = field_errors
 
 
+# A bare messaging operation that feedback accepted before ANYM-342 but that has no gateway tool: keep it valid so
+# a recorded request can still be replayed through the gateway. It makes no tool callable.
+LEGACY_FEEDBACK_OPERATIONS = frozenset({"download"})
+FEEDBACK_OPERATION_HINT = "a tool name from tools/list, with or without the messages_ prefix"
+
+
+def feedback_operation_errors(value):
+    """`operation` of submit_feedback must name a reviewed catalog tool, bare or with the `messages_` prefix.
+
+    The static catalog decides, not the modules deployed or visible to the key, so a report about an unavailable
+    tool is still accepted (ANYM-342). The submitted name is never echoed.
+    """
+    name = value.get("operation")
+    if isinstance(name, str) and name not in CATALOG and "messages_" + name not in CATALOG and name not in LEGACY_FEEDBACK_OPERATIONS:
+        return [{"field": "operation", "reason": "enum", "expected": FEEDBACK_OPERATION_HINT}]
+    return []
+
+
 def arguments(tool, value):
     if not isinstance(value, dict):
         raise ValueError("invalid_arguments")
@@ -79,6 +97,8 @@ def arguments(tool, value):
     errors = list(StrictValidator(schema).iter_errors(value))
     if errors:
         raise InvalidArguments(field_errors(schema, errors))
+    if tool.get("name") == "messages_submit_feedback" and (errors := feedback_operation_errors(value)):
+        raise InvalidArguments(errors)
     if tool["operation"] == "upload_file_chunk":
         try:
             raw = base64.b64decode(value["data_base64"], validate=True)
