@@ -719,11 +719,13 @@ func (s *CaptureStore) StoreReceipt(e *events.Receipt) error {
 }
 
 // capturedMessage returns the capture ID of a retained message with this
-// provider ID and direction, or "" when none is retained.
+// provider ID and direction, or "" when none is retained. A group capture ID
+// carries a sender suffix (LegacyMessageID), so it matches by prefix there.
 func (s *CaptureStore) capturedMessage(chat, id string, fromMe bool) (string, error) {
 	var found string
-	err := s.db.QueryRow("SELECT message_id FROM capture WHERE chat=? AND message_id=? AND length(raw)>0 LIMIT 1",
-		chat, fmt.Sprintf("%t_%s_%s", fromMe, chat, id)).Scan(&found)
+	key := fmt.Sprintf("%t_%s_%s", fromMe, chat, id)
+	err := s.db.QueryRow("SELECT message_id FROM capture WHERE chat=? AND (message_id=? OR substr(message_id,1,?)=?) AND length(raw)>0 ORDER BY seq DESC LIMIT 1",
+		chat, key, len(key)+1, key+"_").Scan(&found)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}

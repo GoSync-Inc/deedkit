@@ -130,15 +130,43 @@ class TelethonProvider:
 
     def bind_state(self,state):
         self.governor=RequestGovernor(state)
-        # Telethon 1.x reconnects inside one connection and does not catch up (its
-        # _handle_auto_reconnect says so): updates may be missing, so the read-state
-        # continuity ends here (ANYM-275). A failed record is logged, never raised.
-        reconnected=self.__dict__.setdefault('_auto_reconnect',self.client._handle_auto_reconnect)
-        async def handle_auto_reconnect():
-            try:await asyncio.to_thread(state.update_gap)
-            except Exception as exc:logging.getLogger(__name__).warning('read_state_gap_failed: %s',type(exc).__name__)
-            return await reconnected()
-        self.client._handle_auto_reconnect=handle_auto_reconnect
+        self.read_gap_state=state
+        if '_read_gap_tasks' in self.__dict__:return
+        # Telethon 1.x can lose updates inside one connection: its auto-reconnect does
+        # not catch up, and a too-long (channel) difference or a premature channel
+        # difference end drops them. Each ends the read-state continuity (ANYM-275).
+        from telethon.tl.types import updates as diffs
+        self._read_gap_tasks=set()
+        sender=self.client._sender
+        reconnected=sender._auto_reconnect_callback
+        async def auto_reconnect():
+            await self.record_read_gap()
+            if reconnected:return await reconnected()
+        sender._auto_reconnect_callback=auto_reconnect
+        box=self.client._message_box;base=type(box);provider=self
+        class WatchedBox(base):
+            # MessageBox has __slots__: an empty-slot subclass keeps its layout.
+            __slots__=()
+            def apply_difference(self,diff,*args):
+                if isinstance(diff,diffs.DifferenceTooLong):provider.read_gap_soon()
+                return base.apply_difference(self,diff,*args)
+            def apply_channel_difference(self,request,diff,*args):
+                if isinstance(diff,diffs.ChannelDifferenceTooLong):provider.read_gap_soon()
+                return base.apply_channel_difference(self,request,diff,*args)
+            def end_channel_difference(self,*args):
+                provider.read_gap_soon()
+                return base.end_channel_difference(self,*args)
+        box.__class__=WatchedBox
+
+    def read_gap_soon(self):
+        # Called inside Telethon's update loop: never block or raise there.
+        try:task=asyncio.get_running_loop().create_task(self.record_read_gap())
+        except RuntimeError:return
+        self._read_gap_tasks.add(task);task.add_done_callback(self._read_gap_tasks.discard)
+
+    async def record_read_gap(self):
+        try:await asyncio.to_thread(self.read_gap_state.update_gap)
+        except Exception as exc:logging.getLogger(__name__).warning('read_state_gap_failed: %s',type(exc).__name__)
 
     async def rpc(self,operation,phase):
         governor=getattr(self,'governor',None)

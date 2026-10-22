@@ -286,24 +286,36 @@ def test_quarantined_or_invalid_capture_ends_continuity(live):
 def test_telegram_auto_reconnect_ends_continuity():
     import asyncio
     from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.tl import types
     from messaging_service.telegram_collector import TelethonProvider
-    # The wrapped hook is Telethon's own; a bump that drops it fails here.
-    assert callable(getattr(TelegramClient, '_handle_auto_reconnect', None))
+    # A real, never-connected client: the hooks are the ones Telethon itself calls.
+    client = TelegramClient(StringSession(), 1, 'synthetic', receive_updates=False)
+    assert client._sender._auto_reconnect_callback == client._handle_auto_reconnect
     calls = []
-    class Client:
-        async def _handle_auto_reconnect(self): calls.append('telethon')
+    async def telethon_reconnect(): calls.append('telethon')
+    client._sender._auto_reconnect_callback = telethon_reconnect
     class State:
         def __init__(self, fail=False): self.fail = fail
         def update_gap(self):
             calls.append('gap')
             if self.fail: raise RuntimeError('synthetic')
     provider = object.__new__(TelethonProvider)
-    provider.client = Client()
+    provider.client = client
     provider.bind_state(State())
     provider.bind_state(State(fail=True))
-    asyncio.run(provider.client._handle_auto_reconnect())
-    # Bound twice: one gap, then Telethon's own handler, even when the gap write fails.
-    assert calls == ['gap', 'telethon']
+    async def scenario():
+        await client._sender._auto_reconnect_callback()
+        box = client._message_box
+        box.map[1] = box.map.get(1) or type('Entry', (), {'pts': 0})()
+        request = type("Request", (), {"channel": types.InputChannel(1, 0)})()
+        box.apply_channel_difference(request, types.updates.ChannelDifferenceTooLong(
+            dialog=type('Dialog', (), {'pts': 5})(),
+            messages=[], chats=[], users=[], final=True, timeout=None), type('Hashes', (), {'extend': lambda *a: None})())
+        await asyncio.sleep(0.05)
+    asyncio.run(scenario())
+    # Bound twice: one hook each; a failed gap write never stops Telethon's own handler.
+    assert calls == ['gap', 'telethon', 'gap']
 
 
 # spec: ANYM-275

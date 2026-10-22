@@ -1272,3 +1272,32 @@ func TestOwnerReadSequencesGiveTheSameCapturesInAnyOrder(t *testing.T) {
 		}
 	}
 }
+
+// spec: ANYM-275
+func TestGroupReceiptsMatchCapturesWithTheSenderSuffix(t *testing.T) {
+	p := readStateProvider(t)
+	s := p.Capture
+	group := types.NewJID("123-456", types.GroupServer)
+	member := types.NewJID("222222", types.DefaultUserServer)
+	in := fixtureMessage("g1", 1700000000)
+	in.Info.Chat, in.Info.Sender, in.Info.IsGroup = group, member, true
+	out := fixtureMessage("g2", 1700000001)
+	out.Info.Chat, out.Info.Sender, out.Info.IsGroup, out.Info.IsFromMe = group, s.Owner, true, true
+	for _, m := range []*events.Message{in, out} {
+		if err := s.Put(m, "live"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.handleReadEvent(ownerReceipt(s.Owner, group, types.ReceiptTypeRead, 1700000100, "g1"))
+	got := readCaptures(t, s)
+	if len(got) != 1 || fmt.Sprint(got[0]["observation"].(map[string]any)["read_message_ids"]) != "["+LegacyMessageID(in)+"]" {
+		t.Fatal("group owner read", got)
+	}
+	peer := &events.Receipt{MessageSource: types.MessageSource{Chat: group, Sender: member, IsGroup: true}, MessageIDs: []types.MessageID{"g2"}, Timestamp: time.Unix(1700000200, 0), Type: types.ReceiptTypeRead}
+	if !p.handleReadEvent(peer) {
+		t.Fatal("peer receipt")
+	}
+	if obs, err := s.ReceiptObservations(LegacyChatID(group), LegacyMessageID(out)); err != nil || len(obs) != 1 {
+		t.Fatal("group delivery evidence", obs, err)
+	}
+}
