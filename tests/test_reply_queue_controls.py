@@ -400,3 +400,136 @@ def test_reply_controls_surface_and_backup(inbox):
         assert manifest['reply_mutes']['rows'] == 1 and manifest['reply_snoozes']['rows'] == 0
         assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '41'
     assert s.list_reply_dismissals(key)['items'] == [] and mid
+
+
+# spec: ANYM-281
+def test_due_snooze_does_not_revive_a_superseded_hint(inbox):
+    s, ar, key, add, queue = inbox
+    first = add('100', 1)
+    chat = chat_of('100')
+    with s.pool.connection() as c:
+        until = (c.execute('SELECT clock_timestamp() AS t').fetchone()['t']+timedelta(days=30)).isoformat()
+    s.snooze_reply(key, chat, first, 1, until)
+    newer = add('100', 2, 5)
+    assert hint(queue()['items'][0]) == (newer, 1)
+    # Both hints age out of the 14-day window, then the stale snooze falls due.
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET sent_at=sent_at-interval '20 days' WHERE chat=%s", (chat,))
+        c.execute("UPDATE reply_snoozes SET snoozed_until=CURRENT_TIMESTAMP-interval '1 minute' WHERE chat=%s", (chat,))
+    assert queue()['items'] == []
+    with pytest.raises(APIError, match='reply_target_changed'):
+        s.dismiss_reply(key, chat, first, 1)
+
+
+# spec: ANYM-281
+def test_muted_rows_stay_counted_under_row_filters(inbox):
+    s, ar, key, add, queue = inbox
+    plain = add('300', 1, 1, sender='43', body='Synthetic plain note')
+    question = add('300', 2, 5, body='Synthetic question?')
+    chat = chat_of('300')
+    s.mute_reply_source(key, account='controls-test', sender_id='42')
+    assert hint(queue()['items'][0]) == (plain, 1) and queue()['muted_total'] == 0
+    # Without the mute the question row meets only_questions; with it the row is removed and counted.
+    filtered = queue(only_questions=True)
+    assert filtered['items'] == [] and filtered['muted_total'] == 1
+    shown = queue(only_questions=True, include_muted=True)['items']
+    assert [(r['id'], r['awaiting_reply_muted'], hint(r)) for r in shown] == [(chat, 'sender', (question, 1))]
+    # A dismissed skipping hint leaves the muted sender's row counted and visible.
+    s.dismiss_reply(key, chat, plain, 1)
+    assert queue()['items'] == [] and queue()['muted_total'] == 1
+    assert [hint(r) for r in queue(include_muted=True)['items']] == [(question, 1)]
+
+
+# spec: ANYM-281
+def test_list_reply_dismissals_names_senders(inbox):
+    s, ar, key, add, queue = inbox
+    profile = {'sender_profile': {'display_name': 'Synthetic Sender'}}
+    mid = add('100', 1, 1, **profile)
+    add('200', 1, 2, sender='77', **profile)
+    s.dismiss_reply(key, chat_of('100'), mid, 1, reason='other')
+    s.mute_reply_source(key, account='controls-test', sender_id='77')
+    assert s.list_reply_dismissals(key)['items'][0]['sender_name'] == 'Synthetic Sender'
+    assert s.list_reply_dismissals(key, kind='muted')['items'][0]['sender_name'] == 'Synthetic Sender'
+
+
+# spec: ANYM-281
+def test_reply_controls_serialize_with_key_changes(inbox):
+    from threading import Event
+    from messaging_service.reply_state import mute
+    from test_access import wait_for_acl_waiter
+    s, ar, key, add, queue = inbox
+    mid = add('100', 1, 1)
+    chat = chat_of('100')
+    credential = s.capabilities(key)['credential_id']
+    s.dismiss_reply(key, chat, mid, 1, reason='other', note='Synthetic')
+    with s.pool.connection() as c:
+        until = (c.execute('SELECT clock_timestamp() AS t').fetchone()['t']+timedelta(days=1)).isoformat()
+    # extend-key keeps the key's entries.
+    s.extend_key(credential, 30)
+    assert [i['reason'] for i in s.list_reply_dismissals(key)['items']] == ['other']
+    # An admitted mutation finishes before a permission change; the next call rechecks.
+    started = Event()
+    def narrow():started.set();return s.set_access('controls-agent', permissions=['read'])
+    with ThreadPoolExecutor(1) as threads:
+        with s.authorized(key, 'mute_reply_source') as (c, p):
+            changing = threads.submit(narrow);assert started.wait(1)
+            wait_for_acl_waiter(s);assert not changing.done()
+            assert mute(s, c, p, chat, None, None, None, None)['created'] is True
+        changing.result(timeout=3)
+    with pytest.raises(APIError, match='forbidden'):
+        s.snooze_reply(key, chat, mid, 1, until)
+    s.set_access('controls-agent', permissions=['read', 'cursor-write'])
+    # An admitted mutation finishes before a revocation; the next call fails.
+    with ThreadPoolExecutor(1) as threads:
+        with s.authorized(key, 'unmute_reply_source') as (c, p):
+            revoking = threads.submit(s.revoke, credential_id=credential)
+            wait_for_acl_waiter(s);assert not revoking.done()
+        assert revoking.result(timeout=3) == 1
+    with pytest.raises(APIError, match='unauthorized'):
+        s.restore_reply(key, chat, mid, 1)
+    assert s.list_reply_dismissals(s.issue_key('controls-agent', ['controls-test']), kind='muted')['items']
+
+
+# spec: ANYM-281
+def test_restore_quarantine_keeps_reply_controls(database, tmp_path):
+    from psycopg.conninfo import make_conninfo
+    from messaging_service.backup import database_manifest, quarantine_restore
+    from messaging_service.store import Store
+    base_dsn = database.pool.conninfo
+    name = 'anymsg_reply_' + uuid4().hex + '_restore_test'
+    restored = None
+    created = False
+    try:
+        with psycopg.connect(base_dsn, autocommit=True) as owner:
+            owner.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(name)))
+        created = True
+        restored = Store(make_conninfo(base_dsn, dbname=name), tmp_path / 'synthetic-originals', 'http://testserver')
+        restored.migrate()
+        restored.seed()
+        ar = Archive(restored)
+        ar.register('controls-test', 'telegram', 'Synthetic controls', discover=True)
+        key = restored.issue_key('controls-agent', ['controls-test'])
+        at = datetime.now(timezone.utc).isoformat()
+        mids = [ar.ingest(event(account='controls-test', chat=chat, provider_id='1', sender=sender, sent_at=at,
+            updated_at=at, metadata={'chat_type': 'private'}))['message'] for chat, sender in (('100', '42'), ('200', '77'))]
+        with restored.pool.connection() as c:
+            until = (c.execute('SELECT clock_timestamp() AS t').fetchone()['t']+timedelta(days=1)).isoformat()
+        restored.dismiss_reply(key, chat_of('100'), mids[0], 1, reason='spam_or_mailing', note='Synthetic note')
+        restored.snooze_reply(key, chat_of('200'), mids[1], 1, until, note='Synthetic later')
+        restored.mute_reply_source(key, account='controls-test', sender_id='77', reason='other')
+        with restored.pool.connection() as c:
+            before = database_manifest(c)
+        assert [before[t]['rows'] for t in ('reply_dismissals', 'reply_snoozes', 'reply_mutes')] == [1, 1, 1]
+        quarantine_restore(restored)
+        with restored.pool.connection() as c:
+            after = database_manifest(c)
+            kept = c.execute('SELECT reason,note FROM reply_dismissals').fetchone()
+        for table in ('reply_dismissals', 'reply_snoozes', 'reply_mutes'):
+            assert after[table] == before[table]
+        assert kept == {'reason': 'spam_or_mailing', 'note': 'Synthetic note'}
+    finally:
+        if restored is not None:
+            restored.close()
+        if created:
+            with psycopg.connect(base_dsn, autocommit=True) as owner:
+                owner.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(name)))

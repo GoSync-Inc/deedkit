@@ -334,7 +334,15 @@ def list_entries(store,c,p,kind='dismissed',after='',limit=20):
         ([r['chat'] or r.get('_name_chat') for r in items if r['chat'] or r.get('_name_chat')],)).fetchall()}
     private=[(chats[r['chat']]['account'],r['chat']) for r in items if r['chat'] and chats[r['chat']]['chat_type']=='private']
     titles=labels(c,p,private) if private else {}
-    for row in items:row['_resolve_chat']=row['chat'] or row.get('_name_chat');row['sender_name']=None
+    for row in items:
+        row['_resolve_chat']=row['chat'] or row.get('_name_chat');row['sender_name']=None
+        if row['sender'] and row['_resolve_chat']:
+            # The authorized chat's own profile name first; resolve() then replaces only raw IDs.
+            named=c.execute('''SELECT sp.display_name FROM sender_profiles sp WHERE sp.account=%s AND sp.chat=%s AND sp.sender=%s
+                AND EXISTS(SELECT 1 FROM messages source WHERE source.id=sp.source_message AND source.account=sp.account
+                  AND source.chat=sp.chat AND source.sender=sp.sender AND NOT source.deleted)''',
+                (row['account'],row['_resolve_chat'],row['sender'])).fetchone()
+            row['sender_name']=named['display_name'] if named else None
     resolve(c,p,[r for r in items if r['sender'] and r['_resolve_chat']],chat='_resolve_chat',sender='sender')
     out=[]
     for row in items:

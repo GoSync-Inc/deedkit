@@ -1,4 +1,5 @@
 """Scoped catalogue and evidence-backed, deliberately heuristic reply queue."""
+import re
 from psycopg.types.json import Jsonb
 
 from .policy import scope_filter,targets
@@ -192,9 +193,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         return (f"EXISTS(SELECT 1 FROM reply_snoozes sz WHERE sz.key_id={key} AND sz.chat={chat} AND sz.message={message}.id"
             f" AND sz.revision={message}.revision AND sz.snoozed_until{'<=' if due else '>'}CURRENT_TIMESTAMP)")
     if snoozes and awaiting_reply_days:
-        # A due snooze returns its hint even when it is older than the age window.
+        # A due snooze returns its hint even when it is older than the age window,
+        # only while it still names the chat's latest candidate: a due snooze lifts
+        # the window for the whole chat, so a newer hint stays the target.
         age=f'({age} OR {snooze_of("attention","c.id",True)})'
-        attention_age=f'({attention_age} OR {snooze_of("m","m.chat",True)})'
+        attention_age=(f'({attention_age} OR EXISTS(SELECT 1 FROM reply_snoozes sz WHERE sz.key_id={key}'
+            ' AND sz.chat=m.chat AND sz.snoozed_until<=CURRENT_TIMESTAMP))')
     sender_skip=(f'NOT EXISTS(SELECT 1 FROM reply_mutes rm WHERE rm.principal={principal} AND rm.account=m.account'
         ' AND rm.sender=m.sender)') if mutes else 'true'
     chat_muted=f'EXISTS(SELECT 1 FROM reply_mutes rc WHERE rc.principal={principal} AND rc.chat=c.id)'
@@ -303,8 +307,17 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         return lookup
     attention_lookup=attention_for(sender_skip)
     # Rank 1 is the hint a sender mute skipped, read only for the muted count and view.
-    ranked=('SELECT * FROM ((SELECT e.*,0 AS mute_rank FROM ('+attention_lookup+') e) UNION ALL (SELECT r.*,1 FROM ('+
-        attention_for('true')+') r)) ranked ORDER BY mute_rank LIMIT 1') if mutes and awaiting_reply else None
+    # The skipping hint ranks first only while it meets the request's own row filters,
+    # so a row the mute removed stays counted and visible under those filters.
+    ranked=ranked_args=None
+    if mutes and awaiting_reply:
+        kept=[unmuted_pending,*(['attention.question'] if only_questions else []),
+            *(['(attention.sender IS NULL OR NOT attention.sender=ANY(%s))'] if exclude_senders is not None else []),
+            *(['NOT '+broadcast] if exclude_likely_broadcasts else [])]
+        ranked_args=[exclude_senders] if exclude_senders is not None else []
+        kept=re.sub(r'\battention\.','e.',' AND '.join(kept))
+        ranked=('SELECT * FROM ((SELECT e.*,0 AS mute_rank FROM ('+attention_lookup+') e WHERE '+kept+') UNION ALL (SELECT r.*,1 FROM ('+
+            attention_for('true')+') r)) ranked ORDER BY mute_rank LIMIT 1')
     if include_muted and ranked:attention_lookup=ranked
     muted_flag=f"CASE WHEN {chat_muted} THEN 'chat' WHEN attention.mute_rank=1 THEN 'sender' END"
     def base_for(attention_lookup):return f''' FROM chats c JOIN accounts a ON a.id=c.account
@@ -312,12 +325,14 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
       LEFT JOIN LATERAL ({latest_sql(last_sql,both_directions=True)}) last ON true
       LEFT JOIN LATERAL ({latest_sql(owner_sql)}) own_last ON true
       LEFT JOIN LATERAL ({latest_sql(select_message+" AND m.direction='incoming'")}) incoming ON true
-      LEFT JOIN LATERAL ({attention_lookup}) attention ON true
-      LEFT JOIN sender_profiles sp ON sp.account=c.account AND sp.chat=c.id AND sp.sender=attention.sender
       LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
-      LEFT JOIN reply_dismissals d ON d.key_id=%s AND d.chat=c.id WHERE '''
+      LEFT JOIN reply_dismissals d ON d.key_id=%s AND d.chat=c.id
+      LEFT JOIN LATERAL ({attention_lookup}) attention ON true
+      LEFT JOIN sender_profiles sp ON sp.account=c.account AND sp.chat=c.id AND sp.sender=attention.sender WHERE '''
     base=base_for(attention_lookup)
     base_args=[score_at,owner_senders(c,p),p['key_id']]
+    ranked_base_args=[*base_args,*(ranked_args or [])]
+    if attention_lookup is ranked:base_args=ranked_base_args
     # A first queue page counts the same filtered rows it sorts, in one pass.
     inline_totals=awaiting_reply and not only_unread and not after
     excluded=None
@@ -333,7 +348,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     muted_total=None
     if ranked:
         muted_total=c.execute('SELECT count(*) AS n'+base_for(ranked)+' AND '.join([*(unmuted_pending if v==pending else v for v in clauses),
-            '('+chat_muted+' OR attention.mute_rank=1)']),[*base_args,*args]).fetchone()['n']
+            '('+chat_muted+' OR attention.mute_rank=1)']),[*ranked_base_args,*args]).fetchone()['n']
     if after:
         cid=valid_text(after,empty=False) if order=='id' else position_text(pos.get('id'))
         if not c.execute('SELECT 1 FROM chats c WHERE c.id=%s AND '+scope,[cid,*scope_filter(p,'c',chat_column='id')[1]]).fetchone():raise APIError('not_found',404)
