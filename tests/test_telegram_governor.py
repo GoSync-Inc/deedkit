@@ -179,3 +179,47 @@ def test_discovery_flushes_partial_page_and_retries_same_iterator_after_flood():
         assert clock()==60 and len(opens)==1
         with pytest.raises(StopAsyncIteration):await anext(batches)
     asyncio.run(scenario())
+
+
+# spec: ANYM-475
+def test_a_failed_cooldown_write_keeps_the_pause_and_is_retried_until_written():
+    from psycopg.errors import TransactionTimeout
+    async def scenario():
+        clock=Clock();state=State(clock);failures=[TransactionTimeout('synthetic'),TransactionTimeout('synthetic')]
+        persist=state.defer
+        def defer(seconds):
+            if failures:raise failures.pop()
+            persist(seconds)
+        state.defer=defer
+        gate=RequestGovernor(state,clock=clock,sleep=clock.sleep)
+        async def flooded():raise ProviderRateLimited(120)
+        # The server's transaction timeout is not a collector-stopping error: the caller sees the FloodWait.
+        with pytest.raises(ProviderRateLimited):await gate.call(flooded,'telegram_history')
+        assert state.until==0 and await gate.admit('search',1)==120  # retry fails again; the pause holds
+        async def read():raise AssertionError('no provider request during the pause')
+        with pytest.raises(ProviderRateLimited):await gate.scoped_call(read,'live_search','search')
+        assert state.until==120 and gate.unrecorded==0  # that refusal's retry persisted it
+    asyncio.run(scenario())
+
+
+# spec: ANYM-475
+def test_a_cancelled_cooldown_write_waits_one_bounded_budget(monkeypatch):
+    import time
+    from messaging_service import telegram_governor
+    monkeypatch.setattr(telegram_governor,'RECORD_SECONDS',0.2);monkeypatch.setattr(telegram_governor,'RECORD_GRACE',0.1)
+    async def scenario():
+        clock=Clock();state=State(clock);entered=Event();release=Event()
+        def defer(seconds):entered.set();release.wait(3)
+        state.defer=defer
+        gate=RequestGovernor(state,clock=clock,sleep=clock.sleep)
+        async def flooded():raise ProviderRateLimited(120)
+        task=asyncio.create_task(gate.call(flooded,'telegram_history'))
+        try:
+            assert await asyncio.to_thread(entered.wait,1)
+            began=time.monotonic();await asyncio.sleep(0.2);task.cancel()
+            with pytest.raises(asyncio.CancelledError):await task
+            elapsed=time.monotonic()-began
+        finally:release.set()
+        # One budget of 0.3 s from the write start; a fresh budget after cancellation would be 0.5 s.
+        assert elapsed<0.42 and not gate.lock.locked() and gate.unrecorded==120
+    asyncio.run(scenario())

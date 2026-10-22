@@ -1,8 +1,11 @@
 """Single-owner outbound pacing; the provider's required pause lives in PostgreSQL."""
 import asyncio
 import contextvars
+import logging
 import re
 import time
+
+logger=logging.getLogger(__name__)
 
 # ANYM-475: a FloodWait of at most this many seconds on an agent-requested read
 # pauses only that read's method scope; a longer one pauses the whole account.
@@ -15,6 +18,10 @@ UNKNOWN_FLOOD_SECONDS=60
 LIVE_BUDGETS={'search':(3,10.0,100),'chat_history':(3,10.0,300)}
 # The deadline-bound CollectorState of the live read running in this task (release-042 B1).
 LIVE_STATE=contextvars.ContextVar('live_state',default=None)
+# A cooldown write is one transaction that PostgreSQL ends after this many seconds, so a stalled write
+# never holds the lease fence; the caller waits for it at most this long plus RECORD_GRACE (release-042 B1).
+RECORD_SECONDS=2.0
+RECORD_GRACE=0.5
 
 
 class ProviderRateLimited(Exception):
@@ -49,9 +56,13 @@ def flood_seconds(exc):
 
 
 class RequestGovernor:
-    def __init__(self,state,*,interval=1.0,clock=time.monotonic,sleep=asyncio.sleep,wall=time.time,budgets=None):
+    def __init__(self,state,*,interval=1.0,clock=time.monotonic,sleep=asyncio.sleep,wall=time.time,budgets=None,
+                 bound=None):
         self.state,self.interval,self.clock,self.sleep,self.wall=state,interval,clock,sleep,wall
         self.lock=asyncio.Lock(); self.next_call=0
+        # bound(state, monotonic deadline) gives the same state with server-bounded transactions.
+        self.bound=bound
+        self.unrecorded=0  # monotonic end of an account cooldown whose write failed; retried before reads
         self.scoped={}  # scope -> monotonic end of a method-scoped FloodWait
         self.budgets={scope:LiveBudget(*limits,clock=clock,wall=wall) for scope,limits in (budgets or LIVE_BUDGETS).items()}
 
@@ -67,7 +78,7 @@ class RequestGovernor:
         # Re-read after waking: another operation/operator may extend the pause.
         # Cancellation interrupts sleep immediately; no provider/lease is opened here.
         while True:
-            remaining=await asyncio.to_thread(self.state.cooldown_remaining)
+            remaining=await self.account_remaining()
             if remaining<=0:return
             await self.sleep(min(remaining,30))
 
@@ -78,20 +89,53 @@ class RequestGovernor:
         """Seconds the scope must wait (account cooldown, its own FloodWait, its budget) or 0.
 
         Never sleeps and never calls the provider; a refusal spends no budget."""
-        remaining=max(self.scoped_remaining(scope),await asyncio.to_thread(self.state.cooldown_remaining))
+        remaining=max(self.scoped_remaining(scope),await self.account_remaining())
         if remaining>0:return max(1,int(remaining+0.999))
         return self.budgets[scope].take(requests)
 
+    async def account_remaining(self):
+        """Seconds of account cooldown: the persisted one, or an unwritten one kept in memory."""
+        left=self.unrecorded-self.clock()
+        if left>0:await self._write(max(1,int(left+0.999)))
+        else:self.unrecorded=0
+        remaining=await asyncio.to_thread(self.state.cooldown_remaining)
+        return max(remaining,self.unrecorded-self.clock())
+
     async def _record(self,seconds):
-        # Commit BEFORE releasing the shared gate or propagating the error.
-        # Never deadline-bound: a cooldown is recorded even after a live read's deadline; it is always awaited.
-        recording=asyncio.create_task(asyncio.to_thread(self._state.defer,seconds))
-        try:await asyncio.shield(recording)
+        # Commit BEFORE releasing the shared gate or propagating the error. The pause holds in memory
+        # first, so a write that fails or times out still gates this process and is retried later.
+        self.unrecorded=max(self.unrecorded,self.clock()+seconds)
+        await self._write(seconds)
+
+    async def _write(self,seconds):
+        """Persist the cooldown in one transaction bounded on the server; never past RECORD_SECONDS.
+
+        Not bound to a live read's deadline: the cooldown is recorded even after it. A cancelled caller
+        still waits, as the transaction holds the lease fence until PostgreSQL ends it; the caller waits at
+        most RECORD_SECONDS+RECORD_GRACE in total."""
+        # Any database error (the server's transaction timeout is an InternalError) keeps the pause in
+        # memory for a later retry; a lost lease is a RuntimeError and still raises.
+        from psycopg import Error
+        from psycopg_pool import PoolTimeout
+        state=self.bound(self._state,time.monotonic()+RECORD_SECONDS) if self.bound else self._state
+        recording=asyncio.ensure_future(asyncio.to_thread(state.defer,seconds))
+        loop=asyncio.get_running_loop();end=loop.time()+RECORD_SECONDS+RECORD_GRACE
+        cancelled=False
+        try:await asyncio.wait({recording},timeout=RECORD_SECONDS+RECORD_GRACE)
         except asyncio.CancelledError:
-            # to_thread cancellation does not stop its SQL. Wait for the
-            # bounded transaction before shutdown releases account ownership.
-            await recording
-            raise
+            # One wait budget in total, also when cancelled.
+            cancelled=True
+            await asyncio.wait({recording},timeout=max(0,end-loop.time()))
+        if not recording.done():
+            # The server has ended the transaction; the stalled thread's late error is dropped.
+            recording.add_done_callback(lambda t:t.cancelled() or t.exception())
+            logger.warning('cooldown_write_failed exception_type=TimeoutError')
+        elif isinstance(recording.exception(),(Error,PoolTimeout,TimeoutError)):
+            logger.warning('cooldown_write_failed exception_type=%s',type(recording.exception()).__name__)
+        else:
+            recording.result()  # a lost lease still raises
+            if self.unrecorded<=self.clock()+seconds:self.unrecorded=0
+        if cancelled:raise asyncio.CancelledError
 
     async def call(self,operation,phase):
         from telethon.errors import FloodWaitError
@@ -118,7 +162,7 @@ class RequestGovernor:
         from telethon.errors import FloodError,FloodWaitError
         async with self.lock:
             async def refusal():
-                remaining=max(self.scoped_remaining(scope),await asyncio.to_thread(self.state.cooldown_remaining))
+                remaining=max(self.scoped_remaining(scope),await self.account_remaining())
                 if remaining>0:raise ProviderRateLimited(remaining+0.999)
             await refusal()
             delay=self.next_call-self.clock()
