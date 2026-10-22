@@ -23,7 +23,7 @@ class State:
     def cooldown_remaining(self):return max(0,self.until-self.clock())
     def defer(self,seconds):self.until=max(self.until,self.clock()+seconds)
     def status(self,status,phase):self.phases.append((status,phase))
-    def phase(self,name,state,code):self.phases.append((name,state,code))
+    def phase(self,name,state,code,**identity):self.phases.append((name,state,code))
     def connection_gate(self):return {'blocked':False,'remaining_seconds':0}
 
 

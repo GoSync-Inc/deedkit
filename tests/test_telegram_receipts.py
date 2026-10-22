@@ -294,7 +294,7 @@ def test_receipt_callback_is_subscribed_before_connect_with_explicit_capability(
     worker.provider = NS(supports_receipts=supports, subscribe=subscribe, connect=connect,
         disconnect=disconnect)
     state = NS(policy=lambda: worker.policy, status=lambda *args: None,
-        phase=lambda *args: None, connection_gate=lambda: {'blocked': False, 'remaining_seconds': 0},
+        phase=lambda *args, **identity: None, connection_gate=lambda: {'blocked': False, 'remaining_seconds': 0},
         connection_failed=lambda code: pytest.fail(code))
     worker.state_class = lambda *args: state
     worker.archive = NS(acquire=lambda *args: 1, release=lambda *args: lifecycle.append('release'))
