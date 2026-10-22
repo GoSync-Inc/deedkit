@@ -402,6 +402,30 @@ def test_gap_write_waits_for_a_running_heartbeat_and_is_retried_before_the_next(
     assert _gap_race(tmp_path, 'heartbeat') == ['heartbeat', 'gap_failed', 'gap', 'heartbeat']
 
 # spec: ANYM-275
+def test_a_stalled_spool_scan_never_holds_up_a_gap_write():
+    import asyncio
+    import threading
+    from types import SimpleNamespace as NS
+    from messaging_service.telegram_collector import TelegramCollector, TelethonProvider
+    scanning, release, gaps = threading.Event(), threading.Event(), []
+    class Path:
+        def glob(self, pattern):
+            scanning.set(); release.wait(5); return iter(())
+    spool = NS(path=Path(), drain=lambda apply, limit: None, quarantined=lambda: 0)
+    provider = object.__new__(TelethonProvider)
+    provider.read_gap_state = NS(update_gap=lambda *args: gaps.append('gap'))
+    worker = TelegramCollector(None, 'fresh-test', provider, spool, writer=object())
+    worker.state = NS(capture_progress=lambda *args, **health: None)
+    async def scenario():
+        drain = asyncio.create_task(worker.drain_captures([spool]))
+        await asyncio.to_thread(scanning.wait, 5)
+        try: await asyncio.wait_for(provider.record_read_gap(), 1)
+        finally: release.set()
+        await drain
+    asyncio.run(scenario())
+    assert gaps == ['gap']
+
+# spec: ANYM-275
 def test_receipt_without_retained_messages_invalidates_the_count(wa):
     s, message, read, row, reads = wa
     message('A', 10)

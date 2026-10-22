@@ -809,10 +809,11 @@ class TelegramCollector:
             skipped,self.rejected_messages=getattr(self,'rejected_messages',[]),[]
             if skipped:extra['rejected_messages']=skipped
             try:
+                backlog=await asyncio.to_thread(pending,spools)
                 # A gap write waits for this heartbeat; one that failed meanwhile is written first.
                 async with gap_lock:
                     await self.flush_read_gap()
-                    await asyncio.to_thread(self.state.capture_progress,last,count,await asyncio.to_thread(pending,spools),
+                    await asyncio.to_thread(self.state.capture_progress,last,count,backlog,
                         quarantined=min(20000,quarantined),invalid=invalid,**extra)
             except BaseException:
                 # Skipped items have no spool record to replay; keep their counts for the retry.
