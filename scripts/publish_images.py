@@ -26,7 +26,7 @@ ABSENT = ("manifest unknown", "name unknown")  # the registry's MANIFEST_UNKNOWN
 MANIFESTS = {"application/vnd.docker.distribution.manifest.v2+json", "application/vnd.oci.image.manifest.v1+json"}
 # A network or API failure that says nothing about the image: a read retries it ATTEMPTS times, waiting BACKOFF,
 # 2*BACKOFF, ... seconds in between. Anything else (404, "no attestations found", a policy mismatch) is final.
-# gh fetches the Sigstore trusted root on every call; when that fetch fails it says nothing about the image.
+# Every gh call initializes its Sigstore verifier, which can fail transiently (likely the trusted-root fetch); that says nothing about the image.
 TRANSIENT = re.compile(r"(?:HTTP(?: status:)?|status code|StatusCode:) (?:429|5\d\d)|rate limit|Internal Server Error"
                        r"|Bad Gateway|Service Unavailable|Gateway Time-?out|Too Many Requests|\bEOF\b|connection (?:reset|refused)|broken pipe|timeout|timed out"
                        r"|TLS handshake|no such host|temporary failure|Sigstore verifier"
