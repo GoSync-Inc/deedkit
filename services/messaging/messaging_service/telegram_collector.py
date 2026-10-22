@@ -745,6 +745,7 @@ class TelegramCollector:
             await asyncio.sleep(self.heartbeat_interval)
             await self.renew_lease()
             await self.refresh_policy()
+            await self.publish_disk_floors()
 
     async def media_once(self):
         governor=getattr(self.provider,'governor',None)
@@ -838,6 +839,11 @@ class TelegramCollector:
             getattr(self,'history_spool',None)) if s is not None and hasattr(s,'path') and hasattr(s,'reserve_bytes')]
         return disk_floors(places)
 
+    async def publish_disk_floors(self):
+        """Best effort, again each heartbeat: until it lands cold restores wait (ANYM-350)."""
+        with suppress(Exception):
+            await asyncio.to_thread(self.state.disk_floors,self.disk_floors())
+
     async def run(self):
         started=time.monotonic()
         epoch=await asyncio.to_thread(self.archive.acquire,self.account,self.owner,self.lease_ttl)
@@ -850,9 +856,7 @@ class TelegramCollector:
             # Status evidence only: without it sync status keeps its unknown basis.
             with suppress(Exception):
                 await asyncio.to_thread(self.state.media_policy,self.media_prefetch_days,self.history_since)
-            # Best effort: without it cold restores keep only their own floor.
-            with suppress(Exception):
-                await asyncio.to_thread(self.state.disk_floors,self.disk_floors())
+            await self.publish_disk_floors()
             sweep=getattr(self.writer,'sweep_abandoned',None)
             if sweep is not None:
                 # Best effort: leftovers only waste disk, they never block capture.

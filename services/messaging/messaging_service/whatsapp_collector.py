@@ -456,6 +456,7 @@ class WhatsAppCollector(TelegramCollector):
             await asyncio.sleep(self.heartbeat_interval)
             await self.renew_lease()
             await self.refresh_policy()
+            await self.publish_disk_floors()
             await self.provider.set_policy(self.policy)
             if isinstance(self.provider,WhatsmeowProvider):
                 status=await asyncio.to_thread(self.provider.history_status)

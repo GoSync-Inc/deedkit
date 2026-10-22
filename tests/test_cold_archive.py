@@ -80,12 +80,15 @@ def keys(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def clear_cold_copies(database):
-    with database.pool.connection() as c:c.execute('DELETE FROM attachment_cold_copies')
-    yield
-    with database.pool.connection() as c:
+    def clear(c):
         c.execute('DELETE FROM attachment_cold_copies')
-        # Published collector floors would hold later restores to them.
+        # Published collector floors would hold later restores to them, and a live
+        # collector lease without a current floor defers them (ANYM-350).
         c.execute("UPDATE collector_health SET operations=operations-'disk_floors' WHERE operations ? 'disk_floors'")
+        c.execute("UPDATE collector_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE expires_at>clock_timestamp()")
+    with database.pool.connection() as c:clear(c)
+    yield
+    with database.pool.connection() as c:clear(c)
 
 
 @pytest.fixture(autouse=True)
@@ -1025,3 +1028,78 @@ def test_collectors_publish_media_and_capture_floors_per_volume(archive,tmp_path
     state.disk_floors(floors)
     with s.pool.connection() as c:assert published_floor(c,volume)>=floors[volume]
 
+
+# spec: ANYM-350
+def test_restore_waits_while_a_live_collector_has_no_current_floor(env,archive):
+    _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive,mid='floor-unknown-1',payload=b'Synthetic unknown floor')
+    s.request_file_download(key,fid);reads=calls(cloud).count('get_object')
+    # The collector's first publication failed: its live lease has no floor for this epoch.
+    run=floor_publisher(s,fid)
+    report=restorer(env).run_once()
+    assert report['reasons']=={'disk_reserve':1} and calls(cloud).count('get_object')==reads
+    assert not resident(s,blob.digest) and job_state(s,fid)=='ready'
+    with s.pool.connection() as c:c.execute("UPDATE attachment_cold_copies SET restore_finished_at=clock_timestamp()-interval '10 minutes' WHERE digest=%s",(blob.digest,))
+    # A later heartbeat publishes; the next request restores.
+    run.disk_floors({'fs:1':0})
+    assert s.request_file_download(key,fid)['rehydration_source']=='cold_archive'
+    assert restorer(env).run_once()['restored']==1 and resident(s,blob.digest)
+
+
+# spec: ANYM-350
+def test_collectors_republish_floors_each_heartbeat_and_survive_failure():
+    import asyncio
+    from types import SimpleNamespace
+    from messaging_service.telegram_collector import TelegramCollector
+    from messaging_service.whatsapp_collector import WhatsAppCollector
+    class Stop(Exception):pass
+    for heartbeat in (TelegramCollector.heartbeat,WhatsAppCollector.heartbeat):
+        published=[];ticks=[]
+        def disk_floors(floors):
+            published.append(floors)
+            if len(published)==1:raise OSError('database unavailable')
+        async def renew_lease():
+            ticks.append(1)
+            if len(ticks)>3:raise Stop
+        async def nothing(*args):pass
+        run=SimpleNamespace(heartbeat_interval=0,renew_lease=renew_lease,refresh_policy=nothing,policy=None,
+            provider=SimpleNamespace(set_policy=nothing),state=SimpleNamespace(disk_floors=disk_floors),
+            disk_floors=lambda:{'fs:1':1})
+        run.publish_disk_floors=lambda:TelegramCollector.publish_disk_floors(run)
+        with pytest.raises(Stop):asyncio.run(heartbeat(run))
+        # A failed publication never stops the heartbeat; the next one retries.
+        assert published==[{'fs:1':1}]*3
+
+
+# spec: ANYM-350
+def test_cold_role_without_the_lease_grant_defers_restores(env,archive):
+    from contextlib import contextmanager
+    from copy import copy as clone
+    from uuid import uuid4
+    from psycopg import sql
+    _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive,mid='floor-grant-1',payload=b'Synthetic grant')
+    role='messaging_cold_archive_'+uuid4().hex
+    class RestrictedPool:
+        @contextmanager
+        def connection(self):
+            with s.pool.connection() as c:
+                c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+                yield c
+    root=Path(__file__).resolve().parents[1]/'services/messaging/messaging_service'
+    with s.pool.connection() as c:c.execute((root/'cold_archive_role.sql').read_text().replace('messaging_cold_archive',role))
+    worker=restorer(env);worker.store=clone(s);worker.store.pool=RestrictedPool()
+    try:
+        with s.pool.connection() as c:
+            c.execute(sql.SQL('REVOKE SELECT ON collector_leases FROM {}').format(sql.Identifier(role)))
+        s.request_file_download(key,fid);reads=calls(cloud).count('get_object')
+        report=worker.run_once()
+        assert report['reasons']=={'disk_reserve':1} and calls(cloud).count('get_object')==reads
+        assert not resident(s,blob.digest)
+        with s.pool.connection() as c:
+            c.execute("UPDATE attachment_cold_copies SET restore_finished_at=clock_timestamp()-interval '10 minutes' WHERE digest=%s",(blob.digest,))
+            c.execute((root/'cold_archive_role.sql').read_text().replace('messaging_cold_archive',role))
+        assert s.request_file_download(key,fid)['rehydration_source']=='cold_archive'
+        assert worker.run_once()['restored']==1 and resident(s,blob.digest)
+    finally:
+        with s.pool.connection() as c:
+            c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
+            c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))

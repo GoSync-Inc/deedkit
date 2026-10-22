@@ -200,9 +200,13 @@ published and re-registered resident; text, ASR and descriptions are untouched.
   `restore_disk_reserve_bytes` (default and minimum 10 GiB) and the highest
   floor any collector publishes for that volume. Each collector publishes the
   max of its media, live-media and capture-spool floors per volume in
-  `collector_health.operations.disk_floors`; the cold role reads that column
+  `collector_health.operations.disk_floors` at start and again each heartbeat;
+  the cold role reads that column and the collector leases
   (`cold_archive_role.sql`, which also exposes the rest of the operations JSON,
-  including the identity's self id). An object over `max_object_bytes` is
+  including the identity's self id). Admission fails closed: while any
+  collector holds a live lease without a floor for its current epoch, or the
+  grants are missing, the restore waits as `disk_reserve` and capture is
+  untouched. An object over `max_object_bytes` is
   refused the same way. In the same transaction the admitted restore leases its
   bytes: a copy whose `restore_finished_at` lies in the future (one transfer
   timeout ahead) holds a lease, and the gateway's 15-minute provider hand-over

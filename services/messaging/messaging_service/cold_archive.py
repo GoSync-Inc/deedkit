@@ -474,7 +474,10 @@ class ColdRestorer(ColdArchiver):
         reserved+=c.execute("""SELECT coalesce(sum(2*bytes+%s),0) AS bytes FROM file_uploads
             WHERE volume_key=%s AND state<>'expired'""",(STREAM_WORKSPACE_BYTES,volume)).fetchone()['bytes']
         reserved+=restore_reserved(c,excluding=digest)
-        floor=max(self.reserve_bytes,published_floor(c,volume))
+        published=published_floor(c,volume)
+        # Unknown collector floors defer the restore like a full disk; capture keeps its own floor.
+        if published is None:return 'disk_reserve',None
+        floor=max(self.reserve_bytes,published)
         free=shutil.disk_usage(self.store.files).free
         if not has_capacity(free,reserved,size+STREAM_WORKSPACE_BYTES,floor):return 'disk_reserve',None
         # The lease ends with the transfer timeout; a crashed worker's lease lapses on its own.
