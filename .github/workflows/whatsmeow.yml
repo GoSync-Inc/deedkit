@@ -21,10 +21,13 @@ jobs:
         with:
           go-version: '1.26.9'
           cache-dependency-path: whatsapp/whatsmeow/go.sum
+      - name: Check the whatsmeow fork against upstream and fork.patch
+        run: python3 scripts/check_whatsmeow_fork.py
       - name: Test durable capture, operations and offline contracts
         working-directory: whatsapp/whatsmeow
         run: |
           go test -race -count=1 -json ./... > "$RUNNER_TEMP/whatsmeow-tests.json"
+          go test -race -count=1 -run '^TestFork' go.mau.fi/whatsmeow
           go vet ./...
           CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/anymsg-whatsmeow" .
           go version -m "$RUNNER_TEMP/anymsg-whatsmeow" > "$RUNNER_TEMP/whatsmeow-build.txt"

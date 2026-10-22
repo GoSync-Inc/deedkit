@@ -212,6 +212,9 @@ jobs:
         with:
           go-version: '1.26.9'
           cache-dependency-path: whatsapp/whatsmeow/go.sum
+      # ANYM-441: the forked whatsmeow pin must equal upstream + fork.patch before any of its code is built.
+      - name: Check the whatsmeow fork against upstream and fork.patch
+        run: python3 scripts/check_whatsmeow_fork.py
       - name: Build native WhatsApp offline normalizer
         run: |
           cd whatsapp/whatsmeow
@@ -497,10 +500,17 @@ jobs:
           cache-dependency-path: |
             whatsapp/whatsmeow/go.sum
             services/release-router/go.sum
+      - name: Check the whatsmeow fork against upstream and fork.patch
+        id: whatsmeow_fork
+        run: python3 scripts/check_whatsmeow_fork.py
       - name: Native WhatsApp adapter tests
         id: whatsmeow
         working-directory: whatsapp/whatsmeow
         run: go test -race -count=1 -json ./... > "$RUNNER_TEMP/ci-evidence/whatsmeow.json"
+      - name: Forked whatsmeow patch tests
+        if: ${{ !cancelled() && steps.whatsmeow_fork.outcome == 'success' }}
+        working-directory: whatsapp/whatsmeow
+        run: go test -race -count=1 -run '^TestFork' go.mau.fi/whatsmeow
       - name: Release router tests
         id: release_router
         if: ${{ !cancelled() }}
@@ -605,6 +615,9 @@ jobs:
         with:
           go-version: '1.26.9'
           cache-dependency-path: whatsapp/whatsmeow/go.sum
+      # ANYM-441: the forked whatsmeow pin must equal upstream + fork.patch before any of its code is built.
+      - name: Check the whatsmeow fork against upstream and fork.patch
+        run: python3 scripts/check_whatsmeow_fork.py
       - name: Build native WhatsApp offline normalizer
         run: |
           cd whatsapp/whatsmeow

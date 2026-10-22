@@ -49,7 +49,9 @@ Current contract:
 - `services/messaging/messaging_service/whatsapp_collector.py` and
   `whatsapp_identity.py`.
 
-Native API pin: `go.mau.fi/whatsmeow v0.0.0-20261014094007-f16f9ca30d6a`.
+Native API pin: `go.mau.fi/whatsmeow v0.0.0-20261014094007-f16f9ca30d6a`, built from
+the fork `github.com/GoSync-Inc/whatsmeow` at fa2ca87d4bd8 (upstream plus
+`whatsapp/whatsmeow/fork.patch`, ANYM-441; see `docs/whatsapp-native.md`, License).
 The map below was checked against its `send.go`, `receipt.go`, `group.go`,
 `user.go`, `appstate/encode.go`, `store/store.go` and event definitions. A named
 upstream API proves feasibility, not AnyMsg implementation or live behavior.
