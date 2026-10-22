@@ -5,10 +5,12 @@ are terminal unknown and are never retried automatically.
 """
 import asyncio
 import hashlib
+import logging
 import math
 import os
 import re
 import stat
+import time
 
 from psycopg.types.json import Jsonb
 
@@ -18,15 +20,25 @@ from .store import APIError, serial
 from .outgoing import finish_durably
 
 MAX_FILE_BYTES = 32 * 1024**2
+LIVE_SEARCH = 'search_messages_live'
+# ANYM-475: governor waits, resolution, the provider request and the receipt together.
+LIVE_SEARCH_TIMEOUT = 15
+# Kept free inside LIVE_SEARCH_TIMEOUT for the foreground loop's pacing, so a queued send starts within it.
+LIVE_FOREGROUND_RESERVE = 1.0
+# Preflight, governor waits and the request end this long after the claim; the rest is the receipt's.
+LIVE_EXECUTION_TIMEOUT = 8
 PHONE_LOOKUPS_PER_HOUR = 10
 OPEN_CHAT_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
     '--operations <current operations> open_chat_by_phone')
+log = logging.getLogger('anymsg.live_search')
 BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session','session_data',
     'password','secret','stack','traceback','diagnostic','diagnostics','credentials'))
 
 
 class CommandRejected(RuntimeError):
     """Known local rejection before invoking a provider operation."""
+    def __init__(self,code,*,retry_after=None):
+        super().__init__(code);self.retry_after=retry_after
 
 
 def safe_result(value):
@@ -116,7 +128,8 @@ def _policy(c,account,operation,provider_chats=(),*,ready=False):
             (account,)).fetchone()
         if (not connected or not connected['active'] or
             connected['operations'].get('connection',{}).get('state')!='connected'):
-            raise APIError('sender_not_ready',409)
+            # ANYM-475: a live read is refused at once instead of waiting in the queue.
+            raise APIError('session_unavailable' if operation==LIVE_SEARCH else 'sender_not_ready',409)
 
 
 def _chat(c,p,account,chat_id):
@@ -176,6 +189,12 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     from .messenger_operations import validate_operation,operation_manifest,CATALOG_VERSION,ParameterError
     from .whatsapp_capabilities import account_provider
     spec=_spec(operation);account_row=_account(c,p,account)
+    if operation==LIVE_SEARCH and not chat_id:
+        # ANYM-475: without a chat the live search spans every chat of the account.
+        spec.update(target='account',full_account=True)
+    if operation==LIVE_SEARCH and chat_id and p['chat_ids'] is not None and chat_id not in p['chat_ids']:
+        # A chat-scoped key learns nothing about chats outside its scope, existing or not.
+        raise APIError('forbidden',403)
     provider=account_provider(c,account,account_row['platform'])
     required=_required_permissions(spec['permission'],operation,parameters)
     if set(required)-set(p['permissions']):raise APIError('forbidden',403)
@@ -491,6 +510,11 @@ def status(store,c,p,operation_id):
 class CommandWorker:
     def __init__(self,state,execute,gate=None):
         self.state,self.execute,self.gate=state,execute,gate
+        self.settling,self.unsettled=set(),None
+
+    def _settled(self,task):
+        self.settling.discard(task)
+        if not task.cancelled() and task.exception() is not None:self.unsettled=task.exception()
 
     def _identity(self,c,row):
         lock_principal(c,row['principal'],shared=True)
@@ -506,9 +530,11 @@ class CommandWorker:
         st=self.state;store=st.archive.store
         with store.pool.connection() as c:
             st.archive.fence(c,st.account,st.lease)
+            # A row locked by a live receipt is skipped, not waited for under the fence; a later claim recovers it.
             c.execute("""UPDATE messenger_commands SET status='unknown',error_code='operation_result_unknown',
-                finished_at=clock_timestamp() WHERE account=%s AND status='dispatching'
-                AND (lease_epoch IS DISTINCT FROM %s OR expires_at<=clock_timestamp())""",(st.account,st.lease[1]))
+                finished_at=clock_timestamp() WHERE id IN (SELECT id FROM messenger_commands WHERE account=%s
+                AND status='dispatching' AND (lease_epoch IS DISTINCT FROM %s OR expires_at<=clock_timestamp())
+                FOR UPDATE SKIP LOCKED)""",(st.account,st.lease[1]))
             row=c.execute("""SELECT * FROM messenger_commands WHERE account=%s AND status='queued'
                 ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED""",(st.account,)).fetchone()
             if not row:return None
@@ -567,6 +593,38 @@ class CommandWorker:
                 WHERE id=%s AND status='dispatching' AND lease_epoch=%s''',
                 (status,Jsonb(result) if result is not None else None,code,job['id'],st.lease[1]))
 
+    def finish_live(self,job,status,result,code,budget):
+        """Record a live read's receipt in one attempt bounded by the budget left (ANYM-475).
+
+        It takes no lease fence: the fence locks the lease row every send claim needs, and a
+        commit can stall while holding it. The UPDATE checks ownership without a lock and writes
+        only a dispatching row of this lease; a new owner's recovery skips the row while the receipt
+        holds it and otherwise rechecks its status, so neither overwrites the other's outcome. It
+        runs off the foreground path (see settle in _once). The pool wait and each
+        statement get only what is left of one deadline. Nothing is retried: the row stays
+        dispatching, and claim or the receipt read reports it unknown after the lease changes or
+        the operation expires. A lost lease stops the collector at its next fenced step."""
+        import psycopg
+        from psycopg_pool import PoolTimeout
+        st=self.state;end=time.monotonic()+budget
+        def left():
+            remaining=end-time.monotonic()
+            if remaining<=0:raise TimeoutError('live_receipt_deadline')
+            return remaining
+        def bound(c):
+            ms=str(max(1,int(left()*1000)))
+            c.execute("SELECT set_config('lock_timeout',%s,true),set_config('statement_timeout',%s,true)",(ms,ms))
+        try:
+            with st.archive.store.pool.connection(timeout=left()) as c:
+                bound(c);c.execute('''UPDATE messenger_commands SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
+                    WHERE id=%s AND account=%s AND status='dispatching' AND lease_epoch=%s AND EXISTS(
+                        SELECT 1 FROM collector_leases WHERE account=%s AND owner=%s AND epoch=%s
+                        AND expires_at>clock_timestamp())''',
+                    (status,Jsonb(result) if result is not None else None,code,job['id'],st.account,st.lease[1],
+                     st.account,st.lease[0],st.lease[1]))
+        except (psycopg.OperationalError,PoolTimeout,TimeoutError) as exc:
+            log.warning('live_search receipt_unrecorded %s',type(exc).__name__)
+
     def archived(self,chat):
         """Whether the archive holds this exact chat (the adapter's local LID)."""
         with self.state.archive.store.pool.connection() as c:
@@ -612,6 +670,7 @@ class CommandWorker:
                 WHERE id=%s''',(status,Jsonb(result) if result is not None else None,code,row['id']))
 
     async def once(self):
+        if self.unsettled is not None:raise self.unsettled
         if await asyncio.to_thread(self.state.cooldown_remaining)>0:return False
         if self.gate is not None:
             async with self.gate:return await self._once()
@@ -622,8 +681,24 @@ class CommandWorker:
         if not job:return False
         if job.get('cancelled'):return True
         phases=[]
+        live=job['operation']==LIVE_SEARCH
+        # ANYM-475: one deadline from the claim bounds preflight, governor waits, the request and the receipt.
+        loop=asyncio.get_running_loop();end=loop.time()+max(0.0,LIVE_SEARCH_TIMEOUT-LIVE_FOREGROUND_RESERVE)
+        deadline=min(end,loop.time()+LIVE_EXECUTION_TIMEOUT)
+        def left():return max(0.0,deadline-loop.time())
+        async def settle(*args):
+            if not live:return await finish_durably(self.finish,*args)
+            # One tracked attempt off the foreground path: no receipt commit holds up the send loop.
+            # At most one in flight, so receipts take at most one pool connection; a skipped one
+            # leaves the row dispatching, read as unknown once it expires.
+            if self.settling:return log.warning('live_search receipt_unrecorded receipt_in_flight')
+            task=asyncio.create_task(asyncio.to_thread(self.finish_live,*args,max(0.0,end-loop.time())))
+            self.settling.add(task);task.add_done_callback(self._settled)
         try:
-            await asyncio.to_thread(self.preflight,job)
+            if not live:await asyncio.to_thread(self.preflight,job)
+            else:
+                try:await asyncio.wait_for(asyncio.to_thread(self.preflight,job),left())
+                except TimeoutError:raise CommandRejected('provider_timeout') from None
             async def last_moment_preflight():
                 await asyncio.to_thread(self.preflight,job,verify_file=False)
             job['_preflight']=last_moment_preflight
@@ -633,7 +708,12 @@ class CommandWorker:
             # Providers report 'waiting' and then 'started' before the first mutation.
             job['_provider_phase']=phases.append
             timeout=180 if job['operation']=='send_file' else 30
-            answer=safe_result(await asyncio.wait_for(self.execute(job),timeout))
+            if live:timeout=left()
+            try:answer=safe_result(await asyncio.wait_for(self.execute(job),timeout))
+            except TimeoutError:
+                # A read changes nothing at the provider, so its timeout is a safe-to-repeat refusal.
+                if job['mutation'] or not live:raise
+                raise CommandRejected('provider_timeout') from None
             if isinstance(answer.get('data'),dict) and 'archive_reference' in answer['data']:
                 from .outgoing import archive_reference
                 archive_reference(job,{'provider_message_id':answer.get('provider_message_id'),
@@ -643,23 +723,25 @@ class CommandWorker:
                 'operation_target_changed','sender_not_ready','attachment_unavailable','unsupported_operation',
                 'forbidden','not_found','operation_rejected','identity_unresolved','chat_not_collected',
                 'rate_limited','provider_timeout','invalid_phone','invite_invalid','invite_expired','chat_full',
-                'join_not_allowed','already_member') else 'operation_rejected'
+                'join_not_allowed','already_member','invalid_cursor') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
+            if code=='rate_limited' and exc.retry_after:
+                result={'data':{'code':code,'retry_after':exc.retry_after}}
             if code=='rate_limited' and job['operation']=='open_chat_by_phone':
                 result={'data':{'code':code,'resets_in_seconds':job.get('_lookup_resets_in') or 1,'provider_lookup':False}}
-            await finish_durably(self.finish,job,'expired' if code=='operation_expired' else 'failed',result,code)
+            await settle(job,'expired' if code=='operation_expired' else 'failed',result,code)
         except Exception:
             # A provider that reports no phase stays conservative: any mutation may have run.
             if job['mutation'] and phases and phases[-1]!='started':
-                await finish_durably(self.finish,job,'failed',None,'operation_not_started')
+                await settle(job,'failed',None,'operation_not_started')
             else:
-                await finish_durably(self.finish,job,'unknown' if job['mutation'] else 'failed',None,'operation_result_unknown')
+                await settle(job,'unknown' if job['mutation'] else 'failed',None,'operation_result_unknown')
         else:
             if job['operation']=='open_chat_by_phone' and answer['outcome']=='confirmed':
                 await finish_durably(self.finish_open_chat,job,answer)
                 return True
             confirmed=answer['outcome']=='confirmed'
-            await finish_durably(self.finish,job,'succeeded' if confirmed else
+            await settle(job,'succeeded' if confirmed else
                 'unknown' if job['mutation'] else 'failed',answer,None if confirmed else 'operation_result_unknown')
         return True
