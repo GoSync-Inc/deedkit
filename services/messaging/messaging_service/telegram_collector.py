@@ -19,6 +19,7 @@ import traceback
 from .adapters import telegram_message
 from .archive import Archive
 from .blobs import BlobWriter
+from .envelope import stable_id
 from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,session_lock
 from .spool import InvalidCapture
 from .store import Store
@@ -26,6 +27,8 @@ from .telegram_governor import LIVE_BUDGETS,ProviderRateLimited,RequestGovernor
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .storage_admission import MEDIA_RESERVE_BYTES
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy,validate_prefetch_days
+
+log=logging.getLogger(__name__)
 
 
 class ProviderUnavailable(Exception): pass
@@ -975,7 +978,32 @@ class TelegramCollector:
 
     async def execute_operation(self,job):
         job['_policy']=await asyncio.to_thread(self.state.policy)
-        return await self.provider.execute_operation(job)
+        if job.get('operation')!='search_messages_live': return await self.provider.execute_operation(job)
+        job['_live_hits']=found=[]
+        answer=await self.provider.execute_operation(job)
+        await self.store_live_hits(found)
+        return answer
+
+    async def store_live_hits(self,found):
+        """ANYM-476: archive live search hits as backfill through the history page commit.
+
+        Checkpoints and coverage stay with the history traversal. A hit that cannot be stored is
+        reported in its receipt and never fails the search or the collector."""
+        stored=skipped=failed=0
+        for message,hit,chat_type,title in found:
+            if not self.in_window([message]):
+                hit.update(stored=False,reason='outside_history_window'); skipped+=1; continue
+            chat=str(message.chat_id);invalid=self.invalid_messages
+            try:
+                kind=peer_kind(message)
+                await asyncio.to_thread(self.state.catalog,chat,kind,title or chat,chat_type,self.history_since)
+                await self.commit_page([message],chat,title or '',kind,'backfill')
+            except Exception as exc:
+                log.warning('live_search_store_failed error=%s',type(exc).__name__); invalid=None
+            if invalid is None or self.invalid_messages>invalid:
+                hit.update(stored=False,reason='not_stored'); failed+=1; continue
+            hit.update(stored=True,message_id=stable_id('msg',self.account,chat,str(message.id))); stored+=1
+        if found: log.info('live_search_store stored=%d outside_window=%d not_stored=%d',stored,skipped,failed)
 
     async def send_outgoing(self,job):
         receipt=await self.provider.send_text(job)

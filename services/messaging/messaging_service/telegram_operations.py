@@ -1099,7 +1099,8 @@ LIVE_TEXT = 300
 # name a message or chat the policy excludes, so an agent sees only the token.
 LIVE_CURSORS = {}
 LIVE_CURSORS_MAX = 1024
-LIVE_RECEIPT_BYTES = 56000
+# Leaves room for the archive fields ANYM-476 adds to each hit after the request (about 60 bytes x 50).
+LIVE_RECEIPT_BYTES = 52000
 
 
 def chat_kind(entity):
@@ -1233,7 +1234,7 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
         except (TypeError, ValueError):
             continue
     raw = [m for m in (getattr(response, 'messages', None) or [])[:limit] if isinstance(m, types.Message)]
-    hits = []
+    hits, kept = [], job.get('_live_hits')
     for message in raw:
         try:
             provider_chat = str(utils.get_peer_id(message.peer_id))
@@ -1255,6 +1256,9 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
                      'time': message.date.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
                      'sender': {'id': sender, 'name': entity_name(entities.get(sender)) if sender else None},
                      'text': safe_text(message.message, LIVE_TEXT) or ''})
+        if kept is not None:
+            # ANYM-476: the collector archives these after the request; the receipt never carries them.
+            kept.append((message, hits[-1], kind, entity_name(entity)))
     next_cursor = None
     if len(raw) >= limit and raw and not isinstance(response, types.messages.Messages):
         last = raw[-1]
