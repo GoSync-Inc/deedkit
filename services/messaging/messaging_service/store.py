@@ -262,7 +262,7 @@ class Store:
                     'context':'independent_before_and_after_counts','chat_orders':['id','activity','last_activity_desc','priority'],
                     'chat_order_default':'activity','awaiting_reply_default_days':14,
                     'awaiting_reply_bots':'exclude_observed_bot_senders_not_name_guesses',
-                    'reply_queue_filters':['exclude_chats','exclude_senders','only_questions','only_unread','chat_types','exclude_likely_broadcasts'],
+                    'reply_queue_filters':['exclude_chats','exclude_senders','only_questions','only_unread','chat_types','exclude_likely_broadcasts','promotional'],
                     'reply_queue_dismissal':'credential_local_until_next_meaningful_incoming',
                     'owner_read_state':'timestamped_provider_observations_unknown_or_stale_explicit',
                     'sync_status_details':['compact','full'],
@@ -436,7 +436,7 @@ class Store:
                    order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
                    include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
                    only_questions=False,only_unread=False,view='archive',exclude_likely_broadcasts=False,
-                   include_muted=False):
+                   include_muted=False,promotional='exclude'):
         from .chat_queries import list_chats
         from .message_queries import hint_forward_origin
         with self.authorized(token,'list_chats') as (c,p):
@@ -445,7 +445,7 @@ class Store:
                 from_time=from_time,to_time=to_time,include_coverage=include_coverage,
                 awaiting_reply_days=awaiting_reply_days,exclude_chats=exclude_chats,exclude_senders=exclude_senders,
                 only_questions=only_questions,only_unread=only_unread,view=view,
-                exclude_likely_broadcasts=exclude_likely_broadcasts,include_muted=include_muted)
+                exclude_likely_broadcasts=exclude_likely_broadcasts,include_muted=include_muted,promotional=promotional)
             hint_forward_origin(c,result['items'])
             return result
 
