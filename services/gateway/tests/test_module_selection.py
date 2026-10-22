@@ -48,11 +48,13 @@ def gateway(tmp_path):
     value["profiles"]["reader"] = {"tools": PLATFORM + [t for m in MODULES for t in MODULE_TOOLS[m]], "actions": {}}
     value["principals"] = [principal(tmp_path, "a", MODULES), principal(tmp_path, "b", MODULES)]
     path = tmp_path / "policy.json"
-    requests = []
+    requests, down = [], set()
 
     def handler(module):
         def respond(request):
             requests.append((module, request.url.path))
+            if request.url.path == "/v1/capabilities" and module in down:
+                return httpx.Response(503, json={"error": "service_unavailable"})
             if request.url.path == "/v1/capabilities":
                 return httpx.Response(200, json={"permissions": GRANTS[module]})
             return httpx.Response(200, json={"items": [], "coverage": "unknown"})
@@ -67,6 +69,7 @@ def gateway(tmp_path):
 
     value["revision"] = 0
     write()
+    write.down = down  # modules whose backend reports not ready
     app = create_app(path, "http://testserver", transports={m: handler(m) for m in MODULES})
     return app, value, write, requests
 
@@ -139,18 +142,26 @@ def module_paths():
 
 # spec: ANYM-271
 def test_selection_only_narrows(gateway):
-    """Every profile × grant × credential × path combination: a path lists its modules' share of the plain list."""
+    """Every profile × grant × credential × readiness × path combination: a path lists its modules' share of the
+    plain list, and each combination starts from the complete principal."""
     app, value, write, _ = gateway
+    complete = json.loads(json.dumps(value["principals"][0]))
     with TestClient(app) as client:
-        for dropped_tools, no_grant, no_credential in itertools.product(
-                (None, "messaging", "calls"), (None, "calendar", "messaging"), (None, "calls", "calendar")):
+        for dropped_tools, no_grant, no_credential, not_ready in itertools.product(
+                (None, "messaging", "calls"), (None, "calendar", "messaging"), (None, "calls", "calendar"),
+                (None, "messaging", "calendar")):
             def change(v):
                 v["profiles"]["reader"]["tools"] = PLATFORM + [
                     t for m in MODULES if m != dropped_tools for t in MODULE_TOOLS[m]]
-                v["principals"][0] = principal_of(v, no_grant, no_credential)
+                v["principals"][0] = principal_of(complete, no_grant, no_credential)
             write(change)
+            write.down.clear()
+            write.down.update({not_ready} - {None})
+            agent = value["principals"][0]
+            assert set(agent["credentials"]) == set(MODULES) - {no_credential}
+            assert set(agent["grants"]) == set(MODULES) - {no_grant}
             plain, _ = listed(client)
-            excluded = {dropped_tools, no_credential} - {None}
+            excluded = {dropped_tools, no_credential, not_ready} - {None}
             # A missing grant hides that module's scoped tools; scope-free ones (its capabilities) stay.
             assert not [n for n in plain if CATALOG[n]["module"] in excluded
                         or (CATALOG[n]["module"] == no_grant and CATALOG[n]["scopes"])]
@@ -163,8 +174,8 @@ def test_selection_only_narrows(gateway):
                     assert call(client, name, path=path)["isError"], (path, name)
 
 
-def principal_of(value, no_grant, no_credential):
-    agent = json.loads(json.dumps(value["principals"][0]))
+def principal_of(complete, no_grant, no_credential):
+    agent = json.loads(json.dumps(complete))
     agent["grants"] = {m: GRANTS[m] for m in MODULES if m != no_grant}
     agent["credentials"] = {m: c for m, c in agent["credentials"].items() if m != no_credential}
     return agent
@@ -238,6 +249,35 @@ def test_selection_reset_on_revision(gateway):
         after, _ = listed(client)
     assert after == before
     assert app.state.dispatch.selections == {}
+
+
+# spec: ANYM-271
+def test_selection_cleared_by_another_principals_request_after_revision(gateway):
+    app, _, write, _ = gateway
+    with TestClient(app) as client:
+        call(client, "platform_select_modules", {"modules": ["calls"]})
+        call(client, "platform_select_modules", {"modules": ["calls"]}, path="/mcp/modules/calls,messaging")
+        assert len(app.state.dispatch.selections) == 2
+        write(lambda v: v["principals"].pop(0))
+        listed(client, key="b")
+        assert app.state.dispatch.selections == {}
+        write()
+        call(client, "platform_select_modules", {"modules": ["calls"]}, key="b")
+        write()
+        assert client.post("/v1/messages_search", json={"query": "x"},
+                           headers={"Authorization": "Bearer gateway-b"}).status_code == 200
+        assert app.state.dispatch.selections == {}
+
+
+# spec: ANYM-271
+def test_select_tool_is_a_local_write_not_a_provider_mutation(gateway):
+    app, value, write, _ = gateway
+    hints = CATALOG["platform_select_modules"]["annotations"]
+    assert hints == {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True,
+                     "openWorldHint": False}
+    write(lambda v: v["profiles"]["reader"].update(tools=PLATFORM + MODULE_TOOLS["calendar"]))
+    with TestClient(app) as client:
+        assert call(client, "platform_capabilities")["structuredContent"]["provider_mutations"] is False
 
 
 # spec: ANYM-271

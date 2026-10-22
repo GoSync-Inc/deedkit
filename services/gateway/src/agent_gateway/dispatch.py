@@ -103,8 +103,8 @@ class Dispatch:
     def __init__(self, policy, clients, tickets=None):
         self.policy, self.clients, self.tickets = policy, clients, tickets
         self.warned = {}
-        # In-session module selections: (principal id, route path) -> (policy revision, modules). Memory only.
-        self.selections = {}
+        # In-session module selections of one policy revision: (principal id, route path) -> modules. Memory only.
+        self.selections, self.selection_revision = {}, None
 
     def credential(self, agent):
         """Expiry for the authenticated holder; logs one warning per principal per UTC day."""
@@ -193,14 +193,15 @@ class Dispatch:
 
     def selected(self, agent, revision, route):
         """The modules an MCP route may use: its path's modules narrowed by the principal's selection; None = all."""
+        if revision != self.selection_revision:
+            # Any request that observes a new policy revision clears every principal's selection.
+            self.selections, self.selection_revision = {}, revision
         if route is None:
             return None
         modules = route.modules
         entry = self.selections.get((agent["id"], route.path))
-        if entry and entry[0] != revision:
-            self.selections = {k: v for k, v in self.selections.items() if v[0] == revision}
-        elif entry:
-            modules = entry[1] if modules is None else modules & entry[1]
+        if entry:
+            modules = entry if modules is None else modules & entry
         return modules
 
     async def discover(self, key, route=None, narrow=True):
@@ -260,8 +261,8 @@ class Dispatch:
         """Record a narrowing selection for this principal and route; report the list it yields."""
         route = route or Route(PLAIN_PATH)
         snapshot, agent = self.authenticate(key)
-        self.selections = {k: v for k, v in self.selections.items() if v[0] == snapshot["revision"]}
-        self.selections[(agent["id"], route.path)] = (snapshot["revision"], frozenset(modules))
+        self.selected(agent, snapshot["revision"], None)
+        self.selections[(agent["id"], route.path)] = frozenset(modules)
         _, _, visible, details = await self.discover(key, route)
         return {
             "selection_path": route.path,
@@ -347,8 +348,10 @@ class Dispatch:
                 "backend_states": states["states"],
                 "coverage": "query selected module capabilities; unavailable/stale sources remain unknown",
                 "subscriptions": "existing backend identity; passive events do not ACK",
+                # The gateway's own local write (platform_select_modules) is not a provider mutation.
                 "provider_mutations": any(
-                    not CATALOG[n].get("annotations", {}).get("readOnlyHint", False) for n in visible
+                    CATALOG[n]["module"] != "gateway"
+                    and not CATALOG[n].get("annotations", {}).get("readOnlyHint", False) for n in visible
                 ),
                 "owner_authorization_verified": False,
                 "credential": credential,

@@ -40,8 +40,7 @@
       "mcp__claude_ai_Deedkit__messages_search",
       "mcp__claude_ai_Deedkit__messages_search_files",
       "mcp__claude_ai_Deedkit__messages_search_people",
-      "mcp__claude_ai_Deedkit__platform_capabilities",
-      "mcp__claude_ai_Deedkit__platform_select_modules"
+      "mcp__claude_ai_Deedkit__platform_capabilities"
     ],
     "deny": [
       "Read(./.local/**)",
@@ -100,7 +99,8 @@
       "mcp__claude_ai_Deedkit__messages_unmute_reply_source",
       "mcp__claude_ai_Deedkit__messages_update_subscription",
       "mcp__claude_ai_Deedkit__messages_upload_file_chunk",
-      "mcp__claude_ai_Deedkit__messages_wait_for_subscription_events"
+      "mcp__claude_ai_Deedkit__messages_wait_for_subscription_events",
+      "mcp__claude_ai_Deedkit__platform_select_modules"
     ]
   },
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
