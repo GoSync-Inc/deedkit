@@ -26,7 +26,7 @@ SAFE_ERROR_CODES = frozenset({
     'invalid_receipt','invalid_utc_date','invalid_version','not_found',
     'query_timeout','rate_limited','service_busy','service_unavailable',
     'stale_ack','temporarily_unavailable','unauthorized','version_conflict',
-    'invalid_message_text','invalid_request_id','idempotency_conflict','sending_disabled','sender_not_ready',
+    'invalid_message_text','invalid_request_id','idempotency_conflict','sending_disabled','sender_not_ready','session_unavailable',
     'invalid_message_format','unsafe_message_markup','invalid_message_entities',
     'formatting_too_complex','unsupported_message_formatting',
     'lossy_formatting_requires_confirmation','message_too_long','preview_required','preview_mismatch',

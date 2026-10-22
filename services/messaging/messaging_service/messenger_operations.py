@@ -3,7 +3,11 @@
 Archive reads retain their existing passive contract. These operations run on the
 existing session owner with an independent key grant and account opt-in.
 """
+import base64
 from copy import deepcopy
+from datetime import datetime, timezone
+import hashlib
+import json
 import math
 import re
 
@@ -44,6 +48,15 @@ _link = {'link': _field('chat_link', required=True)}
 JOIN_LIMITATION = ('Needs a check_chat_link of this link by the same key within 60 minutes showing not_member; '
     'pending_approval is not a join. A joined chat is visible to no chat-scoped key and to full-account keys '
     'only when the collection policy collects it. Leave with leave_group.')
+LIVE_SEARCH = 'search_messages_live'
+LIVE_SEARCH_LIMITATION = ('Telegram only. Searches Telegram itself: an empty chat_id searches all the owner\'s chats '
+    '(full-account key; channels only when chat_types names channel), a chat_id searches that archived chat. One '
+    'provider request per call, no automatic paging: pass next_cursor with the same parameters for more. Per account '
+    '3 requests at once, then one per 10 s, 100 per UTC day (in memory; a collector restart resets them); over it, '
+    'rate_limited with retry_after. Hits in chats the collection policy excludes are dropped. Writes nothing to the '
+    'archive.')
+LIVE_CHAT_TYPES = ('private', 'group', 'channel')
+LIVE_FILTERS = ('documents', 'photos', 'links', 'voice')
 BATCH_LIMITATION = ('One row per ID: applied, refused, unknown or not_attempted; an uncertain ID is never retried.')
 OPERATIONS = {
     'chat_info': _spec('read-live'),
@@ -139,6 +152,12 @@ OPERATIONS = {
     'request_chat_history': _spec('read-live', mutation=True, platforms=('whatsapp',),
         fields={'count':_field('integer',default=50,minimum=1,maximum=50)},
         limitation='Native only: explicit phone history request, at most 50 messages and one per account per minute; partial history is not guaranteed.'),
+    LIVE_SEARCH: _spec('read-live', platforms=('telegram',), fields={
+        'query': _field('string', required=True, maximum=256, nonempty=True),
+        'chat_types': _field('chat_types'), 'filter': _field('search_filter'),
+        'from_time': _field('timestamp'), 'to_time': _field('timestamp'),
+        'limit': _field('integer', default=20, minimum=1, maximum=50),
+        'cursor': _field('search_cursor')}, limitation=LIVE_SEARCH_LIMITATION),
     'get_labels': _spec('contacts-read', 'account', full_account=True,
         platforms=('whatsapp',), limitation='Business feature; availability depends on the account.'),
     'set_chat_labels': _spec('chat-manage', mutation=True, platforms=('whatsapp',),
@@ -292,6 +311,11 @@ def parameter_format(platform, kind):
         'slow_mode_seconds': 'one of ' + ', '.join(map(str, SLOW_MODE_SECONDS)) + ' seconds; 0 turns slow mode off',
         'poll_options': '2-10 unique non-blank strings of at most 100 UTF-16 code units',
         'poll_indices': 'up to 20 unique integers from 0 to 9 (zero-based option positions)',
+        'chat_types': '1-3 unique items of ' + ', '.join(LIVE_CHAT_TYPES),
+        'search_filter': 'one of ' + ', '.join(LIVE_FILTERS),
+        'timestamp': 'ISO 8601 date and time with a UTC offset, such as 2026-10-22T08:00:00Z; from_time is inclusive, '
+            'to_time exclusive',
+        'search_cursor': 'next_cursor of an earlier search_messages_live with the same account, chat_id and parameters',
         'label_ids': 'up to 20 unique label IDs of 1-64 letters, digits, _ or -, from get_labels'}.get(kind)
 
 
@@ -354,10 +378,61 @@ def _problem(platform, descriptor, value, field):
         errors = [e for i, x in enumerate(value) for e in (_problem(platform, item, x, '%s/%d' % (field, i)) or ())]
         if errors: return errors
         return None if len(set(value)) == len(value) else fail('unique', 'no duplicate items')
+    if kind == 'chat_types':
+        if not isinstance(value, list): return fail('type', 'array')
+        if not 1 <= len(value) <= 3: return fail('min_items' if not value else 'max_items', parameter_format(platform, kind))
+        if any(item not in LIVE_CHAT_TYPES for item in value): return fail('enum', allowed=list(LIVE_CHAT_TYPES))
+        return None if len(set(value)) == len(value) else fail('unique', 'no duplicate items')
+    if kind == 'search_filter':
+        if not isinstance(value, str): return fail('type', 'string')
+        return None if value in LIVE_FILTERS else fail('enum', allowed=list(LIVE_FILTERS))
+    if kind == 'timestamp':
+        if not isinstance(value, str): return fail('type', 'string')
+        return None if timestamp(value) else fail('format', parameter_format(platform, kind))
+    if kind == 'search_cursor':
+        if not isinstance(value, str): return fail('type', 'string')
+        return None if re.fullmatch(r'[A-Za-z0-9_-]{8,512}', value) else fail('format', parameter_format(platform, kind))
     if kind == 'label_id':
         if not isinstance(value, str): return fail('type', 'string')
         return None if re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', value) else fail('format', parameter_format(platform, 'label_ids'))
     return fail('type')
+
+
+def timestamp(value):
+    """Normalized UTC text of an ISO 8601 time with an offset, or None."""
+    if not isinstance(value, str) or len(value) > 40: return None
+    try: parsed = datetime.fromisoformat(value.replace('Z', '+00:00') if value.endswith('Z') else value)
+    except ValueError: return None
+    if parsed.tzinfo is None or not 2000 <= parsed.year <= 2100: return None
+    return parsed.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def live_cursor_binding(account, chat_id, parameters):
+    """Binds a live-search cursor to the account, operation, chat and every other normalized field."""
+    fields = {k: v for k, v in parameters.items() if k != 'cursor'}
+    text = json.dumps([account, LIVE_SEARCH, chat_id or '', fields], sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(text.encode()).hexdigest()[:24]
+
+
+def encode_live_cursor(binding, position):
+    raw = json.dumps({'b': binding, **position}, sort_keys=True, separators=(',', ':')).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip('=')
+
+
+def decode_live_cursor(value, binding):
+    """The position of a cursor bound to binding, else ValueError('invalid_cursor')."""
+    try:
+        data = json.loads(base64.urlsafe_b64decode(value + '=' * (-len(value) % 4)))
+        if not isinstance(data, dict) or data.get('b') != binding: raise ValueError
+        position = {k: data[k] for k in ('i', 'r', 'p') if k in data}
+        if type(position.get('i')) is not int or not 0 < position['i'] < 2**31: raise ValueError
+        if type(position.get('r', 0)) is not int or not 0 <= position.get('r', 0) < 2**31: raise ValueError
+        # The offset peer stays in the collector's memory; the cursor names it by a random token.
+        if 'p' in position and not (isinstance(position['p'], str) and re.fullmatch(r'[A-Za-z0-9_-]{16}', position['p'])):
+            raise ValueError
+        return position
+    except (ValueError, TypeError, UnicodeError):
+        raise ValueError('invalid_cursor') from None
 
 
 def validate_operation(platform, operation, parameters, *, provider=None):
@@ -379,7 +454,8 @@ def validate_operation(platform, operation, parameters, *, provider=None):
             problem = _problem(platform, descriptor, value, name)
             if problem: errors.extend(problem)
             else: output[name] = (phone_digits(value)[0] if descriptor['type'] == 'phone_number' else
-                chat_link_key(platform, value) if descriptor['type'] == 'chat_link' else value)
+                chat_link_key(platform, value) if descriptor['type'] == 'chat_link' else
+                timestamp(value) if descriptor['type'] == 'timestamp' else value)
         # Only a bounded identifier name is returned; the submitted value never is.
         allowed = 'only ' + ', '.join(fields) if fields else 'no parameters'
         for name in parameters:
@@ -395,4 +471,7 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     if operation == 'send_file' and (('attachment_id' in output)+('upload_id' in output)!=1):
         raise ParameterError(field_error('upload_id' if 'upload_id' in output else 'attachment_id',
             'unique' if 'upload_id' in output else 'required', 'exactly one of attachment_id or upload_id'))
+    if operation == LIVE_SEARCH and 'from_time' in output and 'to_time' in output and (
+            datetime.fromisoformat(output['from_time']) >= datetime.fromisoformat(output['to_time'])):
+        raise ParameterError(field_error('to_time', 'minimum', 'later than from_time'))
     return output

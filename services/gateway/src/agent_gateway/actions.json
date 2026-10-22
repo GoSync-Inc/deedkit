@@ -114,6 +114,9 @@
   "revoke_invite_link": [
     "groups-manage"
   ],
+  "search_messages_live": [
+    "read-live"
+  ],
   "send_contact": [
     "send"
   ],

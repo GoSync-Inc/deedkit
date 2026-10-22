@@ -18,6 +18,9 @@ from .store import APIError, serial
 from .outgoing import finish_durably
 
 MAX_FILE_BYTES = 32 * 1024**2
+LIVE_SEARCH = 'search_messages_live'
+# ANYM-475: governor waits, resolution, the provider request and the receipt together.
+LIVE_SEARCH_TIMEOUT = 15
 PHONE_LOOKUPS_PER_HOUR = 10
 OPEN_CHAT_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
     '--operations <current operations> open_chat_by_phone')
@@ -27,6 +30,8 @@ BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session
 
 class CommandRejected(RuntimeError):
     """Known local rejection before invoking a provider operation."""
+    def __init__(self,code,*,retry_after=None):
+        super().__init__(code);self.retry_after=retry_after
 
 
 def safe_result(value):
@@ -116,7 +121,8 @@ def _policy(c,account,operation,provider_chats=(),*,ready=False):
             (account,)).fetchone()
         if (not connected or not connected['active'] or
             connected['operations'].get('connection',{}).get('state')!='connected'):
-            raise APIError('sender_not_ready',409)
+            # ANYM-475: a live read is refused at once instead of waiting in the queue.
+            raise APIError('session_unavailable' if operation==LIVE_SEARCH else 'sender_not_ready',409)
 
 
 def _chat(c,p,account,chat_id):
@@ -176,6 +182,12 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     from .messenger_operations import validate_operation,operation_manifest,CATALOG_VERSION,ParameterError
     from .whatsapp_capabilities import account_provider
     spec=_spec(operation);account_row=_account(c,p,account)
+    if operation==LIVE_SEARCH and not chat_id:
+        # ANYM-475: without a chat the live search spans every chat of the account.
+        spec.update(target='account',full_account=True)
+    if operation==LIVE_SEARCH and chat_id and p['chat_ids'] is not None and chat_id not in p['chat_ids']:
+        # A chat-scoped key learns nothing about chats outside its scope, existing or not.
+        raise APIError('forbidden',403)
     provider=account_provider(c,account,account_row['platform'])
     required=_required_permissions(spec['permission'],operation,parameters)
     if set(required)-set(p['permissions']):raise APIError('forbidden',403)
@@ -249,6 +261,10 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
             raise APIError('unsupported_operation')
         if provider=='whatsmeow' and (mode=='sticker' and mime!='image/webp' or
             mode in ('audio','voice','sticker') and parameters['caption']):raise APIError('unsupported_operation')
+    if operation==LIVE_SEARCH and 'cursor' in parameters:
+        from .messenger_operations import decode_live_cursor,live_cursor_binding
+        try:decode_live_cursor(parameters['cursor'],live_cursor_binding(account,chat_id,parameters))
+        except ValueError:raise APIError('invalid_cursor') from None
     _policy(c,account,operation,provider_chats,ready=ready)
     if operation=='open_chat_by_phone':_phone_policy(c,account,parameters['phone'])
     if operation=='join_chat':
@@ -632,8 +648,12 @@ class CommandWorker:
                 job['_archived']=archived
             # Providers report 'waiting' and then 'started' before the first mutation.
             job['_provider_phase']=phases.append
-            timeout=180 if job['operation']=='send_file' else 30
-            answer=safe_result(await asyncio.wait_for(self.execute(job),timeout))
+            timeout=180 if job['operation']=='send_file' else LIVE_SEARCH_TIMEOUT if job['operation']==LIVE_SEARCH else 30
+            try:answer=safe_result(await asyncio.wait_for(self.execute(job),timeout))
+            except TimeoutError:
+                # A read changes nothing at the provider, so its timeout is a safe-to-repeat refusal.
+                if job['mutation'] or job['operation']!=LIVE_SEARCH:raise
+                raise CommandRejected('provider_timeout') from None
             if isinstance(answer.get('data'),dict) and 'archive_reference' in answer['data']:
                 from .outgoing import archive_reference
                 archive_reference(job,{'provider_message_id':answer.get('provider_message_id'),
@@ -643,9 +663,11 @@ class CommandWorker:
                 'operation_target_changed','sender_not_ready','attachment_unavailable','unsupported_operation',
                 'forbidden','not_found','operation_rejected','identity_unresolved','chat_not_collected',
                 'rate_limited','provider_timeout','invalid_phone','invite_invalid','invite_expired','chat_full',
-                'join_not_allowed','already_member') else 'operation_rejected'
+                'join_not_allowed','already_member','invalid_cursor') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
+            if code=='rate_limited' and exc.retry_after:
+                result={'data':{'code':code,'retry_after':exc.retry_after}}
             if code=='rate_limited' and job['operation']=='open_chat_by_phone':
                 result={'data':{'code':code,'resets_in_seconds':job.get('_lookup_resets_in') or 1,'provider_lookup':False}}
             await finish_durably(self.finish,job,'expired' if code=='operation_expired' else 'failed',result,code)
