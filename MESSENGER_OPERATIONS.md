@@ -387,7 +387,11 @@ needs `read-live`, the account opt-in and, through the gateway, the
 - Telegram receipt: `delivery: immediate`, `fetched`, `stored_new` (new archive
   rows), `basis: live_provider_history`; with `before_message` also
   `provider_history_start_reached` (Telegram returned fewer than asked), with a
-  time range `range_exhausted` (fewer returned or `from_time` reached).
+  time range `range_exhausted` (fewer returned or `from_time` reached). When some
+  messages of the page were not stored (a storage error, or the read's deadline),
+  it adds `not_stored` and `retry_parameters`: the request that loads the same
+  page again, since a later request without an anchor starts below them.
+- Service messages (joins, title changes, calls) are part of the page.
 - Telegram archive: the page is committed as live search hits are (above):
   origin `backfill`, the usual revision rules, media jobs, the collection policy
   and `history_since`; checkpoints and coverage do not move. A rerun adds no rows.
