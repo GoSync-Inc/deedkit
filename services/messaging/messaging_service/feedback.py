@@ -1,5 +1,7 @@
 """Private, bounded, exact-credential-owned feedback; never external messaging."""
 from __future__ import annotations
+import base64
+from datetime import datetime, timedelta
 import hashlib
 import json
 import re
@@ -18,6 +20,12 @@ AGENT_VERDICTS = ('verified', 'reopened')
 FIXED_IN = re.compile(r'deedkit@[0-9a-f]{40}|anymsg@(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?')
 SPEC_REF = re.compile(r'ANYM-[1-9][0-9]{0,5}')
 UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+# A submission transaction ends within this bound or is aborted, never committed late (ANYM-265). The export
+# overlap minimum (2 minutes) exceeds it plus the 5 s statements that authorize the key before it starts.
+SUBMIT_TRANSACTION_TIMEOUT = '60s'
+OVERLAP_MINUTES = (2, 10, 1440)  # minimum, default, maximum
+SUBMISSION_FIELDS = ('id', 'request_id', 'category', 'description', 'operation', 'created_at', 'principal', 'key_id')
+DISPOSITION_FIELDS = ('id', 'status', 'status_note', 'fixed_in', 'spec_ref', 'duplicate_of', 'status_changed_at')
 
 
 def _invalid(errors):
@@ -90,6 +98,7 @@ def _validate_refs(c, p, refs):
 
 def submit_feedback(store, c, p, request_id, category, description, *, operation=None, refs=None):
     from .store import APIError
+    c.execute("SELECT set_config('transaction_timeout',%s,true)", (SUBMIT_TRANSACTION_TIMEOUT,))
     if 'read' not in p['permissions']:
         raise APIError('forbidden', 403)
     errors = []
@@ -214,3 +223,77 @@ def set_feedback_status(c, ids, status, *, fixed_in=None, spec_ref=None, duplica
         audit(c, {'id': row['principal'], 'key_id': row['key_id'], '_audit_targets': [str(row['id'])]},
             'set_feedback_status', 'ok')
     return {'updated': len(changed), 'status': status, 'feedback_ids': sorted(str(row['id']) for row in changed)}
+
+
+def _timestamp(value, code):
+    try:
+        parsed = datetime.fromisoformat(value) if isinstance(value, str) and len(value) <= 64 else None
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.tzinfo is None:
+        raise ValueError(code)
+    return parsed
+
+
+def _page_token(mode, head, row):
+    position = {'v': 1, 'm': mode, 'h': head.isoformat(), 't': row[mode_column(mode)].isoformat(), 'i': str(row['id'])}
+    return base64.urlsafe_b64encode(json.dumps(position, separators=(',', ':')).encode()).decode().rstrip('=')
+
+
+def mode_column(mode):
+    return 'created_at' if mode == 'created' else 'status_changed_at'
+
+
+def _read_page_token(token):
+    try:
+        raw = base64.urlsafe_b64decode(token + '=' * (-len(token) % 4)) if isinstance(token, str) and len(token) <= 512 else b''
+        position = json.loads(raw)
+        if not (isinstance(position, dict) and set(position) == {'v', 'm', 'h', 't', 'i'} and position['v'] == 1
+                and position['m'] in ('created', 'changed') and isinstance(position['i'], str) and UUID.fullmatch(position['i'])):
+            raise ValueError
+        return position['m'], _timestamp(position['h'], 'invalid_page'), _timestamp(position['t'], 'invalid_page'), position['i']
+    except ValueError:
+        raise ValueError('invalid_page') from None
+
+
+def export_feedback(c, *, since=None, changed_since=None, page=None, overlap=None, limit=50):
+    """Owner export of every principal's feedback (ANYM-265): operator CLI only, read-only, keyset-paged.
+
+    `created` mode pages submissions with their current dispositions by (created_at, id); `changed` mode pages
+    dispositions by (status_changed_at, id). Every page of one export is bounded by `export_head`, fixed by the
+    first page. Pages are separate transactions, not a snapshot: a row committed late behind the cursor is returned
+    by the next export, whose start is `since` minus the overlap; the caller deduplicates by feedback ID.
+    """
+    from .store import bounded, serial
+    c.execute('SET TRANSACTION READ ONLY')
+    bounded(limit)
+    if sum(value is not None for value in (since, changed_since, page)) > 1:
+        raise ValueError('since_changed_since_and_page_are_exclusive')
+    if overlap is not None and since is None and changed_since is None:
+        raise ValueError('overlap_needs_since_or_changed_since')
+    overlap = OVERLAP_MINUTES[1] if overlap is None else overlap
+    if isinstance(overlap, bool) or not isinstance(overlap, int) or not OVERLAP_MINUTES[0] <= overlap <= OVERLAP_MINUTES[2]:
+        raise ValueError('invalid_overlap')
+    lower = after = None
+    if page is not None:
+        mode, head, *after = _read_page_token(page)
+    else:
+        mode = 'changed' if changed_since is not None else 'created'
+        start = since if mode == 'created' else changed_since
+        lower = None if start is None else _timestamp(start, 'invalid_since') - timedelta(minutes=overlap)
+        head = c.execute('SELECT clock_timestamp() AS head').fetchone()['head']
+    column = mode_column(mode)
+    fields = SUBMISSION_FIELDS + DISPOSITION_FIELDS[1:] if mode == 'created' else DISPOSITION_FIELDS
+    rows = c.execute('SELECT ' + ','.join(fields) + ' FROM agent_feedback WHERE ' + column + ' IS NOT NULL AND ' +
+        column + '<=%(head)s AND (%(lower)s::timestamptz IS NULL OR ' + column + '>=%(lower)s) AND ' +
+        '(%(after)s::timestamptz IS NULL OR (' + column + ',id)>(%(after)s,%(after_id)s::uuid)) ORDER BY ' + column +
+        ',id LIMIT %(limit)s', {'head': head, 'lower': lower, 'after': after[0] if after else None,
+        'after_id': after[1] if after else None, 'limit': limit + 1}).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    result = {'untrusted_content': True, 'mode': mode, 'export_head': head,
+              'dispositions': [{name: row[name] for name in DISPOSITION_FIELDS} for row in rows],
+              'has_more': has_more, 'next_page': _page_token(mode, head, rows[-1]) if has_more else None}
+    if mode == 'created':
+        result['submissions'] = [{name: row[name] for name in SUBMISSION_FIELDS} for row in rows]
+    return serial(result)

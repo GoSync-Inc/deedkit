@@ -301,7 +301,11 @@ against the current credential. Each key has a 1000-record bound; request-ID
 retries are idempotent and changed payloads conflict. `list_feedback(limit=50)`
 returns only this exact key's records; source reference IDs are omitted to avoid
 revealing a previously authorized scope after a policy change. Feedback does not
-send messages, create external issues or forward reports to a third party.
+send messages, create external issues or forward reports to a third party. A submission
+transaction ends within 60 seconds or is aborted and not stored (its failure is audited as
+`query_timeout`). The maintainer reads every principal's feedback for triage only through the
+operator command `export-feedback` (ACCESS.md); it is not an MCP tool, REST route or gateway
+action.
 
 A rejected `submit_feedback` names what to fix. Over REST and MCP the schema check
 returns `invalid_parameters` with the existing `fields` list plus `field_errors`; the

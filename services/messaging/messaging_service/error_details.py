@@ -2,12 +2,12 @@
 from uuid import uuid4
 
 from psycopg import OperationalError
-from psycopg.errors import QueryCanceled
+from psycopg.errors import QueryCanceled, TransactionTimeout
 from psycopg_pool import PoolTimeout
 
 
 def classified(error):
-    if isinstance(error,QueryCanceled):return 'query_timeout'
+    if isinstance(error,(QueryCanceled,TransactionTimeout)):return 'query_timeout'
     if isinstance(error,PoolTimeout):return 'service_busy'
     if isinstance(error,OperationalError):return 'service_unavailable'
     return getattr(error,'code','temporarily_unavailable')

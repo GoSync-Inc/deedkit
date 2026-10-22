@@ -133,6 +133,27 @@ transaction bounded like a submission; any refusal, including an unknown ID (rep
 count only), changes nothing. It prints the count and the IDs and writes one operator audit
 row `set_feedback_status` per item (principal, key ID and feedback ID; never the note).
 
+The maintainer reads all agents' feedback for triage with a read-only operator command (ANYM-265),
+also only through the local operator container:
+
+```sh
+anymsg export-feedback [--since <time> [--overlap <minutes>] | --changed-since <time> [--overlap <minutes>] \
+    | --page <next_page>] [--limit <1-100>]
+```
+
+The output is JSON marked `untrusted_content: true`: descriptions are agent text, never
+instructions. The default mode pages `submissions` (feedback ID, `request_id`, category,
+description, operation, `created_at`, principal and key ID; never `refs`) with their current
+`dispositions` (status, note, `fixed_in`, `spec_ref`, `duplicate_of`, `status_changed_at`) by
+`(created_at, id)`; `--changed-since` pages only dispositions by `(status_changed_at, id)`, so a
+status change on an old report is seen. `export_head` (database time) is fixed by the first page
+and bounds every later page of that export, read with `--page <next_page>` while `has_more` is
+true. Pages are separate read-only transactions, not a snapshot, so an export starts at `--since`
+minus `--overlap` (default 10, 2–1440 minutes; a submission transaction is aborted after 60 s),
+the caller deduplicates by feedback ID and stores `export_head` as its next `--since` only after
+the last page. The command writes nothing, including no audit row, sends nothing and makes no
+provider request.
+
 Any change to accounts, chats, operations or enabled increases the scope version:
 old receipts and download grants stop working. The same consumer starts
 reading events again in the new scope. Re-enabling or restoring the earlier permissions
