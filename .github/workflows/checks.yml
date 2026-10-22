@@ -137,11 +137,13 @@ jobs:
         with: {version: '0.9.26'}
       - name: Native extraction tools
         # A stuck mirror connection once held this step for 20 minutes (the job timeout) while the same step took
-        # 30 s on the sibling jobs: bound each attempt and retry once on a fresh connection.
+        # 30 s on the sibling jobs: bound each attempt and retry once, on archive.ubuntu.com (the azure mirror stalls
+        # mid-download, so a retry on the same mirror would stall again).
         timeout-minutes: 9
         run: |
           apt_opts=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=3)
           for attempt in 1 2; do
+            if [ "$attempt" = 2 ] && [ -f /etc/apt/apt-mirrors.txt ]; then echo 'http://archive.ubuntu.com/ubuntu/ priority:1' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null; fi
             if sudo timeout --kill-after=10s 90 apt-get "${apt_opts[@]}" update && sudo timeout --kill-after=10s 150 apt-get "${apt_opts[@]}" install -y poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0; then exit 0; fi
             echo "::warning::Native extraction tools attempt $attempt failed"
           done
@@ -594,11 +596,13 @@ jobs:
         with: {version: '0.9.26'}
       - name: Native extraction tools
         # A stuck mirror connection once held this step for 20 minutes (the job timeout) while the same step took
-        # 30 s on the sibling jobs: bound each attempt and retry once on a fresh connection.
+        # 30 s on the sibling jobs: bound each attempt and retry once, on archive.ubuntu.com (the azure mirror stalls
+        # mid-download, so a retry on the same mirror would stall again).
         timeout-minutes: 9
         run: |
           apt_opts=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=3)
           for attempt in 1 2; do
+            if [ "$attempt" = 2 ] && [ -f /etc/apt/apt-mirrors.txt ]; then echo 'http://archive.ubuntu.com/ubuntu/ priority:1' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null; fi
             if sudo timeout --kill-after=10s 90 apt-get "${apt_opts[@]}" update && sudo timeout --kill-after=10s 150 apt-get "${apt_opts[@]}" install -y poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0; then exit 0; fi
             echo "::warning::Native extraction tools attempt $attempt failed"
           done
