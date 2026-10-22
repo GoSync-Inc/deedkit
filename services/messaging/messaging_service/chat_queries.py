@@ -202,6 +202,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         attention_age=(f"m.sent_at>=least(CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days',"
             f'(SELECT sm.sent_at FROM reply_snoozes sz JOIN messages sm ON sm.id=sz.message WHERE sz.key_id={key}'
             " AND sz.chat=c.id AND sz.snoozed_until<=CURRENT_TIMESTAMP AND (c.chat_type='group' OR sz.incoming_head=incoming.id)))")
+    # The standalone group count has no incoming lateral; for a group the clause is true.
+    group_attention_age=attention_age.replace(" AND (c.chat_type='group' OR sz.incoming_head=incoming.id)",'')
     sender_skip=(f'NOT EXISTS(SELECT 1 FROM reply_mutes rm WHERE rm.principal={principal} AND rm.account=m.account'
         ' AND rm.sender=m.sender)') if mutes else 'true'
     chat_muted=f'EXISTS(SELECT 1 FROM reply_mutes rc WHERE rc.principal={principal} AND rc.chat=c.id)'
@@ -429,7 +431,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             if view=='conversation' and row['type']=='group':
                 row['awaiting_reply_incoming_count']=c.execute('''SELECT threads.n FROM chats c
                     JOIN accounts a ON a.id=c.account CROSS JOIN LATERAL ('''+group_thread_query(
-                        'count(*) AS n',criteria=attention_age,count=True)+
+                        'count(*) AS n',criteria=group_attention_age,count=True)+
                     ') threads WHERE c.account=%s AND c.id=%s',
                     (row['account'],row['id'])).fetchone()['n']
             else:row['awaiting_reply_incoming_count']=c.execute(f'''SELECT count(*) AS n FROM messages m

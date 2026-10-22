@@ -456,6 +456,18 @@ def test_due_group_snooze_reads_only_messages_since_its_hint(inbox, view):
 
 
 # spec: ANYM-281
+def test_pending_group_row_counts_while_the_key_holds_a_snooze(inbox):
+    s, ar, key, add, queue = inbox
+    snoozed = add('100', 1, 1)
+    with s.pool.connection() as c:
+        until = (c.execute('SELECT clock_timestamp() AS t').fetchone()['t']+timedelta(days=1)).isoformat()
+    s.snooze_reply(key, chat_of('100'), snoozed, 1, until)
+    add('500', 1, 2, metadata={'chat_type': 'group', 'mentions_owner': True})
+    rows = queue(view='conversation')['items']
+    assert [(r['id'], r['awaiting_reply_incoming_count']) for r in rows] == [(chat_of('500'), 1)]
+
+
+# spec: ANYM-281
 def test_muted_rows_stay_counted_under_row_filters(inbox):
     s, ar, key, add, queue = inbox
     plain = add('300', 1, 1, sender='43', body='Synthetic plain note')
