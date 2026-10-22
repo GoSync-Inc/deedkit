@@ -122,3 +122,37 @@ def test_a_receipt_stuck_on_a_lock_frees_the_send_claim_within_the_deadline(live
     assert marks['send'] - marks['claimed'] < 2.5
     assert 'receipt_unrecorded' in caplog.text
     assert s.get_messenger_operation(key, operation)['status'] == 'dispatching'
+
+
+# spec: ANYM-475
+def test_fence_and_receipt_waits_share_one_deadline(live, monkeypatch, caplog):
+    import threading
+    import time
+    import messaging_service.commands as commands
+    from messaging_service.outgoing import OutgoingWorker
+    s, _, key, state = live
+    monkeypatch.setattr(commands, 'LIVE_SEARCH_TIMEOUT', 2); monkeypatch.setattr(commands, 'LIVE_FOREGROUND_RESERVE', 0)
+    monkeypatch.setattr(commands, 'LIVE_EXECUTION_TIMEOUT', 0.5, raising=False)
+    operation = search(s, key)['operation_id']
+    marks, lease_holder, row_holder = {}, s.pool.getconn(), s.pool.getconn()
+    class Worker(commands.CommandWorker):
+        def claim(self):
+            job = super().claim(); marks.setdefault('claimed', time.monotonic()); return job
+    async def found(job):
+        # The fence waits for the lease row until 1.4 s, then the UPDATE waits for the command row.
+        lease_holder.execute('SELECT 1 FROM collector_leases WHERE account=%s FOR UPDATE', (ACCOUNT,))
+        row_holder.execute('SELECT 1 FROM messenger_commands WHERE id=%s FOR UPDATE', (job['id'],))
+        threading.Timer(1.4 - (time.monotonic() - marks['claimed']), lease_holder.rollback).start()
+        return {'outcome': 'confirmed', 'data': {'hits': [], 'next_cursor': None, 'provider_total_approx': 0}}
+    async def scenario():
+        try:
+            assert await Worker(state, found).once(); await asyncio.sleep(0.2)
+            await asyncio.to_thread(OutgoingWorker(state, None).claim)
+            marks['send'] = time.monotonic()
+        finally:row_holder.rollback(); lease_holder.rollback()
+    with caplog.at_level('WARNING', logger='anymsg.live_search'):asyncio.run(scenario())
+    s.pool.putconn(lease_holder); s.pool.putconn(row_holder)
+    # Each wait alone fits the 2 s budget; together they must not pass it (Sol F2 recheck).
+    assert marks['send'] - marks['claimed'] < 2.7
+    assert 'receipt_unrecorded' in caplog.text
+    assert s.get_messenger_operation(key, operation)['status'] == 'dispatching'

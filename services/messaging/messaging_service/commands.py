@@ -10,6 +10,7 @@ import math
 import os
 import re
 import stat
+import time
 
 from psycopg.types.json import Jsonb
 
@@ -588,20 +589,27 @@ class CommandWorker:
     def finish_live(self,job,status,result,code,budget):
         """Record a live read's receipt in one attempt bounded by the budget left (ANYM-475).
 
-        The fence holds the lease row every send claim needs, so lock waits and statements stop at
-        the budget. Nothing is retried: the row stays dispatching, and claim or the receipt read
-        reports it unknown after the lease changes or the operation expires."""
+        The fence holds the lease row every send claim needs, so the pool wait and each statement
+        get only what is left of one deadline, recomputed before every wait. Nothing is retried: the
+        row stays dispatching, and claim or the receipt read reports it unknown after the lease
+        changes or the operation expires."""
         import psycopg
         from psycopg_pool import PoolTimeout
-        st=self.state;budget=max(0.05,budget);ms=int(budget*1000)
+        st=self.state;end=time.monotonic()+budget
+        def left():
+            remaining=end-time.monotonic()
+            if remaining<=0:raise TimeoutError('live_receipt_deadline')
+            return remaining
+        def bound(c):
+            ms=str(max(1,int(left()*1000)))
+            c.execute("SELECT set_config('lock_timeout',%s,true),set_config('statement_timeout',%s,true)",(ms,ms))
         try:
-            with st.archive.store.pool.connection(timeout=budget) as c:
-                c.execute("SELECT set_config('lock_timeout',%s,true),set_config('statement_timeout',%s,true)",(str(ms),str(ms)))
-                st.archive.fence(c,st.account,st.lease)
-                c.execute('''UPDATE messenger_commands SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
+            with st.archive.store.pool.connection(timeout=left()) as c:
+                bound(c);st.archive.fence(c,st.account,st.lease)
+                bound(c);c.execute('''UPDATE messenger_commands SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
                     WHERE id=%s AND status='dispatching' AND lease_epoch=%s''',
                     (status,Jsonb(result) if result is not None else None,code,job['id'],st.lease[1]))
-        except (psycopg.OperationalError,PoolTimeout) as exc:
+        except (psycopg.OperationalError,PoolTimeout,TimeoutError) as exc:
             log.warning('live_search receipt_unrecorded %s',type(exc).__name__)
 
     def archived(self,chat):
