@@ -142,7 +142,7 @@ jobs:
         run: |
           apt_opts=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=3)
           for attempt in 1 2; do
-            if sudo timeout 90 apt-get "${apt_opts[@]}" update && sudo timeout 150 apt-get "${apt_opts[@]}" install -y poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0; then exit 0; fi
+            if sudo timeout --kill-after=10s 90 apt-get "${apt_opts[@]}" update && sudo timeout --kill-after=10s 150 apt-get "${apt_opts[@]}" install -y poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0; then exit 0; fi
             echo "::warning::Native extraction tools attempt $attempt failed"
           done
           exit 1
@@ -599,7 +599,7 @@ jobs:
         run: |
           apt_opts=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=3)
           for attempt in 1 2; do
-            if sudo timeout 90 apt-get "${apt_opts[@]}" update && sudo timeout 150 apt-get "${apt_opts[@]}" install -y poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0; then exit 0; fi
+            if sudo timeout --kill-after=10s 90 apt-get "${apt_opts[@]}" update && sudo timeout --kill-after=10s 150 apt-get "${apt_opts[@]}" install -y poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0; then exit 0; fi
             echo "::warning::Native extraction tools attempt $attempt failed"
           done
           exit 1
