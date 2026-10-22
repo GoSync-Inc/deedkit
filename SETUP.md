@@ -75,7 +75,7 @@ python3 - <<'PY'
 from pathlib import Path
 import json, urllib.request
 key = Path('private/issued-keys/evaluation.token').read_text().strip()
-req = urllib.request.Request('http://127.0.0.1:18940/v1/capabilities', data=b'{}',
+req = urllib.request.Request('http://127.0.0.1:18940/v1/capabilities', data=b'{"detail":"full"}',
  headers={'Authorization':'Bearer '+key, 'Content-Type':'application/json'})
 with urllib.request.urlopen(req, timeout=20) as r:
  data = json.load(r)
