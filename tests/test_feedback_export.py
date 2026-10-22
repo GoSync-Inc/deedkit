@@ -188,6 +188,37 @@ def test_submission_over_the_transaction_timeout_is_not_stored_and_its_failure_i
 
 
 # spec: ANYM-265
+@pytest.mark.parametrize('stage', ['audit', 'commit'])
+def test_submission_timing_out_in_its_audit_or_commit_is_not_stored_and_is_audited(seeded, monkeypatch, stage):
+    store, *_ = seeded
+    token = identity(store)
+    write = store_module.audit
+    calls = []
+
+    def slow(*arguments):
+        calls.append(arguments[2])
+        # The first call is the success audit inside the submission transaction: expire the timeout
+        # before it (audit stage) or after it, so the next statement is the commit (commit stage).
+        if len(calls) == 1 and stage == 'audit':
+            time.sleep(0.6)
+        write(*arguments)
+        if len(calls) == 1 and stage == 'commit':
+            time.sleep(0.6)
+    monkeypatch.setattr(feedback_module, 'SUBMIT_TRANSACTION_TIMEOUT', '300ms')
+    monkeypatch.setattr(store_module, 'audit', slow)
+    with pytest.raises(APIError) as failure:
+        store.submit_feedback(token, 'synthetic-timeout-' + stage, 'bug', 'Synthetic slow report')
+    assert failure.value.code == 'query_timeout' and failure.value.audited
+    with store.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM agent_feedback').fetchone()['n'] == 0
+        rows = c.execute("SELECT * FROM audit_log WHERE operation='submit_feedback'").fetchall()
+    assert [(row['principal'], row['outcome'], row['error_code'], row['resource_ids']) for row in rows] == [
+        ('event-reader', 'denied', 'query_timeout', [])]
+    monkeypatch.setattr(store_module, 'audit', write)
+    assert submit(store, token, 2)
+
+
+# spec: ANYM-265
 def test_changed_since_finds_a_status_change_on_an_old_item(seeded):
     store, *_ = seeded
     token = identity(store)

@@ -122,32 +122,40 @@ class Store:
         failure = None
         p = None
         late = None
-        with self.pool.connection() as c:
-            with c.transaction():
-                try:
-                    with c.transaction():
-                        p = resolve_identity(c)
-                        permission = OPERATION_PERMISSIONS[operation] if operation else None
-                        if permission and permission not in p['permissions']:
-                            raise APIError('forbidden', 403)
-                        yield c, p
-                except Exception as error:
-                    # Roll back the attempted action, but commit its denial audit
-                    # outside the savepoint. Successful mutations + audit commit
-                    # atomically; a broken audit sink never becomes silent success.
-                    from .error_details import classified
-                    code=classified(error)
-                    failure = APIError(code,503) if code in ('query_timeout','service_busy','service_unavailable') else error
-                    p = p or getattr(error, 'audit_identity', None)
-                    # transaction_timeout ends the server session (ANYM-265): nothing was committed, and the
-                    # failure is audited on a fresh connection instead of the closed one.
-                    late = isinstance(error, TransactionTimeout) and c.closed
-                if operation:
-                    outcome = 'ok' if failure is None else ('denied' if isinstance(failure, APIError) else 'error')
-                    entry = (p, operation, outcome,
-                             failure.code if isinstance(failure, APIError) else ('operation_failed' if failure else None))
-                    if not late:
-                        audit(c, *entry)
+        try:
+            with self.pool.connection() as c:
+                with c.transaction():
+                    try:
+                        with c.transaction():
+                            p = resolve_identity(c)
+                            permission = OPERATION_PERMISSIONS[operation] if operation else None
+                            if permission and permission not in p['permissions']:
+                                raise APIError('forbidden', 403)
+                            yield c, p
+                    except Exception as error:
+                        # Roll back the attempted action, but commit its denial audit
+                        # outside the savepoint. Successful mutations + audit commit
+                        # atomically; a broken audit sink never becomes silent success.
+                        from .error_details import classified
+                        code=classified(error)
+                        failure = APIError(code,503) if code in ('query_timeout','service_busy','service_unavailable') else error
+                        p = p or getattr(error, 'audit_identity', None)
+                        # transaction_timeout ends the server session (ANYM-265): nothing was committed, and the
+                        # failure is audited on a fresh connection instead of the closed one.
+                        late = isinstance(error, TransactionTimeout) and c.closed
+                    if operation:
+                        outcome = 'ok' if failure is None else ('denied' if isinstance(failure, APIError) else 'error')
+                        entry = (p, operation, outcome,
+                                 failure.code if isinstance(failure, APIError) else ('operation_failed' if failure else None))
+                        if not late:
+                            audit(c, *entry)
+        except TransactionTimeout:
+            # The audit write or the commit ran past transaction_timeout: the server rolled the whole
+            # transaction back and closed the session, so the timeout is audited on a fresh connection.
+            if not operation:
+                raise
+            failure, late = APIError('query_timeout', 503), True
+            entry = (p, operation, 'denied', 'query_timeout')
         if late and operation:
             with self.pool.connection() as fresh:
                 audit(fresh, *entry)
