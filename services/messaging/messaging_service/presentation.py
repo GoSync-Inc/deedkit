@@ -233,6 +233,8 @@ def lean_chat(row):
             'basis':row.get('awaiting_reply_basis')}
         if row.get('awaiting_reply_has_question'):hint['has_question']=True
         if row.get('awaiting_reply_dismissed'):hint['dismissed']=True
+        if row.get('awaiting_reply_muted'):hint['muted']=row['awaiting_reply_muted']
+        if row.get('awaiting_reply_snoozed_until'):hint['snoozed_until']=row['awaiting_reply_snoozed_until']
         if row.get('awaiting_reply_confidence') not in (None,'heuristic_not_obligation'):
             hint['confidence']=row['awaiting_reply_confidence']
         if last and last['id']==hint['message_id']:

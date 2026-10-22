@@ -252,3 +252,6 @@ operator runs `release-retention-hold` ([SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#even
 An older restore quarantined at its own schema has no hold after migration 40, but its
 definitions are closed and acknowledged-event retention never prunes closed ones; rerun
 quarantine after migrating it to set the hold for later pruning paths.
+
+Schema 41 adds `reply_snoozes`, `reply_mutes` and the `reason`/`note` columns of
+`reply_dismissals` to the manifest; backups of schemas 2-40 still restore.

@@ -12,6 +12,7 @@ const METHODS = Object.freeze([
   'get_messages', 'get_context', 'get_sync_status', 'resolve_reference',
   'get_attachment', 'request_file_download', 'get_file_text', 'get_file_segments', 'get_file_occurrences',
   'get_updates', 'dismiss_reply', 'ack_updates', 'get_reviews', 'record_review',
+  'snooze_reply', 'restore_reply', 'mute_reply_source', 'unmute_reply_source', 'list_reply_dismissals',
   'preview_message','send_message','get_send_status',
   'list_messenger_operations','preview_messenger_operation','execute_messenger_operation','get_messenger_operation',
   'create_subscription','list_subscriptions','get_subscription','update_subscription','get_subscription_events',
@@ -472,6 +473,11 @@ export class AnyMsgClient {
     } finally { await handle?.close(); }
   }
   dismissReply(args) { return this.call('dismiss_reply', args); }
+  snoozeReply(args) { return this.call('snooze_reply', args); }
+  restoreReply(args) { return this.call('restore_reply', args); }
+  muteReplySource(args) { return this.call('mute_reply_source', args); }
+  unmuteReplySource(args) { return this.call('unmute_reply_source', args); }
+  listReplyDismissals(args) { return this.call('list_reply_dismissals', args); }
   listChats(args = {}) { return this.call('list_chats', args); }
   search(args = {}) { return this.call('search', args); }
   searchPeople(args = {}) { return this.call('search_people', args); }

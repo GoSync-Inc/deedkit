@@ -1,3 +1,4 @@
+export type ReplyReason = 'no_reply_needed' | 'spam_or_mailing' | 'handled_elsewhere' | 'other';
 export type Json = null | boolean | number | string | Json[] | {[key: string]: Json};
 export type Arguments = {[key: string]: Json};
 export type MessageFormat = 'plain' | 'markdown' | 'html';
@@ -159,7 +160,13 @@ export declare class AnyMsgClient {
   getFileUpload(args: {upload_id:string}, options?: {signal?: AbortSignal}): Promise<FileUploadStatus>;
   /** Stream a local regular file, reject changes, and stage only. Never previews or sends. */
   uploadFile(file: string, options: LocalFileUploadOptions): Promise<FileUploadStatus>;
-  dismissReply(args: {chat_id: string; message_id: string; expected_revision: number}): Promise<Record<string, unknown>>;
+  dismissReply(args: {chat_id: string; message_id: string; expected_revision: number; reason?: ReplyReason; note?: string}): Promise<Record<string, unknown>>;
+  snoozeReply(args: {chat_id: string; message_id: string; expected_revision: number; until: string; note?: string}): Promise<Record<string, unknown>>;
+  /** Undo this credential's dismissal or snooze of the exact hint; after an uncertain result read listReplyDismissals instead of retrying. */
+  restoreReply(args: {chat_id: string; message_id: string; expected_revision: number}): Promise<Record<string, unknown>>;
+  muteReplySource(args: {chat_id?: string; account?: string; sender_id?: string; reason?: ReplyReason; note?: string}): Promise<Record<string, unknown>>;
+  unmuteReplySource(args: {chat_id?: string; account?: string; sender_id?: string}): Promise<Record<string, unknown>>;
+  listReplyDismissals(args: {kind?: 'dismissed' | 'snoozed' | 'muted'; after?: string; limit?: number}): Promise<Record<string, unknown>>;
   listChats(args?: Arguments): Promise<Record<string, unknown>>;
   search(args?: Arguments): Promise<Record<string, unknown>>;
   searchPeople(args?: Arguments): Promise<Record<string, unknown>>;

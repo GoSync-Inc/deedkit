@@ -41,7 +41,9 @@ GRANT SELECT,INSERT,UPDATE ON subscriptions TO messaging_gateway;
 GRANT SELECT,INSERT ON subscription_sources TO messaging_gateway;
 GRANT SELECT ON subscription_matches TO messaging_gateway;
 GRANT SELECT ON chat_read_observations TO messaging_gateway;
-GRANT SELECT,INSERT,UPDATE ON reply_dismissals TO messaging_gateway;
+GRANT SELECT,INSERT,UPDATE,DELETE ON reply_dismissals TO messaging_gateway;
+GRANT SELECT,INSERT,UPDATE,DELETE ON reply_snoozes TO messaging_gateway;
+GRANT SELECT,INSERT,DELETE,UPDATE(reason,note,updated_at) ON reply_mutes TO messaging_gateway;
 GRANT SELECT,INSERT,UPDATE ON file_uploads TO messaging_gateway;
 GRANT SELECT ON media_reservations TO messaging_gateway;
 -- Schedule only existing originals; no state, source, attempt or lease mutation.

@@ -502,7 +502,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "List permitted chats. order: activity (default) or last_activity_desc = recent first;\nid = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,\nor explicit group owner mention/reply; heuristic, not obligation. Attention expires after\nawaiting_reply_days (default 14; 0 = no age limit), based on the attention message time.\nGroup evidence survives others' chatter and clears after owner writes. No provider read changes.\npriority requires awaiting_reply=true; score/reasons are transparent heuristics.\nexclude_chats takes archive IDs, exclude_senders account-scoped provider sender IDs.\nonly_questions uses question punctuation; private-only uses chat_types=['private'].\nonly_unread includes fresh known chat read observations only; unknown/stale count is explicit.\nexclude_likely_broadcasts (queue only, default false) drops one-way chats, including a first contact the owner\nhas not answered, and provider business/verified senders; it reports excluded_likely_broadcasts_total within\nscope. detail=full adds awaiting_reply_priority_components (points per reason).\nCompact rows omit values the row fixes; an absent field means the value below.\nlast_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;\nelse the shown head's direction (owner/peer; a head hint: peer).\nsuggested_action and basis on channel and self_chat rows: not_applicable, channel_or_self_chat. On a group without a hint, suggested_action, basis and\nowner_attention: not_applicable, no_observed_owner_attention (no owner attention observed).\nowner_attention on a group with a hint: last_turn peer (the peer wrote last).\nA question is question_mark in reasons. A private hint's basis: last_archived_message_incoming.\nsender_name on an outgoing head without sender_id: the owner. head_freshness: stale.\nWithout conversation.basis beside a hint, the hint's confidence, else its basis, gives the reason.\nnext_step: provider_head_stale, provider_head_not_verified, history_has_gaps -> answer_with_caveat.\nnext_step: ambiguous_message_order, ambiguous_attention_reply_order, head_candidates_truncated -> answer_with_caveat.\nnext_step: message_revision_changed_during_read, message_version_conflict -> reread_now.\nnext_step: rate_limited, provider_temporarily_unavailable -> wait_for_provider_cooldown.\nnext_step: provider_unavailable, provider_chat_error -> check_provider_access.\nnext_step: unclassified_latest_message, chat_type_unknown, any other code -> get_context.\nnext_step: no_archived_messages -> wait_for_history.\nretry_after_s: seconds left of a rate limit. catchup (WhatsApp, beside coverage): state moving, queued, stalled or unknown.\nRows without type omit nothing.\nlimit defaults to 25 (maximum 100); continue with next_cursor.\n",
+      "description": "List permitted chats. order: activity (default) or last_activity_desc = recent first;\nid = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,\nor explicit group owner mention/reply; heuristic, not obligation. Attention expires after\nawaiting_reply_days (default 14; 0 = no age limit), based on the attention message time.\nGroup evidence survives others' chatter and clears after owner writes. No provider read changes.\npriority requires awaiting_reply=true; score/reasons are transparent heuristics.\nexclude_chats takes archive IDs, exclude_senders account-scoped provider sender IDs.\nonly_questions uses question punctuation; private-only uses chat_types=['private'].\nonly_unread includes fresh known chat read observations only; unknown/stale count is explicit.\nexclude_likely_broadcasts (queue only, default false) drops one-way chats, including a first contact the owner\nhas not answered, and provider business/verified senders; it reports excluded_likely_broadcasts_total within\nscope. detail=full adds awaiting_reply_priority_components (points per reason).\nWhile this agent has a mute the queue reports muted_total (rows mutes remove); include_muted=true\n(queue only) returns them with awaiting_reply.muted chat or sender. A due snooze returns with\nsnoozed_until and snooze_due.\nCompact rows omit values the row fixes; an absent field means the value below.\nlast_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;\nelse the shown head's direction (owner/peer; a head hint: peer).\nsuggested_action and basis on channel and self_chat rows: not_applicable, channel_or_self_chat. On a group without a hint, suggested_action, basis and\nowner_attention: not_applicable, no_observed_owner_attention (no owner attention observed).\nowner_attention on a group with a hint: last_turn peer (the peer wrote last).\nA question is question_mark in reasons. A private hint's basis: last_archived_message_incoming.\nsender_name on an outgoing head without sender_id: the owner. head_freshness: stale.\nWithout conversation.basis beside a hint, the hint's confidence, else its basis, gives the reason.\nnext_step: provider_head_stale, provider_head_not_verified, history_has_gaps -> answer_with_caveat.\nnext_step: ambiguous_message_order, ambiguous_attention_reply_order, head_candidates_truncated -> answer_with_caveat.\nnext_step: message_revision_changed_during_read, message_version_conflict -> reread_now.\nnext_step: rate_limited, provider_temporarily_unavailable -> wait_for_provider_cooldown.\nnext_step: provider_unavailable, provider_chat_error -> check_provider_access.\nnext_step: unclassified_latest_message, chat_type_unknown, any other code -> get_context.\nnext_step: no_archived_messages -> wait_for_history.\nretry_after_s: seconds left of a rate limit. catchup (WhatsApp, beside coverage): state moving, queued, stalled or unknown.\nRows without type omit nothing.\nlimit defaults to 25 (maximum 100); continue with next_cursor.\n",
       "inputSchema": {
         "properties": {
           "after": {
@@ -666,6 +666,11 @@
             "default": false,
             "title": "Exclude Likely Broadcasts",
             "type": "boolean"
+          },
+          "include_muted": {
+            "default": false,
+            "title": "Include Muted",
+            "type": "boolean"
           }
         },
         "type": "object",
@@ -686,7 +691,126 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Hide this exact reply hint for this credential until a new meaningful incoming.\n\nRequires read and cursor-write. Use the hint's message ID/revision. A changed\ntarget returns reply_target_changed; refresh it before deciding. Repeating\nthe same dismissal is safe, but does not prove a newer hint was dismissed.\nArchive-local queue action: does not send, mark provider read or assert a\nrequest was fulfilled. Other agents' credentials keep their own queue.\n",
+      "description": "Hide this exact reply hint for this credential until a new meaningful incoming.\n\nRequires read and cursor-write. Use the hint's message ID/revision. A changed\ntarget returns reply_target_changed; refresh it before deciding. Repeating\nthe same dismissal is safe, but does not prove a newer hint was dismissed.\nArchive-local queue action: does not send, mark provider read or assert a\nrequest was fulfilled. Other agents' credentials keep their own queue.\nreason: no_reply_needed, spam_or_mailing, handled_elsewhere or other; note: 1-200\ncharacters, stored as untrusted text. A bad reason or note returns invalid_filter.\nUndo with restore_reply; for a recurring sender use mute_reply_source.\n",
+      "inputSchema": {
+        "properties": {
+          "chat_id": {
+            "title": "Chat Id",
+            "type": "string"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Note"
+          }
+        },
+        "required": [
+          "chat_id",
+          "message_id",
+          "expected_revision"
+        ],
+        "type": "object",
+        "title": "dismiss_replyArguments",
+        "additionalProperties": false
+      },
+      "name": "dismiss_reply",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "dismiss_replyDictOutput"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Hide this exact reply hint for this credential until `until` or a new meaningful incoming.\n\nRequires read and cursor-write. until: RFC 3339 with an offset, in the future and at\nmost 90 days ahead, else invalid_date_range. After until the row returns, even past\nawaiting_reply_days, with snoozed_until and snooze_due. Replaces this credential's\ndismissal or snooze of the chat. Archive-local; no provider action.\n",
+      "inputSchema": {
+        "properties": {
+          "chat_id": {
+            "title": "Chat Id",
+            "type": "string"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "until": {
+            "title": "Until",
+            "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Note"
+          }
+        },
+        "required": [
+          "chat_id",
+          "message_id",
+          "expected_revision",
+          "until"
+        ],
+        "type": "object",
+        "title": "snooze_replyArguments",
+        "additionalProperties": false
+      },
+      "name": "snooze_reply",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "snooze_replyDictOutput"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Undo this credential's dismissal or snooze of this exact hint; the queue then recomputes the row.\n\nRequires read and cursor-write. Pass the message ID/revision the entry names (list_reply_dismissals).\nrestored false: no such entry; an entry for another hint is never removed. removed.active\nfalse: the entry no longer hid the row. Mutes are untouched. Keeps no request result: after\nan uncertain response read list_reply_dismissals, do not retry. Archive-local; no provider action.\n",
       "inputSchema": {
         "properties": {
           "chat_id": {
@@ -708,14 +832,195 @@
           "expected_revision"
         ],
         "type": "object",
-        "title": "dismiss_replyArguments",
+        "title": "restore_replyArguments",
         "additionalProperties": false
       },
-      "name": "dismiss_reply",
+      "name": "restore_reply",
       "outputSchema": {
         "type": "object",
         "additionalProperties": true,
-        "title": "dismiss_replyDictOutput"
+        "title": "restore_replyDictOutput"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Keep a chat, or a sender within one account, out of this agent's reply queue until unmuted.\n\nRequires read and cursor-write. Pass chat_id, or account plus the hint's sender_id. A chat\nmute removes the chat; a sender mute skips that sender's messages when choosing a hint (a\ngroup stays when another participant's attention remains). Shared by this agent's keys and\nkept across key rotation; other agents are unaffected. One mute per sender ID and account.\nAt most 1000 per agent (mute_limit_reached). Repeating updates reason/note (dismiss_reply's\nset). Archive-local: never mutes, archives or marks read on the provider.\n",
+      "inputSchema": {
+        "properties": {
+          "chat_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Chat Id"
+          },
+          "account": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Account"
+          },
+          "sender_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sender Id"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Note"
+          }
+        },
+        "type": "object",
+        "title": "mute_reply_sourceArguments",
+        "additionalProperties": false
+      },
+      "name": "mute_reply_source",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "mute_reply_sourceDictOutput"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Remove this agent's mute of the chat, or of the sender within the account. unmuted false: none existed.\n\nRequires read and cursor-write. After an uncertain response read list_reply_dismissals,\ndo not retry. Archive-local; no provider action.\n",
+      "inputSchema": {
+        "properties": {
+          "chat_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Chat Id"
+          },
+          "account": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Account"
+          },
+          "sender_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sender Id"
+          }
+        },
+        "type": "object",
+        "title": "unmute_reply_sourceArguments",
+        "additionalProperties": false
+      },
+      "name": "unmute_reply_source",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "unmute_reply_sourceDictOutput"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "List this credential's dismissals or snoozes, or this agent's mutes, in chats it can read now.\n\nItems: target (chat or sender), chat_id, title, sender_id, sender_name, reason, note (untrusted),\ncreated_at; dismissals and snoozes add message_id, revision (restore_reply's arguments),\nsnippet, snoozed_until and active (still hides the current hint). limit 1-100 (default 20).\n",
+      "inputSchema": {
+        "properties": {
+          "kind": {
+            "default": "dismissed",
+            "enum": [
+              "dismissed",
+              "snoozed",
+              "muted"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "after": {
+            "default": "",
+            "title": "After",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "type": "object",
+        "title": "list_reply_dismissalsArguments",
+        "additionalProperties": false
+      },
+      "name": "list_reply_dismissals",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "list_reply_dismissalsDictOutput"
       }
     },
     {
@@ -2878,19 +3183,24 @@
                   "list_chats",
                   "list_feedback",
                   "list_messenger_operations",
+                  "list_reply_dismissals",
                   "list_subscriptions",
+                  "mute_reply_source",
                   "prepare_file_upload",
                   "preview_message",
                   "preview_messenger_operation",
                   "record_review",
                   "request_file_download",
                   "resolve_reference",
+                  "restore_reply",
                   "search",
                   "search_files",
                   "search_people",
                   "send_message",
+                  "snooze_reply",
                   "submit_feedback",
                   "test_subscription",
+                  "unmute_reply_source",
                   "update_subscription",
                   "upload_file_chunk",
                   "wait_for_subscription_events"

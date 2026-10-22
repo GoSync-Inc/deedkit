@@ -621,7 +621,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                    from_time: str='', to_time: str='', include_coverage: bool | None=None, detail: Detail='compact',
                    awaiting_reply_days: StrictInt=14,exclude_chats: list[StrictStr] | None=None,
                    exclude_senders: list[StrictStr] | None=None,only_questions: bool=False,only_unread: bool=False,
-                   view: ConversationView='conversation',exclude_likely_broadcasts: bool=False) -> dict[str, Any]:
+                   view: ConversationView='conversation',exclude_likely_broadcasts: bool=False,
+                   include_muted: bool=False) -> dict[str, Any]:
         """List permitted chats. order: activity (default) or last_activity_desc = recent first;
         id = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,
         or explicit group owner mention/reply; heuristic, not obligation. Attention expires after
@@ -634,6 +635,9 @@ def create_app(store: Store, allowed_hosts: list[str]):
         exclude_likely_broadcasts (queue only, default false) drops one-way chats, including a first contact the owner
         has not answered, and provider business/verified senders; it reports excluded_likely_broadcasts_total within
         scope. detail=full adds awaiting_reply_priority_components (points per reason).
+        While this agent has a mute the queue reports muted_total (rows mutes remove); include_muted=true
+        (queue only) returns them with awaiting_reply.muted chat or sender. A due snooze returns with
+        snoozed_until and snooze_due.
         Compact rows omit values the row fixes; an absent field means the value below.
         last_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;
         else the shown head's direction (owner/peer; a head hint: peer).
@@ -659,11 +663,12 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     from_time=from_time,to_time=to_time,include_coverage=include_coverage,
                     awaiting_reply_days=awaiting_reply_days,exclude_chats=exclude_chats,exclude_senders=exclude_senders,
                     only_questions=only_questions,only_unread=only_unread,view=view,
-                    exclude_likely_broadcasts=exclude_likely_broadcasts)
+                    exclude_likely_broadcasts=exclude_likely_broadcasts,include_muted=include_muted)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=False, idempotentHint=True, openWorldHint=False))
-    def dismiss_reply(ctx: Context,chat_id: StrictStr,message_id: StrictStr,expected_revision: StrictInt) -> dict[str,Any]:
+    def dismiss_reply(ctx: Context,chat_id: StrictStr,message_id: StrictStr,expected_revision: StrictInt,
+                      reason: StrictStr | None=None,note: StrictStr | None=None) -> dict[str,Any]:
         """Hide this exact reply hint for this credential until a new meaningful incoming.
 
         Requires read and cursor-write. Use the hint's message ID/revision. A changed
@@ -671,8 +676,78 @@ def create_app(store: Store, allowed_hosts: list[str]):
         the same dismissal is safe, but does not prove a newer hint was dismissed.
         Archive-local queue action: does not send, mark provider read or assert a
         request was fulfilled. Other agents' credentials keep their own queue.
+        reason: no_reply_needed, spam_or_mailing, handled_elsewhere or other; note: 1-200
+        characters, stored as untrusted text. A bad reason or note returns invalid_filter.
+        Undo with restore_reply; for a recurring sender use mute_reply_source.
         """
-        return call(ctx,'dismiss_reply',chat_id=chat_id,message_id=message_id,expected_revision=expected_revision)
+        return call(ctx,'dismiss_reply',chat_id=chat_id,message_id=message_id,expected_revision=expected_revision,
+                    **({} if reason is None else {'reason':reason}),**({} if note is None else {'note':note}))
+
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
+        destructiveHint=False, idempotentHint=True, openWorldHint=False))
+    def snooze_reply(ctx: Context,chat_id: StrictStr,message_id: StrictStr,expected_revision: StrictInt,
+                     until: StrictStr,note: StrictStr | None=None) -> dict[str,Any]:
+        """Hide this exact reply hint for this credential until `until` or a new meaningful incoming.
+
+        Requires read and cursor-write. until: RFC 3339 with an offset, in the future and at
+        most 90 days ahead, else invalid_date_range. After until the row returns, even past
+        awaiting_reply_days, with snoozed_until and snooze_due. Replaces this credential's
+        dismissal or snooze of the chat. Archive-local; no provider action.
+        """
+        return call(ctx,'snooze_reply',chat_id=chat_id,message_id=message_id,expected_revision=expected_revision,
+                    until=until,**({} if note is None else {'note':note}))
+
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
+        destructiveHint=False, idempotentHint=True, openWorldHint=False))
+    def restore_reply(ctx: Context,chat_id: StrictStr,message_id: StrictStr,expected_revision: StrictInt) -> dict[str,Any]:
+        """Undo this credential's dismissal or snooze of this exact hint; the queue then recomputes the row.
+
+        Requires read and cursor-write. Pass the message ID/revision the entry names (list_reply_dismissals).
+        restored false: no such entry; an entry for another hint is never removed. removed.active
+        false: the entry no longer hid the row. Mutes are untouched. Keeps no request result: after
+        an uncertain response read list_reply_dismissals, do not retry. Archive-local; no provider action.
+        """
+        return call(ctx,'restore_reply',chat_id=chat_id,message_id=message_id,expected_revision=expected_revision)
+
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
+        destructiveHint=False, idempotentHint=True, openWorldHint=False))
+    def mute_reply_source(ctx: Context,chat_id: StrictStr | None=None,account: StrictStr | None=None,
+                          sender_id: StrictStr | None=None,reason: StrictStr | None=None,
+                          note: StrictStr | None=None) -> dict[str,Any]:
+        """Keep a chat, or a sender within one account, out of this agent's reply queue until unmuted.
+
+        Requires read and cursor-write. Pass chat_id, or account plus the hint's sender_id. A chat
+        mute removes the chat; a sender mute skips that sender's messages when choosing a hint (a
+        group stays when another participant's attention remains). Shared by this agent's keys and
+        kept across key rotation; other agents are unaffected. One mute per sender ID and account.
+        At most 1000 per agent (mute_limit_reached). Repeating updates reason/note (dismiss_reply's
+        set). Archive-local: never mutes, archives or marks read on the provider.
+        """
+        return call(ctx,'mute_reply_source',**{k:v for k,v in {'chat_id':chat_id,'account':account,
+            'sender_id':sender_id,'reason':reason,'note':note}.items() if v is not None})
+
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
+        destructiveHint=False, idempotentHint=True, openWorldHint=False))
+    def unmute_reply_source(ctx: Context,chat_id: StrictStr | None=None,account: StrictStr | None=None,
+                            sender_id: StrictStr | None=None) -> dict[str,Any]:
+        """Remove this agent's mute of the chat, or of the sender within the account. unmuted false: none existed.
+
+        Requires read and cursor-write. After an uncertain response read list_reply_dismissals,
+        do not retry. Archive-local; no provider action.
+        """
+        return call(ctx,'unmute_reply_source',**{k:v for k,v in {'chat_id':chat_id,'account':account,
+            'sender_id':sender_id}.items() if v is not None})
+
+    @mcp.tool(structured_output=True, annotations=read)
+    def list_reply_dismissals(ctx: Context,kind: Literal['dismissed','snoozed','muted']='dismissed',
+                              after: str='',limit: StrictInt=20) -> dict[str,Any]:
+        """List this credential's dismissals or snoozes, or this agent's mutes, in chats it can read now.
+
+        Items: target (chat or sender), chat_id, title, sender_id, sender_name, reason, note (untrusted),
+        created_at; dismissals and snoozes add message_id, revision (restore_reply's arguments),
+        snippet, snoozed_until and active (still hides the current hint). limit 1-100 (default 20).
+        """
+        return call(ctx,'list_reply_dismissals',kind=kind,after=after,limit=limit)
 
     @mcp.tool(structured_output=True, annotations=read)
     def search_people(ctx: Context, query: str='', accounts: list[StrictStr] | None=None,
@@ -993,6 +1068,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
     async def rest(request):
         operations={'capabilities','list_chats','search','get_messages','get_context',
                     'get_attachment','request_file_download','get_updates','ack_updates','dismiss_reply','record_review','get_reviews',
+                    'snooze_reply','restore_reply','mute_reply_source','unmute_reply_source','list_reply_dismissals',
                     'search_people','search_files','get_file_text','get_sync_status','get_file_occurrences','get_file_segments','resolve_reference','preview_message','send_message','get_send_status',
                     'list_messenger_operations','preview_messenger_operation','execute_messenger_operation','get_messenger_operation',
                     'prepare_file_upload','upload_file_chunk','get_file_upload',

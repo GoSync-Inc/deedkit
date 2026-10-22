@@ -27,7 +27,7 @@ npx anymsg search --url https://messages.example.com --token-file /private/agent
 ```
 
 Keep token files private (`chmod 600`); do not put tokens in command arguments.
-Use `call('operation', arguments)` for the 41 allowlisted HTTP operations exported as `tools`.
+Use `call('operation', arguments)` for the 46 allowlisted HTTP operations exported as `tools`.
 Confirmed text sending uses `sendMessage` and `getSendStatus`, separate send rights
 and account opt-in. The acting agent must obtain exact owner confirmation; the
 server has no approval gate yet. Reuse the same action ID after a lost response;
@@ -94,6 +94,12 @@ first; dismissal affects only this credential and needs read + cursor-write.
 `reply_target_changed` means refresh the hint, not automatically retry a changed
 write. Queue filters and priority use the same snake_case parameters as REST.
 See the server's SEARCH.md for owner-read observations and heuristic limits.
+
+Development source adds `snoozeReply`, `restoreReply`, `muteReplySource`,
+`unmuteReplySource` and `listReplyDismissals`, and `dismissReply` accepts an
+optional `reason` and `note`. Dismissals and snoozes belong to this credential;
+mutes belong to its agent and survive key rotation. After an uncertain restore or
+unmute, read `listReplyDismissals` instead of retrying.
 
 ## Stage a file or photo without sending it
 
