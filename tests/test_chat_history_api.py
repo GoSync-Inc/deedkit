@@ -156,3 +156,36 @@ def test_page_is_committed_as_backfill_and_a_rerun_adds_no_rows(worker):
     again, _ = fetch(w, *page)
     assert again['fetched'] == 2 and again['stored_new'] == 0 and counts(store) == before
     assert rows(store, 'collector_chats') == coverage
+
+
+# spec: ANYM-477
+def test_a_stalled_archive_write_frees_the_lease_fence_at_the_deadline(worker, monkeypatch):
+    import threading
+    import time
+    w, store, _ = worker
+    asyncio.run(w.sync_once())
+    fence = Archive.fence
+    def stalled(c, account, lease):
+        fence(c, account, lease)
+        # The write thread stalls on the client while its transaction holds the lease row.
+        if threading.current_thread() is not threading.main_thread(): time.sleep(3)
+    monkeypatch.setattr(Archive, 'fence', staticmethod(stalled))
+    found = []
+    job = {'operation': 'request_chat_history', 'platform': 'telegram', 'mutation': False, 'expires_at': 4e9, 'account': w.account,
+           'chat_id': stable_id('chat', w.account, '100'), 'provider_chat': '100', 'provider_message_id': '50',
+           'parameters': validate_operation('telegram', 'request_chat_history', {'count': 10}), '_history': found,
+           '_policy': {'enabled': True, 'discover_chats': True, 'include_chats': [], 'exclude_chats': []}}
+    asyncio.run(execute(Resolving(types.messages.Messages([hit(40, 'older synthetic', day=1)], [], [GROUP], [PERSON, MEMBER, OWNER])), job))
+    assert found
+    def lease_row_free():
+        with store.pool.connection() as c:
+            c.execute("SET LOCAL lock_timeout='500ms'")
+            return bool(c.execute('SELECT 1 FROM collector_leases WHERE account=%s FOR UPDATE', (w.account,)).fetchone())
+    async def timed_out():
+        began = asyncio.get_running_loop().time()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(w.store_live_hits(found, label='chat_history', deadline=began + 1), 1)
+        # Back on the foreground path (where the receipt and the next send claim run) while the thread still stalls.
+        return asyncio.get_running_loop().time() - began, await asyncio.to_thread(lease_row_free)
+    elapsed, free = asyncio.run(timed_out())  # asyncio.run then waits for the stalled thread itself
+    assert elapsed < 2.5 and free  # the deadline plus STORE_GRACE, not the 3 s stall; the server ended the fence

@@ -260,8 +260,10 @@ def test_service_messages_of_the_page_are_kept_for_the_archive():
 
 
 # spec: ANYM-477
-def test_a_timed_out_read_waits_for_its_archive_write_and_starts_no_other():
+def test_a_timed_out_read_waits_for_its_archive_write_and_starts_no_other(monkeypatch):
     import time
+    import messaging_service.telegram_collector as telegram_collector
+    monkeypatch.setattr(telegram_collector, 'bounded_state', lambda state, deadline: state)
     active, started = [], []
     def apply(capture):
         started.append(1); active.append(1); time.sleep(.2); active.pop()
@@ -283,18 +285,28 @@ def test_a_timed_out_read_waits_for_its_archive_write_and_starts_no_other():
 
 # spec: ANYM-477
 def test_a_message_not_stored_is_reported_with_the_request_that_reloads_its_page():
+    applied, failing = [], {'39'}
     def apply(capture):
-        if capture['envelope']['provider_id'] == '39': raise RuntimeError('synthetic transient failure')
+        number = capture['envelope']['provider_id']
+        if number in failing: raise RuntimeError('synthetic transient failure')
+        applied.append(number)
         return {'outcome': 'created'}
     c = collector(apply)
-    c.oldest_archived = lambda chat: '41'
+    # An archive that was empty: no default anchor, and after this page its oldest message is 38.
+    oldest = [None]
+    c.oldest_archived = lambda chat: oldest[0]
     async def provider(value):
-        return await execute(owner_client(page([message(n) for n in (40, 39, 38)])), value)
+        return await execute(owner_client(page([message(n, when=WHEN + n * 60) for n in (40, 39, 38)])), value)
     c.provider.execute_operation = provider
-    value = job({'count': 10})
-    data = asyncio.run(c.chat_history(value))['data']
-    assert data['fetched'] == 3 and data['stored_new'] == 2 and data['not_stored'] == 1
-    assert data['retry_parameters'] == {'count': 10, 'before_message': stable_id('msg', ACCOUNT, '-22', '41')}
+    data = asyncio.run(c.chat_history(job({'count': 10})))['data']
+    assert data['fetched'] == 3 and data['stored_new'] == 2 and data['not_stored'] == 1 and applied == ['40', '38']
+    retry = data['retry_parameters']
+    assert retry == {'count': 10, 'from_time': datetime.fromtimestamp(WHEN + 39 * 60, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                     'to_time': datetime.fromtimestamp(WHEN + 39 * 60 + 1, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}
+    # The archive changed (oldest is now 38) and the failure has passed: the retry loads 39 itself.
+    oldest[0], failing = '38', set()
+    again = asyncio.run(c.chat_history(job(retry)))['data']
+    assert applied[2:] == ['39'] and again['fetched'] == 1 and 'not_stored' not in again
     complete = collector(lambda capture: {'outcome': 'created'})
     complete.oldest_archived, complete.provider.execute_operation = (lambda chat: '41'), provider
     assert 'not_stored' not in asyncio.run(complete.chat_history(job({'count': 10})))['data']

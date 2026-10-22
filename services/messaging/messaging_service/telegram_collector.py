@@ -1,8 +1,9 @@
 """Single-owner Telegram collector. No sign-in, messages or secrets in gateway tools."""
 import asyncio
 from collections import deque
-from contextlib import suppress
-from datetime import datetime,timezone
+import copy
+from contextlib import contextmanager,suppress
+from datetime import datetime,timedelta,timezone
 import errno
 import json
 import logging
@@ -31,14 +32,45 @@ from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy,validate_pr
 log=logging.getLogger(__name__)
 # Seconds before a live read's deadline in which no archive write starts (ANYM-477).
 STORE_MARGIN=0.5
+# Seconds a cancelled live read waits for its write thread; the server has ended the transaction by then.
+STORE_GRACE=1.0
+
+
+class DeadlinePool:
+    """The archive pool for a live read's writes (ANYM-477, Sol recheck F1): one absolute deadline
+    (time.monotonic) bounds the pool wait, and each transaction gets the time left as its
+    transaction_timeout, lock_timeout and statement_timeout. PostgreSQL then ends the transaction and
+    frees the lease fence it holds at the deadline, even when this client stalls."""
+    def __init__(self,pool,deadline):self.pool,self.deadline=pool,deadline
+
+    def left(self):
+        remaining=self.deadline-time.monotonic()
+        if remaining<=0:raise TimeoutError('live_store_deadline')
+        return remaining
+
+    @contextmanager
+    def connection(self,timeout=None):
+        with self.pool.connection(timeout=min(self.left(),timeout or self.left())) as c:
+            ms=str(max(1,int(self.left()*1000)))
+            c.execute("SELECT set_config('transaction_timeout',%s,true),set_config('lock_timeout',%s,true),"
+                "set_config('statement_timeout',%s,true)",(ms,ms,ms))
+            yield c
+
+
+def bounded_state(state,deadline):
+    """A CollectorState for the same account and lease whose archive writes use a DeadlinePool."""
+    archive=copy.copy(state.archive);archive.store=copy.copy(archive.store)
+    archive.store.pool=DeadlinePool(state.archive.store.pool,deadline)
+    return CollectorState(archive,state.account,state.lease)
 
 
 async def finished(fn,*args):
-    """Run fn in a thread; on cancellation wait for it, so its transaction ends before the caller does."""
+    """Run fn in a thread; a cancelled caller waits for it at most STORE_GRACE before it goes on."""
     task=asyncio.ensure_future(asyncio.to_thread(fn,*args))
     try: return await asyncio.shield(task)
     except asyncio.CancelledError:
-        await asyncio.wait({task}); task.exception(); raise
+        await asyncio.wait({task},timeout=STORE_GRACE)
+        task.add_done_callback(lambda t:t.cancelled() or t.exception()); raise
 
 
 class ProviderUnavailable(Exception): pass
@@ -1010,12 +1042,14 @@ class TelegramCollector:
             missed=sum(1 for _,hit,_,_ in found if not hit.get('stored'))
             if missed:
                 # A later default request starts below the oldest archived message and would skip these,
-                # so the receipt names the request that loads this page again (a rerun adds no duplicates).
+                # so the receipt names a time range holding them, independent of the archive's state
+                # (a rerun adds no duplicates).
                 data['not_stored']=missed
-                retry={k:v for k,v in parameters.items() if k in ('count','before_message','around_message','from_time','to_time')}
-                if job.get('provider_message_id') and not any(k in retry for k in ('before_message','around_message','from_time','to_time')):
-                    retry['before_message']=stable_id('msg',self.account,str(job.get('provider_chat')),str(job['provider_message_id']))
-                data['retry_parameters']=retry
+                dates=[m.date for m,hit,_,_ in found if m is not None and not hit.get('stored') and m.date]
+                if dates:
+                    data['retry_parameters']={'count':parameters.get('count',50),
+                        'from_time':min(dates).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'to_time':(max(dates)+timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%SZ')}
         return answer
 
     def oldest_archived(self,chat):
@@ -1032,23 +1066,28 @@ class TelegramCollector:
         Checkpoints and coverage stay with the history traversal. Returns the number of new messages.
 
         A live read's deadline (loop time) bounds it: no write starts in its last STORE_MARGIN seconds,
-        and a cancelled read waits for the write in flight, so no archive transaction holding the lease
-        fence outlives the read's receipt or overlaps the next send claim (Astra r1 F1, ANYM-477)."""
+        every transaction ends at the deadline on the server (DeadlinePool), and a cancelled read waits
+        at most STORE_GRACE for its thread, so no archive transaction holding the lease fence outlives
+        the read's receipt or holds up the next send claim (ANYM-477 review F1)."""
         loop=asyncio.get_running_loop()
+        state=self.state
+        if deadline is not None:state=bounded_state(self.state,time.monotonic()+deadline-loop.time())
+        def late():return deadline is not None and deadline-loop.time()<STORE_MARGIN
         stored=skipped=failed=created=0
         for message,hit,chat_type,title in found:
             if message is not None and not self.in_window([message]):
                 hit.update(stored=False,reason='outside_history_window'); skipped+=1; continue
-            if deadline is not None and deadline-loop.time()<STORE_MARGIN:
+            if late():
                 hit.update(stored=False,reason='deadline'); failed+=1; continue
             outcome=None
             try:
                 if message is None: raise ValueError('uninitialized_message')
                 chat=str(message.chat_id);kind=peer_kind(message)
-                await finished(self.state.catalog,chat,kind,title or chat,chat_type,self.history_since)
+                await finished(state.catalog,chat,kind,title or chat,chat_type,self.history_since)
                 e=telegram_message(self.account,message,chat_title=title or '',origin='backfill',
                     verified_self=getattr(self.provider,'verified_self',None))
-                outcome=(await finished(self.state.apply,{'kind':'message','peer_kind':kind,'envelope':e}))['outcome']
+                if late():raise TimeoutError('live_store_deadline')
+                outcome=(await finished(state.apply,{'kind':'message','peer_kind':kind,'envelope':e}))['outcome']
             except Exception as exc:
                 log.warning('%s_store_failed error=%s',label,type(exc).__name__)
             if outcome in (None,'excluded'):

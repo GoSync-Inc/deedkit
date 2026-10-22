@@ -389,8 +389,11 @@ needs `read-live`, the account opt-in and, through the gateway, the
   `provider_history_start_reached` (Telegram returned fewer than asked), with a
   time range `range_exhausted` (fewer returned or `from_time` reached). When some
   messages of the page were not stored (a storage error, or the read's deadline),
-  it adds `not_stored` and `retry_parameters`: the request that loads the same
-  page again, since a later request without an anchor starts below them.
+  it adds `not_stored` and `retry_parameters`: a `from_time`/`to_time` request
+  covering the messages not stored, since a later request without an anchor
+  starts below them. The page's archive writes end at the read's deadline: each
+  transaction gets the time left as its PostgreSQL `transaction_timeout`, so a
+  stalled write never holds the collector lease past it.
 - Service messages (joins, title changes, calls) are part of the page.
 - Telegram archive: the page is committed as live search hits are (above):
   origin `backfill`, the usual revision rules, media jobs, the collection policy
