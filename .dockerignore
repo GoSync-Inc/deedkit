@@ -19,9 +19,9 @@ __pycache__
 **/._*
 **/node_modules
 # Runtime/private data. Keep public examples named *.example.*.
-.env
-.env.*
-!.env.example
+**/.env
+**/.env.*
+!**/.env.example
 private/
 sessions/
 spool/
