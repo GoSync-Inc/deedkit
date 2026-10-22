@@ -87,6 +87,16 @@ class DeliveryPolicy(TypedDict, total=False):
     expect_reply_within_s: Annotated[StrictInt, Field(ge=60,le=1209600)]
 
 
+PROMOTIONAL_BASIS="business_sender or repeated_days; absent when not promotional."
+# Optional fields an agent can discover from outputSchema; rows stay open objects.
+LIST_CHATS_OUTPUT_PROPERTIES={
+    'excluded_promotional_total':{'type':'integer','minimum':0,'description':
+        'Queue rows promotional=exclude removed (awaiting_reply=true only); absent means none.'},
+    'items':{'type':'array','items':{'type':'object','additionalProperties':True,'properties':{
+        'awaiting_reply':{'description':'Conversation compact hint; carries likely_promotional (true) and '
+            'promotional_basis ('+PROMOTIONAL_BASIS+')'},
+        'awaiting_reply_likely_promotional':{'description':'Store, view=archive and detail=full rows: true when likely promotional; absent otherwise.'},
+        'awaiting_reply_promotional_basis':{'description':'Store, view=archive and detail=full rows: '+PROMOTIONAL_BASIS}}}}}
 def subscription_expiry(value):
     """Validate a zoned ISO timestamp without coercing or echoing input values."""
     try:
@@ -620,7 +630,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
                    awaiting_reply_days: StrictInt=14,exclude_chats: list[StrictStr] | None=None,
                    exclude_senders: list[StrictStr] | None=None,only_questions: bool=False,only_unread: bool=False,
                    view: ConversationView='conversation',exclude_likely_broadcasts: bool=False,
-                   include_muted: bool=False) -> dict[str, Any]:
+                   include_muted: bool=False,promotional: Literal['exclude','include','only']='exclude') -> dict[str, Any]:
         """List permitted chats. order: activity (default) or last_activity_desc = recent first;
         id = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,
         or explicit group owner mention/reply; heuristic, not obligation. Attention expires after
@@ -632,7 +642,12 @@ def create_app(store: Store, allowed_hosts: list[str]):
         only_unread includes fresh known chat read observations only; unknown/stale count is explicit.
         exclude_likely_broadcasts (queue only, default false) drops one-way chats, including a first contact the owner
         has not answered, and provider business/verified senders; it reports excluded_likely_broadcasts_total within
-        scope. detail=full adds awaiting_reply_priority_components (points per reason).
+        scope. promotional (queue only): exclude (default) leaves out likely promotional rows (a one-way private chat
+        from a non-contact that is a business/verified sender or wrote on 3+ UTC days) and reports
+        excluded_promotional_total within scope (absent means none); include returns them with awaiting_reply.likely_promotional and promotional_basis
+        (business_sender or repeated_days); only
+        lists just them; not combinable with exclude_likely_broadcasts. A group owner mention without a question
+        mark scores owner_request. detail=full adds awaiting_reply_priority_components (points per reason).
         While this agent has a mute the queue reports muted_total (rows mutes remove); include_muted=true
         (queue only) returns them with awaiting_reply.muted chat or sender. A due snooze returns with
         snoozed_until and snooze_due.
@@ -661,7 +676,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     from_time=from_time,to_time=to_time,include_coverage=include_coverage,
                     awaiting_reply_days=awaiting_reply_days,exclude_chats=exclude_chats,exclude_senders=exclude_senders,
                     only_questions=only_questions,only_unread=only_unread,view=view,
-                    exclude_likely_broadcasts=exclude_likely_broadcasts,include_muted=include_muted)
+                    exclude_likely_broadcasts=exclude_likely_broadcasts,include_muted=include_muted,
+                    promotional=promotional)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=False, idempotentHint=True, openWorldHint=False))
@@ -1109,6 +1125,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
 
     models={name:tool.fn_metadata.arg_model for name,tool in mcp._tool_manager._tools.items()}
     for tool in mcp._tool_manager._tools.values():tool.parameters['additionalProperties']=False
+    # Published only: the dict model still validates and keeps every key (ANYM-427).
+    mcp._tool_manager._tools['list_chats'].fn_metadata.output_schema['properties']=LIST_CHATS_OUTPUT_PROPERTIES
     app=mcp.streamable_http_app(stateless_http=True,json_response=True,max_request_body_size=UPLOAD_BODY_BYTES,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
             allowed_hosts=allowed_hosts,allowed_origins=[urlsplit(store.public_url)._replace(path='',query='',fragment='').geturl()]))

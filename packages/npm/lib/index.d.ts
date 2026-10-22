@@ -1,6 +1,23 @@
 export type ReplyReason = 'no_reply_needed' | 'spam_or_mailing' | 'handled_elsewhere' | 'other';
 export type Json = null | boolean | number | string | Json[] | {[key: string]: Json};
 export type Arguments = {[key: string]: Json};
+/** Reply-queue promotional filter (ANYM-427); exclude is the default for awaiting_reply=true. */
+export type PromotionalFilter = 'exclude' | 'include' | 'only';
+export type ListChatsArgs = Arguments & {awaiting_reply?: boolean; exclude_likely_broadcasts?: boolean;
+  include_muted?: boolean; promotional?: PromotionalFilter};
+export type ListChatsResult = Record<string, unknown> & {
+  items: Array<Record<string, unknown> & {
+    /** Compact conversation hint; likely_promotional and promotional_basis are absent when not promotional. */
+    awaiting_reply?: boolean | (Record<string, unknown> & {likely_promotional?: true;
+      promotional_basis?: 'business_sender' | 'repeated_days'});
+    awaiting_reply_likely_promotional?: true;
+    awaiting_reply_promotional_basis?: 'business_sender' | 'repeated_days'}>;
+  next_cursor?: string | null;
+  awaiting_reply_total?: number;
+  /** Present only with promotional=exclude and awaiting_reply=true; absent means none. */
+  excluded_promotional_total?: number;
+  excluded_likely_broadcasts_total?: number;
+  muted_total?: number};
 export type MessageFormat = 'plain' | 'markdown' | 'html';
 export interface MessageDraft {
   account: string;
@@ -167,7 +184,7 @@ export declare class AnyMsgClient {
   muteReplySource(args: {chat_id?: string; account?: string; sender_id?: string; reason?: ReplyReason; note?: string}): Promise<Record<string, unknown>>;
   unmuteReplySource(args: {chat_id?: string; account?: string; sender_id?: string}): Promise<Record<string, unknown>>;
   listReplyDismissals(args: {kind?: 'dismissed' | 'snoozed' | 'muted'; after?: string; limit?: number}): Promise<Record<string, unknown>>;
-  listChats(args?: Arguments): Promise<Record<string, unknown>>;
+  listChats(args?: ListChatsArgs): Promise<ListChatsResult>;
   search(args?: Arguments): Promise<Record<string, unknown>>;
   searchPeople(args?: Arguments): Promise<Record<string, unknown>>;
   searchFiles(args?: Arguments): Promise<Record<string, unknown>>;
