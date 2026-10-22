@@ -15,6 +15,8 @@ GRANT SELECT,INSERT,UPDATE ON attachment_cold_copies TO messaging_cold_archive;
 GRANT SELECT ON attachment_eviction_journal TO messaging_cold_archive;
 -- Restores are admitted against the collectors' capacity reservations.
 GRANT SELECT ON media_reservations,file_uploads TO messaging_cold_archive;
+-- Restore admission keeps above every collector's published disk floor (ANYM-350).
+GRANT SELECT(operations) ON collector_health TO messaging_cold_archive;
 GRANT EXECUTE ON FUNCTION public.register_resident_original(text,bigint),
     public.queue_managed_original(text) TO messaging_cold_archive;
 -- No direct residency, journal, fence or archive mutation: archiving cannot evict.

@@ -82,7 +82,10 @@ def keys(tmp_path_factory):
 def clear_cold_copies(database):
     with database.pool.connection() as c:c.execute('DELETE FROM attachment_cold_copies')
     yield
-    with database.pool.connection() as c:c.execute('DELETE FROM attachment_cold_copies')
+    with database.pool.connection() as c:
+        c.execute('DELETE FROM attachment_cold_copies')
+        # Published collector floors would hold later restores to them.
+        c.execute("UPDATE collector_health SET operations=operations-'disk_floors' WHERE operations ? 'disk_floors'")
 
 
 @pytest.fixture(autouse=True)
@@ -745,7 +748,7 @@ def test_stale_restore_never_overwrites_a_newer_request_or_the_fallback(env,arch
         fallback=s.request_file_download(key,fid)
         assert fallback['rehydration_source']=='provider' and fallback['cold_failure']=='cold_restore_stalled'
     # The fetch outlives the window; the user's next request hands it to the provider.
-    def slow(item):
+    def slow(item,admission):
         stall();raise cold().ColdUnavailable('synthetic')
     monkeypatch.setattr(worker,'_fetch',slow)
     assert worker._restore_one(row)==('cold_unavailable',False)
@@ -839,17 +842,19 @@ def test_streaming_restore_leases_capacity_against_collectors(env,archive,monkey
             admitted=StorageAdmission(BlobWriter(s.files,reserve_bytes=floor)).reserve(c,job,until) is not None
             c.execute('DELETE FROM media_reservations WHERE job=%s',(other,))
             return admitted
-    def streaming(row):
+    def streaming(row,admission):
         seen['admitted']=collector_admitted()
         # Past the 15-minute window the request goes to the provider even while the restore streams.
         with monkeypatch.context() as patch:
             patch.setattr(media_requests,'COLD_RESTORE_STALL_SECONDS',0)
             seen['answer']=s.request_file_download(key,fid)
-        return fetch(row)
+        # The hand-over keeps the lease while this writer still runs.
+        seen['admitted_after_handover']=collector_admitted()
+        return fetch(row,admission)
     monkeypatch.setattr(worker,'_fetch',streaming)
     [row]=worker._due(16)
     assert worker._restore_one(row) is None and resident(s,blob.digest)
-    assert seen['admitted'] is False
+    assert seen['admitted'] is False and seen['admitted_after_handover'] is False
     assert seen['answer']['rehydration_source']=='provider' and seen['answer']['cold_failure']=='cold_restore_stalled'
     assert job_state(s,fid)=='queued' and copy(s,blob.digest)['restore_error']=='cold_restore_stalled'
     # The lease ended with the restore; the same collector job fits again.
@@ -911,13 +916,13 @@ def test_late_restore_success_keeps_the_provider_fallback(env,archive,monkeypatc
     _,_,key,_=archive;s,_,_,_=env;fid,blob=evicted_copy(env,archive,mid='late-1',payload=b'Synthetic late success')
     s.request_file_download(key,fid)
     worker=restorer(env);fetch=worker._fetch;[row]=worker._due(16)
-    def late(item):
+    def late(item,admission):
         # Past the window and past the lease, as for a worker that hung.
         with s.pool.connection() as c:
             c.execute('''UPDATE attachment_cold_copies SET restore_requested_at=clock_timestamp()-interval '16 minutes',
                 restore_finished_at=clock_timestamp() WHERE digest=%s''',(blob.digest,))
         assert s.request_file_download(key,fid)['cold_failure']=='cold_restore_stalled'
-        return fetch(item)
+        return fetch(item,admission)
     monkeypatch.setattr(worker,'_fetch',late)
     # The fetch then succeeds: the file is resident and the hand-over stands.
     assert worker._restore_one(row) is None and resident(s,blob.digest)
@@ -946,3 +951,77 @@ def test_unreadable_reconcile_candidate_does_not_block_restores(env,archive,monk
         assert report['restored']==1 and report['reconciled']==0 and resident(s,blob.digest)
         assert not resident(s,broken.digest)
     finally:(s.files/broken.digest).unlink()
+
+
+def floor_publisher(s,fid):
+    """The attachment's collector run, which publishes its disk floors (ANYM-350)."""
+    from messaging_service.collector_state import CollectorState
+    from messaging_service.archive import Archive
+    with s.pool.connection() as c:
+        account=c.execute('SELECT m.account FROM attachments a JOIN messages m ON m.id=a.message WHERE a.id=%s',
+            (fid,)).fetchone()['account']
+    ar=Archive(s);epoch=ar.acquire(account,'floor-owner')
+    return CollectorState(ar,account,('floor-owner',epoch))
+
+
+# spec: ANYM-350
+def test_restore_keeps_above_the_highest_published_collector_floor(env,archive,monkeypatch):
+    from messaging_service import storage_admission
+    from messaging_service.storage_admission import STREAM_WORKSPACE_BYTES,volume_key
+    _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive,mid='floor-1',payload=b'Synthetic floor')
+    s.request_file_download(key,fid);reads=calls(cloud).count('get_object');free=100*1024**3
+    monkeypatch.setattr(storage_admission.shutil,'disk_usage',lambda root:type('U',(),{'free':free})())
+    with s.pool.connection() as c:
+        base=c.execute('SELECT coalesce(sum(reserved_bytes),0) AS bytes FROM media_reservations').fetchone()['bytes'];base=int(base)
+    # A capture floor above the restore's own floor (the default 10 GiB here is 0): only the published value refuses.
+    run=floor_publisher(s,fid)
+    run.disk_floors({volume_key(s.files):free-base-(blob.bytes+STREAM_WORKSPACE_BYTES)+1})
+    report=restorer(env).run_once()
+    assert report['reasons']=={'disk_reserve':1} and calls(cloud).count('get_object')==reads
+    assert copy(s,blob.digest)['restore_finished_at'] is not None and job_state(s,fid)=='ready'
+    with s.pool.connection() as c:c.execute("UPDATE attachment_cold_copies SET restore_finished_at=clock_timestamp()-interval '10 minutes' WHERE digest=%s",(blob.digest,))
+    # A floor of another volume does not count; this one leaves room.
+    run.disk_floors({'fs:1':free,volume_key(s.files):free-base-(blob.bytes+STREAM_WORKSPACE_BYTES)})
+    assert s.request_file_download(key,fid)['rehydration_source']=='cold_archive'
+    assert restorer(env).run_once()['restored']==1 and resident(s,blob.digest)
+
+
+# spec: ANYM-350
+def test_restore_writer_stops_when_its_lease_ends(env,archive,monkeypatch):
+    from datetime import datetime,timedelta,timezone
+    _,_,key,_=archive;s,_,_,_=env;fid,blob=evicted_copy(env,archive,mid='expiry-1',payload=b'Synthetic expiry')
+    s.request_file_download(key,fid)
+    worker=restorer(env);fetch=worker._fetch
+    def delayed(row,admission):
+        # The transfer was delayed past its lease before any byte was written.
+        return fetch(row,(admission[0],datetime.now(timezone.utc)-timedelta(seconds=1)))
+    monkeypatch.setattr(worker,'_fetch',delayed)
+    report=worker.run_once()
+    assert report['reasons']=={'cold_restore_failed':1} and report['provider_fallback']==1
+    assert not (s.files/blob.digest).exists() and not resident(s,blob.digest)
+    with s.pool.connection() as c:
+        assert c.execute('SELECT restore_finished_at<=clock_timestamp() AS ended FROM attachment_cold_copies WHERE digest=%s',
+            (blob.digest,)).fetchone()['ended']
+
+
+# spec: ANYM-350
+def test_collectors_publish_media_and_capture_floors_per_volume(archive,tmp_path):
+    from types import SimpleNamespace
+    from messaging_service.storage_admission import published_floor,volume_key
+    from messaging_service.telegram_collector import TelegramCollector
+    _,s,_,_=archive
+    run=SimpleNamespace(writer=SimpleNamespace(root=s.files,reserve_bytes=12*1024**3),live_writer=None,
+        spool=SimpleNamespace(path=tmp_path,reserve_bytes=15*1024**3),events_spool=None)
+    floors=TelegramCollector.disk_floors(run)
+    volume=volume_key(s.files)
+    # The highest floor per volume: a capture spool on the same device raises it.
+    assert floors[volume]==(15 if volume_key(tmp_path)==volume else 12)*1024**3
+    from messaging_service.collector_state import CollectorState
+    from messaging_service.archive import Archive
+    ar=Archive(s);epoch=ar.acquire('archive-test','floor-owner')
+    state=CollectorState(ar,'archive-test',('floor-owner',epoch))
+    for bad in ({},{'fs:1':-1},{'/data':1},{'fs:1':'1'},{'fs:%d'%i:1 for i in range(9)}):
+        with pytest.raises(ValueError,match='invalid_disk_floors'):state.disk_floors(bad)
+    state.disk_floors(floors)
+    with s.pool.connection() as c:assert published_floor(c,volume)>=floors[volume]
+

@@ -830,6 +830,14 @@ class TelegramCollector:
             delay=self.database_retry
             if not active: await asyncio.sleep(1)
 
+    def disk_floors(self):
+        """Media and capture floors of this run per volume (ANYM-350)."""
+        from .storage_admission import disk_floors
+        places=[(w.root,w.reserve_bytes) for w in (self.writer,self.live_writer) if w is not None]
+        places+=[(s.path,s.reserve_bytes) for s in (self.spool,getattr(self,'events_spool',None),
+            getattr(self,'history_spool',None)) if s is not None and hasattr(s,'path') and hasattr(s,'reserve_bytes')]
+        return disk_floors(places)
+
     async def run(self):
         started=time.monotonic()
         epoch=await asyncio.to_thread(self.archive.acquire,self.account,self.owner,self.lease_ttl)
@@ -842,6 +850,9 @@ class TelegramCollector:
             # Status evidence only: without it sync status keeps its unknown basis.
             with suppress(Exception):
                 await asyncio.to_thread(self.state.media_policy,self.media_prefetch_days,self.history_since)
+            # Best effort: without it cold restores keep only their own floor.
+            with suppress(Exception):
+                await asyncio.to_thread(self.state.disk_floors,self.disk_floors())
             sweep=getattr(self.writer,'sweep_abandoned',None)
             if sweep is not None:
                 # Best effort: leftovers only waste disk, they never block capture.

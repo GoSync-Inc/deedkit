@@ -14,7 +14,7 @@ import shutil
 
 STREAM_WORKSPACE_BYTES = 1024**2
 MEDIA_RESERVE_BYTES = 10*1024**3
-# restore_error of a cold restore that holds a capacity lease until restore_finished_at.
+# restore_error of a cold restore that the worker has admitted and is fetching.
 COLD_RESTORING = 'cold_restoring'
 
 
@@ -37,16 +37,42 @@ def cold_grant(c):
 
 
 def restore_reserved(c, *, excluding=None):
-    """Bytes leased by cold restores still streaming (ANYM-350); 0 without the grant.
+    """Bytes leased by cold restores that may still be writing (ANYM-350); 0 without the grant.
 
-    A role without the grant keeps its old accounting; a separate query because
+    A lease is a future restore_finished_at: the worker sets it on admission and
+    ends it when its writer stops; a hand-over or a new request keeps it. A role
+    without the grant keeps its old accounting; a separate query because
     PostgreSQL checks table privileges even in an unreached CASE branch.
     """
     if not cold_grant(c):
         return 0
     return c.execute('''SELECT coalesce(sum(bytes+%s),0) AS bytes FROM attachment_cold_copies
-        WHERE restore_state='requested' AND restore_error=%s AND restore_finished_at>clock_timestamp()
-          AND digest IS DISTINCT FROM %s''',(STREAM_WORKSPACE_BYTES,COLD_RESTORING,excluding)).fetchone()['bytes']
+        WHERE restore_finished_at>clock_timestamp() AND digest IS DISTINCT FROM %s''',
+        (STREAM_WORKSPACE_BYTES,excluding)).fetchone()['bytes']
+
+
+def published_floor(c, volume):
+    """The highest disk floor any collector published for this volume (ANYM-350); 0 if none.
+
+    Collectors record their media and capture floors per volume in
+    collector_health.operations.disk_floors; a record from an earlier run still
+    counts, so a stopped collector's floor is kept. Malformed values count as none.
+    """
+    if not c.execute("""SELECT CASE WHEN to_regclass('public.collector_health') IS NULL THEN false
+            ELSE has_column_privilege('public.collector_health','operations','SELECT') END AS ok""").fetchone()['ok']:
+        return 0
+    return c.execute("""SELECT coalesce(max((operations->'disk_floors'->'volumes'->>%s)::bigint),0) AS bytes
+        FROM collector_health WHERE jsonb_typeof(operations->'disk_floors'->'volumes'->%s)='number'
+          AND operations->'disk_floors'->'volumes'->>%s ~ '^[0-9]{1,12}$'""",(volume,volume,volume)).fetchone()['bytes']
+
+
+def disk_floors(places):
+    """{volume_key: floor} for (directory, reserve_bytes) pairs; the highest floor per volume."""
+    floors={}
+    for root,reserve in places:
+        key=volume_key(root)
+        floors[key]=max(floors.get(key,0),reserve)
+    return floors
 
 
 def has_capacity(free_bytes, reserved_bytes, requested_bytes, reserve_bytes):

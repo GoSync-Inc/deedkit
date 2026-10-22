@@ -144,8 +144,9 @@ def _request(store,c,p,attachment_id):
         if cold and cold['restore_state']=='requested' and (cold['stalled'] or not cold['worker']):
             # The worker missed its window or is not running: record it and ask the provider now.
             error='cold_restore_stalled' if cold['stalled'] else 'cold_worker_unavailable'
+            # A live capacity lease stays: the worker may still be writing (ANYM-350).
             c.execute("""UPDATE attachment_cold_copies SET restore_state='failed',restore_error=%s,
-                restore_finished_at=clock_timestamp() WHERE digest=%s""",(error,row['digest']))
+                restore_finished_at=greatest(restore_finished_at,clock_timestamp()) WHERE digest=%s""",(error,row['digest']))
             cold.update(restore_state='failed',restore_error=error);fallback=True
         if cold and cold['restore_state']=='failed' and cold['restore_error']:result['cold_failure']=cold['restore_error']
         # A provider job that is not running (ready, failed or exhausted) never blocks the owner's own copy.
@@ -238,7 +239,8 @@ def cold_request(c,p,attachment_id,row,result):
         until=c.execute('''UPDATE media_jobs SET requested_until=clock_timestamp()+interval '1 hour',
             request_key_digest=%s WHERE id=%s RETURNING requested_until''',(p['key_digest'],attachment_id)).fetchone()['requested_until']
     c.execute('''UPDATE attachment_cold_copies SET restore_state='requested',restore_attachment=%s,
-        restore_requested_at=clock_timestamp(),restore_finished_at=NULL,restore_error=NULL WHERE digest=%s''',
+        restore_requested_at=clock_timestamp(),restore_error=NULL,
+        restore_finished_at=CASE WHEN restore_finished_at>clock_timestamp() THEN restore_finished_at END WHERE digest=%s''',
         (attachment_id if provider else None,row['digest']))
     result.pop('cold_failure',None)
     result.update(request_status='queued',reason='managed_original_evicted',rehydration_source='cold_archive',

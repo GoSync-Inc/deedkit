@@ -457,13 +457,16 @@ class ColdRestorer(ColdArchiver):
     def _admit(self,c,digest,size,claimed):
         """Capacity check before any R2 read; lifecycle precedes the capacity lock.
 
-        An admitted restore leases its bytes in the same transaction, so a
-        collector admitted while it streams counts them (restore_reserved).
+        The floor is the higher of the configured one and every collector's
+        published floor for this volume. An admitted restore leases its bytes in
+        the same transaction, so a collector admitted while it streams counts them
+        (restore_reserved); the writer stops when the lease ends.
+        Returns (reason, None) or (None, (floor, lease_end)).
         """
         import shutil
         from .storage_admission import (COLD_RESTORING,STREAM_WORKSPACE_BYTES,StorageAdmission,has_capacity,
-            restore_reserved,volume_key)
-        if size>self.config['max_object_bytes']:return 'cold_size_limit'
+            published_floor,restore_reserved,volume_key)
+        if size>self.config['max_object_bytes']:return 'cold_size_limit',None
         StorageAdmission.lock(c)
         volume=volume_key(self.store.files)
         reserved=c.execute('SELECT coalesce(sum(reserved_bytes),0) AS bytes FROM media_reservations WHERE volume_key=%s',
@@ -471,13 +474,14 @@ class ColdRestorer(ColdArchiver):
         reserved+=c.execute("""SELECT coalesce(sum(2*bytes+%s),0) AS bytes FROM file_uploads
             WHERE volume_key=%s AND state<>'expired'""",(STREAM_WORKSPACE_BYTES,volume)).fetchone()['bytes']
         reserved+=restore_reserved(c,excluding=digest)
+        floor=max(self.reserve_bytes,published_floor(c,volume))
         free=shutil.disk_usage(self.store.files).free
-        if not has_capacity(free,reserved,size+STREAM_WORKSPACE_BYTES,self.reserve_bytes):return 'disk_reserve'
+        if not has_capacity(free,reserved,size+STREAM_WORKSPACE_BYTES,floor):return 'disk_reserve',None
         # The lease ends with the transfer timeout; a crashed worker's lease lapses on its own.
-        c.execute('''UPDATE attachment_cold_copies SET restore_error=%s,
-            restore_finished_at=clock_timestamp()+make_interval(secs=>%s) WHERE '''+claimed[0],
-            (COLD_RESTORING,self.config['timeout_seconds'],*claimed[1]))
-        return None
+        until=c.execute('''UPDATE attachment_cold_copies SET restore_error=%s,
+            restore_finished_at=clock_timestamp()+make_interval(secs=>%s) WHERE '''+claimed[0]+' RETURNING restore_finished_at',
+            (COLD_RESTORING,self.config['timeout_seconds'],*claimed[1])).fetchone()['restore_finished_at']
+        return None,(floor,until)
 
     def _register(self,c,digest,size,generation):
         """Make the original resident; clear the request only while it is still the claimed one.
@@ -520,11 +524,13 @@ class ColdRestorer(ColdArchiver):
                     # Retried next pass; due requests still run after it.
                     skipped+=1
 
-    def _fetch(self,row):
+    def _fetch(self,row,admission):
         from .blobs import BlobSink,BlobWriter
-        digest,size=row['digest'],row['bytes']
-        writer=BlobWriter(self.store.files,max_bytes=self.config['max_object_bytes'],reserve_bytes=self.reserve_bytes)
-        with BlobSink(writer,size,digest) as sink:
+        from .storage_admission import MediaReservation
+        digest,size=row['digest'],row['bytes'];floor,until=admission
+        writer=BlobWriter(self.store.files,max_bytes=self.config['max_object_bytes'],reserve_bytes=floor)
+        # Past its lease the restore no longer owns capacity: the writer stops (media_lease_lost).
+        with BlobSink(writer,size,digest,reservation=MediaReservation(size,until)) as sink:
             with self.transport.get(digest) as (key,stored,reader):
                 if key!=row['object_key'] or stored!=row['ciphertext_bytes']:raise ColdVerifyFailed('cold_ciphertext_mismatch')
                 with identity_descriptor(self.config['identity_file']) as identity:
@@ -552,10 +558,10 @@ class ColdRestorer(ColdArchiver):
             if self._present(digest,size):
                 # Published by an interrupted attempt: register it, never fetch again.
                 self._register(c,digest,size,generation);return None
-            reason=self._admit(c,digest,size,(claimed,(digest,generation)))
+            reason,admission=self._admit(c,digest,size,(claimed,(digest,generation)))
         disproved=False
         if reason is None:
-            try:self._fetch(row)
+            try:self._fetch(row,admission)
             except ColdVerifyFailed as error:
                 reason=str(error) if re.fullmatch('[a-z_]{1,64}',str(error)) else VERIFY_FAILED;disproved=True
             except ColdUnavailable:reason=UNAVAILABLE
@@ -567,6 +573,10 @@ class ColdRestorer(ColdArchiver):
             except OSError:reason='cold_restore_failed'
         with self.store.pool.connection() as c:
             lifecycle_lock(c)
+            if admission is not None:
+                # The writer has stopped: end this restore's capacity lease, whoever owns the request now.
+                c.execute('''UPDATE attachment_cold_copies SET restore_finished_at=clock_timestamp()
+                    WHERE digest=%s AND restore_finished_at>clock_timestamp()''',(digest,))
             if reason is None:
                 # The verified original is in the CAS whoever owns the request now;
                 # a request handed to the provider meanwhile keeps its outcome.
