@@ -208,3 +208,19 @@ def test_the_promotional_count_ignores_the_broadcast_filter_in_the_muted_hint_ch
     plain=queue(include_muted=True)
     filtered=queue(include_muted=True,exclude_likely_broadcasts=True)
     assert plain.get('excluded_promotional_total',0)==filtered.get('excluded_promotional_total',0)
+
+
+# spec: ANYM-427
+def test_list_chats_output_schema_lists_the_promotional_fields_and_stays_open():
+    from pathlib import Path
+    import json
+    root=Path(__file__).resolve().parents[1]
+    catalog=json.loads((root/'services/gateway/src/agent_gateway/catalog.json').read_text())
+    contracts=json.loads((root/'tests/platform/fixtures/messaging-contracts.json').read_text())
+    for schema in (next(t for t in catalog if t.get('operation')=='list_chats')['outputSchema'],
+                   next(t for t in contracts['tools'] if t['name']=='list_chats')['outputSchema']):
+        assert schema['additionalProperties'] is True and 'required' not in schema
+        assert schema['properties']['excluded_promotional_total']['type']=='integer'
+        row=schema['properties']['items']['items']
+        assert row['additionalProperties'] is True and {'awaiting_reply','awaiting_reply_likely_promotional',
+            'awaiting_reply_promotional_basis'}<=set(row['properties'])

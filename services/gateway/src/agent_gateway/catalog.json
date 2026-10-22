@@ -316,6 +316,31 @@
     },
     "name": "messages_list_chats",
     "outputSchema": {
+      "properties": {
+        "excluded_promotional_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Queue rows promotional=exclude removed (awaiting_reply=true only); absent means none."
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "awaiting_reply": {
+                "description": "Conversation compact hint; carries likely_promotional (true) and promotional_basis (business_sender or repeated_days; absent when not promotional.)"
+              },
+              "awaiting_reply_likely_promotional": {
+                "description": "Store, view=archive and detail=full rows: true when likely promotional; absent otherwise."
+              },
+              "awaiting_reply_promotional_basis": {
+                "description": "Store, view=archive and detail=full rows: business_sender or repeated_days; absent when not promotional."
+              }
+            }
+          }
+        }
+      },
       "type": "object",
       "additionalProperties": true,
       "title": "list_chatsDictOutput"

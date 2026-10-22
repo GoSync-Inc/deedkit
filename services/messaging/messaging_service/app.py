@@ -89,6 +89,16 @@ class DeliveryPolicy(TypedDict, total=False):
     expect_reply_within_s: Annotated[StrictInt, Field(ge=60,le=1209600)]
 
 
+PROMOTIONAL_BASIS="business_sender or repeated_days; absent when not promotional."
+# Optional fields an agent can discover from outputSchema; rows stay open objects.
+LIST_CHATS_OUTPUT_PROPERTIES={
+    'excluded_promotional_total':{'type':'integer','minimum':0,'description':
+        'Queue rows promotional=exclude removed (awaiting_reply=true only); absent means none.'},
+    'items':{'type':'array','items':{'type':'object','additionalProperties':True,'properties':{
+        'awaiting_reply':{'description':'Conversation compact hint; carries likely_promotional (true) and '
+            'promotional_basis ('+PROMOTIONAL_BASIS+')'},
+        'awaiting_reply_likely_promotional':{'description':'Store, view=archive and detail=full rows: true when likely promotional; absent otherwise.'},
+        'awaiting_reply_promotional_basis':{'description':'Store, view=archive and detail=full rows: '+PROMOTIONAL_BASIS}}}}}
 def subscription_expiry(value):
     """Validate a zoned ISO timestamp without coercing or echoing input values."""
     try:
@@ -1117,6 +1127,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
 
     models={name:tool.fn_metadata.arg_model for name,tool in mcp._tool_manager._tools.items()}
     for tool in mcp._tool_manager._tools.values():tool.parameters['additionalProperties']=False
+    # Published only: the dict model still validates and keeps every key (ANYM-427).
+    mcp._tool_manager._tools['list_chats'].fn_metadata.output_schema['properties']=LIST_CHATS_OUTPUT_PROPERTIES
     app=mcp.streamable_http_app(stateless_http=True,json_response=True,max_request_body_size=UPLOAD_BODY_BYTES,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
             allowed_hosts=allowed_hosts,allowed_origins=[urlsplit(store.public_url)._replace(path='',query='',fragment='').geturl()]))
