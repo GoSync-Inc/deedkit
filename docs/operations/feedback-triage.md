@@ -23,31 +23,37 @@ writes a private report. It writes nothing to Tiden, GitHub, git or production.
 ## Run
 
 ```sh
-scripts/feedback_triage.py snapshot   # Tiden main --include-sources + every open branch; stops on a failed or truncated read
-scripts/feedback_triage.py pull       # export since the position minus 10 minutes; new IDs go to inbox.json
-scripts/feedback_triage.py match      # candidates.json: local candidate specs per inbox item
-# the session reads inbox.json and candidates.json and writes decisions.json (below)
-scripts/feedback_triage.py record --decisions decisions.json
+S=~/.deedkit/feedback-triage
+python3 scripts/feedback_triage.py snapshot   # Tiden main --include-sources + every open branch; stops on a failed or truncated read
+python3 scripts/feedback_triage.py pull       # export since the position minus 10 minutes; new IDs go to inbox.json
+python3 scripts/feedback_triage.py match      # candidates.json: local candidate specs per inbox item
+# the session reads $S/inbox.json and $S/candidates.json and writes $S/decisions.json (umask 077; below)
+python3 scripts/feedback_triage.py record --decisions $S/decisions.json
 ```
+
+The decisions file stays in the state directory; one inside a Git checkout is refused.
 
 One run at a time (a lock). A pull with no new feedback writes an empty report and changes
 nothing else.
 
 Decision per item: `{"id", "classification", "reason", "specs": [{"ref", "verdict"}], "primary",
-"duplicate_of"?, "new_card"?}`.
+"duplicate_of"?, "new_card"?, "verdict_of"?}`.
 
 - `classification`: `reported-bug` (contradicts a maintained spec; unverified), `feature`,
   `question` (answered by existing documentation) or `not-actionable`. The agent's own category
   never decides it. `reason`: one line.
 - `specs`: every matched spec from the snapshot with `accepted` or `declined`; `primary` is the
   card that removes the reported failure. An unmatched bug or feature names `new_card` (a slug):
-  the proposed card is its cluster.
+  the proposed card is its cluster. `duplicate_of` names a known item of the same key. A verdict
+  row (proposal/2026-10-17-feedback-reverify) names its target in `verdict_of` and joins the
+  target's cluster.
 
 ## Ledger, position, clusters
 
 `ledger.json` holds one entry per processed feedback ID (the export overlaps, so the ledger
 deduplicates). Each entry is written before its item leaves the inbox, and the position moves
-only past items with complete entries, so a stopped run resumes with the rest. A cluster is one
+only past items with complete entries, so a stopped run resumes with the rest; entries that never reached a report go into the
+next one. A cluster is one
 primary spec or one proposed card; the report counts reports, principals and keys per cluster.
 The store has no agent session ID, so "how many agents" is counted by key.
 
