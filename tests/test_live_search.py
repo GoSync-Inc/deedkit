@@ -149,7 +149,8 @@ def test_hits_outside_the_policy_are_dropped_and_receipt_is_bounded():
     assert result['outcome'] == 'confirmed'
     data = result['data']
     assert 'EXCLUDED' not in repr(data) and '-1000000000009' not in repr(data)
-    import base64, json
+    import base64
+    import json
     raw = json.loads(base64.urlsafe_b64decode(data['next_cursor'] + '=' * (-len(data['next_cursor']) % 4)))
     assert isinstance(raw['p'], str) and ['h', 9, 8] not in raw.values()
     assert [h['provider_id'] for h in data['hits']] == ['1', '2']  # channel left out by default
