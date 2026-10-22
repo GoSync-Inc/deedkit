@@ -156,3 +156,21 @@ def test_fence_and_receipt_waits_share_one_deadline(live, monkeypatch, caplog):
     assert marks['send'] - marks['claimed'] < 2.7
     assert 'receipt_unrecorded' in caplog.text
     assert s.get_messenger_operation(key, operation)['status'] == 'dispatching'
+
+
+# spec: ANYM-475
+def test_live_receipt_commit_does_not_wait_for_the_wal_flush(live, monkeypatch):
+    from messaging_service.archive import Archive as Fenced
+    from messaging_service.commands import CommandWorker
+    s, _, key, state = live
+    operation, seen, fence = search(s, key)['operation_id'], [], Fenced.fence
+    def observed(c, account, lease):
+        seen.append(c.execute('SHOW synchronous_commit').fetchone()['synchronous_commit']); fence(c, account, lease)
+    monkeypatch.setattr(Fenced, 'fence', staticmethod(observed))
+    async def found(job):return {'outcome': 'confirmed', 'data': {'hits': [], 'next_cursor': None, 'provider_total_approx': 0}}
+    assert asyncio.run(CommandWorker(state, found).once())
+    # claim and preflight keep the durable default; only the receipt transaction turns it off
+    assert seen[0] == 'on' and seen[-1] == 'off' and seen.count('off') == 1
+    assert s.get_messenger_operation(key, operation)['status'] == 'succeeded'
+    with s.pool.connection() as c:  # transaction-local: nothing leaks to pooled connections
+        assert c.execute('SHOW synchronous_commit').fetchone()['synchronous_commit'] == 'on'

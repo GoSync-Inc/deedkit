@@ -605,6 +605,9 @@ class CommandWorker:
             c.execute("SELECT set_config('lock_timeout',%s,true),set_config('statement_timeout',%s,true)",(ms,ms))
         try:
             with st.archive.store.pool.connection(timeout=left()) as c:
+                # COMMIT does not wait for the WAL flush while the fence is held; a crash may lose
+                # this receipt, and the row then reads unknown like any receipt not written in time.
+                c.execute("SELECT set_config('synchronous_commit','off',true)")
                 bound(c);st.archive.fence(c,st.account,st.lease)
                 bound(c);c.execute('''UPDATE messenger_commands SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
                     WHERE id=%s AND status='dispatching' AND lease_epoch=%s''',
