@@ -841,7 +841,7 @@ def test_streaming_restore_leases_capacity_against_collectors(env,archive,monkey
             return admitted
     def streaming(row):
         seen['admitted']=collector_admitted()
-        # Past the stall window but inside its lease: a slow restore, the provider is not asked.
+        # Past the 15-minute window the request goes to the provider even while the restore streams.
         with monkeypatch.context() as patch:
             patch.setattr(media_requests,'COLD_RESTORE_STALL_SECONDS',0)
             seen['answer']=s.request_file_download(key,fid)
@@ -850,8 +850,8 @@ def test_streaming_restore_leases_capacity_against_collectors(env,archive,monkey
     [row]=worker._due(16)
     assert worker._restore_one(row) is None and resident(s,blob.digest)
     assert seen['admitted'] is False
-    assert seen['answer']['rehydration_source']=='cold_archive' and 'cold_failure' not in seen['answer']
-    assert job_state(s,fid)=='ready' and copy(s,blob.digest)['restore_state']=='idle'
+    assert seen['answer']['rehydration_source']=='provider' and seen['answer']['cold_failure']=='cold_restore_stalled'
+    assert job_state(s,fid)=='queued' and copy(s,blob.digest)['restore_error']=='cold_restore_stalled'
     # The lease ended with the restore; the same collector job fits again.
     assert collector_admitted() is True
 

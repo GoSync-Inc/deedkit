@@ -8,7 +8,7 @@ from .attachment_metadata import attachment_fields, processing_phases
 from .file_index import _available,_absent
 from .media_policy import ELIGIBILITY_JOIN
 from .policy import scope_filter, targets
-from .storage_admission import COLD_RESTORING, cold_grant
+from .storage_admission import cold_grant
 from .store import APIError, serial
 
 PER_KEY_LIMIT=32
@@ -61,12 +61,11 @@ def cold_copy(c,digest,size):
     if not granted:return None
     return c.execute('''SELECT (state='verified' AND ciphertext_sha256 IS NOT NULL AND verified_at IS NOT NULL) AS verified,
         restore_state,restore_error,(restore_state='requested' AND restore_requested_at<=
-         clock_timestamp()-make_interval(secs=>%s) AND NOT (restore_error IS NOT DISTINCT FROM %s
-         AND restore_finished_at>clock_timestamp())) AS stalled,
+         clock_timestamp()-make_interval(secs=>%s)) AS stalled,
         coalesce(greatest(0,ceil(extract(epoch FROM restore_finished_at+make_interval(secs=>%s)-clock_timestamp()))),0)::bigint AS local_wait,
         NOT pg_try_advisory_xact_lock_shared(hashtextextended(%s,0)) AS worker
         FROM attachment_cold_copies WHERE digest=%s AND bytes=%s''',
-        (COLD_RESTORE_STALL_SECONDS,COLD_RESTORING,COLD_LOCAL_RETRY_SECONDS,COLD_WORKER_LOCK,digest,size)).fetchone()
+        (COLD_RESTORE_STALL_SECONDS,COLD_LOCAL_RETRY_SECONDS,COLD_WORKER_LOCK,digest,size)).fetchone()
 
 
 def cold_inactive(c):

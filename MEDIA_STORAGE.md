@@ -227,8 +227,8 @@ published and re-registered resident; text, ASR and descriptions are untouched.
   a second worker claims nothing. Without a worker a request goes to the
   provider at once (`cold_failure: cold_worker_unavailable`), and a gateway that
   lacks the restore grant reports `cold_failure: cold_first_inactive`.
-- **Stall.** A restore the worker has not finished within 15 minutes and whose
-  lease is not live goes to the provider on the next request
+- **Stall.** A restore the worker has not finished within 15 minutes goes to the
+  provider on the next request
   (`cold_failure: cold_restore_stalled`). Each worker step is conditioned on the
   request generation it claimed, so a late result never overwrites a newer
   request or the fallback: a late success makes the original resident and
