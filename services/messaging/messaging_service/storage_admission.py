@@ -14,6 +14,8 @@ import shutil
 
 STREAM_WORKSPACE_BYTES = 1024**2
 MEDIA_RESERVE_BYTES = 10*1024**3
+# restore_error of a cold restore that holds a capacity lease until restore_finished_at.
+COLD_RESTORING = 'cold_restoring'
 
 
 def volume_key(root):
@@ -26,6 +28,25 @@ def payload_bound(expected_bytes, max_bytes):
     if type(expected_bytes) is not int or not 0<=expected_bytes<=max_bytes:
         raise ValueError('media_size_limit')
     return expected_bytes
+
+
+def cold_grant(c):
+    """This role may read cold-copy restore leases (ANYM-350)."""
+    return c.execute("""SELECT CASE WHEN to_regclass('public.attachment_cold_copies') IS NULL THEN false
+        ELSE has_table_privilege('public.attachment_cold_copies','SELECT') END AS ok""").fetchone()['ok']
+
+
+def restore_reserved(c, *, excluding=None):
+    """Bytes leased by cold restores still streaming (ANYM-350); 0 without the grant.
+
+    A role without the grant keeps its old accounting; a separate query because
+    PostgreSQL checks table privileges even in an unreached CASE branch.
+    """
+    if not cold_grant(c):
+        return 0
+    return c.execute('''SELECT coalesce(sum(bytes+%s),0) AS bytes FROM attachment_cold_copies
+        WHERE restore_state='requested' AND restore_error=%s AND restore_finished_at>clock_timestamp()
+          AND digest IS DISTINCT FROM %s''',(STREAM_WORKSPACE_BYTES,COLD_RESTORING,excluding)).fetchone()['bytes']
 
 
 def has_capacity(free_bytes, reserved_bytes, requested_bytes, reserve_bytes):
@@ -72,6 +93,7 @@ class StorageAdmission:
             FROM media_reservations WHERE volume_key=%s''',(self.volume,)).fetchone()['bytes']
         reserved+=c.execute("""SELECT coalesce(sum(2*bytes+%s),0) AS bytes FROM file_uploads
             WHERE volume_key=%s AND state<>'expired'""",(STREAM_WORKSPACE_BYTES,self.volume)).fetchone()['bytes']
+        reserved+=restore_reserved(c)
         free=shutil.disk_usage(self.writer.root).free
         if not has_capacity(free,reserved,requested,self.writer.reserve_bytes):
             return None

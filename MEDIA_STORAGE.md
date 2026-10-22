@@ -200,10 +200,14 @@ published and re-registered resident; text, ASR and descriptions are untouched.
   `restore_disk_reserve_bytes` (default and minimum 10 GiB, the collectors'
   default media floor; set it to at least the collectors'
   `media_disk_reserve_bytes`). An object over `max_object_bytes` is refused the
-  same way. The restore holds no reservation row while it streams, so a
-  collector admitted meanwhile can at most consume one object's worth of the
-  band between the media floor and the capture floor; `BlobWriter` stops the
-  restore itself at the same floor.
+  same way. In the same transaction the admitted restore leases its bytes
+  (`restore_error: cold_restoring` until `restore_finished_at`, one transfer
+  timeout ahead); collector admission and file uploads count every live lease
+  once their role may read `attachment_cold_copies` (`collector_role.sql`).
+  The lease ends with the restore and lapses by itself after a crash;
+  `BlobWriter` also stops the restore at the same floor. The worker cannot read
+  the collectors' configured floor, so a capture floor above
+  `restore_disk_reserve_bytes` needs that value raised to match.
 
 - **Fallback.** A missing, different or truncated object or an R2 or receiver
   error publishes nothing, records `restore_error` on the copy and queues the
@@ -223,13 +227,17 @@ published and re-registered resident; text, ASR and descriptions are untouched.
   a second worker claims nothing. Without a worker a request goes to the
   provider at once (`cold_failure: cold_worker_unavailable`), and a gateway that
   lacks the restore grant reports `cold_failure: cold_first_inactive`.
-- **Stall.** A restore the worker has not finished within 15 minutes goes to the
-  provider on the next request (`cold_failure: cold_restore_stalled`). Each
-  worker step is conditioned on the request generation it claimed, so a late
-  result never overwrites a newer request or the fallback.
+- **Stall.** A restore the worker has not finished within 15 minutes and whose
+  lease is not live goes to the provider on the next request
+  (`cold_failure: cold_restore_stalled`). Each worker step is conditioned on the
+  request generation it claimed, so a late result never overwrites a newer
+  request or the fallback: a late success makes the original resident and
+  leaves the provider hand-over standing.
 - **Interrupted publication.** A verified original already in the CAS whose
   registration did not commit is registered resident by the next worker pass,
-  whatever the request's age and without reading R2 again.
+  whatever the request's age and without reading R2 again. Each pass walks all
+  candidates in pages; it changes residency only, and a file that cannot be
+  read is skipped (`reconcile_skipped`) without holding up due restores.
 - **Unchanged.** An original evicted without a verified copy, and a gateway
   whose role lacks the restore grant, keep the provider path. The demand window
   opens only when the provider path itself would accept the request (collection

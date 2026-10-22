@@ -470,7 +470,7 @@ def test_rehydrate_prefers_cold_archive(env,archive):
     # No collector job: the provider is never asked while R2 can answer.
     assert job_state(s,fid)=='ready' and ar.claim_media('fixture') is None
     report=restorer(env).run_once()
-    assert report=={'restored':1,'restored_bytes':blob.bytes,'failed':0,'provider_fallback':0,'reasons':{},'reconciled':0}
+    assert report=={'restored':1,'restored_bytes':blob.bytes,'failed':0,'provider_fallback':0,'reasons':{},'reconciled':0,'reconcile_skipped':0}
     data=(s.files/blob.digest).read_bytes()
     assert hashlib.sha256(data).hexdigest()==blob.digest and resident(s,blob.digest)
     assert copy(s,blob.digest)['restore_state']=='idle' and copy(s,blob.digest)['state']=='verified'
@@ -723,7 +723,8 @@ def test_interrupted_publication_is_registered_without_r2(env,archive,monkeypatc
     (cloud/'unavailable').write_text('');reads=calls(cloud).count('get_object')
     report=restorer(env).run_once()
     assert report['reconciled']==1 and report['failed']==0 and calls(cloud).count('get_object')==reads
-    assert resident(s,blob.digest) and copy(s,blob.digest)['restore_state']=='idle'
+    # Residency only: the request outcome is not reconciliation's to clear.
+    assert resident(s,blob.digest) and copy(s,blob.digest)['restore_state']=='requested'
     from messaging_service.backup import blob_inventory
     with s.pool.connection() as c:present,absent=blob_inventory(c,41)
     # The next backup carries the restored bytes again.
@@ -737,8 +738,10 @@ def test_stale_restore_never_overwrites_a_newer_request_or_the_fallback(env,arch
     s.request_file_download(key,fid)
     worker=restorer(env);[row]=worker._due(16)
     def stall():
+        # Past the window and past the capacity lease (a worker that hung).
         with s.pool.connection() as c:
-            c.execute("UPDATE attachment_cold_copies SET restore_requested_at=clock_timestamp()-interval '16 minutes' WHERE digest=%s",(blob.digest,))
+            c.execute('''UPDATE attachment_cold_copies SET restore_requested_at=clock_timestamp()-interval '16 minutes',
+                restore_finished_at=clock_timestamp() WHERE digest=%s''',(blob.digest,))
         fallback=s.request_file_download(key,fid)
         assert fallback['rehydration_source']=='provider' and fallback['cold_failure']=='cold_restore_stalled'
     # The fetch outlives the window; the user's next request hands it to the provider.
@@ -812,3 +815,134 @@ def test_refused_provider_and_disproved_copy_answer_without_a_provider_source(en
     after=s.request_file_download(key,fid)
     assert after['request_status']=='failed' and after['rehydration_source']=='none'
     assert after['cold_failure']==copy(s,blob.digest)['restore_error']
+
+
+# spec: ANYM-350
+def test_streaming_restore_leases_capacity_against_collectors(env,archive,monkeypatch):
+    from messaging_service import media_requests,storage_admission
+    from messaging_service.blobs import BlobWriter
+    from messaging_service.storage_admission import STREAM_WORKSPACE_BYTES,StorageAdmission
+    _,_,key,_=archive;s,_,_,_=env
+    other,_=evicted_copy(env,archive,mid='lease-other',payload=b'Synthetic lease other')
+    fid,blob=evicted_copy(env,archive,mid='lease-1',payload=b'Synthetic lease restore')
+    s.request_file_download(key,fid)
+    worker=restorer(env);fetch=worker._fetch;free=100*1024**3;seen={}
+    def collector_admitted():
+        # A 10-byte collector job against fixed free space and a floor that leaves room for it but not also the lease.
+        with monkeypatch.context() as patch, s.pool.connection() as c:
+            patch.setattr(storage_admission.shutil,'disk_usage',lambda root:type('U',(),{'free':free})())
+            StorageAdmission.lock(c)
+            base=c.execute('SELECT coalesce(sum(reserved_bytes),0) AS bytes FROM media_reservations').fetchone()['bytes']
+            floor=free-base-(10+STREAM_WORKSPACE_BYTES)-(blob.bytes+STREAM_WORKSPACE_BYTES)+1
+            job={'id':other,'descriptor':{'bytes':10},'lease_epoch':0}
+            until=c.execute("SELECT clock_timestamp()+interval '1 minute' AS at").fetchone()['at']
+            admitted=StorageAdmission(BlobWriter(s.files,reserve_bytes=floor)).reserve(c,job,until) is not None
+            c.execute('DELETE FROM media_reservations WHERE job=%s',(other,))
+            return admitted
+    def streaming(row):
+        seen['admitted']=collector_admitted()
+        # Past the stall window but inside its lease: a slow restore, the provider is not asked.
+        with monkeypatch.context() as patch:
+            patch.setattr(media_requests,'COLD_RESTORE_STALL_SECONDS',0)
+            seen['answer']=s.request_file_download(key,fid)
+        return fetch(row)
+    monkeypatch.setattr(worker,'_fetch',streaming)
+    [row]=worker._due(16)
+    assert worker._restore_one(row) is None and resident(s,blob.digest)
+    assert seen['admitted'] is False
+    assert seen['answer']['rehydration_source']=='cold_archive' and 'cold_failure' not in seen['answer']
+    assert job_state(s,fid)=='ready' and copy(s,blob.digest)['restore_state']=='idle'
+    # The lease ended with the restore; the same collector job fits again.
+    assert collector_admitted() is True
+
+
+# spec: ANYM-350
+def test_reserved_cold_fallbacks_count_for_an_ordinary_provider_request(env,archive,monkeypatch):
+    from messaging_service import media_requests
+    from messaging_service.file_lifecycle import LifecycleWorker
+    from messaging_service.store import APIError
+    _,_,key,_=archive;s,_,_,_=env
+    one,_=evicted_copy(env,archive,mid='order-1',payload=b'Synthetic order cold')
+    two,provider_only=processed(archive,mid='order-2',payload=b'Synthetic order provider')
+    # Evicted without a cold copy: its request has no cold row at all.
+    assert LifecycleWorker(s).run_once(apply=True)['evicted']==1 and copy(s,provider_only.digest) is None
+    monkeypatch.setattr(media_requests,'PER_KEY_LIMIT',1)
+    assert s.request_file_download(key,one)['rehydration_source']=='cold_archive'
+    # The reserved cold fallback still counts against this provider request.
+    with pytest.raises(APIError,match='media_request_limit'):s.request_file_download(key,two)
+    assert job_state(s,two)=='ready'
+
+
+# spec: ANYM-350
+def test_reconcile_reaches_a_publication_behind_many_absent_entries(env,archive,monkeypatch):
+    from messaging_service import file_lifecycle
+    _,_,key,_=archive;s,_,_,_=env;fid,blob=evicted_copy(env,archive,mid='behind-1',payload=b'Synthetic behind')
+    s.request_file_download(key,fid)
+    def crash(*args):raise RuntimeError('synthetic crash after publication')
+    with monkeypatch.context() as patch:
+        patch.setattr(file_lifecycle,'register_resident_original',crash)
+        with pytest.raises(RuntimeError,match='synthetic crash'):restorer(env).run_once()
+    synthetic="SELECT lpad(to_hex(i),64,'0') AS digest FROM generate_series(1,1200) i"
+    assert blob.digest>'0'*61+'4b0'
+    try:
+        with s.pool.connection() as c:
+            # 1,200 failed requests whose files are absent sort before the published one.
+            c.execute('INSERT INTO attachment_residency(digest,bytes) SELECT digest,1 FROM ('+synthetic+') d')
+            c.execute("""INSERT INTO attachment_eviction_journal(id,digest,bytes,root_device,root_inode,state,completed_at)
+                SELECT md5(digest)::uuid,digest,1,0,0,'completed',clock_timestamp() FROM ("""+synthetic+') d')
+            c.execute("""UPDATE attachment_residency SET state='evicted',eviction_id=md5(digest)::uuid,evicted_at=clock_timestamp()
+                WHERE digest IN ("""+synthetic+')')
+            c.execute("""INSERT INTO attachment_cold_copies(digest,bytes,object_key,restore_state,restore_error)
+                SELECT digest,1,'synthetic/cold/'||digest||'.age','failed','cold_unavailable' FROM ("""+synthetic+') d')
+            c.execute("UPDATE attachment_cold_copies SET restore_requested_at=clock_timestamp()-interval '1 hour' WHERE digest=%s",(blob.digest,))
+        report=restorer(env).run_once()
+        assert report['reconciled']==1 and resident(s,blob.digest)
+    finally:
+        with s.pool.connection() as c:
+            c.execute('DELETE FROM attachment_cold_copies WHERE digest IN ('+synthetic+')')
+            c.execute("""UPDATE attachment_residency SET state='resident',eviction_id=NULL,evicted_at=NULL
+                WHERE digest IN ("""+synthetic+')')
+            c.execute('DELETE FROM attachment_eviction_journal WHERE digest IN ('+synthetic+')')
+            c.execute('DELETE FROM attachment_residency WHERE digest IN ('+synthetic+')')
+
+
+# spec: ANYM-350
+def test_late_restore_success_keeps_the_provider_fallback(env,archive,monkeypatch):
+    _,_,key,_=archive;s,_,_,_=env;fid,blob=evicted_copy(env,archive,mid='late-1',payload=b'Synthetic late success')
+    s.request_file_download(key,fid)
+    worker=restorer(env);fetch=worker._fetch;[row]=worker._due(16)
+    def late(item):
+        # Past the window and past the lease, as for a worker that hung.
+        with s.pool.connection() as c:
+            c.execute('''UPDATE attachment_cold_copies SET restore_requested_at=clock_timestamp()-interval '16 minutes',
+                restore_finished_at=clock_timestamp() WHERE digest=%s''',(blob.digest,))
+        assert s.request_file_download(key,fid)['cold_failure']=='cold_restore_stalled'
+        return fetch(item)
+    monkeypatch.setattr(worker,'_fetch',late)
+    # The fetch then succeeds: the file is resident and the hand-over stands.
+    assert worker._restore_one(row) is None and resident(s,blob.digest)
+    assert copy(s,blob.digest)['restore_error']=='cold_restore_stalled' and job_state(s,fid)=='queued'
+
+
+# spec: ANYM-350
+def test_unreadable_reconcile_candidate_does_not_block_restores(env,archive,monkeypatch):
+    import errno
+    from messaging_service import blobs
+    _,_,key,_=archive;s,_,_,_=env
+    _,broken=evicted_copy(env,archive,mid='unreadable-1',payload=b'Synthetic unreadable')
+    fid,blob=evicted_copy(env,archive,mid='unreadable-2',payload=b'Synthetic readable')
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_cold_copies SET restore_state='failed',restore_error='cold_unavailable' WHERE digest=%s",(broken.digest,))
+    # A published file of the right size whose read fails with an I/O error.
+    (s.files/broken.digest).write_bytes(b'Synthetic unreadable')
+    digest=blobs.hashlib.file_digest
+    def failing(file,*args):
+        if Path(file.name).name==broken.digest:raise OSError(errno.EIO,'synthetic read error')
+        return digest(file,*args)
+    monkeypatch.setattr(blobs.hashlib,'file_digest',failing)
+    try:
+        s.request_file_download(key,fid)
+        report=restorer(env).run_once()
+        assert report['restored']==1 and report['reconciled']==0 and resident(s,blob.digest)
+        assert not resident(s,broken.digest)
+    finally:(s.files/broken.digest).unlink()

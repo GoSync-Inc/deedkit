@@ -8,6 +8,7 @@ from .attachment_metadata import attachment_fields, processing_phases
 from .file_index import _available,_absent
 from .media_policy import ELIGIBILITY_JOIN
 from .policy import scope_filter, targets
+from .storage_admission import COLD_RESTORING, cold_grant
 from .store import APIError, serial
 
 PER_KEY_LIMIT=32
@@ -60,11 +61,12 @@ def cold_copy(c,digest,size):
     if not granted:return None
     return c.execute('''SELECT (state='verified' AND ciphertext_sha256 IS NOT NULL AND verified_at IS NOT NULL) AS verified,
         restore_state,restore_error,(restore_state='requested' AND restore_requested_at<=
-         clock_timestamp()-make_interval(secs=>%s)) AS stalled,
+         clock_timestamp()-make_interval(secs=>%s) AND NOT (restore_error IS NOT DISTINCT FROM %s
+         AND restore_finished_at>clock_timestamp())) AS stalled,
         coalesce(greatest(0,ceil(extract(epoch FROM restore_finished_at+make_interval(secs=>%s)-clock_timestamp()))),0)::bigint AS local_wait,
         NOT pg_try_advisory_xact_lock_shared(hashtextextended(%s,0)) AS worker
         FROM attachment_cold_copies WHERE digest=%s AND bytes=%s''',
-        (COLD_RESTORE_STALL_SECONDS,COLD_LOCAL_RETRY_SECONDS,COLD_WORKER_LOCK,digest,size)).fetchone()
+        (COLD_RESTORE_STALL_SECONDS,COLD_RESTORING,COLD_LOCAL_RETRY_SECONDS,COLD_WORKER_LOCK,digest,size)).fetchone()
 
 
 def cold_inactive(c):
@@ -73,8 +75,12 @@ def cold_inactive(c):
         AND NOT has_table_privilege('public.attachment_cold_copies','SELECT') AS inactive""").fetchone()['inactive']
 
 
-def provider_demand(c,key_digest,cold):
-    """Outstanding provider demand, including fallbacks reserved by queued cold restores."""
+def provider_demand(c,key_digest):
+    """Outstanding provider demand, including fallbacks reserved by queued cold restores.
+
+    Every provider admission counts them once this role may read cold copies.
+    """
+    cold=cold_grant(c)
     reserved='''OR (j.state='ready' AND EXISTS(SELECT FROM attachment_cold_copies cc
         WHERE cc.restore_attachment=j.id AND cc.restore_state='requested'))''' if cold else ''
     return c.execute('''SELECT count(*) AS total,count(*) FILTER(WHERE j.request_key_digest=%s) AS own
@@ -192,7 +198,7 @@ def _request(store,c,p,attachment_id):
             requested_until=None,retry_after_seconds=deferred['retry_after_seconds'],
             next_action='request_file_download_after_retry')
         return serial(result)
-    count=provider_demand(c,p['key_digest'],cold is not None)
+    count=provider_demand(c,p['key_digest'])
     if count['total']>=GLOBAL_LIMIT or count['own']>=PER_KEY_LIMIT:
         raise APIError('media_request_limit',429)
     until=c.execute('''UPDATE media_jobs SET requested_until=clock_timestamp()+interval '1 hour',
@@ -226,7 +232,7 @@ def cold_request(c,p,attachment_id,row,result):
         "SELECT %s::timestamptz>=clock_timestamp()+interval '1 hour' AS deferred",(row['next_due'],)).fetchone()['deferred'])
     if provider:
         # The fallback is provider demand: it is admitted against the same quotas now.
-        count=provider_demand(c,p['key_digest'],True)
+        count=provider_demand(c,p['key_digest'])
         if count['total']>=GLOBAL_LIMIT or count['own']>=PER_KEY_LIMIT:raise APIError('media_request_limit',429)
     until=None
     if provider:

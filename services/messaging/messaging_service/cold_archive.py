@@ -448,15 +448,21 @@ class ColdRestorer(ColdArchiver):
 
     def _present(self,digest,size):
         from .blobs import Blob,BlobWriter
-        if not (self.store.files/digest).exists():return False
-        try:BlobWriter(self.store.files,reserve_bytes=0).verify(Blob(digest,size))
-        except RuntimeError:return False
+        try:
+            if not (self.store.files/digest).exists():return False
+            BlobWriter(self.store.files,reserve_bytes=0).verify(Blob(digest,size))
+        except (RuntimeError,OSError):return False
         return True
 
-    def _admit(self,c,size):
-        """Capacity check before any R2 read; lifecycle precedes the capacity lock."""
+    def _admit(self,c,digest,size,claimed):
+        """Capacity check before any R2 read; lifecycle precedes the capacity lock.
+
+        An admitted restore leases its bytes in the same transaction, so a
+        collector admitted while it streams counts them (restore_reserved).
+        """
         import shutil
-        from .storage_admission import STREAM_WORKSPACE_BYTES,StorageAdmission,has_capacity,volume_key
+        from .storage_admission import (COLD_RESTORING,STREAM_WORKSPACE_BYTES,StorageAdmission,has_capacity,
+            restore_reserved,volume_key)
         if size>self.config['max_object_bytes']:return 'cold_size_limit'
         StorageAdmission.lock(c)
         volume=volume_key(self.store.files)
@@ -464,34 +470,55 @@ class ColdRestorer(ColdArchiver):
             (volume,)).fetchone()['bytes']
         reserved+=c.execute("""SELECT coalesce(sum(2*bytes+%s),0) AS bytes FROM file_uploads
             WHERE volume_key=%s AND state<>'expired'""",(STREAM_WORKSPACE_BYTES,volume)).fetchone()['bytes']
+        reserved+=restore_reserved(c,excluding=digest)
         free=shutil.disk_usage(self.store.files).free
-        return None if has_capacity(free,reserved,size+STREAM_WORKSPACE_BYTES,self.reserve_bytes) else 'disk_reserve'
+        if not has_capacity(free,reserved,size+STREAM_WORKSPACE_BYTES,self.reserve_bytes):return 'disk_reserve'
+        # The lease ends with the transfer timeout; a crashed worker's lease lapses on its own.
+        c.execute('''UPDATE attachment_cold_copies SET restore_error=%s,
+            restore_finished_at=clock_timestamp()+make_interval(secs=>%s) WHERE '''+claimed[0],
+            (COLD_RESTORING,self.config['timeout_seconds'],*claimed[1]))
+        return None
 
-    def _register(self,c,digest,size):
+    def _register(self,c,digest,size,generation):
+        """Make the original resident; clear the request only while it is still the claimed one.
+
+        A request handed to the provider meanwhile keeps its outcome (stalled
+        fallback); generation None (reconciliation) clears nothing.
+        """
         from .file_lifecycle import register_resident_original
         register_resident_original(c,digest,size)
-        c.execute('''UPDATE attachment_cold_copies SET restore_state='idle',restore_error=NULL,
-            restore_finished_at=clock_timestamp() WHERE digest=%s AND restore_state<>'idle' ''',(digest,))
+        if generation is not None:
+            c.execute('''UPDATE attachment_cold_copies SET restore_state='idle',restore_error=NULL,
+                restore_finished_at=clock_timestamp() WHERE digest=%s AND restore_state='requested'
+                AND restore_requested_at=%s''',(digest,generation))
 
     def _reconcile(self):
         """A published original whose registration was interrupted becomes resident.
 
         Independent of request age and R2 availability: the CAS file is verified
-        locally and registered under the lifecycle lock.
+        locally and registered under the lifecycle lock. Every candidate is seen
+        on every pass (keyset pages); one unreadable file skips only itself.
         """
         from .file_lifecycle import is_managed_evicted
-        with self.store.pool.connection() as c:
-            rows=c.execute('''SELECT cc.digest,cc.bytes FROM attachment_cold_copies cc
-                JOIN attachment_residency r ON r.digest=cc.digest AND r.bytes=cc.bytes
-                WHERE cc.restore_state IN ('requested','failed') AND r.state='evicted' ORDER BY cc.digest LIMIT 1000''').fetchall()
-        reconciled=0
-        for row in rows:
-            if not self._present(row['digest'],row['bytes']):continue
+        reconciled=skipped=0;last=''
+        while True:
             with self.store.pool.connection() as c:
-                lifecycle_lock(c)
-                if is_managed_evicted(c,row['digest'],row['bytes']) and self._present(row['digest'],row['bytes']):
-                    self._register(c,row['digest'],row['bytes']);reconciled+=1
-        return reconciled
+                rows=c.execute('''SELECT cc.digest,cc.bytes FROM attachment_cold_copies cc
+                    JOIN attachment_residency r ON r.digest=cc.digest AND r.bytes=cc.bytes
+                    WHERE cc.restore_state IN ('requested','failed') AND r.state='evicted' AND cc.digest>%s
+                    ORDER BY cc.digest LIMIT 1000''',(last,)).fetchall()
+            if not rows:return reconciled,skipped
+            last=rows[-1]['digest']
+            for row in rows:
+                try:
+                    if not self._present(row['digest'],row['bytes']):continue
+                    with self.store.pool.connection() as c:
+                        lifecycle_lock(c)
+                        if is_managed_evicted(c,row['digest'],row['bytes']) and self._present(row['digest'],row['bytes']):
+                            self._register(c,row['digest'],row['bytes'],None);reconciled+=1
+                except Exception:
+                    # Retried next pass; due requests still run after it.
+                    skipped+=1
 
     def _fetch(self,row):
         from .blobs import BlobSink,BlobWriter
@@ -524,8 +551,8 @@ class ColdRestorer(ColdArchiver):
                 return False
             if self._present(digest,size):
                 # Published by an interrupted attempt: register it, never fetch again.
-                self._register(c,digest,size);return None
-            reason=self._admit(c,size)
+                self._register(c,digest,size,generation);return None
+            reason=self._admit(c,digest,size,(claimed,(digest,generation)))
         disproved=False
         if reason is None:
             try:self._fetch(row)
@@ -541,8 +568,9 @@ class ColdRestorer(ColdArchiver):
         with self.store.pool.connection() as c:
             lifecycle_lock(c)
             if reason is None:
-                # The verified original is in the CAS whoever owns the request now.
-                self._register(c,digest,size);return None
+                # The verified original is in the CAS whoever owns the request now;
+                # a request handed to the provider meanwhile keeps its outcome.
+                self._register(c,digest,size,generation);return None
             if disproved:
                 # A disproved copy no longer counts as verified; it is never used again
                 # until the archiver re-proves it from a resident original.
@@ -559,7 +587,9 @@ class ColdRestorer(ColdArchiver):
 
     def run_once(self,*,limit=16):
         if type(limit) is not int or not 1<=limit<=1000:raise ValueError('invalid_cold_restore_limit')
-        result={'restored':0,'restored_bytes':0,'failed':0,'provider_fallback':0,'reasons':{},'reconciled':self._reconcile()}
+        reconciled,skipped=self._reconcile()
+        result={'restored':0,'restored_bytes':0,'failed':0,'provider_fallback':0,'reasons':{},'reconciled':reconciled,
+                'reconcile_skipped':skipped}
         for row in self._due(limit):
             outcome=self._restore_one(row)
             if outcome is False:continue
