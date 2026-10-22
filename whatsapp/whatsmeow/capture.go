@@ -207,7 +207,7 @@ func normalizeFixture(path string) error {
 	if v.RecipientAlt != "" {
 		event.Info.RecipientAlt, _ = ParseChatID(v.RecipientAlt)
 	}
-	if senderKeyOnly(unwrap(event).Message) {
+	if controlOnly(unwrap(event).Message) {
 		return json.NewEncoder(os.Stdout).Encode(nil)
 	} // as CaptureStore.Put: nothing is journaled
 	if v.Account == "" {
@@ -283,9 +283,11 @@ func interactiveText(v *waE2E.InteractiveMessage) string {
 
 // whatsmeow dispatches the sender-key distribution part of a group message as
 // its own event with the message's ID and time; the content follows as another
-// event. It carries nothing to archive (mautrix-whatsapp getMessageType ignores it).
-func senderKeyOnly(m *waE2E.Message) bool {
-	if m.GetSenderKeyDistributionMessage() == nil {
+// event. A message holding only that and/or message context info carries
+// nothing to archive (mautrix-whatsapp getMessageType ignores it). Unknown wire
+// fields may be content this build cannot read, so they keep the message.
+func controlOnly(m *waE2E.Message) bool {
+	if m.GetSenderKeyDistributionMessage() == nil && m.GetMessageContextInfo() == nil || len(m.ProtoReflect().GetUnknown()) > 0 {
 		return false
 	}
 	only := true

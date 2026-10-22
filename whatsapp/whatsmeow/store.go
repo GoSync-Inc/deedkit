@@ -249,7 +249,7 @@ func (s *CaptureStore) Put(e *events.Message, origin string) error {
 		return nil
 	} // supported sources only
 	e = unwrap(e)
-	if senderKeyOnly(e.Message) {
+	if controlOnly(e.Message) {
 		return nil
 	}
 	if pm := e.Message.GetProtocolMessage(); pm != nil && pm.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT && pm.GetEditedMessage() != nil {

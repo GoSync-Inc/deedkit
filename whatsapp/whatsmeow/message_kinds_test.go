@@ -16,6 +16,7 @@ import (
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -70,7 +71,7 @@ func TestNativeSenderKeyOnlyEventIsNotCapturedAndTheDocumentIs(t *testing.T) {
 	// A sender key travelling with real content is an ordinary message.
 	mixed := senderKeyPart()
 	mixed.Conversation = proto.String("hello group")
-	if senderKeyOnly(mixed) {
+	if controlOnly(mixed) {
 		t.Fatal("content with a sender key was treated as sender-key-only")
 	}
 }
@@ -226,7 +227,7 @@ func TestNativeProtocolEventsWithSenderKeyKeepTheirHandling(t *testing.T) {
 	edit := withKey(&waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: key, EditedMessage: &waE2E.Message{Conversation: proto.String("second")}, TimestampMS: proto.Int64(1700000100000)})
 	revoke := withKey(&waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_REVOKE.Enum(), Key: key})
 	history := withKey(&waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_HISTORY_SYNC_NOTIFICATION.Enum(), HistorySyncNotification: &waE2E.HistorySyncNotification{FileLength: proto.Uint64(100)}})
-	if senderKeyOnly(history) {
+	if controlOnly(history) {
 		t.Fatal("history-sync notification with a sender key was treated as sender-key-only")
 	}
 	for i, m := range []*waE2E.Message{edit, revoke} {
@@ -255,5 +256,45 @@ func TestNativeProtocolEventsWithSenderKeyKeepTheirHandling(t *testing.T) {
 	want := []string{"whatsapp_event/message", "whatsapp_event/edit", "whatsapp_delete"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
 		t.Fatalf("journal = %v, want %v", got, want)
+	}
+}
+
+// spec: ANYM-471
+func TestNativeContextOnlyEventIsSkippedButUnknownFieldsAreKept(t *testing.T) {
+	s := openTestStore(t)
+	contextOnly := &waE2E.Message{MessageContextInfo: &waE2E.MessageContextInfo{MessageSecret: []byte{4, 5, 6}}}
+	if err := s.Put(groupFixture("CTX1", contextOnly), "live"); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	s.db.QueryRow("SELECT COUNT(*) FROM capture").Scan(&rows)
+	if rows != 0 || spoolFiles(t, s.Config.EventsDirectory) != 0 {
+		t.Fatalf("context-only event captured: rows=%d", rows)
+	}
+	doc := &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{FileName: proto.String("plan.pdf"), Mimetype: proto.String("application/pdf"), FileLength: proto.Uint64(1024)}, MessageContextInfo: contextOnly.MessageContextInfo}
+	if err := s.Put(groupFixture("CTX1", doc), "live"); err != nil {
+		t.Fatal(err)
+	}
+	s.db.QueryRow("SELECT COUNT(*) FROM capture").Scan(&rows)
+	if rows != 1 {
+		t.Fatalf("document after context-only event not captured once: rows=%d", rows)
+	}
+	// A field this build cannot read may be content: the event is journaled.
+	future := senderKeyPart()
+	wire := protowire.AppendTag(nil, 9999, protowire.BytesType)
+	future.ProtoReflect().SetUnknown(protowire.AppendBytes(wire, []byte("future content")))
+	if controlOnly(future) {
+		t.Fatal("sender key with an unknown wire field was treated as control-only")
+	}
+	if err := s.Put(groupFixture("FUT1", future), "live"); err != nil {
+		t.Fatal(err)
+	}
+	s.db.QueryRow("SELECT COUNT(*) FROM capture").Scan(&rows)
+	if rows != 2 {
+		t.Fatalf("event with unknown wire field dropped: rows=%d", rows)
+	}
+	loaded, err := s.Get("120363000000000001@g.us", "false_120363000000000001@g.us_FUT1_222222@c.us")
+	if err != nil || len(loaded.Message.ProtoReflect().GetUnknown()) == 0 {
+		t.Fatalf("unknown wire field not retained in the journal: %v", err)
 	}
 }
