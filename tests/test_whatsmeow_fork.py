@@ -86,6 +86,10 @@ def test_reviewed_pin_and_patch_are_consistent():
     assert set(changes) == fork_check.PATCHABLE and changes['deedkit_fork_test.go'][0] and not changes['request.go'][0]
 
 
+def selected(version,path,replace_version):
+    return {'Path':'go.mau.fi/whatsmeow','Version':version,'Replace':{'Path':path,'Version':replace_version}}
+
+
 def adapter(tmp_path,patch,fork_sum='h1:fork='):
     root = tmp_path/'adapter'
     root.mkdir()
@@ -119,6 +123,9 @@ def test_main_checks_hashes_and_only_downloads(tmp_path,monkeypatch,case,error):
     if case=='extracted tree differs from its authenticated hash':(dirs[fork_key]/'send.go').write_text('package whatsmeow\n\nfunc send() { leak() }\n')
     commands = []
     def run(command,**kwargs):
+        if command[:3]==['go','list','-m']:
+            assert kwargs['cwd']==root
+            return subprocess.CompletedProcess(command,0,json.dumps(selected(fork_check.UPSTREAM_VERSION,FORK,FORK_VERSION)),'')
         commands.append((command,kwargs['env']['GOSUMDB'],kwargs['env']['GOFLAGS']))
         return subprocess.CompletedProcess(command,0,json.dumps({'Sum':sums[command[-1]],'Dir':str(dirs[command[-1]])}),'')
     monkeypatch.setattr(fork_check,'adapter',root)
@@ -137,3 +144,32 @@ def test_main_rejects_unrecorded_upstream_bump(tmp_path,monkeypatch):
     monkeypatch.setattr(fork_check,'adapter',root)
     monkeypatch.setattr(fork_check.subprocess,'run',lambda *_,**__:pytest.fail('downloaded before the pin check'))
     with pytest.raises(fork_check.ForkError,match='recorded upstream pin'):fork_check.main()
+
+
+# spec: ANYM-441
+@pytest.mark.parametrize('extra',[
+    'replace go.mau.fi/whatsmeow {up} => ./extra-fork\n',
+    'replace (\n\tgo.mau.fi/whatsmeow {up} => github.com/attacker/whatsmeow v1.0.0\n)\n',
+    'replace go.mau.fi/whatsmeow => ./extra-fork // local\n',
+])
+def test_a_second_replacement_of_whatsmeow_fails(tmp_path,monkeypatch,extra):
+    root = adapter(tmp_path,'')
+    (root/'go.mod').write_text((root/'go.mod').read_text()+extra.format(up=fork_check.UPSTREAM_VERSION))
+    monkeypatch.setattr(fork_check,'adapter',root)
+    monkeypatch.setattr(fork_check.subprocess,'run',lambda *_,**__:pytest.fail('ran Go before the go.mod check'))
+    with pytest.raises(fork_check.ForkError,match='exactly one unversioned module replace'):fork_check.main()
+
+
+# spec: ANYM-441
+@pytest.mark.parametrize('case',['Go selects another replacement','vendor tree'])
+def test_a_build_that_would_not_use_the_checked_module_fails(tmp_path,monkeypatch,case):
+    root = adapter(tmp_path,'')
+    if case=='vendor tree':(root/'vendor').mkdir()
+    # For example a go.work or GOFLAGS=-modfile pointing the build at other code.
+    answer = selected(fork_check.UPSTREAM_VERSION,'../extra-fork',None)
+    def run(command,**_):
+        assert command[:3]==['go','list','-m'],'downloaded before the effective-module check'
+        return subprocess.CompletedProcess(command,0,json.dumps(answer),'')
+    monkeypatch.setattr(fork_check,'adapter',root)
+    monkeypatch.setattr(fork_check.subprocess,'run',run)
+    with pytest.raises(fork_check.ForkError,match='vendor' if case=='vendor tree' else 'Go selects'):fork_check.main()

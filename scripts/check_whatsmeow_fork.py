@@ -30,9 +30,11 @@ class ForkError(Exception):
 def pins(gomod,gosum):
     """Return (upstream version, fork path, fork version, fork go.sum hash) from go.mod and go.sum."""
     require = re.findall(rf'^\s*(?:require\s+)?{re.escape(UPSTREAM)} (v\S+)$',gomod,re.M)
-    replace = re.findall(rf'^replace {re.escape(UPSTREAM)} => (\S+) (v\S+)$',gomod,re.M)
-    if len(require)!=1 or len(replace)!=1:raise ForkError('go.mod needs one require and one replace of '+UPSTREAM)
-    path,version = replace[0]
+    # Every replacement of the module, versioned or not, in a block or not, with or without a comment.
+    replace = re.findall(rf'^\s*(?:replace\s+)?{re.escape(UPSTREAM)}(\s+v\S+)?\s*=>\s*(\S+)(\s+v\S+)?\s*(?://.*)?$',gomod,re.M)
+    if len(require)!=1 or len(replace)!=1 or replace[0][0] or not replace[0][2]:
+        raise ForkError('go.mod needs one require and exactly one unversioned module replace of '+UPSTREAM)
+    path,version = replace[0][1],replace[0][2].strip()
     sums = re.findall(rf'^{re.escape(path)} {re.escape(version)} (h1:\S+)$',gosum,re.M)
     if len(sums)!=1:raise ForkError(f'go.sum has no single hash for {path}@{version}')
     return require[0],path,version,sums[0]
@@ -130,9 +132,20 @@ def download(module,version,workdir):
     return info['Sum'],files
 
 
+def effective():
+    """Ask Go which module the adapter build selects (go.mod, go.work and GOFLAGS as the build sees them)."""
+    run = subprocess.run(['go','list','-m','-json',UPSTREAM],cwd=adapter,env=dict(os.environ),capture_output=True,text=True)
+    if run.returncode:raise ForkError(f'go list -m {UPSTREAM} failed: {run.stdout}{run.stderr}')
+    info = json.loads(run.stdout)
+    return info.get('Version'),(info.get('Replace') or {}).get('Path'),(info.get('Replace') or {}).get('Version')
+
+
 def main():
     version,fork_path,fork_version,fork_sum = pins((adapter/'go.mod').read_text(),(adapter/'go.sum').read_text())
     if version!=UPSTREAM_VERSION:raise ForkError(f'go.mod requires {version}; the recorded upstream pin is {UPSTREAM_VERSION}')
+    # A vendor tree would be built instead of the module cache.
+    if (adapter/'vendor').exists():raise ForkError('whatsapp/whatsmeow/vendor would bypass the checked module')
+    if (found := effective())!=(version,fork_path,fork_version):raise ForkError(f'Go selects {found}, not the checked {(version,fork_path,fork_version)}')
     with tempfile.TemporaryDirectory() as workdir:
         upstream_sum,upstream = download(UPSTREAM,version,workdir)
         if upstream_sum!=UPSTREAM_SUM:raise ForkError(f'upstream hash {upstream_sum} differs from the recorded {UPSTREAM_SUM}')
