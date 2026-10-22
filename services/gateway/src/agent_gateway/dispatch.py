@@ -12,6 +12,7 @@ from .sections import capabilities_view
 
 PLAIN_PATH = "/mcp"
 MODULE_PATH = "/mcp/modules/"
+LIVE_SEARCH = "search_messages_live"
 # One line each for an agent choosing what to load (ANYM-271); the ids are the deployable modules.
 # No ", " or ": ": the MCP text block is compact JSON (ANYM-408).
 MODULE_PURPOSES = {
@@ -424,6 +425,13 @@ class Dispatch:
             args = {k: v for k, v in args.items() if k != "projection_status"}
             if rules_ceiling and (caps.get("features") or {}).get("projection_status") is True:
                 args["projection_status"] = True
+        # ANYM-478: search's live part is the search_messages_live action, so it needs that grant too;
+        # without it the backend answers from the archive only and live says not_permitted.
+        live_denied = (module == "messaging" and tool["operation"] == "search"
+                       and LIVE_SEARCH not in self.policy.actions(snapshot, agent, caps["permissions"]))
+        live_requested = live_denied and args.get("live", "off") != "off"
+        if live_requested:
+            args = {**args, "live": "off"}
         started = datetime.now(timezone.utc).timestamp()
         # Admission is rechecked after all local work; a cached MCP session is
         # never authority. ACK is not retried if its network outcome is unknown.
@@ -447,6 +455,12 @@ class Dispatch:
                 error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                            phase="operation", read_only=True)
             raise
+        if live_denied and isinstance(result, dict) and isinstance(result.get("result_evidence"), dict):
+            evidence = result["result_evidence"]
+            if (evidence.get("suggested_call") or {}).get("tool") == "messages_search":
+                evidence.pop("suggested_call")
+            if live_requested:
+                evidence["live"] = [{"state": "not_permitted", "reason": "gateway_action"}]
         if module == "calls":
             receipt_reference(tool["operation"], result)
         if (module == "calendar" and tool["operation"] == "plan" and not rules_ceiling and isinstance(result, dict)

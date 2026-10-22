@@ -32,6 +32,7 @@ from .telemetry import capture as capture_error
 from .uploads import UPLOAD_BODY_BYTES
 
 WaitSeconds = Annotated[float, Field(strict=True,ge=0,le=25,allow_inf_nan=False)]
+LiveWaitSeconds = Annotated[float, Field(strict=True,ge=0,le=20,allow_inf_nan=False)]
 WakeRule = Literal['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send']
 WakeRules = Annotated[list[WakeRule], Field(min_length=1,max_length=4)]
 SendReference = Annotated[StrictStr, Field(min_length=1,max_length=128)]
@@ -427,6 +428,14 @@ def create_app(store: Store, allowed_hosts: list[str]):
         if method == 'wait_for_subscription_events':
             from .subscription_consumption import wait_for_subscription_events
             return await wait_for_subscription_events(store, token, **arguments)
+        if method == 'search':
+            # ANYM-478: live is off unless asked for; off keeps the plain archive search.
+            from .live_search import search as live_search
+            live={k:arguments.pop(k) for k in ('live','wait_s','request_id') if k in arguments}
+            if live.get('live','off')!='off':
+                return await live_search(store,token,arguments,**live)
+            from .live_search import validate
+            validate('off',live.get('wait_s'),live.get('request_id',''))
         if method == 'send_message':
             from .send_wait import validate_wait_s, wait_for_send
             wait_s=validate_wait_s(arguments.pop('wait_s', 0))
@@ -777,14 +786,15 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     transliterate=transliterate,group_by_sender=group_by_sender)
 
     @mcp.tool(structured_output=True, annotations=read)
-    def search(ctx: Context, query: str='', account: str='', chat: str='', sender: str='',
+    async def search(ctx: Context, query: str='', account: str='', chat: str='', sender: str='',
                from_time: str='', to_time: str='', after: str='', limit: int=20,
                accounts: list[StrictStr] | None=None, chats: list[StrictStr] | None=None,
                senders: list[StrictStr] | None=None, query_mode: QueryMode='all', order: Literal['asc','desc','relevance']='asc',
                before: str='', direction: Literal['','incoming','outgoing']='', search_language: SearchLanguage='auto', fuzzy: bool=False,
                compact: bool | None=None, body_chars: StrictInt | None=None, include_coverage: bool | None=None, detail: MessageDetail='compact',
                     view: ConversationView='conversation',include_system: StrictBool=False,exclude_channels: StrictBool=False,
-               chat_types: list[Literal['private','group','channel','unknown']] | None=None,include_channels: StrictBool=False) -> dict[str, Any]:
+               chat_types: list[Literal['private','group','channel','unknown']] | None=None,include_channels: StrictBool=False,
+               live: Literal['off','auto','on']='off', wait_s: LiveWaitSeconds | None=None, request_id: StrictStr='') -> dict[str, Any]:
         """Search archived text across chosen accounts/chats/sender IDs. Lists use OR within each
         dimension, AND between dimensions; [] matches nothing. Exact account-scoped sender IDs,
         not a merged person directory. query_mode: all words (all), phrase, or web (quotes/OR/-word).
@@ -795,14 +805,21 @@ def create_app(store: Store, allowed_hosts: list[str]):
         direction: incoming/outgoing or empty. detail=transcript returns only the numbered transcript.
         Channels are excluded unless include_channels=true, chat_types lists channel, or chat/chats is set.
         chat_types: private/group/channel/unknown (null type = unknown), ANDed with exclude_channels.
-        No provider calls, ACK or semantic task extraction.
+        live (Telegram, first page only): on also searches Telegram itself; auto only when the archive
+        answer is thin (empty_reason history_loading/history_not_scanned/history_has_gaps/
+        no_matches_in_partial_archive). It waits once up to wait_s (0-20, default 15), then rereads the
+        archive; result_evidence.live has per account state, stored_new and the provider hits. Supported:
+        query (all/phrase), one chat, chat_types/channels, from_time/to_time; anything else gives
+        unsupported_filter. Keep one request_id per intent: a repeat queues no new provider request.
+        Needs read-live and the account's search_messages_live opt-in. live=off makes no provider calls.
+        No ACK or semantic task extraction.
         """
-        return call(ctx,'search',detail=detail,query=query,account=account,chat=chat,sender=sender,
+        return await async_call(ctx,'search',detail=detail,query=query,account=account,chat=chat,sender=sender,
                     from_time=from_time,to_time=to_time,after=after,limit=limit,
                     accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,
                     order=order,before=before,direction=direction,search_language=search_language,fuzzy=fuzzy,
                     compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
-                    chat_types=chat_types,include_channels=include_channels)
+                    chat_types=chat_types,include_channels=include_channels,live=live,wait_s=wait_s,request_id=request_id)
 
     @mcp.tool(structured_output=True, annotations=read)
     def search_files(ctx: Context, query: str='', account: str='', chat: str='', sender: str='',

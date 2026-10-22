@@ -627,13 +627,35 @@ class Store:
         # None is the internal no-default sentinel of message_queries.search, never a public value.
         if type(include_channels) is not bool:raise APIError('invalid_filter')
         from .message_queries import named_chats
+        from .live_search import suggest
         with self.authorized(token,'search') as (c,p):
             named_chats(c,p,chat,chats)
-            return self._search(c,p,query,account,chat,sender,from_time,to_time,after,limit,
+            result=self._search(c,p,query,account,chat,sender,from_time,to_time,after,limit,
                 accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,
                 order=order,before=before,direction=direction,search_language=search_language,
                 fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
                 chat_types=chat_types,include_channels=include_channels)
+            # ANYM-478: a thin archive answer names the call that may find more.
+            suggest(c,p,{'account':account,'accounts':accounts,'chat':chat,'chats':chats,'chat_types':chat_types},
+                result['result_evidence'])
+            return result
+
+    def live_search_plan(self,token,arguments,*,paged,request_id):
+        """ANYM-478: per-account live entries and the operations to queue; reads only."""
+        from .live_search import plan
+        with self.authorized(token,'search') as (c,p):
+            return plan(c,p,arguments,paged=paged,request_id=request_id)
+
+    def live_search_receipts(self,token,operation_ids):
+        """ANYM-478: this key's receipts of its live searches, one short read; a missing one is left out."""
+        from .commands import status
+        result={}
+        with self.authorized(token) as (c,p):
+            for operation_id in operation_ids:
+                try:
+                    with c.transaction():result[operation_id]=status(self,c,p,operation_id)
+                except APIError:pass
+        return result
 
     def _search(self,c,p,*args,**kwargs):
         from .message_queries import search

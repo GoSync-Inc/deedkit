@@ -1024,7 +1024,9 @@ class TelegramCollector:
         if job.get('operation')!='search_messages_live': return await self.provider.execute_operation(job)
         job['_live_hits']=found=[]
         answer=await self.provider.execute_operation(job)
-        await self.store_live_hits(found,deadline=job.get('_deadline'))
+        created=await self.store_live_hits(found,deadline=job.get('_deadline'))
+        # ANYM-478: search with live reports how many hits were new to the archive.
+        if isinstance(answer,dict) and isinstance(answer.get('data'),dict):answer['data']['stored_new']=created
         return answer
 
     async def chat_history(self,job):
