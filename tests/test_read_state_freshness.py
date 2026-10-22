@@ -142,10 +142,11 @@ def test_whatsapp_read_sources_pass_validation():
     assert validate_observation({'observed_at':at, 'basis':'whatsapp_history_sync', 'unread_count':3, 'marked_unread':False})
     assert validate_observation({'observed_at':at, 'basis':'whatsapp_owner_receipt', 'unread_count':None,
         'read_message_ids':['B', 'A', 'A']})['read_message_ids'] == ['A', 'B']
+    # A receipt whose messages are no longer retained still invalidates an older count.
+    assert validate_observation({'observed_at':at, 'basis':'whatsapp_owner_receipt', 'read_message_ids':[]})['read_message_ids'] == []
     for bad in ({'basis':'whatsapp_app_state_read', 'unread_count':2, 'marked_unread':False},
                 {'basis':'whatsapp_app_state_read', 'unread_count':0, 'marked_unread':True},
                 {'basis':'whatsapp_owner_receipt', 'unread_count':1, 'read_message_ids':['A']},
-                {'basis':'whatsapp_owner_receipt', 'read_message_ids':[]},
                 {'basis':'whatsapp_history_sync', 'unread_count':None},
                 {'basis':'telegram_dialog', 'unread_count':1, 'marked_unread':True},
                 {'basis':'whatsapp_history_sync', 'unread_count':1, 'read_inbox_max_id':4}):
@@ -253,3 +254,78 @@ def test_captured_chat_without_a_source_keeps_the_known_count(wa):
         observe(c, 'wa-read', '15550001111@c.us', {'observed_at':ago(seconds=1).isoformat(), 'unread_count':None,
             'basis':'whatsmeow_captured_chat', 'is_self_chat':False})
     assert (row()['provider_unread_count'], row()['read_state_basis']) == (1, 'whatsapp_history_sync')
+
+
+# spec: ANYM-275
+@pytest.mark.parametrize('reason', ['provider_disconnected', 'provider_reconnected', 'read_state_write_failed'])
+def test_native_connection_gaps_end_continuity(live, reason):
+    s, ar, state, row = live
+    assert row()['read_state'] == 'observed'
+    state.apply(validate_capture({'kind':'read_state_gap', 'account':'fresh-test',
+        'observed_at':datetime.now(timezone.utc).isoformat(), 'reason':reason}))
+    assert row()['read_state'] == 'stale'
+
+
+# spec: ANYM-275
+def test_quarantined_or_invalid_capture_ends_continuity(live):
+    s, ar, state, row = live
+    state.capture_progress(None, 0, 0, quarantined=0)
+    assert row()['read_state'] == 'observed'
+    state.capture_progress(None, 0, 0, quarantined=1)
+    assert row()['read_state'] == 'stale'
+    state.phase('connection', 'connected', 'provider_ready')
+    with s.pool.connection() as c:
+        c.execute("UPDATE collector_health SET receiving_since=now()-interval '3 hours 30 minutes' WHERE account='fresh-test'")
+    state.capture_progress(None, 0, 0, quarantined=1)
+    assert row()['read_state'] == 'observed'
+    state.capture_progress(None, 0, 0, invalid=1)
+    assert row()['read_state'] == 'stale'
+
+
+# spec: ANYM-275
+def test_telegram_auto_reconnect_ends_continuity():
+    import asyncio
+    from telethon import TelegramClient
+    from messaging_service.telegram_collector import TelethonProvider
+    # The wrapped hook is Telethon's own; a bump that drops it fails here.
+    assert callable(getattr(TelegramClient, '_handle_auto_reconnect', None))
+    calls = []
+    class Client:
+        async def _handle_auto_reconnect(self): calls.append('telethon')
+    class State:
+        def __init__(self, fail=False): self.fail = fail
+        def update_gap(self):
+            calls.append('gap')
+            if self.fail: raise RuntimeError('synthetic')
+    provider = object.__new__(TelethonProvider)
+    provider.client = Client()
+    provider.bind_state(State())
+    provider.bind_state(State(fail=True))
+    asyncio.run(provider.client._handle_auto_reconnect())
+    # Bound twice: one gap, then Telethon's own handler, even when the gap write fails.
+    assert calls == ['gap', 'telethon']
+
+
+# spec: ANYM-275
+def test_receipt_without_retained_messages_invalidates_the_count(wa):
+    s, message, read, row, reads = wa
+    message('A', 10)
+    read('whatsapp_history_sync', 5, unread_count=1, marked_unread=False)
+    read('whatsapp_owner_receipt', 1, unread_count=None, read_message_ids=[])
+    r = row()
+    assert r['provider_unread_count'] is None and r['read_state_count_basis'] == 'stale_since_baseline' and reads() == []
+
+
+# spec: ANYM-275
+def test_discovery_without_evidence_never_hides_an_older_baseline(wa):
+    s, message, read, row, reads = wa
+    message('A', 10)
+    with s.pool.connection() as c:
+        observe(c, 'wa-read', '15550001111@c.us', {'observed_at':ago(seconds=1).isoformat(), 'unread_count':None,
+            'basis':'whatsapp_cached_chat', 'is_self_chat':False})
+    read('whatsapp_history_sync', 5, unread_count=3, marked_unread=False)
+    assert (row()['provider_unread_count'], row()['read_state_basis']) == (3, 'whatsapp_history_sync')
+    # A receipt row is evidence: an older baseline does not replace it.
+    read('whatsapp_owner_receipt', 1, unread_count=None, read_message_ids=['A'])
+    read('whatsapp_history_sync', 6, unread_count=4, marked_unread=False)
+    assert row()['provider_unread_count'] is None

@@ -128,7 +128,17 @@ class TelethonProvider:
         self.verified_self=None
         self.governor=None
 
-    def bind_state(self,state): self.governor=RequestGovernor(state)
+    def bind_state(self,state):
+        self.governor=RequestGovernor(state)
+        # Telethon 1.x reconnects inside one connection and does not catch up (its
+        # _handle_auto_reconnect says so): updates may be missing, so the read-state
+        # continuity ends here (ANYM-275). A failed record is logged, never raised.
+        reconnected=self.__dict__.setdefault('_auto_reconnect',self.client._handle_auto_reconnect)
+        async def handle_auto_reconnect():
+            try:await asyncio.to_thread(state.update_gap)
+            except Exception as exc:logging.getLogger(__name__).warning('read_state_gap_failed: %s',type(exc).__name__)
+            return await reconnected()
+        self.client._handle_auto_reconnect=handle_auto_reconnect
 
     async def rpc(self,operation,phase):
         governor=getattr(self,'governor',None)

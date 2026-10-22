@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1041,10 +1042,12 @@ func TestOwnDeviceReceiptListsExactlyCapturedIncomingIDs(t *testing.T) {
 	if obs, err := s.ReceiptObservations("111111@c.us", LegacyMessageID(out)); err != nil || len(obs) != 0 {
 		t.Fatal("own-device receipt became delivery evidence", obs, err)
 	}
-	// A receipt that lists no captured incoming message records nothing.
+	// A receipt that lists no retained incoming message still invalidates an
+	// older count: it records an empty ID list. A chat with no capture records nothing.
 	p.handleReadEvent(ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000040, "out", "absent"))
-	if len(readCaptures(t, s)) != 2 {
-		t.Fatal("empty owner read recorded")
+	p.handleReadEvent(ownerReceipt(s.Owner, types.NewJID("999999", types.DefaultUserServer), types.ReceiptTypeRead, 1700000041, "x"))
+	if got = readCaptures(t, s); len(got) != 3 || fmt.Sprint(got[2]["observation"].(map[string]any)["read_message_ids"]) != "[]" {
+		t.Fatal("receipt without retained messages", got)
 	}
 	// A peer's read receipt on the outgoing message stays delivery evidence only.
 	peer := &events.Receipt{MessageSource: types.MessageSource{Chat: chat, Sender: chat}, MessageIDs: []types.MessageID{"out", "m3"}, Timestamp: time.Unix(1700000050, 0), Type: types.ReceiptTypeRead}
@@ -1054,7 +1057,7 @@ func TestOwnDeviceReceiptListsExactlyCapturedIncomingIDs(t *testing.T) {
 	if obs, err := s.ReceiptObservations("111111@c.us", LegacyMessageID(out)); err != nil || len(obs) != 1 || obs[0]["state"] != "read" {
 		t.Fatal("peer delivery evidence", obs, err)
 	}
-	if len(readCaptures(t, s)) != 2 {
+	if len(readCaptures(t, s)) != 3 {
 		t.Fatal("peer receipt became owner read evidence")
 	}
 }
@@ -1157,5 +1160,115 @@ func TestReadStatePathsSendNothingToTheProvider(t *testing.T) {
 	}
 	if p.Client.IsConnected() || len(readCaptures(t, p.Capture)) != 3 {
 		t.Fatal("unexpected provider use or missing evidence")
+	}
+}
+
+// spec: ANYM-275
+func TestReadStateWriteFailureEndsContinuityWithoutStoppingCapture(t *testing.T) {
+	p := readStateProvider(t)
+	s := p.Capture
+	chat := types.NewJID("111111", types.DefaultUserServer)
+	if err := s.Put(fixtureMessage("m1", 1700000000), "live"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`CREATE TRIGGER fail_read BEFORE INSERT ON capture WHEN NEW.message_id LIKE 'read:%' OR NEW.message_id LIKE 'gap:%' BEGIN SELECT RAISE(ABORT,'synthetic'); END`); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []any{
+		&events.MarkChatAsRead{JID: chat, Timestamp: time.Unix(1700000100, 0), Action: &waSyncAction.MarkChatAsReadAction{Read: proto.Bool(true)}},
+		ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000110, "m1"),
+		&events.AppStateSyncError{Name: "regular_high", Error: errors.New("synthetic")},
+	} {
+		if !p.handleReadEvent(event) {
+			t.Fatalf("%T: a read-state write failure must not refuse the event", event)
+		}
+	}
+	if p.failure.Load() != nil || !p.ready.Load() || !p.readGapPending.Load() {
+		t.Fatal("read-state failure stopped the provider or lost the gap", p.failure.Load())
+	}
+	// Message capture keeps working, and the pending gap is written before the next read event.
+	if err := s.Put(fixtureMessage("m2", 1700000200), "live"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("DROP TRIGGER fail_read"); err != nil {
+		t.Fatal(err)
+	}
+	p.handleReadEvent(ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000300, "m2"))
+	got := readCaptures(t, s)
+	if p.readGapPending.Load() || len(got) != 2 || got[0]["kind"] != "read_state_gap" || got[0]["reason"] != "read_state_write_failed" || got[1]["kind"] != "owner_read_state" {
+		t.Fatal("pending gap", got)
+	}
+	// Disconnect and reconnect gaps use the same capture.
+	p.readGap("provider_disconnected")
+	p.readGap("provider_reconnected")
+	if got = readCaptures(t, s); len(got) != 4 || got[2]["reason"] != "provider_disconnected" || got[3]["reason"] != "provider_reconnected" {
+		t.Fatal("connection gaps", got)
+	}
+}
+
+// spec: ANYM-275
+func TestOwnerReadResolvesLocalAliasAndOldRetainedMessages(t *testing.T) {
+	p := readStateProvider(t)
+	s := p.Capture
+	lid := types.NewJID("777777", types.HiddenUserServer)
+	pn := types.NewJID("111111", types.DefaultUserServer)
+	s.Alias = func(j types.JID) types.JID {
+		if j == lid {
+			return pn
+		}
+		return types.EmptyJID
+	}
+	// The receipt names the oldest of more than 1,000 retained messages.
+	for i := range 1005 {
+		if err := s.Put(fixtureMessage(fmt.Sprintf("m%d", i), 1700000000+int64(i)), "live"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.handleReadEvent(ownerReceipt(s.Owner, lid, types.ReceiptTypeRead, 1700002000, "m0"))
+	p.handleReadEvent(&events.MarkChatAsRead{JID: lid, Timestamp: time.Unix(1700002100, 0), Action: &waSyncAction.MarkChatAsReadAction{Read: proto.Bool(true)}})
+	got := readCaptures(t, s)
+	if len(got) != 2 || got[0]["chat"] != "111111@c.us" || fmt.Sprint(got[0]["observation"].(map[string]any)["read_message_ids"]) != "[false_111111@c.us_m0]" || got[1]["chat"] != "111111@c.us" {
+		t.Fatal("LID receipt for a PN-captured chat", got)
+	}
+}
+
+// spec: ANYM-275
+func TestOwnerReadSequencesGiveTheSameCapturesInAnyOrder(t *testing.T) {
+	// Baseline mark-read at T, incoming A and B, receipts for A (twice) and B, a
+	// newer mark-read: the captured evidence is the same set in any order.
+	chat := types.NewJID("111111", types.DefaultUserServer)
+	run := func(order []int) []string {
+		p := readStateProvider(t)
+		s := p.Capture
+		for i, id := range []string{"a", "b"} {
+			if err := s.Put(fixtureMessage(id, 1700000100+int64(i)), "live"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		read := func(at int64) any {
+			return &events.MarkChatAsRead{JID: chat, Timestamp: time.Unix(at, 0), Action: &waSyncAction.MarkChatAsReadAction{Read: proto.Bool(true)}}
+		}
+		evs := []any{read(1700000000), ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000200, "a"),
+			ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000200, "a"), ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000300, "b"), read(1700000400)}
+		for _, i := range order {
+			if !p.handleReadEvent(evs[i]) {
+				t.Fatal("event", i)
+			}
+		}
+		out := []string{}
+		for _, v := range readCaptures(t, s) {
+			out = append(out, string(mustJSON(v["observation"])))
+		}
+		sort.Strings(out)
+		return out
+	}
+	want := run([]int{0, 1, 2, 3, 4})
+	if len(want) != 4 || !strings.Contains(strings.Join(want, "\n"), `"read_message_ids":["false_111111@c.us_a"]`) || strings.Contains(strings.Join(want, "\n"), `"unread_count":2`) {
+		t.Fatal("in-order evidence", want)
+	}
+	for _, order := range [][]int{{3, 1, 0, 2, 4}, {4, 2, 3, 1, 0, 1}} {
+		if got := run(order); fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatal("order changed the evidence", order, got, want)
+		}
 	}
 }

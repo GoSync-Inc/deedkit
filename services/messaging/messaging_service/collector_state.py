@@ -16,7 +16,7 @@ from .envelope import canonical,utc,validate,stable_id,MAX_ENVELOPE
 from .spool import DurableSpool
 
 
-GAP_REASONS=('app_state_sync_error',)
+GAP_REASONS=('app_state_sync_error','provider_disconnected','provider_reconnected','read_state_write_failed')
 
 
 def validate_capture(value):
@@ -352,10 +352,13 @@ class CollectorState:
                 'inspect_capture_quarantine' if held and not pending else None,**extra)
             if history_pending is not None:
                 value['history']={**value.get('history',{}),'pending_events':history_pending}
-            # Drained live captures are the heartbeat; an undrained spool may hold a delayed read event.
+            # Drained live captures are the heartbeat; an undrained spool may hold a delayed read event,
+            # and a newly quarantined or invalid capture may have been one: both end continuity.
+            lost=bool(invalid) or held>previous.get('quarantined_captures',0)
             c.execute('''UPDATE collector_health SET receiving_heartbeat_at=clock_timestamp(),
-                receiving_backlog_since=CASE WHEN %s THEN coalesce(receiving_backlog_since,clock_timestamp()) END
-                WHERE account=%s AND receiving_epoch=%s AND receiving_since IS NOT NULL''',(pending>0,self.account,self.lease[1]))
+                receiving_backlog_since=CASE WHEN %s THEN coalesce(receiving_backlog_since,clock_timestamp()) END,
+                receiving_gap_at=CASE WHEN %s THEN clock_timestamp() ELSE receiving_gap_at END
+                WHERE account=%s AND receiving_epoch=%s AND receiving_since IS NOT NULL''',(pending>0,lost,self.account,self.lease[1]))
             self._save_operations(c,value)
 
     def policy(self):

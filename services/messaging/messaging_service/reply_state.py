@@ -38,7 +38,7 @@ def validate_observation(value):
         raise ValueError('invalid_read_observation')
     ids=value.get('read_message_ids')
     if (basis=='whatsapp_owner_receipt')!=(ids is not None):raise ValueError('invalid_read_observation')
-    if ids is not None and (not isinstance(ids,list) or not 1<=len(ids)<=1000 or value.get('unread_count') is not None
+    if ids is not None and (not isinstance(ids,list) or not 0<=len(ids)<=1000 or value.get('unread_count') is not None
             or any(not isinstance(i,str) or not 0<len(i)<=256 or '\x00' in i for i in ids)):
         raise ValueError('invalid_read_observation')
     # A mark-read is exactly 0 and not marked unread; a mark-unread is a flag, never a count.
@@ -70,6 +70,12 @@ def telegram_read_capture(account,update,*,verified_self,expected_user_id):
     except (ValueError,AttributeError):return None
     return {'kind':'owner_read_state','account':account,'chat':str(utils.get_peer_id(peer)),
         'observed_at':observed['observed_at'],'observation':observed}
+
+
+# A row with no read evidence at all (chat discovery stamps its cache time) never
+# outranks an older WhatsApp baseline or flag; a receipt row ('partial') does.
+EMPTY_ROW='''(chat_read_observations.unread_count IS NULL AND chat_read_observations.marked_unread IS NULL
+    AND chat_read_observations.read_inbox_max_id IS NULL AND chat_read_observations.count_basis IS NULL)'''
 
 
 def observe(c,account,provider_chat,value):
@@ -108,13 +114,13 @@ def observe(c,account,provider_chat,value):
             observed_at=excluded.observed_at,unread_count=NULL,read_inbox_max_id=NULL,basis=excluded.basis,marked_unread=true,
             count_basis=CASE WHEN chat_read_observations.unread_count IS NOT NULL
                 OR chat_read_observations.count_basis='stale_since_baseline' THEN 'stale_since_baseline' ELSE 'partial' END
-            WHERE excluded.observed_at>chat_read_observations.observed_at''',args)
+            WHERE excluded.observed_at>chat_read_observations.observed_at OR '''+EMPTY_ROW,args)
     elif value['basis'] in WHATSAPP_READ_BASES:
         # A whole-chat baseline: a mark-read (0) or a history-sync count at its snapshot time.
         c.execute(insert+'''%s,'provider') ON CONFLICT(chat) DO UPDATE SET
             observed_at=excluded.observed_at,unread_count=excluded.unread_count,read_inbox_max_id=NULL,
             basis=excluded.basis,marked_unread=excluded.marked_unread,baseline_at=excluded.baseline_at,count_basis='provider'
-            WHERE excluded.observed_at>chat_read_observations.observed_at''',(*args,value['observed_at']))
+            WHERE excluded.observed_at>chat_read_observations.observed_at OR '''+EMPTY_ROW,(*args,value['observed_at']))
     else:
         # One timestamp covers both read fields. An incomplete observation must not
         # discard known evidence or make retained numbers look newly verified.
