@@ -631,7 +631,7 @@ def test_run_reports_the_capture_stop_detail_to_state(tmp_path):
     async def idle():await asyncio.Event().wait()
     async def disconnect():pass
     worker.provider=NS(subscribe=lambda *a:None,connect=connect,disconnect=disconnect,wait_disconnected=idle)
-    state=NS(policy=lambda:{'account':'tg-fixture'},status=lambda *a:None,phase=lambda *a:None,
+    state=NS(policy=lambda:{'account':'tg-fixture'},status=lambda *a:None,phase=lambda *a,**k:None,
         connection_gate=lambda:{'blocked':False,'remaining_seconds':0},connection_failed=lambda *a:calls.append(a))
     worker.state_class=lambda *a:state
     worker.archive=NS(acquire=lambda *a:1,release=lambda *a:None)

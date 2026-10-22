@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from .envelope import stable_id
 from .policy import scope_filter
 from .status_details import describe,freshness
-from .operational import liveness, operations
+from .operational import identity_safe, liveness, operations
 from .media_policy import ELIGIBILITY_JOIN, published_window
 
 
@@ -210,7 +210,7 @@ def get_sync_status(c, p):
         sources = [catalogs[k] for k in sorted(catalogs)]
     else:
         sources = c.execute('''SELECT a.id AS account,a.platform,h.status,h.detail_code,h.cooldown_until,
-            h.updated_at,h.discovery_started_at,h.discovery_completed_at,h.discovery_count,h.discovery_limited,h.operations,
+            h.updated_at,h.discovery_started_at,h.discovery_completed_at,h.discovery_count,h.discovery_limited,'''+identity_safe('h.operations')+''' AS operations,
             l.expires_at AS collector_lease_until,
             s.last_ingest_at,s.detail_code AS archive_detail_code
             FROM accounts a LEFT JOIN collector_health h ON h.account=a.id

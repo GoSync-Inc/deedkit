@@ -170,7 +170,7 @@ class NodeProvider:
         self.script=script or whatsapp_asset('provider.mjs')
         self.process=None; self.lock=asyncio.Lock(); self.counter=0; self.policy=None
         self.send_lock=asyncio.Lock();self.disconnect_lock=asyncio.Lock()
-        self.send_reader=None;self.send_writer=None
+        self.send_reader=None;self.send_writer=None;self.started=False
     def subscribe(self,*_): pass # Provider writes callbacks to its own disk queue, never RAM polling.
     def bind_state(self,state):self.state=state
     def command(self):
@@ -195,6 +195,8 @@ class NodeProvider:
             parent.setblocking(False)
             self.send_reader,self.send_writer=await asyncio.open_connection(sock=parent,limit=1024*1024+1)
             await self.call('start',{'policy':self.policy})
+            # Both adapters answer start only after the session's own ID equals expected_wid.
+            self.started=True
             if hasattr(self,'state'):
                 await asyncio.to_thread(self.state.provider_observation,self.cfg.get('provider','webjs'))
         except BaseException:
@@ -205,7 +207,11 @@ class NodeProvider:
     async def disconnect(self):
         async with self.disconnect_lock:
             await self._disconnect()
+    def self_provider_id(self):
+        running=self.started and self.process is not None and self.process.returncode is None
+        return self.cfg.get('expected_wid') if running else None
     async def _disconnect(self):
+        self.started=False
         if self.send_writer:
             self.send_writer.close()
             with suppress(OSError):await self.send_writer.wait_closed()
