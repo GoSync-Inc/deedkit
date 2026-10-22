@@ -335,12 +335,12 @@ gateway, the `search_messages_live` action grant. It writes nothing to the archi
 - FloodWait: a wait of up to 3600 seconds pauses only live search on that account;
   sends and collection go on. A longer wait, or another 420 answer, pauses the
   account like any FloodWait.
-- Failures: without a running session `session_unavailable`; 15 seconds after the
-  collector claims it (checks, waits, request and receipt together)
-  `provider_timeout`. Both are safe to repeat with a new request ID. The collector
-  writes the receipt after it moves on to queued sends, so the operation may read
-  `dispatching` a moment longer; a receipt that cannot be written stops the
-  collector, and the next start marks the operation `unknown`.
+- Failures: without a running session `session_unavailable`; 8 seconds after the
+  collector claims it (checks, waits and request) `provider_timeout`. Both are safe
+  to repeat with a new request ID. The receipt gets one attempt that ends 14 seconds
+  after the claim, so a queued send starts within 15 seconds. A receipt not written
+  by then leaves the operation `dispatching` (log line `live_search
+  receipt_unrecorded`); it reads `unknown` once it expires or the collector restarts.
 - Data: the query goes only to Telegram. The operation row keeps the parameters
   and the receipt like every other operation, so both reach backups. The log line
   `live_search` holds counts, duration and FloodWait seconds, never the query or

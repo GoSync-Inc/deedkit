@@ -90,3 +90,35 @@ def test_worker_round_trip_keeps_hits_and_retry_after(live):
     assert asyncio.run(CommandWorker(state, limited).once())
     receipt = s.get_messenger_operation(key, second['operation_id'])
     assert receipt['status'] == 'failed' and receipt['result']['data'] == {'code': 'rate_limited', 'retry_after': 7}
+
+
+# spec: ANYM-475
+def test_a_receipt_stuck_on_a_lock_frees_the_send_claim_within_the_deadline(live, monkeypatch, caplog):
+    import time
+    import messaging_service.commands as commands
+    from messaging_service.outgoing import OutgoingWorker
+    s, _, key, state = live
+    monkeypatch.setattr(commands, 'LIVE_SEARCH_TIMEOUT', 1.5); monkeypatch.setattr(commands, 'LIVE_FOREGROUND_RESERVE', 0)
+    monkeypatch.setattr(commands, 'LIVE_EXECUTION_TIMEOUT', 0.5, raising=False)
+    operation = search(s, key)['operation_id']
+    marks, blocker = {}, s.pool.getconn()
+    class Worker(commands.CommandWorker):
+        def claim(self):
+            job = super().claim(); marks.setdefault('claimed', time.monotonic()); return job
+    async def found(job):
+        # Another transaction holds the command row, so the receipt waits inside the lease fence.
+        blocker.execute('SELECT 1 FROM messenger_commands WHERE id=%s FOR UPDATE', (job['id'],))
+        return {'outcome': 'confirmed', 'data': {'hits': [], 'next_cursor': None, 'provider_total_approx': 0}}
+    worker = Worker(state, found)
+    async def scenario():
+        try:
+            assert await worker.once(); await asyncio.sleep(0.2)  # a receipt off the foreground path has the fence by now
+            await asyncio.to_thread(OutgoingWorker(state, None).claim)  # the real send claim takes the same fence
+            marks['send'] = time.monotonic()
+        finally:blocker.rollback()
+        assert not await worker.once()  # the worker keeps running
+    with caplog.at_level('WARNING', logger='anymsg.live_search'):asyncio.run(scenario())
+    s.pool.putconn(blocker)
+    assert marks['send'] - marks['claimed'] < 2.5
+    assert 'receipt_unrecorded' in caplog.text
+    assert s.get_messenger_operation(key, operation)['status'] == 'dispatching'

@@ -79,12 +79,8 @@ def run(client, value, governor=None):
 
 
 def once(worker):
-    """One worker turn, then the live receipt it settles off the foreground path."""
-    async def turn():
-        active = await worker._once()
-        await asyncio.gather(*list(worker.settling))
-        return active
-    return asyncio.run(turn())
+    """One worker turn; a live receipt is written inside it."""
+    return asyncio.run(worker._once())
 
 
 def governed():
@@ -232,7 +228,7 @@ def test_slow_preflight_counts_against_the_live_deadline(monkeypatch):
     class Worker(CommandWorker):
         def claim(self):return {'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}
         def preflight(self, job, *, verify_file=True):time.sleep(0.2); return job
-        def finish(self, job, status, result=None, code=None):finished.append((status, result, code))
+        def finish_live(self, job, status, result, code, budget):finished.append((status, result, code))
     monkeypatch.setattr(commands, 'LIVE_SEARCH_TIMEOUT', 0.3); monkeypatch.setattr(commands, 'LIVE_FOREGROUND_RESERVE', 0)
     async def hangs(job):await asyncio.sleep(60)
     started = time.monotonic()
@@ -252,6 +248,7 @@ def test_next_send_opportunity_follows_a_hung_search_within_the_deadline(monkeyp
     import messaging_service.outgoing as outgoing
     from messaging_service.telegram_collector import TelegramCollector
     monkeypatch.setattr(commands, 'LIVE_SEARCH_TIMEOUT', 0.3); monkeypatch.setattr(commands, 'LIVE_FOREGROUND_RESERVE', 0)
+    monkeypatch.setattr(commands, 'LIVE_EXECUTION_TIMEOUT', 0.15)
     marks, finished, jobs = {}, [], [{'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}]
     class Sends:
         def __init__(self, *args):pass
@@ -262,7 +259,8 @@ def test_next_send_opportunity_follows_a_hung_search_within_the_deadline(monkeyp
         def claim(self):
             if jobs:marks['claimed'] = time.monotonic(); return jobs.pop()
         def preflight(self, job, *, verify_file=True):time.sleep(0.1); return job
-        def finish(self, job, status, result=None, code=None):time.sleep(0.4); finished.append(code)
+        # A receipt stuck on a lock holds out its whole budget, as lock_timeout lets it.
+        def finish_live(self, job, status, result, code, budget):time.sleep(budget); finished.append(code)
     class State:
         def cooldown_remaining(self):return 0
     monkeypatch.setattr(outgoing, 'OutgoingWorker', Sends); monkeypatch.setattr(commands, 'CommandWorker', Worker)
@@ -272,31 +270,11 @@ def test_next_send_opportunity_follows_a_hung_search_within_the_deadline(monkeyp
     collector.execute_operation = hangs
     async def scenario():
         loop = asyncio.create_task(collector.outgoing_loop())
-        while not finished:await asyncio.sleep(0.02)
+        while 'send' not in marks:await asyncio.sleep(0.02)
         loop.cancel()
     asyncio.run(scenario())
-    # Preflight 0.1 s + hung request to the 0.3 s deadline + 0.25 s pacing; the 0.4 s receipt write is not waited for.
+    # Preflight 0.1 s + hung request to the 0.15 s execution deadline + a stuck receipt to 0.3 s + 0.25 s pacing.
     assert marks['send'] - marks['claimed'] < 0.65 and finished == ['provider_timeout']
-
-
-# spec: ANYM-475
-def test_an_unrecorded_live_receipt_stops_the_worker_at_its_next_turn(monkeypatch):
-    import messaging_service.commands as commands
-    async def unrecorded(*args):raise RuntimeError('dispatch_result_unrecorded')
-    monkeypatch.setattr(commands, 'finish_durably', unrecorded)
-    class Worker(CommandWorker):
-        def claim(self):return {'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}
-        def preflight(self, job, *, verify_file=True):return job
-    async def found(job):return {'outcome': 'confirmed', 'data': {'hits': []}}
-    class State:
-        def cooldown_remaining(self):return 0
-    worker = Worker(State(), found)
-    async def turns():
-        await worker.once()
-        await asyncio.gather(*list(worker.settling), return_exceptions=True)
-        with pytest.raises(RuntimeError, match='dispatch_result_unrecorded'):
-            await worker.once()
-    asyncio.run(turns())
 
 
 # spec: ANYM-475
@@ -413,7 +391,7 @@ def test_worker_bounds_a_live_search_and_reports_retry_after(monkeypatch):
     class Worker(CommandWorker):
         def claim(self):return {'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}
         def preflight(self, job, *, verify_file=True):return job
-        def finish(self, job, status, result=None, code=None):finished.append((status, result, code))
+        def finish_live(self, job, status, result, code, budget):finished.append((status, result, code))
     monkeypatch.setattr(commands, 'LIVE_SEARCH_TIMEOUT', 0.05); monkeypatch.setattr(commands, 'LIVE_FOREGROUND_RESERVE', 0)
     async def hangs(job):await asyncio.sleep(60)
     assert once(Worker(SimpleNamespace(), hangs))

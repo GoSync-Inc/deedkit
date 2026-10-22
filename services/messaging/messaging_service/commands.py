@@ -5,6 +5,7 @@ are terminal unknown and are never retried automatically.
 """
 import asyncio
 import hashlib
+import logging
 import math
 import os
 import re
@@ -23,9 +24,12 @@ LIVE_SEARCH = 'search_messages_live'
 LIVE_SEARCH_TIMEOUT = 15
 # Kept free inside LIVE_SEARCH_TIMEOUT for the foreground loop's pacing, so a queued send starts within it.
 LIVE_FOREGROUND_RESERVE = 1.0
+# Preflight, governor waits and the request end this long after the claim; the rest is the receipt's.
+LIVE_EXECUTION_TIMEOUT = 8
 PHONE_LOOKUPS_PER_HOUR = 10
 OPEN_CHAT_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
     '--operations <current operations> open_chat_by_phone')
+log = logging.getLogger('anymsg.live_search')
 BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session','session_data',
     'password','secret','stack','traceback','diagnostic','diagnostics','credentials'))
 
@@ -505,20 +509,6 @@ def status(store,c,p,operation_id):
 class CommandWorker:
     def __init__(self,state,execute,gate=None):
         self.state,self.execute,self.gate=state,execute,gate
-        self.settling,self.unsettled=set(),None
-
-    async def _settle(self,live,finish,*args):
-        """Record an outcome. A live read's receipt is written off the foreground path (ANYM-475).
-
-        Its row stays dispatching until then; if every attempt fails, the next once() raises the
-        error and stops the collector as for any job, and the next lease marks the row unknown."""
-        if not live:return await finish_durably(finish,*args)
-        task=asyncio.create_task(finish_durably(finish,*args))
-        self.settling.add(task);task.add_done_callback(self._settled)
-
-    def _settled(self,task):
-        self.settling.discard(task)
-        if not task.cancelled() and task.exception() is not None:self.unsettled=task.exception()
 
     def _identity(self,c,row):
         lock_principal(c,row['principal'],shared=True)
@@ -595,6 +585,25 @@ class CommandWorker:
                 WHERE id=%s AND status='dispatching' AND lease_epoch=%s''',
                 (status,Jsonb(result) if result is not None else None,code,job['id'],st.lease[1]))
 
+    def finish_live(self,job,status,result,code,budget):
+        """Record a live read's receipt in one attempt bounded by the budget left (ANYM-475).
+
+        The fence holds the lease row every send claim needs, so lock waits and statements stop at
+        the budget. Nothing is retried: the row stays dispatching, and claim or the receipt read
+        reports it unknown after the lease changes or the operation expires."""
+        import psycopg
+        from psycopg_pool import PoolTimeout
+        st=self.state;budget=max(0.05,budget);ms=int(budget*1000)
+        try:
+            with st.archive.store.pool.connection(timeout=budget) as c:
+                c.execute("SELECT set_config('lock_timeout',%s,true),set_config('statement_timeout',%s,true)",(str(ms),str(ms)))
+                st.archive.fence(c,st.account,st.lease)
+                c.execute('''UPDATE messenger_commands SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
+                    WHERE id=%s AND status='dispatching' AND lease_epoch=%s''',
+                    (status,Jsonb(result) if result is not None else None,code,job['id'],st.lease[1]))
+        except (psycopg.OperationalError,PoolTimeout) as exc:
+            log.warning('live_search receipt_unrecorded %s',type(exc).__name__)
+
     def archived(self,chat):
         """Whether the archive holds this exact chat (the adapter's local LID)."""
         with self.state.archive.store.pool.connection() as c:
@@ -640,7 +649,6 @@ class CommandWorker:
                 WHERE id=%s''',(status,Jsonb(result) if result is not None else None,code,row['id']))
 
     async def once(self):
-        if self.unsettled is not None:raise self.unsettled
         if await asyncio.to_thread(self.state.cooldown_remaining)>0:return False
         if self.gate is not None:
             async with self.gate:return await self._once()
@@ -653,8 +661,12 @@ class CommandWorker:
         phases=[]
         live=job['operation']==LIVE_SEARCH
         # ANYM-475: one deadline from the claim bounds preflight, governor waits, the request and the receipt.
-        deadline=asyncio.get_running_loop().time()+max(0.0,LIVE_SEARCH_TIMEOUT-LIVE_FOREGROUND_RESERVE)
-        def left():return max(0.0,deadline-asyncio.get_running_loop().time())
+        loop=asyncio.get_running_loop();end=loop.time()+max(0.0,LIVE_SEARCH_TIMEOUT-LIVE_FOREGROUND_RESERVE)
+        deadline=min(end,loop.time()+LIVE_EXECUTION_TIMEOUT)
+        def left():return max(0.0,deadline-loop.time())
+        async def settle(*args):
+            if not live:return await finish_durably(self.finish,*args)
+            await asyncio.to_thread(self.finish_live,*args,max(0.0,end-loop.time()))
         try:
             if not live:await asyncio.to_thread(self.preflight,job)
             else:
@@ -690,18 +702,18 @@ class CommandWorker:
                 result={'data':{'code':code,'retry_after':exc.retry_after}}
             if code=='rate_limited' and job['operation']=='open_chat_by_phone':
                 result={'data':{'code':code,'resets_in_seconds':job.get('_lookup_resets_in') or 1,'provider_lookup':False}}
-            await self._settle(live,self.finish,job,'expired' if code=='operation_expired' else 'failed',result,code)
+            await settle(job,'expired' if code=='operation_expired' else 'failed',result,code)
         except Exception:
             # A provider that reports no phase stays conservative: any mutation may have run.
             if job['mutation'] and phases and phases[-1]!='started':
-                await self._settle(live,self.finish,job,'failed',None,'operation_not_started')
+                await settle(job,'failed',None,'operation_not_started')
             else:
-                await self._settle(live,self.finish,job,'unknown' if job['mutation'] else 'failed',None,'operation_result_unknown')
+                await settle(job,'unknown' if job['mutation'] else 'failed',None,'operation_result_unknown')
         else:
             if job['operation']=='open_chat_by_phone' and answer['outcome']=='confirmed':
                 await finish_durably(self.finish_open_chat,job,answer)
                 return True
             confirmed=answer['outcome']=='confirmed'
-            await self._settle(live,self.finish,job,'succeeded' if confirmed else
+            await settle(job,'succeeded' if confirmed else
                 'unknown' if job['mutation'] else 'failed',answer,None if confirmed else 'operation_result_unknown')
         return True
