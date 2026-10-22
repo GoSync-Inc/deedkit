@@ -37,6 +37,8 @@ GRANT UPDATE(status,started_at,finished_at,lease_epoch,result,error_code)
     ON messenger_commands TO messaging_collector;
 GRANT SELECT,INSERT,UPDATE ON chat_read_observations TO messaging_collector;
 GRANT SELECT ON file_uploads TO messaging_collector;
+-- Media admission counts the capacity leases of in-flight cold restores (ANYM-350).
+GRANT SELECT ON attachment_cold_copies TO messaging_collector;
 
 -- Verified original publication changes residency, never retained CAS identity.
 GRANT EXECUTE ON FUNCTION public.register_resident_original(text,bigint) TO messaging_collector;

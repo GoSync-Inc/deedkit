@@ -8,4 +8,17 @@ END $$;
 GRANT USAGE ON SCHEMA public TO messaging_cold_archive;
 GRANT SELECT ON probe_metadata,attachment_residency TO messaging_cold_archive;
 GRANT SELECT,INSERT,UPDATE ON attachment_cold_copies TO messaging_cold_archive;
--- No residency, journal, fence or archive mutation: archiving cannot evict.
+-- Cold-first rehydration (ANYM-350): read the eviction journal, mark a restored
+-- original resident and hand a failed restore to the provider, both only
+-- through the SECURITY DEFINER functions of migration 033. The restore
+-- service mounts the CAS writable; the archive service keeps it read-only.
+GRANT SELECT ON attachment_eviction_journal TO messaging_cold_archive;
+-- Restores are admitted against the collectors' capacity reservations.
+GRANT SELECT ON media_reservations,file_uploads TO messaging_cold_archive;
+-- Restore admission keeps above every collector's published disk floor (ANYM-350).
+-- Admission fails closed while a live collector has not published for its epoch.
+GRANT SELECT(account,operations) ON collector_health TO messaging_cold_archive;
+GRANT SELECT(account,epoch,expires_at) ON collector_leases TO messaging_cold_archive;
+GRANT EXECUTE ON FUNCTION public.register_resident_original(text,bigint),
+    public.queue_managed_original(text) TO messaging_cold_archive;
+-- No direct residency, journal, fence or archive mutation: archiving cannot evict.
