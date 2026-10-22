@@ -95,10 +95,14 @@ previous topic ID from its target read. A failed send keeps its reply waiter
 until the reply or the next disconnect (closing it races the receive loop). Group
 cache refreshes apply in reply order off the reply path, and a slow LID or
 contact store write never delays a later cache write; a change waits for its
-target read's refresh. Known limits, left to a follow-up (ANYM-441):
-message sends, block/unblock, app-state patches and status still use the
-library transport, which resends after a reconnect, and have no native deadline;
-`send_file` has a 90 s IPC wait under the worker's 180 s.
+target read's refresh. Every other native operation, `send_text` and the history
+request run the same way (ANYM-441): their context carries the fork's
+`WithoutFrameRetry`, so the library never writes a frame again after a reconnect
+(a drop after the frame may have left ends `unknown`), and they answer within
+20 s (`send_file`: 75 s for upload plus send) by phase: before the change
+`operation_target_unavailable` or `operation_query_failed`, after it `unknown`;
+`send_text` answers `provider_operation_uncertain` at its deadline. A guard test
+keeps each deadline at least 10 s under the IPC wait and the worker timeout.
 Reply/edit/revoke/forward/media targets require the original in the native cache;
 an older PostgreSQL-only record can still be read but may return
 `operation_target_unavailable` until native history supplies it.
@@ -127,12 +131,18 @@ soak. See `quality/whatsmeow-parity.md` for the current acceptance matrix.
 
 ## License
 
-Our adapter code is MIT. The pinned upstream whatsmeow library is MPL-2.0.
-Native images include a module/version inventory and dependency license texts
-under `/app/whatsmeow-licenses`. Upstream source for the pinned revision is
-https://github.com/tulir/whatsmeow/tree/f16f9ca30d6a . Changes to MPL-covered files
-must remain available under MPL when distributed; this adapter does not edit
-upstream files. `group_iq.go` transcribes upstream group node shapes and is
+Our adapter code is MIT. The whatsmeow library is MPL-2.0. The build uses the
+fork https://github.com/GoSync-Inc/whatsmeow (branch `deedkit/f16f9ca30d6a`,
+revision fa2ca87d4bd8): upstream f16f9ca30d6a plus `whatsapp/whatsmeow/fork.patch`
+(two hunks in `request.go`, one test file). `scripts/check_whatsmeow_fork.py`
+proves in CI that the pinned fork equals upstream plus that patch before its code
+is built. Upstream update: rebase the commit onto the new upstream commit, push
+a new `deedkit/<commit>` branch, regenerate `fork.patch`, update `require`,
+`replace` and the recorded hash in the script in one reviewed PR; drop the fork
+once upstream has an equivalent option. Native images include a module/version
+inventory and dependency license texts under `/app/whatsmeow-licenses`. The
+modified files stay available under MPL-2.0 at the fork revision above and in
+`fork.patch`. `group_iq.go` transcribes upstream group node shapes and is
 itself MPL-2.0 (file header). Release source includes the Go module lock and
 adapter sources.
 

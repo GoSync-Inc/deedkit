@@ -33,6 +33,7 @@ NATIVE_SOURCES = (
     "go.mod", "go.sum", "main.go", "config.go", "runtime.go", "capture.go",
     "history.go", "store.go", "send.go", "media.go", "operations.go", "group_iq.go",
     "runtime_test.go", "send_test.go", "media_test.go", "operations_test.go",
+    "fork.patch",
 )
 
 

@@ -33,10 +33,15 @@ that every transitive dependency or model has completed a license audit.
 
 The optional native WhatsApp adapter uses [whatsmeow](https://github.com/tulir/whatsmeow)
 (MPL-2.0), pinned with its transitive dependencies in `whatsapp/whatsmeow/go.mod`
-and `go.sum`. Our adapter is separate MIT source and does not modify upstream
-files. Source archives retain the adapter sources and Go locks. Native container
-images retain the module inventory and dependency license texts under
-`/app/whatsmeow-licenses`; the Python wheel does not bundle a Go executable.
-The corresponding pinned upstream source is
-https://github.com/tulir/whatsmeow/tree/f16f9ca30d6a . Preserve the upstream source
-availability and license obligations when redistributing a native binary.
+and `go.sum`. Our adapter is separate MIT source. The build replaces whatsmeow with
+a modified version: the fork https://github.com/GoSync-Inc/whatsmeow at revision
+fa2ca87d4bd8 (branch `deedkit/f16f9ca30d6a`), which is upstream commit f16f9ca30d6a
+(https://github.com/tulir/whatsmeow/tree/f16f9ca30d6a) plus one commit: two hunks in
+`request.go` and the test file `deedkit_fork_test.go`, recorded exactly in
+`whatsapp/whatsmeow/fork.patch`. The modified files remain MPL-2.0 with their upstream
+notices; their source is the fork revision above and `fork.patch` in the source
+archive (MPL-2.0 section 3.2). Source archives retain the adapter sources, Go locks
+and `fork.patch`. Native container images retain the module inventory (`modules.txt`
+lists the replacement) and dependency license texts under `/app/whatsmeow-licenses`;
+the Python wheel does not bundle a Go executable. Preserve the source availability
+and license obligations when redistributing a native binary.

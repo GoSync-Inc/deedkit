@@ -980,13 +980,18 @@ func TestGroupDeadlineScope(t *testing.T) {
 			t.Fatalf("%s deadline=%v want %v", job.Operation, seen, hasDeadline)
 		}
 	}
+	// ANYM-441 extends the deadline from group operations to every operation.
 	r := &recordingIQ{reply: syntheticReply}
 	deadline(t, operationJob("chat_info", operationsGroup, nil), groupOperationDeps(t, r), true)
-	deadline(t, operationJob("chat_info", operationsChat, nil), groupOperationDeps(t, r), false)
-	deadline(t, operationJob("get_contact", "", map[string]any{"user_id": operationsChat}), groupOperationDeps(t, r), false)
-	for _, op := range []string{"send_file", "request_chat_history", "mark_read", "archive_chat", "block_contact"} {
-		if groupBounded(operationJob(op, operationsChat, nil)) {
-			t.Fatalf("%s must keep its own bounds", op)
+	deadline(t, operationJob("chat_info", operationsChat, nil), groupOperationDeps(t, r), true)
+	deadline(t, operationJob("get_contact", "", map[string]any{"user_id": operationsChat}), groupOperationDeps(t, r), true)
+	for op := range operationFields {
+		want := groupOperationDeadline
+		if op == "send_file" {
+			want = fileOperationDeadline
+		}
+		if got := operationDeadline(operationJob(op, operationsChat, nil)); got != want {
+			t.Fatalf("%s deadline %s want %s", op, got, want)
 		}
 	}
 }

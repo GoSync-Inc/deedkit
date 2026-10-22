@@ -118,8 +118,23 @@ func (p *Provider) SendText(ctx context.Context, raw json.RawMessage) (any, erro
 	if decodeStrict(raw, &req) != nil {
 		return nil, errors.New("send_target_invalid")
 	}
-	return sendText(ctx, req, p.sendDependencies())
+	return boundedSendText(ctx, req, p.sendDependencies())
 }
+
+func boundedSendText(ctx context.Context, req textRequest, d sendDependencies) (any, error) {
+	return runBounded(ctx, sendTextDeadline, func(ctx context.Context, _ *operationGate) (any, error) {
+		return sendText(ctx, req, d)
+	}, func(bool) (any, error) {
+		// The steps before the send are local reads; the outbox records the
+		// answer as unknown and never resends (ANYM-167).
+		return nil, errors.New("provider_operation_uncertain")
+	}, nil)
+}
+
+// sendTextDeadline answers send_text 10 s inside the outbox's 30 s dispatch
+// bound (outgoing.py), so its expiry never tears down the native process
+// (ANYM-441).
+var sendTextDeadline = 20 * time.Second
 
 func sendText(ctx context.Context, req textRequest, d sendDependencies) (any, error) {
 	check := func() error {
@@ -178,6 +193,10 @@ func sendAndCaptureReceipt(ctx context.Context, d sendDependencies, to types.JID
 	id := d.newID()
 	if id == "" || !serializedMessagePattern.MatchString(id) {
 		return nil, errors.New("send_target_invalid")
+	}
+	// After a deadline answer, no send may start (ANYM-441).
+	if !startChange(ctx) {
+		return nil, errors.New("operation_target_unavailable")
 	}
 	resp, err := d.send(ctx, to, message, whatsmeow.SendRequestExtra{ID: id})
 	if err != nil {

@@ -467,13 +467,17 @@ func TestNativeFileUploadVerifiedBeforeSendAndReauthorizedAfterUpload(t *testing
 				return whatsmeow.SendResponse{ID: extra.ID, Chat: to, Sender: d.owner, Timestamp: time.Unix(1700000000, 0)}, nil
 			}
 			r, e := executeOperation(context.Background(), job, d)
-			outcome := "confirmed"
 			wantSends := 1
 			if revoke {
-				outcome = "unknown"
+				// The upload is not a change phase (ANYM-441): nothing was
+				// sent, so the revoked chat gets a definite refusal.
 				wantSends = 0
+				if e == nil || e.Error() != "operation_target_invalid" {
+					t.Fatalf("revoked after upload: %#v %v", r, e)
+				}
+			} else {
+				operationResult(t, r, e, "confirmed")
 			}
-			operationResult(t, r, e, outcome)
 			if uploads != 1 || sends != wantSends {
 				t.Fatalf("uploads=%d sends=%d", uploads, sends)
 			}
