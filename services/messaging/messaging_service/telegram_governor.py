@@ -111,21 +111,26 @@ class RequestGovernor:
         """Persist the cooldown in one transaction bounded on the server; never past RECORD_SECONDS.
 
         Not bound to a live read's deadline: the cooldown is recorded even after it. A cancelled caller
-        still waits, as the transaction holds the lease fence until PostgreSQL ends it."""
-        from psycopg import OperationalError
+        still waits, as the transaction holds the lease fence until PostgreSQL ends it; the caller waits at
+        most RECORD_SECONDS+RECORD_GRACE in total."""
+        # Any database error (the server's transaction timeout is an InternalError) keeps the pause in
+        # memory for a later retry; a lost lease is a RuntimeError and still raises.
+        from psycopg import Error
         from psycopg_pool import PoolTimeout
         state=self.bound(self._state,time.monotonic()+RECORD_SECONDS) if self.bound else self._state
         recording=asyncio.ensure_future(asyncio.to_thread(state.defer,seconds))
+        loop=asyncio.get_running_loop();end=loop.time()+RECORD_SECONDS+RECORD_GRACE
         cancelled=False
         try:await asyncio.wait({recording},timeout=RECORD_SECONDS+RECORD_GRACE)
         except asyncio.CancelledError:
+            # One wait budget in total, also when cancelled.
             cancelled=True
-            await asyncio.wait({recording},timeout=RECORD_SECONDS+RECORD_GRACE)
+            await asyncio.wait({recording},timeout=max(0,end-loop.time()))
         if not recording.done():
             # The server has ended the transaction; the stalled thread's late error is dropped.
             recording.add_done_callback(lambda t:t.cancelled() or t.exception())
             logger.warning('cooldown_write_failed exception_type=TimeoutError')
-        elif isinstance(recording.exception(),(OperationalError,PoolTimeout,TimeoutError)):
+        elif isinstance(recording.exception(),(Error,PoolTimeout,TimeoutError)):
             logger.warning('cooldown_write_failed exception_type=%s',type(recording.exception()).__name__)
         else:
             recording.result()  # a lost lease still raises
