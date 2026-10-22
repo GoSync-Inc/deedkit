@@ -10,14 +10,21 @@ import (
 	"fmt"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
+	waSyncAction "go.mau.fi/whatsmeow/proto/waSyncAction"
+	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"google.golang.org/protobuf/proto"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -926,5 +933,371 @@ func TestDialogsMarkOwnerLIDChatAsSelfChat(t *testing.T) {
 		if v[0] == "999900002222@lid" && v[4].(map[string]any)["is_self_chat"] != nil {
 			t.Fatal("owner LID guessed without identity evidence")
 		}
+	}
+}
+
+func readStateProvider(t *testing.T) *Provider {
+	t.Helper()
+	p := skipProvider(t)
+	owner := p.Capture.Owner
+	p.Client = nativeClient(&store.Device{ID: &owner})
+	return p
+}
+
+// readCaptures returns the owner read-state and gap envelopes in capture order.
+func readCaptures(t *testing.T, s *CaptureStore) []map[string]any {
+	t.Helper()
+	rows, err := s.db.Query("SELECT envelope FROM capture WHERE message_id LIKE 'read:%' OR message_id LIKE 'gap:%' ORDER BY seq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var data []byte
+		var v map[string]any
+		if err = rows.Scan(&data); err != nil || json.Unmarshal(data, &v) != nil {
+			t.Fatal(err)
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func ownerReceipt(owner types.JID, chat types.JID, typ types.ReceiptType, at int64, ids ...types.MessageID) *events.Receipt {
+	return &events.Receipt{MessageSource: types.MessageSource{Chat: chat, Sender: owner, IsFromMe: true}, MessageIDs: ids, Timestamp: time.Unix(at, 0), Type: typ}
+}
+
+// spec: ANYM-275
+func TestMarkChatAsReadGivesZeroAtActionTimeAndUnreadOnlyAFlag(t *testing.T) {
+	p := readStateProvider(t)
+	chat := types.NewJID("111111", types.DefaultUserServer)
+	at := time.Unix(1700000100, 500)
+	if !p.handleReadEvent(&events.MarkChatAsRead{JID: chat, Timestamp: at, Action: &waSyncAction.MarkChatAsReadAction{Read: proto.Bool(true)}}) {
+		t.Fatal("mark-read not stored")
+	}
+	if !p.handleReadEvent(&events.MarkChatAsRead{JID: chat, Timestamp: at.Add(time.Minute), Action: &waSyncAction.MarkChatAsReadAction{Read: proto.Bool(false)}}) {
+		t.Fatal("mark-unread not stored")
+	}
+	got := readCaptures(t, p.Capture)
+	if len(got) != 2 {
+		t.Fatal(got)
+	}
+	stamp := at.UTC().Format(time.RFC3339Nano)
+	read := got[0]["observation"].(map[string]any)
+	if got[0]["kind"] != "owner_read_state" || got[0]["chat"] != "111111@c.us" || got[0]["observed_at"] != stamp || read["observed_at"] != stamp ||
+		read["basis"] != "whatsapp_app_state_read" || read["unread_count"] != float64(0) || read["marked_unread"] != false {
+		t.Fatal("mark-read", got[0])
+	}
+	unread := got[1]["observation"].(map[string]any)
+	if count, present := unread["unread_count"]; !present || count != nil || unread["marked_unread"] != true || unread["basis"] != "whatsapp_app_state_read" {
+		t.Fatal("mark-unread must be a flag without a count", got[1])
+	}
+	// A replayed app-state action is the same capture.
+	p.handleReadEvent(&events.MarkChatAsRead{JID: chat, Timestamp: at, Action: &waSyncAction.MarkChatAsReadAction{Read: proto.Bool(true)}})
+	if len(readCaptures(t, p.Capture)) != 2 {
+		t.Fatal("replay duplicated the observation")
+	}
+}
+
+// spec: ANYM-275
+func TestOwnDeviceReceiptListsExactlyCapturedIncomingIDs(t *testing.T) {
+	p := readStateProvider(t)
+	s := p.Capture
+	chat := types.NewJID("111111", types.DefaultUserServer)
+	for i, id := range []string{"m1", "m2", "m3", "m4"} {
+		if err := s.Put(fixtureMessage(id, 1700000000+int64(i)), "live"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := fixtureMessage("out", 1700000005)
+	out.Info.IsFromMe = true
+	out.Info.Sender = s.Owner
+	if err := s.Put(out, "live"); err != nil {
+		t.Fatal(err)
+	}
+	// Selective receipt: messages 2 and 4 (one listed twice), plus an outgoing and an unknown ID.
+	if !p.handleReadEvent(ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000020, "m4", "m2", "m4", "out", "absent")) {
+		t.Fatal("receipt not stored")
+	}
+	if !p.handleReadEvent(ownerReceipt(s.Owner, chat, types.ReceiptTypeReadSelf, 1700000030, "m1")) {
+		t.Fatal("read-self not stored")
+	}
+	got := readCaptures(t, s)
+	if len(got) != 2 {
+		t.Fatal(got)
+	}
+	first := got[0]["observation"].(map[string]any)
+	ids := fmt.Sprint(first["read_message_ids"])
+	if first["basis"] != "whatsapp_owner_receipt" || ids != "[false_111111@c.us_m2 false_111111@c.us_m4]" || first["observed_at"] != time.Unix(1700000020, 0).UTC().Format(time.RFC3339Nano) {
+		t.Fatal("receipt evidence must list exactly 2 and 4", first)
+	}
+	if count, present := first["unread_count"]; !present || count != nil || first["marked_unread"] != nil {
+		t.Fatal("a receipt never carries a count or flag", first)
+	}
+	if fmt.Sprint(got[1]["observation"].(map[string]any)["read_message_ids"]) != "[false_111111@c.us_m1]" {
+		t.Fatal("read-self", got[1])
+	}
+	// Owner reads never become delivery evidence for the outgoing message.
+	if obs, err := s.ReceiptObservations("111111@c.us", LegacyMessageID(out)); err != nil || len(obs) != 0 {
+		t.Fatal("own-device receipt became delivery evidence", obs, err)
+	}
+	// A receipt that lists no retained incoming message still invalidates an
+	// older count: it records an empty ID list. A chat with no capture records nothing.
+	p.handleReadEvent(ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000040, "out", "absent"))
+	p.handleReadEvent(ownerReceipt(s.Owner, types.NewJID("999999", types.DefaultUserServer), types.ReceiptTypeRead, 1700000041, "x"))
+	if got = readCaptures(t, s); len(got) != 3 || fmt.Sprint(got[2]["observation"].(map[string]any)["read_message_ids"]) != "[]" {
+		t.Fatal("receipt without retained messages", got)
+	}
+	// A peer's read receipt on the outgoing message stays delivery evidence only.
+	peer := &events.Receipt{MessageSource: types.MessageSource{Chat: chat, Sender: chat}, MessageIDs: []types.MessageID{"out", "m3"}, Timestamp: time.Unix(1700000050, 0), Type: types.ReceiptTypeRead}
+	if !p.handleReadEvent(peer) {
+		t.Fatal("peer receipt")
+	}
+	if obs, err := s.ReceiptObservations("111111@c.us", LegacyMessageID(out)); err != nil || len(obs) != 1 || obs[0]["state"] != "read" {
+		t.Fatal("peer delivery evidence", obs, err)
+	}
+	if len(readCaptures(t, s)) != 3 {
+		t.Fatal("peer receipt became owner read evidence")
+	}
+}
+
+// spec: ANYM-275
+func TestHistoryUnreadCountIsStampedNoLaterThanNewestMessage(t *testing.T) {
+	p := readStateProvider(t)
+	chat := "111111@s.whatsapp.net"
+	var messages []*waHistorySync.HistorySyncMsg
+	for i, id := range []string{"h1", "h2"} {
+		messages = append(messages, &waHistorySync.HistorySyncMsg{Message: &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(chat), ID: proto.String(id)}, MessageTimestamp: proto.Uint64(1700000000 + uint64(i)*60), Message: &waE2E.Message{Conversation: proto.String("synthetic " + id)}}})
+	}
+	data := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{
+		{ID: proto.String(chat), UnreadCount: proto.Uint32(3), ConversationTimestamp: proto.Uint64(1700009999), Messages: messages},
+		// Only the flag: the count stays unknown, never a derived zero.
+		{ID: proto.String("222222@s.whatsapp.net"), MarkedAsUnread: proto.Bool(true), ConversationTimestamp: proto.Uint64(1700000500)},
+		// Neither field: no observation.
+		{ID: proto.String("333333@s.whatsapp.net"), ConversationTimestamp: proto.Uint64(1700000500)},
+	}}
+	before := time.Now()
+	if err := p.captureHistory(data); err != nil {
+		t.Fatal(err)
+	}
+	got := readCaptures(t, p.Capture)
+	if len(got) != 2 {
+		t.Fatal(got)
+	}
+	count := got[0]["observation"].(map[string]any)
+	at, _ := time.Parse(time.RFC3339Nano, count["observed_at"].(string))
+	if count["basis"] != "whatsapp_history_sync" || count["unread_count"] != float64(3) || count["marked_unread"] != false ||
+		at.After(time.Unix(1700000060, 0)) || !at.Before(before) || got[0]["chat"] != "111111@c.us" {
+		t.Fatal("history count must be stamped at the newest message time", got[0])
+	}
+	flag := got[1]["observation"].(map[string]any)
+	if c, present := flag["unread_count"]; !present || c != nil || flag["marked_unread"] != true || flag["observed_at"] != time.Unix(1700000500, 0).UTC().Format(time.RFC3339Nano) {
+		t.Fatal("flag-only history", got[1])
+	}
+}
+
+// spec: ANYM-275
+func TestAppStateSyncErrorRecordsAReadStateGap(t *testing.T) {
+	p := readStateProvider(t)
+	for range 2 {
+		if !p.handleReadEvent(&events.AppStateSyncError{Name: "regular_high", Error: errors.New("synthetic")}) {
+			t.Fatal("gap not stored")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	got := readCaptures(t, p.Capture)
+	if len(got) != 2 || got[0]["kind"] != "read_state_gap" || got[0]["reason"] != "app_state_sync_error" || got[0]["account"] != "test" || len(got[0]) != 4 {
+		t.Fatal("each gap is its own capture", got)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, got[0]["observed_at"].(string)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// spec: ANYM-275
+func TestReadStatePathsSendNothingToTheProvider(t *testing.T) {
+	// Every read-state path only records; none may call the client (no send,
+	// no receipt, no mark-read, no presence).
+	files := token.NewFileSet()
+	paths := map[string]bool{"handleReadEvent": true, "StoreReceipt": true, "capturedMessage": true, "readState": true,
+		"storeOwnerRead": true, "StoreMarkChatAsRead": true, "StoreReadStateGap": true, "captureHistoryReadState": true}
+	found := 0
+	for _, name := range []string{"runtime.go", "store.go", "history.go"} {
+		f, err := parser.ParseFile(files, name, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || !paths[fn.Name.Name] {
+				continue
+			}
+			found++
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "Client" {
+					t.Errorf("%s reaches the provider client", fn.Name.Name)
+				}
+				return true
+			})
+		}
+	}
+	if found != len(paths) {
+		t.Fatal("read-state functions moved", found)
+	}
+	// The handler runs on a client that never connected: any provider request would fail it.
+	p := readStateProvider(t)
+	chat := types.NewJID("111111", types.DefaultUserServer)
+	if err := p.Capture.Put(fixtureMessage("m1", 1700000000), "live"); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []any{ownerReceipt(p.Capture.Owner, chat, types.ReceiptTypeRead, 1700000010, "m1"),
+		&events.MarkChatAsRead{JID: chat, Timestamp: time.Unix(1700000020, 0), Action: &waSyncAction.MarkChatAsReadAction{Read: proto.Bool(true)}},
+		&events.AppStateSyncError{Name: "regular", Error: errors.New("synthetic")}} {
+		if !p.handleReadEvent(event) {
+			t.Fatal("read event needed the provider", event)
+		}
+	}
+	if p.Client.IsConnected() || len(readCaptures(t, p.Capture)) != 3 {
+		t.Fatal("unexpected provider use or missing evidence")
+	}
+}
+
+// spec: ANYM-275
+func TestReadStateWriteFailureEndsContinuityWithoutStoppingCapture(t *testing.T) {
+	p := readStateProvider(t)
+	s := p.Capture
+	chat := types.NewJID("111111", types.DefaultUserServer)
+	if err := s.Put(fixtureMessage("m1", 1700000000), "live"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`CREATE TRIGGER fail_read BEFORE INSERT ON capture WHEN NEW.message_id LIKE 'read:%' OR NEW.message_id LIKE 'gap:%' BEGIN SELECT RAISE(ABORT,'synthetic'); END`); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []any{
+		&events.MarkChatAsRead{JID: chat, Timestamp: time.Unix(1700000100, 0), Action: &waSyncAction.MarkChatAsReadAction{Read: proto.Bool(true)}},
+		ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000110, "m1"),
+		&events.AppStateSyncError{Name: "regular_high", Error: errors.New("synthetic")},
+	} {
+		if !p.handleReadEvent(event) {
+			t.Fatalf("%T: a read-state write failure must not refuse the event", event)
+		}
+	}
+	if p.failure.Load() != nil || !p.ready.Load() || !p.readGapPending.Load() {
+		t.Fatal("read-state failure stopped the provider or lost the gap", p.failure.Load())
+	}
+	// Message capture keeps working, and the pending gap is written before the next read event.
+	if err := s.Put(fixtureMessage("m2", 1700000200), "live"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("DROP TRIGGER fail_read"); err != nil {
+		t.Fatal(err)
+	}
+	p.handleReadEvent(ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000300, "m2"))
+	got := readCaptures(t, s)
+	if p.readGapPending.Load() || len(got) != 2 || got[0]["kind"] != "read_state_gap" || got[0]["reason"] != "read_state_write_failed" || got[1]["kind"] != "owner_read_state" {
+		t.Fatal("pending gap", got)
+	}
+	// Disconnect and reconnect gaps use the same capture.
+	p.readGap("provider_disconnected")
+	p.readGap("provider_reconnected")
+	if got = readCaptures(t, s); len(got) != 4 || got[2]["reason"] != "provider_disconnected" || got[3]["reason"] != "provider_reconnected" {
+		t.Fatal("connection gaps", got)
+	}
+}
+
+// spec: ANYM-275
+func TestOwnerReadResolvesLocalAliasAndOldRetainedMessages(t *testing.T) {
+	p := readStateProvider(t)
+	s := p.Capture
+	lid := types.NewJID("777777", types.HiddenUserServer)
+	pn := types.NewJID("111111", types.DefaultUserServer)
+	s.Alias = func(j types.JID) types.JID {
+		if j == lid {
+			return pn
+		}
+		return types.EmptyJID
+	}
+	// The receipt names the oldest of more than 1,000 retained messages.
+	for i := range 1005 {
+		if err := s.Put(fixtureMessage(fmt.Sprintf("m%d", i), 1700000000+int64(i)), "live"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.handleReadEvent(ownerReceipt(s.Owner, lid, types.ReceiptTypeRead, 1700002000, "m0"))
+	p.handleReadEvent(&events.MarkChatAsRead{JID: lid, Timestamp: time.Unix(1700002100, 0), Action: &waSyncAction.MarkChatAsReadAction{Read: proto.Bool(true)}})
+	got := readCaptures(t, s)
+	if len(got) != 2 || got[0]["chat"] != "111111@c.us" || fmt.Sprint(got[0]["observation"].(map[string]any)["read_message_ids"]) != "[false_111111@c.us_m0]" || got[1]["chat"] != "111111@c.us" {
+		t.Fatal("LID receipt for a PN-captured chat", got)
+	}
+}
+
+// spec: ANYM-275
+func TestOwnerReadSequencesGiveTheSameCapturesInAnyOrder(t *testing.T) {
+	// Baseline mark-read at T, incoming A and B, receipts for A (twice) and B, a
+	// newer mark-read: the captured evidence is the same set in any order.
+	chat := types.NewJID("111111", types.DefaultUserServer)
+	run := func(order []int) []string {
+		p := readStateProvider(t)
+		s := p.Capture
+		for i, id := range []string{"a", "b"} {
+			if err := s.Put(fixtureMessage(id, 1700000100+int64(i)), "live"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		read := func(at int64) any {
+			return &events.MarkChatAsRead{JID: chat, Timestamp: time.Unix(at, 0), Action: &waSyncAction.MarkChatAsReadAction{Read: proto.Bool(true)}}
+		}
+		evs := []any{read(1700000000), ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000200, "a"),
+			ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000200, "a"), ownerReceipt(s.Owner, chat, types.ReceiptTypeRead, 1700000300, "b"), read(1700000400)}
+		for _, i := range order {
+			if !p.handleReadEvent(evs[i]) {
+				t.Fatal("event", i)
+			}
+		}
+		out := []string{}
+		for _, v := range readCaptures(t, s) {
+			out = append(out, string(mustJSON(v["observation"])))
+		}
+		sort.Strings(out)
+		return out
+	}
+	want := run([]int{0, 1, 2, 3, 4})
+	if len(want) != 4 || !strings.Contains(strings.Join(want, "\n"), `"read_message_ids":["false_111111@c.us_a"]`) || strings.Contains(strings.Join(want, "\n"), `"unread_count":2`) {
+		t.Fatal("in-order evidence", want)
+	}
+	for _, order := range [][]int{{3, 1, 0, 2, 4}, {4, 2, 3, 1, 0, 1}} {
+		if got := run(order); fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatal("order changed the evidence", order, got, want)
+		}
+	}
+}
+
+// spec: ANYM-275
+func TestGroupReceiptsMatchCapturesWithTheSenderSuffix(t *testing.T) {
+	p := readStateProvider(t)
+	s := p.Capture
+	group := types.NewJID("123-456", types.GroupServer)
+	member := types.NewJID("222222", types.DefaultUserServer)
+	in := fixtureMessage("g1", 1700000000)
+	in.Info.Chat, in.Info.Sender, in.Info.IsGroup = group, member, true
+	out := fixtureMessage("g2", 1700000001)
+	out.Info.Chat, out.Info.Sender, out.Info.IsGroup, out.Info.IsFromMe = group, s.Owner, true, true
+	for _, m := range []*events.Message{in, out} {
+		if err := s.Put(m, "live"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.handleReadEvent(ownerReceipt(s.Owner, group, types.ReceiptTypeRead, 1700000100, "g1"))
+	got := readCaptures(t, s)
+	if len(got) != 1 || fmt.Sprint(got[0]["observation"].(map[string]any)["read_message_ids"]) != "["+LegacyMessageID(in)+"]" {
+		t.Fatal("group owner read", got)
+	}
+	peer := &events.Receipt{MessageSource: types.MessageSource{Chat: group, Sender: member, IsGroup: true}, MessageIDs: []types.MessageID{"g2"}, Timestamp: time.Unix(1700000200, 0), Type: types.ReceiptTypeRead}
+	if !p.handleReadEvent(peer) {
+		t.Fatal("peer receipt")
+	}
+	if obs, err := s.ReceiptObservations(LegacyChatID(group), LegacyMessageID(out)); err != nil || len(obs) != 1 {
+		t.Fatal("group delivery evidence", obs, err)
 	}
 }
