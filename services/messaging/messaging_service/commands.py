@@ -13,6 +13,7 @@ import stat
 import time
 
 import psycopg
+import psycopg.errors
 from psycopg.types.json import Jsonb
 
 from .envelope import canonical, stable_id
@@ -737,8 +738,11 @@ class CommandWorker:
             # The collector stops starting archive writes for a live read before this deadline.
             if live:timeout=left();job['_deadline']=deadline
             try:answer=safe_result(await asyncio.wait_for(self.execute(job),timeout))
-            except TimeoutError:
-                # A read changes nothing at the provider, so its timeout is a safe-to-repeat refusal.
+            except (TimeoutError,psycopg.OperationalError,psycopg.errors.TransactionTimeout,
+                    psycopg.errors.IdleInTransactionSessionTimeout):
+                # A read changes nothing at the provider, so its timeout is a safe-to-repeat refusal. Its
+                # database work ends at the deadline on the server (DeadlinePool), and that error can arrive
+                # before the asyncio timer: query canceled, lock or transaction timeout, pool timeout.
                 if job['mutation'] or not live:raise
                 raise CommandRejected('provider_timeout') from None
             if isinstance(answer.get('data'),dict) and 'archive_reference' in answer['data']:
