@@ -24,7 +24,7 @@ from .envelope import stable_id
 from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,session_lock
 from .spool import InvalidCapture
 from .store import Store
-from .telegram_governor import LIVE_BUDGETS,ProviderRateLimited,RequestGovernor
+from .telegram_governor import LIVE_BUDGETS,LIVE_STATE,ProviderRateLimited,RequestGovernor
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .storage_admission import MEDIA_RESERVE_BYTES
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy,validate_prefetch_days
@@ -1019,20 +1019,29 @@ class TelegramCollector:
             await asyncio.sleep(.25 if active else 1)
 
     async def execute_operation(self,job):
-        job['_policy']=await asyncio.to_thread(self.state.policy)
-        if job.get('operation')=='request_chat_history': return await self.chat_history(job)
-        if job.get('operation')!='search_messages_live': return await self.provider.execute_operation(job)
-        job['_live_hits']=found=[]
-        answer=await self.provider.execute_operation(job)
-        await self.store_live_hits(found,deadline=job.get('_deadline'))
-        return answer
+        # A live read's policy read and governor state calls (cooldown, status) take the lease fence too, so
+        # they get its deadline on the server as well (release-042 B1); other callers keep the shared state.
+        live=bounded_state(self.state,job['_deadline']) if job.get('_deadline') is not None else None
+        bound=LIVE_STATE.set(live) if live is not None else None
+        try:
+            job['_policy']=await asyncio.to_thread((live or self.state).policy)
+            if job.get('operation')=='request_chat_history': return await self.chat_history(job)
+            if job.get('operation')!='search_messages_live': return await self.provider.execute_operation(job)
+            job['_live_hits']=found=[]
+            answer=await self.provider.execute_operation(job)
+            await self.store_live_hits(found,deadline=job.get('_deadline'))
+            return answer
+        finally:
+            if bound is not None:LIVE_STATE.reset(bound)
 
     async def chat_history(self,job):
         """ANYM-477: one agent-requested history page, archived as live search hits are; stored_new counts new rows."""
         parameters=job.get('parameters') or {}
+        default=None
         if not any(k in parameters for k in ('before_message','around_message','from_time','to_time')):
-            # The default anchor is the oldest archived message, so each repeat reaches further back.
-            job['provider_message_id']=await asyncio.to_thread(self.oldest_archived,job.get('chat_id'))
+            # The default anchor is the oldest archived message, so each repeat reaches further back. It is
+            # kept here too: each provider request's preflight replaces the job's payload fields (release-042 M1).
+            default=job['provider_message_id']=await asyncio.to_thread(self.oldest_archived,job.get('chat_id'))
         job['_history']=found=[]
         answer=await self.provider.execute_operation(job)
         created=await self.store_live_hits(found,label='chat_history',deadline=job.get('_deadline'))
@@ -1049,9 +1058,9 @@ class TelegramCollector:
                 anchors=('before_message','around_message','from_time','to_time')
                 if any(k in parameters for k in anchors):
                     data['retry_parameters']={k:v for k,v in parameters.items() if k in ('count',*anchors)}
-                elif job.get('provider_message_id'):
+                elif default:
                     data['retry_parameters']={'count':parameters.get('count',50),'before_message':
-                        stable_id('msg',self.account,str(job.get('provider_chat')),str(job['provider_message_id']))}
+                        stable_id('msg',self.account,str(job.get('provider_chat')),str(default))}
                 else:
                     dates=[m.date for m,hit,_,_ in found if m is not None and not hit.get('stored') and m.date]
                     if dates:

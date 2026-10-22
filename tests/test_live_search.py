@@ -473,3 +473,17 @@ def test_operation_uses_the_one_existing_client(monkeypatch, tmp_path):
     for _ in range(2):
         asyncio.run(provider.execute_operation(job()))
     assert len(created) == 1 and len(created[0].requests) == 2
+
+
+# spec: ANYM-475
+def test_a_server_deadline_error_of_a_live_read_is_a_safe_to_repeat_timeout(monkeypatch):
+    from psycopg import errors as pg
+    finished = []
+    class Worker(CommandWorker):
+        def claim(self):return {'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}
+        def preflight(self, job, *, verify_file=True):return job
+        def finish_live(self, job, status, result, code, budget):finished.append((status, result, code))
+    for error in (pg.QueryCanceled, pg.LockNotAvailable, pg.TransactionTimeout):
+        async def ends(job, error=error):raise error('synthetic server deadline')
+        assert once(Worker(SimpleNamespace(), ends))
+        assert finished[-1] == ('failed', {'data': {'code': 'provider_timeout', 'retry': True}}, 'provider_timeout')
