@@ -790,7 +790,7 @@ class TelegramCollector:
         def apply(item):
             nonlocal last,count
             self.state.apply(item);last=item;count+=1
-        gap_lock=getattr(self.provider,'read_gap_lock',None) or nullcontext()
+        gap_lock=getattr(getattr(self,'provider',None),'read_gap_lock',None) or nullcontext()
         async with gap_lock:await self.flush_read_gap()
         for spool in spools:await asyncio.to_thread(spool.drain,apply,100)
         # History pages were applied inline when fetched. Replaying them is
@@ -825,7 +825,7 @@ class TelegramCollector:
 
     async def flush_read_gap(self):
         # A lost gap write (ANYM-275): persist it before any heartbeat; while it fails, none.
-        if not getattr(self.provider,'read_gap_pending',False):return
+        if not getattr(getattr(self,'provider',None),'read_gap_pending',False):return
         self.provider.read_gap_pending=False
         try:await asyncio.to_thread(self.state.update_gap)
         except BaseException:
