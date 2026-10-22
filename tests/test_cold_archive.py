@@ -85,6 +85,15 @@ def clear_cold_copies(database):
     with database.pool.connection() as c:c.execute('DELETE FROM attachment_cold_copies')
 
 
+@pytest.fixture(autouse=True)
+def restore_worker(database):
+    """A running restore worker holds its presence lock (ANYM-350)."""
+    presence=cold().WorkerPresence(database.pool.conninfo)
+    assert presence.acquire()
+    yield presence
+    presence.close()
+
+
 def cold():
     from messaging_service import cold_archive
     return cold_archive
@@ -461,7 +470,7 @@ def test_rehydrate_prefers_cold_archive(env,archive):
     # No collector job: the provider is never asked while R2 can answer.
     assert job_state(s,fid)=='ready' and ar.claim_media('fixture') is None
     report=restorer(env).run_once()
-    assert report=={'restored':1,'restored_bytes':blob.bytes,'failed':0,'provider_fallback':0,'reasons':{}}
+    assert report=={'restored':1,'restored_bytes':blob.bytes,'failed':0,'provider_fallback':0,'reasons':{},'reconciled':0}
     data=(s.files/blob.digest).read_bytes()
     assert hashlib.sha256(data).hexdigest()==blob.digest and resident(s,blob.digest)
     assert copy(s,blob.digest)['restore_state']=='idle' and copy(s,blob.digest)['state']=='verified'
@@ -545,15 +554,24 @@ def _digest_of(s,fid):
 @pytest.mark.parametrize('limit',['disk_reserve','cold_size_limit'])
 def test_restore_honors_disk_reserve_and_object_size_bound(env,archive,limit):
     import shutil as disk
-    ar,_,key,_=archive;s,_,_,_=env;fid,blob=evicted_copy(env,archive)
-    s.request_file_download(key,fid)
+    ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid);reads=calls(cloud).count('get_object')
     changes={'reserve_bytes':disk.disk_usage(s.files).free+1} if limit=='disk_reserve' else {'max_object_bytes':blob.bytes-1}
     report=restorer(env,**changes).run_once()
-    assert report['reasons']=={limit:1} and report['provider_fallback']==1
+    # Refused before any R2 read; the provider would hit the same limit, so nothing is queued.
+    assert report['reasons']=={limit:1} and report['provider_fallback']==0
+    assert calls(cloud).count('get_object')==reads and job_state(s,fid)=='ready'
     assert not (s.files/blob.digest).exists()
     assert not [p for p in s.files.iterdir() if p.name.startswith('.pending-')]
     # A local limit says nothing against the copy.
     assert copy(s,blob.digest)['state']=='verified' and copy(s,blob.digest)['restore_error']==limit
+    answer=s.request_file_download(key,fid)
+    assert answer['request_status']=='unavailable' and answer['reason']==limit
+    assert answer['rehydration_source']=='cold_archive' and 0<answer['retry_after_seconds']<=300
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_cold_copies SET restore_finished_at=clock_timestamp()-interval '301 seconds' WHERE digest=%s",(blob.digest,))
+    assert s.request_file_download(key,fid)['request_status']=='queued'
+    assert restorer(env).run_once()['restored']==1 and resident(s,blob.digest)
 
 
 # spec: ANYM-350
@@ -583,6 +601,7 @@ def test_least_privilege_gateway_queues_and_cold_role_restores(env,archive):
         # A gateway role from before the restore grant keeps the provider path.
         old=gateway.request_file_download(key,fid)
         assert old['request_status']=='queued' and old['rehydration_source']=='provider'
+        assert old['cold_failure']=='cold_first_inactive'
         with s.pool.connection() as c:
             c.execute("UPDATE media_jobs SET state='ready',requested_until=NULL WHERE id=%s",(fid,))
             c.execute((root/'gateway_role.sql').read_text().replace('messaging_gateway',roles['messaging_gateway']))
@@ -597,17 +616,23 @@ def test_least_privilege_gateway_queues_and_cold_role_restores(env,archive):
 
 # spec: ANYM-350
 def test_restore_drill_rehydrates_from_cold(env,archive,tmp_path):
-    """Restore a backup point into an isolated files directory, then rehydrate from cold/.
-
-    The disposable test database stands in for the restored database (the dump
-    is a stub; pg_restore itself is the BACKUP.md drill); the CAS is a fresh
-    directory filled only from the bundle.
-    """
-    from copy import copy as clone
-    from messaging_service.backup import create_snapshot,verify_bundle,verify_snapshot
+    """Restore a real backup point into an isolated database and files directory, then rehydrate from cold/."""
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import conninfo_to_dict,make_conninfo
+    from uuid import uuid4
+    from messaging_service.backup import create_snapshot,quarantine_restore,verify_bundle,verify_snapshot
     from messaging_service.blobs import Blob,BlobWriter
+    from messaging_service.store import Store
+    container=os.environ.get('ANYMSG_TEST_POSTGRES_CONTAINER')
+    if not container:
+        if os.environ.get('CI'):pytest.fail('CI must provide the isolated PostgreSQL container for the restore drill')
+        pytest.skip('isolated PostgreSQL container unavailable locally')
     _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
-    create_snapshot(s,tmp_path/'point',[sys.executable,'-c','print("synthetic dump")'])
+    values=conninfo_to_dict(s.pool.conninfo);assert values['dbname']=='messaging_probe_test'
+    inside=make_conninfo(host='127.0.0.1',port=5432,user=values['user'],dbname='messaging_probe_test')
+    docker=['docker','exec','-i','-e','PGPASSWORD='+values['password'],container]
+    create_snapshot(s,tmp_path/'point',[*docker,'pg_dump','--dbname='+inside])
     manifest=verify_bundle(tmp_path/'point')
     [absent]=[item for item in manifest['absent_blobs'] if item['digest']==blob.digest]
     assert absent['cold_object_key']=='synthetic-owner/v1/cold/'+blob.digest+'.age'
@@ -615,14 +640,36 @@ def test_restore_drill_rehydrates_from_cold(env,archive,tmp_path):
     for item in manifest['blobs']:
         with (tmp_path/'point/files'/item['digest']).open('rb') as source:
             writer.write(iter(lambda:source.read(1024**2),b''),expected_bytes=item['bytes'],expected_sha256=item['digest'])
-    target=clone(s);target.files=isolated
-    assert verify_snapshot(target,tmp_path/'point')['status']=='verified'
-    assert s.request_file_download(key,fid)['rehydration_source']=='cold_archive'
-    worker=restorer(env);worker.store=target
-    assert worker.run_once()['restored']==1
-    writer.verify(Blob(blob.digest,blob.bytes))
-    assert hashlib.sha256((isolated/blob.digest).read_bytes()).hexdigest()==absent['digest']
-    assert not (s.files/blob.digest).exists()
+    name='anymsg_cold_drill_'+uuid4().hex+'_restore_test';restored=presence=None;created=False
+    try:
+        with psycopg.connect(s.pool.conninfo,autocommit=True) as owner:
+            owner.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(name)))
+        created=True
+        subprocess.run([*docker,'pg_restore','--dbname='+make_conninfo(inside,dbname=name),'--exit-on-error','--no-owner','--no-acl'],
+            input=(tmp_path/'point/database.dump').read_bytes(),check=True,capture_output=True)
+        restored=Store(make_conninfo(s.pool.conninfo,dbname=name),isolated,'http://testserver')
+        assert verify_snapshot(restored,tmp_path/'point')['status']=='verified'
+        quarantine_restore(restored)
+        # The restore runs only beside a worker started against the isolated database.
+        presence=cold().WorkerPresence(restored.pool.conninfo);assert presence.acquire()
+        drill=restored.issue_key('cold-drill-reader',['archive-test'])
+        answer=restored.request_file_download(drill,fid)
+        # Quarantine disabled collection: R2 is the only source, no provider fallback.
+        assert answer['rehydration_source']=='cold_archive' and answer['requested_until'] is None
+        worker=restorer(env);worker.store=restored
+        assert worker.run_once()['restored']==1
+        writer.verify(Blob(blob.digest,blob.bytes))
+        assert hashlib.sha256((isolated/blob.digest).read_bytes()).hexdigest()==absent['digest']
+        assert restored.request_file_download(drill,fid)['request_status']=='ready'
+    finally:
+        if presence is not None:presence.close()
+        if restored is not None:restored.close()
+        if created:
+            with psycopg.connect(s.pool.conninfo,autocommit=True) as owner:
+                owner.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(name)))
+    # The source database and CAS are untouched.
+    assert not (s.files/blob.digest).exists() and not resident(s,blob.digest)
+    assert copy(s,blob.digest)['restore_state']=='idle'
 
 
 # spec: ANYM-350
@@ -641,3 +688,127 @@ def test_compose_runs_cold_restore_with_the_cold_key_and_writable_cas():
     assert service['user']=='10001:10001' and service['read_only'] and service['cap_drop']==['ALL']
     from messaging_service.cold_archive import main
     with pytest.raises(SystemExit):main(['--restore','--apply','--config','/nonexistent','--dsn-file','/nonexistent'])
+
+
+# spec: ANYM-350
+def test_restore_respects_collector_media_reservations(env,archive):
+    import shutil as disk
+    from messaging_service.storage_admission import volume_key
+    _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid);reads=calls(cloud).count('get_object')
+    with s.pool.connection() as c:
+        c.execute("""INSERT INTO media_reservations(job,volume_key,lease_epoch,reserved_bytes,expires_at)
+            VALUES(%s,%s,1,%s,clock_timestamp()+interval '1 hour')""",(fid,volume_key(s.files),20*1024**3))
+    # Free space alone would admit it; the collectors' reserved bytes do not.
+    report=restorer(env,reserve_bytes=max(0,disk.disk_usage(s.files).free-10*1024**3)).run_once()
+    assert report['reasons']=={'disk_reserve':1} and calls(cloud).count('get_object')==reads
+    with s.pool.connection() as c:c.execute('DELETE FROM media_reservations WHERE job=%s',(fid,))
+    # The default floor is the collectors' 10 GiB media floor; lower values are refused.
+    assert env[2]().config['restore_disk_reserve_bytes']==10*1024**3
+
+
+# spec: ANYM-350
+def test_interrupted_publication_is_registered_without_r2(env,archive,monkeypatch):
+    from messaging_service import file_lifecycle
+    _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid)
+    def crash(*args):raise RuntimeError('synthetic crash after publication')
+    with monkeypatch.context() as patch:
+        patch.setattr(file_lifecycle,'register_resident_original',crash)
+        with pytest.raises(RuntimeError,match='synthetic crash'):restorer(env).run_once()
+    assert (s.files/blob.digest).exists() and not resident(s,blob.digest)
+    # Past the deadline, with R2 down: the published copy is verified locally and registered.
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_cold_copies SET restore_requested_at=clock_timestamp()-interval '1 hour' WHERE digest=%s",(blob.digest,))
+    (cloud/'unavailable').write_text('');reads=calls(cloud).count('get_object')
+    report=restorer(env).run_once()
+    assert report['reconciled']==1 and report['failed']==0 and calls(cloud).count('get_object')==reads
+    assert resident(s,blob.digest) and copy(s,blob.digest)['restore_state']=='idle'
+    from messaging_service.backup import blob_inventory
+    with s.pool.connection() as c:present,absent=blob_inventory(c,41)
+    # The next backup carries the restored bytes again.
+    assert blob.digest in {item['digest'] for item in present} and blob.digest not in {item['digest'] for item in absent}
+    assert s.request_file_download(key,fid)['request_status']=='ready'
+
+
+# spec: ANYM-350
+def test_stale_restore_never_overwrites_a_newer_request_or_the_fallback(env,archive,monkeypatch):
+    ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid)
+    worker=restorer(env);[row]=worker._due(16)
+    def stall():
+        with s.pool.connection() as c:
+            c.execute("UPDATE attachment_cold_copies SET restore_requested_at=clock_timestamp()-interval '16 minutes' WHERE digest=%s",(blob.digest,))
+        fallback=s.request_file_download(key,fid)
+        assert fallback['rehydration_source']=='provider' and fallback['cold_failure']=='cold_restore_stalled'
+    # The fetch outlives the window; the user's next request hands it to the provider.
+    def slow(item):
+        stall();raise cold().ColdUnavailable('synthetic')
+    monkeypatch.setattr(worker,'_fetch',slow)
+    assert worker._restore_one(row)==('cold_unavailable',False)
+    assert copy(s,blob.digest)['restore_error']=='cold_restore_stalled' and job_state(s,fid)=='queued'
+    # A snapshot of an earlier generation is not claimed at all.
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_cold_copies SET restore_state='requested',restore_requested_at=clock_timestamp() WHERE digest=%s",(blob.digest,))
+    assert worker._restore_one(row) is False and copy(s,blob.digest)['restore_state']=='requested'
+    # A second worker claims nothing while the first holds the presence lock.
+    assert not cold().WorkerPresence(s.pool.conninfo).acquire()
+
+
+# spec: ANYM-350
+def test_missing_worker_sends_the_request_to_the_provider_at_once(env,archive,restore_worker):
+    ar,_,key,_=archive;s,_,_,_=env
+    one,_=evicted_copy(env,archive,mid='absent-1',payload=b'Synthetic absent first')
+    two,second=evicted_copy(env,archive,mid='absent-2',payload=b'Synthetic absent second')
+    assert s.request_file_download(key,two)['rehydration_source']=='cold_archive'
+    restore_worker.close()
+    first=s.request_file_download(key,one)
+    assert first['request_status']=='queued' and first['rehydration_source']=='provider'
+    assert first['cold_failure']=='cold_worker_unavailable' and job_state(s,one)=='queued'
+    queued=s.request_file_download(key,two)
+    assert queued['request_status']=='queued' and queued['cold_failure']=='cold_worker_unavailable'
+    assert copy(s,second.digest)['restore_state']=='failed' and copy(s,second.digest)['state']=='verified'
+
+
+# spec: ANYM-350
+def test_cold_copy_is_retried_after_the_provider_failed(env,archive):
+    ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid);(cloud/'unavailable').write_text('')
+    assert restorer(env).run_once()['provider_fallback']==1
+    # The provider no longer has the original; R2 comes back.
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET state='failed',error_code='synthetic_gone',requested_until=NULL WHERE id=%s",(fid,))
+    (cloud/'unavailable').unlink()
+    again=s.request_file_download(key,fid)
+    assert again['request_status']=='queued' and again['rehydration_source']=='cold_archive'
+    assert again['requested_until'] is None and 'cold_failure' not in again
+    report=restorer(env).run_once()
+    assert report['restored']==1 and report['provider_fallback']==0 and resident(s,blob.digest)
+    assert job_state(s,fid)=='failed'
+
+
+# spec: ANYM-350
+def test_reserved_fallbacks_count_against_provider_quotas(env,archive,monkeypatch):
+    from messaging_service import media_requests
+    from messaging_service.store import APIError
+    _,_,key,_=archive;s,_,_,_=env
+    one,_=evicted_copy(env,archive,mid='quota-1',payload=b'Synthetic quota first')
+    two,_=evicted_copy(env,archive,mid='quota-2',payload=b'Synthetic quota second')
+    monkeypatch.setattr(media_requests,'PER_KEY_LIMIT',1)
+    assert s.request_file_download(key,one)['requested_until'] is not None
+    with pytest.raises(APIError,match='media_request_limit'):s.request_file_download(key,two)
+    assert copy(s,_digest_of(s,two))['restore_state']=='idle'
+
+
+# spec: ANYM-350
+def test_refused_provider_and_disproved_copy_answer_without_a_provider_source(env,archive):
+    ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    with s.pool.connection() as c:c.execute('UPDATE media_jobs SET attempts=5 WHERE id=%s',(fid,))
+    queued=s.request_file_download(key,fid)
+    # The owner's own copy is restored even when provider rules refuse a download.
+    assert queued['rehydration_source']=='cold_archive' and queued['requested_until'] is None
+    (cloud/'tamper').write_text('missing')
+    assert restorer(env).run_once()['provider_fallback']==0
+    after=s.request_file_download(key,fid)
+    assert after['request_status']=='failed' and after['rehydration_source']=='none'
+    assert after['cold_failure']==copy(s,blob.digest)['restore_error']

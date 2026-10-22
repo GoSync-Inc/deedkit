@@ -19,6 +19,7 @@ import tempfile
 import threading
 
 from .file_lifecycle import _digest, _identity, lifecycle_lock
+from .storage_admission import MEDIA_RESERVE_BYTES
 
 MIB=1024**2
 AGE_HEADER=b'age-encryption.org/v1\n'
@@ -53,7 +54,7 @@ def load_config(path):
         value=unique_json(source.read(16385))
     required={'v','transfer','recipients','identity_file','total_bytes'}
     defaults={'age':'age','archive_after_days':23,'pass_bytes':8*1024**3,'pass_files':500,
-              'max_object_bytes':4*1024**3,'timeout_seconds':3600}
+              'max_object_bytes':4*1024**3,'timeout_seconds':3600,'restore_disk_reserve_bytes':MEDIA_RESERVE_BYTES}
     if (not isinstance(value,dict) or not required<=set(value) or set(value)-required-set(defaults) or
             type(value['v']) is not int or value['v']!=1):raise ValueError('invalid_cold_archive_config')
     value={**defaults,**value}
@@ -72,7 +73,9 @@ def load_config(path):
     if not isinstance(value['age'],str) or not re.fullmatch(r'age|/[a-zA-Z0-9_./-]{1,255}',value['age']):
         raise ValueError('invalid_cold_archive_config')
     limits={'archive_after_days':(1,29),'pass_files':(1,100000),'timeout_seconds':(60,21600),
-            'max_object_bytes':(64,5*1024**4),'pass_bytes':(1,10*1024**4),'total_bytes':(1,100*1024**4)}
+            'max_object_bytes':(64,5*1024**4),'pass_bytes':(1,10*1024**4),'total_bytes':(1,100*1024**4),
+            # Restores never dip below the collectors' default media floor (ANYM-350).
+            'restore_disk_reserve_bytes':(MEDIA_RESERVE_BYTES,100*1024**3)}
     for key,(low,high) in limits.items():
         if type(value[key]) is not int or not low<=value[key]<=high:raise ValueError('invalid_cold_archive_limits')
     return value
@@ -424,20 +427,71 @@ class ColdRestorer(ColdArchiver):
 
     The gateway queues a restore (media_requests.cold_request). The ciphertext
     must match its recorded size and SHA-256 and decrypt to the CAS digest; the
-    plaintext goes only through BlobWriter. Any failure publishes nothing and
-    hands the request to the provider path while its demand window is open.
+    plaintext goes only through BlobWriter. A restore is admitted against the
+    collectors' media floor and reservations before any R2 read. Any later
+    failure publishes nothing; a remote or copy failure hands the request to
+    the provider path while its demand window is open, a local limit does not.
+    Every state change is conditioned on the request generation it claimed.
     """
-    def __init__(self,store,config,transport=None,*,reserve_bytes=1024**3):
-        super().__init__(store,config,transport);self.reserve_bytes=reserve_bytes
+    def __init__(self,store,config,transport=None,*,reserve_bytes=None):
+        super().__init__(store,config,transport)
+        self.reserve_bytes=config['restore_disk_reserve_bytes'] if reserve_bytes is None else reserve_bytes
 
     def _due(self,limit):
         from .media_requests import COLD_RESTORE_STALL_SECONDS
         # Older requests belong to the gateway's stalled-restore fallback.
         with self.store.pool.connection() as c:
-            return c.execute('''SELECT digest,bytes,object_key,ciphertext_bytes,ciphertext_sha256,restore_attachment
+            return c.execute('''SELECT digest,bytes,object_key,ciphertext_bytes,ciphertext_sha256,restore_requested_at
                 FROM attachment_cold_copies WHERE restore_state='requested' AND state='verified'
                   AND restore_requested_at>clock_timestamp()-make_interval(secs=>%s)
                 ORDER BY restore_requested_at,digest LIMIT %s''',(COLD_RESTORE_STALL_SECONDS,limit)).fetchall()
+
+    def _present(self,digest,size):
+        from .blobs import Blob,BlobWriter
+        if not (self.store.files/digest).exists():return False
+        try:BlobWriter(self.store.files,reserve_bytes=0).verify(Blob(digest,size))
+        except RuntimeError:return False
+        return True
+
+    def _admit(self,c,size):
+        """Capacity check before any R2 read; lifecycle precedes the capacity lock."""
+        import shutil
+        from .storage_admission import STREAM_WORKSPACE_BYTES,StorageAdmission,has_capacity,volume_key
+        if size>self.config['max_object_bytes']:return 'cold_size_limit'
+        StorageAdmission.lock(c)
+        volume=volume_key(self.store.files)
+        reserved=c.execute('SELECT coalesce(sum(reserved_bytes),0) AS bytes FROM media_reservations WHERE volume_key=%s',
+            (volume,)).fetchone()['bytes']
+        reserved+=c.execute("""SELECT coalesce(sum(2*bytes+%s),0) AS bytes FROM file_uploads
+            WHERE volume_key=%s AND state<>'expired'""",(STREAM_WORKSPACE_BYTES,volume)).fetchone()['bytes']
+        free=shutil.disk_usage(self.store.files).free
+        return None if has_capacity(free,reserved,size+STREAM_WORKSPACE_BYTES,self.reserve_bytes) else 'disk_reserve'
+
+    def _register(self,c,digest,size):
+        from .file_lifecycle import register_resident_original
+        register_resident_original(c,digest,size)
+        c.execute('''UPDATE attachment_cold_copies SET restore_state='idle',restore_error=NULL,
+            restore_finished_at=clock_timestamp() WHERE digest=%s AND restore_state<>'idle' ''',(digest,))
+
+    def _reconcile(self):
+        """A published original whose registration was interrupted becomes resident.
+
+        Independent of request age and R2 availability: the CAS file is verified
+        locally and registered under the lifecycle lock.
+        """
+        from .file_lifecycle import is_managed_evicted
+        with self.store.pool.connection() as c:
+            rows=c.execute('''SELECT cc.digest,cc.bytes FROM attachment_cold_copies cc
+                JOIN attachment_residency r ON r.digest=cc.digest AND r.bytes=cc.bytes
+                WHERE cc.restore_state IN ('requested','failed') AND r.state='evicted' ORDER BY cc.digest LIMIT 1000''').fetchall()
+        reconciled=0
+        for row in rows:
+            if not self._present(row['digest'],row['bytes']):continue
+            with self.store.pool.connection() as c:
+                lifecycle_lock(c)
+                if is_managed_evicted(c,row['digest'],row['bytes']) and self._present(row['digest'],row['bytes']):
+                    self._register(c,row['digest'],row['bytes']);reconciled+=1
+        return reconciled
 
     def _fetch(self,row):
         from .blobs import BlobSink,BlobWriter
@@ -453,48 +507,59 @@ class ColdRestorer(ColdArchiver):
             return sink.finish()
 
     def _restore_one(self,row):
-        from .file_lifecycle import is_managed_evicted,register_resident_original
-        digest,size=row['digest'],row['bytes']
+        from .file_lifecycle import is_managed_evicted
+        from .media_requests import COLD_LOCAL,COLD_RESTORE_STALL_SECONDS
+        digest,size,generation=row['digest'],row['bytes'],row['restore_requested_at']
+        claimed='digest=%s AND restore_state=\'requested\' AND restore_requested_at=%s'
         with self.store.pool.connection() as c:
             lifecycle_lock(c)
+            # Revalidate the claim: a stalled, superseded or disproved request is not ours.
+            if c.execute('SELECT FROM attachment_cold_copies WHERE '+claimed+''' AND state='verified'
+                    AND restore_requested_at>clock_timestamp()-make_interval(secs=>%s) FOR UPDATE''',
+                    (digest,generation,COLD_RESTORE_STALL_SECONDS)).fetchone() is None:return False
             if not is_managed_evicted(c,digest,size):
                 # Already resident again (provider or an earlier restore).
                 c.execute('''UPDATE attachment_cold_copies SET restore_state='idle',restore_error=NULL,
-                    restore_finished_at=clock_timestamp() WHERE digest=%s AND restore_state='requested' ''',(digest,))
+                    restore_finished_at=clock_timestamp() WHERE '''+claimed,(digest,generation))
                 return False
-        reason=None;disproved=False
-        try:self._fetch(row)
-        except ColdVerifyFailed as error:
-            reason=str(error) if re.fullmatch('[a-z_]{1,64}',str(error)) else VERIFY_FAILED;disproved=True
-        except ColdUnavailable:reason=UNAVAILABLE
-        except ValueError as error:
-            reason={'media_size_limit':'cold_size_limit','private_cold_identity_required':'private_cold_identity_required'}.get(
-                str(error),VERIFY_FAILED)
-            disproved=reason==VERIFY_FAILED
-        except RuntimeError as error:reason='disk_reserve' if str(error)=='disk_reserve' else 'cold_restore_failed'
-        except OSError:reason='cold_restore_failed'
+            if self._present(digest,size):
+                # Published by an interrupted attempt: register it, never fetch again.
+                self._register(c,digest,size);return None
+            reason=self._admit(c,size)
+        disproved=False
+        if reason is None:
+            try:self._fetch(row)
+            except ColdVerifyFailed as error:
+                reason=str(error) if re.fullmatch('[a-z_]{1,64}',str(error)) else VERIFY_FAILED;disproved=True
+            except ColdUnavailable:reason=UNAVAILABLE
+            except ValueError as error:
+                reason={'media_size_limit':'cold_size_limit','private_cold_identity_required':'private_cold_identity_required'}.get(
+                    str(error),VERIFY_FAILED)
+                disproved=reason==VERIFY_FAILED
+            except RuntimeError as error:reason='disk_reserve' if str(error)=='disk_reserve' else 'cold_restore_failed'
+            except OSError:reason='cold_restore_failed'
         with self.store.pool.connection() as c:
             lifecycle_lock(c)
             if reason is None:
-                register_resident_original(c,digest,size)
-                c.execute('''UPDATE attachment_cold_copies SET restore_state='idle',restore_error=NULL,
-                    restore_finished_at=clock_timestamp() WHERE digest=%s''',(digest,))
-                return None
-            # A disproved copy no longer counts as verified; it is never used again
-            # until the archiver re-proves it from a resident original.
-            c.execute('''UPDATE attachment_cold_copies SET restore_state='failed',restore_error=%s,
-                restore_finished_at=clock_timestamp(),state=CASE WHEN %s THEN 'failed' ELSE state END,
-                error_code=CASE WHEN %s THEN %s ELSE error_code END,
-                verified_at=CASE WHEN %s THEN NULL ELSE verified_at END WHERE digest=%s''',
-                (reason,disproved,disproved,reason,disproved,digest))
+                # The verified original is in the CAS whoever owns the request now.
+                self._register(c,digest,size);return None
+            if disproved:
+                # A disproved copy no longer counts as verified; it is never used again
+                # until the archiver re-proves it from a resident original.
+                c.execute('''UPDATE attachment_cold_copies SET state='failed',error_code=%s,verified_at=NULL
+                    WHERE digest=%s''',(reason,digest))
+            owner=c.execute('''UPDATE attachment_cold_copies SET restore_state='failed',restore_error=%s,
+                restore_finished_at=clock_timestamp() WHERE '''+claimed+' RETURNING restore_attachment',
+                (reason,digest,generation)).fetchone()
             queued=False
-            if row['restore_attachment']:
-                queued=c.execute('SELECT public.queue_managed_original(%s) AS queued',(row['restore_attachment'],)).fetchone()['queued']
+            # A local limit would stop the provider download too; a superseded request is not ours to hand over.
+            if owner and owner['restore_attachment'] and reason not in COLD_LOCAL:
+                queued=c.execute('SELECT public.queue_managed_original(%s) AS queued',(owner['restore_attachment'],)).fetchone()['queued']
         return reason,queued
 
     def run_once(self,*,limit=16):
         if type(limit) is not int or not 1<=limit<=1000:raise ValueError('invalid_cold_restore_limit')
-        result={'restored':0,'restored_bytes':0,'failed':0,'provider_fallback':0,'reasons':{}}
+        result={'restored':0,'restored_bytes':0,'failed':0,'provider_fallback':0,'reasons':{},'reconciled':self._reconcile()}
         for row in self._due(limit):
             outcome=self._restore_one(row)
             if outcome is False:continue
@@ -504,6 +569,35 @@ class ColdRestorer(ColdArchiver):
             result['failed']+=1;result['provider_fallback']+=int(bool(queued))
             result['reasons'][reason]=result['reasons'].get(reason,0)+1
         return result
+
+
+class WorkerPresence:
+    """Session advisory lock held while the restore worker runs (ANYM-350).
+
+    The gateway sends a request straight to the provider when no worker holds
+    it; it also keeps a second worker from running beside the first.
+    """
+    def __init__(self,conninfo):
+        self.conninfo=conninfo;self.connection=None;self.held=False
+
+    def acquire(self):
+        import psycopg
+        from .media_requests import COLD_WORKER_LOCK
+        try:
+            if self.held:
+                # A dropped session releases the lock; take it again before claiming work.
+                self.connection.execute('SELECT 1');return True
+            if self.connection is None:self.connection=psycopg.connect(self.conninfo,autocommit=True)
+            self.held=self.connection.execute('SELECT pg_try_advisory_lock(hashtextextended(%s,0))',(COLD_WORKER_LOCK,)).fetchone()[0]
+        except psycopg.Error:
+            self.close()
+        return self.held
+
+    def close(self):
+        if self.connection is not None:
+            try:self.connection.close()
+            except Exception:pass
+        self.connection=None;self.held=False
 
 
 def status(store,config=None):
@@ -549,6 +643,7 @@ def main(argv=None):
         print(json.dumps({'status':'error','error_code':'invalid_cold_archive_config'}),flush=True);return 1
     store=Store(Path(args.dsn_file).read_text().strip(),Path(args.files),'http://localhost')
     stopped=threading.Event();old={}
+    presence=WorkerPresence(store.pool.conninfo) if args.restore else None
     if args.interval_seconds:
         for signum in (signal.SIGINT,signal.SIGTERM):old[signum]=signal.signal(signum,lambda *_:stopped.set())
     try:
@@ -556,6 +651,11 @@ def main(argv=None):
             print(json.dumps(status(store,config)),flush=True);return 0
         archiver=ColdRestorer(store,config) if args.restore else ColdArchiver(store,config)
         while not stopped.is_set():
+            if presence is not None and not presence.acquire():
+                # Another worker runs, or the database is unreachable: claim nothing.
+                print(json.dumps({'status':'error','error_code':'cold_restore_worker_busy'}),flush=True)
+                if args.interval_seconds is None:return 1
+                stopped.wait(args.interval_seconds);continue
             try:result=archiver.run_once(limit=args.limit) if args.restore else archiver.run_once(apply=args.apply,limit=args.limit)
             except Exception:
                 # Never print SQL, DSNs, paths, keys or arbitrary exception text.
@@ -563,12 +663,14 @@ def main(argv=None):
                 if args.interval_seconds is None:return 1
             else:
                 # An idle restore poll prints nothing, so the log keeps real events.
-                if not args.restore or result['restored'] or result['failed'] or args.interval_seconds is None:
+                if (not args.restore or result['restored'] or result['failed'] or result['reconciled'] or
+                        args.interval_seconds is None):
                     print(json.dumps(result),flush=True)
             if args.interval_seconds is None:break
             stopped.wait(args.interval_seconds)
         return 0
     finally:
+        if presence is not None:presence.close()
         store.close()
         for signum,handler in old.items():signal.signal(signum,handler)
 

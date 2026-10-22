@@ -473,9 +473,10 @@ stays; record its digest with the drill evidence. Use no real originals.
 service reads objects back through the same `cold get` and decrypts them with
 the cold identity; it writes nothing to R2. A backup point names each evicted
 original's object in `absent_blobs[].cold_object_key`. Drill: restore the point
-into an isolated database and files directory, request one evicted original
-there, run one `cold_archive --restore` pass against the isolated DSN and files,
-and compare the restored file's SHA-256 with its `absent_blobs` digest
+into an isolated database and files directory, start `cold_archive --restore
+--interval-seconds 10` against the isolated DSN and files, request one evicted
+original there (a request without a running worker goes to the provider), and
+compare the restored file's SHA-256 with its `absent_blobs` digest
 ([MEDIA_STORAGE.md](MEDIA_STORAGE.md#cold-first-rehydration-anym-350)). With
 the cold identity lost, decrypt with the backup recovery identity instead.
 
