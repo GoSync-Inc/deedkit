@@ -306,16 +306,25 @@ def test_telegram_auto_reconnect_ends_continuity():
     provider.bind_state(State(fail=True))
     async def scenario():
         await client._sender._auto_reconnect_callback()
+        from telethon._updates.messagebox import ENTRY_ACCOUNT, State as BoxState
         box = client._message_box
-        box.map[1] = box.map.get(1) or type('Entry', (), {'pts': 0})()
-        request = type("Request", (), {"channel": types.InputChannel(1, 0)})()
-        box.apply_channel_difference(request, types.updates.ChannelDifferenceTooLong(
-            dialog=type('Dialog', (), {'pts': 5})(),
-            messages=[], chats=[], users=[], final=True, timeout=None), type('Hashes', (), {'extend': lambda *a: None})())
+        # Nothing to fetch: no gap.
+        assert box.get_difference() is None and box.get_channel_difference({}) is None
+        await asyncio.sleep(0.05)
+        calls.append('idle')
+        # Any account difference Telethon starts (it drops pts reads while fetching).
+        box.map[ENTRY_ACCOUNT] = BoxState(pts=10, deadline=0)
+        box.getting_diff_for.add(ENTRY_ACCOUNT)
+        assert box.get_difference() is not None
+        box.getting_diff_for.discard(ENTRY_ACCOUNT)
+        # A channel difference that ends early because the access hash is missing.
+        box.map[7] = BoxState(pts=1, deadline=0)
+        box.getting_diff_for.add(7)
+        assert box.get_channel_difference({}) is None
         await asyncio.sleep(0.05)
     asyncio.run(scenario())
     # Bound twice: one hook each; a failed gap write never stops Telethon's own handler.
-    assert calls == ['gap', 'telethon', 'gap']
+    assert calls == ['gap', 'telethon', 'idle', 'gap', 'gap']
 
 
 # spec: ANYM-275

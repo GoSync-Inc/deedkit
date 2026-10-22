@@ -286,7 +286,7 @@ schema 42 (ANYM-275), for up to 24 hours while continuity is proven: the collect
 receiving period began before the snapshot under the same lease epoch, that lease is
 unexpired, the capture heartbeat is under a minute old, the live capture spool is
 drained and no update gap was recorded since: a whatsmeow app-state sync error,
-disconnect or reconnect, a Telethon auto-reconnect or too-long (channel) difference,
+disconnect or reconnect, a Telethon auto-reconnect or any (channel) difference fetch,
 a failed read-state write, or a
 newly quarantined or invalid capture. A restart, disconnect, takeover or expired
 lease starts over, and the five-minute rule applies. A later owner read arrives as a passive event and

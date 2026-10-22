@@ -133,9 +133,9 @@ class TelethonProvider:
         self.read_gap_state=state
         if '_read_gap_tasks' in self.__dict__:return
         # Telethon 1.x can lose updates inside one connection: its auto-reconnect does
-        # not catch up, and a too-long (channel) difference or a premature channel
-        # difference end drops them. Each ends the read-state continuity (ANYM-275).
-        from telethon.tl.types import updates as diffs
+        # not catch up, and while it fetches any (channel) difference it drops pts
+        # updates such as inbox reads, or ends the fetch early. So every difference
+        # fetch Telethon starts ends the read-state continuity (ANYM-275).
         self._read_gap_tasks=set()
         sender=self.client._sender
         reconnected=sender._auto_reconnect_callback
@@ -147,15 +147,14 @@ class TelethonProvider:
         class WatchedBox(base):
             # MessageBox has __slots__: an empty-slot subclass keeps its layout.
             __slots__=()
-            def apply_difference(self,diff,*args):
-                if isinstance(diff,diffs.DifferenceTooLong):provider.read_gap_soon()
-                return base.apply_difference(self,diff,*args)
-            def apply_channel_difference(self,request,diff,*args):
-                if isinstance(diff,diffs.ChannelDifferenceTooLong):provider.read_gap_soon()
-                return base.apply_channel_difference(self,request,diff,*args)
-            def end_channel_difference(self,*args):
-                provider.read_gap_soon()
-                return base.end_channel_difference(self,*args)
+            def get_difference(self):
+                request=base.get_difference(self)
+                if request is not None:provider.read_gap_soon()
+                return request
+            def get_channel_difference(self,*args):
+                # Also covers the early end when the channel's access hash is missing.
+                if any(isinstance(entry,int) for entry in self.getting_diff_for):provider.read_gap_soon()
+                return base.get_channel_difference(self,*args)
         box.__class__=WatchedBox
 
     def read_gap_soon(self):
