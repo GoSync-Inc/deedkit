@@ -294,9 +294,19 @@ configuration and must be backed up separately under the recovery-state policy.
 `submit_feedback(request_id, category, description, operation?, refs?)` records
 private feedback locally with explicit `feedback-write`. Categories are `bug`,
 `feature`, `quality` and `other`; descriptions are limited to 4000 characters and
-references to 32 IDs per type. `operation`, when given, is one messaging operation name;
-the input schema lists the accepted names (`enum`), so feedback about a tool of another
-module, such as `calls_dial_call`, names that tool in `description` instead. Message/chat/subscription references are validated
+references to 32 IDs per type. `operation`, when given, is the tool name as `tools/list`
+shows it, for any module: a messaging operation bare (`search`) or with the gateway prefix
+(`messages_search`), or a tool of another module under its gateway name (`calendar_slots`,
+`calls_get_call_status`, `platform_capabilities`). It is stored in one canonical form: messaging
+operations bare (existing rows keep their meaning), other modules' tools under the full gateway name,
+and `list_feedback` returns the stored value. The idempotency hash uses the stored form, so replaying a
+`request_id` with the other spelling of the same name returns the same feedback ID. The common gateway
+checks the name against its reviewed catalog before relaying, whichever modules are deployed or visible
+to the key, so a report about an unavailable tool is still accepted; an unknown name is rejected there
+with `invalid_arguments` and a `field_errors` entry for `operation`. The messaging REST API, called
+directly, checks the shape only: a messaging operation, the same with the `messages_` prefix, or
+`calendar_`, `calls_` or `platform_` followed by 1–120 lowercase letters, digits or `_`. The name list is
+not returned in the error. Message/chat/subscription references are validated
 against the current credential. Each key has a 1000-record bound; request-ID
 retries are idempotent and changed payloads conflict. `list_feedback(limit=50)`
 returns only this exact key's records; source reference IDs are omitted to avoid
