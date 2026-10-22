@@ -5,14 +5,22 @@ from .envelope import stable_id, utc
 from .policy import scope_filter, targets
 
 
+# Passive WhatsApp read sources (ANYM-275). Each keeps its own basis: the owner's app-state
+# mark-read is a whole-chat baseline (0 or a marked-unread flag), a history-sync count is a
+# provider count at its snapshot time and an own-device receipt is per-message evidence only.
+WHATSAPP_READ_BASES=('whatsapp_app_state_read','whatsapp_owner_receipt','whatsapp_history_sync')
+BASELINE_BASES=('telegram_dialog','whatsapp_cached_chat','whatsapp_history_sync','whatsapp_app_state_read')
+
+
 def validate_observation(value):
-    if not isinstance(value, dict) or set(value)-{'observed_at','unread_count','read_inbox_max_id','basis','is_self_chat'}:
+    if not isinstance(value, dict) or set(value)-{'observed_at','unread_count','read_inbox_max_id','basis','is_self_chat',
+            'marked_unread','read_message_ids'}:
         raise ValueError('invalid_read_observation')
     basis=value.get('basis')
     # Native discovery is a local WhatsApp cache observation too. Preserve the
     # existing stored basis/schema; it does not imply a known unread count.
     if basis=='whatsmeow_captured_chat':basis='whatsapp_cached_chat'
-    if basis not in ('telegram_dialog','whatsapp_cached_chat'):
+    if basis not in ('telegram_dialog','whatsapp_cached_chat',*WHATSAPP_READ_BASES):
         raise ValueError('invalid_read_observation')
     at=utc(value.get('observed_at'))
     if datetime.fromisoformat(at)>datetime.now(timezone.utc):
@@ -21,11 +29,24 @@ def validate_observation(value):
         number=value.get(key)
         if number is not None and (type(number) is not int or not 0<=number<=maximum):
             raise ValueError('invalid_read_observation')
-    if value.get('is_self_chat') is not None and type(value['is_self_chat']) is not bool:
+    for key in ('is_self_chat','marked_unread'):
+        if value.get(key) is not None and type(value[key]) is not bool:
+            raise ValueError('invalid_read_observation')
+    if basis!='telegram_dialog' and value.get('read_inbox_max_id') is not None:
         raise ValueError('invalid_read_observation')
-    if basis=='whatsapp_cached_chat' and value.get('read_inbox_max_id') is not None:
+    if value.get('marked_unread') is not None and basis not in ('whatsapp_app_state_read','whatsapp_history_sync'):
         raise ValueError('invalid_read_observation')
-    return {**value,'observed_at':at,'basis':basis}
+    ids=value.get('read_message_ids')
+    if (basis=='whatsapp_owner_receipt')!=(ids is not None):raise ValueError('invalid_read_observation')
+    if ids is not None and (not isinstance(ids,list) or not 1<=len(ids)<=1000 or value.get('unread_count') is not None
+            or any(not isinstance(i,str) or not 0<len(i)<=256 or '\x00' in i for i in ids)):
+        raise ValueError('invalid_read_observation')
+    # A mark-read is exactly 0 and not marked unread; a mark-unread is a flag, never a count.
+    if basis=='whatsapp_app_state_read' and (value.get('unread_count'),value.get('marked_unread')) not in ((0,False),(None,True)):
+        raise ValueError('invalid_read_observation')
+    if basis=='whatsapp_history_sync' and value.get('unread_count') is None and value.get('marked_unread') is not True:
+        raise ValueError('invalid_read_observation')
+    return {**value,'observed_at':at,'basis':basis,**({'read_message_ids':sorted(set(ids))} if ids is not None else {})}
 
 
 def telegram_read_capture(account,update,*,verified_self,expected_user_id):
@@ -57,19 +78,57 @@ def observe(c,account,provider_chat,value):
     if not platform or value['basis'].split('_',1)[0]!=platform['platform']:
         raise ValueError('invalid_read_observation')
     chat=stable_id('chat',account,provider_chat)
-    # One timestamp covers both read fields. An incomplete observation must not
-    # discard known evidence or make retained numbers look newly verified.
-    c.execute('''INSERT INTO chat_read_observations(chat,account,observed_at,unread_count,read_inbox_max_id,basis,is_self_chat)
-        VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(chat) DO UPDATE SET
-        observed_at=excluded.observed_at,unread_count=excluded.unread_count,
-        read_inbox_max_id=excluded.read_inbox_max_id,basis=excluded.basis,
-        is_self_chat=coalesce(excluded.is_self_chat,chat_read_observations.is_self_chat)
-        WHERE excluded.observed_at>chat_read_observations.observed_at
-          AND (excluded.unread_count IS NOT NULL OR excluded.read_inbox_max_id IS NOT NULL)
-          AND (chat_read_observations.unread_count IS NULL OR excluded.unread_count IS NOT NULL)
-          AND (chat_read_observations.read_inbox_max_id IS NULL OR excluded.read_inbox_max_id IS NOT NULL)''',
-        (chat,account,value['observed_at'],value.get('unread_count'),
-         value.get('read_inbox_max_id'),value['basis'],value.get('is_self_chat')))
+    args=(chat,account,value['observed_at'],value.get('unread_count'),value.get('read_inbox_max_id'),
+        value['basis'],value.get('is_self_chat'),value.get('marked_unread'))
+    insert='''INSERT INTO chat_read_observations(chat,account,observed_at,unread_count,read_inbox_max_id,basis,
+        is_self_chat,marked_unread,baseline_at,count_basis) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'''
+    if value['basis']=='whatsapp_owner_receipt':
+        # Evidence for exactly the listed messages; the first read time is kept on replay.
+        for provider_id in value['read_message_ids']:
+            c.execute('''INSERT INTO owner_message_reads(chat,account,provider_id,read_at,basis) VALUES(%s,%s,%s,%s,%s)
+                ON CONFLICT(chat,provider_id) DO UPDATE SET read_at=least(owner_message_reads.read_at,excluded.read_at)''',
+                (chat,account,provider_id,value['observed_at'],value['basis']))
+        # A receipt never sets or adjusts a count: one newer than the chat's baseline only
+        # invalidates it. Receipts in any order give the same row.
+        c.execute(insert+'''NULL,'partial') ON CONFLICT(chat) DO UPDATE SET
+            unread_count=CASE WHEN excluded.observed_at>coalesce(chat_read_observations.baseline_at,chat_read_observations.observed_at)
+                THEN NULL ELSE chat_read_observations.unread_count END,
+            count_basis=CASE WHEN chat_read_observations.unread_count IS NOT NULL
+                AND excluded.observed_at>coalesce(chat_read_observations.baseline_at,chat_read_observations.observed_at)
+                THEN 'stale_since_baseline' WHEN chat_read_observations.unread_count IS NULL
+                THEN coalesce(chat_read_observations.count_basis,'partial') ELSE chat_read_observations.count_basis END,
+            marked_unread=CASE WHEN excluded.observed_at>chat_read_observations.observed_at THEN NULL
+                ELSE chat_read_observations.marked_unread END,
+            basis=CASE WHEN excluded.observed_at>chat_read_observations.observed_at THEN excluded.basis
+                ELSE chat_read_observations.basis END,
+            observed_at=greatest(chat_read_observations.observed_at,excluded.observed_at)''',args)
+    elif value['basis'] in WHATSAPP_READ_BASES and value.get('marked_unread') and value.get('unread_count') is None:
+        # A flag, not a count: a newer mark-unread clears the count it supersedes.
+        c.execute(insert+'''NULL,'partial') ON CONFLICT(chat) DO UPDATE SET
+            observed_at=excluded.observed_at,unread_count=NULL,read_inbox_max_id=NULL,basis=excluded.basis,marked_unread=true,
+            count_basis=CASE WHEN chat_read_observations.unread_count IS NOT NULL
+                OR chat_read_observations.count_basis='stale_since_baseline' THEN 'stale_since_baseline' ELSE 'partial' END
+            WHERE excluded.observed_at>chat_read_observations.observed_at''',args)
+    elif value['basis'] in WHATSAPP_READ_BASES:
+        # A whole-chat baseline: a mark-read (0) or a history-sync count at its snapshot time.
+        c.execute(insert+'''%s,'provider') ON CONFLICT(chat) DO UPDATE SET
+            observed_at=excluded.observed_at,unread_count=excluded.unread_count,read_inbox_max_id=NULL,
+            basis=excluded.basis,marked_unread=excluded.marked_unread,baseline_at=excluded.baseline_at,count_basis='provider'
+            WHERE excluded.observed_at>chat_read_observations.observed_at''',(*args,value['observed_at']))
+    else:
+        # One timestamp covers both read fields. An incomplete observation must not
+        # discard known evidence or make retained numbers look newly verified.
+        known=value.get('unread_count') is not None
+        c.execute(insert+'''%s,%s) ON CONFLICT(chat) DO UPDATE SET
+            observed_at=excluded.observed_at,unread_count=excluded.unread_count,
+            read_inbox_max_id=excluded.read_inbox_max_id,basis=excluded.basis,
+            is_self_chat=coalesce(excluded.is_self_chat,chat_read_observations.is_self_chat),
+            marked_unread=NULL,baseline_at=excluded.baseline_at,count_basis=excluded.count_basis
+            WHERE excluded.observed_at>chat_read_observations.observed_at
+              AND (excluded.unread_count IS NOT NULL OR excluded.read_inbox_max_id IS NOT NULL)
+              AND (chat_read_observations.unread_count IS NULL OR excluded.unread_count IS NOT NULL)
+              AND (chat_read_observations.read_inbox_max_id IS NULL OR excluded.read_inbox_max_id IS NOT NULL)''',
+            (*args,value['observed_at'] if known else None,'provider' if known else None))
     if value.get('is_self_chat') is not None:
         # Identity evidence is independent of read evidence. Never refresh the
         # count timestamp when discovery only proves whether this is self-chat.

@@ -49,3 +49,5 @@ DO $$ BEGIN
             public.publish_file_enrichment_event(text,text,text,text,jsonb) FROM PUBLIC;
     END IF;
 END $$;
+-- Schema 42: WhatsApp owner read receipts (ANYM-275).
+GRANT SELECT,INSERT,UPDATE ON owner_message_reads TO messaging_collector;

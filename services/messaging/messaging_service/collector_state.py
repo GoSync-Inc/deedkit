@@ -16,18 +16,32 @@ from .envelope import canonical,utc,validate,stable_id,MAX_ENVELOPE
 from .spool import DurableSpool
 
 
+GAP_REASONS=('app_state_sync_error',)
+
+
 def validate_capture(value):
     if not isinstance(value,dict) or len(canonical(value))>MAX_ENVELOPE: raise ValueError('invalid_capture')
     if value.get('kind')=='owner_read_state':
         from .reply_state import validate_observation
         if (set(value)!={'kind','account','chat','observed_at','observation'}
             or not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account'])
-            or not isinstance(value['chat'],str) or not re.fullmatch(r'-?[0-9]{1,20}',value['chat'])):
+            or not isinstance(value['chat'],str)):
             raise ValueError('invalid_read_capture')
+        from .reply_state import WHATSAPP_READ_BASES
         observation=validate_observation(value['observation'])
-        if observation['basis']!='telegram_dialog' or utc(value['observed_at'])!=observation['observed_at']:
+        # Telegram inbox reads and the passive WhatsApp read sources (ANYM-275), never a cache guess.
+        whatsapp=observation['basis'] in WHATSAPP_READ_BASES
+        if (observation['basis']!='telegram_dialog' and not whatsapp
+                or not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,140}@(c.us|g.us|lid)' if whatsapp else r'-?[0-9]{1,20}',value['chat'])
+                or utc(value['observed_at'])!=observation['observed_at']):
             raise ValueError('invalid_read_capture')
         return {**value,'observed_at':observation['observed_at'],'observation':observation}
+    if value.get('kind')=='read_state_gap':
+        # A provider update gap (whatsmeow app-state sync error): read events may be missing.
+        if (set(value)!={'kind','account','observed_at','reason'} or value['reason'] not in GAP_REASONS
+                or not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account'])):
+            raise ValueError('invalid_capture')
+        return {**value,'observed_at':utc(value['observed_at'])}
     if value.get('kind')=='message_receipt':
         from .receipts import validate_capture as validate_receipt
         return validate_receipt(value)
@@ -210,6 +224,24 @@ class CollectorState:
         c.execute('UPDATE collector_health SET operations=%s,updated_at=clock_timestamp() WHERE account=%s',
             (Jsonb(value),self.account))
 
+    # Receiving period (ANYM-275): continuity evidence that keeps an older read observation true.
+    # It starts when the provider connection is ready under this lease epoch and ends on any
+    # disconnect or stop; a takeover or an expired lease is visible through collector_leases.
+    def _start_period(self,c):
+        c.execute('''UPDATE collector_health SET receiving_epoch=%s,receiving_since=clock_timestamp(),
+            receiving_heartbeat_at=clock_timestamp(),receiving_backlog_since=NULL,receiving_gap_at=NULL
+            WHERE account=%s''',(self.lease[1],self.account))
+
+    def _end_period(self,c):
+        c.execute('''UPDATE collector_health SET receiving_since=NULL,receiving_heartbeat_at=NULL,
+            receiving_backlog_since=NULL,receiving_gap_at=NULL WHERE account=%s''',(self.account,))
+
+    def update_gap(self,observed_at=None):
+        with self.archive.store.pool.connection() as c:
+            self.archive.fence(c,self.account,self.lease)
+            c.execute('''UPDATE collector_health SET receiving_gap_at=clock_timestamp()
+                WHERE account=%s AND receiving_epoch=%s AND receiving_since IS NOT NULL''',(self.account,self.lease[1]))
+
     @staticmethod
     def _phase(value,name,state,code,observed,action=None,**extra):
         previous=value.get(name,{})
@@ -226,6 +258,8 @@ class CollectorState:
             connected=name=='connection' and state=='connected'
             extra={'retry_at':None,'retry_attempts':0} if connected else {}
             self._phase(value,name,state,code,row['observed'],**extra)
+            if connected:self._start_period(c)
+            elif name in ('connection','live_capture') and state!='receiving':self._end_period(c)
             if connected and self_provider_id is not None:
                 # Only the ID the provider just verified against the configured one; a
                 # malformed value is dropped, never a reason to fail the connect (ANYM-470).
@@ -263,6 +297,7 @@ class CollectorState:
             # A capture stop keeps its content-free cause after the next run resets the phase.
             stop={'last_capture_stop':{'code':code,'detail':detail,'at':now.isoformat()}} if code in CAPTURE_STOPS else {}
             self._phase(value,'live_capture','paused',code,now,TERMINAL.get(code,'wait_for_retry'),**stop)
+            self._end_period(c)
             self._save_operations(c,value)
 
     def connection_gate(self):
@@ -317,6 +352,10 @@ class CollectorState:
                 'inspect_capture_quarantine' if held and not pending else None,**extra)
             if history_pending is not None:
                 value['history']={**value.get('history',{}),'pending_events':history_pending}
+            # Drained live captures are the heartbeat; an undrained spool may hold a delayed read event.
+            c.execute('''UPDATE collector_health SET receiving_heartbeat_at=clock_timestamp(),
+                receiving_backlog_since=CASE WHEN %s THEN coalesce(receiving_backlog_since,clock_timestamp()) END
+                WHERE account=%s AND receiving_epoch=%s AND receiving_since IS NOT NULL''',(pending>0,self.account,self.lease[1]))
             self._save_operations(c,value)
 
     def policy(self):
@@ -424,6 +463,7 @@ class CollectorState:
         if not re.fullmatch(r'[a-z_]{1,64}',code): raise ValueError('invalid_status_code')
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)
+            if status=='stopped':self._end_period(c)
             c.execute('''UPDATE source_status SET status=%s,coverage='partial',
                 detail_code=CASE WHEN detail_code='version_conflict' THEN detail_code ELSE %s END WHERE account=%s''',
                 (status,code,self.account))
@@ -479,6 +519,9 @@ class CollectorState:
                 record(self.archive,e,capture.get('identity_observations',[]),self.lease)
             return result
         if capture['account']!=self.account: raise ValueError('foreign_capture')
+        if capture['kind']=='read_state_gap':
+            self.update_gap(capture['observed_at'])
+            return {'outcome':'read_state_gap_recorded'}
         chat=capture['chat']
         if chat and not self.allows(self.policy(),chat): return {'outcome':'excluded'}
         if capture['kind']=='owner_read_state':
@@ -488,7 +531,8 @@ class CollectorState:
                 self.archive.fence(c,self.account,self.lease)
                 policy=c.execute('SELECT p.*,a.platform FROM account_policies p JOIN accounts a ON a.id=p.account '
                     'WHERE p.account=%s AND p.enabled',(self.account,)).fetchone()
-                if not policy or policy['platform']!='telegram':raise RuntimeError('collection_disabled')
+                if not policy or policy['platform']!=capture['observation']['basis'].split('_',1)[0]:
+                    raise RuntimeError('collection_disabled')
                 if not self.allows(policy,chat):return {'outcome':'excluded'}
                 cid=stable_id('chat',self.account,chat)
                 c.execute('INSERT INTO chats(id,account,title,provider_chat) VALUES(%s,%s,%s,%s) '

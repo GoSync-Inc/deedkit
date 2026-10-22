@@ -597,6 +597,11 @@ ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 `promotable()` (the previous revision is no longer current `main`), does not run or
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
+Messaging migration 042 (`manual`, ANYM-275) is additive: nullable columns, a wider
+`chat_read_observations.basis` check and the new `owner_message_reads` table with its
+collector and gateway grants. A schema-41 runtime refuses schema 42, so it ships
+with its release; until a collector starts a new receiving period, freshness falls
+back to the five-minute rule.
 Messaging migration 041 (`manual`) keeps a schema-40 runtime working: it ignores
 `reply_snoozes` and `reply_mutes`, so snoozed and muted rows show in the queue
 again (nothing stays hidden longer than under schema 40), and its re-dismissal

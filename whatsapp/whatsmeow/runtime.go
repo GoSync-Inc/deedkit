@@ -101,6 +101,46 @@ func (p *Provider) owner() types.JID {
 	}
 	return types.EmptyJID
 }
+
+// handleReadEvent stores receipt and owner read-state evidence (ANYM-275).
+// It only records what the provider already delivered and never calls the client.
+func (p *Provider) handleReadEvent(value any) bool {
+	if !p.identityOK() {
+		p.fail("whatsapp_identity_mismatch")
+		return false
+	}
+	chat := types.EmptyJID
+	switch e := value.(type) {
+	case *events.Receipt:
+		chat = e.Chat
+	case *events.MarkChatAsRead:
+		chat = e.JID
+	}
+	if !chat.IsEmpty() {
+		policy, err := p.policy()
+		if err != nil {
+			p.fail(safeError(err))
+			return false
+		}
+		if !policy.Allows(LegacyChatID(chat)) {
+			return true
+		}
+	}
+	var err error
+	switch e := value.(type) {
+	case *events.Receipt:
+		err = p.Capture.StoreReceipt(e)
+	case *events.MarkChatAsRead:
+		err = p.Capture.StoreMarkChatAsRead(e)
+	case *events.AppStateSyncError:
+		err = p.Capture.StoreReadStateGap(time.Now())
+	}
+	if err != nil {
+		p.captureFailure(err)
+		return false
+	}
+	return true
+}
 func (p *Provider) identityOK() bool { return LegacyChatID(p.owner()) == p.Config.ExpectedWID }
 func (p *Provider) start(ctx context.Context) (result any, err error) {
 	defer func() {
@@ -195,22 +235,8 @@ func (p *Provider) start(ctx context.Context) (result any, err error) {
 				p.captureFailure(err)
 				return false
 			}
-		case *events.Receipt:
-			if !p.identityOK() {
-				p.fail("whatsapp_identity_mismatch")
-				return false
-			}
-			policy, err := p.policy()
-			if err != nil {
-				p.fail(safeError(err))
-				return false
-			}
-			if policy.Allows(LegacyChatID(e.Chat)) {
-				if err = p.Capture.StoreReceipt(e); err != nil {
-					p.captureFailure(err)
-					return false
-				}
-			}
+		case *events.Receipt, *events.MarkChatAsRead, *events.AppStateSyncError:
+			return p.handleReadEvent(e)
 		}
 		return true
 	})
