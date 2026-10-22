@@ -22,7 +22,7 @@ async def check(url, token_file, consumer):
                 if result.is_error: raise RuntimeError('Tool failed: '+name)
                 if result.structured_content is None: raise RuntimeError('Missing structured output: '+name)
                 return result.structured_content
-            caps=await call('capabilities')
+            caps=await call('capabilities',{'detail':'full'})
             page=await call('search',{'query':'Маяк'})
             assert page['items'][0]['id']=='demo-tg-1'
             denied=await call('search',{'query':'PRIVATE_SCOPE_SENTINEL'})

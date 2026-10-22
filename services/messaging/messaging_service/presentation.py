@@ -22,6 +22,8 @@ LEAN_FILE_FIELDS = ('id','display_name','mime','bytes','download_status','extrac
 
 def options(method, arguments):
     arguments=dict(arguments)
+    # capabilities keeps its own detail (summary|full) for the store (ANYM-270).
+    if method=='capabilities':return arguments,'full'
     detail=arguments.pop('detail','compact')
     # Explicit legacy options remain valid; otherwise compact is the default.
     if 'compact' in arguments:

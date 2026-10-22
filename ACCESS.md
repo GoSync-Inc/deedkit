@@ -72,6 +72,32 @@ keys too, with no other account, chat or field becoming visible:
   stored value failing the format). It is never guessed from messages, and `get_sync_status`
   does not return it.
 
+Since ANYM-270, `capabilities` takes `detail` (`summary` or `full`) and `sections`:
+
+- MCP (direct and the gateway's `messages_capabilities`) returns `detail=summary` by default:
+  service, version, principal, `credential_id`, permissions, accounts (`id`, `platform`,
+  `label`), `chat_scope` as `all_in_permitted_accounts` plus `chat_count`, `tool_manifest.version`,
+  the section names and a `next_action`. Through the gateway the summary names
+  `gateway_principal`, `backend_principal` and `gateway_tool_count` and leaves out backend
+  permissions, as `full` does.
+- REST (`POST /v1/capabilities`, the gateway's `/v1/messages_capabilities`) and the Python and
+  npm clients still return the full payload when `detail` is omitted, for this release only. The
+  in-repo consumers (the gateway's own capability check, the calls service) now ask for
+  `detail=full` by name, and against a messaging API from before `detail` (400
+  `invalid_parameters`) once more with no arguments. Once that is deployed, the next release
+  makes summary the REST and SDK default too; callers that need everything pass `detail=full`.
+- `sections=[names]` returns only those blocks with today's keys: `identity`, `accounts`,
+  `coverage`, `tool_manifest`, `search_options`, `sending`, `file_uploads`, `subscriptions`
+  (with `events`), `feedback`, `messenger_operations` (per-account `supported_by_account`; through
+  the gateway the `gateway_actions*` fields), `limits` (with `unavailable`). Every key of `full`
+  is in exactly one section. An unknown name returns `invalid_filter`. In the
+  `messenger_operations` section each account's `operations`, `count` and `available_operations`
+  hold only operations this key may use there (`key_permitted` of `list_messenger_operations`):
+  a chat-scoped key sees no full-account operation such as `list_contacts` or `create_group`.
+- `detail=full` is the previous payload unchanged, including its full per-account operation
+  list. Every view is cut from the same scoped payload, so no view shows an account or chat
+  outside the key's scope.
+
 ## Operator commands
 
 The commands require `DATABASE_URL_FILE` with the owner DSN. Below are placeholders, not real

@@ -456,9 +456,10 @@ def create_app(store: Store, allowed_hosts: list[str]):
     read = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 
     @mcp.tool(structured_output=True, annotations=read)
-    def capabilities(ctx: Context) -> dict[str, Any]:
-        """Identity, permitted accounts, source coverage and unavailable features."""
-        return call(ctx,'capabilities')
+    def capabilities(ctx: Context,detail: Literal['summary','full']='summary',
+                     sections: Annotated[list[StrictStr],Field(min_length=1,max_length=16)] | None=None) -> dict[str, Any]:
+        """Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter."""
+        return call(ctx,'capabilities',detail=detail,**({} if sections is None else {'sections':sections}))
 
     @mcp.tool(structured_output=True, annotations=read)
     def preview_message(ctx: Context,account: StrictStr,chat_id: StrictStr,text: StrictStr,
@@ -1097,6 +1098,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
             # REST/SDK defaults remain archive-compatible; MCP defaults to the new view.
             if method in ('list_chats','search','get_messages','get_context'):
                 params.setdefault('view','archive')
+            # REST and the SDKs keep the full capabilities payload; MCP defaults to the summary (ANYM-270).
+            if method=='capabilities':params.setdefault('detail','full')
             params=validate_arguments(models,method,params)
             # An omitted delivery policy keeps the schema-37 payload (same rule as the MCP tool).
             if method=='configure_subscription_delivery' and params.get('delivery_policy') is None: params.pop('delivery_policy',None)
