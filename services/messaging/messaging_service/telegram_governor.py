@@ -10,7 +10,8 @@ SCOPED_FLOOD_MAX_SECONDS=3600
 UNKNOWN_FLOOD_SECONDS=60
 # Per-scope admission: burst, refill seconds per request and requests per UTC day.
 # In memory: a collector restart resets them (MESSENGER_OPERATIONS.md).
-LIVE_BUDGETS={'search':(3,10.0,100)}
+# ANYM-477: agent-requested chat history has its own scope, so its pause and budget never touch search.
+LIVE_BUDGETS={'search':(3,10.0,100),'chat_history':(3,10.0,300)}
 
 
 class ProviderRateLimited(Exception):

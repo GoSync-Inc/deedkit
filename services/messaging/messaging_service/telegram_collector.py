@@ -1,8 +1,9 @@
 """Single-owner Telegram collector. No sign-in, messages or secrets in gateway tools."""
 import asyncio
 from collections import deque
-from contextlib import suppress
-from datetime import datetime,timezone
+import copy
+from contextlib import contextmanager,suppress
+from datetime import datetime,timedelta,timezone
 import errno
 import json
 import logging
@@ -29,6 +30,47 @@ from .storage_admission import MEDIA_RESERVE_BYTES
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy,validate_prefetch_days
 
 log=logging.getLogger(__name__)
+# Seconds before a live read's deadline in which no archive write starts (ANYM-477).
+STORE_MARGIN=0.5
+# Seconds a cancelled live read waits for its write thread; the server has ended the transaction by then.
+STORE_GRACE=1.0
+
+
+class DeadlinePool:
+    """The archive pool for a live read's writes (ANYM-477, Sol recheck F1): one absolute deadline
+    (time.monotonic) bounds the pool wait, and each transaction gets the time left as its
+    transaction_timeout, lock_timeout and statement_timeout. PostgreSQL then ends the transaction and
+    frees the lease fence it holds at the deadline, even when this client stalls."""
+    def __init__(self,pool,deadline):self.pool,self.deadline=pool,deadline
+
+    def left(self):
+        remaining=self.deadline-time.monotonic()
+        if remaining<=0:raise TimeoutError('live_store_deadline')
+        return remaining
+
+    @contextmanager
+    def connection(self,timeout=None):
+        with self.pool.connection(timeout=min(self.left(),timeout or self.left())) as c:
+            ms=str(max(1,int(self.left()*1000)))
+            c.execute("SELECT set_config('transaction_timeout',%s,true),set_config('lock_timeout',%s,true),"
+                "set_config('statement_timeout',%s,true)",(ms,ms,ms))
+            yield c
+
+
+def bounded_state(state,deadline):
+    """A CollectorState for the same account and lease whose archive writes use a DeadlinePool."""
+    archive=copy.copy(state.archive);archive.store=copy.copy(archive.store)
+    archive.store.pool=DeadlinePool(state.archive.store.pool,deadline)
+    return CollectorState(archive,state.account,state.lease)
+
+
+async def finished(fn,*args):
+    """Run fn in a thread; a cancelled caller waits for it at most STORE_GRACE before it goes on."""
+    task=asyncio.ensure_future(asyncio.to_thread(fn,*args))
+    try: return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.wait({task},timeout=STORE_GRACE)
+        task.add_done_callback(lambda t:t.cancelled() or t.exception()); raise
 
 
 class ProviderUnavailable(Exception): pass
@@ -143,7 +185,7 @@ class TelethonProvider:
         self.verified_self=None
         self.governor=None
         budget=cfg.get('live_search_budget') or live_search_budget(None)
-        self.live_budgets={'search':(budget['burst'],float(budget['refill_seconds']),budget['daily'])}
+        self.live_budgets={**LIVE_BUDGETS,'search':(budget['burst'],float(budget['refill_seconds']),budget['daily'])}
 
     def bind_state(self,state):
         self.governor=RequestGovernor(state,budgets=getattr(self,'live_budgets',None))
@@ -978,36 +1020,90 @@ class TelegramCollector:
 
     async def execute_operation(self,job):
         job['_policy']=await asyncio.to_thread(self.state.policy)
+        if job.get('operation')=='request_chat_history': return await self.chat_history(job)
         if job.get('operation')!='search_messages_live': return await self.provider.execute_operation(job)
         job['_live_hits']=found=[]
         answer=await self.provider.execute_operation(job)
-        await self.store_live_hits(found)
+        await self.store_live_hits(found,deadline=job.get('_deadline'))
         return answer
 
-    async def store_live_hits(self,found):
+    async def chat_history(self,job):
+        """ANYM-477: one agent-requested history page, archived as live search hits are; stored_new counts new rows."""
+        parameters=job.get('parameters') or {}
+        if not any(k in parameters for k in ('before_message','around_message','from_time','to_time')):
+            # The default anchor is the oldest archived message, so each repeat reaches further back.
+            job['provider_message_id']=await asyncio.to_thread(self.oldest_archived,job.get('chat_id'))
+        job['_history']=found=[]
+        answer=await self.provider.execute_operation(job)
+        created=await self.store_live_hits(found,label='chat_history',deadline=job.get('_deadline'))
+        data=answer.get('data')
+        if isinstance(data,dict):
+            data['stored_new']=created
+            missed=sum(1 for _,hit,_,_ in found if not hit.get('stored'))
+            if missed:
+                # A later default request starts below the oldest archived message and would skip these,
+                # so the receipt names the request that loads this page again (a rerun adds no duplicates):
+                # the request's own anchor, the default anchor it used, or for a chat with no archived
+                # message a time range over the messages not stored at the largest page.
+                data['not_stored']=missed
+                anchors=('before_message','around_message','from_time','to_time')
+                if any(k in parameters for k in anchors):
+                    data['retry_parameters']={k:v for k,v in parameters.items() if k in ('count',*anchors)}
+                elif job.get('provider_message_id'):
+                    data['retry_parameters']={'count':parameters.get('count',50),'before_message':
+                        stable_id('msg',self.account,str(job.get('provider_chat')),str(job['provider_message_id']))}
+                else:
+                    dates=[m.date for m,hit,_,_ in found if m is not None and not hit.get('stored') and m.date]
+                    if dates:
+                        data['retry_parameters']={'count':100,
+                            'from_time':min(dates).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                            'to_time':(max(dates)+timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%SZ')}
+        return answer
+
+    def oldest_archived(self,chat):
+        with self.state.archive.store.pool.connection() as c:
+            row=c.execute('''SELECT provider_id FROM messages WHERE account=%s AND chat=%s
+                ORDER BY length(provider_id),provider_id LIMIT 1''',(self.account,chat)).fetchone()
+        return row['provider_id'] if row else None
+
+    async def store_live_hits(self,found,*,label='live_search',deadline=None):
         """ANYM-476: archive live search hits as backfill through the history page commit's archive apply.
 
         No spool: a hit that cannot be stored is reported in its receipt and is not replayed, so it never
         reaches the drain loop, fails the search or stops the collector. A rerun stores it again.
-        Checkpoints and coverage stay with the history traversal."""
-        stored=skipped=failed=0
+        Checkpoints and coverage stay with the history traversal. Returns the number of new messages.
+
+        A live read's deadline (loop time) bounds it: no write starts in its last STORE_MARGIN seconds,
+        every transaction ends at the deadline on the server (DeadlinePool), and a cancelled read waits
+        at most STORE_GRACE for its thread, so no archive transaction holding the lease fence outlives
+        the read's receipt or holds up the next send claim (ANYM-477 review F1)."""
+        loop=asyncio.get_running_loop()
+        state=self.state
+        if deadline is not None:state=bounded_state(self.state,time.monotonic()+deadline-loop.time())
+        def late():return deadline is not None and deadline-loop.time()<STORE_MARGIN
+        stored=skipped=failed=created=0
         for message,hit,chat_type,title in found:
             if message is not None and not self.in_window([message]):
                 hit.update(stored=False,reason='outside_history_window'); skipped+=1; continue
+            if late():
+                hit.update(stored=False,reason='deadline'); failed+=1; continue
             outcome=None
             try:
                 if message is None: raise ValueError('uninitialized_message')
                 chat=str(message.chat_id);kind=peer_kind(message)
-                await asyncio.to_thread(self.state.catalog,chat,kind,title or chat,chat_type,self.history_since)
+                await finished(state.catalog,chat,kind,title or chat,chat_type,self.history_since)
                 e=telegram_message(self.account,message,chat_title=title or '',origin='backfill',
                     verified_self=getattr(self.provider,'verified_self',None))
-                outcome=(await asyncio.to_thread(self.state.apply,{'kind':'message','peer_kind':kind,'envelope':e}))['outcome']
+                if late():raise TimeoutError('live_store_deadline')
+                outcome=(await finished(state.apply,{'kind':'message','peer_kind':kind,'envelope':e}))['outcome']
             except Exception as exc:
-                log.warning('live_search_store_failed error=%s',type(exc).__name__)
+                log.warning('%s_store_failed error=%s',label,type(exc).__name__)
             if outcome in (None,'excluded'):
                 hit.update(stored=False,reason='not_stored'); failed+=1; continue
             hit.update(stored=True,message_id=stable_id('msg',self.account,chat,str(message.id))); stored+=1
-        if found: log.info('live_search_store stored=%d outside_window=%d not_stored=%d',stored,skipped,failed)
+            created+=outcome=='created'
+        if found: log.info('%s_store stored=%d outside_window=%d not_stored=%d',label,stored,skipped,failed)
+        return created
 
     async def send_outgoing(self,job):
         receipt=await self.provider.send_text(job)

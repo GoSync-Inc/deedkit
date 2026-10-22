@@ -334,4 +334,4 @@ Operator config `history_since` is an ISO timestamp with a mandatory timezone, o
 
 `window_complete` means the set time bound was reached; `history_exhausted` is the end of the provider's available pages. These are different flags. Changing `history_since` resets only the first; the boundary of the last page is kept so that extending the period does not lose the part of a page that was cut off. Neither flag proves the completeness of old edits/deletions or the availability of all attachments. Discovery prints only the aggregated number of dialogs, the limit and history_since, with no names or messages.
 
-This is not a new general rate governor: the existing FloodWait handling is kept. A shared limit on all API/media requests and a client interface for the targeted expansion of a single chat remain separate work.
+This is not a new general rate governor: the existing FloodWait handling is kept. A shared limit on all API/media requests remains separate work. The targeted expansion of a single chat on request is `request_chat_history` (MESSENGER_OPERATIONS.md).

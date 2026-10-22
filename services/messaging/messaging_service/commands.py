@@ -21,6 +21,7 @@ from .outgoing import finish_durably
 
 MAX_FILE_BYTES = 32 * 1024**2
 LIVE_SEARCH = 'search_messages_live'
+HISTORY = 'request_chat_history'
 # ANYM-475: governor waits, resolution, the provider request and the receipt together.
 LIVE_SEARCH_TIMEOUT = 15
 # Kept free inside LIVE_SEARCH_TIMEOUT for the foreground loop's pacing, so a queued send starts within it.
@@ -99,9 +100,14 @@ def _required_permissions(permission,operation,parameters=None):
     return sorted(values)
 
 
-def _spec(operation):
+def live_read(operation,platform):
+    """ANYM-475/477: an agent-requested Telegram read that answers within the live deadline or is refused."""
+    return operation==LIVE_SEARCH or operation==HISTORY and platform=='telegram'
+
+
+def _spec(operation,platform=None):
     from .messenger_operations import operation_spec
-    try:return operation_spec(operation)
+    try:return operation_spec(operation,platform)
     except (ValueError,TypeError):raise APIError('unsupported_operation') from None
 
 
@@ -113,7 +119,7 @@ def _account(c,p,account):
     return row
 
 
-def _policy(c,account,operation,provider_chats=(),*,ready=False):
+def _policy(c,account,operation,provider_chats=(),*,ready=False,live=False):
     from .collector_state import CollectorState
     row=c.execute('SELECT * FROM account_policies WHERE account=%s',(account,)).fetchone()
     if not row or not row['enabled'] or operation not in row['operations_enabled']:
@@ -129,7 +135,7 @@ def _policy(c,account,operation,provider_chats=(),*,ready=False):
         if (not connected or not connected['active'] or
             connected['operations'].get('connection',{}).get('state')!='connected'):
             # ANYM-475: a live read is refused at once instead of waiting in the queue.
-            raise APIError('session_unavailable' if operation==LIVE_SEARCH else 'sender_not_ready',409)
+            raise APIError('session_unavailable' if live else 'sender_not_ready',409)
 
 
 def _chat(c,p,account,chat_id):
@@ -188,7 +194,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
              *,ready=False,verify_file=False,validate_parameters=True,retained_upload=False,saved=None):
     from .messenger_operations import validate_operation,operation_manifest,CATALOG_VERSION,ParameterError
     from .whatsapp_capabilities import account_provider
-    spec=_spec(operation);account_row=_account(c,p,account)
+    spec=_spec(operation);account_row=_account(c,p,account);spec=_spec(operation,account_row['platform'])
     if operation==LIVE_SEARCH and not chat_id:
         # ANYM-475: without a chat the live search spans every chat of the account.
         spec.update(target='account',full_account=True)
@@ -238,6 +244,14 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
                 raise APIError('forbidden',403)
             payload['provider_message_id']=message['provider_id'];refs.append(message_id)
         elif message_id or expected_revision:raise _empty(spec,chat_id,message_id,expected_revision)
+    if operation==HISTORY and account_row['platform']=='telegram':
+        anchor=parameters.get('before_message') or parameters.get('around_message')
+        if anchor is not None:
+            # ANYM-477: an archived message of this chat; another chat's or an unknown one looks the same.
+            row=c.execute('SELECT provider_id FROM messages WHERE id=%s AND account=%s AND chat=%s',
+                          (anchor,account,chat_id)).fetchone()
+            if not row:raise APIError('invalid_anchor')
+            payload['provider_message_id']=row['provider_id']
     if operation=='forward_message':
         source=_message(c,p,account,parameters['source_message_id'],parameters['source_revision'],field='source_revision')
         source_chat=_chat(c,p,account,source['chat'])
@@ -268,7 +282,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
             raise APIError('unsupported_operation')
         if provider=='whatsmeow' and (mode=='sticker' and mime!='image/webp' or
             mode in ('audio','voice','sticker') and parameters['caption']):raise APIError('unsupported_operation')
-    _policy(c,account,operation,provider_chats,ready=ready)
+    _policy(c,account,operation,provider_chats,ready=ready,live=live_read(operation,account_row['platform']))
     if operation=='open_chat_by_phone':_phone_policy(c,account,parameters['phone'])
     if operation=='join_chat':
         # Saved intent keeps the chat the owner confirmed; a new preview binds the key's latest check.
@@ -681,7 +695,7 @@ class CommandWorker:
         if not job:return False
         if job.get('cancelled'):return True
         phases=[]
-        live=job['operation']==LIVE_SEARCH
+        live=live_read(job['operation'],job.get('platform'))
         # ANYM-475: one deadline from the claim bounds preflight, governor waits, the request and the receipt.
         loop=asyncio.get_running_loop();end=loop.time()+max(0.0,LIVE_SEARCH_TIMEOUT-LIVE_FOREGROUND_RESERVE)
         deadline=min(end,loop.time()+LIVE_EXECUTION_TIMEOUT)
@@ -708,7 +722,8 @@ class CommandWorker:
             # Providers report 'waiting' and then 'started' before the first mutation.
             job['_provider_phase']=phases.append
             timeout=180 if job['operation']=='send_file' else 30
-            if live:timeout=left()
+            # The collector stops starting archive writes for a live read before this deadline.
+            if live:timeout=left();job['_deadline']=deadline
             try:answer=safe_result(await asyncio.wait_for(self.execute(job),timeout))
             except TimeoutError:
                 # A read changes nothing at the provider, so its timeout is a safe-to-repeat refusal.
@@ -723,7 +738,7 @@ class CommandWorker:
                 'operation_target_changed','sender_not_ready','attachment_unavailable','unsupported_operation',
                 'forbidden','not_found','operation_rejected','identity_unresolved','chat_not_collected',
                 'rate_limited','provider_timeout','invalid_phone','invite_invalid','invite_expired','chat_full',
-                'join_not_allowed','already_member','invalid_cursor') else 'operation_rejected'
+                'join_not_allowed','already_member','invalid_cursor','invalid_anchor') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
             if code=='rate_limited' and exc.retry_after:
@@ -741,6 +756,10 @@ class CommandWorker:
             if job['operation']=='open_chat_by_phone' and answer['outcome']=='confirmed':
                 await finish_durably(self.finish_open_chat,job,answer)
                 return True
+            if (job['operation']==HISTORY and job.get('platform')=='whatsapp' and isinstance(answer.get('data'),dict)
+                    and 'code' not in answer['data']):
+                # ANYM-477: the phone sends the messages later; the agent searches the archive again after a minute.
+                answer['data'].update(delivery='via_phone',search_again_after_s=60)
             confirmed=answer['outcome']=='confirmed'
             await settle(job,'succeeded' if confirmed else
                 'unknown' if job['mutation'] else 'failed',answer,None if confirmed else 'operation_result_unknown')

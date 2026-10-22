@@ -370,6 +370,52 @@ back in the reverse order. Enable per account (the list replaces the current one
 python -m messaging_service set-messenger-operations --account account-demo --operations chat_info search_messages_live
 ```
 
+## Chat history on request
+
+`request_chat_history` loads older or missing messages of one archived chat. It
+needs `read-live`, the account opt-in and, through the gateway, the
+`request_chat_history` action grant. `chat_id` must be in the key's scope.
+
+- Telegram: one provider page through the account's request governor, answered
+  at once; no preview (it changes nothing at Telegram). `count` 1-100 (default
+  50) and at most one anchor: `before_message` (an archived message ID of the
+  same chat, exclusive; by default the oldest archived message, so a repeat goes
+  further back; an empty chat starts from the newest message), `around_message`
+  (same chat; about half before it, half after it), or `from_time` (inclusive) /
+  `to_time` (exclusive), newest first. A message ID of another chat, or an
+  unknown one, gets `invalid_anchor`.
+- Telegram receipt: `delivery: immediate`, `fetched`, `stored_new` (new archive
+  rows), `basis: live_provider_history`; with `before_message` also
+  `provider_history_start_reached` (Telegram returned fewer than asked), with a
+  time range `range_exhausted` (fewer returned or `from_time` reached). When some
+  messages of the page were not stored (a storage error, or the read's deadline),
+  it adds `not_stored` and `retry_parameters`, since a later request without an
+  anchor starts below them: the request's own anchor, or the default anchor it
+  used as `before_message`; for a chat with no archived message, a
+  `from_time`/`to_time` range over the messages not stored with `count` 100. The page's archive writes end at the read's deadline: each
+  transaction gets the time left as its PostgreSQL `transaction_timeout`, so a
+  stalled write never holds the collector lease past it.
+- Service messages (joins, title changes, calls) are part of the page.
+- Telegram archive: the page is committed as live search hits are (above):
+  origin `backfill`, the usual revision rules, media jobs, the collection policy
+  and `history_since`; checkpoints and coverage do not move. A rerun adds no rows.
+- Telegram budget per account: 3 requests at once, then one per 10 seconds, 300
+  per UTC day, counting the chat lookup and the page; over it `rate_limited` with
+  `result.data.retry_after` before any provider request. In memory; a collector
+  restart resets it. A FloodWait of up to 3600 seconds pauses only this operation
+  on that account (not live search, sends or collection); a longer one, or another
+  420 answer, pauses the account. Without a running session
+  `session_unavailable`; timeouts as for live search.
+- Data: the parameters and counts are kept in the operation row; the log line
+  `chat_history` holds counts, duration and FloodWait seconds only.
+- WhatsApp (native adapter only): unchanged. A mutation with preview, `count`
+  1-50, one request per account per minute, sent to the phone. The receipt adds
+  `delivery: via_phone` and `search_again_after_s: 60`: the messages arrive later
+  through history sync, so search the archive again after a minute.
+
+Roll out as for live search: API and collectors, then the gateway, then the
+policy naming the action; roll back in the reverse order.
+
 ## Important platform differences
 
 - WhatsApp `delete_message` is unsupported: the upstream global-revoke behavior

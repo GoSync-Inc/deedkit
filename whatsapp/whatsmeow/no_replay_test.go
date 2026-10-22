@@ -500,3 +500,43 @@ func TestForkCancelResponseRace(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+// spec: ANYM-477
+func TestRequestHistoryIsOncePerMinutePerAccountOnTheRealStore(t *testing.T) {
+	p := historyProvider(t)
+	other := fixtureMessage("OTHER", 1700000001)
+	other.Info.Chat = types.NewJID("222222", types.DefaultUserServer)
+	other.Info.Sender = other.Info.Chat
+	if err := p.Capture.Put(other, "live"); err != nil {
+		t.Fatal(err)
+	}
+	sent := 0
+	old := sendHistoryRequest
+	sendHistoryRequest = func(context.Context, *whatsmeow.Client, *types.MessageInfo, int) error {
+		sent++
+		return nil
+	}
+	t.Cleanup(func() { sendHistoryRequest = old })
+	pol, _ := p.policy()
+	ask := func(chat string) error {
+		raw, _ := json.Marshal(map[string]any{"chat": chat, "count": 10})
+		_, err := p.requestHistory(context.Background(), raw, pol)
+		return err
+	}
+	if err := ask(historyChat); err != nil || sent != 1 {
+		t.Fatalf("first request err=%v sent=%d", err, sent)
+	}
+	// Within the minute: refused before any peer send, for this chat and for another chat of the account.
+	for _, chat := range []string{historyChat, "222222@c.us"} {
+		if err := ask(chat); err == nil || err.Error() != "history_rate_limited" || sent != 1 {
+			t.Fatalf("second request in the minute chat=%s err=%v sent=%d", chat, err, sent)
+		}
+	}
+	// Past the minute boundary the account may ask again.
+	if _, err := p.Capture.db.Exec("UPDATE history_requests SET last_ms=last_ms-60001 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ask("222222@c.us"); err != nil || sent != 2 {
+		t.Fatalf("request after the minute err=%v sent=%d", err, sent)
+	}
+}
