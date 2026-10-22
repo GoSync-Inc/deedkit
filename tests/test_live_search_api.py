@@ -6,7 +6,6 @@ import pytest
 from messaging_service.archive import Archive
 from messaging_service.collector_state import CollectorState
 from messaging_service.envelope import stable_id
-from messaging_service.messenger_operations import encode_live_cursor, live_cursor_binding
 from messaging_service.store import APIError
 from test_archive import event
 
@@ -67,16 +66,13 @@ def test_unavailable_session_is_refused_at_once_and_nothing_is_queued(live):
 
 
 # spec: ANYM-475
-def test_cursor_is_bound_to_account_chat_and_fields(live):
+def test_a_well_formed_cursor_is_queued_for_the_collector_to_check(live):
     s, _, key, _ = live
-    fields = {'query': 'synthetic', 'limit': 20}
-    good = encode_live_cursor(live_cursor_binding(ACCOUNT, '', fields), {'i': 5})
-    assert search(s, key, cursor=good)['status'] == 'queued'
-    for request_id, changes in (('synthetic-live-0002', {'limit': 10}), ('synthetic-live-0003', {'filter': 'voice'})):
-        with pytest.raises(APIError, match='invalid_cursor'):
-            search(s, key, request_id, cursor=good, **changes)
-    with pytest.raises(APIError, match='invalid_cursor'):
-        search(s, key, 'synthetic-live-0004', chat_id=chat('100'), cursor=good)
+    # The binding lives with the cursor in collector memory (test_live_search.py); the API checks the form.
+    assert search(s, key, cursor='synthetic_cursor_token_0001')['status'] == 'queued'
+    with pytest.raises(APIError):
+        search(s, key, 'synthetic-live-0002', cursor='not a cursor!')
+    assert queued(s) == 1
 
 
 # spec: ANYM-475

@@ -3,10 +3,8 @@
 Archive reads retain their existing passive contract. These operations run on the
 existing session owner with an independent key grant and account opt-in.
 """
-import base64
 from copy import deepcopy
 from datetime import datetime, timezone
-import hashlib
 import json
 import math
 import re
@@ -408,31 +406,11 @@ def timestamp(value):
 
 
 def live_cursor_binding(account, chat_id, parameters):
-    """Binds a live-search cursor to the account, operation, chat and every other normalized field."""
+    """The account, operation, chat and every other normalized field a live-search cursor was issued for.
+
+    The collector keeps it next to the cursor's position, so a caller cannot rewrite it."""
     fields = {k: v for k, v in parameters.items() if k != 'cursor'}
-    text = json.dumps([account, LIVE_SEARCH, chat_id or '', fields], sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(text.encode()).hexdigest()[:24]
-
-
-def encode_live_cursor(binding, position):
-    raw = json.dumps({'b': binding, **position}, sort_keys=True, separators=(',', ':')).encode()
-    return base64.urlsafe_b64encode(raw).decode().rstrip('=')
-
-
-def decode_live_cursor(value, binding):
-    """The position of a cursor bound to binding, else ValueError('invalid_cursor')."""
-    try:
-        data = json.loads(base64.urlsafe_b64decode(value + '=' * (-len(value) % 4)))
-        if not isinstance(data, dict) or data.get('b') != binding: raise ValueError
-        position = {k: data[k] for k in ('i', 'r', 'p') if k in data}
-        if type(position.get('i')) is not int or not 0 < position['i'] < 2**31: raise ValueError
-        if type(position.get('r', 0)) is not int or not 0 <= position.get('r', 0) < 2**31: raise ValueError
-        # The offset peer stays in the collector's memory; the cursor names it by a random token.
-        if 'p' in position and not (isinstance(position['p'], str) and re.fullmatch(r'[A-Za-z0-9_-]{16}', position['p'])):
-            raise ValueError
-        return position
-    except (ValueError, TypeError, UnicodeError):
-        raise ValueError('invalid_cursor') from None
+    return json.dumps([account, LIVE_SEARCH, chat_id or '', fields], sort_keys=True, ensure_ascii=False)
 
 
 def validate_operation(platform, operation, parameters, *, provider=None):

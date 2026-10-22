@@ -261,10 +261,6 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
             raise APIError('unsupported_operation')
         if provider=='whatsmeow' and (mode=='sticker' and mime!='image/webp' or
             mode in ('audio','voice','sticker') and parameters['caption']):raise APIError('unsupported_operation')
-    if operation==LIVE_SEARCH and 'cursor' in parameters:
-        from .messenger_operations import decode_live_cursor,live_cursor_binding
-        try:decode_live_cursor(parameters['cursor'],live_cursor_binding(account,chat_id,parameters))
-        except ValueError:raise APIError('invalid_cursor') from None
     _policy(c,account,operation,provider_chats,ready=ready)
     if operation=='open_chat_by_phone':_phone_policy(c,account,parameters['phone'])
     if operation=='join_chat':
@@ -638,8 +634,14 @@ class CommandWorker:
         if not job:return False
         if job.get('cancelled'):return True
         phases=[]
+        live=job['operation']==LIVE_SEARCH
+        # ANYM-475: one deadline from the claim bounds preflight, governor waits, the request and the receipt.
+        deadline=asyncio.get_running_loop().time()+LIVE_SEARCH_TIMEOUT
         try:
-            await asyncio.to_thread(self.preflight,job)
+            if not live:await asyncio.to_thread(self.preflight,job)
+            else:
+                try:await asyncio.wait_for(asyncio.to_thread(self.preflight,job),LIVE_SEARCH_TIMEOUT)
+                except TimeoutError:raise CommandRejected('provider_timeout') from None
             async def last_moment_preflight():
                 await asyncio.to_thread(self.preflight,job,verify_file=False)
             job['_preflight']=last_moment_preflight
@@ -648,11 +650,11 @@ class CommandWorker:
                 job['_archived']=archived
             # Providers report 'waiting' and then 'started' before the first mutation.
             job['_provider_phase']=phases.append
-            timeout=180 if job['operation']=='send_file' else LIVE_SEARCH_TIMEOUT if job['operation']==LIVE_SEARCH else 30
+            timeout=180 if job['operation']=='send_file' else max(0.0,deadline-asyncio.get_running_loop().time()) if live else 30
             try:answer=safe_result(await asyncio.wait_for(self.execute(job),timeout))
             except TimeoutError:
                 # A read changes nothing at the provider, so its timeout is a safe-to-repeat refusal.
-                if job['mutation'] or job['operation']!=LIVE_SEARCH:raise
+                if job['mutation'] or not live:raise
                 raise CommandRejected('provider_timeout') from None
             if isinstance(answer.get('data'),dict) and 'archive_reference' in answer['data']:
                 from .outgoing import archive_reference

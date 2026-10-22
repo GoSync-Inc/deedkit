@@ -9,10 +9,9 @@ from telethon import errors, functions, types
 
 from messaging_service.commands import CommandRejected, CommandWorker, LIVE_SEARCH_TIMEOUT
 from messaging_service.envelope import stable_id
-from messaging_service.messenger_operations import (ParameterError, decode_live_cursor, live_cursor_binding,
-                                                    validate_operation)
+from messaging_service.messenger_operations import ParameterError, live_cursor_binding, validate_operation
 from messaging_service.telegram_governor import LiveBudget, ProviderRateLimited, RequestGovernor
-from messaging_service.telegram_operations import CURSOR_PEERS, execute
+from messaging_service.telegram_operations import LIVE_CURSORS, execute
 
 SENTINEL = 'zebra-sentinel-query-7351'
 ACCOUNT = 'synthetic-telegram'
@@ -149,10 +148,6 @@ def test_hits_outside_the_policy_are_dropped_and_receipt_is_bounded():
     assert result['outcome'] == 'confirmed'
     data = result['data']
     assert 'EXCLUDED' not in repr(data) and '-1000000000009' not in repr(data)
-    import base64
-    import json
-    raw = json.loads(base64.urlsafe_b64decode(data['next_cursor'] + '=' * (-len(data['next_cursor']) % 4)))
-    assert isinstance(raw['p'], str) and ['h', 9, 8] not in raw.values()
     assert [h['provider_id'] for h in data['hits']] == ['1', '2']  # channel left out by default
     private, group = data['hits']
     assert private['chat'] == stable_id('chat', ACCOUNT, '11') and private['chat_type'] == 'private'
@@ -160,21 +155,106 @@ def test_hits_outside_the_policy_are_dropped_and_receipt_is_bounded():
     assert group['chat_type'] == 'group' and len(group['text']) == 300
     assert data['provider_total_approx'] == 120 and data['next_cursor']
     binding = live_cursor_binding(ACCOUNT, '', job({'limit': 4})['parameters'])
-    position = decode_live_cursor(data['next_cursor'], binding)
-    # The excluded chat's peer stays in collector memory, never in the agent-visible cursor.
-    assert position['i'] == 4 and position['r'] == 77 and CURSOR_PEERS[position['p']] == ['h', 9, 8]
+    # The excluded hit's message ID and chat stay in collector memory, never in the agent-visible cursor.
+    assert LIVE_CURSORS[data['next_cursor']] == (binding, {'i': 4, 'r': 77, 'p': ['h', 9, 8]})
     following = Client(page([]))
     run(following, job({'limit': 4, 'cursor': data['next_cursor']}))
     request = following.requests[0]
     assert request.offset_id == 4 and request.offset_rate == 77 and isinstance(request.offset_peer, types.InputPeerChannel)
     with pytest.raises(CommandRejected, match='invalid_cursor'):  # the same cursor with other fields
         run(Client(page([])), job({'limit': 5, 'cursor': data['next_cursor']}))
-    CURSOR_PEERS.clear()  # a collector restart forgets issued offset peers
+    LIVE_CURSORS.clear()  # a collector restart forgets issued cursors
     with pytest.raises(CommandRejected, match='invalid_cursor'):
         run(Client(page([])), job({'limit': 4, 'cursor': data['next_cursor']}))
     big = [message(types.PeerChat(22), n, '😀' * 300) for n in range(1, 51)]
     from messaging_service.commands import safe_result
     assert safe_result(run(Client(page(big)), job({'limit': 50})))  # fits the 60 KB result bound
+
+
+# spec: ANYM-475
+def test_cursor_is_an_opaque_token_bound_to_account_chat_and_fields():
+    import base64
+    excluded_only = [message(types.PeerChannel(9), 123456, 'EXCLUDED-SENTINEL')]
+    data = run(Client(page(excluded_only, count=9)), job({'limit': 1}))['data']
+    assert data['hits'] == [] and data['next_cursor']
+    decoded = base64.urlsafe_b64decode(data['next_cursor'] + '=' * (-len(data['next_cursor']) % 4))
+    assert b'123456' not in decoded and b'123456' not in data['next_cursor'].encode()
+    cursor = data['next_cursor']
+    other_account = dict(job({'limit': 1, 'cursor': cursor}), account='synthetic-other')
+    for rewritten in (job({'limit': 2, 'cursor': cursor}), job({'limit': 1, 'query': 'other', 'cursor': cursor}),
+                      job({'limit': 1, 'cursor': cursor}, chat='-22'), other_account,
+                      job({'limit': 1, 'cursor': cursor[:-1] + ('A' if cursor[-1] != 'A' else 'B')})):
+        client = Client(page([]))
+        with pytest.raises(CommandRejected, match='invalid_cursor'):
+            run(client, rewritten)
+        assert client.requests == [] and client.resolved == []
+    following = Client(page([]))
+    run(following, job({'limit': 1, 'cursor': cursor}))
+    assert following.requests[0].offset_id == 123456
+
+
+# spec: ANYM-475
+def test_global_page_without_next_rate_continues_from_the_last_date():
+    first = run(Client(page([message(types.PeerChat(22), 7, 'synthetic', when=1_799_990_000)], count=9)),
+                job({'limit': 1}))['data']
+    following = Client(page([]))
+    run(following, job({'limit': 1, 'cursor': first['next_cursor']}))
+    assert following.requests[0].offset_rate == 1_799_990_000 and following.requests[0].offset_id == 7
+
+
+# spec: ANYM-475
+def test_receipt_with_worst_case_names_fits_the_result_bound():
+    from messaging_service.commands import safe_result
+    from messaging_service.envelope import canonical
+    title = '\U0001F600' * 200
+    wide = types.Chat(22, title, None, 3, datetime.fromtimestamp(0, timezone.utc), 1)
+    person = types.User(11, access_hash=5, first_name=title, last_name=title)
+    response = types.messages.MessagesSlice(120, [message(types.PeerChat(22), n, '\U0001F600' * 300, sender=11)
+                                                 for n in range(1, 51)], [], [wide], [person])
+    result = run(Client(response), job({'limit': 50}))
+    assert len(result['data']['hits']) == 50 and safe_result(result) and len(canonical(result)) <= 60_000
+
+
+# spec: ANYM-475
+def test_slow_preflight_counts_against_the_live_deadline(monkeypatch):
+    import time
+    import messaging_service.commands as commands
+    finished = []
+    class Worker(CommandWorker):
+        def claim(self):return {'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}
+        def preflight(self, job, *, verify_file=True):time.sleep(0.2); return job
+        def finish(self, job, status, result=None, code=None):finished.append((status, result, code))
+    monkeypatch.setattr(commands, 'LIVE_SEARCH_TIMEOUT', 0.3)
+    async def hangs(job):await asyncio.sleep(60)
+    started = time.monotonic()
+    assert asyncio.run(Worker(SimpleNamespace(), hangs)._once())
+    assert time.monotonic() - started < 0.6
+    assert finished[-1] == ('failed', {'data': {'code': 'provider_timeout', 'retry': True}}, 'provider_timeout')
+    monkeypatch.setattr(commands, 'LIVE_SEARCH_TIMEOUT', 0.05)
+    started = time.monotonic()
+    asyncio.run(Worker(SimpleNamespace(), hangs)._once())  # a preflight past the whole deadline
+    assert finished[-1][2] == 'provider_timeout' and time.monotonic() - started < 0.5
+
+
+# spec: ANYM-475
+def test_budget_comes_from_collector_config_and_resets_at_utc_midnight(tmp_path):
+    from messaging_service import telegram_collector
+    assert telegram_collector.live_search_budget(None) == {'burst': 3, 'refill_seconds': 10, 'daily': 100}
+    assert telegram_collector.live_search_budget({'daily': 20}) == {'burst': 3, 'refill_seconds': 10, 'daily': 20}
+    for bad in ({'daily': 0}, {'burst': 11}, {'refill_seconds': 1.5}, {'other': 1}, [3]):
+        with pytest.raises(ValueError, match='invalid_live_search_budget'):
+            telegram_collector.live_search_budget(bad)
+    provider = telegram_collector.TelethonProvider(
+        {'session_file': str(tmp_path / 's.session'), 'live_search_budget': {'burst': 1, 'refill_seconds': 60, 'daily': 2}},
+        {'api_id': 1, 'api_hash': '0' * 32, 'expected_user_id': 1}, receive_updates=False)
+    clock = Clock(); provider.bind_state(State(clock))
+    budget = provider.governor.budgets['search']
+    assert (budget.burst, budget.refill, budget.daily) == (1, 60.0, 2)
+    daily = LiveBudget(3, 10.0, 2, clock=clock, wall=clock.time)
+    clock.wall = 86400 * 20000 - 30
+    assert daily.take(1) == 0 and daily.take(1) == 0 and 1 <= daily.take(1) <= 31
+    clock.advance(31)  # the next UTC day
+    assert daily.take(1) == 0
 
 
 # spec: ANYM-475

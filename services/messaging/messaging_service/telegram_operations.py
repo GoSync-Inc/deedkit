@@ -22,7 +22,7 @@ import time
 from telethon import errors, functions, types, utils
 
 from .envelope import canonical, stable_id
-from .messenger_operations import LIVE_SEARCH, decode_live_cursor, encode_live_cursor, live_cursor_binding
+from .messenger_operations import LIVE_SEARCH, live_cursor_binding
 
 log = logging.getLogger('anymsg.live_search')
 
@@ -1095,10 +1095,10 @@ LIVE_FILTERS = {'documents': types.InputMessagesFilterDocument, 'photos': types.
                 'links': types.InputMessagesFilterUrl, 'voice': types.InputMessagesFilterVoice}
 LIVE_FLAGS = {'private': 'users_only', 'group': 'groups_only', 'channel': 'broadcasts_only'}
 LIVE_TEXT = 300
-# Offset peers of issued global-search cursors. In memory and bounded: the peer may be a
-# chat the policy excludes, so it never appears in an agent-visible cursor.
-CURSOR_PEERS = {}
-CURSOR_PEERS_MAX = 1024
+# Issued cursors: random token -> (binding, position). In memory and bounded: the position may
+# name a message or chat the policy excludes, so an agent sees only the token.
+LIVE_CURSORS = {}
+LIVE_CURSORS_MAX = 1024
 LIVE_RECEIPT_BYTES = 56000
 
 
@@ -1129,20 +1129,26 @@ def cursor_peer(entity):
     return None
 
 
-def remember_peer(value):
-    token = secrets.token_urlsafe(12)
-    CURSOR_PEERS[token] = value
-    while len(CURSOR_PEERS) > CURSOR_PEERS_MAX:
-        CURSOR_PEERS.pop(next(iter(CURSOR_PEERS)))
+def remember_cursor(binding, position):
+    token = secrets.token_urlsafe(16)
+    LIVE_CURSORS[token] = (binding, position)
+    while len(LIVE_CURSORS) > LIVE_CURSORS_MAX:
+        LIVE_CURSORS.pop(next(iter(LIVE_CURSORS)))
     return token
 
 
-def input_offset_peer(token):
-    if token is None:
+def recall_cursor(token, binding):
+    """The position of a cursor issued for exactly this binding; unknown (restart) or other: invalid_cursor."""
+    entry = LIVE_CURSORS.get(token) if isinstance(token, str) else None
+    if entry is None or entry[0] != binding:
+        reject('invalid_cursor')
+    return dict(entry[1])
+
+
+def input_offset_peer(value):
+    if value is None:
         return types.InputPeerEmpty()
-    if token not in CURSOR_PEERS:
-        reject('invalid_cursor')  # issued before a collector restart
-    kind, number, access_hash = CURSOR_PEERS[token]
+    kind, number, access_hash = value
     return {'u': lambda: types.InputPeerUser(number, access_hash), 'c': lambda: types.InputPeerChat(number),
             'h': lambda: types.InputPeerChannel(number, access_hash)}[kind]()
 
@@ -1172,12 +1178,8 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
         reject('invalid_parameters')
     account, chat_id = job.get('account'), job.get('chat_id') or ''
     chat = number_id(job.get('provider_chat'), marked=True) if chat_id else None
-    position = {}
-    if 'cursor' in parameters:
-        try:
-            position = decode_live_cursor(parameters['cursor'], live_cursor_binding(account, chat_id, parameters))
-        except ValueError:
-            reject('invalid_cursor')
+    binding = live_cursor_binding(account, chat_id, parameters)
+    position = recall_cursor(parameters['cursor'], binding) if 'cursor' in parameters else {}
     if chat is not None:
         referenced_peers.add(str(chat))
     else:
@@ -1258,22 +1260,23 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
         last = raw[-1]
         place = {'i': last.id}
         if chat is None:
-            place.update(r=getattr(response, 'next_rate', None) or 0,
+            # Without next_rate Telegram continues from the last returned message's date.
+            place.update(r=getattr(response, 'next_rate', None) or (int(last.date.timestamp()) if last.date else 0),
                          p=cursor_peer(entities.get(str(utils.get_peer_id(last.peer_id)))))
-            if place['p'] is None:
-                place.pop('p')
-            else:
-                place['p'] = remember_peer(place['p'])
-        next_cursor = encode_live_cursor(live_cursor_binding(account, chat_id, parameters), place)
+        next_cursor = remember_cursor(binding, place)
     total = getattr(response, 'count', None)
     result = {'outcome': 'confirmed', 'hits': hits, 'next_cursor': next_cursor,
               'provider_total_approx': total if type(total) is int else len(raw), 'basis': 'live_provider_search'}
     width = LIVE_TEXT
-    while len(canonical(result)) > LIVE_RECEIPT_BYTES and width > 20:
-        # Bound the receipt (commands.py safe_result: 60 KB) by shortening texts, never by dropping hits.
+    while len(canonical(result)) > LIVE_RECEIPT_BYTES and width:
+        # Bound the receipt (commands.py safe_result: 60 KB) by shortening every free-text field, never by
+        # dropping hits: the fixed fields of 50 hits stay far below the bound, so width 0 always fits.
         width //= 2
         for hit in hits:
             hit['text'] = hit['text'][:width]
+            for holder, field in ((hit, 'chat_title'), (hit['sender'], 'name')):
+                if holder[field]:
+                    holder[field] = holder[field][:width]
     counts['returned'] = len(hits)
     finish('done')
     return result

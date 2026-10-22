@@ -22,7 +22,7 @@ from .blobs import BlobWriter
 from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,session_lock
 from .spool import InvalidCapture
 from .store import Store
-from .telegram_governor import ProviderRateLimited,RequestGovernor
+from .telegram_governor import LIVE_BUDGETS,ProviderRateLimited,RequestGovernor
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .storage_admission import MEDIA_RESERVE_BYTES
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy,validate_prefetch_days
@@ -64,7 +64,7 @@ def configuration(path):
     cfg=private_json(path)
     fields={'enabled','account','credentials_file','session_file','permit_file','spool_directory',
             'batch_size','scan_interval_seconds','max_media_bytes','disk_reserve_bytes',
-            'max_dialogs','history_since','media_backfill'}|MEDIA_POLICY_FIELDS
+            'max_dialogs','history_since','media_backfill','live_search_budget'}|MEDIA_POLICY_FIELDS
     if not isinstance(cfg,dict) or set(cfg)-fields: raise ValueError('invalid_collector_config')
     if cfg.get('enabled') is not True: raise RuntimeError('collector_disabled')
     if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',cfg.get('account','')): raise ValueError('invalid_account')
@@ -82,6 +82,7 @@ def configuration(path):
     if maximum is not None and (type(maximum) is not int or not 1<=maximum<=10000):
         raise ValueError('invalid_max_dialogs')
     cfg['history_since']=history_bound(cfg.get('history_since'))
+    cfg['live_search_budget']=live_search_budget(cfg.get('live_search_budget'))
     auth=private_json(cfg['credentials_file']); permit=private_json(cfg['permit_file'])
     if not isinstance(auth,dict) or set(auth)!={'api_id','api_hash','expected_user_id'}:
         raise ValueError('invalid_telegram_credentials')
@@ -92,6 +93,17 @@ def configuration(path):
     if not isinstance(permit,dict) or permit.get('account')!=cfg['account'] or permit.get('expected_user_id')!=auth['expected_user_id'] or permit.get('prior_clients_stopped') is not True:
         raise RuntimeError('session_handover_not_confirmed')
     return cfg,auth
+
+
+def live_search_budget(value):
+    """ANYM-475: per-account live-search limits {burst, refill_seconds, daily}; omitted keys keep the defaults."""
+    burst,refill,daily=LIVE_BUDGETS['search']
+    if value is None: return {'burst':burst,'refill_seconds':int(refill),'daily':daily}
+    if not isinstance(value,dict) or set(value)-{'burst','refill_seconds','daily'}: raise ValueError('invalid_live_search_budget')
+    result={'burst':value.get('burst',burst),'refill_seconds':value.get('refill_seconds',int(refill)),'daily':value.get('daily',daily)}
+    for key,lo,hi in [('burst',1,10),('refill_seconds',1,3600),('daily',1,10000)]:
+        if type(result[key]) is not int or not lo<=result[key]<=hi: raise ValueError('invalid_live_search_budget')
+    return result
 
 
 def history_bound(value):
@@ -127,8 +139,10 @@ class TelethonProvider:
         self.expected_user_id=auth['expected_user_id']
         self.verified_self=None
         self.governor=None
+        budget=cfg.get('live_search_budget') or live_search_budget(None)
+        self.live_budgets={'search':(budget['burst'],float(budget['refill_seconds']),budget['daily'])}
 
-    def bind_state(self,state): self.governor=RequestGovernor(state)
+    def bind_state(self,state): self.governor=RequestGovernor(state,budgets=self.live_budgets)
 
     async def rpc(self,operation,phase):
         governor=getattr(self,'governor',None)

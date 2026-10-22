@@ -323,21 +323,28 @@ gateway, the `search_messages_live` action grant. It writes nothing to the archi
   dropped. A long receipt shortens hit texts, never drops hits.
 - Paging: one provider request per call, never automatic. Pass `next_cursor` with
   the same account, `chat_id` and parameters; any other combination gets
-  `invalid_cursor`. A cursor names its offset chat by a token kept in collector
-  memory, so it stops working after a collector restart.
+  `invalid_cursor` before any provider request. The cursor is a random token; its
+  position and binding stay in collector memory, so it reveals no message or chat
+  and stops working after a collector restart.
 - Budget per account: 3 requests at once, then one per 10 seconds, 100 per UTC
-  day. Over it the call fails with `rate_limited` and `result.data.retry_after`
-  before any provider request. The budget lives in memory; a collector restart
-  resets it.
+  day; a chat search counts its chat lookup too. The collector configuration key
+  `live_search_budget` (`burst` 1-10, `refill_seconds` 1-3600, `daily` 1-10000)
+  overrides the defaults. Over it the call fails with `rate_limited` and
+  `result.data.retry_after` before any provider request. The budget lives in
+  memory; a collector restart resets it.
 - FloodWait: a wait of up to 3600 seconds pauses only live search on that account;
   sends and collection go on. A longer wait, or another 420 answer, pauses the
   account like any FloodWait.
-- Failures: without a running session `session_unavailable`; past 15 seconds
+- Failures: without a running session `session_unavailable`; 15 seconds after the
+  collector claims it (checks, waits, request and receipt together)
   `provider_timeout`. Both are safe to repeat with a new request ID.
 - Data: the query goes only to Telegram. The operation row keeps the parameters
   and the receipt like every other operation, so both reach backups. The log line
   `live_search` holds counts, duration and FloodWait seconds, never the query or
-  hits.
+  hits. Telethon caches the chats and users of every answer (IDs, access hashes,
+  names, usernames, phones Telegram returns) in the session file, excluded chats
+  included, as for any other request; the session file and its backups already
+  hold such data.
 
 Roll out the API and collectors first, then the gateway, then the policy that
 names the action: an older gateway rejects a policy with an unknown action. Roll
