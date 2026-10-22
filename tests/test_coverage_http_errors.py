@@ -41,7 +41,7 @@ def test_unexpected_http_failures_have_one_safe_response_and_one_capture(channel
         def audit_boundary(self, code):
             audits.append(code)
 
-        def capabilities(self, token):
+        def capabilities(self, token, detail='full', sections=None):
             calls.append('capabilities')
             raise failure
 
