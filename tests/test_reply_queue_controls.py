@@ -455,6 +455,12 @@ def test_due_group_snooze_reads_only_messages_since_its_hint(inbox, view):
         c.execute('SET LOCAL enable_seqscan=off')
         measured = QueueMeasured(c)
         page = list_chats(s, measured, p, awaiting_reply=True, include_coverage=False, view=view)
+    def heavy(node):
+        own = [{k: node.get(k) for k in ('Node Type', 'Index Name', 'Index Cond', 'Recheck Cond', 'Filter',
+            'Actual Rows', 'Rows Removed by Filter', 'Actual Loops')}] if node.get('Relation Name') == 'messages' and visited(
+            {**node, 'Plans': []}, {'messages'}) >= 50 else []
+        return own+sum((heavy(child) for child in node.get('Plans', [])), [])
+    print(heavy(measured.plans[0]['Plan']))
     assert page['items'] == []
     # The due snooze moves the bound back to its own hint, never over the older history.
     assert visited(measured.plans[0]['Plan'], {'messages'}) < 100, scans(measured.plans[0]['Plan'])
