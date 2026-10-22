@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import stat
+from psycopg.errors import CheckViolation
 from psycopg.types.json import Jsonb
 
 from .operational import CAPTURE_STOP_DETAILS,OVERLOAD_STOP_DETAILS,CONNECTION_ERRORS,TERMINAL,PHASE_STATES,PHASE_REASONS
@@ -197,6 +198,15 @@ class CollectorState:
             'WHERE account=%s FOR UPDATE',(self.account,)).fetchone()
 
     def _save_operations(self,c,value):
+        if 'identity' in value:
+            # The optional verified ID never costs a phase write its 16 KiB budget
+            # (018): over the limit the row is saved without it (ANYM-SPEC).
+            try:
+                with c.transaction():
+                    c.execute('UPDATE collector_health SET operations=%s,updated_at=clock_timestamp() WHERE account=%s',
+                        (Jsonb(value),self.account))
+                return
+            except CheckViolation:value.pop('identity')
         c.execute('UPDATE collector_health SET operations=%s,updated_at=clock_timestamp() WHERE account=%s',
             (Jsonb(value),self.account))
 

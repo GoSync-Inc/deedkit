@@ -141,3 +141,117 @@ def test_providers_report_only_the_identity_they_verified(tmp_path):
     whatsapp.process = SimpleNamespace(returncode=None)
     whatsapp.started = True
     assert whatsapp.self_provider_id() == '15550000001@c.us'
+
+
+def health(store, account):
+    with store.pool.connection() as c:
+        return c.execute('SELECT operations,octet_length(operations::text) AS size FROM collector_health '
+            'WHERE account=%s', (account,)).fetchone()
+
+
+def lease_state(store, account, owner):
+    archive = Archive(store)
+    archive.register(account, 'telegram', 'Synthetic '+account, discover=True)
+    return CollectorState(archive, account, (owner, archive.acquire(account, owner)))
+
+
+def set_operations(store, account, expression, *args):
+    with store.pool.connection() as c:
+        c.execute('UPDATE collector_health SET operations='+expression+' WHERE account=%s', (*args, account))
+
+
+# spec: ANYM-SPEC
+def test_whatsmeow_provider_reports_the_verified_id_like_the_webjs_provider(tmp_path):
+    from messaging_service.whatsapp_collector import WhatsmeowProvider
+    native = WhatsmeowProvider({'expected_wid': '15550000001@c.us', 'native_executable': str(tmp_path/'native')},
+        tmp_path/'config.json', -1)
+    assert native.self_provider_id() is None
+    native.process, native.started = SimpleNamespace(returncode=None), True
+    assert native.self_provider_id() == '15550000001@c.us'
+    native.process = SimpleNamespace(returncode=1)
+    assert native.self_provider_id() is None
+
+
+# spec: ANYM-SPEC
+def test_a_reconnect_rewrites_the_same_id_and_a_failed_identity_check_keeps_the_last_verified_one(seeded):
+    store, token, _ = seeded
+    state = lease_state(store, 'telegram-demo', 'fixture')
+    state.phase('connection', 'connected', 'provider_ready', self_provider_id='123456789')
+    first = health(store, 'telegram-demo')['operations']['identity']
+    state.phase('connection', 'connected', 'provider_ready', self_provider_id='123456789')
+    second = health(store, 'telegram-demo')['operations']['identity']
+    assert first['self_provider_id'] == second['self_provider_id'] == '123456789'
+    assert second['verified_at'] >= first['verified_at']
+    # A mismatch never reaches the connected phase; the ID stays the last verified one.
+    state.connection_failed('telegram_identity_mismatch')
+    assert accounts(store.capabilities(token))['telegram-demo'] == '123456789'
+
+
+# spec: ANYM-SPEC
+def test_a_collector_that_lost_its_lease_cannot_write_an_id(seeded):
+    store, token, _ = seeded
+    stale = lease_state(store, 'telegram-demo', 'old-owner')
+    stale.phase('connection', 'connected', 'provider_ready', self_provider_id='123456789')
+    with store.pool.connection() as c:
+        c.execute("UPDATE collector_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE account=%s",
+            ('telegram-demo',))
+    Archive(store).acquire('telegram-demo', 'new-owner')
+    with pytest.raises(Exception):
+        stale.phase('connection', 'connected', 'provider_ready', self_provider_id='987654321')
+    assert accounts(store.capabilities(token))['telegram-demo'] == '123456789'
+
+
+def pad_to(store, account, target):
+    """Grow operations with a synthetic diagnostic key until its text is `target` bytes."""
+    set_operations(store, account, "operations-'padding'")
+    size = health(store, account)['size']
+    set_operations(store, account, "operations||jsonb_build_object('padding',repeat('x',%s))",
+        target-size-len(', "padding": ""'))
+    assert health(store, account)['size'] == target
+
+
+# spec: ANYM-SPEC
+def test_near_the_16_kib_limit_the_connect_is_saved_without_the_id(seeded):
+    store, token, _ = seeded
+    state = lease_state(store, 'telegram-demo', 'fixture')
+    state.phase('connection', 'connected', 'provider_ready')
+    pad_to(store, 'telegram-demo', 16384-8)
+    # The same phase write without an ID still fits; the ID would push it over the limit.
+    state.phase('connection', 'connected', 'provider_ready', self_provider_id='123456789')
+    row = health(store, 'telegram-demo')
+    assert row['operations']['connection']['state'] == 'connected' and 'identity' not in row['operations']
+    assert accounts(store.capabilities(token))['telegram-demo'] is None
+
+
+# spec: ANYM-SPEC
+def test_a_stored_id_never_makes_a_later_phase_write_fail(seeded):
+    store, token, _ = seeded
+    state = lease_state(store, 'telegram-demo', 'fixture')
+    state.phase('connection', 'connected', 'provider_ready', self_provider_id='123456789')
+    pad_to(store, 'telegram-demo', 16384-2)
+    # 'connecting'/'collector_starting' is 5 bytes longer than 'connected'/'provider_ready':
+    # over the 2 spare bytes with the stored ID, well within the limit without it.
+    state.phase('connection', 'connecting', 'collector_starting')
+    row = health(store, 'telegram-demo')
+    assert row['operations']['connection']['state'] == 'connecting' and 'identity' not in row['operations']
+    assert accounts(store.capabilities(token))['telegram-demo'] is None
+
+
+# spec: ANYM-SPEC
+@pytest.mark.parametrize('stored', ['{"self_provider_id": 123456789}', '{"self_provider_id": {"id": "1"}}',
+    '"123456789"', '{"self_provider_id": "15550000001@c.us"}'])
+def test_a_malformed_stored_id_reads_as_null(seeded, stored):
+    store, token, _ = seeded
+    lease_state(store, 'telegram-demo', 'fixture').phase('connection', 'connected', 'provider_ready')
+    set_operations(store, 'telegram-demo', "jsonb_set(operations,'{identity}',%s::jsonb)", stored)
+    assert accounts(store.capabilities(token))['telegram-demo'] is None
+
+
+# spec: ANYM-SPEC
+def test_two_keys_of_one_principal_each_see_their_own_expiry(seeded):
+    store, _, _ = seeded
+    short = store.issue_key('agent-c', ['telegram-demo'], days=3)
+    long = store.issue_key('agent-c', ['telegram-demo'], days=20)
+    assert store.capabilities(short)['expires_at'] == key_expiry(store, short)
+    assert store.capabilities(long)['expires_at'] == key_expiry(store, long)
+    assert store.capabilities(short)['expires_at'] < store.capabilities(long)['expires_at']
