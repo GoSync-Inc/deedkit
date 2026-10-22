@@ -285,9 +285,10 @@ cannot predate the latest incoming message. It is fresh for five minutes, or, si
 schema 42 (ANYM-275), for up to 24 hours while continuity is proven: the collector's
 receiving period began before the snapshot under the same lease epoch, that lease is
 unexpired, the capture heartbeat is under a minute old, the live capture spool is
-drained and no provider update gap (a whatsmeow app-state sync error) was recorded
-since. A restart, disconnect, takeover or expired lease starts over, and the
-five-minute rule applies. A later owner read arrives as a passive event and
+drained and no update gap was recorded since: a whatsmeow app-state sync error,
+disconnect or reconnect, a Telethon auto-reconnect, a failed read-state write, or a
+newly quarantined or invalid capture. A restart, disconnect, takeover or expired
+lease starts over, and the five-minute rule applies. A later owner read arrives as a passive event and
 replaces the snapshot, so a continuously received snapshot stays true.
 Telegram's inbox boundary can establish `read_by_owner` for the hinted message;
 inbox read updates flow through the existing durable collector. WhatsApp keeps each
@@ -296,8 +297,9 @@ passive source apart (`read_state_basis`): the owner's app-state mark-read
 sets `read_state_marked_unread`; a history-sync `unreadCount`
 (`whatsapp_history_sync`) is stamped no later than the conversation's newest
 message; an own-device read receipt (`whatsapp_owner_receipt`) is evidence for
-exactly the listed messages, so `read_by_owner` is true for the hinted message only
-when the receipt names it. A receipt never sets or adjusts a count: one newer than
+exactly the listed messages (resolved through the session's local LID/phone
+mapping), so `read_by_owner` is true for the hinted message only when the receipt
+names it. A receipt never sets or adjusts a count: one newer than
 the count's baseline turns it into null with `read_state_count_basis:
 stale_since_baseline`, and receipts alone give `partial`. whatsapp-web.js uses
 cached chat counts from catalog scans. There is no extra account session,
