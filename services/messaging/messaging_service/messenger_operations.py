@@ -53,6 +53,17 @@ LIVE_SEARCH_LIMITATION = ('Telegram only. Searches Telegram itself: an empty cha
     '3 requests at once, then one per 10 s, 100 per UTC day (in memory; a collector restart resets them); over it, '
     'rate_limited with retry_after. Hits in chats the collection policy excludes are dropped. Writes nothing to the '
     'archive.')
+HISTORY = 'request_chat_history'
+TELEGRAM_HISTORY_LIMITATION = ('Telegram: one provider page of this archived chat, 1-100 messages (default 50), at '
+    'one anchor: before_message (exclusive; default the oldest archived message, so a repeat goes further back), '
+    'around_message (about half before, half after it) or from_time (inclusive) / to_time (exclusive), newest first. '
+    'Messages are archived as backfill; the receipt has fetched and stored_new counts. Per account 3 requests at '
+    'once, then one per 10 s, 300 per UTC day (in memory; a collector restart resets them); over it, rate_limited '
+    'with retry_after.')
+TELEGRAM_HISTORY_FIELDS = {
+    'count': _field('integer', default=50, minimum=1, maximum=100),
+    'before_message': _field('message_id'), 'around_message': _field('message_id'),
+    'from_time': _field('timestamp'), 'to_time': _field('timestamp')}
 LIVE_CHAT_TYPES = ('private', 'group', 'channel')
 LIVE_FILTERS = ('documents', 'photos', 'links', 'voice')
 BATCH_LIMITATION = ('One row per ID: applied, refused, unknown or not_attempted; an uncertain ID is never retried.')
@@ -147,7 +158,7 @@ OPERATIONS = {
     'block_contact': _spec('contacts-manage', 'account', mutation=True, full_account=True, fields=_user),
     'unblock_contact': _spec('contacts-manage', 'account', mutation=True, full_account=True, fields=_user),
     'update_profile': _spec('profile-manage', 'account', mutation=True, full_account=True),
-    'request_chat_history': _spec('read-live', mutation=True, platforms=('whatsapp',),
+    HISTORY: _spec('read-live', mutation=True, platforms=('whatsapp', 'telegram'),
         fields={'count':_field('integer',default=50,minimum=1,maximum=50)},
         limitation='Native only: explicit phone history request, at most 50 messages and one per account per minute; partial history is not guaranteed.'),
     LIVE_SEARCH: _spec('read-live', platforms=('telegram',), fields={
@@ -168,10 +179,14 @@ OPERATIONS = {
 }
 
 
-def operation_spec(name):
+def operation_spec(name, platform=None):
     if not isinstance(name, str) or name not in OPERATIONS:
         raise ValueError('unsupported_operation')
-    return deepcopy(OPERATIONS[name])
+    spec = deepcopy(OPERATIONS[name])
+    if name == HISTORY and platform == 'telegram':
+        # ANYM-477: Telegram answers at once and changes nothing at the provider; WhatsApp asks the phone.
+        spec.update(mutation=False, limitation=TELEGRAM_HISTORY_LIMITATION)
+    return spec
 
 
 # Address book and label operations need a verified provider-side equivalent.
@@ -192,6 +207,8 @@ def _supported(platform, name, spec, provider=None):
 
 
 def _fields(platform, name, spec):
+    if platform == 'telegram' and name == HISTORY:
+        return TELEGRAM_HISTORY_FIELDS
     if platform == 'telegram' and name == 'pin_message':
         return {}  # Telegram pins have no expiry parameter.
     if name == 'send_contact':
@@ -219,7 +236,8 @@ def operation_manifest(platform, *, provider=None):
     if platform not in ('telegram', 'whatsapp'):
         raise ValueError('unsupported_platform')
     rows = []
-    for name, spec in sorted(OPERATIONS.items()):
+    for name in sorted(OPERATIONS):
+        spec = operation_spec(name, platform)
         row = {k: deepcopy(v) for k, v in spec.items() if k not in ('fields', 'platforms')}
         row.update(operation=name, supported=_supported(platform, name, spec, provider),
                    parameters_schema=_schema(platform, _fields(platform, name, spec)))
@@ -414,7 +432,7 @@ def live_cursor_binding(account, chat_id, parameters):
 
 
 def validate_operation(platform, operation, parameters, *, provider=None):
-    spec = operation_spec(operation)
+    spec = operation_spec(operation, platform)
     if not _supported(platform, operation, spec, provider): raise ValueError('unsupported_operation')
     if parameters is None: parameters = {}
     if not isinstance(parameters, dict): raise ParameterError(field_error('parameters', 'type', 'object'))
@@ -452,4 +470,13 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     if operation == LIVE_SEARCH and 'from_time' in output and 'to_time' in output and (
             datetime.fromisoformat(output['from_time']) >= datetime.fromisoformat(output['to_time'])):
         raise ParameterError(field_error('to_time', 'minimum', 'later than from_time'))
+    if operation == HISTORY and platform == 'telegram':
+        anchors = [k for k in ('before_message', 'around_message') if k in output]
+        anchors += ['from_time'] if 'from_time' in output or 'to_time' in output else []
+        if len(anchors) > 1:
+            raise ParameterError(field_error(anchors[1], 'unique',
+                'at most one of before_message, around_message or from_time/to_time'))
+        if 'from_time' in output and 'to_time' in output and (
+                datetime.fromisoformat(output['from_time']) >= datetime.fromisoformat(output['to_time'])):
+            raise ParameterError(field_error('to_time', 'minimum', 'later than from_time'))
     return output

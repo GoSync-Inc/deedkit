@@ -111,6 +111,9 @@
   "rename_group": [
     "groups-manage"
   ],
+  "request_chat_history": [
+    "read-live"
+  ],
   "revoke_invite_link": [
     "groups-manage"
   ],

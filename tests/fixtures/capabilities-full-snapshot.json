@@ -164,7 +164,7 @@
   "supported_by_account": {
    "telegram-demo": {
     "available_operations": [],
-    "count": 50,
+    "count": 51,
     "operations": [
      "add_contact",
      "add_participant",
@@ -199,6 +199,7 @@
      "reject_join_requests",
      "remove_participant",
      "rename_group",
+     "request_chat_history",
      "revoke_invite_link",
      "search_messages_live",
      "send_contact",
@@ -273,7 +274,7 @@
    }
   },
   "supported_count_by_platform": {
-   "telegram": 50,
+   "telegram": 51,
    "whatsapp": 45
   },
   "tools": [

@@ -143,7 +143,7 @@ class TelethonProvider:
         self.verified_self=None
         self.governor=None
         budget=cfg.get('live_search_budget') or live_search_budget(None)
-        self.live_budgets={'search':(budget['burst'],float(budget['refill_seconds']),budget['daily'])}
+        self.live_budgets={**LIVE_BUDGETS,'search':(budget['burst'],float(budget['refill_seconds']),budget['daily'])}
 
     def bind_state(self,state):
         self.governor=RequestGovernor(state,budgets=getattr(self,'live_budgets',None))
@@ -978,19 +978,38 @@ class TelegramCollector:
 
     async def execute_operation(self,job):
         job['_policy']=await asyncio.to_thread(self.state.policy)
+        if job.get('operation')=='request_chat_history': return await self.chat_history(job)
         if job.get('operation')!='search_messages_live': return await self.provider.execute_operation(job)
         job['_live_hits']=found=[]
         answer=await self.provider.execute_operation(job)
         await self.store_live_hits(found)
         return answer
 
-    async def store_live_hits(self,found):
+    async def chat_history(self,job):
+        """ANYM-477: one agent-requested history page, archived as live search hits are; stored_new counts new rows."""
+        parameters=job.get('parameters') or {}
+        if not any(k in parameters for k in ('before_message','around_message','from_time','to_time')):
+            # The default anchor is the oldest archived message, so each repeat reaches further back.
+            job['provider_message_id']=await asyncio.to_thread(self.oldest_archived,job.get('chat_id'))
+        job['_history']=found=[]
+        answer=await self.provider.execute_operation(job)
+        created=await self.store_live_hits(found,label='chat_history')
+        if isinstance(answer.get('data'),dict): answer['data']['stored_new']=created
+        return answer
+
+    def oldest_archived(self,chat):
+        with self.state.archive.store.pool.connection() as c:
+            row=c.execute('''SELECT provider_id FROM messages WHERE account=%s AND chat=%s
+                ORDER BY length(provider_id),provider_id LIMIT 1''',(self.account,chat)).fetchone()
+        return row['provider_id'] if row else None
+
+    async def store_live_hits(self,found,*,label='live_search'):
         """ANYM-476: archive live search hits as backfill through the history page commit's archive apply.
 
         No spool: a hit that cannot be stored is reported in its receipt and is not replayed, so it never
         reaches the drain loop, fails the search or stops the collector. A rerun stores it again.
-        Checkpoints and coverage stay with the history traversal."""
-        stored=skipped=failed=0
+        Checkpoints and coverage stay with the history traversal. Returns the number of new messages."""
+        stored=skipped=failed=created=0
         for message,hit,chat_type,title in found:
             if message is not None and not self.in_window([message]):
                 hit.update(stored=False,reason='outside_history_window'); skipped+=1; continue
@@ -1003,11 +1022,13 @@ class TelegramCollector:
                     verified_self=getattr(self.provider,'verified_self',None))
                 outcome=(await asyncio.to_thread(self.state.apply,{'kind':'message','peer_kind':kind,'envelope':e}))['outcome']
             except Exception as exc:
-                log.warning('live_search_store_failed error=%s',type(exc).__name__)
+                log.warning('%s_store_failed error=%s',label,type(exc).__name__)
             if outcome in (None,'excluded'):
                 hit.update(stored=False,reason='not_stored'); failed+=1; continue
             hit.update(stored=True,message_id=stable_id('msg',self.account,chat,str(message.id))); stored+=1
-        if found: log.info('live_search_store stored=%d outside_window=%d not_stored=%d',stored,skipped,failed)
+            created+=outcome=='created'
+        if found: log.info('%s_store stored=%d outside_window=%d not_stored=%d',label,stored,skipped,failed)
+        return created
 
     async def send_outgoing(self,job):
         receipt=await self.provider.send_text(job)

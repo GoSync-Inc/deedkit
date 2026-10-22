@@ -22,9 +22,10 @@ import time
 from telethon import errors, functions, types, utils
 
 from .envelope import canonical, stable_id
-from .messenger_operations import LIVE_SEARCH, live_cursor_binding
+from .messenger_operations import HISTORY, LIVE_SEARCH, live_cursor_binding
 
 log = logging.getLogger('anymsg.live_search')
+history_log = logging.getLogger('anymsg.chat_history')
 
 
 MAX_ORIGINAL_BYTES = 32 * 1024 * 1024
@@ -32,7 +33,7 @@ MAX_PROFILE_PAGE = 50
 READ_OPERATIONS = frozenset({
     'chat_info', 'list_participants', 'get_reactions', 'get_message_info',
     'list_topics', 'get_profile', 'list_contacts', 'get_contact', 'list_blocked',
-    'get_invite_link', 'check_chat_link', LIVE_SEARCH,
+    'get_invite_link', 'check_chat_link', LIVE_SEARCH, HISTORY,
 })
 PARAMETERS = {
     'chat_info': set(), 'list_participants': {'limit', 'offset'},
@@ -61,6 +62,7 @@ PARAMETERS = {
     'approve_join_requests': {'user_ids'}, 'reject_join_requests': {'user_ids'},
     'check_chat_link': {'link'}, 'join_chat': {'link'},
     LIVE_SEARCH: {'query', 'chat_types', 'filter', 'from_time', 'to_time', 'limit', 'cursor'},
+    HISTORY: {'count', 'before_message', 'around_message', 'from_time', 'to_time'},
 }
 # ANYM-242: each setter owns one value; the default rights flag it changes, or slow mode.
 GROUP_SETTERS = {'set_group_messages_admins_only': ('messages_admins_only', 'enabled', 'send_messages'),
@@ -485,6 +487,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         if operation == LIVE_SEARCH:
             return await live_search(client, job, parameters, governor, rpc, allowed_provider_id,
                                      referenced_peers, check_policy)
+        if operation == HISTORY:
+            return await chat_history(client, job, parameters, governor, rpc, referenced_peers, check_policy)
 
         account_only = {'list_contacts', 'list_blocked', 'get_contact', 'get_profile',
                         'add_contact', 'delete_contact', 'block_contact', 'unblock_contact',
@@ -1289,6 +1293,98 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
                 if holder[field]:
                     holder[field] = holder[field][:width]
     counts['returned'] = len(hits)
+    finish('done')
+    return result
+
+
+async def chat_history(client, job, parameters, governor, rpc, referenced_peers, check_policy):
+    """ANYM-477: one governed history page of one archived chat at one anchor.
+
+    The backend resolved an explicit anchor to provider_message_id and the collector the default
+    one (the oldest archived message; none in an empty chat, which starts from the newest). The
+    messages go to the collector (job['_history']) for the archive; the receipt has counts only."""
+    from .commands import CommandRejected
+    from .telegram_governor import ProviderRateLimited
+    count = integer(parameters.get('count', 50), 1, 100)
+    around, timed = 'around_message' in parameters, 'from_time' in parameters or 'to_time' in parameters
+    if ('before_message' in parameters) + around + timed > 1:
+        reject('invalid_parameters')
+    try:
+        since, until = utc_seconds(parameters.get('from_time')), utc_seconds(parameters.get('to_time'))
+    except (TypeError, ValueError):
+        reject('invalid_parameters')
+    chat = number_id(job.get('provider_chat'), marked=True)
+    anchor = 0 if timed or not job.get('provider_message_id') else number_id(job['provider_message_id'])
+    if (around or 'before_message' in parameters) and not anchor:
+        reject('invalid_parameters')
+    referenced_peers.add(str(chat))
+    check_policy()
+    started, counts = time.monotonic(), {'fetched': 0, 'flood_wait_s': 0}
+
+    def finish(state):
+        history_log.info('chat_history state=%s fetched=%d flood_wait_s=%d duration_ms=%d', state, counts['fetched'],
+                         counts['flood_wait_s'], int((time.monotonic() - started) * 1000))
+
+    def limited(seconds, state):
+        finish(state)
+        raise CommandRejected('rate_limited', retry_after=max(1, int(seconds)))
+
+    if governor is not None:
+        # Entity resolution and the page: both are counted before any provider call.
+        wait = await governor.admit('chat_history', 2)
+        if wait:
+            limited(wait, 'refused')
+    # Telegram returns messages older than offset_id or sent before offset_date (whole seconds), newest first.
+    offset_date = datetime.fromtimestamp(math.ceil(until), timezone.utc) if until is not None else None
+    try:
+        peer = await rpc(lambda: client.get_input_entity(chat), scope='chat_history')
+        request = functions.messages.GetHistoryRequest(peer, anchor, offset_date, -(count // 2) if around else 0,
+                                                       count, 0, 0, 0)
+        response = await rpc(lambda: client(request), scope='chat_history')
+    except ProviderRateLimited as exc:
+        counts['flood_wait_s'] = exc.seconds
+        limited(exc.seconds, 'flood_wait')
+    except (errors.ChannelPrivateError, errors.ChatAdminRequiredError, errors.PeerIdInvalidError):
+        finish('refused')
+        reject('not_found')
+    except errors.RPCError:
+        finish('provider_error')
+        reject('operation_rejected')
+    entities = {}
+    for entity in list(getattr(response, 'chats', None) or []) + list(getattr(response, 'users', None) or []):
+        try:
+            entities[str(utils.get_peer_id(entity))] = entity
+        except (TypeError, ValueError):
+            continue
+    known = {int(key): entity for key, entity in entities.items()}
+    entity = entities.get(str(chat))
+    returned = list(getattr(response, 'messages', None) or [])[:count]
+    kept, below, found = [], False, job.get('_history')
+    for message in returned:
+        moment = message.date.timestamp() if getattr(message, 'date', None) else None
+        if since is not None and moment is not None and moment < since:
+            below = True
+            continue
+        try:
+            same = str(utils.get_peer_id(message.peer_id)) == str(chat)
+        except (TypeError, ValueError):
+            same = False
+        if not isinstance(message, types.Message) or not same or (until is not None and (moment is None or moment >= until)):
+            continue
+        kept.append(message)
+        if found is not None:
+            # Initialized as iter_messages does for a history page, from this response's entities only.
+            try:
+                message._finish_init(client, known, None)
+            except Exception:
+                message = None
+            found.append((message, {}, chat_kind(entity), entity_name(entity)))
+    result = {'outcome': 'confirmed', 'delivery': 'immediate', 'fetched': len(kept), 'basis': 'live_provider_history'}
+    if timed:
+        result['range_exhausted'] = below or len(returned) < count
+    elif not around:
+        result['provider_history_start_reached'] = len(returned) < count
+    counts['fetched'] = len(kept)
     finish('done')
     return result
 
