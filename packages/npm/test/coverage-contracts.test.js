@@ -59,7 +59,8 @@ test('every public convenience helper delegates the exact operation and retains 
     assert.equal(typeof client[name],'function',name);
     assert.strictEqual(await client[name](args),server,name);
     assert.deepEqual(seen.at(-1),[operation,args],name);
-    const resultType=['prepareFileUpload','uploadFileChunk','getFileUpload'].includes(name)?'FileUploadStatus':'Record<string,\\s*unknown>';
+    const resultType=['prepareFileUpload','uploadFileChunk','getFileUpload'].includes(name)?'FileUploadStatus':
+      name==='listChats'?'ListChatsResult':'Record<string,\\s*unknown>';
     const method=new RegExp(`\\b${name}\\(args(\\?)?:[^\\n]+Promise<${resultType}>;`).exec(declared);
     assert.ok(method,`typed declaration missing for ${name}`);
     assert.equal(Boolean(method[1]),defaults.has(name),name);

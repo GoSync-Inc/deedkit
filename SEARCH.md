@@ -272,7 +272,9 @@ Priority cursors retain a scoring timestamp and bind all filters.
 Additional query filters: `exclude_chats` (archive chat IDs), `exclude_senders`
 (provider sender IDs within selected accounts), `only_questions`, `only_unread`,
 `exclude_likely_broadcasts` (opt-in: one-way chats and provider business/verified
-senders; `excluded_likely_broadcasts_total`) and `chat_types=['private']`. Exclusions are per request; a stored mute is
+senders; `excluded_likely_broadcasts_total`), `promotional` (`exclude` by default: likely promotional
+one-way non-contact mailings leave the queue, `excluded_promotional_total`; `include`, `only`; CONVERSATION.md)
+and `chat_types=['private']`. Exclusions are per request; a stored mute is
 `mute_reply_source` (below). Select accounts when the same provider sender ID is ambiguous.
 
 `unread_count`/`provider_unread_count` is a timestamped chat observation, separate

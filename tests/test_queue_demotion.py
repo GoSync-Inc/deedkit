@@ -109,12 +109,13 @@ def test_queue_labelled_ranking_fixture(demote):
     s,ar,key,add,history,queue,rows=demote
     labels=labelled_fixture(add,history)
     assert len(labels)>=20
-    ordered=[r['provider_chat_id'] for r in queue(order='priority',limit=100)['items']]
+    # ANYM-427 leaves one-way non-contact business mailings out by default; the ranking covers every row.
+    ordered=[r['provider_chat_id'] for r in queue(order='priority',limit=100,promotional='include')['items']]
     assert sorted(ordered)==sorted(labels)
     needs=[labels[c]=='needs' for c in ordered]
     # Every needs-owner row ranks above every noise row.
     assert all(needs[:needs.count(True)]) and not any(needs[needs.count(True):]),ordered
-    by_chat=rows()
+    by_chat=rows(promotional='include')
     assert components(by_chat['bank1'])['one_way_chat']==-60
     assert components(by_chat['shop0'])['provider_business_or_verified']==-40
     assert components(by_chat['bot0'])['observed_bot']==-20 and 'one_way_chat' not in components(by_chat['bot0'])

@@ -148,6 +148,7 @@ Direct Store calls, which have no presentation level, always include it.
 | `provider_contact` | +10 | the sender is an observed provider contact |
 | `waiting_age`, `waiting_age_capped` | +1 to +19, +20 | square root of waiting hours; capped after about 17 days |
 | `owner_question` | +40 | a group message that mentions the owner (basis `owner_mention`) with question punctuation, from a sender that is not an observed bot, a provider business/verified sender or another account of the key |
+| `owner_request` | +63 | the same group owner mention without question punctuation and not a closing courtesy (ANYM-427); exclusive with `owner_question` |
 | `one_way_chat` | -60 | private chat in which no meaningful owner message is archived |
 | `provider_business_or_verified` | -40 | the provider stated a business/verified (WhatsApp `VerifiedName`) or verified/support (Telegram) sender |
 | `own_account` | -80 | the sender ID is a recent outgoing sender of another account of the key |
@@ -158,7 +159,10 @@ A demotion never excludes a row (private bots stay excluded as before); a
 demoted private hint may rank below a group hint, and a group question that
 mentions the owner (+40, owner decision 2026-10-19) outranks a one-way mailing
 with a question mark up to 85 points (waiting capped, no contact). Replies to the
-owner and statements without a question get no bonus; channels have no hints.
+owner without a mention get no bonus (owner decision 2026-10-22); a statement that
+mentions the owner gets `owner_request` (+63, ANYM-427), so it also outranks every
+one-way non-contact private row, and stays at or below the same message with a
+question (25+40). Channels have no hints.
 Every private question without a demotion still outranks every group hint. Weights were checked only
 against the synthetic labelled fixture in `tests/test_queue_demotion.py`. All
 signals are archive or provider facts: an unknown or absent flag never demotes,
@@ -176,11 +180,31 @@ en `thanks`, `thank you`, `thx`, `ty`, `ok`, `okay`, `noted`, `got it`, `great`,
 follow a closing word but never stand alone. A message with other words
 ("ок, завтра созвонимся") is not a courtesy.
 
+By default the queue leaves out likely promotional rows (ANYM-427): a private
+chat with no meaningful owner message whose attention sender is not an observed
+provider contact, and either the provider states a business/verified sender or
+the chat's incoming messages fall on at least 3 UTC days. WhatsApp native states
+no contact flag, so an absent flag counts as a non-contact there. They are removed
+before totals, paging and the cursor; `excluded_promotional_total` counts them
+within the key's scope and the request's other filters except
+`exclude_likely_broadcasts` (absent means none; dismissed and snoozed rows are not
+counted, muted rows only with `include_muted=true`). Store, `view=archive` and
+`detail=full` rows carry the flat `awaiting_reply_likely_promotional` and
+`awaiting_reply_promotional_basis`. `promotional=include` returns them
+with their usual score and `awaiting_reply.likely_promotional: true` plus
+`promotional_basis` (`business_sender` or `repeated_days`); `promotional=only`
+lists just them. When the count grows, read `promotional=only`: a person who
+wrote on three days without an answer is there too. `promotional` other than
+`exclude` needs `awaiting_reply=true` and does not combine with
+`exclude_likely_broadcasts` (`invalid_filter`).
+
 `list_chats(awaiting_reply=true, exclude_likely_broadcasts=true)` (default
 false) removes rows with `one_way_chat` or `provider_business_or_verified`
 before totals, paging and the cursor; the cursor binds the flag.
 `excluded_likely_broadcasts_total` counts the removed rows within the key's
-scope and the request's other filters, `only_unread` included. A one-way chat is
+scope and the request's other filters, `only_unread` included, except the default
+`promotional=exclude`. With both filters the two counts overlap: each is what its
+own filter removes, and they do not add up. A one-way chat is
 also a person's first message until the owner replies: use the filter to shorten a
 long queue, not as the default view.
 
