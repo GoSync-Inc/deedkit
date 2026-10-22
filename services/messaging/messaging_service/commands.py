@@ -689,6 +689,9 @@ class CommandWorker:
         async def settle(*args):
             if not live:return await finish_durably(self.finish,*args)
             # One tracked attempt off the foreground path: no receipt commit holds up the send loop.
+            # At most one in flight, so receipts take at most one pool connection; a skipped one
+            # leaves the row dispatching, read as unknown once it expires.
+            if self.settling:return log.warning('live_search receipt_unrecorded receipt_in_flight')
             task=asyncio.create_task(asyncio.to_thread(self.finish_live,*args,max(0.0,end-loop.time())))
             self.settling.add(task);task.add_done_callback(self._settled)
         try:

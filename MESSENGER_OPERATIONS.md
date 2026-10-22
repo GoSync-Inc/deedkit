@@ -339,7 +339,8 @@ gateway, the `search_messages_live` action grant. It writes nothing to the archi
   collector claims it (checks, waits and request) `provider_timeout`. Both are safe
   to repeat with a new request ID. The receipt is written in one attempt off the send
   path, holding no lock sends need, with its waits ending 14 seconds after the claim,
-  so a queued send starts within 15 seconds. A receipt not written by then leaves the
+  so a queued send starts within 15 seconds. At most one receipt is in flight per
+  account; while it is, the next one is skipped. A receipt not written leaves the
   operation `dispatching` (log line `live_search receipt_unrecorded`); it reads
   `unknown` once it expires or the collector restarts. Known limit: a database that
   stalls every commit delays sends as well, live search or not.

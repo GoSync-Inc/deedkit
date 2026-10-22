@@ -37,6 +37,11 @@ def search(s, key, request_id='synthetic-live-0001', chat_id='', **parameters):
                                          parameters={'query': 'synthetic', **parameters}, request_id=request_id)
 
 
+async def settled(worker):
+    """One worker turn, then the live receipt it writes off the foreground path."""
+    active = await worker.once(); await asyncio.gather(*list(worker.settling)); return active
+
+
 def queued(s):
     with s.pool.connection() as c:
         return c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n']
@@ -83,11 +88,11 @@ def test_worker_round_trip_keeps_hits_and_retry_after(live):
     async def provider(job):
         assert job['_policy']['operations_enabled'] == ['search_messages_live'] and job['chat_id'] == ''
         return {'outcome': 'confirmed', 'data': {'hits': [], 'next_cursor': None, 'provider_total_approx': 0}}
-    assert asyncio.run(CommandWorker(state, provider).once())
+    assert asyncio.run(settled(CommandWorker(state, provider)))
     assert s.get_messenger_operation(key, first['operation_id'])['result']['data']['hits'] == []
     second = search(s, key, 'synthetic-live-0002')
     async def limited(job):raise CommandRejected('rate_limited', retry_after=7)
-    assert asyncio.run(CommandWorker(state, limited).once())
+    assert asyncio.run(settled(CommandWorker(state, limited)))
     receipt = s.get_messenger_operation(key, second['operation_id'])
     assert receipt['status'] == 'failed' and receipt['result']['data'] == {'code': 'rate_limited', 'retry_after': 7}
 
@@ -234,3 +239,28 @@ def test_new_owner_recovery_skips_a_row_a_receipt_holds(live):
     with s.pool.connection() as c:
         assert c.execute('SELECT status FROM messenger_commands WHERE id=%s', (operation,)).fetchone()['status'] == 'unknown'
     archive.release(ACCOUNT, *lease)
+
+
+# spec: ANYM-475
+def test_overlapping_blocked_receipts_take_one_connection_and_never_delay_the_send_claim(live, caplog):
+    import time
+    from messaging_service.commands import CommandRejected, CommandWorker
+    from messaging_service.outgoing import OutgoingWorker
+    s, _, key, state = live
+    for n in range(6):search(s, key, f'synthetic-live-01{n:02d}')
+    holder = s.pool.getconn()  # holds every command row, so each receipt would wait on its lock
+    async def refused(job):
+        holder.execute('SELECT 1 FROM messenger_commands WHERE id=%s FOR UPDATE', (job['id'],))
+        raise CommandRejected('rate_limited', retry_after=7)  # fast refusals spend no provider budget
+    worker = CommandWorker(state, refused)
+    async def scenario():
+        try:
+            for _ in range(6):assert await worker.once()
+            started = time.monotonic(); await asyncio.to_thread(OutgoingWorker(state, None).claim)
+            return time.monotonic() - started, len(worker.settling)
+        finally:holder.rollback()
+    with caplog.at_level('WARNING', logger='anymsg.live_search'):
+        took, in_flight = asyncio.run(scenario())
+    s.pool.putconn(holder)
+    assert took < 1 and in_flight <= 1
+    assert caplog.text.count('receipt_in_flight') == 5
