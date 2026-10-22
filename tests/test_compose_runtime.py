@@ -24,7 +24,8 @@ BASE = ["compose.yaml", "compose.collectors.yaml", "compose.whatsapp.yaml", "com
         "compose.file-lifecycle.yaml", "compose.file-understanding.yaml"]
 NATIVE = "compose.whatsapp-native.yaml"
 APPLICATIONS = {"api", "telegram", "whatsapp1", "whatsapp2", "indexer", "enricher", "enricher-local",
-                "operator", "subscriptions", "file-lifecycle", "cold-archive", "file-understanding"}
+                "operator", "subscriptions", "file-lifecycle", "cold-archive", "cold-restore",
+                "file-understanding"}
 COLLECTORS = {"telegram", "whatsapp1", "whatsapp2"}
 SECRET_DIRECTORIES = ["processing-locks", "telegram-session", "whatsapp1-session", "whatsapp2-session",
                       "issued-keys", "cold-archive-identity", "cold-archive-ssh", "enrichment-models"]
@@ -172,7 +173,7 @@ def assert_runtime(stack, declared, native):
     assert stack.network("backend")["Internal"] is True
     members = {name: networks_of(container) for name, container in containers.items()}
     assert {name for name, joined in members.items() if f"{stack.project}_collector_egress" in joined} == COLLECTORS
-    assert {name for name, joined in members.items() if f"{stack.project}_cold_archive_egress" in joined} == {"cold-archive"}
+    assert {name for name, joined in members.items() if f"{stack.project}_cold_archive_egress" in joined} == {"cold-archive", "cold-restore"}
     assert stack.network("collector_egress")["Internal"] is False
     assert stack.network("cold_archive_egress")["Internal"] is False
     profile = json.loads((stack.deploy / "chromium-seccomp.json").read_text())
