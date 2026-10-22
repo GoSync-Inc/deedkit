@@ -205,11 +205,12 @@ class Store:
             from .messenger_operations import CATALOG_VERSION,OPERATIONS,operation_manifest
             from .commands import manifest
             dataset=self.dataset(c,p)
-            from .operational import self_provider_id
+            from .operational import identity_safe,self_provider_id
             # Same visible accounts as before; each adds the owner's ID its collector
-            # verified at connect, or null (ANYM-470). Never derived from messages.
+            # verified at connect, or null (ANYM-470). Never derived from messages. Only
+            # identity's written shape leaves SQL: the driver never decodes another one.
             accounts = c.execute('''SELECT a.id,a.platform,a.label,a.synthetic,
-                h.operations->'identity'->'self_provider_id' AS self_provider_id FROM accounts a
+                ('''+identity_safe('h.operations')+''')->'identity'->>'self_provider_id' AS self_provider_id FROM accounts a
                 LEFT JOIN collector_health h ON h.account=a.id WHERE a.id=ANY(%s) ORDER BY a.id''',
                 ([r['id'] for r in dataset['sources']],)).fetchall()
             for account in accounts:

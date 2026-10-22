@@ -75,6 +75,18 @@ def collector_stop(exc, component):
 SELF_PROVIDER_ID = {'telegram':re.compile(r'[1-9][0-9]{0,19}'),'whatsapp':re.compile(r'[0-9]{5,20}@c\.us')}
 
 
+def identity_safe(column):
+    """SQL for `column` (a collector_health.operations) with `identity` kept only in its written
+    shape, so the driver never decodes another stored value there (ANYM-470)."""
+    i=column+"->'identity'"
+    return (f"CASE WHEN NOT ({column} ? 'identity') THEN {column} "
+        f"WHEN jsonb_typeof({i})='object' AND jsonb_typeof({i}->'self_provider_id')='string' "
+        f"AND coalesce(jsonb_typeof({i}->'verified_at'),'string')='string' "
+        f"THEN ({column}-'identity')||jsonb_build_object('identity',jsonb_strip_nulls(jsonb_build_object("
+        f"'self_provider_id',{i}->'self_provider_id','verified_at',{i}->'verified_at'))) "
+        f"ELSE {column}-'identity' END")
+
+
 def self_provider_id(platform, value):
     """The value when it has its platform's exact form, else None."""
     pattern=SELF_PROVIDER_ID.get(platform)

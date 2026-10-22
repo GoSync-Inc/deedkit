@@ -143,6 +143,51 @@ def test_providers_report_only_the_identity_they_verified(tmp_path):
     assert whatsapp.self_provider_id() == '15550000001@c.us'
 
 
+FAKE_ADAPTER = """import json, sys
+mode = json.load(open(sys.argv[-1]))['mode']
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['method'] == 'start' and mode != 'verified':
+        sys.exit(1)  # the adapter refuses start: the session's own ID is not expected_wid
+    print(json.dumps({'id': request['id'], 'result': {}}), flush=True)
+"""
+
+
+def whatsapp_providers(tmp_path, mode):
+    """Both adapters' real connect/disconnect, each over a synthetic child process."""
+    from messaging_service.whatsapp_collector import WhatsmeowProvider
+    import os
+    import stat
+    import sys
+    script, native, config = tmp_path/'fake_adapter.py', tmp_path/'native', tmp_path/'config.json'
+    script.write_text(FAKE_ADAPTER)
+    native.write_text('#!'+sys.executable+'\n'+FAKE_ADAPTER)
+    native.chmod(native.stat().st_mode | stat.S_IXUSR)
+    config.write_text('{"mode": "'+mode+'"}')
+    lock_fd = os.open(tmp_path/'lock', os.O_CREAT | os.O_RDWR, 0o600)
+    cfg = {'expected_wid': '15550000001@c.us', 'node_executable': sys.executable, 'native_executable': str(native)}
+    return [NodeProvider(cfg, config, lock_fd, script=script), WhatsmeowProvider(cfg, config, lock_fd)]
+
+
+# spec: ANYM-470
+def test_whatsapp_providers_report_the_id_only_between_a_verified_start_and_disconnect(tmp_path):
+    from messaging_service.telegram_collector import TelegramCollector
+
+    async def lifecycle(provider):
+        assert provider.self_provider_id() is None
+        await provider.connect()
+        # What the shared connect path hands to the connected-phase write.
+        seen = TelegramCollector.verified_self_id(SimpleNamespace(provider=provider))
+        await provider.disconnect()
+        return seen, provider.self_provider_id()
+    for provider in whatsapp_providers(tmp_path, 'verified'):
+        assert asyncio.run(lifecycle(provider)) == ('15550000001@c.us', None)
+    for provider in whatsapp_providers(tmp_path, 'mismatch'):
+        with pytest.raises(Exception):
+            asyncio.run(provider.connect())
+        assert provider.self_provider_id() is None and not provider.started
+
+
 def health(store, account):
     with store.pool.connection() as c:
         return c.execute('SELECT operations,octet_length(operations::text) AS size FROM collector_health '
@@ -239,11 +284,21 @@ def test_a_stored_id_never_makes_a_later_phase_write_fail(seeded):
 
 # spec: ANYM-470
 @pytest.mark.parametrize('stored', ['{"self_provider_id": 123456789}', '{"self_provider_id": {"id": "1"}}',
-    '"123456789"', '{"self_provider_id": "15550000001@c.us"}'])
+    '"123456789"', '{"self_provider_id": "15550000001@c.us"}',
+    # Past CPython's 4,300-digit int limit: decoding it in Python would raise.
+    '{"self_provider_id": '+'1'*5000+'}', '{"self_provider_id": "123456789", "verified_at": '+'1'*5000+'}'])
 def test_a_malformed_stored_id_reads_as_null(seeded, stored):
     store, token, _ = seeded
-    lease_state(store, 'telegram-demo', 'fixture').phase('connection', 'connected', 'provider_ready')
+    state = lease_state(store, 'telegram-demo', 'fixture')
+    state.phase('connection', 'connected', 'provider_ready')
     set_operations(store, 'telegram-demo', "jsonb_set(operations,'{identity}',%s::jsonb)", stored)
+    assert accounts(store.capabilities(token))['telegram-demo'] is None
+    with store.pool.connection() as c:
+        source = get_sync_status(c, {'accounts': ['telegram-demo'], 'chat_ids': None})['sources'][0]
+    assert 'identity' not in source['operations']
+    # The next phase write succeeds; the value still reads as null.
+    state.phase('connection', 'connecting', 'collector_starting')
+    assert health(store, 'telegram-demo')['operations']['connection']['state'] == 'connecting'
     assert accounts(store.capabilities(token))['telegram-demo'] is None
 
 

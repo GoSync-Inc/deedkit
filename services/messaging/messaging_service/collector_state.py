@@ -10,7 +10,7 @@ from psycopg.errors import CheckViolation
 from psycopg.types.json import Jsonb
 
 from .operational import CAPTURE_STOP_DETAILS,OVERLOAD_STOP_DETAILS,CONNECTION_ERRORS,TERMINAL,PHASE_STATES,PHASE_REASONS
-from .operational import self_provider_id as verified_self_id
+from .operational import identity_safe,self_provider_id as verified_self_id
 
 from .envelope import canonical,utc,validate,stable_id,MAX_ENVELOPE
 from .spool import DurableSpool
@@ -194,8 +194,8 @@ class CollectorState:
     def _operations(self,c):
         self.archive.fence(c,self.account,self.lease)
         c.execute('INSERT INTO collector_health(account) VALUES(%s) ON CONFLICT DO NOTHING',(self.account,))
-        return c.execute('SELECT operations,clock_timestamp() AS observed FROM collector_health '
-            'WHERE account=%s FOR UPDATE',(self.account,)).fetchone()
+        return c.execute('SELECT '+identity_safe('operations')+' AS operations,clock_timestamp() AS observed '
+            'FROM collector_health WHERE account=%s FOR UPDATE',(self.account,)).fetchone()
 
     def _save_operations(self,c,value):
         if 'identity' in value:
