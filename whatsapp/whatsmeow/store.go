@@ -221,6 +221,7 @@ func unmarshalMessage(b []byte) (*events.Message, error) {
 			return nil, e
 		}
 		msg.UnwrapRaw()
+		unwrapAlbumChild(msg)
 	}
 	if saved.IsViewOnce != nil {
 		msg.IsViewOnce = msg.IsViewOnce || *saved.IsViewOnce
@@ -248,6 +249,9 @@ func (s *CaptureStore) Put(e *events.Message, origin string) error {
 		return nil
 	} // supported sources only
 	e = unwrap(e)
+	if controlOnly(e.Message) {
+		return nil
+	}
 	if pm := e.Message.GetProtocolMessage(); pm != nil && pm.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT && pm.GetEditedMessage() != nil {
 		copy := *e
 		copy.Info.ID = pm.GetKey().GetID()

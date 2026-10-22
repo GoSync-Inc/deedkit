@@ -70,6 +70,20 @@ def test_whatsapp_native_type_is_classified_independently_of_text(native, kind):
     assert result['metadata']['provider_message_type'] == native
 
 
+# spec: ANYM-471
+def test_whatsapp_business_messages_with_text_are_text_and_masked_ones_stay_unknown():
+    for native in ('template', 'interactive', 'buttons', 'list', 'product', 'group_invite'):
+        result = whatsapp_message('wa-fixture', whatsapp(messageType=native, body='Invoice 42'))
+        assert result['metadata']['message_kind'] == 'text'
+        assert result['metadata']['provider_message_type'] == native
+        assert whatsapp_message('wa-fixture', whatsapp(messageType=native))['metadata']['message_kind'] == 'unknown'
+    placeholder = whatsapp_message('wa-fixture', whatsapp(messageType='placeholder'))
+    assert placeholder['metadata']['message_kind'] == 'unknown' and placeholder['body'] == ''
+    for native in ('album', 'history_notice'):
+        service = whatsapp_message('wa-fixture', whatsapp(messageType=native, isService=True))
+        assert service['metadata']['message_kind'] == 'system'
+
+
 def test_whatsapp_missing_type_and_empty_body_stays_unknown():
     result = whatsapp_message('wa-fixture', whatsapp())
     assert result['metadata']['message_kind'] == 'unknown'

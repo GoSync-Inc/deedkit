@@ -10,6 +10,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"os"
 	"regexp"
 	"strconv"
@@ -188,6 +189,12 @@ func normalizeFixture(path string) error {
 		msg = &waE2E.Message{PtvMessage: &waE2E.VideoMessage{Caption: proto.String(v.Text), Seconds: proto.Uint32(v.Duration), Mimetype: proto.String(v.Mime), FileLength: proto.Uint64(v.Bytes), ContextInfo: ctx}}
 	case "document":
 		msg = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{FileName: proto.String(v.Filename), Caption: proto.String(v.Text), Mimetype: proto.String(v.Mime), FileLength: proto.Uint64(v.Bytes), ContextInfo: ctx}}
+	case "album_photo":
+		msg = &waE2E.Message{AssociatedChildMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Caption: proto.String(v.Text), Mimetype: proto.String(v.Mime), FileLength: proto.Uint64(v.Bytes), ContextInfo: ctx}}}}
+	case "sender_key":
+		msg = &waE2E.Message{SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{GroupID: proto.String(v.Chat), AxolotlSenderKeyDistributionMessage: []byte{1}}}
+	case "template":
+		msg = &waE2E.Message{TemplateMessage: &waE2E.TemplateMessage{Format: &waE2E.TemplateMessage_HydratedFourRowTemplate_{HydratedFourRowTemplate: &waE2E.TemplateMessage_HydratedFourRowTemplate{HydratedContentText: proto.String(v.Text)}}}}
 	case "notification":
 		msg = nil
 	default:
@@ -200,6 +207,9 @@ func normalizeFixture(path string) error {
 	if v.RecipientAlt != "" {
 		event.Info.RecipientAlt, _ = ParseChatID(v.RecipientAlt)
 	}
+	if controlOnly(unwrap(event).Message) {
+		return json.NewEncoder(os.Stdout).Encode(nil)
+	} // as CaptureStore.Put: nothing is journaled
 	if v.Account == "" {
 		v.Account = "test"
 	}
@@ -228,8 +238,68 @@ func unwrap(e *events.Message) *events.Message {
 	if m != nil {
 		copy.RawMessage = proto.Clone(m).(*waE2E.Message)
 		copy.UnwrapRaw()
+		unwrapAlbumChild(&copy)
 	}
 	return &copy
+}
+
+// An album photo or video arrives inside associatedChildMessage, which
+// UnwrapRaw leaves wrapped (Baileys normalizeMessageContent unwraps it like the
+// view-once wrappers). Wrappers inside the child keep their restrictions.
+func unwrapAlbumChild(e *events.Message) {
+	child := e.Message.GetAssociatedChildMessage().GetMessage()
+	if child == nil {
+		return
+	}
+	inner := (&events.Message{RawMessage: child}).UnwrapRaw()
+	e.Message = inner.Message
+	e.IsViewOnce = e.IsViewOnce || inner.IsViewOnce
+	e.IsEphemeral = e.IsEphemeral || inner.IsEphemeral
+	e.IsDocumentWithCaption = e.IsDocumentWithCaption || inner.IsDocumentWithCaption
+}
+
+func joinText(parts ...string) string {
+	kept := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, "\n\n")
+}
+func templateText(v *waE2E.TemplateMessage) string {
+	if i := v.GetInteractiveMessageTemplate(); i != nil {
+		return interactiveText(i)
+	}
+	h := v.GetHydratedFourRowTemplate()
+	if h == nil {
+		h = v.GetHydratedTemplate()
+	}
+	return joinText(h.GetHydratedTitleText(), h.GetHydratedContentText(), h.GetHydratedFooterText())
+}
+func interactiveText(v *waE2E.InteractiveMessage) string {
+	return joinText(v.GetHeader().GetTitle(), v.GetHeader().GetSubtitle(), v.GetBody().GetText(), v.GetFooter().GetText())
+}
+
+// whatsmeow dispatches the sender-key distribution part of a group message as
+// its own event with the message's ID and time; the content follows as another
+// event. A message holding only that and/or message context info carries
+// nothing to archive (mautrix-whatsapp getMessageType ignores it). Unknown wire
+// fields may be content this build cannot read, so they keep the message.
+func controlOnly(m *waE2E.Message) bool {
+	if m.GetSenderKeyDistributionMessage() == nil && m.GetMessageContextInfo() == nil || len(m.ProtoReflect().GetUnknown()) > 0 {
+		return false
+	}
+	only := true
+	m.ProtoReflect().Range(func(f protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		switch f.Name() {
+		case "senderKeyDistributionMessage", "messageContextInfo":
+			return true
+		}
+		only = false
+		return false
+	})
+	return only
 }
 func messageContext(m *waE2E.Message) *waE2E.ContextInfo {
 	switch {
@@ -381,6 +451,39 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 		case m.GetPollCreationMessageV3() != nil:
 			kind = "poll_creation"
 			body = m.GetPollCreationMessageV3().GetName()
+		// Business messages keep their visible text; header media is not fetched.
+		case m.GetTemplateMessage() != nil:
+			kind = "template"
+			body = templateText(m.GetTemplateMessage())
+		case m.GetInteractiveMessage() != nil:
+			kind = "interactive"
+			body = interactiveText(m.GetInteractiveMessage())
+		case m.GetButtonsMessage() != nil:
+			v := m.GetButtonsMessage()
+			kind = "buttons"
+			body = joinText(v.GetText(), v.GetContentText(), v.GetFooterText())
+		case m.GetListMessage() != nil:
+			v := m.GetListMessage()
+			kind = "list"
+			body = joinText(v.GetTitle(), v.GetDescription(), v.GetFooterText())
+		case m.GetProductMessage() != nil:
+			v := m.GetProductMessage()
+			kind = "product"
+			body = joinText(v.GetProduct().GetTitle(), v.GetProduct().GetDescription(), v.GetBody(), v.GetFooter())
+		case m.GetGroupInviteMessage() != nil:
+			v := m.GetGroupInviteMessage()
+			kind = "group_invite"
+			body = joinText(v.GetGroupName(), v.GetCaption())
+		case m.GetAlbumMessage() != nil:
+			// The parent only announces a count; each photo or video is its own message.
+			kind = "album"
+			service = true
+		case m.GetMessageHistoryNotice() != nil:
+			kind = "history_notice"
+			service = true
+		case m.GetPlaceholderMessage() != nil:
+			// Business content masked from linked devices; only the phone shows it.
+			kind = "placeholder"
 		case m.GetReactionMessage() != nil:
 			kind = "reaction"
 			service = true
