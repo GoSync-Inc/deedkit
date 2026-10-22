@@ -707,7 +707,8 @@ class CommandWorker:
                 job['_archived']=archived
             # Providers report 'waiting' and then 'started' before the first mutation.
             job['_provider_phase']=phases.append
-            timeout=180 if job['operation']=='send_file' else left() if live else 30
+            timeout=180 if job['operation']=='send_file' else 30
+            if live:timeout=left()
             try:answer=safe_result(await asyncio.wait_for(self.execute(job),timeout))
             except TimeoutError:
                 # A read changes nothing at the provider, so its timeout is a safe-to-repeat refusal.
