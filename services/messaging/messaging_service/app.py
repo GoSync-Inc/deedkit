@@ -43,7 +43,7 @@ FeedbackReferences = dict[Literal['message_ids','chat_ids','subscription_ids'],A
 FeedbackDescription = Annotated[StrictStr,Field(min_length=1,max_length=4000,pattern=r'^[^\x00-\x08\x0b-\x1f\x7f]+$')]
 # A tool name as tools/list shows it (feedback.py canonical_operation, ANYM-342). The name list is not repeated
 # here: the gateway owns the catalog, so the schema carries the shape only.
-FeedbackOperation = Annotated[StrictStr,Field(min_length=1,max_length=128,pattern=r'^[a-z][a-z0-9_]*$')]
+FeedbackOperation = Annotated[StrictStr,Field(min_length=1,max_length=129,pattern=r'^[a-z][a-z0-9_]*$')]
 FeedbackStatus = Literal['received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened']
 Detail = Literal['compact','full']
 MessageDetail = Literal['compact','full','transcript']

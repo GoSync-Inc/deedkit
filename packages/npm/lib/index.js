@@ -278,7 +278,7 @@ function feedbackArguments(method,args) {
     else if (key==='category') valid=typeof value==='string' && ['bug','feature','quality','other'].includes(value);
     else if (key==='description') valid=typeof value==='string' && [...value].length>=1 &&
       [...value].length<=4000 && value.trim().length>0 && !/[\x00-\x08\x0b-\x1f\x7f]/.test(value);
-    else if (key==='operation') valid=value===null || typeof value==='string' && /^[a-z][a-z0-9_]{0,63}$/.test(value);
+    else if (key==='operation') valid=value===null || typeof value==='string' && /^[a-z][a-z0-9_]{0,128}$/.test(value);
     else valid=value===null || plainObject(value) && Object.keys(value).every(name=>
       ['message_ids','chat_ids','subscription_ids'].includes(name) && Array.isArray(value[name]) &&
       value[name].length<=32 && value[name].every(item=>typeof item==='string' &&

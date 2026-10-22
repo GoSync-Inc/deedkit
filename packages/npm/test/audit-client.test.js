@@ -72,7 +72,7 @@ const invalid=[
   ...['short','x'.repeat(129),'private\ncontrol',true].map(request_id=>['testSubscription',{request_id}]),
   ...['unknown',false,['bug']].map(category=>['submitFeedback',{category}]),
   ...['',' ','x'.repeat(4001),'private\x00control',false].map(description=>['submitFeedback',{description}]),
-  ...[false,'private\noperation','x'.repeat(65)].map(operation=>['submitFeedback',{operation}]),
+  ...[false,'private\noperation','x'.repeat(130)].map(operation=>['submitFeedback',{operation}]),
   ...[[],{unknown:[]},{message_ids:'message'},{message_ids:Array(33).fill('x')},
     {chat_ids:[false]},{subscription_ids:['']}].map(refs=>['submitFeedback',{refs}]),
   ['listFeedback',{limit:0}],
@@ -157,3 +157,13 @@ test('listFeedback forwards a status filter and rejects an unknown status before
     assert.throws(()=>client.listFeedback({status}),TypeError);
   assert.deepEqual(seen,[{limit:5,status:'verify_requested'}]);
 });
+
+// spec: ANYM-342
+test('feedback operation accepts the longest tool name before transport',async()=>{
+  const seen=[];
+  const client=new AnyMsgClient({...options,fetch:async(url,init)=>{seen.push(JSON.parse(init.body));return Response.json({});}});
+  const [,args]=methods.submitFeedback;
+  await client.submitFeedback({...args,operation:'calendar_'+'a'.repeat(120)});
+  assert.deepEqual(seen.map(body=>body.operation),['calendar_'+'a'.repeat(120)]);
+});
+

@@ -281,3 +281,16 @@ def test_feedback_operation_unknown_field_error(tmp_path, operation):
     assert operation not in rest.text and operation not in json.dumps(mcp)
     assert requests == []
 
+
+# spec: ANYM-342
+def test_feedback_operation_legacy_bare_download_is_still_relayed(tmp_path):
+    # `download` was accepted before the catalog check but is no gateway tool; a recorded request stays replayable.
+    requests = []
+    app = messaging_app(tmp_path, "messages_submit_feedback", requests)
+    rest, mcp = post_both(app, "messages_submit_feedback", {**FEEDBACK, "operation": "download"})
+    assert rest.status_code == 200 and not mcp["isError"]
+    assert [body["operation"] for _, body in requests] == ["download"] * 2
+    rest, _ = post_both(messaging_app(tmp_path, "messages_submit_feedback"), "messages_submit_feedback",
+                        {**FEEDBACK, "operation": "messages_download"})
+    assert rest.status_code == 422
+

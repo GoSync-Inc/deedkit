@@ -303,7 +303,9 @@ and `list_feedback` returns the stored value. The idempotency hash uses the stor
 `request_id` with the other spelling of the same name returns the same feedback ID. The common gateway
 checks the name against its reviewed catalog before relaying, whichever modules are deployed or visible
 to the key, so a report about an unavailable tool is still accepted; an unknown name is rejected there
-with `invalid_arguments` and a `field_errors` entry for `operation`. The messaging REST API, called
+with `invalid_arguments` and a `field_errors` entry for `operation`; the bare `download`, valid before
+the check although it has no gateway tool, stays accepted so a recorded request can be replayed. The
+`operation` schema allows up to 129 characters (`calendar_` or `platform_` plus 120). The messaging REST API, called
 directly, checks the shape only: a messaging operation, the same with the `messages_` prefix, or
 `calendar_`, `calls_` or `platform_` followed by 1–120 lowercase letters, digits or `_`. The name list is
 not returned in the error. Message/chat/subscription references are validated

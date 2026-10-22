@@ -118,7 +118,7 @@ INVALID = [
     *[('test_subscription', {'request_id': v}) for v in ('short', 'x'*129, 'private\ncontrol', True)],
     *[('submit_feedback', {'category': v}) for v in ('unknown', False, ['bug'])],
     *[('submit_feedback', {'description': v}) for v in ('', ' ', 'x'*4001, 'private\x00control', False)],
-    *[('submit_feedback', {'operation': v}) for v in (False, 'private\noperation', 'x'*65)],
+    *[('submit_feedback', {'operation': v}) for v in (False, 'private\noperation', 'x'*130)],
     *[('submit_feedback', {'refs': v}) for v in ([], {'unknown': []}, {'message_ids': 'message'},
         {'message_ids': ['x']*33}, {'chat_ids': [False]}, {'subscription_ids': ['']})],
     ('list_feedback', {'limit': 0}),
@@ -230,3 +230,15 @@ def test_python_list_feedback_forwards_status_filter_and_rejects_unknown_status(
             with pytest.raises(ValueError, match='invalid_parameters'):
                 client.list_feedback(status=status)
     assert seen == [{'limit': 5, 'status': 'verify_requested'}]
+
+
+# spec: ANYM-342
+def test_python_feedback_operation_accepts_the_longest_tool_name():
+    seen = []
+    def transport(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(transport)) as client:
+        client.submit_feedback(**{**METHODS['submit_feedback'], 'operation': 'calendar_' + 'a' * 120})
+    assert [body['operation'] for body in seen] == ['calendar_' + 'a' * 120]
+

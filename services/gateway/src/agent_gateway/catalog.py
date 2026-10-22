@@ -71,6 +71,9 @@ class InvalidArguments(ValueError):
         self.field_errors = field_errors
 
 
+# A bare messaging operation that feedback accepted before ANYM-342 but that has no gateway tool: keep it valid so
+# a recorded request can still be replayed through the gateway. It makes no tool callable.
+LEGACY_FEEDBACK_OPERATIONS = frozenset({"download"})
 FEEDBACK_OPERATION_HINT = "a tool name from tools/list, with or without the messages_ prefix"
 
 
@@ -81,7 +84,7 @@ def feedback_operation_errors(value):
     tool is still accepted (ANYM-342). The submitted name is never echoed.
     """
     name = value.get("operation")
-    if isinstance(name, str) and name not in CATALOG and "messages_" + name not in CATALOG:
+    if isinstance(name, str) and name not in CATALOG and "messages_" + name not in CATALOG and name not in LEGACY_FEEDBACK_OPERATIONS:
         return [{"field": "operation", "reason": "enum", "expected": FEEDBACK_OPERATION_HINT}]
     return []
 
