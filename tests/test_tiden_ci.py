@@ -734,7 +734,11 @@ def test_image_build_job_is_gated_only_by_the_change_decision():
     assert build["strategy"]["matrix"]["target"] == [
         "runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "calls", "backup"]
     # The build and smoke test come first; the publication steps after it only export what was tested.
-    assert build["steps"][1]["run"] == 'python3 scripts/production.py check-image --target "$TARGET"'
+    names = [step.get("name") for step in build["steps"]]
+    check = names.index("Build and smoke-test the production target without providers")
+    assert build["steps"][check]["run"] == 'python3 scripts/production.py check-image --target "$TARGET"'
+    # ANYM-441: the whatsmeow fork content check runs before check-image compiles the native adapter.
+    assert names.index("Check the whatsmeow fork against upstream and fork.patch") < check
     assert all("docker build" not in step.get("run", "") for step in build["steps"])
 
 
