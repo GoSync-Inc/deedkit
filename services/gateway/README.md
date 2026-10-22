@@ -101,6 +101,51 @@ cached description; if they differ, its tool list is stale and the owner should 
 client. Hosts should also reconnect after a DeedKit release or a profile change. The server `instructions`
 say the same.
 
+### Choosing modules (ANYM-271)
+
+An agent that needs only some modules can load fewer tools. Selection only narrows the key's list. It grants
+no tool, scope or action.
+
+- **Connection path.** `POST /mcp/modules/<m>[,<m>...]` with `m` from `messaging`, `calendar`, `calls` is the
+  same MCP endpoint as `/mcp`. Its `tools/list` and `tools/call` cover `platform_capabilities`,
+  `platform_select_modules` (when the profile lists it) and the named modules' tools, intersected with
+  everything that limits the key on `/mcp`. Order does not matter (`calendar,messaging` and
+  `messaging,calendar` are one path, reported as the sorted form). An unknown or repeated name, an empty list
+  or extra segments return 404 `{"error": "unknown_module"}` before any backend is asked. A module the key
+  cannot use yields no tools, not an error. Plain `/mcp` is unchanged. Host, Origin, bearer, the 64 KiB body
+  limit, the upload-chunk envelope, `GET` 405 and revocation apply to every module path exactly as to `/mcp`.
+- **In-session tool.** `platform_select_modules({"modules": [...]})` records a selection for this principal
+  and connection path, replacing the previous one. The path's own modules still bound it: on
+  `/mcp/modules/messaging`, selecting `["calendar", "messaging"]` keeps messaging only. To widen again, select
+  all three modules. The result has `selection_path`, `effective_modules`, the new `tools_sha256`,
+  `takes_effect: "next_tools_list"` and `next_action: "refresh_connection_if_tools_list_differs"`; the server
+  does not push a list change (ANYM-248). The selection lives in gateway memory only, one entry per
+  principal and path, and is cleared by a policy revision change, a gateway restart or a release handover.
+  New tool, so existing profiles do not get it until the owner adds it to a profile.
+- **Shared key.** Every connection of one key on the same path shares its in-session selection. Use one key
+  per host. A module path is stateless and is the better choice when one key must serve several hosts.
+- **Calls outside the selection.** An MCP `tools/call` for a tool whose module is not selected returns
+  `isError: true` with `{"error": "module_not_selected", "module": "<m>",
+  "next_action": "select_module_or_use_its_connection_path"}`, and no backend is contacted.
+- **REST has no selection.** `POST /v1/<tool>` ignores module paths and selections and keeps the full profile
+  set. `POST /v1/platform_select_modules` records the selection of plain `/mcp`; it affects MCP only.
+- **Summary.** `platform_capabilities` adds `selection_path`, `selected_modules` and `modules_available`: for
+  each module with at least one usable tool for the key, `{id, purpose, tool_count, selected, path}`.
+  `tools` and `discovery` describe the current path's effective list on MCP and the full list on REST.
+
+Connector setup with a module path: keep the host's existing DeedKit connector settings and authentication and
+change only the URL path from `/mcp` to the module path (`<gateway>` is the public gateway URL).
+
+- Claude Desktop / claude.ai: Settings → Connectors → add (or edit) the custom connector with URL
+  `https://<gateway>/mcp/modules/messaging`. Reconnect it after a change.
+- Claude Code: `claude mcp add --transport http deedkit-messaging https://<gateway>/mcp/modules/messaging
+  --header "Authorization: Bearer <key>"`.
+- Grok (remote MCP tool): `server_url` `https://<gateway>/mcp/modules/calendar,messaging` with the same
+  `Authorization` header as for `/mcp`.
+
+Hosts with deferred tool loading (Claude Code tool search) need this less; hosts that load every tool
+(Grok, Cursor, some Desktop setups) gain the most.
+
 Module capabilities preserve the backend `principal` and add `backend_principal`
 and `gateway_principal`; platform `principal` remains the gateway identity.
 Subscription ownership and receipts continue to use the existing backend credential.
