@@ -462,6 +462,9 @@ def test_operation_uses_the_one_existing_client(monkeypatch, tmp_path):
     class FakeTelegramClient(Client):
         def __init__(self, *args, **kwargs):
             super().__init__(page([])); created.append(self)
+            # bind_state wraps Telethon's reconnect hook and message box (ANYM-275).
+            self._sender = SimpleNamespace(_auto_reconnect_callback=None)
+            self._message_box = type('Box', (), {})()
     monkeypatch.setattr(telethon, 'TelegramClient', FakeTelegramClient)
     provider = telegram_collector.TelethonProvider({'session_file': str(tmp_path / 's.session')},
         {'api_id': 1, 'api_hash': '0' * 32, 'expected_user_id': 1}, receive_updates=False)
