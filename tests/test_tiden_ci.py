@@ -801,6 +801,16 @@ def test_image_inputs_cover_every_source_the_image_targets_build_from(tmp_path):
     assert dockerfile_sources(tmp_path / "Dockerfile", "") == dockerfile_sources(tmp_path / "Dockerfile", "final")
 
 
+# spec: ANYM-300
+def test_the_root_build_context_leaves_out_env_files_at_every_depth_but_keeps_the_examples():
+    lines = [line.strip() for line in (Path(__file__).resolve().parents[1] / ".dockerignore").read_text().splitlines()]
+    rules = [line for line in lines if line and not line.startswith("#")]
+    for excluded in ("**/.env", "**/.env.*"):
+        assert excluded in rules
+    # Docker applies the last matching rule, so the example exception must come after the exclusions.
+    assert rules.index("!**/.env.example") > rules.index("**/.env.*")
+
+
 
 RELEASE_SHA = "a" * 40
 RUN_URL = "https://github.com/example/repo/actions/runs/7/attempts/1"
