@@ -4942,5 +4942,48 @@
       "openWorldHint": false,
       "readOnlyHint": true
     }
+  },
+  {
+    "name": "platform_select_modules",
+    "module": "gateway",
+    "operation": "select_modules",
+    "scopes": [],
+    "description": "Narrow this key's DeedKit tool list on this connection path to the named modules; it never adds a tool or a right. Takes effect at the next tools/list: refresh the connection if the list differs. Shared by every connection of this key; REST calls ignore it. To widen again, select all modules; a policy change or gateway restart clears it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "modules": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "calendar",
+              "calls",
+              "messaging"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "title": "Modules"
+        }
+      },
+      "required": [
+        "modules"
+      ],
+      "title": "select_modulesArguments",
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "additionalProperties": true,
+      "title": "select_modulesDictOutput"
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
   }
 ]

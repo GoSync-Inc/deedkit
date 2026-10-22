@@ -9,6 +9,16 @@ from .catalog import arguments, CATALOG, InvalidArguments
 from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, stale_arguments_hint, unavailable, unknown_tool_denial
 from .policy import Denied, key_from_file
 
+PLAIN_PATH = "/mcp"
+MODULE_PATH = "/mcp/modules/"
+# One line each for an agent choosing what to load (ANYM-271); the ids are the deployable modules.
+# No ", " or ": ": the MCP text block is compact JSON (ANYM-408).
+MODULE_PURPOSES = {
+    "calendar": "Family calendar agenda and free slots with planned event changes",
+    "calls": "Voice calls with briefs and preflight plus placed calls and their records",
+    "messaging": "Messenger chats with search and the reply queue plus files and sending",
+}
+
 CALENDAR_CONSTRAINTS = {
     "event_write",
     "time_format",
@@ -30,6 +40,26 @@ CALENDAR_CONSTRAINTS = {
     "atomic_cross_provider",
     "availability_sources",
 }
+
+
+class Route:
+    """An MCP connection path: plain `/mcp` (all modules) or `/mcp/modules/<m>[,<m>...]` (only those)."""
+
+    def __init__(self, path, modules=None):
+        self.path, self.modules = path, modules
+
+    @classmethod
+    def parse(cls, path):
+        """The route of an MCP path, None for any other path; a malformed module path is `unknown_module`."""
+        if path.rstrip("/") == PLAIN_PATH:
+            return cls(PLAIN_PATH)
+        if path.rstrip("/") != PLAIN_PATH + "/modules" and not path.startswith(MODULE_PATH):
+            return None
+        names = path[len(MODULE_PATH):]
+        names = (names[:-1] if names.endswith("/") else names).split(",")
+        if not names or len(set(names)) != len(names) or not set(names) <= MODULE_PURPOSES.keys():
+            raise Denied("unknown_module", 404)
+        return cls(MODULE_PATH + ",".join(sorted(names)), frozenset(names))
 
 
 WARNING_WINDOW_DAYS = 7
@@ -73,6 +103,8 @@ class Dispatch:
     def __init__(self, policy, clients, tickets=None):
         self.policy, self.clients, self.tickets = policy, clients, tickets
         self.warned = {}
+        # In-session module selections of one policy revision: (principal id, route path) -> modules. Memory only.
+        self.selections, self.selection_revision = {}, None
 
     def credential(self, agent):
         """Expiry for the authenticated holder; logs one warning per principal per UTC day."""
@@ -159,9 +191,26 @@ class Dispatch:
             raise Denied("backend_capability_contract_unavailable", 503)
         return result
 
-    async def discover(self, key):
+    def selected(self, agent, revision, route):
+        """The modules an MCP route may use: its path's modules narrowed by the principal's selection; None = all."""
+        if revision != self.selection_revision:
+            # Any request that observes a new policy revision clears every principal's selection.
+            self.selections, self.selection_revision = {}, revision
+        if route is None:
+            return None
+        modules = route.modules
+        entry = self.selections.get((agent["id"], route.path))
+        if entry:
+            modules = entry if modules is None else modules & entry
+        return modules
+
+    async def discover(self, key, route=None, narrow=True):
+        """Effective tools; on an MCP route with `narrow`, only the selected modules' (their backends alone are asked)."""
         snapshot, agent = self.authenticate(key)
         visible = self.policy.visible(snapshot, agent)
+        selected = self.selected(agent, snapshot["revision"], route)
+        if narrow and selected is not None:
+            visible = [n for n in visible if CATALOG[n]["module"] in selected | {"gateway"}]
         modules = sorted({CATALOG[name]["module"] for name in visible} - {"gateway"})
 
         async def one(module):
@@ -205,7 +254,45 @@ class Dispatch:
         return current, principal, visible, {
             "states": states, "scopes": scopes, "actions": actions,
             "discovery": discovery(visible, actions, current["revision"]),
-            "backend_tool_manifests": manifests,
+            "backend_tool_manifests": manifests, "selected": selected,
+        }
+
+    async def select_modules(self, key, route, modules):
+        """Record a narrowing selection for this principal and route; report the list it yields."""
+        route = route or Route(PLAIN_PATH)
+        snapshot, agent = self.authenticate(key)
+        self.selected(agent, snapshot["revision"], None)
+        self.selections[(agent["id"], route.path)] = frozenset(modules)
+        _, _, visible, details = await self.discover(key, route)
+        return {
+            "selection_path": route.path,
+            "effective_modules": sorted({CATALOG[n]["module"] for n in visible} - {"gateway"}),
+            "tools_sha256": details["discovery"]["tools_sha256"],
+            "takes_effect": "next_tools_list",
+            "next_action": details["discovery"]["next_action"],
+        }
+
+    async def platform(self, key, route):
+        """`platform_capabilities`: the route's effective list plus every module the key can use (REST: all tools)."""
+        snapshot, agent, usable, states = await self.discover(key, route or Route(PLAIN_PATH), narrow=False)
+        selected = states["selected"]
+        visible = usable
+        if route is not None and selected is not None:
+            visible = [n for n in usable if CATALOG[n]["module"] in selected | {"gateway"}]
+            states["discovery"] = discovery(visible, states["actions"], snapshot["revision"])
+        counts = {}
+        for name in usable:
+            if CATALOG[name]["module"] != "gateway":
+                counts[CATALOG[name]["module"]] = counts.get(CATALOG[name]["module"], 0) + 1
+        chosen = sorted(m for m in counts if selected is None or m in selected)
+        return snapshot, agent, visible, states, {
+            "selection_path": (route or Route(PLAIN_PATH)).path,
+            "selected_modules": chosen,
+            "modules_available": [
+                {"id": m, "purpose": MODULE_PURPOSES[m], "tool_count": counts[m], "selected": m in chosen,
+                 "path": MODULE_PATH + m}
+                for m in sorted(counts)
+            ],
         }
 
     def authenticate(self, key):
@@ -217,7 +304,8 @@ class Dispatch:
     def admit(self, key, name):
         return self.policy.authorize_agent(*self.authenticate(key), name)
 
-    async def call(self, key, name, values):
+    async def call(self, key, name, values, route=None):
+        """One admitted tool call; `route` is the MCP connection path (REST passes None and ignores selection)."""
         try:
             snapshot, agent, tool = self.admit(key, name)
         except Denied as error:
@@ -225,6 +313,12 @@ class Dispatch:
             if error.code == "not_found_or_forbidden" and error.status == 403:
                 error.detail = unknown_tool_denial()
             raise
+        selected = self.selected(agent, snapshot["revision"], route)
+        if selected is not None and tool["module"] not in selected | {"gateway"}:
+            denied = Denied("module_not_selected", 403)
+            denied.detail = {"error": "module_not_selected", "module": tool["module"],
+                             "next_action": "select_module_or_use_its_connection_path"}
+            raise denied
         try:
             args = arguments(tool, values)
         except InvalidArguments as error:
@@ -236,8 +330,10 @@ class Dispatch:
             raise denied from None
         except ValueError:
             raise Denied("invalid_arguments", 422) from None
+        if tool["operation"] == "select_modules":
+            return await self.select_modules(key, route, args["modules"])
         if tool["module"] == "gateway":
-            snapshot, agent, visible, states = await self.discover(key)
+            snapshot, agent, visible, states, selection = await self.platform(key, route)
             credential = admitted.get()
             return {
                 "service": "deedkit",
@@ -252,12 +348,15 @@ class Dispatch:
                 "backend_states": states["states"],
                 "coverage": "query selected module capabilities; unavailable/stale sources remain unknown",
                 "subscriptions": "existing backend identity; passive events do not ACK",
+                # The gateway's own local write (platform_select_modules) is not a provider mutation.
                 "provider_mutations": any(
-                    not CATALOG[n].get("annotations", {}).get("readOnlyHint", False) for n in visible
+                    CATALOG[n]["module"] != "gateway"
+                    and not CATALOG[n].get("annotations", {}).get("readOnlyHint", False) for n in visible
                 ),
                 "owner_authorization_verified": False,
                 "credential": credential,
                 "capability": Capability("gateway", "capabilities", snapshot["revision"]).to_dict(),
+                **selection,
             }
         module = tool["module"]
         target = snapshot["deployment"]["backends"].get(module)
