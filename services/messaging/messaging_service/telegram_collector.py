@@ -1082,15 +1082,16 @@ class TelegramCollector:
             default=job['provider_message_id']=await asyncio.to_thread(self.oldest_archived,job.get('chat_id'))
         job['_history']=found=[]
         answer=await self.provider.execute_operation(job)
-        created=await self.store_live_hits(found,label='chat_history',deadline=job.get('_deadline'))
+        # Owner 2026-10-23: an explicit request for one named chat also stores its page below history_since;
+        # background collection and live search hits keep the boundary.
+        created=await self.store_live_hits(found,label='chat_history',deadline=job.get('_deadline'),window=False)
         data=answer.get('data')
         if isinstance(data,dict):
             data['stored_new']=created
-            # Messages below history_since are never stored, so a retry cannot help them (F-477a): they get
-            # their own count, and not_stored with retry_parameters covers only storage errors and the deadline.
-            outside=sum(1 for _,hit,_,_ in found if hit.get('reason')=='outside_history_window')
-            if outside:data['outside_history_window']=outside
-            missed=sum(1 for _,hit,_,_ in found if not hit.get('stored') and hit.get('reason')!='outside_history_window')
+            below=sum(1 for m,_,_,_ in found if m is not None and m.date and not self.in_window([m]))
+            if below:data['below_history_since']=below
+            # not_stored with retry_parameters covers only storage errors and the deadline (F-477a).
+            missed=sum(1 for _,hit,_,_ in found if not hit.get('stored'))
             if missed:
                 # A later default request starts below the oldest archived message and would skip these,
                 # so the receipt names the request that loads this page again (a rerun adds no duplicates):
@@ -1104,8 +1105,7 @@ class TelegramCollector:
                     data['retry_parameters']={'count':parameters.get('count',50),'before_message':
                         stable_id('msg',self.account,str(job.get('provider_chat')),str(default))}
                 else:
-                    dates=[m.date for m,hit,_,_ in found if m is not None and not hit.get('stored') and m.date
-                             and hit.get('reason')!='outside_history_window']
+                    dates=[m.date for m,hit,_,_ in found if m is not None and not hit.get('stored') and m.date]
                     if dates:
                         data['retry_parameters']={'count':100,
                             'from_time':min(dates).strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -1118,7 +1118,7 @@ class TelegramCollector:
                 ORDER BY length(provider_id),provider_id LIMIT 1''',(self.account,chat)).fetchone()
         return row['provider_id'] if row else None
 
-    async def store_live_hits(self,found,*,label='live_search',deadline=None):
+    async def store_live_hits(self,found,*,label='live_search',deadline=None,window=True):
         """ANYM-476: archive live search hits as backfill through the history page commit's archive apply.
 
         No spool: a hit that cannot be stored is reported in its receipt and is not replayed, so it never
@@ -1135,7 +1135,7 @@ class TelegramCollector:
         def late():return deadline is not None and deadline-loop.time()<STORE_MARGIN
         stored=skipped=failed=created=0
         for message,hit,chat_type,title in found:
-            if message is not None and not self.in_window([message]):
+            if window and message is not None and not self.in_window([message]):
                 hit.update(stored=False,reason='outside_history_window'); skipped+=1; continue
             if late():
                 hit.update(stored=False,reason='deadline'); failed+=1; continue
