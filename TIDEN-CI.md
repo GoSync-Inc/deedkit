@@ -654,10 +654,13 @@ Readiness also requires a captured candidate release gate and a review of the
 unresolved production issues. Errors reach their component through its runtime
 paths: each messaging component lists its `messaging_service` files as
 `services/messaging/messaging_service/<file>.py` and the older
-`messaging_service/<file>.py`. A changed component path for such a file changes
-its runtime paths too (`tiden component update --runtime-path`, which replaces
-the list). The gate's product `prod_issues` row fails on any error left without
-a component. Missing release evidence is unknown. Report the native verdict
+`messaging_service/<file>.py`. A change that edits a messaging component's
+paths also re-issues that component's full runtime-path list, both forms of
+every file (`tiden component update --runtime-path` replaces the whole list).
+The gate's product `prod_issues` row fails on any error left without a
+component: add the missing runtime path to the owning component; never resolve
+or ignore the error to clear it. A passing row does not replace release-scope
+triage. Missing release evidence is unknown. Report the native verdict
 separately from the project's readiness decision.
 
 Messaging telemetry names its release `deedkit@<sha>` from the exact source

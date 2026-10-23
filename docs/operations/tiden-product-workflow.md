@@ -32,12 +32,12 @@ GitHub.
 `scripts/spec_impact.py <base> --body-file <body>` builds the `Spec impact:` list (harness
 `tiden.md`). Maintenance windows are in TIDEN-CI.md.
 
-A Tiden branch whose work is finished elsewhere but which stays `open` (for example an intent
-branch whose pull request merged while its auto-merge still reports `no_merged_pr`) is closed
-with `tiden branch close --name <branch>` (CLI 0.40 or later): closing is final and keeps specs,
-links and runs. Never `branch delete` it. Proposal and review branches stay open until
-implemented; an intent branch with an open session or an open pull request stays open, because
-closing it also closes the session.
+Close only an intent branch whose pull request merged or closed and whose session is closed;
+proposal and review branches stay open until implemented, and an intent branch with an open
+session or pull request stays open (closing it closes the session). Such a branch can stay
+`open` when its auto-merge status (`autoMerge` in `branch merge-preview`) never sees the merge,
+for example `no_merged_pr`. Close it with `tiden branch close --name <branch>` (CLI 0.40 or
+later): final, and it keeps specs, links and runs. Never `branch delete` it.
 
 ## Agent feedback
 

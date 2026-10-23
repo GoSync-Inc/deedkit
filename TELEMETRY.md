@@ -82,7 +82,7 @@ allowlisted exception type, public Python filenames/line numbers and, for Telegr
 and WhatsApp collector events, the `fingerprint` described above. Filenames are
 relative to the repository root (`services/messaging/messaging_service/<file>.py`),
 like Tiden component paths. Older events used `messaging_service/<file>.py`; component
-runtime paths attribute both forms (TIDEN-CI.md), and a recurring error may appear once
+runtime paths match both path forms (TIDEN-CI.md), and a recurring error may appear once
 under each.
 It excludes exception text, cause chains, locals, source lines, absolute paths,
 HTTP bodies/headers/URLs, account/chat/person identifiers, search terms, messages,
