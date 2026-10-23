@@ -1387,6 +1387,24 @@ def rolled_back_refusal(host, match):
     assert host.mutations() == [] and not (host.state / RELEASES[1] / "rollback.json").exists()
 
 
+# spec: ANYM-488
+def test_rollback_and_prepare_do_not_check_the_host_backup_runner(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    stale = tmp_path / "stale_runner.py"
+    stale.write_bytes(b"stale runner\n")
+    monkeypatch.setattr(p, "BACKUP_RUNNER", stale)
+    def checked(*args):
+        raise AssertionError("the host backup runner was read")
+    monkeypatch.setattr(p, "check_backup_runner", checked)
+    assert p.rollback(host.settings, RELEASES[1])["status"] == "rolled-back"
+    host.main = RELEASES[2]
+    p.prepare(host.settings, RELEASES[2])
+    with pytest.raises(AssertionError, match="backup runner was read"):
+        p.apply(host.settings, RELEASES[2])
+
+
 @pytest.mark.parametrize("drift", ["recreated-same-image", "other-image", "compose-configuration"])
 def test_rollback_is_refused_when_production_changed_since_apply(tmp_path, monkeypatch, drift):
     host = Host(tmp_path, monkeypatch)
@@ -2694,6 +2712,34 @@ def test_a_refusal_before_any_change_pauses_and_a_network_or_quota_error_is_retr
         host.steps.clear()
         # The retry applies the prepared release without preparing it again.
         assert host.deploy()["status"] == "deployed" and host.steps[0] == ("apply", NEWEST)
+
+# spec: ANYM-488
+def test_an_automatic_deploy_pauses_on_a_host_backup_runner_mismatch_and_keeps_the_prepared_release(tmp_path,
+                                                                                                  monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    runner = tmp_path / "backup_runner.py"
+    runner.write_bytes(b"stale runner\n")
+    monkeypatch.setattr(p, "BACKUP_RUNNER", runner)
+    release = b"release runner\n"
+    expected = hashlib.sha1(b"blob %d\0" % len(release) + release).hexdigest()
+    original = p.run
+    def command(argv, **kw):
+        if argv[-2:-1] == ["rev-parse"] and argv[-1].endswith(":" + p.BACKUP_RUNNER_SOURCE):
+            return expected + "\n"
+        return original(argv, **kw)
+    monkeypatch.setattr(p, "run", command)
+    def refused(sha):
+        (host.state / sha / "attempted.json").unlink()  # the real apply refuses before it writes the attempt
+        p.check_backup_runner(host.state / sha / "source", sha)
+    host.fail_apply = refused
+    outcome = host.deploy(auto=True)
+    assert outcome["status"] == "halted" and "refused before any change" in outcome["reason"]
+    assert expected[:12] in outcome["reason"] and p.blob(runner)[:12] in outcome["reason"]
+    assert expected[:12] in host.paused() and expected[:12] in json.dumps(p.read(host.state / "deploy.json"))
+    assert (host.state / NEWEST / "prepared.json").exists() and p.read(host.state / "current.json")["sha"] == BASE
+    host.steps.clear()
+    assert host.deploy(auto=True)["status"] == "paused" and host.steps == []
+
 
 
 def test_deploy_waits_for_the_api_quota_and_for_the_interval_between_automatic_deploys(tmp_path, monkeypatch):

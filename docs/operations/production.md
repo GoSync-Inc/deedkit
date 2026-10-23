@@ -590,14 +590,16 @@ With the timer and the backup service idle, from the prepared release:
 ```sh
 sha=<same-sha>; src=/var/lib/deedkit-production/$sha/source
 sudo cp -p /opt/personal-os-probe/ops/backup_runner.py /opt/personal-os-probe/ops/backup_runner.py.before-$sha
-sudo sh -c 'umask 077 && cd /opt/personal-os-probe/ops &&
-  git -C "$0" show "$1:services/messaging/messaging_service/backup_runner.py" > .backup_runner.py.new &&
-  mv .backup_runner.py.new backup_runner.py' "$src" "$sha"
-sudo git hash-object /opt/personal-os-probe/ops/backup_runner.py   # = git rev-parse $sha:<that path>
+sudo install -o root -g root -m 0600 "$src/services/messaging/messaging_service/backup_runner.py" \
+  /opt/personal-os-probe/ops/backup_runner.py
+sudo git hash-object /opt/personal-os-probe/ops/backup_runner.py   # = git -C "$src" rev-parse $sha:<that path>
 ```
 
-Undo: install the `.before-<sha>` copy back the same way. A runner change that
-also changes its worker protocol needs the matching backup image pinned first.
+When the backup worker changed in the same range, update the backup image pin
+in `runner.json` too. Install the new runner before you add any new
+`runner.json` key: the runner refuses keys it does not know. Then remove
+`/etc/deedkit/autodeploy.pause`. Undo: install the `.before-<sha>` copy back
+the same way.
 
 ## Roll back the current release
 
@@ -791,6 +793,9 @@ Otherwise it:
    class changes nothing else: the run pauses and you migrate by hand.
    When the only such change is the `production.py`/`seamless_release.py`
    pair, the self-updating layout installs it instead ("Deploy tool updates");
+   apply also refuses before any change while the host backup runner is not
+   the candidate's ("Backup runner"), so every merge that changes
+   `backup_runner.py` pauses automatic deploys until the operator installs it;
 4. runs `prepare` + `apply` (plan A), then `seamless_release.py prepare` +
    `promote` (plan B), all at that one SHA with every guard of those steps;
    when plan A is ahead of the HTTP release, it runs plan B only;
