@@ -4876,6 +4876,8 @@ def test_a_missing_configuration_file_is_named_in_the_refusal(tmp_path, monkeypa
                           ("DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a.json\nNOTES='\nDEEDKIT_DEPLOY_CONFIG=/etc/deedkit/b.json\n'\n",
                            "cannot read as systemd does"),
                           ("OTHER=value\\ \nDEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a.json\n", "cannot read as systemd does"),
+                          ("DEEDKIT_DEPLOY_CONFIG=/a.json\n# note\fDEEDKIT_DEPLOY_CONFIG=/b.json\n", "character status cannot read as systemd does"),
+                          ("DEEDKIT_DEPLOY_CONFIG=/a.json\u00a0\n", "character status cannot read as systemd does"),
                           ("DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a.json\nDEEDKIT_DEPLOY_CONFIG=\n", "empty DEEDKIT_DEPLOY_CONFIG")]:
         (tmp_path / "autodeploy.env").write_text(text)
         with pytest.raises(SystemExit):
