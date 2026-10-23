@@ -312,6 +312,31 @@ def test_a_message_not_stored_is_reported_with_the_request_that_reloads_its_page
     assert 'not_stored' not in asyncio.run(complete.chat_history(job({'count': 10})))['data']
 
 
+
+# spec: ANYM-477
+def test_a_page_below_the_history_window_is_reported_as_such_with_no_futile_retry():
+    applied, failing = [], set()
+    def apply(capture):
+        number = capture['envelope']['provider_id']
+        if number in failing: raise RuntimeError('synthetic transient failure')
+        applied.append(number)
+        return {'outcome': 'created'}
+    c = collector(apply)
+    # The default anchor (the oldest archived message) is itself older than history_since.
+    c.history_since = datetime.fromtimestamp(WHEN + 39 * 60, timezone.utc)
+    c.oldest_archived = lambda chat: '41'
+    async def provider(value):
+        return await execute(owner_client(page([message(n, when=WHEN + (n - 10) * 60) for n in (40, 39, 38)])), value)
+    c.provider.execute_operation = provider
+    data = asyncio.run(c.chat_history(job({'count': 10})))['data']
+    assert data['fetched'] == 3 and data['stored_new'] == 0 and data['outside_history_window'] == 3 and applied == []
+    assert 'not_stored' not in data and 'retry_parameters' not in data
+    # A storage failure in the same page is still not_stored with its retry; the outside-window part keeps its own name.
+    c.history_since, failing = datetime.fromtimestamp(WHEN + 29 * 60, timezone.utc), {'39'}
+    data = asyncio.run(c.chat_history(job({'count': 10})))['data']
+    assert data['outside_history_window'] == 1 and data['not_stored'] == 1 and applied == ['40']
+    assert data['retry_parameters'] == {'count': 10, 'before_message': stable_id('msg', ACCOUNT, '-22', '41')}
+
 class Paging(Client):
     """A fake Telegram history: the exclusive offset_id/offset_date first, then the page limit."""
     def __init__(self, messages):
