@@ -96,3 +96,13 @@ def test_queue_numeric_date_rolls_into_a_leap_year_and_rejects_invalid_dates():
 # spec: ANYM-282
 def test_queue_parser_error_drops_the_flag_not_the_read():
     assert passed_reference('сегодня?','not a datetime',at(20),UTC) is None
+
+
+# spec: ANYM-282
+def test_queue_past_qualifier_stays_within_the_weekday_clause():
+    for text in ('on Friday of last week?','hari Jumat minggu lalu?'):
+        assert passed_reference(text,MONDAY,at(20),UTC) is None
+        assert passed_reference('сегодня? '+text,MONDAY,at(20),UTC)['resolved_date']=='2026-10-12'
+    # A past phrase in the next sentence does not cancel a future Friday.
+    assert passed_reference('today or on Friday? Last week was busy.',MONDAY,at(14),UTC) is None
+    assert passed_reference('Last week was busy. Today or on Friday?',MONDAY,at(14),UTC) is None
