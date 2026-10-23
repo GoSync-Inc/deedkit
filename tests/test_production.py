@@ -4825,3 +4825,66 @@ def test_an_unresolved_or_malformed_tool_update_pauses_before_any_other_step(tmp
     assert outcome["status"] == "halted" and host.git == [] and host.steps == []
     assert ("malformed" in outcome["reason"]) if status == "malformed" else (
         f"python3 {host.tool}/releases/{BASE}/production.py" in outcome["reason"])
+
+
+# spec: ANYM-443
+def test_status_reads_the_configuration_the_autodeploy_unit_reads(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("DEEDKIT_DEPLOY_CONFIG", raising=False)
+    monkeypatch.setattr(p, "CONFIG_DIRECTORY", tmp_path / "etc")
+    monkeypatch.setattr(p, "PAUSE", tmp_path / "etc" / "autodeploy.pause")
+    monkeypatch.setattr(p, "lock", lambda state: contextlib.nullcontext())
+    states = {name: tmp_path / name for name in ("production", "stale", "active", "explicit")}
+    for name, state in states.items():
+        state.mkdir()
+        p.write(state / "current.json", {"sha": name[0] * 40, "status": "applied"})
+    monkeypatch.setattr(p, "config", lambda path: {"state_directory": str(states[Path(path).stem])})
+    def status(*argv):
+        p.main(["status", *argv])
+        return json.loads(capsys.readouterr().out)
+    # No autodeploy.env: the unit's default.
+    assert status()["sha"] == "p" * 40
+    p.CONFIG_DIRECTORY.mkdir()
+    # As systemd reads it: comments skipped, the last assignment wins.
+    (p.CONFIG_DIRECTORY / "autodeploy.env").write_text("DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/stale.json\n"
+        "# DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/explicit.json\nDEEDKIT_DEPLOY_CONFIG='/etc/deedkit/active.json'\n")
+    printed = status()
+    assert printed["sha"] == "a" * 40 and printed["config"] == "/etc/deedkit/active.json"
+    # The process environment wins, as systemd's Environment= would for the operator's shell; --config wins over both.
+    monkeypatch.setenv("DEEDKIT_DEPLOY_CONFIG", "/etc/deedkit/stale.json")
+    assert status()["sha"] == "s" * 40
+    assert status("--config", "/etc/deedkit/explicit.json")["sha"] == "e" * 40
+    # Other actions keep the fixed default.
+    monkeypatch.delenv("DEEDKIT_DEPLOY_CONFIG")
+    seen = []
+    monkeypatch.setattr(p, "config", lambda path: seen.append(path) or {"state_directory": str(states["stale"])})
+    monkeypatch.setattr(p, "images_report", lambda settings: {})
+    p.main(["images"])
+    assert seen == [p.CONFIG]
+
+
+# spec: ANYM-443
+def test_a_missing_configuration_file_is_named_in_the_refusal(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("DEEDKIT_DEPLOY_CONFIG", raising=False)
+    missing = tmp_path / "absent.json"
+    with pytest.raises(SystemExit) as stopped:
+        p.main(["status", "--config", str(missing)])
+    assert stopped.value.code == 1
+    assert capsys.readouterr().err == f"promotion refused: FileNotFoundError {missing}\n"
+    # An autodeploy.env this parser cannot read as systemd does is refused, not guessed.
+    monkeypatch.setattr(p, "CONFIG_DIRECTORY", tmp_path)
+    for text, refusal in [("DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a\\\n.json\n", "cannot read as systemd does"),
+                          ("DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a.json\nNOTES='\nDEEDKIT_DEPLOY_CONFIG=/etc/deedkit/b.json\n'\n",
+                           "cannot read as systemd does"),
+                          ("OTHER=value\\ \nDEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a.json\n", "cannot read as systemd does"),
+                          ("DEEDKIT_DEPLOY_CONFIG=/a.json\n# note\fDEEDKIT_DEPLOY_CONFIG=/b.json\n", "character status cannot read as systemd does"),
+                          ("DEEDKIT_DEPLOY_CONFIG=/a.json\u00a0\n", "character status cannot read as systemd does"),
+                          ("DEEDKIT_DEPLOY_CONFIG=/a.json\n# note\rDEEDKIT_DEPLOY_CONFIG=/b.json\n",
+                           "character status cannot read as systemd does"),
+                          ("DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a.json\nDEEDKIT_DEPLOY_CONFIG=\n", "empty DEEDKIT_DEPLOY_CONFIG")]:
+        (tmp_path / "autodeploy.env").write_text(text)
+        with pytest.raises(SystemExit):
+            p.main(["status"])
+        assert refusal + "; pass --config" in capsys.readouterr().err
+    # Plain lines with spaces around = and paired quotes read as systemd reads them.
+    (tmp_path / "autodeploy.env").write_text('; note\nOTHER = "x y"\nDEEDKIT_DEPLOY_CONFIG = "/etc/deedkit/b.json"\n')
+    assert p.active_config() == "/etc/deedkit/b.json"
