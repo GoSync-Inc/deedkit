@@ -598,8 +598,11 @@ sudo git hash-object /opt/personal-os-probe/ops/backup_runner.py   # = git -C "$
 When the backup worker changed in the same range, update the backup image pin
 in `runner.json` too. Install the new runner before you add any new
 `runner.json` key: the runner refuses keys it does not know. Then remove
-`/etc/deedkit/autodeploy.pause`. Undo: install the `.before-<sha>` copy back
-the same way.
+`/etc/deedkit/autodeploy.pause`. Undo, in this order: remove from
+`runner.json` every key the `.before-<sha>` runner does not know (for example
+`busy_wait_seconds`) and put back the image pin it ran with, then install the
+`.before-<sha>` copy the same way. An older runner refuses a newer key, so
+the backup would fail on every run.
 
 ## Roll back the current release
 

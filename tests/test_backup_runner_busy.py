@@ -120,3 +120,77 @@ def test_the_busy_wait_bound_is_an_optional_whole_number_of_seconds(tmp_path, va
     else:
         with pytest.raises(ValueError, match='invalid_backup_timeout'):
             backup_runner.config(path)
+
+
+# spec: ANYM-489
+@pytest.mark.parametrize('after', [30, None])
+def test_the_capture_deadline_counts_neither_busy_answers_nor_waits_but_still_ends_a_stuck_worker(tmp_path, after):
+    attempts = []
+    runner, docker = streaming_runner(tmp_path, busy_stream(3, attempts))
+    now = [0.0]
+    runner.clock = lambda: now[0]
+    def sleep(seconds):
+        now[0] += seconds
+    runner.sleep = sleep
+    # The worker is told to start only by the stored offer, after three minutes of busy answers (timeout 60 s).
+    original = docker.inspect
+    def inspect(cid):
+        info = original(cid)
+        if info and cid.startswith('pos-backup-') and (tmp_path / info['Config']['Labels']['personal-os.backup.id']
+                                                       / 'result.json').exists():
+            stored.setdefault('at', now[0])
+            if after is None or now[0] < stored['at'] + after:
+                info['State'].update(Running=True, Status='running')
+        return info
+    stored = {}
+    docker.inspect = inspect
+    if after is None:
+        with pytest.raises(RuntimeError, match='backup_capture_timeout'):
+            runner.run()
+        assert 3 * backup_runner.BUSY_RETRY_SECONDS + 60 < now[0] <= 3 * backup_runner.BUSY_RETRY_SECONDS + 61
+    else:
+        runner.run()
+        assert read_json(tmp_path / 'status.json')['state'] == 'ok' and len(attempts) == 4
+
+
+# spec: ANYM-489
+def test_no_offer_starts_after_the_bound_and_every_refused_offer_is_journaled(tmp_path, capsys):
+    attempts, now = [], [0.0]
+    async def send(path, metadata, transfer, timeout, start, completed, stopped=None):
+        attempts.append(now[0])
+        now[0] += 50  # each busy answer takes 50 s
+        raise RuntimeError('receiver_busy')
+    runner, _ = streaming_runner(tmp_path, send)
+    runner.cfg['busy_wait_seconds'] = 180
+    runner.clock = lambda: now[0]
+    def sleep(seconds):
+        now[0] += seconds
+    runner.sleep = sleep
+    with pytest.raises(RuntimeError, match='receiver_busy'):
+        runner.run()
+    first = attempts[0]
+    assert len(attempts) == 2 and all(start - first <= 180 for start in attempts)
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if 'receiver_busy' in line]
+    assert [line['attempt'] for line in lines] == [1]
+    assert lines[0] == {'status': 'waiting', 'code': 'receiver_busy', 'id': runner.journal['id'], 'attempt': 1,
+                        'retry_seconds': backup_runner.BUSY_RETRY_SECONDS}
+
+
+# spec: ANYM-489
+def test_a_sigterm_during_the_busy_wait_keeps_the_capture_and_the_next_run_stores_it(tmp_path):
+    attempts, seen = [], []
+    runner, docker = streaming_runner(tmp_path, busy_stream(1, attempts))
+    def sleep(seconds):
+        if seconds == backup_runner.BUSY_RETRY_SECONDS:
+            seen.append((read_json(tmp_path / 'status.json')['state'], docker.containers['tg-id']['State']['Running']))
+            raise InterruptedError('backup_interrupted')
+    runner.sleep = sleep
+    with pytest.raises(InterruptedError):
+        runner.run()
+    assert seen == [('uploading', True)]
+    runner.recover_stop()
+    assert read_json(tmp_path / 'journal.json')['phase'] == 'stream_upload'
+    runner.run()
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert sum(call == ('stop', '--time', '25', 'tg-id') for call in docker.calls) == 1
+    assert read_json(tmp_path / 'status.json')['state'] == 'ok'

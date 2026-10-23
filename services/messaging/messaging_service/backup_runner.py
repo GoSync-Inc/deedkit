@@ -31,7 +31,8 @@ SAFE_ERRORS={'backup_capture_failed','backup_capture_timeout','backup_container_
     'backup_fence_release_failed','backup_capture_unfenced','backup_fence_retained',
     'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop'}
 # The receiver's own verifier holds its upload lock for a whole restore (about an hour). A delivery it refuses as busy
-# before any ciphertext byte is sent is offered again, same backup ID, every BUSY_RETRY_SECONDS up to the bound.
+# before it stores anything (stream_v2: before the stream started) is offered again, same backup ID, every
+# BUSY_RETRY_SECONDS while the bound since the first offer allows; each offer keeps its upload timeout.
 BUSY_RETRY_SECONDS=60
 BUSY_WAIT_SECONDS=7200
 
@@ -237,14 +238,19 @@ class Runner:
         self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
     def save(self):write_json(self.journal_path,self.journal)
     def deliver(self,send,sent=lambda:False):
-        """`send()`, offered again while the receiver answers busy and `sent()` says no byte left yet; returns the
-        receipt and the seconds spent waiting. Past the bound, or on any other error, the error stands."""
-        started=self.clock();bound=self.cfg.get('busy_wait_seconds',BUSY_WAIT_SECONDS)
+        """`send()`, offered again while the receiver answers busy and `sent()` says the stream has not started; a new
+        offer starts only within the bound since the first. Returns the receipt and the seconds before the offer that
+        was stored. Past the bound, or on any other error, the error stands."""
+        first=self.clock();deadline=first+self.cfg.get('busy_wait_seconds',BUSY_WAIT_SECONDS);attempt=1
         while True:
-            try:return send(),self.clock()-started
+            offered=self.clock()
+            try:return send(),offered-first
             except RuntimeError as exc:
-                if str(exc)!='receiver_busy' or sent() or self.clock()-started+BUSY_RETRY_SECONDS>bound:raise
-            self.sleep(BUSY_RETRY_SECONDS)
+                if str(exc)!='receiver_busy' or sent() or self.clock()+BUSY_RETRY_SECONDS>deadline:raise
+            # One journal line per refused offer: the backup ID and the attempt, no host or path.
+            print(json.dumps({'status':'waiting','code':'receiver_busy','id':self.journal['id'],'attempt':attempt,
+                              'retry_seconds':BUSY_RETRY_SECONDS},separators=(',',':')),flush=True)
+            attempt+=1;self.sleep(BUSY_RETRY_SECONDS)
     def status(self,state,code=None):
         previous=read_json(self.status_path) if self.status_path.exists() else {}
         data={**previous,'state':state,'updated_at':datetime.now(timezone.utc).isoformat()}
@@ -424,7 +430,7 @@ class Runner:
         receipt,waited=self.deliver(lambda:asyncio.run(self.stream_send(work/'ciphertext.fifo',metadata,self.cfg['transfer'],
                                           self.cfg['timeout_seconds'],start,completed,stopped=stopped)),
                                     lambda:(work/'stream-start.json').exists())
-        started+=waited  # The capture deadline never counts a wait for the receiver.
+        started+=waited  # The capture deadline never counts the receiver's busy answers and the waits.
         # A failed/changed source cannot publish a terminal frame. A duplicate
         # receipt instead asks the worker to exit without re-encryption.
         while True:
