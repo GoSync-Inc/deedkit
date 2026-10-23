@@ -20,7 +20,7 @@ def keys(store):
 
 # spec: ANYM-499
 @pytest.mark.parametrize('days', [31, 184, 365])
-def test_issue_key_accepts_up_to_365_days_from_the_database_clock(seeded, days):
+def test_issue_key_accepts_up_to_365_days(seeded, days):
     store, _, _ = seeded
     token = store.issue_key('agent-year', ['telegram-demo'], days=days)
     assert timedelta(days=days) - timedelta(seconds=5) < left(store, token) <= timedelta(days=days)

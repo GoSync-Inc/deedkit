@@ -73,7 +73,7 @@ def test_extend_agent_sets_expiry_from_database_now_and_keeps_the_principal(hous
 def test_extend_agent_refuses_a_lifetime_outside_1_to_183_days(household, tmp_path):
     agent(household)
     before = principal(household)
-    # The ceiling is 365 days since ANYM-499 (owner 2026-10-24); test_extend_agent_accepts_365_days_and_refuses_366.
+    # The ceiling is 365 days since ANYM-499 (owner 2026-10-24): see test_extend_agent_accepts_365_days_and_refuses_366.
     for days in ("0", "-1", "1.5", "abc", "", "٣", "1000", "0183"):
         with pytest.raises(CalendarError, match="^invalid_agent_lifetime$"):
             extend(household, tmp_path, "agent", days)
