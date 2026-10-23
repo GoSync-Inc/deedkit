@@ -249,6 +249,40 @@ permission: the new filter replaces the old one, the ACK version increases,
 outstanding deliveries are dropped and the position is kept. ACK order remains commit order,
 not the original timestamp of a backfilled message.
 
+### Incoming overview: `get_updates` with `view: by_chat` (ANYM-458)
+
+`view: by_chat` answers "what is new across my accounts" in one read-only call. It counts created
+incoming message rows (`message.created` events; edits, deletions, receipts and outgoing messages
+are not counted) after the consumer's acknowledged position and, when given, from `from_time`:
+`window` is `acknowledged_position`, `from_time` or `acknowledged_position_and_from_time`; both
+bounds always apply. Without a consumer `from_time` is required (else `invalid_filter` with
+`fields: ["from_time"]`); an existing consumer at position 0 counts from the journal start. The call writes nothing: no consumer row, delivery
+or receipt, so no cursor moves and ACK stays ingestion-ordered through `get_updates`/`ack_updates`.
+
+One row per archive chat: `live` and `backfill` counts (backfill and reconcile origins, as
+`is_backfill`; a history-only chat has `live: 0` and `newest: null`), `newest` (message, `sent_at`,
+sender, sender name and text cut to `body_chars`, default 80; a media-only message shows its file
+label such as `[photo.jpg]`) of the newest live message, `owner_replied_after_newest: true` when
+an outgoing message in the chat is newer than it, and the `list_chats` read state (`read_state`
+observed, stale or unknown; `provider_unread`, `provider_unread_count`, `read_state_observed_at`).
+An absent read field is unknown (`absent_read_fields: unknown`); provider mute and archive are not
+collected (`provider_mute_archive: unknown`). `accounts` lists each scoped account's source
+`status` and `last_ingest_at`, so an empty account can be told apart from a stopped collector.
+Rows order newest live first, history-only chats last; `limit` counts chats (default 20, up to
+100). A page of up to 25 rows stays within 10,000 characters: when needed, texts shorten to 40
+characters, names to 32, texts drop, sender IDs beside a name drop, observation times drop and
+names shorten to 16 and drop, then the oldest rows move to the next call (`has_more`), then
+`accounts` drops; `shortened_for_size` names the last step. `filters` lists only the names of the
+filters that applied. `has_more`, `chats_total`, `live_total` and `backfill_total` cover the whole window, not the
+page. Filters: accounts, chats, senders, dates, `exclude_channels`; chats outside the key's scope
+are neither counted nor named. A WhatsApp conversation stored under a phone and a LID chat is two
+archive chats here (`list_chats` shows it once, ANYM-278). `origins`, `kinds`, `order`,
+`start_from`, `reset_filters` and `direction: outgoing` are `invalid_filter`.
+Example: `{"consumer": "overview", "view": "by_chat", "from_time": "2026-10-23T06:00:00Z"}`.
+
+For the messages themselves in time order use the default view with `direction: incoming`,
+`origins: ["live"]` and `from_time`. `order: sent_at` sorts one delivered page only: read every
+page (ACK each after processing), then sort the union by `sent_at`.
 
 ## Live Telegram search inside `search` (ANYM-478)
 

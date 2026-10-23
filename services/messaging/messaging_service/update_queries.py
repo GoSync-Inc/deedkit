@@ -13,12 +13,17 @@ from .search_query import coverage,filter_values,output_options,shape_messages
 def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=None,
                 origins=None,kinds=None,direction='',from_time='',to_time='',compact=False,
                 body_chars=None,include_coverage=True,exclude_channels=False,order='event',
-                reset_filters=False,expected_ack_version=None,start_from='beginning'):
+                reset_filters=False,expected_ack_version=None,start_from='beginning',view='events'):
     from .store import APIError,bounded,date_bound,digest,serial
     from .message_queries import enrich
     bounded(limit);cap=output_options(compact,body_chars,include_coverage)
     if not isinstance(consumer,str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',consumer):
         raise APIError('invalid_consumer')
+    if not isinstance(view,str) or view not in ('events','by_chat'):raise APIError('invalid_filter')
+    if view=='by_chat' and (origins is not None or kinds is not None or direction=='outgoing' or order!='event'
+            or reset_filters is not False or expected_ack_version is not None or start_from!='beginning'):
+        # The overview counts created incoming messages only and issues no receipt.
+        raise APIError('invalid_filter')
     if not isinstance(direction,str) or direction not in ('','incoming','outgoing'):
         raise APIError('invalid_filter')
     if type(exclude_channels) is not bool or type(reset_filters) is not bool or order not in ('event','sent_at'):
@@ -44,6 +49,8 @@ def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=N
     if direction:filters['direction']=direction
     if lower:filters['from_time']=lower.isoformat()
     if upper:filters['to_time']=upper.isoformat()
+    # The overview's own text default (80) applies on every transport; compact's 320 does not.
+    if view=='by_chat':return overview(store,c,p,consumer,limit,filters,lower,upper,80 if body_chars is None else body_chars)
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('consumers:'+p['id'],))
     total=c.execute('SELECT count(DISTINCT name) AS n FROM consumers WHERE principal=%s',(p['id'],)).fetchone()['n']
     existing=c.execute('SELECT 1 FROM consumers WHERE principal=%s AND name=%s',(p['id'],consumer)).fetchone()
@@ -109,3 +116,118 @@ def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=N
         'ack_version':state['version'],'filters':filters,'order':'ingestion_event_sequence',
         'presentation_order':order,'chronological_scope':'delivered_batch_only' if order=='sent_at' else None,
         'filter_binding':'version_checked_reset_preserves_ack_position',**coverage(store,c,p,include_coverage)})
+
+
+def overview(store,c,p,consumer,limit,filters,lower,upper,width):
+    """Per chat counts of created incoming messages after the consumer's ACK (ANYM-458).
+
+    Read only: no consumer row, delivery or receipt is written, so no cursor moves.
+    Live and backfill (backfill or reconcile origin, as is_backfill) are counted apart.
+    """
+    from .store import APIError,serial
+    from .chat_queries import read_state_sql
+    from .message_queries import enrich
+    state=c.execute('SELECT position FROM consumers WHERE principal=%s AND name=%s AND scope_version=%s',
+        (p['id'],consumer,p['scope_version'])).fetchone()
+    position=state['position'] if state else 0
+    # Without a consumer the window would be the whole journal: from_time bounds it.
+    if state is None and lower is None:
+        failure=APIError('invalid_filter');failure.fields=['from_time'];raise failure
+    head=c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
+    where,args=scope_filter(p,'m')
+    clauses=[where,'m.account=e.account',"e.kind='message.created'","m.direction='incoming'"]
+    for key,column in [('accounts','m.account'),('chats','m.chat'),('senders','m.sender')]:
+        if key in filters:clauses.append(column+'=ANY(%s)');args.append(filters[key])
+    if 'exclude_channels' in filters:
+        clauses.append("EXISTS(SELECT 1 FROM chats ch WHERE ch.id=m.chat AND ch.account=m.account AND ch.chat_type IS DISTINCT FROM 'channel')")
+    for bound,op in [(lower,'>='),(upper,'<')]:
+        if bound:clauses.append('m.sent_at'+op+'%s');args.append(bound)
+    read_sources,fresh,unread=read_state_sql(c)
+    rows=c.execute('''WITH sel AS MATERIALIZED (SELECT m.account,m.chat,m.id,m.sent_at,
+          e.origin IN ('backfill','reconcile') AS backfill
+        FROM events e JOIN messages m ON m.id=e.message WHERE e.id>%s AND e.id<=%s AND '''+' AND '.join(clauses)+'''),
+      per AS (SELECT account,chat,count(*) FILTER (WHERE NOT backfill) AS live,count(*) FILTER (WHERE backfill) AS backfill,
+          max(sent_at) FILTER (WHERE NOT backfill) AS newest_at,max(sent_at) AS latest_at FROM sel GROUP BY account,chat)
+      SELECT per.*,count(*) OVER () AS chats_total,sum(per.live) OVER () AS live_total,sum(per.backfill) OVER () AS backfill_total,
+        (SELECT s.id FROM sel s WHERE s.account=per.account AND s.chat=per.chat AND NOT s.backfill
+          ORDER BY s.sent_at DESC,s.id DESC LIMIT 1) AS newest_message,
+        (SELECT s.id FROM sel s WHERE s.account=per.account AND s.chat=per.chat ORDER BY s.sent_at DESC,s.id DESC LIMIT 1) AS head_message,
+        answer.replied AS owner_replied_after_newest,ro.unread_count AS provider_unread_count,'''+unread+''' AS provider_unread,ro.observed_at AS read_state_observed_at,
+        CASE WHEN '''+fresh+''' THEN 'observed' WHEN ro.observed_at IS NULL THEN 'unknown' ELSE 'stale' END AS read_state
+      FROM per JOIN chats c ON c.id=per.chat AND c.account=per.account
+      LEFT JOIN LATERAL (SELECT im.sent_at FROM messages im WHERE im.account=c.account AND im.chat=c.id
+        AND im.direction='incoming' ORDER BY im.sent_at DESC LIMIT 1) incoming ON true
+      LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
+      LEFT JOIN LATERAL (SELECT true AS replied FROM messages om WHERE om.account=c.account AND om.chat=c.id
+        AND om.direction='outgoing' AND om.sent_at>per.newest_at LIMIT 1) answer ON true
+      ORDER BY per.newest_at DESC NULLS LAST,per.latest_at DESC,per.chat LIMIT %s''',
+        [position,head,*args,limit+1]).fetchall()
+    more=len(rows)>limit;rows=rows[:limit]
+    ids=[r['newest_message'] or r['head_message'] for r in rows]
+    names=enrich(c,[{'id':mid} for mid in ids],p)
+    bodies={r['id']:r for r in c.execute('SELECT id,body,sent_at,sender FROM messages WHERE id=ANY(%s)',
+        ([r['newest_message'] for r in rows if r['newest_message']],)).fetchall()}
+    labels={r['message']:'['+(r['filename'] or 'attachment')+']' for r in c.execute('''SELECT DISTINCT ON (message)
+        message,filename FROM attachments WHERE message=ANY(%s) ORDER BY message,id''',(list(bodies),)).fetchall()}
+    chats=[]
+    for r,named in zip(rows,names):
+        newest=None
+        if r['newest_message']:
+            # A media-only message shows its file label, as compact message rows do.
+            m=bodies[r['newest_message']];text=m['body'] or labels.get(m['id'])
+            if text and len(text)>width:text=text[:width].rstrip()+'…' if width else None
+            newest=compact_row({'message':m['id'],'sent_at':m['sent_at'],'sender':m['sender'],
+                'sender_name':(named.get('sender_name') or '')[:64] or None,'text':text})
+        # An absent read field is unknown; provider mute and archive are never collected.
+        chats.append({**compact_row({'chat':r['chat'],'account':r['account'],'chat_title':(named.get('chat_title') or '')[:72] or None,
+            'chat_type':named.get('chat_type'),'live':r['live'],'backfill':r['backfill'],'read_state':r['read_state'],
+            'owner_replied_after_newest':r['owner_replied_after_newest'],
+            'provider_unread':r['provider_unread'],'provider_unread_count':r['provider_unread_count'],
+            'read_state_observed_at':r['read_state_observed_at']}),'newest':newest})
+    targets(p,[mid for mid in ids if mid])
+    total=rows[0] if rows else {'chats_total':0,'live_total':0,'backfill_total':0}
+    # An empty account may be a quiet one or a stopped collector: each scoped account's
+    # source state and last ingest let the caller tell them apart.
+    sources=[compact_row({'account':r['id'],'status':r['status'],'last_ingest_at':r['last_ingest_at']})
+        for r in store.dataset(c,p)['sources'] if 'accounts' not in filters or r['id'] in filters['accounts']]
+    basis=('acknowledged_position_and_from_time' if lower else 'acknowledged_position') if state else 'from_time'
+    result=serial({'consumer':consumer,'view':'by_chat','window':basis,'chats':chats,'has_more':more,'chats_total':total['chats_total'],
+        'live_total':int(total['live_total']),'backfill_total':int(total['backfill_total']),'filters':sorted(filters),
+        'counts':'created_incoming_messages_after_position','accounts':sources,'provider_mute_archive':'unknown','absent_read_fields':'unknown'})
+    return within_budget(result)
+
+
+def compact_row(row):return {k:v for k,v in row.items() if v is not None}
+
+
+OVERVIEW_BUDGET=10000
+
+
+def within_budget(result):
+    """Keep a page of up to 25 rows within 10,000 characters (ANYM-458): shorten texts, then names."""
+    import json
+    def size():return len(json.dumps(result,ensure_ascii=False,default=str))
+    if len(result['chats'])>25 or size()<=OVERVIEW_BUDGET:return result
+    for step in ('text:40','names:32','text:0','sender_id','observed_at','names:16','names:0'):
+        kind,_,n=step.partition(':')
+        for row in result['chats']:
+            newest=row.get('newest') or {}
+            if kind=='text' and 'text' in newest:
+                if not int(n):newest.pop('text')
+                elif len(newest['text'])>int(n):newest['text']=newest['text'][:int(n)].rstrip()+'…'
+            if kind=='names':
+                for holder,key in ((row,'chat_title'),(newest,'sender_name')):
+                    if key in holder:
+                        if int(n):holder[key]=holder[key][:int(n)]
+                        else:holder.pop(key)
+            if kind=='sender_id' and 'sender_name' in newest:newest.pop('sender',None)
+            if kind=='observed_at':row.pop('read_state_observed_at',None)
+        result['shortened_for_size']=step
+        if size()<=OVERVIEW_BUDGET:return result
+    # Last resort: the oldest rows move to the next call (has_more); totals still cover the window.
+    while len(result['chats'])>1 and size()>OVERVIEW_BUDGET:
+        result['chats'].pop();result['has_more']=True;result['shortened_for_size']='rows'
+    if size()>OVERVIEW_BUDGET:
+        # Many accounts: their source lines are what remains unbounded by the page.
+        result.pop('accounts',None);result['shortened_for_size']='accounts'
+    return result

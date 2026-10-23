@@ -904,14 +904,14 @@ class Store:
     def get_updates(self, token, consumer, limit=20, *, accounts=None,chats=None,senders=None,
                     origins=None,kinds=None,direction='',from_time='',to_time='',compact=False,
                     body_chars=None,include_coverage=True,exclude_channels=False,order='event',
-                    reset_filters=False,expected_ack_version=None,start_from='beginning'):
+                    reset_filters=False,expected_ack_version=None,start_from='beginning',view='events'):
         from .update_queries import get_updates
         with self.authorized(token,'get_updates') as (c,p):
             return get_updates(self,c,p,consumer,limit,accounts=accounts,chats=chats,senders=senders,
                 origins=origins,kinds=kinds,direction=direction,from_time=from_time,to_time=to_time,
                 compact=compact,body_chars=body_chars,include_coverage=include_coverage,
                 exclude_channels=exclude_channels,order=order,reset_filters=reset_filters,
-                expected_ack_version=expected_ack_version,start_from=start_from)
+                expected_ack_version=expected_ack_version,start_from=start_from,view=view)
 
     def create_subscription(self, token, chat_ids, *, sender_ids=None, kinds=None,
                             direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None):
