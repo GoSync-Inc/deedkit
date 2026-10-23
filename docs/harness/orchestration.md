@@ -32,9 +32,18 @@ affect every pull request make parallel edits collide.
   never use bare `git stash`.
 - Tiden commands use `--format json` with a `jq` projection; files over about 20k characters are
   read by range or `grep`. Whole exports never go into a session or a reviewer packet.
-- Models for code: Opus on risk paths (reviews.md, Codex budget); Sonnet, as a trial, on
-  small and medium cards (Effort up to 3, one lane). Search, exploration and scoped fix rechecks
-  in subagents run on Sonnet; r1 reviews keep the model reviews.md names (owner 10-19).
+- Models for code: Opus on risk paths (reviews.md, Codex budget), which wins over the rest. Sonnet
+  high, as an extended trial (owner 10-19, 10-24: «надо давать больше саната»), on small and
+  medium cards (Effort up to 3, one lane). Clear feature cards of Effort 5 (the orchestrator's
+  band for the owner's "more complex tasks") alternate, in dispatch order, Sonnet high and Opus
+  medium (Opus medium on clear feature code: owner 10-21). The read compares the two models within each card Effort band, from the
+  `Model:` line: r1 blocking and major findings per PR, PRs with such findings in a later round,
+  first CI run green, post-merge defects within 72 h (revert, fix PR, red `main`). After about 10
+  Sonnet PRs in the band, a read-only Sonnet subagent writes the read and the orchestrator reports
+  it to the owner; the band goes back to Opus at that read on twice Opus's r1 blocking and major,
+  more than 1 in 5 PRs with later-round findings or a first-green drop of 20 points or more, and at
+  once on a post-merge defect of blocking severity (reviews.md). Search and exploration
+  in subagents run on Sonnet; reviews (r1 and rechecks) keep the model reviews.md names (Routing; Rounds 4, 5; owner 10-19, 10-21, 10-23).
 - Restart. A worker near its brief's token limit (process.md section 6; the orchestrator near 250k), at the next natural boundary,
   writes a handoff of at most 40 lines (templates/handoff.md, kept as `handoffs/TEMPLATE.md` in the orchestrator's directory)
   that lists the files and ranges already read and the decisions taken, waits for its own
@@ -49,8 +58,12 @@ affect every pull request make parallel edits collide.
   once with `gh pr view` before reporting); a wait that ends on failure too (a failed required check, a
   dequeue, a closed pull request), because `gh pr merge --auto` stays armed on a failed one; then
   read the exit status and the report. A missing report is a failure, not "still running". That
-  is one check, never polling.
-- Owner questions (process.md section 2 items and feature or epic acceptance only): while the owner
+  is one check, never polling. `bin/wait-merge.sh` and `bin/review-codex.sh` do this (README, Scripts).
+- Limits (harness D3; Between D5, «мы все время создаем проблемы этими лимитами»): every timeout,
+  cap or quota added in product code or prompts names why it exists and what happens when it trips,
+  and is set with generous headroom, user paths included.
+- Owner questions (process.md section 2 items; feature or epic acceptance unless an accepted
+  package covers it, see Package acceptance): while the owner
   is online, one message as they arise; while the owner is away, one numbered list on waking and
   before sleep, each item with a recommendation. Work that needs no answer keeps running.
 - Host load: locally run only the test modules your change touches and the new tests, never a
@@ -74,8 +87,24 @@ affect every pull request make parallel edits collide.
 - Red or idle workers: an API network error ends a worker's turn silently; read its terminal tail
   and send it a "resume" message. Check idle workers whenever the owner reports red ones or a
   network blip happened.
-- After a worker's DONE: check its worktree is clean and its test containers are gone
-  (`docker ps -a`; remove leftovers yourself), close its terminal and archive its workspace.
+- Abandoned pull request (its worker gone): hand it to another agent with the old handoff, if
+  any; never close it for age (owner 10-16).
+- Live checks (owner 10-18, 10-19, 10-23, 10-24: «Все, что может проверить агент, все пусть
+  проверяет»): an agent runs them and records real results. It picks the account, chat and text
+  itself and asks the owner once, with them filled in, for a live action the project lists
+  (process.md section 1); a read check that is not itself a listed live action needs no yes. The
+  owner does by hand only what no agent can.
+- After a worker's DONE, or when its last PR merges (whoever merged it): check its worktree is
+  clean and its test containers are gone (`docker ps -a`; remove leftovers yourself), close its
+  terminal and archive its workspace at once, unless its task has steps after the merge (enable
+  after deploy, a measurement after N hours, a follow-up PR; from its brief, card or a
+  `Post-merge:` line in its DONE): then move them with their conditions into STATE.md NEXT, or
+  wait for its DONE, and close after.
+- Workspace sweep (owner 10-22): after each merge and on every start or restart, list your
+  project's workspaces (`superset workspaces list`) and close every one of yours with no open task:
+  PR merged or closed with no step after the merge left (above), superseded, a finished research
+  or mockup, an old session workspace. Look at a worktree before archiving (uncommitted work is
+  lost). Never close another orchestrator's or a peer project's workspace.
 - Merge queue: a queued PR shows `autoMergeRequest=null`; dequeue only via GraphQL
   `dequeuePullRequest`. Announce a release freeze before giving merge oks.
 - Release apply notice (owner 10-18): the release worker announces the apply time ahead only when
@@ -92,13 +121,31 @@ affect every pull request make parallel edits collide.
   the number.
 - Process and rule changes (owner 10-18): a quick agreement in chat is enough; no formal proposal
   rounds. Still give your own opinion and say plainly when an owner idea looks wrong or costly.
-  Owner-kept items (process.md section 2) stay owner-kept.
+  Owner-kept items (process.md section 2) stay owner-kept; a quoted owner request naming the
+  change is the owner's decision (process.md section 3).
 - Partner, not yes-man (owner 10-18): hold an evidence-based opinion; when the owner pushes back,
   re-check the facts and concede only what the facts support (say which part stands). Disagree
   openly with a recommendation.
+- Owner asks (owner 10-18, 10-19): an owner-kept item is a short explanation for a yes, never
+  commands for the owner to run; after the yes an agent runs it. The owner's own checklist holds
+  only what no agent can do (a device in hand, a payment, an account signup). Mark each item FYI
+  or QUESTION; an incident is one plain sentence on what breaks for the owner; each question
+  restates its context in full (the owner does not reread).
 - Owner talk: the owner's language, plain names (never a bare card code), each question = what /
   why / cost / options / recommendation. Owner text is only what the owner types to the
   orchestrator. Owner decisions go to the orchestrator's decision log, verbatim with their scope.
+  When two differ, the newer wins within its own scope: a narrower newer decision leaves the rest
+  of a wider older one standing; the newer entry's `Supersedes:` names whole or part (harness D2;
+  Between D120, general rule; example: Between D22 narrowed by D75, differences.md row 9).
+- Package acceptance (harness D3; Between D104(в), D105): when the owner, in words for that package, accepts a
+  scoped package (backlog plus mockups) after its final Fable and Astra pass, with duplicates merged
+  and unneeded cards deleted, its waves run back to back (STATE.md APPROVED WAVE) without asking
+  again about items already discussed; only contested or non-obvious product items go back to the owner.
+- Cross-project (harness D1; Between D119, D51, D33): a request to another project goes to
+  that project's orchestrator, whose workers report only to it; the requester sends the request and
+  gets only the end result. A finding that also applies to another project's copy goes to that
+  orchestrator with file:line on its `main`; never fix another project's repository. Another
+  project's pause or plan binds this project only on the owner's words for this project.
 - Backlog order: Score = Value / Effort (Fibonacci); breakages and deadlines override.
 
 ### STATE.md
@@ -116,7 +163,7 @@ When the context hook says 250k or more, at the next boundary (same exceptions a
 if 30 calls or fewer are left; restart from 150k before over an hour idle):
 
 1. Rewrite STATE.md (self-contained, current workers, NOW/NEXT, approvals).
-2. Start the successor in the orchestrator's workspace with the project's start command: it reads
+2. Start the successor in the orchestrator's workspace (`bin/orchestrator-restart.sh <old name>`): it reads
    STATE.md, sends the live workers its name as the new address, closes the old orchestrator's
    terminal and recreates the wake crons listed in STATE.md.
 3. The successor announces itself, closes the old terminal, recreates any wake crons, continues
