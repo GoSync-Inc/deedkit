@@ -129,30 +129,35 @@ def resolve_alias(c,p,account,provider_chat_id):
     return rows[0] if rows else None
 
 
-def chat_links(c,p,accounts=None):
+def chat_links(c,p,accounts=None,*,lid_chats=None,paired_only=False):
     """Verified visible PN links of the caller's private LID chats (ANYM-278).
 
     The same evidence as resolve_alias: no conflicting observation anywhere in the
     account and one visible, undeleted source. `pn_chat` is the peer's private
     phone-number chat when the caller can read it; stored IDs are never changed.
+    `paired_only` keeps links with a readable PN chat; `lid_chats` limits the LID
+    chats (a page), so the per-link source proof runs only where it is used.
     """
     lid_where,lid_args=scope_filter(p,'c',chat_column='id')
     pn_where,pn_args=scope_filter(p,'c',chat_column='id')
     source_where,source_args=scope_filter(p,'m')
-    account_where=' AND c.account=ANY(%s)' if accounts is not None else ''
+    extra=(' AND c.account=ANY(%s)' if accounts is not None else '')+(' AND c.id=ANY(%s)' if lid_chats is not None else '')
     return c.execute('''WITH lid_chats AS MATERIALIZED (
         SELECT c.id,c.account,messenger_whatsapp_personal_id(c.provider_chat) AS lid
         FROM chats c JOIN accounts a ON a.id=c.account
-        WHERE a.platform='whatsapp' AND c.chat_type='private' AND right(c.provider_chat,4)='@lid' AND '''+lid_where+account_where+'''
+        WHERE a.platform='whatsapp' AND c.chat_type='private' AND right(c.provider_chat,4)='@lid' AND '''+lid_where+extra+'''
         ), candidate AS MATERIALIZED (
         SELECT DISTINCT l.id AS lid_chat,l.account,wi.pn,wi.lid FROM lid_chats l
         JOIN whatsapp_identity_observations wi ON wi.account=l.account AND wi.lid=l.lid
         ), verified AS MATERIALIZED (
-        SELECT pair.* FROM candidate pair
+        SELECT pair.*,pc.id AS pn_chat FROM candidate pair
+        LEFT JOIN LATERAL (SELECT c.id FROM chats c WHERE c.account=pair.account AND c.provider_chat=pair.pn
+            AND c.chat_type='private' AND '''+pn_where+''' LIMIT 1) pc ON true
         WHERE NOT EXISTS(SELECT 1 FROM whatsapp_identity_observations other
             WHERE other.account=pair.account AND other.pn=pair.pn AND other.lid<>pair.lid)
           AND NOT EXISTS(SELECT 1 FROM whatsapp_identity_observations other
-            WHERE other.account=pair.account AND other.lid=pair.lid AND other.pn<>pair.pn)
+            WHERE other.account=pair.account AND other.lid=pair.lid AND other.pn<>pair.pn)'''+(
+            ' AND pc.id IS NOT NULL' if paired_only else '')+'''
         ), sourced AS MATERIALIZED (
         SELECT v.*,(SELECT wi.provenance FROM whatsapp_identity_observations wi
             JOIN messages m ON m.id=wi.source_message JOIN chats ic ON ic.id=m.chat
@@ -160,8 +165,7 @@ def chat_links(c,p,accounts=None):
               AND (wi.identity_id=m.sender OR wi.identity_id=ic.provider_chat) AND '''+source_where+'''
             ORDER BY wi.observed_at DESC,wi.source_message LIMIT 1) AS provenance
         FROM verified v)
-        SELECT s.lid_chat,s.lid,s.pn,s.provenance,pc.id AS pn_chat FROM sourced s
-        LEFT JOIN LATERAL (SELECT c.id FROM chats c WHERE c.account=s.account AND c.provider_chat=s.pn
-            AND c.chat_type='private' AND '''+pn_where+''' LIMIT 1) pc ON true
-        WHERE s.provenance IS NOT NULL ORDER BY s.lid_chat''',
-        [*lid_args,*([accounts] if accounts is not None else []),*source_args,*pn_args]).fetchall()
+        SELECT lid_chat,lid,pn,provenance,pn_chat FROM sourced
+        WHERE provenance IS NOT NULL ORDER BY lid_chat''',
+        [*lid_args,*([accounts] if accounts is not None else []),*([lid_chats] if lid_chats is not None else []),
+         *pn_args,*source_args]).fetchall()

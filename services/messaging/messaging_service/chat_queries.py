@@ -175,7 +175,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     from .whatsapp_identity import chat_links
     whatsapp=c.execute("SELECT EXISTS(SELECT 1 FROM accounts WHERE id=ANY(%s) AND platform='whatsapp') AS x",
         (p['accounts'] if accounts is None else [a for a in accounts if a in p['accounts']],)).fetchone()['x']
-    links=chat_links(c,p,accounts) if whatsapp else [];aliases={};listed={}
+    links=chat_links(c,p,accounts,paired_only=True) if whatsapp else [];aliases={};listed={}
     pairs=[link for link in links if link['pn_chat']]
     if pairs:
         heads={r['id']:r for r in c.execute('''SELECT c.provider_chat,c.id,c.title,ro.unread_count,(SELECT m.sent_at FROM messages m
@@ -564,7 +564,9 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     from .sender_names import resolve
     resolve(c,p,items,chat='id',sender='awaiting_reply_sender',name='awaiting_reply_sender_name',
         basis='awaiting_reply_sender_name_basis')
-    phones={link['lid_chat']:('+'+link['pn'].split('@')[0],link['provenance']) for link in links}
+    lid_rows=[row['id'] for row in private if (row['provider_chat_id'] or '').endswith('@lid')]
+    phones={link['lid_chat']:('+'+link['pn'].split('@')[0],link['provenance'])
+        for link in (chat_links(c,p,lid_chats=lid_rows) if lid_rows else [])}
     for row in private:
         if row['id'] in listed and not selected_chat:
             row.update(alias_chats=[listed[row['id']]['chat']],alias_provenance=listed[row['id']]['provenance'],
