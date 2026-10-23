@@ -81,8 +81,9 @@ The payload contains the release, environment, fixed component/error code,
 allowlisted exception type, public Python filenames/line numbers and, for Telegram
 and WhatsApp collector events, the `fingerprint` described above. Filenames are
 relative to the repository root (`services/messaging/messaging_service/<file>.py`),
-like Tiden component paths. Events sent before this used `messaging_service/<file>.py`;
-a recurring error may therefore appear once as a new issue under the new paths.
+like Tiden component paths. Older events used `messaging_service/<file>.py`; component
+runtime paths attribute both forms (TIDEN-CI.md), and a recurring error may appear once
+under each.
 It excludes exception text, cause chains, locals, source lines, absolute paths,
 HTTP bodies/headers/URLs, account/chat/person identifiers, search terms, messages,
 files and model inputs/outputs. SDK request/user/breadcrumb extras are discarded.

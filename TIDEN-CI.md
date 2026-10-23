@@ -650,11 +650,15 @@ merged backlog needs a verified identity/history-preserving relocation; COW
 updates or deleting/recreating cards do not establish that preservation. Keep
 real defects and required operational acceptance visible in the current scope.
 
-Readiness also requires a captured candidate release gate and an explicit review
-of unresolved production issues, including unattributed ones. The native main
-gate's production-issue signal is not a replacement for release-scope triage.
-Missing release evidence is unknown. Report the native verdict separately from
-the project's readiness decision. See the workflow's readiness section.
+Readiness also requires a captured candidate release gate and a review of the
+unresolved production issues. Errors reach their component through its runtime
+paths: each messaging component lists its `messaging_service` files as
+`services/messaging/messaging_service/<file>.py` and the older
+`messaging_service/<file>.py`. A changed component path for such a file changes
+its runtime paths too (`tiden component update --runtime-path`, which replaces
+the list). The gate's product `prod_issues` row fails on any error left without
+a component. Missing release evidence is unknown. Report the native verdict
+separately from the project's readiness decision.
 
 Messaging telemetry names its release `deedkit@<sha>` from the exact source
 commit in `DEEDKIT_SOURCE_SHA`, and falls back to `anymsg@<package version>`
