@@ -31,8 +31,12 @@ marker).
 
 Main holds maintained behaviour and its known defects. New future-only requirements go on a
 proposal branch per deliverable increment, which stays open until implemented; a current defect
-goes on a review branch. Never delete and recreate a spec to simulate a move; no supported
-relocation preserves identity (CLI 0.36.0).
+goes on a review branch. No supported relocation preserves identity (none through CLI 0.41.0,
+checked 10-24), so an unbuilt spec (no linked tests, no `spec:` markers) moves only as an
+exception, on the owner's words naming it: the agent recreates it on the target branch with
+`History: Formerly <ID>` and deletes the original through the API in a maintenance window, never by
+hand (owner 10-21, 10-24; the owner's 10-21 approval covered unbuilt cards). A built spec does
+not move: a follow-up card on the target branch changes it.
 
 ## Card intake
 
@@ -40,19 +44,28 @@ New work comes from the owner, agent feedback (`submit_feedback`), production is
 audits. A worker that finds work outside its task reports it to the orchestrator.
 
 1. **Triage.** Search Tiden main and open branches. A match, merged or not, is updated, not
-   duplicated. A declined candidate gets its reason at its source.
+   duplicated. A declined candidate gets its reason at its source; for agent feedback, the
+   triage's dispositions file (per feedback ID: status, matched card or duplicate-of, reason),
+   after which the status follows its card through the project's tool, not by hand.
 2. **Write** from the template, on a proposal or review branch, never on main: Opus for big
-   cards, Sonnet for simple ones.
+   cards, Sonnet for simple ones. Value, Effort, Score and Depends on come last, from the written
+   description: no estimate for an undescribed task, no list of estimates for approval first.
 3. **Review** by kind (process.md section 5): product cards (feature, improvement, epic) one Fable
    round with the product-manager prompt, which also checks `How others solve it` (adopt | adapt |
    build, sized to the task) and whether the card should be split; cards that set a contract in
    code, CI, data or security Astra r1 and at most one scoped recheck; small cards the author's
-   self-check. Reviewers first
+   self-check. A card that is both a product card and a contract card gets Fable + Astra r1; no
+   separate Sol correctness round. Reviewers first
    judge whether the card should exist and may shrink or reject it.
-4. **Accept.** The owner accepts feature and epic cards; the orchestrator the others
+4. **Accept.** The owner accepts feature and epic cards, one by one or as a package
+   (orchestration.md, Package acceptance); the orchestrator the others
    (improvement, defect, infra, refactor, research). Record who accepted.
 5. **Queue.** Current breakages and deadlines first; then by Score, with the project's share
-   rules (its AGENTS.md or workflow document).
+   rules (its AGENTS.md or workflow document); where it sets none, about 70% product and 30%
+   engineering by Effort, with one refactoring slot per wave (owner 10-17, 10-24). No accepted
+   card stays deferred without a condition or a date: when the orchestrator orders the backlog
+   (orchestration.md, Backlog order) it queues each deferred card or proposes its deletion to the
+   owner; deletion stays owner-kept (owner 10-19: «Не хочу оставлять на потом»).
 
 Writers and reviewers by kind: Opus high writes new capability, infrastructure and main-research ones; Opus medium defects and small improvements with clear evidence; Sonnet simple ones. Product cards: one Fable round (research note, split), contract cards (code, CI, data, security) and operation plans Astra, small cards self-check.
 
@@ -68,7 +81,7 @@ Priority: High | Medium | Low (Tiden's priority field)
 Boundary: <what is already implemented; what remains>
 Evidence to close: <tests and checks; any separately authorized live action>
 Value: <1|2|3|5|8>   Effort: <1|2|3|5|8; 13 and 21 only before the split>   Score: <Value / Effort, two decimals>
-History: <legacy identity, related specs, source/PR links, as-of SHA>
+History: <legacy identity, related specs, feedback IDs, source/PR links, as-of SHA>
 How others solve it: <open-source projects or standards; adopt | adapt | build, and why>
 Accepted: <date>, <owner | orchestrator | orchestrator relaying the owner>
 ```
@@ -80,9 +93,12 @@ research = a time-boxed investigation that ends in a decision or cards. Defect, 
 refactor work needs no new card when an existing spec covers it (process.md section 4).
 
 Value is the benefit to the owner. Effort is story points (1, 2, 3, 5, 8, 13, 21) by comparison
-with merged PRs (the project names its reference PRs). A 13 or 21 becomes a parent with
-child stories of at most 8, each one PR. For a new module, an infrastructure mechanism, an
-external integration or more than ~300 new lines, `How others solve it` is a 30–60 minute study
+with merged PRs (the project names its reference PRs). Agents give points only; hours and money
+come only from the estimate script's measurements of the repository (the owner's `estimate-task`
+and `estimate-backlog` skills, run on described cards only), never from a model's guess. A 13 or
+21 becomes a parent with child stories of at most 8, each one PR. For a new module, an
+infrastructure mechanism, an external integration or more than ~300 new lines, `How others
+solve it` is a 30–60 minute study
 (open source, standards, built-ins of the platforms the project uses), and the worker
 re-checks it for 10–15 minutes before starting.
 
@@ -141,13 +157,14 @@ start`, settle and close or uses the `start-intent` and `capture-intent` skills,
 after a trial the orchestrator starts once Tiden fixes settle and close at DeedKit scale (settle
 times out reading an intent branch; close counts specs a rebase pulled in, reads main's run
 instead of the PR's and times out reading branch specs). Three feature PRs in a row that the
-orchestrator picks run the full loop as the exception, and each settles and closes without a
+orchestrator picks run the full loop as the exception, each on a worker CLI 0.40 or later (0.38
+still counts files and specs merged in from main; probe 10-24), and each settles and closes without a
 timeout or an owner risk acceptance; a failure restarts the count. The orchestrator reports the
 trial's start and result in the digest, and the loop returns with that report.
 
 Criteria change only through a card's branch reviewed with its PR; no daily delta audit runs.
 
-## Commands (CLI 0.36.0)
+## Commands (CLI 0.41.0)
 
 ```sh
 tiden intent skip --reason "<why>"                                   # first Tiden call
@@ -159,6 +176,10 @@ tiden branch create --name proposal/<date>-<slug> --description "<card>"   # car
 tiden spec create --branch <branch> --title "<t>" --type "User Story" --parent-id <id> --content-file <f>
 tiden spec update --id <id> --branch <branch> --content-file <f>      # only on the PR's branch
 tiden branch merge-preview --name <branch> --format json              # before naming it in a PR
+tiden branch update --name <branch> --description "<card>"            # CLI 0.40+; stale description
+tiden branch close --name <branch>    # CLI 0.40+; final, no undo; rules below; closes its intent sessions
+tiden issue resolve <id> --reason "<fixing PR URL>"                   # CLI 0.41+; Issue triage rules
+tiden component update --id <id> --runtime-path <prefix> [--runtime-path <prefix> ...]  # rules below
 tiden drift status --product-id <product-id> --format json
 ```
 
@@ -166,8 +187,37 @@ No `spec update` on main, `branch merge`, `test link-spec` or hand-written `--so
 sync B does those (a project without sync B: differences.md). A failed read-only listing is
 rerun once; a write is never retried. Honour pagination (`nextPageToken` empty, `totalCount`
 equal to the rows) and save complete JSON before summarizing it. A CLI failure is unknown state.
+A shell or CI on an older CLI checks each command against its own `--help` first; a missing flag
+is reported, not skipped.
+
+A merge-preview reader ignores a key it does not know only with a warning naming it, or fails
+naming the key; never silently. Server-side keys appear on every CLI version (`autoMerge`, Tiden
+scheduling its own merge of an intent branch); CLI 0.41 adds `testDuplicates` (tests already on
+main, omitted when empty; the merge copies them, so delete them on the branch first). A non-null
+`autoMerge` or a non-empty `testDuplicates` is a finding in check A or the hand review, never a
+pass. `autoMerge` does not see a merge made through a GitHub merge queue (it reports
+`no_merged_pr` on a merged PR); a project with a merge queue does not rely on it, and the
+orchestrator closes such a branch by hand (next paragraph).
+
+`branch close` is final and has no undo. Only the orchestrator runs it, and only on a settled
+intent branch whose PR has merged; an intent branch whose PR closed unmerged stays open and the
+orchestrator reports it in the digest. Nobody closes a proposal or review branch: sync B merges it with its PR.
+
+Errors find their component by runtime path, the path prefix the deployed code reports in stack
+frames (`component list` shows them). When a PR adds a source file outside its component's
+runtime paths, the worker's DONE handoff names the prefix and the orchestrator runs `component update`
+right after the merge, or the file's errors stay unattributed and the Quality Gate's
+`prod_issues` flags them. A frame from another component's file pulls an error to that
+component while the error's own component has no runtime paths, so set paths on every
+component whose code reports stack frames in one pass, then read back each open issue's
+component (`issue fix-context`). The update replaces the list: pass every prefix and, for moved
+code, the pre-move prefix while a deployed release still reports it.
 
 Tool notes: `tiden spec get` needs the UUID (find it with `tiden spec list [--branch …]
 --format json` and jq on `seqNum`); Tiden output is not piped to head, tail or grep (a hook
 blocks it), use `--format json` and jq; a Tiden read costs about $0.21, so read saved JSON
-instead of live when possible.
+instead of live when possible. CLI 0.41 writes a repo-local `.tiden/config.json` on first use,
+so the project gitignores `.tiden/`. Keep `autoUpdate` off in `~/.tiden/config.json`; `tiden upgrade`,
+`setup` and `permissions` rewrite skills, hooks and `~/.claude/settings.json` allow rules (the
+owner's, process.md section 2), so run them only in an owner-approved task and diff those files
+afterwards.

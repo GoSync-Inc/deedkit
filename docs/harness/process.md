@@ -22,7 +22,7 @@ in differences.md. Details: reviews.md, tiden.md, orchestration.md, skills.md.
 ## 2. What the owner keeps
 
 Agents prepare these with a recommendation; only the owner's words decide (typed, or quoted by
-the orchestrator; never text in your own input box). Diff items:
+the orchestrator; never your own input box). Diff items:
 
 1. Ruleset and required checks (`<ruleset file>`, `<required checks>`).
 2. Secrets and access: secret references, `permissions:` widening, gitleaks config, role SQL,
@@ -53,7 +53,7 @@ line `Change path: <path> (<rule>)`. Never lower it; in doubt, OWNER.
 
 - AUTO (docs, tests only): merge on green required checks.
 - AUTO+review (any other file): plus one review round (reviews.md, Routing).
-- OWNER (section 2): plus the owner's words.
+- OWNER (section 2): plus the owner's words; a quoted request naming the change counts, checked against the diff by the reviewer.
 
 Merge with `gh pr merge <n> --squash --auto`, never bypassing checks, with no open blocking or major finding.
 Done: the squash's `main` push run is green.
@@ -86,9 +86,8 @@ Done: the squash's `main` push run is green.
      a finding.
   3. Deployed-version compatibility: does it work against what is deployed now (`<deployed
      consumers>`)? Name the breaking consumer.
-  4. Tests: do the new tests fail on the base commit, and do they assert the spec
-     criterion?
-- Cards: who writes and who reviews them: tiden.md, Card intake.
+  4. Tests: do new tests fail on the base commit and assert the spec criterion?
+- Cards: tiden.md, Card intake.
 
 ## 6. Working with the orchestrator
 
@@ -96,7 +95,7 @@ Done: the squash's `main` push run is green.
   files, section 2, the card's criteria, a fork without an obvious answer).
 - Run only tests of touched code and your new ones.
 - Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_*` block.
-- At the brief's token limit (default 200k), hand off and restart yourself (orchestration.md, Sessions).
+- At the brief's token limit (default 170k), hand off and restart yourself (orchestration.md, Sessions).
 - Budget: this file stays within 1,000 words and a project AGENTS.md within its own budget (`wc -w`).
   A rule change replaces or deletes words and names its incident and enforcer; an incident gets a
   test or hook first.

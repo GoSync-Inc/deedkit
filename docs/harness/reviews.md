@@ -1,18 +1,17 @@
 # Reviews
 
 Who reviews what is in process.md section 5; this is the procedure: routing, the packet, the
-rounds and the verdict. A project's review notes add its deployed-version list, its Codex points
-and its change-path grep (project placeholders below).
+rounds and the verdict. A project's review notes add its deployed-version list, its Codex line
+(the shared line, or a legacy points line) and its change-path grep (project placeholders below).
 
 ## Routing
 
 - Code r1: Codex Sol for normal, CI, Tiden, release and docs pull requests:
   `codex exec --disable hooks -m gpt-6.1-sol -c model_reasoning_effort=xhigh -c service_tier="default" "<task>" </dev/null`.
   Astra (`-m gpt-6-astra`, process.md section 5) only for r1 on security, access, data,
-  owner-level or product-behaviour changes, and for a recheck of a blocking finding in security,
-  access or data. (DeedKit orchestrator, standing approval item 13, 10-19; owner 10-19 09:1xZ.)
-- A scoped recheck (r2) and a card review run on Sol. A recheck of a single fixed finding stays on
-  Codex Sol, not an Anthropic subagent, also when Astra ran r1 (owner 10-21).
+  owner-level or product-behaviour changes. (DeedKit orchestrator, standing approval item 13, 10-19; owner 10-19 09:1xZ.)
+- One Codex reviewer per round: Astra or Sol, never both on the same item. A scoped recheck (r2),
+  also of a card and also after an Astra r1, runs on Sol, not an Anthropic subagent (owner 10-21, 10-23).
 - Test-only pull requests and process or rule text: no Codex; an Opus subagent reviewer, plus Fable
   for process text.
 - Codex-written code: an Opus subagent. Product cards: one Fable round (Card review below).
@@ -26,8 +25,8 @@ A review is one packet of files in the author's scratchpad and one report file. 
 Tiden access and get projections, never whole exports, other reviewers' reports or the review
 history.
 
-- `task.md`: the task goal and the card's criteria, the round, and for a recheck the reviewer's
-  own open findings. An Astra task starts with the four fixed questions of process.md section 5,
+- `task.md`: the task goal and the card's criteria, the round, and for a recheck the open
+  findings of r1. An Astra task starts with the four fixed questions of process.md section 5,
   verbatim with the project's values filled in (its AGENTS.md section 5), before any task-specific question. A code packet names the deployed versions for
   question 3 (`<deployed consumers>`, from the project's review notes or the orchestrator).
 - `diff.patch`: `git diff <merge-base>..<head>`; for a recheck, only the fix range. A criterion
@@ -72,6 +71,10 @@ an unmet process.md section 2 authority, a provider-session or send action, a da
 and broken failure isolation (a fail-closed stop of a critical path the project names, such as
 call audio, collection or backup, is itself a failure).
 
+A product-policy risk the owner accepted (an owner decision quoted in the card or brief) is no
+finding: the report lists it under `Owner should know`. Every other finding keeps its severity
+(owner 10-18, 10-24).
+
 It returns one line:
 
 ```text
@@ -85,20 +88,20 @@ VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <
 2. Scope freezes when the round starts; an optional addition goes to a follow-up card. A stop
    order or a change to what the owner keeps reaches the author at once.
 3. The author fixes every finding in one pass and searches for every term the fixes changed.
-4. After a blocking or major finding, the reviewer that raised it rechecks once (r2): the fix
-   range and its own open findings, tests only for the fix, no fresh exploration of the
+4. After a blocking or major finding, one recheck (r2) runs on Sol (Routing; for a no-Codex review, the subagent that raised it): the fix
+   range and the open findings, tests only for the fix, no fresh exploration of the
    repository. It is never a fresh full review, and a recheck's minor opens no round.
 5. Reviews stop at r2. An r3 runs only for a new blocking finding that r2 raised. A blocking or
-   major finding stays open until the reviewer that raised it confirms the fix; never merge with
-   it unconfirmed. A fix made after the cap (r2 done) gets one scoped recheck by that reviewer,
+   major finding stays open until a recheck confirms the fix; never merge with
+   it unconfirmed. A fix made after the cap (r2 done) gets one scoped recheck on Sol,
    outside the round count, recorded as `recheck` in `Review record:`; a regression test that
    fails before the fix and passes after it is the precondition, not a substitute. A new blocking
    there, or a finding still open, is BLOCKED to the orchestrator, who picks a smaller scope, a
    follow-up card or a revert. Merging with an open blocking or major finding accepts a known
    risk, which the owner keeps.
-6. Cards: a contract card gets Astra r1 and at most one scoped recheck; a small card gets only
+6. Cards: a contract card gets Astra r1 and at most one scoped recheck on Sol; a small card gets only
    the author's self-check.
-7. A production operation plan gets at most two Astra rounds before the owner authorizes it.
+7. A production operation plan gets Astra r1 and at most one Sol recheck before the owner authorizes it.
 8. Process text (AGENTS.md, CLAUDE.md, `.claude/`, the project's operations docs and Tiden CI
    document, and this harness) gets the author's checklist: each changed rule matches the
    documents that refer to it, nothing from process.md section 2 changes without the owner's
@@ -109,12 +112,16 @@ VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <
 
 Codex reviews and the owner's other Codex work share one weekly meter across all projects (owner
 10-21: DeedKit, the Between production bot and fintrack use one Codex subscription); a point is
-one percent. Each project spends at most its daily points (`<codex points>`, the project's review
-notes) on a line the project states; the meter reading includes every project's use, so each
-project's line is measured against the shared meter. The orchestrator reads the meter (`rate_limits.primary.used_percent`
-in the newest file under `~/.codex/sessions`) before it starts a review. Under the line every
-review starts. Over it Astra starts only risk-path reviews; the rest wait or, at the
-orchestrator's call, go to an Opus reviewer subagent with the same packet and questions. Risk
+one percent. The line is the shared pace, 100% over the meter's window, plus the add-on
+(`CODEX_LINE_OFFSET`, 30), capped at 100: reviews start early in a fresh window, and limits
+reset unused (owner 10-23; 10-24 «Набавку надо везде сделать»). Every project runs this same
+line; the meter has no per-project split, so a project's share cannot be measured on it
+(incident 10-22: a points line read OVER at 28% after 2.2 of 7 days). A points line
+(`<codex points>`) is legacy, kept for configs that still set a number. The orchestrator reads
+the meter (`rate_limits.primary.used_percent` in the newest file under `~/.codex/sessions`)
+before it starts a review. Under the line every review starts. Over it Astra starts only
+risk-path reviews; the rest wait or, at the orchestrator's call, go to an Opus reviewer subagent
+with the same packet and questions. Risk
 paths: process.md section 2 items, release, deploy and the project's promotion tool, CI gate
 integrity, security and access, migrations, and the live-action code the project lists. Every
 Codex run passes `-c service_tier="default"`: the priority tier costs about twice as much per
@@ -131,8 +138,8 @@ the never-downgraded list above, the recheck rules of Rounds 4 and 5 or anything
   signals (the project's grep). A hit is an item to read, not a verdict; no hit does not make a
   PR AUTO. Read the changed blocks of every listed file (a workflow's `permissions:` and jobs, SQL
   grants, secret mounts); in doubt the path is OWNER. A card's own level label adds no merge gate.
-- `Review record:` one line per reviewer and round with its counts, e.g.
-  `Review record: Astra r1 1 blocking, 2 major; r2 0/0`. No findings ledger or per-finding
+- `Review record:` one line per reviewer and round with its counts, naming one Codex reviewer per
+  round, e.g. `Review record: Astra r1 1 blocking, 2 major; Sol r2 0/0`. No findings ledger or per-finding
   machine lines are kept.
 - `Owner note:` for a product PR, what the owner will notice in daily use.
 - `Spec impact:` and `Settle text:` on every PR (tiden.md, One Tiden branch per pull request).

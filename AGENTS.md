@@ -1,6 +1,6 @@
 # DeedKit agent rules
 
-Process: harness egerev/agent-harness @ 0.1.0, ~/agent-harness; this file adds project rules.
+Process: harness egerev/agent-harness @ 0.11.0, ~/agent-harness; this file adds project rules.
 Claude Code loads harness process.md through the SessionStart hook (`.claude/hooks/harness.sh`:
 merged `origin/main`, else the pinned copy). Codex and cloud agents read the pinned copy
 docs/harness/process.md first. If no harness text is in context, stop and report BLOCKED. Each
@@ -28,6 +28,7 @@ docs/operations/parallel-development.md.
   IDs) or the seven `anymsg-ci::*` checks.
 - Production changes only via `scripts/production.py` from a green `main` SHA
   (docs/operations/production.md); never prune shared Docker data; SSH is read-only except `production.py` and approved steps. Merged source is not live verification.
+- Backups: over the tailnet to the shared backup server only; no public backup port.
 
 ## 2. What the owner keeps
 
