@@ -176,6 +176,7 @@ class NodeProvider:
         self.process=None; self.lock=asyncio.Lock(); self.counter=0; self.policy=None
         self.send_lock=asyncio.Lock();self.disconnect_lock=asyncio.Lock()
         self.send_reader=None;self.send_writer=None;self.started=False
+        self.not_ready_since=None # Start of the current provider_not_ready streak of history reads.
     def subscribe(self,*_): pass # Provider writes callbacks to its own disk queue, never RAM polling.
     def bind_state(self,state):self.state=state
     def command(self):
@@ -292,12 +293,17 @@ class NodeProvider:
             request=await self.request(method,params,sending=sending)
             reply=await self.reply(request,timeout=300 if method=='start' else 90,sending=sending)
             if set(reply)!={'id','result'}: raise RuntimeError('provider_protocol_error')
+            if method in HISTORY_READS:self.not_ready_since=None
             return reply['result']
         except (ProviderUnavailable,ProviderOperationError):
-            raise # Complete error frame; pipe is still synchronized.
+            # Complete error frame; pipe is still synchronized. The provider answered, so it is ready.
+            if method in HISTORY_READS:self.not_ready_since=None
+            raise
         except ProviderNotReady:
             # whatsmeow reconnects by itself after a short drop; a disconnect here would cut that off.
-            if method in HISTORY_READS and not self.failure_recorded():raise
+            if method in HISTORY_READS and not self.failure_recorded():
+                if self.not_ready_since is None:self.not_ready_since=time.monotonic()
+                raise
             await self.disconnect(); raise RuntimeError('provider_not_ready') from None
         except Exception as exc:
             from .outgoing import SendRejected
@@ -555,14 +561,16 @@ class WhatsAppCollector(TelegramCollector):
         await asyncio.to_thread(self.state.phase,'history','waiting','history_scan_finished')
     async def reconcile_loop(self):
         from .telegram_collector import database_errors
-        delay=self.database_retry;not_ready_since=None
+        delay=self.database_retry
         while True:
             try:await self.sync_once()
             except ProviderNotReady:
-                if not_ready_since is None:not_ready_since=time.monotonic()
-                if time.monotonic()-not_ready_since>=NOT_READY_WAIT_SECONDS:raise RuntimeError('provider_not_ready') from None
-                await asyncio.to_thread(self.state.status,'degraded','provider_temporarily_unavailable')
-                await asyncio.to_thread(self.state.phase,'history','error','provider_temporarily_unavailable')
+                # The streak ends at any answer to a history read, also inside a pass.
+                if time.monotonic()-self.provider.not_ready_since>=NOT_READY_WAIT_SECONDS:
+                    raise RuntimeError('provider_not_ready') from None
+                with suppress(*database_errors()): # Reporting must not end the wait; the next attempt reports again.
+                    await asyncio.to_thread(self.state.status,'degraded','provider_temporarily_unavailable')
+                    await asyncio.to_thread(self.state.phase,'history','error','provider_temporarily_unavailable')
                 await asyncio.sleep(min(self.interval,60)); continue
             except (ProviderOperationError,ProviderUnavailable):
                 await asyncio.to_thread(self.state.status,'degraded','provider_temporarily_unavailable')
@@ -570,7 +578,7 @@ class WhatsAppCollector(TelegramCollector):
             except database_errors():
                 # Checkpoints are committed per chat; retry instead of reconnecting the provider.
                 await asyncio.sleep(delay); delay=min(60,delay*2); continue
-            delay=self.database_retry;not_ready_since=None
+            delay=self.database_retry
             await asyncio.sleep(self.interval)
     async def drain_loop(self):
         import psycopg

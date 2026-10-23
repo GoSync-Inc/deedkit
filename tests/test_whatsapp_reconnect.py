@@ -88,3 +88,27 @@ def test_not_ready_outside_history_reads_keeps_disconnecting(tmp_path, method):
     with pytest.raises(RuntimeError, match='^provider_not_ready$'):
         asyncio.run(provider.call(method, {}))
     assert provider.disconnects == 1
+
+
+# spec: ANYM-116
+def test_a_history_read_answered_inside_a_pass_ends_the_not_ready_streak(tmp_path, monkeypatch):
+    # Separate short drops, each after a successful page, never add up to the bound.
+    provider = fake_provider(tmp_path, [PAGE, NOT_READY] * 10)
+    worker, statuses, sleeps, attempts = page_worker(provider, monkeypatch, 10)
+    page = provider.page
+    async def two_pages(chat, *, limit, before=None):
+        await page(chat, limit=limit); await page(chat, limit=limit)
+    provider.page = two_pages
+    with pytest.raises(Stop): asyncio.run(worker.reconcile_loop())
+    assert attempts == [60 * n for n in range(11)] and provider.disconnects == 0
+
+
+# spec: ANYM-116
+def test_a_database_error_while_reporting_the_wait_does_not_stop_the_collector(tmp_path, monkeypatch):
+    import psycopg
+    provider = fake_provider(tmp_path, [NOT_READY, PAGE])
+    worker, statuses, sleeps, attempts = page_worker(provider, monkeypatch, 2)
+    def status(*_): raise psycopg.OperationalError('synthetic outage')
+    worker.state.status = status
+    with pytest.raises(Stop): asyncio.run(worker.reconcile_loop())
+    assert len(attempts) == 3 and sleeps == [60, 600] and provider.disconnects == 0
