@@ -403,8 +403,9 @@ needs `read-live`, the account opt-in and, through the gateway, the
   search hits (above, `outside_history_window`) still skip them. Stored rows are ordinary
   archive messages: search and subscriptions see them, and a request without an anchor
   continues below them. Their attachments get media jobs that the collector never
-  downloads by itself. The media policy reports them as `outside_history_bounds` (no
-  download, also on request), or as unknown while the chat's bound is unconfirmed.
+  downloads by itself. The media policy reports them as `outside_history_bounds`
+  (available on request: an explicit `request_file_download` downloads the original,
+  owner decision 2026-10-23), or as unknown while the chat's bound is unconfirmed.
 - Telegram archive: the page is committed as live search hits are (above):
   origin `backfill`, the usual revision rules, media jobs and the collection policy;
   checkpoints, coverage and `window_complete` do not move. A rerun adds no rows.

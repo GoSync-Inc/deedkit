@@ -280,3 +280,6 @@ Schema 41 adds `reply_snoozes`, `reply_mutes` and the `reason`/`note` columns of
 Schema 42 adds `owner_message_reads`, the receiving-period columns of
 `collector_health` and the read-source columns of `chat_read_observations`;
 backups of schemas 2-41 still restore.
+
+Schema 43 adds `person_links` (owner-made person links, ANYM-283) to the manifest;
+backups of schemas 2-42 still restore.

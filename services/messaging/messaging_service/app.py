@@ -776,14 +776,17 @@ def create_app(store: Store, allowed_hosts: list[str]):
     @mcp.tool(structured_output=True, annotations=read)
     def search_people(ctx: Context, query: str='', accounts: list[StrictStr] | None=None,
                       chats: list[StrictStr] | None=None, after: str='', limit: int=20,
-                      transliterate: bool=True,group_by_sender: bool=False) -> dict[str, Any]:
+                      transliterate: bool=True,group_by_sender: bool=False,person: StrictStr='') -> dict[str, Any]:
         """Find provider-reported name/username fragments or sender IDs in permitted archived chats.
         Results are account/chat-scoped observations, not verified or merged identities.
         Use account + sender_id with search() and source_message with get_context().
         Missing matches may mean metadata has not been observed; no contact-book/provider call.
+        A row whose identity the owner linked to a person carries person (a UUID); person=<id>
+        lists the name observations of that person's identities you can read (across messengers),
+        and search(person=<id>) finds their messages. Links are owner-made, never inferred from names.
         """
         return call(ctx,'search_people',query=query,accounts=accounts,chats=chats,after=after,limit=limit,
-                    transliterate=transliterate,group_by_sender=group_by_sender)
+                    transliterate=transliterate,group_by_sender=group_by_sender,person=person)
 
     # ANYM-478: live may ask Telegram itself, so search is open-world.
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True))
@@ -795,7 +798,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
                compact: bool | None=None, body_chars: StrictInt | None=None, include_coverage: bool | None=None, detail: MessageDetail='compact',
                     view: ConversationView='conversation',include_system: StrictBool=False,exclude_channels: StrictBool=False,
                chat_types: list[Literal['private','group','channel','unknown']] | None=None,include_channels: StrictBool=False,
-               collapse_forwards: StrictBool=True,
+               collapse_forwards: StrictBool=True,person: StrictStr='',
                live: Literal['off','auto','on']='off', wait_s: LiveWaitSeconds | None=None, request_id: StrictStr='') -> dict[str, Any]:
         """Search archived text across chosen accounts/chats/sender IDs. Lists use OR within each
         dimension, AND between dimensions; [] matches nothing. Exact account-scoped sender IDs,
@@ -810,6 +813,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
         A query returns forwarded copies of one message once (the original if archived, else the
         earliest copy) with copies_total (this row included) and copies; it needs a stated origin
         (Telegram), so WhatsApp forwards stay separate. collapse_forwards=false returns every copy.
+        person (from search_people) matches messages sent by any identity the owner linked to that
+        person and you can read, ANDed with the other filters; archive only.
         live (Telegram, first page only): on also searches Telegram itself; auto only when the archive
         answer is thin (empty_reason history_loading/history_not_scanned/history_has_gaps/
         no_matches_in_partial_archive). It waits once up to wait_s (0-20, default 15), then rereads the
@@ -825,7 +830,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     order=order,before=before,direction=direction,search_language=search_language,fuzzy=fuzzy,
                     compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
                     chat_types=chat_types,include_channels=include_channels,collapse_forwards=collapse_forwards,
-                    live=live,wait_s=wait_s,request_id=request_id)
+                    person=person,live=live,wait_s=wait_s,request_id=request_id)
 
     @mcp.tool(structured_output=True, annotations=read)
     def search_files(ctx: Context, query: str='', account: str='', chat: str='', sender: str='',

@@ -282,7 +282,7 @@ def named_chats(c, p, chat='', chats=None):
 def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time='',after='',limit=20,
            *,accounts=None,chats=None,senders=None,query_mode='all',order='asc',before='',direction='',
            search_language='auto',fuzzy=False,compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False,
-           exclude_channels=False,chat_types=None,include_channels=None,collapse_forwards=True):
+           exclude_channels=False,chat_types=None,include_channels=None,collapse_forwards=True,person=''):
     from .store import APIError,bounded,serial
     import re
     from .conversation import options,numeric_order_sql,visible_sql,decorate_messages,presentation
@@ -300,6 +300,12 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     clauses,args,normalized=filters(p,account=account,chat=chat,sender=sender,accounts=accounts,
         chats=chats,senders=senders,from_time=from_time,to_time=to_time,direction=direction,exclude_channels=exclude_channels,
         chat_types=chat_types,include_channels=include_channels)
+    # ANYM-283: an owner-made person narrows to the exact (account,sender) pairs this key can read.
+    members=digest=None
+    if person!='':
+        from .person_links import member_clause,visible_members
+        person,members,digest=visible_members(c,p,person)
+        clause,values=member_clause('m','account','sender',members);clauses.append(clause);args.extend(values)
     # An explicit type filter binds the cursor; the default exclusion keeps bare ID cursors.
     typed=exclude_channels or chat_types is not None or include_channels is True
     # ANYM-273: an explicit flat view binds its cursor, so a page cannot continue in the other view.
@@ -308,6 +314,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         'language':search_language,'order':order,'fuzzy':fuzzy,
         # Only the non-default exact view binds, so cursors issued before ANYM-273 stay valid.
         **({'collapse_forwards':False} if flat else {}),
+        **({'person':person} if members is not None else {}),
         **({'view':view,'include_system':include_system,'conversation_version':1} if conversation else {})})
     extra_join=' LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision' if conversation else ''
     if conversation and not include_system:clauses.append(visible_sql('m','cmd'))
@@ -354,6 +361,8 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         cursor=after or before
         if cursor.startswith('q1.'):
             position=decode_cursor(cursor,binding)
+            # A visible membership change is cursor_changed; a hidden one leaves the digest alone.
+            if members is not None and position.pop('members',None)!=digest:raise APIError('cursor_changed',409)
             if set(position)!=({'id','at','score','revision','fuzzy','source_order','snapshot'} if conversation else {'id','at','score','revision','fuzzy'}):
                 raise APIError('invalid_cursor')
             mid=position_text(position['id'])
@@ -380,7 +389,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
                     cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
                     cursor_args=[at,mid]
         else:
-            if order=='relevance' or conversation or typed or flat:raise APIError('invalid_cursor')
+            if order=='relevance' or conversation or typed or flat or members is not None:raise APIError('invalid_cursor')
             anchor=store.message(c,p,cursor)
             cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
             cursor_args=[anchor['sent_at'],anchor['id']]
@@ -406,6 +415,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     if collapsing:attach_copies(items)
     retitle(c,p,items)
     next_cursor=None
+    extra={'members':digest} if members is not None else {}
     if len(rows)>limit:
         last=items[-1]
         # A group's cursor anchors on the member that holds its place in this order (ANYM-273).
@@ -413,9 +423,9 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         if conversation:
             snapshot=snapshot or read_snapshot()
             next_cursor=encode_cursor(binding,{'id':last['id'],'at':last['sent_at'],'score':last['score'],
-                'revision':last['revision'],'fuzzy':fuzzy_used,'source_order':last['source_order'],'snapshot':snapshot})
+                'revision':last['revision'],'fuzzy':fuzzy_used,'source_order':last['source_order'],'snapshot':snapshot,**extra})
         else:next_cursor=encode_cursor(binding,{'id':last['id'],'at':last['sent_at'],'score':last['score'],
-            'revision':last['revision'],'fuzzy':fuzzy_used}) if order=='relevance' or fuzzy or typed or flat else last['id']
+            'revision':last['revision'],'fuzzy':fuzzy_used,**extra}) if order=='relevance' or fuzzy or typed or flat or members is not None else last['id']
     shape_messages(items,compact=False if conversation else compact)
     from .result_evidence import decorate
     from .chat_evidence import query_evidence

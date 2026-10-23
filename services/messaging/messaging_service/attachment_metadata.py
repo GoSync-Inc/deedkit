@@ -14,7 +14,7 @@ from .status_details import describe
 
 
 # Download phase of a queued original the current collector run will not fetch by itself.
-WAITING = {'outside_prefetch_window':'available_on_request','outside_history_bounds':'unavailable',
+WAITING = {'outside_prefetch_window':'available_on_request','outside_history_bounds':'available_on_request',
     'collection_excluded':'blocked'}
 
 
@@ -84,8 +84,8 @@ def attachment_fields(row, *, original_present=None):
         action='check_original_storage' if original_present is False else 'get_attachment'
         if original_present is False and row.get('original_residency')=='evicted':
             reason='original_evicted';action='request_file_download'
-            # A re-download is bound by collection policy and the history bound (ANYM-284).
-            if eligibility in ('outside_history_bounds','collection_excluded'):
+            # A re-download is bound by collection policy (ANYM-284); an explicit request reaches below the history bound (ANYM-477).
+            if eligibility=='collection_excluded':
                 reason=eligibility;action=describe(eligibility)['next_action']
     else:
         download_status={'leased':'processing','ready':'unavailable'}.get(state,state)

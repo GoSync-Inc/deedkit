@@ -546,13 +546,13 @@ class Store:
             return list_entries(self,c,p,kind,after,limit)
 
     def search_people(self,token,query='',*,accounts=None,chats=None,after='',limit=20,
-                      transliterate=False,group_by_sender=False):
+                      transliterate=False,group_by_sender=False,person=''):
         from .people_candidates import search_people
         with self.authorized(token,'search_people') as (c,p):
             if type(transliterate) is not bool or type(group_by_sender) is not bool:
                 raise APIError('invalid_filter')
             return search_people(self,c,p,query,accounts=accounts,chats=chats,after=after,limit=limit,
-                transliterate=transliterate,group_by_sender=group_by_sender)
+                transliterate=transliterate,group_by_sender=group_by_sender,person=person)
 
     def search_files(self,token,query='',account='',chat='',sender='',from_time='',to_time='',
                      after='',limit=20,*,accounts=None,chats=None,senders=None,query_mode='all',
@@ -629,7 +629,7 @@ class Store:
                to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None, collapse_forwards=True,
                query_mode='all', order='asc', before='', direction='', search_language='auto',
                fuzzy=False, compact=False, body_chars=None, include_coverage=True,view='archive',include_system=False,exclude_channels=False,
-               chat_types=None,include_channels=False,_scope=None):
+               chat_types=None,include_channels=False,person='',_scope=None):
         # None is the internal no-default sentinel of message_queries.search, never a public value.
         if type(include_channels) is not bool:raise APIError('invalid_filter')
         from .message_queries import named_chats
@@ -642,7 +642,7 @@ class Store:
                 accounts=accounts,chats=chats,senders=senders,collapse_forwards=collapse_forwards,query_mode=query_mode,
                 order=order,before=before,direction=direction,search_language=search_language,
                 fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
-                chat_types=chat_types,include_channels=include_channels)
+                chat_types=chat_types,include_channels=include_channels,person=person)
             # ANYM-478: a thin archive answer names the call that may find more; the hint is optional, so its
             # failure (in a savepoint) never costs the archive answer.
             try:
@@ -985,6 +985,28 @@ class Store:
             return set_feedback_status(c, ids, status, fixed_in=fixed_in, spec_ref=spec_ref,
                 duplicate_of=duplicate_of, note=note, unchanged_since=unchanged_since, not_after=not_after)
 
+    # Operator CLI only (ANYM-283): owner-made person links; no operation permission, MCP tool,
+    # REST route or gateway action, and the gateway role has no write grant on person_links.
+    def link_person(self, account, sender, person=None):
+        from .person_links import link
+        with self.pool.connection() as c:
+            return link(c, account, sender, person)
+
+    def unlink_person(self, account, sender):
+        from .person_links import unlink
+        with self.pool.connection() as c:
+            return unlink(c, account, sender)
+
+    def delete_person(self, person):
+        from .person_links import delete
+        with self.pool.connection() as c:
+            return delete(c, person)
+
+    def list_people(self, person=None):
+        from .person_links import list_people
+        with self.pool.connection() as c:
+            return list_people(c, person)
+
     def ack_updates(self, token, consumer, receipt, expected_version):
         with self.authorized(token,'ack_updates') as (c, p):
             if not isinstance(expected_version,int) or isinstance(expected_version,bool) or expected_version<0:
@@ -1041,8 +1063,8 @@ class Store:
             c.execute("SET LOCAL statement_timeout='180s'")
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
-            if version>42: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql')]:
+            if version>43: raise RuntimeError('database_newer_than_runtime')
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:

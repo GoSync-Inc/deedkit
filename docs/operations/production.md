@@ -626,6 +626,10 @@ ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 `promotable()` (the previous revision is no longer current `main`), does not run or
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
+Messaging migration 043 (`manual`, ANYM-283) is additive: the new `person_links` table
+with a SELECT grant to the gateway role. A schema-42 runtime refuses schema 43, so it ships
+with its release; update the pinned backup and restore runtimes first, since earlier ones
+reject schema 43. Rollback: no data outside `person_links` changes.
 Messaging migration 042 (`manual`, ANYM-275) is additive: nullable columns, a wider
 `chat_read_observations.basis` check and the new `owner_message_reads` table with its
 collector and gateway grants. A schema-41 runtime refuses schema 42, so it ships
