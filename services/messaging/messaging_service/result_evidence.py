@@ -85,7 +85,7 @@ def text_excerpt(c,file,budget):
     source=file.get('excerpt_source')
     if not source or not _readable(c,file):return None
     total=file['excerpt_total']
-    pointer={'tool':'get_file_text','attachment_id':file['attachment_id'],'offset':0,
+    pointer={'operation':'get_file_text','attachment_id':file['attachment_id'],'offset':0,
         'content':'extracted' if source=='extracted' else 'enriched'}
     head=file['excerpt_head'][:EXCERPT_CHARS]
     if total>EXCERPT_CHARS:
@@ -143,10 +143,14 @@ def decorate(c,rows):
         item=attachment_fields(file)
         grouped.setdefault(file['message'],[]).append(item)
         file['item']=item
-    # One budget per decorated result, spent in the caller's row order.
+    current={r['id']:r['revision'] for r in c.execute('SELECT id,revision FROM messages WHERE id=ANY(%s)',(ids,))}
+    # One budget per decorated result, spent in the caller's row order; rows whose revision
+    # changed during the read lose their attachments below and spend nothing.
     budget=EXCERPT_BUDGET
-    order={r['id']:n for n,r in enumerate(rows)}
-    for file in sorted(files,key=lambda f:order.get(f['message'],len(order))):
+    order={}
+    for n,r in enumerate(rows):
+        if current.get(r['id'])==r['revision']:order.setdefault(r['id'],n)
+    for file in sorted((f for f in files if f['message'] in order),key=lambda f:order[f['message']]):
         excerpt=text_excerpt(c,file,budget)
         if excerpt:
             file['item']['text_excerpt']=excerpt
@@ -156,7 +160,6 @@ def decorate(c,rows):
         count(*) FILTER(WHERE resolved_at IS NOT NULL) AS historical_conflicts,
         max(observed_at) AS last_conflict_at FROM message_conflicts
         WHERE message=ANY(%s) GROUP BY message''',(ids,))}
-    current={r['id']:r['revision'] for r in c.execute('SELECT id,revision FROM messages WHERE id=ANY(%s)',(ids,))}
     send_provenance(c,rows)
     delivery_evidence(c,rows)
     formatting_evidence(c,rows)

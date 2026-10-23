@@ -1,6 +1,6 @@
 """Message reads carry a bounded excerpt of a file's text (synthetic rows, no provider)."""
 from messaging_service.presentation import render
-from test_file_index import add_file, drain, text, worker_for
+from test_file_index import add_file, drain, original, text, worker_for
 from test_file_retention_api import managed_absence
 from test_voice_transcript_reading import TRANSCRIPT, voice
 
@@ -25,10 +25,11 @@ def test_message_attachment_carries_a_bounded_excerpt_with_a_pointer(seeded):
     excerpt = read(s, b)['scan-pdf']['text_excerpt']
     assert excerpt['source'] == 'extracted' and excerpt['model_generated'] is False and excerpt['untrusted'] is True
     assert 0 < excerpt['excerpt_chars'] == len(excerpt['text']) <= 300 and LONG.startswith(excerpt['text'])
-    assert excerpt['excerpt_chars'] >= 260 and excerpt['text'] == excerpt['text'].rstrip()
+    # Cut at a word boundary: the next retained character is whitespace.
+    assert excerpt['excerpt_chars'] >= 260 and LONG[excerpt['excerpt_chars']].isspace()
     assert excerpt['total_chars'] == len(LONG) and excerpt['complete'] is False
     pointer = excerpt['read_more']
-    assert pointer == {'tool': 'get_file_text', 'attachment_id': 'scan-pdf', 'offset': excerpt['excerpt_chars'],
+    assert pointer == {'operation': 'get_file_text', 'attachment_id': 'scan-pdf', 'offset': excerpt['excerpt_chars'],
                        'content': 'extracted'}
     rest = text(s, b, 'scan-pdf', offset=pointer['offset'], limit=8000, content=pointer['content'])
     assert excerpt['text'] + rest['text'] == LONG
@@ -102,3 +103,29 @@ def test_excerpts_share_one_bounded_budget_per_response(seeded):
     # The budget is spent in the returned order: only the trailing attachments are omitted.
     assert excerpts[-len(omitted):] == omitted
     assert all(len(e['text']) == 300 for e in excerpts if 'text' in e)
+
+
+# spec: ANYM-490
+def test_excerpt_budget_order_truncated_source_and_stale_text(seeded):
+    s, _, b = seeded
+    add_file(s, 'capped-note', 'demo-tg-2', b'Capped synthetic text', 'capped.txt')
+    drain(worker_for(s))
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_text SET truncated=true WHERE attachment='capped-note'")
+    # A capped source: the excerpt holds all retained text, so nothing more to read, yet not complete.
+    capped = read(s, b)['capped-note']['text_excerpt']
+    assert capped['complete'] is False and capped['read_more'] is None and capped['text'] == 'Capped synthetic text'
+    for n in range(11):
+        add_file(s, f'ctx-{n:02d}', 'demo-tg-1', (f'{n:02d}' + 'Q' * 398).encode(), f'ctx-{n}.txt')
+    drain(worker_for(s))
+    # get_context in the conversation view spends the budget in the returned (chronological) order.
+    context = s.get_context(b, 'demo-tg-2', view='conversation')
+    ordered = [f['text_excerpt'] for r in context['context'] for f in r.get('attachments') or [] if 'text_excerpt' in f]
+    first_omitted = next(i for i, e in enumerate(ordered) if 'omitted' in e)
+    assert all('omitted' in e for e in ordered[first_omitted:])
+    # A replaced original makes the derivative stale: no excerpt until it is re-extracted.
+    _, digest = original(s.files, b'Replaced synthetic text')
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachments SET digest=%s,bytes=23 WHERE id='capped-note'", (digest,))
+    stale = s.get_context(b, 'demo-tg-2')['message']['attachments']
+    assert 'text_excerpt' not in {f['id']: f for f in stale}['capped-note']

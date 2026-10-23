@@ -95,10 +95,12 @@ In `get_messages`, `search` and `get_context` (every detail, and the transcript'
 an attachment whose default `get_file_text` text is ready carries `text_excerpt` (ANYM-490):
 at most 300 characters of that text (photo OCR, PDF and other extracted text, or a voice
 note's transcript), `source` (`extracted` or `transcript`), `excerpt_chars`, `total_chars`,
-`complete`, `model_generated`, `untrusted: true` and `read_more`, the `get_file_text`
-call that continues at `offset` (null when the excerpt is the whole text). Excerpts in
-one decorated result share a 3,000-character budget; an attachment past it gets
-`omitted: "response_budget"` with `read_more` at offset 0. Image model descriptions are
+`complete`, `model_generated`, `untrusted: true` and `read_more`: `{operation: get_file_text,
+attachment_id, offset, content}` (gateway tool `messages_get_file_text`), null when the excerpt
+holds all retained text. Excerpts in one result share a 3,000-character budget spent in row
+order; an attachment past it gets `omitted: "response_budget"`, `total_chars` and `read_more`
+at offset 0. When `text_excerpt` is absent, `extraction_status`, `enrichment_status` and
+`transcript_ready` say why. Image model descriptions are
 not excerpted, and an excerpt follows `get_file_text`'s presence rule: no excerpt when the
 original is missing without a completed managed eviction.
 `content='enriched'` pages the model transcript/text up to 1,000,000 stored characters;

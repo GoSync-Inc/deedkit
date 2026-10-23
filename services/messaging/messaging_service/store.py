@@ -733,7 +733,8 @@ class Store:
                 rows=sorted(rows,key=lambda r:(r['id']!=anchor['id'],
                     abs((r['sent_at']-anchor['sent_at']).total_seconds())))[:limit]
             if conversation:
-                enrich(c,rows,p);rows.sort(key=sort_key)
+                # Chronological before enrich too: excerpts spend their budget in row order (ANYM-490).
+                rows.sort(key=lambda r:(r['sent_at'],r['id']));enrich(c,rows,p);rows.sort(key=sort_key)
                 shape_messages(rows,compact=False,body_chars=cap)
                 shape_messages([anchor],compact=False,body_chars=cap)
                 decorate_messages(c,p,rows,include_system=include_system);decorate_messages(c,p,[anchor],include_system=include_system)
