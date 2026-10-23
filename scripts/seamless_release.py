@@ -13,7 +13,8 @@ import hashlib
 import http.client
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import shlex
 import socket
@@ -80,6 +81,9 @@ def validate_settings(settings):
     # Preserve the existing file and its runtime readability; the application
     # bind is read-only. Router/admin/state paths remain operator-owned only.
     private_path(policy, owners={os.geteuid(), 10001})
+    # The gateway reads the policy through its directory mount (ANYM-424), so
+    # the directory is as private as the file.
+    private_path(policy.parent, directory=True, owners={os.geteuid(), 10001})
     if not isinstance(release['legacy'], dict) or set(release['legacy']) != {'api', 'gateway'}:
         raise Refused('explicit legacy HTTP upstreams are required')
     for role, port in [('api', 8080), ('gateway', 13240)]:
@@ -312,6 +316,39 @@ def canonical(unit, role, settings):
     return unit
 
 
+def policy_mount(unit, settings):
+    """Translate the gateway's complete `--policy` path through its mounts (ANYM-424).
+
+    Exactly one mount (volume, tmpfs, secret or config) may cover the path: a
+    read-only bind of the policy file's own directory, whose host file is
+    `gateway_policy`. A single-file bind pins the inode it started with, so an
+    atomic rename beside the live file would never reach the running gateway.
+    """
+    command = dict(zip(unit['command'][::2], unit['command'][1::2], strict=True))
+    target = PurePosixPath(command['--policy'])
+    if not target.is_absolute() or '..' in target.parts or str(target) != command['--policy']:
+        raise Refused('gateway --policy must be a normalized absolute path')
+    def place(path, base='/'):
+        # Docker cleans a mount destination (`..`, `.`, repeated slashes) before mounting.
+        return PurePosixPath('/' + posixpath.normpath(posixpath.join('/', base, path)).lstrip('/'))
+    tmpfs = unit.get('tmpfs') or []
+    mounts = [(place(mount['target']), mount) for mount in unit.get('volumes', [])]
+    mounts += [(place(path.split(':', 1)[0]), path) for path in ([tmpfs] if isinstance(tmpfs, str) else tmpfs)]
+    # A file-backed secret or config is a bind too and can shadow the policy file.
+    mounts += [(place(item.get('target') or item['source'], '/run/secrets' if kind == 'secrets' else '/'), item)
+        for kind in ('secrets', 'configs') for item in unit.get(kind, []) if isinstance(item, dict)]
+    covering = [(where, mount) for where, mount in mounts if where in {target, *target.parents}]
+    if len(covering) != 1 or not isinstance(covering[0][1], dict):
+        raise Refused('exactly one mount may provide the gateway policy')
+    mounted, mount = covering[0]
+    if mounted == target:
+        raise Refused('gateway policy must be mounted through its directory, not as a single file')
+    if mount.get('type') != 'bind' or not mount.get('read_only') or mounted != target.parent:
+        raise Refused('gateway policy directory must be a read-only bind of the policy file\'s own directory')
+    if PurePosixPath(mount['source']) / target.name != PurePosixPath(settings['http_release']['gateway_policy']):
+        raise Refused('gateway policy must be the exact configured read-only bind mount')
+
+
 def isolate(settings, documents, images, release, generation, sha):
     result = {'name': 'deedkit-http-' + generation, 'services': {}, 'networks': {}, 'volumes': {}}
     private = {'controls': {}}
@@ -360,10 +397,7 @@ def isolate(settings, documents, images, release, generation, sha):
                     raise Refused('secrets/configs require explicit unchanged target paths')
                 item['source'] = new_key
         if role == 'gateway':
-            command = dict(zip(unit['command'][::2], unit['command'][1::2], strict=True))
-            matching = [mount for mount in unit.get('volumes', []) if mount['target'] == command['--policy']]
-            if len(matching) != 1 or matching[0].get('type') != 'bind' or matching[0]['source'] != settings['http_release']['gateway_policy'] or not matching[0].get('read_only'):
-                raise Refused('gateway policy must be the exact configured read-only bind mount')
+            policy_mount(unit, settings)
         directory = Path(release) / role
         directory.mkdir(mode=0o700)
         if os.geteuid() == 0:

@@ -6,9 +6,11 @@ services:
       context: ..
       dockerfile: services/gateway/Dockerfile
     env_file: ./private/gateway.env
-    command: ["--policy", "/run/deedkit/policy.json", "--public-url", "${DEEDKIT_PUBLIC_URL:?Set gateway HTTPS origin}", "--host", "0.0.0.0", "--port", "13240"]
+    command: ["--policy", "/run/deedkit/policy/policy.json", "--public-url", "${DEEDKIT_PUBLIC_URL:?Set gateway HTTPS origin}", "--host", "0.0.0.0", "--port", "13240"]
     volumes:
-      - ./private/gateway-policy.json:/run/deedkit/policy.json:ro
+      # The policy directory, never the file: a rename beside the live file reaches the
+      # running gateway (a single-file bind pins the old inode; ANYM-424).
+      - ./private/gateway-policy:/run/deedkit/policy:ro
       - ./private/gateway-keys:/run/deedkit/keys:ro
     ports: ["127.0.0.1:13240:13240"]
     networks: [integration]
