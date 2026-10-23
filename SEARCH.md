@@ -247,7 +247,9 @@ length 1), `chat_types` / `include_channels` / `exclude_channels` (channels only
 the archive) and `from_time` / `to_time`. `web` and `exact` modes, `fuzzy`, `sender`/`senders`,
 `direction`, several chats and `chats: []` give `unsupported_filter`. Keep one `request_id` per intent:
 the same id maps to the same operation per account, so a repeat after a lost response asks the provider
-nothing new. A failure to queue or a provider error never fails or empties the archive answer. At most 8
+nothing new. A failure to queue or a provider error never fails or empties the archive answer. When the
+archive reread after the wait times out, the call returns the first archive answer with the live entries
+and `result_evidence.archive_reread: "failed"` (live hits stored meanwhile appear in the next search). At most 8
 calls wait at once (separate from send waits); a busy server returns the operations as `pending` with
 `result_evidence.live_wait: "busy"`. `live` other than `off` needs `read-live` and, through the
 gateway, the `search_messages_live` action; MCP clients reconnect after the release to see the fields.
