@@ -14,6 +14,7 @@ import http.client
 import json
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import shlex
 import socket
@@ -327,20 +328,22 @@ def policy_mount(unit, settings):
     target = PurePosixPath(command['--policy'])
     if not target.is_absolute() or '..' in target.parts or str(target) != command['--policy']:
         raise Refused('gateway --policy must be a normalized absolute path')
+    def place(path, base='/'):
+        # Docker cleans a mount destination (`..`, `.`, repeated slashes) before mounting.
+        return PurePosixPath('/' + posixpath.normpath(posixpath.join('/', base, path)).lstrip('/'))
     tmpfs = unit.get('tmpfs') or []
-    covering = [mount for mount in unit.get('volumes', []) if PurePosixPath(mount['target']) in {target, *target.parents}]
-    covering += [path for path in ([tmpfs] if isinstance(tmpfs, str) else tmpfs) if PurePosixPath(path.split(':', 1)[0]) in {target, *target.parents}]
+    mounts = [(place(mount['target']), mount) for mount in unit.get('volumes', [])]
+    mounts += [(place(path.split(':', 1)[0]), path) for path in ([tmpfs] if isinstance(tmpfs, str) else tmpfs)]
     # A file-backed secret or config is a bind too and can shadow the policy file.
-    def provided(kind, item):
-        path = item.get('target') or item['source']
-        return PurePosixPath(path) if path.startswith('/') else PurePosixPath('/run/secrets' if kind == 'secrets' else '/') / path
-    covering += [item for kind in ('secrets', 'configs') for item in unit.get(kind, []) if isinstance(item, dict) and provided(kind, item) in {target, *target.parents}]
-    if len(covering) != 1 or not isinstance(covering[0], dict):
+    mounts += [(place(item.get('target') or item['source'], '/run/secrets' if kind == 'secrets' else '/'), item)
+        for kind in ('secrets', 'configs') for item in unit.get(kind, []) if isinstance(item, dict)]
+    covering = [(where, mount) for where, mount in mounts if where in {target, *target.parents}]
+    if len(covering) != 1 or not isinstance(covering[0][1], dict):
         raise Refused('exactly one mount may provide the gateway policy')
-    mount = covering[0]
-    if PurePosixPath(mount['target']) == target:
+    mounted, mount = covering[0]
+    if mounted == target:
         raise Refused('gateway policy must be mounted through its directory, not as a single file')
-    if mount.get('type') != 'bind' or not mount.get('read_only') or PurePosixPath(mount['target']) != target.parent:
+    if mount.get('type') != 'bind' or not mount.get('read_only') or mounted != target.parent:
         raise Refused('gateway policy directory must be a read-only bind of the policy file\'s own directory')
     if PurePosixPath(mount['source']) / target.name != PurePosixPath(settings['http_release']['gateway_policy']):
         raise Refused('gateway policy must be the exact configured read-only bind mount')

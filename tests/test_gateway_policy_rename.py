@@ -167,7 +167,6 @@ def test_policy_renamed_over_the_live_file_reaches_the_running_gateway(gateway_i
         assert gateway.docker("compose", "version", check=False).returncode == 0, "Docker Compose v2 is required"
         gateway.private_files()
         live = gateway.policy_file()
-        assert live.resolve() == (gateway.deploy / "private/gateway-policy/policy.json").resolve()
         write(live, policy(1))
         gateway.override()
         try:
@@ -179,6 +178,7 @@ def test_policy_renamed_over_the_live_file_reaches_the_running_gateway(gateway_i
             target, mount = gateway.policy_mount()
             assert PurePosixPath(mount["target"]) == target.parent, (
                 "the policy must be mounted through its directory, not as a single file", mount)
+            assert live.resolve() == (gateway.deploy / "private/gateway-policy/policy.json").resolve()
         finally:
             gateway.close()
 
