@@ -66,3 +66,33 @@ def test_queue_today_reference_passes_next_day_and_latest_date_decides():
     assert passed_reference('сегодня или до 30.10?',sixteenth,at(20),UTC) is None
     assert passed_reference(None,sixteenth,at(20),UTC) is None
     assert len(passed_reference('сегодня '+'x'*200,sixteenth,at(20),UTC)['text'])<=40
+
+
+# spec: ANYM-282
+@pytest.mark.parametrize('text',['on Frİday?','on Frıday?','on ſunday?','hari Jumat lalu?','on Friday last week?',
+    'в пятницу на прошлой неделе?','в пятницу прошлой недели?','на прошлой неделе в пятницу?'])
+def test_queue_lookalike_or_past_weekday_yields_nothing(text):
+    assert passed_reference(text,MONDAY,at(20),UTC) is None
+    assert passed_reference('сегодня? '+text,MONDAY,at(20),UTC)['resolved_date']=='2026-10-12'
+
+
+# spec: ANYM-282
+@pytest.mark.parametrize('text,expected',[('к пятнице?','2026-10-16'),('к среде?','2026-10-14'),('к субботе?','2026-10-17'),
+    ('к воскресенью?','2026-10-18'),('ко вторнику?','2026-10-13'),('к четвергу?','2026-10-15')])
+def test_queue_flags_russian_by_weekday_deadlines(text,expected):
+    assert passed_reference(text,MONDAY,at(25),UTC)['resolved_date']==expected
+    # A still-future deadline next to "today" keeps the request current.
+    assert passed_reference('сегодня или '+text,MONDAY,at(13),UTC) is None
+
+
+# spec: ANYM-282
+def test_queue_numeric_date_rolls_into_a_leap_year_and_rejects_invalid_dates():
+    sent=datetime(2027,11,15,10,tzinfo=timezone.utc)
+    assert passed_reference('до 29.02?',sent,datetime(2028,3,1,tzinfo=timezone.utc),UTC)['resolved_date']=='2028-02-29'
+    assert passed_reference('до 31.02?',sent,datetime(2028,3,1,tzinfo=timezone.utc),UTC) is None
+    assert passed_reference('до 29.02?',datetime(2026,11,15,tzinfo=timezone.utc),datetime(2027,3,1,tzinfo=timezone.utc),UTC) is None
+
+
+# spec: ANYM-282
+def test_queue_parser_error_drops_the_flag_not_the_read():
+    assert passed_reference('сегодня?','not a datetime',at(20),UTC) is None

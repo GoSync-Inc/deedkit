@@ -146,10 +146,10 @@ time_zone, suggest}`; archive rows carry the same object as
 next day: the request still waits, so the hint is a prompt to check, not a
 verdict. Only the first 160 characters of the message are read, and only a
 small allowlist in Russian, English and Indonesian: today, tomorrow, the day
-after tomorrow, a weekday with a preposition ("в пятницу", "on Friday", "hari
-Jumat", "Jumat ini") and dd.mm or dd/mm dates with a year or a preceding
+after tomorrow, a weekday with a preposition ("в пятницу", "к пятнице", "on Friday",
+"hari Jumat", "Jumat ini") and dd.mm or dd/mm dates with a year or a preceding
 preposition ("до 17.10", "by 15/10"). A weekday equal to the send day, past
-markers ("в прошлую", "last", "lalu") and vague phrases ("в выходные", "next
+markers ("на прошлой неделе", "last week", "lalu") and vague phrases ("в выходные", "next
 week") yield nothing; with several dates the latest decides. Dates resolve in
 the owner's zone, `ANYMSG_OWNER_TIMEZONE` (IANA name) on the messaging server;
 unset or unknown means UTC and `time_zone: "UTC_fallback"`.

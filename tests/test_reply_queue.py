@@ -472,3 +472,15 @@ def test_queue_row_explains_a_passed_date_without_changing_its_priority(inbox, m
     compact = {r['provider_chat_id']: r for r in render('list_chats', queue(order='priority'), 'compact')['items']}
     assert compact['100']['awaiting_reply_time_reference'] == {'resolved_date':flagged['awaiting_reply_time_reference']['resolved_date'],
         'text':'завтра', 'suggest':'acknowledge_delay_offer_new_date'}
+
+
+# spec: ANYM-282
+def test_queue_page_survives_a_message_the_date_reader_cannot_resolve(inbox):
+    s, ar, key, add, queue = inbox
+    add('100', 0, 0, direction='outgoing')
+    add('200', 0, 0, direction='outgoing')
+    add('100', 1, 1, body='on Frİday?')
+    add('200', 1, 2, body='A question?')
+    rows = queue(order='priority')['items']
+    assert sorted(r['provider_chat_id'] for r in rows) == ['100', '200']
+    assert not any('awaiting_reply_time_reference' in r for r in rows)
