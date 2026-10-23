@@ -1,4 +1,5 @@
 """Scoped catalogue and evidence-backed, deliberately heuristic reply queue."""
+import os
 import re
 from psycopg.types.json import Jsonb
 
@@ -6,6 +7,7 @@ from .policy import scope_filter,targets
 from .search_query import coverage,cursor_binding,decode_cursor,encode_cursor,filter_values,position_date,position_text,valid_text
 from .conversation import meaningful_sql,options
 from .conversation_state import conversation_state,group_thread_query
+from .time_references import owner_zone,passed_reference
 
 
 def meaningful(alias='m',metadata='md'):
@@ -477,11 +479,16 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         selves={r['id'] for r in c.execute('SELECT c.id FROM chats c WHERE c.id=ANY(%s) AND '+self_chat_sql(),
             ([row['id'] for row in private],))}
     titles=labels(c,p,[(row['account'],row['id']) for row in private if row['id'] not in selves])
+    zone=owner_zone(os.environ)
     # Compute run counts only for the returned page, never for every chat.
     for row in items:
         if row['awaiting_reply'] and row.get('awaiting_reply_snoozed_until'):
             # The agent asked to be reminded; the row is back for that reason (ANYM-281).
             row['awaiting_reply_priority_reasons']=[*row['awaiting_reply_priority_reasons'],'snooze_due']
+        if row['awaiting_reply'] and (flag:=passed_reference(row.get('awaiting_reply_snippet'),row['awaiting_reply_sent_at'],score_at,zone)):
+            # The message names a date that has passed (ANYM-282): explained, never scored, so order and cursors hold.
+            row['awaiting_reply_time_reference']=flag
+            row['awaiting_reply_priority_reasons']=[*row['awaiting_reply_priority_reasons'],'referenced_date_passed']
         if row['awaiting_reply']:
             if row.get('awaiting_reply_promotional_basis'):row['awaiting_reply_likely_promotional']=True
             if view=='conversation' and row['type']=='group':

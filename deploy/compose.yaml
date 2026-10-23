@@ -34,6 +34,8 @@ services:
       PROBE_FILES: /data/files
       PROBE_BIND: 0.0.0.0
       PROBE_PORT: "8080"
+      # ANYM-282: the zone that dates named in queued messages resolve in; empty means UTC.
+      ANYMSG_OWNER_TIMEZONE: ${ANYMSG_OWNER_TIMEZONE:-}
     volumes:
       - ./private/app.dsn:/run/secrets/database_url:ro
       - files:/data:ro

@@ -245,6 +245,7 @@ def lean_chat(row):
         if row.get('awaiting_reply_likely_promotional'):
             hint.update(likely_promotional=True,promotional_basis=row['awaiting_reply_promotional_basis'])
         if row.get('awaiting_reply_snoozed_until'):hint['snoozed_until']=row['awaiting_reply_snoozed_until']
+        if row.get('awaiting_reply_time_reference'):hint['time_reference']=row['awaiting_reply_time_reference']
         if row.get('awaiting_reply_confidence') not in (None,'heuristic_not_obligation'):
             hint['confidence']=row['awaiting_reply_confidence']
         if last and last['id']==hint['message_id']:
@@ -451,6 +452,8 @@ def render(method, result, detail):
             else:row.pop('last_message_snippet',None)
             if row.get('awaiting_reply_snippet'):
                 row['awaiting_reply_snippet']=row['awaiting_reply_snippet'][:80]
+            if row.get('awaiting_reply_time_reference'):  # ANYM-282: the date and its words; full detail adds status and zone
+                row['awaiting_reply_time_reference']={k:row['awaiting_reply_time_reference'][k] for k in ('resolved_date','text','suggest')}
             if row.get('awaiting_reply_forward_origin'):
                 row['awaiting_reply_forward_origin']=forward_fields({'forwarded':True,
                     'forward_origin':row['awaiting_reply_forward_origin']},brief=True)['forward_origin']

@@ -448,3 +448,39 @@ def test_whatsapp_queue_hint_never_names_a_sender_by_its_raw_id(seeded):
     hints = {r['awaiting_reply']['sender_id']: r['awaiting_reply'] for r in lean['items']}
     assert (hints['321@c.us']['sender_name'], hints['321@c.us']['sender_name_basis']) == ('+321', 'phone_number')
     assert 'sender_name' not in hints['903@lid']
+
+
+# spec: ANYM-282
+def test_queue_row_explains_a_passed_date_without_changing_its_priority(inbox, monkeypatch):
+    s, ar, key, add, queue = inbox
+    monkeypatch.delenv('ANYMSG_OWNER_TIMEZONE', raising=False)
+    at = (datetime.now(timezone.utc)-timedelta(days=3)).isoformat()
+    before = (datetime.now(timezone.utc)-timedelta(days=4)).isoformat()
+    for chat, body in (('100', 'Сможешь завтра?'), ('200', 'Сможешь потом?')):
+        ar.ingest(event(account='queue-test', chat=chat, provider_id='0', sent_at=before, updated_at=before,
+            direction='outgoing', metadata={'chat_type':'private'}))
+        ar.ingest(event(account='queue-test', chat=chat, provider_id='1', sent_at=at, updated_at=at,
+            body=body, metadata={'chat_type':'private'}))
+    rows = {r['provider_chat_id']: r for r in queue(order='priority')['items']}
+    flagged, plain = rows['100'], rows['200']
+    assert flagged['awaiting_reply_priority'] == plain['awaiting_reply_priority']
+    assert flagged['awaiting_reply_priority_reasons'] == [*plain['awaiting_reply_priority_reasons'], 'referenced_date_passed']
+    assert flagged['awaiting_reply_time_reference'] == {'text':'завтра', 'status':'passed', 'time_zone':'UTC_fallback',
+        'suggest':'acknowledge_delay_offer_new_date',
+        'resolved_date':(datetime.fromisoformat(at)+timedelta(days=1)).date().isoformat()}
+    assert 'awaiting_reply_time_reference' not in plain
+    compact = {r['provider_chat_id']: r for r in render('list_chats', queue(order='priority'), 'compact')['items']}
+    assert compact['100']['awaiting_reply_time_reference'] == {'resolved_date':flagged['awaiting_reply_time_reference']['resolved_date'],
+        'text':'завтра', 'suggest':'acknowledge_delay_offer_new_date'}
+
+
+# spec: ANYM-282
+def test_queue_page_survives_a_message_the_date_reader_cannot_resolve(inbox):
+    s, ar, key, add, queue = inbox
+    add('100', 0, 0, direction='outgoing')
+    add('200', 0, 0, direction='outgoing')
+    add('100', 1, 1, body='on Frİday?')
+    add('200', 1, 2, body='A question?')
+    rows = queue(order='priority')['items']
+    assert sorted(r['provider_chat_id'] for r in rows) == ['100', '200']
+    assert not any('awaiting_reply_time_reference' in r for r in rows)
