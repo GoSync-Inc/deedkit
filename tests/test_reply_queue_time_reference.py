@@ -113,3 +113,10 @@ def test_queue_past_qualifier_stays_within_the_weekday_clause():
     'в пятницу\nна прошлой неделе?','hari Jumat (lalu)?','on Friday [last week]?','[last week] on Friday?','в пятницу [на прошлой неделе]?','hari Jumat [lalu]?','(last week) on Friday?','на прошлой неделе — в пятницу?'])
 def test_queue_past_qualifier_crosses_brackets_and_line_breaks(text):
     assert passed_reference(text,MONDAY,at(20),UTC) is None
+
+
+# spec: ANYM-282
+@pytest.mark.parametrize('end',['.','!','?','…','‼','⁉','？','！','。'])
+def test_queue_past_qualifier_never_crosses_a_sentence_end(end):
+    assert passed_reference(f'today or on Friday{end} Last week was busy.',MONDAY,at(14),UTC) is None
+    assert passed_reference(f'Last week was busy{end} today or on Friday?',MONDAY,at(14),UTC) is None
