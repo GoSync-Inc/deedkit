@@ -110,6 +110,6 @@ def test_queue_past_qualifier_stays_within_the_weekday_clause():
 
 # spec: ANYM-282
 @pytest.mark.parametrize('text',['on Friday (last week)?','on Friday\nlast week?','в пятницу (на прошлой неделе)?',
-    'в пятницу\nна прошлой неделе?','hari Jumat (lalu)?','(last week) on Friday?','на прошлой неделе — в пятницу?'])
+    'в пятницу\nна прошлой неделе?','hari Jumat (lalu)?','on Friday [last week]?','[last week] on Friday?','в пятницу [на прошлой неделе]?','hari Jumat [lalu]?','(last week) on Friday?','на прошлой неделе — в пятницу?'])
 def test_queue_past_qualifier_crosses_brackets_and_line_breaks(text):
     assert passed_reference(text,MONDAY,at(20),UTC) is None
