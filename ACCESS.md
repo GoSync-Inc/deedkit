@@ -134,7 +134,10 @@ token file needs a change. An unknown, revoked or already expired key is refused
 key ID and the previous and new `expires_at`; `list-keys` shows the new date. It writes one
 operator audit row `extend_key` (principal and public key ID, never the token or digest) in the
 same transaction, so a failed audit write leaves the expiry unchanged. Agents cannot extend
-their own keys. After a suspected leak, rotate with `issue-key` and `revoke-key` instead.
+their own keys. After a suspected leak, rotate with `issue-key` and `revoke-key` instead; to
+shorten a key, also revoke it and issue a new one. A messaging key gives no in-band warning before
+it expires (unlike a gateway key): a direct client reads `capabilities.expires_at` and warns
+itself, and the owner checks `list-keys`; with keys of up to a year this is the only signal.
 
 Reply-queue dismissals and snoozes belong to one key (SEARCH.md): `extend-key` keeps them,
 and a rotation (`issue-key` plus `revoke-key`) drops them. Since schema 41 reply-queue mutes
