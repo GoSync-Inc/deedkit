@@ -106,3 +106,10 @@ def test_queue_past_qualifier_stays_within_the_weekday_clause():
     # A past phrase in the next sentence does not cancel a future Friday.
     assert passed_reference('today or on Friday? Last week was busy.',MONDAY,at(14),UTC) is None
     assert passed_reference('Last week was busy. Today or on Friday?',MONDAY,at(14),UTC) is None
+
+
+# spec: ANYM-282
+@pytest.mark.parametrize('text',['on Friday (last week)?','on Friday\nlast week?','в пятницу (на прошлой неделе)?',
+    'в пятницу\nна прошлой неделе?','hari Jumat (lalu)?','(last week) on Friday?','на прошлой неделе — в пятницу?'])
+def test_queue_past_qualifier_crosses_brackets_and_line_breaks(text):
+    assert passed_reference(text,MONDAY,at(20),UTC) is None

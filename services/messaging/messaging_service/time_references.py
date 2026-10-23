@@ -19,9 +19,10 @@ WEEKDAY=[rf'\b(?:во?|ко?|до|на)\s+({RU_DAY})\b',rf'\b(?:on|by|this|until
     rf'\bhari\s+({ID_DAY})\b',rf'\b({ID_DAY})\s+ini\b']
 # A numeric date counts only with a year or a word that introduces a date ("версия 5.10" is not one).
 # "в пятницу на прошлой неделе", "on Friday last week", "hari Jumat lalu" name a past day, not a promise.
-# Only within the weekday's own clause: a comma or spaces, never a sentence end ("…on Friday? Last week was busy").
-PAST_BEFORE=re.compile(r'(?:прошл\w*(?:\s+недел\w*)?|last(?:\s+week)?|lalu)[ \t,]*$',re.I)
-PAST_AFTER=re.compile(r'^[ \t,]*(?:(?:на\s+)?прошл\w*|(?:of\s+)?last\b|(?:minggu\s+)?lalu\b|kemarin\b)',re.I)
+# Only within the weekday's own sentence: spaces, line breaks, commas, brackets or dashes, never . ! ?  ("…on Friday? Last week was busy").
+CLAUSE=r'[\s,()\-—–:;«»"]*'
+PAST_BEFORE=re.compile(r'(?:прошл\w*(?:\s+недел\w*)?|last(?:\s+week)?|lalu)'+CLAUSE+'$',re.I)
+PAST_AFTER=re.compile('^'+CLAUSE+r'(?:(?:на\s+)?прошл\w*|(?:of\s+)?last\b|(?:minggu\s+)?lalu\b|kemarin\b)',re.I)
 NUMERIC=re.compile(r'(?<![\d.,/])(?:\b(до|к|на|by|on|until|pada|tanggal|tgl)\s+)?(\d{1,2})[./](\d{1,2})(?:[./](\d{4}|\d{2}))?(?![\d.,/]?\d)',re.I)
 
 
