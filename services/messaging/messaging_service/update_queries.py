@@ -130,9 +130,8 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,width):
     state=c.execute('SELECT position FROM consumers WHERE principal=%s AND name=%s AND scope_version=%s',
         (p['id'],consumer,p['scope_version'])).fetchone()
     position=state['position'] if state else 0
-    # At the journal start (no consumer, or one at position 0) the window is the whole
-    # journal: from_time bounds it.
-    if not position and lower is None:
+    # Without a consumer the window would be the whole journal: from_time bounds it.
+    if state is None and lower is None:
         failure=APIError('invalid_filter');failure.fields=['from_time'];raise failure
     head=c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
     where,args=scope_filter(p,'m')
@@ -192,9 +191,35 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,width):
     sources=[compact_row({'account':r['id'],'status':r['status'],'last_ingest_at':r['last_ingest_at']})
         for r in store.dataset(c,p)['sources'] if 'accounts' not in filters or r['id'] in filters['accounts']]
     basis=('acknowledged_position_and_from_time' if lower else 'acknowledged_position') if state else 'from_time'
-    return serial({'consumer':consumer,'view':'by_chat','window':basis,'chats':chats,'has_more':more,'chats_total':total['chats_total'],
+    result=serial({'consumer':consumer,'view':'by_chat','window':basis,'chats':chats,'has_more':more,'chats_total':total['chats_total'],
         'live_total':int(total['live_total']),'backfill_total':int(total['backfill_total']),'filters':filters,
         'counts':'created_incoming_messages_after_position','accounts':sources,'provider_mute_archive':'unknown','absent_read_fields':'unknown'})
+    return within_budget(result)
 
 
 def compact_row(row):return {k:v for k,v in row.items() if v is not None}
+
+
+OVERVIEW_BUDGET=10000
+
+
+def within_budget(result):
+    """Keep a page of up to 25 rows within 10,000 characters (ANYM-458): shorten texts, then names."""
+    import json
+    def size():return len(json.dumps(result,ensure_ascii=False,default=str))
+    if len(result['chats'])>25 or size()<=OVERVIEW_BUDGET:return result
+    for step in ('text:40','names:32','text:0','sender_id','observed_at','names:16'):
+        kind,_,n=step.partition(':')
+        for row in result['chats']:
+            newest=row.get('newest') or {}
+            if kind=='text' and 'text' in newest:
+                if not int(n):newest.pop('text')
+                elif len(newest['text'])>int(n):newest['text']=newest['text'][:int(n)].rstrip()+'…'
+            if kind=='names':
+                for holder,key in ((row,'chat_title'),(newest,'sender_name')):
+                    if key in holder:holder[key]=holder[key][:int(n)]
+            if kind=='sender_id' and 'sender_name' in newest:newest.pop('sender',None)
+            if kind=='observed_at':row.pop('read_state_observed_at',None)
+        result['shortened_for_size']=step
+        if size()<=OVERVIEW_BUDGET:break
+    return result

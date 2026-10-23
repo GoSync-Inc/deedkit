@@ -8,6 +8,8 @@ from starlette.testclient import TestClient
 
 from messaging_service.app import create_app
 from messaging_service.store import APIError
+from test_archive import event
+from test_read_state_freshness import ago, live  # noqa: F401 (fixture)
 
 ROOT=Path(__file__).resolve().parents[1]
 SINCE='2026-10-20T00:00:00Z'
@@ -176,9 +178,9 @@ def test_overview_consumer_at_journal_start_keeps_its_window(seeded):
         c.execute("INSERT INTO consumers(principal,name,scope_version,filter_spec,position) SELECT id,'unacked',scope_version,'{}',0 FROM principals WHERE id='agent-a'")
     page=s.get_updates(a,'unacked',view='by_chat',from_time=SINCE)
     assert page['window']=='acknowledged_position_and_from_time' and page['live_total']==1
-    with pytest.raises(APIError,match='invalid_filter') as failure:
-        s.get_updates(a,'unacked',view='by_chat')
-    assert failure.value.fields==['from_time']
+    # Position 0 is a valid bound: an existing consumer needs no from_time.
+    whole=s.get_updates(a,'unacked',view='by_chat')
+    assert whole['window']=='acknowledged_position' and 'tg-live' in [row['chat'] for row in whole['chats']]
 
 
 # spec: ANYM-458
@@ -210,3 +212,44 @@ def test_overview_stale_read_state_shows_no_unread(seeded):
         to_time='2026-10-22T04:00:00Z')['chats']}
     for chat in ('tg-stale','tg-newer'):
         assert rows[chat]['read_state']=='stale' and 'provider_unread' not in rows[chat]
+
+
+# spec: ANYM-458
+def test_overview_of_25_populated_chats_over_mcp_within_10000_chars(seeded):
+    s,a,b=seeded
+    with s.pool.connection() as c:
+        for n in range(25):
+            chat=f'populated-{n:02d}';account='telegram-demo' if n%2 else 'whatsapp-demo-1'
+            c.execute('INSERT INTO chats VALUES(%s,%s,%s)',(chat,account,'Синтетический чат с очень длинным названием для проверки '+'я'*20))
+            c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
+                VALUES(%s,%s,%s,%s,'synthetic-sender-with-a-long-identifier-000000000000',%s,%s)""",
+                (f'p{n}',account,chat,f'p{n}','Ш'*400,datetime(2026,10,22,1,n,tzinfo=timezone.utc)))
+            s.append_event(c,account,f'p{n}',origin='live')
+            c.execute("""INSERT INTO sender_profiles(id,account,chat,sender,display_name,source_message,source_sent_at)
+                VALUES(%s,%s,%s,'synthetic-sender-with-a-long-identifier-000000000000',%s,%s,%s)""",
+                (f'sp{n}',account,chat,'Синтетическое Имя Отправителя '+'ж'*40,f'p{n}',datetime(2026,10,22,1,n,tzinfo=timezone.utc)))
+            c.execute("INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction) VALUES(%s,%s,%s,%s,'owner','ok',%s,'outgoing')",
+                (f'o{n}',account,chat,f'o{n}',datetime(2026,10,22,2,n,tzinfo=timezone.utc)))
+            c.execute("INSERT INTO chat_read_observations(chat,account,observed_at,unread_count,basis) VALUES(%s,%s,now(),7,'telegram_dialog')",
+                (chat,account))
+    with TestClient(create_app(s,['testserver'])) as client:
+        headers={'Authorization':'Bearer '+a,'Accept':'application/json, text/event-stream'}
+        rpc=client.post('/mcp',headers=headers,json={'jsonrpc':'2.0','id':1,'method':'tools/call','params':{
+            'name':'get_updates','arguments':{'consumer':'o','view':'by_chat','from_time':SINCE,'limit':25}}}).json()
+    page=rpc['result']['structuredContent']
+    assert len(page['chats'])==25 and all(row['owner_replied_after_newest'] for row in page['chats'])
+    assert all(row['read_state']=='stale' or row['provider_unread'] for row in page['chats'])
+    assert len(json.dumps(page,ensure_ascii=False))<=10000 and page['shortened_for_size']
+
+
+# spec: ANYM-458
+def test_overview_follows_continuous_receiving_freshness(live):
+    s,ar,state,row=live
+    key=s.issue_key('fresh-overview',['fresh-test'])
+    first=s.get_updates(key,'o',view='by_chat',from_time=ago(hours=5).isoformat())['chats'][0]
+    assert first['read_state']=='observed' and first['provider_unread'] is True
+    at=ago(hours=1).isoformat()
+    ar.ingest(event(account='fresh-test',chat='100',provider_id='2',sent_at=at,updated_at=at,metadata={'chat_type':'private'}))
+    # A newer incoming message outside the window still makes the observation stale.
+    later=s.get_updates(key,'o',view='by_chat',from_time=ago(hours=5).isoformat(),to_time=ago(hours=2).isoformat())['chats'][0]
+    assert later['read_state']=='stale' and 'provider_unread' not in later and later['live']==1

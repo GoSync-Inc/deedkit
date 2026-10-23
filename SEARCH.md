@@ -248,8 +248,8 @@ not the original timestamp of a backfilled message.
 incoming message rows (`message.created` events; edits, deletions, receipts and outgoing messages
 are not counted) after the consumer's acknowledged position and, when given, from `from_time`:
 `window` is `acknowledged_position`, `from_time` or `acknowledged_position_and_from_time`; both
-bounds always apply. A consumer without an acknowledged position needs `from_time` (else
-`invalid_filter` with `fields: ["from_time"]`). The call writes nothing: no consumer row, delivery
+bounds always apply. Without a consumer `from_time` is required (else `invalid_filter` with
+`fields: ["from_time"]`); an existing consumer at position 0 counts from the journal start. The call writes nothing: no consumer row, delivery
 or receipt, so no cursor moves and ACK stays ingestion-ordered through `get_updates`/`ack_updates`.
 
 One row per archive chat: `live` and `backfill` counts (backfill and reconcile origins, as
@@ -262,7 +262,9 @@ An absent read field is unknown (`absent_read_fields: unknown`); provider mute a
 collected (`provider_mute_archive: unknown`). `accounts` lists each scoped account's source
 `status` and `last_ingest_at`, so an empty account can be told apart from a stopped collector.
 Rows order newest live first, history-only chats last; `limit` counts chats (default 20, up to
-100). `has_more`, `chats_total`, `live_total` and `backfill_total` cover the whole window, not the
+100). A page of up to 25 rows stays within 10,000 characters: when needed, texts shorten to 40
+characters, names to 32, texts drop, sender IDs beside a name drop, observation times drop and
+names shorten to 16, in that order; `shortened_for_size` names the last step. `has_more`, `chats_total`, `live_total` and `backfill_total` cover the whole window, not the
 page. Filters: accounts, chats, senders, dates, `exclude_channels`; chats outside the key's scope
 are neither counted nor named. A WhatsApp conversation stored under a phone and a LID chat is two
 archive chats here (`list_chats` shows it once, ANYM-278). `origins`, `kinds`, `order`,
