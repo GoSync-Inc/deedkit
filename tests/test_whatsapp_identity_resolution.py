@@ -111,15 +111,20 @@ def pair_archive(seeded):
     ar = Archive(s)
     ar.register('wa-pair', 'whatsapp', 'Synthetic pair', discover=True)
     key = s.issue_key('wa-pair-agent', ['wa-pair'])
-    def add(chat, n, hours, direction='incoming', sender=None, chat_type='private', title=None):
-        at = (datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
+    def add(chat, n, hours, direction='incoming', sender=None, chat_type='private', title=None, at=None):
+        at = at or (datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
         return ar.ingest(event(account='wa-pair', platform='whatsapp', chat=chat, chat_title=title or chat,
             sender=sender or (chat if direction == 'incoming' else '555@c.us'), direction=direction,
             provider_id=f'{str(direction == "outgoing").lower()}_{chat}_{n}', body=f'Synthetic {n}',
             sent_at=at, updated_at=at, metadata={'chat_type': chat_type}))['message']
-    def link(source, pn, lid, provenance='whatsmeow_message_alt_v1'):
+    def link(source, pn, lid, provenance='whatsmeow_message_alt_v1', identity=None):
         with s.pool.connection() as c:
-            sender = c.execute('SELECT sender FROM messages WHERE id=%s', (source,)).fetchone()['sender']
+            sender = identity or c.execute('SELECT sender FROM messages WHERE id=%s', (source,)).fetchone()['sender']
+            if identity is None:
+                # As whatsapp_identity.record(): sender evidence also gives a directory entry.
+                c.execute('''INSERT INTO sender_profiles(id,account,chat,sender,source_message,source_sent_at)
+                    SELECT 'person-'||m.id,m.account,m.chat,m.sender,m.id,m.sent_at FROM messages m WHERE m.id=%s
+                    ON CONFLICT(account,chat,sender) DO NOTHING''', (source,))
             c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,
                 pn,lid,provenance,first_observed_at,observed_at) VALUES('wa-pair',%s,%s,%s,%s,%s,now(),now())''',
                 (source, sender, pn, lid, provenance))
@@ -150,7 +155,8 @@ def test_pn_and_lid_chats_of_one_peer_are_listed_once_without_rekeying(pair_arch
     assert s.get_context(key, new)['message']['provider_id'] == 'false_222@lid_2'
     from messaging_service.presentation import render
     lean = render('list_chats', s.list_chats(key, include_coverage=False, view='conversation'), 'compact')['items']
-    assert [r['alias_chats'][0]['id'] for r in lean if r['id'] == row['id']] == [chat_id(old)]
+    assert [(r['alias_chats'][0]['id'], r['alias_provenance'], r['alias_confidence']) for r in lean if r['id'] == row['id']] == [
+        (chat_id(old), 'whatsmeow_message_alt_v1', 'provider_cache_observation')]
     # The hidden chat's title still finds the conversation.
     assert list(chats(query='Alice Synthetic')) == ['222@lid']
     # A newer message in the phone-number chat makes it the listed chat.
@@ -204,3 +210,94 @@ def test_lid_chat_shows_its_verified_phone_number(pair_archive):
     assert 'peer_phone' not in rows['444@lid'] and 'alias_chats' not in rows['222@lid']
     link(plain, '111@c.us', '444@lid')
     assert all('peer_phone' not in r for r in chats().values())
+
+
+# spec: ANYM-278
+def test_lid_chat_phone_has_search_people_visibility(pair_archive):
+    s, key, add, link, chats, chat_id = pair_archive
+    from messaging_service.presentation import render
+    # A recipient-only observation on the owner's message names no peer profile.
+    sent = add('222@lid', 1, 2, direction='outgoing')
+    link(sent, '111@c.us', '222@lid', identity='222@lid')
+    assert 'peer_phone' not in chats()['222@lid']
+    assert not [p for p in s.search_people(key, '111')['items'] if p.get('identity', {}).get('pn')]
+    # The peer's own profile in that chat makes the same evidence searchable and shown.
+    profile = add('222@lid', 2, 1)
+    link(profile, '111@c.us', '222@lid')
+    assert [p['identity']['pn'] for p in s.search_people(key, '111')['items'] if p.get('identity', {}).get('pn')] == ['111@c.us']
+    row = chats()['222@lid']
+    assert (row['peer_phone'], row['peer_phone_provenance']) == ('+111', 'whatsmeow_message_alt_v1')
+    lean = render('list_chats', s.list_chats(key, include_coverage=False, view='conversation'), 'compact')['items']
+    assert [(r['peer_phone'], r['peer_phone_provenance']) for r in lean if r['id'] == row['id']] == [('+111', 'whatsmeow_message_alt_v1')]
+    # A deleted profile source hides the phone, as search_people hides the person.
+    with s.pool.connection() as c:
+        c.execute('UPDATE messages SET deleted=true WHERE id=%s', (profile,))
+    assert 'peer_phone' not in chats()['222@lid']
+    assert not [p for p in s.search_people(key, '111')['items'] if p.get('identity', {}).get('pn')]
+
+
+# spec: ANYM-278
+def test_device_qualified_phone_chat_groups_with_its_lid_chat(pair_archive):
+    s, key, add, link, chats, chat_id = pair_archive
+    old = add('111:4@c.us', 1, 5)
+    new = add('222@lid', 2, 1)
+    link(new, '111@c.us', '222@lid')
+    rows = chats()
+    assert list(rows) == ['222@lid'] and rows['222@lid']['alias_chats'][0]['id'] == chat_id(old)
+    # Two stored chats with one normalized phone are ambiguous: nothing is grouped.
+    add('111@c.us', 3, 4)
+    assert set(chats()) == {'111:4@c.us', '111@c.us', '222@lid'}
+
+
+# spec: ANYM-278
+@pytest.mark.parametrize('incoming_chat', ['111@c.us', '222@lid'])
+def test_same_second_tie_keeps_the_incoming_hint(pair_archive, incoming_chat):
+    from datetime import datetime, timedelta, timezone
+    s, key, add, link, chats, chat_id = pair_archive
+    at = (datetime.now(timezone.utc)-timedelta(hours=1)).replace(microsecond=0).isoformat()
+    outgoing_chat = '222@lid' if incoming_chat == '111@c.us' else '111@c.us'
+    incoming = add(incoming_chat, 1, 0, at=at)
+    add(outgoing_chat, 2, 0, direction='outgoing', at=at)
+    link(incoming, '111@c.us', '222@lid', identity=incoming_chat)
+    assert list(chats()) == [incoming_chat]
+    queue = s.list_chats(key, awaiting_reply=True, awaiting_reply_days=0, include_coverage=False)
+    assert [r['awaiting_reply_message_id'] for r in queue['items']] == [incoming] and queue['awaiting_reply_total'] == 1
+
+
+# spec: ANYM-278
+@pytest.mark.parametrize('stored', ['', '222', '+222', '222@lid'])
+def test_number_only_title_borrows_the_alias_chat_name(pair_archive, stored):
+    s, key, add, link, chats, chat_id = pair_archive
+    add('111@c.us', 1, 5, title='Alice Synthetic')
+    new = add('222@lid', 2, 1, title=stored or ' ')
+    link(new, '111@c.us', '222@lid')
+    row = chats()['222@lid']
+    assert (row['title'], row['title_basis']) == ('Alice Synthetic', 'alias_chat')
+
+
+# spec: ANYM-278
+def test_linked_pages_exclusions_and_selected_chat_operations(pair_archive):
+    from datetime import datetime, timedelta, timezone
+    s, key, add, link, chats, chat_id = pair_archive
+    old = add('111@c.us', 1, 5)
+    new = add('222@lid', 2, 1)
+    others = [add(f'{n}@c.us', 10+n, n) for n in (2, 3, 4)]
+    link(new, '111@c.us', '222@lid')
+    seen, after = [], ''
+    while True:
+        page = s.list_chats(key, include_coverage=False, limit=1, after=after, accounts=['wa-pair'])
+        seen += [r['id'] for r in page['items']];after = page['next_cursor']
+        assert len(page['items']) == 1
+        if not after:break
+    assert sorted(seen) == sorted([chat_id(new), *map(chat_id, others)])
+    # Excluding either chat of the conversation excludes the conversation.
+    for excluded in (chat_id(old), chat_id(new)):
+        assert '222@lid' not in chats(exclude_chats=[excluded]) and '111@c.us' not in chats(exclude_chats=[excluded])
+    # dismiss and snooze select the listed chat by ID; the hidden chat is not listed.
+    queue = s.list_chats(key, awaiting_reply=True, awaiting_reply_days=0, include_coverage=False, accounts=['wa-pair'])
+    assert chat_id(old) not in [r['id'] for r in queue['items']]
+    assert s.dismiss_reply(key, chat_id(new), new, 1)['dismissed'] is True
+    until = (datetime.now(timezone.utc)+timedelta(days=1)).isoformat()
+    assert s.snooze_reply(key, chat_id(others[0]), others[0], 1, until)['snoozed'] is True
+    queue = s.list_chats(key, awaiting_reply=True, awaiting_reply_days=0, include_coverage=False, accounts=['wa-pair'])
+    assert sorted(r['id'] for r in queue['items']) == sorted(map(chat_id, others[1:]))

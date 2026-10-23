@@ -39,8 +39,11 @@ the original sender ID within an account; it does not merge PN and LID entries.
 `list_chats` lists one conversation once (ANYM-278). A peer's private PN chat
 and private LID chat of one account form one conversation when a link passes the
 `resolve_reference` rules below: no conflict anywhere in the account, a visible
-nondeleted source, and both chats visible to the caller. The chat with the newest
-meaningful message is listed (a tie lists the LID chat) with `alias_chats`
+nondeleted source, and both chats visible to the caller. Chats match by normalized
+ID (`111:4@c.us` is `111@c.us`); two stored chats with one normalized ID group
+nothing. The chat with the newest meaningful message is listed. WhatsApp times have
+second resolution, so a tie lists the chat with an incoming message at that time
+(its reply hint stays), otherwise the LID chat. The listed row has `alias_chats`
 (`id`, `provider_chat_id`, `title`, `last_activity`, `unread_count`),
 `alias_provenance` and `alias_confidence: provider_cache_observation`; the other
 chat leaves the items and every total, before paging. The owner's latest message
@@ -49,7 +52,10 @@ chat. Unread and read state stay those of the listed chat. Excluding either chat
 excludes the conversation; `query` also matches the other chat's title; a raw or
 number-only title borrows the other chat's stored title (`title_basis:
 alias_chat`). A private LID chat with such a link carries `peer_phone`
-(`+<digits>`, the `pn` digits) and `peer_phone_provenance`. Stored chat, message
+(`+<digits>`, the `pn` digits) and `peer_phone_provenance` only when
+`search_people` shows that `pn` too: the evidence names a visible sender profile
+of its source chat, so a recipient-only observation or a deleted profile source
+shows no phone. Stored chat, message
 and provider IDs never change, and `search_people` keeps separate rows.
 
 `resolve_reference` prefers an exact original chat ID. If none exists, it may

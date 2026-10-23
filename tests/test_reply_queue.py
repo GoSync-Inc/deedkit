@@ -516,3 +516,28 @@ def test_owner_reply_in_the_phone_chat_clears_the_lid_chat_hint(seeded, linked):
     result = s.list_chats(key, awaiting_reply=True, include_coverage=False)
     assert [r['provider_chat_id'] for r in result['items']] == ['222@lid'] and result['awaiting_reply_total'] == 1
     assert result['items'][0]['awaiting_reply_incoming_count'] == (1 if linked else 2)
+
+
+# spec: ANYM-278
+def test_incoming_after_the_reply_in_both_chats_is_one_hint_counting_both(seeded):
+    s, _, _ = seeded
+    ar = Archive(s)
+    ar.register('queue-both', 'whatsapp', 'Synthetic WhatsApp pair', discover=True)
+    key = s.issue_key('queue-both-agent', ['queue-both'])
+    def add(chat, n, hours, direction):
+        at = (datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
+        return ar.ingest(event(account='queue-both', platform='whatsapp', chat=chat,
+            sender=chat if direction == 'incoming' else '555@c.us', direction=direction,
+            provider_id=f'{str(direction == "outgoing").lower()}_{chat}_{n}', body=f'Synthetic {n}',
+            sent_at=at, updated_at=at, metadata={'chat_type': 'private'}))['message']
+    first = add('222@lid', 1, 4, 'incoming')
+    add('111@c.us', 2, 3, 'outgoing')
+    add('111@c.us', 3, 2, 'incoming')
+    newest = add('222@lid', 4, 1, 'incoming')
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,
+            pn,lid,provenance,first_observed_at,observed_at)
+            VALUES('queue-both',%s,'222@lid','111@c.us','222@lid','whatsmeow_message_alt_v1',now(),now())''', (first,))
+    result = s.list_chats(key, awaiting_reply=True, include_coverage=False)
+    assert [r['awaiting_reply_message_id'] for r in result['items']] == [newest] and result['awaiting_reply_total'] == 1
+    assert result['items'][0]['awaiting_reply_incoming_count'] == 2

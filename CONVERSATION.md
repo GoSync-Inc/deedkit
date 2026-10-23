@@ -35,8 +35,9 @@ In the conversation view each message tool returns every message text once.
   `awaiting_reply` object and shows the latest message once in `last_message`.
   Each fact appears once per `list_chats` row (compact queue rows below).
   A WhatsApp conversation stored under a phone-number chat and a LID chat is
-  one row with `alias_chats` (compact: `id`, `last_activity`); a LID chat with
-  a verified phone link has `peer_phone` (WHATSAPP_IDENTITIES.md, ANYM-278).
+  one row with `alias_chats` (compact: `id`, `last_activity`), `alias_provenance`
+  and `alias_confidence`; a LID chat with a verified phone link has `peer_phone`
+  and `peer_phone_provenance`, compact too (WHATSAPP_IDENTITIES.md, ANYM-278).
   A forwarded message carries `authorship: "forwarded_by_sender"` and
   `forward_origin`: its `sender` and `sender_name` are the forwarder, never the
   author of the forwarded words. Message rows carry every stated origin field;
