@@ -372,11 +372,14 @@ def test_cli_person_commands_forward_to_the_owner_store(monkeypatch, tmp_path, c
         operator.main()
 
 
-def wait_for_person_lock(s):
+def wait_for_person_lock(s, person=None):
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
         with s.pool.connection() as c:
-            if c.execute("SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted").fetchone():
+            # An advisory key is split into classid (high) and objid (low) 32 bits.
+            if c.execute("""SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND (%(p)s::text IS NULL
+                OR ((classid::bigint<<32)|objid::bigint)=hashtextextended('person_links:'||%(p)s::text,0))""",
+                    {'p': person}).fetchone():
                 return
         time.sleep(.01)
     pytest.fail('delete-person did not wait on the person lock')
@@ -402,14 +405,14 @@ def test_delete_waits_for_an_open_link_and_removes_the_new_member_too(people):
 # spec: ANYM-283
 def test_removing_the_last_visible_member_mid_page_is_not_found_like_an_unknown_person(people):
     s, _, key, say, _ = people
-    say('person-tg', '42', '9', 'Steven again', name='Steven')
+    say('person-tg', '42', '9', 'Steven in another chat', chat='101', name='Steven')
     person = s.link_person('person-tg', '42')['person']
     page = s.search(key, person=person, limit=1)
     people_page = s.search_people(key, person=person, limit=1)
-    assert page['next_cursor']
+    assert page['next_cursor'] and people_page['next_cursor']
     s.unlink_person('person-tg', '42')
     for call in (lambda: s.search(key, person=person, after=page['next_cursor'], limit=1),
-                 lambda: s.search_people(key, person=person, after=people_page['next_cursor'] or '', limit=1),
+                 lambda: s.search_people(key, person=person, after=people_page['next_cursor'], limit=1),
                  lambda: s.search(key, person=str(uuid4()))):
         with pytest.raises(APIError) as error:
             call()
@@ -436,3 +439,53 @@ def test_name_query_discovers_the_person_and_its_id_finds_the_other_messenger(pe
     row = next(r for r in s.search_people(key, 'Степан')['items'] if r['sender_id'] == WA_STEPAN)
     assert row['person'] == person
     assert ids(s.search(key, person=row['person'])) == sorted([mid['steven'], mid['stepan']])
+
+
+# spec: ANYM-283
+@pytest.mark.parametrize('grouped', [False, True])
+def test_people_continuation_ignores_hidden_members_and_stops_on_visible_changes(people, grouped):
+    s, ar, key, say, _ = people
+    say('person-tg', '42', '9', 'Steven in another chat', chat='101', name='Steven')
+    person = s.link_person('person-tg', '42')['person']
+    s.link_person('person-wa', WA_STEPAN, person=person)
+    first = s.search_people(key, person=person, group_by_sender=grouped, limit=1)
+    assert first['next_cursor']
+    rest = s.search_people(key, person=person, group_by_sender=grouped, after=first['next_cursor'], limit=5)
+    # A member this key cannot read changes nothing for the continuation.
+    ar.register('person-tg3', 'telegram', 'Hidden Telegram', discover=True)
+    say('person-tg3', '77', '1', 'Unseen', name='Unseen')
+    s.link_person('person-tg3', '77', person=person)
+    again = s.search_people(key, person=person, group_by_sender=grouped, after=first['next_cursor'], limit=5)
+    assert again['items'] == rest['items']
+    # A visible change ends it with cursor_changed.
+    s.link_person('person-tg', '43', person=person)
+    with pytest.raises(APIError) as error:
+        s.search_people(key, person=person, group_by_sender=grouped, after=first['next_cursor'], limit=5)
+    assert (error.value.code, error.value.status) == ('cursor_changed', 409)
+
+
+# spec: ANYM-283
+def test_unlink_follows_a_moved_identity_and_waits_for_its_new_person(people):
+    s, *_ = people
+    old = s.link_person('person-tg', '42')['person']
+    new = s.link_person('person-tg', '43')['person']
+    with ThreadPoolExecutor(1) as threads:
+        with s.pool.connection() as holder:
+            holder.execute("SELECT pg_advisory_xact_lock(hashtextextended('person_links:'||%s,0))", (new,))
+            with s.pool.connection() as mover:
+                # Move 42 from old to new; the unlink below read it under old and waits there.
+                assert s_unlink(mover, '42') == old
+                mover.execute('INSERT INTO person_links(person,account,sender) VALUES(%s,%s,%s)',
+                              (new, 'person-tg', '42'))
+                removing = threads.submit(s.unlink_person, 'person-tg', '42')
+                wait_for_person_lock(s, old)
+            # The identity now belongs to new, whose lock is held: unlink must wait for it.
+            wait_for_person_lock(s, new)
+            assert not removing.done()
+        assert removing.result(timeout=3) == {'person': new, 'account': 'person-tg', 'sender': '42'}
+    assert [(m['account'], m['sender']) for m in s.list_people(new)['people'][0]['members']] == [('person-tg', '43')]
+
+
+def s_unlink(c, sender):
+    from messaging_service.person_links import unlink as remove
+    return remove(c, 'person-tg', sender)['person']

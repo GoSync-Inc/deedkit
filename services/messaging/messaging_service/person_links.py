@@ -74,15 +74,19 @@ def link(c, account, sender, person=None):
 def unlink(c, account, sender):
     _identity(account, sender)
     c.execute("SET LOCAL transaction_timeout='5s'")
-    current = c.execute('SELECT person FROM person_links WHERE account=%s AND sender=%s',
-                        (account, sender)).fetchone()
-    if current:
-        _lock(c, str(current['person']))
-    row = c.execute('DELETE FROM person_links WHERE account=%s AND sender=%s RETURNING person',
-                    (account, sender)).fetchone()
-    if not row:
-        raise ValueError('not_linked')
-    return {'person': str(row['person']), 'account': account, 'sender': sender}
+    # Lock the identity's person, then delete only under that person: if the identity moved to
+    # another person meanwhile, follow it (a few times at most) instead of bypassing that lock.
+    for _ in range(3):
+        current = c.execute('SELECT person FROM person_links WHERE account=%s AND sender=%s',
+                            (account, sender)).fetchone()
+        if not current:
+            raise ValueError('not_linked')
+        person = str(current['person'])
+        _lock(c, person)
+        if c.execute('DELETE FROM person_links WHERE account=%s AND sender=%s AND person=%s RETURNING person',
+                     (account, sender, person)).fetchone():
+            return {'person': person, 'account': account, 'sender': sender}
+    raise ValueError('link_changed')
 
 
 def delete(c, person):
