@@ -1,4 +1,4 @@
-"""messages_capabilities over the gateway: a summary by default over MCP, named sections, full over REST (ANYM-270)."""
+"""messages_capabilities over the gateway: a summary by default over MCP and REST, named sections, full by name (ANYM-270)."""
 import json
 
 import httpx
@@ -23,7 +23,7 @@ def call(client, arguments):
 def test_gateway_capabilities_summary_sections_and_full(tmp_path):
     app, seen = capabilities(tmp_path, SUPPORTED)
     with TestClient(app) as client:
-        full = client.post("/v1/messages_capabilities", json={}, headers=HEADERS).json()
+        full = client.post("/v1/messages_capabilities", json={"detail": "full"}, headers=HEADERS).json()
         assert full["gateway_actions"] == ["rename_group"] and "gateway_tools" in full
         assert call(client, {"detail": "full"}) == (full, False)
         summary, error = call(client, {})
@@ -43,6 +43,14 @@ def test_gateway_capabilities_summary_sections_and_full(tmp_path):
         response = client.post("/v1/messages_capabilities", json={"sections": ["unknown"]}, headers=HEADERS)
         assert response.status_code == 400 and response.json()["error"] == "invalid_filter"
         assert seen == []
+
+
+# spec: ANYM-270
+def test_gateway_rest_capabilities_default_to_summary(tmp_path):
+    app, _ = capabilities(tmp_path, SUPPORTED)
+    with TestClient(app) as client:
+        rest = client.post("/v1/messages_capabilities", json={}, headers=HEADERS).json()
+        assert rest == call(client, {})[0] and rest["detail"] == "summary" and "gateway_actions" not in rest
 
 
 def recording_app(tmp_path, old_backend):

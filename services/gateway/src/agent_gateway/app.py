@@ -215,9 +215,6 @@ def create_app(policy_path, public_url, *, transports=None):
 
         try:
             value = await request.json()
-            if name == "messages_capabilities" and isinstance(value, dict):
-                # REST and the SDKs keep the full payload; MCP defaults to the summary (ANYM-270).
-                value.setdefault("detail", "full")
             result = await dispatch.call(current_key.get(), name, value)
             return JSONResponse(result, headers=headers())
         except Denied as error:

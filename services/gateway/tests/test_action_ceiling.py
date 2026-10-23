@@ -286,7 +286,7 @@ def test_native_contact_gaps_do_not_remove_telegram_support_or_expand_grants(tmp
             if "operation" in tool["inputSchema"]["properties"]:
                 assert tool["inputSchema"]["properties"]["operation"]["enum"] == ["add_contact"]
         caps = client.post(
-            "/v1/messages_capabilities", json={}, headers={"Authorization": "Bearer gateway-a"}
+            "/v1/messages_capabilities", json={"detail": "full"}, headers={"Authorization": "Bearer gateway-a"}
         ).json()
         assert caps["gateway_actions"] == ["add_contact"]
         assert caps["gateway_actions_by_account"] == {"wa": [], "tg": ["add_contact"]}

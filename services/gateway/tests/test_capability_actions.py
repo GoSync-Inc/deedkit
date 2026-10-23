@@ -33,7 +33,7 @@ def test_only_granted_supported_and_available_actions_are_advertised(tmp_path):
     }
     app, seen = capabilities(tmp_path, supported)
     with TestClient(app) as client:
-        caps = client.post("/v1/messages_capabilities", json={}, headers=HEADERS).json()
+        caps = client.post("/v1/messages_capabilities", json={"detail": "full"}, headers=HEADERS).json()
         assert caps["gateway_actions_by_account"] == {
             "synthetic": ["rename_group"], "second": ["leave_group"], "disabled": []}
         assert caps["gateway_actions"] == ["leave_group", "rename_group"]
@@ -62,7 +62,7 @@ def test_missing_or_malformed_availability_advertises_nothing(tmp_path, report):
         row["available_operations"] = report
     app, _ = capabilities(tmp_path, {"synthetic": row})
     with TestClient(app) as client:
-        caps = client.post("/v1/messages_capabilities", json={}, headers=HEADERS).json()
+        caps = client.post("/v1/messages_capabilities", json={"detail": "full"}, headers=HEADERS).json()
     assert caps["gateway_actions"] == [] and caps["gateway_actions_by_account"] == {"synthetic": []}
     assert caps["gateway_actions_excluded_by_account"] == {"synthetic": {"availability_not_reported": 2}}
 
@@ -70,7 +70,7 @@ def test_missing_or_malformed_availability_advertises_nothing(tmp_path, report):
 def test_missing_support_contract_reports_no_accounts(tmp_path):
     app, _ = capabilities(tmp_path, "not-a-mapping")
     with TestClient(app) as client:
-        caps = client.post("/v1/messages_capabilities", json={}, headers=HEADERS).json()
+        caps = client.post("/v1/messages_capabilities", json={"detail": "full"}, headers=HEADERS).json()
     assert caps["gateway_actions"] == [] and caps["gateway_actions_by_account"] == {}
     assert caps["gateway_actions_excluded_by_account"] == {}
 
@@ -84,7 +84,7 @@ def test_availability_report_never_loosens_the_call_ceiling(tmp_path):
     }
     app, seen = capabilities(tmp_path, supported, selected=["rename_group"])
     with TestClient(app) as client:
-        caps = client.post("/v1/messages_capabilities", json={}, headers=HEADERS).json()
+        caps = client.post("/v1/messages_capabilities", json={"detail": "full"}, headers=HEADERS).json()
         assert caps["gateway_actions_by_account"] == {"synthetic": ["rename_group"]}
         assert caps["gateway_actions_excluded_by_account"] == {}
         for operation in ("leave_group", "remove_participant", "add_contact"):
@@ -97,7 +97,7 @@ def test_availability_report_never_loosens_the_call_ceiling(tmp_path):
         # An action that is granted and supported but not reported available keeps
         # its existing ceiling: the backend still decides account opt-in.
         supported["synthetic"]["available_operations"] = []
-        caps = client.post("/v1/messages_capabilities", json={}, headers=HEADERS).json()
+        caps = client.post("/v1/messages_capabilities", json={"detail": "full"}, headers=HEADERS).json()
         assert caps["gateway_actions_by_account"] == {"synthetic": []}
         response = client.post("/v1/messages_preview_messenger_operation",
                                json={**ARGS, "operation": "rename_group"}, headers=HEADERS)

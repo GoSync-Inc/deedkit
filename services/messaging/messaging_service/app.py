@@ -1116,8 +1116,6 @@ def create_app(store: Store, allowed_hosts: list[str]):
             # REST/SDK defaults remain archive-compatible; MCP defaults to the new view.
             if method in ('list_chats','search','get_messages','get_context'):
                 params.setdefault('view','archive')
-            # REST and the SDKs keep the full capabilities payload; MCP defaults to the summary (ANYM-270).
-            if method=='capabilities':params.setdefault('detail','full')
             params=validate_arguments(models,method,params)
             # An omitted delivery policy keeps the schema-37 payload (same rule as the MCP tool).
             if method=='configure_subscription_delivery' and params.get('delivery_policy') is None: params.pop('delivery_policy',None)
