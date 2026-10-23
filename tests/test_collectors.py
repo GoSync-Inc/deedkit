@@ -178,6 +178,79 @@ def test_expired_telegram_media_is_retried_without_stopping_other_jobs(worker,er
     assert not list(s.files.glob('.pending-*'))
 
 
+# spec: ANYM-487
+def test_unclassified_telegram_media_error_fails_only_that_job(worker,caplog):
+    import hashlib
+    from messaging_service.telegram_collector import TelethonProvider
+    class SyntheticTransferError(Exception):pass
+    w,s,key=worker
+    originals=set(s.files.iterdir())
+    broken,healthy=message(26,media=True),message(27,media=True)
+    asyncio.run(w.capture(NS(message=broken)))
+    asyncio.run(w.capture(NS(message=healthy)))
+    w.spool.drain(w.state.apply)
+    class Stream:
+        def __init__(self,fail):self.fail=fail
+        async def __aiter__(self):
+            yield b'da'
+            # Provider text that must never reach the log or the job; also a media code.
+            if self.fail:raise SyntheticTransferError('media_unavailable synthetic-secret-text')
+            yield b'ta'
+        async def close(self):pass
+    class Client:
+        async def get_messages(self,chat,ids):
+            self.fail=ids==26
+            return broken if self.fail else healthy
+        def iter_download(self,*args,**kwargs):return Stream(self.fail)
+    provider=TelethonProvider.__new__(TelethonProvider);provider.client=Client()
+    w.provider=provider
+    caplog.set_level('WARNING','messaging_service.telegram_collector')
+    assert asyncio.run(w.media_once())
+    assert asyncio.run(w.media_once())
+    broken_id=stable_id('msg',w.account,'100','26')
+    with s.pool.connection() as c:
+        job=c.execute('SELECT state,error_code,attempts,next_due>now() AS delayed FROM media_jobs WHERE message=%s',
+                      (broken_id,)).fetchone()
+        assert job['state']=='queued' and job['error_code']=='network_error'
+        assert job['attempts']==1 and job['delayed']
+    assert len(s.get_context(key,stable_id('msg',w.account,'100','27'))['attachments'])==1
+    assert 'media_transfer_failed error=SyntheticTransferError' in caplog.text
+    assert 'synthetic-secret-text' not in caplog.text
+    # The last attempt ends the job failed; the collector keeps running.
+    with s.pool.connection() as c:
+        c.execute('UPDATE media_jobs SET attempts=4,next_due=now() WHERE message=%s',(broken_id,))
+    assert asyncio.run(w.media_once())
+    with s.pool.connection() as c:
+        job=c.execute('SELECT state,error_code,attempts FROM media_jobs WHERE message=%s',(broken_id,)).fetchone()
+    assert (job['state'],job['error_code'],job['attempts'])==('failed','network_error',5)
+    assert not asyncio.run(w.media_once())
+    assert s.get_context(key,broken_id)['attachments']==[]
+    assert set(s.files.iterdir())==originals|{s.files/hashlib.sha256(b'data').hexdigest()}
+    assert not list(s.files.glob('.pending-*'))
+
+
+# spec: ANYM-487
+@pytest.mark.parametrize('error_name',['AuthKeyUnregisteredError','AuthKeyDuplicatedError'])
+def test_session_terminal_telegram_media_error_still_stops_collector(worker,error_name):
+    from telethon import errors
+    from messaging_service.telegram_collector import TelethonProvider
+    w,s,_=worker
+    item=message(28,media=True)
+    asyncio.run(w.capture(NS(message=item))); w.spool.drain(w.state.apply)
+    class Stream:
+        async def __aiter__(self):
+            yield b'da'
+            raise getattr(errors,error_name)(request=None)
+        async def close(self):pass
+    class Client:
+        async def get_messages(self,chat,ids):return item
+        def iter_download(self,*args,**kwargs):return Stream()
+    provider=TelethonProvider.__new__(TelethonProvider);provider.client=Client()
+    w.provider=provider
+    with pytest.raises(getattr(errors,error_name)):asyncio.run(w.media_once())
+    assert not list(s.files.glob('.pending-*'))
+
+
 @pytest.fixture
 def worker(seeded,tmp_path):
     store,_,_=seeded; archive=Archive(store)
