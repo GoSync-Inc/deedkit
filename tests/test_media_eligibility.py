@@ -362,3 +362,18 @@ def test_explicit_request_downloads_an_original_below_the_history_bound_and_the_
     status,_=media(s)
     assert status['outside_history_bounds_jobs']==0 and status['eligible_queued_jobs']==1
     assert ar.claim_media('fixture',account=ACCOUNT,since=since,media_prefetch_days=7)['id']==fid
+
+
+# spec: ANYM-477
+@pytest.mark.parametrize('evidence',['absent','live_callback_row','stale_row'])
+def test_explicit_request_below_an_unconfirmed_history_bound_is_not_claimed(archive,evidence):
+    ar,s,key,_=archive
+    fid=queued(ar,s,days=90)
+    since=bounded(ar,s,chat_since={'absent':'absent','live_callback_row':None,
+        'stale_row':datetime.now(timezone.utc)-timedelta(days=120)}[evidence])
+    result=s.request_file_download(key,fid)
+    assert result['request_status']=='queued' and result['download_eligibility']=='unknown'
+    # Status and claim agree: the job stays history_bound_unknown and the run does not take it.
+    status,_=media(s)
+    assert status['history_bound_unknown_jobs']==1 and status['eligible_queued_jobs']==0
+    assert ar.claim_media('fixture',account=ACCOUNT,since=since,media_prefetch_days=7) is None
