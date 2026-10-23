@@ -167,6 +167,34 @@ captured origin. Enable the flag only when the release a rollback would return t
 already contains this change: an older server rejects a capture that carries the
 origin, so the message would be skipped.
 
+### Forwarded copies in search (ANYM-273)
+
+A `search` with a non-empty `query` returns forwarded copies of one message as
+one row. Copies group only by the stated origin, never by text: the origin chat
+and message ID, or else, for a `user` origin, the origin sender, time to the
+second and exact text (one person can send two messages in one second). Origins without such a key (`hidden_user`, `unknown`, `not_captured`,
+WhatsApp forwards without IDs) never group. The key holds the platform, not the
+account, so one forward received by two owner accounts is one row. An archived,
+not forwarded original joins its group when it also matches: by its chat and
+message ID, or by its sender, second and text; only the earliest such original
+joins.
+
+The row shows the original, or else the earliest copy. It adds `copies_total`
+(every readable member, this row included), `latest_copy_at` and `copies`: up to
+20 other members, earliest first, each `{chat, message_id, sender, sent_at}`.
+Members are only messages that the key can read and that pass the same filters,
+so a chat outside the key's scope never appears. The group sits, and
+`next_cursor` anchors, where its first member in the requested order sits: in
+`desc` order a fresh forward of an old original keeps the original near the top.
+Groups are formed over all matches before the page cut, so pages never repeat or
+skip one. `search.collapse_forwards` reports whether grouping applied;
+`collapse_forwards: false` returns every copy, as before, and binds its cursor.
+`get_messages`, `get_context` and empty-query listings never group. Provider hits
+in `result_evidence.live` are not grouped. `detail=transcript` shows the shown row
+only; its copies are not listed there. Grouping applies to forwards archived
+with a stated origin; forwards stored before origin capture keep `not_captured`
+and stay separate rows.
+
 MCP/REST `list_chats` defaults to recent activity order. `order: activity` and
 `order: last_activity_desc` are aliases; `order: id` retains stable catalogue
 traversal. Direct Store calls retain the legacy ID default. Restart pagination

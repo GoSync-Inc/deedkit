@@ -626,7 +626,7 @@ class Store:
             return serial(result)
 
     def search(self, token, query='', account='', chat='', sender='', from_time='',
-               to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None,
+               to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None, collapse_forwards=True,
                query_mode='all', order='asc', before='', direction='', search_language='auto',
                fuzzy=False, compact=False, body_chars=None, include_coverage=True,view='archive',include_system=False,exclude_channels=False,
                chat_types=None,include_channels=False,_scope=None):
@@ -639,7 +639,7 @@ class Store:
             if isinstance(_scope,list):_scope.append(scope(p))
             named_chats(c,p,chat,chats)
             result=self._search(c,p,query,account,chat,sender,from_time,to_time,after,limit,
-                accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,
+                accounts=accounts,chats=chats,senders=senders,collapse_forwards=collapse_forwards,query_mode=query_mode,
                 order=order,before=before,direction=direction,search_language=search_language,
                 fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
                 chat_types=chat_types,include_channels=include_channels)

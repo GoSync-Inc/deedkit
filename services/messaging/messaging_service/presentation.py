@@ -66,6 +66,11 @@ def forward_fields(row, *, brief=False):
     return {'forward_origin':origin,'authorship':row.get('authorship') or 'forwarded_by_sender'}
 
 
+def forward_copies(row):
+    # ANYM-273: a search row that stands for forwarded copies names the other readable ones.
+    return {k:row[k] for k in ('copies_total','latest_copy_at','copies') if row.get(k)}
+
+
 def message_summary(row):
     result={k:row[k] for k in MESSAGE_FIELDS if k in row and row[k] is not None}
     if row.get('conversation_view_version')==1:
@@ -75,7 +80,7 @@ def message_summary(row):
         result['formatting']=summary(result['formatting'])
     for key,maximum in [('sender_name',64),('username',64),('chat_title',72)]:
         if key in result:result[key]=result[key][:maximum]
-    result.update(forward_fields(row))
+    result.update(forward_fields(row));result.update(forward_copies(row))
     snippet=row.get('snippet') or row.get('body') or ''
     files=row.get('attachments') or []
     if not snippet and (files or row.get('media_kind')):
@@ -129,7 +134,7 @@ def lean_message(row, *, search=False, files=True):
         result['snippet']=snippet[start:start+160]
     for flag in ('mentions_owner','reply_to_owner','forwarded'):
         if row.get(flag) is True:result[flag]=True
-    result.update(forward_fields(row))
+    result.update(forward_fields(row));result.update(forward_copies(row))
     if row.get('reply_to_provider_id'):result['reply_to_provider_id']=row['reply_to_provider_id']
     if row.get('reply_to'):result['reply_to']=row['reply_to']
     if row.get('agent_send'):
