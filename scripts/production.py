@@ -2492,13 +2492,29 @@ def http_release_tool():
     return seamless_release
 
 
+def active_config():
+    """The plan A configuration the autodeploy unit reads: DEEDKIT_DEPLOY_CONFIG from the environment, else from the
+    optional /etc/deedkit/autodeploy.env (deploy/deedkit-autodeploy.service), else CONFIG."""
+    if value := os.environ.get("DEEDKIT_DEPLOY_CONFIG"):
+        return value
+    try:
+        lines = (CONFIG_DIRECTORY / "autodeploy.env").read_text().splitlines()
+    except FileNotFoundError:
+        return CONFIG
+    for line in lines:
+        key, _, value = line.partition("=")
+        if key.strip() == "DEEDKIT_DEPLOY_CONFIG" and (value := value.strip().strip("\"'")):
+            return value
+    return CONFIG
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["verify", "prepare", "prepare-router", "apply", "rollback", "status",
                                            "images", "check-image", "deploy", "self-test", "tool-rollback"])
     parser.add_argument("--sha")
     parser.add_argument("--target", choices=sorted(BUILDS))
-    parser.add_argument("--config", default=CONFIG)
+    parser.add_argument("--config", help="default " + CONFIG + "; status: the autodeploy unit's (active_config)")
     parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy: seamless_release.py's")
     parser.add_argument("--auto", action="store_true", help="deploy: at most one deploy start per 20 minutes (timer)")
     parser.add_argument("--dry-run", action="store_true", help="deploy: print the plan or pause reason, change nothing")
@@ -2506,6 +2522,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
+        args.config = args.config or (active_config() if args.action == "status" else CONFIG)
         if args.action == "check-image":
             if not args.target:
                 raise Refused("select a target for container verification")
@@ -2547,6 +2564,7 @@ def main(argv=None):
                     locks.enter_context(lock(state))
                 if args.action == "status":
                     result = read(state / "current.json") if (state / "current.json").exists() else {"status": "not promoted by this tool"}
+                    result["config"] = str(args.config)
                     if (state / "deploy.json").exists():
                         result["deploy"] = read(state / "deploy.json")
                     if PAUSE.exists():
@@ -2567,6 +2585,8 @@ def main(argv=None):
         print(json.dumps(result, indent=2))
     except Exception as exc:
         message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        if isinstance(exc, OSError) and exc.filename:
+            message += " " + str(exc.filename)
         parser.exit(1, "promotion refused: " + message + "\n")
 
 

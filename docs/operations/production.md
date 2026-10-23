@@ -499,6 +499,12 @@ python3 /usr/local/lib/deedkit/production.py apply --sha <same-sha>
 python3 /usr/local/lib/deedkit/production.py status
 ```
 
+Without `--config`, `status` reads the configuration the autodeploy unit reads
+(`DEEDKIT_DEPLOY_CONFIG` from the environment, else from
+`/etc/deedkit/autodeploy.env`, else `/etc/deedkit/production.json`) and prints
+its path as `config`; other actions default to `/etc/deedkit/production.json`.
+A missing file is named in the refusal.
+
 Apply locks the host, checks main and the attestation again and validates the prepared
 image labels, configuration hashes and existing container identities, and that
 each `<project>.before.json` still has the digest `prepared.json` recorded when
