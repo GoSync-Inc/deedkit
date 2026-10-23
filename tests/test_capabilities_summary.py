@@ -55,9 +55,9 @@ def test_capabilities_summary_within_1500_chars(seeded):
         'identity','accounts','coverage','tool_manifest','search_options','sending','file_uploads',
         'subscriptions','feedback','messenger_operations','limits']
     assert 'sections' in summary['next_action'] and 'detail=full' in summary['next_action']
-    for name in ('service','version','principal','credential_id','permissions'):
+    for name in ('service','version','principal','credential_id','permissions','expires_at'):
         assert summary[name]==full[name]
-    assert summary['accounts']==[{k:a[k] for k in ('id','platform','label')} for a in full['accounts']]
+    assert summary['accounts']==[{k:a[k] for k in ('id','platform','label','self_provider_id')} for a in full['accounts']]
     assert len(summary['accounts'])==2
     assert summary['chat_scope']=={'all_in_permitted_accounts':True,'chat_count':None}
     assert summary['tool_manifest']=={'version':full['tool_manifest']['version']}

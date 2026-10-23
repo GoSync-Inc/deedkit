@@ -310,3 +310,16 @@ def test_two_keys_of_one_principal_each_see_their_own_expiry(seeded):
     assert store.capabilities(short)['expires_at'] == key_expiry(store, short)
     assert store.capabilities(long)['expires_at'] == key_expiry(store, long)
     assert store.capabilities(short)['expires_at'] < store.capabilities(long)['expires_at']
+
+
+# spec: ANYM-470
+def test_default_summary_keeps_the_key_expiry_and_each_owner_id(seeded):
+    store, _, _ = seeded
+    verify(store, 'telegram-demo', 'telegram', '123456789')
+    add_chat(store, 'telegram-demo', 'telegram-demo-group')
+    token = store.issue_key('between', ['telegram-demo', 'whatsapp-demo-1', 'whatsapp-demo-2'],
+        chats=['telegram-demo-chat', 'telegram-demo-group', 'whatsapp-demo-1-chat'], permissions=['read'])
+    summary, full = store.capabilities(token, detail='summary'), store.capabilities(token, detail='full')
+    assert summary['detail'] == 'summary' and summary['expires_at'] == full['expires_at'] == key_expiry(store, token)
+    # The same visible accounts as the full view; whatsapp-demo-2 has no chat in scope and stays out.
+    assert accounts(summary) == accounts(full) == {'telegram-demo': '123456789', 'whatsapp-demo-1': None}

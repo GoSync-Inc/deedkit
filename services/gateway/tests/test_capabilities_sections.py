@@ -88,3 +88,28 @@ def test_gateway_reads_full_backend_capabilities_by_name(tmp_path, old_backend):
                           "gateway_actions_by_account": {"synthetic": ["rename_group"]},
                           "gateway_actions_excluded_by_account": {},
                           "gateway_actions_basis": "granted_supported_and_available_for_account"}
+
+
+# spec: ANYM-470
+def test_gateway_summary_keeps_the_backend_key_expiry_and_each_owner_id(tmp_path):
+    _, value, path, _ = setup(tmp_path, SUPPORTED)
+    value["profiles"]["reader"]["tools"].append("messages_capabilities")
+    value["revision"] += 1
+    path.write_text(json.dumps(value))
+    rows = [{"id": "telegram-demo", "platform": "telegram", "label": "Synthetic", "synthetic": True,
+             "self_provider_id": "123456789"},
+            {"id": "whatsapp-demo-1", "platform": "whatsapp", "label": "Synthetic", "synthetic": True,
+             "self_provider_id": None}]
+
+    def backend(request):
+        return httpx.Response(200, json={
+            "permissions": value["principals"][0]["grants"]["messaging"], "expires_at": "2027-04-19T22:37:50.000000Z",
+            "accounts": rows, "chat_scope": {"chat_ids": None},
+            "messenger_operations": {"supported_by_account": SUPPORTED}})
+    app = create_app(path, "http://testserver", transports={"messaging": httpx.MockTransport(backend)})
+    with TestClient(app) as client:
+        summary, error = call(client, {})
+        rest = client.post("/v1/messages_capabilities", json={}, headers=HEADERS).json()
+    assert not error and summary == rest and summary["detail"] == "summary"
+    assert summary["expires_at"] == "2027-04-19T22:37:50.000000Z"
+    assert summary["accounts"] == [{k: row[k] for k in ("id", "platform", "label", "self_provider_id")} for row in rows]
