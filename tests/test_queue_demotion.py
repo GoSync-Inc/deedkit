@@ -21,6 +21,8 @@ def structured(response):
 
 CODES={'private_chat','group_attention','question_mark','provider_contact','waiting_age','waiting_age_capped',
     'one_way_chat','provider_business_or_verified','observed_bot','own_account','closing_courtesy','owner_question'}
+# Reasons appended outside the score (ANYM-281 snooze, ANYM-282 passed date): a row can carry them at zero points.
+UNSCORED={'snooze_due','referenced_date_passed'}
 OWNER_SENDER='OWNER2'
 
 
@@ -85,8 +87,9 @@ def test_queue_priority_components_sum_to_priority(demote):
         parts=components(row)
         assert set(parts)<=CODES and all(type(v) is int and v for v in parts.values()),parts
         assert sum(parts.values())==row['awaiting_reply_priority'],row['provider_chat_id']
-        # detail=full reasons: exactly the non-zero keys, in one vocabulary.
-        assert set(row['awaiting_reply_priority_reasons'])==set(parts) and len(row['awaiting_reply_priority_reasons'])==len(parts)
+        # detail=full reasons: exactly the non-zero keys, in one vocabulary; explanation-only reasons add no points.
+        scored=[r for r in row['awaiting_reply_priority_reasons'] if r not in UNSCORED]
+        assert set(scored)==set(parts) and len(scored)==len(parts)
     with TestClient(create_app(s,['testserver'])) as client:
         full=rpc(client,key,'list_chats',{'awaiting_reply':True,'order':'priority','detail':'full','limit':100}).json()
         compact=rpc(client,key,'list_chats',{'awaiting_reply':True,'order':'priority','detail':'compact','limit':100}).json()
@@ -94,7 +97,7 @@ def test_queue_priority_components_sum_to_priority(demote):
     assert len(full_items)>=20
     for row in full_items:
         assert sum(row['awaiting_reply_priority_components'].values())==row['awaiting_reply_priority']
-        assert set(row['awaiting_reply_priority_reasons'])==set(row['awaiting_reply_priority_components'])
+        assert set(row['awaiting_reply_priority_reasons'])-UNSCORED==set(row['awaiting_reply_priority_components'])
     # Owner decision 2026-10-18: compact stays as it was; components come with detail=full only, reasons stay everywhere.
     compact_items=compact['result']['structuredContent']['items']
     assert len(compact_items)>=20
