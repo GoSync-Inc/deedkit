@@ -575,6 +575,35 @@ image/config ([platform-cutover.md](platform-cutover.md)). Do not use `down -v`,
 prune unrelated objects or restart a stale calendar writer. Keep the previous
 images until acceptance.
 
+### Backup runner
+
+The host backup runner (`/opt/personal-os-probe/ops/backup_runner.py`, the
+`personal-os-backup.service` program, BACKUP.md) is neither an image nor a deploy
+tool, so neither `apply` nor `deploy` installs it: the operator installs it
+together with the backup image its private `runner.json` pins. Apply refuses
+before any stop while that file exists and its git blob is not the release's
+`services/messaging/messaging_service/backup_runner.py`; the refusal names both
+blob ids, and under `deploy --auto` it pauses the deployer like any refusal
+before a change. A host without the file runs no backup and is not checked.
+With the timer and the backup service idle, from the prepared release:
+
+```sh
+sha=<same-sha>; src=/var/lib/deedkit-production/$sha/source
+sudo cp -p /opt/personal-os-probe/ops/backup_runner.py /opt/personal-os-probe/ops/backup_runner.py.before-$sha
+sudo install -o root -g root -m 0600 "$src/services/messaging/messaging_service/backup_runner.py" \
+  /opt/personal-os-probe/ops/backup_runner.py
+sudo git hash-object /opt/personal-os-probe/ops/backup_runner.py   # = git -C "$src" rev-parse $sha:<that path>
+```
+
+When the backup worker changed in the same range, update the backup image pin
+in `runner.json` too. Install the new runner before you add any new
+`runner.json` key: the runner refuses keys it does not know. Then remove
+`/etc/deedkit/autodeploy.pause`. Undo, in this order: remove from
+`runner.json` every key the `.before-<sha>` runner does not know (for example
+`busy_wait_seconds`) and put back the image pin it ran with, then install the
+`.before-<sha>` copy the same way. An older runner refuses a newer key, so
+the backup would fail on every run.
+
 ## Roll back the current release
 
 A release whose `up --wait` failed while every replacement it started runs the
@@ -767,6 +796,9 @@ Otherwise it:
    class changes nothing else: the run pauses and you migrate by hand.
    When the only such change is the `production.py`/`seamless_release.py`
    pair, the self-updating layout installs it instead ("Deploy tool updates");
+   apply also refuses before any change while the host backup runner is not
+   the candidate's ("Backup runner"), so every merge that changes
+   `backup_runner.py` pauses automatic deploys until the operator installs it;
 4. runs `prepare` + `apply` (plan A), then `seamless_release.py prepare` +
    `promote` (plan B), all at that one SHA with every guard of those steps;
    when plan A is ahead of the HTTP release, it runs plan B only;

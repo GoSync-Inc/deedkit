@@ -957,6 +957,32 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# The host backup runner (BACKUP.md) is no image and no deploy tool: an operator installs it together with the backup
+# image its runner.json pins. Plan A refuses while the installed file is not the release's, so a merged runner fix never
+# stays off the host unnoticed. A host without the file runs no backup and is not checked.
+BACKUP_RUNNER = Path("/opt/personal-os-probe/ops/backup_runner.py")
+BACKUP_RUNNER_SOURCE = "services/messaging/messaging_service/backup_runner.py"
+
+
+def check_backup_runner(source, sha):
+    if not os.path.lexists(BACKUP_RUNNER):
+        return
+    expected = run(["git", "-C", str(source), "rev-parse", f"{sha}:{BACKUP_RUNNER_SOURCE}"]).strip()
+    try:
+        # The file itself, never a link to another one.
+        fd = os.open(BACKUP_RUNNER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise Refused(f"the backup runner {BACKUP_RUNNER} is not a regular file")
+            content = handle.read()
+        installed = hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest()
+    except OSError as exc:
+        raise Refused(f"cannot read the backup runner {BACKUP_RUNNER}: {type(exc).__name__}") from exc
+    if installed != expected:
+        raise Refused(f"the backup runner {BACKUP_RUNNER} is blob {installed[:12]}, not {sha[:12]}'s {expected[:12]}; "
+                      "install it with its backup image (production.md, Backup runner)")
+
+
 def apply(settings, sha):
     promotable(sha)
     state = Path(settings["state_directory"])
@@ -982,6 +1008,7 @@ def apply(settings, sha):
             raise Refused("this release was prepared without a bound rollback snapshot; prepare it again")
         if not previous.exists() or digest(read(previous)) != item["before_file_digest"]:
             raise Refused("the before-release snapshot is missing or changed since preparation")
+    check_backup_runner(release / "source", sha)
     # No call is active before the last remote gate, nor after it: a call that started meanwhile is waited for before
     # anything is written, within the same bound.
     deadline = time.monotonic() + CALL_WAIT

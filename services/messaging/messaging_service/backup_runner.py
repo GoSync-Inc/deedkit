@@ -30,6 +30,11 @@ SAFE_ERRORS={'backup_capture_failed','backup_capture_timeout','backup_container_
     'receiver_busy','backup_id_conflict','docker_inspection_failed','docker_operation_failed',
     'backup_fence_release_failed','backup_capture_unfenced','backup_fence_retained',
     'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop'}
+# The receiver's own verifier holds its upload lock for a whole restore (about an hour). A delivery it refuses as busy
+# before it stores anything (stream_v2: before the stream started) is offered again, same backup ID, every
+# BUSY_RETRY_SECONDS while the bound since the first offer allows; each offer keeps its upload timeout.
+BUSY_RETRY_SECONDS=60
+BUSY_WAIT_SECONDS=7200
 
 
 def read_json(path,limit=65536):
@@ -54,7 +59,7 @@ def write_json(path,data):
 
 def config(path):
     cfg=read_json(path)
-    if set(cfg)-{'delivery_mode'}!={'directory','project','network','image','files_volume','dsn_file','recipient_file',
+    if set(cfg)-{'delivery_mode','busy_wait_seconds'}!={'directory','project','network','image','files_volume','dsn_file','recipient_file',
                   'mounts','recovery','transfer','timeout_seconds','keep_local'}:raise ValueError('invalid_backup_config')
     if cfg.get('delivery_mode','staged_v1') not in ('staged_v1','stream_v2'):raise ValueError('invalid_backup_config')
     for key in ('project','network','files_volume'):
@@ -75,6 +80,8 @@ def config(path):
         not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}',t['user']) or
         not all(path_valid(t[k]) for k in ('identity_file','known_hosts_file'))):raise ValueError('invalid_backup_transfer')
     if type(cfg['timeout_seconds']) is not int or not 60<=cfg['timeout_seconds']<=7200:raise ValueError('invalid_backup_timeout')
+    if type(cfg.get('busy_wait_seconds',0)) is not int or not 0<=cfg.get('busy_wait_seconds',0)<=7200:
+        raise ValueError('invalid_backup_timeout')
     if type(cfg['keep_local']) is not int or not 1<=cfg['keep_local']<=24:raise ValueError('invalid_backup_retention')
     return cfg
 
@@ -230,6 +237,27 @@ class Runner:
         self.journal_path=self.root/'journal.json';self.status_path=self.root/'status.json'
         self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
     def save(self):write_json(self.journal_path,self.journal)
+    def deliver(self,send,sent=lambda:False):
+        """`send()`, offered again while the receiver answers busy and `sent()` says the stream has not started; a new
+        offer starts only within the bound since the first. Returns the receipt and the seconds before the offer that
+        was stored. Past the bound, or on any other error, the error stands."""
+        first=self.clock();deadline=first+self.cfg.get('busy_wait_seconds',BUSY_WAIT_SECONDS);attempt=1
+        while True:
+            offered=self.clock()
+            try:return send(),offered-first
+            except RuntimeError as exc:
+                if str(exc)!='receiver_busy' or sent():raise
+                retry=self.clock()+BUSY_RETRY_SECONDS<=deadline;self.refused(attempt,retry)
+                if not retry:raise
+            attempt+=1;self.sleep(BUSY_RETRY_SECONDS)
+            if self.clock()>deadline:  # A late wakeup never starts an offer past the bound.
+                self.refused(attempt-1,False);raise RuntimeError('receiver_busy')
+    def refused(self,attempt,retry):
+        """One journal line per busy answer: the backup ID and the attempt, no host or path. Never fails a delivery."""
+        try:print(json.dumps({'status':'waiting' if retry else 'refused','code':'receiver_busy','id':self.journal['id'],
+                              'attempt':attempt,'retry_seconds':BUSY_RETRY_SECONDS if retry else 0},
+                             separators=(',',':')),flush=True)
+        except (OSError,ValueError):pass
     def status(self,state,code=None):
         previous=read_json(self.status_path) if self.status_path.exists() else {}
         data={**previous,'state':state,'updated_at':datetime.now(timezone.utc).isoformat()}
@@ -406,8 +434,10 @@ class Runner:
             if (work/'result.json').exists():return True
             info=self.check_worker(self.docker.inspect(self.journal['container']))
             return info is None or not info['State']['Running']
-        receipt=asyncio.run(self.stream_send(work/'ciphertext.fifo',metadata,self.cfg['transfer'],
-                                          self.cfg['timeout_seconds'],start,completed,stopped=stopped))
+        receipt,waited=self.deliver(lambda:asyncio.run(self.stream_send(work/'ciphertext.fifo',metadata,self.cfg['transfer'],
+                                          self.cfg['timeout_seconds'],start,completed,stopped=stopped)),
+                                    lambda:(work/'stream-start.json').exists())
+        started+=waited  # The capture deadline never counts the receiver's busy answers and the waits.
         # A failed/changed source cannot publish a terminal frame. A duplicate
         # receipt instead asks the worker to exit without re-encryption.
         while True:
@@ -551,7 +581,7 @@ class Runner:
                 if path.stat().st_size!=result['bytes'] or hashlib.file_digest(f,'sha256').hexdigest()!=result['sha256']:
                     raise RuntimeError('local_backup_corrupt')
             self.cleanup_plaintext(work);self.status('uploading')
-            receipt=asyncio.run(self.send(path,result,self.cfg['transfer'],self.cfg['timeout_seconds']))
+            receipt,_=self.deliver(lambda:asyncio.run(self.send(path,result,self.cfg['transfer'],self.cfg['timeout_seconds'])))
             self.finish(work,result,receipt)
         except BaseException as exc:
             self.status('error',str(exc) if str(exc) in SAFE_ERRORS else 'backup_job_failed')
