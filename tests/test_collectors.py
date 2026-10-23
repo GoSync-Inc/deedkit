@@ -178,7 +178,7 @@ def test_expired_telegram_media_is_retried_without_stopping_other_jobs(worker,er
     assert not list(s.files.glob('.pending-*'))
 
 
-# spec: ANYM-400
+# spec: ANYM-487
 def test_unclassified_telegram_media_error_fails_only_that_job(worker,caplog):
     import hashlib
     from messaging_service.telegram_collector import TelethonProvider
@@ -226,6 +226,28 @@ def test_unclassified_telegram_media_error_fails_only_that_job(worker,caplog):
     assert not asyncio.run(w.media_once())
     assert s.get_context(key,broken_id)['attachments']==[]
     assert set(s.files.iterdir())==originals|{s.files/hashlib.sha256(b'data').hexdigest()}
+    assert not list(s.files.glob('.pending-*'))
+
+
+# spec: ANYM-487
+@pytest.mark.parametrize('error_name',['AuthKeyUnregisteredError','AuthKeyDuplicatedError'])
+def test_session_terminal_telegram_media_error_still_stops_collector(worker,error_name):
+    from telethon import errors
+    from messaging_service.telegram_collector import TelethonProvider
+    w,s,_=worker
+    item=message(28,media=True)
+    asyncio.run(w.capture(NS(message=item))); w.spool.drain(w.state.apply)
+    class Stream:
+        async def __aiter__(self):
+            yield b'da'
+            raise getattr(errors,error_name)(request=None)
+        async def close(self):pass
+    class Client:
+        async def get_messages(self,chat,ids):return item
+        def iter_download(self,*args,**kwargs):return Stream()
+    provider=TelethonProvider.__new__(TelethonProvider);provider.client=Client()
+    w.provider=provider
+    with pytest.raises(getattr(errors,error_name)):asyncio.run(w.media_once())
     assert not list(s.files.glob('.pending-*'))
 
 

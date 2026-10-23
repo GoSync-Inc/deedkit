@@ -938,11 +938,14 @@ class TelegramCollector:
                     retry_after=exc.seconds if isinstance(exc,ProviderRateLimited) else None,collector_lease=self.state.lease)
         except Exception as exc:
             # An unclassified provider error fails only this original, never the collector;
-            # archive faults still reach media_loop. Class name only, never provider text.
-            if isinstance(exc,database_errors()): raise
+            # archive faults still reach media_loop and a session-terminal error (as in chat_page)
+            # still stops the collector. Class name only, never provider text.
+            from telethon.errors import AuthKeyDuplicatedError,UnauthorizedError
+            if isinstance(exc,database_errors()+(UnauthorizedError,AuthKeyDuplicatedError)): raise
             log.warning('media_transfer_failed error=%s',chat_error_evidence(exc)['error_class'])
-            with suppress(RuntimeError):
-                await asyncio.to_thread(self.archive.fail_media,job,'network_error',collector_lease=self.state.lease)
+            try:await asyncio.to_thread(self.archive.fail_media,job,'network_error',collector_lease=self.state.lease)
+            except RuntimeError as lost:
+                if str(lost)=='collector_lease_lost':raise
         finally:
             renewal.cancel(); download.cancel()
             await asyncio.gather(renewal,download,return_exceptions=True)
