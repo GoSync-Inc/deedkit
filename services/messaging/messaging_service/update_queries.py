@@ -192,7 +192,7 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,width):
         for r in store.dataset(c,p)['sources'] if 'accounts' not in filters or r['id'] in filters['accounts']]
     basis=('acknowledged_position_and_from_time' if lower else 'acknowledged_position') if state else 'from_time'
     result=serial({'consumer':consumer,'view':'by_chat','window':basis,'chats':chats,'has_more':more,'chats_total':total['chats_total'],
-        'live_total':int(total['live_total']),'backfill_total':int(total['backfill_total']),'filters':filters,
+        'live_total':int(total['live_total']),'backfill_total':int(total['backfill_total']),'filters':sorted(filters),
         'counts':'created_incoming_messages_after_position','accounts':sources,'provider_mute_archive':'unknown','absent_read_fields':'unknown'})
     return within_budget(result)
 
@@ -227,4 +227,7 @@ def within_budget(result):
     # Last resort: the oldest rows move to the next call (has_more); totals still cover the window.
     while len(result['chats'])>1 and size()>OVERVIEW_BUDGET:
         result['chats'].pop();result['has_more']=True;result['shortened_for_size']='rows'
+    if size()>OVERVIEW_BUDGET:
+        # Many accounts: their source lines are what remains unbounded by the page.
+        result.pop('accounts',None);result['shortened_for_size']='accounts'
     return result

@@ -253,3 +253,14 @@ def test_overview_follows_continuous_receiving_freshness(live):
     # A newer incoming message outside the window still makes the observation stale.
     later=s.get_updates(key,'o',view='by_chat',from_time=ago(hours=5).isoformat(),to_time=ago(hours=2).isoformat())['chats'][0]
     assert later['read_state']=='stale' and 'provider_unread' not in later and later['live']==1
+
+
+# spec: ANYM-458
+def test_overview_stays_within_budget_with_large_filters(seeded):
+    s,a,b=seeded
+    add(s,'telegram-demo','tg-live','m1',1)
+    senders=['synthetic-sender']+[f'{n:03d}'+'x'*253 for n in range(40)]
+    page=s.get_updates(a,'o',view='by_chat',from_time=SINCE,senders=senders)
+    # Filter names only are echoed: the caller's values never inflate the page.
+    assert page['filters']==['from_time','senders'] and page['live_total']==1
+    assert len(json.dumps(page,ensure_ascii=False))<=10000

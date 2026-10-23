@@ -264,7 +264,9 @@ collected (`provider_mute_archive: unknown`). `accounts` lists each scoped accou
 Rows order newest live first, history-only chats last; `limit` counts chats (default 20, up to
 100). A page of up to 25 rows stays within 10,000 characters: when needed, texts shorten to 40
 characters, names to 32, texts drop, sender IDs beside a name drop, observation times drop and
-names shorten to 16, in that order; `shortened_for_size` names the last step. `has_more`, `chats_total`, `live_total` and `backfill_total` cover the whole window, not the
+names shorten to 16 and drop, then the oldest rows move to the next call (`has_more`), then
+`accounts` drops; `shortened_for_size` names the last step. `filters` lists only the names of the
+filters that applied. `has_more`, `chats_total`, `live_total` and `backfill_total` cover the whole window, not the
 page. Filters: accounts, chats, senders, dates, `exclude_channels`; chats outside the key's scope
 are neither counted nor named. A WhatsApp conversation stored under a phone and a LID chat is two
 archive chats here (`list_chats` shows it once, ANYM-278). `origins`, `kinds`, `order`,
