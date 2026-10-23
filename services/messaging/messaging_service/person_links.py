@@ -40,6 +40,11 @@ def whatsapp_siblings(c, account, sender):
     return [{'sender': r['sender'], 'person': str(r['person']) if r['person'] else None} for r in rows]
 
 
+def _lock(c, person):
+    """One lock per person serializes its existence check with every membership change (ANYM-283)."""
+    c.execute("SELECT pg_advisory_xact_lock(hashtextextended('person_links:'||%s,0))", (person,))
+
+
 def link(c, account, sender, person=None):
     _identity(account, sender)
     if person is not None:
@@ -48,9 +53,10 @@ def link(c, account, sender, person=None):
     if not c.execute('SELECT 1 FROM messages WHERE account=%s AND sender=%s AND NOT deleted LIMIT 1',
                      (account, sender)).fetchone():
         raise ValueError('unknown_identity')
-    if person is not None and not c.execute('SELECT 1 FROM person_links WHERE person=%s FOR UPDATE',
-                                            (person,)).fetchall():
-        raise ValueError('unknown_person')
+    if person is not None:
+        _lock(c, person)
+        if not c.execute('SELECT 1 FROM person_links WHERE person=%s LIMIT 1', (person,)).fetchone():
+            raise ValueError('unknown_person')
     target = person or str(uuid4())
     # The primary key decides between concurrent links of one identity.
     inserted = c.execute('''INSERT INTO person_links(person,account,sender) VALUES(%s,%s,%s)
@@ -67,6 +73,11 @@ def link(c, account, sender, person=None):
 
 def unlink(c, account, sender):
     _identity(account, sender)
+    c.execute("SET LOCAL transaction_timeout='5s'")
+    current = c.execute('SELECT person FROM person_links WHERE account=%s AND sender=%s',
+                        (account, sender)).fetchone()
+    if current:
+        _lock(c, str(current['person']))
     row = c.execute('DELETE FROM person_links WHERE account=%s AND sender=%s RETURNING person',
                     (account, sender)).fetchone()
     if not row:
@@ -76,6 +87,8 @@ def unlink(c, account, sender):
 
 def delete(c, person):
     person = _person(person)
+    c.execute("SET LOCAL transaction_timeout='5s'")
+    _lock(c, person)
     rows = c.execute('DELETE FROM person_links WHERE person=%s RETURNING account', (person,)).fetchall()
     if not rows:
         raise ValueError('unknown_person')

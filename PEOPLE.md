@@ -27,6 +27,49 @@ this metadata, unknown usernames or unavailable contacts cannot be found by
 name; use the exact sender ID in `search`. Checking the completeness of the catalog on
 working accounts remains part of live acceptance.
 
+## Linked people (ANYM-283, schema 43)
+
+The owner may state that identities in different messengers are one person. Links are
+made by hand only: DeedKit never merges identities by name, spelling or phone number.
+Each link is an exact `(account, sender)` pair; source messages, names and profiles stay
+as they are.
+
+Owner commands (operator CLI, owner database connection; no MCP tool, REST route,
+operation permission or gateway action can change links):
+
+```sh
+python -m messaging_service link-person --account <account> --sender <sender_id> [--person <id>]
+python -m messaging_service unlink-person --account <account> --sender <sender_id>
+python -m messaging_service delete-person --person <id>
+python -m messaging_service list-people [--person <id>]
+```
+
+Take `--account` and `--sender` from a `search_people` row (`account`, `sender_id`) read
+with the owner's key. Without `--person` a new person is created and its id printed;
+with `--person` the identity joins that person. Repeating the same link is a no-op; an
+identity already linked to another person is refused (`identity_already_linked`), so
+take it off that person first. A WhatsApp contact may appear under a phone (PN) and a
+LID sender: these are two identities. `link-person` and `list-people` print
+`whatsapp_siblings`, the other half of a provider-observed PN/LID pair; link it too, or
+`search(person)` returns half the WhatsApp side. `delete-person` removes only the links.
+Link and removal commands of one person are serialized, so a delete never leaves a
+member that was linked at the same moment.
+
+Reading: a `search_people` row of a linked identity carries `person`, the person's id.
+`search_people(person=<id>)` lists the name observations of that person's identities;
+an identity with no observed name is not listed there but `search(person=<id>)` still
+finds its messages. `search(person=<id>)` needs no text query and matches messages sent
+*by* the person's identities; the owner's own messages in a chat with them are found
+through that chat. Both tools AND `person` with their other filters.
+
+Visibility: a key sees a person only through members it can read now (account, chat
+and a non-deleted message). Hidden members, their number and the fact that they exist
+are never shown. A person with no visible member, or an unknown id, is `not_found`; this
+holds mid-pagination too, when the last visible member is removed or hidden. A change
+of the visible members during pagination returns `cursor_changed`. A key that sees one
+member still sees that member's `person` id; this reveals only that a link exists, not
+the other members. `person` is archive only (see `live` in SEARCH.md).
+
 ## Sender names
 
 Messages (`search`, `get_messages`, `get_context`, `get_updates`), the conversation

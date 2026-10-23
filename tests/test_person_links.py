@@ -1,10 +1,12 @@
 """Owner-made person links across messengers (ANYM-283); synthetic accounts only."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import copy
 import json
 from pathlib import Path
 import sys
 import threading
+import time
 from uuid import uuid4
 
 import psycopg
@@ -17,6 +19,7 @@ from messaging_service import store as store_module
 from messaging_service.app import create_app
 from messaging_service.archive import Archive
 from messaging_service.live_search import unsupported
+from messaging_service.person_links import link
 from messaging_service.policy import OPERATION_PERMISSIONS
 from messaging_service.store import APIError
 from test_archive import event
@@ -367,3 +370,69 @@ def test_cli_person_commands_forward_to_the_owner_store(monkeypatch, tmp_path, c
     monkeypatch.setattr(sys, 'argv', ['anymsg', 'link-person', '--account', 'tg'])
     with pytest.raises(SystemExit):
         operator.main()
+
+
+def wait_for_person_lock(s):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with s.pool.connection() as c:
+            if c.execute("SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted").fetchone():
+                return
+        time.sleep(.01)
+    pytest.fail('delete-person did not wait on the person lock')
+
+
+# spec: ANYM-283
+def test_delete_waits_for_an_open_link_and_removes_the_new_member_too(people):
+    s, *_ = people
+    person = s.link_person('person-tg', '42')['person']
+    with ThreadPoolExecutor(1) as threads:
+        with s.pool.connection() as c:
+            assert link(c, 'person-wa', WA_STEPAN, person)['linked'] is True
+            deleting = threads.submit(s.delete_person, person)
+            wait_for_person_lock(s)
+            assert not deleting.done()
+        assert deleting.result(timeout=3) == {'person': person, 'unlinked': 2}
+    assert s.list_people()['people'] == []
+    # The reverse order: a link to a deleted person is refused, never recreating it.
+    with pytest.raises(ValueError, match='^unknown_person$'):
+        s.link_person('person-tg', '43', person=person)
+
+
+# spec: ANYM-283
+def test_removing_the_last_visible_member_mid_page_is_not_found_like_an_unknown_person(people):
+    s, _, key, say, _ = people
+    say('person-tg', '42', '9', 'Steven again', name='Steven')
+    person = s.link_person('person-tg', '42')['person']
+    page = s.search(key, person=person, limit=1)
+    people_page = s.search_people(key, person=person, limit=1)
+    assert page['next_cursor']
+    s.unlink_person('person-tg', '42')
+    for call in (lambda: s.search(key, person=person, after=page['next_cursor'], limit=1),
+                 lambda: s.search_people(key, person=person, after=people_page['next_cursor'] or '', limit=1),
+                 lambda: s.search(key, person=str(uuid4()))):
+        with pytest.raises(APIError) as error:
+            call()
+        assert (error.value.code, error.value.status) == ('not_found', 404)
+
+
+# spec: ANYM-283
+def test_member_without_a_profile_is_found_by_message_search_only(people):
+    s, _, key, say, mid = people
+    silent = say('person-tg', '55', '5', 'A message with no sender name')
+    person = s.link_person('person-tg', '55')['person']
+    s.link_person('person-wa', WA_STEPAN, person=person)
+    # search(person) needs no text query and returns every visible member's messages.
+    assert ids(s.search(key, person=person)) == sorted([silent, mid['stepan']])
+    # search_people(person) lists only visible name observations of the members.
+    assert pairs(s.search_people(key, person=person)) == [('person-wa', WA_STEPAN)]
+
+
+# spec: ANYM-283
+def test_name_query_discovers_the_person_and_its_id_finds_the_other_messenger(people):
+    s, _, key, _, mid = people
+    person = s.link_person('person-tg', '42')['person']
+    s.link_person('person-wa', WA_STEPAN, person=person)
+    row = next(r for r in s.search_people(key, 'Степан')['items'] if r['sender_id'] == WA_STEPAN)
+    assert row['person'] == person
+    assert ids(s.search(key, person=row['person'])) == sorted([mid['steven'], mid['stepan']])

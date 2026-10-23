@@ -782,8 +782,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
         Use account + sender_id with search() and source_message with get_context().
         Missing matches may mean metadata has not been observed; no contact-book/provider call.
         A row whose identity the owner linked to a person carries person (a UUID); person=<id>
-        lists that person's identities you can read (across messengers), and search(person=<id>)
-        finds their messages. Links are owner-made, never inferred from names.
+        lists the name observations of that person's identities you can read (across messengers),
+        and search(person=<id>) finds their messages. Links are owner-made, never inferred from names.
         """
         return call(ctx,'search_people',query=query,accounts=accounts,chats=chats,after=after,limit=limit,
                     transliterate=transliterate,group_by_sender=group_by_sender,person=person)

@@ -167,6 +167,13 @@ captured origin. Enable the flag only when the release a rollback would return t
 already contains this change: an older server rejects a capture that carries the
 origin, so the message would be skipped.
 
+### Person filter (ANYM-283)
+
+`person` (a person id from a `search_people` row) matches messages sent by any identity the owner
+linked to that person and the key can read, as exact `(account, sender)` pairs, ANDed with the other
+filters; no text query is needed. Cursors of a `person` request are bound to it. Linking, visibility
+and errors: [PEOPLE.md](PEOPLE.md#linked-people-anym-283-schema-43).
+
 ### Forwarded copies in search (ANYM-273)
 
 A `search` with a non-empty `query` returns forwarded copies of one message as
@@ -272,7 +279,7 @@ account `state`, `stored_new` and the provider `hits`:
 
 Live search applies `query` (`query_mode` `all` or `phrase`), at most one chat (`chat` or `chats` of
 length 1), `chat_types` / `include_channels` / `exclude_channels` (channels only when asked for, as in
-the archive) and `from_time` / `to_time`. `web` and `exact` modes, `fuzzy`, `sender`/`senders`,
+the archive) and `from_time` / `to_time`. `web` and `exact` modes, `fuzzy`, `sender`/`senders`, `person`,
 `direction`, several chats and `chats: []` give `unsupported_filter`. Keep one `request_id` per intent:
 the same id maps to the same operation per account, so a repeat after a lost response asks the provider
 nothing new. A failure to queue or a provider error never fails or empties the archive answer. When the

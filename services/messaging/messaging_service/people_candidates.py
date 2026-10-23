@@ -115,9 +115,9 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
         last=items[-1]
         cursor=encode_cursor(binding,{'rank':last['match_rank'],'account':last['account'],'sender':last['sender_id'],**extra}) if group_by_sender else (
             encode_cursor(binding,{'rank':last['match_rank'],'id':last['id'],**extra}) if query or members is not None else last['id'])
+    if group_by_sender:annotate(c,p,items)
     for row in items:
         row.pop('match_rank',None)
-        if group_by_sender:annotate(c,p,[row])
         if group_by_sender:
             for observation in row['observations']:observation.pop('match_rank',None)
     observations=[r for row in items for r in (row['observations'] if group_by_sender else [row])]
