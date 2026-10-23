@@ -13,12 +13,17 @@ from .search_query import coverage,filter_values,output_options,shape_messages
 def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=None,
                 origins=None,kinds=None,direction='',from_time='',to_time='',compact=False,
                 body_chars=None,include_coverage=True,exclude_channels=False,order='event',
-                reset_filters=False,expected_ack_version=None,start_from='beginning'):
+                reset_filters=False,expected_ack_version=None,start_from='beginning',view='events'):
     from .store import APIError,bounded,date_bound,digest,serial
     from .message_queries import enrich
     bounded(limit);cap=output_options(compact,body_chars,include_coverage)
     if not isinstance(consumer,str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',consumer):
         raise APIError('invalid_consumer')
+    if not isinstance(view,str) or view not in ('events','by_chat'):raise APIError('invalid_filter')
+    if view=='by_chat' and (origins is not None or kinds is not None or direction=='outgoing' or order!='event'
+            or reset_filters is not False or expected_ack_version is not None or start_from!='beginning'):
+        # The overview counts created incoming messages only and issues no receipt.
+        raise APIError('invalid_filter')
     if not isinstance(direction,str) or direction not in ('','incoming','outgoing'):
         raise APIError('invalid_filter')
     if type(exclude_channels) is not bool or type(reset_filters) is not bool or order not in ('event','sent_at'):
@@ -44,6 +49,7 @@ def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=N
     if direction:filters['direction']=direction
     if lower:filters['from_time']=lower.isoformat()
     if upper:filters['to_time']=upper.isoformat()
+    if view=='by_chat':return overview(c,p,consumer,limit,filters,lower,upper,cap)
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('consumers:'+p['id'],))
     total=c.execute('SELECT count(DISTINCT name) AS n FROM consumers WHERE principal=%s',(p['id'],)).fetchone()['n']
     existing=c.execute('SELECT 1 FROM consumers WHERE principal=%s AND name=%s',(p['id'],consumer)).fetchone()
@@ -109,3 +115,73 @@ def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=N
         'ack_version':state['version'],'filters':filters,'order':'ingestion_event_sequence',
         'presentation_order':order,'chronological_scope':'delivered_batch_only' if order=='sent_at' else None,
         'filter_binding':'version_checked_reset_preserves_ack_position',**coverage(store,c,p,include_coverage)})
+
+
+def overview(c,p,consumer,limit,filters,lower,upper,cap):
+    """Per chat counts of created incoming messages after the consumer's ACK (ANYM-458).
+
+    Read only: no consumer row, delivery or receipt is written, so no cursor moves.
+    Live and backfill (backfill or reconcile origin, as is_backfill) are counted apart.
+    """
+    from .store import APIError,serial
+    from .chat_queries import read_state_sql
+    from .message_queries import enrich
+    state=c.execute('SELECT position FROM consumers WHERE principal=%s AND name=%s AND scope_version=%s',
+        (p['id'],consumer,p['scope_version'])).fetchone()
+    position=state['position'] if state else 0
+    # Without an acknowledged position the window is the whole journal: from_time bounds it.
+    if not position and lower is None:raise APIError('invalid_filter')
+    head=c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
+    where,args=scope_filter(p,'m')
+    clauses=[where,'m.account=e.account',"e.kind='message.created'","m.direction='incoming'"]
+    for key,column in [('accounts','m.account'),('chats','m.chat'),('senders','m.sender')]:
+        if key in filters:clauses.append(column+'=ANY(%s)');args.append(filters[key])
+    if 'exclude_channels' in filters:
+        clauses.append("EXISTS(SELECT 1 FROM chats ch WHERE ch.id=m.chat AND ch.account=m.account AND ch.chat_type IS DISTINCT FROM 'channel')")
+    for bound,op in [(lower,'>='),(upper,'<')]:
+        if bound:clauses.append('m.sent_at'+op+'%s');args.append(bound)
+    read_sources,fresh,unread=read_state_sql(c)
+    rows=c.execute('''WITH sel AS MATERIALIZED (SELECT m.account,m.chat,m.id,m.sent_at,
+          e.origin IN ('backfill','reconcile') AS backfill
+        FROM events e JOIN messages m ON m.id=e.message WHERE e.id>%s AND e.id<=%s AND '''+' AND '.join(clauses)+'''),
+      per AS (SELECT account,chat,count(*) FILTER (WHERE NOT backfill) AS live,count(*) FILTER (WHERE backfill) AS backfill,
+          max(sent_at) FILTER (WHERE NOT backfill) AS newest_at,max(sent_at) AS latest_at FROM sel GROUP BY account,chat)
+      SELECT per.*,count(*) OVER () AS chats_total,sum(per.live) OVER () AS live_total,sum(per.backfill) OVER () AS backfill_total,
+        (SELECT s.id FROM sel s WHERE s.account=per.account AND s.chat=per.chat AND NOT s.backfill
+          ORDER BY s.sent_at DESC,s.id DESC LIMIT 1) AS newest_message,
+        (SELECT s.id FROM sel s WHERE s.account=per.account AND s.chat=per.chat ORDER BY s.sent_at DESC,s.id DESC LIMIT 1) AS head_message,
+        ro.unread_count AS provider_unread_count,'''+unread+''' AS provider_unread,ro.observed_at AS read_state_observed_at,
+        CASE WHEN '''+fresh+''' THEN 'observed' WHEN ro.observed_at IS NULL THEN 'unknown' ELSE 'stale' END AS read_state
+      FROM per JOIN chats c ON c.id=per.chat AND c.account=per.account
+      LEFT JOIN LATERAL (SELECT im.sent_at FROM messages im WHERE im.account=c.account AND im.chat=c.id
+        AND im.direction='incoming' ORDER BY im.sent_at DESC LIMIT 1) incoming ON true
+      LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
+      ORDER BY per.newest_at DESC NULLS LAST,per.latest_at DESC,per.chat LIMIT %s''',
+        [position,head,*args,limit+1]).fetchall()
+    more=len(rows)>limit;rows=rows[:limit]
+    ids=[r['newest_message'] or r['head_message'] for r in rows]
+    names=enrich(c,[{'id':mid} for mid in ids],p)
+    bodies={r['id']:r for r in c.execute('SELECT id,body,sent_at,sender FROM messages WHERE id=ANY(%s)',
+        ([r['newest_message'] for r in rows if r['newest_message']],)).fetchall()}
+    width=cap or 80;chats=[]
+    for r,named in zip(rows,names):
+        newest=None
+        if r['newest_message']:
+            m=bodies[r['newest_message']];text=m['body']
+            if text and len(text)>width:text=text[:width].rstrip()+'…'
+            newest=compact_row({'message':m['id'],'sent_at':m['sent_at'],'sender':m['sender'],
+                'sender_name':named.get('sender_name'),'text':text})
+        # An absent read field is unknown; provider mute and archive are never collected.
+        chats.append({**compact_row({'chat':r['chat'],'account':r['account'],'chat_title':named.get('chat_title'),
+            'chat_type':named.get('chat_type'),'live':r['live'],'backfill':r['backfill'],'read_state':r['read_state'],
+            'provider_unread':r['provider_unread'],'provider_unread_count':r['provider_unread_count'],
+            'read_state_observed_at':r['read_state_observed_at']}),'newest':newest})
+    targets(p,[mid for mid in ids if mid])
+    total=rows[0] if rows else {'chats_total':0,'live_total':0,'backfill_total':0}
+    return serial({'consumer':consumer,'view':'by_chat','cursor_basis':'acknowledged_position' if position else 'no_consumer',
+        'position':position,'head':head,'chats':chats,'has_more':more,'chats_total':total['chats_total'],
+        'live_total':int(total['live_total']),'backfill_total':int(total['backfill_total']),'filters':filters,
+        'counts':'created_incoming_messages_after_position','provider_mute_archive':'unknown','absent_read_fields':'unknown'})
+
+
+def compact_row(row):return {k:v for k,v in row.items() if v is not None}

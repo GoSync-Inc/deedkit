@@ -142,6 +142,26 @@ def owner_senders(c,p):
     return Jsonb(owners)
 
 
+def read_state_sql(c):
+    """(read_sources, fresh, unread) SQL over aliases c (chat), ro (chat_read_observations) and
+    incoming (the newest incoming message); list_chats and the incoming overview share it."""
+    # An observation is current while nothing newer arrived and it has a count (or the owner's
+    # marked-unread flag), and it is at most 5 minutes old or the collector has received every
+    # update since it under one live lease epoch (ANYM-275): a later owner read would have replaced it.
+    # A schema before 42 (rollback drill) has none of these columns: keep the 5-minute rule there.
+    read_sources=c.execute("SELECT to_regclass('public.owner_message_reads') IS NOT NULL AS x").fetchone()['x']
+    continuous=f"""(ro.observed_at>=CURRENT_TIMESTAMP-interval '{READ_STATE_MAX_AGE_HOURS} hours' AND EXISTS(
+      SELECT 1 FROM collector_health rh JOIN collector_leases rl ON rl.account=rh.account AND rl.epoch=rh.receiving_epoch
+      WHERE rh.account=c.account AND rl.expires_at>CURRENT_TIMESTAMP AND rh.receiving_since<=ro.observed_at
+        AND rh.receiving_heartbeat_at>=CURRENT_TIMESTAMP-interval '{READ_STATE_HEARTBEAT_SECONDS} seconds'
+        AND rh.receiving_backlog_since IS NULL AND (rh.receiving_gap_at IS NULL OR rh.receiving_gap_at<ro.observed_at)))""" if read_sources else 'false'
+    marked=' OR ro.marked_unread IS TRUE' if read_sources else ''
+    fresh=("(ro.observed_at>=incoming.sent_at AND (ro.unread_count IS NOT NULL"+marked+")"
+        " AND (ro.observed_at>=CURRENT_TIMESTAMP-interval '5 minutes' OR "+continuous+"))")
+    unread='CASE WHEN '+fresh+' THEN ro.unread_count>0'+marked+' END'
+    return read_sources,fresh,unread
+
+
 def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=None,
         order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
         include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
@@ -276,20 +296,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     # The muted count reads the queue without the chat-mute exclusion.
     unmuted_pending=pending
     if mutes and not include_dismissed and not include_muted:pending=pending[:-1]+' AND NOT '+chat_muted+')'
-    # An observation is current while nothing newer arrived and it has a count (or the owner's
-    # marked-unread flag), and it is at most 5 minutes old or the collector has received every
-    # update since it under one live lease epoch (ANYM-275): a later owner read would have replaced it.
-    # A schema before 42 (rollback drill) has none of these columns: keep the 5-minute rule there.
-    read_sources=c.execute("SELECT to_regclass('public.owner_message_reads') IS NOT NULL AS x").fetchone()['x']
-    continuous=f"""(ro.observed_at>=CURRENT_TIMESTAMP-interval '{READ_STATE_MAX_AGE_HOURS} hours' AND EXISTS(
-      SELECT 1 FROM collector_health rh JOIN collector_leases rl ON rl.account=rh.account AND rl.epoch=rh.receiving_epoch
-      WHERE rh.account=c.account AND rl.expires_at>CURRENT_TIMESTAMP AND rh.receiving_since<=ro.observed_at
-        AND rh.receiving_heartbeat_at>=CURRENT_TIMESTAMP-interval '{READ_STATE_HEARTBEAT_SECONDS} seconds'
-        AND rh.receiving_backlog_since IS NULL AND (rh.receiving_gap_at IS NULL OR rh.receiving_gap_at<ro.observed_at)))""" if read_sources else 'false'
-    marked=' OR ro.marked_unread IS TRUE' if read_sources else ''
-    fresh=("(ro.observed_at>=incoming.sent_at AND (ro.unread_count IS NOT NULL"+marked+")"
-        " AND (ro.observed_at>=CURRENT_TIMESTAMP-interval '5 minutes' OR "+continuous+"))")
-    unread='CASE WHEN '+fresh+' THEN ro.unread_count>0'+marked+' END'
+    read_sources,fresh,unread=read_state_sql(c)
     # Waiting points grow with the square root of hours (1h=1, 1d=4, 4d=9) up to
     # 20 at about 17 days, so recent requests differ before a day has passed.
     waited="greatest(0,extract(epoch FROM (score_clock.at-attention.sent_at))/3600)"

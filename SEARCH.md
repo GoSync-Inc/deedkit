@@ -242,6 +242,27 @@ permission: the new filter replaces the old one, the ACK version increases,
 outstanding deliveries are dropped and the position is kept. ACK order remains commit order,
 not the original timestamp of a backfilled message.
 
+### Incoming overview: `get_updates` with `view: by_chat` (ANYM-458)
+
+`view: by_chat` answers "what is new across my accounts" in one read-only call. It counts created
+incoming messages after the consumer's acknowledged position (`cursor_basis:
+acknowledged_position`); for a consumer without one it needs `from_time` (`cursor_basis:
+no_consumer`). It writes nothing: no consumer row, delivery or receipt, so no cursor moves and
+ACK stays ingestion-ordered through the normal `get_updates`/`ack_updates` pair.
+
+One row per chat: `live` and `backfill` counts (backfill and reconcile origins, as `is_backfill`;
+a history-only chat has `live: 0` and `newest: null`), `newest` (message, `sent_at`, sender,
+sender name and text cut to `body_chars`, default 80) of the newest live message, and the
+`list_chats` read state (`read_state` observed, stale or unknown; `provider_unread`,
+`provider_unread_count`, `read_state_observed_at`). An absent read field is unknown
+(`absent_read_fields: unknown`); provider mute and archive are not collected
+(`provider_mute_archive: unknown`). Rows order newest live first, history-only chats last;
+`limit` counts chats (default 20, up to 100), with `has_more`, `chats_total`, `live_total` and
+`backfill_total` over the whole window. Filters: accounts, chats, senders, dates,
+`exclude_channels`; chats outside the key's scope are neither counted nor named. `origins`,
+`kinds`, `order`, `start_from`, `reset_filters` and `direction: outgoing` are `invalid_filter`.
+Example: `{"consumer": "overview", "view": "by_chat", "from_time": "2026-10-23T06:00:00Z"}`.
+
 
 ## Live Telegram search inside `search` (ANYM-478)
 

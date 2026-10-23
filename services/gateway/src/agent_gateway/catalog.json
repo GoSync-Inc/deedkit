@@ -1550,7 +1550,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Read changes without advancing ACK. Consumer belongs to this principal.\norigins=['live'] excludes backfill. kinds=['message.status'] selects passive receipt\nupdates, without marking provider chats read. order=sent_at sorts the delivered batch only;\nACK/pagination stay ingestion ordered. To replace this consumer's filters explicitly,\nuse reset_filters=true with its current expected_ack_version and cursor-write permission.\nReset preserves acknowledged position and invalidates outstanding receipts; it does not replay old history.\n",
+    "description": "Read changes without advancing ACK. Consumer belongs to this principal.\norigins=['live'] excludes backfill. kinds=['message.status'] selects passive receipt\nupdates, without marking provider chats read. order=sent_at sorts the delivered batch only;\nACK/pagination stay ingestion ordered. To replace this consumer's filters explicitly,\nuse reset_filters=true with its current expected_ack_version and cursor-write permission.\nReset preserves acknowledged position and invalidates outstanding receipts; it does not replay old history.\nview=by_chat: read-only overview, one row per chat with new incoming messages after this consumer's ACK\n(from_time required without one): live and backfill counts, the newest live message, read state;\nnewest live first, limit = chats. No receipt; origins, kinds, order and outgoing are invalid.\n",
     "inputSchema": {
       "properties": {
         "consumer": {
@@ -1754,6 +1754,14 @@
             "now"
           ],
           "title": "Start From",
+          "type": "string"
+        },
+        "view": {
+          "enum": [
+            "events",
+            "by_chat"
+          ],
+          "title": "View",
           "type": "string"
         }
       },

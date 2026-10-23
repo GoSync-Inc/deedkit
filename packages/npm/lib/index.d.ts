@@ -214,6 +214,7 @@ export declare class AnyMsgClient {
   getFileText(args: Arguments): Promise<Record<string, unknown>>;
   getFileSegments(args: Arguments): Promise<Record<string, unknown>>;
   getFileOccurrences(args: Arguments): Promise<Record<string, unknown>>;
+  /** view: 'by_chat' returns a read-only per chat overview of new incoming messages (no receipt). */
   getUpdates(args?: Arguments): Promise<Record<string, unknown>>;
   ackUpdates(args: Arguments): Promise<Record<string, unknown>>;
   getReviews(args: Arguments): Promise<Record<string, unknown>>;

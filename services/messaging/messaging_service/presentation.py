@@ -435,6 +435,7 @@ def render(method, result, detail):
         compact['detail']='compact'
         compact['next_action']='get_sync_status_detail_full_or_chat_id_for_diagnostics'
         return compact
+    if method=='get_updates' and result.get('view')=='by_chat':return result  # already compact (ANYM-458)
     result=dict(result)
     result.pop('sources',None)
     if method in ('search','get_messages','get_updates'):
