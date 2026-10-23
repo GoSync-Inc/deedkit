@@ -85,7 +85,7 @@ it, and that is what happens for a tested source without the node or the target.
 Assembly refuses evidence whose shard reports hold one of these cases.
 
 The separate reporting job receives no database or messenger credentials. It
-uses Tiden CLI 0.36.0 from the official release with a pinned SHA-256 checksum.
+uses Tiden CLI 0.41.0 from the official release with a pinned SHA-256 checksum.
 Fork pull requests do not receive the Tiden secret or publish evidence. Package
 release workflows that do not pass this optional secret still verify packages.
 
@@ -449,7 +449,7 @@ completes, whatever its conclusion, and on dispatch from `main`; the job's `if:`
 and a shell guard refuse any other upstream event or branch. Runs never overlap
 (one concurrency group, no cancelling). Each run checks out `main` as it is when
 it starts and freezes that HEAD as TARGET. It has no persisted
-Git credential, the pinned CLI 0.36.0 called by its path, and the Tiden token only
+Git credential, the pinned CLI 0.41.0 called by its path, and the Tiden token only
 in its report step. Its permissions are `contents: read` and `actions: read`
 (ANYM-438, the sync lookup below, no write scope); the job's `GITHUB_TOKEN`
 reaches the report step alone, as `GH_TOKEN`. It is not a required check: a red run blocks no merge, release

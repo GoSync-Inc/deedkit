@@ -54,12 +54,14 @@ NODE_NAME = re.compile(r"\s*(?:'([^'\\\x00-\x1f\x7f]+)'|\"([^\"\\\x00-\x1f\x7f]+
 GO_TEST = re.compile(rf"^[ \t]*func\s+(Test(?![a-z])\w*)\s*(?:{COMMENT}\s*)*\(", re.MULTILINE)
 # Story-level means a leaf that holds criteria: not an Epic and without child specs.
 CONTAINER_TYPES = {"Epic"}
-# The merge-preview shape of CLI 0.33.0 (read 2026-10-19 from 62 open branches); empty fields may be omitted. Any
-# other key is a change this job cannot judge, so it refuses. The main sync (tiden_sync.py) uses the same parser.
+# The merge-preview shape of CLI 0.33.0 (read 2026-10-19 from 62 open branches); empty fields may be omitted. CLI 0.41.0
+# adds `testDuplicates` (test marks, omitted when empty) and the server `autoMerge` (an intent branch Tiden merges by
+# itself; read 2026-10-24 from 51 open branches). Any other key is a change this job cannot judge, so it refuses. The
+# main sync (tiden_sync.py) uses the same parser.
 PREVIEW_CHANGES = ("additions", "modifications")
-PREVIEW_EMPTY = ("deletions", "testAdditions", "testModifications", "testDeletions", "componentAdditions",
-                 "componentModifications", "componentDeletions")
-PREVIEW_OTHER = ("stats", "intentSession", "blockingSessions", "hasRequirementChanges")
+PREVIEW_EMPTY = ("deletions", "testAdditions", "testModifications", "testDeletions", "testDuplicates",
+                 "componentAdditions", "componentModifications", "componentDeletions")
+PREVIEW_OTHER = ("stats", "intentSession", "blockingSessions", "hasRequirementChanges", "autoMerge")
 # Tests that verify no spec, as `<path>::<test>` patterns with the reason; widening it is a reviewed code change.
 NO_SPEC: tuple[tuple[str, str], ...] = ()
 TIMEOUT = 120
@@ -364,8 +366,7 @@ def preview_numbers(preview: dict, name: str) -> tuple[set[int], list[str]]:
         raise Refused(f"the merge preview of {name} has malformed stats")
     other += [f"stats.{key}" for key, value in stats.items() if value and key not in PREVIEW_CHANGES]
     other += [f"stats.{key}" for key in PREVIEW_CHANGES if stats.get(key, len(lists[key])) != len(lists[key])]
-    if preview.get("intentSession") is not None:
-        other.append("intentSession")
+    other += [key for key in ("intentSession", "autoMerge") if preview.get(key) is not None]
     if preview.get("blockingSessions") not in (None, 0, []):
         other.append("blockingSessions")
     if not isinstance(preview.get("hasRequirementChanges", True), bool):

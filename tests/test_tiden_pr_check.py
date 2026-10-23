@@ -225,6 +225,39 @@ def test_a_forbidden_preview_is_a_verdict_and_a_malformed_preview_is_not_checked
     assert not server.writes()
 
 
+# The full merge-preview of a proposal branch as CLI 0.41.0 printed it on 2026-10-24: every list and stat present.
+CLI_041_PREVIEW = {
+    "additions": [{"seqNum": 50}], "modifications": [], "deletions": [], "testAdditions": [], "testModifications": [],
+    "testDeletions": [], "componentAdditions": [], "componentModifications": [], "componentDeletions": [],
+    "stats": {key: 0 for key in ("modifications", "deletions", "conflicts", "testAdditions", "testModifications",
+                                 "testDeletions", "componentAdditions", "componentModifications",
+                                 "componentDeletions")} | {"additions": 1},
+    "intentSession": None, "blockingSessions": [], "hasRequirementChanges": True}
+AUTO_MERGE = {"state": "in_progress", "reason": "no_merged_pr", "nextCheckAt": "2026-10-30T07:46:19Z"}
+
+
+# spec: ANYM-445
+@pytest.mark.parametrize("extra, kind, text", [
+    ({}, "passed", ""),
+    ({"testDuplicates": []}, "passed", ""),
+    ({"autoMerge": None}, "passed", ""),
+    ({"testDuplicates": [{"id": "t"}]}, "verdict", "testDuplicates"),
+    ({"autoMerge": AUTO_MERGE}, "verdict", "autoMerge"),
+    ({"testDuplicates": {"count": 1}}, "refused", "the merge preview of proposal/x is malformed"),
+])
+def test_the_cli_041_preview_keys_are_judged_not_refused_as_unknown(repo, server, monkeypatch, capsys, extra, kind,
+                                                                      text):
+    previewed(server, CLI_041_PREVIEW | extra, (50,))
+    code, out = run_main(repo, server, "Delivers: ANYM-50\nTiden branch: proposal/x", monkeypatch, capsys)
+    assert "unknown fields" not in out and not server.writes()
+    if kind == "passed":
+        assert code == 0 and "Branch preview: ANYM-50" in out, out
+    elif kind == "verdict":
+        assert code == 1 and f"the preview of proposal/x holds more than spec changes ({text})" in out
+    else:
+        assert code == 1 and f"Refused: {text}" in out
+
+
 # spec: ANYM-445
 @pytest.mark.parametrize("fault, reason", [
     ({"branch merge-preview": "exit"}, "Refused: tiden branch merge-preview exited 3"),

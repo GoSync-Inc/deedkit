@@ -492,6 +492,25 @@ def test_a_preview_outside_the_known_spec_only_shape_is_never_merged(root, serve
 
 
 # spec: ANYM-405
+def test_the_cli_041_preview_keys_merge_when_empty_and_stop_the_sync_when_set(root, server):
+    full_server(server)
+    preview = {"additions": [{"seqNum": 50}], "modifications": [], "stats": {"conflicts": 0}, "testDuplicates": [],
+               "autoMerge": None}
+    server.set(previews={"proposal/x": preview})
+    merged(root, server, {"app/new.py": "y\n"}, "Delivers: ANYM-50\nTiden branch: proposal/x")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert {"name": "proposal/x", "status": "merged"} in server.state()["branches"]
+    for extra, reason in (({"testDuplicates": [{"id": "t"}]}, "testDuplicates"),
+                          ({"autoMerge": {"state": "in_progress", "reason": "round_active"}}, "autoMerge")):
+        full_server(server)
+        server.set(previews={"proposal/x": preview | extra}, log=[])
+        code, out = run(root, server)
+        assert code == 1 and "Failed at step merge" in out and reason in out and "unknown fields" not in out
+        assert not server.writes()
+
+
+# spec: ANYM-405
 def test_a_merge_that_leaves_the_branch_open_fails_and_stops_before_other_writes(root, server):
     full_server(server)
     server.set(fault={"branch merge": "noop"})
