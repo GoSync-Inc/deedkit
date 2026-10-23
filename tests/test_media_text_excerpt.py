@@ -129,3 +129,21 @@ def test_excerpt_budget_order_truncated_source_and_stale_text(seeded):
         c.execute("UPDATE attachments SET digest=%s,bytes=23 WHERE id='capped-note'", (digest,))
     stale = s.get_context(b, 'demo-tg-2')['message']['attachments']
     assert 'text_excerpt' not in {f['id']: f for f in stale}['capped-note']
+
+
+# spec: ANYM-490
+def test_excerpt_budget_follows_the_conversation_order_on_a_timestamp_tie(seeded):
+    s, _, b = seeded
+    add_file(s, 'tie-first', 'demo-tg-2', ('T' * 400).encode(), 'tie-first.txt')
+    for n in range(10):
+        add_file(s, f'tie-{n:02d}', 'demo-tg-1', (f'{n:02d}' + 'W' * 398).encode(), f'tie-{n}.txt')
+    drain(worker_for(s))
+    with s.pool.connection() as c:
+        # Same second; the Telegram provider id puts demo-tg-2 first although its archive id sorts last.
+        c.execute("UPDATE messages SET sent_at=(SELECT sent_at FROM messages WHERE id='demo-tg-1'),"
+                  "provider_id=CASE id WHEN 'demo-tg-1' THEN '20' ELSE '10' END WHERE id IN ('demo-tg-1','demo-tg-2')")
+    rows = s.get_context(b, 'demo-tg-2', view='conversation')['context']
+    assert [r['id'] for r in rows][:2] == ['demo-tg-2', 'demo-tg-1']
+    shown = files(rows)
+    assert 'text' in shown['tie-first']['text_excerpt']
+    assert any('omitted' in shown[f'tie-{n:02d}']['text_excerpt'] for n in range(10))

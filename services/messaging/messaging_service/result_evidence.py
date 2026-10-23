@@ -99,7 +99,7 @@ def text_excerpt(c,file,budget):
         'read_more':None if len(head)==total else {**pointer,'offset':len(head)}}
 
 
-def decorate(c,rows):
+def decorate(c,rows,*,order_key=None):
     if not rows:return rows
     ids=list({r['id'] for r in rows})
     files=c.execute('''SELECT j.message,j.id AS attachment_id,a.id,a.filename,a.mime,a.bytes,a.digest,
@@ -148,7 +148,8 @@ def decorate(c,rows):
     # changed during the read lose their attachments below and spend nothing.
     budget=EXCERPT_BUDGET
     order={}
-    for n,r in enumerate(rows):
+    # The caller's final order when it sorts after decoration (get_context's conversation view).
+    for n,r in enumerate(sorted(rows,key=order_key) if order_key else rows):
         if current.get(r['id'])==r['revision']:order.setdefault(r['id'],n)
     for file in sorted((f for f in files if f['message'] in order),key=lambda f:order[f['message']]):
         excerpt=text_excerpt(c,file,budget)
