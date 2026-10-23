@@ -490,7 +490,7 @@ def test_unreviewed_candidate_runtime_settings_are_refused(tmp_path, mutation):
 
 # spec: ANYM-424
 @pytest.mark.parametrize('mutation', ['single-file', 'writable', 'other-directory', 'other-filename',
-    'shadowing-file', 'shadowing-tmpfs', 'parent-directory', 'volume', 'unnormalized'])
+    'shadowing-file', 'shadowing-tmpfs', 'shadowing-secret', 'shadowing-config', 'parent-directory', 'volume', 'unnormalized'])
 def test_gateway_policy_must_be_the_read_only_bind_of_its_own_directory(tmp_path, mutation):
     cfg = settings(tmp_path)
     docs = documents(cfg)
@@ -508,6 +508,10 @@ def test_gateway_policy_must_be_the_read_only_bind_of_its_own_directory(tmp_path
         gateway['volumes'].append({'type': 'bind', 'source': policy, 'target': '/run/deedkit/policy/policy.json', 'read_only': True})
     elif mutation == 'shadowing-tmpfs':
         gateway['tmpfs'] = ['/run/deedkit:size=1m']
+    elif mutation in ('shadowing-secret', 'shadowing-config'):
+        kind = mutation.split('-')[1] + 's'
+        docs['gateway'][kind] = {'stale': {'file': policy}}
+        gateway[kind] = [{'source': 'stale', 'target': '/run/deedkit/policy/policy.json'}]
     elif mutation == 'parent-directory':
         mount.update(source=str(tmp_path), target='/run/deedkit/private')
         gateway['command'][1] = '/run/deedkit/private/gateway-policy/policy.json'

@@ -70,16 +70,18 @@ class Gateway:
     def service(self):
         return json.loads(self.compose("config", "--format", "json").stdout)["services"]["gateway"]
 
-    def policy_file(self):
-        """The host file the container's `--policy` reads, through the policy directory's read-only bind."""
+    def policy_mount(self):
         unit = self.service()
         target = PurePosixPath(unit["command"][unit["command"].index("--policy") + 1])
         mounts = [m for m in unit["volumes"] if PurePosixPath(m["target"]) in {target, *target.parents}]
         assert len(mounts) == 1, mounts
-        assert PurePosixPath(mounts[0]["target"]) == target.parent, (
-            "the policy must be mounted through its directory, not as a single file", mounts[0])
         assert mounts[0]["type"] == "bind" and mounts[0]["read_only"] is True, mounts[0]
-        return Path(mounts[0]["source"]) / target.name
+        return target, mounts[0]
+
+    def policy_file(self):
+        """The host file the container's `--policy` reads, through whichever read-only bind provides it."""
+        target, mount = self.policy_mount()
+        return Path(mount["source"]) / target.relative_to(mount["target"])
 
     def private_files(self):
         private = self.deploy / "private"
@@ -174,6 +176,9 @@ def test_policy_renamed_over_the_live_file_reaches_the_running_gateway(gateway_i
             replace_by_rename(live, policy(2))
             assert gateway.revision(started[0]) == 2
             assert gateway.container() == started, "the gateway must not be recreated or restarted"
+            target, mount = gateway.policy_mount()
+            assert PurePosixPath(mount["target"]) == target.parent, (
+                "the policy must be mounted through its directory, not as a single file", mount)
         finally:
             gateway.close()
 

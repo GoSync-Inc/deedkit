@@ -318,10 +318,10 @@ def canonical(unit, role, settings):
 def policy_mount(unit, settings):
     """Translate the gateway's complete `--policy` path through its mounts (ANYM-424).
 
-    Exactly one mount may cover the path: a read-only bind of the policy file's
-    own directory, whose host file is `gateway_policy`. A single-file bind pins
-    the inode it started with, so an atomic rename beside the live file would
-    never reach the running gateway.
+    Exactly one mount (volume, tmpfs, secret or config) may cover the path: a
+    read-only bind of the policy file's own directory, whose host file is
+    `gateway_policy`. A single-file bind pins the inode it started with, so an
+    atomic rename beside the live file would never reach the running gateway.
     """
     command = dict(zip(unit['command'][::2], unit['command'][1::2], strict=True))
     target = PurePosixPath(command['--policy'])
@@ -330,6 +330,11 @@ def policy_mount(unit, settings):
     tmpfs = unit.get('tmpfs') or []
     covering = [mount for mount in unit.get('volumes', []) if PurePosixPath(mount['target']) in {target, *target.parents}]
     covering += [path for path in ([tmpfs] if isinstance(tmpfs, str) else tmpfs) if PurePosixPath(path.split(':', 1)[0]) in {target, *target.parents}]
+    # A file-backed secret or config is a bind too and can shadow the policy file.
+    def provided(kind, item):
+        path = item.get('target') or item['source']
+        return PurePosixPath(path) if path.startswith('/') else PurePosixPath('/run/secrets' if kind == 'secrets' else '/') / path
+    covering += [item for kind in ('secrets', 'configs') for item in unit.get(kind, []) if isinstance(item, dict) and provided(kind, item) in {target, *target.parents}]
     if len(covering) != 1 or not isinstance(covering[0], dict):
         raise Refused('exactly one mount may provide the gateway policy')
     mount = covering[0]
