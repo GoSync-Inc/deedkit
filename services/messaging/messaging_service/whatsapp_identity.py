@@ -138,7 +138,8 @@ def chat_links(c,p,accounts=None,*,lid_chats=None,paired_only=False,profiled=Fal
     `paired_only` keeps links with a readable PN chat; `lid_chats` limits the LID
     chats (a page), so the per-link source proof runs only where it is used.
     Chats match by normalized ID (a device suffix is not another peer); two stored
-    chats with one normalized ID are ambiguous and pair nothing. `profiled` keeps
+    chats with one normalized ID are ambiguous and pair nothing; each still has its
+    phone link. `profiled` keeps
     only evidence `search_people` shows: the observed identity is a visible sender
     profile of the source chat (people_join), so a recipient-only observation or a
     deleted profile source names no phone.
@@ -160,17 +161,18 @@ def chat_links(c,p,accounts=None,*,lid_chats=None,paired_only=False,profiled=Fal
         SELECT account,normalized_id,min(id) AS id FROM private_chats WHERE normalized_id IS NOT NULL
         GROUP BY account,normalized_id HAVING count(*)=1
         ), candidate AS MATERIALIZED (
-        SELECT DISTINCT l.id AS lid_chat,l.account,wi.pn,wi.lid FROM unique_chats l
+        SELECT DISTINCT l.id AS lid_chat,l.account,wi.pn,wi.lid FROM private_chats l
         JOIN whatsapp_identity_observations wi ON wi.account=l.account AND wi.lid=l.normalized_id
         WHERE right(l.normalized_id,4)='@lid\''''+page+'''
         ), verified AS MATERIALIZED (
-        SELECT pair.*,pc.id AS pn_chat FROM candidate pair
+        SELECT pair.*,CASE WHEN lu.id IS NOT NULL THEN pc.id END AS pn_chat FROM candidate pair
+        LEFT JOIN unique_chats lu ON lu.id=pair.lid_chat
         LEFT JOIN unique_chats pc ON pc.account=pair.account AND pc.normalized_id=pair.pn
         WHERE NOT EXISTS(SELECT 1 FROM whatsapp_identity_observations other
             WHERE other.account=pair.account AND other.pn=pair.pn AND other.lid<>pair.lid)
           AND NOT EXISTS(SELECT 1 FROM whatsapp_identity_observations other
             WHERE other.account=pair.account AND other.lid=pair.lid AND other.pn<>pair.pn)'''+(
-            ' AND pc.id IS NOT NULL' if paired_only else '')+'''
+            ' AND lu.id IS NOT NULL AND pc.id IS NOT NULL' if paired_only else '')+'''
         ), sourced AS MATERIALIZED (
         SELECT v.*,(SELECT wi.provenance FROM whatsapp_identity_observations wi
             JOIN messages m ON m.id=wi.source_message JOIN chats ic ON ic.id=m.chat

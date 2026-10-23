@@ -247,6 +247,13 @@ def test_device_qualified_phone_chat_groups_with_its_lid_chat(pair_archive):
     # Two stored chats with one normalized phone are ambiguous: nothing is grouped.
     add('111@c.us', 3, 4)
     assert set(chats()) == {'111:4@c.us', '111@c.us', '222@lid'}
+    # Two stored LID chats with one normalized LID group nothing but keep their phone.
+    device = add('222:4@lid', 4, 3)
+    link(device, '111@c.us', '222@lid')
+    rows = chats()
+    assert set(rows) == {'111:4@c.us', '111@c.us', '222@lid', '222:4@lid'}
+    assert all('alias_chats' not in r for r in rows.values())
+    assert rows['222@lid']['peer_phone'] == rows['222:4@lid']['peer_phone'] == '+111'
 
 
 # spec: ANYM-278
@@ -297,7 +304,13 @@ def test_linked_pages_exclusions_and_selected_chat_operations(pair_archive):
     queue = s.list_chats(key, awaiting_reply=True, awaiting_reply_days=0, include_coverage=False, accounts=['wa-pair'])
     assert chat_id(old) not in [r['id'] for r in queue['items']]
     assert s.dismiss_reply(key, chat_id(new), new, 1)['dismissed'] is True
-    until = (datetime.now(timezone.utc)+timedelta(days=1)).isoformat()
-    assert s.snooze_reply(key, chat_id(others[0]), others[0], 1, until)['snoozed'] is True
     queue = s.list_chats(key, awaiting_reply=True, awaiting_reply_days=0, include_coverage=False, accounts=['wa-pair'])
-    assert sorted(r['id'] for r in queue['items']) == sorted(map(chat_id, others[1:]))
+    assert sorted(r['id'] for r in queue['items']) == sorted(map(chat_id, others))
+    # A newer incoming message in the hidden phone chat makes it the listed chat; snooze it.
+    pn_new = add('111@c.us', 20, 0.5)
+    queue = s.list_chats(key, awaiting_reply=True, awaiting_reply_days=0, include_coverage=False, accounts=['wa-pair'])
+    assert chat_id(new) not in [r['id'] for r in queue['items']] and chat_id(old) in [r['id'] for r in queue['items']]
+    until = (datetime.now(timezone.utc)+timedelta(days=1)).isoformat()
+    assert s.snooze_reply(key, chat_id(old), pn_new, 1, until)['snoozed'] is True
+    queue = s.list_chats(key, awaiting_reply=True, awaiting_reply_days=0, include_coverage=False, accounts=['wa-pair'])
+    assert sorted(r['id'] for r in queue['items']) == sorted(map(chat_id, others))
