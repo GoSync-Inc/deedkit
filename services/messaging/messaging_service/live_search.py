@@ -81,6 +81,7 @@ def unsupported(arguments):
     if arguments.get('fuzzy'): fields.append('fuzzy')
     if arguments.get('sender'): fields.append('sender')
     if arguments.get('senders') is not None: fields.append('senders')
+    if arguments.get('person'): fields.append('person')
     chats = arguments.get('chats')
     if chats is not None and (len(chats) != 1 or arguments.get('chat')): fields.append('chats')
     if arguments.get('direction'): fields.append('direction')
