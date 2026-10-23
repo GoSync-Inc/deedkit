@@ -172,7 +172,12 @@ class Store:
                             permission = OPERATION_PERMISSIONS[operation] if operation else None
                             if permission and permission not in p['permissions']:
                                 raise APIError('forbidden', 403)
-                            yield c, p
+                            from .result_evidence import FILES_ROOT
+                            root = FILES_ROOT.set(self.files)
+                            try:
+                                yield c, p
+                            finally:
+                                FILES_ROOT.reset(root)
                     except Exception as error:
                         # Roll back the attempted action, but commit its denial audit
                         # outside the savepoint. Successful mutations + audit commit
@@ -737,7 +742,8 @@ class Store:
                 rows=sorted(rows,key=lambda r:(r['id']!=anchor['id'],
                     abs((r['sent_at']-anchor['sent_at']).total_seconds())))[:limit]
             if conversation:
-                enrich(c,rows,p);rows.sort(key=sort_key)
+                # Excerpts spend their budget in the returned order (ANYM-490).
+                enrich(c,rows,p,order_key=sort_key);rows.sort(key=sort_key)
                 shape_messages(rows,compact=False,body_chars=cap)
                 shape_messages([anchor],compact=False,body_chars=cap)
                 decorate_messages(c,p,rows,include_system=include_system);decorate_messages(c,p,[anchor],include_system=include_system)

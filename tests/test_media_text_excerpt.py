@@ -1,0 +1,149 @@
+"""Message reads carry a bounded excerpt of a file's text (synthetic rows, no provider)."""
+from messaging_service.presentation import render
+from test_file_index import add_file, drain, original, text, worker_for
+from test_file_retention_api import managed_absence
+from test_voice_transcript_reading import TRANSCRIPT, voice
+
+LONG = ' '.join(['Синтетический счёт номер 42 за маяк.'] * 20)
+CHAT = 'telegram-demo-chat'
+
+
+def files(rows):
+    return {f['id']: f for row in rows for f in row.get('attachments') or []}
+
+
+def read(s, token, *, view='archive', detail='full'):
+    return files(render('get_messages', s.get_messages(token, CHAT, view=view, limit=50), detail)['items'])
+
+
+# spec: ANYM-490
+def test_message_attachment_carries_a_bounded_excerpt_with_a_pointer(seeded):
+    s, _, b = seeded
+    add_file(s, 'scan-pdf', 'demo-tg-1', LONG.encode(), 'scan.txt')
+    add_file(s, 'short-note', 'demo-tg-1', b'Short synthetic note', 'note.txt')
+    drain(worker_for(s))
+    excerpt = read(s, b)['scan-pdf']['text_excerpt']
+    assert excerpt['source'] == 'extracted' and excerpt['model_generated'] is False and excerpt['untrusted'] is True
+    assert 0 < excerpt['excerpt_chars'] == len(excerpt['text']) <= 300 and LONG.startswith(excerpt['text'])
+    # Cut at a word boundary: the next retained character is whitespace.
+    assert excerpt['excerpt_chars'] >= 260 and LONG[excerpt['excerpt_chars']].isspace()
+    assert excerpt['total_chars'] == len(LONG) and excerpt['complete'] is False
+    pointer = excerpt['read_more']
+    assert pointer == {'operation': 'get_file_text', 'attachment_id': 'scan-pdf', 'offset': excerpt['excerpt_chars'],
+                       'content': 'extracted'}
+    rest = text(s, b, 'scan-pdf', offset=pointer['offset'], limit=8000, content=pointer['content'])
+    assert excerpt['text'] + rest['text'] == LONG
+    short = read(s, b)['short-note']['text_excerpt']
+    assert short['text'] == 'Short synthetic note' and short['complete'] is True and short['read_more'] is None
+    # Every message read surface shows the same excerpt.
+    for view, detail in [('archive', 'compact'), ('conversation', 'compact'), ('conversation', 'transcript')]:
+        if detail == 'transcript':
+            shown = {f['id']: f for f in render('get_messages', s.get_messages(b, CHAT, view=view, limit=50),
+                                                detail)['files']}
+        else:
+            shown = read(s, b, view=view, detail=detail)
+        assert shown['short-note']['text_excerpt'] == short, (view, detail)
+    hit = files(render('search', s.search(b, 'Маяк', view='conversation'), 'compact')['items'])
+    assert hit['short-note']['text_excerpt'] == short
+    context = s.get_context(b, 'demo-tg-1')
+    assert {f['id']: f for f in context['message']['attachments']}['short-note']['text_excerpt'] == short
+
+
+# spec: ANYM-490
+def test_voice_note_excerpt_is_its_model_transcript(seeded):
+    s, _, b = seeded
+    voice(s)
+    excerpt = read(s, b)['voice-note']['text_excerpt']
+    assert excerpt['text'] == TRANSCRIPT and excerpt['source'] == 'transcript'
+    assert excerpt['model_generated'] is True and excerpt['complete'] is True and excerpt['read_more'] is None
+    voice(s, 'voice-long', transcript='слово ' * 100)
+    pointer = read(s, b)['voice-long']['text_excerpt']['read_more']
+    assert pointer['content'] == 'enriched' and pointer['offset'] > 0
+
+
+# spec: ANYM-490
+def test_no_excerpt_without_ready_text_or_for_image_descriptions(seeded):
+    s, _, b = seeded
+    voice(s, 'voice-pending', state='unconfigured')
+    voice(s, 'photo-described', filename='photo.jpg', mime='image/jpeg', transcript='Model description of a photo')
+    add_file(s, 'clip', 'demo-tg-1', b'abc', 'clip.mp4', 'video/mp4')
+    add_file(s, 'queued-note', 'demo-tg-1', b'Not yet extracted text', 'queued.txt')
+    shown = read(s, b)
+    for attachment in ('voice-pending', 'photo-described', 'clip', 'queued-note'):
+        assert 'text_excerpt' not in shown[attachment], attachment
+    # The existing statuses still say why there is no excerpt yet.
+    assert shown['queued-note']['extraction_status'] != 'ready' and 'transcript_ready' not in shown['voice-pending']
+
+
+# spec: ANYM-490
+def test_excerpt_follows_the_file_text_presence_rule(seeded):
+    s, _, b = seeded
+    lost = add_file(s, 'lost-note', 'demo-tg-1', b'Lost synthetic text', 'lost.txt')
+    kept = add_file(s, 'evicted-note', 'demo-tg-1', b'Evicted synthetic text', 'evicted.txt')
+    drain(worker_for(s))
+    (s.files / lost).unlink()
+    managed_absence(s, kept, len(b'Evicted synthetic text'))
+    shown = read(s, b)
+    assert 'text_excerpt' not in shown['lost-note']
+    assert shown['evicted-note']['text_excerpt']['text'] == 'Evicted synthetic text'
+
+
+# spec: ANYM-490
+def test_excerpts_share_one_bounded_budget_per_response(seeded):
+    s, _, b = seeded
+    for n in range(12):
+        add_file(s, f'bulk-{n:02d}', 'demo-tg-1', (f'{n:02d}' + 'Z' * 398).encode(), f'bulk-{n}.txt')
+    drain(worker_for(s))
+    shown = [f for name, f in sorted(read(s, b).items()) if name.startswith('bulk-')]
+    excerpts = [f['text_excerpt'] for f in shown]
+    assert sum(len(e.get('text', '')) for e in excerpts) <= 3000
+    omitted = [e for e in excerpts if 'text' not in e]
+    assert omitted and all(e['omitted'] == 'response_budget' and e['read_more']['offset'] == 0 for e in omitted)
+    assert all(e['total_chars'] == 400 for e in omitted)
+    # The budget is spent in the returned order: only the trailing attachments are omitted.
+    assert excerpts[-len(omitted):] == omitted
+    assert all(len(e['text']) == 300 for e in excerpts if 'text' in e)
+
+
+# spec: ANYM-490
+def test_excerpt_budget_order_truncated_source_and_stale_text(seeded):
+    s, _, b = seeded
+    add_file(s, 'capped-note', 'demo-tg-2', b'Capped synthetic text', 'capped.txt')
+    drain(worker_for(s))
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_text SET truncated=true WHERE attachment='capped-note'")
+    # A capped source: the excerpt holds all retained text, so nothing more to read, yet not complete.
+    capped = read(s, b)['capped-note']['text_excerpt']
+    assert capped['complete'] is False and capped['read_more'] is None and capped['text'] == 'Capped synthetic text'
+    for n in range(11):
+        add_file(s, f'ctx-{n:02d}', 'demo-tg-1', (f'{n:02d}' + 'Q' * 398).encode(), f'ctx-{n}.txt')
+    drain(worker_for(s))
+    # get_context in the conversation view spends the budget in the returned (chronological) order.
+    context = s.get_context(b, 'demo-tg-2', view='conversation')
+    ordered = [f['text_excerpt'] for r in context['context'] for f in r.get('attachments') or [] if 'text_excerpt' in f]
+    first_omitted = next(i for i, e in enumerate(ordered) if 'omitted' in e)
+    assert all('omitted' in e for e in ordered[first_omitted:])
+    # A replaced original makes the derivative stale: no excerpt until it is re-extracted.
+    _, digest = original(s.files, b'Replaced synthetic text')
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachments SET digest=%s,bytes=23 WHERE id='capped-note'", (digest,))
+    stale = s.get_context(b, 'demo-tg-2')['message']['attachments']
+    assert 'text_excerpt' not in {f['id']: f for f in stale}['capped-note']
+
+
+# spec: ANYM-490
+def test_excerpt_budget_follows_the_conversation_order_on_a_timestamp_tie(seeded):
+    s, _, b = seeded
+    add_file(s, 'tie-first', 'demo-tg-2', ('T' * 400).encode(), 'tie-first.txt')
+    for n in range(10):
+        add_file(s, f'tie-{n:02d}', 'demo-tg-1', (f'{n:02d}' + 'W' * 398).encode(), f'tie-{n}.txt')
+    drain(worker_for(s))
+    with s.pool.connection() as c:
+        # Same second; the Telegram provider id puts demo-tg-2 first although its archive id sorts last.
+        c.execute("UPDATE messages SET sent_at=(SELECT sent_at FROM messages WHERE id='demo-tg-1'),"
+                  "provider_id=CASE id WHEN 'demo-tg-1' THEN '20' ELSE '10' END WHERE id IN ('demo-tg-1','demo-tg-2')")
+    rows = s.get_context(b, 'demo-tg-2', view='conversation')['context']
+    assert [r['id'] for r in rows][:2] == ['demo-tg-2', 'demo-tg-1']
+    shown = files(rows)
+    assert 'text' in shown['tie-first']['text_excerpt']
+    assert any('omitted' in shown[f'tie-{n:02d}']['text_excerpt'] for n in range(10))

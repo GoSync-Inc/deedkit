@@ -91,6 +91,18 @@ reads `content='extracted'`. When that transcript is not ready, the reply has em
 `processing_failed` with `failure_reason`, or `processing_not_configured`, which only
 the owner can change). Explicit `content` values keep their meaning.
 Message rows mark a voice note whose transcript is ready with `transcript_ready: true`.
+In `get_messages`, `search` and `get_context` (every detail, and the transcript's file list)
+an attachment whose default `get_file_text` text is ready carries `text_excerpt` (ANYM-490):
+at most 300 characters of that text (photo OCR, PDF and other extracted text, or a voice
+note's transcript), `source` (`extracted` or `transcript`), `excerpt_chars`, `total_chars`,
+`complete`, `model_generated`, `untrusted: true` and `read_more`: `{operation: get_file_text,
+attachment_id, offset, content}` (gateway tool `messages_get_file_text`), null when the excerpt
+holds all retained text. Excerpts in one result share a 3,000-character budget spent in row
+order; an attachment past it gets `omitted: "response_budget"`, `total_chars` and `read_more`
+at offset 0. When `text_excerpt` is absent, `extraction_status`, `enrichment_status` and
+`transcript_ready` say why. Image model descriptions are
+not excerpted, and an excerpt follows `get_file_text`'s presence rule: no excerpt when the
+original is missing without a completed managed eviction.
 `content='enriched'` pages the model transcript/text up to 1,000,000 stored characters;
 raw extraction has the same configurable ceiling. Each response page is at most 8,000 characters.
 `get_attachment` and `request_file_download` expose the same current extraction
