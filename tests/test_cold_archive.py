@@ -1103,3 +1103,76 @@ def test_cold_role_without_the_lease_grant_defers_restores(env,archive):
         with s.pool.connection() as c:
             c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
             c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
+# spec: ANYM-350
+def test_collection_and_backup_proceed_during_a_slow_reconcile(env,archive,monkeypatch):
+    import queue
+    import threading
+    from messaging_service import blobs,file_lifecycle
+    from test_archive import event
+    ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid)
+    def crash(*args):raise RuntimeError('synthetic crash after publication')
+    with monkeypatch.context() as patch:
+        patch.setattr(file_lifecycle,'register_resident_original',crash)
+        with pytest.raises(RuntimeError,match='synthetic crash'):restorer(env).run_once()
+    assert (s.files/blob.digest).exists() and not resident(s,blob.digest)
+    # Every hash of the published original stalls until collection and backup were tried.
+    hashing,proceed=queue.Queue(),queue.Queue();digest=blobs.hashlib.file_digest
+    def slow(file,*args):
+        if Path(file.name).name==blob.digest:hashing.put(1);proceed.get(timeout=30)
+        return digest(file,*args)
+    monkeypatch.setattr(blobs.hashlib,'file_digest',slow)
+    def collect_and_back_up(n):
+        ar.ingest(event(provider_id='during-reconcile-'+str(n)))
+        with s.pool.connection() as c:
+            file_lifecycle.begin_backup_fence(c,'synthetic-reconcile-'+str(n))
+            file_lifecycle.end_backup_fence(c,'synthetic-reconcile-'+str(n))
+    report=[];worker=threading.Thread(target=lambda:report.append(restorer(env).run_once()));worker.start()
+    stalls=[]
+    try:
+        while worker.is_alive():
+            try:hashing.get(timeout=0.2)
+            except queue.Empty:continue
+            other=threading.Thread(target=collect_and_back_up,args=(len(stalls),));other.start();other.join(3)
+            stalls.append(not other.is_alive());proceed.put(1);other.join(30)
+    finally:
+        for _ in range(4):proceed.put(1)
+        worker.join(30)
+    # The slow hash never holds the lifecycle lock that collection and backup take.
+    assert stalls and all(stalls)
+    assert report[0]['reconciled']==1 and resident(s,blob.digest)
+
+
+# spec: ANYM-350
+def test_queued_restore_reaches_the_provider_after_the_gateway_grant_is_revoked(env,archive):
+    from contextlib import contextmanager
+    from copy import copy as clone
+    from uuid import uuid4
+    from psycopg import sql
+    ar,_,key,_=archive;s,_,_,_=env;fid,blob=evicted_copy(env,archive)
+    role='messaging_gateway_'+uuid4().hex
+    class RestrictedPool:
+        @contextmanager
+        def connection(self):
+            with s.pool.connection() as c:
+                c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+                yield c
+    root=Path(__file__).resolve().parents[1]/'services/messaging/messaging_service'
+    with s.pool.connection() as c:c.execute((root/'gateway_role.sql').read_text().replace('messaging_gateway',role))
+    gateway=clone(s);gateway.pool=RestrictedPool()
+    try:
+        queued=gateway.request_file_download(key,fid)
+        assert queued['request_status']=='queued' and queued['rehydration_source']=='cold_archive'
+        assert job_state(s,fid)=='ready' and queued['requested_until'] is not None
+        # Undo of the restore grant while the restore is queued and its demand window open.
+        with s.pool.connection() as c:
+            c.execute(sql.SQL('REVOKE SELECT,UPDATE ON attachment_cold_copies FROM {}').format(sql.Identifier(role)))
+        again=gateway.request_file_download(key,fid)
+        assert again['request_status']=='queued' and again['rehydration_source']=='provider'
+        assert job_state(s,fid)=='queued' and ar.claim_media('fixture')['id']==fid
+    finally:
+        with s.pool.connection() as c:
+            c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
+            c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))

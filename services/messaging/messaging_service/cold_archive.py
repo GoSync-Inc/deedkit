@@ -447,12 +447,26 @@ class ColdRestorer(ColdArchiver):
                 ORDER BY restore_requested_at,digest LIMIT %s''',(COLD_RESTORE_STALL_SECONDS,limit)).fetchall()
 
     def _present(self,digest,size):
+        """Identity of a verified CAS original, or None; called without the lifecycle lock.
+
+        Hashing a large original takes long; collection and backup take the
+        same lock, so it is verified first and only its identity rechecked
+        under the lock (_unchanged), as file_lifecycle._complete does.
+        """
         from .blobs import Blob,BlobWriter
+        path=self.store.files/digest
         try:
-            if not (self.store.files/digest).exists():return False
+            before=os.lstat(path)
             BlobWriter(self.store.files,reserve_bytes=0).verify(Blob(digest,size))
-        except (RuntimeError,OSError):return False
-        return True
+            after=os.lstat(path)
+        except (RuntimeError,OSError):return None
+        return _identity(after) if _identity(before)==_identity(after) else None
+
+    def _unchanged(self,digest,identity):
+        """Under the lifecycle lock: the file verified by _present is still in place, unmodified."""
+        try:info=os.lstat(self.store.files/digest)
+        except OSError:return False
+        return stat.S_ISREG(info.st_mode) and _identity(info)==identity
 
     def _admit(self,c,digest,size,claimed):
         """Capacity check before any R2 read; lifecycle precedes the capacity lock.
@@ -518,10 +532,11 @@ class ColdRestorer(ColdArchiver):
             last=rows[-1]['digest']
             for row in rows:
                 try:
-                    if not self._present(row['digest'],row['bytes']):continue
+                    identity=self._present(row['digest'],row['bytes'])
+                    if identity is None:continue
                     with self.store.pool.connection() as c:
                         lifecycle_lock(c)
-                        if is_managed_evicted(c,row['digest'],row['bytes']) and self._present(row['digest'],row['bytes']):
+                        if is_managed_evicted(c,row['digest'],row['bytes']) and self._unchanged(row['digest'],identity):
                             self._register(c,row['digest'],row['bytes'],None);reconciled+=1
                 except Exception:
                     # Retried next pass; due requests still run after it.
@@ -547,6 +562,8 @@ class ColdRestorer(ColdArchiver):
         from .media_requests import COLD_LOCAL,COLD_RESTORE_STALL_SECONDS
         digest,size,generation=row['digest'],row['bytes'],row['restore_requested_at']
         claimed='digest=%s AND restore_state=\'requested\' AND restore_requested_at=%s'
+        # Verified before the lifecycle lock; only its identity is rechecked under it.
+        identity=self._present(digest,size)
         with self.store.pool.connection() as c:
             lifecycle_lock(c)
             # Revalidate the claim: a stalled, superseded or disproved request is not ours.
@@ -558,9 +575,11 @@ class ColdRestorer(ColdArchiver):
                 c.execute('''UPDATE attachment_cold_copies SET restore_state='idle',restore_error=NULL,
                     restore_finished_at=clock_timestamp() WHERE '''+claimed,(digest,generation))
                 return False
-            if self._present(digest,size):
+            if identity is not None:
                 # Published by an interrupted attempt: register it, never fetch again.
-                self._register(c,digest,size,generation);return None
+                if self._unchanged(digest,identity):self._register(c,digest,size,generation);return None
+                # Replaced since it was verified: the next pass verifies it again.
+                return False
             reason,admission=self._admit(c,digest,size,(claimed,(digest,generation)))
         disproved=False
         if reason is None:

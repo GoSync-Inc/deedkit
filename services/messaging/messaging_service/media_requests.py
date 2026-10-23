@@ -187,7 +187,9 @@ def _request(store,c,p,attachment_id):
         return serial(result)
     active=c.execute('SELECT %s::timestamptz>clock_timestamp() AS active',
         (row['requested_until'],)).fetchone()['active']
-    if active and not fallback:
+    # A ready managed job in its window is only a cold restore's reserved fallback;
+    # nobody serves it without the restore grant (undo), so the provider is asked now.
+    if active and not fallback and not (managed and row['job_state']=='ready'):
         result.update(request_status='coalesced',requested_until=row['requested_until'])
         return serial(result)
     deferred=c.execute('''SELECT %s::timestamptz>=clock_timestamp()+interval '1 hour' AS deferred,
