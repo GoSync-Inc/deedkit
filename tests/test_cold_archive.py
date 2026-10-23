@@ -1124,19 +1124,22 @@ def test_collection_and_backup_proceed_during_a_slow_reconcile(env,archive,monke
         if Path(file.name).name==blob.digest:hashing.put(1);proceed.get(timeout=30)
         return digest(file,*args)
     monkeypatch.setattr(blobs.hashlib,'file_digest',slow)
+    done=[]
     def collect_and_back_up(n):
         ar.ingest(event(provider_id='during-reconcile-'+str(n)))
         with s.pool.connection() as c:
             file_lifecycle.begin_backup_fence(c,'synthetic-reconcile-'+str(n))
             file_lifecycle.end_backup_fence(c,'synthetic-reconcile-'+str(n))
+        done.append(n)
     report=[];worker=threading.Thread(target=lambda:report.append(restorer(env).run_once()));worker.start()
     stalls=[]
     try:
         while worker.is_alive():
             try:hashing.get(timeout=0.2)
             except queue.Empty:continue
-            other=threading.Thread(target=collect_and_back_up,args=(len(stalls),));other.start();other.join(3)
-            stalls.append(not other.is_alive());proceed.put(1);other.join(30)
+            n=len(stalls);other=threading.Thread(target=collect_and_back_up,args=(n,));other.start();other.join(3)
+            # Done only when the ingest and both fence calls returned, not when the thread died.
+            stalls.append(n in done);proceed.put(1);other.join(30)
     finally:
         for _ in range(4):proceed.put(1)
         worker.join(30)
@@ -1176,3 +1179,35 @@ def test_queued_restore_reaches_the_provider_after_the_gateway_grant_is_revoked(
         with s.pool.connection() as c:
             c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
             c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
+# spec: ANYM-350
+@pytest.mark.parametrize('swap',['rename_over','symlink'])
+def test_reconcile_registers_only_the_file_it_hashed(env,archive,monkeypatch,swap):
+    from messaging_service import blobs,file_lifecycle
+    _,_,key,_=archive;s,_,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid)
+    def crash(*args):raise RuntimeError('synthetic crash after publication')
+    with monkeypatch.context() as patch:
+        patch.setattr(file_lifecycle,'register_resident_original',crash)
+        with pytest.raises(RuntimeError,match='synthetic crash'):restorer(env).run_once()
+    # Past the deadline: only reconciliation may register the published file.
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_cold_copies SET restore_requested_at=clock_timestamp()-interval '1 hour' WHERE digest=%s",(blob.digest,))
+    path=s.files/blob.digest;data=path.read_bytes()
+    if swap=='symlink':
+        outside=s.files.parent/('outside-'+blob.digest);outside.write_bytes(data);path.unlink();path.symlink_to(outside)
+        try:assert restorer(env).run_once()['reconciled']==0 and not resident(s,blob.digest)
+        finally:path.unlink();outside.unlink()
+        return
+    digest=blobs.hashlib.file_digest;swapped=[]
+    def replaced(file,*args):
+        result=digest(file,*args)
+        if Path(file.name).name==blob.digest and not swapped:
+            # Same bytes, another inode: renamed over the entry after it was hashed.
+            other=s.files/'.pending-synthetic-swap';other.write_bytes(data);os.replace(other,path);swapped.append(1)
+        return result
+    monkeypatch.setattr(blobs.hashlib,'file_digest',replaced)
+    assert restorer(env).run_once()['reconciled']==0 and swapped and not resident(s,blob.digest)
+    # The replacement is verified on its own on the next pass.
+    assert restorer(env).run_once()['reconciled']==1 and resident(s,blob.digest)

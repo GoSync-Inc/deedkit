@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import threading
 
-from .file_lifecycle import _digest, _identity, lifecycle_lock
+from .file_lifecycle import _digest, _identity, _root_identity, lifecycle_lock
 from .storage_admission import MEDIA_RESERVE_BYTES
 
 MIB=1024**2
@@ -451,22 +451,33 @@ class ColdRestorer(ColdArchiver):
 
         Hashing a large original takes long; collection and backup take the
         same lock, so it is verified first and only its identity rechecked
-        under the lock (_unchanged), as file_lifecycle._complete does.
+        under the lock (_unchanged), as file_lifecycle._complete does. The
+        identity is the hashed descriptor's own, under the root it was opened in.
         """
-        from .blobs import Blob,BlobWriter
-        path=self.store.files/digest
+        _digest(digest)
+        try:root=os.open(self.store.files,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        except OSError:return None
         try:
-            before=os.lstat(path)
-            BlobWriter(self.store.files,reserve_bytes=0).verify(Blob(digest,size))
-            after=os.lstat(path)
-        except (RuntimeError,OSError):return None
-        return _identity(after) if _identity(before)==_identity(after) else None
+            def opener(name,flags):return os.open(name,flags|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=root)
+            with open(digest,'rb',opener=opener) as file:
+                before=os.fstat(file.fileno())
+                if not stat.S_ISREG(before.st_mode) or before.st_size!=size:return None
+                if hashlib.file_digest(file,'sha256').hexdigest()!=digest:return None
+                after=os.fstat(file.fileno())
+            if _identity(before)!=_identity(after):return None
+            return _root_identity(os.fstat(root)),_identity(after)
+        except OSError:return None
+        finally:os.close(root)
 
     def _unchanged(self,digest,identity):
-        """Under the lifecycle lock: the file verified by _present is still in place, unmodified."""
-        try:info=os.lstat(self.store.files/digest)
+        """Under the lifecycle lock: the CAS entry is still the hashed file in the same root."""
+        try:root=os.open(self.store.files,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
         except OSError:return False
-        return stat.S_ISREG(info.st_mode) and _identity(info)==identity
+        try:
+            info=os.stat(digest,dir_fd=root,follow_symlinks=False)
+            return stat.S_ISREG(info.st_mode) and (_root_identity(os.fstat(root)),_identity(info))==identity
+        except OSError:return False
+        finally:os.close(root)
 
     def _admit(self,c,digest,size,claimed):
         """Capacity check before any R2 read; lifecycle precedes the capacity lock.
