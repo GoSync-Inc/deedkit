@@ -2501,11 +2501,11 @@ def active_config():
         text = (CONFIG_DIRECTORY / "autodeploy.env").read_bytes().decode("ascii", "replace")
     except FileNotFoundError:
         return CONFIG
-    if re.search(r"[^\x20-\x7e\t\r\n]", text):
+    if re.search(r"[^\x20-\x7e\t\n]", text):  # no CR: systemd also ends a line (and a comment) there
         raise Refused(f"{CONFIG_DIRECTORY / 'autodeploy.env'} has a character status cannot read as systemd does; pass --config")
     found = CONFIG
     for line in text.split("\n"):
-        line = line.strip(" \t\r")
+        line = line.strip(" \t")
         if not line or line[0] in "#;":
             continue
         # Only plain KEY=value lines (one optional pair of quotes): what systemd's EnvironmentFile= reads the same way.
@@ -2514,7 +2514,7 @@ def active_config():
         if not match:
             raise Refused(f"{CONFIG_DIRECTORY / 'autodeploy.env'} has a line status cannot read as systemd does; pass --config")
         if match[1] == "DEEDKIT_DEPLOY_CONFIG":
-            found = match[2] if match[2] is not None else match[3] if match[3] is not None else match[4].strip(" \t\r")
+            found = match[2] if match[2] is not None else match[3] if match[3] is not None else match[4].strip(" \t")
     if not found:
         raise Refused(f"{CONFIG_DIRECTORY / 'autodeploy.env'} sets an empty DEEDKIT_DEPLOY_CONFIG; pass --config")
     return found
