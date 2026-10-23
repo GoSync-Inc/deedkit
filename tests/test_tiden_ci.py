@@ -577,13 +577,13 @@ def test_merge_queue_reporting_gets_no_tiden_credential_or_cli(tmp_path):
     assert config["env"]["SOURCE_BRANCH"] == prepared["env"]["SOURCE_BRANCH"] == "${{ github.head_ref || github.ref_name }}"
     assert config["env"]["EVENT_NAME"] == "${{ github.event_name }}"
     enabled_or_queue = "steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true'"
-    assert steps["actions/checkout"]["if"] == steps["actions/download-artifact"]["if"] == enabled_or_queue
+    assert steps["actions/checkout"]["if"] == enabled_or_queue
     # Only a configured non-queue run installs the CLI and receives the credential.
     for name in ("Install pinned Tiden CLI with integrity check", "Publish and verify branch association"):
         assert steps[name]["if"] == "steps.config.outputs.enabled == 'true'"
     queue = steps["Record that a merge queue run publishes nothing"]
     assert queue["if"] == "steps.config.outputs.queue == 'true'" and "env" not in queue
-    assert queue["run"] == 'python scripts/tiden_ci.py publish --directory "$RUNNER_TEMP/ci-evidence"'
+    assert queue["run"] == 'python scripts/tiden_ci.py queue-receipt --directory "$RUNNER_TEMP/ci-evidence"'
     assert f"({enabled_or_queue})" in steps["Retain Tiden association and verdict receipt"]["if"]
 
     def configure(**env):
@@ -612,6 +612,42 @@ def test_merge_queue_reporting_gets_no_tiden_credential_or_cli(tmp_path):
                           ("pull_request", "codex/gh-readonly-queue/x")]:
         queue = configure(EVENT_NAME=event, SOURCE_BRANCH=branch, **configured)[1] == ["enabled=false", "queue=true"]
         assert queue == merge_queue_run({"event": event, "git_branch": branch}), (event, branch)
+
+
+# spec: ANYM-500
+def test_a_merge_queue_run_records_its_skipped_receipt_without_downloading_the_evidence(tmp_path):
+    import os
+    import subprocess
+    import yaml
+    from scripts.tiden_ci import MERGE_QUEUE_SKIP
+    root = Path(__file__).resolve().parents[1]
+    job = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]["tiden"]
+    steps = {step.get("name") or step["uses"].split("@")[0]: step for step in job["steps"]}
+    # A hung download of evidence that checks / evidence already enforced cannot fail a queue run.
+    assert "queue" not in steps["actions/download-artifact"]["if"]
+    queue = steps["Record that a merge queue run publishes nothing"]
+    directory = tmp_path / "ci-evidence"  # absent, as without the download
+    completed = subprocess.run(["bash", "-e", "-c", queue["run"]], cwd=root, capture_output=True, text=True,
+                               env={"PATH": os.environ["PATH"], "RUNNER_TEMP": str(tmp_path)})
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads((directory / "tiden-route.json").read_text()) == {
+        "branch": None, "source": "skipped", "reason": MERGE_QUEUE_SKIP}
+    assert "::notice title=Tiden evidence not published::" in completed.stdout
+    assert [path.name for path in directory.iterdir()] == ["tiden-route.json"]
+
+
+# spec: ANYM-500
+def test_pull_request_and_push_runs_still_fail_without_their_evidence_artifact():
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    job = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]["tiden"]
+    steps = {step.get("name") or step["uses"].split("@")[0]: step for step in job["steps"]}
+    download = steps["actions/download-artifact"]
+    # A run that publishes downloads its evidence, and a failed download still fails the job.
+    assert download["if"] == "steps.config.outputs.enabled == 'true'" and download["with"]["name"] == "ci-evidence"
+    assert "continue-on-error" not in download and "continue-on-error" not in job
+    names = list(steps)
+    assert names.index("actions/download-artifact") < names.index("Publish and verify branch association")
 
 
 def image_workflow():

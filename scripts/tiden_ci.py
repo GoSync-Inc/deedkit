@@ -995,7 +995,7 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["assemble", "prepare", "verdict", "publish", "release"])
+    parser.add_argument("command", choices=["assemble", "prepare", "verdict", "publish", "queue-receipt", "release"])
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--fragments", type=Path)
     parser.add_argument("--producer", action="append", default=[], help="<job>:<job result>:<captured source SHA>")
@@ -1008,6 +1008,13 @@ def main() -> int:
     directory = args.directory.resolve()
     if args.command == "release":
         return release(args, directory)
+    if args.command == "queue-receipt":
+        # A merge queue run publishes nothing; its receipt needs no evidence download (ANYM-500).
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "tiden-route.json").write_text(json.dumps({"branch": None, "source": "skipped",
+                                                                "reason": MERGE_QUEUE_SKIP}))
+        print(f"::notice title=Tiden evidence not published::{MERGE_QUEUE_SKIP}; main CI publishes it after merge")
+        return 0
     if args.command == "assemble":
         ci_url = "https://github.com/{}/actions/runs/{}/attempts/{}".format(*(
             os.environ.get(name, "") for name in ("GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")))

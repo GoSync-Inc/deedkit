@@ -969,8 +969,10 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
+      # A merge queue run publishes nothing and its receipt needs no evidence: checks / evidence already enforced it,
+      # so a hung download cannot fail the queue (ANYM-500).
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        if: steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true'
+        if: steps.config.outputs.enabled == 'true'
         timeout-minutes: 3
         with:
           name: ci-evidence
@@ -1013,7 +1015,7 @@ jobs:
       - name: Record that a merge queue run publishes nothing
         if: steps.config.outputs.queue == 'true'
         timeout-minutes: 1
-        run: python scripts/tiden_ci.py publish --directory "$RUNNER_TEMP/ci-evidence"
+        run: python scripts/tiden_ci.py queue-receipt --directory "$RUNNER_TEMP/ci-evidence"
       - name: Record that a docs-only run publishes nothing
         if: steps.config.outputs.docs_only == 'true'
         timeout-minutes: 1
