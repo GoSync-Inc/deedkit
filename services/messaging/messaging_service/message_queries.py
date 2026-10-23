@@ -246,7 +246,10 @@ def filters(p, *, account='',chat='',sender='',accounts=None,chats=None,senders=
     if types is not None:
         normalized['chat_types']=sorted(types)
         if set(types)!=set(CHAT_TYPES):
-            clauses.append("EXISTS(SELECT 1 FROM chats ch WHERE ch.id=m.chat AND ch.account=m.account AND coalesce(ch.chat_type,'unknown')=ANY(%s))")
+            # The bare column keeps chats.chat_type statistics. coalesce() got a fixed 0.5% guess per type, so the
+            # planner walked every message of the (supposedly few) chats instead of the text indexes (ANYM-272, ANYM-501).
+            clauses.append("EXISTS(SELECT 1 FROM chats ch WHERE ch.id=m.chat AND ch.account=m.account AND (ch.chat_type=ANY(%s)"+
+                (' OR ch.chat_type IS NULL' if 'unknown' in types else '')+'))')
             args.append(sorted(types))
     for column,value in [('account',account),('chat',chat),('sender',sender)]:
         valid_text(value)
@@ -297,6 +300,9 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     if after and before or before and order=='relevance':raise APIError('invalid_filter')
     if fuzzy and (query_mode!='all' or not re.fullmatch(r'\w{3,64}',query,flags=re.UNICODE)):
         raise APIError('invalid_fuzzy_query')
+    # A common word over a large archive costs the plan past jit_optimize_above_cost: about 4.6 s of LLVM
+    # compilation under the pool's 5 s statement_timeout, for a query that runs in well under a second (as list_chats; ANYM-501).
+    c.execute('SET LOCAL jit=off')
     clauses,args,normalized=filters(p,account=account,chat=chat,sender=sender,accounts=accounts,
         chats=chats,senders=senders,from_time=from_time,to_time=to_time,direction=direction,exclude_channels=exclude_channels,
         chat_types=chat_types,include_channels=include_channels)
