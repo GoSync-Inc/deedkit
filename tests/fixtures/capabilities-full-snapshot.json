@@ -155,7 +155,7 @@
   "independent_key_permissions": true,
   "mutation_preview_digest_required": true,
   "new_permissions_inherited_by_existing_keys": false,
-  "operation_count": 59,
+  "operation_count": 60,
   "platform_counts_basis": "legacy_defaults_use_account_manifest_for_actual_support",
   "preview_digest_proves_owner_approval": false,
   "provider_session_owner": "existing_fenced_collector",
@@ -164,7 +164,7 @@
   "supported_by_account": {
    "telegram-demo": {
     "available_operations": [],
-    "count": 49,
+    "count": 51,
     "operations": [
      "add_contact",
      "add_participant",
@@ -199,7 +199,9 @@
      "reject_join_requests",
      "remove_participant",
      "rename_group",
+     "request_chat_history",
      "revoke_invite_link",
+     "search_messages_live",
      "send_contact",
      "send_file",
      "send_location",
@@ -272,7 +274,7 @@
    }
   },
   "supported_count_by_platform": {
-   "telegram": 49,
+   "telegram": 51,
    "whatsapp": 45
   },
   "tools": [

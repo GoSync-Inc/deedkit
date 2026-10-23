@@ -64,7 +64,7 @@ COPY scripts ./scripts
 COPY config ./config
 COPY services/messaging ./services/messaging
 COPY services/messaging/anymsg ./anymsg
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE .dockerignore ./
 COPY services/messaging/pyproject.toml ./services/messaging/pyproject.toml
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=whatsmeow-build /out/anymsg-whatsmeow /usr/local/bin/anymsg-whatsmeow

@@ -1,0 +1,336 @@
+diff --git a/deedkit_fork_test.go b/deedkit_fork_test.go
+new file mode 100644
+index 0000000..f989a8a
+--- /dev/null
++++ b/deedkit_fork_test.go
+@@ -0,0 +1,273 @@
++// Copyright (c) 2026 GoSync Inc.
++//
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++package whatsmeow
++
++import (
++	"context"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/sha256"
++	"encoding/binary"
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/coder/websocket"
++	"golang.org/x/crypto/hkdf"
++
++	"go.mau.fi/whatsmeow/appstate"
++	waBinary "go.mau.fi/whatsmeow/binary"
++	"go.mau.fi/whatsmeow/socket"
++	"go.mau.fi/whatsmeow/store"
++	"go.mau.fi/whatsmeow/types"
++)
++
++// forkAppStateStore holds one app state key; every other store call is a no-op.
++type forkAppStateStore struct{ store.NoopStore }
++
++var forkKeyID = []byte("deedkit-test-key")
++
++func (*forkAppStateStore) GetLatestAppStateSyncKeyID(context.Context) ([]byte, error) {
++	return forkKeyID, nil
++}
++
++func (*forkAppStateStore) GetAppStateSyncKey(context.Context, []byte) (*store.AppStateSyncKey, error) {
++	return &store.AppStateSyncKey{Data: make([]byte, 32)}, nil
++}
++
++// forkServer is a local websocket peer that speaks the post-handshake noise
++// transport. It counts app state mutation IQs and answers each one with the
++// action the test scripts for it.
++type forkServer struct {
++	t          *testing.T
++	srv        *httptest.Server
++	clientKey  cipher.AEAD
++	serverKey  cipher.AEAD
++	mutations  atomic.Int32
++	actions    []string // per mutation IQ: "conflict", "drop"
++	lock       sync.Mutex
++	connectErr error
++}
++
++func forkAEAD(t *testing.T, key []byte) cipher.AEAD {
++	block, err := aes.NewCipher(key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	aead, err := cipher.NewGCM(block)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return aead
++}
++
++func forkIV(count uint32) []byte {
++	iv := make([]byte, 12)
++	binary.BigEndian.PutUint32(iv[8:], count)
++	return iv
++}
++
++func newForkServer(t *testing.T, actions ...string) *forkServer {
++	// NoiseHandshake.Finish right after Start derives the transport keys from
++	// the start pattern alone, so both ends can compute them without a handshake.
++	h := hkdf.New(sha256.New, nil, []byte(socket.NoiseStartPattern), nil)
++	write, read := make([]byte, 32), make([]byte, 32)
++	if _, err := io.ReadFull(h, write); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := io.ReadFull(h, read); err != nil {
++		t.Fatal(err)
++	}
++	fs := &forkServer{t: t, clientKey: forkAEAD(t, write), serverKey: forkAEAD(t, read), actions: actions}
++	fs.srv = httptest.NewServer(http.HandlerFunc(fs.serve))
++	t.Cleanup(fs.srv.Close)
++	return fs
++}
++
++func (fs *forkServer) serve(w http.ResponseWriter, r *http.Request) {
++	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true}) // the client sends the WhatsApp Origin
++	if err != nil {
++		return
++	}
++	defer conn.CloseNow()
++	ctx := r.Context()
++	var readCounter, writeCounter uint32
++	for {
++		_, msg, err := conn.Read(ctx)
++		if err != nil {
++			return
++		}
++		for len(msg) >= 3 {
++			size := int(msg[0])<<16 | int(msg[1])<<8 | int(msg[2])
++			frame := msg[3 : 3+size]
++			msg = msg[3+size:]
++			plain, err := fs.clientKey.Open(nil, forkIV(readCounter), frame, nil)
++			readCounter++
++			if err != nil {
++				fs.t.Errorf("decrypt client frame: %v", err)
++				return
++			}
++			unpacked, err := waBinary.Unpack(plain)
++			if err != nil {
++				fs.t.Errorf("unpack client frame: %v", err)
++				return
++			}
++			node, err := waBinary.Unmarshal(unpacked)
++			if err != nil {
++				fs.t.Errorf("unmarshal client frame: %v", err)
++				return
++			}
++			if node.Tag != "iq" || node.AttrGetter().OptionalString("xmlns") != "w:sync:app:state" || node.AttrGetter().OptionalString("type") != "set" {
++				continue
++			}
++			n := int(fs.mutations.Add(1))
++			action := "drop"
++			if n <= len(fs.actions) {
++				action = fs.actions[n-1]
++			}
++			if action == "drop" {
++				return
++			}
++			reply := waBinary.Node{
++				Tag:   "iq",
++				Attrs: waBinary.Attrs{"id": node.AttrGetter().String("id"), "type": "result", "from": types.ServerJID},
++				Content: []waBinary.Node{{Tag: "sync", Content: []waBinary.Node{{
++					Tag:     "collection",
++					Attrs:   waBinary.Attrs{"name": string(appstate.WAPatchRegularHigh), "type": "error", "version": 1},
++					Content: []waBinary.Node{{Tag: "error", Attrs: waBinary.Attrs{"code": 409, "text": "conflict"}}},
++				}}}},
++			}
++			payload, err := waBinary.Marshal(reply)
++			if err != nil {
++				fs.t.Errorf("marshal reply: %v", err)
++				return
++			}
++			sealed := fs.serverKey.Seal(nil, forkIV(writeCounter), payload, nil)
++			writeCounter++
++			out := append([]byte{byte(len(sealed) >> 16), byte(len(sealed) >> 8), byte(len(sealed))}, sealed...)
++			if err := conn.Write(ctx, websocket.MessageBinary, out); err != nil {
++				return
++			}
++		}
++	}
++}
++
++// connect installs a fresh noise socket to the server on cli, as a completed
++// login would. With reconnect set, a dropped socket is replaced at once, so a
++// frame retry finds a live connection to write to.
++func (fs *forkServer) connect(cli *Client, reconnect bool) error {
++	frames := socket.NewFrameSocket(cli.Log, fs.srv.Client())
++	frames.URL = "ws" + strings.TrimPrefix(fs.srv.URL, "http")
++	frames.Header = nil
++	if err := frames.Connect(context.Background()); err != nil {
++		return err
++	}
++	nh := socket.NewNoiseHandshake()
++	nh.Start(socket.NoiseStartPattern, nil)
++	onDisconnect := func(ctx context.Context, ns *socket.NoiseSocket, _ bool) {
++		cli.onDisconnect(ctx, ns, false)
++		if reconnect {
++			if err := fs.connect(cli, false); err != nil {
++				fs.lock.Lock()
++				fs.connectErr = err
++				fs.lock.Unlock()
++			}
++		}
++	}
++	ns, err := nh.Finish(frames, cli.makeFrameHandler(make(chan *waBinary.Node, handlerQueueSize)), onDisconnect)
++	if err != nil {
++		return err
++	}
++	cli.socketLock.Lock()
++	cli.socket = ns
++	cli.socketLock.Unlock()
++	cli.isLoggedIn.Store(true)
++	cli.closeSocketWaitChan()
++	return nil
++}
++
++func newForkClient(t *testing.T) *Client {
++	fake := &forkAppStateStore{}
++	device := *store.NoopDevice
++	device.AppState, device.AppStateKeys = fake, fake
++	cli := NewClient(&device, nil)
++	cli.EnableAutoReconnect = false
++	t.Cleanup(func() {
++		cli.socketLock.Lock()
++		sock := cli.socket
++		cli.socket = nil
++		cli.socketLock.Unlock()
++		if sock != nil {
++			sock.Stop(true, false)
++		}
++	})
++	return cli
++}
++
++// TestForkAppStateConflictNoReplay drives SendAppState over a local noise
++// socket. A 409 conflict is a definite rejection, so the library may send one
++// new patch IQ; under WithoutFrameRetry a disconnection after that permitted
++// resend ends in a DisconnectedError and never writes the patch again, even
++// though a connection is available again at once.
++func TestForkAppStateConflictNoReplay(t *testing.T) {
++	patch := appstate.BuildMute(types.NewJID("10000000000", types.DefaultUserServer), true, time.Hour)
++	cases := []struct {
++		name      string
++		marked    bool
++		actions   []string
++		mutations int32
++		wantErr   func(error) bool
++	}{
++		{"conflict permits one resend, repeated conflict no third", true, []string{"conflict", "conflict"}, 2,
++			func(err error) bool { return errors.Is(err, ErrAppStateUpdate) }},
++		{"disconnect after the permitted resend is not replayed", true, []string{"conflict", "drop"}, 2,
++			func(err error) bool { var de *DisconnectedError; return errors.As(err, &de) }},
++		// Control: the same script without the marker replays the dropped
++		// patch on the new connection, so the harness can observe a replay.
++		{"unmarked context replays after reconnect (control)", false, []string{"conflict", "drop", "conflict"}, 3,
++			func(err error) bool { return err != nil }},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			server := newForkServer(t, tc.actions...)
++			cli := newForkClient(t)
++			if err := server.connect(cli, true); err != nil {
++				t.Fatal(err)
++			}
++			ctx := context.Background()
++			if tc.marked {
++				ctx = WithoutFrameRetry(ctx)
++			}
++			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
++			defer cancel()
++			start := time.Now()
++			err := cli.SendAppState(ctx, patch)
++			if !tc.wantErr(err) {
++				t.Fatalf("SendAppState error = %v", err)
++			}
++			if tc.marked && time.Since(start) > 2*time.Second {
++				t.Fatalf("SendAppState took %s, want an immediate answer", time.Since(start))
++			}
++			// Give a late replay the chance to arrive before counting.
++			time.Sleep(200 * time.Millisecond)
++			if got := server.mutations.Load(); got != tc.mutations {
++				t.Fatalf("server saw %d patch IQs, want %d", got, tc.mutations)
++			}
++			server.lock.Lock()
++			defer server.lock.Unlock()
++			if server.connectErr != nil {
++				t.Fatalf("reconnect failed: %v", server.connectErr)
++			}
++		})
++	}
++}
+diff --git a/request.go b/request.go
+index b6db05b..60ea8c5 100644
+--- a/request.go
++++ b/request.go
+@@ -61,10 +61,15 @@ func (cli *Client) waitResponse(reqID string) chan *waBinary.Node {
+ 	return ch
+ }
+ 
++// cancelResponse unregisters a waiter without closing it: receiveResponse may
++// already have taken the waiter out of the map and be sending to it outside the
++// lock, and a send on a closed channel panics. The channel is buffered, so that
++// send never blocks; an abandoned channel is garbage collected.
+ func (cli *Client) cancelResponse(reqID string, ch chan *waBinary.Node) {
+ 	cli.responseWaitersLock.Lock()
+-	close(ch)
+-	delete(cli.responseWaiters, reqID)
++	if current, ok := cli.responseWaiters[reqID]; ok && current == ch {
++		delete(cli.responseWaiters, reqID)
++	}
+ 	cli.responseWaitersLock.Unlock()
+ }
+ 
+@@ -182,6 +187,23 @@ func (cli *Client) sendIQ(ctx context.Context, query infoQuery) (*waBinary.Node,
+ 	}
+ }
+ 
++type noFrameRetryKey struct{}
++
++// WithoutFrameRetry returns a context under which a request interrupted by a
++// websocket disconnection is never written again after reconnecting: the
++// caller gets a DisconnectedError instead. Use it for requests that must not
++// be applied twice, such as message sends and state changes, where the frame
++// may already have reached the server before the disconnection.
++func WithoutFrameRetry(ctx context.Context) context.Context {
++	return context.WithValue(ctx, noFrameRetryKey{}, true)
++}
++
++// FrameRetryDisabled reports whether ctx was derived from WithoutFrameRetry.
++func FrameRetryDisabled(ctx context.Context) bool {
++	disabled, _ := ctx.Value(noFrameRetryKey{}).(bool)
++	return disabled
++}
++
+ func (cli *Client) retryFrame(
+ 	ctx context.Context,
+ 	reqType,
+@@ -190,6 +212,10 @@ func (cli *Client) retryFrame(
+ 	origResp *waBinary.Node,
+ 	timeout time.Duration,
+ ) (*waBinary.Node, error) {
++	if FrameRetryDisabled(ctx) {
++		cli.Log.Debugf("%s (%s) was interrupted by websocket disconnection (%s), not retrying as the caller disabled frame retries", id, reqType, origResp)
++		return nil, &DisconnectedError{Action: reqType, Node: origResp}
++	}
+ 	if isAuthErrorDisconnect(origResp) {
+ 		cli.Log.Debugf("%s (%s) was interrupted by websocket disconnection (%s), not retrying as it looks like an auth error", id, reqType, origResp)
+ 		return nil, &DisconnectedError{Action: reqType, Node: origResp}

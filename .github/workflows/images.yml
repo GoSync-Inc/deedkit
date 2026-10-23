@@ -94,6 +94,13 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.source_ref }}
+      # ANYM-441: the forked whatsmeow pin must equal upstream + fork.patch before an image compiles it.
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.9'
+          cache: false
+      - name: Check the whatsmeow fork against upstream and fork.patch
+        run: python3 scripts/check_whatsmeow_fork.py
       - name: Build and smoke-test the production target without providers
         env:
           TARGET: ${{ matrix.target }}

@@ -734,7 +734,11 @@ def test_image_build_job_is_gated_only_by_the_change_decision():
     assert build["strategy"]["matrix"]["target"] == [
         "runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "calls", "backup"]
     # The build and smoke test come first; the publication steps after it only export what was tested.
-    assert build["steps"][1]["run"] == 'python3 scripts/production.py check-image --target "$TARGET"'
+    names = [step.get("name") for step in build["steps"]]
+    check = names.index("Build and smoke-test the production target without providers")
+    assert build["steps"][check]["run"] == 'python3 scripts/production.py check-image --target "$TARGET"'
+    # ANYM-441: the whatsmeow fork content check runs before check-image compiles the native adapter.
+    assert names.index("Check the whatsmeow fork against upstream and fork.patch") < check
     assert all("docker build" not in step.get("run", "") for step in build["steps"])
 
 
@@ -799,6 +803,16 @@ def test_image_inputs_cover_every_source_the_image_targets_build_from(tmp_path):
                                          "COPY --from=2 /s /s\n")
     assert sorted(dockerfile_sources(tmp_path / "Dockerfile", "final")) == ["a", "b", "c", "d"]
     assert dockerfile_sources(tmp_path / "Dockerfile", "") == dockerfile_sources(tmp_path / "Dockerfile", "final")
+
+
+# spec: ANYM-300
+def test_the_root_build_context_leaves_out_env_files_at_every_depth_but_keeps_the_examples():
+    lines = [line.strip() for line in (Path(__file__).resolve().parents[1] / ".dockerignore").read_text().splitlines()]
+    rules = [line for line in lines if line and not line.startswith("#")]
+    for excluded in ("**/.env", "**/.env.*"):
+        assert excluded in rules
+    # Docker applies the last matching rule, so the example exception must come after the exclusions.
+    assert rules.index("!**/.env.example") > rules.index("**/.env.*")
 
 
 

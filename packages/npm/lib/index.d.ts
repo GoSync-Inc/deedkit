@@ -1,6 +1,15 @@
 export type ReplyReason = 'no_reply_needed' | 'spam_or_mailing' | 'handled_elsewhere' | 'other';
 export type Json = null | boolean | number | string | Json[] | {[key: string]: Json};
 export type Arguments = {[key: string]: Json};
+/** Archive search; live (Telegram, first page only) also asks Telegram itself (ANYM-478). */
+export type SearchArgs = Arguments & {
+  /** off (default): archive only; auto: only when the archive answer is thin; on: always. */
+  live?: 'off' | 'auto' | 'on';
+  /** One wait for all live searches, 0-20 seconds (default 15). */
+  wait_s?: number | null;
+  /** Keep one per intent: a repeat queues no new provider request. */
+  request_id?: string;
+};
 /** Reply-queue promotional filter (ANYM-427); exclude is the default for awaiting_reply=true. */
 export type PromotionalFilter = 'exclude' | 'include' | 'only';
 export type ListChatsArgs = Arguments & {awaiting_reply?: boolean; exclude_likely_broadcasts?: boolean;
@@ -192,7 +201,7 @@ export declare class AnyMsgClient {
   unmuteReplySource(args: {chat_id?: string; account?: string; sender_id?: string}): Promise<Record<string, unknown>>;
   listReplyDismissals(args: {kind?: 'dismissed' | 'snoozed' | 'muted'; after?: string; limit?: number}): Promise<Record<string, unknown>>;
   listChats(args?: ListChatsArgs): Promise<ListChatsResult>;
-  search(args?: Arguments): Promise<Record<string, unknown>>;
+  search(args?: SearchArgs): Promise<Record<string, unknown>>;
   searchPeople(args?: Arguments): Promise<Record<string, unknown>>;
   searchFiles(args?: Arguments): Promise<Record<string, unknown>>;
   getMessages(args: Arguments): Promise<Record<string, unknown>>;

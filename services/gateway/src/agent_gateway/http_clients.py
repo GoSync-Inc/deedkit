@@ -70,6 +70,7 @@ class Clients:
         self.metadata, self.bulk, self.budgets, self.bulk_budgets = {}, {}, {}, {}
         self.uploads, self.upload_budgets = {}, {}
         self.waits, self.wait_budgets = {}, {}
+        self.searches, self.search_budgets = {}, {}
         self.upload_rate = UploadRate()
         self.closed = False
 
@@ -84,7 +85,7 @@ class Clients:
                               "host_header": target.get("host_header") or urlsplit(target["url"]).netloc}
                 pools = [(self.metadata, 8), (self.bulk, 2)]
                 if module == "messaging":
-                    pools.extend([(self.uploads, 2), (self.waits, 2)])
+                    pools.extend([(self.uploads, 2), (self.waits, 2), (self.searches, 4)])
                 for container, maximum in pools:
                     container[module] = httpx.AsyncClient(
                         base_url=target["url"].rstrip("/"),
@@ -99,13 +100,15 @@ class Clients:
                 if module == "messaging":
                     self.upload_budgets[module] = Budget(2, 4)
                     self.wait_budgets[module] = Budget(2, 4)
+                    # ANYM-478: a search with live waits up to 20 s; its own pool keeps sends and reads admitted.
+                    self.search_budgets[module] = Budget(4, 4)
             return self
         except BaseException:
             await self.__aexit__(None, None, None)
             raise
 
     async def __aexit__(self, *args):
-        for client in [*self.metadata.values(), *self.bulk.values(), *self.uploads.values(), *self.waits.values()]:
+        for client in [*self.metadata.values(), *self.bulk.values(), *self.uploads.values(), *self.waits.values(), *self.searches.values()]:
             await client.aclose()
         self.upload_rate.observations.clear()
         self.closed = True
@@ -120,8 +123,11 @@ class Clients:
             operation == "wait_for_subscription_events"
             or operation == "send_message" and arguments.get("wait_s", 0) > 0
         )
+        searching = module == "messaging" and operation == "search" and arguments.get("live", "off") != "off"
         if uploading:
             budget, client = self.upload_budgets[module], self.uploads[module]
+        elif searching:
+            budget, client = self.search_budgets[module], self.searches[module]
         elif waiting:
             budget, client = self.wait_budgets[module], self.waits[module]
         else:

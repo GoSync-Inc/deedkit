@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import hashlib
 import inspect
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -20,13 +21,19 @@ import time
 
 from telethon import errors, functions, types, utils
 
+from .envelope import canonical, stable_id
+from .messenger_operations import HISTORY, LIVE_SEARCH, live_cursor_binding
+
+log = logging.getLogger('anymsg.live_search')
+history_log = logging.getLogger('anymsg.chat_history')
+
 
 MAX_ORIGINAL_BYTES = 32 * 1024 * 1024
 MAX_PROFILE_PAGE = 50
 READ_OPERATIONS = frozenset({
     'chat_info', 'list_participants', 'get_reactions', 'get_message_info',
     'list_topics', 'get_profile', 'list_contacts', 'get_contact', 'list_blocked',
-    'get_invite_link', 'check_chat_link',
+    'get_invite_link', 'check_chat_link', LIVE_SEARCH, HISTORY,
 })
 PARAMETERS = {
     'chat_info': set(), 'list_participants': {'limit', 'offset'},
@@ -54,6 +61,8 @@ PARAMETERS = {
     'set_slow_mode': {'seconds'}, 'list_join_requests': {'limit'},
     'approve_join_requests': {'user_ids'}, 'reject_join_requests': {'user_ids'},
     'check_chat_link': {'link'}, 'join_chat': {'link'},
+    LIVE_SEARCH: {'query', 'chat_types', 'filter', 'from_time', 'to_time', 'limit', 'cursor'},
+    HISTORY: {'count', 'before_message', 'around_message', 'from_time', 'to_time'},
 }
 # ANYM-242: each setter owns one value; the default rights flag it changes, or slow mode.
 GROUP_SETTERS = {'set_group_messages_admins_only': ('messages_admins_only', 'enabled', 'send_messages'),
@@ -311,7 +320,7 @@ async def _execute(client, job, *, verified_self=None, governor=None):
 
     check_policy()
 
-    async def rpc(fn, *, mutation=False, budget=False):
+    async def rpc(fn, *, mutation=False, budget=False, scope=None):
         async def guarded():
             nonlocal started_mutation
             check_expiry()
@@ -329,7 +338,11 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 if report is not None:
                     report('started')
             return await fn()
-        return await governor.call(guarded, 'provider_command') if governor else await guarded()
+        if governor is None:
+            return await guarded()
+        if scope is not None:
+            return await governor.scoped_call(guarded, 'provider_command', scope)
+        return await governor.call(guarded, 'provider_command')
 
     async def invoke(request, *, mutation=False):
         return await rpc(lambda: client(request), mutation=mutation)
@@ -470,6 +483,12 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         if operation in ('check_chat_link', 'join_chat') and (not isinstance(parameters.get('link'), str) or
                 not CHAT_LINK.fullmatch(parameters['link'])):
             reject('invalid_parameters')
+
+        if operation == LIVE_SEARCH:
+            return await live_search(client, job, parameters, governor, rpc, allowed_provider_id,
+                                     referenced_peers, check_policy)
+        if operation == HISTORY:
+            return await chat_history(client, job, parameters, governor, rpc, referenced_peers, check_policy)
 
         account_only = {'list_contacts', 'list_blocked', 'get_contact', 'get_profile',
                         'add_contact', 'delete_contact', 'block_contact', 'unblock_contact',
@@ -1074,6 +1093,301 @@ async def _execute(client, job, *, verified_self=None, governor=None):
     finally:
         if stream is not None:
             stream.close()
+
+
+LIVE_FILTERS = {'documents': types.InputMessagesFilterDocument, 'photos': types.InputMessagesFilterPhotos,
+                'links': types.InputMessagesFilterUrl, 'voice': types.InputMessagesFilterVoice}
+LIVE_FLAGS = {'private': 'users_only', 'group': 'groups_only', 'channel': 'broadcasts_only'}
+LIVE_TEXT = 300
+# Issued cursors: random token -> (binding, position). In memory and bounded: the position may
+# name a message or chat the policy excludes, so an agent sees only the token.
+LIVE_CURSORS = {}
+LIVE_CURSORS_MAX = 1024
+# Leaves room for the archive fields ANYM-476 adds to each hit after the request (about 60 bytes x 50).
+LIVE_RECEIPT_BYTES = 52000
+
+
+def chat_kind(entity):
+    if isinstance(entity, types.User):
+        return 'private'
+    if isinstance(entity, (types.Chat, types.ChatForbidden)):
+        return 'group'
+    if isinstance(entity, (types.Channel, types.ChannelForbidden)):
+        return 'group' if getattr(entity, 'megagroup', False) or getattr(entity, 'gigagroup', False) else 'channel'
+    return None
+
+
+def entity_name(entity):
+    if isinstance(entity, types.User):
+        return safe_text(' '.join(p for p in (entity.first_name, entity.last_name) if p) or entity.username, 128)
+    return safe_text(getattr(entity, 'title', None), 128)
+
+
+def cursor_peer(entity):
+    """The offset peer of the next searchGlobal page as plain integers, never a TL object."""
+    if isinstance(entity, types.User) and entity.access_hash is not None:
+        return ['u', entity.id, entity.access_hash]
+    if isinstance(entity, types.Chat):
+        return ['c', entity.id, 0]
+    if isinstance(entity, types.Channel) and entity.access_hash is not None:
+        return ['h', entity.id, entity.access_hash]
+    return None
+
+
+def remember_cursor(binding, position):
+    token = secrets.token_urlsafe(16)
+    LIVE_CURSORS[token] = (binding, position)
+    while len(LIVE_CURSORS) > LIVE_CURSORS_MAX:
+        LIVE_CURSORS.pop(next(iter(LIVE_CURSORS)))
+    return token
+
+
+def recall_cursor(token, binding):
+    """The position of a cursor issued for exactly this binding; unknown (restart) or other: invalid_cursor."""
+    entry = LIVE_CURSORS.get(token) if isinstance(token, str) else None
+    if entry is None or entry[0] != binding:
+        reject('invalid_cursor')
+    return dict(entry[1])
+
+
+def input_offset_peer(value):
+    if value is None:
+        return types.InputPeerEmpty()
+    kind, number, access_hash = value
+    return {'u': lambda: types.InputPeerUser(number, access_hash), 'c': lambda: types.InputPeerChat(number),
+            'h': lambda: types.InputPeerChannel(number, access_hash)}[kind]()
+
+
+def utc_seconds(value):
+    return datetime.fromisoformat(value).timestamp() if value else None
+
+
+async def live_search(client, job, parameters, governor, rpc, allowed_provider_id, referenced_peers, check_policy):
+    """ANYM-475: one governed Telegram search request; hits the collection policy excludes are dropped.
+
+    The query leaves the process only to Telegram: no log line, telemetry or error
+    names it. Only counts, duration and FloodWait seconds are logged."""
+    from .commands import CommandRejected
+    from .telegram_governor import ProviderRateLimited
+    bounded_text(parameters.get('query'), 256)
+    limit = integer(parameters.get('limit', 20), 1, 50)
+    types_wanted = parameters.get('chat_types')
+    if types_wanted is not None and (not isinstance(types_wanted, list) or not types_wanted or
+                                     set(types_wanted) - set(LIVE_FLAGS)):
+        reject('invalid_parameters')
+    if parameters.get('filter') is not None and parameters['filter'] not in LIVE_FILTERS:
+        reject('invalid_parameters')
+    try:
+        since, until = utc_seconds(parameters.get('from_time')), utc_seconds(parameters.get('to_time'))
+    except (TypeError, ValueError):
+        reject('invalid_parameters')
+    account, chat_id = job.get('account'), job.get('chat_id') or ''
+    chat = number_id(job.get('provider_chat'), marked=True) if chat_id else None
+    binding = live_cursor_binding(account, chat_id, parameters)
+    position = recall_cursor(parameters['cursor'], binding) if 'cursor' in parameters else {}
+    if chat is not None:
+        referenced_peers.add(str(chat))
+    else:
+        # Without a chat the default leaves channels out, as the archive search does.
+        types_wanted = types_wanted or ['private', 'group']
+    check_policy()
+    started, method = time.monotonic(), 'search' if chat is not None else 'search_global'
+    counts = {'returned': 0, 'dropped': 0, 'flood_wait_s': 0}
+
+    def finish(state):
+        log.info('live_search method=%s state=%s returned=%d dropped=%d flood_wait_s=%d duration_ms=%d', method,
+                 state, counts['returned'], counts['dropped'], counts['flood_wait_s'],
+                 int((time.monotonic() - started) * 1000))
+
+    def limited(seconds, state):
+        finish(state)
+        raise CommandRejected('rate_limited', retry_after=max(1, int(seconds)))
+
+    if governor is not None:
+        # Admission before any provider call counts every request, entity resolution included.
+        wait = await governor.admit('search', 2 if chat is not None else 1)
+        if wait:
+            limited(wait, 'refused')
+    search_filter = LIVE_FILTERS[parameters['filter']]() if parameters.get('filter') else types.InputMessagesFilterEmpty()
+    # Telegram dates are whole seconds: min_date and max_date are both exclusive.
+    min_date = math.ceil(since) - 1 if since is not None else None
+    max_date = math.ceil(until) if until is not None else None
+    try:
+        if chat is not None:
+            peer = await rpc(lambda: client.get_input_entity(chat), scope='search')
+            request = functions.messages.SearchRequest(peer, parameters['query'], search_filter, min_date, max_date,
+                position.get('i', 0), 0, limit, 0, 0, 0)
+        else:
+            flags = {LIVE_FLAGS[types_wanted[0]]: True} if len(types_wanted) == 1 else {}
+            request = functions.messages.SearchGlobalRequest(parameters['query'], search_filter, min_date, max_date,
+                position.get('r', 0), input_offset_peer(position.get('p')), position.get('i', 0), limit, **flags)
+        response = await rpc(lambda: client(request), scope='search')
+    except ProviderRateLimited as exc:
+        counts['flood_wait_s'] = exc.seconds
+        limited(exc.seconds, 'flood_wait')
+    except (errors.ChannelPrivateError, errors.ChatAdminRequiredError, errors.PeerIdInvalidError):
+        finish('refused')
+        reject('not_found')
+    except errors.RPCError:
+        finish('provider_error')
+        reject('operation_rejected')
+    entities = {}
+    for entity in list(getattr(response, 'chats', None) or []) + list(getattr(response, 'users', None) or []):
+        try:
+            entities[str(utils.get_peer_id(entity))] = entity
+        except (TypeError, ValueError):
+            continue
+    raw = [m for m in (getattr(response, 'messages', None) or [])[:limit] if isinstance(m, types.Message)]
+    hits, kept = [], job.get('_live_hits')
+    known = {int(key): entity for key, entity in entities.items()}
+    for message in raw:
+        try:
+            provider_chat = str(utils.get_peer_id(message.peer_id))
+        except (TypeError, ValueError):
+            counts['dropped'] += 1
+            continue
+        if not allowed_provider_id(provider_chat) or chat is not None and provider_chat != str(chat):
+            counts['dropped'] += 1
+            continue
+        entity = entities.get(provider_chat)
+        kind = chat_kind(entity)
+        moment = message.date.timestamp() if message.date else None
+        if (types_wanted and kind not in types_wanted or moment is None or since is not None and moment < since or
+                until is not None and moment >= until):
+            continue
+        sender = str(utils.get_peer_id(message.from_id)) if message.from_id else provider_chat if kind == 'private' else None
+        hits.append({'chat': stable_id('chat', account, provider_chat), 'chat_title': entity_name(entity),
+                     'chat_type': kind, 'provider_id': str(message.id),
+                     'time': message.date.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                     'sender': {'id': sender, 'name': entity_name(entities.get(sender)) if sender else None},
+                     'text': safe_text(message.message, LIVE_TEXT) or ''})
+        if kept is not None:
+            # ANYM-476: the collector archives these after the request; the receipt never carries them.
+            # Initialized as iter_messages does for a history page: cached sender and chat, outgoing
+            # Saved Messages. It uses only this response's entities, never the network.
+            try:
+                message._finish_init(client, known, None)
+            except Exception:
+                message = None
+            kept.append((message, hits[-1], kind, entity_name(entity)))
+    next_cursor = None
+    if len(raw) >= limit and raw and not isinstance(response, types.messages.Messages):
+        last = raw[-1]
+        place = {'i': last.id}
+        if chat is None:
+            # Without next_rate Telegram continues from the last returned message's date.
+            place.update(r=getattr(response, 'next_rate', None) or (int(last.date.timestamp()) if last.date else 0),
+                         p=cursor_peer(entities.get(str(utils.get_peer_id(last.peer_id)))))
+        next_cursor = remember_cursor(binding, place)
+    total = getattr(response, 'count', None)
+    result = {'outcome': 'confirmed', 'hits': hits, 'next_cursor': next_cursor,
+              'provider_total_approx': total if type(total) is int else len(raw), 'basis': 'live_provider_search'}
+    width = LIVE_TEXT
+    while len(canonical(result)) > LIVE_RECEIPT_BYTES and width:
+        # Bound the receipt (commands.py safe_result: 60 KB) by shortening every free-text field, never by
+        # dropping hits: the fixed fields of 50 hits stay far below the bound, so width 0 always fits.
+        width //= 2
+        for hit in hits:
+            hit['text'] = hit['text'][:width]
+            for holder, field in ((hit, 'chat_title'), (hit['sender'], 'name')):
+                if holder[field]:
+                    holder[field] = holder[field][:width]
+    counts['returned'] = len(hits)
+    finish('done')
+    return result
+
+
+async def chat_history(client, job, parameters, governor, rpc, referenced_peers, check_policy):
+    """ANYM-477: one governed history page of one archived chat at one anchor.
+
+    The backend resolved an explicit anchor to provider_message_id and the collector the default
+    one (the oldest archived message; none in an empty chat, which starts from the newest). The
+    messages go to the collector (job['_history']) for the archive; the receipt has counts only."""
+    from .commands import CommandRejected
+    from .telegram_governor import ProviderRateLimited
+    count = integer(parameters.get('count', 50), 1, 100)
+    around, timed = 'around_message' in parameters, 'from_time' in parameters or 'to_time' in parameters
+    if ('before_message' in parameters) + around + timed > 1:
+        reject('invalid_parameters')
+    try:
+        since, until = utc_seconds(parameters.get('from_time')), utc_seconds(parameters.get('to_time'))
+    except (TypeError, ValueError):
+        reject('invalid_parameters')
+    chat = number_id(job.get('provider_chat'), marked=True)
+    anchor = 0 if timed or not job.get('provider_message_id') else number_id(job['provider_message_id'])
+    if (around or 'before_message' in parameters) and not anchor:
+        reject('invalid_parameters')
+    referenced_peers.add(str(chat))
+    check_policy()
+    started, counts = time.monotonic(), {'fetched': 0, 'flood_wait_s': 0}
+
+    def finish(state):
+        history_log.info('chat_history state=%s fetched=%d flood_wait_s=%d duration_ms=%d', state, counts['fetched'],
+                         counts['flood_wait_s'], int((time.monotonic() - started) * 1000))
+
+    def limited(seconds, state):
+        finish(state)
+        raise CommandRejected('rate_limited', retry_after=max(1, int(seconds)))
+
+    if governor is not None:
+        # Entity resolution and the page: both are counted before any provider call.
+        wait = await governor.admit('chat_history', 2)
+        if wait:
+            limited(wait, 'refused')
+    # Telegram returns messages older than offset_id or sent before offset_date (whole seconds), newest first.
+    offset_date = datetime.fromtimestamp(math.ceil(until), timezone.utc) if until is not None else None
+    try:
+        peer = await rpc(lambda: client.get_input_entity(chat), scope='chat_history')
+        request = functions.messages.GetHistoryRequest(peer, anchor, offset_date, -(count // 2) if around else 0,
+                                                       count, 0, 0, 0)
+        response = await rpc(lambda: client(request), scope='chat_history')
+    except ProviderRateLimited as exc:
+        counts['flood_wait_s'] = exc.seconds
+        limited(exc.seconds, 'flood_wait')
+    except (errors.ChannelPrivateError, errors.ChatAdminRequiredError, errors.PeerIdInvalidError):
+        finish('refused')
+        reject('not_found')
+    except errors.RPCError:
+        finish('provider_error')
+        reject('operation_rejected')
+    entities = {}
+    for entity in list(getattr(response, 'chats', None) or []) + list(getattr(response, 'users', None) or []):
+        try:
+            entities[str(utils.get_peer_id(entity))] = entity
+        except (TypeError, ValueError):
+            continue
+    known = {int(key): entity for key, entity in entities.items()}
+    entity = entities.get(str(chat))
+    returned = list(getattr(response, 'messages', None) or [])[:count]
+    kept, below, found = [], False, job.get('_history')
+    for message in returned:
+        moment = message.date.timestamp() if getattr(message, 'date', None) else None
+        if since is not None and moment is not None and moment < since:
+            below = True
+            continue
+        try:
+            same = str(utils.get_peer_id(message.peer_id)) == str(chat)
+        except (TypeError, ValueError):
+            same = False
+        # Service messages (joins, titles, calls) are history as iter_messages returns them.
+        if not isinstance(message, (types.Message, types.MessageService)) or not same or (until is not None and (moment is None or moment >= until)):
+            continue
+        kept.append(message)
+        if found is not None:
+            # Initialized as iter_messages does for a history page, from this response's entities only.
+            try:
+                message._finish_init(client, known, None)
+            except Exception:
+                message = None
+            found.append((message, {}, chat_kind(entity), entity_name(entity)))
+    result = {'outcome': 'confirmed', 'delivery': 'immediate', 'fetched': len(kept), 'basis': 'live_provider_history'}
+    if timed:
+        result['range_exhausted'] = below or len(returned) < count
+    elif not around:
+        result['provider_history_start_reached'] = len(returned) < count
+    counts['fetched'] = len(kept)
+    finish('done')
+    return result
 
 
 async def execute(client, job, *, verified_self=None, governor=None):

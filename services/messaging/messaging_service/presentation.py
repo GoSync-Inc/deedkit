@@ -376,6 +376,9 @@ def transcript(method, result):
         output['next_cursor']=result.get('next_cursor')
         empty=(result.get('result_evidence') or {}).get('empty_reason')
         if empty:output['empty_reason']=empty
+        # ANYM-478: the live part and the hint have no transcript lines of their own.
+        for key in ('live','suggested_call'):
+            if key in (result.get('result_evidence') or {}):output[key]=result['result_evidence'][key]
     if files:output['files']=files[:20]
     output.update({k:result[k] for k in ('coverage','synthetic') if k in result})
     output['detail']='transcript'

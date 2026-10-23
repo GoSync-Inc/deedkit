@@ -65,7 +65,7 @@ AUDIT_CODES = frozenset({
     'upload_offset_conflict','upload_hash_mismatch',
     'subscription_wait_timeout','consumer_already_initialized','media_request_limit','subscription_receipt_limit','invalid_feedback','feedback_limit',
     'invalid_receiver','delivery_not_configured','invalid_phone','chat_not_collected',
-    'identity_unresolved','provider_timeout',
+    'identity_unresolved','provider_timeout','session_unavailable','invalid_anchor',
 })
 UNSET = object()
 

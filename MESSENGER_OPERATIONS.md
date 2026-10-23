@@ -122,9 +122,9 @@ with `operation_not_started`.
 `result.outcome` separately preserves `confirmed`, `submitted` or `unknown` provider
 evidence when it exists. Status is visible only within the originating key/principal's permitted scope.
 No automatic retry of ambiguous writes is provided by the SDK or command worker.
-Native WhatsApp group operations also send each provider query once and answer
-within 20 s; other native WhatsApp mutations still go through the library
-transport, which may resend a frame after a reconnect (docs/whatsapp-native.md).
+Native WhatsApp operations and sends write each provider frame once (no resend
+after a reconnect) and answer within 20 s, `send_file` within 75 s; a late
+change or send ends `unknown` (docs/whatsapp-native.md).
 
 ## Parameter formats and field errors
 
@@ -302,6 +302,122 @@ the browser WhatsApp fallback supports neither:
 - A joined chat is visible to no existing chat-scoped key (ACCESS.md). Leave with
   `leave_group`. Opt in only after the API, gateway and native adapter of the same
   release are installed.
+
+## Live Telegram search
+
+`search_messages_live` asks Telegram itself, so it finds messages the archive
+never collected. It runs only on Telegram accounts (others get
+`unsupported_operation`), needs `read-live`, the account opt-in and, through the
+gateway, the `search_messages_live` action grant. Its hits are archived (below),
+so a following archive search finds them too.
+
+- Scope: an empty `chat_id` searches every chat of the account and needs a
+  full-account key; a `chat_id` searches that archived chat. A chat-scoped key
+  naming a chat outside its list gets `forbidden`, whether the chat exists or not.
+- Parameters: `query` (1-256 characters, required), `chat_types` (1-3 of
+  `private`, `group`, `channel`), `filter` (`documents`, `photos`, `links`,
+  `voice`), `from_time` (inclusive) and `to_time` (exclusive) as ISO 8601 with a
+  UTC offset, `limit` (1-50, default 20) and `cursor`.
+- Result: `hits` (`chat`, `chat_title`, `chat_type`, `provider_id`, `time`,
+  `sender`, `text`), `next_cursor`, `provider_total_approx` and
+  `basis: live_provider_search`. Hits in chats the collection policy excludes are
+  dropped. A long receipt shortens hit texts, never drops hits.
+- Archive: each hit is committed like a history page, origin `backfill`: new
+  messages are inserted, stored ones follow the usual edit, deletion and conflict
+  rules, a chat not yet catalogued enters the catalog, and media jobs are created
+  as for history. Each hit then carries `stored: true` and `message_id`, or
+  `stored: false` with `reason` `outside_history_window` (older than the
+  collector's `history_since`) or `not_stored` (the archive commit failed; the
+  search answer stands). Checkpoints and history coverage do not move. Default
+  subscriptions (origin `live`) get no events; `get_updates` without an origin
+  filter shows them as backfill.
+- Paging: one provider request per call, never automatic. Pass `next_cursor` with
+  the same account, `chat_id` and parameters; any other combination gets
+  `invalid_cursor` before any provider request. The cursor is a random token; its
+  position and binding stay in collector memory, so it reveals no message or chat
+  and stops working after a collector restart.
+- Budget per account: 3 requests at once, then one per 10 seconds, 100 per UTC
+  day; a chat search counts its chat lookup too. The collector configuration key
+  `live_search_budget` (`burst` 1-10, `refill_seconds` 1-3600, `daily` 1-10000)
+  overrides the defaults. Over it the call fails with `rate_limited` and
+  `result.data.retry_after` before any provider request. The budget lives in
+  memory; a collector restart resets it.
+- FloodWait: a wait of up to 3600 seconds pauses only live search on that account;
+  sends and collection go on. A longer wait, or another 420 answer, pauses the
+  account like any FloodWait.
+- Failures: without a running session `session_unavailable`; 8 seconds after the
+  collector claims it (checks, waits and request) `provider_timeout`. Both are safe
+  to repeat with a new request ID. The receipt is written in one attempt off the send
+  path, holding no lock sends need, with its waits ending 14 seconds after the claim,
+  so a queued send starts within 15 seconds. At most one receipt is in flight per
+  account; while it is, the next one is skipped. A receipt not written leaves the
+  operation `dispatching` (log line `live_search receipt_unrecorded`); it reads
+  `unknown` once it expires or the collector restarts. Known limit: a database that
+  stalls every commit delays sends as well, live search or not.
+- Data: the query goes only to Telegram. The operation row keeps the parameters
+  and the receipt like every other operation, so both reach backups. The log line
+  `live_search` holds counts, duration and FloodWait seconds, never the query or
+  hits. Telethon caches the chats and users of every answer (IDs, access hashes,
+  names, usernames, phones Telegram returns) in the session file, excluded chats
+  included, as for any other request; the session file and its backups already
+  hold such data.
+
+Roll out the API and collectors first, then the gateway, then the policy that
+names the action: an older gateway rejects a policy with an unknown action. Roll
+back in the reverse order. Enable per account (the list replaces the current one):
+
+```sh
+python -m messaging_service set-messenger-operations --account account-demo --operations chat_info search_messages_live
+```
+
+## Chat history on request
+
+`request_chat_history` loads older or missing messages of one archived chat. It
+needs `read-live`, the account opt-in and, through the gateway, the
+`request_chat_history` action grant. `chat_id` must be in the key's scope.
+
+- Telegram: one provider page through the account's request governor, answered
+  at once; no preview (it changes nothing at Telegram). `count` 1-100 (default
+  50) and at most one anchor: `before_message` (an archived message ID of the
+  same chat, exclusive; by default the oldest archived message, so a repeat goes
+  further back; an empty chat starts from the newest message), `around_message`
+  (same chat; about half before it, half after it), or `from_time` (inclusive) /
+  `to_time` (exclusive), newest first. A message ID of another chat, or an
+  unknown one, gets `invalid_anchor`.
+- Telegram receipt: `delivery: immediate`, `fetched`, `stored_new` (new archive
+  rows), `basis: live_provider_history`; with `before_message` also
+  `provider_history_start_reached` (Telegram returned fewer than asked), with a
+  time range `range_exhausted` (fewer returned or `from_time` reached). When some
+  messages of the page were not stored (a storage error, or the read's deadline),
+  it adds `not_stored` and `retry_parameters`, since a later request without an
+  anchor starts below them: the request's own anchor, or the default anchor it
+  used as `before_message`; for a chat with no archived message, a
+  `from_time`/`to_time` range over the messages not stored with `count` 100. The page's archive writes end at the read's deadline: each
+  transaction gets the time left as its PostgreSQL `transaction_timeout`, so a
+  stalled write never holds the collector lease past it.
+- Service messages (joins, title changes, calls) are part of the page.
+- The chat's history window (`history_since`) still applies: messages of a page below it are
+  fetched but not stored (`stored_new: 0`), and a request without an anchor then repeats the same
+  page. For older messages inside the window, use `from_time`/`to_time`.
+- Telegram archive: the page is committed as live search hits are (above):
+  origin `backfill`, the usual revision rules, media jobs, the collection policy
+  and `history_since`; checkpoints and coverage do not move. A rerun adds no rows.
+- Telegram budget per account: 3 requests at once, then one per 10 seconds, 300
+  per UTC day, counting the chat lookup and the page; over it `rate_limited` with
+  `result.data.retry_after` before any provider request. In memory; a collector
+  restart resets it. A FloodWait of up to 3600 seconds pauses only this operation
+  on that account (not live search, sends or collection); a longer one, or another
+  420 answer, pauses the account. Without a running session
+  `session_unavailable`; timeouts as for live search.
+- Data: the parameters and counts are kept in the operation row; the log line
+  `chat_history` holds counts, duration and FloodWait seconds only.
+- WhatsApp (native adapter only): unchanged. A mutation with preview, `count`
+  1-50, one request per account per minute, sent to the phone. The receipt adds
+  `delivery: via_phone` and `search_again_after_s: 60`: the messages arrive later
+  through history sync, so search the archive again after a minute.
+
+Roll out as for live search: API and collectors, then the gateway, then the
+policy naming the action; roll back in the reverse order.
 
 ## Important platform differences
 

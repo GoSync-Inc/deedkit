@@ -563,3 +563,25 @@ def test_an_unreadable_registry_never_reads_an_existing_tag_as_absent(tmp_path, 
     with pytest.raises(pi.Refused, match="cannot read"):
         pi.publish_one(registry, "runtime", SHA, tmp_path, never_attested)
     assert registry.pushes == [] and registry.tags == before
+
+
+# Verbatim from main push runs 39810919958 and 39821619870: gh could not build its public-good verifier.
+VERIFIER_UNAVAILABLE = ("Error: failed to choose verifier based on provided bundle issuer: public good verifier is not "
+                        "available (initialization may have failed)")
+
+
+# spec: ANYM-300
+@pytest.mark.parametrize("bundle", [False, True], ids=["api", "registry-bundle"])
+def test_attestation_check_retries_when_gh_cannot_build_its_verifier(monkeypatch, bundle):
+    calls, delays = gh_attestation(monkeypatch, [(0, "")] * bundle + [(1, VERIFIER_UNAVAILABLE)] + [(0, "")] * (2 - bundle))
+    assert pi.attested("ghcr.io/gosync-inc/deedkit-backup", "sha256:" + "1" * 64, SHA) == "complete"
+    assert len(calls) == 3 and delays == [pi.BACKOFF]
+
+
+# spec: ANYM-300
+@pytest.mark.parametrize("bundle", [False, True], ids=["api", "registry-bundle"])
+def test_attestation_check_refuses_and_never_reads_none_when_the_verifier_stays_unavailable(monkeypatch, bundle):
+    calls, delays = gh_attestation(monkeypatch, [(0, "")] * bundle + [(1, VERIFIER_UNAVAILABLE)] * pi.ATTEMPTS)
+    with pytest.raises(pi.Refused, match="could not be verified.*verifier is not available"):
+        pi.attested("ghcr.io/gosync-inc/deedkit-backup", "sha256:" + "1" * 64, SHA)
+    assert len(calls) == bundle + pi.ATTEMPTS and delays == [pi.BACKOFF * 2 ** n for n in range(pi.ATTEMPTS - 1)]

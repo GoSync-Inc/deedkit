@@ -127,7 +127,7 @@ type operationDependencies struct {
 	lookupTimeout    time.Duration
 	ownerName        string
 	platform         string
-	// Set by runOperation for group operations (ANYM-431).
+	// Set by runOperation (ANYM-431, ANYM-441).
 	gate               *operationGate
 	groupOperationDone func()
 }
@@ -186,57 +186,80 @@ func (p *Provider) Operation(ctx context.Context, raw json.RawMessage) (any, err
 	return runOperation(ctx, req, p.operationDependencies())
 }
 
-// groupBounded names the operations that only make group IQs and local reads.
-func groupBounded(job operationRequest) bool {
-	if job.Operation == "chat_info" {
-		target, err := ParseChatID(job.ProviderChat)
-		return err == nil && target.Server == types.GroupServer
+// fileOperationDeadline bounds send_file, upload plus send, 15 s inside the
+// collector's 90 s IPC wait (whatsapp_collector.py) (ANYM-441).
+var fileOperationDeadline = 75 * time.Second
+
+func operationDeadline(job operationRequest) time.Duration {
+	if job.Operation == "send_file" {
+		return fileOperationDeadline
 	}
-	return job.Operation == "create_group" || job.Operation == "check_chat_link" || job.Operation == "join_chat" || groupOperations[job.Operation]
+	return groupOperationDeadline
 }
 
-// runOperation answers a group operation within groupOperationDeadline even
-// when its goroutine waits on a library lock that ignores contexts, so the
-// Python worker's 30 s timeout never tears down the shared native process. The
-// gate keeps a late goroutine from starting a change after the answer; a frame
-// it was already writing was answered unknown (ANYM-431).
+// runOperation answers every operation within its deadline even when its
+// goroutine waits on a library lock that ignores contexts, so the Python
+// worker's timeout never tears down the shared native process. The gate keeps
+// a late goroutine from starting a change after the answer; a frame it was
+// already writing was answered unknown, and no frame is written twice after a
+// reconnect (ANYM-431, ANYM-441).
 func runOperation(ctx context.Context, job operationRequest, d operationDependencies) (any, error) {
-	if !groupBounded(job) {
+	return runBounded(ctx, operationDeadline(job), func(ctx context.Context, gate *operationGate) (any, error) {
+		d.gate = gate
 		return executeOperation(ctx, job, d)
-	}
-	ctx, cancel := context.WithTimeout(ctx, groupOperationDeadline)
+	}, func(started bool) (any, error) {
+		if started && job.Operation == "request_chat_history" {
+			return operationOutput("unknown", map[string]any{"code": "history_request_unknown", "retry": "explicit_only"}, "")
+		}
+		if started {
+			return operationOutput("unknown", map[string]any{"code": "provider_operation_uncertain"}, "")
+		}
+		if readOperations[job.Operation] {
+			return nil, errors.New("operation_query_failed")
+		}
+		return nil, errors.New("operation_target_unavailable")
+	}, d.groupOperationDone)
+}
+
+type operationGateKey struct{}
+
+// startChange opens the change phase of the bounded call that owns ctx; false
+// once its deadline answer went out. Outside a bounded call it always allows.
+func startChange(ctx context.Context) bool {
+	gate, _ := ctx.Value(operationGateKey{}).(*operationGate)
+	return gate == nil || gate.start()
+}
+
+// runBounded runs fn under deadline with frame retries disabled and answers
+// with late(started) when fn is still running at the deadline. done, if set,
+// runs after fn returns.
+func runBounded(ctx context.Context, deadline time.Duration, fn func(context.Context, *operationGate) (any, error), late func(started bool) (any, error), done func()) (any, error) {
 	gate := &operationGate{}
-	d.gate = gate
+	ctx, cancel := context.WithTimeout(context.WithValue(whatsmeow.WithoutFrameRetry(ctx), operationGateKey{}, gate), deadline)
 	type answer struct {
 		result any
 		err    error
 	}
-	done := make(chan answer, 1)
+	finished := make(chan answer, 1)
 	go func() {
 		defer cancel()
-		result, err := executeOperation(ctx, job, d)
-		done <- answer{result, err}
-		if d.groupOperationDone != nil {
-			d.groupOperationDone()
+		result, err := fn(ctx, gate)
+		finished <- answer{result, err}
+		if done != nil {
+			done()
 		}
 	}()
 	select {
-	case a := <-done:
+	case a := <-finished:
 		return a.result, a.err
 	case <-ctx.Done():
 	}
 	select {
-	case a := <-done:
+	case a := <-finished:
 		return a.result, a.err
 	default:
 	}
-	if gate.answer() {
-		return operationOutput("unknown", map[string]any{"code": "provider_operation_uncertain"}, "")
-	}
-	if readOperations[job.Operation] {
-		return nil, errors.New("operation_query_failed")
-	}
-	return nil, errors.New("operation_target_unavailable")
+	return late(gate.answer())
 }
 
 func operationOutput(outcome string, data map[string]any, id string) (any, error) {
@@ -781,7 +804,12 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 		case "video":
 			kind = whatsmeow.MediaVideo
 		}
-		if err = mutate("", func() error { var e error; uploaded, e = d.upload(ctx, bytes, kind); return e }); err != nil {
+		// The upload changes nothing a chat can see, so it is not a change
+		// phase: a deadline during it answers operation_target_unavailable.
+		if err = check(""); err != nil {
+			return nil, err
+		}
+		if uploaded, err = d.upload(ctx, bytes, kind); err != nil {
 			return nil, err
 		}
 		if uploaded.FileLength != uint64(len(bytes)) || digestBytes(bytes) != fmt.Sprintf("%x", uploaded.FileSHA256) {

@@ -4,6 +4,8 @@ Archive reads retain their existing passive contract. These operations run on th
 existing session owner with an independent key grant and account opt-in.
 """
 from copy import deepcopy
+from datetime import datetime, timezone
+import json
 import math
 import re
 
@@ -44,6 +46,26 @@ _link = {'link': _field('chat_link', required=True)}
 JOIN_LIMITATION = ('Needs a check_chat_link of this link by the same key within 60 minutes showing not_member; '
     'pending_approval is not a join. A joined chat is visible to no chat-scoped key and to full-account keys '
     'only when the collection policy collects it. Leave with leave_group.')
+LIVE_SEARCH = 'search_messages_live'
+LIVE_SEARCH_LIMITATION = ('Telegram only. Searches Telegram itself: an empty chat_id searches all the owner\'s chats '
+    '(full-account key; channels only when chat_types names channel), a chat_id searches that archived chat. One '
+    'provider request per call, no automatic paging: pass next_cursor with the same parameters for more. Per account '
+    '3 requests at once, then one per 10 s, 100 per UTC day (in memory; a collector restart resets them); over it, '
+    'rate_limited with retry_after. Hits in chats the collection policy excludes are dropped. Writes nothing to the '
+    'archive.')
+HISTORY = 'request_chat_history'
+TELEGRAM_HISTORY_LIMITATION = ('Telegram: one provider page of this archived chat, 1-100 messages (default 50), at '
+    'one anchor: before_message (exclusive; default the oldest archived message, so a repeat goes further back), '
+    'around_message (about half before, half after it) or from_time (inclusive) / to_time (exclusive), newest first. '
+    'Messages are archived as backfill; the receipt has fetched and stored_new counts. Per account 3 requests at '
+    'once, then one per 10 s, 300 per UTC day (in memory; a collector restart resets them); over it, rate_limited '
+    'with retry_after.')
+TELEGRAM_HISTORY_FIELDS = {
+    'count': _field('integer', default=50, minimum=1, maximum=100),
+    'before_message': _field('message_id'), 'around_message': _field('message_id'),
+    'from_time': _field('timestamp'), 'to_time': _field('timestamp')}
+LIVE_CHAT_TYPES = ('private', 'group', 'channel')
+LIVE_FILTERS = ('documents', 'photos', 'links', 'voice')
 BATCH_LIMITATION = ('One row per ID: applied, refused, unknown or not_attempted; an uncertain ID is never retried.')
 OPERATIONS = {
     'chat_info': _spec('read-live'),
@@ -136,9 +158,15 @@ OPERATIONS = {
     'block_contact': _spec('contacts-manage', 'account', mutation=True, full_account=True, fields=_user),
     'unblock_contact': _spec('contacts-manage', 'account', mutation=True, full_account=True, fields=_user),
     'update_profile': _spec('profile-manage', 'account', mutation=True, full_account=True),
-    'request_chat_history': _spec('read-live', mutation=True, platforms=('whatsapp',),
+    HISTORY: _spec('read-live', mutation=True, platforms=('whatsapp', 'telegram'),
         fields={'count':_field('integer',default=50,minimum=1,maximum=50)},
         limitation='Native only: explicit phone history request, at most 50 messages and one per account per minute; partial history is not guaranteed.'),
+    LIVE_SEARCH: _spec('read-live', platforms=('telegram',), fields={
+        'query': _field('string', required=True, maximum=256, nonempty=True),
+        'chat_types': _field('chat_types'), 'filter': _field('search_filter'),
+        'from_time': _field('timestamp'), 'to_time': _field('timestamp'),
+        'limit': _field('integer', default=20, minimum=1, maximum=50),
+        'cursor': _field('search_cursor')}, limitation=LIVE_SEARCH_LIMITATION),
     'get_labels': _spec('contacts-read', 'account', full_account=True,
         platforms=('whatsapp',), limitation='Business feature; availability depends on the account.'),
     'set_chat_labels': _spec('chat-manage', mutation=True, platforms=('whatsapp',),
@@ -151,10 +179,14 @@ OPERATIONS = {
 }
 
 
-def operation_spec(name):
+def operation_spec(name, platform=None):
     if not isinstance(name, str) or name not in OPERATIONS:
         raise ValueError('unsupported_operation')
-    return deepcopy(OPERATIONS[name])
+    spec = deepcopy(OPERATIONS[name])
+    if name == HISTORY and platform == 'telegram':
+        # ANYM-477: Telegram answers at once and changes nothing at the provider; WhatsApp asks the phone.
+        spec.update(mutation=False, limitation=TELEGRAM_HISTORY_LIMITATION)
+    return spec
 
 
 # Address book and label operations need a verified provider-side equivalent.
@@ -175,6 +207,8 @@ def _supported(platform, name, spec, provider=None):
 
 
 def _fields(platform, name, spec):
+    if platform == 'telegram' and name == HISTORY:
+        return TELEGRAM_HISTORY_FIELDS
     if platform == 'telegram' and name == 'pin_message':
         return {}  # Telegram pins have no expiry parameter.
     if name == 'send_contact':
@@ -202,7 +236,8 @@ def operation_manifest(platform, *, provider=None):
     if platform not in ('telegram', 'whatsapp'):
         raise ValueError('unsupported_platform')
     rows = []
-    for name, spec in sorted(OPERATIONS.items()):
+    for name in sorted(OPERATIONS):
+        spec = operation_spec(name, platform)
         row = {k: deepcopy(v) for k, v in spec.items() if k not in ('fields', 'platforms')}
         row.update(operation=name, supported=_supported(platform, name, spec, provider),
                    parameters_schema=_schema(platform, _fields(platform, name, spec)))
@@ -292,6 +327,11 @@ def parameter_format(platform, kind):
         'slow_mode_seconds': 'one of ' + ', '.join(map(str, SLOW_MODE_SECONDS)) + ' seconds; 0 turns slow mode off',
         'poll_options': '2-10 unique non-blank strings of at most 100 UTF-16 code units',
         'poll_indices': 'up to 20 unique integers from 0 to 9 (zero-based option positions)',
+        'chat_types': '1-3 unique items of ' + ', '.join(LIVE_CHAT_TYPES),
+        'search_filter': 'one of ' + ', '.join(LIVE_FILTERS),
+        'timestamp': 'ISO 8601 date and time with a UTC offset, such as 2026-10-22T08:00:00Z; from_time is inclusive, '
+            'to_time exclusive',
+        'search_cursor': 'next_cursor of an earlier search_messages_live with the same account, chat_id and parameters',
         'label_ids': 'up to 20 unique label IDs of 1-64 letters, digits, _ or -, from get_labels'}.get(kind)
 
 
@@ -354,14 +394,45 @@ def _problem(platform, descriptor, value, field):
         errors = [e for i, x in enumerate(value) for e in (_problem(platform, item, x, '%s/%d' % (field, i)) or ())]
         if errors: return errors
         return None if len(set(value)) == len(value) else fail('unique', 'no duplicate items')
+    if kind == 'chat_types':
+        if not isinstance(value, list): return fail('type', 'array')
+        if not 1 <= len(value) <= 3: return fail('min_items' if not value else 'max_items', parameter_format(platform, kind))
+        if any(item not in LIVE_CHAT_TYPES for item in value): return fail('enum', allowed=list(LIVE_CHAT_TYPES))
+        return None if len(set(value)) == len(value) else fail('unique', 'no duplicate items')
+    if kind == 'search_filter':
+        if not isinstance(value, str): return fail('type', 'string')
+        return None if value in LIVE_FILTERS else fail('enum', allowed=list(LIVE_FILTERS))
+    if kind == 'timestamp':
+        if not isinstance(value, str): return fail('type', 'string')
+        return None if timestamp(value) else fail('format', parameter_format(platform, kind))
+    if kind == 'search_cursor':
+        if not isinstance(value, str): return fail('type', 'string')
+        return None if re.fullmatch(r'[A-Za-z0-9_-]{8,512}', value) else fail('format', parameter_format(platform, kind))
     if kind == 'label_id':
         if not isinstance(value, str): return fail('type', 'string')
         return None if re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', value) else fail('format', parameter_format(platform, 'label_ids'))
     return fail('type')
 
 
+def timestamp(value):
+    """Normalized UTC text of an ISO 8601 time with an offset, or None."""
+    if not isinstance(value, str) or len(value) > 40: return None
+    try: parsed = datetime.fromisoformat(value.replace('Z', '+00:00') if value.endswith('Z') else value)
+    except ValueError: return None
+    if parsed.tzinfo is None or not 2000 <= parsed.year <= 2100: return None
+    return parsed.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def live_cursor_binding(account, chat_id, parameters):
+    """The account, operation, chat and every other normalized field a live-search cursor was issued for.
+
+    The collector keeps it next to the cursor's position, so a caller cannot rewrite it."""
+    fields = {k: v for k, v in parameters.items() if k != 'cursor'}
+    return json.dumps([account, LIVE_SEARCH, chat_id or '', fields], sort_keys=True, ensure_ascii=False)
+
+
 def validate_operation(platform, operation, parameters, *, provider=None):
-    spec = operation_spec(operation)
+    spec = operation_spec(operation, platform)
     if not _supported(platform, operation, spec, provider): raise ValueError('unsupported_operation')
     if parameters is None: parameters = {}
     if not isinstance(parameters, dict): raise ParameterError(field_error('parameters', 'type', 'object'))
@@ -379,7 +450,8 @@ def validate_operation(platform, operation, parameters, *, provider=None):
             problem = _problem(platform, descriptor, value, name)
             if problem: errors.extend(problem)
             else: output[name] = (phone_digits(value)[0] if descriptor['type'] == 'phone_number' else
-                chat_link_key(platform, value) if descriptor['type'] == 'chat_link' else value)
+                chat_link_key(platform, value) if descriptor['type'] == 'chat_link' else
+                timestamp(value) if descriptor['type'] == 'timestamp' else value)
         # Only a bounded identifier name is returned; the submitted value never is.
         allowed = 'only ' + ', '.join(fields) if fields else 'no parameters'
         for name in parameters:
@@ -395,4 +467,16 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     if operation == 'send_file' and (('attachment_id' in output)+('upload_id' in output)!=1):
         raise ParameterError(field_error('upload_id' if 'upload_id' in output else 'attachment_id',
             'unique' if 'upload_id' in output else 'required', 'exactly one of attachment_id or upload_id'))
+    if operation == LIVE_SEARCH and 'from_time' in output and 'to_time' in output and (
+            datetime.fromisoformat(output['from_time']) >= datetime.fromisoformat(output['to_time'])):
+        raise ParameterError(field_error('to_time', 'minimum', 'later than from_time'))
+    if operation == HISTORY and platform == 'telegram':
+        anchors = [k for k in ('before_message', 'around_message') if k in output]
+        anchors += ['from_time'] if 'from_time' in output or 'to_time' in output else []
+        if len(anchors) > 1:
+            raise ParameterError(field_error(anchors[1], 'unique',
+                'at most one of before_message, around_message or from_time/to_time'))
+        if 'from_time' in output and 'to_time' in output and (
+                datetime.fromisoformat(output['from_time']) >= datetime.fromisoformat(output['to_time'])):
+            raise ParameterError(field_error('to_time', 'minimum', 'later than from_time'))
     return output
