@@ -24,9 +24,14 @@ from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy
 
 # open_chat_by_phone: both adapter calls and the archive check (the native lookup's 10 s).
 PHONE_RESOLUTION_SECONDS=10
+# How long history waits for whatsmeow's own auto-reconnect: the connect_timeout a fresh start gets.
+NOT_READY_WAIT_SECONDS=300
+HISTORY_READS=('dialogs','page')
 
 
 class ProviderOperationError(RuntimeError): pass
+class ProviderNotReady(RuntimeError):
+    """A history read answered provider_not_ready with no recorded failure; the pipe is in sync."""
 
 
 def clear_browser_runtime_locks(session):
@@ -231,6 +236,9 @@ class NodeProvider:
             code=value.get('code') if isinstance(value,dict) else None
             return code if isinstance(code,str) and code in CONNECTION_ERRORS else 'provider_disconnected'
         except (OSError,ValueError,KeyError):return 'provider_disconnected'
+    def failure_recorded(self):
+        directory=self.cfg.get('events_directory')
+        return bool(directory) and (Path(directory)/'.transport-failure').exists()
     async def wait_disconnected(self):
         await self.process.wait()
         raise RuntimeError(self.failure_code())
@@ -264,6 +272,7 @@ class NodeProvider:
             if code in ('send_expired','sending_disabled','send_target_invalid','link_preview_unsupported'):
                 from .outgoing import SendRejected
                 raise SendRejected(code)
+            if code=='provider_not_ready':raise ProviderNotReady(code)
             if isinstance(code,str) and code in CONNECTION_ERRORS:raise RuntimeError(code)
             if code in ('media_unavailable','media_reference_changed','unsupported_media_type'): raise ProviderUnavailable(code)
             safe=MEDIA_ERRORS|{'provider_operation_failed','chat_excluded','send_receipt_mismatch',
@@ -286,6 +295,10 @@ class NodeProvider:
             return reply['result']
         except (ProviderUnavailable,ProviderOperationError):
             raise # Complete error frame; pipe is still synchronized.
+        except ProviderNotReady:
+            # whatsmeow reconnects by itself after a short drop; a disconnect here would cut that off.
+            if method in HISTORY_READS and not self.failure_recorded():raise
+            await self.disconnect(); raise RuntimeError('provider_not_ready') from None
         except Exception as exc:
             from .outgoing import SendRejected
             from .commands import CommandRejected
@@ -542,16 +555,22 @@ class WhatsAppCollector(TelegramCollector):
         await asyncio.to_thread(self.state.phase,'history','waiting','history_scan_finished')
     async def reconcile_loop(self):
         from .telegram_collector import database_errors
-        delay=self.database_retry
+        delay=self.database_retry;not_ready_since=None
         while True:
             try:await self.sync_once()
+            except ProviderNotReady:
+                if not_ready_since is None:not_ready_since=time.monotonic()
+                if time.monotonic()-not_ready_since>=NOT_READY_WAIT_SECONDS:raise RuntimeError('provider_not_ready') from None
+                await asyncio.to_thread(self.state.status,'degraded','provider_temporarily_unavailable')
+                await asyncio.to_thread(self.state.phase,'history','error','provider_temporarily_unavailable')
+                await asyncio.sleep(min(self.interval,60)); continue
             except (ProviderOperationError,ProviderUnavailable):
                 await asyncio.to_thread(self.state.status,'degraded','provider_temporarily_unavailable')
                 await asyncio.to_thread(self.state.phase,'history','error','provider_temporarily_unavailable')
             except database_errors():
                 # Checkpoints are committed per chat; retry instead of reconnecting the provider.
                 await asyncio.sleep(delay); delay=min(60,delay*2); continue
-            delay=self.database_retry
+            delay=self.database_retry;not_ready_since=None
             await asyncio.sleep(self.interval)
     async def drain_loop(self):
         import psycopg
