@@ -171,9 +171,49 @@ def test_no_offer_starts_after_the_bound_and_every_refused_offer_is_journaled(tm
     first = attempts[0]
     assert len(attempts) == 2 and all(start - first <= 180 for start in attempts)
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if 'receiver_busy' in line]
-    assert [line['attempt'] for line in lines] == [1]
-    assert lines[0] == {'status': 'waiting', 'code': 'receiver_busy', 'id': runner.journal['id'], 'attempt': 1,
-                        'retry_seconds': backup_runner.BUSY_RETRY_SECONDS}
+    assert lines == [{'status': 'waiting', 'code': 'receiver_busy', 'id': runner.journal['id'], 'attempt': 1,
+                      'retry_seconds': backup_runner.BUSY_RETRY_SECONDS},
+                     {'status': 'refused', 'code': 'receiver_busy', 'id': runner.journal['id'], 'attempt': 2,
+                      'retry_seconds': 0}]
+
+
+# spec: ANYM-489
+def test_a_late_wakeup_past_the_bound_starts_no_new_offer(tmp_path, capsys):
+    attempts, now = [], [0.0]
+    async def send(path, metadata, transfer, timeout, start, completed, stopped=None):
+        attempts.append(now[0])
+        raise RuntimeError('receiver_busy')
+    runner, _ = streaming_runner(tmp_path, send)
+    runner.cfg['busy_wait_seconds'] = 180
+    runner.clock = lambda: now[0]
+    def sleep(seconds):
+        now[0] += 181 if seconds == backup_runner.BUSY_RETRY_SECONDS else seconds  # the host slept too long
+    runner.sleep = sleep
+    with pytest.raises(RuntimeError, match='receiver_busy'):
+        runner.run()
+    assert attempts == [0.0]
+    statuses = [json.loads(line)['status'] for line in capsys.readouterr().out.splitlines() if 'receiver_busy' in line]
+    assert statuses == ['waiting', 'refused']
+
+
+class LostJournal:
+    def __init__(self, error):
+        self.error = error
+    def write(self, text):
+        raise self.error
+    def flush(self):
+        raise self.error
+
+
+# spec: ANYM-489
+@pytest.mark.parametrize('error', [BrokenPipeError(), ValueError('I/O operation on closed file.')])
+def test_a_journal_line_that_cannot_be_written_never_fails_the_delivery(tmp_path, monkeypatch, error):
+    attempts = []
+    runner, _ = streaming_runner(tmp_path, busy_stream(1, attempts))
+    fake_time(runner)
+    monkeypatch.setattr(backup_runner.sys, 'stdout', LostJournal(error))
+    runner.run()
+    assert len(attempts) == 2 and read_json(tmp_path / 'status.json')['state'] == 'ok'
 
 
 # spec: ANYM-489

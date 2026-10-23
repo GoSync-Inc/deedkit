@@ -246,11 +246,18 @@ class Runner:
             offered=self.clock()
             try:return send(),offered-first
             except RuntimeError as exc:
-                if str(exc)!='receiver_busy' or sent() or self.clock()+BUSY_RETRY_SECONDS>deadline:raise
-            # One journal line per refused offer: the backup ID and the attempt, no host or path.
-            print(json.dumps({'status':'waiting','code':'receiver_busy','id':self.journal['id'],'attempt':attempt,
-                              'retry_seconds':BUSY_RETRY_SECONDS},separators=(',',':')),flush=True)
+                if str(exc)!='receiver_busy' or sent():raise
+                retry=self.clock()+BUSY_RETRY_SECONDS<=deadline;self.refused(attempt,retry)
+                if not retry:raise
             attempt+=1;self.sleep(BUSY_RETRY_SECONDS)
+            if self.clock()>deadline:  # A late wakeup never starts an offer past the bound.
+                self.refused(attempt-1,False);raise RuntimeError('receiver_busy')
+    def refused(self,attempt,retry):
+        """One journal line per busy answer: the backup ID and the attempt, no host or path. Never fails a delivery."""
+        try:print(json.dumps({'status':'waiting' if retry else 'refused','code':'receiver_busy','id':self.journal['id'],
+                              'attempt':attempt,'retry_seconds':BUSY_RETRY_SECONDS if retry else 0},
+                             separators=(',',':')),flush=True)
+        except (OSError,ValueError):pass
     def status(self,state,code=None):
         previous=read_json(self.status_path) if self.status_path.exists() else {}
         data={**previous,'state':state,'updated_at':datetime.now(timezone.utc).isoformat()}

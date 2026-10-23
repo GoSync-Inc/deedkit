@@ -194,8 +194,9 @@ refuses as `receiver_busy` before it stores anything (stream_v2: before the stre
 receiver checks its lock before it stores a byte, though the runner may already have sent part of the bundle
 to it) is offered again, same ID, after 60 seconds. A new offer starts only within `busy_wait_seconds` of
 the first (optional in `runner.json`, default and maximum 7200, 0 turns the wait off), and each offer keeps
-its upload timeout. Every refused offer prints one line to the unit's journal
-(`{"status":"waiting","code":"receiver_busy","id":…,"attempt":n,…}`). Any other error, or a busy answer
+its upload timeout; a wakeup past the bound starts none. Every busy answer prints one line to the unit's
+journal (`{"status":"waiting","code":"receiver_busy","id":…,"attempt":n,"retry_seconds":60}`, the last one
+`"status":"refused"`); a line that cannot be written is dropped, never the delivery. Any other error, or a busy answer
 after the stream started, is not retried. The collectors already run again during that wait, the capture
 timeout does not count it, `status.json` stays `uploading`, and the runner lock stays held, so a deploy skips
 meanwhile. A SIGTERM during the wait takes the usual stop recovery and keeps the stream_v2 capture. A run lasts
