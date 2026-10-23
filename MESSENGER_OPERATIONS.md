@@ -396,14 +396,18 @@ needs `read-live`, the account opt-in and, through the gateway, the
   transaction gets the time left as its PostgreSQL `transaction_timeout`, so a
   stalled write never holds the collector lease past it.
 - Service messages (joins, title changes, calls) are part of the page.
-- The chat's history window (`history_since`) still applies: messages of a page below it are
-  fetched but not stored (`stored_new: 0`); the receipt counts them as `outside_history_window`,
-  never as `not_stored`, and offers no `retry_parameters` for them, since a retry cannot store them.
-  A request without an anchor then repeats the same page. For older messages inside the window, use
-  `from_time`/`to_time`.
+- This explicit request for one named chat also reads below the collector's
+  `history_since` (owner decision 2026-10-23): messages of the page older than it are
+  stored like the rest, and the receipt counts them (a number) as `below_history_since`.
+  The global boundary is unchanged: backfill, reconcile, the dialog inventory and live
+  search hits (above, `outside_history_window`) still skip them. Stored rows are ordinary
+  archive messages: search and subscriptions see them, and a request without an anchor
+  continues below them. Their attachments get media jobs that the collector never
+  downloads by itself. The media policy reports them as `outside_history_bounds` (no
+  download, also on request), or as unknown while the chat's bound is unconfirmed.
 - Telegram archive: the page is committed as live search hits are (above):
-  origin `backfill`, the usual revision rules, media jobs, the collection policy
-  and `history_since`; checkpoints and coverage do not move. A rerun adds no rows.
+  origin `backfill`, the usual revision rules, media jobs and the collection policy;
+  checkpoints, coverage and `window_complete` do not move. A rerun adds no rows.
 - Telegram budget per account: 3 requests at once, then one per 10 seconds, 300
   per UTC day, counting the chat lookup and the page; over it `rate_limited` with
   `result.data.retry_after` before any provider request. In memory; a collector

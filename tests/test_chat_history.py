@@ -322,19 +322,21 @@ def test_a_page_below_the_history_window_is_reported_as_such_with_no_futile_retr
         applied.append(number)
         return {'outcome': 'created'}
     c = collector(apply)
-    # The default anchor (the oldest archived message) is itself older than history_since.
+    # The default anchor (the oldest archived message) is itself older than history_since. Since the owner's
+    # 2026-10-23 decision the explicit request stores such a page and reports its size as below_history_since.
     c.history_since = datetime.fromtimestamp(WHEN + 39 * 60, timezone.utc)
     c.oldest_archived = lambda chat: '41'
     async def provider(value):
         return await execute(owner_client(page([message(n, when=WHEN + (n - 10) * 60) for n in (40, 39, 38)])), value)
     c.provider.execute_operation = provider
     data = asyncio.run(c.chat_history(job({'count': 10})))['data']
-    assert data['fetched'] == 3 and data['stored_new'] == 0 and data['outside_history_window'] == 3 and applied == []
+    assert data['fetched'] == 3 and data['stored_new'] == 3 and data['below_history_since'] == 3
+    assert applied == ['40', '39', '38'] and 'outside_history_window' not in data
     assert 'not_stored' not in data and 'retry_parameters' not in data
-    # A storage failure in the same page is still not_stored with its retry; the outside-window part keeps its own name.
-    c.history_since, failing = datetime.fromtimestamp(WHEN + 29 * 60, timezone.utc), {'39'}
+    # A storage failure in the same page is still not_stored with its retry; below_history_since keeps its own count.
+    c.history_since, failing, applied[:] = datetime.fromtimestamp(WHEN + 29 * 60, timezone.utc), {'39'}, []
     data = asyncio.run(c.chat_history(job({'count': 10})))['data']
-    assert data['outside_history_window'] == 1 and data['not_stored'] == 1 and applied == ['40']
+    assert data['below_history_since'] == 1 and data['not_stored'] == 1 and applied == ['40', '38']
     assert data['retry_parameters'] == {'count': 10, 'before_message': stable_id('msg', ACCOUNT, '-22', '41')}
 
 class Paging(Client):
@@ -376,3 +378,25 @@ def test_a_same_second_page_is_retried_from_its_own_anchor():
         resolved = '41'  # commands._resolve maps before_message to its provider message
         asyncio.run(c.chat_history(job(retry, anchor=resolved)))
         assert applied == ['40']
+
+
+# spec: ANYM-477
+def test_an_explicit_history_request_stores_its_page_below_history_since_and_live_search_still_does_not():
+    applied = []
+    def apply(capture):
+        applied.append(capture['envelope']['provider_id'])
+        return {'outcome': 'created'}
+    c = collector(apply)
+    # Owner 2026-10-23: one named chat's explicit request reads below the boundary; 39 and 38 are older than it.
+    c.history_since = datetime.fromtimestamp(WHEN + 30 * 60, timezone.utc)
+    c.oldest_archived = lambda chat: '41'
+    async def provider(value):
+        return await execute(owner_client(page([message(n, when=WHEN + (n - 10) * 60) for n in (40, 39, 38)])), value)
+    c.provider.execute_operation = provider
+    data = asyncio.run(c.chat_history(job({'count': 10})))['data']
+    assert data['fetched'] == 3 and data['stored_new'] == 3 and applied == ['40', '39', '38']
+    assert data['below_history_since'] == 2 and 'outside_history_window' not in data and 'not_stored' not in data
+    # Live search hits keep the boundary (ANYM-476 criterion 3).
+    found = [(message(37, when=WHEN), {}, 'group', 'synthetic')]
+    assert asyncio.run(c.store_live_hits(found)) == 0 and found[0][1] == {'stored': False, 'reason': 'outside_history_window'}
+    assert applied == ['40', '39', '38']
