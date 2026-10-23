@@ -334,3 +334,27 @@ def test_a_failing_live_plan_or_hint_keeps_the_archive_answer(live, monkeypatch)
     thin = s.search(key, 'needle')
     assert thin['items'] == [] and thin['result_evidence']['empty_reason'] in live_search.THIN
     assert 'suggested_call' not in thin['result_evidence'] and queued(s) == 0
+
+
+# spec: ANYM-478
+def test_a_timed_out_archive_reread_keeps_the_first_archive_answer_and_the_live_entries(live, monkeypatch):
+    s, archive, key, state, _ = live
+    search, calls = s.search, []
+    def slow_reread(token, **arguments):
+        calls.append(arguments)
+        if len(calls) == 1: return search(token, **arguments)
+        # The reread after the wait hits the server's statement timeout, as a slow archive query does.
+        with s.authorized(token, 'search') as (c, _):
+            c.execute('SET LOCAL statement_timeout = 1'); c.execute('SELECT pg_sleep(1)')
+    monkeypatch.setattr(s, 'search', slow_reread)
+    result = run(s, key, {'query': 'Synthetic'}, [CommandWorker(state, found(archive))], live='on', wait_s=10)
+    assert len(calls) == 2 and result['items'] and result['result_evidence']['archive_reread'] == 'failed'
+    entry, = result['result_evidence']['live']
+    assert entry['state'] == 'done' and [h['provider_id'] for h in entry['hits']] == ['7']
+    def reread_forbidden(token, **arguments):
+        calls.append(arguments)
+        if len(calls) % 2: return search(token, **arguments)
+        raise APIError('unauthorized', 401)
+    calls.clear(); monkeypatch.setattr(s, 'search', reread_forbidden)
+    with pytest.raises(APIError, match='unauthorized'):
+        run(s, key, {'query': 'Synthetic'}, live='on', wait_s=0, request_id='synthetic-reread-2')

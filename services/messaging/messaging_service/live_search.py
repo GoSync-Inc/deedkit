@@ -277,7 +277,12 @@ async def search(store, token, arguments, *, live='off', wait_s=None, request_id
             receipt = receipts.get(entries[i]['operation_id'])
             if receipt: entries[i] = from_receipt(entries[i], receipt)
     # The archive is read again with the caller's current authorization; never a cached page.
-    second = await run(store.search, token, **arguments)
+    try: second = await run(store.search, token, **arguments)
+    except Exception as error:
+        # A revoked key still fails the call; a slow or failed reread keeps the first archive answer.
+        if not isinstance(error, APIError) or error.code not in PLAN_DEGRADED: raise
+        log.warning('live_search_reread_failed code=%s', error.code)
+        second = first; evidence['archive_reread'] = 'failed'
     evidence = second['result_evidence']; evidence.pop('suggested_call', None)
     evidence['live'] = entries
     if waited: evidence['live_wait'] = waited
