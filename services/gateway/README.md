@@ -50,6 +50,16 @@ that principal, the same `key_sha256` and credential binding, and a higher
 `0600` file beside it, then rename it over the old one). The next request uses
 the new date without a restart. Agents cannot extend their own keys.
 
+Containers mount the policy through its directory, never as a single file
+(`deploy/compose.gateway.yaml`: `./private/gateway-policy/` read-only at
+`/run/deedkit/policy/`, `--policy /run/deedkit/policy/policy.json`). A
+single-file bind keeps the inode the container started with, so a rename over
+it would never reach the running gateway. The directory is private (no group
+or other bits) and readable by the runtime UID 10001; it holds only
+`policy.json`, never unrelated secrets or kept backups. A transient private
+staging file written there and renamed over `policy.json` is the expected
+procedure; the gateway reads only `policy.json`.
+
 `POST /mcp` uses the official SDK transport and lifespan. `GET /mcp` returns 405;
 notifications/SSE are disabled. `POST /v1/{selected_tool}` uses the same authorization
 and argument schema. There is no generic arbitrary backend executor. Unknown writes

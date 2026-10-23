@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
@@ -100,4 +101,36 @@ def test_missing_or_public_secret_fails_only_for_selected_managed_module(tmp_pat
     launcher.validate_files(plan, tmp_path)
     path.chmod(0o644)
     with pytest.raises(ValueError):
+        launcher.validate_files(plan, tmp_path)
+
+
+# spec: ANYM-424
+def test_gateway_preflight_checks_the_policy_file_the_gateway_reads(tmp_path):
+    unit = yaml.safe_load((ROOT / "deploy/compose.gateway.yaml").read_text())["services"]["gateway"]
+    policy = unit["command"][unit["command"].index("--policy") + 1]
+    mounts = [v.split(":") for v in unit["volumes"] if Path(policy).parent == Path(v.split(":")[1])]
+    assert len(mounts) == 1 and mounts[0][2] == "ro"
+    read = str(Path("deploy") / mounts[0][0] / Path(policy).name)
+    plan = launcher.resolve(profile(["calendar"], external=["calendar"]))
+    gateway = next(m for m in plan["modules"] if m["module"] == "gateway")
+    assert Path(read) in {Path(f) for f in gateway["required_files"]}
+    for relative in gateway["required_files"]:
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text("synthetic")
+        (tmp_path / relative).chmod(0o600)
+    # Only the new layout exists: no legacy single policy file beside it.
+    assert not (tmp_path / "deploy/private/gateway-policy.json").exists()
+    launcher.validate_files(plan, tmp_path)
+    path = tmp_path / read
+    path.chmod(0o640)
+    with pytest.raises(ValueError, match="gateway"):
+        launcher.validate_files(plan, tmp_path)
+    path.unlink()
+    with pytest.raises(ValueError, match="gateway"):
+        launcher.validate_files(plan, tmp_path)
+    target = tmp_path / "elsewhere.json"
+    target.write_text("synthetic")
+    target.chmod(0o600)
+    path.symlink_to(target)
+    with pytest.raises(ValueError, match="gateway"):
         launcher.validate_files(plan, tmp_path)

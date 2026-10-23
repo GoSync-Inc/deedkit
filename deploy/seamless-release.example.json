@@ -39,7 +39,7 @@
       "project": "deedkit-gateway",
       "service": "gateway"
     },
-    "gateway_policy": "/opt/deedkit/deploy/private/gateway-policy.json",
+    "gateway_policy": "/opt/deedkit/deploy/private/gateway-policy/policy.json",
     "gateway_public_url": "https://deedkit.example/deedkit",
     "router": {
       "container": "deedkit-release-router",

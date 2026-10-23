@@ -23,7 +23,8 @@ ROUTER_ID = 'e' * 64
 def settings(tmp_path):
     router = tmp_path / 'router'
     router.mkdir(mode=0o700)
-    policy = tmp_path / 'policy.json'
+    (tmp_path / 'gateway-policy').mkdir(mode=0o700)
+    policy = tmp_path / 'gateway-policy' / 'policy.json'
     policy.write_text(json.dumps({'revision': 1, 'keys': {'secret': 'synthetic'}, 'deployment': {'backends': {
         'messaging': {'url': 'https://example.invalid/pos-probe', 'download_origin': 'https://example.invalid/pos-probe'},
         'calendar': {'url': 'http://calendar-api:8080'}}}}))
@@ -101,8 +102,8 @@ def documents(cfg):
         'networks': {'backend': {'name': 'messages_backend'}, 'frontend': {'name': 'frontend'}},
         'volumes': {'files': {'name': 'messages_files'}}},
         'gateway': {'name': 'gateway', 'services': {'gateway': {
-        'image': OLD, 'command': ['--policy', '/run/deedkit/policy.json', '--public-url', cfg['http_release']['gateway_public_url'], '--host', '0.0.0.0', '--port', '13240'],
-        'volumes': [{'type': 'bind', 'source': cfg['http_release']['gateway_policy'], 'target': '/run/deedkit/policy.json', 'read_only': True}],
+        'image': OLD, 'command': ['--policy', '/run/deedkit/policy/policy.json', '--public-url', cfg['http_release']['gateway_public_url'], '--host', '0.0.0.0', '--port', '13240'],
+        'volumes': [{'type': 'bind', 'source': str(Path(cfg['http_release']['gateway_policy']).parent), 'target': '/run/deedkit/policy', 'read_only': True}],
         'networks': {'integration': {}, 'frontend': {'aliases': ['deedkit-gateway']}}}},
         'networks': {'integration': {'name': 'integration'}, 'frontend': {'name': 'frontend'}}}}
 
@@ -121,8 +122,8 @@ def test_candidate_has_unique_aliases_no_ports_and_reuses_external_state(tmp_pat
     assert doc['volumes']['messages-files'] == {'external': True, 'name': 'messages_files'}
     assert doc['networks']['messages-backend'] == {'external': True, 'name': 'messages_backend'}
     gateway = doc['services']['http-gateway-'+GEN]
-    mount = next(value for value in gateway['volumes'] if value['target'] == '/run/deedkit/policy.json')
-    assert mount['source'] == cfg['http_release']['gateway_policy'] and mount['read_only'] is True
+    mount = next(value for value in gateway['volumes'] if value['target'] == '/run/deedkit/policy')
+    assert mount['source'] == str(Path(cfg['http_release']['gateway_policy']).parent) and mount['read_only'] is True
     assert gateway['environment']['DEEDKIT_RELEASE_MESSAGING_URL'] == 'http://http-api-'+GEN+':8080'
     assert 'policy' not in private
 
@@ -485,6 +486,46 @@ def test_unreviewed_candidate_runtime_settings_are_refused(tmp_path, mutation):
         gateway['environment'] = {'PYTHONPATH': '/data/extensions'}
     with pytest.raises(s.Refused):
         s.isolate(cfg, docs, {'runtime': IMAGE, 'gateway': IMAGE}, tmp_path, GEN, SHA)
+
+
+# spec: ANYM-424
+@pytest.mark.parametrize('mutation', ['single-file', 'writable', 'other-directory', 'other-filename',
+    'shadowing-file', 'shadowing-tmpfs', 'parent-directory', 'volume', 'unnormalized'])
+def test_gateway_policy_must_be_the_read_only_bind_of_its_own_directory(tmp_path, mutation):
+    cfg = settings(tmp_path)
+    docs = documents(cfg)
+    gateway = docs['gateway']['services']['gateway']
+    mount, policy = gateway['volumes'][0], cfg['http_release']['gateway_policy']
+    if mutation == 'single-file':
+        mount.update(source=policy, target='/run/deedkit/policy/policy.json')
+    elif mutation == 'writable':
+        mount['read_only'] = False
+    elif mutation == 'other-directory':
+        mount['source'] = str(tmp_path / 'other-policy')
+    elif mutation == 'other-filename':
+        gateway['command'][1] = '/run/deedkit/policy/staged.json'
+    elif mutation == 'shadowing-file':
+        gateway['volumes'].append({'type': 'bind', 'source': policy, 'target': '/run/deedkit/policy/policy.json', 'read_only': True})
+    elif mutation == 'shadowing-tmpfs':
+        gateway['tmpfs'] = ['/run/deedkit:size=1m']
+    elif mutation == 'parent-directory':
+        mount.update(source=str(tmp_path), target='/run/deedkit/private')
+        gateway['command'][1] = '/run/deedkit/private/gateway-policy/policy.json'
+    elif mutation == 'volume':
+        mount.update(type='volume', source='policy')
+        docs['gateway']['volumes'] = {'policy': {'name': 'gateway_policy'}}
+    else:
+        gateway['command'][1] = '/run/deedkit/other/../policy/policy.json'
+    with pytest.raises(s.Refused, match='policy'):
+        s.isolate(cfg, docs, {'runtime': IMAGE, 'gateway': IMAGE}, tmp_path, GEN, SHA)
+
+
+# spec: ANYM-424
+def test_gateway_policy_directory_must_be_private(tmp_path):
+    cfg = settings(tmp_path)
+    Path(cfg['http_release']['gateway_policy']).parent.chmod(0o750)
+    with pytest.raises(s.Refused, match='private'):
+        s.validate_settings(cfg)
 
 
 def test_bootstrap_writes_only_pinned_private_router_artifacts(tmp_path, monkeypatch):

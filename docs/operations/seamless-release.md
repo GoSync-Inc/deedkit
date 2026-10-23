@@ -54,8 +54,9 @@ Ticket TTL limits admission; it never kills an admitted transfer.
 Only the gateway and messaging `serve` processes overlap. Telegram, WhatsApp,
 calendar API/worker, voice, indexer, subscriptions, enrichment and database
 containers retain their current owners. The gateway keeps the original read-only
-policy bind, so ACL and credential revocation reaches serving and draining
-instances. A strictly generation-bound messaging dial override selects its paired
+bind of the policy directory, so ACL and credential revocation reaches serving
+and draining instances, including a policy replaced by rename (ANYM-424);
+`prepare` refuses a single-file policy bind. A strictly generation-bound messaging dial override selects its paired
 API while preserving the original Host, public download origin, consumer
 identities and all other module targets.
 
