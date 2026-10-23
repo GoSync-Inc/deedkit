@@ -51,7 +51,7 @@ def page_worker(provider, monkeypatch, attempts_before_stop):
     return worker, statuses, sleeps, attempts
 
 
-# spec: ANYM-116
+# spec: ANYM-486
 def test_page_during_auto_reconnect_degrades_history_and_keeps_the_provider(tmp_path, monkeypatch):
     provider = fake_provider(tmp_path, [NOT_READY, PAGE])
     worker, statuses, sleeps, attempts = page_worker(provider, monkeypatch, 2)
@@ -63,7 +63,7 @@ def test_page_during_auto_reconnect_degrades_history_and_keeps_the_provider(tmp_
     assert sleeps == [60, 600]
 
 
-# spec: ANYM-116
+# spec: ANYM-486
 def test_provider_still_not_ready_after_five_minutes_stops_the_collector(tmp_path, monkeypatch):
     provider = fake_provider(tmp_path, [NOT_READY] * 10)
     worker, statuses, sleeps, attempts = page_worker(provider, monkeypatch, 10)
@@ -72,7 +72,7 @@ def test_provider_still_not_ready_after_five_minutes_stops_the_collector(tmp_pat
     assert attempts == [0, 60, 120, 180, 240, 300] and provider.disconnects == 0
 
 
-# spec: ANYM-116
+# spec: ANYM-486
 def test_recorded_provider_failure_still_stops_at_once(tmp_path, monkeypatch):
     (tmp_path / '.transport-failure').write_text(json.dumps({'code': 'policy_expired'}))
     provider = fake_provider(tmp_path, [NOT_READY])
@@ -81,7 +81,7 @@ def test_recorded_provider_failure_still_stops_at_once(tmp_path, monkeypatch):
     assert provider.disconnects == 1 and len(attempts) == 1 and statuses == []
 
 
-# spec: ANYM-116
+# spec: ANYM-486
 @pytest.mark.parametrize('method', ['media', 'request_history', 'policy'])
 def test_not_ready_outside_history_reads_keeps_disconnecting(tmp_path, method):
     provider = fake_provider(tmp_path, [NOT_READY])
@@ -90,7 +90,7 @@ def test_not_ready_outside_history_reads_keeps_disconnecting(tmp_path, method):
     assert provider.disconnects == 1
 
 
-# spec: ANYM-116
+# spec: ANYM-486
 def test_a_history_read_answered_inside_a_pass_ends_the_not_ready_streak(tmp_path, monkeypatch):
     # Separate short drops, each after a successful page, never add up to the bound.
     provider = fake_provider(tmp_path, [PAGE, NOT_READY] * 10)
@@ -103,7 +103,7 @@ def test_a_history_read_answered_inside_a_pass_ends_the_not_ready_streak(tmp_pat
     assert attempts == [60 * n for n in range(11)] and provider.disconnects == 0
 
 
-# spec: ANYM-116
+# spec: ANYM-486
 def test_a_database_error_while_reporting_the_wait_does_not_stop_the_collector(tmp_path, monkeypatch):
     import psycopg
     provider = fake_provider(tmp_path, [NOT_READY, PAGE])
