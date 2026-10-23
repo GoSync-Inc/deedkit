@@ -1076,7 +1076,11 @@ class TelegramCollector:
         data=answer.get('data')
         if isinstance(data,dict):
             data['stored_new']=created
-            missed=sum(1 for _,hit,_,_ in found if not hit.get('stored'))
+            # Messages below history_since are never stored, so a retry cannot help them (F-477a): they get
+            # their own count, and not_stored with retry_parameters covers only storage errors and the deadline.
+            outside=sum(1 for _,hit,_,_ in found if hit.get('reason')=='outside_history_window')
+            if outside:data['outside_history_window']=outside
+            missed=sum(1 for _,hit,_,_ in found if not hit.get('stored') and hit.get('reason')!='outside_history_window')
             if missed:
                 # A later default request starts below the oldest archived message and would skip these,
                 # so the receipt names the request that loads this page again (a rerun adds no duplicates):
@@ -1090,7 +1094,8 @@ class TelegramCollector:
                     data['retry_parameters']={'count':parameters.get('count',50),'before_message':
                         stable_id('msg',self.account,str(job.get('provider_chat')),str(default))}
                 else:
-                    dates=[m.date for m,hit,_,_ in found if m is not None and not hit.get('stored') and m.date]
+                    dates=[m.date for m,hit,_,_ in found if m is not None and not hit.get('stored') and m.date
+                             and hit.get('reason')!='outside_history_window']
                     if dates:
                         data['retry_parameters']={'count':100,
                             'from_time':min(dates).strftime('%Y-%m-%dT%H:%M:%SZ'),

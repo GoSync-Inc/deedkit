@@ -397,8 +397,10 @@ needs `read-live`, the account opt-in and, through the gateway, the
   stalled write never holds the collector lease past it.
 - Service messages (joins, title changes, calls) are part of the page.
 - The chat's history window (`history_since`) still applies: messages of a page below it are
-  fetched but not stored (`stored_new: 0`), and a request without an anchor then repeats the same
-  page. For older messages inside the window, use `from_time`/`to_time`.
+  fetched but not stored (`stored_new: 0`); the receipt counts them as `outside_history_window`,
+  never as `not_stored`, and offers no `retry_parameters` for them, since a retry cannot store them.
+  A request without an anchor then repeats the same page. For older messages inside the window, use
+  `from_time`/`to_time`.
 - Telegram archive: the page is committed as live search hits are (above):
   origin `backfill`, the usual revision rules, media jobs, the collection policy
   and `history_since`; checkpoints and coverage do not move. A rerun adds no rows.
