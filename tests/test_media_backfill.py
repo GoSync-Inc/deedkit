@@ -93,7 +93,8 @@ def test_backfill_needs_a_bounded_window(backlog, days):
 def backfill_claim_work(ar, s, claim, name):
     """Claims a fresh out-of-window voice note through backfill; returns the locked statement's work."""
     newest=job(ar,name,8*DAY-3600)
-    with s.pool.connection() as c: c.execute('ANALYZE media_jobs'); c.execute('ANALYZE messages')
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='120s'"); c.execute('ANALYZE media_jobs'); c.execute('ANALYZE messages')
     assert claim() is None
     plans=[]
     with explained(ar,plans): got=claim(backfill=True)
