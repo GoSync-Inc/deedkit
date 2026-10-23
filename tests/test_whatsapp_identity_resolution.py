@@ -314,3 +314,35 @@ def test_linked_pages_exclusions_and_selected_chat_operations(pair_archive):
     assert s.snooze_reply(key, chat_id(old), pn_new, 1, until)['snoozed'] is True
     queue = s.list_chats(key, awaiting_reply=True, awaiting_reply_days=0, include_coverage=False, accounts=['wa-pair'])
     assert sorted(r['id'] for r in queue['items']) == sorted(map(chat_id, others))
+
+
+# spec: ANYM-458
+def test_incoming_overview_counts_a_linked_pn_and_lid_conversation_once(pair_archive):
+    from datetime import datetime, timedelta, timezone
+    s, key, add, link, chats, chat_id = pair_archive
+    since = (datetime.now(timezone.utc)-timedelta(days=1)).isoformat()
+    def overview():
+        page = s.get_updates(key, 'overview', view='by_chat', from_time=since, accounts=['wa-pair'])
+        return page, {r['chat']: r for r in page['chats']}
+    old = add('111@c.us', 1, 5)
+    new = add('222@lid', 2, 1)
+    other = add('333@c.us', 3, 2)
+    # Without a verified link the archive chats stay apart.
+    page, rows = overview()
+    assert set(rows) == {chat_id(old), chat_id(new), chat_id(other)} and page['chats_total'] == 3
+    link(new, '111@c.us', '222@lid')
+    page, rows = overview()
+    assert set(rows) == {chat_id(new), chat_id(other)}
+    assert (page['chats_total'], page['live_total']) == (2, 3)
+    row = rows[chat_id(new)]
+    assert (row['live'], row['newest']['message']) == (2, new)
+    assert row['alias_chats'] == [{'id': chat_id(old)}]
+    assert (row['alias_provenance'], row['alias_confidence']) == ('whatsmeow_message_alt_v1', 'provider_cache_observation')
+    assert 'owner_replied_after_newest' not in row and 'alias_chats' not in rows[chat_id(other)]
+    # A newer message in the phone chat shows the conversation under it; an owner reply in either chat counts.
+    pn_new = add('111@c.us', 4, 0.5)
+    add('222@lid', 5, 0.25, direction='outgoing')
+    page, rows = overview()
+    row = rows[chat_id(old)]
+    assert chat_id(new) not in rows and (row['live'], row['newest']['message']) == (3, pn_new)
+    assert row['alias_chats'] == [{'id': chat_id(new)}] and row['owner_replied_after_newest'] is True

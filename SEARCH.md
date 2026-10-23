@@ -275,8 +275,11 @@ names shorten to 16 and drop, then the oldest rows move to the next call (`has_m
 `accounts` drops; `shortened_for_size` names the last step. `filters` lists only the names of the
 filters that applied. `has_more`, `chats_total`, `live_total` and `backfill_total` cover the whole window, not the
 page. Filters: accounts, chats, senders, dates, `exclude_channels`; chats outside the key's scope
-are neither counted nor named. A WhatsApp conversation stored under a phone and a LID chat is two
-archive chats here (`list_chats` shows it once, ANYM-278). `origins`, `kinds`, `order`,
+are neither counted nor named. A WhatsApp conversation stored under a phone and a LID chat, joined
+by the verified visible link `list_chats` uses (ANYM-278), is one row: counts cover both chats, the
+row's `chat` is the chat of its newest counted message (its read state is that chat's),
+`owner_replied_after_newest` looks at both, and `alias_chats` (`[{id}]`), `alias_provenance` and
+`alias_confidence` name the other chat. A `chats` filter merges only the chats it names. `origins`, `kinds`, `order`,
 `start_from`, `reset_filters` and `direction: outgoing` are `invalid_filter`.
 Example: `{"consumer": "overview", "view": "by_chat", "from_time": "2026-10-23T06:00:00Z"}`.
 

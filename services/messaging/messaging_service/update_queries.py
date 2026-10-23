@@ -143,25 +143,41 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,width):
     for bound,op in [(lower,'>='),(upper,'<')]:
         if bound:clauses.append('m.sent_at'+op+'%s');args.append(bound)
     read_sources,fresh,unread=read_state_sql(c)
+    # ANYM-278: a WhatsApp peer's PN chat and LID chat, joined by a verified visible link,
+    # are one conversation: one row, shown under the chat of its newest counted message.
+    from .whatsapp_identity import chat_links
+    scoped=[a for a in filters.get('accounts',p['accounts']) if a in p['accounts']]
+    whatsapp=c.execute("SELECT EXISTS(SELECT 1 FROM accounts WHERE id=ANY(%s) AND platform='whatsapp') AS x",
+        (scoped,)).fetchone()['x']
+    aliases,provenance={},{}
+    for link in (chat_links(c,p,filters.get('accounts'),paired_only=True) if whatsapp else []):
+        aliases[link['lid_chat']],aliases[link['pn_chat']]=link['pn_chat'],link['lid_chat']
+        provenance[link['lid_chat']]=provenance[link['pn_chat']]=link['provenance']
     rows=c.execute('''WITH sel AS MATERIALIZED (SELECT m.account,m.chat,m.id,m.sent_at,
-          e.origin IN ('backfill','reconcile') AS backfill
+          e.origin IN ('backfill','reconcile') AS backfill,
+          least(m.chat,coalesce(%s::jsonb->>m.chat,m.chat)) AS conversation
         FROM events e JOIN messages m ON m.id=e.message WHERE e.id>%s AND e.id<=%s AND '''+' AND '.join(clauses)+'''),
-      per AS (SELECT account,chat,count(*) FILTER (WHERE NOT backfill) AS live,count(*) FILTER (WHERE backfill) AS backfill,
-          max(sent_at) FILTER (WHERE NOT backfill) AS newest_at,max(sent_at) AS latest_at FROM sel GROUP BY account,chat)
-      SELECT per.*,count(*) OVER () AS chats_total,sum(per.live) OVER () AS live_total,sum(per.backfill) OVER () AS backfill_total,
-        (SELECT s.id FROM sel s WHERE s.account=per.account AND s.chat=per.chat AND NOT s.backfill
+      grouped AS (SELECT account,conversation,count(*) FILTER (WHERE NOT backfill) AS live,count(*) FILTER (WHERE backfill) AS backfill,
+          max(sent_at) FILTER (WHERE NOT backfill) AS newest_at,max(sent_at) AS latest_at FROM sel GROUP BY account,conversation),
+      heads AS (SELECT grouped.*,
+        (SELECT s.id FROM sel s WHERE s.account=grouped.account AND s.conversation=grouped.conversation AND NOT s.backfill
           ORDER BY s.sent_at DESC,s.id DESC LIMIT 1) AS newest_message,
-        (SELECT s.id FROM sel s WHERE s.account=per.account AND s.chat=per.chat ORDER BY s.sent_at DESC,s.id DESC LIMIT 1) AS head_message,
+        (SELECT s.id FROM sel s WHERE s.account=grouped.account AND s.conversation=grouped.conversation
+          ORDER BY s.sent_at DESC,s.id DESC LIMIT 1) AS head_message FROM grouped),
+      per AS (SELECT heads.*,(SELECT s.chat FROM sel s WHERE s.id=coalesce(heads.newest_message,heads.head_message) LIMIT 1) AS chat
+        FROM heads)
+      SELECT per.*,count(*) OVER () AS chats_total,sum(per.live) OVER () AS live_total,sum(per.backfill) OVER () AS backfill_total,
         answer.replied AS owner_replied_after_newest,ro.unread_count AS provider_unread_count,'''+unread+''' AS provider_unread,ro.observed_at AS read_state_observed_at,
         CASE WHEN '''+fresh+''' THEN 'observed' WHEN ro.observed_at IS NULL THEN 'unknown' ELSE 'stale' END AS read_state
       FROM per JOIN chats c ON c.id=per.chat AND c.account=per.account
       LEFT JOIN LATERAL (SELECT im.sent_at FROM messages im WHERE im.account=c.account AND im.chat=c.id
         AND im.direction='incoming' ORDER BY im.sent_at DESC LIMIT 1) incoming ON true
       LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
-      LEFT JOIN LATERAL (SELECT true AS replied FROM messages om WHERE om.account=c.account AND om.chat=c.id
+      LEFT JOIN LATERAL (SELECT true AS replied FROM messages om WHERE om.account=c.account
+        AND (om.chat=c.id OR om.chat=%s::jsonb->>c.id)
         AND om.direction='outgoing' AND om.sent_at>per.newest_at LIMIT 1) answer ON true
       ORDER BY per.newest_at DESC NULLS LAST,per.latest_at DESC,per.chat LIMIT %s''',
-        [position,head,*args,limit+1]).fetchall()
+        [Jsonb(aliases),position,head,*args,Jsonb(aliases),limit+1]).fetchall()
     more=len(rows)>limit;rows=rows[:limit]
     ids=[r['newest_message'] or r['head_message'] for r in rows]
     names=enrich(c,[{'id':mid} for mid in ids],p)
@@ -184,6 +200,9 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,width):
             'owner_replied_after_newest':r['owner_replied_after_newest'],
             'provider_unread':r['provider_unread'],'provider_unread_count':r['provider_unread_count'],
             'read_state_observed_at':r['read_state_observed_at']}),'newest':newest})
+        if r['chat'] in aliases:
+            chats[-1].update(alias_chats=[{'id':aliases[r['chat']]}],alias_provenance=provenance[r['chat']],
+                alias_confidence='provider_cache_observation')
     targets(p,[mid for mid in ids if mid])
     total=rows[0] if rows else {'chats_total':0,'live_total':0,'backfill_total':0}
     # An empty account may be a quiet one or a stopped collector: each scoped account's
