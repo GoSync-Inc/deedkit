@@ -232,6 +232,7 @@ def test_archive_view_and_transcript_keep_one_row_per_group(copies):
             assert [r['id'] for r in items]==[ids[0]] and items[0]['copies_total']==3,detail
             assert items[0]['latest_copy_at']=='2026-10-01T12:02:00+00:00',detail
             assert [c['message_id'] for c in items[0]['copies']]==ids[1:],detail
+            assert result['search']['collapse_forwards'] is True,detail
         # REST returns the same group and reports the option.
         body=client.post('/v1/search',json={'query':'synthetic marquee'},headers={'Authorization':'Bearer '+key}).json()
         assert [r['id'] for r in body['items']]==[ids[0]] and body['items'][0]['copies_total']==3
@@ -313,3 +314,36 @@ def test_malformed_or_keyless_origins_stay_ordinary_hits(copies):
     result=s.search(key,'synthetic marquee',limit=50)
     assert sorted(r['id'] for r in result['items'])==sorted(ids)
     assert all('copies_total' not in r for r in result['items']) and result['search']['collapse_forwards'] is True
+
+
+# spec: ANYM-273
+@pytest.mark.parametrize('order',['asc','desc'])
+def test_a_cursor_never_continues_in_the_other_view(copies,order):
+    s,add=copies
+    for n in range(4):
+        add(f'f{n}','synthetic marquee news',('300','301')[n%2],at=f'2026-10-01T1{n}:00:00+00:00',
+            origin={**POST,'provider_message_id':str(100+n%2)})
+    key=s.issue_key('forward-reader',['forward-tg'])
+    collapsed=s.search(key,'synthetic marquee',order=order,limit=1)
+    flat=s.search(key,'synthetic marquee',order=order,limit=1,collapse_forwards=False)
+    assert collapsed['next_cursor'] and flat['next_cursor'] and flat['next_cursor'].startswith('q1.')
+    for cursor,collapse in ((collapsed['next_cursor'],False),(flat['next_cursor'],True)):
+        with pytest.raises(APIError) as error:
+            s.search(key,'synthetic marquee',order=order,limit=1,after=cursor,collapse_forwards=collapse)
+        assert error.value.code=='invalid_cursor'
+    # The flat view pages through every copy exactly once.
+    seen=[*flat['items']];cursor=flat['next_cursor']
+    while cursor:
+        page=s.search(key,'synthetic marquee',order=order,limit=1,after=cursor,collapse_forwards=False)
+        seen.extend(page['items']);cursor=page['next_cursor']
+    assert len({r['id'] for r in seen})==len(seen)==4
+
+
+# spec: ANYM-273
+@pytest.mark.parametrize('kind',['hidden_user','status','unknown'])
+def test_excluded_origin_kinds_never_group_even_with_ids(copies,kind):
+    s,add=copies
+    ids=[add(str(n),'synthetic marquee news',str(300+n),origin={**POST,'kind':kind}) for n in range(2)]
+    key=s.issue_key('forward-reader',['forward-tg'])
+    rows=s.search(key,'synthetic marquee')['items']
+    assert sorted(r['id'] for r in rows)==sorted(ids) and all('copies_total' not in r for r in rows)

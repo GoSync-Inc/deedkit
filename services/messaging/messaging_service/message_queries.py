@@ -52,7 +52,8 @@ BASE = 'm.id,m.account,m.chat,m.sender,m.body,m.sent_at,m.revision,m.direction'
 # received by two owner accounts of one platform is one group.
 # Times compare as UTC text to the second (envelope.utc stores them so); no cast can fail.
 COPIES_LISTED = 20
-FORWARD_KEY = '''CASE WHEN md.v->'forwarded'='true'::jsonb AND jsonb_typeof(md.v->'forward_origin')='object' THEN
+FORWARD_KEY = '''CASE WHEN md.v->'forwarded'='true'::jsonb AND jsonb_typeof(md.v->'forward_origin')='object'
+      AND md.v->'forward_origin'->>'kind' IN ('user','chat','channel','newsletter') THEN
       CASE WHEN nullif(md.v->'forward_origin'->>'chat_id','') IS NOT NULL AND nullif(md.v->'forward_origin'->>'provider_message_id','') IS NOT NULL
         THEN a.platform||'|p|'||(md.v->'forward_origin'->>'chat_id')||'|'||(md.v->'forward_origin'->>'provider_message_id')
       WHEN md.v->'forward_origin'->>'kind'='user' AND nullif(md.v->'forward_origin'->>'sender_id','') IS NOT NULL
@@ -301,10 +302,12 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         chat_types=chat_types,include_channels=include_channels)
     # An explicit type filter binds the cursor; the default exclusion keeps bare ID cursors.
     typed=exclude_channels or chat_types is not None or include_channels is True
+    # ANYM-273: an explicit flat view binds its cursor, so a page cannot continue in the other view.
+    flat=bool(plan.query) and not collapse_forwards
     binding=cursor_binding(p,'messages',{**normalized,'query':query,'query_mode':query_mode,
         'language':search_language,'order':order,'fuzzy':fuzzy,
         # Only the non-default exact view binds, so cursors issued before ANYM-273 stay valid.
-        **({'collapse_forwards':False} if plan.query and not collapse_forwards else {}),
+        **({'collapse_forwards':False} if flat else {}),
         **({'view':view,'include_system':include_system,'conversation_version':1} if conversation else {})})
     extra_join=' LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision' if conversation else ''
     if conversation and not include_system:clauses.append(visible_sql('m','cmd'))
@@ -377,7 +380,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
                     cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
                     cursor_args=[at,mid]
         else:
-            if order=='relevance' or conversation or typed:raise APIError('invalid_cursor')
+            if order=='relevance' or conversation or typed or flat:raise APIError('invalid_cursor')
             anchor=store.message(c,p,cursor)
             cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
             cursor_args=[anchor['sent_at'],anchor['id']]
@@ -412,7 +415,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
             next_cursor=encode_cursor(binding,{'id':last['id'],'at':last['sent_at'],'score':last['score'],
                 'revision':last['revision'],'fuzzy':fuzzy_used,'source_order':last['source_order'],'snapshot':snapshot})
         else:next_cursor=encode_cursor(binding,{'id':last['id'],'at':last['sent_at'],'score':last['score'],
-            'revision':last['revision'],'fuzzy':fuzzy_used}) if order=='relevance' or fuzzy or typed else last['id']
+            'revision':last['revision'],'fuzzy':fuzzy_used}) if order=='relevance' or fuzzy or typed or flat else last['id']
     shape_messages(items,compact=False if conversation else compact)
     from .result_evidence import decorate
     from .chat_evidence import query_evidence
