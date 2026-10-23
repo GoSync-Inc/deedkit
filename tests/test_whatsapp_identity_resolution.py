@@ -346,3 +346,11 @@ def test_incoming_overview_counts_a_linked_pn_and_lid_conversation_once(pair_arc
     row = rows[chat_id(old)]
     assert chat_id(new) not in rows and (row['live'], row['newest']['message']) == (3, pn_new)
     assert row['alias_chats'] == [{'id': chat_id(new)}] and row['owner_replied_after_newest'] is True
+    # A chats filter naming one chat of the pair neither merges, names nor reads the other.
+    # The owner replied only in the LID chat, so the phone chat alone has no reply after its newest message.
+    page = s.get_updates(key, 'overview', view='by_chat', from_time=since, chats=[chat_id(old)])
+    assert [r['chat'] for r in page['chats']] == [chat_id(old)]
+    row = page['chats'][0]
+    assert row['live'] == 2 and 'alias_chats' not in row and 'owner_replied_after_newest' not in row
+    page = s.get_updates(key, 'overview', view='by_chat', from_time=since, chats=[chat_id(new), chat_id(old)])
+    assert [(r['chat'], r['live']) for r in page['chats']] == [(chat_id(old), 3)]

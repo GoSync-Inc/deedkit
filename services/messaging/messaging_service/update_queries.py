@@ -151,6 +151,8 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,width):
         (scoped,)).fetchone()['x']
     aliases,provenance={},{}
     for link in (chat_links(c,p,filters.get('accounts'),paired_only=True) if whatsapp else []):
+        # A chats filter merges, names and checks replies only across the chats it names.
+        if 'chats' in filters and not {link['lid_chat'],link['pn_chat']}<=set(filters['chats']):continue
         aliases[link['lid_chat']],aliases[link['pn_chat']]=link['pn_chat'],link['lid_chat']
         provenance[link['lid_chat']]=provenance[link['pn_chat']]=link['provenance']
     rows=c.execute('''WITH sel AS MATERIALIZED (SELECT m.account,m.chat,m.id,m.sent_at,
