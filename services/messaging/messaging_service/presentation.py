@@ -206,6 +206,11 @@ def _own_head(message):
 def lean_chat(row):
     result={k:row[k] for k in ('id','account','title','title_basis','type','last_activity') if row.get(k) is not None}
     result['title']=result['title'][:64]
+    # ANYM-278: the other chat of one WhatsApp conversation, and a LID chat's known phone.
+    if row.get('alias_chats'):
+        result['alias_chats']=[{k:a[k] for k in ('id','last_activity') if a.get(k) is not None} for a in row['alias_chats']]
+        result.update(alias_provenance=row.get('alias_provenance'),alias_confidence=row.get('alias_confidence'))
+    if row.get('peer_phone'):result.update(peer_phone=row['peer_phone'],peer_phone_provenance=row.get('peer_phone_provenance'))
     state=row.get('conversation')
     latest=(state or {}).get('latest_known_meaningful_message')
     kind=row.get('type')
