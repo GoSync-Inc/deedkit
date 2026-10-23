@@ -100,3 +100,107 @@ def test_alias_ambiguity_only_counts_authorized_original_chats(identity_archive)
     s.set_access('identity-reader', accounts=['telegram-demo'], chats=None)
     with pytest.raises(APIError, match='not_found'):
         s.resolve_reference(key, 'wa-identities', '1234567890:2@c.us')
+
+
+@pytest.fixture()
+def pair_archive(seeded):
+    from datetime import datetime, timedelta, timezone
+    from messaging_service.archive import Archive
+    from test_archive import event
+    s, *_ = seeded
+    ar = Archive(s)
+    ar.register('wa-pair', 'whatsapp', 'Synthetic pair', discover=True)
+    key = s.issue_key('wa-pair-agent', ['wa-pair'])
+    def add(chat, n, hours, direction='incoming', sender=None, chat_type='private', title=None):
+        at = (datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
+        return ar.ingest(event(account='wa-pair', platform='whatsapp', chat=chat, chat_title=title or chat,
+            sender=sender or (chat if direction == 'incoming' else '555@c.us'), direction=direction,
+            provider_id=f'{str(direction == "outgoing").lower()}_{chat}_{n}', body=f'Synthetic {n}',
+            sent_at=at, updated_at=at, metadata={'chat_type': chat_type}))['message']
+    def link(source, pn, lid, provenance='whatsmeow_message_alt_v1'):
+        with s.pool.connection() as c:
+            sender = c.execute('SELECT sender FROM messages WHERE id=%s', (source,)).fetchone()['sender']
+            c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,
+                pn,lid,provenance,first_observed_at,observed_at) VALUES('wa-pair',%s,%s,%s,%s,%s,now(),now())''',
+                (source, sender, pn, lid, provenance))
+    def chats(**kwargs):
+        rows = s.list_chats(key, include_coverage=False, **kwargs)['items']
+        return {r['provider_chat_id']: r for r in rows if r['account'] == 'wa-pair'}
+    def chat_id(message):
+        return s.get_context(key, message)['message']['chat']
+    return s, key, add, link, chats, chat_id
+
+
+# spec: ANYM-278
+@pytest.mark.parametrize('order', ['id', 'activity'])
+def test_pn_and_lid_chats_of_one_peer_are_listed_once_without_rekeying(pair_archive, order):
+    s, key, add, link, chats, chat_id = pair_archive
+    old = add('111@c.us', 1, 5, title='Alice Synthetic')
+    new = add('222@lid', 2, 1)
+    link(new, '111@c.us', '222@lid')
+    rows = chats(order=order)
+    assert list(rows) == ['222@lid']
+    row = rows['222@lid']
+    assert row['id'] == chat_id(new)
+    assert [(a['id'], a['provider_chat_id']) for a in row['alias_chats']] == [(chat_id(old), '111@c.us')]
+    assert row['alias_chats'][0]['last_activity'] is not None
+    assert (row['alias_provenance'], row['alias_confidence']) == ('whatsmeow_message_alt_v1', 'provider_cache_observation')
+    # Stored chats and messages keep their own IDs and provider IDs.
+    assert s.get_context(key, old)['message']['provider_id'] == 'false_111@c.us_1'
+    assert s.get_context(key, new)['message']['provider_id'] == 'false_222@lid_2'
+    from messaging_service.presentation import render
+    lean = render('list_chats', s.list_chats(key, include_coverage=False, view='conversation'), 'compact')['items']
+    assert [r['alias_chats'][0]['id'] for r in lean if r['id'] == row['id']] == [chat_id(old)]
+    # The hidden chat's title still finds the conversation.
+    assert list(chats(query='Alice Synthetic')) == ['222@lid']
+    # A newer message in the phone-number chat makes it the listed chat.
+    add('111@c.us', 3, 0.5)
+    rows = chats(order=order)
+    assert list(rows) == ['111@c.us'] and rows['111@c.us']['alias_chats'][0]['provider_chat_id'] == '222@lid'
+
+
+# spec: ANYM-278
+def test_conflicting_link_keeps_both_chats_and_shows_no_phone(pair_archive):
+    s, key, add, link, chats, chat_id = pair_archive
+    add('111@c.us', 1, 5)
+    new = add('222@lid', 2, 1)
+    other = add('333@lid', 3, 2)
+    link(new, '111@c.us', '222@lid')
+    link(other, '111@c.us', '333@lid')
+    rows = chats()
+    assert set(rows) == {'111@c.us', '222@lid', '333@lid'}
+    for row in rows.values():
+        assert 'alias_chats' not in row and 'peer_phone' not in row
+
+
+# spec: ANYM-278
+def test_grouping_needs_both_chats_and_a_visible_source_in_scope(pair_archive):
+    s, key, add, link, chats, chat_id = pair_archive
+    old = add('111@c.us', 1, 5)
+    new = add('222@lid', 2, 1)
+    group = add('999@g.us', 3, 3, sender='222@lid', chat_type='group')
+    link(group, '111@c.us', '222@lid')
+    assert set(chats()) == {'222@lid', '999@g.us'}
+    old, new = chat_id(old), chat_id(new)
+    s.set_access('wa-pair-agent', chats=[old])
+    rows = chats(awaiting_reply=True, awaiting_reply_days=0)
+    assert list(rows) == ['111@c.us'] and 'alias_chats' not in rows['111@c.us']
+    assert s.list_chats(key, include_coverage=False, awaiting_reply=True, awaiting_reply_days=0)['awaiting_reply_total'] == 1
+    # Both chats visible, but the only evidence sits in a chat the key cannot read.
+    s.set_access('wa-pair-agent', chats=[old, new])
+    rows = chats()
+    assert set(rows) == {'111@c.us', '222@lid'}
+    assert all('alias_chats' not in r and 'peer_phone' not in r for r in rows.values())
+
+
+# spec: ANYM-278
+def test_lid_chat_shows_its_verified_phone_number(pair_archive):
+    s, key, add, link, chats, chat_id = pair_archive
+    lid = add('222@lid', 1, 1)
+    plain = add('444@lid', 2, 1)
+    link(lid, '111@c.us', '222@lid', 'webjs_contact_cache_v1')
+    rows = chats()
+    assert (rows['222@lid']['peer_phone'], rows['222@lid']['peer_phone_provenance']) == ('+111', 'webjs_contact_cache_v1')
+    assert 'peer_phone' not in rows['444@lid'] and 'alias_chats' not in rows['222@lid']
+    link(plain, '111@c.us', '444@lid')
+    assert all('peer_phone' not in r for r in chats().values())

@@ -169,15 +169,45 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     lower,upper=date_bound(from_time),date_bound(to_time)
     if lower and upper and lower>=upper:raise APIError('invalid_date_range')
     scope,args=scope_filter(p,'c',chat_column='id');clauses=[scope]
+    # ANYM-278: a peer's private PN chat and LID chat, joined by a verified visible
+    # link, are one conversation. The chat with the newest meaningful message is
+    # listed (a tie lists the LID chat); the other one names it in alias_chats.
+    from .whatsapp_identity import chat_links
+    whatsapp=c.execute("SELECT EXISTS(SELECT 1 FROM accounts WHERE id=ANY(%s) AND platform='whatsapp') AS x",
+        (p['accounts'] if accounts is None else [a for a in accounts if a in p['accounts']],)).fetchone()['x']
+    links=chat_links(c,p,accounts) if whatsapp else [];aliases={};listed={}
+    pairs=[link for link in links if link['pn_chat']]
+    if pairs:
+        heads={r['id']:r for r in c.execute('''SELECT c.provider_chat,c.id,c.title,ro.unread_count,(SELECT m.sent_at FROM messages m
+            LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
+            WHERE m.account=c.account AND m.chat=c.id AND '''+meaningful()+''' ORDER BY m.sent_at DESC LIMIT 1) AS at
+            FROM chats c LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
+            WHERE c.id=ANY(%s)''',([i for link in pairs for i in (link['lid_chat'],link['pn_chat'])],))}
+        for link in pairs:
+            lid,pn=heads[link['lid_chat']],heads[link['pn_chat']]
+            shown,other=(pn,lid) if pn['at'] and (not lid['at'] or pn['at']>lid['at']) else (lid,pn)
+            aliases[lid['id']]=pn['id'];aliases[pn['id']]=lid['id']
+            listed[shown['id']]={'chat':{'id':other['id'],'provider_chat_id':other['provider_chat'],
+                'title':other['title'],'last_activity':other['at'],'unread_count':other['unread_count']},
+                'provenance':link['provenance']}
+    hidden={v['chat']['id']:shown for shown,v in listed.items()}
+    if hidden and not selected_chat:clauses.append('NOT c.id=ANY(%s)');args.append(list(hidden))
     if selected_chat:clauses.append('c.id=%s');args.append(selected_chat)
     if accounts is not None:clauses.append('c.account=ANY(%s)');args.append(accounts)
     if query:
         pattern='%'+query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
-        clauses.append("(c.title ILIKE %s ESCAPE E'\\\\' OR "+raw_title_sql()+" AND "+peer_name_sql()+" ILIKE %s ESCAPE E'\\\\')")
-        args.extend([pattern,pattern])
+        match="(c.title ILIKE %s ESCAPE E'\\\\' OR "+raw_title_sql()+" AND "+peer_name_sql()+" ILIKE %s ESCAPE E'\\\\')"
+        # A listed row also matches by its hidden alias chat's title.
+        found=[hidden[r['id']] for r in c.execute('SELECT c.id FROM chats c WHERE c.id=ANY(%s) AND '+match,
+            [list(hidden),pattern,pattern])] if hidden else []
+        clauses.append('('+match+(' OR c.id=ANY(%s)' if found else '')+')')
+        args.extend([pattern,pattern,*([found] if found else [])])
     if chat_types is not None:clauses.append("coalesce(c.chat_type,'unknown')=ANY(%s)");args.append(chat_types)
     if exclude_channels:clauses.append("c.chat_type IS DISTINCT FROM 'channel'")
-    if exclude_chats is not None:clauses.append('NOT c.id=ANY(%s)');args.append(exclude_chats)
+    if exclude_chats is not None:
+        # Excluding either chat of a conversation excludes the conversation.
+        excluded_chats=[*exclude_chats,*(hidden[i] for i in exclude_chats if i in hidden)]
+        clauses.append('NOT c.id=ANY(%s)');args.append(excluded_chats)
     if exclude_senders is not None:
         clauses.append('(attention.sender IS NULL OR NOT attention.sender=ANY(%s))');args.append(exclude_senders)
     binding=cursor_binding(p,'chats',{'accounts':accounts,'query':query,'types':chat_types,'order':order,
@@ -371,17 +401,23 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         ranked=ranked_for()
     if include_muted and ranked:attention_lookup=ranked
     muted_flag=f"CASE WHEN {chat_muted} THEN 'chat' WHEN attention.mute_rank=1 THEN 'sender' END"
+    owner_lookup=latest_sql(owner_sql)
+    if aliases:
+        # The owner's latest message in either chat of a conversation (ANYM-278).
+        alias_owner=latest_sql(owner_sql.replace('m.chat=c.id',"m.chat=(score_clock.aliases->>c.id)"))
+        owner_lookup=('SELECT * FROM (('+owner_lookup+') UNION ALL ('+alias_owner+
+            ')) owner_heads ORDER BY sent_at DESC,numeric_id DESC,id DESC LIMIT 1')
     def base_for(attention_lookup):return f''' FROM chats c JOIN accounts a ON a.id=c.account
-      CROSS JOIN (SELECT %s::timestamptz AS at,%s::jsonb AS owners) score_clock
+      CROSS JOIN (SELECT %s::timestamptz AS at,%s::jsonb AS owners,%s::jsonb AS aliases) score_clock
       LEFT JOIN LATERAL ({latest_sql(last_sql,both_directions=True)}) last ON true
-      LEFT JOIN LATERAL ({latest_sql(owner_sql)}) own_last ON true
+      LEFT JOIN LATERAL ({owner_lookup}) own_last ON true
       LEFT JOIN LATERAL ({latest_sql(select_message+" AND m.direction='incoming'")}) incoming ON true
       LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
       LEFT JOIN reply_dismissals d ON d.key_id=%s AND d.chat=c.id
       LEFT JOIN LATERAL ({attention_lookup}) attention ON true
       LEFT JOIN sender_profiles sp ON sp.account=c.account AND sp.chat=c.id AND sp.sender=attention.sender WHERE '''
     base=base_for(attention_lookup)
-    base_args=[score_at,owner_senders(c,p),p['key_id']]
+    base_args=[score_at,owner_senders(c,p),Jsonb(aliases),p['key_id']]
     ranked_base_args=[*base_args,*(ranked_args or [])]
     if attention_lookup is ranked:base_args=ranked_base_args
     # A first queue page counts the same filtered rows it sorts, in one pass.
@@ -499,12 +535,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
                     (row['account'],row['id'])).fetchone()['n']
             else:row['awaiting_reply_incoming_count']=c.execute(f'''SELECT count(*) AS n FROM messages m
                 LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
-                WHERE m.account=%s AND m.chat=%s AND m.direction='incoming' AND {meaningful()}
+                WHERE m.account=%s AND m.chat=ANY(%s) AND m.direction='incoming' AND {meaningful()}
                   AND NOT coalesce(md.metadata->'sender_is_bot'='true'::jsonb,false)
                   AND (%s::timestamptz IS NULL OR m.sent_at>%s::timestamptz OR
                     (%s='telegram' AND m.sent_at=%s::timestamptz AND {number('m')} >%s::bigint) OR
                     (%s='whatsapp' AND m.sent_at=%s::timestamptz))''',
-                (row['account'],row['id'],row['_own_sent_at'],row['_own_sent_at'],
+                (row['account'],[row['id'],*([aliases[row['id']]] if row['id'] in aliases else [])],row['_own_sent_at'],row['_own_sent_at'],
                  row['_platform'],row['_own_sent_at'],row['_own_numeric_id'],
                  row['_platform'],row['_own_sent_at'])).fetchone()['n']
         else:
@@ -528,11 +564,22 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     from .sender_names import resolve
     resolve(c,p,items,chat='id',sender='awaiting_reply_sender',name='awaiting_reply_sender_name',
         basis='awaiting_reply_sender_name_basis')
+    phones={link['lid_chat']:('+'+link['pn'].split('@')[0],link['provenance']) for link in links}
     for row in private:
+        if row['id'] in listed and not selected_chat:
+            row.update(alias_chats=[listed[row['id']]['chat']],alias_provenance=listed[row['id']]['provenance'],
+                alias_confidence='provider_cache_observation')
+        if row['id'] in phones:
+            row['peer_phone'],row['peer_phone_provenance']=phones[row['id']]
         if row['id'] in selves:row.update(title=SELF_CHAT_TITLE,title_basis='self_chat')
         elif (row['account'],row['id']) in titles:
             row['title'],basis=titles[(row['account'],row['id'])]
             if basis:row['title_basis']=basis
+        alias=listed.get(row['id'],{}).get('chat') if not selected_chat else None
+        if (alias and alias['title'] and alias['title']!=alias['provider_chat_id'] and row['id'] not in selves and
+                (row['title'] in ('',row['provider_chat_id']) or row.get('title_basis')=='phone_number')):
+            # A raw or number-only title borrows the alias chat's stored name.
+            row.update(title=alias['title'],title_basis='alias_chat')
     targets(p,[r['id'] for r in items])
     if include_coverage:
         from .chat_evidence import chat_statuses

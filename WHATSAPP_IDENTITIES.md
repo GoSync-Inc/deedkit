@@ -36,6 +36,22 @@ visible, nondeleted message in that observed chat. Empty-name senders can obtain
 an entry from a provider link, without inventing a name. Grouping still groups
 the original sender ID within an account; it does not merge PN and LID entries.
 
+`list_chats` lists one conversation once (ANYM-278). A peer's private PN chat
+and private LID chat of one account form one conversation when a link passes the
+`resolve_reference` rules below: no conflict anywhere in the account, a visible
+nondeleted source, and both chats visible to the caller. The chat with the newest
+meaningful message is listed (a tie lists the LID chat) with `alias_chats`
+(`id`, `provider_chat_id`, `title`, `last_activity`, `unread_count`),
+`alias_provenance` and `alias_confidence: provider_cache_observation`; the other
+chat leaves the items and every total, before paging. The owner's latest message
+in either chat ends the reply hint, so the hint is always a message of the listed
+chat. Unread and read state stay those of the listed chat. Excluding either chat
+excludes the conversation; `query` also matches the other chat's title; a raw or
+number-only title borrows the other chat's stored title (`title_basis:
+alias_chat`). A private LID chat with such a link carries `peer_phone`
+(`+<digits>`, the `pn` digits) and `peer_phone_provenance`. Stored chat, message
+and provider IDs never change, and `search_people` keeps separate rows.
+
 `resolve_reference` prefers an exact original chat ID. If none exists, it may
 resolve a visible verified namespace link to one visible original chat. Multiple
 possible chats return `ambiguous_reference`; opaque message IDs are never

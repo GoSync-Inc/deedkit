@@ -484,3 +484,35 @@ def test_queue_page_survives_a_message_the_date_reader_cannot_resolve(inbox):
     rows = queue(order='priority')['items']
     assert sorted(r['provider_chat_id'] for r in rows) == ['100', '200']
     assert not any('awaiting_reply_time_reference' in r for r in rows)
+
+
+# spec: ANYM-278
+@pytest.mark.parametrize('linked', [True, False])
+def test_owner_reply_in_the_phone_chat_clears_the_lid_chat_hint(seeded, linked):
+    s, _, _ = seeded
+    ar = Archive(s)
+    ar.register('queue-pair', 'whatsapp', 'Synthetic WhatsApp pair', discover=True)
+    key = s.issue_key('queue-pair-agent', ['queue-pair'])
+    def add(chat, n, hours, direction):
+        at = (datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
+        return ar.ingest(event(account='queue-pair', platform='whatsapp', chat=chat,
+            sender=chat if direction == 'incoming' else '555@c.us', direction=direction,
+            provider_id=f'{str(direction == "outgoing").lower()}_{chat}_{n}', body=f'Synthetic {n}',
+            sent_at=at, updated_at=at, metadata={'chat_type': 'private'}))['message']
+    incoming = add('222@lid', 1, 2, 'incoming')
+    add('111@c.us', 2, 1, 'outgoing')
+    if linked:
+        with s.pool.connection() as c:
+            c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,
+                pn,lid,provenance,first_observed_at,observed_at)
+                VALUES('queue-pair',%s,'222@lid','111@c.us','222@lid','whatsmeow_message_alt_v1',now(),now())''', (incoming,))
+    result = s.list_chats(key, awaiting_reply=True, include_coverage=False)
+    if linked:
+        assert (result['items'], result['awaiting_reply_total']) == ([], 0)
+    else:
+        assert [r['provider_chat_id'] for r in result['items']] == ['222@lid'] and result['awaiting_reply_total'] == 1
+    # A newer incoming message in the LID chat is one hint for the conversation.
+    add('222@lid', 3, 0.5, 'incoming')
+    result = s.list_chats(key, awaiting_reply=True, include_coverage=False)
+    assert [r['provider_chat_id'] for r in result['items']] == ['222@lid'] and result['awaiting_reply_total'] == 1
+    assert result['items'][0]['awaiting_reply_incoming_count'] == (1 if linked else 2)
