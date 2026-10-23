@@ -116,7 +116,7 @@ def test_queue_past_qualifier_crosses_brackets_and_line_breaks(text):
 
 
 # spec: ANYM-282
-@pytest.mark.parametrize('end',['.','!','?','…','‼','⁉','？','！','。'])
+@pytest.mark.parametrize('end',['.','!','?','…','‼','⁉','？','！','。','．','﹒','﹖','﹗','｡','؟'])
 def test_queue_past_qualifier_never_crosses_a_sentence_end(end):
     assert passed_reference(f'today or on Friday{end} Last week was busy.',MONDAY,at(14),UTC) is None
     assert passed_reference(f'Last week was busy{end} today or on Friday?',MONDAY,at(14),UTC) is None
