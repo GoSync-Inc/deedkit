@@ -249,7 +249,7 @@ published and re-registered resident; text, ASR and descriptions are untouched.
 - **Unchanged.** An original evicted without a verified copy, and a gateway
   whose role lacks the restore grant, keep the provider path. The demand window
   opens only when the provider path itself would accept the request (collection
-  policy, attempt cap, cooldown, history bounds); otherwise a cold restore still
+  policy, attempt cap, cooldown); otherwise a cold restore still
   runs, without a provider fallback.
 - **Activation.** In this order: re-run `cold_archive_role.sql` (read the
   eviction journal, `media_reservations` and `file_uploads`; execute
@@ -278,7 +278,8 @@ Direct embedded `Archive.claim_media` calls retain their legacy unbounded
 default; live collector entry points always pass the validated configuration.
 
 An unexpired explicit original request is selected ahead of automatic prefetch,
-including outside its rolling window. It does not override history bounds,
+including outside its rolling window and below `history_since` (owner decision
+2026-10-23, ANYM-477; the run never claims such a job by itself). It does not override
 collection/account/chat access, deleted or superseded revisions, the attempt cap,
 provider cooldown, file-size limits or storage admission. Outside-window jobs
 remain queued without consuming a provider attempt. Requests do not reset failed
@@ -393,7 +394,7 @@ With a current record, account media operations report
 each queued original without a registered original exactly once:
 
 - **eligible**: an unexpired explicit request, or a message inside the window
-  (`null` window: any message), in both cases not before the run's history bound.
+  (`null` window: any message); without a request, not before the run's history bound.
   `eligible_queued_jobs` counts them. `storage_paused_jobs`,
   `storage_unavailable_jobs`, `retry_queued_jobs` and the queued `diagnostics`
   count eligible jobs only, by their recorded code. Media `state` is
@@ -401,7 +402,8 @@ each queued original without a registered original exactly once:
 - **`outside_prefetch_window_jobs`**: known occurrences that wait for an explicit
   `request_file_download`, whatever code they recorded earlier.
 - **`outside_history_bounds_jobs`**: messages older than the chat's confirmed
-  history bound; a request does not download them.
+  history bound and no unexpired request; the run never downloads them by itself, an
+  explicit `request_file_download` does (ANYM-477).
 - **`history_bound_unknown_jobs`**: messages older than the run's published bound
   in a chat whose bound is not confirmed (see below); the run does not download
   them, and a request cannot be promised.
@@ -427,10 +429,10 @@ managed-evicted original there has the same reason and action instead of
 original outside the window has
 `download_phase: available_on_request`, reason `outside_prefetch_window` and next
 action `request_file_download` (conversation text: "файл доступен по запросу"),
-not `blocked`. Before a confirmed bound, an original that needs a provider download
-or re-download (including a managed-evicted one) has reason
-`outside_history_bounds` and no `request_file_download` action; its request returns
-`request_status: unavailable` with that reason and records no `requested_until`. A
+not `blocked`. Before a confirmed bound, a queued original has the same phase and
+action with reason `outside_history_bounds`; its request is queued as eligible and the
+collector downloads it (owner decision 2026-10-23, ANYM-477). A managed-evicted
+original there keeps reason `original_evicted` and action `request_file_download`. A
 present original stays `ready` regardless of the bound. Access, deletion,
 active-transfer and terminal-failure answers keep their precedence. With an
 unknown bound (or no current record) the attachment and every request for it,

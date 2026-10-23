@@ -334,7 +334,7 @@ class Archive:
                 WHERE p.enabled AND (%(account)s::text IS NULL OR j.account=%(account)s) AND j.attempts<5 AND
                 NOT m.deleted AND NOT(ch.provider_chat=ANY(p.exclude_chats)) AND
                 (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
-                (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s) AND
+                (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s OR j.requested_until>clock_timestamp()) AND
                 (%(days)s::integer IS NULL OR j.requested_until>clock_timestamp() OR
                     (%(days)s::integer>0 AND m.sent_at>=%(now)s-%(days)s*interval '1 day'
                         AND m.sent_at<=%(now)s+interval '5 minutes') OR
