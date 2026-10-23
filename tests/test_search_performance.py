@@ -4,11 +4,11 @@ from messaging_service.file_index import search_files
 
 
 class Measured:
-    def __init__(self,connection):self.connection=connection;self.plans=[]
+    def __init__(self,connection):self.connection=connection;self.plans=[];self.jit=[]
     def execute(self,sql,args=None):
         if sql.startswith('WITH search_query'):
-            self.plans.append(self.connection.execute('EXPLAIN (ANALYZE,FORMAT JSON) '+sql,args)
-                .fetchone()['QUERY PLAN'][0]['Plan'])
+            explained=self.connection.execute('EXPLAIN (ANALYZE,FORMAT JSON) '+sql,args).fetchone()['QUERY PLAN'][0]
+            self.plans.append(explained['Plan']);self.jit.append(explained.get('JIT'))
         return self.connection.execute(sql,args)
     def __getattr__(self,name):return getattr(self.connection,name)
 
@@ -69,6 +69,43 @@ def test_default_channel_exclusion_keeps_absent_query_candidates_bounded(seeded)
         result=search(s,measured,p,query='absentlexicalneedleqxz',include_channels=False)
     assert result['items']==[]
     assert measured.plans and sum(ordered_visits(plan) for plan in measured.plans)<100, [scans(plan) for plan in measured.plans]
+
+
+# spec: ANYM-501
+def test_default_channel_exclusion_reads_matches_through_text_indexes(seeded):
+    s,a,b=seeded
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='60s'")
+        c.execute('''INSERT INTO chats(id,account,provider_chat,title,chat_type)
+            SELECT 'people-'||n,'telegram-demo','people-'||n,'Synthetic people',CASE WHEN n%2=0 THEN 'private' ELSE 'group' END
+            FROM generate_series(1,400) n''')
+        # 20 of 8,000 messages in 400 private and group chats carry the term.
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
+            SELECT 'people-post-'||n,'telegram-demo','people-'||(n%400+1),n::text,'fixture',
+                CASE WHEN n%400=7 THEN 'scarcelexicalneedle ' ELSE '' END||repeat('ordinary private content ',5),
+                now()+n*interval '1 second'
+            FROM generate_series(1,8000) n''')
+        c.execute('ANALYZE messages');c.execute('ANALYZE chats')
+        for index in ('message_fts','message_fts_english','message_fts_indonesian','message_fts_russian'):
+            c.execute('SELECT gin_clean_pending_list(%s::regclass)',(index,))
+    with s.authorized(b,'search') as (c,p):
+        c.execute('SET LOCAL enable_seqscan=off')
+        measured=Measured(c)
+        result=search(s,measured,p,query='scarcelexicalneedle',include_channels=False)
+    assert len(result['items'])==20
+    # coalesce(chat_type) estimated ~1.5% of the chats, so the plan walked every message of all 400 chats (8,000 rows).
+    assert measured.plans and sum(visited(plan,{'messages'}) for plan in measured.plans)<500, [scans(plan) for plan in measured.plans]
+
+
+# spec: ANYM-501
+def test_message_search_runs_without_jit_compilation(seeded):
+    s,a,b=seeded
+    with s.authorized(b,'search') as (c,p):
+        # Every plan crosses the threshold, as a common word over a large archive does.
+        c.execute('SET LOCAL jit_above_cost=0')
+        measured=Measured(c)
+        search(s,measured,p,query='synthetic')
+    assert measured.jit and measured.jit==[None]*len(measured.jit), measured.jit
 
 
 def test_absent_file_query_reads_bounded_file_candidates(seeded):
