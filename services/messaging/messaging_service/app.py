@@ -979,8 +979,9 @@ def create_app(store: Store, allowed_hosts: list[str]):
         use reset_filters=true with its current expected_ack_version and cursor-write permission.
         Reset preserves acknowledged position and invalidates outstanding receipts; it does not replay old history.
         view=by_chat: read-only overview, one row per chat with new incoming messages after this consumer's ACK
-        (from_time required without one): live and backfill counts, the newest live message, read state;
-        newest live first, limit = chats. No receipt; origins, kinds, order and outgoing are invalid.
+        and from_time (from_time required without an ACK): live and backfill counts, the newest live message,
+        owner_replied_after_newest, read state, per account source state; newest live first, limit = chats.
+        No receipt; origins, kinds, order and outgoing are invalid.
         """
         return call(ctx,'get_updates',detail=detail,consumer=consumer,limit=limit,accounts=accounts,chats=chats,senders=senders,
                     origins=origins,kinds=kinds,direction=direction,from_time=from_time,to_time=to_time,

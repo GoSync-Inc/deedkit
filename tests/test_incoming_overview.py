@@ -35,16 +35,22 @@ def test_overview_splits_live_and_backfill(seeded):
     add(s,'telegram-demo','tg-live','m2',3,body='Newest live question?')
     add(s,'telegram-demo','tg-live','m3',2,origin='backfill')
     add(s,'telegram-demo','tg-live','m4',4,direction='outgoing')
+    add(s,'whatsapp-demo-1','wa-photo','m7',0,body='')
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO attachments(id,message,digest,filename,mime,bytes) VALUES('f7','m7','7777777777777777777777777777777777777777777777777777777777777777','photo.jpg','image/jpeg',1)")
     add(s,'whatsapp-demo-1','wa-history','m5',5,origin='backfill')
     add(s,'whatsapp-demo-1','wa-history','m6',6,origin='reconcile')
     page=s.get_updates(a,'overview',view='by_chat',from_time=SINCE)
     rows={row['chat']:row for row in page['chats']}
-    assert [row['chat'] for row in page['chats']]==['tg-live','wa-history']
+    assert [row['chat'] for row in page['chats']]==['tg-live','wa-photo','wa-history']
     assert (rows['tg-live']['live'],rows['tg-live']['backfill'])==(2,1)
     assert rows['tg-live']['newest']['message']=='m2'
     assert rows['tg-live']['newest']['text']=='Newest live question?'
+    assert rows['tg-live']['owner_replied_after_newest'] is True and 'owner_replied_after_newest' not in rows['wa-photo']
+    assert rows['wa-photo']['newest']['text']=='[photo.jpg]'
     assert (rows['wa-history']['live'],rows['wa-history']['backfill'],rows['wa-history']['newest'])==(0,2,None)
-    assert (page['live_total'],page['backfill_total'],page['chats_total'])==(2,3,2)
+    assert (page['live_total'],page['backfill_total'],page['chats_total'])==(3,3,3)
+    assert [row['account'] for row in page['accounts']]==['telegram-demo','whatsapp-demo-1']
     assert page['view']=='by_chat' and page['has_more'] is False
 
 
@@ -58,11 +64,16 @@ def test_overview_never_acks_or_moves_cursors(seeded):
     pending=s.get_updates(a,'main',from_time=SINCE)
     before=state(s)
     page=s.get_updates(a,'main',view='by_chat')
-    assert page['cursor_basis']=='acknowledged_position'
+    assert page['window']=='acknowledged_position'
     assert [(row['chat'],row['live']) for row in page['chats']]==[('tg-live',1)]
     assert 'receipt' not in page and 'ack_version' not in page
     fresh=s.get_updates(a,'never-created',view='by_chat',from_time=SINCE)
-    assert fresh['cursor_basis']=='no_consumer' and fresh['live_total']==2
+    assert fresh['window']=='from_time' and fresh['live_total']==2
+    # A supplied from_time also bounds a consumer's window; neither bound is dropped.
+    both=s.get_updates(a,'main',view='by_chat',from_time='2026-10-22T01:30:00Z')
+    assert both['window']=='acknowledged_position_and_from_time' and both['live_total']==1
+    later=s.get_updates(a,'main',view='by_chat',from_time='2026-10-22T03:00:00Z')
+    assert (later['chats'],later['live_total'])==([],0)
     assert state(s)==before
     assert s.ack_updates(a,'main',pending['receipt'],pending['ack_version'])['acked']
 
@@ -118,8 +129,9 @@ def test_overview_of_25_chats_within_10000_chars(seeded):
 def test_overview_rejects_event_only_options_and_unbounded_scans(seeded,options):
     s,a,b=seeded
     before=state(s)
-    with pytest.raises(APIError,match='invalid_filter'):
+    with pytest.raises(APIError,match='invalid_filter') as failure:
         s.get_updates(a,'o',view='by_chat',**({'from_time':SINCE} if options else {}),**options)
+    if not options:assert failure.value.fields==['from_time']
     with pytest.raises(APIError,match='invalid_filter'):
         s.get_updates(a,'o',view='timeline')
     assert state(s)==before
