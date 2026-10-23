@@ -24,3 +24,5 @@ Tests were not re-run; the Tiden trace verdict (PASS on all 15) and the merged p
 | ANYM-451 out-of-band key resend | Review | live check never run |
 
 The exact missing calls for each Review card are in that card's evidence note in Tiden.
+
+ANYM-427 (part A, Medium): the owner confirmed the Mandiri row on 2026-10-23; the live check was recorded the same day, so the card is Done.
