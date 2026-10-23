@@ -76,8 +76,9 @@ Since ANYM-270, `capabilities` takes `detail` (`summary` or `full`) and `section
 
 - MCP (direct and the gateway's `messages_capabilities`), REST (`POST /v1/capabilities`, the
   gateway's `/v1/messages_capabilities`) and the Python and npm clients return `detail=summary`
-  when `detail` is omitted: service, version, principal, `credential_id`, permissions, accounts
-  (`id`, `platform`, `label`), `chat_scope` as `all_in_permitted_accounts` plus `chat_count`,
+  when `detail` is omitted: service, version, principal, `credential_id`, permissions,
+  `expires_at`, accounts (`id`, `platform`, `label`, `self_provider_id`; ANYM-470), `chat_scope`
+  as `all_in_permitted_accounts` plus `chat_count`,
   `tool_manifest.version`, the section names and a `next_action`. Through the gateway the summary
   names `gateway_principal`, `backend_principal` and `gateway_tool_count` and leaves out backend
   permissions, as `full` does. Callers that need everything pass `detail=full`, as the in-repo

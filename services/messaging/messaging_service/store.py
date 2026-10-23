@@ -65,8 +65,9 @@ def capability_view(full, detail='full', sections=None, permitted=None):
     if detail!='summary':raise APIError('invalid_filter')
     scope=full['chat_scope']
     return {'service':full['service'],'version':full['version'],'principal':full['principal'],
-        'credential_id':full['credential_id'],'permissions':full['permissions'],
-        'accounts':[{k:a[k] for k in ('id','platform','label')} for a in full['accounts']],
+        'credential_id':full['credential_id'],'permissions':full['permissions'],'expires_at':full['expires_at'],
+        # ANYM-470: the key's expiry and each owner's ID stay in the default view.
+        'accounts':[{k:a[k] for k in ('id','platform','label','self_provider_id')} for a in full['accounts']],
         'chat_scope':{'all_in_permitted_accounts':scope['all_in_permitted_accounts'],
                       'chat_count':None if scope['chat_ids'] is None else len(scope['chat_ids'])},
         'tool_manifest':{'version':full['tool_manifest']['version']},

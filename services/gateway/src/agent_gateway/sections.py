@@ -36,9 +36,12 @@ def capabilities_view(result, args):
     chats = scope.get("chat_ids")
     accounts = result.get("accounts") if isinstance(result.get("accounts"), list) else []
     summary = {key: result[key] for key in ("service", "version", "gateway_principal", "backend_principal",
-                                            "credential_id") if key in result}
+                                            "credential_id", "expires_at") if key in result}
+    # ANYM-470: the backend key's expiry and each owner's ID stay in the default view.
     summary.update(
-        accounts=[{k: a.get(k) for k in ("id", "platform", "label")} for a in accounts if isinstance(a, dict)],
+        accounts=[{k: a.get(k) for k in ("id", "platform", "label")}
+                  | ({"self_provider_id": a["self_provider_id"]} if "self_provider_id" in a else {})
+                  for a in accounts if isinstance(a, dict)],
         chat_scope={"all_in_permitted_accounts": scope.get("all_in_permitted_accounts"),
                     "chat_count": len(chats) if isinstance(chats, list) else None},
         gateway_tool_count=len(result.get("gateway_tools") or []),
