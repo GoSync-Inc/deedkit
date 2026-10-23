@@ -208,7 +208,7 @@ def within_budget(result):
     import json
     def size():return len(json.dumps(result,ensure_ascii=False,default=str))
     if len(result['chats'])>25 or size()<=OVERVIEW_BUDGET:return result
-    for step in ('text:40','names:32','text:0','sender_id','observed_at','names:16'):
+    for step in ('text:40','names:32','text:0','sender_id','observed_at','names:16','names:0'):
         kind,_,n=step.partition(':')
         for row in result['chats']:
             newest=row.get('newest') or {}
@@ -217,9 +217,14 @@ def within_budget(result):
                 elif len(newest['text'])>int(n):newest['text']=newest['text'][:int(n)].rstrip()+'…'
             if kind=='names':
                 for holder,key in ((row,'chat_title'),(newest,'sender_name')):
-                    if key in holder:holder[key]=holder[key][:int(n)]
+                    if key in holder:
+                        if int(n):holder[key]=holder[key][:int(n)]
+                        else:holder.pop(key)
             if kind=='sender_id' and 'sender_name' in newest:newest.pop('sender',None)
             if kind=='observed_at':row.pop('read_state_observed_at',None)
         result['shortened_for_size']=step
-        if size()<=OVERVIEW_BUDGET:break
+        if size()<=OVERVIEW_BUDGET:return result
+    # Last resort: the oldest rows move to the next call (has_more); totals still cover the window.
+    while len(result['chats'])>1 and size()>OVERVIEW_BUDGET:
+        result['chats'].pop();result['has_more']=True;result['shortened_for_size']='rows'
     return result
