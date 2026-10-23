@@ -46,6 +46,12 @@ def validate(live, wait_s, request_id):
     return float(wait_s)
 
 
+def scope(p):
+    """What a search page was read under: a reread failure may reuse the page only while this is unchanged."""
+    return (p['id'], p['key_id'], p['scope_version'], p['key_permission_version'], sorted(p['accounts']),
+            None if p.get('chat_ids') is None else sorted(p['chat_ids']), sorted(p['permissions']))
+
+
 def accounts_in_scope(c, p, arguments):
     """Accounts the archive search can match: named chats, account/accounts and chat types ANDed as in filters()."""
     from .message_queries import CHAT_TYPES
@@ -241,8 +247,9 @@ async def search(store, token, arguments, *, live='off', wait_s=None, request_id
     """The archive answer, plus result_evidence.live when live is auto or on (ANYM-478)."""
     wait_s = validate(live, wait_s, request_id)
     run = asyncio.to_thread
-    first = await run(store.search, token, **arguments)
-    if live == 'off': return first
+    if live == 'off': return await run(store.search, token, **arguments)
+    read_under = []
+    first = await run(lambda: store.search(token, **arguments, _scope=read_under))
     evidence = first['result_evidence']; evidence.pop('suggested_call', None)
     paged = bool(arguments.get('after') or arguments.get('before'))
     # A continuation page goes on to the plan, which says first_page_only (S3.1).
@@ -279,8 +286,12 @@ async def search(store, token, arguments, *, live='off', wait_s=None, request_id
     # The archive is read again with the caller's current authorization; never a cached page.
     try: second = await run(store.search, token, **arguments)
     except Exception as error:
-        # A revoked key still fails the call; a slow or failed reread keeps the first archive answer.
+        # A slow or failed reread keeps the first archive answer, but only after the caller's access is checked
+        # again and is unchanged since that page was read; otherwise the call fails as the reread did (F-478a).
         if not isinstance(error, APIError) or error.code not in PLAN_DEGRADED: raise
+        try: current = await run(store.live_search_scope, token)
+        except Exception: raise error from None
+        if not read_under or current != read_under[0]: raise error
         log.warning('live_search_reread_failed code=%s', error.code)
         second = first; evidence['archive_reread'] = 'failed'
     evidence = second['result_evidence']; evidence.pop('suggested_call', None)

@@ -623,12 +623,14 @@ class Store:
                to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None,
                query_mode='all', order='asc', before='', direction='', search_language='auto',
                fuzzy=False, compact=False, body_chars=None, include_coverage=True,view='archive',include_system=False,exclude_channels=False,
-               chat_types=None,include_channels=False):
+               chat_types=None,include_channels=False,_scope=None):
         # None is the internal no-default sentinel of message_queries.search, never a public value.
         if type(include_channels) is not bool:raise APIError('invalid_filter')
         from .message_queries import named_chats
-        from .live_search import suggest
+        from .live_search import suggest, scope
         with self.authorized(token,'search') as (c,p):
+            # ANYM-478: the live search keeps the scope this page was read under (F-478a); never in the answer.
+            if isinstance(_scope,list):_scope.append(scope(p))
             named_chats(c,p,chat,chats)
             result=self._search(c,p,query,account,chat,sender,from_time,to_time,after,limit,
                 accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,
@@ -651,6 +653,12 @@ class Store:
         from .live_search import plan
         with self.authorized(token,'search') as (c,p):
             return plan(c,p,arguments,paged=paged,request_id=request_id)
+
+    def live_search_scope(self,token):
+        """ANYM-478: the caller's current search scope, checked as the archive search checks it."""
+        from .live_search import scope
+        with self.authorized(token,'search') as (_,p):
+            return scope(p)
 
     def live_search_receipts(self,token,operation_ids):
         """ANYM-478: this key's receipts of its live searches, one short read; a missing one is left out."""

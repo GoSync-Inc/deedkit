@@ -347,10 +347,22 @@ def test_a_timed_out_archive_reread_keeps_the_first_archive_answer_and_the_live_
         with s.authorized(token, 'search') as (c, _):
             c.execute('SET LOCAL statement_timeout = 1'); c.execute('SELECT pg_sleep(1)')
     monkeypatch.setattr(s, 'search', slow_reread)
-    result = run(s, key, {'query': 'Synthetic'}, [CommandWorker(state, found(archive))], live='on', wait_s=10)
+    result = run(s, key, {'query': 'Synthetic', 'view': 'conversation'}, [CommandWorker(state, found(archive))],
+                 live='on', wait_s=10)
     assert len(calls) == 2 and result['items'] and result['result_evidence']['archive_reread'] == 'failed'
     entry, = result['result_evidence']['live']
     assert entry['state'] == 'done' and [h['provider_id'] for h in entry['hits']] == ['7']
+    from messaging_service.presentation import render
+    assert render('search', result, 'transcript')['archive_reread'] == 'failed'
+    # The caller's scope changed after the first page was read: that page is never reused.
+    def scope_changes(token, **arguments):
+        calls.append(arguments)
+        if len(calls) % 2: return search(token, **arguments)
+        s.issue_key('live-agent', [ACCOUNT], permissions=['read'])
+        return slow_reread(token, **arguments)
+    calls.clear(); monkeypatch.setattr(s, 'search', scope_changes)
+    with pytest.raises(APIError, match='query_timeout'):
+        run(s, key, {'query': 'Synthetic'}, live='on', wait_s=0, request_id='synthetic-reread-3')
     def reread_forbidden(token, **arguments):
         calls.append(arguments)
         if len(calls) % 2: return search(token, **arguments)
