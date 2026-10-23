@@ -936,6 +936,13 @@ class TelegramCollector:
             with suppress(RuntimeError):
                 await asyncio.to_thread(self.archive.fail_media,job,code,permanent=permanent,
                     retry_after=exc.seconds if isinstance(exc,ProviderRateLimited) else None,collector_lease=self.state.lease)
+        except Exception as exc:
+            # An unclassified provider error fails only this original, never the collector;
+            # archive faults still reach media_loop. Class name only, never provider text.
+            if isinstance(exc,database_errors()): raise
+            log.warning('media_transfer_failed error=%s',chat_error_evidence(exc)['error_class'])
+            with suppress(RuntimeError):
+                await asyncio.to_thread(self.archive.fail_media,job,'network_error',collector_lease=self.state.lease)
         finally:
             renewal.cancel(); download.cancel()
             await asyncio.gather(renewal,download,return_exceptions=True)
