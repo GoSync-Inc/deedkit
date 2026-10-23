@@ -4872,7 +4872,15 @@ def test_a_missing_configuration_file_is_named_in_the_refusal(tmp_path, monkeypa
     assert capsys.readouterr().err == f"promotion refused: FileNotFoundError {missing}\n"
     # An autodeploy.env this parser cannot read as systemd does is refused, not guessed.
     monkeypatch.setattr(p, "CONFIG_DIRECTORY", tmp_path)
-    (tmp_path / "autodeploy.env").write_text("DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a\\\n.json\n")
-    with pytest.raises(SystemExit):
-        p.main(["status"])
-    assert "continues a line; pass --config" in capsys.readouterr().err
+    for text, refusal in [("DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a\\\n.json\n", "cannot read as systemd does"),
+                          ("DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a.json\nNOTES='\nDEEDKIT_DEPLOY_CONFIG=/etc/deedkit/b.json\n'\n",
+                           "cannot read as systemd does"),
+                          ("OTHER=value\\ \nDEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a.json\n", "cannot read as systemd does"),
+                          ("DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/a.json\nDEEDKIT_DEPLOY_CONFIG=\n", "empty DEEDKIT_DEPLOY_CONFIG")]:
+        (tmp_path / "autodeploy.env").write_text(text)
+        with pytest.raises(SystemExit):
+            p.main(["status"])
+        assert refusal + "; pass --config" in capsys.readouterr().err
+    # Plain lines with spaces around = and paired quotes read as systemd reads them.
+    (tmp_path / "autodeploy.env").write_text('; note\nOTHER = "x y"\nDEEDKIT_DEPLOY_CONFIG = "/etc/deedkit/b.json"\n')
+    assert p.active_config() == "/etc/deedkit/b.json"
