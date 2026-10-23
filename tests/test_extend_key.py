@@ -65,7 +65,8 @@ def test_extend_key_moves_expiry_from_database_clock_and_keeps_everything_else(s
 
 
 # spec: ANYM-422
-@pytest.mark.parametrize('days', [0, -1, 184, 365, True, 1.5, '7', None])
+# The ceiling is 365 days since ANYM-499 (owner 2026-10-24); the name and the other cases keep their Tiden IDs.
+@pytest.mark.parametrize('days', [0, -1, True, 1.5, '7', None])
 def test_extend_key_refuses_lifetime_outside_one_to_183_days(seeded, days):
     store, token, _ = seeded
     key = credential(store, token)

@@ -7,7 +7,7 @@ Provider sessions, the owner DSN and the backup decryption key are not given to 
 ## What a credential allows
 
 Each agent has its own principal and a separate Bearer key. A key is issued
-for 1–30 days (7 by default), can be extended in place by the owner ([below](#extending-a-key)), is stored in the DB only as a SHA256, and has a public UUID
+for 1–365 days (7 by default), can be extended in place by the owner ([below](#extending-a-key)), is stored in the DB only as a SHA256, and has a public UUID
 for revocation. Several keys of one principal share the principal scope and the
 archive-consumer ACK; the subscription ACK and feedback belong to the exact key.
 Different agents get different principals. Keys must not be passed in a query string,
@@ -111,7 +111,7 @@ python -m messaging_service set-access --principal assistant-work \
 
 python -m messaging_service list-keys --principal assistant-work
 python -m messaging_service revoke-key --key-id PUBLIC_CREDENTIAL_UUID
-python -m messaging_service extend-key --key-id PUBLIC_CREDENTIAL_UUID --days 183
+python -m messaging_service extend-key --key-id PUBLIC_CREDENTIAL_UUID --days 365
 python -m messaging_service set-access --principal assistant-work --disable
 python -m messaging_service set-access --principal assistant-work --enable
 python -m messaging_service audit-tail --principal assistant-work --limit 50
@@ -124,7 +124,7 @@ principal does not enable it again.
 
 ### Extending a key
 
-Since schema 36 `extend-key` sets one live key's expiry to now + `--days` (an integer 1–183,
+Since schema 36 `extend-key` sets one live key's expiry to now + `--days` (an integer 1–365,
 required), measured by the database clock under the principal lock. The token, its digest,
 permissions and the principal's scope stay the same, so its subscriptions, their ACK and its
 feedback keep working, and neither the gateway policy (`key_sha256`) nor a calls `archive_config`

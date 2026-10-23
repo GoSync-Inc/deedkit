@@ -1090,7 +1090,8 @@ class Store:
     def issue_key(self, principal, accounts, days=7, *, chats=UNSET, permissions=UNSET,
                   key_permissions=UNSET):
         principal_id(principal)
-        if type(days) is not int or not 1<=days<=30:
+        # Up to one year (owner 2026-10-24, ANYM-499); the default stays 7 days.
+        if type(days) is not int or not 1<=days<=365:
             raise ValueError('invalid_key_lifetime')
         token = 'pos_probe_'+secrets.token_urlsafe(32)
         with self.pool.connection() as c:
@@ -1173,7 +1174,7 @@ class Store:
     def extend_key(self,credential_id,days):
         # Renewal in place (ANYM-422): token, digest, permissions and scope stay unchanged.
         credential_id=key_id(credential_id)
-        if type(days) is not int or not 1<=days<=183:raise ValueError('invalid_key_lifetime')
+        if type(days) is not int or not 1<=days<=365:raise ValueError('invalid_key_lifetime')
         with self.pool.connection() as c:
             known=c.execute('SELECT principal FROM api_keys WHERE id=%s',(credential_id,)).fetchone()
             if not known:raise ValueError('unknown_key')
