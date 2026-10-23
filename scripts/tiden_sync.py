@@ -55,7 +55,8 @@ WINDOW = "only in a maintenance window, with the sync workflow disabled and no r
 
 def write(cli: str, arguments: list[str], product: str | None) -> None:
     """One Tiden write; its output is not trusted (each step reads back instead) and never shown. `spec update`,
-    `test links` and `test link-spec` take global IDs and reject `--product-id` (CLI 0.33.0), so product is None."""
+    `test links` and `test link-spec` take global IDs; CLI 0.33.0 rejected `--product-id` on them (0.41.0 accepts it
+    as a check), so product is None."""
     command = [cli, *arguments, *(["--product-id", product] if product else []), "--format", "json"]
     try:
         completed = subprocess.run(command, capture_output=True, text=True, timeout=TIMEOUT)

@@ -79,8 +79,8 @@ jobs:
       # The sync calls the CLI by its path; a workflow_run job writes nothing to GITHUB_PATH or GITHUB_ENV.
       - name: Install pinned Tiden CLI with integrity check
         run: |
-          curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.36.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
-          echo "166995cd41353986931dc26b2fce256a5bc517fda8eef217ffd6c723873b5527  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
+          curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.41.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
+          echo "d42fca58f868dc22be1aa01187105a1c442b4a32c88e9c47ac2f051ef05fb286  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
           mkdir "$RUNNER_TEMP/tiden-bin"
           tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
       # It writes since check A ran green on three pull requests (#136, #137, #138; ANYM-405). Without
