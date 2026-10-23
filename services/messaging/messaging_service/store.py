@@ -171,7 +171,12 @@ class Store:
                             permission = OPERATION_PERMISSIONS[operation] if operation else None
                             if permission and permission not in p['permissions']:
                                 raise APIError('forbidden', 403)
-                            yield c, p
+                            from .result_evidence import FILES_ROOT
+                            root = FILES_ROOT.set(self.files)
+                            try:
+                                yield c, p
+                            finally:
+                                FILES_ROOT.reset(root)
                     except Exception as error:
                         # Roll back the attempted action, but commit its denial audit
                         # outside the savepoint. Successful mutations + audit commit

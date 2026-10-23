@@ -1,6 +1,21 @@
 """Consistent, bounded message/file evidence from already authorized rows."""
+import re
+from contextvars import ContextVar
+
 from .attachment_metadata import attachment_fields
 from .media_policy import ELIGIBILITY_JOIN
+
+# Set by Store.access; without it no excerpt is shown (the presence rule cannot run).
+FILES_ROOT:ContextVar=ContextVar('files_root',default=None)
+EXCERPT_CHARS=300
+EXCERPT_BUDGET=3000
+# get_file_text's default choice: ready extracted text, else a voice note's ready transcript (ANYM-453).
+_EXTRACTED="f.state='ready' AND coalesce(f.text_content,'')<>''"
+_TRANSCRIPT="(a.mime LIKE 'audio/%%' OR a.mime='application/ogg') AND e.state='ready' AND coalesce(e.text_content,'')<>''"
+_TEXT='(CASE WHEN '+_EXTRACTED+' THEN f.text_content WHEN '+_TRANSCRIPT+' THEN e.text_content END)'
+EXCERPT_COLUMNS=(',CASE WHEN '+_EXTRACTED+" THEN 'extracted' WHEN "+_TRANSCRIPT+" THEN 'transcript' END AS excerpt_source,"
+    'left('+_TEXT+',%s) AS excerpt_head,length('+_TEXT+') AS excerpt_total,'
+    'CASE WHEN '+_EXTRACTED+' THEN f.truncated WHEN '+_TRANSCRIPT+' THEN e.truncated END AS excerpt_source_truncated')
 
 
 def send_provenance(c,rows):
@@ -55,6 +70,35 @@ def delivery_evidence(c,rows):
         row['delivery_receipt']=proofs.get(row.get('id') or row.get('message'),unknown_evidence())
 
 
+def _readable(c,file):
+    """get_file_text's rule: the original is resident, or gone by a completed managed eviction."""
+    from .file_index import _absent,_available
+    from .file_lifecycle import is_managed_evicted
+    root=FILES_ROOT.get()
+    if root is None or not file.get('digest'):return False
+    row={'sha256':file['digest'],'bytes':file['bytes']}
+    return _available(root,row) or (_absent(root,row) and is_managed_evicted(c,file['digest'],file['bytes']))
+
+
+def text_excerpt(c,file,budget):
+    """A bounded head of the text get_file_text returns by default, with where to read on."""
+    source=file.get('excerpt_source')
+    if not source or not _readable(c,file):return None
+    total=file['excerpt_total']
+    pointer={'tool':'get_file_text','attachment_id':file['attachment_id'],'offset':0,
+        'content':'extracted' if source=='extracted' else 'enriched'}
+    head=file['excerpt_head'][:EXCERPT_CHARS]
+    if total>EXCERPT_CHARS:
+        # Prefer a word boundary near the end so the excerpt does not stop mid-word.
+        match=re.search(r'\s\S*$',head[EXCERPT_CHARS-40:])
+        if match:head=head[:EXCERPT_CHARS-40+match.start()].rstrip() or head
+    common={'source':source,'model_generated':source=='transcript','untrusted':True}
+    if len(head)>budget:return {'omitted':'response_budget',**common,'total_chars':total,'read_more':pointer}
+    return {'text':head,**common,'excerpt_chars':len(head),'total_chars':total,
+        'complete':len(head)==total and not file['excerpt_source_truncated'],
+        'read_more':None if len(head)==total else {**pointer,'offset':len(head)}}
+
+
 def decorate(c,rows):
     if not rows:return rows
     ids=list({r['id'] for r in rows})
@@ -64,6 +108,7 @@ def decorate(c,rows):
         j.state AS job_state,j.error_code AS download_error_code,el.occurrence AS download_eligibility,
         coalesce(a.filename,j.descriptor->>'filename') AS source_name,
         coalesce(f.state,'unknown') AS extraction_state,CASE WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio' WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END) THEN 'queued' ELSE coalesce(e.state,'unconfigured') END AS enrichment_state
+        '''+EXCERPT_COLUMNS+'''
         FROM media_jobs j JOIN messages m ON m.id=j.message
         JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
         LEFT JOIN attachments a ON a.id=j.id AND a.active
@@ -73,7 +118,7 @@ def decorate(c,rows):
             AND f.source_bytes=a.bytes AND f.state<>'superseded'
         LEFT JOIN attachment_enrichment e ON e.attachment=a.id AND e.source_digest=a.digest
             AND e.source_revision=m.revision AND e.state<>'superseded'
-        WHERE j.message=ANY(%s) AND j.state<>'superseded' AND NOT m.deleted ORDER BY j.id''',(ids,)).fetchall()
+        WHERE j.message=ANY(%s) AND j.state<>'superseded' AND NOT m.deleted ORDER BY j.id''',(EXCERPT_CHARS+1,ids)).fetchall()
     # Synthetic fixtures and restored legacy originals may predate media jobs.
     files+=c.execute('''SELECT a.message,a.id AS attachment_id,a.id,a.filename,a.mime,a.bytes,a.digest,
         NULL::jsonb AS descriptor,NULL::integer AS attempts,NULL::timestamptz AS next_due,
@@ -81,6 +126,7 @@ def decorate(c,rows):
         m.provider_id AS provider_message_id,ch.provider_chat AS provider_chat_id,
         'ready' AS job_state,NULL AS download_error_code,a.filename AS source_name,
         coalesce(f.state,'unknown') AS extraction_state,CASE WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio' WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END) THEN 'queued' ELSE coalesce(e.state,'unconfigured') END AS enrichment_state
+        '''+EXCERPT_COLUMNS+'''
         FROM attachments a JOIN messages m ON m.id=a.message
         JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
         LEFT JOIN attachment_text f ON f.attachment=a.id AND f.source_digest=a.digest
@@ -89,13 +135,22 @@ def decorate(c,rows):
         LEFT JOIN attachment_enrichment e ON e.attachment=a.id AND e.source_digest=a.digest
             AND e.source_revision=m.revision AND e.state<>'superseded'
         WHERE a.message=ANY(%s) AND a.active AND NOT m.deleted
-        AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE j.id=a.id) ORDER BY a.id''',(ids,)).fetchall()
+        AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE j.id=a.id) ORDER BY a.id''',(EXCERPT_CHARS+1,ids)).fetchall()
     grouped={}
     for file in files:
         # A database download receipt is not a fresh filesystem presence check.
         # get_attachment verifies the original before issuing any bearer URL.
         item=attachment_fields(file)
         grouped.setdefault(file['message'],[]).append(item)
+        file['item']=item
+    # One budget per decorated result, spent in the caller's row order.
+    budget=EXCERPT_BUDGET
+    order={r['id']:n for n,r in enumerate(rows)}
+    for file in sorted(files,key=lambda f:order.get(f['message'],len(order))):
+        excerpt=text_excerpt(c,file,budget)
+        if excerpt:
+            file['item']['text_excerpt']=excerpt
+            budget-=excerpt.get('excerpt_chars',0)
     conflicts={r['message']:r for r in c.execute('''SELECT message,
         count(*) FILTER(WHERE resolved_at IS NULL) AS active_conflicts,
         count(*) FILTER(WHERE resolved_at IS NOT NULL) AS historical_conflicts,
