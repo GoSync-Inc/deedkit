@@ -2501,11 +2501,15 @@ def active_config():
         lines = (CONFIG_DIRECTORY / "autodeploy.env").read_text().splitlines()
     except FileNotFoundError:
         return CONFIG
+    if any(line.rstrip().endswith("\\") for line in lines):
+        raise Refused(f"{CONFIG_DIRECTORY / 'autodeploy.env'} continues a line; pass --config")
+    found = CONFIG
     for line in lines:
         key, _, value = line.partition("=")
+        # As systemd's EnvironmentFile=: comments start with # or ;, the last assignment wins.
         if key.strip() == "DEEDKIT_DEPLOY_CONFIG" and (value := value.strip().strip("\"'")):
-            return value
-    return CONFIG
+            found = value
+    return found
 
 
 def main(argv=None):
