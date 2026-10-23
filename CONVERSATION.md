@@ -132,6 +132,28 @@ The remaining hint fields keep their names and meanings: `message_id`,
 message; `last_message` carries the same pair for a forwarded head. The
 row's `read_state` is unchanged. `detail="full"` keeps every field.
 
+A hint whose message names a date that has already passed carries
+`time_reference` and the reason `referenced_date_passed` (ANYM-282), for
+example "visit today" sent on the 16th and read on the 17th, or "в пятницу"
+after that Friday. The reason adds no points: the score, order and cursors are
+unchanged, so the agent can apologise and offer a new date instead of a plain
+answer: `suggest` is `acknowledge_delay_offer_new_date`. The conversation
+hint carries `time_reference` as `{text, resolved_date, status: "passed",
+time_zone, suggest}`; archive rows carry the same object as
+`awaiting_reply_time_reference`, and compact archive rows keep `resolved_date`,
+`text` (at most 40 characters) and `suggest`. Numeric dates are read day first
+(`10/5` is 10 May). A narrative "сегодня было холодно" is flagged too on the
+next day: the request still waits, so the hint is a prompt to check, not a
+verdict. Only the first 160 characters of the message are read, and only a
+small allowlist in Russian, English and Indonesian: today, tomorrow, the day
+after tomorrow, a weekday with a preposition ("в пятницу", "on Friday", "hari
+Jumat", "Jumat ini") and dd.mm or dd/mm dates with a year or a preceding
+preposition ("до 17.10", "by 15/10"). A weekday equal to the send day, past
+markers ("в прошлую", "last", "lalu") and vague phrases ("в выходные", "next
+week") yield nothing; with several dates the latest decides. Dates resolve in
+the owner's zone, `ANYMSG_OWNER_TIMEZONE` (IANA name) on the messaging server;
+unset or unknown means UTC and `time_zone: "UTC_fallback"`.
+
 ### Queue priority components
 
 The queue score is a sum of named components, each a fixed integer. `detail="full"`
