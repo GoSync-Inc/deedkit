@@ -1141,6 +1141,11 @@
             "title": "Limit",
             "type": "integer"
           },
+          "person": {
+            "default": "",
+            "title": "Person",
+            "type": "string"
+          },
           "query": {
             "default": "",
             "title": "Query",
@@ -1352,6 +1357,11 @@
               "relevance"
             ],
             "title": "Order",
+            "type": "string"
+          },
+          "person": {
+            "default": "",
+            "title": "Person",
             "type": "string"
           },
           "query": {

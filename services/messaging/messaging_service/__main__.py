@@ -16,7 +16,7 @@ def main():
         'replay','snapshot','verify-restore','quarantine-restore','register-account',
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
         'set-messenger-operations','extend-key','set-feedback-status','export-feedback','release-retention-hold',
-        'set-subscription-retention'])
+        'set-subscription-retention','link-person','unlink-person','delete-person','list-people'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -60,6 +60,8 @@ def main():
     parser.add_argument('--overlap',type=int,help='export-feedback: minutes before --since/--changed-since, 2-1440 (default 10)')
     parser.add_argument('--subscription-ids',nargs='+',help='release-retention-hold: subscription UUIDs')
     parser.add_argument('--all-subscriptions',action='store_true',help='release-retention-hold: every held subscription')
+    parser.add_argument('--sender',help='link-person/unlink-person: exact provider sender ID (sender_id from search_people)')
+    parser.add_argument('--person',help='link-person: add to this person UUID (default: a new person); delete-person, list-people')
     args=parser.parse_args()
     if args.command == 'serve':
         configure('gateway')
@@ -139,6 +141,17 @@ def main():
             if not args.key_id or args.key_file or args.days is None:
                 parser.error('extend-key requires --key-id and --days, never --key-file')
             print(json.dumps(store.extend_key(args.key_id,args.days)))
+        elif args.command in ('link-person','unlink-person'):
+            # ANYM-283: owner-made links only; an agent key has no path to these.
+            if not args.account or not args.sender:
+                parser.error(args.command+' requires --account and --sender')
+            print(json.dumps(store.link_person(args.account,args.sender,args.person) if args.command=='link-person'
+                else store.unlink_person(args.account,args.sender)))
+        elif args.command=='delete-person':
+            if not args.person: parser.error('delete-person requires --person')
+            print(json.dumps(store.delete_person(args.person)))
+        elif args.command=='list-people':
+            print(json.dumps(store.list_people(args.person)))
         elif args.command=='set-feedback-status':
             if not args.feedback_ids or not args.status:
                 parser.error('set-feedback-status requires --id and --status')

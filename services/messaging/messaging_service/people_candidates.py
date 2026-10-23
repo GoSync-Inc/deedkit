@@ -7,10 +7,11 @@ from .name_variants import patterns
 from .whatsapp_identity import visible_cte,people_join
 from .sender_names import resolve
 from .message_queries import chat_titles
+from .person_links import annotate,member_clause,visible_members
 
 
 def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=20,
-                  transliterate=False,group_by_sender=False):
+                  transliterate=False,group_by_sender=False,person=''):
     from .store import APIError,bounded,serial
     bounded(limit);valid_text(query,200);valid_text(after,4096)
     if type(transliterate) is not bool or type(group_by_sender) is not bool:raise APIError('invalid_filter')
@@ -21,6 +22,11 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
     clauses=[scope,'NOT m.deleted','sp.account=m.account','sp.chat=m.chat','sp.sender=m.sender']
     for column,values in [('account',accounts),('chat',chats)]:
         if values is not None:clauses.append('m.'+column+'=ANY(%s)');args.append(values)
+    members=None
+    # ANYM-283: only the owner-linked members this key can read; exact (account,sender) pairs.
+    if person!='':
+        person,members,digest=visible_members(c,p,person)
+        clause,values=member_clause('sp','account','sender',members);clauses.append(clause);args.extend(values)
     match='(sp.search_text LIKE q.pattern OR identity.search_text LIKE q.pattern)'
     if query:
         condition=match
@@ -55,7 +61,15 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
         FROM sender_profiles sp JOIN messages m ON m.id=sp.source_message '''+people_join()+''' CROSS JOIN q
         WHERE '''+' AND '.join(clauses)+') '
     binding=cursor_binding(p,'people',{'query':query,'accounts':accounts,'chats':chats,
-        'transliterate':transliterate,'group_by_sender':group_by_sender,'spelling_candidates':2})
+        'transliterate':transliterate,'group_by_sender':group_by_sender,'spelling_candidates':2,
+        **({'person':person} if members is not None else {})})
+    # A visible membership change is cursor_changed; a hidden one leaves the digest alone.
+    extra={'members':digest} if members is not None else {}
+    def position(pos,keys):
+        if members is not None:
+            if pos.pop('members',None)!=digest:raise APIError('cursor_changed',409)
+        if set(pos)!=keys:raise APIError('invalid_cursor')
+        return pos
     query_args=[*identity_args,pattern,variants,query,terms,pattern[1:],
         [value[1:] for value in variants],transliterate,*args]
     cursor_args=[];cursor_clause=''
@@ -64,8 +78,8 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
             " CASE WHEN bool_or(match_type='literal') THEN 'literal' ELSE 'transliteration_candidate' END AS match_type,"+\
             " min(match_rank) AS match_rank FROM observed GROUP BY account,sender_id) "
         if after:
-            pos=decode_cursor(after,binding)
-            if set(pos)!= {'rank','account','sender'} or type(pos['rank']) is not int or not 0<=pos['rank']<=7:
+            pos=position(decode_cursor(after,binding),{'rank','account','sender'})
+            if type(pos['rank']) is not int or not 0<=pos['rank']<=7:
                 raise APIError('invalid_cursor')
             position_text(pos['account']);position_text(pos['sender'])
             anchor=c.execute(cte+'SELECT match_rank FROM grouped WHERE account=%s AND sender_id=%s',
@@ -77,9 +91,9 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
         sql='SELECT * FROM grouped '+cursor_clause+' ORDER BY match_rank,account,sender_id LIMIT %s'
     else:
         if after:
-            if query:
-                pos=decode_cursor(after,binding)
-                if set(pos)!= {'rank','id'} or type(pos['rank']) is not int or not 0<=pos['rank']<=7:
+            if query or members is not None:
+                pos=position(decode_cursor(after,binding),{'rank','id'})
+                if type(pos['rank']) is not int or not 0<=pos['rank']<=7:
                     raise APIError('invalid_cursor')
                 position_text(pos['id'])
                 anchor=c.execute(cte+'SELECT match_rank FROM observed WHERE id=%s',[*query_args,pos['id']]).fetchone()
@@ -99,16 +113,18 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
     cursor=None
     if len(rows)>limit:
         last=items[-1]
-        cursor=encode_cursor(binding,{'rank':last['match_rank'],'account':last['account'],'sender':last['sender_id']}) if group_by_sender else (
-            encode_cursor(binding,{'rank':last['match_rank'],'id':last['id']}) if query else last['id'])
+        cursor=encode_cursor(binding,{'rank':last['match_rank'],'account':last['account'],'sender':last['sender_id'],**extra}) if group_by_sender else (
+            encode_cursor(binding,{'rank':last['match_rank'],'id':last['id'],**extra}) if query or members is not None else last['id'])
     for row in items:
         row.pop('match_rank',None)
+        if group_by_sender:annotate(c,p,[row])
         if group_by_sender:
             for observation in row['observations']:observation.pop('match_rank',None)
     observations=[r for row in items for r in (row['observations'] if group_by_sender else [row])]
     # display_name stays this chat's observation; sender_name is the readable label.
     for row in observations:row['sender_name']=row['display_name']
     resolve(c,p,observations,sender='sender_id')
+    annotate(c,p,observations)
     chat_titles(c,observations,p=p)
     refs=[r['source_message'] for r in observations]
     targets(p,refs)

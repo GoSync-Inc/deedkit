@@ -76,3 +76,5 @@ GRANT EXECUTE ON FUNCTION public.queue_managed_original(text) TO messaging_gatew
 GRANT SELECT ON attachment_cold_copies TO messaging_gateway;
 GRANT UPDATE(restore_state,restore_attachment,restore_requested_at,restore_finished_at,restore_error)
     ON attachment_cold_copies TO messaging_gateway;
+-- Owner-made person links (ANYM-283): read only; the owner CLI writes them.
+GRANT SELECT ON person_links TO messaging_gateway;

@@ -441,6 +441,11 @@
           "default": false,
           "title": "Group By Sender",
           "type": "boolean"
+        },
+        "person": {
+          "default": "",
+          "title": "Person",
+          "type": "string"
         }
       },
       "type": "object",
@@ -725,6 +730,11 @@
         },
         "request_id": {
           "title": "Request Id",
+          "type": "string"
+        },
+        "person": {
+          "default": "",
+          "title": "Person",
           "type": "string"
         }
       },
