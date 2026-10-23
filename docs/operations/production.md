@@ -575,6 +575,30 @@ image/config ([platform-cutover.md](platform-cutover.md)). Do not use `down -v`,
 prune unrelated objects or restart a stale calendar writer. Keep the previous
 images until acceptance.
 
+### Backup runner
+
+The host backup runner (`/opt/personal-os-probe/ops/backup_runner.py`, the
+`personal-os-backup.service` program, BACKUP.md) is neither an image nor a deploy
+tool, so neither `apply` nor `deploy` installs it: the operator installs it
+together with the backup image its private `runner.json` pins. Apply refuses
+before any stop while that file exists and its git blob is not the release's
+`services/messaging/messaging_service/backup_runner.py`; the refusal names both
+blob ids, and under `deploy --auto` it pauses the deployer like any refusal
+before a change. A host without the file runs no backup and is not checked.
+With the timer and the backup service idle, from the prepared release:
+
+```sh
+sha=<same-sha>; src=/var/lib/deedkit-production/$sha/source
+sudo cp -p /opt/personal-os-probe/ops/backup_runner.py /opt/personal-os-probe/ops/backup_runner.py.before-$sha
+sudo sh -c 'umask 077 && cd /opt/personal-os-probe/ops &&
+  git -C "$0" show "$1:services/messaging/messaging_service/backup_runner.py" > .backup_runner.py.new &&
+  mv .backup_runner.py.new backup_runner.py' "$src" "$sha"
+sudo git hash-object /opt/personal-os-probe/ops/backup_runner.py   # = git rev-parse $sha:<that path>
+```
+
+Undo: install the `.before-<sha>` copy back the same way. A runner change that
+also changes its worker protocol needs the matching backup image pinned first.
+
 ## Roll back the current release
 
 A release whose `up --wait` failed while every replacement it started runs the

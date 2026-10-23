@@ -30,6 +30,10 @@ SAFE_ERRORS={'backup_capture_failed','backup_capture_timeout','backup_container_
     'receiver_busy','backup_id_conflict','docker_inspection_failed','docker_operation_failed',
     'backup_fence_release_failed','backup_capture_unfenced','backup_fence_retained',
     'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop'}
+# The receiver's own verifier holds its upload lock for a whole restore (about an hour). A delivery it refuses as busy
+# before any ciphertext byte is sent is offered again, same backup ID, every BUSY_RETRY_SECONDS up to the bound.
+BUSY_RETRY_SECONDS=60
+BUSY_WAIT_SECONDS=7200
 
 
 def read_json(path,limit=65536):
@@ -54,7 +58,7 @@ def write_json(path,data):
 
 def config(path):
     cfg=read_json(path)
-    if set(cfg)-{'delivery_mode'}!={'directory','project','network','image','files_volume','dsn_file','recipient_file',
+    if set(cfg)-{'delivery_mode','busy_wait_seconds'}!={'directory','project','network','image','files_volume','dsn_file','recipient_file',
                   'mounts','recovery','transfer','timeout_seconds','keep_local'}:raise ValueError('invalid_backup_config')
     if cfg.get('delivery_mode','staged_v1') not in ('staged_v1','stream_v2'):raise ValueError('invalid_backup_config')
     for key in ('project','network','files_volume'):
@@ -75,6 +79,8 @@ def config(path):
         not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}',t['user']) or
         not all(path_valid(t[k]) for k in ('identity_file','known_hosts_file'))):raise ValueError('invalid_backup_transfer')
     if type(cfg['timeout_seconds']) is not int or not 60<=cfg['timeout_seconds']<=7200:raise ValueError('invalid_backup_timeout')
+    if type(cfg.get('busy_wait_seconds',0)) is not int or not 0<=cfg.get('busy_wait_seconds',0)<=7200:
+        raise ValueError('invalid_backup_timeout')
     if type(cfg['keep_local']) is not int or not 1<=cfg['keep_local']<=24:raise ValueError('invalid_backup_retention')
     return cfg
 
@@ -230,6 +236,15 @@ class Runner:
         self.journal_path=self.root/'journal.json';self.status_path=self.root/'status.json'
         self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
     def save(self):write_json(self.journal_path,self.journal)
+    def deliver(self,send,sent=lambda:False):
+        """`send()`, offered again while the receiver answers busy and `sent()` says no byte left yet; returns the
+        receipt and the seconds spent waiting. Past the bound, or on any other error, the error stands."""
+        started=self.clock();bound=self.cfg.get('busy_wait_seconds',BUSY_WAIT_SECONDS)
+        while True:
+            try:return send(),self.clock()-started
+            except RuntimeError as exc:
+                if str(exc)!='receiver_busy' or sent() or self.clock()-started+BUSY_RETRY_SECONDS>bound:raise
+            self.sleep(BUSY_RETRY_SECONDS)
     def status(self,state,code=None):
         previous=read_json(self.status_path) if self.status_path.exists() else {}
         data={**previous,'state':state,'updated_at':datetime.now(timezone.utc).isoformat()}
@@ -406,8 +421,10 @@ class Runner:
             if (work/'result.json').exists():return True
             info=self.check_worker(self.docker.inspect(self.journal['container']))
             return info is None or not info['State']['Running']
-        receipt=asyncio.run(self.stream_send(work/'ciphertext.fifo',metadata,self.cfg['transfer'],
-                                          self.cfg['timeout_seconds'],start,completed,stopped=stopped))
+        receipt,waited=self.deliver(lambda:asyncio.run(self.stream_send(work/'ciphertext.fifo',metadata,self.cfg['transfer'],
+                                          self.cfg['timeout_seconds'],start,completed,stopped=stopped)),
+                                    lambda:(work/'stream-start.json').exists())
+        started+=waited  # The capture deadline never counts a wait for the receiver.
         # A failed/changed source cannot publish a terminal frame. A duplicate
         # receipt instead asks the worker to exit without re-encryption.
         while True:
@@ -551,7 +568,7 @@ class Runner:
                 if path.stat().st_size!=result['bytes'] or hashlib.file_digest(f,'sha256').hexdigest()!=result['sha256']:
                     raise RuntimeError('local_backup_corrupt')
             self.cleanup_plaintext(work);self.status('uploading')
-            receipt=asyncio.run(self.send(path,result,self.cfg['transfer'],self.cfg['timeout_seconds']))
+            receipt,_=self.deliver(lambda:asyncio.run(self.send(path,result,self.cfg['transfer'],self.cfg['timeout_seconds'])))
             self.finish(work,result,receipt)
         except BaseException as exc:
             self.status('error',str(exc) if str(exc) in SAFE_ERRORS else 'backup_job_failed')

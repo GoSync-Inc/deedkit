@@ -189,6 +189,14 @@ On a delivery error the same encrypted package and journal are kept; a retry
 does not take a new snapshot and does not stop the collectors again. The error
 is saved in `backups/status.json`; the last successful ID/hash/delivery and
 `last_snapshot_at` are there too. Staleness must be counted from the snapshot, not from a late retry.
+The receiver's own verifier holds the upload lock for a whole restore (about an hour): a delivery it
+refuses as `receiver_busy` before any ciphertext byte is sent is offered again, same ID, every 60 seconds
+for up to `busy_wait_seconds` (optional in `runner.json`, default and maximum 7200, 0 turns the wait off).
+Any other error, or a busy answer after the stream started, is not retried. The collectors already run
+again during that wait, the capture timeout does not count it, and the runner lock stays held, so a
+deploy skips meanwhile. A run lasts at most capture `timeout_seconds` + the wait + upload
+`timeout_seconds` (21600 s at the maxima), which must fit the backup unit's `TimeoutStartSec`.
+Install a runner that knows this key before adding it: the runner refuses unknown keys.
 systemd repeats a failed job after 5 minutes. A separate operator record
 `backup-config/last-restore.json` shows the last actual restore check.
 
