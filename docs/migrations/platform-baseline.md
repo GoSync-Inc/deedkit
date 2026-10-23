@@ -31,7 +31,9 @@ create, bind, update, merge, push, link or unlink.
 
 `tests/platform/fixtures/*-contracts.json` contain synthetic schema discovery
 from the separate locked backend environments. Capture with
-`scripts/capture_legacy_contract.py`. Run platform tests with
+`scripts/capture_legacy_contract.py`; `--canonical` writes the committed messaging
+snapshot's format (sorted keys, ASCII escapes), so a refresh changes only real
+differences. Run platform tests with
 `uv run --project tools/dev --locked pytest --confcutdir=tests/platform tests/platform`;
 the legacy root conftest intentionally depends on the messaging environment.
 Set `DEEDKIT_{MESSAGING,CALENDAR}_{SOURCE,PYTHON}` for live schema comparisons.

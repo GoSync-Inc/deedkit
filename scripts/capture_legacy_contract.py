@@ -34,6 +34,8 @@ def main():
     parser.add_argument("--module", choices=["messaging", "calendar"], required=True)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--canonical", action="store_true",
+                        help="sorted keys and ASCII escapes: the committed tests/platform/fixtures/messaging-contracts.json format")
     args = parser.parse_args()
     sys.path.insert(0, str(args.source.resolve()))
     from starlette.testclient import TestClient
@@ -54,7 +56,8 @@ def main():
               "transport": {"unknown_rest_status": malformed.status_code, "get_mcp_status": get.status_code},
               "limitations": "Schema/transport snapshot; DB ACL, files, subscriptions and ACK require isolated integration evidence."}
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    text = json.dumps(result, indent=2, sort_keys=True) if args.canonical else json.dumps(result, ensure_ascii=False, indent=2)
+    args.output.write_text(text + "\n")
     print(json.dumps({"module": args.module, "tools": len(tools), "transport": result["transport"]}))
 
 
