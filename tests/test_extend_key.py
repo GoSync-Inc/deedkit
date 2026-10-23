@@ -64,12 +64,22 @@ def test_extend_key_moves_expiry_from_database_clock_and_keeps_everything_else(s
     assert listed[key]['expires_at'] == result['expires_at']
 
 
+# The ceiling is 365 days since ANYM-499 (owner 2026-10-24): the name and every case keep their Tiden IDs,
+# and the 184 and 365 cases, now valid, assert the extension instead.
 # spec: ANYM-422
 @pytest.mark.parametrize('days', [0, -1, 184, 365, True, 1.5, '7', None])
 def test_extend_key_refuses_lifetime_outside_one_to_183_days(seeded, days):
     store, token, _ = seeded
     key = credential(store, token)
     before = key_row(store, key)
+    if days in (184, 365) and type(days) is int:
+        store.extend_key(key, days)
+        with store.pool.connection() as c:
+            left = c.execute('SELECT %s::timestamptz-clock_timestamp() AS left',
+                             (key_row(store, key)['expires_at'],)).fetchone()['left']
+        assert timedelta(days=days) - timedelta(seconds=5) < left <= timedelta(days=days)
+        assert len(extend_audit(store)) == 1
+        return
     with pytest.raises(ValueError, match='^invalid_key_lifetime$'):
         store.extend_key(key, days)
     assert key_row(store, key) == before and extend_audit(store) == []

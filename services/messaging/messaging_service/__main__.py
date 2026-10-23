@@ -33,7 +33,7 @@ def main():
     state.add_argument('--enable',action='store_true')
     state.add_argument('--disable',action='store_true')
     parser.add_argument('--limit',type=int,default=50)
-    parser.add_argument('--days',type=int,help='issue-key: 1-30 (default 7); extend-key: required, 1-183')
+    parser.add_argument('--days',type=int,help='issue-key: 1-365 (default 7); extend-key: required, 1-365')
     parser.add_argument('--input',type=Path)
     parser.add_argument('--spool',type=Path)
     parser.add_argument('--snapshot-dir',type=Path)
