@@ -49,7 +49,8 @@ def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=N
     if direction:filters['direction']=direction
     if lower:filters['from_time']=lower.isoformat()
     if upper:filters['to_time']=upper.isoformat()
-    if view=='by_chat':return overview(store,c,p,consumer,limit,filters,lower,upper,cap)
+    # The overview's own text default (80) applies on every transport; compact's 320 does not.
+    if view=='by_chat':return overview(store,c,p,consumer,limit,filters,lower,upper,80 if body_chars is None else body_chars)
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('consumers:'+p['id'],))
     total=c.execute('SELECT count(DISTINCT name) AS n FROM consumers WHERE principal=%s',(p['id'],)).fetchone()['n']
     existing=c.execute('SELECT 1 FROM consumers WHERE principal=%s AND name=%s',(p['id'],consumer)).fetchone()
@@ -117,7 +118,7 @@ def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=N
         'filter_binding':'version_checked_reset_preserves_ack_position',**coverage(store,c,p,include_coverage)})
 
 
-def overview(store,c,p,consumer,limit,filters,lower,upper,cap):
+def overview(store,c,p,consumer,limit,filters,lower,upper,width):
     """Per chat counts of created incoming messages after the consumer's ACK (ANYM-458).
 
     Read only: no consumer row, delivery or receipt is written, so no cursor moves.
@@ -129,7 +130,8 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,cap):
     state=c.execute('SELECT position FROM consumers WHERE principal=%s AND name=%s AND scope_version=%s',
         (p['id'],consumer,p['scope_version'])).fetchone()
     position=state['position'] if state else 0
-    # Without an acknowledged position the window is the whole journal: from_time bounds it.
+    # At the journal start (no consumer, or one at position 0) the window is the whole
+    # journal: from_time bounds it.
     if not position and lower is None:
         failure=APIError('invalid_filter');failure.fields=['from_time'];raise failure
     head=c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
@@ -168,17 +170,17 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,cap):
         ([r['newest_message'] for r in rows if r['newest_message']],)).fetchall()}
     labels={r['message']:'['+(r['filename'] or 'attachment')+']' for r in c.execute('''SELECT DISTINCT ON (message)
         message,filename FROM attachments WHERE message=ANY(%s) ORDER BY message,id''',(list(bodies),)).fetchall()}
-    width=cap or 80;chats=[]
+    chats=[]
     for r,named in zip(rows,names):
         newest=None
         if r['newest_message']:
             # A media-only message shows its file label, as compact message rows do.
             m=bodies[r['newest_message']];text=m['body'] or labels.get(m['id'])
-            if text and len(text)>width:text=text[:width].rstrip()+'…'
+            if text and len(text)>width:text=text[:width].rstrip()+'…' if width else None
             newest=compact_row({'message':m['id'],'sent_at':m['sent_at'],'sender':m['sender'],
-                'sender_name':named.get('sender_name'),'text':text})
+                'sender_name':(named.get('sender_name') or '')[:64] or None,'text':text})
         # An absent read field is unknown; provider mute and archive are never collected.
-        chats.append({**compact_row({'chat':r['chat'],'account':r['account'],'chat_title':named.get('chat_title'),
+        chats.append({**compact_row({'chat':r['chat'],'account':r['account'],'chat_title':(named.get('chat_title') or '')[:72] or None,
             'chat_type':named.get('chat_type'),'live':r['live'],'backfill':r['backfill'],'read_state':r['read_state'],
             'owner_replied_after_newest':r['owner_replied_after_newest'],
             'provider_unread':r['provider_unread'],'provider_unread_count':r['provider_unread_count'],
@@ -189,7 +191,7 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,cap):
     # source state and last ingest let the caller tell them apart.
     sources=[compact_row({'account':r['id'],'status':r['status'],'last_ingest_at':r['last_ingest_at']})
         for r in store.dataset(c,p)['sources'] if 'accounts' not in filters or r['id'] in filters['accounts']]
-    basis=('acknowledged_position_and_from_time' if lower else 'acknowledged_position') if position else 'from_time'
+    basis=('acknowledged_position_and_from_time' if lower else 'acknowledged_position') if state else 'from_time'
     return serial({'consumer':consumer,'view':'by_chat','window':basis,'chats':chats,'has_more':more,'chats_total':total['chats_total'],
         'live_total':int(total['live_total']),'backfill_total':int(total['backfill_total']),'filters':filters,
         'counts':'created_incoming_messages_after_position','accounts':sources,'provider_mute_archive':'unknown','absent_read_fields':'unknown'})

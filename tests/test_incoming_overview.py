@@ -105,10 +105,13 @@ def test_overview_hides_out_of_scope_chats(seeded):
     add(s,'telegram-demo','tg-visible','m3',3)
     page=s.get_updates(b,'o',view='by_chat',from_time=SINCE)
     assert [row['chat'] for row in page['chats']]==['tg-visible'] and page['live_total']==1
+    # Ingestion in a hidden account leaves the answer unchanged: no global position is exposed.
+    add(s,'whatsapp-demo-1','wa-hidden','m4',4,body='OUT_OF_SCOPE_SENTINEL')
+    assert s.get_updates(b,'o',view='by_chat',from_time=SINCE)==page
     named=s.get_updates(b,'o',view='by_chat',from_time=SINCE,chats=['wa-hidden','wa-unscoped'])
     assert (named['chats'],named['live_total'],named['chats_total'])==([],0,0)
     assert 'OUT_OF_SCOPE_SENTINEL' not in json.dumps(page,ensure_ascii=False)+json.dumps(named,ensure_ascii=False)
-    assert [row['chat'] for row in s.get_updates(a,'o',view='by_chat',from_time=SINCE)['chats']]==['tg-visible','wa-hidden']
+    assert [row['chat'] for row in s.get_updates(a,'o',view='by_chat',from_time=SINCE)['chats']]==['wa-hidden','tg-visible']
 
 
 # spec: ANYM-458
@@ -121,6 +124,16 @@ def test_overview_of_25_chats_within_10000_chars(seeded):
     page=s.get_updates(a,'o',view='by_chat',from_time=SINCE,limit=25)
     assert len(page['chats'])==25 and page['has_more'] is True and page['chats_total']==30
     assert len(json.dumps(page,ensure_ascii=False))<=10000
+    # The MCP default (compact) must not widen the overview's 80-character text.
+    with TestClient(create_app(s,['testserver'])) as client:
+        headers={'Authorization':'Bearer '+a,'Accept':'application/json, text/event-stream'}
+        rpc=client.post('/mcp',headers=headers,json={'jsonrpc':'2.0','id':1,'method':'tools/call','params':{
+            'name':'get_updates','arguments':{'consumer':'o','view':'by_chat','from_time':SINCE,'limit':25}}}).json()
+    mcp=rpc['result']['structuredContent']
+    assert len(mcp['chats'])==25 and len(json.dumps(mcp,ensure_ascii=False))<=10000
+    assert all(len(row['newest']['text'])<=81 for row in mcp['chats'])
+    zero=s.get_updates(a,'o',view='by_chat',from_time=SINCE,limit=25,body_chars=0)
+    assert not any('text' in row['newest'] for row in zero['chats'])
 
 
 # spec: ANYM-458
@@ -153,3 +166,47 @@ def test_overview_is_offered_over_mcp_and_the_gateway_catalog(seeded):
     # The gateway fills schema defaults (catalog.py); a pre-458 messaging release rejects unknown fields.
     assert 'default' not in tool['inputSchema']['properties']['view']
     assert 'by_chat' in tool['description']
+
+
+# spec: ANYM-458
+def test_overview_consumer_at_journal_start_keeps_its_window(seeded):
+    s,a,b=seeded
+    add(s,'telegram-demo','tg-live','m1',1)
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO consumers(principal,name,scope_version,filter_spec,position) SELECT id,'unacked',scope_version,'{}',0 FROM principals WHERE id='agent-a'")
+    page=s.get_updates(a,'unacked',view='by_chat',from_time=SINCE)
+    assert page['window']=='acknowledged_position_and_from_time' and page['live_total']==1
+    with pytest.raises(APIError,match='invalid_filter') as failure:
+        s.get_updates(a,'unacked',view='by_chat')
+    assert failure.value.fields==['from_time']
+
+
+# spec: ANYM-458
+def test_overview_hides_chats_outside_a_chat_scoped_key(seeded):
+    s,a,b=seeded
+    add(s,'telegram-demo','tg-allowed','m1',1)
+    add(s,'telegram-demo','tg-hidden','m2',2,body='HIDDEN_CHAT_SENTINEL')
+    key=s.issue_key('chat-scoped',['telegram-demo'],chats=['tg-allowed'])
+    page=s.get_updates(key,'o',view='by_chat',from_time=SINCE)
+    assert [row['chat'] for row in page['chats']]==['tg-allowed'] and page['live_total']==1
+    named=s.get_updates(key,'o',view='by_chat',from_time=SINCE,chats=['tg-hidden'])
+    assert (named['chats'],named['live_total'],named['chats_total'])==([],0,0)
+    text=json.dumps(page,ensure_ascii=False)+json.dumps(named,ensure_ascii=False)
+    assert 'HIDDEN_CHAT_SENTINEL' not in text and 'tg-hidden' not in text.replace('"chats": ["tg-hidden"]','')
+
+
+# spec: ANYM-458
+def test_overview_stale_read_state_shows_no_unread(seeded):
+    s,a,b=seeded
+    add(s,'telegram-demo','tg-stale','m1',1)
+    add(s,'telegram-demo','tg-newer','m2',2)
+    add(s,'telegram-demo','tg-newer','m3',30)
+    with s.pool.connection() as c:
+        # Observed before the newest incoming message: stale, even though m3 is outside the window.
+        c.execute("""INSERT INTO chat_read_observations(chat,account,observed_at,unread_count,basis) VALUES
+            ('tg-stale','telegram-demo',now()-interval '2 days',4,'telegram_dialog'),
+            ('tg-newer','telegram-demo','2026-10-22T05:00:00Z',1,'telegram_dialog')""")
+    rows={row['chat']:row for row in s.get_updates(a,'o',view='by_chat',from_time=SINCE,
+        to_time='2026-10-22T04:00:00Z')['chats']}
+    for chat in ('tg-stale','tg-newer'):
+        assert rows[chat]['read_state']=='stale' and 'provider_unread' not in rows[chat]
