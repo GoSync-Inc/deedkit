@@ -668,6 +668,12 @@ class WorkerPresence:
 
     def close(self):
         if self.connection is not None:
+            # The server ends a closed session's backend, and frees its lock, only later;
+            # unlock first so the lock is free once close returns.
+            if self.held:
+                from .media_requests import COLD_WORKER_LOCK
+                try:self.connection.execute('SELECT pg_advisory_unlock(hashtextextended(%s,0))',(COLD_WORKER_LOCK,))
+                except Exception:pass
             try:self.connection.close()
             except Exception:pass
         self.connection=None;self.held=False

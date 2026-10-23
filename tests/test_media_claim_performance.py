@@ -30,6 +30,9 @@ def message(ar, provider_id, age, *, account=ACCOUNT, chat='100'):
 def grow_dormant(s, count, offset=0):
     """Adds out-of-window, unrequested or expired-request jobs; none is claimable or needs housekeeping."""
     with s.pool.connection() as c:
+        # Loading the synthetic backlog is setup, not a claim: a slow runner may take longer
+        # than the store's 5 s serving timeout, which the claims below still run under.
+        c.execute("SET LOCAL statement_timeout='120s'")
         chat=stable_id('chat',ACCOUNT,'100')
         c.execute('''INSERT INTO chats(id,account,title,provider_chat) VALUES(%s,%s,'Fixture room','100')
             ON CONFLICT DO NOTHING''',(chat,ACCOUNT))
@@ -79,6 +82,8 @@ def explained(ar, plans):
         def execute(self,query,params=None,**kwargs):
             if TOUCHES.search(query) and not query.lstrip().startswith('EXPLAIN'):
                 self.c.execute('SAVEPOINT explain_claim')
+                # Instrumentation is slower than the statement; the rollback restores the 5 s timeout.
+                self.c.execute("SET LOCAL statement_timeout='120s'")
                 plan=self.c.execute('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) '+query,params).fetchone()
                 self.c.execute('ROLLBACK TO SAVEPOINT explain_claim')
                 plans.append((query,next(iter(plan.values()))[0]['Plan']))

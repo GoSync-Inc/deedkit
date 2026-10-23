@@ -1211,3 +1211,19 @@ def test_reconcile_registers_only_the_file_it_hashed(env,archive,monkeypatch,swa
     assert restorer(env).run_once()['reconciled']==0 and swapped and not resident(s,blob.digest)
     # The replacement is verified on its own on the next pass.
     assert restorer(env).run_once()['reconciled']==1 and resident(s,blob.digest)
+
+
+# spec: ANYM-350
+def test_closed_worker_presence_frees_its_lock_before_the_session_ends(database,restore_worker):
+    import psycopg
+    from messaging_service.media_requests import COLD_WORKER_LOCK as lock
+    connection=restore_worker.connection;real=connection.close;free=[]
+    def close():
+        # The server frees a closed session's locks only when its backend exits, after close returns.
+        with psycopg.connect(database.pool.conninfo,autocommit=True) as other:
+            free.append(other.execute('SELECT pg_try_advisory_lock(hashtextextended(%s,0))',(lock,)).fetchone()[0])
+            other.execute('SELECT pg_advisory_unlock_all()')
+        real()
+    connection.close=close
+    restore_worker.close()
+    assert free==[True] and restore_worker.connection is None and not restore_worker.held
