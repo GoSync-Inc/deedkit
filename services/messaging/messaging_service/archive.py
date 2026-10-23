@@ -334,7 +334,12 @@ class Archive:
                 WHERE p.enabled AND (%(account)s::text IS NULL OR j.account=%(account)s) AND j.attempts<5 AND
                 NOT m.deleted AND NOT(ch.provider_chat=ANY(p.exclude_chats)) AND
                 (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
-                (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s) AND
+                (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s OR
+                    -- Below the bound only explicit demand in a chat whose row confirms this bound (ANYM-477);
+                    -- an unconfirmed bound stays history_bound_unknown in media_policy and is not claimed.
+                    j.requested_until>clock_timestamp() AND EXISTS(SELECT 1 FROM collector_chats bc
+                        WHERE bc.account=j.account AND bc.provider_chat=ch.provider_chat
+                        AND bc.history_since=%(since)s::timestamptz)) AND
                 (%(days)s::integer IS NULL OR j.requested_until>clock_timestamp() OR
                     (%(days)s::integer>0 AND m.sent_at>=%(now)s-%(days)s*interval '1 day'
                         AND m.sent_at<=%(now)s+interval '5 minutes') OR

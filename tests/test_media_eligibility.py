@@ -168,16 +168,17 @@ def bounded(ar, s, **publication):
 def test_request_before_confirmed_history_bound_is_unavailable(archive):
     ar,s,key,_=archive;bounded(ar,s)
     fid=queued(ar,s,days=90,code='paused_storage')
-    result=s.request_file_download(key,fid)
-    assert result['request_status']=='unavailable' and result['reason']=='outside_history_bounds'
-    assert result['requested_until'] is None and result['next_action']!='request_file_download'
-    with s.pool.connection() as c:
-        assert c.execute('SELECT requested_until FROM media_jobs WHERE id=%s',(fid,)).fetchone()['requested_until'] is None
+    # Owner 2026-10-23 (ANYM-477): the collector never fetches it by itself, an explicit request does.
     attachment=s.get_attachment(key,fid)
     assert attachment['download_reason']=='outside_history_bounds'
-    assert attachment['next_action']!='request_file_download' and attachment['download_phase']!='blocked'
+    assert attachment['next_action']=='request_file_download' and attachment['download_phase']=='available_on_request'
     status,_=media(s)
     assert status['outside_history_bounds_jobs']==1 and status['outside_prefetch_window_jobs']==0
+    result=s.request_file_download(key,fid)
+    assert result['request_status']=='queued' and result['requested_until']
+    assert result['download_eligibility']=='eligible'
+    status,_=media(s)
+    assert status['outside_history_bounds_jobs']==0
     # Inside the bound the same old job is available on request and becomes eligible.
     inside=queued(ar,s,mid='305',days=30)
     requested=s.request_file_download(key,inside)
@@ -189,8 +190,11 @@ def test_request_before_confirmed_history_bound_is_unavailable(archive):
 def test_existing_request_is_not_extended_outside_history_bound(archive):
     ar,s,key,_=archive;bounded(ar,s)
     fid=queued(ar,s,days=90,requested=True)
+    with s.pool.connection() as c:
+        until=c.execute('SELECT requested_until FROM media_jobs WHERE id=%s',(fid,)).fetchone()['requested_until']
+    # An unexpired request below the bound is the same explicit request (ANYM-477): coalesced, not extended.
     result=s.request_file_download(key,fid)
-    assert result['request_status']=='unavailable' and result['reason']=='outside_history_bounds'
+    assert result['request_status']=='coalesced' and result['requested_until']==until.isoformat()
 
 
 # spec: ANYM-284
@@ -239,13 +243,14 @@ def test_managed_evicted_original_before_history_bound_is_unavailable(archive):
     assert lifecycle().LifecycleWorker(s).run_once(apply=True)['evicted']==1
     bounded(ar,s)
     attachment=s.get_attachment(key,fid)
-    assert attachment['download_reason']=='outside_history_bounds'
-    assert attachment['next_action']!='request_file_download'
+    assert attachment['download_reason']=='original_evicted'
+    assert attachment['next_action']=='request_file_download'
+    # An explicit re-download reaches below the bound (ANYM-477).
     result=s.request_file_download(key,fid)
-    assert result['request_status']=='unavailable' and result['reason']=='outside_history_bounds'
+    assert result['request_status']=='queued' and result['reason']=='managed_original_evicted'
     with s.pool.connection() as c:
-        assert c.execute('SELECT state,requested_until FROM media_jobs WHERE id=%s',(fid,)).fetchone()=={
-            'state':'ready','requested_until':None}
+        row=c.execute('SELECT state,requested_until FROM media_jobs WHERE id=%s',(fid,)).fetchone()
+    assert row['state']=='queued' and row['requested_until'] is not None
 
 
 # spec: ANYM-284
@@ -333,3 +338,42 @@ def test_excluded_collection_blocks_managed_evicted_redownload_advice(archive,ch
     assert attachment['next_action']=='check_collection_policy'
     result=s.request_file_download(key,fid)
     assert result['request_status']=='blocked' and result['next_action']=='check_collection_policy'
+
+
+# spec: ANYM-477
+def test_explicit_request_downloads_an_original_below_the_history_bound_and_the_background_run_does_not(archive):
+    from messaging_service.store import APIError
+    ar,s,key,_=archive;since=bounded(ar,s)
+    fid=queued(ar,s,days=90)
+    # Without a request the run never claims a job below its bound, also through backfill.
+    assert ar.claim_media('fixture',account=ACCOUNT,since=since,media_prefetch_days=7) is None
+    assert ar.claim_media('fixture',account=ACCOUNT,since=since,media_prefetch_days=7,backfill=True) is None
+    before=s.get_attachment(key,fid)
+    assert before['download_reason']=='outside_history_bounds'
+    assert before['next_action']=='request_file_download' and before['download_phase']=='available_on_request'
+    status,_=media(s)
+    assert status['outside_history_bounds_jobs']==1
+    # A key without the chat in its scope cannot see or request it.
+    other=s.issue_key('other-reader',['archive-test'],chats=[])
+    with pytest.raises(APIError,match='not_found'):s.request_file_download(other,fid)
+    result=s.request_file_download(key,fid)
+    assert result['request_status']=='queued' and result['requested_until']
+    assert result['download_eligibility']=='eligible' and 'eligibility_reason' not in result
+    status,_=media(s)
+    assert status['outside_history_bounds_jobs']==0 and status['eligible_queued_jobs']==1
+    assert ar.claim_media('fixture',account=ACCOUNT,since=since,media_prefetch_days=7)['id']==fid
+
+
+# spec: ANYM-477
+@pytest.mark.parametrize('evidence',['absent','live_callback_row','stale_row'])
+def test_explicit_request_below_an_unconfirmed_history_bound_is_not_claimed(archive,evidence):
+    ar,s,key,_=archive
+    fid=queued(ar,s,days=90)
+    since=bounded(ar,s,chat_since={'absent':'absent','live_callback_row':None,
+        'stale_row':datetime.now(timezone.utc)-timedelta(days=120)}[evidence])
+    result=s.request_file_download(key,fid)
+    assert result['request_status']=='queued' and result['download_eligibility']=='unknown'
+    # Status and claim agree: the job stays history_bound_unknown and the run does not take it.
+    status,_=media(s)
+    assert status['history_bound_unknown_jobs']==1 and status['eligible_queued_jobs']==0
+    assert ar.claim_media('fixture',account=ACCOUNT,since=since,media_prefetch_days=7) is None

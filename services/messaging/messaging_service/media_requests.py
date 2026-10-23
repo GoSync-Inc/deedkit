@@ -180,11 +180,6 @@ def _request(store,c,p,attachment_id):
         result.update(request_status='failed',reason=row['error_code'] or 'retry_exhausted',
             requested_until=None)
         return serial(result)
-    if row.get('download_eligibility')=='outside_history_bounds':
-        # A request never overrides the collector's history bound (ANYM-284).
-        result.update(request_status='unavailable',reason='outside_history_bounds',requested_until=None,
-            next_action='get_sync_status_for_chat')
-        return serial(result)
     active=c.execute('SELECT %s::timestamptz>clock_timestamp() AS active',
         (row['requested_until'],)).fetchone()['active']
     # A ready managed job in its window is only a cold restore's reserved fallback;
@@ -223,14 +218,14 @@ def cold_request(c,p,attachment_id,row,result):
 
     The demand window opens only when the provider path would accept this
     request, so the worker's fallback never bypasses collection policy, the
-    attempt cap, cooldown or history bounds.
+    attempt cap or cooldown. An explicit request also reaches below the history
+    bound (owner 2026-10-23, ANYM-477).
     """
     outstanding=c.execute("""SELECT count(*) AS total FROM attachment_cold_copies WHERE restore_state='requested'
         AND restore_requested_at>clock_timestamp()-make_interval(secs=>%s)""",(COLD_RESTORE_STALL_SECONDS,)).fetchone()['total']
     if outstanding>=GLOBAL_LIMIT:raise APIError('media_request_limit',429)
     provider=(row['job_state']=='ready' and row['collection_enabled'] and row['provider_chat_id'] not in row['exclude_chats'] and
-        (row['discover_chats'] or row['provider_chat_id'] in row['include_chats']) and row['attempts']<5 and
-        row.get('download_eligibility')!='outside_history_bounds' and not c.execute(
+        (row['discover_chats'] or row['provider_chat_id'] in row['include_chats']) and row['attempts']<5 and not c.execute(
         "SELECT %s::timestamptz>=clock_timestamp()+interval '1 hour' AS deferred",(row['next_due'],)).fetchone()['deferred'])
     if provider:
         # The fallback is provider demand: it is admitted against the same quotas now.

@@ -60,6 +60,7 @@ def published_window(account):
 # el.claim mirrors Archive.claim_media (what the run downloads by itself; status
 # counts). el.occurrence is what one attachment and its request may promise: it is
 # unknown whenever the chat's bound is unconfirmed, also for a repeated request.
+# Below the bound only an explicit request is claimed (owner 2026-10-23, ANYM-477).
 ELIGIBILITY_JOIN=published_window('m.account')+'''
     LEFT JOIN collector_chats ecc ON ecc.account=m.account AND ecc.provider_chat=ch.provider_chat
         AND ecc.history_since IS NOT DISTINCT FROM mp.since
@@ -70,7 +71,8 @@ ELIGIBILITY_JOIN=published_window('m.account')+'''
         FROM (SELECT CASE WHEN ecp.account IS NULL OR NOT ecp.enabled OR ch.provider_chat=ANY(ecp.exclude_chats)
                 OR NOT (ecp.discover_chats OR ch.provider_chat=ANY(ecp.include_chats)) THEN 'collection_excluded'
             WHEN mp.published IS NULL THEN 'unknown'
-            WHEN ecc.history_since IS NOT NULL AND m.sent_at<ecc.history_since THEN 'outside_history_bounds'
+            WHEN ecc.history_since IS NOT NULL AND m.sent_at<ecc.history_since THEN
+                CASE WHEN j.requested_until>clock_timestamp() THEN 'eligible' ELSE 'outside_history_bounds' END
             WHEN mp.since IS NOT NULL AND m.sent_at<mp.since THEN 'history_bound_unknown'
             WHEN j.requested_until>clock_timestamp() OR mp.days IS NULL OR mp.days>0
                 AND m.sent_at>=clock_timestamp()-mp.days*interval '1 day'
