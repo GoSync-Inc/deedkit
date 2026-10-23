@@ -231,8 +231,15 @@ def test_archive_view_and_transcript_keep_one_row_per_group(copies):
             items=result['items']
             assert [r['id'] for r in items]==[ids[0]] and items[0]['copies_total']==3,detail
             assert items[0]['latest_copy_at']=='2026-10-01T12:02:00+00:00',detail
-            assert result.get('search',{}).get('collapse_forwards',True) is True,detail
             assert [c['message_id'] for c in items[0]['copies']]==ids[1:],detail
+        # REST returns the same group and reports the option.
+        body=client.post('/v1/search',json={'query':'synthetic marquee'},headers={'Authorization':'Bearer '+key}).json()
+        assert [r['id'] for r in body['items']]==[ids[0]] and body['items'][0]['copies_total']==3
+        assert body['items'][0]['latest_copy_at']=='2026-10-01T12:02:00+00:00'
+        assert [c['message_id'] for c in body['items'][0]['copies']]==ids[1:] and body['search']['collapse_forwards'] is True
+        flat=client.post('/v1/search',json={'query':'synthetic marquee','collapse_forwards':False},
+            headers={'Authorization':'Bearer '+key}).json()
+        assert [r['id'] for r in flat['items']]==ids and flat['search']['collapse_forwards'] is False
         # The transcript names the shown row only; its copies are not listed there.
         text=json.dumps(structured(rpc(client,key,'search',{'query':'synthetic marquee','detail':'transcript',
             'include_coverage':False})),default=str)
@@ -289,3 +296,20 @@ def test_live_search_passes_collapse_forwards_to_the_archive_read():
             calls.append(arguments);return {'items':[],'result_evidence':{}}
     asyncio.run(live_search.search(Archive(),'synthetic-token',{'query':'synthetic marquee','collapse_forwards':False}))
     assert calls==[{'query':'synthetic marquee','collapse_forwards':False}]
+
+
+# spec: ANYM-273
+def test_malformed_or_keyless_origins_stay_ordinary_hits(copies):
+    s,add=copies
+    bad=[{'kind':'user','sender_id':'77','sent_at':'2026-10'},{'kind':'user','sent_at':PERSON['sent_at']},
+        {'kind':'channel','chat_id':'-1000000000777','provider_message_id':''},{'kind':'unknown'},'text']
+    ids=[add(str(n),'synthetic marquee news',str(300+n)) for n in range(len(bad))]
+    # Shapes an older writer or a damaged row could hold, set below the ingest validation.
+    with s.pool.connection() as c:
+        for mid,origin in zip(ids,bad):
+            c.execute("UPDATE message_metadata SET metadata=jsonb_build_object('forwarded',true,'forward_origin',%s::jsonb) WHERE message=%s",
+                [json.dumps(origin),mid])
+    key=s.issue_key('forward-reader',['forward-tg'])
+    result=s.search(key,'synthetic marquee',limit=50)
+    assert sorted(r['id'] for r in result['items'])==sorted(ids)
+    assert all('copies_total' not in r for r in result['items']) and result['search']['collapse_forwards'] is True
