@@ -46,6 +46,73 @@ META = '''nullif(sp.display_name,'') AS sender_name,nullif(sp.username,'') AS us
     'archive_revision_observation'::text AS first_observed_at_basis'''
 BASE = 'm.id,m.account,m.chat,m.sender,m.body,m.sent_at,m.revision,m.direction'
 
+# ANYM-273: forwarded copies group only by the provider-stated origin, never by text alone. Keys:
+# p = origin chat and message ID, u = origin sender, second and text hash (one sender can post two
+# messages in one second). Platform, not account: one message
+# received by two owner accounts of one platform is one group.
+# Times compare as UTC text to the second (envelope.utc stores them so); no cast can fail.
+COPIES_LISTED = 20
+FORWARD_KEY = '''CASE WHEN md.v->'forwarded'='true'::jsonb AND jsonb_typeof(md.v->'forward_origin')='object'
+      AND md.v->'forward_origin'->>'kind' IN ('user','chat','channel','newsletter') THEN
+      CASE WHEN nullif(md.v->'forward_origin'->>'chat_id','') IS NOT NULL AND nullif(md.v->'forward_origin'->>'provider_message_id','') IS NOT NULL
+        THEN a.platform||'|p|'||(md.v->'forward_origin'->>'chat_id')||'|'||(md.v->'forward_origin'->>'provider_message_id')
+      WHEN md.v->'forward_origin'->>'kind'='user' AND nullif(md.v->'forward_origin'->>'sender_id','') IS NOT NULL
+          AND length(md.v->'forward_origin'->>'sent_at')>=19
+        THEN a.platform||'|u|'||(md.v->'forward_origin'->>'sender_id')||'|'||left(md.v->'forward_origin'->>'sent_at',19)||'|'||md5(m.body)
+      END END'''
+
+
+def collapse_ctes(position):
+    """Groups over every match before the cursor cut, so a page never repeats or skips a group.
+
+    One row per group shows the archived original (the earliest one per key) or else the earliest
+    copy. The group sits, and its cursor anchors, where its first member in the page order sits
+    (position), so a fresh forward of an old original is not pushed back by the original's date.
+    Members are matches only, so they already passed the caller's scope and the search filters.
+    """
+    return ['''keyed AS MATERIALIZED (SELECT x.*,m.chat AS member_chat,m.sender AS member_sender,'''+FORWARD_KEY+''' AS fkey,
+          coalesce(md.v->'forwarded'='true'::jsonb,false) AS is_forward,
+          a.platform||'|p|'||ch.provider_chat||'|'||m.provider_id AS post_key,
+          CASE WHEN m.sender<>'' THEN a.platform||'|u|'||m.sender||'|'||to_char(m.sent_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS')||'|'||md5(m.body) END AS person_key
+        FROM matches x JOIN messages m ON m.id=x.id JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
+        JOIN accounts a ON a.id=m.account
+        LEFT JOIN message_revisions mr ON mr.message=m.id AND mr.revision=m.revision
+        LEFT JOIN message_metadata mm ON mm.message=m.id AND mm.revision=m.revision
+        CROSS JOIN LATERAL (SELECT coalesce(mm.metadata,mr.snapshot->'metadata') AS v) md)''',
+        '''forward_keys AS MATERIALIZED (SELECT DISTINCT fkey FROM keyed WHERE fkey IS NOT NULL)''',
+        '''originals AS MATERIALIZED (SELECT o.*,coalesce(fp.fkey,fu.fkey) AS okey FROM keyed o
+          LEFT JOIN forward_keys fp ON fp.fkey=o.post_key LEFT JOIN forward_keys fu ON fu.fkey=o.person_key
+          WHERE NOT o.is_forward)''',
+        '''members AS MATERIALIZED (SELECT k.*,CASE WHEN k.is_forward THEN k.fkey
+            WHEN o.okey IS NOT NULL AND o.rank=1 THEN o.okey END AS gkey FROM keyed k
+          LEFT JOIN (SELECT id,okey,row_number() OVER (PARTITION BY okey ORDER BY sent_at,id) AS rank
+            FROM originals WHERE okey IS NOT NULL) o ON o.id=k.id)''',
+        '''grouped AS MATERIALIZED (SELECT *,row_number() OVER (PARTITION BY gkey ORDER BY is_forward,sent_at,id) AS grank,
+          row_number() OVER (PARTITION BY gkey ORDER BY '''+position+''') AS prank,
+          first_value(id) OVER (PARTITION BY gkey ORDER BY is_forward,sent_at,id) AS shown,
+          count(*) OVER (PARTITION BY gkey) AS group_size,max(sent_at) OVER (PARTITION BY gkey) AS latest_at FROM members)''',
+        '''results AS NOT MATERIALIZED (SELECT id,sent_at,revision,source_order,score,gkey,
+          CASE WHEN gkey IS NOT NULL THEN shown END AS shown,
+          CASE WHEN gkey IS NOT NULL THEN group_size END AS copies_total,
+          CASE WHEN gkey IS NOT NULL THEN latest_at END AS latest_copy_at FROM grouped WHERE gkey IS NULL OR prank=1)''']
+
+
+LISTED_CTE=('''listed AS MATERIALIZED (SELECT gkey,array_agg(id ORDER BY grank) AS copy_ids,
+          array_agg(member_chat ORDER BY grank) AS copy_chats,array_agg(member_sender ORDER BY grank) AS copy_senders,
+          array_agg(sent_at ORDER BY grank) AS copy_times FROM grouped
+          WHERE grank BETWEEN 2 AND '''+str(COPIES_LISTED+1)+''' AND gkey IN (SELECT gkey FROM page WHERE copies_total>1) GROUP BY gkey)''')
+
+
+def attach_copies(items):
+    """Shown rows gain copies_total, latest_copy_at and up to COPIES_LISTED other members, earliest first."""
+    for item in items:
+        item.pop('gkey',None);total=item.pop('copies_total',None);latest=item.pop('latest_copy_at',None)
+        listed=[item.pop(k,None) for k in ('copy_ids','copy_chats','copy_senders','copy_times')]
+        if listed[0] and total and total>1:
+            item['copies_total']=total;item['latest_copy_at']=latest
+            item['copies']=[{'chat':chat,'message_id':mid,'sender':sender,'sent_at':at} for mid,chat,sender,at in zip(*listed)]
+    return items
+
 
 def forward_presence(rows):
     # Only a forwarded message carries an origin and the authorship marker, in every detail level.
@@ -215,7 +282,7 @@ def named_chats(c, p, chat='', chats=None):
 def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time='',after='',limit=20,
            *,accounts=None,chats=None,senders=None,query_mode='all',order='asc',before='',direction='',
            search_language='auto',fuzzy=False,compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False,
-           exclude_channels=False,chat_types=None,include_channels=None):
+           exclude_channels=False,chat_types=None,include_channels=None,collapse_forwards=True):
     from .store import APIError,bounded,serial
     import re
     from .conversation import options,numeric_order_sql,visible_sql,decorate_messages,presentation
@@ -224,7 +291,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     bounded(limit)
     cap=output_options(compact,body_chars,include_coverage)
     plan=compile_query(query,query_mode,search_language)
-    if order not in ('asc','desc','relevance') or type(fuzzy) is not bool:
+    if order not in ('asc','desc','relevance') or type(fuzzy) is not bool or type(collapse_forwards) is not bool:
         raise APIError('invalid_filter')
     valid_text(after,4096);valid_text(before,4096)
     if after and before or before and order=='relevance':raise APIError('invalid_filter')
@@ -235,8 +302,12 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         chat_types=chat_types,include_channels=include_channels)
     # An explicit type filter binds the cursor; the default exclusion keeps bare ID cursors.
     typed=exclude_channels or chat_types is not None or include_channels is True
+    # ANYM-273: an explicit flat view binds its cursor, so a page cannot continue in the other view.
+    flat=bool(plan.query) and not collapse_forwards
     binding=cursor_binding(p,'messages',{**normalized,'query':query,'query_mode':query_mode,
         'language':search_language,'order':order,'fuzzy':fuzzy,
+        # Only the non-default exact view binds, so cursors issued before ANYM-273 stay valid.
+        **({'collapse_forwards':False} if flat else {}),
         **({'view':view,'include_system':include_system,'conversation_version':1} if conversation else {})})
     extra_join=' LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision' if conversation else ''
     if conversation and not include_system:clauses.append(visible_sql('m','cmd'))
@@ -270,6 +341,10 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     cursor_clause='';cursor_args=[]
     snapshot=None
     snapshot_ctes=list(ctes)
+    # ANYM-273: a query search returns forwarded copies once; a chat listing keeps every copy.
+    collapsing=bool(plan.query) and collapse_forwards
+    if collapsing:ctes.extend(collapse_ctes('score DESC,sent_at DESC,id DESC' if order=='relevance' else
+        ','.join(column+' '+order.upper() for column in ('sent_at',*(('source_order',) if conversation else ()),'id'))))
     def read_snapshot():
         value=c.execute('WITH '+','.join(snapshot_ctes)+''' SELECT count(*) AS n,
             coalesce(sum(hashtextextended(id||'|'||sent_at::text||'|'||revision::text||'|'||source_order::text,0)::numeric),0)::text AS checksum
@@ -305,7 +380,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
                     cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
                     cursor_args=[at,mid]
         else:
-            if order=='relevance' or conversation or typed:raise APIError('invalid_cursor')
+            if order=='relevance' or conversation or typed or flat:raise APIError('invalid_cursor')
             anchor=store.message(c,p,cursor)
             cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
             cursor_args=[anchor['sent_at'],anchor['id']]
@@ -314,28 +389,33 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         # Aggregate and page share one statement snapshot. A late backfill
         # cannot slip between reading this page and creating its continuation.
         ctes.append("view_snapshot AS MATERIALIZED (SELECT count(*) AS n,coalesce(sum(hashtextextended(id||'|'||sent_at::text||'|'||revision::text||'|'||source_order::text,0)::numeric),0)::text AS checksum FROM matches)")
-    ctes.append('page AS MATERIALIZED (SELECT * FROM matches '+cursor_clause+' ORDER BY '+sort+' LIMIT %s)')
+    ctes.append('page AS MATERIALIZED (SELECT * FROM '+('results ' if collapsing else 'matches ')+cursor_clause+' ORDER BY '+sort+' LIMIT %s)')
+    if collapsing:ctes.append(LISTED_CTE)
     final_sort='page.score DESC,m.sent_at DESC,m.id DESC' if order=='relevance' else ('m.sent_at '+order.upper()+(',page.source_order '+order.upper() if conversation else '')+',m.id '+order.upper())
+    if collapsing:final_sort=re.sub(r'\bm\.','page.',final_sort)
     snippet='left('+plan.snippet('m.body')+',800)'
     projection=BASE if cap is None else BASE.replace('m.body','left(m.body,'+str(cap)+') AS body,length(m.body)>'+str(cap)+' AS body_truncated')
     rows=c.execute('WITH '+','.join(ctes)+' SELECT '+projection+','+META+',page.score,'+match_type+
-        ' AS match_type,'+snippet+' AS snippet,page.source_order'+(',view_snapshot.n AS snapshot_count,view_snapshot.checksum AS snapshot_checksum' if conversation else '')+' FROM page JOIN messages m ON m.id=page.id '+JOINS+
+        ' AS match_type,'+snippet+' AS snippet,page.source_order'+(',page.gkey,page.copies_total,page.latest_copy_at,page.id AS position_id,page.sent_at AS position_at,page.revision AS position_revision,listed.copy_ids,listed.copy_chats,listed.copy_senders,listed.copy_times' if collapsing else '')+(',view_snapshot.n AS snapshot_count,view_snapshot.checksum AS snapshot_checksum' if conversation else '')+' FROM page JOIN messages m ON m.id='+('coalesce(page.shown,page.id) ' if collapsing else 'page.id ')+JOINS+(' LEFT JOIN listed ON listed.gkey=page.gkey' if collapsing else '')+
         ' CROSS JOIN search_query q'+(' CROSS JOIN view_snapshot' if conversation else '')+' ORDER BY '+final_sort,[*plan.params,*args,*cursor_args,limit+1]).fetchall()
     if conversation and rows:
         current_snapshot=fingerprint({'n':rows[0]['snapshot_count'],'checksum':rows[0]['snapshot_checksum']})
         if snapshot is not None and snapshot!=current_snapshot:raise APIError('cursor_changed',409)
         snapshot=current_snapshot
     items=reply_context(c,p,resolve(c,p,forward_presence(rows[:limit])))
+    if collapsing:attach_copies(items)
     retitle(c,p,items)
     next_cursor=None
     if len(rows)>limit:
         last=items[-1]
+        # A group's cursor anchors on the member that holds its place in this order (ANYM-273).
+        if collapsing:last={**last,'id':last['position_id'],'sent_at':last['position_at'],'revision':last['position_revision']}
         if conversation:
             snapshot=snapshot or read_snapshot()
             next_cursor=encode_cursor(binding,{'id':last['id'],'at':last['sent_at'],'score':last['score'],
                 'revision':last['revision'],'fuzzy':fuzzy_used,'source_order':last['source_order'],'snapshot':snapshot})
         else:next_cursor=encode_cursor(binding,{'id':last['id'],'at':last['sent_at'],'score':last['score'],
-            'revision':last['revision'],'fuzzy':fuzzy_used}) if order=='relevance' or fuzzy or typed else last['id']
+            'revision':last['revision'],'fuzzy':fuzzy_used}) if order=='relevance' or fuzzy or typed or flat else last['id']
     shape_messages(items,compact=False if conversation else compact)
     from .result_evidence import decorate
     from .chat_evidence import query_evidence
@@ -349,13 +429,13 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
                 if len(item['display_text'])>cap:
                     item['display_text']=item['display_text'][:cap];item['display_text_truncated']=True
     for item in items:
-        for internal in ('source_order','snapshot_count','snapshot_checksum'):item.pop(internal,None)
-    targets(p,[r['id'] for r in items])
+        for internal in ('source_order','snapshot_count','snapshot_checksum','position_id','position_at','position_revision'):item.pop(internal,None)
+    targets(p,[i for r in items for i in [r['id'],*(x['message_id'] for x in r.get('copies',()))]])
     return serial({'items':items,'next_cursor':next_cursor,
         'result_evidence':query_evidence(c,p,normalized,items,paged=bool(after or before),include=include_coverage),
         **({'conversation_view':presentation(items,order=order,include_system=include_system)} if conversation else {}),
         'search':{'language':search_language,'query_mode':query_mode,'order':order,'fuzzy_used':fuzzy_used,
-            'fuzzy_candidate_limit':200 if fuzzy_used else None},**coverage(store,c,p,include_coverage)})
+            'fuzzy_candidate_limit':200 if fuzzy_used else None,'collapse_forwards':collapsing},**coverage(store,c,p,include_coverage)})
 
 
 def history_snapshot(c,p,chat,*,include_system=False):

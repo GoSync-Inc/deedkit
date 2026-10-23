@@ -795,6 +795,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
                compact: bool | None=None, body_chars: StrictInt | None=None, include_coverage: bool | None=None, detail: MessageDetail='compact',
                     view: ConversationView='conversation',include_system: StrictBool=False,exclude_channels: StrictBool=False,
                chat_types: list[Literal['private','group','channel','unknown']] | None=None,include_channels: StrictBool=False,
+               collapse_forwards: StrictBool=True,
                live: Literal['off','auto','on']='off', wait_s: LiveWaitSeconds | None=None, request_id: StrictStr='') -> dict[str, Any]:
         """Search archived text across chosen accounts/chats/sender IDs. Lists use OR within each
         dimension, AND between dimensions; [] matches nothing. Exact account-scoped sender IDs,
@@ -806,6 +807,9 @@ def create_app(store: Store, allowed_hosts: list[str]):
         direction: incoming/outgoing or empty. detail=transcript returns only the numbered transcript.
         Channels are excluded unless include_channels=true, chat_types lists channel, or chat/chats is set.
         chat_types: private/group/channel/unknown (null type = unknown), ANDed with exclude_channels.
+        A query returns forwarded copies of one message once (the original if archived, else the
+        earliest copy) with copies_total (this row included) and copies; it needs a stated origin
+        (Telegram), so WhatsApp forwards stay separate. collapse_forwards=false returns every copy.
         live (Telegram, first page only): on also searches Telegram itself; auto only when the archive
         answer is thin (empty_reason history_loading/history_not_scanned/history_has_gaps/
         no_matches_in_partial_archive). It waits once up to wait_s (0-20, default 15), then rereads the
@@ -820,7 +824,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,
                     order=order,before=before,direction=direction,search_language=search_language,fuzzy=fuzzy,
                     compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
-                    chat_types=chat_types,include_channels=include_channels,live=live,wait_s=wait_s,request_id=request_id)
+                    chat_types=chat_types,include_channels=include_channels,collapse_forwards=collapse_forwards,
+                    live=live,wait_s=wait_s,request_id=request_id)
 
     @mcp.tool(structured_output=True, annotations=read)
     def search_files(ctx: Context, query: str='', account: str='', chat: str='', sender: str='',
