@@ -152,8 +152,19 @@ key an operation issued (public fields only, or `found: false`).
 arguments (for `issue-key` the issue's own validation: accounts, chats, permission ceilings, a
 token already in use and an operation conflict; for `key-info` the key file and its bounds),
 writes nothing and answers `{"check": "ok" | "schema_not_ready", "schema_version",
-"required"}`; the admin CLI uses it to test a backend before a multi-store step. Invocations
-without these options behave as before.
+"required"}`; the admin CLI uses it to test a backend before a multi-store step. `ok` means
+the real command would succeed now, either creating the key or replaying the operation;
+`key-info --operation-id` tells which. A validation failure exits with the same error as the real
+command (`operation_conflict`, `token_in_use`, ...), and an unreachable or refused database with
+its connection error, never `schema_not_ready`. Invocations without these options behave as before.
+
+A token is 32–256 printable ASCII characters without spaces (for example
+`python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`). `/dev/stdin` may be a pipe or a
+redirected file. Both the creating call (`"replayed": false`) and a replay answer with `revoked`
+and `expires_at`, so a replay of a since-revoked key is visible as such. Pass the same `--days` on
+a rerun: another value is `operation_conflict`. Two concurrent runs of one operation end as one key
+and a replay (or `operation_conflict`), never a database error. A token lost before it was written
+durably needs a new operation ID with a new token.
 
 ```sh
 python -m messaging_service issue-key --principal assistant-work --accounts account-work \
