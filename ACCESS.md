@@ -1,6 +1,6 @@
 # Agent access and audit
 
-Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 43. Setup is done by the operator through the local CLI
+Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 44. Setup is done by the operator through the local CLI
 or SSH with the owner DSN. There are no remote MCP/REST methods for managing keys and permissions.
 Provider sessions, the owner DSN and the backup decryption key are not given to agents.
 
@@ -133,6 +133,33 @@ exists), `expires_at` and `revoked`. `key-info --key-file FILE` reads one token 
 public key ID, principal, `expires_at` and `revoked`, or `found: false`; a line that cannot be a
 token reports `error: invalid_key`. Neither command prints a token or a digest, and neither
 writes. `deedkit admin key list` (docs/operations/production.md, Admin CLI) runs both.
+
+### Repeatable issue (ANYM-495, schema 44)
+
+`issue-key --token-file FILE --operation-id ID` (both or neither) stores the digest of a token
+the caller generated and wrote durably first; it never writes or prints the token and takes no
+`--key-file`. The file is an owner-only regular file (mode 0600 or tighter, no symlink) or
+`/dev/stdin`, with one token line; anything else is `unsafe_token_file` or `invalid_key`. The
+operation ID is 1–128 characters of `[A-Za-z0-9._/-]` and is unique per credential: one parent
+operation uses distinct derived IDs for its main and archive keys. The same ID with the same
+request (principal, accounts, chats, permissions, key permissions, days, token digest) answers the existing key's
+public fields with `"replayed": true` and creates nothing, so a crash at any point is resolved by
+running the same command again; the same ID with another request is `operation_conflict`, and a
+token already stored under another key is `token_in_use`. `key-info --operation-id ID` reads the
+key an operation issued (public fields only, or `found: false`).
+
+`--check` on `issue-key`, `extend-key`, `revoke-key`, `list-keys` and `key-info` validates the
+arguments, writes nothing and answers `{"check": "ok" | "schema_not_ready", "schema_version",
+"required"}`; the admin CLI uses it to test a backend before a multi-store step. Invocations
+without these options behave as before.
+
+```sh
+python -m messaging_service issue-key --principal assistant-work --accounts account-work \
+  --days 7 --token-file /dev/stdin --operation-id op-2026-10-24/main < /private/new.token
+python -m messaging_service key-info --operation-id op-2026-10-24/main
+python -m messaging_service issue-key --check --principal assistant-work --accounts account-work \
+  --days 7 --token-file /dev/stdin --operation-id op-2026-10-24/main < /private/new.token
+```
 
 ### Extending a key
 
