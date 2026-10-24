@@ -3,8 +3,9 @@
 -- request is refused. Version-2 code selects principals with SELECT *, whose prepared plans fail once the
 -- row type changes: deploy the version-3 code first (it names its columns), then migrate.
 -- The queued wait for the exclusive lock (2 s) and the two steps that hold it (1 s each) are bounded one by
--- one; transaction_timeout bounds the whole hold from here to commit at 4 s, the rest of migrate() included:
--- past it the server ends the session and rolls back, so a slow upgrade fails and is retried instead.
+-- one; transaction_timeout bounds the whole hold from here up to COMMIT at 4 s, the rest of migrate() included:
+-- past it the server ends the session and rolls back, so a slow upgrade fails and is retried instead. The WAL
+-- flush at commit runs after the timer stops, as for every principals write.
 -- migrate() sets no transaction_timeout, so the timer starts at this SET; it is not reset, since DEFAULT
 -- stops it.
 SET LOCAL transaction_timeout = '4s';

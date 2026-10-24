@@ -5,10 +5,11 @@
 -- The ALTER holds an exclusive lock on api_keys (read by every authentication) until commit.
 -- An authentication waits at most the runtime's 5 s statement timeout. The queued wait for the
 -- lock (lock_timeout 2 s) and the two steps that hold it (1 s each; the check and the index scan
--- one row per key) are bounded one by one; transaction_timeout bounds the whole hold from here to
--- commit at 4 s, the rest of migrate() included: past it the server ends the session and rolls
--- back, so a slow upgrade fails and is retried instead of failing logins. migrate() sets no
--- transaction_timeout, so the timer starts at this SET; it is not reset, since DEFAULT stops it.
+-- one row per key) are bounded one by one; transaction_timeout bounds the whole hold from here up
+-- to COMMIT at 4 s, the rest of migrate() included: past it the server ends the session and rolls
+-- back, so a slow upgrade fails and is retried instead of failing logins. The WAL flush at commit
+-- runs after the timer stops, as for every migration since 037 and every api_keys write. migrate()
+-- sets no transaction_timeout, so the timer starts at this SET; it is not reset (DEFAULT stops it).
 SET LOCAL transaction_timeout='4s';
 SET LOCAL lock_timeout='2s';
 SET LOCAL statement_timeout='1s';
