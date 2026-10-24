@@ -16,7 +16,42 @@ from family_calendar.errors import CalendarError
 
 
 HERE = Path(__file__).parent
-MIGRATIONS = ((1, HERE / "schema.sql"), (2, HERE / "schema_v2.sql"))
+MIGRATIONS = ((1, HERE / "schema.sql"), (2, HERE / "schema_v2.sql"), (3, HERE / "schema_v3.sql"))
+
+
+def caller_key(value):
+    # A caller-made key (ANYM-495): printable ASCII without spaces, as authentication reads it.
+    if not isinstance(value, str) or not re.fullmatch(r"[!-~]{32,512}", value):
+        raise CalendarError("invalid_key")
+    return value
+
+
+def operation_name(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._/-]{1,128}", value):
+        raise CalendarError("invalid_operation_id")
+    return value
+
+
+class OperationTaken(Exception):
+    # ANYM-495: the operation ID, principal ID or key is held by a committed principal; the transaction rolls back.
+    pass
+
+
+def agent_operation(c, operation_id):
+    # No foreign key (migration 3 takes no lock on principals): an operation without its principal still holds the ID.
+    return c.execute(
+        "SELECT p.id,p.expires_at,NOT p.enabled AS revoked,p.key_hash,o.operation_request FROM principal_operations o "
+        "LEFT JOIN principals p ON p.id=o.principal_id WHERE o.operation_id=%s",
+        (operation_id,),
+    ).fetchone()
+
+
+def replay(prior, key_hash, request, operation_id):
+    if (prior["operation_request"] != request or prior["key_hash"] is None
+            or not secrets.compare_digest(prior["key_hash"], key_hash)):
+        raise CalendarError("operation_conflict")
+    return {"principal_id": prior["id"], "expires_at": prior["expires_at"].isoformat(), "revoked": prior["revoked"],
+            "operation_id": operation_id, "replayed": True}
 
 
 def ref(prefix):
@@ -193,24 +228,97 @@ class Store:
             (group_id, person_id, calendar_ref),
         )
 
-    def agent(self, principal_id, group_id, person_id, scopes, calendars, visibility="details"):
-        token = secrets.token_urlsafe(48)
-        with self.transaction() as c:
-            c.execute(
-                "INSERT INTO principals(id,group_id,person_id,scopes,key_hash) VALUES (%s,%s,%s,%s,%s)",
-                (
-                    principal_id,
-                    group_id,
-                    person_id,
-                    Jsonb(scopes),
-                    hashlib.sha256(token.encode()).hexdigest(),
-                ),
-            )
-            for calendar in calendars:
-                c.execute(
-                    "INSERT INTO agent_calendars VALUES (%s,%s,%s)", (principal_id, calendar, visibility)
-                )
-        return token
+    def agent(self, principal_id, group_id, person_id, scopes, calendars, visibility="details", *, days=90,
+              key=None, operation_id=None, check=False):
+        """A new agent key; returns the key. With the caller's key and an operation ID (ANYM-495) it stores
+        only the hash and returns public fields, and the same request again returns the same record."""
+        if type(days) is not int or not 1 <= days <= 183:
+            raise CalendarError("invalid_agent_lifetime")
+        if len(set(calendars)) != len(calendars):
+            raise CalendarError("duplicate_calendar")
+        once = operation_id is not None
+        if once != (key is not None):
+            raise CalendarError("key_and_operation_id_required")
+        if once:
+            key, operation_id = caller_key(key), operation_name(operation_id)
+            request = hashlib.sha256(
+                json.dumps([principal_id, group_id, person_id, sorted(scopes), sorted(calendars), visibility, days])
+                .encode()
+            ).hexdigest()
+        else:
+            key, request = secrets.token_urlsafe(48), None
+        key_hash = hashlib.sha256(key.encode()).hexdigest()
+        try:
+            with self.transaction() as c:
+                if once:
+                    if not c.execute("SELECT 1 FROM migrations WHERE version=3").fetchone():
+                        raise CalendarError("schema_not_ready")
+                    prior = agent_operation(c, operation_id)
+                    if prior:
+                        return replay(prior, key_hash, request, operation_id)
+                if check:
+                    # ANYM-495 check mode: what the inserts below would refuse, read only.
+                    if not c.execute(
+                        "SELECT 1 FROM memberships WHERE group_id=%s AND person_id=%s", (group_id, person_id)
+                    ).fetchone():
+                        raise CalendarError("unknown_member")
+                    known = c.execute("SELECT ref FROM calendars WHERE ref=ANY(%s)", (list(calendars),)).fetchall()
+                    if {r["ref"] for r in known} != set(calendars):
+                        raise CalendarError("unknown_calendar")
+                    if c.execute(
+                        "SELECT 1 FROM principals WHERE id=%s OR key_hash=%s", (principal_id, key_hash)
+                    ).fetchone():
+                        raise CalendarError("principal_or_key_in_use")
+                    return {"check": "ok"}
+                # A taken principal ID, key or operation ID is no error statement, so no key hash reaches the
+                # database log; the commit that holds it is read back below.
+                row = c.execute(
+                    "INSERT INTO principals(id,group_id,person_id,scopes,key_hash,expires_at) "
+                    "VALUES (%s,%s,%s,%s,%s,now()+make_interval(days=>%s))"
+                    + (" ON CONFLICT DO NOTHING" if once else "") + " RETURNING id,expires_at",
+                    (principal_id, group_id, person_id, Jsonb(scopes), key_hash, days),
+                ).fetchone()
+                if row is None or once and not c.execute(
+                    "INSERT INTO principal_operations(operation_id,operation_request,principal_id) "
+                    "VALUES (%s,%s,%s) ON CONFLICT DO NOTHING RETURNING operation_id",
+                    (operation_id, request, principal_id),
+                ).fetchone():
+                    raise OperationTaken
+                for calendar in calendars:
+                    c.execute(
+                        "INSERT INTO agent_calendars VALUES (%s,%s,%s)", (principal_id, calendar, visibility)
+                    )
+        except OperationTaken:
+            # A concurrent call won the operation ID, the principal ID or the key; its commit is visible now.
+            with self.transaction() as c:
+                prior = agent_operation(c, operation_id)
+            if prior is None:
+                raise CalendarError("principal_or_key_in_use") from None
+            return replay(prior, key_hash, request, operation_id)
+        if not once:
+            return key
+        return {"principal_id": row["id"], "expires_at": row["expires_at"].isoformat(), "revoked": False,
+                "operation_id": operation_id, "replayed": False}
+
+    def agent_operation_info(self, operation_id):
+        # ANYM-495: the agent an operation issued, public fields only.
+        operation_id = operation_name(operation_id)
+        if self.check_schema()["check"] != "ok":
+            raise CalendarError("schema_not_ready")
+        row = self.one(
+            "SELECT p.id AS principal_id,p.expires_at,NOT p.enabled AS revoked,o.operation_id "
+            "FROM principal_operations o JOIN principals p ON p.id=o.principal_id WHERE o.operation_id=%s",
+            (operation_id,),
+        )
+        if row is None:
+            return [{"found": False, "operation_id": operation_id}]
+        return [dict(row, found=True, expires_at=row["expires_at"].isoformat())]
+
+    def check_schema(self, version=3):
+        # ANYM-495 check mode: reads only the migrations table, writes nothing.
+        current = self.one("SELECT coalesce(max(version),0) AS v FROM migrations")["v"]
+        return {"check": "ok" if current >= version else "schema_not_ready", "schema_version": current,
+                "required": version}
 
     def revoke(self, principal_id):
         self.query("UPDATE principals SET enabled=false,version=version+1 WHERE id=%s", (principal_id,))
