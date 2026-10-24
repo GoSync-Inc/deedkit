@@ -1035,15 +1035,22 @@ credential bound to it (public ID, expiry, `live`, `revoked`, `expired`, `missin
 when a backend command fails). It reads the gateway policy and the calls registry and runs the
 messaging `list-keys --all` / `key-info` and calendar `list-agents` / `agent-info` operator
 commands (ACCESS.md, `services/calendar/docs/SERVICE.md`); key files reach those commands on
-stdin, never in argv, environment or output. It takes no lock and writes nothing, so it is safe
-during a call. Filters: `--principal ID`, `--valid` (enabled, unexpired), `--expiring` (within
+stdin, never in argv, environment or output. It takes no lock and writes no store or file, so it
+is safe during a call. The one-shot operator containers keep their stdout (public IDs only) in
+Docker's container log until `run --rm` removes them; on a timeout or an interrupt the CLI stops its
+own uniquely named container (`docker stop`, 30 s bound), and the calendar reads carry a 5 s
+statement timeout. Filters: `--principal ID`, `--valid` (enabled, unexpired), `--expiring` (within
 the gateway's 7-day warning window or expired), `--all` (default); `--json` for machine output;
 `--strict` exits 1 when there are findings (exit 2 is an unreadable input).
 
-Findings, for enabled and unexpired gateway principals only: `credential_missing`,
-`credential_revoked`, `credential_expired`, `backend_expires_first` (the backend key ends before
-the gateway entry), `shared_credential` (one backend key bound to several principals),
-`unbound_key` (a live backend key no principal holds) and `backend_unavailable`.
+Findings, for every gateway principal, disabled and expired ones included (re-enabling one would
+expose them): `credential_missing`, `credential_revoked`, `credential_expired`,
+`credential_pin_mismatch` (the key file does not match the policy's `key_sha256`, so the gateway
+refuses it), `backend_expires_first` (the backend key ends before the gateway entry),
+`shared_credential` (one backend key bound to two or more principals), `unbound_key` (a backend
+key no principal holds, with its status) and `backend_unavailable` (a failed backend command, or
+no calls registry configured while a principal holds a calls key). With `--principal`, the list
+keeps that principal's findings and every `backend_unavailable` of a backend it uses.
 
 The configuration is a private JSON file (`--config`, default
 `/opt/deedkit/deploy/private/admin/config.json`; template `deploy/admin.example.json`): policy

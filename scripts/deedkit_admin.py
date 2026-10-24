@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -27,6 +28,7 @@ from uuid import uuid4
 CONFIG = Path("/opt/deedkit/deploy/private/admin/config.json")
 WINDOW = timedelta(days=7)  # the gateway's expiry warning window (ANYM-289, WARNING_WINDOW_DAYS)
 TIMEOUT = 120  # seconds for one operator command
+CLEANUP = 30  # seconds to stop this invocation's own container after a timeout or an interrupt
 LIMIT = 1024 * 1024  # bytes of one private JSON or key file
 BATCH = 100  # keys per lookup, the operator commands' own bound
 LOOKUP = {"messaging": ["key-info", "--key-file", "/dev/stdin"], "calendar": ["agent-info", "--key-file", "/dev/stdin"]}
@@ -42,13 +44,18 @@ class Unavailable(Exception):
 
 
 def read_private(path: str | Path, limit: int = LIMIT) -> bytes:
-    """A regular, owner-only file that is not a symlink, read in full."""
+    """A regular, owner-only file that is not a symlink, read in full and unchanged while read (the gateway's
+    own reader); an oversized or growing file is refused, never truncated."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_size > limit:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o077 or before.st_size > limit:
             raise AdminError(f"unsafe private file: {path}")
-        return os.read(fd, limit + 1)[:limit]
+        value, after = os.read(fd, limit + 1), os.fstat(fd)
+        if len(value) > limit or (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise AdminError(f"private file changed while read: {path}")
+        return value
     finally:
         os.close(fd)
 
@@ -106,8 +113,14 @@ def runner(config: dict):
         try:
             done = subprocess.run(argv, input=data if data is not None else b"", capture_output=True,
                                   timeout=TIMEOUT, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except OSError as exc:
             raise Unavailable(f"{service}: {type(exc).__name__}") from None
+        except BaseException as exc:  # timeout or interrupt: the killed client may leave its container running
+            if any("{name}" in part for part in prefix):
+                stop(name)
+            if isinstance(exc, subprocess.TimeoutExpired):
+                raise Unavailable(f"{service}: TimeoutExpired") from None
+            raise
         # stderr is dropped: a service's error text is not ours to echo.
         if done.returncode:
             raise Unavailable(f"{service}: {args[0]} exited {done.returncode}")
@@ -116,6 +129,14 @@ def runner(config: dict):
         except ValueError:
             raise Unavailable(f"{service}: {args[0]} printed no JSON") from None
     return run
+
+
+def stop(name: str) -> None:
+    """Stop only this invocation's uniquely named container, bounded; `run --rm` makes the daemon remove it."""
+    try:
+        subprocess.run(["docker", "stop", "--time", "5", name], capture_output=True, timeout=CLEANUP, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def status(record: dict | None, now: datetime) -> str:
@@ -167,7 +188,7 @@ def collect(config: dict, run, now: datetime | None = None) -> dict:
     by_hash = {entry.get("key_sha256"): entry for entry in calls}
     labels = load_labels(config)
     pending: dict[str, list[tuple[dict, str]]] = {"messaging": [], "calendar": []}
-    rows = []
+    rows, unconfigured = [], False
     for principal in principals:
         credentials = []
         items = principal.get("credentials") if isinstance(principal.get("credentials"), dict) else {}
@@ -176,10 +197,15 @@ def collect(config: dict, run, now: datetime | None = None) -> dict:
             token = read_token(config, credential.get("key_file", "")) if isinstance(credential, dict) else None
             if token is None:
                 entry["note"] = "key_file_unreadable"
+            elif not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(),
+                                         str(credential.get("key_sha256", ""))):
+                # The gateway refuses a key file that does not match its pin, so the binding does not work.
+                entry.update(status="unknown", note="credential_pin_mismatch")
             elif backend in pending:
                 pending[backend].append((entry, token))
             elif backend == "calls" and not config.get("calls_registry"):
                 entry.update(status="unknown", note="calls_registry_not_configured")
+                unconfigured = True
             elif backend == "calls":
                 match = by_hash.get(hashlib.sha256(token.encode()).hexdigest())
                 if match is not None:
@@ -195,23 +221,31 @@ def collect(config: dict, run, now: datetime | None = None) -> dict:
                      "profile": principal.get("profile"), "enabled": principal.get("enabled") is True,
                      "expires_at": principal.get("expires_at"), "credentials": credentials})
     unavailable, records = [], {}
+    if unconfigured:
+        unavailable.append({"code": "backend_unavailable", "backend": "calls", "detail": "calls: no registry configured"})
     for service, items in pending.items():
+        # The lookup and the inventory fail apart: a failed inventory keeps the rows' statuses and only loses
+        # this backend's unbound_key findings.
         try:
             found = lookup(run, service, [token for _, token in items]) if items else []
-            records[service] = inventory(run, service)
         except Unavailable as exc:
             unavailable.append({"code": "backend_unavailable", "backend": service, "detail": str(exc)})
             for entry, _ in items:
                 entry["status"] = "unknown"
             continue
-        for (entry, _), record in zip(items, found):
+        try:
+            records[service] = inventory(run, service)
+        except Unavailable as exc:
+            unavailable.append({"code": "backend_unavailable", "backend": service, "detail": str(exc)})
+        for (entry, _), record in zip(items, found, strict=True):
             entry["status"] = status(record, now)
             if record is not None:
                 entry.update(public_id=public_id(service, record), backend_principal=record.get("principal"),
                              expires_at=record.get("expires_at"))
         items.clear()
-    records["calls"] = [{"id": entry.get("id"), "expires_at": entry.get("expires_at"),
-                         "revoked": not entry.get("enabled")} for entry in calls]
+    if config.get("calls_registry"):
+        records["calls"] = [{"id": entry.get("id"), "expires_at": entry.get("expires_at"),
+                             "revoked": not entry.get("enabled")} for entry in calls]
     return {"principals": rows, "findings": unavailable + findings(rows, records, now)}
 
 
@@ -239,38 +273,40 @@ def bound(row: dict):
 
 def findings(rows: list[dict], records: dict, now: datetime) -> list[dict]:
     result, users = [], {}
+    # Every principal counts, disabled or expired too: re-enabling or extending it would expose the finding.
     for row in rows:
         gateway = instant(row["expires_at"])
-        active = row["enabled"] and gateway is not None and gateway > now
         for credential in bound(row):
             if credential["public_id"] is not None:
                 users.setdefault((credential["backend"], credential["public_id"]), []).append(row["id"])
-            # A disabled or expired gateway principal grants nothing; its backend state is not a finding.
-            if not active or gateway is None:
-                continue
             if credential["status"] in ("missing", "revoked", "expired"):
                 result.append({"code": "credential_" + credential["status"], "principal": row["id"],
                                "backend": credential["backend"], "public_id": credential["public_id"]})
+            if credential.get("note") == "credential_pin_mismatch":
+                result.append({"code": "credential_pin_mismatch", "principal": row["id"],
+                               "backend": credential["backend"]})
             backend = instant(credential["expires_at"])
-            if credential["status"] == "live" and backend is not None and backend < gateway:
+            if credential["status"] == "live" and backend is not None and gateway is not None and backend < gateway:
                 result.append({"code": "backend_expires_first", "principal": row["id"],
                                "backend": credential["backend"], "public_id": credential["public_id"],
                                "expires_at": credential["expires_at"], "gateway_expires_at": row["expires_at"]})
     for (backend, key), names in sorted(users.items()):
-        if len(names) > 1:
+        if len(set(names)) > 1:
             result.append({"code": "shared_credential", "backend": backend, "public_id": key,
                            "principals": sorted(set(names))})
     for backend, inventory_rows in sorted(records.items()):
         for record in inventory_rows:
             key = public_id(backend, record)
-            if (backend, key) not in users and status(record, now) == "live":
+            if (backend, key) not in users:
                 result.append({"code": "unbound_key", "backend": backend, "public_id": key,
+                               "status": status(record, now),
                                "backend_principal": record.get("principal") or record.get("person_id")})
     return result
 
 
 def select(view: dict, principal: str | None, scope: str, now: datetime) -> dict:
-    """Rows by --principal and --valid/--expiring/--all; findings that name a shown row or no row."""
+    """Rows by --principal and --valid/--expiring/--all. Findings: all without --principal; with it, those that
+    name a shown row and every unavailable backend a shown row uses."""
     def expiries(row):
         return [instant(row["expires_at"])] + [instant(c["expires_at"]) for c in bound(row)]
 
@@ -287,8 +323,10 @@ def select(view: dict, principal: str | None, scope: str, now: datetime) -> dict
 
     rows = [row for row in view["principals"] if keep(row)]
     shown = {row["id"] for row in rows}
+    used = {credential["backend"] for row in rows for credential in bound(row)}
     found = [item for item in view["findings"]
-             if principal is None or item.get("principal") in shown or shown & set(item.get("principals", []))]
+             if principal is None or item.get("principal") in shown or shown & set(item.get("principals", []))
+             or (item["code"] == "backend_unavailable" and item["backend"] in used)]
     return {"principals": rows, "findings": found}
 
 

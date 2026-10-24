@@ -18,6 +18,8 @@ state = json.load(open(sys.argv[1]))
 with open(sys.argv[1] + ".calls", "a") as log:
     log.write(json.dumps({"argv": sys.argv[2:], "env": dict(__import__("os").environ)}) + "\n")
 service, command = sys.argv[2], sys.argv[3]
+if command in state.get("fail", []):
+    sys.exit(3)
 if command in ("key-info", "agent-info"):
     rows = []
     for line in sys.stdin.read().splitlines():
@@ -104,13 +106,14 @@ class Stores:
                 "calendar": {"by_digest": {r["digest"]: public([r])[0] for r in self.calendar.values()},
                              "inventory": public(self.calendar.values())}}
 
-    def fake(self, broken=()):
-        """Real subprocess runner over a fake operator script: proves what reaches argv, stdin and environment."""
+    def fake(self, broken=(), fail=()):
+        """Real subprocess runner over a fake operator script: proves what reaches argv, stdin and environment.
+        `broken` services exit 3 on every command, `fail` commands exit 3 alone."""
         config = self.root / "admin/config.json"
-        if config.exists() and not broken:  # written once, so a read-only check sees no rewrite of its own
+        if config.exists() and not broken and not fail:  # written once, so a read-only check sees no rewrite
             return config
         state = self.root / "operator-state.json"
-        state.write_text(json.dumps(self.write()))
+        state.write_text(json.dumps(dict(self.write(), fail=list(fail))))
         script = self.root / "fake_operator.py"
         script.write_text(FAKE)
         for service in ("messaging", "calendar"):
@@ -146,8 +149,8 @@ def healthy(stores):
                                      "calls": stores.calls_agent("cc-calls", archive="cc-archive")})
 
 
-def listing(stores, capsys, *arguments, broken=()):
-    code = admin.main(["--config", str(stores.fake(broken)), "key", "list", "--json", *arguments])
+def listing(stores, capsys, *arguments, broken=(), fail=()):
+    code = admin.main(["--config", str(stores.fake(broken, fail)), "key", "list", "--json", *arguments])
     out = capsys.readouterr()
     return code, json.loads(out.out), out
 
@@ -194,10 +197,11 @@ def test_valid_expiring_and_principal_filters_use_the_gateway_window(stores, cap
     ("revoked", {"code": "credential_revoked", "principal": "agent", "backend": "calendar", "public_id": "agent-cal"}),
     ("expired", {"code": "credential_expired", "principal": "agent", "backend": "calls", "public_id": "agent-calls"}),
     ("unbound-messaging", {"code": "unbound_key", "backend": "messaging",
-                           "public_id": "00000000-0000-4000-8000-0000000000aa", "backend_principal": "forgotten"}),
-    ("unbound-calendar", {"code": "unbound_key", "backend": "calendar", "public_id": "stray-cal",
+                           "public_id": "00000000-0000-4000-8000-0000000000aa", "status": "live",
+                           "backend_principal": "forgotten"}),
+    ("unbound-calendar", {"code": "unbound_key", "backend": "calendar", "public_id": "stray-cal", "status": "live",
                           "backend_principal": None}),
-    ("unbound-calls", {"code": "unbound_key", "backend": "calls", "public_id": "stray-calls",
+    ("unbound-calls", {"code": "unbound_key", "backend": "calls", "public_id": "stray-calls", "status": "live",
                        "backend_principal": None}),
     ("earlier", {"code": "backend_expires_first", "principal": "agent", "backend": "calendar",
                  "public_id": "agent-cal", "expires_at": SOON, "gateway_expires_at": LATER}),
@@ -236,11 +240,150 @@ def test_each_disagreement_between_stores_is_one_finding_and_strict_exits_1(stor
 
 
 # spec: ANYM-494
-def test_strict_exits_0_when_the_stores_agree_and_a_disabled_principal_is_no_finding(stores, capsys):
+def test_strict_exits_0_when_the_stores_agree(stores, capsys):
     healthy(stores)
-    stores.principal("retired", {"calendar": stores.calendar_agent("old-cal", revoked=True)}, enabled=False)
     code, view, _ = listing(stores, capsys, "--strict")
     assert code == 0 and view["findings"] == []
+
+
+# spec: ANYM-494
+@pytest.mark.parametrize("enabled,expires", [(False, LATER), (True, PAST), (False, PAST)],
+                         ids=["disabled", "expired", "disabled-expired"])
+def test_a_disabled_or_expired_principal_still_reports_its_credential_findings(stores, capsys, enabled, expires):
+    healthy(stores)
+    stores.principal("retired", {"calendar": stores.calendar_agent("old-cal", revoked=True),
+                                 "messaging": stores.key("never-issued")}, enabled=enabled, expires=expires)
+    code, view, _ = listing(stores, capsys, "--strict")
+    assert code == 1
+    assert view["findings"] == [
+        {"code": "credential_revoked", "principal": "retired", "backend": "calendar", "public_id": "old-cal"},
+        {"code": "credential_missing", "principal": "retired", "backend": "messaging", "public_id": None}]
+
+
+# spec: ANYM-494
+@pytest.mark.parametrize("revoked,expires", [(True, LATER), (False, PAST)], ids=["revoked", "expired"])
+def test_a_revoked_or_expired_unbound_key_is_still_a_finding_with_its_status(stores, capsys, revoked, expires):
+    healthy(stores)
+    stores.messaging_key("old", "00000000-0000-4000-8000-0000000000cc", "gone", revoked=revoked, expires=expires,
+                         bound=False)
+    stores.calendar_agent("old-cal", revoked=revoked, expires=expires, bound=False)
+    stores.calls_agent("old-calls", enabled=not revoked, expires=expires)
+    state = "revoked" if revoked else "expired"
+    _, view, _ = listing(stores, capsys)
+    assert view["findings"] == [
+        {"code": "unbound_key", "backend": "calendar", "public_id": "old-cal", "status": state,
+         "backend_principal": None},
+        {"code": "unbound_key", "backend": "calls", "public_id": "old-calls", "status": state,
+         "backend_principal": None},
+        {"code": "unbound_key", "backend": "messaging", "public_id": "00000000-0000-4000-8000-0000000000cc",
+         "status": state, "backend_principal": "gone"}]
+
+
+# spec: ANYM-494
+def test_principal_filter_keeps_the_unavailable_backend_it_uses_so_strict_fails(stores, capsys):
+    healthy(stores)
+    stores.principal("other", {"messaging": stores.messaging_key("o", "00000000-0000-4000-8000-0000000000dd", "o")})
+    code, view, _ = listing(stores, capsys, "--principal", "claude-code", "--strict", broken=("calendar",))
+    assert code == 1
+    assert view["findings"] == [{"code": "backend_unavailable", "backend": "calendar",
+                                 "detail": "calendar: agent-info exited 3"}]
+    code, view, _ = listing(stores, capsys, "--principal", "other", "--strict", broken=("calendar",))
+    assert code == 0 and view["findings"] == []
+
+
+# spec: ANYM-494
+def test_no_calls_registry_configured_is_a_finding_when_a_principal_holds_a_calls_key(stores, capsys):
+    healthy(stores)
+    stores.fake()
+    config = json.loads((stores.root / "admin/config.json").read_text())
+    del config["calls_registry"]
+    private(stores.root / "admin/config.json", config)
+    code, view, _ = listing(stores, capsys, "--principal", "claude-code", "--strict")
+    calls = {c["backend"]: c for c in view["principals"][0]["credentials"]}["calls"]
+    assert code == 1 and calls["status"] == "unknown" and calls["note"] == "calls_registry_not_configured"
+    assert view["findings"] == [{"code": "backend_unavailable", "backend": "calls",
+                                 "detail": "calls: no registry configured"}]
+
+
+# spec: ANYM-494
+def test_a_key_file_that_does_not_match_the_policy_pin_is_a_content_free_finding_not_live(stores, capsys):
+    healthy(stores)
+    other = stores.calendar_agent("other-cal")  # a valid backend key, but not the one the policy pins
+    stores.principal("agent", {"calendar": dict(stores.key("agent-cal"), key_file=other["key_file"])})
+    stores.calendar_agent("agent-cal")
+    _, view, out = listing(stores, capsys)
+    row = next(r for r in view["principals"] if r["id"] == "agent")
+    assert row["credentials"] == [{"backend": "calendar", "public_id": None, "expires_at": None,
+                                   "status": "unknown", "note": "credential_pin_mismatch"}]
+    assert {"code": "credential_pin_mismatch", "principal": "agent", "backend": "calendar"} in view["findings"]
+    for value in stores.tokens.values():
+        assert value not in out.out and sha(value) not in out.out
+
+
+# spec: ANYM-494
+def test_one_principal_holding_a_key_directly_and_as_its_calls_archive_is_not_shared(stores, capsys):
+    stores.messaging_key("own", "00000000-0000-4000-8000-0000000000ee", "agent", bound=False)
+    stores.principal("agent", {"messaging": stores.key("own"), "calls": stores.calls_agent("agent-calls", archive="own")})
+    _, view, _ = listing(stores, capsys, "--strict")
+    assert view["findings"] == []
+
+
+# spec: ANYM-494
+def test_a_failed_inventory_keeps_the_successful_lookups(stores, capsys):
+    healthy(stores)
+    _, view, _ = listing(stores, capsys, fail=("list-keys",))
+    credentials = {c["backend"]: c for c in view["principals"][0]["credentials"]}
+    assert credentials["messaging"]["status"] == "live" and credentials["calls"]["archive"]["status"] == "live"
+    assert view["findings"] == [{"code": "backend_unavailable", "backend": "messaging",
+                                 "detail": "messaging: list-keys exited 3"}]
+
+
+# spec: ANYM-494
+@pytest.mark.parametrize("interrupt", [False, True], ids=["timeout", "interrupt"])
+def test_a_timed_out_or_interrupted_command_stops_only_its_own_container(stores, monkeypatch, interrupt):
+    real, seen = admin.subprocess.run, []
+
+    def run(argv, **options):
+        seen.append(argv)
+        if argv[0] == "docker":
+            return admin.subprocess.CompletedProcess(argv, 0)
+        if interrupt:
+            raise KeyboardInterrupt
+        return real(argv, **options)
+
+    monkeypatch.setattr(admin, "TIMEOUT", 0.2)
+    monkeypatch.setattr(admin.subprocess, "run", run)
+    command = admin.runner({"calendar": [sys.executable, "-c", "import time; time.sleep(30)", "--name", "{name}"]})
+    if interrupt:
+        with pytest.raises(KeyboardInterrupt):
+            command("calendar", ["list-agents"])
+    else:
+        with pytest.raises(admin.Unavailable, match="calendar: TimeoutExpired"):
+            command("calendar", ["list-agents"])
+    name = seen[0][-2]
+    assert name.startswith("deedkit-admin-")
+    assert seen[1] == ["docker", "stop", "--time", "5", name] and len(seen) == 2
+
+
+# spec: ANYM-494
+def test_a_private_file_that_is_oversized_or_changes_while_read_is_refused_never_truncated(tmp_path, monkeypatch):
+    path = private(tmp_path / "key", "x" * 20)
+    with pytest.raises(admin.AdminError, match="unsafe private file"):
+        admin.read_private(path, 10)
+    real, calls = admin.os.fstat, []
+
+    def fstat(fd):
+        info = real(fd)
+        calls.append(fd)
+        if len(calls) == 1:
+            return info
+        values = list(info)
+        values[6] += 1  # st_size grew after the first look
+        return admin.os.stat_result(values)
+
+    monkeypatch.setattr(admin.os, "fstat", fstat)
+    with pytest.raises(admin.AdminError, match="changed while read"):
+        admin.read_private(path)
 
 
 # spec: ANYM-494
