@@ -38,14 +38,17 @@ class OperationTaken(Exception):
 
 
 def agent_operation(c, operation_id):
+    # No foreign key (migration 3 takes no lock on principals): an operation without its principal still holds the ID.
     return c.execute(
-        "SELECT id,expires_at,NOT enabled AS revoked,key_hash,operation_request FROM principals WHERE operation_id=%s",
+        "SELECT p.id,p.expires_at,NOT p.enabled AS revoked,p.key_hash,o.operation_request FROM principal_operations o "
+        "LEFT JOIN principals p ON p.id=o.principal_id WHERE o.operation_id=%s",
         (operation_id,),
     ).fetchone()
 
 
 def replay(prior, key_hash, request, operation_id):
-    if prior["operation_request"] != request or not secrets.compare_digest(prior["key_hash"], key_hash):
+    if (prior["operation_request"] != request or prior["key_hash"] is None
+            or not secrets.compare_digest(prior["key_hash"], key_hash)):
         raise CalendarError("operation_conflict")
     return {"principal_id": prior["id"], "expires_at": prior["expires_at"].isoformat(), "revoked": prior["revoked"],
             "operation_id": operation_id, "replayed": True}
@@ -251,11 +254,6 @@ class Store:
                     prior = agent_operation(c, operation_id)
                     if prior:
                         return replay(prior, key_hash, request, operation_id)
-                    # A taken principal ID, key or operation ID is no error statement, so no key hash reaches the
-                    # database log; the commit that holds it is read back below.
-                    columns, values = ",operation_id,operation_request", ",%s,%s) ON CONFLICT DO NOTHING"
-                else:
-                    columns, values = "", ")"
                 if check:
                     # ANYM-495 check mode: what the inserts below would refuse, read only.
                     if not c.execute(
@@ -270,13 +268,19 @@ class Store:
                     ).fetchone():
                         raise CalendarError("principal_or_key_in_use")
                     return {"check": "ok"}
+                # A taken principal ID, key or operation ID is no error statement, so no key hash reaches the
+                # database log; the commit that holds it is read back below.
                 row = c.execute(
-                    "INSERT INTO principals(id,group_id,person_id,scopes,key_hash,expires_at" + columns + ") "
-                    "VALUES (%s,%s,%s,%s,%s,now()+make_interval(days=>%s)" + values + " RETURNING id,expires_at",
-                    (principal_id, group_id, person_id, Jsonb(scopes), key_hash, days)
-                    + ((operation_id, request) if once else ()),
+                    "INSERT INTO principals(id,group_id,person_id,scopes,key_hash,expires_at) "
+                    "VALUES (%s,%s,%s,%s,%s,now()+make_interval(days=>%s))"
+                    + (" ON CONFLICT DO NOTHING" if once else "") + " RETURNING id,expires_at",
+                    (principal_id, group_id, person_id, Jsonb(scopes), key_hash, days),
                 ).fetchone()
-                if row is None:
+                if row is None or once and not c.execute(
+                    "INSERT INTO principal_operations(operation_id,operation_request,principal_id) "
+                    "VALUES (%s,%s,%s) ON CONFLICT DO NOTHING RETURNING operation_id",
+                    (operation_id, request, principal_id),
+                ).fetchone():
                     raise OperationTaken
                 for calendar in calendars:
                     c.execute(
@@ -300,8 +304,8 @@ class Store:
         if self.check_schema()["check"] != "ok":
             raise CalendarError("schema_not_ready")
         row = self.one(
-            "SELECT id AS principal_id,expires_at,NOT enabled AS revoked,operation_id FROM principals "
-            "WHERE operation_id=%s",
+            "SELECT p.id AS principal_id,p.expires_at,NOT p.enabled AS revoked,o.operation_id "
+            "FROM principal_operations o JOIN principals p ON p.id=o.principal_id WHERE o.operation_id=%s",
             (operation_id,),
         )
         if row is None:

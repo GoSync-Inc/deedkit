@@ -79,7 +79,7 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-KEY_OPERATION_SCHEMA=44  # api_keys.operation_id (ANYM-495)
+KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
 
 
 def caller_token(value):
@@ -107,8 +107,10 @@ class OperationTaken(Exception):
 
 
 def key_operation(c,operation_id):
-    return c.execute('''SELECT id,principal,expires_at,revoked,digest,operation_request FROM api_keys
-        WHERE operation_id=%s''',(operation_id,)).fetchone()
+    # No foreign key (044 takes no lock on api_keys): an operation without its key row still holds the ID.
+    return c.execute('''SELECT k.id,k.principal,k.expires_at,k.revoked,k.digest,o.operation_request
+        FROM api_key_operations o LEFT JOIN api_keys k ON k.id=o.key_id WHERE o.operation_id=%s''',
+        (operation_id,)).fetchone()
 
 
 def schema_version(c):
@@ -1151,7 +1153,7 @@ class Store:
             replayed=True
         if check and issued is None:return {'check':'ok'}
         if not once:return token
-        if replayed and (issued['operation_request']!=request or
+        if replayed and (issued['operation_request']!=request or issued['digest'] is None or
                          not secrets.compare_digest(issued['digest'],digest(token))):
             raise ValueError('operation_conflict')
         return serial({'key_id':issued['id'],'principal':issued['principal'],'expires_at':issued['expires_at'],
@@ -1179,12 +1181,13 @@ class Store:
             self._write_policy(c,principal,old,accounts,chats,permissions,old['enabled'] if old else True)
             operation_id,request=operation or (None,None)
             # A taken operation ID or token is not an error statement, so no key digest reaches the database log.
-            issued=c.execute('''INSERT INTO api_keys(digest,principal,expires_at,permissions'''+
-                (',operation_id,operation_request) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING' if operation
-                 else ') VALUES(%s,%s,%s,%s)')+' RETURNING id,principal,expires_at,revoked',
-                (digest(token),principal,datetime.now(timezone.utc)+timedelta(days=days),key_permissions,
-                 *((operation_id,request) if operation else ()))).fetchone()
-            if issued is None:raise OperationTaken
+            issued=c.execute('INSERT INTO api_keys(digest,principal,expires_at,permissions) VALUES(%s,%s,%s,%s)'+
+                (' ON CONFLICT DO NOTHING' if operation else '')+' RETURNING id,principal,expires_at,revoked',
+                (digest(token),principal,datetime.now(timezone.utc)+timedelta(days=days),key_permissions)).fetchone()
+            if issued is None or operation and not c.execute('''INSERT INTO api_key_operations(operation_id,
+                    operation_request,key_id) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING RETURNING key_id''',
+                    (operation_id,request,issued['id'])).fetchone():
+                raise OperationTaken
             audit(c,{'id':principal,'key_id':issued['id']},'issue_key','ok')
             return issued,False
 
@@ -1300,8 +1303,9 @@ class Store:
         operation_id=operation_name(operation_id)
         with self.pool.connection() as c:
             require_schema(c,KEY_OPERATION_SCHEMA)
-            row=c.execute('''SELECT id AS key_id,principal,expires_at,revoked,operation_id FROM api_keys
-                WHERE operation_id=%s''',(operation_id,)).fetchone()
+            row=c.execute('''SELECT k.id AS key_id,k.principal,k.expires_at,k.revoked,o.operation_id
+                FROM api_key_operations o JOIN api_keys k ON k.id=o.key_id WHERE o.operation_id=%s''',
+                (operation_id,)).fetchone()
         return [serial({'found':True,**row}) if row else {'found':False,'operation_id':operation_id}]
 
     def check_schema(self,version=KEY_OPERATION_SCHEMA):

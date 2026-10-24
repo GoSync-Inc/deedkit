@@ -30,7 +30,8 @@ def key_file(tmp_path, value=KEY, name="agent.key", mode=0o600):
 
 
 def state(store):
-    return (store.query("SELECT id,key_hash,expires_at,operation_id,operation_request FROM principals ORDER BY id"),
+    return (store.query("SELECT p.id,p.key_hash,p.expires_at,o.operation_id,o.operation_request FROM principals p "
+                        "LEFT JOIN principal_operations o ON o.principal_id=p.id ORDER BY p.id"),
             store.query("SELECT * FROM agent_calendars ORDER BY 1,2"))
 
 
@@ -258,20 +259,26 @@ def test_migration_three_is_additive_and_repeatable(schema_two):
     schema_two.group("family", "Family")
     schema_two.member("family", "adult-a", "group_admin")
     key = schema_two.agent("planner", "family", "adult-a", ["agenda:read"], [])
-    before = schema_two.query("SELECT id,key_hash,expires_at,enabled FROM principals")
+    before = schema_two.query("SELECT to_jsonb(p) AS p FROM principals p")
+    # Migration 3 takes no lock on principals, which every request reads: no foreign key, no change to it.
+    with psycopg.connect(schema_two.dsn) as probe:
+        probe.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(schema_two.schema)))
+        probe.execute(store_module.MIGRATIONS[2][1].read_text())
+        assert probe.execute("SELECT mode FROM pg_locks WHERE pid=pg_backend_pid() "
+                             "AND relation='principals'::regclass").fetchall() == []
+        probe.rollback()
     schema_two.migrate()
-    migrated = schema_two.query("SELECT id,key_hash,expires_at,enabled,operation_id,operation_request FROM principals")
-    assert [{k: v for k, v in row.items() if not k.startswith("operation")} for row in migrated] == before
-    assert all(row["operation_id"] is None and row["operation_request"] is None for row in migrated)
+    assert schema_two.query("SELECT to_jsonb(p) AS p FROM principals p") == before
+    assert schema_two.query("SELECT count(*) AS n FROM pg_constraint WHERE contype='f' "
+                            "AND conrelid='principal_operations'::regclass") == [{"n": 0}]
     schema_two.migrate()
-    assert schema_two.query(
-        "SELECT id,key_hash,expires_at,enabled,operation_id,operation_request FROM principals") == migrated
+    assert schema_two.query("SELECT to_jsonb(p) AS p FROM principals p") == before
     v3 = hashlib.sha256(store_module.MIGRATIONS[2][1].read_bytes()).hexdigest()
     assert schema_two.query("SELECT version,checksum FROM migrations ORDER BY version")[-1] == {
         "version": 3, "checksum": v3}
     assert schema_two.agent_info([key])[0]["principal_id"] == "planner"
     with pytest.raises(psycopg.errors.CheckViolation):
-        schema_two.query("UPDATE principals SET operation_id='only-half' WHERE id='planner'")
+        schema_two.query("INSERT INTO principal_operations VALUES ('bad id',%s,'planner')", ("0" * 64,))
 
 
 # spec: ANYM-495
@@ -337,9 +344,9 @@ def test_a_concurrent_issue_that_loses_the_operation_or_key_is_refused_without_a
     try:
         winner.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(granted.schema)))
         winner.execute(
-            "INSERT INTO principals(id,group_id,person_id,scopes,key_hash,operation_id,operation_request) "
-            "VALUES ('winner','family','adult-a','[]',%s,'op-race',%s)",
-            (hashlib.sha256(KEY.encode()).hexdigest(), "f" * 64))
+            "INSERT INTO principals(id,group_id,person_id,scopes,key_hash) VALUES ('winner','family','adult-a','[]',%s)",
+            (hashlib.sha256(KEY.encode()).hexdigest(),))
+        winner.execute("INSERT INTO principal_operations VALUES ('op-race',%s,'winner')", ("f" * 64,))
         results = {}
 
         def call():
@@ -385,9 +392,10 @@ def test_a_concurrent_identical_issue_waits_on_the_winner_and_replays_it(granted
     try:
         winner.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(granted.schema)))
         winner.execute(
-            "INSERT INTO principals(id,group_id,person_id,scopes,key_hash,operation_id,operation_request) "
-            "VALUES ('planner','family','adult-a','[\"agenda:read\"]',%s,'op-race',%s)",
-            (hashlib.sha256(KEY.encode()).hexdigest(), request))
+            "INSERT INTO principals(id,group_id,person_id,scopes,key_hash) "
+            "VALUES ('planner','family','adult-a','[\"agenda:read\"]',%s)",
+            (hashlib.sha256(KEY.encode()).hexdigest(),))
+        winner.execute("INSERT INTO principal_operations VALUES ('op-race',%s,'planner')", (request,))
         results = {}
 
         def call():
