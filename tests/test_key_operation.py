@@ -1,8 +1,11 @@
 """Repeatable messaging key issue (ANYM-495): caller token file, operation ID replay and conflict, check mode."""
+from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
 import sys
+import threading
+import time
 
 import psycopg
 import pytest
@@ -12,6 +15,7 @@ from messaging_service import store as store_module
 from messaging_service.store import digest
 
 TOKEN = 'pos_probe_' + 'a1' * 24
+MIGRATION_044 = Path(store_module.__file__).with_name('migrations')/'044_key_operation_id.sql'
 
 
 @pytest.fixture
@@ -73,7 +77,8 @@ def test_the_same_operation_and_request_replays_the_record_and_creates_nothing(s
 
 
 # spec: ANYM-495
-@pytest.mark.parametrize('change', ['days', 'accounts', 'principal', 'token'])
+@pytest.mark.parametrize('change', ['days', 'accounts', 'principal', 'token', 'chats', 'permissions',
+                                    'key-permissions'])
 def test_the_same_operation_with_another_request_or_token_is_refused_as_a_conflict(seeded, run, tmp_path, change):
     store = seeded[0]
     issue(run, token_file(tmp_path), 'op-1')
@@ -85,6 +90,10 @@ def test_the_same_operation_with_another_request_or_token_is_refused_as_a_confli
         principal = 'agent-d'
     elif change == 'token':
         path = token_file(tmp_path, 'pos_probe_' + 'b2' * 24, 'other.token')
+    elif change == 'chats':
+        extra = ['--all-chats']
+    elif change in ('permissions', 'key-permissions'):
+        extra = ['--'+change, 'read']
     with pytest.raises(ValueError, match='^operation_conflict$'):
         if change == 'accounts':
             run('issue-key', '--principal', 'agent-c', '--accounts', 'telegram-demo', 'whatsapp-demo-1',
@@ -180,9 +189,25 @@ def test_token_file_and_operation_id_go_together_and_exclude_key_file(seeded, ru
     assert not (tmp_path/'new.key').exists()
 
 
-def set_schema(store, version):
+@contextmanager
+def schema_43(store):
+    # A real schema-43 shape (no ANYM-495 columns, index or check), then migration 044 again.
     with store.pool.connection() as c:
-        c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'", (str(version),))
+        c.execute('ALTER TABLE api_keys DROP COLUMN operation_id, DROP COLUMN operation_request')
+        c.execute("UPDATE probe_metadata SET value='43' WHERE name='schema_version'")
+    try:
+        yield
+    finally:
+        with store.pool.connection() as c:
+            c.execute(MIGRATION_044.read_text())
+            c.execute("UPDATE probe_metadata SET value='44' WHERE name='schema_version'")
+
+
+def rows_any(store):
+    with store.pool.connection() as c:
+        keys = c.execute('SELECT to_jsonb(k) AS k FROM api_keys k ORDER BY id').fetchall()
+        audit = c.execute('SELECT count(*) AS n FROM audit_log').fetchone()['n']
+    return keys, audit
 
 
 CHECKS = {
@@ -203,27 +228,21 @@ def test_check_validates_and_reports_the_schema_and_writes_nothing(seeded, run, 
     with store.pool.connection() as c:
         ids = {r['principal']: str(r['id']) for r in c.execute('SELECT principal,id FROM api_keys')}
     path = token_file(tmp_path)
-    before = rows(store)
-    set_schema(store, version)
-    try:
+    with schema_43(store) if version == 43 else nullcontext():
+        before = rows_any(store)
         reply, _ = run(command, *CHECKS[command](ids, path), '--check')
-    finally:
-        set_schema(store, 44)
+        assert rows_any(store) == before
     assert reply == {'check': answer, 'schema_version': version, 'required': 44}
-    assert rows(store) == before
 
 
 # spec: ANYM-495
 def test_issue_by_operation_on_an_n_minus_1_schema_is_refused_before_any_write(seeded, run, tmp_path):
     store = seeded[0]
-    before = rows(store)
-    set_schema(store, 43)
-    try:
+    with schema_43(store):
+        before = rows_any(store)
         with pytest.raises(RuntimeError, match='^schema_not_ready$'):
             issue(run, token_file(tmp_path), 'op-1')
-    finally:
-        set_schema(store, 44)
-    assert rows(store) == before
+        assert rows_any(store) == before
 
 
 # spec: ANYM-495
@@ -240,4 +259,108 @@ def test_migration_044_is_additive_and_a_second_migrate_changes_nothing(seeded):
     assert columns == {'operation_id': 'YES', 'operation_request': 'YES'}
     with pytest.raises(psycopg.errors.CheckViolation), store.pool.connection() as c:
         c.execute("UPDATE api_keys SET operation_id='only-half' WHERE id=%s", (keys[0]['id'],))
-    assert Path(store_module.__file__).with_name('migrations').joinpath('044_key_operation_id.sql').exists()
+    assert MIGRATION_044.read_text().startswith('-- rollout: manual\n')
+
+
+# spec: ANYM-495
+@pytest.mark.parametrize('problem,code', [('unknown-account', 'unknown_account_scope'), ('token-in-use', 'token_in_use'),
+                                          ('conflict', 'operation_conflict')])
+def test_issue_check_runs_the_issue_validation_and_writes_nothing(seeded, run, tmp_path, problem, code):
+    store = seeded[0]
+    issue(run, token_file(tmp_path), 'op-1')
+    before = rows(store)
+    path, operation, accounts = token_file(tmp_path, 'pos_probe_' + 'e5' * 24, 'new.token'), 'op-2', ['telegram-demo']
+    if problem == 'unknown-account':
+        accounts = ['no-such-account']
+    elif problem == 'token-in-use':
+        path = token_file(tmp_path)
+    else:
+        operation = 'op-1'
+    with pytest.raises(ValueError) as failure:
+        run('issue-key', '--principal', 'agent-d', '--accounts', *accounts, '--token-file', str(path),
+            '--operation-id', operation, '--check')
+    assert str(failure.value) == code
+    assert rows(store) == before
+
+
+# spec: ANYM-495
+@pytest.mark.parametrize('problem,code', [('missing', None), ('too-large', 'key_file_too_large'),
+                                          ('empty', 'invalid_key_count')])
+def test_key_info_check_reads_and_bounds_the_key_file(seeded, run, tmp_path, problem, code):
+    path = tmp_path/'keys.txt'
+    if problem == 'too-large':
+        path.write_text((TOKEN+'\n')*2000)
+    elif problem == 'empty':
+        path.write_text('')
+    with pytest.raises(FileNotFoundError if code is None else ValueError) as failure:
+        run('key-info', '--key-file', str(path), '--check')
+    if code:
+        assert str(failure.value) == code
+
+
+def race(store, monkeypatch, first, second):
+    # The first issue pauses after its INSERT, inside its transaction; the second starts, then the first commits.
+    paused, release, original, results = threading.Event(), threading.Event(), store_module.audit, {}
+
+    def audit(c, principal, operation, *args, **kwargs):
+        if operation == 'issue_key' and not paused.is_set():
+            paused.set()
+            assert release.wait(30)
+        return original(c, principal, operation, *args, **kwargs)
+    monkeypatch.setattr(store_module, 'audit', audit)
+
+    def call(name, kwargs):
+        try:
+            results[name] = store.issue_key(accounts=['telegram-demo'], **kwargs)
+        except Exception as error:
+            results[name] = error
+    one = threading.Thread(target=call, args=('first', first))
+    one.start()
+    assert paused.wait(30)
+    two = threading.Thread(target=call, args=('second', second))
+    two.start()
+    time.sleep(0.5)
+    release.set()
+    one.join(30)
+    two.join(30)
+    return results
+
+
+# spec: ANYM-495
+def test_a_concurrent_identical_issue_waits_and_replays_the_winner(seeded, monkeypatch):
+    store = seeded[0]
+    request = dict(principal='agent-c', token=TOKEN, operation_id='op-race')
+    results = race(store, monkeypatch, request, request)
+    assert results['first']['replayed'] is False and results['second']['replayed'] is True
+    assert results['second']['key_id'] == results['first']['key_id']
+    assert [k['operation_id'] for k in rows(store)[0]].count('op-race') == 1
+
+
+# spec: ANYM-495
+@pytest.mark.parametrize('collision,code', [('operation', 'operation_conflict'), ('token', 'token_in_use')])
+def test_a_concurrent_issue_that_loses_the_operation_or_token_is_refused_without_a_unique_violation(
+        seeded, monkeypatch, collision, code):
+    store = seeded[0]
+    first = dict(principal='agent-c', token=TOKEN, operation_id='op-race')
+    second = dict(principal='agent-d', token='pos_probe_' + 'f6' * 24 if collision == 'operation' else TOKEN,
+                  operation_id='op-race' if collision == 'operation' else 'op-other')
+    results = race(store, monkeypatch, first, second)
+    assert results['first']['replayed'] is False
+    assert isinstance(results['second'], ValueError) and str(results['second']) == code
+    keys = rows(store)[0]
+    assert [k['principal'] for k in keys if k['principal'] in ('agent-c', 'agent-d')] == ['agent-c']
+
+
+# spec: ANYM-495
+def test_a_crash_between_the_parent_operations_two_commits_then_a_rerun_completes_it(seeded, run, tmp_path):
+    store = seeded[0]
+    main = token_file(tmp_path, 'pos_probe_' + 'c3' * 24, 'main.token')
+    archive = token_file(tmp_path, 'pos_probe_' + 'd4' * 24, 'archive.token')
+    first, _ = issue(run, main, 'issue-8/messaging', 'agent-c')
+    # The parent operation stops here; a rerun replays the first key and issues the second once.
+    assert issue(run, main, 'issue-8/messaging', 'agent-c')[0] == dict(first, replayed=True)
+    second, _ = issue(run, archive, 'issue-8/archive', 'agent-c-calls-archive')
+    assert second['replayed'] is False
+    assert issue(run, archive, 'issue-8/archive', 'agent-c-calls-archive')[0] == dict(second, replayed=True)
+    operations = sorted(k['operation_id'] for k in rows(store)[0] if k['operation_id'])
+    assert operations == ['issue-8/archive', 'issue-8/messaging']

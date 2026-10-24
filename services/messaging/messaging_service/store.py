@@ -18,7 +18,7 @@ import threading
 from collections import OrderedDict
 from uuid import UUID
 
-from psycopg.errors import TransactionTimeout, UniqueViolation
+from psycopg.errors import TransactionTimeout
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from . import __version__
@@ -102,6 +102,11 @@ def issue_request(principal,accounts,days,chats,permissions,key_permissions):
     def given(value):return 'unset' if value is UNSET else None if value is None else sorted(value)
     return hashlib.sha256(json.dumps([principal,sorted(accounts or []),days,given(chats),given(permissions),
         given(key_permissions)]).encode()).hexdigest()
+
+
+class OperationTaken(Exception):
+    # ANYM-495: the operation ID or the caller's token is held by a committed key; the transaction rolls back.
+    pass
 
 
 def key_operation(c,operation_id):
@@ -1131,7 +1136,7 @@ class Store:
             END $$''')
 
     def issue_key(self, principal, accounts, days=7, *, chats=UNSET, permissions=UNSET,
-                  key_permissions=UNSET, token=None, operation_id=None):
+                  key_permissions=UNSET, token=None, operation_id=None, check=False):
         """A new key; returns its token. With the caller's token and an operation ID (ANYM-495) it stores
         only the digest and returns public fields, and the same request again returns the same record."""
         principal_id(principal)
@@ -1146,13 +1151,13 @@ class Store:
         else:token = 'pos_probe_'+secrets.token_urlsafe(32)
         try:
             issued,replayed=self._issue_key(principal,accounts,days,chats,permissions,key_permissions,token,
-                                            (operation_id,request) if once else None)
-        except UniqueViolation:
-            if not once:raise
+                                            (operation_id,request) if once else None,check)
+        except OperationTaken:
             # A concurrent call won the operation ID or the token (either commit is visible now).
             with self.pool.connection() as c:issued=key_operation(c,operation_id)
             if issued is None:raise ValueError('token_in_use') from None
             replayed=True
+        if check and issued is None:return {'check':'ok'}
         if not once:return token
         if replayed and (issued['operation_request']!=request or
                          not secrets.compare_digest(issued['digest'],digest(token))):
@@ -1160,7 +1165,7 @@ class Store:
         return serial({'key_id':issued['id'],'principal':issued['principal'],'expires_at':issued['expires_at'],
                        'revoked':issued['revoked'],'operation_id':operation_id,'replayed':replayed})
 
-    def _issue_key(self,principal,accounts,days,chats,permissions,key_permissions,token,operation):
+    def _issue_key(self,principal,accounts,days,chats,permissions,key_permissions,token,operation,check=False):
         with self.pool.connection() as c:
             if operation:require_schema(c,KEY_OPERATION_SCHEMA)
             lock_principal(c,principal)
@@ -1174,13 +1179,20 @@ class Store:
             key_permissions=normalize_list(key_permissions,maximum=len(PERMISSIONS))
             if set(key_permissions)-(set(permissions)|(LEGACY_PERMISSIONS if implicit_ceiling else set())):
                 raise ValueError('invalid_key_permissions')
+            if check:
+                # ANYM-495 check mode: the same validation as an issue, then nothing is written.
+                if operation and c.execute('SELECT 1 FROM api_keys WHERE digest=%s',(digest(token),)).fetchone():
+                    raise ValueError('token_in_use')
+                return None,False
             self._write_policy(c,principal,old,accounts,chats,permissions,old['enabled'] if old else True)
             operation_id,request=operation or (None,None)
+            # A taken operation ID or token is not an error statement, so no key digest reaches the database log.
             issued=c.execute('''INSERT INTO api_keys(digest,principal,expires_at,permissions'''+
-                (',operation_id,operation_request) VALUES(%s,%s,%s,%s,%s,%s)' if operation else ') VALUES(%s,%s,%s,%s)')+
-                ' RETURNING id,principal,expires_at,revoked',
+                (',operation_id,operation_request) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING' if operation
+                 else ') VALUES(%s,%s,%s,%s)')+' RETURNING id,principal,expires_at,revoked',
                 (digest(token),principal,datetime.now(timezone.utc)+timedelta(days=days),key_permissions,
                  *((operation_id,request) if operation else ()))).fetchone()
+            if issued is None:raise OperationTaken
             audit(c,{'id':principal,'key_id':issued['id']},'issue_key','ok')
             return issued,False
 

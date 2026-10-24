@@ -32,6 +32,11 @@ def operation_name(value):
     return value
 
 
+class OperationTaken(Exception):
+    # ANYM-495: the operation ID, principal ID or key is held by a committed principal; the transaction rolls back.
+    pass
+
+
 def agent_operation(c, operation_id):
     return c.execute(
         "SELECT id,expires_at,NOT enabled AS revoked,key_hash,operation_request FROM principals WHERE operation_id=%s",
@@ -221,7 +226,7 @@ class Store:
         )
 
     def agent(self, principal_id, group_id, person_id, scopes, calendars, visibility="details", *, days=90,
-              key=None, operation_id=None):
+              key=None, operation_id=None, check=False):
         """A new agent key; returns the key. With the caller's key and an operation ID (ANYM-495) it stores
         only the hash and returns public fields, and the same request again returns the same record."""
         if type(days) is not int or not 1 <= days <= 183:
@@ -246,22 +251,38 @@ class Store:
                     prior = agent_operation(c, operation_id)
                     if prior:
                         return replay(prior, key_hash, request, operation_id)
-                    columns, values = ",operation_id,operation_request", ",%s,%s"
+                    # A taken principal ID, key or operation ID is no error statement, so no key hash reaches the
+                    # database log; the commit that holds it is read back below.
+                    columns, values = ",operation_id,operation_request", ",%s,%s) ON CONFLICT DO NOTHING"
                 else:
-                    columns, values = "", ""
+                    columns, values = "", ")"
+                if check:
+                    # ANYM-495 check mode: what the inserts below would refuse, read only.
+                    if not c.execute(
+                        "SELECT 1 FROM memberships WHERE group_id=%s AND person_id=%s", (group_id, person_id)
+                    ).fetchone():
+                        raise CalendarError("unknown_member")
+                    known = c.execute("SELECT ref FROM calendars WHERE ref=ANY(%s)", (list(calendars),)).fetchall()
+                    if {r["ref"] for r in known} != set(calendars):
+                        raise CalendarError("unknown_calendar")
+                    if c.execute(
+                        "SELECT 1 FROM principals WHERE id=%s OR key_hash=%s", (principal_id, key_hash)
+                    ).fetchone():
+                        raise CalendarError("principal_or_key_in_use")
+                    return {"check": "ok"}
                 row = c.execute(
                     "INSERT INTO principals(id,group_id,person_id,scopes,key_hash,expires_at" + columns + ") "
-                    "VALUES (%s,%s,%s,%s,%s,now()+make_interval(days=>%s)" + values + ") RETURNING id,expires_at",
+                    "VALUES (%s,%s,%s,%s,%s,now()+make_interval(days=>%s)" + values + " RETURNING id,expires_at",
                     (principal_id, group_id, person_id, Jsonb(scopes), key_hash, days)
                     + ((operation_id, request) if once else ()),
                 ).fetchone()
+                if row is None:
+                    raise OperationTaken
                 for calendar in calendars:
                     c.execute(
                         "INSERT INTO agent_calendars VALUES (%s,%s,%s)", (principal_id, calendar, visibility)
                     )
-        except psycopg.errors.UniqueViolation:
-            if not once:
-                raise
+        except OperationTaken:
             # A concurrent call won the operation ID, the principal ID or the key; its commit is visible now.
             with self.transaction() as c:
                 prior = agent_operation(c, operation_id)
