@@ -1027,6 +1027,32 @@ reason and the names of unfinished and serving attempts. The tool reads receipts
 After `LIVE`, `python3 scripts/feedback_sync.py follow` (dry run, then `--apply`) moves agent
 feedback whose card that release delivers (ANYM-473, docs/operations/feedback-triage.md).
 
+## Admin CLI
+
+`python3 scripts/deedkit.py admin key list` (ANYM-494) shows every agent key in one view: one row
+per gateway principal (label, enabled, gateway expiry) with the messaging, calendar and calls
+credential bound to it (public ID, expiry, `live`, `revoked`, `expired`, `missing`, or `unknown`
+when a backend command fails). It reads the gateway policy and the calls registry and runs the
+messaging `list-keys --all` / `key-info` and calendar `list-agents` / `agent-info` operator
+commands (ACCESS.md, `services/calendar/docs/SERVICE.md`); key files reach those commands on
+stdin, never in argv, environment or output. It takes no lock and writes nothing, so it is safe
+during a call. Filters: `--principal ID`, `--valid` (enabled, unexpired), `--expiring` (within
+the gateway's 7-day warning window or expired), `--all` (default); `--json` for machine output;
+`--strict` exits 1 when there are findings (exit 2 is an unreadable input).
+
+Findings, for enabled and unexpired gateway principals only: `credential_missing`,
+`credential_revoked`, `credential_expired`, `backend_expires_first` (the backend key ends before
+the gateway entry), `shared_credential` (one backend key bound to several principals),
+`unbound_key` (a live backend key no principal holds) and `backend_unavailable`.
+
+The configuration is a private JSON file (`--config`, default
+`/opt/deedkit/deploy/private/admin/config.json`; template `deploy/admin.example.json`): policy
+and calls registry paths, container-to-host path mappings for key files, and the messaging and
+calendar operator command prefixes. Every private file it reads must be a regular, owner-only
+file (no group or other bits, no symlink). `admin key label ID TEXT` (1–80 printable characters,
+an existing gateway principal) writes the label to `labels.json` beside it, mode 0600, atomically;
+no service reads that file, so the enforced policy never changes.
+
 ## Record the production release
 
 After a successful `apply`, the release owner records the release in Tiden from
