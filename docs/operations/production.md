@@ -637,7 +637,9 @@ Messaging migration 044 (`manual`, ANYM-495) is additive: two nullable `api_keys
 lock on `api_keys`, which every authentication reads, until it commits. The queued wait for the
 lock (2-second lock timeout) and the two steps that hold it (1-second statement timeout each,
 one row per key) are bounded one by one, and a 4-second transaction timeout bounds the whole
-hold up to commit, under the runtime's 5-second statement timeout: past it the server ends the
+hold up to `COMMIT`, under the runtime's 5-second statement timeout (the WAL flush at commit
+runs after the timer stops, as for every migration since 037 and every `api_keys` write;
+a stalled flush stops all writes on the host anyway): past it the server ends the
 migrating session and rolls back, so a slow upgrade fails and is retried instead of failing
 authentication. Retry `migrate` once the cause (a long `api_keys` reader) is gone. A
 schema-43 runtime refuses schema 44, so it ships with its release; update the pinned backup and
