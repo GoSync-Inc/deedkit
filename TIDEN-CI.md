@@ -40,7 +40,8 @@ cancelled or was skipped, and when the prepared evidence records a failed test
 or a failed or blocked check (a missing, invalid or only-skipped report),
 whether or not Tiden reporting is configured. So `CI gate` never depends on the
 outcome of the Tiden publication. The reporting job still fails on a
-configuration error, a missing evidence artifact or an unproven receipt.
+configuration error, an unproven receipt or, with publication enabled, a missing
+evidence artifact.
 
 The native Go suites reach Tiden through the `checks / go` job (ANYM-421): it
 runs `go test -race -count=1 -json ./...` in `whatsapp/whatsmeow` and in
@@ -142,7 +143,7 @@ failed step and writes `tiden-publication.json` (`published: false`: the
 publication was not verified). It retains that file with any Tiden response in
 the `tiden-receipt` artifact. The merge queue, docs-only and pull request reuse
 receipts are not publications and still fail the job when unproven, and so do a
-configuration error and a missing evidence artifact.
+configuration error and, with publication enabled, a missing evidence artifact.
 
 The run's evidence in Tiden is then unverified. Tiden may hold no run for the
 commit, a partial one or a completed run whose association or counts were not
@@ -190,8 +191,9 @@ below), but publishes nothing to Tiden and creates no Tiden branch.
 This takes precedence over every target above, including an override, a map
 entry or a pull request link. A queued group can contain a fork's unmerged code,
 so a `merge_group` run never receives `TIDEN_API_TOKEN`. A queue run checks no
-Tiden configuration and installs no CLI: its reporting job records `skipped` with the reason in
-`tiden-route.json`, logs a notice and stays green. The merged code reaches Tiden
+Tiden configuration and installs no CLI, and its reporting job downloads no evidence (`checks / evidence`
+already enforced it, so a hung download cannot fail the queue): the reporting job records `skipped` with the
+reason in `tiden-route.json`, logs a notice and stays green. The merged code reaches Tiden
 through the main push run. Each queue run has its own concurrency group and
 cancels no other run. Queue runs take their workflow files from the group commit,
 so review workflow changes in a fork's pull request before queuing it.
