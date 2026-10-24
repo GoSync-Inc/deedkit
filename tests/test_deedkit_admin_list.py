@@ -240,8 +240,9 @@ def test_each_disagreement_between_stores_is_one_finding_and_strict_exits_1(stor
 
 
 # spec: ANYM-494
-def test_strict_exits_0_when_the_stores_agree(stores, capsys):
+def test_strict_exits_0_when_the_stores_agree_and_a_disabled_principal_is_no_finding(stores, capsys):
     healthy(stores)
+    stores.principal("retired", {"calendar": stores.calendar_agent("old-cal")}, enabled=False)
     code, view, _ = listing(stores, capsys, "--strict")
     assert code == 0 and view["findings"] == []
 
@@ -318,6 +319,19 @@ def test_a_key_file_that_does_not_match_the_policy_pin_is_a_content_free_finding
     assert {"code": "credential_pin_mismatch", "principal": "agent", "backend": "calendar"} in view["findings"]
     for value in stores.tokens.values():
         assert value not in out.out and sha(value) not in out.out
+
+
+# spec: ANYM-494
+@pytest.mark.parametrize("pin", ["é" * 64, "A" * 64, "0" * 63, None, 7], ids=["non-ascii", "upper", "short", "none",
+                                                                          "number"])
+def test_a_malformed_policy_pin_is_a_pin_mismatch_and_the_rest_still_lists(stores, capsys, pin):
+    healthy(stores)
+    stores.principal("agent", {"calendar": dict(stores.calendar_agent("agent-cal"), key_sha256=pin)})
+    code, view, _ = listing(stores, capsys)
+    assert code == 0 and [r["id"] for r in view["principals"]] == ["claude-code", "agent"]
+    assert view["findings"] == [{"code": "credential_pin_mismatch", "principal": "agent", "backend": "calendar"},
+                                {"code": "unbound_key", "backend": "calendar", "public_id": "agent-cal",
+                                 "status": "live", "backend_principal": None}]
 
 
 # spec: ANYM-494

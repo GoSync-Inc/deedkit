@@ -139,6 +139,13 @@ def stop(name: str) -> None:
         pass
 
 
+def pinned(token: str, pin: object) -> bool:
+    """The token matches the policy's key_sha256; a malformed pin (the gateway refuses it too) never matches."""
+    if not isinstance(pin, str) or len(pin) != 64 or not all(c in "0123456789abcdef" for c in pin):
+        return False
+    return hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), pin)
+
+
 def status(record: dict | None, now: datetime) -> str:
     if record is None:
         return "missing"
@@ -197,8 +204,7 @@ def collect(config: dict, run, now: datetime | None = None) -> dict:
             token = read_token(config, credential.get("key_file", "")) if isinstance(credential, dict) else None
             if token is None:
                 entry["note"] = "key_file_unreadable"
-            elif not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(),
-                                         str(credential.get("key_sha256", ""))):
+            elif not pinned(token, credential.get("key_sha256")):
                 # The gateway refuses a key file that does not match its pin, so the binding does not work.
                 entry.update(status="unknown", note="credential_pin_mismatch")
             elif backend in pending:
