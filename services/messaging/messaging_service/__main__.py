@@ -157,6 +157,9 @@ def main():
                          key_permissions=args.key_permissions)
             if args.check:
                 # The issue's own validation (accounts, chats, permission ceilings, operation replay), no write.
+                principal_id(args.principal)
+                if not 1<=days<=365:raise ValueError('invalid_key_lifetime')
+                if args.token_file:operation_name(args.operation_id)
                 token=read_token(args.token_file) if args.token_file else None
                 if args.key_file and (args.key_file.exists() or args.key_file.is_symlink()):raise ValueError('key_file_exists')
                 result=store.check_schema()

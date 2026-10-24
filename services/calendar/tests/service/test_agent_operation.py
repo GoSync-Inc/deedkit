@@ -88,7 +88,7 @@ def test_the_same_operation_and_request_replays_the_record_and_creates_nothing(g
 
 
 # spec: ANYM-495
-@pytest.mark.parametrize("change", ["days", "calendar", "principal", "key", "scopes", "member"])
+@pytest.mark.parametrize("change", ["days", "calendar", "principal", "key", "scopes", "member", "group", "calendars"])
 def test_the_same_operation_with_another_request_or_key_is_refused_as_a_conflict(granted, tmp_path, change):
     issue(granted, tmp_path, key_file(tmp_path), "op-1")
     before = state(granted)
@@ -105,6 +105,10 @@ def test_the_same_operation_with_another_request_or_key_is_refused_as_a_conflict
         extra = ["--scopes", "agenda:read,event:read"]
     elif change == "member":
         extra = ["--member", "adult-b"]
+    elif change == "group":
+        extra = ["--group", "other"]
+    elif change == "calendars":
+        extra = ["--calendar", "cal-b"]
     with pytest.raises(CalendarError, match="^operation_conflict$"):
         issue(granted, tmp_path, path, "op-1", principal, *extra)
     assert state(granted) == before
@@ -357,3 +361,33 @@ def test_principal_lookups_on_a_warm_connection_survive_migration_three(schema_t
     schema_two.migrate()
     for _ in range(8):
         assert service.principal(key)["id"] == "planner"
+
+
+# spec: ANYM-495
+def test_a_concurrent_identical_issue_waits_on_the_winner_and_replays_it(granted):
+    request = hashlib.sha256(json.dumps(
+        ["planner", "family", "adult-a", ["agenda:read"], ["cal-a"], "details", 90]).encode()).hexdigest()
+    winner = psycopg.connect(granted.dsn, autocommit=False)
+    try:
+        winner.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(granted.schema)))
+        winner.execute(
+            "INSERT INTO principals(id,group_id,person_id,scopes,key_hash,operation_id,operation_request) "
+            "VALUES ('planner','family','adult-a','[\"agenda:read\"]',%s,'op-race',%s)",
+            (hashlib.sha256(KEY.encode()).hexdigest(), request))
+        results = {}
+
+        def call():
+            try:
+                results["second"] = granted.agent("planner", "family", "adult-a", ["agenda:read"], ["cal-a"],
+                                                  key=KEY, operation_id="op-race")
+            except Exception as error:
+                results["second"] = error
+        second = threading.Thread(target=call)
+        second.start()
+        time.sleep(0.5)
+        winner.commit()
+        second.join(30)
+    finally:
+        winner.close()
+    assert results["second"]["replayed"] is True and results["second"]["principal_id"] == "planner"
+    assert [p["id"] for p in state(granted)[0]] == ["planner"]
