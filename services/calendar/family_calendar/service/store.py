@@ -234,6 +234,8 @@ class Store:
         only the hash and returns public fields, and the same request again returns the same record."""
         if type(days) is not int or not 1 <= days <= 183:
             raise CalendarError("invalid_agent_lifetime")
+        if len(set(calendars)) != len(calendars):
+            raise CalendarError("duplicate_calendar")
         once = operation_id is not None
         if once != (key is not None):
             raise CalendarError("key_and_operation_id_required")

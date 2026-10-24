@@ -413,3 +413,13 @@ def test_a_concurrent_identical_issue_waits_on_the_winner_and_replays_it(granted
         winner.close()
     assert results["second"]["replayed"] is True and results["second"]["principal_id"] == "planner"
     assert [p["id"] for p in state(granted)[0]] == ["planner"]
+
+
+# spec: ANYM-495
+@pytest.mark.parametrize("extra", [["--check"], []], ids=["check", "issue"])
+def test_a_repeated_calendar_is_refused_by_check_and_issue_alike(granted, tmp_path, extra):
+    before = state(granted)
+    with pytest.raises(CalendarError) as failure:
+        issue(granted, tmp_path, key_file(tmp_path), "op-1", "planner", "--calendar", "cal-a", *extra)
+    assert str(failure.value) == "duplicate_calendar"
+    assert state(granted) == before

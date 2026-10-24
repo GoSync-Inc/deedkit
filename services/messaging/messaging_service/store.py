@@ -85,6 +85,10 @@ def digest(value: str) -> str:
 KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
 
 
+def revocable_token(value):
+    # What revoke accepts by token; --check runs the same test (ANYM-495).
+    if not isinstance(value,str) or not 32<=len(value)<=256:raise ValueError('invalid_key')
+    return value
 def caller_token(value):
     # A caller-made token (ANYM-495): printable ASCII without spaces, as authentication reads it.
     if not isinstance(value,str) or not re.fullmatch(r'[!-~]{32,256}',value):raise ValueError('invalid_key')
@@ -1248,8 +1252,7 @@ class Store:
     def revoke(self, token=None, *, credential_id=None):
         if (token is None)==(credential_id is None):raise ValueError('one_key_selector_required')
         if token is not None:
-            if not isinstance(token,str) or not 32<=len(token)<=256:raise ValueError('invalid_key')
-            clause,selector='digest=%s',digest(token)
+            clause,selector='digest=%s',digest(revocable_token(token))
         else:clause,selector='id=%s',key_id(credential_id)
         with self.pool.connection() as c:
             row=c.execute('SELECT principal,id FROM api_keys WHERE '+clause,(selector,)).fetchone()

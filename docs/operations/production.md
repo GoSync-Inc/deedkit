@@ -633,8 +633,11 @@ ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
 Messaging migration 044 (`expand`, ANYM-495) is additive: the new `api_key_operations` table
-(operation ID, request digest, key ID) without a foreign key, so applying it takes no lock on
-`api_keys`, which every authentication reads, and needs no outage. Only the operator CLI reads
+(operation ID, request digest, key ID) without a foreign key, so it takes no lock on `api_keys`,
+which every authentication reads. It is not lock-free: like every `migrate`, the same transaction
+reruns `schema.sql`, whose `CREATE INDEX IF NOT EXISTS` holds a share lock on `messages`,
+`deliveries` and `download_grants` until commit, so writes to them (incoming messages,
+deliveries, download grants) wait for the migration. Only the operator CLI reads
 or writes it, so it has no grant. A schema-43 runtime refuses schema 44, so it ships with its
 release; update the pinned backup and restore runtimes first. Calendar migration 3 adds the same
 table for agents (`principal_operations`, no lock on `principals`). Rollback: existing keys are
