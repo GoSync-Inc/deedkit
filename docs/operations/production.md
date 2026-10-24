@@ -642,6 +642,15 @@ runs after the timer stops, as for every migration since 037 and every `api_keys
 a stalled flush stops all writes on the host anyway): past it the server ends the
 migrating session and rolls back, so a slow upgrade fails and is retried instead of failing
 authentication. Retry `migrate` once the cause (a long `api_keys` reader) is gone. A
+stalled commit flush can still outlast the bound, so apply 044 and calendar 3 in a short
+outage window after the release's images run, no step during an active call: `docker stop` the containers that read `api_keys`
+or `principals` through a DB pool (the messaging API container of the current release, plan A
+`api` or the routed plan B one; `calendar-api` and `calendar-worker`), run messaging
+`operator migrate` and calendar `migrate`, `docker start` the same containers (same IDs, so
+release identities hold), then verify `/health` of both APIs and one authenticated read each.
+Expect under a minute of API and MCP errors; the gateway, collectors and queues keep running.
+Abort at any step: `docker start` the stopped containers; 044 and 3 are additive, the release's
+code runs on either schema, and a failed `migrate` rolls back whole. A
 schema-43 runtime refuses schema 44, so it ships with its release; update the pinned backup and
 restore runtimes first. Calendar migration 3 adds the same two columns to `principals` with the
 same timeouts. Deploy the calendar image of this release before `migrate`: earlier code selects
