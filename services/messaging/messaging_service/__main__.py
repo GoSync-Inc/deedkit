@@ -156,11 +156,14 @@ def main():
             options=dict(chats=None if args.all_chats else args.chats,permissions=args.permissions,
                          key_permissions=args.key_permissions)
             if args.check:
-                principal_id(args.principal)
-                if not 1<=days<=365:raise ValueError('invalid_key_lifetime')
-                if args.token_file:read_token(args.token_file);operation_name(args.operation_id)
-                elif args.key_file.exists() or args.key_file.is_symlink():raise ValueError('key_file_exists')
-                print(json.dumps(store.check_schema()))
+                # The issue's own validation (accounts, chats, permission ceilings, operation replay), no write.
+                token=read_token(args.token_file) if args.token_file else None
+                if args.key_file and (args.key_file.exists() or args.key_file.is_symlink()):raise ValueError('key_file_exists')
+                result=store.check_schema()
+                if result['check']=='ok' or not args.token_file:
+                    store.issue_key(args.principal,args.accounts,days,**options,token=token,
+                                    operation_id=args.operation_id,check=True)
+                print(json.dumps(result))
             elif args.token_file:
                 # ANYM-495: the caller wrote the token durably first; only its digest is stored, nothing is written.
                 print(json.dumps(store.issue_key(args.principal,args.accounts,days,**options,
@@ -236,14 +239,15 @@ def main():
             # ANYM-494: one token per line (a key file, or a batch on stdin); public fields only, never a digest.
             if bool(args.key_file)==bool(args.operation_id) or args.key_id:
                 parser.error('key-info requires exactly one of --key-file or --operation-id')
-            if args.check:
-                if args.operation_id:operation_name(args.operation_id)
-                print(json.dumps(store.check_schema()))
-            elif args.operation_id:print(json.dumps({'keys':store.key_operation_info(args.operation_id)}))
+            if args.operation_id:operation_name(args.operation_id)
             else:
                 with args.key_file.open('rb') as source:raw=source.read(KEY_INFO_BYTES+1)
                 if len(raw)>KEY_INFO_BYTES:raise ValueError('key_file_too_large')
-                print(json.dumps({'keys':store.key_info(raw.decode().splitlines())}))
+                tokens=raw.decode().splitlines()
+                if not 1<=len(tokens)<=100:raise ValueError('invalid_key_count')
+            if args.check:print(json.dumps(store.check_schema()))
+            elif args.operation_id:print(json.dumps({'keys':store.key_operation_info(args.operation_id)}))
+            else:print(json.dumps({'keys':store.key_info(tokens)}))
         elif args.command=='audit-tail':
             print(json.dumps(store.audit_tail(args.principal or '',args.limit)))
         else:

@@ -138,7 +138,7 @@ writes. `deedkit admin key list` (docs/operations/production.md, Admin CLI) runs
 
 `issue-key --token-file FILE --operation-id ID` (both or neither) stores the digest of a token
 the caller generated and wrote durably first; it never writes or prints the token and takes no
-`--key-file`. The file is an owner-only regular file (mode 0600 or tighter, no symlink) or
+`--key-file`. The file is an owner-only regular file (mode 0600 or tighter, no symlink, no FIFO) or
 `/dev/stdin`, with one token line; anything else is `unsafe_token_file` or `invalid_key`. The
 operation ID is 1–128 characters of `[A-Za-z0-9._/-]` and is unique per credential: one parent
 operation uses distinct derived IDs for its main and archive keys. The same ID with the same
@@ -149,7 +149,9 @@ token already stored under another key is `token_in_use`. `key-info --operation-
 key an operation issued (public fields only, or `found: false`).
 
 `--check` on `issue-key`, `extend-key`, `revoke-key`, `list-keys` and `key-info` validates the
-arguments, writes nothing and answers `{"check": "ok" | "schema_not_ready", "schema_version",
+arguments (for `issue-key` the issue's own validation: accounts, chats, permission ceilings, a
+token already in use and an operation conflict; for `key-info` the key file and its bounds),
+writes nothing and answers `{"check": "ok" | "schema_not_ready", "schema_version",
 "required"}`; the admin CLI uses it to test a backend before a multi-store step. Invocations
 without these options behave as before.
 

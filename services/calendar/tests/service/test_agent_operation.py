@@ -3,9 +3,12 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import threading
+import time
 from uuid import uuid4
 
 import psycopg
+from psycopg import sql
 import pytest
 
 from family_calendar.errors import CalendarError
@@ -69,7 +72,7 @@ def test_first_call_stores_only_the_hash_of_the_callers_key_and_returns_public_f
     principals, calendars = state(granted)
     assert [(p["id"], p["key_hash"], p["operation_id"]) for p in principals] == [
         ("planner", hashlib.sha256(KEY.encode()).hexdigest(), "op-1")]
-    assert [c["calendar_id"] for c in calendars] == ["cal-a"]
+    assert [c["calendar_ref"] for c in calendars] == ["cal-a"]
     assert path.read_bytes() == before
     assert KEY not in json.dumps(result) and hashlib.sha256(KEY.encode()).hexdigest() not in json.dumps(result)
     assert granted.agent_info([KEY])[0]["principal_id"] == "planner"
@@ -85,7 +88,7 @@ def test_the_same_operation_and_request_replays_the_record_and_creates_nothing(g
 
 
 # spec: ANYM-495
-@pytest.mark.parametrize("change", ["days", "calendar", "principal", "key"])
+@pytest.mark.parametrize("change", ["days", "calendar", "principal", "key", "scopes", "member"])
 def test_the_same_operation_with_another_request_or_key_is_refused_as_a_conflict(granted, tmp_path, change):
     issue(granted, tmp_path, key_file(tmp_path), "op-1")
     before = state(granted)
@@ -98,6 +101,10 @@ def test_the_same_operation_with_another_request_or_key_is_refused_as_a_conflict
         principal = "helper"
     elif change == "key":
         path = key_file(tmp_path, "fcs-agent-" + "b2" * 24, "other.key")
+    elif change == "scopes":
+        extra = ["--scopes", "agenda:read,event:read"]
+    elif change == "member":
+        extra = ["--member", "adult-b"]
     with pytest.raises(CalendarError, match="^operation_conflict$"):
         issue(granted, tmp_path, path, "op-1", principal, *extra)
     assert state(granted) == before
@@ -185,8 +192,10 @@ def test_agent_info_by_operation_id_reads_back_public_fields_only(granted, tmp_p
 
 
 # spec: ANYM-495
-@pytest.mark.parametrize("problem,code", [("group-readable", "unsafe_private_permissions"), ("two-lines", "invalid_key"),
-                                          ("short", "invalid_key"), ("operation", "invalid_operation_id")])
+@pytest.mark.parametrize("problem,code", [("group-readable", "unsafe_key_file"), ("two-lines", "invalid_key"),
+                                          ("short", "invalid_key"), ("operation", "invalid_operation_id"),
+                                          ("symlink", "unsafe_key_file"), ("fifo", "unsafe_key_file"),
+                                          ("too-large", "invalid_key")])
 def test_an_unsafe_key_file_or_a_bad_operation_id_is_refused_before_any_write(granted, tmp_path, problem, code):
     before = state(granted)
     path = key_file(tmp_path, mode=0o640 if problem == "group-readable" else 0o600)
@@ -194,6 +203,15 @@ def test_an_unsafe_key_file_or_a_bad_operation_id_is_refused_before_any_write(gr
         path.write_text(KEY + "\n" + KEY + "\n")
     elif problem == "short":
         path.write_text("short\n")
+    elif problem == "symlink":
+        link = tmp_path / "link.key"
+        link.symlink_to(path)
+        path = link
+    elif problem == "fifo":
+        path = tmp_path / "pipe.key"
+        os.mkfifo(path, 0o600)
+    elif problem == "too-large":
+        path.write_text("x" * 1_000_000)
     with pytest.raises(CalendarError) as failure:
         issue(granted, tmp_path, path, "bad id!" if problem == "operation" else "op-1")
     assert str(failure.value) == code
@@ -250,3 +268,92 @@ def test_migration_three_is_additive_and_repeatable(schema_two):
     assert schema_two.agent_info([key])[0]["principal_id"] == "planner"
     with pytest.raises(psycopg.errors.CheckViolation):
         schema_two.query("UPDATE principals SET operation_id='only-half' WHERE id='planner'")
+
+
+# spec: ANYM-495
+@pytest.mark.parametrize("problem,code", [("member", "unknown_member"), ("calendar", "unknown_calendar"),
+                                          ("principal", "principal_or_key_in_use"), ("key", "principal_or_key_in_use"),
+                                          ("conflict", "operation_conflict")])
+def test_agent_key_check_runs_the_issue_validation_and_writes_nothing(granted, tmp_path, problem, code):
+    issue(granted, tmp_path, key_file(tmp_path), "op-1")
+    before = state(granted)
+    path, principal, operation, extra = key_file(tmp_path, "fcs-agent-" + "e5" * 24, "new.key"), "helper", "op-2", []
+    if problem == "member":
+        extra = ["--member", "nobody"]
+    elif problem == "calendar":
+        extra = ["--calendar", "no-such-calendar"]
+    elif problem == "principal":
+        principal = "planner"
+    elif problem == "key":
+        path = key_file(tmp_path)
+    else:
+        operation = "op-1"
+    with pytest.raises(CalendarError) as failure:
+        issue(granted, tmp_path, path, operation, principal, *extra, "--check")
+    assert str(failure.value) == code
+    assert state(granted) == before
+
+
+# spec: ANYM-495
+@pytest.mark.parametrize("problem,code", [("missing", None), ("too-large", "key_file_too_large"),
+                                          ("empty", "invalid_key_count")])
+def test_agent_info_check_reads_and_bounds_the_key_file(granted, tmp_path, problem, code):
+    path = tmp_path / "keys.txt"
+    if problem == "too-large":
+        path.write_text((KEY + "\n") * 2000)
+    elif problem == "empty":
+        path.write_text("")
+    with pytest.raises(FileNotFoundError if code is None else CalendarError) as failure:
+        dispatch(granted, tmp_path, "agent-info", "--key-file", str(path), "--check")
+    if code:
+        assert str(failure.value) == code
+
+
+# spec: ANYM-495
+@pytest.mark.parametrize("collision,code", [("operation", "operation_conflict"), ("key", "principal_or_key_in_use")])
+def test_a_concurrent_issue_that_loses_the_operation_or_key_is_refused_without_a_unique_violation(
+        granted, collision, code):
+    # Another transaction holds an uncommitted principal with the operation ID and key; it commits while the
+    # issue waits on the unique index, and the issue reads the winner back instead of failing on the index.
+    winner = psycopg.connect(granted.dsn, autocommit=False)
+    try:
+        winner.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(granted.schema)))
+        winner.execute(
+            "INSERT INTO principals(id,group_id,person_id,scopes,key_hash,operation_id,operation_request) "
+            "VALUES ('winner','family','adult-a','[]',%s,'op-race',%s)",
+            (hashlib.sha256(KEY.encode()).hexdigest(), "f" * 64))
+        results = {}
+
+        def call():
+            try:
+                results["second"] = granted.agent(
+                    "planner", "family", "adult-a", ["agenda:read"], ["cal-a"],
+                    key="fcs-agent-" + "f6" * 24 if collision == "operation" else KEY,
+                    operation_id="op-race" if collision == "operation" else "op-other")
+            except Exception as error:
+                results["second"] = error
+        second = threading.Thread(target=call)
+        second.start()
+        time.sleep(0.5)
+        winner.commit()
+        second.join(30)
+    finally:
+        winner.close()
+    assert isinstance(results["second"], CalendarError) and str(results["second"]) == code
+    assert [p["id"] for p in state(granted)[0]] == ["winner"]
+
+
+# spec: ANYM-495
+def test_principal_lookups_on_a_warm_connection_survive_migration_three(schema_two):
+    from family_calendar.service.core import FamilyService
+
+    schema_two.person("adult-a", "Adult A")
+    schema_two.group("family", "Family")
+    schema_two.member("family", "adult-a", "group_admin")
+    key = schema_two.agent("planner", "family", "adult-a", ["agenda:read"], [])
+    service = FamilyService(schema_two)
+    for _ in range(8):
+        assert service.principal(key)["id"] == "planner"
+    schema_two.migrate()
+    for _ in range(8):
+        assert service.principal(key)["id"] == "planner"

@@ -147,9 +147,12 @@ class FamilyService:
             if principal_id
             else ("key_hash", hashlib.sha256((key or "").encode()).hexdigest())
         )
-        # Column selection is fixed, never user input.
+        # Column selection is fixed, never user input. Named columns keep the prepared plan valid when a
+        # migration adds a principals column (ANYM-495, version 3).
         p = self.store.one(
-            f"SELECT * FROM principals WHERE {field}=%s AND enabled AND expires_at>now()", (value,)
+            "SELECT id, group_id, person_id, scopes, key_hash, enabled, version, expires_at FROM principals"
+            f" WHERE {field}=%s AND enabled AND expires_at>now()",
+            (value,),
         )
         if not p:
             raise CalendarError("not_found_or_forbidden")
