@@ -2,8 +2,12 @@
 -- operation_request is the sha256 of the issue request, so a replay of the same operation ID with another
 -- request is refused. Version-2 code selects principals with SELECT *, whose prepared plans fail once the
 -- row type changes: deploy the version-3 code first (it names its columns), then migrate.
--- The queued wait for the exclusive lock (2 s) plus the two steps that hold it (1 s each) bound how long
--- requests stall; a slow upgrade fails and is retried instead.
+-- The queued wait for the exclusive lock (2 s) and the two steps that hold it (1 s each) are bounded one by
+-- one; transaction_timeout bounds the whole hold from here to commit at 4 s, the rest of migrate() included:
+-- past it the server ends the session and rolls back, so a slow upgrade fails and is retried instead.
+-- migrate() sets no transaction_timeout, so the timer starts at this SET; it is not reset, since DEFAULT
+-- stops it.
+SET LOCAL transaction_timeout = '4s';
 SET LOCAL lock_timeout = '2s';
 SET LOCAL statement_timeout = '1s';
 ALTER TABLE principals ADD COLUMN operation_id text, ADD COLUMN operation_request text,

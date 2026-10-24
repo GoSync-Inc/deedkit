@@ -635,9 +635,11 @@ schema or data, follow the module's backup and migration runbook instead.
 Messaging migration 044 (`manual`, ANYM-495) is additive: two nullable `api_keys` columns
 (`operation_id`, `operation_request`), a check and a partial unique index. It holds an exclusive
 lock on `api_keys`, which every authentication reads, until it commits. The queued wait for the
-lock (2-second lock timeout) plus the two steps that hold it (1-second statement timeout each,
-one row per key) stay under the runtime's 5-second statement timeout, so a slow upgrade fails
-and is retried instead of failing authentication. A
+lock (2-second lock timeout) and the two steps that hold it (1-second statement timeout each,
+one row per key) are bounded one by one, and a 4-second transaction timeout bounds the whole
+hold up to commit, under the runtime's 5-second statement timeout: past it the server ends the
+migrating session and rolls back, so a slow upgrade fails and is retried instead of failing
+authentication. Retry `migrate` once the cause (a long `api_keys` reader) is gone. A
 schema-43 runtime refuses schema 44, so it ships with its release; update the pinned backup and
 restore runtimes first. Calendar migration 3 adds the same two columns to `principals` with the
 same timeouts. Deploy the calendar image of this release before `migrate`: earlier code selects

@@ -313,6 +313,20 @@ def test_agent_info_check_reads_and_bounds_the_key_file(granted, tmp_path, probl
         assert str(failure.value) == code
 
 
+def blocked_by(dsn, pid):
+    # True once another backend waits on a lock that `pid` holds; polled in autocommit, since a transaction
+    # keeps one pg_stat_activity snapshot.
+    deadline = time.monotonic() + 10
+    with psycopg.connect(dsn, autocommit=True) as observer:
+        while time.monotonic() < deadline:
+            if observer.execute(
+                    "SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND %s = ANY(pg_blocking_pids(pid))",
+                    (pid,)).fetchone():
+                return True
+            time.sleep(0.05)
+    return False
+
+
 # spec: ANYM-495
 @pytest.mark.parametrize("collision,code", [("operation", "operation_conflict"), ("key", "principal_or_key_in_use")])
 def test_a_concurrent_issue_that_loses_the_operation_or_key_is_refused_without_a_unique_violation(
@@ -338,7 +352,7 @@ def test_a_concurrent_issue_that_loses_the_operation_or_key_is_refused_without_a
                 results["second"] = error
         second = threading.Thread(target=call)
         second.start()
-        time.sleep(0.5)
+        assert blocked_by(granted.dsn, winner.info.backend_pid)
         winner.commit()
         second.join(30)
     finally:
@@ -384,7 +398,7 @@ def test_a_concurrent_identical_issue_waits_on_the_winner_and_replays_it(granted
                 results["second"] = error
         second = threading.Thread(target=call)
         second.start()
-        time.sleep(0.5)
+        assert blocked_by(granted.dsn, winner.info.backend_pid)
         winner.commit()
         second.join(30)
     finally:

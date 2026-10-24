@@ -298,12 +298,27 @@ def test_key_info_check_reads_and_bounds_the_key_file(seeded, run, tmp_path, pro
         assert str(failure.value) == code
 
 
+def blocked_by(dsn, pid):
+    # True once another backend waits on a lock that `pid` holds; polled in autocommit, since a transaction
+    # keeps one pg_stat_activity snapshot.
+    deadline = time.monotonic() + 10
+    with psycopg.connect(dsn, autocommit=True) as c:
+        while time.monotonic() < deadline:
+            if c.execute("SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND %s=ANY(pg_blocking_pids(pid))",
+                         (pid,)).fetchone():
+                return True
+            time.sleep(0.05)
+    return False
+
+
 def race(store, monkeypatch, first, second):
-    # The first issue pauses after its INSERT, inside its transaction; the second starts, then the first commits.
-    paused, release, original, results = threading.Event(), threading.Event(), store_module.audit, {}
+    # The first issue pauses after its INSERT, inside its transaction; the second starts and is seen waiting on the
+    # first's lock, then the first commits.
+    paused, release, original, results, winner = threading.Event(), threading.Event(), store_module.audit, {}, {}
 
     def audit(c, principal, operation, *args, **kwargs):
         if operation == 'issue_key' and not paused.is_set():
+            winner['pid'] = c.info.backend_pid
             paused.set()
             assert release.wait(30)
         return original(c, principal, operation, *args, **kwargs)
@@ -319,8 +334,10 @@ def race(store, monkeypatch, first, second):
     assert paused.wait(30)
     two = threading.Thread(target=call, args=('second', second))
     two.start()
-    time.sleep(0.5)
-    release.set()
+    try:
+        assert blocked_by(store.pool.conninfo, winner['pid'])
+    finally:
+        release.set()
     one.join(30)
     two.join(30)
     return results
