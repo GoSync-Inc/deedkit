@@ -239,6 +239,36 @@ class Store:
             )
         return p["expires_at"], p["new"]
 
+    def list_agents(self):
+        # ANYM-494: every agent principal with public fields only; revoked means disabled.
+        with self.transaction() as conn:
+            conn.execute("SET LOCAL statement_timeout = '5s'")  # an admin read never outlives its CLI
+            rows = conn.execute(
+                "SELECT p.id AS principal_id,p.group_id,p.person_id,p.expires_at,NOT p.enabled AS revoked,"
+                "(SELECT count(*) FROM agent_calendars a WHERE a.principal_id=p.id) AS calendars "
+                "FROM principals p ORDER BY p.id"
+            ).fetchall()
+        return [dict(row, expires_at=row["expires_at"].isoformat()) for row in rows]
+
+    def agent_info(self, keys):
+        # ANYM-494: an agent's public record by its key, in input order; the hash never leaves this method.
+        if not isinstance(keys, list) or not 1 <= len(keys) <= 100:
+            raise CalendarError("invalid_key_count")
+        result = []
+        with self.transaction() as conn:
+            conn.execute("SET LOCAL statement_timeout = '5s'")
+            for key in keys:
+                key = key.strip()
+                if not 1 <= len(key) <= 512 or any(c.isspace() for c in key):
+                    result.append({"found": False, "error": "invalid_key"})
+                    continue
+                row = conn.execute(
+                    "SELECT id AS principal_id,expires_at,NOT enabled AS revoked FROM principals WHERE key_hash=%s",
+                    (hashlib.sha256(key.encode()).hexdigest(),),
+                ).fetchone()
+                result.append(dict(row, found=True, expires_at=row["expires_at"].isoformat()) if row else {"found": False})
+        return result
+
     def guardian_rule_set(self, group_id, dependent, activity, duty, guardian, source, target, lead, title,
                           visibility, copy_location=False, expected_version=None):
         # Owner CLI only (SERVICE.md): a rule is the default drive duty, never a write authorization.

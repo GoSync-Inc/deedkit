@@ -110,6 +110,8 @@ python -m messaging_service set-access --principal assistant-work \
   --chats chat-work --permissions read
 
 python -m messaging_service list-keys --principal assistant-work
+python -m messaging_service list-keys --all
+python -m messaging_service key-info --key-file /dev/stdin < /private/assistant-work.token
 python -m messaging_service revoke-key --key-id PUBLIC_CREDENTIAL_UUID
 python -m messaging_service extend-key --key-id PUBLIC_CREDENTIAL_UUID --days 365
 python -m messaging_service set-access --principal assistant-work --disable
@@ -121,6 +123,16 @@ Permissions that are not specified are preserved. Issuing another key to the sam
 without `--chats`/`--permissions` keeps its restrictions; the account list must be given
 explicitly. Rotation with the same permissions does not reset the ACK. Issuing a key to a disabled
 principal does not enable it again.
+
+### Key inventory
+
+`list-keys --all` lists every key of every principal (exactly one of `--principal` or `--all`):
+public key ID, principal, `created_at` (the operator `issue_key` audit row, `null` when none
+exists), `expires_at` and `revoked`. `key-info --key-file FILE` reads one token per line (at most
+100 lines and 64 KiB; `/dev/stdin` for a batch) and prints, in input order, `found` with the
+public key ID, principal, `expires_at` and `revoked`, or `found: false`; a line that cannot be a
+token reports `error: invalid_key`. Neither command prints a token or a digest, and neither
+writes. `deedkit admin key list` (docs/operations/production.md, Admin CLI) runs both.
 
 ### Extending a key
 

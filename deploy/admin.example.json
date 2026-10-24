@@ -1,0 +1,11 @@
+{
+  "policy": "/opt/deedkit/deploy/private/gateway-policy/policy.json",
+  "calls_registry": "/opt/deedkit/deploy/private/calls-agents.json",
+  "labels": "/opt/deedkit/deploy/private/admin/labels.json",
+  "paths": {
+    "/run/deedkit/keys": "/opt/deedkit/deploy/private/gateway-keys",
+    "/run/deedkit/voice": "/opt/deedkit/deploy/private/voice"
+  },
+  "messaging": ["docker", "compose", "--project-name", "<messaging compose project>", "--project-directory", "/opt/deedkit/deploy", "-f", "/opt/deedkit/deploy/compose.yaml", "-f", "/opt/deedkit/deploy/compose.operator.yaml", "--profile", "operator", "run", "--rm", "-T", "--no-deps", "--name", "{name}", "operator"],
+  "calendar": ["docker", "compose", "--project-name", "deedkit-calendar", "--env-file", "<calendar env file>", "-f", "/opt/deedkit/deploy/compose.calendar.yaml", "run", "--rm", "-T", "--no-deps", "--name", "{name}", "--volume", "<CALENDAR_STATE_DIR>/service:/data/service:ro", "calendar-api"]
+}

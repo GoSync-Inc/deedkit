@@ -8,6 +8,8 @@ from .store import Store
 from .policy import PERMISSIONS, UNSET
 from .messenger_operations import OPERATIONS
 
+KEY_INFO_BYTES=64*1024
+
 
 def main():
     from .telemetry import configure
@@ -16,11 +18,12 @@ def main():
         'replay','snapshot','verify-restore','quarantine-restore','register-account',
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
         'set-messenger-operations','extend-key','set-feedback-status','export-feedback','release-retention-hold',
-        'set-subscription-retention','link-person','unlink-person','delete-person','list-people'])
+        'set-subscription-retention','link-person','unlink-person','delete-person','list-people','key-info'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
     parser.add_argument('--key-id',help='Public credential UUID; never the token or its hash')
+    parser.add_argument('--all',action='store_true',dest='all_keys',help='list-keys: every key of every principal')
     group=parser.add_mutually_exclusive_group()
     group.add_argument('--chats',nargs='*',default=UNSET)
     group.add_argument('--all-chats',action='store_true')
@@ -180,8 +183,14 @@ def main():
                 parser.error('set-key-permissions requires --key-id and explicit --permissions')
             print(json.dumps(store.set_key_permissions(args.key_id,args.permissions)))
         elif args.command=='list-keys':
-            if not args.principal:parser.error('list-keys requires --principal')
-            print(json.dumps(store.list_keys(args.principal)))
+            if bool(args.principal)==args.all_keys:parser.error('list-keys requires exactly one of --principal or --all')
+            print(json.dumps(store.list_all_keys() if args.all_keys else store.list_keys(args.principal)))
+        elif args.command=='key-info':
+            # ANYM-494: one token per line (a key file, or a batch on stdin); public fields only, never a digest.
+            if not args.key_file or args.key_id:parser.error('key-info requires --key-file')
+            with args.key_file.open('rb') as source:raw=source.read(KEY_INFO_BYTES+1)
+            if len(raw)>KEY_INFO_BYTES:raise ValueError('key_file_too_large')
+            print(json.dumps({'keys':store.key_info(raw.decode().splitlines())}))
         elif args.command=='audit-tail':
             print(json.dumps(store.audit_tail(args.principal or '',args.limit)))
         else:
