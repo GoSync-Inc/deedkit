@@ -405,3 +405,17 @@ def test_issue_check_on_an_n_minus_1_schema_still_validates_the_arguments(seeded
         with pytest.raises(ValueError) as failure:
             issue(run, token_file(tmp_path), operation, principal, *extra, '--check')
     assert str(failure.value) == code
+
+
+# spec: ANYM-495
+@pytest.mark.parametrize('content', ['short', ''])
+def test_revoke_check_refuses_the_key_file_that_revoke_refuses(seeded, run, tmp_path, content):
+    store = seeded[0]
+    path = tmp_path/'revoke.txt'
+    path.write_text(content+'\n')
+    before = rows_any(store)
+    for extra in (['--check'], []):
+        with pytest.raises(ValueError) as failure:
+            run('revoke-key', '--key-file', str(path), *extra)
+        assert str(failure.value) == 'invalid_key'
+    assert rows_any(store) == before

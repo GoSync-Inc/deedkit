@@ -6,7 +6,7 @@ from pathlib import Path
 import stat
 import sys
 
-from .store import Store, caller_token, operation_name
+from .store import Store, caller_token, operation_name, revocable_token
 from .policy import PERMISSIONS, UNSET, key_id, principal_id
 from .messenger_operations import OPERATIONS
 
@@ -181,7 +181,7 @@ def main():
             if bool(args.key_file)==bool(args.key_id):parser.error('revoke-key requires exactly one of --key-file or --key-id')
             if args.check:
                 if args.key_id:key_id(args.key_id)
-                elif not args.key_file.is_file():raise ValueError('key_file_unreadable')
+                else:revocable_token(args.key_file.read_text().strip())
                 print(json.dumps(store.check_schema()))
             else:
                 count=store.revoke(args.key_file.read_text().strip() if args.key_file else None,credential_id=args.key_id)
