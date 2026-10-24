@@ -364,3 +364,21 @@ def test_a_crash_between_the_parent_operations_two_commits_then_a_rerun_complete
     assert issue(run, archive, 'issue-8/archive', 'agent-c-calls-archive')[0] == dict(second, replayed=True)
     operations = sorted(k['operation_id'] for k in rows(store)[0] if k['operation_id'])
     assert operations == ['issue-8/archive', 'issue-8/messaging']
+
+
+# spec: ANYM-495
+@pytest.mark.parametrize('problem,code', [('principal', 'invalid_principal'), ('days', 'invalid_key_lifetime'),
+                                          ('operation', 'invalid_operation_id')])
+def test_issue_check_on_an_n_minus_1_schema_still_validates_the_arguments(seeded, run, tmp_path, problem, code):
+    store = seeded[0]
+    principal, extra, operation = 'agent-c', [], 'op-1'
+    if problem == 'principal':
+        principal = 'Bad Principal!'
+    elif problem == 'days':
+        extra = ['--days', '400']
+    else:
+        operation = 'bad id!'
+    with schema_43(store):
+        with pytest.raises(ValueError) as failure:
+            issue(run, token_file(tmp_path), operation, principal, *extra, '--check')
+    assert str(failure.value) == code

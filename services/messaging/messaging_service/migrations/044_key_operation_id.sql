@@ -2,11 +2,12 @@
 -- Repeatable key issue (ANYM-495). Expand-only: two nullable columns and a partial unique index;
 -- deployed schema-43 code never reads or writes them. operation_request is the sha256 of the
 -- issue request, so a replay of the same operation ID with another request is refused.
--- The ALTER holds an exclusive lock on api_keys (read by every authentication) until commit:
--- lock_timeout bounds the wait for it and statement_timeout bounds each step while it is held
--- (the check and the index scan one row per key), so a slow upgrade fails instead of stalling.
+-- The ALTER holds an exclusive lock on api_keys (read by every authentication) until commit.
+-- An authentication waits at most the runtime's 5 s statement timeout: the queued wait for the
+-- lock (lock_timeout 2 s) plus the two steps that hold it (1 s each; the check and the index scan
+-- one row per key) stay under it, so a slow upgrade fails and is retried instead of failing logins.
 SET LOCAL lock_timeout='2s';
-SET LOCAL statement_timeout='5s';
+SET LOCAL statement_timeout='1s';
 ALTER TABLE api_keys ADD COLUMN operation_id text, ADD COLUMN operation_request text,
  ADD CONSTRAINT api_keys_operation_check CHECK((operation_id IS NULL)=(operation_request IS NULL)
   AND (operation_id IS NULL OR operation_id ~ '^[A-Za-z0-9._/-]{1,128}$')

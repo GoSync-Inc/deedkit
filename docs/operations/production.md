@@ -634,9 +634,10 @@ reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
 Messaging migration 044 (`manual`, ANYM-495) is additive: two nullable `api_keys` columns
 (`operation_id`, `operation_request`), a check and a partial unique index. It holds an exclusive
-lock on `api_keys`, which every authentication reads, until it commits: a 2-second lock timeout
-bounds the wait for the lock and a 5-second statement timeout each step while it is held (one
-row per key), so a slow upgrade fails and is retried instead of stalling authentication. A
+lock on `api_keys`, which every authentication reads, until it commits. The queued wait for the
+lock (2-second lock timeout) plus the two steps that hold it (1-second statement timeout each,
+one row per key) stay under the runtime's 5-second statement timeout, so a slow upgrade fails
+and is retried instead of failing authentication. A
 schema-43 runtime refuses schema 44, so it ships with its release; update the pinned backup and
 restore runtimes first. Calendar migration 3 adds the same two columns to `principals` with the
 same timeouts. Deploy the calendar image of this release before `migrate`: earlier code selects
