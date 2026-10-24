@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -138,6 +139,12 @@ def validate_files(plan, root=ROOT):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["admin"]:
+        # `deedkit admin ...` (ANYM-491): host administration, separate from module deployment.
+        from deedkit_admin import main as admin
+
+        sys.exit(admin(argv[1:]))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["resolve", "up", "status", "stop"])
     parser.add_argument("--profile", required=True, type=Path)

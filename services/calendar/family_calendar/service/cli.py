@@ -18,6 +18,9 @@ from .store import Store
 from .vault import Vault
 
 
+KEY_INFO_BYTES = 64 * 1024
+
+
 def parser():
     p = argparse.ArgumentParser(description="Family Calendar owner CLI / isolated gateway / worker")
     sub = p.add_subparsers(dest="action", required=True)
@@ -83,6 +86,9 @@ def parser():
     extend = sub.add_parser("extend-agent")
     extend.add_argument("--id", required=True)
     extend.add_argument("--days", required=True, help="New lifetime from now, 1-365 days")
+    sub.add_parser("list-agents")
+    info = sub.add_parser("agent-info")
+    info.add_argument("--key-file", type=Path, required=True, help="One key per line; /dev/stdin for a batch")
     disconnect = sub.add_parser("disconnect")
     disconnect.add_argument("--connection", required=True)
     reconcile = sub.add_parser("reconcile")
@@ -258,6 +264,15 @@ def dispatch(args, home, root, config, store):
     if args.action == "extend-agent":
         previous, new = store.extend_agent(args.id, args.days)
         return {"principal_id": args.id, "previous_expires_at": previous.isoformat(), "expires_at": new.isoformat()}
+    if args.action == "list-agents":
+        return {"agents": store.list_agents()}
+    if args.action == "agent-info":
+        # ANYM-494: public fields by key file, in input order; the key and its hash are never printed.
+        with args.key_file.open("rb") as source:
+            raw = source.read(KEY_INFO_BYTES + 1)
+        if len(raw) > KEY_INFO_BYTES:
+            raise CalendarError("key_file_too_large")
+        return {"agents": store.agent_info(raw.decode().splitlines())}
     if args.action == "guardian-rule":
         if args.rule_action == "set":
             return store.guardian_rule_set(

@@ -1196,6 +1196,28 @@ class Store:
             return serial(c.execute('SELECT id,principal,expires_at,revoked,permissions,permission_version FROM api_keys WHERE principal=%s ORDER BY expires_at,id',
                                     (principal,)).fetchall())
 
+    def list_all_keys(self):
+        # ANYM-494: every key with public fields only; created_at is the operator's issue_key audit row, if any.
+        with self.pool.connection() as c:
+            return serial(c.execute('''SELECT k.id,k.principal,i.created_at,k.expires_at,k.revoked FROM api_keys k
+                LEFT JOIN (SELECT key_id,min(occurred_at) AS created_at FROM audit_log
+                    WHERE operation='issue_key' AND actor='operator' GROUP BY key_id) i ON i.key_id=k.id
+                ORDER BY k.principal,k.expires_at,k.id''').fetchall())
+
+    def key_info(self,tokens):
+        # ANYM-494: a token's public record by its digest, in input order; the digest never leaves this method.
+        if not isinstance(tokens,list) or not 1<=len(tokens)<=100:raise ValueError('invalid_key_count')
+        result=[]
+        with self.pool.connection() as c:
+            for token in tokens:
+                token=token.strip()
+                if not 32<=len(token)<=256 or any(ch.isspace() for ch in token):
+                    result.append({'found':False,'error':'invalid_key'});continue
+                row=c.execute('SELECT id AS key_id,principal,expires_at,revoked FROM api_keys WHERE digest=%s',
+                              (digest(token),)).fetchone()
+                result.append(serial({'found':True,**row}) if row else {'found':False})
+        return result
+
     def audit_tail(self,principal='',limit=50):
         bounded(limit)
         if principal:principal_id(principal)

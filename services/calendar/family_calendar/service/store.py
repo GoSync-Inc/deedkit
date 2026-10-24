@@ -239,6 +239,34 @@ class Store:
             )
         return p["expires_at"], p["new"]
 
+    def list_agents(self):
+        # ANYM-494: every agent principal with public fields only; revoked means disabled.
+        return [
+            dict(row, expires_at=row["expires_at"].isoformat())
+            for row in self.query(
+                "SELECT p.id AS principal_id,p.group_id,p.person_id,p.expires_at,NOT p.enabled AS revoked,"
+                "(SELECT count(*) FROM agent_calendars a WHERE a.principal_id=p.id) AS calendars "
+                "FROM principals p ORDER BY p.id"
+            )
+        ]
+
+    def agent_info(self, keys):
+        # ANYM-494: an agent's public record by its key, in input order; the hash never leaves this method.
+        if not isinstance(keys, list) or not 1 <= len(keys) <= 100:
+            raise CalendarError("invalid_key_count")
+        result = []
+        for key in keys:
+            key = key.strip()
+            if not 1 <= len(key) <= 512 or any(c.isspace() for c in key):
+                result.append({"found": False, "error": "invalid_key"})
+                continue
+            row = self.one(
+                "SELECT id AS principal_id,expires_at,NOT enabled AS revoked FROM principals WHERE key_hash=%s",
+                (hashlib.sha256(key.encode()).hexdigest(),),
+            )
+            result.append(dict(row, found=True, expires_at=row["expires_at"].isoformat()) if row else {"found": False})
+        return result
+
     def guardian_rule_set(self, group_id, dependent, activity, duty, guardian, source, target, lead, title,
                           visibility, copy_location=False, expected_version=None):
         # Owner CLI only (SERVICE.md): a rule is the default drive duty, never a write authorization.
