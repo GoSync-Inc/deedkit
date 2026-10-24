@@ -3,12 +3,30 @@ import argparse
 import json
 import os
 from pathlib import Path
+import stat
+import sys
 
-from .store import Store
-from .policy import PERMISSIONS, UNSET
+from .store import Store, caller_token, operation_name
+from .policy import PERMISSIONS, UNSET, key_id, principal_id
 from .messenger_operations import OPERATIONS
 
 KEY_INFO_BYTES=64*1024
+TOKEN_BYTES=4096
+
+
+def read_token(path):
+    # ANYM-495: the caller's token from an owner-only regular file, or stdin; never printed.
+    if str(path)=='/dev/stdin':raw=sys.stdin.buffer.read(TOKEN_BYTES+1)
+    else:
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        try:
+            info=os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_mode&0o077:raise ValueError('unsafe_token_file')
+            raw=os.read(fd,TOKEN_BYTES+1)
+        finally:os.close(fd)
+    lines=raw.decode(errors='replace').splitlines() if len(raw)<=TOKEN_BYTES else []
+    if len(lines)!=1:raise ValueError('invalid_key')
+    return caller_token(lines[0].strip())
 
 
 def main():
@@ -23,6 +41,10 @@ def main():
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
     parser.add_argument('--key-id',help='Public credential UUID; never the token or its hash')
+    parser.add_argument('--token-file',type=Path,help='issue-key: an existing owner-only file (or /dev/stdin) with the caller\'s token')
+    parser.add_argument('--operation-id',help='issue-key, key-info: 1-128 of [A-Za-z0-9._/-]; the same request again replays')
+    parser.add_argument('--check',action='store_true',
+        help='issue-key, extend-key, revoke-key, list-keys, key-info: validate and report the schema, write nothing')
     parser.add_argument('--all',action='store_true',dest='all_keys',help='list-keys: every key of every principal')
     group=parser.add_mutually_exclusive_group()
     group.add_argument('--chats',nargs='*',default=UNSET)
@@ -127,23 +149,45 @@ def main():
                 else: result=verify_snapshot(store,args.snapshot_dir)
                 print(json.dumps(result))
         elif args.command=='issue-key':
-            if not args.principal or not args.accounts or not args.key_file:
-                parser.error('issue-key requires --principal, --accounts and --key-file')
-            # Reserve the output first; never silently replace a user's active credential.
-            fd=os.open(args.key_file,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
-            with os.fdopen(fd,'w') as out:
-                out.write(store.issue_key(args.principal,args.accounts,7 if args.days is None else args.days,
-                    chats=None if args.all_chats else args.chats,permissions=args.permissions,
-                    key_permissions=args.key_permissions)+'\n')
-            print(json.dumps({'issued':True,'principal':args.principal,'key_file':str(args.key_file)}))
+            if not args.principal or not args.accounts or bool(args.key_file)==bool(args.token_file):
+                parser.error('issue-key requires --principal, --accounts and exactly one of --key-file or --token-file')
+            if bool(args.token_file)!=bool(args.operation_id):parser.error('--token-file and --operation-id go together')
+            days=7 if args.days is None else args.days
+            options=dict(chats=None if args.all_chats else args.chats,permissions=args.permissions,
+                         key_permissions=args.key_permissions)
+            if args.check:
+                principal_id(args.principal)
+                if not 1<=days<=365:raise ValueError('invalid_key_lifetime')
+                if args.token_file:read_token(args.token_file);operation_name(args.operation_id)
+                elif args.key_file.exists() or args.key_file.is_symlink():raise ValueError('key_file_exists')
+                print(json.dumps(store.check_schema()))
+            elif args.token_file:
+                # ANYM-495: the caller wrote the token durably first; only its digest is stored, nothing is written.
+                print(json.dumps(store.issue_key(args.principal,args.accounts,days,**options,
+                    token=read_token(args.token_file),operation_id=args.operation_id)))
+            else:
+                # Reserve the output first; never silently replace a user's active credential.
+                fd=os.open(args.key_file,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+                with os.fdopen(fd,'w') as out:
+                    out.write(store.issue_key(args.principal,args.accounts,days,**options)+'\n')
+                print(json.dumps({'issued':True,'principal':args.principal,'key_file':str(args.key_file)}))
         elif args.command=='revoke-key':
             if bool(args.key_file)==bool(args.key_id):parser.error('revoke-key requires exactly one of --key-file or --key-id')
-            count=store.revoke(args.key_file.read_text().strip() if args.key_file else None,credential_id=args.key_id)
-            print(json.dumps({'revoked':count}))
+            if args.check:
+                if args.key_id:key_id(args.key_id)
+                elif not args.key_file.is_file():raise ValueError('key_file_unreadable')
+                print(json.dumps(store.check_schema()))
+            else:
+                count=store.revoke(args.key_file.read_text().strip() if args.key_file else None,credential_id=args.key_id)
+                print(json.dumps({'revoked':count}))
         elif args.command=='extend-key':
             if not args.key_id or args.key_file or args.days is None:
                 parser.error('extend-key requires --key-id and --days, never --key-file')
-            print(json.dumps(store.extend_key(args.key_id,args.days)))
+            if args.check:
+                key_id(args.key_id)
+                if not 1<=args.days<=365:raise ValueError('invalid_key_lifetime')
+                print(json.dumps(store.check_schema()))
+            else:print(json.dumps(store.extend_key(args.key_id,args.days)))
         elif args.command in ('link-person','unlink-person'):
             # ANYM-283: owner-made links only; an agent key has no path to these.
             if not args.account or not args.sender:
@@ -184,13 +228,22 @@ def main():
             print(json.dumps(store.set_key_permissions(args.key_id,args.permissions)))
         elif args.command=='list-keys':
             if bool(args.principal)==args.all_keys:parser.error('list-keys requires exactly one of --principal or --all')
-            print(json.dumps(store.list_all_keys() if args.all_keys else store.list_keys(args.principal)))
+            if args.check:
+                if args.principal:principal_id(args.principal)
+                print(json.dumps(store.check_schema()))
+            else:print(json.dumps(store.list_all_keys() if args.all_keys else store.list_keys(args.principal)))
         elif args.command=='key-info':
             # ANYM-494: one token per line (a key file, or a batch on stdin); public fields only, never a digest.
-            if not args.key_file or args.key_id:parser.error('key-info requires --key-file')
-            with args.key_file.open('rb') as source:raw=source.read(KEY_INFO_BYTES+1)
-            if len(raw)>KEY_INFO_BYTES:raise ValueError('key_file_too_large')
-            print(json.dumps({'keys':store.key_info(raw.decode().splitlines())}))
+            if bool(args.key_file)==bool(args.operation_id) or args.key_id:
+                parser.error('key-info requires exactly one of --key-file or --operation-id')
+            if args.check:
+                if args.operation_id:operation_name(args.operation_id)
+                print(json.dumps(store.check_schema()))
+            elif args.operation_id:print(json.dumps({'keys':store.key_operation_info(args.operation_id)}))
+            else:
+                with args.key_file.open('rb') as source:raw=source.read(KEY_INFO_BYTES+1)
+                if len(raw)>KEY_INFO_BYTES:raise ValueError('key_file_too_large')
+                print(json.dumps({'keys':store.key_info(raw.decode().splitlines())}))
         elif args.command=='audit-tail':
             print(json.dumps(store.audit_tail(args.principal or '',args.limit)))
         else:

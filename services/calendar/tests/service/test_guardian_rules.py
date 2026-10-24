@@ -100,7 +100,7 @@ def test_migration_two_is_additive_and_repeatable(schema_one, tmp_path, monkeypa
     s.grant("family", "adult-a", "cal-a", READ, "details")
     tables, columns, data = snapshot(s)
     assert "guardian_rules" not in tables
-    s.migrate()
+    s.migrate(through=2)  # version 3 (ANYM-495) has its own test
     migrated = snapshot(s)
     after_tables, after_columns, after_data = snapshot(s)
     assert set(after_tables) - set(tables) == {"guardian_rules", "projection_links"}
@@ -113,7 +113,7 @@ def test_migration_two_is_additive_and_repeatable(schema_one, tmp_path, monkeypa
     data.pop("migrations")
     assert {t: v for t, v in after_data.items() if t in data} == data
     assert hashlib.sha256((SERVICE / "schema.sql").read_bytes()).hexdigest() == SCHEMA_ONE_SHA256
-    s.migrate()
+    s.migrate(through=2)
     assert snapshot(s) == migrated
     status = cli.dispatch(cli.parser().parse_args(["schema-status"]), tmp_path, tmp_path, {}, s)
     assert [m["version"] for m in status["migrations"]] == [1, 2]
