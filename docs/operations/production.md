@@ -632,30 +632,13 @@ ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 `promotable()` (the previous revision is no longer current `main`), does not run or
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
-Messaging migration 044 (`manual`, ANYM-495) is additive: two nullable `api_keys` columns
-(`operation_id`, `operation_request`), a check and a partial unique index. It holds an exclusive
-lock on `api_keys`, which every authentication reads, until it commits. The queued wait for the
-lock (2-second lock timeout) and the two steps that hold it (1-second statement timeout each,
-one row per key) are bounded one by one, and a 4-second transaction timeout bounds the whole
-hold up to `COMMIT`, under the runtime's 5-second statement timeout (the WAL flush at commit
-runs after the timer stops, as for every migration since 037 and every `api_keys` write;
-a stalled flush stops all writes on the host anyway): past it the server ends the
-migrating session and rolls back, so a slow upgrade fails and is retried instead of failing
-authentication. Retry `migrate` once the cause (a long `api_keys` reader) is gone. A
-stalled commit flush can still outlast the bound, so apply 044 and calendar 3 in a short
-outage window after the release's images run, no step during an active call: `docker stop` the containers that read `api_keys`
-or `principals` through a DB pool (the messaging API container of the current release, plan A
-`api` or the routed plan B one; `calendar-api` and `calendar-worker`), run messaging
-`operator migrate` and calendar `migrate`, `docker start` the same containers (same IDs, so
-release identities hold), then verify `/health` of both APIs and one authenticated read each.
-Expect under a minute of API and MCP errors; the gateway, collectors and queues keep running.
-Abort at any step: `docker start` the stopped containers; 044 and 3 are additive, the release's
-code runs on either schema, and a failed `migrate` rolls back whole. A
-schema-43 runtime refuses schema 44, so it ships with its release; update the pinned backup and
-restore runtimes first. Calendar migration 3 adds the same two columns to `principals` with the
-same timeouts. Deploy the calendar image of this release before `migrate`: earlier code selects
-`principals` with `SELECT *`, and its prepared plans fail once the row type changes. Rollback:
-existing keys are untouched; only rows issued with `--operation-id` carry the new columns.
+Messaging migration 044 (`expand`, ANYM-495) is additive: the new `api_key_operations` table
+(operation ID, request digest, key ID) without a foreign key, so applying it takes no lock on
+`api_keys`, which every authentication reads, and needs no outage. Only the operator CLI reads
+or writes it, so it has no grant. A schema-43 runtime refuses schema 44, so it ships with its
+release; update the pinned backup and restore runtimes first. Calendar migration 3 adds the same
+table for agents (`principal_operations`, no lock on `principals`). Rollback: existing keys are
+untouched; only keys issued with `--operation-id` have an operation row.
 Messaging migration 043 (`manual`, ANYM-283) is additive: the new `person_links` table
 with a SELECT grant to the gateway role. A schema-42 runtime refuses schema 43, so it ships
 with its release; update the pinned backup and restore runtimes first, since earlier ones

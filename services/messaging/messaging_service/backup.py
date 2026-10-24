@@ -57,6 +57,7 @@ V38_TABLES={'subscription_hint_windows':'subscription'}
 V41_TABLES={'reply_snoozes':'key_id,chat','reply_mutes':'id'}
 V42_TABLES={'owner_message_reads':'chat,provider_id'}
 V43_TABLES={'person_links':'account,sender'}
+V44_TABLES={'api_key_operations':'operation_id'}
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
@@ -79,7 +80,8 @@ def database_manifest(c):
                        **(V33_TABLES if version>=33 else {}),**(V34_TABLES if version>=34 else {}),
                        **(V35_TABLES if version>=35 else {}),
                        **(V37_TABLES if version>=37 else {}),
-                       **(V38_TABLES if version>=38 else {}),**(V41_TABLES if version>=41 else {}),**(V42_TABLES if version>=42 else {}),**(V43_TABLES if version>=43 else {})}.items():
+                       **(V38_TABLES if version>=38 else {}),**(V41_TABLES if version>=41 else {}),**(V42_TABLES if version>=42 else {}),**(V43_TABLES if version>=43 else {}),
+                       **(V44_TABLES if version>=44 else {})}.items():
         query=sql.SQL('SELECT row_to_json(t) AS record FROM {} t ORDER BY {}').format(
             sql.Identifier(name),sql.SQL(',').join(sql.Identifier(part) for part in order.split(',')))
         sha=hashlib.sha256(); count=0

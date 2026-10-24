@@ -283,3 +283,5 @@ backups of schemas 2-41 still restore.
 
 Schema 43 adds `person_links` (owner-made person links, ANYM-283) to the manifest;
 backups of schemas 2-42 still restore.
+Schema 44 adds `api_key_operations` (repeatable key issue, ANYM-495) to the manifest;
+backups of schemas 2-43 still restore.

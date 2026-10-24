@@ -39,7 +39,8 @@ def token_file(tmp_path, value=TOKEN, name='agent.token', mode=0o600):
 
 def rows(store):
     with store.pool.connection() as c:
-        keys = c.execute('SELECT id,principal,digest,operation_id,operation_request FROM api_keys ORDER BY id').fetchall()
+        keys = c.execute('''SELECT k.id,k.principal,k.digest,o.operation_id,o.operation_request FROM api_keys k
+            LEFT JOIN api_key_operations o ON o.key_id=k.id ORDER BY k.id''').fetchall()
         audit = c.execute('SELECT count(*) AS n FROM audit_log').fetchone()['n']
     return keys, audit
 
@@ -191,9 +192,9 @@ def test_token_file_and_operation_id_go_together_and_exclude_key_file(seeded, ru
 
 @contextmanager
 def schema_43(store):
-    # A real schema-43 shape (no ANYM-495 columns, index or check), then migration 044 again.
+    # A real schema-43 shape (no ANYM-495 table), then migration 044 again.
     with store.pool.connection() as c:
-        c.execute('ALTER TABLE api_keys DROP COLUMN operation_id, DROP COLUMN operation_request')
+        c.execute('DROP TABLE api_key_operations')
         c.execute("UPDATE probe_metadata SET value='43' WHERE name='schema_version'")
     try:
         yield
@@ -248,18 +249,23 @@ def test_issue_by_operation_on_an_n_minus_1_schema_is_refused_before_any_write(s
 # spec: ANYM-495
 def test_migration_044_is_additive_and_a_second_migrate_changes_nothing(seeded):
     store = seeded[0]
-    keys, _ = rows(store)
-    assert keys and all(k['operation_id'] is None and k['operation_request'] is None for k in keys)
-    store.migrate()
-    assert rows(store)[0] == keys
+    keys = rows_any(store)
     with store.pool.connection() as c:
-        columns = {r['column_name']: r['is_nullable'] for r in c.execute(
-            "SELECT column_name,is_nullable FROM information_schema.columns WHERE table_name='api_keys' "
-            "AND column_name IN ('operation_id','operation_request')")}
-    assert columns == {'operation_id': 'YES', 'operation_request': 'YES'}
+        # 044 takes no lock on api_keys, which every authentication reads: no foreign key, no change to it.
+        c.execute('DROP TABLE api_key_operations')
+        c.execute(MIGRATION_044.read_text())
+        locks = c.execute("SELECT mode FROM pg_locks WHERE pid=pg_backend_pid() AND relation='api_keys'::regclass"
+                          ).fetchall()
+    assert locks == []
+    store.migrate()
+    assert rows_any(store) == keys
+    with store.pool.connection() as c:
+        foreign = c.execute("SELECT count(*) AS n FROM pg_constraint WHERE contype='f' "
+                            "AND conrelid='api_key_operations'::regclass").fetchone()['n']
+    assert foreign == 0
     with pytest.raises(psycopg.errors.CheckViolation), store.pool.connection() as c:
-        c.execute("UPDATE api_keys SET operation_id='only-half' WHERE id=%s", (keys[0]['id'],))
-    assert MIGRATION_044.read_text().startswith('-- rollout: manual\n')
+        c.execute("INSERT INTO api_key_operations VALUES('bad id',%s,gen_random_uuid())", ('0' * 64,))
+    assert MIGRATION_044.read_text().startswith('-- rollout: expand\n')
 
 
 # spec: ANYM-495
