@@ -38,19 +38,28 @@ class APIError(Exception):
 MIGRATE_LOCK_TIMEOUT="SET LOCAL lock_timeout='2s'"
 
 
+REPLAY_LOCK_TABLES=('messages','deliveries','download_grants')
+
+
 def lock_replay_tables(c, seconds=2):
     # schema.sql's CREATE INDEX IF NOT EXISTS needs SHARE on these. Take them together and never queue:
     # a queued request holds new writers behind it, and locks taken one by one stay held while the
-    # next one waits, so three short waits could add up past a writer's 5 s budget.
+    # next one waits, so short waits could add up past a writer's 5 s budget. A table missing from a
+    # partial restore is left to the replay to recreate.
+    present=[t for t in REPLAY_LOCK_TABLES
+             if c.execute('SELECT to_regclass(%s) IS NOT NULL AS present',('public.'+t,)).fetchone()['present']]
+    if not present: return
+    statement='LOCK TABLE '+', '.join(present)+' IN SHARE MODE NOWAIT'
     deadline=time.monotonic()+seconds
     while True:
         try:
             with c.transaction():
-                c.execute('LOCK TABLE messages, deliveries, download_grants IN SHARE MODE NOWAIT')
+                c.execute(statement)
             return
         except LockNotAvailable:
             if time.monotonic()>=deadline: raise
             time.sleep(0.05)
+
 
 # capabilities sections (ANYM-270): each key of the full payload sits in exactly one
 # named block, with today's shape; summary is the short index an agent reads first.
