@@ -458,8 +458,10 @@ def backlog_metric(root: Path, actions: Actions, head: str, start: datetime) -> 
     listings share one TIMEOUT budget; a failed, truncated or late listing makes the metric unknown."""
     commits, older = backlog_scope(root, head, start)
     numbers = {"since": SYNC_BACKLOG_SINCE, "head": head, "in_scope": len(commits), "not_checked": older}
+    # The rollout commit, its history and the commits older than the window are named as not checked, never counted.
+    skipped = f"not checked: {SYNC_BACKLOG_SINCE[:12]} and earlier, {older} later commit(s) older than 7 days"
     if not commits:
-        return metric(PASS, "no main commit in scope", numbers=numbers, commits=[])
+        return metric(PASS, f"no main commit in scope; {skipped}", numbers=numbers, commits=[])
     end = actions.clock() + TIMEOUT
     lower = min(committed for _, committed in commits) - SYNC_SLACK
     syncs = actions.listing(lower, end)
@@ -467,6 +469,8 @@ def backlog_metric(root: Path, actions: Actions, head: str, start: datetime) -> 
     if any(not any(run["conclusion"] == "success" or run["status"] in ACTIVE for run in sync_runs(syncs, sha))
            for sha, _ in commits):
         ci = actions.listing(lower, end, CI_WORKFLOW, ("event=push",))
+    if actions.clock() >= end:  # a last page that returned after the budget still makes the metric late
+        raise Unknown("gh api timed out")
     rows, findings, warnings = [], [], []
     for sha, committed in commits:
         state, reason, url = backlog_decision(sha, committed, syncs, ci, start)
@@ -478,7 +482,7 @@ def backlog_metric(root: Path, actions: Actions, head: str, start: datetime) -> 
             warnings.append(f"{sha}: {shown(reason)}")
     numbers |= {state: sum(row["state"] == state for row in rows) for state in (SYNCED, PENDING, UNSYNCED)}
     reason = (f"{numbers[UNSYNCED]} unsynced, {numbers[PENDING]} pending, {numbers[SYNCED]} synced of {len(rows)} main "
-              f"commit(s) after {SYNC_BACKLOG_SINCE[:12]}")
+              f"commit(s) after {SYNC_BACKLOG_SINCE[:12]}; {skipped}")
     result = metric(FAIL if findings else PASS, reason, numbers=numbers, commits=rows)
     result["findings"], result["warnings"] = findings, warnings
     return result

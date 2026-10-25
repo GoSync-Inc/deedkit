@@ -545,7 +545,8 @@ commit `SYNC_BACKLOG_SINCE` in `scripts/tiden_health.py` (b61f412, the base of
 the pull request that added the check) up to TARGET, whose committer date is
 within 7 days of the check's start. The rollout commit, older commits and older
 dates are not checked, never reported as synced or missing (runs before 1a4b78d
-have no `Tiden sync <sha>` title). The check reads its own listings, the
+have no `Tiden sync <sha>` title); the metric's reason names them as
+`not checked: <rollout commit> and earlier, <n> later commit(s) older than 7 days`. The check reads its own listings, the
 `tiden-sync.yml` runs and the `ci.yml` runs with event `push` of `main`, created
 since one day before the oldest commit in scope, every page (at most 10 of 100),
 all within one budget of 120 seconds. Each listed run carries its latest
@@ -569,7 +570,7 @@ it with a warning that lists it. Each unsynced commit is listed with its reason,
 its last sync run URL and the recovery line
 `gh workflow run tiden-sync.yml --ref main -f sha=<sha>`; dispatch it once the
 cause (for example a merge-preview refusal) is fixed. A listing error, a
-truncated listing, an overrun budget or a rollout commit missing from the clone
+truncated listing, an overrun budget (also a last page that returns after it) or a rollout commit missing from the clone
 makes only this metric unknown; the four others are unchanged, and it is
 measured whether or not test evidence was read, even without Tiden
 configuration. The artifact holds every commit in scope (`commits`) with its

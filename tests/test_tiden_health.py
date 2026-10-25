@@ -1511,14 +1511,16 @@ def dated(repo, message, when):
 class FakeBacklog:
     """The sync backlog's own listings: rows per workflow, or an exception; records each call."""
 
-    def __init__(self, syncs=(), ci=(), error=None):
+    def __init__(self, syncs=(), ci=(), error=None, elapse=0.0):
         self.rows, self.error, self.calls = {"tiden-sync.yml": list(syncs), "ci.yml": list(ci)}, error, []
+        self.now, self.elapse = 1000.0, elapse
 
     def clock(self):
-        return 1000.0
+        return self.now
 
     def listing(self, since, end, workflow="tiden-sync.yml", filters=()):
         self.calls.append((workflow, since, end, filters))
+        self.now += self.elapse  # each listing returns ELAPSE seconds later
         if self.error:
             raise self.error
         return self.rows[workflow]
@@ -1540,6 +1542,14 @@ def test_the_backlog_scope_starts_after_the_rollout_commit_and_within_seven_days
     monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", "f" * 40)
     with pytest.raises(health.Unknown, match="rollout commit"):
         health.backlog_scope(repo, head, START)
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", boundary)
+    entry = health.backlog_metric(repo, FakeBacklog(syncs=[sync_attempt(1, head), sync_attempt(2, child)]), head, START)
+    assert entry["reason"] == (f"0 unsynced, 0 pending, 2 synced of 2 main commit(s) after {boundary[:12]}; not checked: "
+                               f"{boundary[:12]} and earlier, 1 later commit(s) older than 7 days")
+    assert old not in {row["sha"] for row in entry["commits"]} and entry["numbers"]["not_checked"] == 1
+    entry = health.backlog_metric(repo, FakeBacklog(), boundary, START)  # TARGET is the rollout commit itself
+    assert entry["state"] == PASS and entry["commits"] == [] and entry["reason"] == (
+        f"no main commit in scope; not checked: {boundary[:12]} and earlier, 0 later commit(s) older than 7 days")
 
 
 # spec: ANYM-503
@@ -1612,6 +1622,26 @@ def test_a_backlog_listing_error_makes_only_the_backlog_unknown(repo, server, mo
     entry = data["metrics"].pop("sync_backlog")
     assert entry["state"] == UNKNOWN and entry["reason"] == reason and SECRET not in json.dumps(entry)
     assert outcome({"metrics": {"sync_backlog": entry}}) == 2
+    assert {name: (value["state"], value["reason"]) for name, value in data["metrics"].items()} == \
+        {name: (value["state"], value["reason"]) for name, value in before["metrics"].items()}
+
+
+# spec: ANYM-503
+def test_a_backlog_listing_that_returns_after_its_120_s_budget_makes_only_the_backlog_unknown(repo, server,
+                                                                                               monkeypatch):
+    a = dated(repo, "boundary", START - timedelta(days=1))
+    b = dated(repo, "head", START - timedelta(hours=2))
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", a)
+    server.world(b)
+    _, before = measure(repo, server, b)
+    now = START
+    rows = {"syncs": [sync_attempt(1, b, "failure")], "ci": [ci_attempt(9, b)]}
+    assert health.backlog_metric(repo, FakeBacklog(**rows, elapse=59), b, now)["state"] == FAIL  # 118 s: in budget
+    clock = Clock()
+    data = report(repo, Tiden(server.cli, "product", "workspace"), b, "refs/remotes/origin/main", False, clock,
+                  clock.sleep, backlog=FakeBacklog(**rows, elapse=60), now=lambda: now)  # the last page at 120 s
+    entry = data["metrics"].pop("sync_backlog")
+    assert (entry["state"], entry["reason"]) == (UNKNOWN, "gh api timed out")
     assert {name: (value["state"], value["reason"]) for name, value in data["metrics"].items()} == \
         {name: (value["state"], value["reason"]) for name, value in before["metrics"].items()}
 
