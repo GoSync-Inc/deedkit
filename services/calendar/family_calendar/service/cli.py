@@ -2,7 +2,11 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
+import re
+import stat
+import sys
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from psycopg import sql
@@ -14,11 +18,34 @@ from family_calendar.private_files import read_private, write_private, private_d
 from family_calendar.providers.google.auth import connect
 from .core import READ, WRITE
 from .providers import Providers, source_ref
-from .store import Store
+from .store import Store, caller_key, operation_name
 from .vault import Vault
 
 
 KEY_INFO_BYTES = 64 * 1024
+
+
+def read_key(path):
+    # ANYM-495: the caller's key from an owner-only regular file, or stdin; never printed. No symlink, no FIFO
+    # wait (nonblocking open, then the type check) and a bounded read.
+    if str(path) == "/dev/stdin":
+        raw = sys.stdin.buffer.read(4097)
+    else:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            raise CalendarError("unsafe_key_file") from None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+                raise CalendarError("unsafe_key_file")
+            raw = os.read(fd, 4097)
+        finally:
+            os.close(fd)
+    lines = raw.decode(errors="replace").splitlines() if len(raw) <= 4096 else []
+    if len(lines) != 1:
+        raise CalendarError("invalid_key")
+    return caller_key(lines[0].strip())
 
 
 def parser():
@@ -80,15 +107,22 @@ def parser():
     agent.add_argument("--calendar", action="append", default=[])
     agent.add_argument("--scopes", default=",".join(READ))
     agent.add_argument("--visibility", choices=["details", "busy_only"], default="details")
-    agent.add_argument("--output", type=Path, required=True)
+    agent.add_argument("--output", type=Path)
+    agent.add_argument("--token-file", type=Path, help="An existing owner-only file (or /dev/stdin) with the caller's key")
+    agent.add_argument("--operation-id", help="1-128 of [A-Za-z0-9._/-]; the same request again replays")
+    agent.add_argument("--days", default="90", help="Lifetime from now, 1-183 days (default 90)")
     revoke = sub.add_parser("revoke-agent")
     revoke.add_argument("--id", required=True)
     extend = sub.add_parser("extend-agent")
     extend.add_argument("--id", required=True)
     extend.add_argument("--days", required=True, help="New lifetime from now, 1-365 days")
-    sub.add_parser("list-agents")
+    agents = sub.add_parser("list-agents")
     info = sub.add_parser("agent-info")
-    info.add_argument("--key-file", type=Path, required=True, help="One key per line; /dev/stdin for a batch")
+    info.add_argument("--key-file", type=Path, help="One key per line; /dev/stdin for a batch")
+    info.add_argument("--operation-id")
+    for command in (agent, revoke, extend, agents, info):
+        # ANYM-495: validate the arguments and report whether the schema is applied; writes nothing.
+        command.add_argument("--check", action="store_true")
     disconnect = sub.add_parser("disconnect")
     disconnect.add_argument("--connection", required=True)
     reconcile = sub.add_parser("reconcile")
@@ -255,9 +289,32 @@ def dispatch(args, home, root, config, store):
         scopes = args.scopes.split(",")
         if set(scopes) - set(READ + WRITE):
             raise CalendarError("unsupported_scope")
-        key = store.agent(args.id, args.group, args.member, scopes, args.calendar, args.visibility)
+        if (args.output is None) == (args.token_file is None):
+            raise CalendarError("output_or_token_file_required")
+        if (args.token_file is None) != (args.operation_id is None):
+            raise CalendarError("key_and_operation_id_required")
+        if not re.fullmatch("[0-9]{1,3}", args.days) or not 1 <= int(args.days) <= 183:
+            raise CalendarError("invalid_agent_lifetime")
+        options = {"days": int(args.days)}
+        if args.token_file is not None:
+            # ANYM-495: the caller wrote the key durably first; only its hash is stored, nothing is written.
+            options.update(key=read_key(args.token_file), operation_id=operation_name(args.operation_id))
+        if args.check:
+            # The issue's own validation (member, calendars, principal and key free, operation replay), no write.
+            result = store.check_schema()
+            if result["check"] == "ok" or args.token_file is None:
+                store.agent(args.id, args.group, args.member, scopes, args.calendar, args.visibility, **options,
+                            check=True)
+            return result
+        if args.token_file is not None:
+            return store.agent(args.id, args.group, args.member, scopes, args.calendar, args.visibility, **options)
+        key = store.agent(args.id, args.group, args.member, scopes, args.calendar, args.visibility, **options)
         write_private(args.output, key.encode())
-        return {"principal_id": args.id, "key_saved": True, "expires_days": 90}
+        return {"principal_id": args.id, "key_saved": True, "expires_days": options["days"]}
+    if args.action in ("revoke-agent", "extend-agent", "list-agents") and args.check:
+        if args.action == "extend-agent" and (not re.fullmatch("[0-9]{1,3}", args.days) or not 1 <= int(args.days) <= 365):
+            raise CalendarError("invalid_agent_lifetime")
+        return store.check_schema()
     if args.action == "revoke-agent":
         store.revoke(args.id)
         return {"revoked": True}
@@ -266,13 +323,25 @@ def dispatch(args, home, root, config, store):
         return {"principal_id": args.id, "previous_expires_at": previous.isoformat(), "expires_at": new.isoformat()}
     if args.action == "list-agents":
         return {"agents": store.list_agents()}
+    if args.action == "agent-info" and (args.key_file is None) == (args.operation_id is None):
+        raise CalendarError("key_file_or_operation_id_required")
     if args.action == "agent-info":
-        # ANYM-494: public fields by key file, in input order; the key and its hash are never printed.
-        with args.key_file.open("rb") as source:
-            raw = source.read(KEY_INFO_BYTES + 1)
-        if len(raw) > KEY_INFO_BYTES:
-            raise CalendarError("key_file_too_large")
-        return {"agents": store.agent_info(raw.decode().splitlines())}
+        if args.operation_id is not None:
+            operation_name(args.operation_id)
+        else:
+            # ANYM-494: public fields by key file, in input order; the key and its hash are never printed.
+            with args.key_file.open("rb") as source:
+                raw = source.read(KEY_INFO_BYTES + 1)
+            if len(raw) > KEY_INFO_BYTES:
+                raise CalendarError("key_file_too_large")
+            keys = raw.decode().splitlines()
+            if not 1 <= len(keys) <= 100:
+                raise CalendarError("invalid_key_count")
+        if args.check:
+            return store.check_schema()
+        if args.operation_id is not None:
+            return {"agents": store.agent_operation_info(args.operation_id)}
+        return {"agents": store.agent_info(keys)}
     if args.action == "guardian-rule":
         if args.rule_action == "set":
             return store.guardian_rule_set(

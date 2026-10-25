@@ -106,6 +106,52 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
+
+
+def revocable_token(value):
+    # What revoke accepts by token; --check runs the same test (ANYM-495).
+    if not isinstance(value,str) or not 32<=len(value)<=256:raise ValueError('invalid_key')
+    return value
+def caller_token(value):
+    # A caller-made token (ANYM-495): printable ASCII without spaces, as authentication reads it.
+    if not isinstance(value,str) or not re.fullmatch(r'[!-~]{32,256}',value):raise ValueError('invalid_key')
+    return value
+
+
+def operation_name(value):
+    if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9._/-]{1,128}',value):
+        raise ValueError('invalid_operation_id')
+    return value
+
+
+def issue_request(principal,accounts,days,chats,permissions,key_permissions):
+    # The request as given, so a replay with other arguments is refused even when the result would match.
+    def given(value):return 'unset' if value is UNSET else None if value is None else sorted(value)
+    return hashlib.sha256(json.dumps([principal,sorted(accounts or []),days,given(chats),given(permissions),
+        given(key_permissions)]).encode()).hexdigest()
+
+
+class OperationTaken(Exception):
+    # ANYM-495: the operation ID or the caller's token is held by a committed key; the transaction rolls back.
+    pass
+
+
+def key_operation(c,operation_id):
+    # No foreign key (044 takes no lock on api_keys): an operation without its key row still holds the ID.
+    return c.execute('''SELECT k.id,k.principal,k.expires_at,k.revoked,k.digest,o.operation_request
+        FROM api_key_operations o LEFT JOIN api_keys k ON k.id=o.key_id WHERE o.operation_id=%s''',
+        (operation_id,)).fetchone()
+
+
+def schema_version(c):
+    return int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
+
+
+def require_schema(c,version):
+    if schema_version(c)<version:raise RuntimeError('schema_not_ready')
+
+
 def bounded(value: int, maximum: int = 100) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
         raise APIError('invalid_limit')
@@ -1095,8 +1141,8 @@ class Store:
                 lock_replay_tables(c)
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
-            if version>43: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql')]:
+            if version>44: raise RuntimeError('database_newer_than_runtime')
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
@@ -1122,14 +1168,40 @@ class Store:
             END $$''')
 
     def issue_key(self, principal, accounts, days=7, *, chats=UNSET, permissions=UNSET,
-                  key_permissions=UNSET):
+                  key_permissions=UNSET, token=None, operation_id=None, check=False):
+        """A new key; returns its token. With the caller's token and an operation ID (ANYM-495) it stores
+        only the digest and returns public fields, and the same request again returns the same record."""
         principal_id(principal)
         # Up to one year (owner 2026-10-24, ANYM-499); the default stays 7 days.
         if type(days) is not int or not 1<=days<=365:
             raise ValueError('invalid_key_lifetime')
-        token = 'pos_probe_'+secrets.token_urlsafe(32)
+        once=operation_id is not None
+        if once!=(token is not None):raise ValueError('token_and_operation_id_required')
+        if once:
+            token,operation_id=caller_token(token),operation_name(operation_id)
+            request=issue_request(principal,accounts,days,chats,permissions,key_permissions)
+        else:token = 'pos_probe_'+secrets.token_urlsafe(32)
+        try:
+            issued,replayed=self._issue_key(principal,accounts,days,chats,permissions,key_permissions,token,
+                                            (operation_id,request) if once else None,check)
+        except OperationTaken:
+            # A concurrent call won the operation ID or the token (either commit is visible now).
+            with self.pool.connection() as c:issued=key_operation(c,operation_id)
+            if issued is None:raise ValueError('token_in_use') from None
+            replayed=True
+        if check and issued is None:return {'check':'ok'}
+        if not once:return token
+        if replayed and (issued['operation_request']!=request or issued['digest'] is None or
+                         not secrets.compare_digest(issued['digest'],digest(token))):
+            raise ValueError('operation_conflict')
+        return serial({'key_id':issued['id'],'principal':issued['principal'],'expires_at':issued['expires_at'],
+                       'revoked':issued['revoked'],'operation_id':operation_id,'replayed':replayed})
+
+    def _issue_key(self,principal,accounts,days,chats,permissions,key_permissions,token,operation,check=False):
         with self.pool.connection() as c:
+            if operation:require_schema(c,KEY_OPERATION_SCHEMA)
             lock_principal(c,principal)
+            if operation and (prior:=key_operation(c,operation[0])) is not None:return prior,True
             old = c.execute('SELECT * FROM principals WHERE id=%s FOR UPDATE', (principal,)).fetchone()
             if chats is UNSET:chats=old['chat_ids'] if old else None
             if permissions is UNSET:permissions=old['permissions'] if old else DEFAULT_PERMISSIONS
@@ -1139,11 +1211,23 @@ class Store:
             key_permissions=normalize_list(key_permissions,maximum=len(PERMISSIONS))
             if set(key_permissions)-(set(permissions)|(LEGACY_PERMISSIONS if implicit_ceiling else set())):
                 raise ValueError('invalid_key_permissions')
+            if check:
+                # ANYM-495 check mode: the same validation as an issue, then nothing is written.
+                if operation and c.execute('SELECT 1 FROM api_keys WHERE digest=%s',(digest(token),)).fetchone():
+                    raise ValueError('token_in_use')
+                return None,False
             self._write_policy(c,principal,old,accounts,chats,permissions,old['enabled'] if old else True)
-            issued=c.execute('INSERT INTO api_keys(digest,principal,expires_at,permissions) VALUES(%s,%s,%s,%s) RETURNING id',
+            operation_id,request=operation or (None,None)
+            # A taken operation ID or token is not an error statement, so no key digest reaches the database log.
+            issued=c.execute('INSERT INTO api_keys(digest,principal,expires_at,permissions) VALUES(%s,%s,%s,%s)'+
+                (' ON CONFLICT DO NOTHING' if operation else '')+' RETURNING id,principal,expires_at,revoked',
                 (digest(token),principal,datetime.now(timezone.utc)+timedelta(days=days),key_permissions)).fetchone()
+            if issued is None or operation and not c.execute('''INSERT INTO api_key_operations(operation_id,
+                    operation_request,key_id) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING RETURNING key_id''',
+                    (operation_id,request,issued['id'])).fetchone():
+                raise OperationTaken
             audit(c,{'id':principal,'key_id':issued['id']},'issue_key','ok')
-        return token
+            return issued,False
 
     def set_key_permissions(self,credential_id,permissions):
         credential_id=key_id(credential_id)
@@ -1194,8 +1278,7 @@ class Store:
     def revoke(self, token=None, *, credential_id=None):
         if (token is None)==(credential_id is None):raise ValueError('one_key_selector_required')
         if token is not None:
-            if not isinstance(token,str) or not 32<=len(token)<=256:raise ValueError('invalid_key')
-            clause,selector='digest=%s',digest(token)
+            clause,selector='digest=%s',digest(revocable_token(token))
         else:clause,selector='id=%s',key_id(credential_id)
         with self.pool.connection() as c:
             row=c.execute('SELECT principal,id FROM api_keys WHERE '+clause,(selector,)).fetchone()
@@ -1251,6 +1334,21 @@ class Store:
                               (digest(token),)).fetchone()
                 result.append(serial({'found':True,**row}) if row else {'found':False})
         return result
+
+    def key_operation_info(self,operation_id):
+        # ANYM-495: the key an operation issued, public fields only.
+        operation_id=operation_name(operation_id)
+        with self.pool.connection() as c:
+            require_schema(c,KEY_OPERATION_SCHEMA)
+            row=c.execute('''SELECT k.id AS key_id,k.principal,k.expires_at,k.revoked,o.operation_id
+                FROM api_key_operations o JOIN api_keys k ON k.id=o.key_id WHERE o.operation_id=%s''',
+                (operation_id,)).fetchone()
+        return [serial({'found':True,**row}) if row else {'found':False,'operation_id':operation_id}]
+
+    def check_schema(self,version=KEY_OPERATION_SCHEMA):
+        # ANYM-495 check mode: reads only the schema version, writes nothing.
+        with self.pool.connection() as c:current=schema_version(c)
+        return {'check':'ok' if current>=version else 'schema_not_ready','schema_version':current,'required':version}
 
     def audit_tail(self,principal='',limit=50):
         bounded(limit)

@@ -244,7 +244,7 @@ def test_gateway_role_append_only_and_backup_covers_provenance(reviewers):
                 with gateway.pool.connection() as c:c.execute(sql)
         with s.pool.connection() as c:
             manifest=database_manifest(c)
-        assert len(manifest)==70 and manifest['reviews']['rows']==manifest['review_sources']['rows']==1
+        assert len(manifest)==71 and manifest['reviews']['rows']==manifest['review_sources']['rows']==1
     finally:
         with s.pool.connection() as c:c.execute('DROP OWNED BY '+role);c.execute('DROP ROLE '+role)
 
