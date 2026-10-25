@@ -336,3 +336,32 @@ def test_migration_036_gives_up_on_a_busy_audit_log_without_stalling_requests(sc
         assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '43'
         with pytest.raises(psycopg.errors.CheckViolation), c.transaction():
             c.execute("INSERT INTO audit_log(principal,operation,outcome) VALUES('agent-busy','not_an_operation','ok')")
+
+
+# spec: ANYM-422
+def test_migrate_gives_up_on_a_busy_messages_table_without_stalling_writers(seeded):
+    store = seeded[0]
+    holder = psycopg.connect(store.pool.conninfo)
+    try:
+        # An open writer holds ROW EXCLUSIVE on messages; schema.sql's CREATE INDEX IF NOT EXISTS needs SHARE.
+        holder.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE')
+        outcome = []
+        def migrate():
+            try: store.migrate(); outcome.append('migrated')
+            except psycopg.errors.LockNotAvailable: outcome.append('lock_not_available')
+        worker = threading.Thread(target=migrate)
+        started = time.monotonic()
+        worker.start()
+        time.sleep(0.5)
+        # A new writer queued behind the migrate lock request still finishes in its 5 s budget.
+        with store.pool.connection() as c:
+            c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE')
+        assert time.monotonic() - started < 5
+        worker.join(10)
+        assert outcome == ['lock_not_available']
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '43'
+    finally:
+        holder.rollback()
+        holder.close()
+    store.migrate()

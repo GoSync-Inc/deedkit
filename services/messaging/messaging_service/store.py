@@ -34,6 +34,9 @@ class APIError(Exception):
         super().__init__(code)
 
 
+# Under the 5 s request budget, so a writer queued behind a migrate lock request still finishes.
+MIGRATE_LOCK_TIMEOUT="SET LOCAL lock_timeout='2s'"
+
 # capabilities sections (ANYM-270): each key of the full payload sits in exactly one
 # named block, with today's shape; summary is the short index an agent reads first.
 CAPABILITY_SECTIONS={
@@ -1061,6 +1064,9 @@ class Store:
         with self.pool.connection() as c:
             c.execute('SELECT pg_advisory_xact_lock(74509137)')
             c.execute("SET LOCAL statement_timeout='180s'")
+            # An open writer (schema.sql's CREATE INDEX needs SHARE) would queue new writers behind
+            # migrate for up to 180 s; give up instead and roll the whole migrate back.
+            c.execute(MIGRATE_LOCK_TIMEOUT)
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version>43: raise RuntimeError('database_newer_than_runtime')
@@ -1068,6 +1074,8 @@ class Store:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
+                    # 040 resets lock_timeout to DEFAULT; each migration starts under the bound again.
+                    c.execute(MIGRATE_LOCK_TIMEOUT)
                     c.execute(migration.read_text())
                     if target==17:
                         from .chat_evidence import backfill
