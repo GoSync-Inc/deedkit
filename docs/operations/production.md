@@ -637,9 +637,10 @@ Messaging migration 044 (`expand`, ANYM-495) is additive: the new `api_key_opera
 which every authentication reads. It is not lock-free: like every `migrate`, the same transaction
 reruns `schema.sql`, whose `CREATE INDEX IF NOT EXISTS` holds a share lock on `messages`,
 `deliveries` and `download_grants` until commit, so writes to them (incoming messages,
-deliveries, download grants) wait for the migration. Each of those lock waits is bounded to 2 s
-(#283): behind an open writer `migrate` exits with `LockNotAvailable` and rolls back, the schema
-stays 43, and it runs again only once that writer ends. Only the operator CLI reads
+deliveries, download grants) wait for the migration. `migrate` takes those three locks together
+or not at all, never queued (#283, #286): behind an open writer it retries for 2 s, then exits with
+`LockNotAvailable` and rolls back, the schema stays 43, and it runs again only once that writer
+ends. Only the operator CLI reads
 or writes it, so it has no grant. A schema-43 runtime refuses schema 44, so it ships with its
 release; update the pinned backup and restore runtimes first. Calendar migration 3 adds the same
 table for agents (`principal_operations`, no lock on `principals`). Rollback: existing keys are

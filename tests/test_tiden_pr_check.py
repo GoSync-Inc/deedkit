@@ -62,6 +62,18 @@ def test_unanchored_code_without_a_spec_line_fails_and_anchored_code_needs_none(
     assert code == 0, out
 
 
+# spec: ANYM-504
+def test_a_licence_only_change_needs_no_spec_but_a_code_file_beside_it_still_does(repo, server):
+    server.set(main=[spec(12, sources=[anchor("app/core.py")])])
+    code, out = run(repo, server, {"services/calls/LICENSE": "licence text\n"})
+    assert code == 0, out
+    assert "code files 0" in out and "no anchor" not in out and "LICENSE" not in out
+    code, out = run(repo, server, {"services/calls/LICENSE": "licence text 2\n",
+                                   "services/calls/healthcheck.py": "ok = True\n"})
+    assert code == 1 and "1 changed code file(s) have no anchor" in out
+    assert "services/calls/healthcheck.py" in out and "LICENSE" not in out
+
+
 # spec: ANYM-405
 def test_an_added_test_without_a_marker_fails_but_existing_tests_need_none(repo, server):
     server.set(main=[spec(12)])

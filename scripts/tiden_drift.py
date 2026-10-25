@@ -45,6 +45,9 @@ EXCLUDED = (
     ("*/requirements*.in", "dependency pins"),
     ("*/requirements*.txt", "dependency pins"),
     ("*/requirements*.lock", "exported lockfiles"),
+    ("LICENSE", "licence text"),
+    ("*/LICENSE", "licence text"),
+    ("*-LICENSE", "licence text"),
 )
 SHA = re.compile(r"[0-9a-f]{40}")
 TIMEOUT = 120

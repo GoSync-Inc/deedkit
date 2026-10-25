@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import threading
 import time
 from uuid import uuid4
@@ -254,7 +255,7 @@ def schema35_store(database, tmp_path):
 
 
 @contextmanager
-def old_schema_store(database, tmp_path, last):
+def old_schema_store(database, tmp_path, last, base=None):
     name = 'anymsg_extend_' + uuid4().hex + '_test'
     dsn = database.pool.conninfo
     old = None
@@ -266,7 +267,7 @@ def old_schema_store(database, tmp_path, last):
         old = Store(make_conninfo(dsn, dbname=name), files, 'http://testserver')
         source = Path(store_module.__file__).parent
         with old.pool.connection() as c:
-            c.execute(source.joinpath('schema.sql').read_text())
+            c.execute(base or source.joinpath('schema.sql').read_text())
             for migration in sorted(source.joinpath('migrations').glob('*.sql')):
                 version = int(migration.name[:3])
                 if version > last:
@@ -346,29 +347,46 @@ def test_migration_036_gives_up_on_a_busy_audit_log_without_stalling_requests(sc
 
 
 
-def wait_for_lock_request(conninfo, table):
-    with psycopg.connect(conninfo, autocommit=True) as watcher:
-        deadline = time.monotonic() + 10
-        while not watcher.execute('SELECT 1 FROM pg_locks WHERE relation=%s::regclass AND NOT granted',
-                (table,)).fetchone():
-            assert time.monotonic() < deadline, 'migrate never queued its lock request'
-            time.sleep(0.02)
+def queued_on(table):
+    def ready(watcher):
+        return watcher.execute('SELECT 1 FROM pg_locks WHERE relation=%s::regclass AND NOT granted', (table,)).fetchone()
+    return ready
 
 
-def migrate_behind_lock(store, table, mode, request):
-    """Holds `mode` on `table` in an open transaction, runs migrate in a thread, then runs `request`
-    once migrate's lock request is queued. Returns migrate's outcome and both durations."""
-    holder = psycopg.connect(store.pool.conninfo)
+@pytest.fixture
+def replay_attempt(monkeypatch):
+    """Readiness for migrate's replay locks: a failed NOWAIT attempt (it sleeps before the next), or, before
+    that fix, migrate's own backend (the one holding its advisory lock) waiting on a lock."""
+    attempted = threading.Event()
+    def sleep(seconds):
+        attempted.set()
+        time.sleep(seconds)
+    monkeypatch.setattr(store_module, 'time', SimpleNamespace(monotonic=time.monotonic, sleep=sleep))
+    def ready(watcher):
+        return attempted.is_set() or watcher.execute("""SELECT 1 FROM pg_stat_activity a JOIN pg_locks l
+            ON l.pid=a.pid AND l.locktype='advisory' AND l.objid=74509137 AND l.granted
+            WHERE a.wait_event_type='Lock'""").fetchone()
+    return ready
+
+
+def migrate_behind_lock(store, holds, ready, request):
+    """Holds each (table, mode) of `holds` in its own open transaction, runs migrate in a thread and
+    `request` once `ready(watcher)` holds. Returns migrate's outcome and both durations."""
+    holders = [psycopg.connect(store.pool.conninfo) for _ in holds]
     outcome = []
     def migrate():
         try: store.migrate(); outcome.append('migrated')
         except psycopg.errors.LockNotAvailable: outcome.append('lock_not_available')
     worker = threading.Thread(target=migrate)
     try:
-        holder.execute(sql.SQL('LOCK TABLE {} IN ' + mode + ' MODE').format(sql.Identifier(table)))
+        for holder, (table, mode) in zip(holders, holds):
+            holder.execute(sql.SQL('LOCK TABLE {} IN ' + mode + ' MODE').format(sql.Identifier(table)))
         started = time.monotonic()
         worker.start()
-        wait_for_lock_request(store.pool.conninfo, table)
+        with psycopg.connect(store.pool.conninfo, autocommit=True) as watcher:
+            while not ready(watcher):
+                assert time.monotonic() - started < 10, 'migrate never reached its lock'
+                time.sleep(0.01)
         queued = time.monotonic()
         with store.pool.connection() as c:
             request(c)
@@ -376,9 +394,10 @@ def migrate_behind_lock(store, table, mode, request):
         worker.join(30)
         return outcome, request_seconds, time.monotonic() - started
     finally:
-        holder.rollback()
-        holder.close()
-        worker.join(30)
+        for holder in holders:
+            holder.rollback()
+            holder.close()
+        if worker.ident: worker.join(30)
 
 
 def schema_state(store):
@@ -389,12 +408,12 @@ def schema_state(store):
 
 
 # spec: ANYM-422
-def test_migrate_gives_up_on_a_busy_messages_table_without_stalling_writers(seeded):
+def test_migrate_gives_up_on_a_busy_messages_table_without_stalling_writers(seeded, replay_attempt):
     store = seeded[0]
-    # An open writer holds ROW EXCLUSIVE on messages; schema.sql's CREATE INDEX IF NOT EXISTS needs SHARE,
-    # and a new writer queues behind that request.
-    outcome, writer_seconds, migrate_seconds = migrate_behind_lock(store, 'messages', 'ROW EXCLUSIVE',
-        lambda c: c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE'))
+    # An open writer holds ROW EXCLUSIVE on messages; schema.sql's CREATE INDEX IF NOT EXISTS needs SHARE.
+    # A new writer must not queue behind migrate's attempt.
+    outcome, writer_seconds, migrate_seconds = migrate_behind_lock(store, [('messages', 'ROW EXCLUSIVE')],
+        replay_attempt, lambda c: c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE'))
     assert outcome == ['lock_not_available']
     assert writer_seconds < 5 and migrate_seconds < 10
     assert schema_state(store) == ('44', 44, True)
@@ -407,7 +426,8 @@ def test_migrate_lock_timeout_rolls_back_migrations_it_already_applied(database,
         assert schema_state(store) == ('16', 16, False)
         # 017-021 apply, then 022's ALTER TABLE principals waits behind a reader; a request reading
         # principals queues behind that ACCESS EXCLUSIVE request.
-        outcome, request_seconds, migrate_seconds = migrate_behind_lock(store, 'principals', 'ACCESS SHARE',
+        outcome, request_seconds, migrate_seconds = migrate_behind_lock(store,
+            [('principals', 'ACCESS SHARE')], queued_on('principals'),
             lambda c: c.execute('SELECT count(*) FROM principals').fetchone())
         assert outcome == ['lock_not_available']
         assert request_seconds < 5 and migrate_seconds < 10
@@ -415,3 +435,30 @@ def test_migrate_lock_timeout_rolls_back_migrations_it_already_applied(database,
         assert schema_state(store) == ('16', 16, False)
         store.migrate()
         assert schema_state(store) == ('44', 44, True)
+
+
+# spec: ANYM-422
+def test_migrate_never_holds_one_replay_lock_while_waiting_for_another(seeded, replay_attempt):
+    store = seeded[0]
+    # messages is free, deliveries has an open writer. Taken one by one, migrate would hold SHARE on
+    # messages while it waits for deliveries, and a new messages writer would wait with it (up to 2 s
+    # per table, adding up past the 5 s budget over three tables).
+    outcome, writer_seconds, migrate_seconds = migrate_behind_lock(store, [('deliveries', 'ROW EXCLUSIVE')],
+        replay_attempt, lambda c: c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE'))
+    assert outcome == ['lock_not_available']
+    assert writer_seconds < 1 and migrate_seconds < 10
+    assert schema_state(store) == ('44', 44, True)
+    store.migrate()
+    assert schema_state(store) == ('44', 44, True)
+
+
+# spec: ANYM-422
+def test_migrate_replays_replay_tables_missing_from_a_partial_restore(database, tmp_path):
+    base = Path(store_module.__file__).with_name('schema.sql').read_text()
+    partial = base[:base.index('CREATE TABLE IF NOT EXISTS deliveries')]
+    with old_schema_store(database, tmp_path, 1, base=partial) as store:
+        store.migrate()
+        assert schema_state(store) == ('44', 44, True)
+        with store.pool.connection() as c:
+            assert c.execute("""SELECT to_regclass('deliveries') IS NOT NULL
+                AND to_regclass('download_grants') IS NOT NULL AS present""").fetchone()['present']

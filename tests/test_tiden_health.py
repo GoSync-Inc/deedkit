@@ -1,6 +1,7 @@
 """The Tiden health report against temporary Git repositories and a fake Tiden CLI; it never calls Tiden."""
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -869,10 +870,20 @@ def test_the_command_reports_locally_read_only_with_the_same_result(repo, server
     assert git(repo, "for-each-ref") == refs
 
 
-def command(repo, tmp_path, cli, *extra, env=None) -> tuple[subprocess.CompletedProcess, dict]:
+# Runs the command with SYNC_BACKLOG_SINCE set to a commit of the temporary repository (ANYM-503).
+SINCE_COMMAND = ("import sys; sys.path.insert(0, sys.argv.pop(1)); import scripts.tiden_health as health; "
+                 "health.SYNC_BACKLOG_SINCE = sys.argv.pop(1); sys.exit(health.main())")
+
+
+def script(since=None):
+    return [sys.executable, str(ROOT / "scripts/tiden_health.py")] if since is None else \
+        [sys.executable, "-c", SINCE_COMMAND, str(ROOT), since]
+
+
+def command(repo, tmp_path, cli, *extra, env=None, since=None) -> tuple[subprocess.CompletedProcess, dict]:
     """The measuring command as the workflow runs it; it must always leave its JSON report behind."""
     output = tmp_path / "health.json"
-    completed = subprocess.run([sys.executable, str(ROOT / "scripts/tiden_health.py"), "--root", str(repo), "--cli",
+    completed = subprocess.run([*script(since), "--root", str(repo), "--cli",
                                 cli, "--output", str(output), *extra], capture_output=True, text=True,
                                env={"PATH": "/usr/bin:/bin", "FAKE_TIDEN_STATE": str(tmp_path / "state.json"),
                                     "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"), **(env or {})})
@@ -963,7 +974,8 @@ FAKE_GH = textwrap.dedent(f"""\
         print("[1]"); sys.exit(0)
     page = int(next(arg for arg in args if arg.startswith("page=")).split("=")[1])
     cutoff = next(arg for arg in args if arg.startswith("created=>=")).split(">=")[1]
-    rows = [row for row in state["rows"] if row.get("created_at", "z") >= cutoff]
+    workflow = args[3].split("/")[-2]
+    rows = [row for row in state.get("by_workflow", {{}}).get(workflow, state["rows"]) if row.get("created_at", "z") >= cutoff]
     chunk = rows[(page - 1) * 100:page * 100]
     body = {{"total_count": state.get("total", len(rows)), "workflow_runs": chunk}}
     if mode == "no-total":
@@ -1394,22 +1406,301 @@ def test_a_lookup_failure_through_the_real_command_leaves_the_other_metrics_and_
 # spec: ANYM-438
 def test_the_command_takes_the_repository_for_the_sync_lookup_and_an_empty_one_is_a_lookup_error(repo, server, gh,
                                                                                                  tmp_path):
-    _, b = history(repo)
+    a, b = history(repo)
     server.world(b)
     common = ("--product-id", "product", "--workspace-id", "workspace", "--target", b, "--require-token", "--gh",
               gh.cli)
     gh.set(rows=[sync_row(3, b)])
     completed, data = command(repo, tmp_path, server.cli, *common, "--sync-repository", "o/r",
-                              env={"TIDEN_API_TOKEN": SECRET, "FAKE_GH_STATE": gh.state})
+                              env={"TIDEN_API_TOKEN": SECRET, "FAKE_GH_STATE": gh.state}, since=a)
     assert completed.returncode == 0, completed.stderr
     decided(data, 3)
-    assert "Tiden sync" in completed.stdout and len(gh.calls()) == 2  # before and after the inventory read
+    # Before and after the inventory read; the sync backlog (ANYM-503) reads its own listing last.
+    assert "Tiden sync" in completed.stdout and len(gh.calls()) == 3
+    assert data["metrics"].pop("sync_backlog")["state"] == PASS
     server.world(b)
     gh.set(rows=[sync_row(3, b)])
     completed, data = command(repo, tmp_path, server.cli, *common, "--sync-repository", "",
-                              env={"TIDEN_API_TOKEN": SECRET, "FAKE_GH_STATE": gh.state})
+                              env={"TIDEN_API_TOKEN": SECRET, "FAKE_GH_STATE": gh.state}, since=a)
     assert completed.returncode == 2 and data["sync"] == NO_SYNC and gh.calls() == []
+    assert data["metrics"].pop("sync_backlog")["state"] == UNKNOWN
     assert states(data) == {"drift": PASS, "unlinked_tests": UNKNOWN, "stale_anchors": PASS, "done_open_checks": PASS}
+
+
+# The sync backlog of earlier main commits (ANYM-503).
+START = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+SHA_C = "c" * 40
+
+
+def ago(minutes):
+    return (START - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def sync_attempt(run_id, sha, conclusion="success", minutes=20, status="completed", attempt=1):
+    """A `Tiden sync` run as GitHub lists it: its latest attempt started and last updated MINUTES before START."""
+    return sync_row(run_id, sha, conclusion, ago(minutes), attempt, status, run_started_at=ago(minutes),
+                    created_at=ago(minutes + 5))
+
+
+def ci_attempt(run_id, sha, conclusion="success", minutes=40, status="completed", started=None, created=None,
+               event="push", attempt=1):
+    return {**sync_row(run_id, sha, conclusion, ago(minutes), attempt, status, title="CI", head=sha),
+            "event": event, "run_started_at": ago(started if started is not None else minutes + 10),
+            "created_at": ago(created if created is not None else (started or minutes) + 10)}
+
+
+def decide(syncs=(), ci=(), committed=120):
+    state, reason, url = health.backlog_decision(SHA_C, START - timedelta(minutes=committed), list(syncs), list(ci),
+                                                 START)
+    return state, reason, url
+
+
+# spec: ANYM-503
+@pytest.mark.parametrize(("syncs", "ci", "committed", "state", "reason"), [
+    pytest.param([sync_attempt(1, SHA_C, "failure")], [ci_attempt(9, SHA_C)], 120, "unsynced",
+                 "last sync failure; CI push run success at", id="failed-only"),
+    pytest.param([sync_attempt(1, SHA_C, "cancelled")], [ci_attempt(9, SHA_C)], 120, "unsynced",
+                 "last sync cancelled", id="cancelled-only"),
+    pytest.param([], [ci_attempt(9, SHA_C)], 120, "unsynced", "no sync run; CI push run success", id="no-run"),
+    pytest.param([sync_attempt(1, SHA_C, "failure", 50), sync_attempt(2, SHA_C, "success", 30)], [], 120, "synced",
+                 "", id="success-after-failure"),
+    pytest.param([sync_attempt(1, SHA_C, "failure", 35, attempt=2)], [ci_attempt(9, SHA_C, minutes=60)], 120,
+                 "unsynced", "last sync failure", id="success-then-failed-rerun"),
+    pytest.param([sync_attempt(1, SHA_C, status="queued", minutes=10)], [], 120, "pending", "Tiden sync run queued",
+                 id="queued"),
+    pytest.param([sync_attempt(1, SHA_C, status="waiting", minutes=46)], [ci_attempt(9, SHA_C)], 120, "unsynced",
+                 "stuck waiting", id="waiting-past-45-min"),
+    pytest.param([sync_attempt(1, SHA_C, "failure", 25)], [ci_attempt(9, SHA_C, minutes=29)], 120, "pending",
+                 "CI push run completed less than 30 min ago", id="inside-grace"),
+    pytest.param([sync_attempt(1, SHA_C, "failure", 25)], [ci_attempt(9, SHA_C, minutes=30)], 120, "unsynced",
+                 "last sync failure", id="grace-expired"),
+    pytest.param([], [ci_attempt(8, SHA_C, minutes=10, created=30, attempt=2), ci_attempt(9, SHA_C, minutes=200,
+                                                                                         created=20)],
+                 240, "unsynced", "CI push run success at " + ago(200), id="ci-rerun-newest-run-decides"),
+    pytest.param([], [ci_attempt(9, SHA_C, minutes=10, created=300, attempt=2)], 400, "pending",
+                 "less than 30 min", id="ci-rerun-latest-attempt-decides"),
+    pytest.param([], [], 59, "pending", "no CI push run yet", id="no-ci-59-min"),
+    pytest.param([], [], 61, "unsynced", "no sync run; no CI push run", id="no-ci-61-min"),
+    pytest.param([], [ci_attempt(9, SHA_C, status="in_progress", minutes=1, started=89)], 120, "pending",
+                 "CI push run in_progress", id="ci-running-89-min"),
+    pytest.param([], [ci_attempt(9, SHA_C, status="in_progress", minutes=1, started=91)], 120, "unsynced",
+                 "CI attempt running over 90 min", id="ci-running-91-min"),
+    pytest.param([sync_attempt(1, SHA_C, "skipped", 50)], [ci_attempt(9, SHA_C)], 120, "unsynced",
+                 "no sync run", id="skipped-only-is-no-run"),
+    pytest.param([], [ci_attempt(9, SHA_C, event="pull_request")], 61, "unsynced", "no CI push run",
+                 id="a-pull-request-ci-run-is-not-evidence"),
+])
+def test_the_sync_backlog_decides_each_commit_by_its_latest_attempts(syncs, ci, committed, state, reason):
+    found, why, url = decide(syncs, ci, committed)
+    assert found == state and reason in why
+    kept = [run for run in syncs if run["conclusion"] != "skipped"]
+    assert url == (max(kept, key=lambda run: run["updated_at"])["html_url"] if kept else None)
+
+
+def dated(repo, message, when):
+    """A main commit with its committer date at WHEN, pushed."""
+    (repo / "log.txt").write_text(message)
+    git(repo, "add", "log.txt")
+    stamp = when.strftime("%Y-%m-%dT%H:%M:%SZ")
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", message], check=True,
+                   env={**os.environ, "GIT_COMMITTER_DATE": stamp, "GIT_AUTHOR_DATE": stamp})
+    git(repo, "push", "-q", "origin", "main")
+    return git(repo, "rev-parse", "HEAD")
+
+
+class FakeBacklog:
+    """The sync backlog's own listings: rows per workflow, or an exception; records each call."""
+
+    def __init__(self, syncs=(), ci=(), error=None, elapse=0.0):
+        self.rows, self.error, self.calls = {"tiden-sync.yml": list(syncs), "ci.yml": list(ci)}, error, []
+        self.now, self.elapse = 1000.0, elapse
+
+    def clock(self):
+        return self.now
+
+    def listing(self, since, end, workflow="tiden-sync.yml", filters=()):
+        self.calls.append((workflow, since, end, filters))
+        self.now += self.elapse  # each listing returns ELAPSE seconds later
+        if self.error:
+            raise self.error
+        return self.rows[workflow]
+
+
+# spec: ANYM-503
+def test_the_backlog_scope_starts_after_the_rollout_commit_and_within_seven_days(repo, monkeypatch):
+    before = dated(repo, "before", START - timedelta(days=9))
+    boundary = dated(repo, "boundary", START - timedelta(days=9))
+    old = dated(repo, "old child", START - timedelta(days=8))
+    child = dated(repo, "child", START - timedelta(days=6))
+    head = dated(repo, "head", START - timedelta(hours=1))
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", boundary)
+    commits, older = health.backlog_scope(repo, head, START)
+    assert [sha for sha, _ in commits] == [head, child] and older == 1
+    assert before not in dict(commits) and boundary not in dict(commits) and old not in dict(commits)
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", child)
+    assert [sha for sha, _ in health.backlog_scope(repo, head, START)[0]] == [head]  # the boundary's child is checked
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", "f" * 40)
+    with pytest.raises(health.Unknown, match="rollout commit"):
+        health.backlog_scope(repo, head, START)
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", boundary)
+    entry = health.backlog_metric(repo, FakeBacklog(syncs=[sync_attempt(1, head), sync_attempt(2, child)]), head, START)
+    assert entry["reason"] == (f"0 unsynced, 0 pending, 2 synced of 2 main commit(s) after {boundary[:12]}; not checked: "
+                               f"{boundary[:12]} and earlier, 1 later commit(s) older than 7 days")
+    assert old not in {row["sha"] for row in entry["commits"]} and entry["numbers"]["not_checked"] == 1
+    entry = health.backlog_metric(repo, FakeBacklog(), boundary, START)  # TARGET is the rollout commit itself
+    assert entry["state"] == PASS and entry["commits"] == [] and entry["reason"] == (
+        f"no main commit in scope; not checked: {boundary[:12]} and earlier, 0 later commit(s) older than 7 days")
+
+
+# spec: ANYM-503
+def test_pending_and_unsynced_commits_together_fail_and_both_are_listed_with_dates_out_of_order(repo, server,
+                                                                                               monkeypatch):
+    history(repo)
+    boundary = dated(repo, "boundary", START - timedelta(days=2))
+    lost = dated(repo, "lost", START - timedelta(minutes=10))  # committed after its first-parent child
+    fresh = dated(repo, "fresh", START - timedelta(hours=5))
+    done = dated(repo, "done", START - timedelta(hours=3))
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", boundary)
+    server.world(done)
+    backlog = FakeBacklog(syncs=[sync_attempt(1, lost, "failure", 100), sync_attempt(2, done),
+                                 sync_attempt(3, fresh, status="in_progress", minutes=5)],
+                          ci=[ci_attempt(9, lost, minutes=100)])
+    clock = Clock()
+    data = report(repo, Tiden(server.cli, "product", "workspace"), done, "refs/remotes/origin/main", False, clock,
+                  clock.sleep, backlog=backlog, now=lambda: START)
+    code = outcome(data)
+    entry = data["metrics"].pop("sync_backlog")
+    assert code == 1 and set(states(data).values()) == {PASS}
+    assert entry["state"] == FAIL and [row["sha"] for row in entry["commits"]] == [done, fresh, lost]
+    assert [row["state"] for row in entry["commits"]] == ["synced", "pending", "unsynced"]
+    assert entry["findings"] == [f"{lost}: last sync failure; CI push run success at {ago(100)}; last run "
+                                 f"https://example.invalid/runs/1; gh workflow run tiden-sync.yml --ref main -f sha={lost}"]
+    assert entry["warnings"] == [f"{fresh}: Tiden sync run in_progress"]
+    assert entry["numbers"] == {"since": boundary, "head": done, "in_scope": 3, "not_checked": 0, "synced": 1,
+                                     "pending": 1, "unsynced": 1}
+    data["metrics"]["sync_backlog"] = entry
+    text = "\n".join(health.render(data, code))
+    assert "| sync_backlog | fail | 1 unsynced, 1 pending, 1 synced of 3 main commit(s)" in text
+    assert f"gh workflow run tiden-sync.yml --ref main -f sha={lost}" in text and "### sync_backlog: 1 warning(s)" in text
+    lower = START - timedelta(hours=5) - timedelta(days=1)
+    assert [(call[0], call[1], call[2], call[3]) for call in backlog.calls] == [
+        ("tiden-sync.yml", lower, 1120.0, ()), ("ci.yml", lower, 1120.0, ("event=push",))]  # one 120 s budget
+    assert health.backlog_lines(entry) == [
+        f"synced {done}", f"pending {fresh} Tiden sync run in_progress",
+        f"unsynced {lost} last sync failure; CI push run success at {ago(100)}; last run "
+        f"https://example.invalid/runs/1; gh workflow run tiden-sync.yml --ref main -f sha={lost}"]
+
+
+# spec: ANYM-503
+def test_a_pending_commit_alone_passes_with_a_warning_and_an_all_synced_backlog_skips_the_ci_listing(repo, server,
+                                                                                                     monkeypatch):
+    boundary = dated(repo, "boundary", START - timedelta(days=1))
+    head = dated(repo, "head", START - timedelta(minutes=20))
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", boundary)
+    entry = health.backlog_metric(repo, FakeBacklog(ci=[ci_attempt(9, head, minutes=5)]), head, START)
+    assert entry["state"] == PASS and entry["warnings"] == [f"{head}: CI push run completed less than 30 min ago"]
+    backlog = FakeBacklog(syncs=[sync_attempt(1, head)])
+    entry = health.backlog_metric(repo, backlog, head, START)
+    assert entry["state"] == PASS and not entry["warnings"] and [call[0] for call in backlog.calls] == ["tiden-sync.yml"]
+
+
+# spec: ANYM-503
+@pytest.mark.parametrize(("error", "reason"), [
+    (health.Unknown("gh api pagination is incomplete"), "gh api pagination is incomplete"),
+    (health.Unknown("gh api exited 1"), "gh api exited 1"),
+    (health.Unknown("gh api timed out"), "gh api timed out"),
+    (KeyError(SECRET), "unexpected KeyError while measuring"),
+])
+def test_a_backlog_listing_error_makes_only_the_backlog_unknown(repo, server, monkeypatch, error, reason):
+    a, b = history(repo)
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", a)
+    server.world(b)
+    _, before = measure(repo, server, b)
+    clock = Clock()
+    data = report(repo, Tiden(server.cli, "product", "workspace"), b, "refs/remotes/origin/main", False, clock,
+                  clock.sleep, backlog=FakeBacklog(error=error), now=lambda: datetime.now(timezone.utc))
+    entry = data["metrics"].pop("sync_backlog")
+    assert entry["state"] == UNKNOWN and entry["reason"] == reason and SECRET not in json.dumps(entry)
+    assert outcome({"metrics": {"sync_backlog": entry}}) == 2
+    assert {name: (value["state"], value["reason"]) for name, value in data["metrics"].items()} == \
+        {name: (value["state"], value["reason"]) for name, value in before["metrics"].items()}
+
+
+# spec: ANYM-503
+def test_a_backlog_listing_that_returns_after_its_120_s_budget_makes_only_the_backlog_unknown(repo, server,
+                                                                                               monkeypatch):
+    a = dated(repo, "boundary", START - timedelta(days=1))
+    b = dated(repo, "head", START - timedelta(hours=2))
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", a)
+    server.world(b)
+    _, before = measure(repo, server, b)
+    now = START
+    rows = {"syncs": [sync_attempt(1, b, "failure")], "ci": [ci_attempt(9, b)]}
+    assert health.backlog_metric(repo, FakeBacklog(**rows, elapse=59), b, now)["state"] == FAIL  # 118 s: in budget
+    clock = Clock()
+    data = report(repo, Tiden(server.cli, "product", "workspace"), b, "refs/remotes/origin/main", False, clock,
+                  clock.sleep, backlog=FakeBacklog(**rows, elapse=60), now=lambda: now)  # the last page at 120 s
+    entry = data["metrics"].pop("sync_backlog")
+    assert (entry["state"], entry["reason"]) == (UNKNOWN, "gh api timed out")
+    assert {name: (value["state"], value["reason"]) for name, value in data["metrics"].items()} == \
+        {name: (value["state"], value["reason"]) for name, value in before["metrics"].items()}
+
+
+# spec: ANYM-503
+def test_a_truncated_backlog_listing_through_gh_is_unknown(repo, server, gh, monkeypatch):
+    a, b = history(repo)
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", a)
+    gh.set(rows=[sync_row(1, "a" * 40, created_at="2099-01-01T00:00:00Z")], total=2)
+    with pytest.raises(health.Unknown, match="pagination is incomplete"):
+        health.backlog_metric(repo, health.Actions("o/r", gh.cli), b, datetime.now(timezone.utc))
+
+
+# spec: ANYM-503
+def test_the_backlog_is_measured_without_test_evidence_and_without_tiden_configuration(repo, server, monkeypatch):
+    a, b = history(repo)
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", a)
+    server.world(b, runs=[[]])  # no Tiden run of TARGET: the unlinked tests stay unknown after the bound
+    clock = Clock()
+    backlog = FakeBacklog(syncs=[sync_attempt(1, b)])
+    now = datetime.now(timezone.utc)
+    data = report(repo, Tiden(server.cli, "product", "workspace"), b, "refs/remotes/origin/main", False, clock,
+                  clock.sleep, backlog=backlog, now=lambda: now)
+    assert states(data)["unlinked_tests"] == UNKNOWN and data["metrics"]["sync_backlog"]["state"] == PASS
+    server.set(calls=[])
+    data = report(repo, Tiden(server.cli, "product", "workspace"), b, "refs/remotes/origin/main", False, clock,
+                  clock.sleep, unconfigured="Tiden is not configured", backlog=backlog, now=lambda: now)
+    assert data["metrics"].pop("sync_backlog")["state"] == PASS and set(states(data).values()) == {UNKNOWN}
+    assert server.state()["calls"] == []
+
+
+def watcher(repo, gh, since, *extra):
+    return subprocess.run([*script(since), "--root", str(repo), "--gh", gh.cli, "--sync-backlog-only", *extra],
+                          capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "FAKE_GH_STATE": gh.state})
+
+
+# spec: ANYM-503
+def test_the_watcher_mode_fetches_main_needs_no_tiden_and_exits_0_1_or_2(repo, gh):
+    a, b = history(repo)
+    git(repo, "update-ref", "refs/remotes/origin/main", a)  # stale until the watcher fetches main
+    now = datetime.now(timezone.utc)
+    stamp = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    gh.set(by_workflow={"tiden-sync.yml": [sync_row(5, b, updated=stamp, created_at=stamp, run_started_at=stamp)]},
+           rows=[])
+    completed = watcher(repo, gh, a, "--sync-repository", "o/r")
+    assert (completed.returncode, completed.stdout, completed.stderr) == (0, f"synced {b}\n", "")
+    gh.set(by_workflow={"tiden-sync.yml": [sync_row(5, b, "failure", stamp, created_at=stamp, run_started_at=stamp)],
+                        "ci.yml": [{**sync_row(9, b, updated=stamp, title="CI", head=b), "event": "push",
+                                    "created_at": stamp, "run_started_at": stamp}]}, rows=[])
+    completed = watcher(repo, gh, a, "--sync-repository", "o/r")
+    assert completed.returncode == 1 and completed.stdout == (
+        f"unsynced {b} last sync failure; CI push run success at {stamp}; last run https://example.invalid/runs/5; "
+        f"gh workflow run tiden-sync.yml --ref main -f sha={b}\n")
+    gh.set(rows=[], mode="exit")
+    completed = watcher(repo, gh, a, "--sync-repository", "o/r")
+    assert (completed.returncode, completed.stdout) == (2, "") and completed.stderr == "unknown: gh api exited 1\n"
+    completed = watcher(repo, gh, a)
+    assert completed.returncode == 2 and "needs --sync-repository" in completed.stderr
+    assert SECRET not in completed.stdout + completed.stderr
 
 
 # The workflow.
