@@ -397,7 +397,7 @@ def test_migrate_gives_up_on_a_busy_messages_table_without_stalling_writers(seed
         lambda c: c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE'))
     assert outcome == ['lock_not_available']
     assert writer_seconds < 5 and migrate_seconds < 10
-    assert schema_state(store) == ('43', 43, True)
+    assert schema_state(store) == ('44', 44, True)
     store.migrate()
 
 
@@ -414,4 +414,4 @@ def test_migrate_lock_timeout_rolls_back_migrations_it_already_applied(database,
         # Nothing of 017-021 stays: same version, no new migration rows, no new table.
         assert schema_state(store) == ('16', 16, False)
         store.migrate()
-        assert schema_state(store) == ('43', 43, True)
+        assert schema_state(store) == ('44', 44, True)
