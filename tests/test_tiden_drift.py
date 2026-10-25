@@ -418,7 +418,8 @@ def test_the_exclusion_categories_are_exactly_the_reviewed_set():
     assert [pattern for pattern, _ in EXCLUDED] == [
         "*.md", "docs/*", ".claude/*", "tests/*", "*/tests/*", "*_test.go", "*.test.mjs", "*.test.js", "*.test.ts",
         "*/fixtures/*", "*/testdata/*", "uv.lock", "*/uv.lock", "package-lock.json", "*/package-lock.json",
-        "*/go.sum", "*/go.mod", "*/requirements*.in", "*/requirements*.txt", "*/requirements*.lock"]
+        "*/go.sum", "*/go.mod", "*/requirements*.in", "*/requirements*.txt", "*/requirements*.lock",
+        "LICENSE", "*/LICENSE", "*-LICENSE"]
     assert all(reason for _, reason in EXCLUDED)
 
 
@@ -430,6 +431,26 @@ def test_no_tracked_code_file_is_excluded():
         assert manifest in code
     for path in ("scripts/tiden_drift.py", ".github/workflows/tiden-drift.yml", "deploy/main-ruleset.json",
                  "whatsapp/whatsmeow/main.go", "services/messaging/messaging_service/app.py"):
+        assert not excluded(path)
+
+
+LICENCE_TEXTS = {"LICENSE", "services/messaging/LICENSE", "services/calendar/LICENSE", "services/calls/LICENSE",
+                 "packages/npm/LICENSE", "packages/platform-contracts/LICENSE", "packages/deedkit/LICENSE",
+                 "licenses/age-LICENSE", "deploy/MOBY-LICENSE"}
+
+
+# spec: ANYM-504
+def test_the_licence_patterns_match_exactly_the_nine_licence_texts():
+    tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"], check=True, capture_output=True,
+                             text=True).stdout.split("\0")
+    from fnmatch import fnmatchcase
+    licence = [pattern for pattern, reason in EXCLUDED if reason == "licence text"]
+    assert licence == ["LICENSE", "*/LICENSE", "*-LICENSE"]
+    assert {path for path in tracked if any(fnmatchcase(path, pattern) for pattern in licence)} == LICENCE_TEXTS
+    assert all(excluded(path) for path in LICENCE_TEXTS)
+    # Build contexts, enforcement and manifests stay checked.
+    for path in ("Dockerfile", ".dockerignore", ".gitignore", ".github/dco.yml", "deploy/.env.example",
+                 "pyproject.toml", "services/gateway/Dockerfile", "services/gateway/Dockerfile.dockerignore"):
         assert not excluded(path)
 
 

@@ -3,10 +3,14 @@
 
 Four metrics, each `pass`, `fail` or `unknown` with its reason: drift (the watermark covers TARGET), unlinked tests
 (per suite and overall, against the Tiden main run of TARGET, read after the `Tiden sync` run of TARGET has finished,
-ANYM-438), stale anchors (repo_file sources of untracked paths) and Done specs with an open check marker. Exit 0 when all pass, 1 when any fails, 2 when none fails and any is
+ANYM-438), stale anchors (repo_file sources of untracked paths) and Done specs with an open check marker. With
+`--sync-repository` a fifth, the sync backlog (ANYM-503): every recent first-parent main commit up to TARGET has a
+successful `Tiden sync` run. Exit 0 when all pass, 1 when any fails, 2 when none fails and any is
 unknown. Every input must be provably complete; anything else makes the metrics that need it unknown, never green.
-It writes nothing to Tiden, and to Git only a fetch of main when `--fetch` is given (the workflow does). With
-`--sync-repository` it also lists that repository's workflow runs through `gh api` (read-only).
+It writes nothing to Tiden, and to Git only a fetch of main when `--fetch` or `--sync-backlog-only` is given (the
+workflow passes `--fetch`). With `--sync-repository` it also lists that repository's workflow runs through `gh api`
+(read-only). `--sync-backlog-only` (the orchestrator's watcher) measures the sync backlog alone up to the fetched main
+head, without Tiden, and prints one line per commit.
 """
 from __future__ import annotations
 
@@ -53,6 +57,18 @@ SHA = re.compile(r"[0-9a-f]{40}")
 REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SYNC_WORKFLOW, SYNC_PAGE_SIZE, SYNC_MAX_PAGES = "tiden-sync.yml", 100, 10
 SYNC_SLACK = timedelta(days=1)  # a run that processes TARGET is created after TARGET exists; the slack covers clock skew
+# The sync backlog (ANYM-503). The rollout commit, the base of the pull request that added the check: it and older
+# commits are not checked (sync runs before 1a4b78d carry no `Tiden sync <sha>` title).
+SYNC_BACKLOG_SINCE = "b61f412a0ab5e2c596d268f159cba4061949886d"
+CI_WORKFLOW = "ci.yml"
+BACKLOG_WINDOW = timedelta(days=7)
+SYNC_STUCK = timedelta(minutes=45)  # an active sync run started longer ago is stuck
+CI_GRACE = timedelta(minutes=30)  # after the CI push run completes, sync B has this long to succeed
+CI_STUCK = timedelta(minutes=90)  # a CI attempt running longer is stuck
+CI_ABSENT = timedelta(minutes=60)  # a commit pushed longer ago without a CI push run is unsynced
+ACTIVE = ("queued", "in_progress", "waiting", "requested", "pending")
+SYNCED, PENDING, UNSYNCED = "synced", "pending", "unsynced"
+DISPATCH = "gh workflow run tiden-sync.yml --ref main -f sha={sha}"
 TIMEOUT = 120
 RETRY_DELAY = 2  # seconds before the one retry of a listing
 RETRY_MIN = 10  # a retry needs at least this many seconds left of the call's one TIMEOUT budget
@@ -292,11 +308,13 @@ class Actions:
     def __init__(self, repository: str, gh: str = "gh", clock=time.monotonic):
         self.repository, self.gh, self.clock = repository, gh, clock
 
-    def page(self, number: int, created: str, end: float) -> dict:
+    def page(self, number: int, created: str, end: float, workflow: str = SYNC_WORKFLOW,
+             filters: tuple[str, ...] = ()) -> dict:
         if not REPOSITORY_NAME.fullmatch(self.repository) or any(not part.strip(".") for part in self.repository.split("/")):
             raise Unknown("the sync lookup repository is not owner/name")
-        endpoint = f"repos/{self.repository}/actions/workflows/{SYNC_WORKFLOW}/runs"
-        command = [self.gh, "api", "--method", "GET", endpoint, "-f", "branch=main", "-f", f"created=>={created}",
+        endpoint = f"repos/{self.repository}/actions/workflows/{workflow}/runs"
+        command = [self.gh, "api", "--method", "GET", endpoint, "-f", "branch=main",
+                   *(part for value in filters for part in ("-f", value)), "-f", f"created=>={created}",
                    "-F", f"per_page={SYNC_PAGE_SIZE}", "-F", f"page={number}"]
         try:
             # All pages of one lookup share one TIMEOUT budget, so a slow API cannot outlast the report's deadlines.
@@ -319,11 +337,15 @@ class Actions:
         """Every run created at or after SINCE (a rerun keeps its `created_at`, so no run of TARGET is hidden by
         age); the pages count only when their rows equal `total_count`, which GitHub caps at 1000. The pages take
         WITHIN seconds (what the report deadline leaves) at the most."""
+        return self.listing(since, self.clock() + (TIMEOUT if within is None else min(TIMEOUT, within)))
+
+    def listing(self, since: datetime, end: float, workflow: str = SYNC_WORKFLOW,
+                filters: tuple[str, ...] = ()) -> list[dict]:
+        """The runs of WORKFLOW on main created at or after SINCE, every page before END (monotonic)."""
         created = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        end = self.clock() + (TIMEOUT if within is None else min(TIMEOUT, within))
         rows: list[dict] = []
         for number in range(1, SYNC_MAX_PAGES + 1):
-            page = self.page(number, created, end)
+            page = self.page(number, created, end, workflow, filters)
             batch, total = page.get("workflow_runs") if isinstance(page, dict) else None, \
                 page.get("total_count") if isinstance(page, dict) else None
             if not isinstance(batch, list) or type(total) is not int or total < 0:
@@ -369,6 +391,111 @@ def await_sync(actions: Actions, target: str, since: datetime, deadline: float, 
 
 def metric(state: str, reason: str, **values) -> dict:
     return {"state": state, "reason": reason, "numbers": {}, "findings": [], "warnings": [], **values}
+
+
+def backlog_scope(root: Path, head: str, start: datetime) -> tuple[list[tuple[str, datetime]], int]:
+    """The first-parent commits of main after SYNC_BACKLOG_SINCE up to HEAD, newest first, whose committer date is
+    within BACKLOG_WINDOW of START; and how many in that range are older, so not checked."""
+    if not present(root, SYNC_BACKLOG_SINCE) or not ancestor(root, SYNC_BACKLOG_SINCE, head):
+        raise Unknown(f"the rollout commit {SYNC_BACKLOG_SINCE} is not on main's history")
+    commits, older = [], 0
+    text = git(root, "log", "--first-parent", "--format=%H %cI", f"{SYNC_BACKLOG_SINCE}..{head}").decode("ascii")
+    for line in text.splitlines():
+        sha, _, stamp = line.partition(" ")
+        committed = moment(stamp)
+        if not SHA.fullmatch(sha) or committed is None:
+            raise Unknown("git log returned a malformed commit line")
+        if committed > start - BACKLOG_WINDOW:
+            commits.append((sha, committed))
+        else:
+            older += 1
+    return commits, older
+
+
+def started(run: dict) -> datetime:
+    stamp = moment(run.get("run_started_at"))
+    if stamp is None:
+        raise Unknown("gh api returned a run without its start time")
+    return stamp
+
+
+def backlog_decision(sha: str, committed: datetime, syncs: list[dict], ci: list[dict] | None,
+                     start: datetime) -> tuple[str, str, str | None]:
+    """(state, reason, last sync run URL) of one main commit (ANYM-503). Each listed run carries its latest attempt;
+    skipped sync runs processed nothing. CI is None when the caller has not listed it: only a synced commit or one
+    with an active sync run is decided without it."""
+    kept = sync_runs(syncs, sha)
+    last = decisive(kept) if kept else None
+    url = last["html_url"] if last else None
+    if any(run["conclusion"] == "success" for run in kept):
+        return SYNCED, "", url
+    active = [run for run in kept if run["status"] in ACTIVE]
+    if active:
+        newest = max(active, key=started)
+        if start - started(newest) < SYNC_STUCK:
+            return PENDING, f"Tiden sync run {newest['status']}", url
+        return UNSYNCED, f"stuck {newest['status']}", url
+    if ci is None:
+        raise Unknown("the CI push runs were not listed")
+    previous = f"last sync {last['conclusion']}" if last else "no sync run"
+    pushes = [run for run in ci if run.get("event") == "push" and run.get("head_sha") == sha]
+    if pushes:
+        run = max(pushes, key=lambda run: (moment(run.get("created_at")) or started(run), run["id"]))
+        if run["status"] == "completed":
+            if start - moment(run["updated_at"]) >= CI_GRACE:
+                return UNSYNCED, f"{previous}; CI push run {run['conclusion']} at {run['updated_at']}", url
+            return PENDING, "CI push run completed less than 30 min ago", url
+        if start - started(run) < CI_STUCK:
+            return PENDING, f"CI push run {run['status']}", url
+        return UNSYNCED, f"{previous}; CI attempt running over 90 min", url
+    if start - committed > CI_ABSENT:
+        return UNSYNCED, f"{previous}; no CI push run", url
+    return PENDING, "no CI push run yet", url
+
+
+def backlog_metric(root: Path, actions: Actions, head: str, start: datetime) -> dict:
+    """Every first-parent main commit in scope up to HEAD has a successful `Tiden sync` run (ANYM-503). Its own
+    listings share one TIMEOUT budget; a failed, truncated or late listing makes the metric unknown."""
+    commits, older = backlog_scope(root, head, start)
+    numbers = {"since": SYNC_BACKLOG_SINCE, "head": head, "in_scope": len(commits), "not_checked": older}
+    if not commits:
+        return metric(PASS, "no main commit in scope", numbers=numbers, commits=[])
+    end = actions.clock() + TIMEOUT
+    lower = min(committed for _, committed in commits) - SYNC_SLACK
+    syncs = actions.listing(lower, end)
+    ci = None
+    if any(not any(run["conclusion"] == "success" or run["status"] in ACTIVE for run in sync_runs(syncs, sha))
+           for sha, _ in commits):
+        ci = actions.listing(lower, end, CI_WORKFLOW, ("event=push",))
+    rows, findings, warnings = [], [], []
+    for sha, committed in commits:
+        state, reason, url = backlog_decision(sha, committed, syncs, ci, start)
+        rows.append({"sha": sha, "state": state, "reason": reason, "url": url,
+                     "dispatch": DISPATCH.format(sha=sha) if state == UNSYNCED else None})
+        if state == UNSYNCED:
+            findings.append(f"{sha}: {shown(reason)}; last run {shown(url or 'none')}; {DISPATCH.format(sha=sha)}")
+        elif state == PENDING:
+            warnings.append(f"{sha}: {shown(reason)}")
+    numbers |= {state: sum(row["state"] == state for row in rows) for state in (SYNCED, PENDING, UNSYNCED)}
+    reason = (f"{numbers[UNSYNCED]} unsynced, {numbers[PENDING]} pending, {numbers[SYNCED]} synced of {len(rows)} main "
+              f"commit(s) after {SYNC_BACKLOG_SINCE[:12]}")
+    result = metric(FAIL if findings else PASS, reason, numbers=numbers, commits=rows)
+    result["findings"], result["warnings"] = findings, warnings
+    return result
+
+
+def backlog_lines(entry: dict) -> list[str]:
+    """One watcher line per commit in scope: `synced|pending|unsynced <sha> [reason, last run URL, dispatch]`."""
+    lines = []
+    for row in entry["commits"]:
+        if row["state"] == SYNCED:
+            lines.append(f"{SYNCED} {row['sha']}")
+        elif row["state"] == PENDING:
+            lines.append(f"{PENDING} {row['sha']} {shown(row['reason'])}")
+        else:
+            lines.append(f"{UNSYNCED} {row['sha']} {shown(row['reason'])}; last run {shown(row['url'] or 'none')}; "
+                         f"{row['dispatch']}")
+    return lines
 
 
 def drift_metric(root: Path, tiden: Tiden, target: str, main_ref: str, fetch: bool, deadline: float,
@@ -583,10 +710,13 @@ def unlinked_metric(cases: list[dict], results: list[dict], seq: int, listed: di
 
 
 def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool, clock=time.monotonic,
-           sleep=time.sleep, unconfigured: str | None = None, actions: Actions | None = None) -> dict:
+           sleep=time.sleep, unconfigured: str | None = None, actions: Actions | None = None,
+           backlog: Actions | None = None, now=lambda: datetime.now(timezone.utc)) -> dict:
     """The four metrics at TARGET; `unconfigured` names missing Tiden configuration, which makes every one unknown.
-    With `actions` the unlinked-test count is read only after the sync run of TARGET succeeded (ANYM-438)."""
-    start = clock()
+    With `actions` the unlinked-test count is read only after the sync run of TARGET succeeded (ANYM-438). With
+    `backlog`, its own lookup, the sync backlog up to TARGET is the fifth metric (ANYM-503); it needs no Tiden
+    configuration and is measured last, whatever the others found."""
+    start, began = clock(), now()
     data = {"target": None, "observedAt": datetime.now(timezone.utc).isoformat(), "evidence": {},
             "sync": {"checked": actions is not None, "target": None, "run_id": None, "run_attempt": None, "url": None,
                      "conclusion": None, "completed_at": None, "inventory_read_at": None}, "metrics": {}}
@@ -599,10 +729,10 @@ def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool
         target = data["target"] = commit(root, target_ref)
         if not ancestor(root, target, main_ref):
             raise Unknown("TARGET is not on main's history")
-        if unconfigured:
-            raise Unknown(unconfigured)
     except Unknown as error:
         data["metrics"] = {name: metric(UNKNOWN, str(error)) for name in names}
+        if backlog is not None:
+            data["metrics"]["sync_backlog"] = metric(UNKNOWN, str(error))
         return data
 
     def measure(name, compute):
@@ -615,6 +745,16 @@ def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool
         except Exception as error:  # noqa: BLE001 - any other defect leaves this metric unknown; the report is still written
             data["metrics"][name] = metric(UNKNOWN, f"unexpected {type(error).__name__} while measuring")
 
+    def finish() -> dict:
+        data["metrics"] = {name: data["metrics"][name] for name in names}
+        if backlog is not None:
+            measure("sync_backlog", lambda: backlog_metric(root, backlog, target, began))
+        data["observedAt"] = datetime.now(timezone.utc).isoformat()
+        return data
+
+    if unconfigured:
+        data["metrics"] = {name: metric(UNKNOWN, unconfigured) for name in names}
+        return finish()
     measure("drift", lambda: drift_metric(root, tiden, target, main_ref, fetch, start + DRIFT_WAIT, clock, sleep))
     try:
         specs: list[dict] | Unknown = tiden.specs()
@@ -666,9 +806,7 @@ def report(root: Path, tiden: Tiden, target_ref: str, main_ref: str, fetch: bool
         return unlinked_metric(cases, tiden.results(run["seqNum"]), run["seqNum"], listed, list_errors)
 
     measure("unlinked_tests", unlinked)
-    data["metrics"] = {name: data["metrics"][name] for name in names}
-    data["observedAt"] = datetime.now(timezone.utc).isoformat()
-    return data
+    return finish()
 
 
 def outcome(data: dict) -> int:
@@ -700,6 +838,8 @@ def render(data: dict, code: int) -> list[str]:
     if older:
         lines.append(f"Not evidence for TARGET: newest completed main run {older['seqNum']} is for its own SHA "
                      f"`{older['buildSha']}` ({older['status']}, live-doc {older['liveDocStatus']}).")
+    if "sync_backlog" not in data["metrics"]:
+        lines.append("Sync backlog of earlier main commits: not checked (no --sync-repository).")
     lines += ["", "| Metric | State | Reason |", "| --- | --- | --- |"]
     lines += [f"| {name} | {entry['state']} | {entry['reason']} |" for name, entry in data["metrics"].items()]
     drift = data["metrics"]["drift"]["numbers"].get("after_target")
@@ -726,6 +866,26 @@ def render(data: dict, code: int) -> list[str]:
     return lines
 
 
+def backlog_only(root: Path, main_ref: str, repository: str | None, gh: str,
+                 now=lambda: datetime.now(timezone.utc)) -> int:
+    """Watcher mode: exit 0 when no commit in scope is unsynced, 1 when any is, 2 when the metric is unknown (the
+    reason on stderr)."""
+    began = now()
+    try:
+        if not repository:
+            raise Unknown("--sync-backlog-only needs --sync-repository")
+        git(root, "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main")
+        entry = backlog_metric(root, Actions(repository, gh), commit(root, main_ref), began)
+    except Unknown as error:
+        print(f"unknown: {error}", file=sys.stderr)
+        return 2
+    except Exception as error:  # noqa: BLE001 - any other defect is unknown, never a pass
+        print(f"unknown: unexpected {type(error).__name__} while measuring", file=sys.stderr)
+        return 2
+    print("\n".join(backlog_lines(entry)))
+    return 1 if entry["state"] == FAIL else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only Tiden health report for one main commit (ANYM-360).")
     parser.add_argument("--product-id", default=os.environ.get("TIDEN_PRODUCT_ID"))
@@ -741,7 +901,12 @@ def main() -> int:
     parser.add_argument("--output", type=Path, help="write the full report as JSON")
     parser.add_argument("--require-token", action="store_true",
                         help="treat an unset TIDEN_API_TOKEN as missing configuration (the workflow passes it)")
+    parser.add_argument("--sync-backlog-only", action="store_true",
+                        help="fetch main and list each main commit in scope as synced, pending or unsynced; needs "
+                        "--sync-repository, no Tiden token (the orchestrator's watcher, ANYM-503)")
     args = parser.parse_args()
+    if args.sync_backlog_only:
+        return backlog_only(args.root.resolve(), args.main_ref, args.sync_repository, args.gh)
     # Missing configuration still writes a full report, every metric unknown, never a green run without one.
     unconfigured = None
     if not args.product_id or not args.workspace_id:
@@ -750,7 +915,8 @@ def main() -> int:
         unconfigured = "Tiden is not configured: TIDEN_API_TOKEN is not set (TIDEN-CI.md)"
     data = report(args.root.resolve(), Tiden(args.cli, args.product_id or "", args.workspace_id or ""), args.target,
                   args.main_ref, args.fetch, unconfigured=unconfigured,
-                  actions=None if args.sync_repository is None else Actions(args.sync_repository, args.gh))
+                  actions=None if args.sync_repository is None else Actions(args.sync_repository, args.gh),
+                  backlog=None if args.sync_repository is None else Actions(args.sync_repository, args.gh))
     code = outcome(data)
     lines = render(data, code)
     print("\n".join(lines))

@@ -402,6 +402,20 @@ def test_anchoring_resends_every_source_with_provenance_and_never_overwrites_a_r
     assert "anchors: 1 file(s) anchored to ANYM-12: app/new.py" in out
 
 
+# spec: ANYM-504
+def test_a_changed_licence_text_is_not_anchored(root, server):
+    server.set(main=[spec(12, sources=[anchor("app/core.py")])])
+    merged(root, server, {"services/calls/LICENSE": "licence text\n", "app/new.py": "y\n"}, "Spec: ANYM-12")
+    code, out = run(root, server)
+    assert code == 0, out
+    assert [source["repoPath"] for source in server.state()["sent_sources"][0]] == ["app/core.py", "app/new.py"]
+    assert "anchors: 1 file(s) anchored to ANYM-12: app/new.py" in out and "LICENSE" not in out
+    merged(root, server, {"services/calls/LICENSE": "licence text 2\n"}, "", number=8)
+    code, out = run(root, server)
+    assert code == 0, out
+    assert len(server.state()["sent_sources"]) == 1 and "0 code file(s)" in out
+
+
 # spec: ANYM-405
 def test_a_lost_source_or_no_named_spec_fails_the_anchors_step(root, server):
     server.set(main=[spec(12, sources=[anchor("app/core.py")]), spec(20, kind="Epic")], fault={"spec update": "drop"})

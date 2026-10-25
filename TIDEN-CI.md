@@ -332,6 +332,8 @@ bookkeeping a merge needs (harness process.md section 4):
   list; existing tests need none;
 - every changed code file outside drift's `EXCLUDED` list has a `repo_file`
   anchor on Tiden main, or the body names a spec for the sync to anchor it to.
+  Licence texts are in that list (ANYM-504), so a pull request that changes
+  only a `LICENSE` file needs no spec.
 
 Only a verdict fails the run, and so `CI gate`. A verdict is the check's list
 of problems in the job summary, or a refusal of the pull request's own content:
@@ -382,7 +384,9 @@ overlap and a run in progress is never cancelled (one concurrency group), becaus
 the sync is the only automated writer of anchors and replaces whole source lists.
 GitHub keeps one waiting run and drops an older waiting one. A later run does not
 cover an earlier commit, so dispatch a dropped run again from main with its SHA
-(`gh workflow run tiden-sync.yml --ref main -f sha=<sha>`).
+(`gh workflow run tiden-sync.yml --ref main -f sha=<sha>`). A failed or dropped
+sync is named by the `sync_backlog` metric of `Tiden health` and by the
+orchestrator's watcher (Tiden health, Sync backlog, ANYM-503).
 
 The run title (`run-name`) is `Tiden sync <sha>`: the commit the run processes,
 which is `github.event.workflow_run.head_sha` (the CI run's commit) for a
@@ -411,7 +415,8 @@ it is when the run starts, not its event commit, and runs
 1. It reads the watermark W (`tiden drift status`) and lists the files changed
    from W to that checkout, leaving out deletions and the categories in the
    checker's `EXCLUDED` list (Markdown and `docs/`, `.claude/`, tests and their
-   fixtures, lockfiles and dependency pins). Tests trace to specs through test
+   fixtures, lockfiles and dependency pins, licence texts: `LICENSE`,
+   `*/LICENSE`, `*-LICENSE`, ANYM-504). Tests trace to specs through test
    links, not anchors.
 2. Every remaining path needs a `repo_file` anchor on some spec on Tiden main.
    If one lacks it, the run fails, lists the paths in its summary and leaves the
@@ -458,8 +463,9 @@ reaches the report step alone, as `GH_TOKEN`. It is not a required check: a red 
 or promotion, and `CI`, `CI gate`, `checks / verify`, the seven `anymsg-ci::*`
 checks, `deploy/main-ruleset.json` and `production.py verify` do not read it.
 
-`scripts/tiden_health.py` computes four metrics for TARGET, each `pass`, `fail`
-or `unknown` with its reason, and exits 0 when all pass, 1 when any fails (after
+`scripts/tiden_health.py` computes four metrics for TARGET, and with
+`--sync-repository` (the workflow passes it) a fifth, the sync backlog (below),
+each `pass`, `fail` or `unknown` with its reason, and exits 0 when all pass, 1 when any fails (after
 printing every finding) and 2 when none fails and any is unknown. The run summary
 and the `tiden-health` artifact (`tiden-health.json`, uploaded even after a
 failure) hold every state, the numbers, TARGET and the evidence: the Tiden run's
@@ -530,6 +536,58 @@ summary hold a `sync` object: `target`, `run_id`, `run_attempt`, `url`,
 Rerun a failed `Tiden health` run after a missing or failed sync is repaired, as
 before; the ordering race itself needs no rerun.
 
+### Sync backlog
+
+The `sync_backlog` metric (ANYM-503) names every recent main commit whose `Tiden
+sync` did not succeed, so a lost sync is seen without waiting for the health run
+of a later push. Scope: the first-parent commits of `main` after the rollout
+commit `SYNC_BACKLOG_SINCE` in `scripts/tiden_health.py` (b61f412, the base of
+the pull request that added the check) up to TARGET, whose committer date is
+within 7 days of the check's start. The rollout commit, older commits and older
+dates are not checked, never reported as synced or missing (runs before 1a4b78d
+have no `Tiden sync <sha>` title). The check reads its own listings, the
+`tiden-sync.yml` runs and the `ci.yml` runs with event `push` of `main`, created
+since one day before the oldest commit in scope, every page (at most 10 of 100),
+all within one budget of 120 seconds. Each listed run carries its latest
+attempt. Per commit, `skipped` sync runs ignored:
+
+| Evidence (first match decides) | State |
+| --- | --- |
+| a `Tiden sync <sha>` run concluded `success` | synced |
+| a sync run queued, in progress, waiting, requested or pending, its attempt started under 45 minutes before the check | pending |
+| such a run started 45 minutes or more before | unsynced, `stuck <status>` |
+| the newest CI push run of the commit completed (any conclusion) under 30 minutes before the check (`updated_at`) | pending |
+| it completed 30 minutes or more before | unsynced |
+| it is still running, its attempt started under 90 minutes before | pending |
+| it started 90 minutes or more before | unsynced, `CI attempt running over 90 min` |
+| no CI push run, the commit is 60 minutes old or younger | pending |
+| no CI push run, the commit is older than 60 minutes | unsynced, `no CI push run` |
+
+A commit without a pull request is judged the same way (its sync succeeds with
+no work). Any unsynced commit fails the metric; otherwise any pending one passes
+it with a warning that lists it. Each unsynced commit is listed with its reason,
+its last sync run URL and the recovery line
+`gh workflow run tiden-sync.yml --ref main -f sha=<sha>`; dispatch it once the
+cause (for example a merge-preview refusal) is fixed. A listing error, a
+truncated listing, an overrun budget or a rollout commit missing from the clone
+makes only this metric unknown; the four others are unchanged, and it is
+measured whether or not test evidence was read, even without Tiden
+configuration. The artifact holds every commit in scope (`commits`) with its
+state.
+
+The orchestrator's watcher runs the same check every 10 minutes from a clean
+`main` checkout, without a Tiden token:
+
+```sh
+python3 scripts/tiden_health.py --sync-backlog-only --sync-repository GoSync-Inc/deedkit
+```
+
+It fetches `main`, prints one line per commit in scope (`synced <sha>`,
+`pending <sha> <reason>`, `unsynced <sha> <reason>; last run <url>; <dispatch
+command>`) and exits 0 when none is unsynced, 1 when any is and 2 when the metric
+is unknown (the reason on stderr). Worst case from a lost sync to its alert: the
+CI push run's 90 minutes plus one watcher interval.
+
 A historical anchor is provenance, not staleness: the 2026-10-16 reconciliation
 kept the former repository's anchors with their receipts and anchored each moved
 file again under `services/messaging/`
@@ -592,7 +650,8 @@ before its step's, failing the job in that case; it rewrites the receipt at
 every state change, so the warning and the receipt upload always run. The `production`
 record still fails on every Tiden error. The rule lasts until three consecutive
 automatic `Tiden health` runs (`workflow_run`, distinct TARGET SHAs, each
-upstream CI run `success`) report `## Tiden health: PASS`; a FAIL, UNKNOWN or
+upstream CI run `success`) report `## Tiden health: PASS`, which counts every
+metric, `sync_backlog` included; a FAIL, UNKNOWN or
 missing report resets the streak. Then a pull request makes a Tiden error in
 the release record fail the job again (ANYM-411 criterion 6). The
 `production` release is recorded by the dispatch in
