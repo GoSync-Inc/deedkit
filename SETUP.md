@@ -136,7 +136,11 @@ python3.13 -m venv .venv
 ```
 
 Prepare PostgreSQL 18, a private owner DSN file, a writable originals directory,
-then set `DATABASE_URL_FILE` and `PROBE_FILES` before `anymsg migrate`. Apply the
+then set `DATABASE_URL_FILE` and `PROBE_FILES` before `anymsg migrate`. Each lock wait in its
+`schema.sql` replay and in migrations up to 035 is bounded to 2 s (036 and later set their own
+bound, and some reset it for their last statements): behind an open transaction on a table it
+needs, it exits with `LockNotAvailable` and rolls back as a whole; run it again once that
+transaction ends. Apply the
 role SQL as owner and switch the gateway to its dedicated DSN before `anymsg serve`.
 Backups need PostgreSQL tools and age. OCR needs Poppler and Tesseract. Optional
 audio profiles need ffmpeg and their configured runtime/model dependencies.
