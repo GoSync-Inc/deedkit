@@ -33,11 +33,30 @@ GitHub.
 `tiden.md`). Maintenance windows are in TIDEN-CI.md.
 
 Close only an intent branch whose pull request merged or closed and whose session is closed;
-proposal and review branches stay open until implemented, and an intent branch with an open
+proposal and review branches stay open until implemented (a proposal's merge to Tiden main at the
+start of its work is the next section), and an intent branch with an open
 session or pull request stays open (closing it closes the session). Such a branch can stay
 `open` when its auto-merge status (`autoMerge` in `branch merge-preview`) never sees the merge,
 for example `no_merged_pr`. Close it with `tiden branch close --name <branch>` (CLI 0.40 or
 later): final, and it keeps specs, links and runs. Never `branch delete` it.
+
+## Proposal branch to Tiden main
+
+A proposal branch stays open while it is future-only; never merge it merely to register that
+its cards exist. Check A needs a pull request's specs on Tiden main or on the branch it names,
+and it refuses a branch that names an Epic or Feature with children, and the CLI cannot move one
+card off a branch keeping its number. So once the owner has accepted the proposal's cards into
+the ready queue and the first card's work starts, the worker of that first card:
+
+1. runs `tiden branch merge-preview` for the proposal: it must hold only the proposal's cards
+   and no conflicts; otherwise stop and report BLOCKED;
+2. merges the whole proposal to Tiden main and reads back the merged cards (IDs, statuses);
+3. then names each pull request's story on main (`Spec:` / `Delivers:`), not the branch.
+
+Cards on the proposal that are not accepted (Backlog, Review) merge with it and stay Backlog on
+main; the queue takes only accepted cards. This is not an exception that needs the owner's words
+and is not a relocation: no card is recreated or deleted, and IDs stay. Branch hygiene and
+closing: previous section.
 
 ## Agent feedback
 
