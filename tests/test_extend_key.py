@@ -1,4 +1,5 @@
 """In-place extension of a live messaging key (ANYM-422): same token, new expiry."""
+from contextlib import contextmanager
 from datetime import timedelta
 import hashlib
 import json
@@ -247,6 +248,13 @@ def test_cli_extend_key_requires_explicit_key_id_and_days(cli, arguments):
 @pytest.fixture
 def schema35_store(database, tmp_path):
     """An independent database built from the unchanged schema-35 SQL and checksums."""
+    with old_schema_store(database, tmp_path, 35) as old:
+        old.seed()
+        yield old
+
+
+@contextmanager
+def old_schema_store(database, tmp_path, last):
     name = 'anymsg_extend_' + uuid4().hex + '_test'
     dsn = database.pool.conninfo
     old = None
@@ -261,7 +269,7 @@ def schema35_store(database, tmp_path):
             c.execute(source.joinpath('schema.sql').read_text())
             for migration in sorted(source.joinpath('migrations').glob('*.sql')):
                 version = int(migration.name[:3])
-                if version > 35:
+                if version > last:
                     break
                 c.execute(migration.read_text())
                 if version == 17:
@@ -270,7 +278,6 @@ def schema35_store(database, tmp_path):
                 c.execute('INSERT INTO archive_migrations(version,sha256) VALUES(%s,%s)',
                     (version, hashlib.sha256(migration.read_bytes()).hexdigest()))
                 c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'", (str(version),))
-        old.seed()
         yield old
     finally:
         if old is not None:
@@ -338,30 +345,73 @@ def test_migration_036_gives_up_on_a_busy_audit_log_without_stalling_requests(sc
             c.execute("INSERT INTO audit_log(principal,operation,outcome) VALUES('agent-busy','not_an_operation','ok')")
 
 
-# spec: ANYM-422
-def test_migrate_gives_up_on_a_busy_messages_table_without_stalling_writers(seeded):
-    store = seeded[0]
+
+def wait_for_lock_request(conninfo, table):
+    with psycopg.connect(conninfo, autocommit=True) as watcher:
+        deadline = time.monotonic() + 10
+        while not watcher.execute('SELECT 1 FROM pg_locks WHERE relation=%s::regclass AND NOT granted',
+                (table,)).fetchone():
+            assert time.monotonic() < deadline, 'migrate never queued its lock request'
+            time.sleep(0.02)
+
+
+def migrate_behind_lock(store, table, mode, request):
+    """Holds `mode` on `table` in an open transaction, runs migrate in a thread, then runs `request`
+    once migrate's lock request is queued. Returns migrate's outcome and both durations."""
     holder = psycopg.connect(store.pool.conninfo)
+    outcome = []
+    def migrate():
+        try: store.migrate(); outcome.append('migrated')
+        except psycopg.errors.LockNotAvailable: outcome.append('lock_not_available')
+    worker = threading.Thread(target=migrate)
     try:
-        # An open writer holds ROW EXCLUSIVE on messages; schema.sql's CREATE INDEX IF NOT EXISTS needs SHARE.
-        holder.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE')
-        outcome = []
-        def migrate():
-            try: store.migrate(); outcome.append('migrated')
-            except psycopg.errors.LockNotAvailable: outcome.append('lock_not_available')
-        worker = threading.Thread(target=migrate)
+        holder.execute(sql.SQL('LOCK TABLE {} IN ' + mode + ' MODE').format(sql.Identifier(table)))
         started = time.monotonic()
         worker.start()
-        time.sleep(0.5)
-        # A new writer queued behind the migrate lock request still finishes in its 5 s budget.
+        wait_for_lock_request(store.pool.conninfo, table)
+        queued = time.monotonic()
         with store.pool.connection() as c:
-            c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE')
-        assert time.monotonic() - started < 5
-        worker.join(10)
-        assert outcome == ['lock_not_available']
-        with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '43'
+            request(c)
+        request_seconds = time.monotonic() - queued
+        worker.join(30)
+        return outcome, request_seconds, time.monotonic() - started
     finally:
         holder.rollback()
         holder.close()
+        worker.join(30)
+
+
+def schema_state(store):
+    with store.pool.connection() as c:
+        return (c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'],
+            c.execute('SELECT max(version) AS v FROM archive_migrations').fetchone()['v'],
+            c.execute("SELECT to_regclass('message_conflicts') IS NOT NULL AS t").fetchone()['t'])
+
+
+# spec: ANYM-422
+def test_migrate_gives_up_on_a_busy_messages_table_without_stalling_writers(seeded):
+    store = seeded[0]
+    # An open writer holds ROW EXCLUSIVE on messages; schema.sql's CREATE INDEX IF NOT EXISTS needs SHARE,
+    # and a new writer queues behind that request.
+    outcome, writer_seconds, migrate_seconds = migrate_behind_lock(store, 'messages', 'ROW EXCLUSIVE',
+        lambda c: c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE'))
+    assert outcome == ['lock_not_available']
+    assert writer_seconds < 5 and migrate_seconds < 10
+    assert schema_state(store) == ('43', 43, True)
     store.migrate()
+
+
+# spec: ANYM-422
+def test_migrate_lock_timeout_rolls_back_migrations_it_already_applied(database, tmp_path):
+    with old_schema_store(database, tmp_path, 16) as store:
+        assert schema_state(store) == ('16', 16, False)
+        # 017-021 apply, then 022's ALTER TABLE principals waits behind a reader; a request reading
+        # principals queues behind that ACCESS EXCLUSIVE request.
+        outcome, request_seconds, migrate_seconds = migrate_behind_lock(store, 'principals', 'ACCESS SHARE',
+            lambda c: c.execute('SELECT count(*) FROM principals').fetchone())
+        assert outcome == ['lock_not_available']
+        assert request_seconds < 5 and migrate_seconds < 10
+        # Nothing of 017-021 stays: same version, no new migration rows, no new table.
+        assert schema_state(store) == ('16', 16, False)
+        store.migrate()
+        assert schema_state(store) == ('43', 43, True)
