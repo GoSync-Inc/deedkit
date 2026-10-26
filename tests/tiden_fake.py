@@ -11,10 +11,11 @@ import sys
 import textwrap
 
 SECRET = "tfy_sentinel_secret_value"
-READS = {("spec", "list"), ("branch", "list"), ("branch", "merge-preview"), ("test", "list"), ("test", "links")}
+READS = {("spec", "list"), ("branch", "list"), ("branch", "merge-preview"), ("test", "list"), ("test", "links"),
+         ("gate", "check")}
 FAKE = textwrap.dedent(f"""\
     #!{sys.executable}
-    import json, os, sys, uuid
+    import json, os, sys, time, uuid
     path = os.environ["FAKE_TIDEN_STATE"]
     state = json.load(open(path))
     args = sys.argv[1:]
@@ -31,6 +32,7 @@ FAKE = textwrap.dedent(f"""\
         ("test", "links"): {{"--format"}},
         ("test", "link-spec"): {{"--spec-id", "--format"}},
         ("spec", "update"): {{"--id", "--sources-file", "--status", "--format"}},
+        ("gate", "check"): {{"--branch", "--product-id", "--format"}},
     }}
     command = tuple(args[:2])
     if command not in FLAGS:
@@ -91,6 +93,13 @@ FAKE = textwrap.dedent(f"""\
             if branch["name"] == name:
                 branch["status"] = "merged"
         save(); print(json.dumps({{"merged": True}}))
+    elif command == ("gate", "check"):
+        if fault == "sleep":
+            time.sleep(30)
+        # The 0.41.0 branch verdict exits 3 when it is not a pass, with the verdict on stdout.
+        gate = state.get("gate") or {{"exit": 0, "reply": {{"scope": "VERDICT_SCOPE_BRANCH",
+                                                           "status": "VERDICT_STATUS_PASS", "subjects": []}}}}
+        print(json.dumps(gate["reply"])); sys.exit(gate["exit"])
     elif command == ("test", "list"):
         rows = state.get("tests", [])
         print(json.dumps({{"view": "identity", "identities": rows,

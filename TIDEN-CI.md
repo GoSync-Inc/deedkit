@@ -335,6 +335,23 @@ bookkeeping a merge needs (harness process.md section 4):
   Licence texts are in that list (ANYM-504), so a pull request that changes
   only a `LICENSE` file needs no spec.
 
+When the body has a valid `Tiden branch:` line, the check then shows Tiden's
+own verdict for that branch (ANYM-541) as advisory lines, after its outcome and
+closing line are fixed and just above that line. It runs `tiden gate check
+--branch <branch> -f json` once, with a timeout of the lesser of 60 s and the
+time left in the step's 480 s minus a 60 s margin, counted from the script's
+start; with less than 10 s left it skips the call. A reply of the CLI 0.41.0
+shape, with exit 0 or 3 (3 is a verdict that is not a pass), prints the verdict
+and one line per spec, `ANYM-n <status> <state>`, for example `ANYM-527 Backlog
+no_test (planned)`: a ready card on its branch is `Backlog` without tests, so
+`no_test` is the expected state there. A spec the branch does not change but the
+verdict counts is marked `(neighbour)`. A timeout, another exit code, a reply
+that is not JSON or not that shape prints one line `Tiden branch gate: not
+checked (<reason>)` with a fixed reason and no CLI output. Spec bodies and
+Tiden's next-action text are never printed. These lines never change the
+check's outcome, exit code or closing line; making the branch verdict blocking
+is a later change of the required checks, which the owner keeps.
+
 Only a verdict fails the run, and so `CI gate`. A verdict is the check's list
 of problems in the job summary, or a refusal of the pull request's own content:
 a test file that does not parse, or a changed path that is not UTF-8. The body
