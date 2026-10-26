@@ -76,6 +76,9 @@ def valid(value):
 def gate_chat_info(c,answer):
     """Before migration 046 a chat_info result reads my_role unknown, as list_chats does (ANYM-533 criterion 2)."""
     from .store import schema_version
-    if (not isinstance(answer,dict) or not isinstance(answer.get('data'),dict) or 'my_role' not in answer['data'] or
-            schema_version(c)>=CHAT_ROLE_SCHEMA):return answer
-    return {**answer,'data':{**answer['data'],'my_role':'unknown','can_post':None}}
+    if not isinstance(answer,dict) or not isinstance(answer.get('data'),dict) or 'my_role' not in answer['data']:return answer
+    try:
+        # A savepoint: a failed lookup reads unknown and never fails the receipt read.
+        with c.transaction():ready=schema_version(c)>=CHAT_ROLE_SCHEMA
+    except Exception:ready=False
+    return answer if ready else {**answer,'data':{**answer['data'],'my_role':'unknown','can_post':None}}

@@ -283,3 +283,23 @@ def test_chat_info_result_reads_unknown_role_before_migration_046(database,tmp_p
         assert gate_chat_info(c,answer)==answer
     with database.pool.connection() as c:
         assert gate_chat_info(c,None) is None and gate_chat_info(c,{'outcome':'refused'})=={'outcome':'refused'}
+
+
+# spec: ANYM-533
+def test_chat_info_receipt_read_survives_a_failed_schema_lookup(database):
+    from messaging_service.chat_roles import gate_chat_info
+    answer={'outcome':'confirmed','data':{'title':'Owner notes','my_role':'creator','can_post':True}}
+    with database.pool.connection() as c:
+        with c.transaction():
+            c.execute('SELECT 1')
+            real=c.execute
+            def cancelled(query,*args,**kwargs):
+                # A real server-side error aborts the statement, as a cancelled lookup would.
+                if 'probe_metadata' in str(query):return real('SELECT 1/0')
+                return real(query,*args,**kwargs)
+            c.execute=cancelled
+            try:gated=gate_chat_info(c,answer)
+            finally:c.execute=real
+            # The surrounding transaction stays usable after the failed lookup.
+            assert c.execute('SELECT 2 AS n').fetchone()['n']==2
+    assert gated['data']['my_role']=='unknown' and gated['data']['can_post'] is None and gated['data']['title']=='Owner notes'
