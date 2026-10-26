@@ -132,6 +132,25 @@ Do not label a feature run as `main` just to make the main gate green. Failed
 evidence association fails the publication step. Without a token the job clearly
 states that reporting is not configured. No workspace credentials belong in Git.
 
+When `publish` completes a Tiden run whose status is `failed`, it then calls
+`run triage <seq> --limit 10 --cluster-exemplars 3 --failure-output-lines 0`
+(no baseline, so no new or pre-existing labels; ANYM-542) and adds one step
+summary line per group: `Tiden triage: <count> × <first exemplar test>:
+<message>`, the message cut to 200 characters without control characters.
+`tiden-triage.json` in the `tiden-receipt` artifact keeps only `triage: {groups:
+[{count, exemplar}]}`. A group shares a normalized message; that is a lead, not
+a proven common cause. Exit 0 of `run triage` means a triage was produced, not
+that the run passed. The call starts after the publication result and receipts
+are saved; its timeout is the lesser of 60 s and the publish step's 180 s minus
+a 30 s margin, counted from the script's start, and with under 10 s left it is
+skipped. A skipped, failed, slow or malformed triage writes one line `Tiden
+triage: not available (<reason>)` (`no time`, `timeout`, `exit <n>`,
+`malformed`, `CLI not started`, `unexpected error`) and changes neither the
+step's result nor any job; create, report and complete are never repeated.
+An unwritable receipt or summary adds `Tiden triage: receipt not written` or
+`summary not written` to the log and keeps the step's result.
+A passed, skipped or unmapped run makes no triage call.
+
 A publication failure is a warning, not a red gate. In this document a failed
 publication is a failed CLI install or publication step, and the reporting job
 still succeeds. That covers a Tiden error, a refused route or association, a
