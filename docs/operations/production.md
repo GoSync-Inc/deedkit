@@ -1227,10 +1227,11 @@ included) is revoked, disabled or expired, or a store's expiry would move earlie
 `extend-key`); the output lists the previous and new expiry per store. The backends extend by
 their own database clock, so these checks keep a one-hour margin: a credential ending within the
 hour, or one ending less than an hour before the new bound or later, refuses (issue a new key, or
-pick another N). The margin relies on every store's database sharing the admin host's clock: they
-run as containers on that host (deploy/compose.yaml, deploy/compose.calendar.yaml). A store moved to
-another host reopens ANYM-567 (each store checks the extend by its own clock). If a store still reads back an expiry before the gateway's current one, the
-gateway entry is left unchanged and the command stops. A rerun with `--operation` checks every
+pick another N). The margin relies on both backend databases (messaging, calendar) sharing the
+admin host's clock: they run as containers on that host (deploy/compose.yaml,
+deploy/compose.calendar.yaml). Moving either to another host needs ANYM-567 first (each store
+checks the extend by its own clock). If a store still reads back an expiry before the gateway's
+current one, the gateway entry is left unchanged and the command stops. A rerun with `--operation` checks every
 credential again (one revoked since refuses) and reads a step it had sent from its store instead of
 sending it again; sending one again is harmless, since each store sets its expiry under the
 principal lock and refuses a shorter one. `undo` of an extend is refused: expiries never move
