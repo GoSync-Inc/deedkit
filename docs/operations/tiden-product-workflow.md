@@ -31,8 +31,8 @@ Steps 1–4, the template and the scales: harness `tiden.md`. DeedKit's steps 5 
    get`: for a ready merge the card writer, once its ready-merge run read the specs back; for a
    pull request's own branch the orchestrator, once that squash's sync B run is green (TIDEN-CI.md,
    Main sync). A missing component is not set by a `spec update` on main (harness `tiden.md`,
-   Commands): the orchestrator lists it and sets it in the next maintenance window (TIDEN-CI.md,
-   Main sync).
+   Commands): the reader reports it to the orchestrator, which lists it in STATE.md and sets it
+   in the next maintenance window (TIDEN-CI.md, Main sync).
 
 The card template, categories and estimation scales are harness `tiden.md`. DeedKit's Effort
 reference pull requests: 1 = #59, 2 = #66, 3 = #52, 5 = #68, 8 = #40. `History:` names the DK-*
