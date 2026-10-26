@@ -608,7 +608,9 @@ def plan_link(state_now, linked, since, busy):
         if i in busy or now['status'] != 'received' or now['spec_ref']:
             continue
         refs = sorted(linked[i])
-        if len(refs) > 1:
+        if (now.get('note') or '').startswith(triage.HOLD):
+            rows.append((i, now, None, 'opt-in hold'))  # delivered but off: it waits for the owner (ANYM-570)
+        elif len(refs) > 1:
             rows.append((i, now, None, 'several cards'))
         elif not settled(now, since):
             rows.append((i, now, None, 'changed during read'))
@@ -686,6 +688,8 @@ def auto_run(args, ssh, read, live, gh, run, root, fetch, report):
             reason = 'card missing' if now['spec_ref'] in known['seen'] else 'waiting for main'
             if reason == 'waiting for main':
                 report['waiting_for_main'].append({'feedback': i, 'card': now['spec_ref'], 'age_hours': age(now, head)})
+        elif reason == 'no card' and now['status'] == 'received' and (now.get('note') or '').startswith(triage.HOLD):
+            reason = 'opt-in hold'
         elif reason == 'no card' and now['status'] == 'received':
             reason = 'waiting for a card'
             report['waiting_for_card'].append({'feedback': i, 'age_hours': age(now, head)})
