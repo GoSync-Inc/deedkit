@@ -6,7 +6,7 @@ services:
     env_file: ./private/calls.env
     environment:
       VOICE_DATA_DIR: /data
-      VOICE_AGENT_REGISTRY: /run/deedkit/agents.json
+      VOICE_AGENT_REGISTRY: /run/deedkit/agents/agents.json
       VOICE_BROWSER_ENABLED: "0"
       VOICE_EXTERNAL_MCP: "0"
       # The host-side Docker peer (docs/operations/production.md), never the integration subnet.
@@ -16,9 +16,12 @@ services:
         source: ${CALLS_STATE_DIR:?Set explicit existing calls state directory}
         target: /data
         bind: {create_host_path: false}
+      # The registry directory, never the file: a rename beside the live file reaches the
+      # running service on its next request (a single-file bind pins the old inode; ANYM-424).
+      # Archive configurations and their token files live in the same directory.
       - type: bind
-        source: ./private/calls-agents.json
-        target: /run/deedkit/agents.json
+        source: ./private/calls-agents
+        target: /run/deedkit/agents
         read_only: true
         bind: {create_host_path: false}
     networks: [integration, calls-egress]

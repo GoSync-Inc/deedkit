@@ -53,7 +53,11 @@ Calls agent API credentials are separate from the owner control token. An atomic
 private `VOICE_AGENT_REGISTRY` JSON file contains version 1, a monotonically
 increasing revision and principals with ID, SHA-256 key digest, enabled flag,
 timezone-aware expiry, scopes, channels and, for SIP only, exact destination
-allowlists. Phone, WhatsApp and Telegram have no recipient list (ANYM-288): an agent
+allowlists. Compose mounts the registry's directory read-only
+(`deploy/private/calls-agents/` at `/run/deedkit/agents/`, beside the archive
+configurations and their token files), so a revision renamed over `agents.json`
+is read on the next request without a restart; a single-file bind would keep the
+old inode (ANYM-424). Phone, WhatsApp and Telegram have no recipient list (ANYM-288): an agent
 may call a destination the owner named or one it found for the owner's task.
 `dial_call` carries the owner's own words (`owner_instruction`) and the destination's
 origin (`owner_named`, which the words must contain, or `agent_found` with evidence);
