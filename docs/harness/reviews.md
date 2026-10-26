@@ -113,9 +113,14 @@ VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <
 Codex reviews and the owner's other Codex work share one weekly meter across all projects (owner
 10-21: DeedKit, the Between production bot and fintrack use one Codex subscription); a point is
 one percent. The line is the shared pace, 100% over the meter's window, plus the add-on
-(`CODEX_LINE_OFFSET`, 30), capped at 100: reviews start early in a fresh window, and limits
-reset unused (owner 10-23; 10-24 «Набавку надо везде сделать»). Every project runs this same
-line; the meter has no per-project split, so a project's share cannot be measured on it
+(`CODEX_LINE_OFFSET`, 90), capped at 100. With 90 the line reaches 100 after about a tenth of the
+window (about 17 h of 7 days), so the gate can fire only in a fresh window, when the meter is
+already above 90%; after that every review starts, and risk-path and other reviews differ only
+by reviewer routing. The reason: Codex always stays with a large reserve and limits reset unused
+(owner 10-23; 10-24 «Набавку надо везде сделать»; harness D5 10-24 «не нужно единый лимит, либо
+его надо сильно увеличить»); the line stays as a stop for a meter nearly used up at the window's
+start, the owner's other Codex work being what can use it up. Every project runs this same line; the
+meter has no per-project split, so a project's share cannot be measured on it
 (incident 10-22: a points line read OVER at 28% after 2.2 of 7 days). A points line
 (`<codex points>`) is legacy, kept for configs that still set a number. The orchestrator reads
 the meter (`rate_limits.primary.used_percent` in the newest file under `~/.codex/sessions`)

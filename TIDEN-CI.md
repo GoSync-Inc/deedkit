@@ -404,6 +404,65 @@ it can lose anchors, since both replace whole source lists. Such a write needs a
 maintenance window agreed with the owner, with the workflow disabled and no
 run in progress for the whole operation.
 
+### Ready merge
+
+The ready merge (harness `tiden.md`, Ready merge) is a dispatch of the same
+workflow with a branch instead of a commit:
+`gh workflow run tiden-sync.yml --ref main -f branch=<proposal/... or review/...>`.
+The guard admits exactly one of `sha` and `branch`, a branch only by check A's
+name pattern. The run is titled `Tiden sync ready merge <branch>`, never a
+commit, so `Tiden health` never takes it for the sync of one. It runs
+`scripts/tiden_sync.py --ready-branch <branch>`, which merges the branch to
+Tiden main only when:
+
+1. the branch is open;
+2. `branch merge-preview` holds spec additions or text changes alone, read by
+   the parser of check A and sync B: no deletion, test or component change,
+   conflict, intent or blocking session, `autoMerge`, `testDuplicates` or
+   unknown field;
+3. every changed spec is `Backlog` on the branch, and on main when it is there
+   already (a change to work in progress goes on the review branch of the pull
+   request that builds it, which sync B merges);
+4. a text change changes the title and text alone: type, parent, component,
+   priority, position, status and sources (by their fields) stay as main has
+   them, in the listings (which name a parent, absent for none) and in the
+   preview's two versions; only a branch copy's own record ID, branch and
+   times differ;
+5. every changed spec has a `Ready:` record with text after the colon that
+   starts its line (bold, or a top-level `- ` item at most), outside fenced
+   code and code spans; a spec with a raw `<pre>`, `<script>`, `<style>`,
+   `<textarea>` or `<!--` block has none: a legacy
+   `Accepted:` alone is refused (add `Ready:` citing it), and a text change of
+   a spec on main brings a new record, not main's text in any markup (main's
+   record is compared without the strict reading, and readiness text on main
+   that it cannot compare is refused until fixed by hand).
+
+Tiden merges a branch by name, with no revision a merge can be held to, so the
+job reads the preview and both listings again just before the merge and
+refuses when anything differs from what it checked. The window between that
+read and the merge stays; the read-back closes it by detection, not
+prevention: main must then hold the specs it had (same record, same fields, a
+parent's child count raised by each new spec under it), plus exactly the
+checked branch copies (parent included), a text change in main's record and
+a new spec in its branch record (no record is created on
+a merge: 2026-10-26, the main specs that merged branches changed kept their
+`createdAt`, and none was created at a merge). Its output, each number with
+its record ID, new or text changed, is the receipt. A refusal names its step
+(`branch`, `preview`, `ready`) and writes nothing. When the merge call fails
+but the branch reads merged, the same run reads it back; when it reads open,
+dispatch again. A merged branch can no longer be listed, so a dispatch of one
+fails at `branch` and names the receipt of the run that merged it; a failed
+`read-back` is checked on main by hand (needs a maintenance window to fix).
+Nobody writes to a branch after its dispatch.
+
+It runs in the `tiden-sync` concurrency group, so it is no change by hand and
+needs no maintenance window; while one has the workflow disabled, it cannot be
+dispatched, so it is dispatched after the window. The
+dispatcher (the card's writer, the orchestrator for a package) waits for its run
+(`gh run list --workflow tiden-sync.yml --event workflow_dispatch`, by title),
+dispatches it again when GitHub dropped it, and dispatches by SHA a squash sync
+that its run displaced (`sync_backlog` names one).
+
 ## Drift watermark
 
 `.github/workflows/tiden-drift.yml` keeps the drift watermark current after every
@@ -690,8 +749,8 @@ Reverse-engineered specs are candidates for review. Check API arguments, state
 semantics, schema versions and deployment exceptions against the implementation;
 a source-file anchor does not guarantee that every sentence is accurate.
 Maintained baseline contracts use `Active`; that is not a claim that someone is
-currently implementing them. Tiden is also the primary work queue: future work
-uses `Backlog`, implementations and operational acceptance awaiting review use
+currently implementing them. Tiden is also the primary work queue: ready cards
+(planned work) use `Backlog`, implementations and operational acceptance awaiting review use
 `Review`, and bounded delivered work uses `Done` with its evidence. Keep the
 implemented boundary and remaining acceptance explicit. Do not confuse `Backlog`
 with missing test coverage or set `Done` merely because a related test passes.
@@ -703,14 +762,24 @@ without checking their verification scope.
 The 2026-10-16 reconciliation measured that the current gate includes Backlog,
 Review and General index specs. The whole-product gate therefore also exposes
 unimplemented plans as `no_test`: the branch verdict is `NOT VERIFIED`, while
-main reports `BLOCKED` for those coverage gaps. Status is not a release-scope
-filter. Preserve that result and inspect its per-spec causes; do not fabricate
-coverage or weaken CI to make a planning inventory pass a release gate.
+main reports `BLOCKED` for those coverage gaps, and every ready card keeps it so
+(no status filter: an open Tiden limitation, harness `tiden.md`). Status is not
+a release-scope filter. Read the gate per spec: `no_test` on `Backlog` is
+planned work, any other failing row a finding. No DeedKit job fails on main's
+verdict: the `release` job records the gate it captured (Environments) and
+`checks / evidence` judges the run's own evidence (`tiden_ci.py verdict`), never
+Tiden's gate; a job that comes to fail on it filters those rows first. Do not
+fabricate coverage, link tests or move cards to turn it green, or weaken CI to
+make a planning inventory pass a release gate.
 
-Create new future-only specs on independent proposal branches. The existing
-merged backlog needs a verified identity/history-preserving relocation; COW
-updates or deleting/recreating cards do not establish that preservation. Keep
-real defects and required operational acceptance visible in the current scope.
+Main holds maintained behaviour, known defects and ready cards (owner D6,
+2026-10-26). An idea is a draft on a proposal branch until its reviews make it
+ready; the ready merge (Main sync, Ready merge) then puts the branch on main as
+`Backlog`, before any pull request names its cards. A spec on main stays there:
+no relocation preserves identity (none through CLI 0.41.0, checked 2026-10-24),
+and COW updates or deleting and recreating cards do not, so a follow-up card or
+a review branch changes it. Keep real defects and required operational
+acceptance visible in the current scope.
 
 Readiness also requires a captured candidate release gate and a review of the
 unresolved production issues. Errors reach their component through its runtime

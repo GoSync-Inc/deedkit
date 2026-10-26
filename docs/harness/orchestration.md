@@ -52,6 +52,13 @@ affect every pull request make parallel edits collide.
   stops. Not with about 30 calls left (only merge, `main` push run, read-back, DONE): finish.
   Restart early, from 150k, before an expected idle of over an hour (owner gate, usage limit,
   overnight).
+  The successor closes the old terminal as its last step, after it has read the handoff and the briefs. Background jobs
+  are waited for (closing kills them); live subagents are the case for `--keep-old` (or `HARNESS_KEEP_OLD=1`), which takes
+  the close step out of the prompt; a line `Keep old session: yes` in the handoff (STATE.md for the orchestrator) does the
+  same, and the script reads it. The old session then sends `RESTARTED`, does nothing else, and closes its own terminal
+  when its last subagent has reported (the workspace sweep closes a leftover). An old orchestrator also deletes its own
+  wake crons first (CronDelete), or two sessions would act. Both scripts refuse a workspace or terminal ID that is not
+  a UUID, extra arguments, and (orchestrator) a successor template without a `{CLOSE_STEP}` line or with its own close command.
 - Background jobs (a Codex review, a backup, a CI or merge wait): one check about 30 s after the
   start that the job runs (the log shows progress, no usage or trust error); a `timeout` on every
   job (a merge wait: 60 minutes; on its timeout run `gh pr merge --disable-auto` or read the state
@@ -62,8 +69,8 @@ affect every pull request make parallel edits collide.
 - Limits (harness D3; Between D5, «мы все время создаем проблемы этими лимитами»): every timeout,
   cap or quota added in product code or prompts names why it exists and what happens when it trips,
   and is set with generous headroom, user paths included.
-- Owner questions (process.md section 2 items; feature or epic acceptance unless an accepted
-  package covers it, see Package acceptance): while the owner
+- Owner questions (process.md section 2 items; a feature or epic idea from agents, tiden.md Card
+  intake step 1): while the owner
   is online, one message as they arise; while the owner is away, one numbered list on waking and
   before sleep, each item with a recommendation. Work that needs no answer keeps running.
 - Host load: locally run only the test modules your change touches and the new tests, never a
@@ -95,8 +102,8 @@ affect every pull request make parallel edits collide.
   (process.md section 1); a read check that is not itself a listed live action needs no yes. The
   owner does by hand only what no agent can.
 - After a worker's DONE, or when its last PR merges (whoever merged it): check its worktree is
-  clean and its test containers are gone (`docker ps -a`; remove leftovers yourself), close its
-  terminal and archive its workspace at once, unless its task has steps after the merge (enable
+  clean and its test containers are gone (`docker ps -a`; `docker stop` running leftovers yourself; a stopped
+  one is the owner's `docker rm`, named in STATE.md), close its terminal and archive its workspace at once, unless its task has steps after the merge (enable
   after deploy, a measurement after N hours, a follow-up PR; from its brief, card or a
   `Post-merge:` line in its DONE): then move them with their conditions into STATE.md NEXT, or
   wait for its DONE, and close after.
@@ -137,9 +144,9 @@ affect every pull request make parallel edits collide.
   When two differ, the newer wins within its own scope: a narrower newer decision leaves the rest
   of a wider older one standing; the newer entry's `Supersedes:` names whole or part (harness D2;
   Between D120, general rule; example: Between D22 narrowed by D75, differences.md row 9).
-- Package acceptance (harness D3; Between D104(в), D105): when the owner, in words for that package, accepts a
-  scoped package (backlog plus mockups) after its final Fable and Astra pass, with duplicates merged
-  and unneeded cards deleted, its waves run back to back (STATE.md APPROVED WAVE) without asking
+- Packages (harness D3; Between D104(в), D105; acceptance part superseded by harness D6): a scoped
+  package (backlog plus mockups) whose cards are ready after their final Fable and Astra pass, with duplicates
+  merged and unneeded cards deleted, runs its waves back to back (STATE.md APPROVED WAVE) without asking
   again about items already discussed; only contested or non-obvious product items go back to the owner.
 - Cross-project (harness D1; Between D119, D51, D33): a request to another project goes to
   that project's orchestrator, whose workers report only to it; the requester sends the request and
@@ -163,11 +170,12 @@ When the context hook says 250k or more, at the next boundary (same exceptions a
 if 30 calls or fewer are left; restart from 150k before over an hour idle):
 
 1. Rewrite STATE.md (self-contained, current workers, NOW/NEXT, approvals).
-2. Start the successor in the orchestrator's workspace (`bin/orchestrator-restart.sh <old name>`): it reads
-   STATE.md, sends the live workers its name as the new address, closes the old orchestrator's
-   terminal and recreates the wake crons listed in STATE.md.
-3. The successor announces itself, closes the old terminal, recreates any wake crons, continues
-   NOW/NEXT.
+2. Start the successor in the orchestrator's workspace (`bin/orchestrator-restart.sh [--keep-old] <old name>`): it reads
+   STATE.md, sends the live workers its name as the new address, recreates the wake crons listed in STATE.md
+   and closes the old orchestrator's terminal last.
+3. The successor announces itself, recreates any wake crons, closes the old terminal, continues
+   NOW/NEXT, and sets `Keep old session:` back to `no` in STATE.md. With `--keep-old`, or when STATE.md says
+   `Keep old session: yes` (the old session has live subagents), the old terminal stays open (rules: Restart, Sessions).
 
 Session crons die with the old terminal: always list them in STATE.md ("Wake crons: …") so the
 successor can recreate them.
