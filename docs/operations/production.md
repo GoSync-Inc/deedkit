@@ -1180,9 +1180,19 @@ each new expiry and then sets the gateway `expires_at` to the earliest of them a
 the gateway never outlives a backend whatever the step delays or clocks. Tokens and key hashes stay
 the same, so no client changes. It refuses before any write when a credential (the gateway entry
 included) is revoked, disabled or expired, or a store's expiry would move earlier (ACCESS.md,
-`extend-key`); the output lists the previous and new expiry per store. A rerun with
-`--operation` reads a step it had sent from its store instead of sending it again. `undo` of an
-extend is refused: expiries never move earlier.
+`extend-key`); the output lists the previous and new expiry per store. The backends extend by
+their own database clock, so these checks keep a one-hour margin: a credential ending within the
+hour, or one ending less than an hour before the new bound or later, refuses (issue a new key, or
+pick another N). If a store still reads back an expiry before the gateway's current one, the
+gateway entry is left unchanged and the command stops. A rerun with `--operation` checks every
+credential again (one revoked since refuses) and reads a step it had sent from its store instead of
+sending it again; sending one again is harmless, since each store sets its expiry under the
+principal lock and refuses a shorter one. `undo` of an extend is refused: expiries never move
+earlier.
+
+Both commands refuse before any write when a running gateway's `--policy` is not the configured
+policy file through its directory mount, since neither the write nor the evidence would reach the
+file it enforces. The journal records whether `--token-file` was given, never its path.
 
 `deedkit admin key revoke <id> [--token-file <path>] [--dry-run]` sets the gateway entry
 `enabled: false` first (access ends on the next request), then revokes each backend credential
