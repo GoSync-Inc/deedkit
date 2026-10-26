@@ -294,3 +294,10 @@ def test_native_and_image_rules_are_untouched_by_the_docs_only_decision():
     assert ci["jobs"]["gate"]["needs"] == ["reuse", "pr_reuse", "checks", "native", "images"]
     images = yaml.safe_load((ROOT / ".github/workflows/images.yml").read_text())
     assert "docs_only" not in json.dumps(images) and "docs_only" not in json.dumps(ci["jobs"]["publish"])
+
+
+# spec: ANYM-323
+def test_the_shared_tiden_cli_pin_is_not_documentation():
+    # CI installs the Tiden CLI from this file's version and checksum, so a change to it verifies in full.
+    assert docs_only.eligible("docs/harness/tiden.md") is False
+    assert docs_only.eligible("docs/harness/process.md") is True

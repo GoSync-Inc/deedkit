@@ -50,9 +50,9 @@ jobs:
         if: steps.config.outputs.enabled == 'true'
         run: |
           pin="$GITHUB_WORKSPACE/docs/harness/tiden.md"
-          ver=$(sed -n 's/^TIDEN_CLI_VERSION=//p' "$pin" | head -n 1)
-          sum=$(sed -n 's/^TIDEN_CLI_SHA256_linux_amd64=//p' "$pin" | head -n 1)
-          [ -n "$ver" ] && [ -n "$sum" ] || { echo "no Tiden pin in $pin" >&2; exit 1; }
+          ver=$(sed -n 's/^TIDEN_CLI_VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$pin" | head -n 1)
+          sum=$(sed -n 's/^TIDEN_CLI_SHA256_linux_amd64=\([0-9a-f]\{64\}\)$/\1/p' "$pin" | head -n 1)
+          [ -n "$ver" ] && [ -n "$sum" ] || { echo "no valid Tiden pin in $pin" >&2; exit 1; }
           curl --fail --silent --show-error --location -o "$RUNNER_TEMP/tiden.tar.gz" \
             "https://github.com/qase-tms/homebrew-tap/releases/download/v$ver/tiden_linux_amd64.tar.gz"
           echo "$sum  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check --strict

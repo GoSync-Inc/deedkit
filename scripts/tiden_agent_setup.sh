@@ -17,9 +17,9 @@ fi
 cd "$(git rev-parse --show-toplevel)"
 # The shared pin (harness tiden.md, "Tiden CLI version"), the same one CI reads.
 pin=docs/harness/tiden.md
-version=$(sed -n 's/^TIDEN_CLI_VERSION=//p' "$pin" | head -n 1)
-checksum=$(sed -n 's/^TIDEN_CLI_SHA256_linux_amd64=//p' "$pin" | head -n 1)
-[ -n "$version" ] && [ -n "$checksum" ] || { echo "no Tiden pin in $pin" >&2; exit 1; }
+version=$(sed -n 's/^TIDEN_CLI_VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$pin" | head -n 1)
+checksum=$(sed -n 's/^TIDEN_CLI_SHA256_linux_amd64=\([0-9a-f]\{64\}\)$/\1/p' "$pin" | head -n 1)
+[ -n "$version" ] && [ -n "$checksum" ] || { echo "no valid Tiden pin in $pin" >&2; exit 1; }
 
 if ! "$bin_dir/tiden" version 2>/dev/null | grep -q "$version"; then
   work=$(mktemp -d)

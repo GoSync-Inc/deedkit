@@ -18,8 +18,9 @@ import re
 import subprocess
 import sys
 
-# Code reads these (tests/test_telemetry.py, scripts/check_release.py) or packages and images ship them.
-DENIED_FILES = frozenset({"SETUP.md", "THIRD_PARTY_NOTICES.md", "TELEMETRY.md"})
+# Code reads these (tests/test_telemetry.py, scripts/check_release.py) or packages and images ship them; CI installs
+# the Tiden CLI from the version and checksum in docs/harness/tiden.md.
+DENIED_FILES = frozenset({"SETUP.md", "THIRD_PARTY_NOTICES.md", "TELEMETRY.md", "docs/harness/tiden.md"})
 DENIED_NAMES = frozenset({"README.md"})
 DENIED_NAME_PREFIXES = ("LICENSE", "COPYING")
 # Module trees package their own documents (the calendar sdist, the npm client) and their tests may read them.
