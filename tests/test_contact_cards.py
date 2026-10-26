@@ -95,8 +95,10 @@ def telegram_contact(**media):
 
 # spec: ANYM-529
 def test_telegram_contact_media_fills_the_block_only_when_enabled(monkeypatch):
+    # Enabled is the default since the flip; 0 is the kill switch (the name is a Tiden case ID).
+    monkeypatch.setenv('ANYMSG_CAPTURE_CONTACT_CARDS','0')
     assert 'contact' not in telegram_message('tg-owner',telegram_contact())['metadata']
-    monkeypatch.setenv('ANYMSG_CAPTURE_CONTACT_CARDS','1')
+    monkeypatch.delenv('ANYMSG_CAPTURE_CONTACT_CARDS')
     e=telegram_message('tg-owner',telegram_contact())
     assert e['metadata']['message_kind']=='contact'
     assert e['metadata']['contact']=={'status':'parsed','contacts':[{'name':'Synthetic Friend','telegram_user_id':'777',

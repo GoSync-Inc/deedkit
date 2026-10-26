@@ -52,8 +52,8 @@ changes have been continuously captured and indexed in the archive. These need
 their own bounded schemas, observation time, revision/coverage rules and refresh
 jobs. In particular, a live Telegram poll/topic result is not yet a searchable,
 complete passive poll/topic archive. Shared contact cards (names, phones,
-WhatsApp/Telegram IDs) are captured as a bounded block when
-`ANYMSG_CAPTURE_CONTACT_CARDS=1` ([SEARCH.md](SEARCH.md#shared-contact-cards)).
+WhatsApp/Telegram IDs) are captured as a bounded block unless
+`ANYMSG_CAPTURE_CONTACT_CARDS=0` ([SEARCH.md](SEARCH.md#shared-contact-cards)).
 
 ## Capability-extension design reference
 

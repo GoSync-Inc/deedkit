@@ -216,8 +216,8 @@ export function event(message, body=undefined, ownerIds=[]) {
     value.forwardOrigin={kind:'unknown',basis:'whatsapp_web_js_message',
       ...(Number.isSafeInteger(score) && score>=0 && score<2**32?{forwarding_score:score}:{})};
   }
-  // Off until the release a rollback would return to accepts contactCard (ANYM-529).
-  if (['vcard','multi_vcard'].includes(type) && process.env.ANYMSG_CAPTURE_CONTACT_CARDS==='1')
+  // On unless ANYMSG_CAPTURE_CONTACT_CARDS=0, the kill switch (ANYM-529).
+  if (['vcard','multi_vcard'].includes(type) && process.env.ANYMSG_CAPTURE_CONTACT_CARDS!=='0')
     value.contactCard=sharedContacts(message,raw);
   if (!Number.isSafeInteger(value.timestamp) || value.timestamp<=0 || value.timestamp>MAX_UNIX)
     throw new Error('invalid_provider_time');

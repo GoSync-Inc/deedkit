@@ -188,12 +188,12 @@ collector skips that message.
 ### Shared contact cards
 
 Collectors record a shared contact card's names, phone numbers and WhatsApp or
-Telegram ID (`contact`, [SEARCH.md](SEARCH.md#shared-contact-cards)) only when
-their environment sets `ANYMSG_CAPTURE_CONTACT_CARDS=1`; it is off by default
+Telegram ID (`contact`, [SEARCH.md](SEARCH.md#shared-contact-cards)) by default
 (native WhatsApp, the whatsapp-web.js fallback and Telegram read the same
-variable). The server always accepts, returns and searches a captured card. Set
-it on the collector services only once the release a rollback would return to
-already accepts the block: an older server rejects such a capture.
+variable). `ANYMSG_CAPTURE_CONTACT_CARDS=0` on the collector services is the kill
+switch: their contact messages then carry no block, as before. The server always
+accepts, returns and searches a captured card; a server older than the contact
+card release (0f173c2) rejects one, so a rollback past it sets the kill switch first.
 
 ### Provider business and verified flags
 

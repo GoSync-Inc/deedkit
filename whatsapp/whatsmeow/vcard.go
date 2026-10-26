@@ -24,10 +24,9 @@ var (
 	waidValue = regexp.MustCompile(`^[0-9]{1,32}$`)
 )
 
-// contactCardCapture stays off until the release a rollback would return to
-// accepts contactCard (ANYM-529, ANYMSG_CAPTURE_CONTACT_CARDS).
+// contactCardCapture is on unless ANYMSG_CAPTURE_CONTACT_CARDS=0, the kill switch (ANYM-529).
 func contactCardCapture() bool {
-	return os.Getenv("ANYMSG_CAPTURE_CONTACT_CARDS") == "1"
+	return os.Getenv("ANYMSG_CAPTURE_CONTACT_CARDS") != "0"
 }
 
 type sharedContact struct {

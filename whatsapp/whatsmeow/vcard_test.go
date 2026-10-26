@@ -224,8 +224,9 @@ func TestNativeContactCardBoundsTruncate(t *testing.T) {
 }
 
 // spec: ANYM-529
+// The name predates the default flip (a Tiden case ID); it now checks the 0 kill switch.
 func TestNativeContactCardCaptureIsOffByDefaultAndLogsNothing(t *testing.T) {
-	t.Setenv("ANYMSG_CAPTURE_CONTACT_CARDS", "")
+	t.Setenv("ANYMSG_CAPTURE_CONTACT_CARDS", "0")
 	var logged bytes.Buffer
 	previous := log.Writer()
 	log.SetOutput(&logged)
@@ -247,6 +248,19 @@ func TestNativeContactCardCaptureIsOffByDefaultAndLogsNothing(t *testing.T) {
 	}
 	if strings.Contains(logged.String(), "81200000001") {
 		t.Fatal("a contact field reached the log")
+	}
+}
+
+// spec: ANYM-529
+func TestNativeContactCardCaptureIsOnWithoutTheVariable(t *testing.T) {
+	t.Setenv("ANYMSG_CAPTURE_CONTACT_CARDS", "")
+	m := &waE2E.Message{ContactMessage: &waE2E.ContactMessage{DisplayName: proto.String("Deskha"), Vcard: proto.String(syntheticCard)}}
+	v, err := NormalizeMessage(privateContact("C6", m), types.EmptyJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if card, ok := v["contactCard"].(map[string]any); !ok || card["status"] != "parsed" {
+		t.Fatalf("contactCard missing by default: %#v", v["contactCard"])
 	}
 }
 
