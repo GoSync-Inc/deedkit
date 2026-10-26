@@ -582,7 +582,11 @@ deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS
 The purge (ANYM-511) keeps event IDs, kinds and positions: a consumer behind it receives
 the `message.created`/`message.edited` events and the `message.deleted` event of a purged
 message as content-free snapshots marked `deleted: true, purged: true`, never the old body.
-ACK positions and versions are unchanged, and hints stay content-free references.
+Every other event of the message (`message.status`, `attachment.ready`, file processing
+kinds) gets the same snapshot and keeps its content-free state: `delivery_receipt` and
+`metadata.processing` (attachment ID, stage, state, artifact version); its body, file names
+and other metadata go. ACK positions and versions are unchanged, and hints stay
+content-free references.
 
 ## Remaining extensions and verification boundaries
 

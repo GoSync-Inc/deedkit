@@ -633,18 +633,33 @@ ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
 Messaging migration 045 (`manual`, ANYM-511) adds the deletion purge: `messages.purged`
-(defaulted, no rewrite), an index on `events(message)` whose build holds a share lock on `events`
-(event inserts wait for it), the `message_purges`, `chat_tombstones`, `ingest_receipt_links` and
-`purge_state` tables without foreign keys, guard triggers that keep later writes of a purged
-message content-free, and the audit CHECK re-added `NOT VALID` with `message_purge`. Running
-schema-44 processes keep working: their writes pass through the guards unchanged. A schema-44
-runtime refuses schema 45, so it ships with its release; update the pinned backup and restore
-runtimes first. After `migrate`, run `purge_role.sql` (NOLOGIN role `messaging_purge`) and
-`gateway_role.sql` as the owner; the worker (`deploy/compose.message-purge.yaml`) sets that role
-on its DSN with `--role messaging_purge`. Messages deleted before 045 are purged only by
-`purge-deleted --apply`, after `--preview` and a fresh verified backup, outside an active call.
+(defaulted, a catalog change), `chats.purged_at`, the `message_purges`, `chat_tombstones`,
+`ingest_receipt_links` and `purge_state` tables without foreign keys, guard triggers that keep
+later writes of a purged message content-free, and the audit CHECK re-added `NOT VALID` with
+`message_purge`. Running schema-44 processes keep working: their writes pass through the guards
+unchanged. A schema-44 runtime refuses schema 45, so it ships with its release. Release steps, in
+order, outside an active call:
+0. As the owner, before `migrate`: `CREATE INDEX CONCURRENTLY IF NOT EXISTS events_message ON
+   events(message);` (no lock on event inserts; about 250k rows). Without it, 045 refuses on a
+   table of more than 100k events, so the build never runs inside the migration transaction.
+1. Update the pinned backup and restore runtimes to the schema-45 release.
+2. Fresh verified backup (the backup gate), then `migrate`.
+3. As the owner: `purge_role.sql` (NOLOGIN role `messaging_purge`) and `gateway_role.sql`.
+4. The worker's own login (owner decision 2026-10-26, «1) а»): as the owner create
+   `messaging_purge_runtime` with `LOGIN IN ROLE messaging_purge` and no other grants, with a
+   generated password passed to `psql` through a variable read from a 0600 file, never on the command
+   line; write its DSN (host and database as in the other private DSNs) to `private/message-purge.dsn`
+   with mode 0600, owned like them. Print or log no password. Undo: stop the service,
+   `DROP ROLE messaging_purge_runtime`, remove the file.
+5. Start the worker: add `deploy/compose.message-purge.yaml` to the project's compose files for
+   `production.py apply`, or `docker compose --profile message-purge up -d message-purge`. From here
+   every new deletion is purged within a minute: the point of no return for future deletions.
+6. `purge-deleted --preview`, then after a fresh verified backup `purge-deleted --apply` for the
+   messages deleted before 045: the point of no return for past deletions. `--apply` drains every
+   due mark and exits non-zero while marks stay pending (contention or failures); run it again.
 The purge is irreversible: rolling back code or schema does not bring content back; only a
-restore of an earlier backup does. `purge-disable` stops the worker without a deploy.
+restore of a backup taken before it does, and only while that backup is kept (about two days of
+daily verified backups). `purge-disable` stops the worker without a deploy.
 Messaging migration 044 (`expand`, ANYM-495) is additive: the new `api_key_operations` table
 (operation ID, request digest, key ID) without a foreign key, so it takes no lock on `api_keys`,
 which every authentication reads. It is not lock-free: like every `migrate`, the same transaction

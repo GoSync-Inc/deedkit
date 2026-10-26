@@ -2,9 +2,11 @@
 
 A message deleted in the messenger loses its text, file names, file text, transcripts and AI output
 within minutes; agents keep a content-free mark. The worker runs under its own role
-(purge_role.sql): each transaction clears at most 50 messages under `archive:<account>` with a 2 s
-lock wait and a 10 s statement bound, and gives way on contention. A failure stops only the purge;
-it is retried with backoff and reported through get_sync_status. Logs carry counts only.
+(purge_role.sql): each transaction clears at most 50 messages under `archive:<account>` and
+`purge:<account>`, both taken without waiting, with a 2 s lock and statement bound and a 3 s
+transaction bound, so ingest, sends and commands waiting behind it wait at most 3 s. It gives way
+on contention; a failure stops only the purge, is retried with backoff (one message at a time
+after a failure) and is reported through get_sync_status. Logs carry counts only.
 """
 import argparse
 from contextlib import contextmanager
@@ -20,13 +22,22 @@ from psycopg import sql
 log=logging.getLogger('messaging_service.message_purge')
 BATCH=50
 APPLY_BATCH=500
+APPLY_RETRIES=3
 EVENT_WINDOW=5000
 LINK_CHUNK=5000
 OVERDUE_SECONDS=900
 AUDIT_IDS=100
+PURGE_STATEMENT='2s'
+PURGE_TRANSACTION='3s'
 REASONS=('deleted_for_everyone','deleted_for_me','chat_deleted','chat_cleared','telegram_deleted','existing_deleted')
-PLATFORM_REASON={'telegram':'telegram_deleted','whatsapp':'deleted_for_everyone'}
 GUARANTEE={'telegram':'best_effort','whatsapp':'reported'}
+# The provider chat of a message: its chat row, else its newest revision (017 left chats.provider_chat nullable).
+PROVIDER_CHAT='''coalesce(nullif(ch.provider_chat,''),(SELECT r.snapshot->>'provider_chat' FROM message_revisions r
+    WHERE r.message=m.id ORDER BY r.revision DESC LIMIT 1),'')'''
+
+
+def lock_key(name):
+    return sql.SQL('hashtextextended({},0)').format(sql.Literal(name))
 
 
 class Purger:
@@ -34,9 +45,11 @@ class Purger:
         self.store=store;self.role=role
 
     @contextmanager
-    def tx(self,statement_timeout='10s'):
+    def tx(self,statement_timeout='10s',transaction_timeout=None):
         with self.store.pool.connection() as c:
             if self.role:c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(self.role)))
+            if transaction_timeout:
+                c.execute(sql.SQL('SET LOCAL transaction_timeout={}').format(sql.Literal(transaction_timeout)))
             c.execute("SET LOCAL lock_timeout='2s'")
             c.execute(sql.SQL('SET LOCAL statement_timeout={}').format(sql.Literal(statement_timeout)))
             yield c
@@ -64,7 +77,7 @@ class Purger:
             upper=min(head,cursor+EVENT_WINDOW)
             if upper<=cursor:return 0
             rows=c.execute('''INSERT INTO message_purges(message,account,provider_chat,provider_id,reason,observed_at)
-                SELECT DISTINCT ON(m.id) m.id,m.account,coalesce(ch.provider_chat,''),m.provider_id,
+                SELECT DISTINCT ON(m.id) m.id,m.account,'''+PROVIDER_CHAT+''',m.provider_id,
                     CASE a.platform WHEN 'telegram' THEN 'telegram_deleted' ELSE 'deleted_for_everyone' END,e.created_at
                 FROM events e JOIN messages m ON m.id=e.message JOIN chats ch ON ch.id=m.chat
                 JOIN accounts a ON a.id=m.account
@@ -74,15 +87,27 @@ class Purger:
             return len(rows)
 
     def backfill_links(self):
-        """Link receipts stored before schema 45 to their message; True once every receipt is linked."""
+        """Link receipts stored before schema 45, one chunk per call; True once every receipt is linked.
+
+        A message purged before its receipts were linked is scrubbed here, chunk by chunk. The chunk
+        holds `purge-backfill` exclusively and every purge holds it shared, so a purge and a chunk
+        never miss each other's uncommitted rows."""
         with self.tx() as c:
             if self.state(c,'receipt_backfill')=='complete':return True
+            c.execute(sql.SQL('SELECT pg_advisory_xact_lock({})').format(lock_key('purge-backfill')))
             cursor=self.state(c,'receipt_cursor')
             row=c.execute('''WITH chunk AS (SELECT digest,account,coalesce(envelope->>'chat','') AS provider_chat,
                     coalesce(envelope->>'provider_id','') AS provider_id FROM ingest_receipts
                     WHERE digest>%s ORDER BY digest LIMIT %s),
-                linked AS (INSERT INTO ingest_receipt_links SELECT * FROM chunk ON CONFLICT(digest) DO NOTHING)
-                SELECT max(digest) AS last,count(*) AS n FROM chunk''',(cursor,LINK_CHUNK)).fetchone()
+                linked AS (INSERT INTO ingest_receipt_links SELECT * FROM chunk ON CONFLICT(digest) DO NOTHING),
+                scrubbed AS (UPDATE ingest_receipts r SET envelope=public.purged_envelope(r.envelope) FROM chunk k
+                    WHERE r.digest=k.digest AND r.envelope->'purged' IS DISTINCT FROM 'true'::jsonb
+                    AND EXISTS(SELECT 1 FROM message_purges p JOIN messages m ON m.id=p.message
+                        WHERE p.account=k.account AND p.provider_chat=k.provider_chat AND p.provider_id=k.provider_id
+                        AND p.purged_at IS NOT NULL AND m.purged) RETURNING 1)
+                SELECT max(digest) AS last,count(*) AS n,(SELECT count(*) FROM scrubbed) AS scrubbed FROM chunk''',
+                (cursor,LINK_CHUNK)).fetchone()
+            if row['scrubbed']:log.info('message_purge receipts_rescrubbed=%d',row['scrubbed'])
             if row['n']<LINK_CHUNK:
                 self.set_state(c,'receipt_backfill','complete');return True
             self.set_state(c,'receipt_cursor',row['last']);return False
@@ -92,18 +117,27 @@ class Purger:
             return [r['account'] for r in c.execute('''SELECT DISTINCT account FROM message_purges
                 WHERE purged_at IS NULL AND next_attempt_at<=clock_timestamp() ORDER BY account''')]
 
+    def pending_count(self):
+        with self.tx() as c:
+            return c.execute('SELECT count(*) AS n FROM message_purges WHERE purged_at IS NULL').fetchone()['n']
+
     def purge_account(self,account,limit=BATCH):
-        """One pass: at most `limit` pending messages of one account in one transaction."""
+        """One pass: at most `limit` pending messages of one account in one bounded transaction."""
         ids=[]
         try:
-            with self.tx() as c:
-                if not c.execute('SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS ok',
-                                 ('archive:'+account,)).fetchone()['ok']:
-                    return {'purged':0,'gave_way':1,'failed':0}
-                rows=c.execute('''SELECT message,provider_chat,provider_id FROM message_purges
+            with self.tx(PURGE_STATEMENT,PURGE_TRANSACTION) as c:
+                for name,shared in (('purge:'+account,False),('purge-backfill',True),('archive:'+account,False)):
+                    statement='pg_try_advisory_xact_lock_shared' if shared else 'pg_try_advisory_xact_lock'
+                    if not c.execute(sql.SQL('SELECT {}({}) AS ok').format(sql.Identifier(statement),lock_key(name))
+                                     ).fetchone()['ok']:
+                        return {'purged':0,'gave_way':1,'failed':0}
+                rows=c.execute('''SELECT message,provider_chat,provider_id,attempts FROM message_purges
                     WHERE account=%s AND purged_at IS NULL AND next_attempt_at<=clock_timestamp()
                     ORDER BY next_attempt_at,message LIMIT %s FOR UPDATE SKIP LOCKED''',(account,limit)).fetchall()
                 if not rows:return {'purged':0,'gave_way':0,'failed':0}
+                # After a failure, one message at a time: a slow batch shrinks until it fits the bound.
+                retried=[r for r in rows if r['attempts']]
+                if retried:rows=retried[:1]
                 ids=[r['message'] for r in rows]
                 counts=self.scrub(c,account,rows)
                 c.execute('''UPDATE message_purges SET purged_at=clock_timestamp(),counts=%s,failure_code=NULL
@@ -115,7 +149,11 @@ class Purger:
             return {'purged':len(ids),'gave_way':0,'failed':0}
         except psycopg.Error as exc:
             code=('lock_timeout' if isinstance(exc,psycopg.errors.LockNotAvailable) else
-                  'statement_timeout' if isinstance(exc,psycopg.errors.QueryCanceled) else 'purge_error')
+                  'statement_timeout' if isinstance(exc,psycopg.errors.QueryCanceled) else
+                  # The server ends the session at the transaction bound; the pool drops that connection,
+                  # and a client that notices only the closed socket sees no SQLSTATE.
+                  'transaction_timeout' if isinstance(exc,psycopg.errors.TransactionTimeout) or (
+                      isinstance(exc,psycopg.OperationalError) and exc.sqlstate is None) else 'purge_error')
             self.failed(account,ids,code)
             log.warning('message_purge failed=%d code=%s',len(ids),code)
             return {'purged':0,'gave_way':int(code!='purge_error'),'failed':len(ids)}
@@ -133,8 +171,9 @@ class Purger:
         chats=[r['provider_chat'] for r in rows];provider_ids=[r['provider_id'] for r in rows]
         def n(statement,args):return c.execute(statement,args).rowcount
         c.execute('SELECT id FROM messages WHERE id=ANY(%s) AND account=%s FOR UPDATE',(ids,account))
-        # The flag first: from here every guard trigger treats a late write as purged.
+        # The flag first: after commit every guard trigger treats a late write as purged.
         counts={'messages':n("UPDATE messages SET body='',purged=true WHERE id=ANY(%s) AND account=%s",(ids,account))}
+        # Bounded by the chat's own messages (message_chat_date index); the listing reads only the mark.
         counts['hidden_chats']=n('''UPDATE chats ch SET purged_at=clock_timestamp() WHERE ch.account=%s
             AND ch.id IN (SELECT chat FROM messages WHERE id=ANY(%s)) AND NOT EXISTS(SELECT 1 FROM messages m
                 WHERE m.account=ch.account AND m.chat=ch.id AND NOT m.purged)''',(account,ids))
@@ -158,17 +197,28 @@ class Purger:
             WHERE l.account=%s AND r.digest=l.digest''',(chats,provider_ids,account))
         counts['metadata']=n('DELETE FROM message_metadata WHERE message=ANY(%s)',(ids,))
         # Review results lose their reference text (an exception to ANYM-20's append-only rows).
-        counts['reviews']=n("UPDATE reviews SET result_ref='purged' WHERE message=ANY(%s) AND result_ref<>'purged'",(ids,))
-        counts['sends']=n('''UPDATE outgoing_messages o SET body='purged',
-            source_text=CASE WHEN o.source_text IS NULL THEN NULL ELSE 'purged' END,
+        counts['reviews']=n("UPDATE reviews SET result_ref='[deleted]' WHERE message=ANY(%s) AND result_ref<>'[deleted]'",(ids,))
+        # A send is this message by its verified wire reference (native WhatsApp may archive a LID chat
+        # for a PN request); a send without one by its requested chat and returned ID.
+        counts['sends']=n('''UPDATE outgoing_messages o SET body='[deleted]',
+            source_text=CASE WHEN o.source_text IS NULL THEN NULL ELSE '[deleted]' END,
             render_artifact=CASE WHEN o.render_artifact IS NULL THEN NULL ELSE '{}'::jsonb END
-            FROM unnest(%s::text[],%s::text[]) AS t(provider_chat,provider_id)
-            WHERE o.account=%s AND o.provider_chat=t.provider_chat AND o.provider_message_id=t.provider_id''',
-            (chats,provider_ids,account))
-        # Mutation commands keep their request IDs and status; only their text goes.
-        counts['commands']=n('''UPDATE messenger_commands SET payload='{"purged":true}'::jsonb,
-            result=CASE WHEN result IS NULL THEN NULL ELSE '{"purged":true}'::jsonb END
-            WHERE account=%s AND message=ANY(%s)''',(account,ids))
+            WHERE o.account=%s AND EXISTS(SELECT 1 FROM unnest(%s::text[],%s::text[]) AS t(provider_chat,provider_id)
+                WHERE CASE WHEN o.archive_reference IS NULL
+                    THEN o.provider_chat=t.provider_chat AND o.provider_message_id=t.provider_id
+                    ELSE o.archive_reference->>'provider_chat_id'=t.provider_chat
+                        AND o.archive_reference->>'provider_message_id'=t.provider_id END)''',
+            (account,chats,provider_ids))
+        # Commands that target it, or produced it (send_poll, send_file ...), keep their request IDs,
+        # status, routing and authorization binding; only their text goes.
+        counts['commands']=n('''UPDATE messenger_commands mc SET payload=public.purged_command_payload(mc.payload),
+            result=public.purged_command_result(mc.result)
+            WHERE mc.account=%s AND (mc.message=ANY(%s) OR (mc.message IS NULL AND mc.result IS NOT NULL AND EXISTS(
+                SELECT 1 FROM unnest(%s::text[],%s::text[]) AS t(provider_chat,provider_id)
+                WHERE (t.provider_chat=mc.payload->>'provider_chat' AND t.provider_id=mc.result->>'provider_message_id')
+                    OR (t.provider_chat=mc.result#>>'{data,archive_reference,provider_chat_id}'
+                        AND t.provider_id=mc.result#>>'{data,archive_reference,provider_message_id}'))))''',
+            (account,ids,chats,provider_ids))
         hits=[json.dumps([{'chat':m['chat'],'provider_id':m['provider_id']}]) for m in
               c.execute('SELECT chat,provider_id FROM messages WHERE id=ANY(%s)',(ids,))]
         counts['live_results']=n('''UPDATE messenger_commands SET result=public.purged_command_hits(account,result)
@@ -183,11 +233,11 @@ class Purger:
         totals={'discovered':0,'purged':0,'gave_way':0,'failed':0,'links_complete':False}
         if not self.enabled():return {**totals,'enabled':False}
         totals['discovered']=self.discover()
+        # The purge does not wait for the backfill: each backfill chunk scrubs the receipts of
+        # messages purged before their link existed.
         totals['links_complete']=self.backfill_links()
-        # Until every older receipt is linked a purge could miss one; wait for the backfill.
-        if totals['links_complete']:
-            for account in self.pending_accounts():
-                for key,value in self.purge_account(account).items():totals[key]+=value
+        for account in self.pending_accounts():
+            for key,value in self.purge_account(account).items():totals[key]+=value
         return {**totals,'enabled':True}
 
     def preview(self):
@@ -200,29 +250,38 @@ class Purger:
                 WHERE m.deleted AND NOT m.purged GROUP BY m.account ORDER BY m.account''')]
 
     def apply(self):
-        """Purge messages already marked deleted (reason existing_deleted), passes of at most 500."""
+        """Purge messages already marked deleted (reason existing_deleted), queued in passes of at most
+        500, and drain every due pending mark, including marks an interrupted run left queued."""
         while not self.backfill_links():pass
-        totals={'queued':0,'purged':0,'failed':0,'passes':0}
+        totals={'queued':0,'purged':0,'gave_way':0,'failed':0,'passes':0}
+        retries=0
         while True:
             with self.tx('120s') as c:
                 rows=c.execute('''INSERT INTO message_purges(message,account,provider_chat,provider_id,reason,observed_at)
-                    SELECT m.id,m.account,coalesce(ch.provider_chat,''),m.provider_id,'existing_deleted',
+                    SELECT m.id,m.account,'''+PROVIDER_CHAT+''',m.provider_id,'existing_deleted',
                         coalesce(m.provider_updated_at,m.sent_at)
                     FROM messages m JOIN chats ch ON ch.id=m.chat
                     WHERE m.deleted AND NOT m.purged AND NOT EXISTS(SELECT 1 FROM message_purges p WHERE p.message=m.id)
-                    ORDER BY m.id LIMIT %s ON CONFLICT(message) DO NOTHING RETURNING message,account''',
+                    ORDER BY m.id LIMIT %s ON CONFLICT(message) DO NOTHING RETURNING message''',
                     (APPLY_BATCH,)).fetchall()
-            accounts=sorted({r['account'] for r in rows});totals['queued']+=len(rows)
-            pass_purged=0
-            for account in accounts:
+            totals['queued']+=len(rows)
+            progress=gave_way=0
+            for account in self.pending_accounts():
                 while True:
                     result=self.purge_account(account)
-                    pass_purged+=result['purged'];totals['failed']+=result['failed']
+                    for key in ('purged','gave_way','failed'):totals[key]+=result[key]
+                    progress+=result['purged'];gave_way+=result['gave_way']
                     if not result['purged']:break
-            totals['purged']+=pass_purged
-            if rows:totals['passes']+=1
-            if not rows or not pass_purged:break
-        log.info('message_purge apply queued=%d purged=%d failed=%d',totals['queued'],totals['purged'],totals['failed'])
+            if rows or progress:totals['passes']+=1
+            if rows or progress:continue
+            # Only contention left (the live worker holds the account): wait briefly, then report.
+            if gave_way and retries<APPLY_RETRIES:
+                retries+=1;time.sleep(1);continue
+            break
+        totals['pending']=self.pending_count()
+        totals['complete']=totals['pending']==0
+        log.info('message_purge apply queued=%d purged=%d gave_way=%d failed=%d pending=%d',totals['queued'],
+                 totals['purged'],totals['gave_way'],totals['failed'],totals['pending'])
         return totals
 
     def status(self):
@@ -294,11 +353,15 @@ def main(argv=None):
         if args.command=='run':
             while True:
                 try:result=purger.run_once()
-                except psycopg.Error as exc:
+                # Any failure ends only this pass; the class name alone reaches the log.
+                except Exception as exc:
                     log.warning('message_purge pass_failed %s',type(exc).__name__);result=None
                 if args.once:out(result);return 0 if result is not None else 1
                 time.sleep(args.interval)
-        if args.command=='purge-deleted':out(purger.preview() if args.preview else purger.apply())
+        if args.command=='purge-deleted':
+            if args.preview:out(purger.preview());return 0
+            result=purger.apply();out(result)
+            return 0 if result['complete'] else 1
         elif args.command=='purge-status':out(purger.status())
         else:out(purger.set_enabled(args.command=='purge-enable'))
         return 0

@@ -1,5 +1,6 @@
 -- Operator-only messenger deletion purge (ANYM-511). Run as the migration owner after migrations;
--- grant the NOLOGIN role to a dedicated runtime login, or SET ROLE to it (`--role messaging_purge`).
+-- grant the NOLOGIN role to the dedicated runtime login messaging_purge_runtime (production.md,
+-- 045 step 4); the worker also sets it per transaction (`--role messaging_purge`).
 -- No sessions, provider keys, Docker socket, dumps, DDL or database ownership; never DELETE on
 -- messages or events, never INSERT on reviews.
 DO $$ BEGIN

@@ -286,6 +286,11 @@ The account/chat ACL is checked by the shared Store layer for MCP and REST; this
 Compromise of the gateway process itself is a separate threat boundary, since its
 DB role reads the archive. This DSN is not available to the agent.
 
+The deletion purge (schema 45, ANYM-511) runs as `messaging_purge` (`purge_role.sql`) through
+its own login `messaging_purge_runtime`: it reads the archive and updates only content columns
+of deleted messages, deletes their derived text and open download grants, and inserts only its
+own audit rows. It cannot delete messages or events, insert reviews, run DDL or reach sessions.
+
 Audit retention is not enabled yet: rows are kept and included in the encrypted
 backup. Before significant load, growth measurement and an agreed retention
 period are needed. Gateway/uvicorn access logs are off. Proxies/clients have separate

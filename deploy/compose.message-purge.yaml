@@ -1,7 +1,8 @@
 # Messenger deletion purge (ANYM-511): clears the content of messages deleted in the
-# messenger within minutes and keeps a content-free mark. Every transaction runs as the
-# messaging_purge role (purge_role.sql) through SET ROLE on the mounted DSN, so the DSN's
-# login needs membership in that role. Database only: no files, sessions or provider keys.
+# messenger within minutes and keeps a content-free mark. The mounted DSN is the worker's own
+# login messaging_purge_runtime, a member of the messaging_purge role (purge_role.sql) and
+# nothing else (docs/operations/production.md, migration 045 step 4); every transaction also
+# sets that role. Database only: no files, sessions or provider keys.
 # Stop it with `purge-disable` (state in purge_state) or by stopping this service.
 services:
   message-purge:

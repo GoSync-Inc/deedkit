@@ -344,11 +344,14 @@ receives) is a tombstone, as before. The `message-purge` worker
 text, file names, file text, transcripts, AI output, review references, send and command
 text within minutes and keeps a content-free `message_purges` mark. Collectors need no
 change: guard triggers keep a later import or backfill of a purged message content-free,
-its ingest receipt included. The worker takes `archive:<account>` with a try-lock, at most
-50 messages per transaction, a 2 s lock wait and a 10 s statement bound, so ingest is never
-held up; a busy account is retried on the next pass. Messages deleted before schema 45 are
+its ingest receipt included. The worker runs on its own login `messaging_purge_runtime`. It
+takes `purge:<account>` and `archive:<account>` with try-locks, at most 50 messages per
+transaction (one after a failure), a 2 s lock and statement bound and a 3 s transaction bound
+(PostgreSQL ends the session there), so ingest, sends and commands behind it wait at most
+3 s; a busy account is retried on the next pass. Messages deleted before schema 45 are
 purged by the operator: `python -m messaging_service.message_purge --dsn-file <dsn> --role
-messaging_purge purge-deleted --preview`, then `--apply` after a fresh verified backup.
+messaging_purge purge-deleted --preview`, then `--apply` after a fresh verified backup;
+`--apply` exits non-zero while marks stay pending.
 `get_sync_status` shows `deletions` per account (guarantee, pending, failed, last purge);
 `purge-status` lists failed message IDs. Telegram's guarantee stays `best_effort`: it does
 not report every deletion.
