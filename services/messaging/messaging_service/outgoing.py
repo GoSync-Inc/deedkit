@@ -115,7 +115,9 @@ def target(c,p,account,chat_id,reply_to):
     if not isinstance(reply_to,str) or len(reply_to)>256:
         raise APIError('not_found',404)
     if not permitted(p,account,chat_id):raise phone_not_found(chat_id,c,p,account)
-    chat=c.execute('''SELECT c.*,a.platform FROM chats c JOIN accounts a ON a.id=c.account
+    # Named columns: a prepared c.* fails once a migration adds a chats column (046, ANYM-533).
+    chat=c.execute('''SELECT c.id,c.account,c.title,c.chat_type,c.provider_chat,c.purged_at,a.platform
+        FROM chats c JOIN accounts a ON a.id=c.account
         WHERE c.id=%s AND c.account=%s''',(chat_id,account)).fetchone()
     if not chat or not chat['provider_chat']:raise phone_not_found(chat_id,c,p,account)
     reply_id=None
