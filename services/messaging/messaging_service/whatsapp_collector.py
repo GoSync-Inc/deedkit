@@ -379,6 +379,13 @@ class NodeProvider:
             remaining=int((deadline-time.monotonic())*1000)
             if remaining<100:raise CommandRejected('provider_timeout')
             payload['lookup_ms']=remaining
+            if job.get('expected_lid') is not None:
+                # With no lookup allowed, the adapter answers rate_limited when the LID left its
+                # chat list between the two calls: that is a changed identity, not a quota.
+                try:return await self._call_unlocked('messenger_operation',payload,sending=True)
+                except CommandRejected as exc:
+                    if str(exc)=='rate_limited':raise CommandRejected('identity_changed') from None
+                    raise
         return await self._call_unlocked('messenger_operation',payload,sending=True)
     async def chunks(self,source,descriptor):
         complete=False

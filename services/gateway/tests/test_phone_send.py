@@ -19,7 +19,7 @@ PREVIEW = {"tool": "preview_message", "arguments": {"account": "synthetic", "pho
            "caller_supplies": ["text"], "caller_may_supply": ["format", "reply_to"]}
 
 
-def backend(request, seen, permissions):
+def backend(request, seen, permissions, refusal=None):
     if request.url.path == "/v1/capabilities":
         return httpx.Response(200, json={"permissions": list(permissions), "messenger_operations": {
             "supported_by_account": {"synthetic": {"provider": "whatsmeow", "operations": ["open_chat_by_phone"]}}}})
@@ -30,10 +30,12 @@ def backend(request, seen, permissions):
                                          "hint": "open_chat_by_phone",
                                          "next_action": "preview_message_then_send_message_with_its_digest",
                                          "next_call": PREVIEW})
+    if refusal is not None and "phone" in args:
+        return httpx.Response(refusal[1], json={"error": refusal[0], "request_id": "c" * 32, "retryable": False})
     return httpx.Response(200, json={"status": "queued", "send_id": "send_" + "a" * 32, "preview_digest": "d" * 64})
 
 
-def setup(tmp_path, actions=("open_chat_by_phone",), permissions=("read", "send")):
+def setup(tmp_path, actions=("open_chat_by_phone",), permissions=("read", "send"), refusal=None):
     value = config()
     value["deployment"] = {"modules": ["messaging"], "backends": {"messaging": {"url": "http://backend.test"}}}
     value["profiles"]["reader"] = {"tools": ["messages_" + n for n in TOOLS],
@@ -51,7 +53,7 @@ def setup(tmp_path, actions=("open_chat_by_phone",), permissions=("read", "send"
     path.chmod(0o600)
     seen = []
     app = create_app(path, "http://testserver",
-                     transports={"messaging": httpx.MockTransport(lambda request: backend(request, seen, permissions))})
+                     transports={"messaging": httpx.MockTransport(lambda request: backend(request, seen, permissions, refusal))})
     return app, seen
 
 
@@ -81,6 +83,25 @@ def test_a_phone_recipient_needs_the_open_chat_grant_and_send_scope(tmp_path, ac
                                "text": "Synthetic"}, headers=HEADERS)
         assert response.status_code == 200
     assert [operation for operation, _ in seen] == ["preview_message"]  # zero phone requests reach the backend
+
+
+# spec: ANYM-532
+@pytest.mark.parametrize("refusal", [
+    ("operation_disabled", 409),  # the account has no open_chat_by_phone opt-in
+    ("chat_not_collected", 409),  # the collector or policy does not admit the chat
+    ("forbidden", 403),  # a chat-scoped key: the separate operation needs the full account
+])
+def test_backend_guards_of_the_separate_operation_reach_the_caller_unchanged(tmp_path, refusal):
+    # The gateway checks only its grants; the backend rechecks opt-in, policy and the full account.
+    app, seen = setup(tmp_path, refusal=refusal)
+    with TestClient(app) as client:
+        for tool, arguments in calls():
+            rest = client.post("/v1/messages_" + tool, json=arguments, headers=HEADERS)
+            mcp = rpc(client, "tools/call", {"name": "messages_" + tool, "arguments": arguments}).json()["result"]
+            assert rest.status_code == refusal[1] and mcp["isError"], (tool, rest.text)
+            assert rest.json()["error"] == mcp["structuredContent"]["error"] == refusal[0]
+            assert "send_id" not in rest.json() and "preview_digest" not in rest.json()
+    assert [operation for operation, _ in seen] == ["preview_message"] * 2 + ["send_message"] * 2
 
 
 # spec: ANYM-532

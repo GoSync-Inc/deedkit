@@ -463,17 +463,33 @@ def test_a_pending_phone_lookup_leaves_ordinary_sends_and_collection_usable(nati
     s, archive, state, key = native
     jobs = []
     archive_chat(state, PN, 'PN1')
-    # A phone preview whose lookup never runs, and a phone send's chat step that never runs.
-    s.phone_preview_lookup(key, **draft(text='Stalled'))
     digest = preview(s, key, state, jobs)['preview_digest']
+    # Another number's lookup stalls inside the adapter; a phone send's chat step stays queued behind it.
+    other = draft(phone='12025550162', text='Stalled')
+    stalled = s.phone_preview_lookup(key, **other)
     s.phone_send_begin(key, **draft(), request_id='phone-stall-0001', preview_digest=digest)
     queued = s.send_message(key, account=ACCOUNT, chat_id=stable_id('chat', ACCOUNT, PN), text=TEXT,
                             request_id='ordinary-send-0001')
     calls = []
-    async def provider(job):
-        calls.append(job); return {'provider_message_id': 'true_'+PN+'_SENT1'}
-    asyncio.run(OutgoingWorker(state, provider).once())
+    async def check():
+        gate, started = asyncio.Lock(), asyncio.Event()
+        async def execute(job):
+            # Like the collector: the lookup's own deadline ends a stall as a retryable timeout.
+            jobs.append(job); started.set()
+            try: await asyncio.wait_for(asyncio.Event().wait(), 0.3)
+            except TimeoutError: raise CommandRejected('provider_timeout') from None
+        async def provider(job):
+            calls.append(job); return {'provider_message_id': 'true_'+PN+'_SENT1'}
+        lookup = asyncio.create_task(CommandWorker(state, execute, gate).once())
+        await started.wait()
+        sending = asyncio.create_task(OutgoingWorker(state, provider, gate).once())
+        await asyncio.sleep(0.1)
+        assert calls == []  # the send lane waits for the stalled lookup, it is not lost
+        assert await asyncio.wait_for(lookup, 5) is True and await asyncio.wait_for(sending, 5) is True
+    asyncio.run(check())
+    assert jobs[-1]['parameters'] == {'phone': '12025550162', 'create': False}
     assert len(calls) == 1 and s.get_send_status(key, queued['send_id'])['status'] != 'queued'
+    refused(lambda: s.phone_preview_result(key, operation_id=stalled, **other), 'provider_timeout')
     archive_chat(state, PN, 'PN2')
     assert count(s, 'messages', f"chat='{stable_id('chat', ACCOUNT, PN)}'") == 2
 
@@ -554,6 +570,23 @@ def test_the_collector_answers_the_send_step_only_from_the_previewed_identity(tm
         # Isolation: the adapter stays usable for the next ordinary send.
         sent = await node._call_unlocked('send_text', {'chat': LID, 'text': 'Synthetic'}, sending=True)
         assert sent == {'provider_message_id': 'true_1@lid_X'} or stored != LID
+    asyncio.run(check())
+
+
+# spec: ANYM-532
+def test_a_lid_that_leaves_the_adapter_between_the_two_calls_is_a_changed_identity(tmp_path):
+    async def check():
+        node = provider(tmp_path, LID)
+        # operations.go answers rate_limited when no lookup is allowed and the LID is no longer a known chat.
+        node.send_reader.feed_data(json.dumps({'id': 2, 'error': 'rate_limited'}).encode()+b'\n')
+        async def archived(chat): raise AssertionError('no archive check for a send step')
+        job = {'operation': 'open_chat_by_phone', 'parameters': {'phone': '+'+PHONE, 'create': True},
+               'expires_at': 1.0, 'known_chats': [], 'lookup_allowed': True, '_archived': archived, 'expected_lid': LID}
+        async with node.send_lock:
+            with pytest.raises(CommandRejected, match='identity_changed'):
+                await node.execute_operation(job)
+        lines = [line['params'] for line in node.send_writer.lines]
+        assert len(lines) == 2 and lines[1]['lookup_allowed'] is False and lines[1]['known_chats'] == [LID]
     asyncio.run(check())
 
 
