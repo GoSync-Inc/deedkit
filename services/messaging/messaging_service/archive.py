@@ -234,8 +234,12 @@ class Archive:
                 reply = capture_reply(c,e,cid) if outcome=='created' else None
                 self.store.append_event(c,aid,mid,'message.'+outcome,e['origin'],receipt,
                     snapshot_metadata={'reply_evidence':reply} if reply else None)
-            c.execute('INSERT INTO ingest_receipts(digest,account,envelope,outcome) VALUES(%s,%s,%s,%s)',
-                      (receipt,aid,Jsonb(captured),outcome))
+            # A receipt of a deleted or tombstoned message keeps no content (ANYM-511); its digest
+            # still names the provider envelope, so a repeated copy stays a duplicate.
+            scrub=bool(e['deleted'] or (old and old['deleted']))
+            c.execute('''INSERT INTO ingest_receipts(digest,account,envelope,outcome)
+                VALUES(%s,%s,CASE WHEN %s THEN public.purged_envelope(%s) ELSE %s END,%s)''',
+                      (receipt,aid,scrub,Jsonb(captured),Jsonb(captured),outcome))
             if outcome=='conflict':
                 c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
