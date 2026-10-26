@@ -30,6 +30,11 @@ OVERDUE_SECONDS=900
 AUDIT_IDS=100
 PURGE_STATEMENT='2s'
 PURGE_TRANSACTION='3s'
+HIDE_STATEMENT='500ms'
+# The listing hides a chat whose every message is purged; it reads only this mark.
+HIDE_CHATS='''UPDATE chats ch SET purged_at=clock_timestamp() WHERE ch.account=%s
+    AND ch.id IN (SELECT chat FROM messages WHERE id=ANY(%s)) AND NOT EXISTS(SELECT 1 FROM messages m
+        WHERE m.account=ch.account AND m.chat=ch.id AND NOT m.purged)'''
 REASONS=('deleted_for_everyone','deleted_for_me','chat_deleted','chat_cleared','telegram_deleted','existing_deleted')
 GUARANTEE={'telegram':'best_effort','whatsapp':'reported'}
 # The provider chat of a message: its chat row, else its newest revision (017 left chats.provider_chat nullable).
@@ -90,10 +95,10 @@ class Purger:
     def backfill_links(self):
         """Link receipts stored before schema 45, one chunk per call; True once every receipt is linked.
 
-        A message purged before its receipts were linked is scrubbed here, chunk by chunk. The chunk
-        holds `purge-backfill` exclusively and every purge holds it shared, so a purge and a chunk
-        never miss each other's uncommitted rows. A purge in progress makes the chunk wait for the
-        next call instead of failing on the lock bound."""
+        No purge completes before this returns True (purge_account checks it in its transaction): an
+        unlinked receipt would keep a purged message's text past the deadline. The guard trigger links
+        every receipt stored after the migration. Concurrent callers (worker, apply) take turns on
+        `purge-backfill` without waiting."""
         with self.tx() as c:
             if self.state(c,'receipt_backfill')=='complete':return True
             if not c.execute(sql.SQL('SELECT pg_try_advisory_xact_lock({}) AS ok').format(
@@ -102,18 +107,18 @@ class Purger:
             row=c.execute('''WITH chunk AS (SELECT digest,account,coalesce(envelope->>'chat','') AS provider_chat,
                     coalesce(envelope->>'provider_id','') AS provider_id FROM ingest_receipts
                     WHERE digest>%s ORDER BY digest LIMIT %s),
-                linked AS (INSERT INTO ingest_receipt_links SELECT * FROM chunk ON CONFLICT(digest) DO NOTHING),
-                scrubbed AS (UPDATE ingest_receipts r SET envelope=public.purged_envelope(r.envelope) FROM chunk k
-                    WHERE r.digest=k.digest AND r.envelope->'purged' IS DISTINCT FROM 'true'::jsonb
-                    AND EXISTS(SELECT 1 FROM message_purges p JOIN messages m ON m.id=p.message
-                        WHERE p.account=k.account AND p.provider_chat=k.provider_chat AND p.provider_id=k.provider_id
-                        AND p.purged_at IS NOT NULL AND m.purged) RETURNING 1)
-                SELECT max(digest) AS last,count(*) AS n,(SELECT count(*) FROM scrubbed) AS scrubbed FROM chunk''',
-                (cursor,LINK_CHUNK)).fetchone()
-            if row['scrubbed']:log.info('message_purge receipts_rescrubbed=%d',row['scrubbed'])
+                linked AS (INSERT INTO ingest_receipt_links SELECT * FROM chunk ON CONFLICT(digest) DO NOTHING)
+                SELECT max(digest) AS last,count(*) AS n FROM chunk''',(cursor,LINK_CHUNK)).fetchone()
             if row['n']<LINK_CHUNK:
                 self.set_state(c,'receipt_backfill','complete');return True
             self.set_state(c,'receipt_cursor',row['last']);return False
+
+    def backfill(self,seconds=PASS_SECONDS):
+        """Link chunks until every receipt is linked (True) or `seconds` pass (False)."""
+        started=time.monotonic()
+        while not self.backfill_links():
+            if time.monotonic()-started>=seconds:return False
+        return True
 
     def pending_accounts(self):
         with self.tx() as c:
@@ -129,11 +134,13 @@ class Purger:
         ids=[]
         try:
             with self.tx(PURGE_STATEMENT,PURGE_TRANSACTION) as c:
-                for name,shared in (('purge:'+account,False),('purge-backfill',True),('archive:'+account,False)):
-                    statement='pg_try_advisory_xact_lock_shared' if shared else 'pg_try_advisory_xact_lock'
-                    if not c.execute(sql.SQL('SELECT {}({}) AS ok').format(sql.Identifier(statement),lock_key(name))
+                for name in ('purge:'+account,'archive:'+account):
+                    if not c.execute(sql.SQL('SELECT pg_try_advisory_xact_lock({}) AS ok').format(lock_key(name))
                                      ).fetchone()['ok']:
                         return {'purged':0,'gave_way':1,'failed':0}
+                # Until every older receipt is linked a purge could miss one: the mark stays pending
+                # (and turns overdue) instead of reporting a purge that left a copy.
+                if self.state(c,'receipt_backfill')!='complete':return {'purged':0,'gave_way':0,'failed':0}
                 rows=c.execute('''SELECT message,provider_chat,provider_id,attempts FROM message_purges
                     WHERE account=%s AND purged_at IS NULL AND next_attempt_at<=clock_timestamp()
                     ORDER BY next_attempt_at,message LIMIT %s FOR UPDATE SKIP LOCKED''',(account,limit)).fetchall()
@@ -176,10 +183,6 @@ class Purger:
         c.execute('SELECT id FROM messages WHERE id=ANY(%s) AND account=%s FOR UPDATE',(ids,account))
         # The flag first: after commit every guard trigger treats a late write as purged.
         counts={'messages':n("UPDATE messages SET body='',purged=true WHERE id=ANY(%s) AND account=%s",(ids,account))}
-        # Bounded by the chat's own messages (message_chat_date index); the listing reads only the mark.
-        counts['hidden_chats']=n('''UPDATE chats ch SET purged_at=clock_timestamp() WHERE ch.account=%s
-            AND ch.id IN (SELECT chat FROM messages WHERE id=ANY(%s)) AND NOT EXISTS(SELECT 1 FROM messages m
-                WHERE m.account=ch.account AND m.chat=ch.id AND NOT m.purged)''',(account,ids))
         files=[r['id'] for r in c.execute('SELECT id FROM attachments WHERE message=ANY(%s)',(ids,))]
         counts['file_names']=n("UPDATE attachments SET filename='' WHERE message=ANY(%s) AND filename<>''",(ids,))
         derived=0
@@ -230,15 +233,26 @@ class Purger:
         counts['reply_notes']=sum(n(sql.SQL('''UPDATE {} SET note=NULL WHERE note IS NOT NULL
             AND (message=ANY(%s) OR incoming_head=ANY(%s))''').format(sql.Identifier(t)),(ids,ids))
             for t in ('reply_dismissals','reply_snoozes'))
+        # Last, in a savepoint with its own short bound: proving that a chat has no unpurged message
+        # left reads its purged history (message_chat_date index), which in a long chat may not fit.
+        # Then the content purge still commits and only the chat stays listed (hidden_chats_skipped).
+        try:
+            with c.transaction():
+                c.execute(sql.SQL('SET LOCAL statement_timeout={}').format(sql.Literal(HIDE_STATEMENT)))
+                counts['hidden_chats']=n(HIDE_CHATS,(account,ids))
+        except psycopg.errors.QueryCanceled:
+            counts['hidden_chats']=0;counts['hidden_chats_skipped']=1
+        # A released savepoint keeps its SET LOCAL until the transaction ends.
+        c.execute(sql.SQL('SET LOCAL statement_timeout={}').format(sql.Literal(PURGE_STATEMENT)))
         return counts
 
     def run_once(self):
         totals={'discovered':0,'purged':0,'gave_way':0,'failed':0,'links_complete':False}
         if not self.enabled():return {**totals,'enabled':False}
         totals['discovered']=self.discover()
-        # The purge does not wait for the backfill: each backfill chunk scrubs the receipts of
-        # messages purged before their link existed.
-        totals['links_complete']=self.backfill_links()
+        # Purges wait until every older receipt is linked; until then their marks stay pending.
+        totals['links_complete']=self.backfill()
+        if not totals['links_complete']:return {**totals,'enabled':True}
         for account in self.pending_accounts():
             started=time.monotonic()
             # Drain the account while it makes progress, within one pass: after a failure the
@@ -261,7 +275,7 @@ class Purger:
     def apply(self):
         """Purge messages already marked deleted (reason existing_deleted), queued in passes of at most
         500, and drain every due pending mark, including marks an interrupted run left queued."""
-        while not self.backfill_links():time.sleep(0.05)
+        while not self.backfill():time.sleep(0.05)
         totals={'queued':0,'purged':0,'gave_way':0,'failed':0,'passes':0}
         retries=0
         while True:

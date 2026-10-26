@@ -2,26 +2,50 @@
 -- Manual: it seeds worker state, adds guard functions and triggers and re-adds the audit CHECK, so the
 -- release is the standing manual one (backup gate first); every change still adds, nothing drops data.
 -- Messenger deletion purge (ANYM-511). New tables carry no foreign keys (044 precedent: a key locks
--- the referenced table at create). The events index is built before this file, outside its transaction
--- (`CREATE INDEX CONCURRENTLY IF NOT EXISTS events_message ON events(message)`, release step 0): built
--- here it would hold SHARE on events and every lock taken after it for the whole build. With the index
--- present this file takes no lock on events for it (a plain IF NOT EXISTS would still take SHARE); a
--- small test database builds it in place; a large one without it, or with an INVALID one left by a
--- failed concurrent build, refuses. After that every statement only changes the catalog: the
--- defaulted flag on messages is a metadata change, each lock waits at most the 2 s migrate bound.
+-- the referenced table at create).
+-- Locks: every table this file alters or adds a trigger to is locked first, all in one attempt that
+-- never queues (NOWAIT), retried for at most 2 s, as lock_replay_tables does (store.py). Waits one
+-- table at a time would each stay under the 2 s lock bound while the locks already held kept writers
+-- waiting for their sum. Once the locks are held every later statement only changes the catalog.
+-- The events index is built before this file, outside its transaction (`CREATE INDEX CONCURRENTLY IF
+-- NOT EXISTS events_message ON events(message)`, release step 0); this file checks that the index is
+-- valid, ready and on events(message). Only a small database (an exact bounded count and size, not
+-- the planner's estimate) builds it here, inside the locked phase.
 -- Guard triggers keep every later write of a purged message content-free, so deployed schema-44 code
 -- keeps writing through them unchanged.
-DO $$ BEGIN
- IF EXISTS(SELECT 1 FROM pg_index WHERE indexrelid=to_regclass('public.events_message') AND NOT indisvalid) THEN
-  RAISE EXCEPTION 'events_message is INVALID: DROP INDEX CONCURRENTLY events_message, then rebuild it CONCURRENTLY';
- END IF;
- IF to_regclass('public.events_message') IS NULL THEN
-  -- reltuples is -1 on a restored table not yet analysed; the size test covers that case.
-  IF (SELECT reltuples FROM pg_class WHERE oid='public.events'::regclass)>100000
-    OR pg_relation_size('public.events')>50*1024*1024 THEN
+DO $$ DECLARE deadline timestamptz := clock_timestamp()+interval '2 seconds'; BEGIN
+ LOOP
+  BEGIN
+   LOCK TABLE messages,chats,audit_log IN ACCESS EXCLUSIVE MODE NOWAIT;
+   LOCK TABLE events,ingest_receipts,attachments,message_revisions,message_metadata,attachment_text,
+    attachment_text_chunks,attachment_enrichment,attachment_enrichment_chunks,attachment_understanding,
+    reviews,messenger_commands,outgoing_messages IN SHARE ROW EXCLUSIVE MODE NOWAIT;
+   EXIT;
+  EXCEPTION WHEN lock_not_available THEN
+   IF clock_timestamp()>=deadline THEN RAISE; END IF;
+   PERFORM pg_sleep(0.05);
+  END;
+ END LOOP;
+END $$;
+DO $$ DECLARE ix regclass := to_regclass('public.events_message'); ok boolean; BEGIN
+ IF ix IS NULL THEN
+  IF pg_relation_size('public.events')>8*1024*1024 THEN
+   RAISE EXCEPTION 'events_message missing: run CREATE INDEX CONCURRENTLY IF NOT EXISTS events_message ON events(message) first';
+  END IF;
+  IF (SELECT count(*) FROM (SELECT 1 FROM events LIMIT 10001) s)>10000 THEN
    RAISE EXCEPTION 'events_message missing: run CREATE INDEX CONCURRENTLY IF NOT EXISTS events_message ON events(message) first';
   END IF;
   CREATE INDEX events_message ON events(message);
+ ELSE
+  SELECT i.indisvalid AND i.indisready AND i.indrelid='public.events'::regclass AND i.indpred IS NULL
+    AND i.indexprs IS NULL AND i.indnkeyatts=1 AND i.indkey[0]=a.attnum AND am.amname='btree' INTO ok
+   FROM pg_index i JOIN pg_class ic ON ic.oid=i.indexrelid JOIN pg_am am ON am.oid=ic.relam
+   JOIN pg_attribute a ON a.attrelid='public.events'::regclass AND a.attname='message'
+   WHERE i.indexrelid=ix;
+  -- An interrupted concurrent build leaves an INVALID index that IF NOT EXISTS then skips.
+  IF NOT coalesce(ok,false) THEN
+   RAISE EXCEPTION 'events_message is not a valid btree index on events(message): DROP INDEX CONCURRENTLY events_message, then CREATE INDEX CONCURRENTLY events_message ON events(message)';
+  END IF;
  END IF;
 END $$;
 ALTER TABLE messages ADD COLUMN purged boolean NOT NULL DEFAULT false;
@@ -96,20 +120,31 @@ CREATE FUNCTION public.purged_envelope(e jsonb) RETURNS jsonb LANGUAGE sql IMMUT
    FROM jsonb_array_elements(e->'media') m) END))
   || '{"body":"","deleted":true,"purged":true}'::jsonb
 $$;
--- A purged message's command keeps its routing, authorization binding, request ID and status
--- (commands._check_saved reads them); only the text parameters it carried go.
-CREATE FUNCTION public.purged_command_parameters(x jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+-- A purged message's command keeps only what routes, authorizes and correlates it: request ID and
+-- status (columns), the authorization binding, chat, message, provider and file identifiers
+-- (commands._check_saved reads them). Every other field is content (text, captions, file names,
+-- coordinates, contact names ...) and goes, whatever its name: an allowlist, not a denylist.
+CREATE FUNCTION public.purged_fields(x jsonb,keep text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
  SELECT CASE WHEN jsonb_typeof(x) IS DISTINCT FROM 'object' THEN x ELSE (SELECT coalesce(jsonb_object_agg(k,CASE
-   WHEN k IN ('text','caption','question','description','phone','first_name','last_name','bio','title','query')
-    AND jsonb_typeof(v)='string' THEN '"[deleted]"'::jsonb
-   WHEN k='options' AND jsonb_typeof(v)='array' THEN (SELECT coalesce(jsonb_agg('"[deleted]"'::jsonb),'[]'::jsonb)
-    FROM jsonb_array_elements(v))
-   ELSE v END),'{}'::jsonb) FROM jsonb_each(x) AS p(k,v)) END
+   WHEN k=ANY(keep) THEN v
+   WHEN jsonb_typeof(v)='string' THEN '"[deleted]"'::jsonb
+   WHEN jsonb_typeof(v)='array' THEN (SELECT coalesce(jsonb_agg('"[deleted]"'::jsonb),'[]'::jsonb) FROM jsonb_array_elements(v))
+   ELSE 'null'::jsonb END),'{}'::jsonb) FROM jsonb_each(x) AS p(k,v)) END
+$$;
+CREATE FUNCTION public.purged_command_parameters(x jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+ SELECT public.purged_fields(x,ARRAY['around_message','attachment_id','before_message','chat_types','contact_ids',
+  'count','create','enabled','from_time','label_ids','limit','mode','multiple','offset','option_indices','seconds',
+  'source_message_id','source_revision','to_time','upload_id','user_id','user_ids'])
 $$;
 CREATE FUNCTION public.purged_command_payload(x jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
- SELECT x||jsonb_build_object('parameters',public.purged_command_parameters(x->'parameters'))
+ SELECT public.purged_fields(x,ARRAY['platform','catalog_version','operation','account','adapter',
+   'authorization_binding','chat_id','message_id','expected_revision','provider_chat','provider_message_id',
+   'source_chat_id','source_provider_chat','source_provider_message','file_upload_id','file_message_id',
+   'file_message_revision','file_chat_id','file_digest','file_bytes','file_mime'])
+  ||jsonb_build_object('parameters',public.purged_command_parameters(x->'parameters'))
   ||CASE WHEN jsonb_typeof(x->'request_input')='object' THEN jsonb_build_object('request_input',
-   x->'request_input'||jsonb_build_object('parameters',public.purged_command_parameters(x#>'{request_input,parameters}')))
+   public.purged_fields(x->'request_input',ARRAY['account','operation','chat_id','message_id','expected_revision',
+    'preview_digest'])||jsonb_build_object('parameters',public.purged_command_parameters(x#>'{request_input,parameters}')))
    ELSE '{}'::jsonb END
 $$;
 -- The result keeps its outcome and the provider identifiers of the message it produced.

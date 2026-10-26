@@ -12,6 +12,7 @@ from messaging_service.blobs import BlobWriter
 from messaging_service.envelope import stable_id
 from test_archive import archive, event
 from test_messenger_commands import operator  # noqa: F401  (fixture)
+from test_sending import sender  # noqa: F401  (fixture)
 
 CHAT=stable_id('chat','archive-test','100')
 VOICE={'provider_id':'voice-17','filename':'sentinel-a-voice.ogg','mime':'audio/ogg','bytes':5}
@@ -561,19 +562,31 @@ def test_reply_controls_keep_working_in_a_fully_purged_chat(purge):
 
 
 # spec: ANYM-511
-def test_receipts_linked_after_the_purge_are_scrubbed_by_the_backfill(purge,monkeypatch):
+def test_no_purge_completes_before_every_older_receipt_is_linked(purge,monkeypatch):
     from messaging_service import message_purge
     ar,s,key,p=purge
     ar.ingest(event(body='sentinel-a first'))
-    with s.pool.connection() as c:c.execute('DELETE FROM ingest_receipt_links')  # a receipt stored before schema 45
+    for n in range(9):ar.ingest(event(provider_id=str(30+n),body='filler'))
+    with s.pool.connection() as c:c.execute('DELETE FROM ingest_receipt_links')  # receipts stored before schema 45
     delete(ar)
-    # The purge does not wait for the backfill; that receipt is not linked yet.
-    monkeypatch.setattr(message_purge.Purger,'backfill_links',lambda self:False)
-    assert p.run_once()['purged']==1
-    assert leaks(s,'sentinel-a')=={'ingest_receipts':1}
+    # An interrupted backfill: one chunk of two receipts per pass, never the whole table.
+    monkeypatch.setattr(message_purge,'LINK_CHUNK',2)
+    monkeypatch.setattr(message_purge.Purger,'backfill',lambda self,seconds=0:self.backfill_links())
+    for _ in range(3):
+        result=p.run_once()
+        assert result['purged']==0 and result['links_complete'] is False
+    # Called directly, the purge refuses too: it reports nothing while a copy may remain.
+    assert p.purge_account('archive-test')=={'purged':0,'gave_way':0,'failed':0}
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM message_purges WHERE purged_at IS NULL').fetchone()['n']==1
+        assert c.execute("SELECT value FROM purge_state WHERE name='receipt_backfill'").fetchone()['value']=='pending'
+        c.execute("UPDATE message_purges SET observed_at=clock_timestamp()-interval '1 hour'")
+    assert [f['code'] for f in p.status()['failed']]==['purge_overdue']
+    assert 'ingest_receipts' in leaks(s,'sentinel-a')
     monkeypatch.undo()
-    while not p.backfill_links():pass
-    assert leaks(s,'sentinel-a')=={}
+    result=p.run_once()
+    assert result['links_complete'] and result['purged']==1
+    assert leaks(s,'sentinel-a')=={} and p.status()['failed']==[]
 
 
 # spec: ANYM-511
@@ -604,4 +617,222 @@ def test_whatsapp_deletion_is_reported_and_purged(purge):
         assert c.execute('SELECT reason FROM message_purges WHERE message=%s',(mid,)).fetchone()['reason']=='deleted_for_everyone'
     status={r['account']:r for r in s.get_sync_status(owner)['sources']}['wa-purge']['deletions']
     assert status['guarantee']=='reported' and status['purged_total']==1
+    assert leaks(s,'sentinel-a')=={}
+
+
+# spec: ANYM-511
+def test_store_created_file_and_location_commands_keep_no_content(operator):
+    import asyncio
+    import hashlib
+    from messaging_service.commands import CommandWorker
+    from messaging_service.message_purge import Purger
+    s,archive,key,state=operator
+    reset_state(s)
+    s.set_messenger_operations('command-fixture',['send_file','send_location'])
+    content=b'Synthetic purge original';sha=hashlib.sha256(content).hexdigest()
+    s.files.mkdir(parents=True,exist_ok=True);(s.files/sha).write_bytes(content)
+    aid=stable_id('att','command-fixture','100','1','purge-file')
+    with s.pool.connection() as c:
+        c.execute('INSERT INTO attachments(id,message,digest,filename,mime,bytes) VALUES(%s,%s,%s,%s,%s,%s)',
+            (aid,stable_id('msg','command-fixture','100','1'),sha,'sentinel-f-document.pdf','application/pdf',len(content)))
+    chat=stable_id('chat','command-fixture','200')
+    def queue(operation,parameters,request_id):
+        args={'account':'command-fixture','operation':operation,'chat_id':chat,'parameters':parameters}
+        draft=s.preview_messenger_operation(key,**args)
+        first=s.execute_messenger_operation(key,**args,request_id=request_id,preview_digest=draft['preview_digest'])
+        return args,draft,first
+    def provider(provider_id):
+        async def send(job):return {'outcome':'confirmed','provider_message_id':provider_id}
+        return send
+    def output(provider_id,body):
+        archive.ingest(event(account='command-fixture',chat='200',provider_id=provider_id,direction='outgoing',body=body))
+        archive.ingest(event(account='command-fixture',chat='200',provider_id=provider_id,direction='outgoing',
+                             deleted=True,updated_at='2026-10-01T12:05:00Z'))
+    # The location result is published before its message is deleted and purged ...
+    location=queue('send_location',{'latitude':12.3456789,'longitude':98.7654321},'purge-location-0001')
+    assert asyncio.run(CommandWorker(state,provider('41')).once())
+    output('41','sentinel-a location')
+    # ... the file result after: the publication guard redacts it.
+    sent=queue('send_file',{'mode':'document','attachment_id':aid,'sha256':sha,'caption':'sentinel-a caption'},
+               'purge-file-send-0001')
+    with s.pool.connection() as c:
+        saved=c.execute('SELECT payload FROM messenger_commands WHERE id=%s',(sent[2]['operation_id'],)).fetchone()['payload']
+    assert saved['file_name']=='sentinel-f-document.pdf'  # the real payload carries the name at top level
+    output('42','sentinel-a caption')
+    assert Purger(s).run_once()['purged']==2
+    assert asyncio.run(CommandWorker(state,provider('42')).once())
+    with s.pool.connection() as c:
+        rows={r['operation']:r for r in c.execute('''SELECT operation,status,payload,result FROM messenger_commands
+            WHERE operation IN ('send_file','send_location')''')}
+    for row in rows.values():
+        stored=json.dumps(row['payload'])+json.dumps(row['result'])
+        for content_value in ('sentinel','12.3456789','98.7654321'):assert content_value not in stored
+        assert row['status']=='succeeded' and row['result']['purged']
+    assert rows['send_file']['payload']['file_name']=='[deleted]'
+    assert rows['send_file']['payload']['parameters']['attachment_id']==aid
+    assert rows['send_file']['payload']['file_digest']==sha and rows['send_file']['payload']['provider_chat']=='200'
+    assert rows['send_location']['payload']['parameters']=={'latitude':None,'longitude':None,'description':'[deleted]'}
+    assert rows['send_location']['payload']['request_input']['parameters']=={'latitude':None,'longitude':None}
+    # Status and an idempotent replay stay readable.
+    for (args,draft,first),request_id in ((location,'purge-location-0001'),(sent,'purge-file-send-0001')):
+        assert s.get_messenger_operation(key,first['operation_id'])['status']=='succeeded'
+        replay=s.execute_messenger_operation(key,**args,request_id=request_id,preview_digest=draft['preview_digest'])
+        assert replay['operation_id']==first['operation_id']
+    assert leaks(s,'sentinel-a')=={}
+
+
+# spec: ANYM-511
+def test_a_slow_chat_visibility_check_does_not_stop_the_purge(purge,monkeypatch):
+    from messaging_service import message_purge
+    ar,s,key,p=purge
+    ar.ingest(event(body='sentinel-a only'));delete(ar)
+    # Stands in for a chat whose long purged history the visibility probe cannot read in time.
+    monkeypatch.setattr(message_purge,'HIDE_STATEMENT','50ms')
+    monkeypatch.setattr(message_purge,'HIDE_CHATS',message_purge.HIDE_CHATS+' AND (SELECT true FROM pg_sleep(1))')
+    assert p.run_once()['purged']==1
+    assert leaks(s,'sentinel-a')=={}
+    with s.pool.connection() as c:
+        counts=c.execute('SELECT counts FROM message_purges').fetchone()['counts']
+    assert counts['hidden_chats']==0 and counts['hidden_chats_skipped']==1 and counts['messages']==1
+    assert [c['id'] for c in s.list_chats(key)['items']]==[CHAT]  # listed, content-free
+    monkeypatch.undo()
+    # The chat's next message and its deletion: the probe fits again and hides the chat; a later one reopens it.
+    ar.ingest(event(provider_id='30',body='sentinel-c next',sent_at='2026-10-02T12:00:00Z',updated_at='2026-10-02T12:00:00Z'))
+    delete(ar,provider_id='30',at='2026-10-02T12:05:00Z',sent_at='2026-10-02T12:00:00Z')
+    assert p.run_once()['purged']==1 and s.list_chats(key)['items']==[]
+    ar.ingest(event(provider_id='31',body='reopened',sent_at='2026-10-03T12:00:00Z',updated_at='2026-10-03T12:00:00Z'))
+    assert [c['id'] for c in s.list_chats(key)['items']]==[CHAT]
+
+
+def schema44(database,tmp_path):
+    from test_extend_key import old_schema_store
+    return old_schema_store(database,tmp_path,44)
+
+
+# spec: ANYM-511
+@pytest.mark.parametrize('index',['invalid','other_key'])
+def test_migration_refuses_an_unusable_events_message_index(database,tmp_path,index):
+    with schema44(database,tmp_path) as store:
+        with store.pool.connection() as c:
+            if index=='invalid':
+                # What an interrupted CREATE INDEX CONCURRENTLY leaves behind.
+                c.execute('CREATE INDEX events_message ON events(message)')
+                c.execute("UPDATE pg_index SET indisvalid=false WHERE indexrelid='events_message'::regclass")
+            else:c.execute('CREATE INDEX events_message ON events(kind)')
+        with pytest.raises(psycopg.errors.RaiseException,match='not a valid btree index'):store.migrate()
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='44'
+            c.execute('DROP INDEX events_message');c.execute('CREATE INDEX events_message ON events(message)')
+        store.migrate()
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='45'
+
+
+def migrate_attempted(watcher):
+    """045's lock loop is between two NOWAIT attempts (pg_sleep), or migrate waits on a lock."""
+    return watcher.execute("""SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid AND l.locktype='advisory'
+        AND l.objid=74509137 AND l.granted WHERE a.wait_event='PgSleep' OR a.wait_event_type='Lock'""").fetchone()
+
+
+# spec: ANYM-511
+def test_migration_045_never_holds_a_table_while_it_waits_for_another(database,tmp_path):
+    import time
+    from test_extend_key import migrate_behind_lock
+    with schema44(database,tmp_path) as store:
+        # A writer in flight on a late trigger target. Locked one by one, 045 would hold events while
+        # it waits here, and an event writer would wait with it.
+        outcome,writer_seconds,migrate_seconds=migrate_behind_lock(store,[('message_metadata','ROW EXCLUSIVE')],
+            migrate_attempted,lambda c:c.execute('LOCK TABLE events IN ROW EXCLUSIVE MODE'))
+        assert outcome==['lock_not_available'] and writer_seconds<1 and migrate_seconds<10
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='44'
+        # Successive writers that each finish within the 2 s retry: 045 applies and no writer waits.
+        holders=[psycopg.connect(store.pool.conninfo) for _ in range(2)]
+        outcome,waits=[],[]
+        def migrate():
+            try:store.migrate();outcome.append('migrated')
+            except psycopg.errors.LockNotAvailable:outcome.append('lock_not_available')
+        def writers():
+            holders[0].execute('LOCK TABLE reviews IN ROW EXCLUSIVE MODE')
+            time.sleep(0.4)
+            holders[1].execute('LOCK TABLE outgoing_messages IN ROW EXCLUSIVE MODE');holders[0].rollback()
+            for table in ('events','ingest_receipts','attachments'):
+                started=time.monotonic()
+                with store.pool.connection() as c:c.execute(sql.SQL('LOCK TABLE {} IN ROW EXCLUSIVE MODE').format(
+                    sql.Identifier(table)))
+                waits.append(time.monotonic()-started)
+            time.sleep(0.4);holders[1].rollback()
+        try:
+            started,errors=threads(writers)
+            time.sleep(0.1)
+            migrator,migrate_errors=threads(migrate)
+            for t in started+migrator:t.join(15)
+        finally:
+            for h in holders:h.close()
+        assert errors==[] and migrate_errors==[] and outcome==['migrated']
+        assert max(waits)<0.5,waits
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='45'
+
+
+# spec: ANYM-511
+@pytest.mark.parametrize('mode',['held','timeout'])
+def test_send_download_backup_and_ingest_complete_around_a_purge(sender,monkeypatch,mode):
+    import time
+    from messaging_service.backup import database_manifest
+    from messaging_service.file_lifecycle import lifecycle_lock
+    from messaging_service.message_purge import Purger
+    from messaging_service.outgoing import OutgoingWorker
+    s,archive,key,_,state=sender
+    reset_state(s)
+    p=Purger(s)
+    sent=s.send_message(key,account='send-fixture',chat_id=stable_id('chat','send-fixture','100'),
+                        text='sentinel-a sent',request_id='purge-send-0001')
+    job=OutgoingWorker(state,None).claim()  # claimed and fenced before the purge
+    assert job['id']==sent['send_id']
+    archive.ingest(event(account='send-fixture',chat='100',provider_id='17',direction='outgoing',body='sentinel-a sent'))
+    archive.ingest(event(account='send-fixture',chat='100',provider_id='25',body='kept with a file',
+        media=[{**SCAN,'provider_id':'scan-25','filename':'kept-scan.pdf'}]))
+    media=archive.claim_media('fixture',account='send-fixture')  # an unrelated collector download in flight
+    assert media and media['message']==stable_id('msg','send-fixture','100','25')
+    archive.ingest(event(account='send-fixture',chat='100',provider_id='17',direction='outgoing',deleted=True,
+                         updated_at='2026-10-01T12:05:00Z'))
+    def slow(c):
+        for _ in range(3):c.execute('SELECT pg_sleep(1.5)')
+    gate,inside=hold_scrub(monkeypatch,after=slow if mode=='timeout' else None)
+    if mode=='timeout':gate.set()
+    results,seconds={},{}
+    purger,purge_errors=threads(lambda:results.update(purge=p.run_once()))
+    if mode=='held':assert inside.wait(5)
+    else:time.sleep(0.3)
+    def timed(name,function):
+        def run():
+            started=time.monotonic();function();seconds[name]=time.monotonic()-started
+        return run
+    def finish_send():OutgoingWorker(state,None).finish(job,'sent','17')
+    def ingest():assert archive.ingest(event(account='send-fixture',chat='100',provider_id='26',body='during'))['outcome']=='created'
+    def download():
+        writer=BlobWriter(s.files,reserve_bytes=0);archive.finish_media(media,writer.write([b'bytes']),writer)
+    def backup():
+        with s.pool.connection() as c:
+            lifecycle_lock(c)  # the residency lock a backup snapshot holds
+            assert 'message_purges' in database_manifest(c)
+    workers,errors=threads(*(timed(n,f) for n,f in (('send',finish_send),('ingest',ingest),('download',download),
+                                                    ('backup',backup))))
+    if mode=='held':
+        time.sleep(0.5);gate.set()
+    for t in purger+workers:t.join(15)
+    assert errors==[] and purge_errors==[]
+    assert set(seconds)=={'send','ingest','download','backup'} and max(seconds.values())<3.5,seconds
+    if mode=='timeout':
+        assert results['purge']['purged']==0 and results['purge']['failed']==1
+        monkeypatch.undo()
+        with s.pool.connection() as c:c.execute('UPDATE message_purges SET next_attempt_at=clock_timestamp()')
+        assert p.run_once()['purged']==1
+    else:assert results['purge']['purged']==1
+    status=s.get_send_status(key,sent['send_id'])
+    assert status['status']=='sent'
+    with s.pool.connection() as c:
+        assert c.execute('SELECT body FROM outgoing_messages WHERE id=%s',(sent['send_id'],)).fetchone()['body']=='[deleted]'
+        assert c.execute('SELECT digest FROM attachments WHERE message=%s',(media['message'],)).fetchone()['digest']
     assert leaks(s,'sentinel-a')=={}

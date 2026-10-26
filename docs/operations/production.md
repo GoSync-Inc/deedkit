@@ -642,10 +642,13 @@ order, outside an active call:
 0. As the owner, before `migrate`: `CREATE INDEX CONCURRENTLY IF NOT EXISTS events_message ON
    events(message);` (no lock on event inserts; about 250k rows), then check that `\d events` lists
    `events_message` without `INVALID` (a failed build: `DROP INDEX CONCURRENTLY events_message` and
-   build again). Without it, or with an INVALID one, 045 refuses on a table of more than 100k events
-   or 50 MB, so the build never runs inside the migration transaction.
+   build again). 045 refuses an index that is invalid, not ready or not a btree on `events(message)`;
+   without one it builds in place only on a table of at most 10k events and 8 MB, so a production
+   build never runs inside the migration transaction.
 1. Update the pinned backup and restore runtimes to the schema-45 release.
-2. Fresh verified backup (the backup gate), then `migrate`.
+2. Fresh verified backup (the backup gate), then `migrate`. 045 takes all its table locks in one
+   attempt that never queues, retried for 2 s; `LockNotAvailable` (busy tables) rolls everything
+   back: run `migrate` again.
 3. As the owner: `purge_role.sql` (NOLOGIN role `messaging_purge`) and `gateway_role.sql`; deploy
    the release.
 4. The worker's own login (owner decision 2026-10-26, «1) а»): as the owner create
@@ -656,7 +659,9 @@ order, outside an active call:
    `DROP ROLE messaging_purge_runtime`, remove the file.
 5. Start the worker: add `deploy/compose.message-purge.yaml` to the project's compose files for
    `production.py apply`, or `docker compose --profile message-purge up -d message-purge`. From here
-   every new deletion is purged within a minute: the point of no return for future deletions.
+   every new deletion is purged within a minute: the point of no return for future deletions. Its
+   first passes link the receipts stored before 045; deletions wait pending until then (`pending`
+   in `get_sync_status` deletions) and are reported `purge_overdue` after 15 minutes.
 6. Read-only: `purge-deleted --preview` (counts per account of messages deleted before 045).
 7. After a fresh verified backup, `purge-deleted --apply`: the point of no return for past
    deletions. `--apply` drains every due mark and exits non-zero while marks stay pending
