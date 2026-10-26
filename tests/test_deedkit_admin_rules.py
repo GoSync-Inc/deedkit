@@ -608,7 +608,7 @@ def write_refused(site, capsys, verb, message):
     assert site.snapshot() == before and site.operator.state["extended"] == []
 
 
-# spec: ANYM-493
+# spec: ANYM-497
 @pytest.mark.parametrize("verb", list(WRITES))
 @pytest.mark.parametrize("lock", ["state/global/deploy.lock", "state/http/deploy.lock", "state/a/deploy.lock",
                                   "calls registry"])
@@ -619,7 +619,7 @@ def test_extend_and_revoke_take_the_same_locks(site, capsys, verb, lock):
                       else "a deploy is running")
 
 
-# spec: ANYM-493
+# spec: ANYM-497
 @pytest.mark.parametrize("verb", list(WRITES))
 def test_extend_and_revoke_refuse_during_an_active_call_or_a_pause(site, capsys, verb):
     site.calls.append("call-1 (in_progress)")
@@ -629,14 +629,14 @@ def test_extend_and_revoke_refuse_during_an_active_call_or_a_pause(site, capsys,
     write_refused(site, capsys, verb, "deploys are paused")
 
 
-# spec: ANYM-493
+# spec: ANYM-497
 @pytest.mark.parametrize("verb", list(WRITES))
 def test_extend_and_revoke_validate_in_the_rollback_image_before_any_write(site, capsys, verb):
     site.docker.images["gateway:old"] = lambda path: "silent"
     write_refused(site, capsys, verb, "refused by image gateway:old")
 
 
-# spec: ANYM-493
+# spec: ANYM-497
 @pytest.mark.parametrize("verb, command", [("extend", "extend-key"), ("revoke", "revoke-agent")])
 def test_extend_and_revoke_refuse_an_image_without_their_command(site, capsys, verb, command):
     service = "messaging" if command == "extend-key" else "calendar"
@@ -644,7 +644,7 @@ def test_extend_and_revoke_refuse_an_image_without_their_command(site, capsys, v
     write_refused(site, capsys, verb, f"the {service} image does not answer `{command} --check`")
 
 
-# spec: ANYM-493
+# spec: ANYM-497
 def test_extend_and_revoke_never_touch_a_service_container_or_leave_a_one_shot(site, capsys):
     containers = json.dumps(site.docker.containers)
     token = private(site.root / "mac/src.token", site.tokens["src-gateway"] + "\n")
@@ -659,7 +659,7 @@ def test_extend_and_revoke_never_touch_a_service_container_or_leave_a_one_shot(s
     assert len(set(names)) == len(names) and all(name.startswith("deedkit-admin-") for name in names)
 
 
-# spec: ANYM-493
+# spec: ANYM-497
 def test_extend_and_revoke_put_no_secret_in_output_argv_environment_or_the_journal(site, capsys):
     state = site.root / "operator.json"
     for service in ("messaging", "calendar"):
