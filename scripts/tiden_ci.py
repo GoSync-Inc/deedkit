@@ -897,7 +897,10 @@ def triage(directory: Path, seq: int, product: str, started: float, cli: str = "
     except Exception:
         reason = "unexpected error"
         record, lines = {"state": "not available", "reason": reason}, [f"Tiden triage: not available ({reason})"]
-    (directory / TRIAGE).write_text(json.dumps({"triage": record}, indent=2))
+    try:
+        (directory / TRIAGE).write_text(json.dumps({"triage": record}, indent=2))
+    except OSError:
+        lines = [*lines, "Tiden triage: receipt not written"]
     return lines
 
 
@@ -1122,9 +1125,12 @@ def main() -> int:
     if result["status"] == "failed" and result.get("seqNum") is not None:
         # Advisory, after the result and receipts are saved: the step's result stays the publication's.
         lines = triage(directory, result["seqNum"], os.environ["TIDEN_PRODUCT_ID"], started)
-        if os.environ.get("GITHUB_STEP_SUMMARY"):
-            with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-                summary.write("".join(line + "\n" for line in lines))
+        try:
+            if os.environ.get("GITHUB_STEP_SUMMARY"):
+                with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                    summary.write("".join(line + "\n" for line in lines))
+        except OSError:
+            print("Tiden triage: summary not written")
     return 0 if result["status"] in {"passed", "skipped"} else 1
 
 

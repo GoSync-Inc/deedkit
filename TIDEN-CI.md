@@ -147,6 +147,8 @@ skipped. A skipped, failed, slow or malformed triage writes one line `Tiden
 triage: not available (<reason>)` (`no time`, `timeout`, `exit <n>`,
 `malformed`, `CLI not started`, `unexpected error`) and changes neither the
 step's result nor any job; create, report and complete are never repeated.
+An unwritable receipt or summary adds `Tiden triage: receipt not written` or
+`summary not written` to the log and keeps the step's result.
 A passed, skipped or unmapped run makes no triage call.
 
 A publication failure is a warning, not a red gate. In this document a failed

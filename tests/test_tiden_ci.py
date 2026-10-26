@@ -991,6 +991,44 @@ def test_with_under_ten_seconds_left_the_triage_is_skipped(tmp_path, monkeypatch
     assert timeouts == [] and json.loads((tmp_path / "tiden-triage.json").read_text())["triage"]["reason"] == "no time"
 
 
+
+# spec: ANYM-542
+@pytest.mark.parametrize("elapsed", [140.5, 400])
+def test_a_publication_without_time_left_skips_the_triage_and_keeps_its_result(tmp_path, monkeypatch, elapsed):
+    calls, timeouts = triage_cli(monkeypatch, tmp_path)
+    published, starts = {}, []
+    from scripts import tiden_ci
+    original = tiden_ci.triage
+    def late(directory, seq, product, started, **options):
+        # The publish step has already used `elapsed` seconds since the script started.
+        published.update(publication_files(directory))
+        starts.append(started)
+        return original(directory, seq, product, started, clock=lambda: started + elapsed)
+    monkeypatch.setattr(tiden_ci, "triage", late)
+    import time
+    before = time.monotonic()
+    assert run_publish(monkeypatch, tmp_path) == 1
+    # The budget counts from the script's start, taken in this run.
+    assert len(starts) == 1 and before <= starts[0] <= time.monotonic()
+    assert timeouts == [] and not any(call[1:3] == ["run", "triage"] for call in calls)
+    assert published and publication_files(tmp_path) == published
+    assert (tmp_path / "summary.md").read_text() == "Tiden triage: not available (no time)\n"
+
+
+# spec: ANYM-542
+def test_an_unwritable_triage_receipt_or_summary_keeps_the_publication_result(tmp_path, monkeypatch, capsys):
+    calls, _ = triage_cli(monkeypatch, tmp_path)
+    (tmp_path / "tiden-triage.json").mkdir()
+    (tmp_path / "summary.md").mkdir()
+    from scripts import tiden_ci
+    original = tiden_ci.triage
+    lines = []
+    monkeypatch.setattr(tiden_ci, "triage", lambda *a, **k: lines.extend(original(*a, **k)) or lines)
+    assert run_publish(monkeypatch, tmp_path) == 1
+    assert lines[-1] == "Tiden triage: receipt not written"
+    assert capsys.readouterr().out.splitlines()[-1] == "Tiden triage: summary not written"
+
+
 RELEASE_SHA = "a" * 40
 RUN_URL = "https://github.com/example/repo/actions/runs/7/attempts/1"
 CREATED = "2026-01-01T00:10:00.000000Z"
