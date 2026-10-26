@@ -4,6 +4,7 @@ reader (ANYM-570).
 
     autoloop.py tick|status [--state DIR] [--triage-state DIR]
     autoloop.py gate|finish INTENT [--state DIR]
+    autoloop.py decline INTENT --reason CODE | large INTENT [--state DIR] [--triage-state DIR]
     autoloop.py hold|release CARD [--state DIR]
     autoloop.py read [--state DIR] [--triage-state DIR]
 
@@ -16,6 +17,12 @@ workspace list by name, applies owner-principal `AUTOLOOP STOP` and `AUTOLOOP DR
 `config.json`, runs the reader on the items within the daily caps; with `live: false` (the default) it writes
 `plan.json` and starts nothing. Provenance comes from `config.json` principals only. Launches (ANYM-571, ANYM-572)
 go through `admit` and `launch`: the intent, its slot and its full wall-clock limit are written before the start.
+Live, each new owner-agent cluster with a committed card brief gets one card worker (ANYM-571): a Superset workspace
+with the worker preset whose prompt names `briefs/autoloop-card.md`, the intent, the cluster key, the feedback IDs
+and the projection path, never feedback text. The worker ends with `finish`, after `decline` (a Fable reject, by
+reason code) or `large` (an epic or a card over 8 SP) when no Ready card comes of it. Status notes the agent can act
+on (over a daily cap, paused, declined, queued as a large card) go out as dispositions files that the ANYM-536
+`auto` applies, each note once per item.
 `gate` exits 1 on PAUSE, a held card, a dropped item or no live intent; `status` exits 1 when the last good tick is
 older than 2 hours, the stop is not effective or an audit paused the loop.
 
@@ -111,6 +118,20 @@ ACTIVE = ('queued', 'in_progress', 'waiting', 'requested', 'pending')
 PR = ('number id state headRefName mergedAt mergeCommit { oid } autoMergeRequest { enabledAt } '
       'mergeQueueEntry { state } headRepository { nameWithOwner }')
 DEQUEUE = 'mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }'
+# The card worker (ANYM-571): a local workspace of the deedkit project with the worker preset (worker settings, empty
+# MCP config); its brief template stays in the harness, outside Git.
+BRIEFS = Path.home() / 'deedkit-orchestrator' / 'briefs'
+CARD_BRIEF = BRIEFS / 'autoloop-card.md'
+PROJECT_ID = '705cd9cb-2688-4db6-8e65-abc4d978339c'
+PRESET = 'd2e1c0de-5eed-4b2c-9a10-2026101900aa'
+EFFORT = 'high'
+RETRY = ('lost', 'interrupted', 'cancelled', 'stopped')  # card intents after which a cluster gets its one relaunch
+# Status notes the agent can act on (plan §3 step 9), besides WITHDRAWN and the reader's opt-in hold.
+LARGE = 'queued: large card, built by the orchestrator'
+PAUSED = 'paused'
+OVER_CAP = 'over daily cap, next run {}'
+DECLINED = {'not-needed': 'not needed now', 'covered': 'an existing card covers it',
+            'out-of-scope': 'outside the product', 'unclear': 'too unclear to card'}
 
 
 class Refused(Exception):
@@ -759,20 +780,25 @@ def fence(state, now, superset, gh):
                   for r in work['runs'] if r.get('conclusion') == 'success' and utc(r.get('updatedAt')) > paused_at]
         for name in sorted({a['branch'].removeprefix('proposal/') for a in after} & set(known)):
             hold(state, known[name]['card'], 'written after stop', now)
+        stopped = []
         if work['read_back'] == 'clean':
             for name, intent in known.items():
                 if intent['status'] in LIVE and not work['terminals'].get(name):
                     put(state, dict(intent, status='stopped', ended_at=triage.stamp(now)))
+                    stopped += intent['feedback']
         result = {'effective': work['read_back'] == 'clean' and not work['alive'] and not work['failed'],
-                  'read_back': work['read_back'], 'alive': work['alive'], 'failed': work['failed'], 'after_stop': after}
+                  'read_back': work['read_back'], 'alive': work['alive'], 'failed': work['failed'], 'after_stop': after,
+                  'stopped': sorted(stopped)}
     result.update(at=triage.stamp(now), paused_at=triage.stamp(paused_at))
     triage.save(state / 'fence.json', result)
     return result
 
 
-def fenced(state, now, superset, gh):
+def fenced(state, now, superset, gh, triage_state=None):
     consumed(state)  # a STOP that wrote PAUSE never pauses again after the owner resumes
     result = fence(state, now, superset, gh)
+    if triage_state is not None and result.get('stopped'):  # the items of the workers the stop closed
+        notify(state, triage_state, {i: ('received', PAUSED) for i in result['stopped']}, now)
     heartbeat(state, now, 'paused')
     if result['effective']:
         return 0, f"paused: stop effective; written after stop {len(result['after_stop'])}"
@@ -795,6 +821,106 @@ def withhold(state, superset, gh):
     except (Refused, triage.Refused) as error:
         return [f'read failed: {error}']
     return work['alive'] + work['failed'] + ([] if work['read_back'] == 'clean' else [work['read_back']])
+
+
+# --- the card launcher and status notes (ANYM-571) -----------------------------------------------------------------
+def notify(state, triage_state, notes, now):
+    """Status notes ({feedback ID: (status, note)}) through a dispositions file that the ANYM-536 `auto` applies (its
+    never-down rule keeps an item that is further along); a note already sent to an item is not sent again."""
+    sent = triage.load(state / 'notes.json', {})
+    rows = [{'id': i, 'status': status, 'spec_ref': None, 'duplicate_of': None, 'fixed_in': None, 'note': note,
+             'decided_at': triage.stamp(now)} for i, (status, note) in sorted(notes.items()) if sent.get(i) != note]
+    if rows:
+        name = now.strftime('autoloop-note-%Y-%m-%dT%H%M%S.%fZ')
+        triage.save(triage.fresh_name(triage_state / 'dispositions', name, '.json'), rows)
+        triage.save(state / 'notes.json', dict(sent, **{row['id']: row['note'] for row in rows}))
+    return len(rows)
+
+
+def card_clusters(state, triage_state, principals):
+    """{cluster: feedback IDs} of the new owner-agent clusters a card worker may take: a committed brief, no dropped
+    item, and no card intent but a lost, interrupted, cancelled or stopped one without an outcome (`admit` allows one
+    relaunch)."""
+    ledger, briefs = triage.load(triage_state / 'ledger.json', {}), committed_briefs(state, triage_state)
+    dropped, known = set(holds(state)['items']), intents(state).values()
+    out = {}
+    for cluster, kind in provenance(ledger, principals).items():
+        ids = sorted(i for i, entry in ledger.items() if entry['cluster'] == cluster)
+        if kind == 'owner-agent' and CARD.fullmatch(cluster) and cluster.startswith('new:') and set(ids) & set(briefs) \
+                and not set(ids) & dropped \
+                and not any(i['kind'] == 'card' and i['card'] == cluster
+                            and (i['status'] not in RETRY or i.get('outcome')) for i in known):
+            out[cluster] = ids
+    return out
+
+
+def card_projection(state, triage_state, intent):
+    """The card worker's only input besides its brief: IDs, principal labels, classifications and the reader's
+    scrubbed card briefs (untrusted model output, never feedback text)."""
+    ledger, briefs = triage.load(triage_state / 'ledger.json', {}), committed_briefs(state, triage_state)
+    path = state / 'projections' / f"{intent['name']}.json"
+    triage.save(path, {'intent': intent['name'], 'cluster': intent['card'], 'feedback': intent['feedback'],
+                       'principals': sorted({ledger[i]['principal'] for i in intent['feedback']}),
+                       'classifications': {i: ledger[i]['classification'] for i in intent['feedback']},
+                       'briefs': {i: briefs[i]['card_brief'] for i in intent['feedback'] if i in briefs}})
+    return path
+
+
+def card_start(superset, projection_path):
+    """The start of one card worker; its prompt holds the intent, the cluster key, the feedback IDs and the
+    projection path only. A reply without a workspace ID leaves the intent `unknown` for `reconcile`."""
+    def start(intent):
+        prompt = (f"Read and follow {BRIEFS / 'common.md'} and {CARD_BRIEF}. Intent: {intent['name']}. "
+                  f"Cluster: {intent['card']}. Feedback: {', '.join(intent['feedback'])}. "
+                  f"Projection: {projection_path}.")
+        reply = superset(['workspaces', 'create', '--local', '--project', PROJECT_ID, '--name', intent['name'],
+                          '--branch', intent['name'], '--skip-branch-prefix', '--base-branch', 'main',
+                          '--agent', PRESET, '--model', MODEL, '--effort', EFFORT, '--prompt', prompt])
+        found = reply.get('workspace', reply) if isinstance(reply, dict) else None
+        if not isinstance(found, dict) or not isinstance(found.get('id'), str):
+            raise Refused('superset workspaces create: no workspace ID in the reply')
+        return found['id']
+    return start
+
+
+def launch_cards(state, triage_state, cfg, now, superset):
+    """One card worker per new owner-agent cluster within the caps: {cluster: intent name or why it waits}. A
+    cluster over a daily cap or stopped by PAUSE gets its status note."""
+    if not CARD_BRIEF.is_file():
+        return {'*': 'no card brief template'}
+    out, notes = {}, {}
+    over = OVER_CAP.format((now.astimezone(cfg['zone']).date() + timedelta(days=1)).isoformat())
+    for cluster, ids in card_clusters(state, triage_state, cfg['principals']).items():
+        intent, why = admit(state, cfg, 'card', cluster, ids, now)
+        if intent:
+            try:
+                started, why = launch(state, intent['name'], card_start(superset, card_projection(state, triage_state,
+                                                                                                  intent)), now)
+            except (Refused, triage.Refused):
+                started, why = None, 'start unknown'  # settled from the workspace list by `reconcile`, never retried
+            intent = started
+        out[cluster] = intent['name'] if intent else why
+        if why in ('daily launches', 'worker hours'):
+            notes.update({i: ('received', over) for i in ids})
+        elif why == 'paused':
+            notes.update({i: ('received', PAUSED) for i in ids})
+    notify(state, triage_state, notes, now)
+    return out
+
+
+def card_end(state, triage_state, name, result, now):
+    """A card worker's end without a Ready card: a Fable reject (`declined` with its reason code) or an epic or a card
+    over 8 SP (`large`). The gate comes first: PAUSE, a held card or a dropped item refuses it."""
+    why = gate(state, name)
+    intent = stored(state, name)
+    if why or intent is None or intent['kind'] != 'card':
+        raise Refused(f"{name}: {why or 'not a card intent'}")
+    if result != 'large' and result not in DECLINED:
+        raise Refused(f"a reason code is one of {', '.join(DECLINED)}")
+    status, note = ('received', LARGE) if result == 'large' else ('declined', f'declined by review: {DECLINED[result]}')
+    count = notify(state, triage_state, {i: (status, note) for i in intent['feedback']}, now)
+    put(state, dict(intent, outcome=result))
+    return count
 
 
 # --- provenance, caps, tick, status ------------------------------------------------------------------------------
@@ -838,14 +964,14 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
         enter(stack, own_lock(state), 'another tick')
         cfg = config(state)
         if (state / 'PAUSE').exists():
-            return fenced(state, now, superset, gh)
+            return fenced(state, now, superset, gh, triage_state)
         # The export first and checked whole: an owner STOP in it writes PAUSE (the one write before the other
         # reads) and needs neither Tiden nor Superset. Its item is recorded by the first tick after the resume.
         items, head = triage.export_pages(host, triage.since(triage_state), ssh)
         stop, _, _ = control(*incoming(triage_state, items), cfg, consumed(state))
         if stop:
             triage.private_write(state / 'PAUSE', f"stop by feedback {' '.join(stop)} at {triage.stamp(now)}\n")
-            return fenced(state, now, superset, gh)
+            return fenced(state, now, superset, gh, triage_state)
         # Reads: each finishes before the first write; a failed, truncated or timed-out one ends the tick here.
         known = intents(state)
         listing = superset(['workspaces', 'list', '--local', '--search', 'autoloop-']) \
@@ -880,8 +1006,13 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
             triage.save(state / 'ledger.json', ledger)
             count, _ = read(state, triage_state, runner, chosen)
             reader = 'ran'
+        cards = launch_cards(state, triage_state, cfg, now, superset) if cfg['live'] else {}
+        if cfg['live'] and over:
+            next_day = (now.astimezone(cfg['zone']).date() + timedelta(days=1)).isoformat()
+            notify(state, triage_state, {i: ('received', OVER_CAP.format(next_day)) for i in over}, now)
         plan = {'at': triage.stamp(now), 'live': cfg['live'], 'pulled': fresh, 'reader': reader, 'read': count,
-                'dropped': sorted(drops), 'withheld': withheld, 'waiting': [] if count else chosen, 'over_cap': over,
+                'dropped': sorted(drops), 'withheld': withheld, 'cards': cards, 'waiting': [] if count else chosen,
+                'over_cap': over,
                 'today': today, 'clusters': provenance(triage.load(triage_state / 'ledger.json', {}), cfg['principals']),
                 'intents': {name: i['status'] for name, i in intents(state).items()}}
         triage.save(state / 'plan.json', plan)
@@ -889,7 +1020,9 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
             heartbeat(state, now, 'live' if cfg['live'] else 'plan')
         return 1 if withheld else 0, (
             f"tick {'live' if cfg['live'] else 'plan only'}: pulled {fresh}, read {count}, over cap {len(over)}, "
-            f"dropped {len(drops)}, withhold not done {len(withheld)}; reader {reader}; plan {state / 'plan.json'}")
+            f"dropped {len(drops)}, withhold not done {len(withheld)}, "
+            f"card workers {sum(v in intents(state) for v in cards.values())}; "
+            f"reader {reader}; plan {state / 'plan.json'}")
 
 
 def status(state, now):
@@ -910,14 +1043,18 @@ def status(state, now):
 
 def main(argv_=None):
     parser = argparse.ArgumentParser(description='Feedback autoloop driver (docs/operations/feedback-autoloop.md).')
-    parser.add_argument('action', choices=['tick', 'fence', 'resume', 'status', 'gate', 'finish', 'hold', 'release', 'read'])
-    parser.add_argument('name', nargs='?', help='the intent (gate, finish) or the card (hold, release)')
+    parser.add_argument('action', choices=['tick', 'fence', 'resume', 'status', 'gate', 'finish', 'hold', 'release', 'read',
+                                           'decline', 'large'])
+    parser.add_argument('name', nargs='?', help='the intent (gate, finish, decline, large) or the card (hold, release)')
+    parser.add_argument('--reason', choices=sorted(DECLINED), help='decline: the reason code of the review reject')
     parser.add_argument('--state', type=Path, default=Path(os.environ.get('AUTOLOOP_STATE', STATE)))
     parser.add_argument('--triage-state', type=Path,
                         default=Path(os.environ.get('FEEDBACK_TRIAGE_STATE', triage.STATE)))
     args = parser.parse_args(argv_)
     if (args.name is None) != (args.action in ('tick', 'fence', 'resume', 'status', 'read')):
         parser.error(f'{args.action} takes {"no argument" if args.name else "one argument"}')
+    if (args.reason is None) == (args.action == 'decline'):
+        parser.error('--reason goes with decline only, and decline needs it')
     now = datetime.now(timezone.utc)
     try:
         if args.action == 'tick':
@@ -928,7 +1065,8 @@ def main(argv_=None):
             # Before `git pull` in the automation: an existing PAUSE is fenced by the installed revision even when
             # the update fails. No PAUSE: nothing is read or written.
             with own_lock(args.state):
-                code, line = fenced(args.state, now, superset_cli, gh_cli) if (args.state / 'PAUSE').exists() \
+                code, line = fenced(args.state, now, superset_cli, gh_cli, args.triage_state) \
+                    if (args.state / 'PAUSE').exists() \
                     else (0, 'not paused')
             print(line, file=sys.stdout if code == 0 else sys.stderr)
             return code
@@ -952,12 +1090,18 @@ def main(argv_=None):
         with own_lock(args.state):
             if args.action == 'finish':
                 print(f'finished; {finish(args.state, args.name, now)} s returned')
+            elif args.action in ('decline', 'large'):
+                count = card_end(args.state, args.triage_state, args.name, args.reason or 'large', now)
+                print(f'{args.action}: {args.name}; {count} status notes')
             else:
                 hold(args.state, args.name, 'orchestrator', now, release=args.action == 'release')
                 print(f'{args.action}: {args.name}')
     except Busy as error:
-        print(error)  # another run is doing the work: not a failure, and nothing was written
-        return 0
+        if args.action in ('tick', 'fence', 'read'):
+            print(error)  # another run is doing the work: not a failure, and nothing was written
+            return 0
+        print(f'BUSY {error}; nothing written, run it again', file=sys.stderr)  # a worker's or owner's step not done
+        return 1
     except (Refused, triage.Refused) as error:
         print(f'REFUSED {error}', file=sys.stderr)
         return 1

@@ -944,3 +944,161 @@ def test_status_exits_1_on_a_stale_tick_or_an_audit_pause(loop):
 def test_the_sync_lock_is_the_feedback_sync_state():
     import scripts.feedback_sync as sync
     assert autoloop.SYNC_STATE == sync.STATE
+
+
+# --- the card launcher and status notes (ANYM-571) ---------------------------------------------------------------
+def new_card(fakes, cards):
+    """The reader proposes a new card for each item in `cards` ({feedback ID: slug}); the rest are not actionable."""
+    def runner(projected):
+        fakes.runner_calls.append([row['id'] for row in projected['items']])
+        return stream(answer(*[decision(row['id'], 'reported-bug', reason_code='new-idea', new_card=cards[row['id']],
+                                        card_brief='Group names vanish after a rename.') if row['id'] in cards
+                               else decision(row['id'], 'not-actionable', reason_code='not-actionable')
+                               for row in projected['items']]))
+    fakes.runner = runner
+
+
+def creates(fakes, reply):
+    real = fakes.superset
+
+    def superset(argv):
+        if argv[:2] == ['workspaces', 'create']:
+            fakes.calls.append(('superset', argv))
+            return reply
+        return real(argv)
+    fakes.superset = superset
+    return lambda: [c[1] for c in fakes.calls if c[0] == 'superset' and c[1][:2] == ['workspaces', 'create']]
+
+
+def notes(t):
+    """The status notes the loop handed to the ANYM-536 apply path, each file checked by its own reader."""
+    import scripts.feedback_sync as sync
+    rows = {}
+    for path in sorted((t / 'dispositions').glob('autoloop-note-*.json')):
+        sync.dispositions(path)
+        rows.update({r['id']: (r['status'], r['note']) for r in json.loads(path.read_text())})
+    return rows
+
+
+@pytest.fixture
+def template(tmp_path, monkeypatch):
+    path = tmp_path / 'briefs' / 'autoloop-card.md'
+    monkeypatch.setattr(autoloop, 'CARD_BRIEF', path)
+    return path
+
+
+# spec: ANYM-571
+def test_a_new_owner_agent_cluster_gets_one_card_worker_whose_prompt_and_projection_carry_no_feedback_text(
+        loop, template, capsys):
+    t, a, s = loop
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, HOSTILE), submission(D2, CANARY + ' stranger idea', STRANGER, 1)])
+    new_card(fakes, {D1: 'group-names', D2: 'stranger-idea'})
+    created = creates(fakes, {'id': 'ws-1', 'name': 'autoloop-card-group-names'})
+    # No template: nothing starts, and the next tick takes the cluster from the ledger.
+    assert run_tick(loop, fakes)[0] == 0 and created() == []
+    assert triage.load(a / 'plan.json', {})['cards'] == {'*': 'no card brief template'}
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    fakes.submissions = []
+    code, line = run_tick(loop, fakes, now=NOW + timedelta(minutes=5))
+    assert code == 0 and 'card workers 1' in line and len(created()) == 1
+    argv = created()[0]
+    name, projection = 'autoloop-card-group-names', a / 'projections' / 'autoloop-card-group-names.json'
+    assert argv[argv.index('--name') + 1] == name and argv[argv.index('--agent') + 1] == autoloop.PRESET
+    assert argv[argv.index('--project') + 1] == autoloop.PROJECT_ID
+    assert argv[argv.index('--prompt') + 1] == (
+        f"Read and follow {autoloop.BRIEFS / 'common.md'} and {template}. Intent: {name}. Cluster: new:group-names. "
+        f"Feedback: {D1}. Projection: {projection}.")
+    assert json.loads(projection.read_text()) == {
+        'intent': name, 'cluster': 'new:group-names', 'feedback': [D1], 'principals': [OWNER],
+        'classifications': {D1: 'reported-bug'}, 'briefs': {D1: 'Group names vanish after a rename.'}}
+    assert stat.S_IMODE(projection.stat().st_mode) == 0o600
+    # The stranger's cluster is report-only; no command or file of the loop carries feedback text.
+    assert triage.load(a / 'plan.json', {})['cards'] == {'new:group-names': name}
+    assert not any(CANARY in ' '.join(c[1]) or 'ssh' in ' '.join(c[1]) for c in fakes.calls if c[0] == 'superset')
+    assert not any(CANARY in p.read_text() for p in a.rglob('*.json')) and CANARY not in str(capsys.readouterr())
+    assert autoloop.intents(a)[name] | {'created_at': None} == autoloop.intents(a)[name] | {
+        'status': 'started', 'workspace': 'ws-1', 'feedback': [D1], 'card': 'new:group-names', 'created_at': None}
+    # A running worker is never started twice.
+    fakes.workspaces = [{'name': name, 'id': 'ws-1', 'projectName': 'deedkit'}]
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert len(created()) == 1 and triage.load(a / 'plan.json', {})['cards'] == {}
+
+
+# spec: ANYM-571
+def test_a_create_reply_without_a_workspace_id_leaves_the_intent_unknown_and_the_name_settles_it(loop, template):
+    t, a, s = loop
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'groups lose names')])
+    new_card(fakes, {D1: 'group-names'})
+    created = creates(fakes, {'error': 'timeout'})
+    run_tick(loop, fakes)
+    name = 'autoloop-card-group-names'
+    assert triage.load(a / 'plan.json', {})['cards'] == {'new:group-names': 'start unknown'}
+    assert autoloop.intents(a)[name]['status'] == 'unknown'
+    fakes.submissions, fakes.workspaces = [], [{'name': name, 'id': 'ws-9', 'projectName': 'deedkit',
+                                                   'createdAt': '2026-10-26T12:00:20Z'}]
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert len(created()) == 1 and autoloop.intents(a)[name]['workspace'] == 'ws-9'
+
+
+# spec: ANYM-571
+def test_a_review_reject_declines_with_its_reason_code_and_a_large_card_is_queued_once_each(loop, capsys):
+    t, a, s = loop
+    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started', [D1, D2])
+    intent(a, 'autoloop-card-epic', 'new:epic', 'started', [D3])
+    common = ['--state', str(a), '--triage-state', str(t)]
+    with pytest.raises(SystemExit):
+        autoloop.main(['decline', 'autoloop-card-xyz', '--reason', 'because the chat said so', *common])
+    with pytest.raises(SystemExit):
+        autoloop.main(['large', 'autoloop-card-epic', '--reason', 'covered', *common])
+    assert autoloop.main(['decline', 'autoloop-card-xyz', '--reason', 'covered', *common]) == 0
+    assert autoloop.main(['large', 'autoloop-card-epic', *common]) == 0
+    declined = ('declined', 'declined by review: an existing card covers it')
+    assert notes(t) == {D1: declined, D2: declined, D3: ('received', autoloop.LARGE)}
+    assert len(list((t / 'dispositions').glob('*.json'))) == 2
+    # Sent once; the cluster never gets a second card worker, also after its worker ends without `finish`.
+    assert autoloop.main(['large', 'autoloop-card-epic', *common]) == 0
+    assert len(list((t / 'dispositions').glob('*.json'))) == 2
+    autoloop.put(a, dict(autoloop.intents(a)['autoloop-card-epic'], status='interrupted'))
+    triage.save(t / 'ledger.json', {D3: {'cluster': 'new:epic', 'principal': OWNER, 'classification': 'feature'}})
+    triage.save(a / 'briefs.json', {D3: {'new_card': 'epic', 'card_brief': 'x'}})
+    assert autoloop.card_clusters(a, t, {OWNER}) == {}
+    # The gate comes first: a dropped item, PAUSE, or the tick holding the lock: nothing is written, the exit is 1.
+    intent(a, 'autoloop-card-late', 'new:late', 'started', [D4, P1])
+    with autoloop.own_lock(a):
+        assert autoloop.main(['large', 'autoloop-card-late', *common]) == 1
+    triage.save(a / 'holds.json', {'cards': {}, 'items': {P1: {'by': P2}}})
+    assert autoloop.main(['large', 'autoloop-card-late', *common]) == 1
+    triage.save(a / 'holds.json', {'cards': {}, 'items': {}})
+    (a / 'PAUSE').touch()
+    assert autoloop.main(['large', 'autoloop-card-late', *common]) == 1
+    assert D4 not in notes(t) and 'BUSY' in capsys.readouterr().err
+
+
+# spec: ANYM-571
+def test_items_over_a_daily_cap_and_items_of_a_worker_the_stop_closed_get_their_note_once(loop, template):
+    t, a, s = loop
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    configure(a, live=True, caps={'items_per_principal': 1, 'card_launches': 0})
+    fakes = Fakes([submission(D1, 'groups lose names'), submission(D2, 'b', OWNER, 1)])
+    new_card(fakes, {D1: 'group-names'})
+    created = creates(fakes, {'id': 'ws-1'})
+    run_tick(loop, fakes)
+    over = ('received', 'over daily cap, next run 2026-10-27')
+    assert notes(t) == {D1: over, D2: over} and created() == []
+    sent = sorted((t / 'dispositions').glob('autoloop-note-*.json'))
+    fakes.submissions = []
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert sorted((t / 'dispositions').glob('autoloop-note-*.json')) == sent
+    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started', [D3], workspace='w1')
+    fakes.workspaces = [{'name': 'autoloop-card-xyz', 'id': 'w1', 'projectName': 'deedkit'}]
+    fakes.terminals = {'w1': ['t1']}
+    paused(a, NOW + timedelta(hours=1, minutes=30))
+    code, _ = run_tick(loop, fakes, now=NOW + timedelta(hours=2))
+    assert code == 0 and notes(t)[D3] == ('received', autoloop.PAUSED)
+    assert autoloop.intents(a)['autoloop-card-xyz']['status'] == 'stopped'
