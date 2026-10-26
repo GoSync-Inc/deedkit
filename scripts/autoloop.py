@@ -451,8 +451,9 @@ def launch(state, name, start, now):
         raise Refused(f'{name}: only a reserved intent starts')
     why = gate(state, name, ('reserved',))
     if why:
-        refund(state, intent, intent['reserved'])
+        # Never launchable again before the refund: a crash in between keeps the reservation (conservative).
         put(state, dict(intent, status='cancelled', ended_at=triage.stamp(now)))
+        refund(state, intent, intent['reserved'])
         return None, why
     put(state, dict(intent, status='unknown', started_at=triage.stamp(now)))  # the earliest possible start
     workspace = start(intent)
@@ -461,15 +462,30 @@ def launch(state, name, start, now):
     return intent, None
 
 
+def ours(intent, workspace):
+    """A workspace is an intent's only by its recorded ID. An `unknown` intent (start called, no reply) claims a
+    same-named workspace of the deedkit project created after its launch stamp; a reserved intent has none."""
+    if workspace.get('projectName') != PROJECT or workspace.get('name') != intent['name'] \
+            or not isinstance(workspace.get('id'), str):
+        return False
+    if intent.get('workspace'):
+        return workspace['id'] == intent['workspace']
+    if intent['status'] != 'unknown' or not intent.get('started_at'):
+        return False
+    try:
+        return utc(workspace.get('createdAt')) >= triage.when(intent['started_at']) - timedelta(minutes=1)
+    except (ValueError, TypeError):
+        return False
+
+
 def reconcile(state, listing, now):
     """An `unknown` intent is started or lost by its workspace name; a started one whose workspace is gone without
     `finish` is interrupted. Lost and interrupted runs keep their whole reservation; a found one keeps the time
     `launch` stamped before its call, never the time it was found."""
-    by_name = {w.get('name'): w for w in listing if isinstance(w, dict) and not w.get('archivedAt')
-               and w.get('projectName') == PROJECT}
+    listing = [w for w in listing if isinstance(w, dict) and not w.get('archivedAt')]
     changed = []
     for name, intent in intents(state).items():
-        found = by_name.get(name)
+        found = next((w for w in listing if ours(intent, w)), None)
         if intent['status'] == 'unknown' and found:
             intent.update(status='started', workspace=found.get('id'),
                           started_at=intent.get('started_at') or intent['created_at'])
@@ -530,17 +546,17 @@ def quiet(i, reason):
 
 
 def control(inbox, ledger, cfg, consumed=()):
-    """Owner-principal STOP and DROP items: (stop item or None, {target: drop item}, decisions that take every
+    """Owner-principal STOP and DROP items: (new STOP items, {target: drop item}, decisions that take every
     control item out of the inbox). A STOP in `consumed` (stops.json) already paused the loop: it is only recorded.
     Any other text, `AUTOLOOP START` included, is ordinary feedback."""
-    stop, drops, decisions = None, {}, []
+    stop, drops, decisions = [], {}, []
     for i, item in sorted(inbox.items(), key=lambda pair: (pair[1].get('created_at') or '', pair[0])):
         command = CONTROL.fullmatch(str(item.get('description') or '').strip())
         if item.get('principal') not in cfg['principals'] or not command:
             continue
         target, reason = command.group(2), 'autoloop control'
         if command.group(1) == 'STOP':
-            stop = stop or (None if i in consumed else i)
+            stop = stop + [i] if i not in consumed else stop
         elif target != i and (inbox.get(target) or ledger.get(target) or {}).get('principal') == item['principal']:
             drops[target] = i
         else:
@@ -561,13 +577,25 @@ def incoming(triage_state, items):
 
 
 def consumed(state):
-    """STOP items that already paused the loop (stops.json); the PAUSE a STOP wrote names its item."""
+    """STOP items that already paused the loop (stops.json). The PAUSE a STOP wrote names every STOP of its
+    export; a paused tick and `resume` journal them. PAUSE removed by hand before any paused tick ran after a
+    crash pauses once more (the safe side), and that pause is journaled."""
     stops = set(triage.load(state / 'stops.json', []))
-    named = re.match(r'stop by feedback (\S+) ', (state / 'PAUSE').read_text()) if (state / 'PAUSE').exists() else None
-    if named and named.group(1) not in stops:
-        stops.add(named.group(1))
+    text = (state / 'PAUSE').read_text() if (state / 'PAUSE').exists() else ''
+    named = set(triage.UUID.findall(text.split(' at ')[0])) if text.startswith('stop by feedback ') else set()
+    if named - stops:
+        stops |= named
         triage.save(state / 'stops.json', sorted(stops))
     return stops
+
+
+def resume(state):
+    """The owner's resume: journal the STOPs named in PAUSE, then remove it (crash-safe in that order)."""
+    if not (state / 'PAUSE').exists():
+        return 'not paused'
+    consumed(state)
+    (state / 'PAUSE').unlink()
+    return 'resumed'
 
 
 def withdraw(state, triage_state, drops, decisions, now):
@@ -607,9 +635,7 @@ def loop_workspaces(known, superset):
     listing = superset(['workspaces', 'list', '--local', '--search', 'autoloop-'])
     if not isinstance(listing, list) or any(not isinstance(w, dict) for w in listing):
         raise Refused('superset workspaces list: unexpected reply')
-    return {w['name']: w['id'] for w in listing
-            if w.get('name') in known and w.get('projectName') == PROJECT and isinstance(w.get('id'), str)
-            and known[w['name']].get('workspace') in (None, w['id'])}
+    return {w['name']: w['id'] for w in listing if w.get('name') in known and ours(known[w['name']], w)}
 
 
 def live_terminals(superset, workspace):
@@ -818,7 +844,7 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
         items, head = triage.export_pages(host, triage.since(triage_state), ssh)
         stop, _, _ = control(*incoming(triage_state, items), cfg, consumed(state))
         if stop:
-            triage.private_write(state / 'PAUSE', f'stop by feedback {stop} at {triage.stamp(now)}\n')
+            triage.private_write(state / 'PAUSE', f"stop by feedback {' '.join(stop)} at {triage.stamp(now)}\n")
             return fenced(state, now, superset, gh)
         # Reads: each finishes before the first write; a failed, truncated or timed-out one ends the tick here.
         known = intents(state)
@@ -859,7 +885,8 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
                 'today': today, 'clusters': provenance(triage.load(triage_state / 'ledger.json', {}), cfg['principals']),
                 'intents': {name: i['status'] for name, i in intents(state).items()}}
         triage.save(state / 'plan.json', plan)
-        heartbeat(state, now, 'live' if cfg['live'] else 'plan')
+        if not withheld:  # a withhold not done is no good tick: `status` reports it and the last good time stays
+            heartbeat(state, now, 'live' if cfg['live'] else 'plan')
         return 1 if withheld else 0, (
             f"tick {'live' if cfg['live'] else 'plan only'}: pulled {fresh}, read {count}, over cap {len(over)}, "
             f"dropped {len(drops)}, withhold not done {len(withheld)}; reader {reader}; plan {state / 'plan.json'}")
@@ -874,6 +901,8 @@ def status(state, now):
         problems.append('paused by an audit')
     if paused and not (triage.load(state / 'fence.json', None) or {}).get('effective'):
         problems.append('the stop is not effective yet (fence.json)')
+    if not paused and (triage.load(state / 'plan.json', None) or {}).get('withheld'):
+        problems.append('a hold or drop is not withheld yet (plan.json withheld)')
     line = f"last tick {last['at'] if last else 'never'} ({last['outcome'] if last else '-'}); " + \
         ('paused' if paused else 'running')
     return (1, line + '; ' + '; '.join(problems)) if problems else (0, line)
@@ -881,13 +910,13 @@ def status(state, now):
 
 def main(argv_=None):
     parser = argparse.ArgumentParser(description='Feedback autoloop driver (docs/operations/feedback-autoloop.md).')
-    parser.add_argument('action', choices=['tick', 'fence', 'status', 'gate', 'finish', 'hold', 'release', 'read'])
+    parser.add_argument('action', choices=['tick', 'fence', 'resume', 'status', 'gate', 'finish', 'hold', 'release', 'read'])
     parser.add_argument('name', nargs='?', help='the intent (gate, finish) or the card (hold, release)')
     parser.add_argument('--state', type=Path, default=Path(os.environ.get('AUTOLOOP_STATE', STATE)))
     parser.add_argument('--triage-state', type=Path,
                         default=Path(os.environ.get('FEEDBACK_TRIAGE_STATE', triage.STATE)))
     args = parser.parse_args(argv_)
-    if (args.name is None) != (args.action in ('tick', 'fence', 'status', 'read')):
+    if (args.name is None) != (args.action in ('tick', 'fence', 'resume', 'status', 'read')):
         parser.error(f'{args.action} takes {"no argument" if args.name else "one argument"}')
     now = datetime.now(timezone.utc)
     try:
@@ -903,6 +932,10 @@ def main(argv_=None):
                     else (0, 'not paused')
             print(line, file=sys.stdout if code == 0 else sys.stderr)
             return code
+        if args.action == 'resume':
+            with own_lock(args.state):
+                print(resume(args.state))
+            return 0
         if args.action == 'status':
             code, line = status(args.state, now)
             print(line, file=sys.stdout if code == 0 else sys.stderr)

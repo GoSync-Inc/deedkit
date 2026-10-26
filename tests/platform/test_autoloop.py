@@ -454,10 +454,10 @@ def run_tick(loop, fakes, now=NOW, **kw):
                          superset=fakes.superset, gh=fakes.gh, **kw)
 
 
-def intent(a, name, card, status, feedback=(), started=NOW - timedelta(minutes=30), reserved=7200):
+def intent(a, name, card, status, feedback=(), started=NOW - timedelta(minutes=30), reserved=7200, workspace=None):
     autoloop.put(a, {'name': name, 'kind': name.split('-')[1], 'card': card, 'feedback': list(feedback),
                      'reserved': reserved, 'day': '2026-10-26', 'status': status, 'created_at': triage.stamp(started),
-                     'started_at': triage.stamp(started), 'ended_at': None, 'workspace': None})
+                     'started_at': triage.stamp(started), 'ended_at': None, 'workspace': workspace})
 
 
 # spec: ANYM-569
@@ -513,11 +513,12 @@ def test_an_owner_stop_pauses_and_fences_and_a_start_or_a_stranger_stop_changes_
     code, _ = run_tick(loop, fakes)
     assert code == 0 and not (a / 'PAUSE').exists() and fakes.runner_calls == [[D1, D2, D3]]
     # A STOP needs only the export: a broken Tiden read does not hold it back.
-    fakes.submissions, fakes.truncate = [submission(D4, '  AUTOLOOP STOP ', OWNER, 3)], True
+    fakes.submissions, fakes.truncate = [submission(D4, '  AUTOLOOP STOP ', OWNER, 3),
+                                         submission(P2, 'AUTOLOOP STOP', OWNER, 3)], True
     code, line = run_tick(loop, fakes, now=NOW + timedelta(hours=1))
     assert code == 0 and line.startswith('paused: stop effective') and (a / 'PAUSE').exists()
     assert D4 in (a / 'PAUSE').read_text() and len(fakes.runner_calls) == 1
-    assert D4 not in triage.load(t / 'ledger.json', {}) and triage.load(a / 'stops.json', []) == [D4]
+    assert D4 not in triage.load(t / 'ledger.json', {}) and triage.load(a / 'stops.json', []) == sorted([D4, P2])
     # A crash between PAUSE and stops.json: the paused tick journals the STOP from the PAUSE text.
     (a / 'stops.json').unlink()
     # Paused: no pull, no triage; an owner START changes nothing and resumes nothing.
@@ -526,13 +527,15 @@ def test_an_owner_stop_pauses_and_fences_and_a_start_or_a_stranger_stop_changes_
     code, line = run_tick(loop, fakes, now=NOW + timedelta(hours=2))
     assert code == 0 and line.startswith('paused') and (a / 'PAUSE').exists()
     assert not any(c[0] == 'ssh' for c in fakes.calls[before:]) and len(fakes.runner_calls) == 1
-    assert triage.load(a / 'stops.json', []) == [D4]
-    # The owner resumes: the same STOP comes back in the export overlap; it is recorded and never pauses again.
-    (a / 'PAUSE').unlink()
+    assert triage.load(a / 'stops.json', []) == sorted([D4, P2])
+    # The owner resumes (`resume` journals first): both STOPs come back in the export; recorded, no new pause.
+    (a / 'stops.json').unlink()
+    assert autoloop.main(['resume', '--state', str(a)]) == 0 and not (a / 'PAUSE').exists()
     code, line = run_tick(loop, fakes, now=NOW + timedelta(hours=3))
     assert code == 0 and line.startswith('tick live') and not (a / 'PAUSE').exists()
     entry = triage.load(t / 'ledger.json', {})[D4]
     assert entry['disposition']['status'] == 'declined' and entry['reason'] == 'autoloop control'
+    assert triage.load(t / 'ledger.json', {})[P2]['reason'] == 'autoloop control'
 
 
 # spec: ANYM-569
@@ -631,8 +634,12 @@ def test_an_intent_is_written_before_the_start_and_an_unknown_outcome_is_settled
         autoloop.launch(a, two['name'], start, NOW)
     # Crash after the start: the workspace of the deedkit project exists, so the intent is started with the time
     # stamped before the call (found an hour later, it is not refunded that hour); one that never came up is lost.
-    listing = [{'name': 'autoloop-card-anym-10', 'id': 'ws-2', 'archivedAt': None, 'projectName': 'deedkit'},
-               {'name': 'autoloop-build-anym-11', 'id': 'ws-3', 'archivedAt': None, 'projectName': 'other'}]
+    listing = [{'name': 'autoloop-card-anym-10', 'id': 'ws-0', 'archivedAt': None, 'projectName': 'deedkit',
+                'createdAt': '2026-10-26T10:00:00Z'},  # older than the launch: not this intent's
+               {'name': 'autoloop-card-anym-10', 'id': 'ws-2', 'archivedAt': None, 'projectName': 'deedkit',
+                'createdAt': '2026-10-26T12:00:05Z'},
+               {'name': 'autoloop-build-anym-11', 'id': 'ws-3', 'archivedAt': None, 'projectName': 'other',
+                'createdAt': '2026-10-26T12:00:05Z'}]
     later = NOW + timedelta(hours=1)
     assert autoloop.reconcile(a, listing, later) == ['autoloop-card-anym-10', 'autoloop-card-group-names']
     known = autoloop.intents(a)
@@ -660,8 +667,21 @@ def test_a_launch_after_pause_a_hold_or_a_drop_is_cancelled_and_returns_its_rese
         assert autoloop.launch(a, reserved['name'], started.append, NOW) == (None, block) and started == []
         assert autoloop.intents(a)[reserved['name']]['status'] == 'cancelled'
         (a / 'PAUSE').unlink(missing_ok=True)
+    # A crash between `cancelled` and the refund keeps the reservation; the intent never launches.
+    held, _ = autoloop.admit(a, c, 'card', 'ANYM-4', [], NOW)
+    (a / 'PAUSE').touch()
+    real, autoloop.refund = autoloop.refund, lambda *args: (_ for _ in ()).throw(OSError('crash'))
+    try:
+        with pytest.raises(OSError):
+            autoloop.launch(a, held['name'], started.append, NOW)
+    finally:
+        autoloop.refund = real
+    (a / 'PAUSE').unlink()
+    assert autoloop.intents(a)[held['name']]['status'] == 'cancelled'
+    with pytest.raises(autoloop.Refused, match='only a reserved intent'):
+        autoloop.launch(a, held['name'], started.append, NOW)
     day = triage.load(a / 'ledger.json', {})['days']['2026-10-26']
-    assert day['seconds'] == 0 and set(day['refunds']) == {'autoloop-card-anym-1', 'autoloop-card-anym-2',
+    assert day['seconds'] == 7200 and set(day['refunds']) == {'autoloop-card-anym-1', 'autoloop-card-anym-2',
                                                            'autoloop-card-anym-3'}
 
 
@@ -749,16 +769,19 @@ def paused(a, at):
 def test_the_fence_closes_loop_terminals_only_cancels_ready_merges_disarms_prs_and_reads_back(loop):
     t, a, s = loop
     configure(a, live=True)
-    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started', [D1])
-    intent(a, 'autoloop-build-anym-10', 'ANYM-10', 'started', [D2])
+    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started', [D1], workspace='w1')
+    intent(a, 'autoloop-build-anym-10', 'ANYM-10', 'started', [D2], workspace='w2')
+    intent(a, 'autoloop-card-unlaunched', 'new:unlaunched', 'reserved')  # no workspace yet: matches none
     paused(a, NOW - timedelta(minutes=10))
     intent(a, 'autoloop-card-recorded', 'new:recorded', 'started')
     autoloop.put(a, dict(autoloop.intents(a)['autoloop-card-recorded'], workspace='w7'))
     fakes = Fakes(workspaces=[{'name': 'autoloop-card-xyz', 'id': 'w1'}, {'name': 'autoloop-build-anym-10', 'id': 'w2'},
                               {'name': 'autoloop-card-not-ours', 'id': 'w3'}, {'name': 'other', 'id': 'w4'},
                               {'name': 'autoloop-card-xyz', 'id': 'w5', 'projectName': 'another-project'},
-                              {'name': 'autoloop-card-recorded', 'id': 'w6'}],
-                  terminals={'w1': ['t1'], 'w2': ['t2', 't3'], 'w3': ['t4'], 'w4': ['t5'], 'w5': ['t6'], 'w6': ['t7']},
+                              {'name': 'autoloop-card-recorded', 'id': 'w6'},
+                              {'name': 'autoloop-card-unlaunched', 'id': 'w8', 'createdAt': '2026-10-26T11:59:00Z'}],
+                  terminals={'w1': ['t1'], 'w2': ['t2', 't3'], 'w3': ['t4'], 'w4': ['t5'], 'w5': ['t6'], 'w6': ['t7'],
+                             'w8': ['t8']},
                   runs=[{'databaseId': 1, 'status': 'in_progress', 'conclusion': None, 'updatedAt': '2026-10-26T11:55:00Z',
                          'displayTitle': 'Tiden sync ready merge proposal/autoloop-card-xyz'},
                         {'databaseId': 2, 'status': 'completed', 'conclusion': 'success',
@@ -779,7 +802,7 @@ def test_the_fence_closes_loop_terminals_only_cancels_ready_merges_disarms_prs_a
                            'mergeCommit': {'oid': 'abc'}}])
     code, line = run_tick(loop, fakes)
     assert code == 0 and line == 'paused: stop effective; written after stop 2'
-    assert fakes.terminals == {'w1': [], 'w2': [], 'w3': ['t4'], 'w4': ['t5'], 'w5': ['t6'], 'w6': ['t7']}
+    assert fakes.terminals == {'w1': [], 'w2': [], 'w3': ['t4'], 'w4': ['t5'], 'w5': ['t6'], 'w6': ['t7'], 'w8': ['t8']}
     writes = [c[1] for c in fakes.calls if c[1][:2] in (['terminals', 'close'], ['run', 'cancel'], ['pr', 'merge'])
               or (c[1][:2] == ['api', 'graphql'] and 'dequeue' in c[1][3])]
     assert [w[:3] for w in writes if w[0] != 'terminals'] == [['run', 'cancel', '1'], ['pr', 'merge', '7'],
@@ -788,7 +811,7 @@ def test_the_fence_closes_loop_terminals_only_cancels_ready_merges_disarms_prs_a
     assert result['effective'] and result['read_back'] == 'clean'
     assert [x.get('pr') or x.get('run') for x in result['after_stop']] == [6, 2] and 'git revert abc' in result['after_stop'][0]['undo']
     assert set(autoloop.holds(a)['cards']) == {'ANYM-10', 'new:xyz'}
-    assert {i['status'] for i in autoloop.intents(a).values()} == {'stopped'}
+    assert {i['status'] for i in autoloop.intents(a).values()} == {'stopped'}  # the reserved one never starts
     assert not any(c[0] == 'ssh' for c in fakes.calls)
     assert autoloop.gate(a, 'autoloop-card-xyz') == 'paused'
 
@@ -845,12 +868,15 @@ def test_a_drop_or_a_hold_disarms_the_intents_prs_every_tick_and_closes_the_pr_b
     fakes.gh = gh
     code, line = run_tick(loop, fakes, now=NOW + timedelta(hours=1))
     assert code == 1 and 'withhold not done' in line
+    assert triage.load(a / 'last-tick.json', {})['at'] == triage.stamp(NOW)  # the last good tick stays
+    assert 'not withheld' in autoloop.status(a, NOW + timedelta(hours=1))[1]
     fakes.fail = set()
     code, line = run_tick(loop, fakes, now=NOW + timedelta(hours=2))
     pr = {p['number']: p for p in fakes.prs}
     assert code == 0 and pr[7]['state'] == 'CLOSED' and pr[8]['state'] == 'OPEN'
     assert not pr[8]['autoMergeRequest'] and not pr[8]['mergeQueueEntry']
     assert pr[9]['autoMergeRequest'] and pr[9]['mergeQueueEntry']  # not held, not dropped: untouched
+    assert autoloop.status(a, NOW + timedelta(hours=2))[0] == 0
 
 
 # spec: ANYM-569
@@ -868,7 +894,7 @@ def test_the_fence_action_runs_without_a_pull_and_only_when_paused(loop, monkeyp
 # spec: ANYM-569
 def test_a_failed_close_or_read_back_leaves_the_stop_not_effective_and_status_exits_1(loop):
     t, a, s = loop
-    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started')
+    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started', workspace='w1')
     paused(a, NOW - timedelta(minutes=5))
     fakes = Fakes(workspaces=[{'name': 'autoloop-card-xyz', 'id': 'w1'}], terminals={'w1': ['t1']})
     fakes.fail = {'terminals close'}

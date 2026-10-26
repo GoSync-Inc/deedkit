@@ -243,9 +243,10 @@ One tick:
 1. `PAUSE` present: fence only (below), no read, triage or launch.
 2. The feedback export, read whole and checked (every item has a feedback ID) before any write. An
    owner-principal `AUTOLOOP STOP` in it writes `PAUSE` at once and fences: it needs neither Tiden
-   nor Superset. Its ID goes to `stops.json` (also from the `PAUSE` text, if the tick stopped in
-   between), so after the resume the same item is recorded as declined `autoloop control` and
-   never pauses again.
+   nor Superset. `PAUSE` names every new STOP of the export; a paused tick and `autoloop.py resume`
+   journal them in `stops.json`, so after the resume they are recorded as declined `autoloop
+   control` and never pause again. A `PAUSE` removed by hand before any paused tick ran, after a
+   crash, pauses once more (the safe side); `resume` journals before it removes.
 3. Reads, all before the first write: the workspace list (only when an intent is open), Tiden main
    and open branches. A failed, truncated or timed-out read ends the tick with no write (exit 1).
 4. Writes: pulls into the inbox, the snapshot, matches; settles `unknown` intents by workspace name.
@@ -257,8 +258,9 @@ One tick:
    nothing resumes by feedback.
 6. Withhold, every tick: each intent of a held card or a dropped item loses auto-merge, its merge
    queue entry and its active ready merges; the open PR of an intent built on a dropped item is
-   closed. Nothing merged is reverted. What failed or is still alive is in `plan.json` `withheld`
-   and the tick exits 1; the next tick tries again.
+   closed. Nothing merged is reverted. What failed or is still alive is in `plan.json` `withheld`,
+   the tick exits 1 and is not a good tick (`last-tick.json` keeps the last good one, `status`
+   exits 1); the next tick tries again.
 7. `live: true`: the reader (above) gets the oldest items within each principal's daily item cap,
    if a reader run is left today; the run and its items (`items`: feedback ID → principal) are
    charged before it starts and never refunded, so a crash after the triage commit cannot pass the
@@ -274,15 +276,16 @@ in `tz`.
   reservation (card 2 h, build 4 h) is written before the start. An intent name is never reused:
   a card whose name is taken (`new:anym-5` after ANYM-5, `new:demo-r1` after a relaunch of
   `new:demo`) is refused. `launch <intent>` reads the intent back from `intents/` under the lock,
-  checks the gate again (`PAUSE`, a held card or a dropped item cancel it and return its
-  reservation) and writes `unknown` with the start time before its call; an `unknown` intent
-  becomes `started` (keeping that time) or `lost` by its workspace name in the deedkit project
-  of `superset workspaces list`, never by a second start. A started intent whose workspace is gone
+  checks the gate again (`PAUSE`, a held card or a dropped item cancel it, `cancelled` saved
+  before its reservation returns) and writes `unknown` with the start time before its call; an `unknown` intent
+  becomes `started` (keeping that time) or `lost` by a workspace of its name in the deedkit
+  project of `superset workspaces list` created after that time, never by a second start. A started intent whose workspace is gone
   without `autoloop.py finish <intent>` is `interrupted`. Lost and interrupted runs keep their
   reservation; `finish` returns the unused part to the day it started, once (the day's `refunds`
   journal). One relaunch per card (`-r1`), as a new reservation.
 - Fence (`PAUSE`): acts only on what belongs to an intent in `intents/`, never on a name prefix:
-  closes the terminals of its workspace (deedkit project, the recorded workspace ID), cancels
+  closes the terminals of its workspace (deedkit project, the recorded workspace ID; an `unknown`
+  intent's as in reconcile; a reserved intent has none), cancels
   queued or running ready merges (`tiden-sync.yml` dispatch) of its `proposal/<intent>` branch,
   disables auto-merge on and dequeues the open PRs whose head is its branch in this repository
   (not a fork's), then reads all three back. With no intent it reads and touches nothing. The run
@@ -291,12 +294,12 @@ in `tz`.
   whether the stop is effective (clean read-back, nothing alive, no failed call) and lists what
   landed after the `PAUSE` time (merged PRs with their revert, successful ready merges) and holds
   those cards. Intents with no live terminal become `stopped`. The tick exits 1 while the stop is
-  not effective. Resume: remove `PAUSE` (the owner, or the orchestrator on the owner's words).
+  not effective. Resume: `autoloop.py resume` (journals the STOPs, then removes `PAUSE`; removing the file works too), by the owner or the orchestrator on the owner's words.
 - `autoloop.py gate <intent>` (workers, before every Tiden write, push, ready dispatch and merge
   arm) exits 1 on `PAUSE`, a held card, a dropped item or an intent that is not running.
   `autoloop.py hold|release ANYM-n` is the orchestrator's per-card control.
 - `autoloop.py status` exits 1 when the last good tick is older than 2 hours, the stop is not
-  effective, or `PAUSE` starts with `audit`.
+  effective, a hold or drop is not withheld, or `PAUSE` starts with `audit`.
 
 ### Superset automation `deedkit-autoloop` (owner Mac)
 
