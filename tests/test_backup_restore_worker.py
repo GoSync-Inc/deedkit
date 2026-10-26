@@ -156,8 +156,17 @@ def test_restored_database_schema_must_match_manifest_before_quarantine_or_proof
     with pytest.raises(ValueError,match='restored_schema_mismatch'):worker.restored_schema_version(store,manifest)
 
 
-@pytest.mark.parametrize('version',[34,44,45])
-def test_restored_database_schema_reports_actual_verified_version(version):
+def test_restored_database_schema_reports_actual_verified_version():
+    from messaging_service import backup_restore_worker as worker
+    class Lease:
+        def __enter__(self):return SimpleNamespace(execute=lambda query:SimpleNamespace(fetchone=lambda:{'value':'34'}))
+        def __exit__(self,*args):pass
+    assert worker.restored_schema_version(SimpleNamespace(pool=SimpleNamespace(connection=Lease)),34)==34
+
+
+# spec: ANYM-511
+@pytest.mark.parametrize('version',[44,45],ids=['n-1','current'])
+def test_restored_database_schema_accepts_the_current_and_previous_schema(version):
     from messaging_service import backup_restore_worker as worker
     class Lease:
         def __enter__(self):return SimpleNamespace(execute=lambda query:SimpleNamespace(fetchone=lambda:{'value':str(version)}))

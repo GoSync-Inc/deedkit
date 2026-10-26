@@ -33,6 +33,7 @@ def test_server_verifier_proof_requires_exact_helper_facts_and_cloud_identity():
     with pytest.raises(ValueError,match='invalid_helper_result'):v.make_proof(receipt,facts,'c'*32)
 
 
+# spec: ANYM-511
 @pytest.mark.parametrize('version,accepted',[(44,True),(45,True),(46,False)],ids=['n-1','current','next'])
 def test_server_verifier_proof_accepts_current_schema_and_rejects_the_next(version,accepted):
     v=module();receipt={'wire':{'id':'20261016T091703Z-fedcba9876543210','bytes':100,'sha256':'a'*64,'snapshot_sha256':'b'*64}}
