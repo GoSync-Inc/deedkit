@@ -1026,8 +1026,10 @@ def test_a_ready_merge_takes_main_s_readiness_record_in_other_markup_for_the_sam
     (f"Criteria.\n+ {READY_LINE}\n", "keeps main's `Ready:` line"),
     (f"Criteria.\n {READY_LINE}\n", "keeps main's `Ready:` line"),
     (f"Criteria.\n\n<!-- note -->\n\n{READY_LINE}\n", "keeps main's `Ready:` line"),
+    ("Criteria.\nReady: 2026-10-26, `note` Fable r1 clean; asked by the owner, 2026-10-26\n",
+     "keeps main's `Ready:` line"),
     ("Criteria.\n\n<!-- Ready: 2026-10-20, Fable r1 clean -->\n", "has a readiness record on main that cannot be"),
-], ids=["plus-item", "leading-space", "after-html-comment", "unreadable"])
+], ids=["plus-item", "leading-space", "after-html-comment", "code-span", "unreadable"])
 def test_a_ready_merge_compares_main_s_readiness_record_in_any_markup(server, main_content, reason):
     ready_server(server, preview={"modifications": [{"seqNum": 60}], "stats": {"modifications": 1, "conflicts": 0}},
                  main=[spec(12), spec(60, status="Backlog", content=main_content)],

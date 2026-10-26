@@ -594,7 +594,7 @@ def flat(text: str) -> str:
 def stale_ready(main_content: str, line: str) -> str | None:
     """Why a branch's `Ready:` line is no refreshed record of a spec on main: main's text has it in any markup, or main
     has readiness text that the strict reading cannot compare."""
-    if flat(line) in flat(main_content):
+    if flat(line) in flat(main_content) or ready_line(main_content)[0] == line:
         return "keeps main's `Ready:` line; a reviewed change refreshes it"
     if ANY_READY.search(main_content) and ready_line(main_content) == (None, False):
         return "has a readiness record on main that cannot be compared; fix main's record by hand first"
