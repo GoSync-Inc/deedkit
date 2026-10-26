@@ -288,7 +288,7 @@ def test_migration_047_indexes_only_contact_metadata_and_repeats_over_schema46_r
             assert c.execute("SELECT to_regclass('message_metadata_contact') AS i").fetchone()['i'] is None
         store.migrate();store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='47'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='48'
             assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=47').fetchone()['n']==1
             index=c.execute('''SELECT i.indisvalid,i.indisready,pg_get_expr(i.indpred,i.indrelid) AS predicate
                 FROM pg_index i WHERE i.indexrelid='message_metadata_contact'::regclass''').fetchone()
