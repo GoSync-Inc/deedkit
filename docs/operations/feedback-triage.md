@@ -70,7 +70,8 @@ is delivered and what is still awaited; all declined gives `declined`; a duplica
 `duplicate`; a question or a not-actionable item without a spec gives `declined`; an unmatched
 bug or feature stays `received` with the proposed card in its note; an answered question gives
 `declined` "answered, no change needed: <answer>"; `enable-only` stays `received` with no
-`spec_ref` and "waits for the owner: opt-in (<spec>)", so it does not follow its Done card. `fixed` and
+`spec_ref` and "waits for the owner: opt-in (<spec>)": `feedback_sync.py` never links or
+follows an item with that note, even when a card names it (reason `opt-in hold`). `fixed` and
 `verify_requested` are not set here: they follow the cards' delivery and deployment.
 
 Each run writes `reports/<time>.md` (items, classes, clusters, items that need the owner and the
@@ -190,23 +191,31 @@ For the feedback autoloop (docs/operations/feedback-autoloop.md) the decisions c
 most 20 inbox items with their candidates, on stdin, to the pinned Claude Code CLI on the owner's
 subscription login with `--tools ""`, `--setting-sources ""`, `--strict-mcp-config` and an empty
 MCP config, `--disable-slash-commands`, `--no-session-persistence` and stream-json output, with
-only `PATH`, `HOME` and `USER` (the login keychain needs it) in an empty temporary directory. It
-takes the triage lock and its own (`~/.deedkit/autoloop`, or `AUTOLOOP_STATE`).
+only `PATH`, `HOME`, `USER` (the login keychain needs it), `CLAUDE_CODE_DISABLE_ATTACHMENTS=1` and
+`CLAUDE_CODE_DISABLE_FILE_MENTIONS=1` in an empty temporary directory. Every `@` on stdin is
+escaped as `\u0040`, so an `@path` in feedback never pulls a local file into the request. It
+takes the triage lock and its own (`~/.deedkit/autoloop`, or `AUTOLOOP_STATE`). With an empty
+inbox it makes no model call; it only publishes ledger entries a stopped run left unreported.
 
 - Before any answer is used, the stream's `init` must match the profile pinned with the CLI
-  version: no tools, MCP servers, slash commands or skills; plugins and agents exactly the pinned
-  built-in sets (plugins with `path: builtin`). Any other event than init, assistant text,
+  version: `tools`, `mcp_servers`, `slash_commands` and `skills` present and empty; plugins and
+  agents exactly the pinned built-in sets (plugins with `path: builtin`). Any other event than init, assistant text,
   rate-limit events and one result (a hook event, a tool call) refuses the run; nothing is
   recorded.
 - The answer is closed: `{"decisions": [...]}` with `id`, `classification` (the classes above
   plus `already-live`), `specs`, `primary`, `duplicate_of`, `new_card`, `reason_code` (an enum;
   the ledger reason is the code's fixed text), `answer` and `card_brief`. An unknown field, an ID
-  outside the input or twice, a spec outside the snapshot or a bad slug refuses the whole answer.
+  outside the input or twice, a spec outside the snapshot, a bad slug or verdict, or `new_card` on
+  anything but an unmatched, non-duplicate bug or feature refuses the whole answer, and so does
+  a decision `record` would refuse: the batch is checked whole before anything is written.
   `already-live` needs one accepted Done spec on main and is recorded as an accepted bug or
   feature, which the ANYM-536 follower moves to `verify_requested`.
-- `answer` and `card_brief` lose URLs, code fences, shell patterns and paths and stay untrusted;
-  card briefs go to `briefs.json` in the autoloop state for the card worker (ANYM-571).
+- `answer` and `card_brief` lose URLs, URIs, addresses, code fences, shell patterns and paths
+  and stay untrusted; card briefs go to `briefs.json` in the autoloop state, and the card worker
+  (ANYM-571) takes one only through `committed_briefs`: its item is in the ledger with the same
+  new card.
 - A new CLI version needs a new pin: update `CLI_VERSION` and `PROFILE` in `scripts/autoloop.py`
   after the canary run on the Mac: `AUTOLOOP_CANARY=1 uv run pytest tests/platform/test_autoloop.py
   -k canary` (hostile settings, hook, MCP config, plugin, memory file and symlink around the
-  reader's directory; a read and a write outside asked by the item; one valid decision expected).
+  reader's directory; a read, `@` mentions of a file and a symlink, and a write outside asked by
+  the item; the canary text must not come back; one valid decision expected).
