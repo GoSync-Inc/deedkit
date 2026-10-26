@@ -346,3 +346,420 @@ def test_canary_the_real_cli_ignores_hostile_files_and_gives_one_valid_decision(
     assert CANARY not in json.dumps(decisions) + json.dumps(briefs)
     assert 'secret' not in json.dumps(briefs)
     shutil.rmtree(parent)
+
+
+# --- the tick (ANYM-569) -----------------------------------------------------------------------------------------
+from datetime import datetime, timedelta, timezone  # noqa: E402
+import fcntl  # noqa: E402
+
+NOW = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)
+OWNER, STRANGER = 'agent-grok', 'agent-other'
+D1, D2, D3, D4 = ('22222222-2222-4222-8222-%012d' % n for n in (1, 2, 3, 4))
+
+
+def submission(i, description, principal=OWNER, minute=0, category='bug'):
+    return dict(item(i, description, category, minute), principal=principal, key_id='k-' + principal)
+
+
+def tiden_reply(specs):
+    return {'requirements': [{'seqNum': int(s['ref'].split('-')[1]), 'title': s['title'], 'status': s['status'],
+                               'content': '', 'sources': []} for s in specs],
+            'pagination': {'totalCount': len(specs), 'nextPageToken': None}}
+
+
+class Fakes:
+    """Stand-ins for the export over SSH, Tiden, superset and gh; each records its calls."""
+
+    def __init__(self, submissions=(), workspaces=(), terminals=None, runs=(), open_prs=(), merged=()):
+        self.submissions, self.workspaces, self.terminals = list(submissions), list(workspaces), terminals or {}
+        self.runs, self.open_prs, self.merged = list(runs), list(open_prs), list(merged)
+        self.calls, self.fail, self.truncate, self.runner_calls = [], set(), False, []
+
+    def ssh(self, host, argv):
+        self.calls.append(('ssh', argv[:2]))
+        if 'export' in self.fail:
+            raise triage.Refused('ssh failed: TimeoutExpired')
+        if argv[:2] == ['docker', 'inspect']:
+            return 'sha256:' + '0' * 64
+        return json.dumps({'mode': 'created', 'submissions': self.submissions, 'dispositions': [],
+                           'export_head': '2026-10-26T11:59:00+00:00', 'has_more': False})
+
+    def tiden(self, *argv):
+        if argv[:2] == ('branch', 'list'):
+            return {'branches': []}
+        reply = tiden_reply(SNAPSHOT['main'])
+        if self.truncate:
+            reply['pagination']['nextPageToken'] = 'more'
+        return reply
+
+    def superset(self, argv):
+        self.calls.append(('superset', argv))
+        if argv[0] in self.fail or ' '.join(argv[:2]) in self.fail:
+            raise triage.Refused('superset failed')
+        if argv[:2] == ['workspaces', 'list']:
+            return [dict(w) for w in self.workspaces]
+        if argv[:2] == ['terminals', 'list']:
+            return {'sessions': [{'terminalId': t, 'exited': False} for t in self.terminals.get(argv[-1], [])]}
+        if argv[:2] == ['terminals', 'close']:
+            self.terminals[argv[4]].remove(argv[6])
+        return {}
+
+    def gh(self, argv):
+        self.calls.append(('gh', argv))
+        if argv[:2] == ['run', 'list']:
+            return json.dumps(self.runs)
+        if argv[:2] == ['run', 'cancel']:
+            next(r for r in self.runs if str(r['databaseId']) == argv[2]).update(status='completed', conclusion='cancelled')
+        elif argv[:2] == ['pr', 'merge']:
+            next(p for p in self.open_prs if str(p['number']) == argv[2])['autoMergeRequest'] = None
+        elif argv[:2] == ['api', 'graphql'] and 'dequeue' in argv[3]:
+            next(p for p in self.open_prs if f"id={p['id']}" == argv[5])['mergeQueueEntry'] = None
+        elif argv[:2] == ['api', 'graphql']:
+            return json.dumps({'data': {'repository': {'open': {'pageInfo': {'hasNextPage': False},
+                                                                'nodes': self.open_prs},
+                                                       'merged': {'nodes': self.merged}}}})
+        return ''
+
+    def runner(self, projected):
+        self.runner_calls.append([row['id'] for row in projected['items']])
+        return stream(answer(*[decision(row['id'], 'not-actionable', reason_code='not-actionable')
+                               for row in projected['items']]))
+
+
+@pytest.fixture
+def loop(tmp_path):
+    t, a, s = tmp_path / 'triage', tmp_path / 'autoloop', tmp_path / 'sync'
+    a.mkdir(mode=0o700)
+    return t, a, s
+
+
+def configure(a, **values):
+    path = a / 'config.json'
+    path.write_text(json.dumps(dict({'principals': [OWNER]}, **values)))
+    path.chmod(0o600)
+
+
+def run_tick(loop, fakes, now=NOW, **kw):
+    t, a, s = loop
+    return autoloop.tick(a, t, s, now=now, ssh=fakes.ssh, read_tiden=fakes.tiden, runner=fakes.runner,
+                         superset=fakes.superset, gh=fakes.gh, **kw)
+
+
+def intent(a, name, card, status, feedback=(), started=NOW - timedelta(minutes=30), reserved=7200):
+    autoloop.put(a, {'name': name, 'kind': name.split('-')[1], 'card': card, 'feedback': list(feedback),
+                     'reserved': reserved, 'day': '2026-10-26', 'status': status, 'created_at': triage.stamp(started),
+                     'started_at': triage.stamp(started), 'ended_at': None, 'workspace': None})
+
+
+# spec: ANYM-569
+@pytest.mark.parametrize('held', ['triage', 'sync', 'tick'])
+def test_a_held_lock_ends_the_tick_as_busy_with_no_read_or_write(loop, held):
+    t, a, s = loop
+    fakes = Fakes([submission(D1, 'x')])
+    path = {'triage': t, 'sync': s, 'tick': a}[held]
+    path.mkdir(exist_ok=True, mode=0o700)
+    with open(path / 'lock', 'w') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(autoloop.Busy, match='busy'):
+            run_tick(loop, fakes)
+    assert fakes.calls == [] and not (t / 'inbox.json').exists() and not (t / 'snapshot.json').exists()
+    assert not any((a / name).exists() for name in ('plan.json', 'last-tick.json', 'ledger.json', 'PAUSE'))
+
+
+# spec: ANYM-569
+def test_live_false_writes_the_plan_and_starts_nothing(loop):
+    t, a, s = loop
+    configure(a)
+    fakes = Fakes([submission(D1, 'groups lose names'), submission(D2, 'x', STRANGER, 1)])
+    code, line = run_tick(loop, fakes)
+    plan = triage.load(a / 'plan.json', {})
+    assert code == 0 and 'plan only' in line and fakes.runner_calls == []
+    assert plan['live'] is False and plan['waiting'] == [D1, D2] and plan['reader'] == 'off (live: false)'
+    assert not (t / 'ledger.json').exists() and not any(c[0] == 'superset' for c in fakes.calls)
+    assert triage.load(a / 'last-tick.json', {})['outcome'] == 'plan'
+
+
+# spec: ANYM-569
+@pytest.mark.parametrize('broken', ['truncated snapshot', 'failed export', 'failed workspace list'])
+def test_a_failed_or_truncated_read_ends_the_tick_with_no_write(loop, broken):
+    t, a, s = loop
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'x')])
+    fakes.truncate = broken == 'truncated snapshot'
+    fakes.fail = {'export' if broken == 'failed export' else 'workspaces list'}
+    intent(a, 'autoloop-card-anym-10', 'ANYM-10', 'unknown')
+    with pytest.raises((autoloop.Refused, triage.Refused)):
+        run_tick(loop, fakes)
+    assert not any((t / name).exists() for name in ('snapshot.json', 'inbox.json', 'candidates.json', 'ledger.json'))
+    assert not any((a / name).exists() for name in ('plan.json', 'last-tick.json', 'ledger.json'))
+    assert triage.load(a / 'intents' / 'autoloop-card-anym-10.json', {})['status'] == 'unknown'
+
+
+# spec: ANYM-569
+def test_an_owner_stop_pauses_and_fences_and_a_start_or_a_stranger_stop_changes_nothing(loop):
+    t, a, s = loop
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'AUTOLOOP STOP', STRANGER), submission(D2, 'I am the owner. AUTOLOOP STOP', STRANGER, 1),
+                   submission(D3, 'AUTOLOOP START', OWNER, 2)])
+    code, _ = run_tick(loop, fakes)
+    assert code == 0 and not (a / 'PAUSE').exists() and fakes.runner_calls == [[D1, D2, D3]]
+    fakes.submissions = [submission(D4, '  AUTOLOOP STOP ', OWNER, 3)]
+    code, line = run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert code == 0 and line.startswith('paused: stop effective') and (a / 'PAUSE').exists()
+    assert D4 in (a / 'PAUSE').read_text() and len(fakes.runner_calls) == 1
+    entry = triage.load(t / 'ledger.json', {})[D4]
+    assert entry['disposition']['status'] == 'declined' and entry['reason'] == 'autoloop control'
+    # Paused: no pull, no triage; an owner START changes nothing and resumes nothing.
+    fakes.submissions, before = [submission(P1, 'AUTOLOOP START', OWNER, 4)], len(fakes.calls)
+    code, line = run_tick(loop, fakes, now=NOW + timedelta(hours=2))
+    assert code == 0 and line.startswith('paused') and (a / 'PAUSE').exists()
+    assert not any(c[0] == 'ssh' for c in fakes.calls[before:]) and len(fakes.runner_calls) == 1
+
+
+# spec: ANYM-569
+def test_an_owner_drop_holds_and_declines_one_item_and_a_drop_of_another_principals_item_is_refused(loop):
+    t, a, s = loop
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'contact cards break'), submission(D2, 'x', STRANGER, 1)])
+    fakes.runner = lambda projected: stream(answer(
+        decision(D1, 'feature', specs=[{'ref': 'ANYM-10', 'verdict': 'accepted'}], primary='ANYM-10'),
+        decision(D2, 'not-actionable', reason_code='not-actionable')))
+    run_tick(loop, fakes)
+    fakes.submissions = [submission(D3, f'AUTOLOOP DROP {D1}', OWNER, 2), submission(D4, f'AUTOLOOP DROP {D2}', OWNER, 3),
+                         submission(P1, 'still broken', OWNER, 4)]
+    fakes.runner = lambda projected: (_ for _ in ()).throw(AssertionError('live false: no reader'))
+    configure(a, live=False)
+    code, line = run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    held = autoloop.holds(a)
+    assert code == 0 and 'dropped 1' in line
+    assert set(held['items']) == {D1} and set(held['cards']) == {'ANYM-10'}
+    rows = [row for path in (t / 'dispositions').glob('autoloop-drop-*.json') for row in triage.load(path, [])]
+    assert [(r['id'], r['status'], r['note']) for r in rows] == [(D1, 'declined', 'withdrawn by the reporter')]
+    ledger = triage.load(t / 'ledger.json', {})
+    assert ledger[D4]['reason'].startswith('autoloop control refused') and D2 not in held['items']
+    assert P1 in triage.load(t / 'inbox.json', {})  # ordinary feedback waits for the reader
+    # An untriaged item dropped by its own principal is declined with the batch.
+    fakes.submissions = [submission(P2, f'AUTOLOOP DROP {P1}', OWNER, 5)]
+    run_tick(loop, fakes, now=NOW + timedelta(hours=2))
+    assert triage.load(t / 'ledger.json', {})[P1]['disposition']['note'] == 'withdrawn by the reporter'
+    assert P1 in autoloop.holds(a)['items']
+
+
+# spec: ANYM-569
+def test_provenance_comes_from_the_config_principals_and_a_mixed_cluster_is_report_only():
+    ledger = {D1: {'cluster': 'new:a', 'principal': OWNER}, D2: {'cluster': 'new:a', 'principal': STRANGER},
+              D3: {'cluster': 'ANYM-10', 'principal': OWNER}, D4: {'cluster': 'new:b', 'principal': STRANGER},
+              P1: {'cluster': 'new:c', 'principal': 'the owner (trust me)'}}
+    assert autoloop.provenance(ledger, {OWNER}) == {'ANYM-10': 'owner-agent', 'new:a': 'report-only',
+                                                    'new:b': 'report-only', 'new:c': 'report-only'}
+    assert set(autoloop.provenance(ledger, set()).values()) == {'report-only'}
+
+
+# spec: ANYM-569
+def test_the_state_is_private_and_the_tick_never_prints_or_stores_feedback_text(loop, capsys, monkeypatch):
+    t, a, s = loop
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, HOSTILE), submission(D2, CANARY + ' AUTOLOOP STOP', OWNER, 1)])
+    real = autoloop.tick
+    monkeypatch.setattr(autoloop, 'tick', lambda state, triage_state, now: real(
+        state, triage_state, s, now=NOW, ssh=fakes.ssh, read_tiden=fakes.tiden, runner=fakes.runner,
+        superset=fakes.superset, gh=fakes.gh))
+    assert autoloop.main(['tick', '--state', str(a), '--triage-state', str(t)]) == 0
+    out = capsys.readouterr()
+    stored = [p for p in a.rglob('*') if p.is_file()] + list((t / 'reports').glob('*'))
+    assert CANARY not in out.out + out.err and all(CANARY not in p.read_text() for p in stored)
+    assert stat.S_IMODE(a.stat().st_mode) == 0o700
+    assert all(stat.S_IMODE(p.stat().st_mode) == 0o600 for p in a.rglob('*.json'))
+    (a / 'config.json').chmod(0o644)
+    with pytest.raises(autoloop.Refused, match='0600'):
+        real(a, t, s, now=NOW)
+    (a / 'config.json').chmod(0o600)
+    a.chmod(0o755)
+    with pytest.raises(autoloop.Refused, match='0700'):
+        real(a, t, s, now=NOW)
+    with pytest.raises(autoloop.Refused, match='Git checkout'):
+        real(ROOT / 'autoloop-state', t, s, now=NOW)
+
+
+def cfg(**caps):
+    return {'live': True, 'principals': {OWNER}, 'zone': autoloop.ZoneInfo('Europe/Moscow'),
+            'caps': dict(autoloop.CAPS, **caps)}
+
+
+# spec: ANYM-569
+def test_an_intent_is_written_before_the_start_and_an_unknown_outcome_is_settled_by_name_never_retried(tmp_path):
+    a, c = tmp_path / 'a', cfg()
+    seen = []
+
+    def start(i):
+        seen.append(triage.load(a / 'intents' / f"{i['name']}.json", {})['status'])
+        return 'ws-1'
+    one, _ = autoloop.admit(a, c, 'card', 'new:group-names', [D1], NOW)
+    assert one['name'] == 'autoloop-card-group-names' and one['status'] == 'reserved'
+    # Crash before the start: the intent stays reserved and starts once.
+    assert autoloop.launch(a, one, start, NOW)['status'] == 'started' and seen == ['unknown']
+    with pytest.raises(autoloop.Refused, match='only a reserved intent'):
+        autoloop.launch(a, one, start, NOW)
+    # Lost response: the start raises; the intent stays unknown and is never started again.
+    two, _ = autoloop.admit(a, c, 'card', 'ANYM-10', [D2], NOW)
+
+    def lost(i):
+        raise triage.Refused('superset failed: TimeoutExpired')
+    with pytest.raises(triage.Refused):
+        autoloop.launch(a, two, lost, NOW)
+    assert autoloop.intents(a)['autoloop-card-anym-10']['status'] == 'unknown'
+    # Crash after the start: the workspace exists, so the intent is started; one that never came up is lost.
+    listing = [{'name': 'autoloop-card-anym-10', 'id': 'ws-2', 'archivedAt': None}]
+    assert autoloop.reconcile(a, listing, NOW) == ['autoloop-card-anym-10', 'autoloop-card-group-names']
+    known = autoloop.intents(a)
+    assert known['autoloop-card-anym-10']['status'] == 'started' and known['autoloop-card-anym-10']['workspace'] == 'ws-2'
+    assert known['autoloop-card-group-names']['status'] == 'interrupted'  # its workspace is gone with no finish
+    intent(a, 'autoloop-build-anym-11', 'ANYM-11', 'unknown')
+    assert autoloop.reconcile(a, listing, NOW) == ['autoloop-build-anym-11']
+    assert autoloop.intents(a)['autoloop-build-anym-11']['status'] == 'lost'
+
+
+# spec: ANYM-569
+def test_caps_reservations_refunds_relaunch_and_the_owner_time_zone_day(tmp_path):
+    a = tmp_path / 'a'
+    c = cfg(card_launches=3, worker_hours=4)
+    first, _ = autoloop.admit(a, c, 'card', 'ANYM-1', [], NOW)
+    second, _ = autoloop.admit(a, c, 'card', 'ANYM-2', [], NOW)  # concurrent admissions see each other
+    assert autoloop.admit(a, c, 'card', 'ANYM-3', [], NOW) == (None, 'workers in flight')
+    assert autoloop.admit(a, c, 'card', 'ANYM-1', [], NOW) == (None, 'workers in flight')
+    days = triage.load(a / 'ledger.json', {})['days']
+    assert days['2026-10-26'] == {'reader_runs': 0, 'items': {}, 'card': 2, 'build': 0, 'seconds': 4 * 3600}
+    # A clean end returns the unused part; an interrupted run keeps its whole reservation.
+    autoloop.put(a, dict(first, status='started', started_at=triage.stamp(NOW)))
+    assert autoloop.finish(a, first['name'], NOW + timedelta(minutes=30)) == 5400
+    autoloop.put(a, dict(second, status='interrupted'))
+    assert triage.load(a / 'ledger.json', {})['days']['2026-10-26']['seconds'] == 2 * 3600 + 1800
+    assert autoloop.admit(a, c, 'card', 'ANYM-3', [], NOW) == (None, 'worker hours')  # 2.5 h + 2 h > 4 h
+    # Day rollover at midnight in the owner's zone (Moscow: 21:00 UTC), not UTC.
+    late, c = datetime(2026, 10, 26, 21, 30, tzinfo=timezone.utc), cfg(card_launches=3)
+    relaunch, _ = autoloop.admit(a, c, 'card', 'ANYM-2', [], late)
+    assert relaunch['name'] == 'autoloop-card-anym-2-r1' and relaunch['day'] == '2026-10-27'
+    autoloop.put(a, dict(relaunch, status='lost'))
+    assert autoloop.admit(a, c, 'card', 'ANYM-2', [], late) == (None, 'relaunch used')
+    autoloop.admit(a, c, 'card', 'ANYM-5', [], late)
+    autoloop.put(a, dict(autoloop.intents(a)['autoloop-card-anym-5'], status='finished'))
+    autoloop.admit(a, c, 'card', 'ANYM-6', [], late)
+    autoloop.put(a, dict(autoloop.intents(a)['autoloop-card-anym-6'], status='finished'))
+    assert autoloop.admit(a, c, 'card', 'ANYM-7', [], late) == (None, 'daily launches')
+    autoloop.hold(a, 'ANYM-8', 'orchestrator', NOW)
+    assert autoloop.admit(a, c, 'build', 'ANYM-8', [], late) == (None, 'held')
+
+
+# spec: ANYM-569
+def test_the_reader_and_item_caps_hold_items_back(loop):
+    t, a, s = loop
+    configure(a, live=True, caps={'items_per_principal': 2, 'reader_runs': 1})
+    fakes = Fakes([submission(D1, 'a'), submission(D2, 'b', OWNER, 1), submission(D3, 'c', OWNER, 2),
+                   submission(D4, 'd', STRANGER, 3)])
+    code, line = run_tick(loop, fakes)
+    assert code == 0 and fakes.runner_calls == [[D1, D2, D4]] and 'over cap 1' in line
+    assert triage.load(a / 'ledger.json', {})['days']['2026-10-26']['items'] == {OWNER: 2, STRANGER: 1}
+    fakes.submissions = [submission(P1, 'e', STRANGER, 4)]
+    code, _ = run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert triage.load(a / 'plan.json', {})['reader'] == 'over the daily reader cap' and len(fakes.runner_calls) == 1
+    # The next day in the owner's zone (UTC here) both caps start again.
+    run_tick(loop, fakes, now=NOW + timedelta(days=1))
+    assert fakes.runner_calls[1] == [D3, P1]
+
+
+def paused(a, at):
+    (a / 'PAUSE').touch()
+    os.utime(a / 'PAUSE', (at.timestamp(), at.timestamp()))
+
+
+# spec: ANYM-569
+def test_the_fence_closes_loop_terminals_only_cancels_ready_merges_disarms_prs_and_reads_back(loop):
+    t, a, s = loop
+    configure(a, live=True)
+    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started', [D1])
+    intent(a, 'autoloop-build-anym-10', 'ANYM-10', 'started', [D2])
+    paused(a, NOW - timedelta(minutes=10))
+    fakes = Fakes(workspaces=[{'name': 'autoloop-card-xyz', 'id': 'w1'}, {'name': 'autoloop-build-anym-10', 'id': 'w2'},
+                              {'name': 'autoloop-card-not-ours', 'id': 'w3'}, {'name': 'other', 'id': 'w4'}],
+                  terminals={'w1': ['t1'], 'w2': ['t2', 't3'], 'w3': ['t4'], 'w4': ['t5']},
+                  runs=[{'databaseId': 1, 'status': 'in_progress', 'conclusion': None, 'updatedAt': '2026-10-26T11:55:00Z',
+                         'displayTitle': 'Tiden sync ready merge proposal/autoloop-card-xyz'},
+                        {'databaseId': 2, 'status': 'completed', 'conclusion': 'success',
+                         'updatedAt': '2026-10-26T11:52:00Z', 'displayTitle': 'Tiden sync ready merge proposal/autoloop-card-xyz'},
+                        {'databaseId': 3, 'status': 'queued', 'conclusion': None, 'updatedAt': '2026-10-26T11:55:00Z',
+                         'displayTitle': 'Tiden sync ready merge proposal/other-card'}],
+                  open_prs=[{'number': 7, 'id': 'PR_7', 'headRefName': 'autoloop-build-anym-10',
+                             'autoMergeRequest': {'enabledAt': 'x'}, 'mergeQueueEntry': {'state': 'QUEUED'}},
+                            {'number': 8, 'id': 'PR_8', 'headRefName': 'feature', 'autoMergeRequest': {'enabledAt': 'x'},
+                             'mergeQueueEntry': None}],
+                  merged=[{'number': 6, 'headRefName': 'autoloop-build-anym-10', 'mergedAt': '2026-10-26T11:58:00Z',
+                           'mergeCommit': {'oid': 'abc'}}])
+    code, line = run_tick(loop, fakes)
+    assert code == 0 and line == 'paused: stop effective; written after stop 2'
+    assert fakes.terminals == {'w1': [], 'w2': [], 'w3': ['t4'], 'w4': ['t5']}
+    writes = [c[1] for c in fakes.calls if c[1][:2] in (['terminals', 'close'], ['run', 'cancel'], ['pr', 'merge'])
+              or (c[1][:2] == ['api', 'graphql'] and 'dequeue' in c[1][3])]
+    assert [w[:3] for w in writes if w[0] != 'terminals'] == [['run', 'cancel', '1'], ['pr', 'merge', '7'],
+                                                               ['api', 'graphql', '-f']]
+    result = triage.load(a / 'fence.json', {})
+    assert result['effective'] and result['read_back'] == 'clean'
+    assert [x.get('pr') or x.get('run') for x in result['after_stop']] == [6, 2] and 'git revert abc' in result['after_stop'][0]['undo']
+    assert set(autoloop.holds(a)['cards']) == {'ANYM-10', 'new:xyz'}
+    assert {i['status'] for i in autoloop.intents(a).values()} == {'stopped'}
+    assert not any(c[0] == 'ssh' for c in fakes.calls)
+    assert autoloop.gate(a, 'autoloop-card-xyz') == 'paused'
+
+
+# spec: ANYM-569
+def test_a_failed_close_or_read_back_leaves_the_stop_not_effective_and_status_exits_1(loop):
+    t, a, s = loop
+    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started')
+    paused(a, NOW - timedelta(minutes=5))
+    fakes = Fakes(workspaces=[{'name': 'autoloop-card-xyz', 'id': 'w1'}], terminals={'w1': ['t1']})
+    fakes.fail = {'terminals close'}
+    code, line = run_tick(loop, fakes)
+    result = triage.load(a / 'fence.json', {})
+    assert code == 1 and 'NOT effective' in line and result['alive'] == ['terminal autoloop-card-xyz']
+    assert result['failed'] == ['close autoloop-card-xyz: superset failed']
+    assert autoloop.intents(a)['autoloop-card-xyz']['status'] == 'started'
+    assert autoloop.status(a, NOW)[0] == 1 and 'not effective' in autoloop.status(a, NOW)[1]
+    fakes.fail = {'workspaces list'}
+    code, _ = run_tick(loop, fakes)
+    assert code == 1 and triage.load(a / 'fence.json', {})['read_back'].startswith('failed')
+
+
+# spec: ANYM-569
+def test_gate_refuses_after_pause_on_a_held_card_a_dropped_item_or_an_unknown_intent(tmp_path):
+    a = tmp_path / 'a'
+    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started', [D1])
+    intent(a, 'autoloop-build-anym-10', 'ANYM-10', 'started', [D2])
+    intent(a, 'autoloop-build-anym-11', 'ANYM-11', 'stopped', [D3])
+    assert autoloop.gate(a, 'autoloop-card-xyz') is None
+    assert autoloop.gate(a, 'autoloop-build-anym-11') == 'intent stopped'
+    assert autoloop.gate(a, 'autoloop-card-nope') == 'unknown intent' and autoloop.gate(a, '../x') == 'unknown intent'
+    autoloop.hold(a, 'ANYM-10', 'orchestrator', NOW)
+    triage.save(a / 'holds.json', dict(autoloop.holds(a), items={D1: {'by': D4}}))
+    assert autoloop.gate(a, 'autoloop-build-anym-10') == 'card held'
+    assert autoloop.gate(a, 'autoloop-card-xyz') == 'feedback dropped'
+    autoloop.hold(a, 'ANYM-10', 'orchestrator', NOW, release=True)
+    assert autoloop.gate(a, 'autoloop-build-anym-10') is None
+    (a / 'PAUSE').touch()  # a worker dispatching after PAUSE is refused
+    assert autoloop.main(['gate', 'autoloop-build-anym-10', '--state', str(a)]) == 1
+
+
+# spec: ANYM-569
+def test_status_exits_1_on_a_stale_tick_or_an_audit_pause(loop):
+    t, a, s = loop
+    assert autoloop.status(a, NOW)[0] == 1
+    run_tick(loop, Fakes())
+    assert autoloop.status(a, NOW + timedelta(minutes=119)) == (0, f'last tick {triage.stamp(NOW)} (plan); running')
+    assert autoloop.status(a, NOW + timedelta(hours=2, minutes=1))[0] == 1
+    (a / 'PAUSE').write_text('audit: a merged loop PR the controller did not approve\n')
+    triage.save(a / 'fence.json', {'effective': True})
+    assert 'paused by an audit' in autoloop.status(a, NOW)[1]
+
+
+# spec: ANYM-569
+def test_the_sync_lock_is_the_feedback_sync_state():
+    import scripts.feedback_sync as sync
+    assert autoloop.SYNC_STATE == sync.STATE
