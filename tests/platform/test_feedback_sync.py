@@ -696,6 +696,18 @@ def test_a_feedback_line_on_exactly_one_card_links_and_other_mentions_do_not(tmp
     assert 'proposed new card' not in (state_dir(tmp_path) / 'last-run.json').read_text()  # no note text
 
 
+# spec: ANYM-570
+def test_an_enable_only_hold_is_never_linked_or_followed_even_when_a_card_names_it(tmp_path):
+    hold = disp('received', note='waits for the owner: opt-in (ANYM-12)')
+    prod = Prod({A: hold, C: hold})  # ANYM-30 in LINK names A and B; no card names C
+    assert auto(tmp_path, prod, '--apply', main=LINK) == 0
+    assert written_ids(prod) == [[B]]  # B, never set, still links; the held A beside it does not
+    assert shown(prod, A) == shown(prod, C) == hold
+    report = synced(tmp_path, 'last-run.json')
+    assert report['reasons']['opt-in hold'] == [{'feedback': A, 'card': None}, {'feedback': C, 'card': None}]
+    assert report['waiting_for_card'] == []
+
+
 # spec: ANYM-536
 def test_a_card_seen_then_absent_is_missing_and_a_never_seen_card_waits_for_main(tmp_path):
     prod = Prod({A: disp('accepted', 'ANYM-40'), B: disp('accepted', 'ANYM-41')})

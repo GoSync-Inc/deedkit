@@ -37,8 +37,9 @@ SSH_TIMEOUT = 120
 TIDEN_TIMEOUT = 120
 OVERLAP_MINUTES = 10
 MAX_PAGES = 100
-CLASSES = ('reported-bug', 'feature', 'question', 'not-actionable')
+CLASSES = ('reported-bug', 'feature', 'question', 'not-actionable', 'enable-only')
 VERDICTS = ('accepted', 'declined')
+HOLD = 'waits for the owner: opt-in'  # an enable-only item's note: the sync tool never links or follows it (ANYM-570)
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 SPEC = re.compile(r'ANYM-[1-9][0-9]*')
 SLUG = re.compile(r'[a-z0-9][a-z0-9-]{2,60}')
@@ -277,6 +278,13 @@ def clean(text, limit=NOTE_LIMIT):
 def disposition(decision, specs):
     """The status hand-off of one item (ANYM-343 vocabulary; `fixed` and later come from the sync tool)."""
     reason, primary = decision['reason'], decision.get('primary')
+    if decision['classification'] == 'enable-only':
+        # Delivered but off: the item waits for the owner, not for its card (ANYM-570); no link, so no follow.
+        return {'status': 'received', 'spec_ref': None, 'duplicate_of': None,
+                'note': f'{HOLD} ({primary})'}
+    if decision.get('answer'):
+        return {'status': 'declined', 'spec_ref': None, 'duplicate_of': None,
+                'note': 'answered, no change needed: ' + decision['answer']}
     if decision.get('duplicate_of'):
         return {'status': 'duplicate', 'spec_ref': primary, 'duplicate_of': decision['duplicate_of'], 'note': reason}
     matched = decision.get('specs') or []
@@ -319,6 +327,12 @@ def checked(decision, specs, keys):
     if matched and any(s['verdict'] == 'accepted' for s in matched) and \
             next(s for s in matched if s['ref'] == primary)['verdict'] != 'accepted':
         raise Refused(f"{decision['id']}: the primary spec must be an accepted one")
+    if decision['classification'] == 'enable-only' and (len(matched) != 1 or matched[0]['verdict'] != 'accepted'):
+        raise Refused(f"{decision['id']}: enable-only needs exactly one accepted spec")
+    answer = decision.get('answer')
+    if answer is not None and (decision['classification'] != 'question' or matched or not isinstance(answer, str)
+                               or not answer.strip() or '\n' in answer or len(answer) > 250):
+        raise Refused(f"{decision['id']}: answer is one line of 1-250 characters on a question without specs")
     duplicate = decision.get('duplicate_of')
     if duplicate is not None and (duplicate == decision['id'] or keys.get(duplicate) is None
                                   or keys[duplicate] != keys[decision['id']]):
@@ -344,13 +358,8 @@ def write_ledger(state, ledger):
     save(state / 'ledger.json', ledger)
 
 
-def record(state, decisions, now=None):
-    now = now or datetime.now(timezone.utc)
-    snap = load(state / 'snapshot.json', None)
-    if snap is None:
-        raise Refused('no snapshot: run `snapshot` first')
-    specs, inbox = known(snap), load(state / 'inbox.json', {})
-    ledger, meta = load(state / 'ledger.json', {}), load(state / 'state.json', {})
+def checked_batch(decisions, specs, inbox, ledger):
+    """Every decision checked before any is recorded: one bad decision refuses the whole batch."""
     if not isinstance(decisions, list):
         raise Refused('decisions must be a JSON list')
     keys = {i: entry.get('key_id') for i, entry in ledger.items()} | {i: item.get('key_id') for i, item in inbox.items()}
@@ -359,6 +368,17 @@ def record(state, decisions, now=None):
         target = decision.get('verdict_of')
         if target and target not in ledger and (target not in chosen or chosen[target].get('verdict_of')):
             raise Refused(f'{i}: verdict_of names an item that has no cluster yet')
+    return chosen
+
+
+def record(state, decisions, now=None):
+    now = now or datetime.now(timezone.utc)
+    snap = load(state / 'snapshot.json', None)
+    if snap is None:
+        raise Refused('no snapshot: run `snapshot` first')
+    specs, inbox = known(snap), load(state / 'inbox.json', {})
+    ledger, meta = load(state / 'ledger.json', {}), load(state / 'state.json', {})
+    chosen = checked_batch(decisions, specs, inbox, ledger)
     if set(inbox) & set(ledger):
         # A run stopped after a ledger write: that entry is complete, so the item leaves the inbox.
         inbox = {i: item for i, item in inbox.items() if i not in ledger}
