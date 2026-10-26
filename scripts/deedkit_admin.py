@@ -24,6 +24,7 @@ import importlib.util
 import io
 import json
 import os
+import posixpath
 from pathlib import Path, PurePosixPath
 import re
 import secrets
@@ -547,9 +548,9 @@ def dockers(config: dict):
 
     def call(args: list[str], name: str | None = None, data: bytes | None = None) -> subprocess.CompletedProcess:
         # A secret only ever on stdin (rule (g)); no stdin at all otherwise.
-        feed = {"input": data} if data is not None else {"stdin": subprocess.DEVNULL}
         try:
-            return subprocess.run(prefix + args, capture_output=True, timeout=TIMEOUT, check=False, **feed)
+            return subprocess.run(prefix + args, capture_output=True, timeout=TIMEOUT, check=False, input=data,
+                                  stdin=None if data is not None else subprocess.DEVNULL)
         except OSError as exc:
             raise AdminError(f"docker: {type(exc).__name__}; nothing changed") from None
         except BaseException as exc:
@@ -1314,6 +1315,9 @@ def undo(config: dict, run, docker, host_factory, operation: str) -> dict:
 
 
 EXTEND_DAYS = (1, 183)  # ANYM-497: within every store's extend limit (365) and the calendar's issue lifetime (183)
+# Backends extend by their own database clock: the host's pre-write checks keep this margin, so a backend clock up
+# to an hour off cannot refuse (expired, would shorten) after an earlier store was already extended.
+SKEW = timedelta(hours=1)
 STEPS = ("messaging", "messaging-archive", "calendar")  # the backend records, in their order
 ORDER = ("gateway", "messaging", "messaging-archive", "calendar", "calls")
 DOCUMENT_STEPS = {"gateway": "gateway policy", "calls": "calls registry"}
@@ -1338,6 +1342,19 @@ for token in sys.stdin.read().split():
         statuses.append(0)
 print(json.dumps({"statuses": statuses}))
 """
+
+
+def policy_read(config: dict, gateway: dict) -> str:
+    """The path inside `gateway` of the policy file it enforces: its `--policy` must name the configured file through
+    its directory mount, else a write or a digest proof would concern a file it does not read."""
+    command = [str(part) for part in gateway["command"]]
+    value = next((command[i + 1] for i, part in enumerate(command[:-1]) if part == "--policy"),
+                 next((part.partition("=")[2] for part in command if part.startswith("--policy=")), None))
+    expected = str(PurePosixPath(gateway["target"]) / Path(config["policy"]).name)
+    if value is None or posixpath.normpath(value) != expected:
+        raise AdminError(f"{gateway['name']} enforces {value or 'no --policy'}, not the configured policy {expected}; "
+                         "nothing changed")
+    return expected
 
 
 def documents(config: dict, docker) -> tuple[Document, Document | None, dict]:
@@ -1494,19 +1511,29 @@ def extend(config: dict, run, docker, host_factory, args) -> dict:
                 != public_ids(target):
             raise AdminError(f"the credentials of {principal!r} changed since operation {journal.data['operation']} "
                              "started; nothing changed")
-        bound = journal.data.get("bound") or (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+        for gateway in found["policy"]:
+            policy_read(config, gateway)
+        now = datetime.now(timezone.utc)
+        bound = journal.data.get("bound") or (now + timedelta(days=days)).isoformat()
         steps = journal.data.get("steps", {})
         for name in (name for name in ORDER if name in target["stores"]):
             row, step = target["stores"][name], DOCUMENT_STEPS.get(name, name)
-            if steps.get(step, {}).get("state") == "done":
-                continue
+            # Every credential, a step done before included, is live now: a rerun never extends past a revocation.
             if row["status"] != "live":
                 raise AdminError(f"the {name} credential is {row['status']}: extend refuses a revoked or expired "
                                  "credential (issue a new key instead); nothing changed")
-            # A step already sent is read back from its store on a rerun; only an unsent one is compared.
-            if step not in steps and instant(row["expires_at"]) > instant(bound):
-                raise AdminError(f"the {name} credential ends {row['expires_at']}, later than {days} days from now, "
-                                 "so extend would move it earlier (expiries never move earlier); nothing changed")
+            if steps.get(step, {}).get("state") == "done":
+                continue
+            # A step already sent is read back from its store on a rerun; only an unsent one is compared, with the
+            # clock margin on both sides.
+            if step not in steps and instant(row["expires_at"]) <= now + SKEW:
+                raise AdminError(f"the {name} credential ends {row['expires_at']}, within an hour: a store whose clock "
+                                 "runs ahead could refuse it as expired after another store was extended; issue a new "
+                                 "key instead; nothing changed")
+            if step not in steps and instant(row["expires_at"]) > instant(bound) - SKEW:
+                raise AdminError(f"the {name} credential ends {row['expires_at']}, within an hour of {days} days from "
+                                 "now or later, so extend would move it earlier (expiries never move earlier); "
+                                 "nothing changed")
         writes = [(step, *backend_write(step, target["stores"][step], ["extend", "--days", str(days)]))
                   for step in STEPS if step in target["stores"]]
         for _, service, argv in writes:
@@ -1535,6 +1562,7 @@ def extend(config: dict, run, docker, host_factory, args) -> dict:
 
 def run_extend(config, run, docker, host, journal: Journal, target: dict, writes, found) -> dict:
     data, principal = journal.data, journal.data["command"]["id"]
+    earlier = [step for step, *_ in writes if data["steps"].get(step, {}).get("state") == "done"]
     for step, service, argv in writes:
         if data["steps"].get(step, {}).get("state") == "done":
             continue
@@ -1550,12 +1578,18 @@ def run_extend(config, run, docker, host, journal: Journal, target: dict, writes
             raise AdminError(f"{service}: {argv[0]} did not read back a later expiry for {argv[2]}")
         journal.step(step, "done", expires_at=row["expires_at"])
     after = {step: data["steps"][step]["expires_at"] for step, *_ in writes}
+    # A step done before this run counts with its current record (extend refused it unless live).
+    after.update({step: target["stores"][step]["expires_at"] for step in earlier})
     if target["calls"] is not None:
         swap(config, docker, journal, "calls registry", "registry", target["calls"]["id"],
              lambda entry: {**entry, "expires_at": data["bound"]}, found["registry"], [])
         after["calls"] = data["bound"]
     # The gateway never outlives a backend: it ends at the earliest expiry read back, whatever the delays or clocks.
     after["gateway"] = min([data["bound"], *after.values()], key=instant)
+    previous = data["stores"]["gateway"]["previous_expires_at"]
+    if previous and instant(after["gateway"]) < instant(previous):
+        raise AdminError(f"a store read back an expiry before the gateway's {previous} (its clock runs behind), so "
+                         "the gateway is left unchanged: expiries never move earlier")
     swap(config, docker, journal, "gateway policy", "policy", principal,
          lambda entry: {**entry, "expires_at": after["gateway"]}, found["policy"], rollback_images(host))
     data["result"] = {
@@ -1619,7 +1653,7 @@ def proof(config: dict, docker, host: Host, gateways: list[dict], principal: str
         raise AdminError(f"the published policy does not disable {principal!r}: revocation not proven")
     digest = hashlib.sha256(published).hexdigest()
     for gateway in gateways:
-        copy = inside(docker, gateway, str(PurePosixPath(gateway["target"]) / Path(config["policy"]).name))
+        copy = inside(docker, gateway, policy_read(config, gateway))
         if copy is None or hashlib.sha256(copy).hexdigest() != digest:
             raise AdminError(f"{gateway['name']} does not read the published policy (its in-container copy differs or "
                              "is unreadable): revocation not proven")
@@ -1642,7 +1676,7 @@ def proof(config: dict, docker, host: Host, gateways: list[dict], principal: str
 
 def revoke(config: dict, run, docker, host_factory, args) -> dict:
     principal = args.principal
-    command = {"verb": "revoke", "id": principal, "token_file": str(args.token_file) if args.token_file else None}
+    command = {"verb": "revoke", "id": principal, "token_file": args.token_file is not None}
     journal = resume(config, args, command)
     if journal.data.get("state") == "done":
         return journal.data["result"]
@@ -1652,6 +1686,8 @@ def revoke(config: dict, run, docker, host_factory, args) -> dict:
             held.enter_context(guarded(config, host, docker))
         policy, registry, found = documents(config, docker)
         target = holdings(config, run, policy, registry, principal)
+        for gateway in found["policy"]:
+            policy_read(config, gateway)
         token = control = None
         if args.token_file is not None:
             token = read_token({}, str(args.token_file))

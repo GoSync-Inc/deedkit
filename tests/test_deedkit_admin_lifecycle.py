@@ -180,6 +180,52 @@ def test_extend_dry_run_prints_previous_and_planned_expiry_and_writes_nothing(si
 
 
 # spec: ANYM-497
+@pytest.mark.parametrize("case", ["calendar ends within the hour", "gateway ends near the new bound"])
+def test_extend_keeps_a_clock_margin_so_no_store_refuses_after_another_was_extended(site, capsys, case):
+    soon = datetime.now(timezone.utc) + (timedelta(minutes=30) if case.startswith("calendar")
+                                         else timedelta(days=120, minutes=-30))
+    if case.startswith("calendar"):
+        site.operator.change(lambda state: state["calendar"]["agents"]["src"].update(expires_at=soon.isoformat()))
+    else:
+        site.principals[0]["expires_at"] = soon.isoformat()
+        site.write_policy()
+    unchanged(site, capsys, lambda: extend(site, capsys), "within an hour")
+
+
+# spec: ANYM-497
+def test_extend_never_moves_the_gateway_earlier_when_a_backend_clock_runs_behind(site, capsys):
+    gateway = (datetime.now(timezone.utc) + timedelta(days=120, hours=-2)).isoformat()
+    site.principals[0]["expires_at"] = gateway
+    site.write_policy()
+    site.operator.change(lambda state: state["offset_hours"].update(messaging=3, calendar=3))
+    code, _, err = extend(site, capsys)
+    assert code == 1 and "never move earlier" in err, err
+    assert entry(site.policy(), "src")["expires_at"] == gateway
+
+
+# spec: ANYM-497
+def test_a_rerun_refuses_when_a_step_done_before_was_revoked_since(site, capsys, monkeypatch):
+    crash_at(monkeypatch, ("calendar", "committed"))
+    with pytest.raises(Crash):
+        site.main("key", "extend", "src", "--days", "120")
+    monkeypatch.setattr(admin, "checkpoint", lambda step, phase: None)
+    site.operator.change(lambda state: state["messaging"]["keys"]["key-src"].update(revoked=True))
+    gateway = entry(site.policy(), "src")["expires_at"]
+    code, _, err = extend(site, capsys, "--operation", started(site))
+    assert code == 2 and "messaging credential is revoked" in err, err
+    assert entry(site.policy(), "src")["expires_at"] == gateway
+
+
+# spec: ANYM-497
+@pytest.mark.parametrize("verb", ["extend", "revoke"])
+def test_extend_and_revoke_refuse_a_gateway_that_enforces_another_policy_file(site, capsys, verb):
+    # The gateway mounts the configured policy's directory but enforces another file in it.
+    site.gateway["Config"]["Cmd"] = ["--policy", "/etc/deedkit-gateway/active.json", "--port", "13240"]
+    run = (lambda: extend(site, capsys)) if verb == "extend" else (lambda: revoke(site, capsys))
+    unchanged(site, capsys, run, "not the configured policy")
+
+
+# spec: ANYM-497
 @pytest.mark.parametrize("sharing", ["direct", "nested archive"])
 @pytest.mark.parametrize("verb", ["extend", "revoke"])
 def test_extend_and_revoke_refuse_a_credential_another_principal_uses(site, capsys, sharing, verb):
