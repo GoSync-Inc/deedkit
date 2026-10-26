@@ -23,8 +23,8 @@ from tests.test_ci_reuse import go_stream
 ROOT = Path(__file__).resolve().parents[1]
 SYNTHETIC_GIT = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "Synthetic", "GIT_AUTHOR_EMAIL": "synthetic@example.invalid",
                  "GIT_COMMITTER_NAME": "Synthetic", "GIT_COMMITTER_EMAIL": "synthetic@example.invalid"}
-VERIFY_REPORTS = ("collector.xml", "npm.xml", "gateway.xml", "calendar.xml", "calls.xml", "calls-frontend.xml",
-                  "backup-restore.xml")
+VERIFY_REPORTS = ("collector.xml", "npm.xml", "gateway.xml", "platform-contracts.xml", "calendar.xml", "calls.xml",
+                  "calls-frontend.xml", "backup-restore.xml")
 PASSING_CASE = '<testsuite><testcase name="x" file="tests/x.py"/></testsuite>'
 FAILING_CASE = '<testsuite><testcase name="x" file="tests/x.py"><failure/></testcase></testsuite>'
 

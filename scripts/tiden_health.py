@@ -47,8 +47,8 @@ NO_SPEC_LIST = "config/tiden-unlinked-tests.json"
 CATEGORIES = ("missing-spec", "helper", "trivial", "duplicate", "dead-code")
 ENTRY_FIELDS = {"caseId", "externalId", "category", "reason"}
 # Fixed suites, one path rule each, in this order; anything else is unassigned and fails by itself.
-SUITES = ("root-python", "calendar", "calls-frontend", "calls", "gateway", "release-router-go", "whatsmeow-go",
-          "whatsapp-node", "npm", "ci")
+SUITES = ("root-python", "calendar", "calls-frontend", "calls", "gateway", "platform-contracts", "release-router-go",
+          "whatsmeow-go", "whatsapp-node", "npm", "ci")
 CALLS_WITHOUT_PATH = ("s:tests.test_voice", "s:tests.test_webrtc")
 BARE_GO_TEST = re.compile(r"[^/]*_test\.go")
 # Tiden's Go reporter records bare file names, so the router's cases are told apart by their package.
@@ -98,6 +98,8 @@ def suite(case: dict) -> str:
         return "calls"
     if path.startswith("services/gateway/"):
         return "gateway"
+    if path.startswith("packages/platform-contracts/"):
+        return "platform-contracts"
     if path.startswith("whatsapp/whatsmeow/") or BARE_GO_TEST.fullmatch(path):
         return "whatsmeow-go"
     if path.startswith("whatsapp/"):

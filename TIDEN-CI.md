@@ -587,7 +587,8 @@ then shown only with its own SHA. A case is active when it has a result in that
 run (`run results --latest-only`) and linked when its `linkedRequirementCount`
 is above zero. Other case rows are stale: counted and listed in the artifact,
 never deleted. The suites are fixed in the script, one path rule each: root
-`tests/`, calendar, calls frontend, calls, gateway, release router Go
+`tests/`, calendar, calls frontend, calls, gateway, platform contracts
+(`packages/platform-contracts/`), release router Go
 (`services/release-router/`, or an `externalId` starting with
 `s:github.com/GoSync-Inc/deedkit/services/release-router::`, since Tiden's Go
 reporter records bare file names; checked before every other rule), whatsmeow Go (also a bare `*_test.go` path),
@@ -893,8 +894,9 @@ Tiden through the main push run; otherwise link the migration PR to its intent
 branch and publish real results there before reviewing the merge. After
 merge, verify both main's gate and the GitHub App processing/drift state.
 
-The integrated CI includes gateway, calendar, calls and calls-frontend reports,
-plus the measured gateway load gate, which runs on a runner of its own in
+The integrated CI includes gateway, platform-contracts, calendar, calls and
+calls-frontend reports, plus the measured gateway load gate, which runs on a
+runner of its own in
 parallel with the suite. Existing messaging check/test identities
 and links remain intact. Module assertions support reviewed contracts in the
 same product; a successful messaging run alone cannot verify another module.

@@ -544,6 +544,11 @@ def test_wake_relay_cases_belong_to_the_npm_suite_that_runs_them():
     assert suite({"filePath": "packages/wake-relay/test/state.test.mjs", "externalId": ""}) == "npm"
 
 
+# spec: ANYM-360
+def test_shared_contract_package_cases_belong_to_their_own_suite():
+    assert suite({"filePath": "packages/platform-contracts/tests/test_agent.py", "externalId": ""}) == "platform-contracts"
+
+
 # Stale anchors.
 
 ODD = ("services/café.py", "services/with space.py", "services/new\nline.py", 'services/quo"te.py')

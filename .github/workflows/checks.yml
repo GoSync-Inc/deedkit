@@ -181,8 +181,6 @@ jobs:
         run: |
           uv sync --locked --group dev
           uv run pytest -q -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/gateway.xml"
-          # The shared contract package has no module report: gateway.xml cannot hold paths outside services/gateway.
-          uv run pytest -q -p no:cacheprovider ../../packages/platform-contracts/tests
           uv build --project ../../packages/platform-contracts --out-dir "$RUNNER_TEMP/gateway-dist"
           uv build --out-dir "$RUNNER_TEMP/gateway-dist"
           uv venv "$RUNNER_TEMP/gateway-installed" --python 3.13
@@ -196,6 +194,15 @@ jobs:
               assert importlib.util.find_spec(module) is None, module
           PY
           "$RUNNER_TEMP/gateway-installed/bin/deedkit-gateway" --help
+      - name: Shared platform contract package tests
+        id: platform_contracts
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        # Its own report, rooted in the package directory: gateway.xml cannot hold paths outside services/gateway.
+        # The gateway's locked environment installs this package, so the tests run there.
+        working-directory: packages/platform-contracts
+        run: |
+          uv run --project ../../services/gateway --locked --group dev pytest -q -p no:cacheprovider --rootdir . \
+            -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/platform-contracts.xml" tests
       - name: Calendar provider policy and database tests
         id: calendar
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -387,7 +394,7 @@ jobs:
           CHECK_OUTCOMES: >-
             {"build":"${{ steps.build.outcome }}","release":"${{ steps.release.outcome }}","python":"${{ steps.python.outcome }}","collector":"${{ steps.collector.outcome }}","npm":"${{ steps.npm.outcome }}","smoke":"${{ steps.smoke.outcome }}","distributions":"${{ steps.distributions.outcome }}"}
           MODULE_OUTCOMES: >-
-            {"gateway":"${{ steps.gateway.outcome }}","calendar":"${{ steps.calendar.outcome }}","calls":"${{ steps.calls.outcome }}","calls_frontend":"${{ steps.calls_frontend.outcome }}","backup_restore":"${{ steps.backup_restore.outcome }}","root_session_lock":"${{ steps.root_session_lock.outcome }}","enricher_audio":"${{ steps.enricher_audio.outcome }}"}
+            {"gateway":"${{ steps.gateway.outcome }}","platform_contracts":"${{ steps.platform_contracts.outcome }}","calendar":"${{ steps.calendar.outcome }}","calls":"${{ steps.calls.outcome }}","calls_frontend":"${{ steps.calls_frontend.outcome }}","backup_restore":"${{ steps.backup_restore.outcome }}","root_session_lock":"${{ steps.root_session_lock.outcome }}","enricher_audio":"${{ steps.enricher_audio.outcome }}"}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
           TIDEN_BRANCH_OVERRIDE: ${{ inputs.tiden_branch }}
         run: |
