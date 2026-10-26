@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import asyncio
 import logging
 from platform_contracts import Capability, safe_error
+from platform_contracts.agent import PLACEHOLDER_REQUEST_ID
 from .adapters.calls import receipt_reference
 
 from .catalog import arguments, CATALOG, InvalidArguments
@@ -42,6 +43,31 @@ CALENDAR_CONSTRAINTS = {
     "atomic_cross_provider",
     "availability_sources",
 }
+
+
+def checked_next(value, visible):
+    """A `next` the caller can run as given: a tool of its own list and arguments its input schema accepts."""
+    try:
+        if set(value) == {"tool", "arguments"} and value["tool"] in visible:
+            arguments(CATALOG[value["tool"]], value["arguments"])
+            return value
+    except (TypeError, KeyError, ValueError):
+        pass
+    return None
+
+
+def runnable_next(detail, visible):
+    """A backend error with every `next` (top level and per candidate) checked; one that fails is dropped (ANYM-544)."""
+    if "next" not in detail and not isinstance(detail.get("candidates"), list):
+        return detail
+    detail = dict(detail)
+    if "next" in detail and checked_next(detail["next"], visible) is None:
+        detail.pop("next")
+    if isinstance(detail.get("candidates"), list):
+        detail["candidates"] = [
+            {k: v for k, v in c.items() if k != "next" or checked_next(v, visible) is not None}
+            if isinstance(c, dict) else c for c in detail["candidates"]]
+    return detail
 
 
 class Route:
@@ -315,6 +341,13 @@ class Dispatch:
         admitted.set(self.credential(agent))
         return snapshot, agent
 
+    def visible_to(self, key):
+        """The caller's own tool names, or none when the key does not authenticate."""
+        try:
+            return self.policy.visible(*self.policy.authenticate(key))
+        except Denied:
+            return []
+
     def admit(self, key, name):
         return self.policy.authorize_agent(*self.authenticate(key), name)
 
@@ -325,22 +358,34 @@ class Dispatch:
         except Denied as error:
             # One body for a nonexistent name, a tool outside the profile and one of an undeployed module.
             if error.code == "not_found_or_forbidden" and error.status == 403:
-                error.detail = unknown_tool_denial()
+                error.detail = unknown_tool_denial("platform_capabilities" in self.visible_to(key))
             raise
         selected = self.selected(agent, snapshot["revision"], route)
         if selected is not None and tool["module"] not in selected | {"gateway"}:
             denied = Denied("module_not_selected", 403)
             denied.detail = {"error": "module_not_selected", "module": tool["module"],
                              "next_action": "select_module_or_use_its_connection_path"}
+            # Only the in-session selection can widen again; a module path excludes the module for good.
+            if ((route.modules is None or tool["module"] in route.modules)
+                    and "platform_select_modules" in self.policy.visible(snapshot, agent)):
+                chosen = self.selections.get((agent["id"], route.path)) or frozenset()
+                denied.detail["next"] = {"tool": "platform_select_modules",
+                                         "arguments": {"modules": sorted(chosen | {tool["module"]})}}
             raise denied
         try:
             args = arguments(tool, values)
+            if args.get("request_id") == PLACEHOLDER_REQUEST_ID:
+                # The placeholder of a `next` (ANYM-544) is never a key: refuse it before any backend sees it.
+                raise InvalidArguments([{"field": "request_id", "reason": "format"}])
         except InvalidArguments as error:
             denied = Denied("invalid_arguments", 422)
             if error.field_errors:
                 denied.detail = stale_arguments_hint(tool, {
                     "error": "invalid_arguments", "field_errors": error.field_errors,
                     "next_action": "check_parameters"})
+                if (error.field_errors == [{"field": "request_id", "reason": "required"}]
+                        and "request_id" in tool["inputSchema"].get("properties", {})):
+                    denied.detail["next"] = {"tool": name, "arguments": {**values, "request_id": PLACEHOLDER_REQUEST_ID}}
             raise denied from None
         except ValueError:
             raise Denied("invalid_arguments", 422) from None
@@ -454,6 +499,8 @@ class Dispatch:
             elif error.code == "backend_unavailable":
                 error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                            phase="operation", read_only=True)
+            elif error.code == "backend_denied" and isinstance(getattr(error, "detail", None), dict):
+                error.detail = runnable_next(error.detail, self.policy.visible(snapshot, agent))
             raise
         if live_denied and isinstance(result, dict):
             # detail=transcript moves live and suggested_call from result_evidence to the top level.

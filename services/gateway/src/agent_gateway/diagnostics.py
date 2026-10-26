@@ -201,10 +201,16 @@ def stale_arguments_hint(tool, detail):
         return detail
 
 
-def unknown_tool_denial():
-    """The admission denial of a tool this key cannot call, with the same once-only refresh hint for every cause."""
-    return {"error": "not_found_or_forbidden", "next_action": "refresh_tool_list_once",
-            "hint": "If the tool is still absent after a refresh, this key does not have it; do not ask again."}
+def unknown_tool_denial(capabilities=False):
+    """The admission denial of a tool this key cannot call, with the same once-only refresh hint for every cause.
+
+    `next` (ANYM-544) is platform_capabilities when the key may call it; it never depends on the name asked for.
+    """
+    result = {"error": "not_found_or_forbidden", "next_action": "refresh_tool_list_once",
+              "hint": "If the tool is still absent after a refresh, this key does not have it; do not ask again."}
+    if capabilities:
+        result["next"] = {"tool": "platform_capabilities", "arguments": {}}
+    return result
 
 
 def catalog_note(found):
