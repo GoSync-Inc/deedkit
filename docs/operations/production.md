@@ -1121,7 +1121,7 @@ no service reads that file, so the enforced policy never changes.
 
 ### Write subcommands (ANYM-493 shared rules)
 
-Running `key issue` or `undo` is the owner's decision (secrets and access); an agent runs them
+Running `key issue`, `key extend`, `key revoke` or `undo` is the owner's decision (secrets and access); an agent runs them
 only on the owner's exact words. Every write subcommand follows these rules
 (tests/test_deedkit_admin_rules.py proves each):
 
@@ -1215,8 +1215,47 @@ the backend credentials; revoked records stay for audit, so `<new-id>` stays tak
 attempt uses another ID. Its output lists `revoked` (store and public ID), `disabled` (entries),
 `deleted_files` and `next` (the `claude mcp remove` command for the Mac).
 
+### Extend or revoke a key in every store (ANYM-497)
+
+`deedkit admin key extend <id> --days N [--dry-run]` (N 1–183) extends every backend credential
+of the principal: messaging `extend-key` per key UUID (the calls archive key too), calendar
+`extend-agent`, then the calls registry entry to the host's start time plus N days. It reads back
+each new expiry and then sets the gateway `expires_at` to the earliest of them and that bound, so
+the gateway never outlives a backend whatever the step delays or clocks. Tokens and key hashes stay
+the same, so no client changes. It refuses before any write when a credential (the gateway entry
+included) is revoked, disabled or expired, or a store's expiry would move earlier (ACCESS.md,
+`extend-key`); the output lists the previous and new expiry per store. The backends extend by
+their own database clock, so these checks keep a one-hour margin: a credential ending within the
+hour, or one ending less than an hour before the new bound or later, refuses (issue a new key, or
+pick another N). If a store still reads back an expiry before the gateway's current one, the
+gateway entry is left unchanged and the command stops. A rerun with `--operation` checks every
+credential again (one revoked since refuses) and reads a step it had sent from its store instead of
+sending it again; sending one again is harmless, since each store sets its expiry under the
+principal lock and refuses a shorter one. `undo` of an extend is refused: expiries never move
+earlier.
+
+Both commands refuse before any write when a running gateway's `--policy` is not the configured
+policy file through its directory mount, since neither the write nor the evidence would reach the
+file it enforces. The journal records whether `--token-file` was given, never its path.
+
+`deedkit admin key revoke <id> [--token-file <path>] [--dry-run]` sets the gateway entry
+`enabled: false` first (access ends on the next request), then revokes each backend credential
+(messaging `revoke-key`, calendar `revoke-agent`; one already revoked is skipped) and disables the
+calls registry entry. Records stay for audit; deleting them is a separate owner decision.
+Evidence: every running gateway's in-container policy (copied out with `docker cp`) has the
+published file's digest, which disables the principal. With `--token-file`, the file's SHA-256
+must equal the principal's `key_sha256` before any write, and the configuration must name
+`probe_control`, the token file of another live principal; after the revoke a disposable
+container in each running gateway's network namespace sends one MCP `initialize` with the control
+token and then the revoked one (both on stdin, only the HTTP statuses are printed) and requires 200
+then 401, so a 401 for another reason never counts. Without `--token-file` the output says the
+bearer probe was not run. `undo` of a revoke enables again only the gateway and calls entries this
+operation disabled (compare-and-swap on the entry it wrote) and says that the messaging and
+calendar revocations are final: a working key then needs `key issue`.
+
 Optional configuration keys, with the defaults above: `tool`, `journal`, `tokens`, `calls_lock`,
-`validators` and `docker` (the Docker command prefix).
+`validators`, `docker` (the Docker command prefix) and `probe_control` (`key revoke --token-file`;
+no default).
 
 ## Record the production release
 

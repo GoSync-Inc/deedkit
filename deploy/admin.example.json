@@ -2,6 +2,7 @@
   "policy": "/opt/deedkit/deploy/private/gateway-policy/policy.json",
   "calls_registry": "/opt/deedkit/deploy/private/calls-agents/agents.json",
   "labels": "/opt/deedkit/deploy/private/admin/labels.json",
+  "probe_control": "/opt/deedkit/deploy/private/admin/control.token",
   "paths": {
     "/run/deedkit/keys": "/opt/deedkit/deploy/private/gateway-keys",
     "/run/deedkit/agents": "/opt/deedkit/deploy/private/calls-agents"

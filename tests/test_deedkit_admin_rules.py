@@ -593,3 +593,92 @@ def test_undo_refuses_a_validator_without_the_check_before_any_write(site, capsy
     assert code == 2 and f"refused by image {image}" in err and "has no such check; nothing changed" in err, err
     assert site.snapshot() == before and site.journal(result["operation"]) == journal
     assert entry(site.policy(), "clone")["enabled"] is True and entry(site.registry_doc(), "clone")["enabled"] is True
+
+
+# Extend and revoke (ANYM-497) under the same rules
+
+WRITES = {"extend": ("key", "extend", "src", "--days", "120"), "revoke": ("key", "revoke", "src")}
+
+
+def write_refused(site, capsys, verb, message):
+    before = site.snapshot()
+    code = site.main(*WRITES[verb])
+    _, err = capsys.readouterr()
+    assert code == 2 and message in err and "nothing changed" in err, err
+    assert site.snapshot() == before and site.operator.state["extended"] == []
+
+
+# spec: ANYM-497
+@pytest.mark.parametrize("verb", list(WRITES))
+@pytest.mark.parametrize("lock", ["state/global/deploy.lock", "state/http/deploy.lock", "state/a/deploy.lock",
+                                  "calls registry"])
+def test_extend_and_revoke_take_the_same_locks(site, capsys, verb, lock):
+    path = Path(site.config["calls_lock"]) if lock == "calls registry" else site.root / lock
+    with held(path):
+        write_refused(site, capsys, verb, "calls-registry writer lock" if lock == "calls registry"
+                      else "a deploy is running")
+
+
+# spec: ANYM-497
+@pytest.mark.parametrize("verb", list(WRITES))
+def test_extend_and_revoke_refuse_during_an_active_call_or_a_pause(site, capsys, verb):
+    site.calls.append("call-1 (in_progress)")
+    write_refused(site, capsys, verb, "a call is active")
+    site.calls.clear()
+    site.tool.PAUSE.write_text("")
+    write_refused(site, capsys, verb, "deploys are paused")
+
+
+# spec: ANYM-497
+@pytest.mark.parametrize("verb", list(WRITES))
+def test_extend_and_revoke_validate_in_the_rollback_image_before_any_write(site, capsys, verb):
+    site.docker.images["gateway:old"] = lambda path: "silent"
+    write_refused(site, capsys, verb, "refused by image gateway:old")
+
+
+# spec: ANYM-497
+@pytest.mark.parametrize("verb, command", [("extend", "extend-key"), ("revoke", "revoke-agent")])
+def test_extend_and_revoke_refuse_an_image_without_their_command(site, capsys, verb, command):
+    service = "messaging" if command == "extend-key" else "calendar"
+    site.operator.change(lambda state: state["missing"].update({service: [command]}))
+    write_refused(site, capsys, verb, f"the {service} image does not answer `{command} --check`")
+
+
+# spec: ANYM-497
+def test_extend_and_revoke_never_touch_a_service_container_or_leave_a_one_shot(site, capsys):
+    containers = json.dumps(site.docker.containers)
+    token = private(site.root / "mac/src.token", site.tokens["src-gateway"] + "\n")
+    for argv in (WRITES["extend"], (*WRITES["revoke"], "--token-file", str(token))):
+        code = site.main(*argv)
+        assert code == 0, capsys.readouterr().err
+    assert json.dumps(site.docker.containers) == containers
+    assert {call[0] for call in site.docker.calls} == {"ps", "inspect", "run", "cp"}
+    runs = [call for call in site.docker.calls if call[0] == "run"]
+    names = [call[call.index("--name") + 1] for call in runs]
+    assert all("--rm" in call and "--network" in call for call in runs)
+    assert len(set(names)) == len(names) and all(name.startswith("deedkit-admin-") for name in names)
+
+
+# spec: ANYM-497
+def test_extend_and_revoke_put_no_secret_in_output_argv_environment_or_the_journal(site, capsys):
+    state = site.root / "operator.json"
+    for service in ("messaging", "calendar"):
+        site.config[service] = [sys.executable, str(FAKES), str(state), service]
+    private(site.root / "admin/config.json", site.config)
+    token = private(site.root / "mac/src.token", site.tokens["src-gateway"] + "\n")
+    seen = []
+    for argv in (("key", "extend", "src", "--days", "120", "--dry-run"), WRITES["extend"],
+                 ("key", "extend", "src", "--days", "1"),  # a refusal
+                 (*WRITES["revoke"], "--token-file", str(token))):
+        site.main(*argv, run=admin.runner(site.config))
+        seen.extend(capsys.readouterr())
+    operation = json.loads(seen[-2])["operation"]
+    seen.append(str(site.main("undo", operation, run=admin.runner(site.config))))
+    seen.extend(capsys.readouterr())
+    calls = (Path(str(state) + ".calls")).read_text()
+    assert calls.count('"argv"') > 10
+    haystacks = seen + [calls, json.dumps(site.docker.calls), json.dumps(site.operator.state["log"])] + [
+        p.read_text() for p in (site.root / "ops").glob("*.json")]
+    for secret in site.tokens.values():
+        for needle in (secret, hashlib.sha256(secret.encode()).hexdigest()):
+            assert not [text for text in haystacks if needle in text], secret[:20]
