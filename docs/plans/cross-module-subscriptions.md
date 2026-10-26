@@ -75,7 +75,7 @@ what is deployed (N-1 schema, installed gateway), effort.
 - **Data egress:** module-to-router HTTP stays on the host; the journal, cursors and backups hold references only (ids, kind, timestamps, enumerated reason), no titles, locations, transcripts or destinations. A delivered hint reaches the subscriber's configured receiver, so it leaves the host: it carries kind, the `subject` ref and the module name only, and the card for the router states and tests that payload. Background calendar refresh contacts Google or CalDAV. Module read tokens are new secrets (owner-kept).
 - **Schema/roles:** messaging: generalise `events` (nullable `account`/`message` for non-message sources, a `source` column) or add a separate journal (sub-option below); `subscription_sources` gets a scope kind beyond `(account, chat)`; router role; a link table `(messaging principal, module, module principal)` set by the operator. Calendar: `change_journal`. Calls: reuse `voice_events` or one small table.
 - **Compatibility:** the risky part. Named consumers of `events` that assume a message: the matcher (`subscriptions.py:351-356` reads `account` and `snapshot->chat`), `get_updates`/consumers, retention and the backup table map (backup.py:28). Sub-option a1 generalises `events` (least code, but shares the `feed_counter` lock with every message hint and needs a gate old readers respect: the S5 review found that rolling back to a plain `paused` state lets the old API resume a dynamic definition, Astra r2 M8); sub-option a2 adds a separate `module_events` journal with its own counter and matches (old code never sees it and no lock is shared, but position semantics of `subscription_outbox.through_position` need a second dimension). **Decision after card review: a2.** Either way the probe "old matcher, old get_updates and old retention ignore the new rows" is a test, and the backup table inventory must cover the new tables (the deployed backup rejects a schema above its own, backup.py:70, as for any migration).
-- **Effort:** journal and contract 5, router and deployment 5, calls producer 5, links/scope 8, calendar change journal 8, calendar refresh and reminders 5, capabilities/gateway 3.
+- **Effort:** journal, matching and contract 8, router and deployment 5, calls producer 5, links/scope 8, calendar change journal 8, calendar refresh and reminders 5, capabilities/gateway 3.
 
 ### (b) Each module runs its own subscriptions and dispatcher under a shared contract
 
@@ -120,13 +120,12 @@ Calendar (buildable only after the change journal exists):
 |---|---|---|
 | `calendar.event.created` | a diff of a re-read window finds an occurrence not seen before | `calendar_ref, event_ref, start_at, version` |
 | `calendar.event.changed` | etag or start/end differ | same + `changed: [start, end, details]` (field names only) |
-| `calendar.event.cancelled` | an occurrence in a previously stored window is gone, or marked cancelled | `calendar_ref, event_ref, start_at` (taken from the stored row; the ref cannot be rebuilt otherwise, providers.py:225) |
+| `calendar.event.cancelled` | the provider marks the occurrence cancelled, or its identity is absent from every stored window after a complete re-read of the window that held it and the provider says nothing else (a move is `changed`; an unlocated move produces no event; failed or partial coverage is no evidence) | `calendar_ref, event_ref, start_at` (taken from the stored row; the ref cannot be rebuilt otherwise, providers.py:225) |
 | `calendar.event.starting` | `start_at - now <= N minutes`, N set per subscription (default 15), once per `(event_ref, start_at, N)` | `calendar_ref, event_ref, start_at, lead_minutes` |
 | invite response | **declined for now**: no attendee data exists (Google `guests` is a bool, iCloud checks `ATTENDEE` presence only; invitations unsupported) | needs an attendee model first (card candidate, not written) |
 
 Limits that the cards must state: change events cover only windows the service has read; with no background refresh today a
-change is seen no sooner than the next refresh; Google gives `originalStartTime` for moved instances so a moved recurring
-instance can be seen as cancelled+created (the card must choose and test one rule).
+change is seen no sooner than the next refresh; Google gives `originalStartTime` for moved instances. Rule chosen after card review: an instance whose provider identity is stored and found at a new start is `changed` (`changed: [start]`) and keeps its `event_ref`; a move out of the read window is `changed` when the identity is found in another stored window and otherwise produces no event; an unlocated disappearance is never a cancellation by itself.
 
 Calls (buildable now from `voice_events` and `stop`):
 
@@ -173,7 +172,7 @@ The card text, criteria and status are kept in Tiden only; this list is the reco
 
 | Card | Title | Value | Effort | Depends |
 |---|---|---|---|---|
-| ANYM-562 | Module events have a journal of their own in messaging: storage, contract, backup, old-reader safety | 5 | 5 | none |
+| ANYM-562 | Module events have a journal of their own in messaging: storage, matching, contract, backup, old-reader safety | 5 | 8 | none |
 | ANYM-575 | A router carries module events into messaging without stalling message hints | 5 | 5 | ANYM-562 |
 | ANYM-563 | Call events: terminal events, `GET /v1/events` | 5 | 5 | ANYM-562 and ANYM-564 for delivery |
 | ANYM-564 | Links, scoped sources, authoritative scope and revocation | 4 | 8 | ANYM-562 |
