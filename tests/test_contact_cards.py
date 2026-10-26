@@ -204,6 +204,21 @@ def test_reads_and_search_find_the_card_by_name_or_digits_within_scope(wa):
 
 
 # spec: ANYM-529
+def test_an_empty_body_card_matches_by_name_in_every_query_mode_and_under_fuzzy(wa):
+    w,s,key=wa
+    # An array card has no body, so only the contact branch can match.
+    w.state.apply(validate_capture(capture(card_event(1,body='',messageType='multi_vcard'))))
+    w.state.apply(validate_capture(capture(event(2,body='unrelated text'))))
+    mid=next(i['id'] for i in s.search(key)['items'] if i.get('contact'))
+    for query,mode in (('Friend Synthetic','all'),('"Synthetic Friend"','web'),('Synthetic Friend','phrase'),
+            ('ynthetic Fri','exact'),('Friend Card','all')):
+        assert [i['id'] for i in s.search(key,query,query_mode=mode)['items']]==[mid],(query,mode)
+    assert s.search(key,'Friend Synthetic',query_mode='phrase')['items']==[]
+    fuzzy=s.search(key,'Synthetic',fuzzy=True)
+    assert [i['id'] for i in fuzzy['items']]==[mid] and fuzzy['items'][0]['match_type']=='contact'
+
+
+# spec: ANYM-529
 def test_deletion_before_after_ingest_and_stale_replay_leave_no_block(wa):
     w,s,key=wa
     def delete(n):
