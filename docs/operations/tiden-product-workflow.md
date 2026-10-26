@@ -15,12 +15,24 @@ health` report (TIDEN-CI.md) fails on a `Done` spec that carries an `[open: live
 
 ## Card intake
 
-Steps 1–4, the template and the scales: harness `tiden.md`. DeedKit's step 5:
+Steps 1–4, the template and the scales: harness `tiden.md`. DeedKit's steps 5 and 6:
 
 5. **Queue.** Current breakages and deadlines first; then about 70% product and 30% engineering
    by Effort, at least one refactor when one is ready, each share by Score. From 10-19 no new
    meta-research or process tooling is queued until ten product cards are delivered, unless the
    owner asks; incident fixes are allowed.
+6. **Component.** Whoever creates a spec on a Tiden branch (the card writer, or a worker's
+   settle) sets its component there, the one that owns the card's expected paths (names in
+   ARCHITECTURE.md, UUIDs from `tiden component list`): `tiden spec update --id <id> --branch
+   <branch> --component-id <uuid>`, then `tiden spec get <id> --format json` shows `componentId`.
+   Not `tiden spec attribute`: it adds the worktree's changed files as component edges (ANYM-506).
+
+   After the merge, one agent reads `componentId` of the merged specs on main with `tiden spec
+   get`: for a ready merge the card writer, once its ready-merge run read the specs back; for a
+   pull request's own branch the orchestrator, once that squash's sync B run is green (TIDEN-CI.md,
+   Main sync). A missing component is not set by a `spec update` on main (harness `tiden.md`,
+   Commands): the reader reports it to the orchestrator, which lists it in STATE.md and sets it
+   in the next maintenance window (TIDEN-CI.md, Main sync).
 
 The card template, categories and estimation scales are harness `tiden.md`. DeedKit's Effort
 reference pull requests: 1 = #59, 2 = #66, 3 = #52, 5 = #68, 8 = #40. `History:` names the DK-*
