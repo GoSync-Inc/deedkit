@@ -84,6 +84,8 @@ FAKE = textwrap.dedent(f"""\
         if fault == "noop":
             save(); print(json.dumps({{"merged": True}})); sys.exit(0)
         merged = {{spec["seqNum"]: spec for spec in state.get("branch_specs", {{}}).get(name, [])}}
+        kept = {{spec["seqNum"]: spec["id"] for spec in state["main"]}}  # a changed spec keeps its main record
+        merged = {{number: dict(spec, id=kept.get(number, spec["id"])) for number, spec in merged.items()}}
         state["main"] = [spec for spec in state["main"] if spec["seqNum"] not in merged] + list(merged.values())
         for branch in state["branches"]:
             if branch["name"] == name:

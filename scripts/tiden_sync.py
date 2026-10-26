@@ -51,8 +51,13 @@ SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 SHA = re.compile(r"[0-9a-f]{40}")
 OPEN_CHECK = re.compile(r"\[open: (?:live|measured)\]")
 # A card's readiness record (harness tiden.md template), also as a list item or in bold. A legacy `Accepted:` alone is
-# no `Ready:` line: such a card gets `Ready:` citing it first.
-READY = re.compile(r"[ \t]*(?:[-*>][ \t]+)?(?:\*\*)?(Ready|Accepted):(?:\*\*)?[ \t]*\S")
+# no `Ready:` line: such a card gets `Ready:` citing it first. Four spaces or a tab make Markdown code, not a record.
+READY = re.compile(r" {0,3}(?:[-*>][ \t]+)?(?:\*\*)?(Ready|Accepted):(.*)")
+# What a branch copy of a spec has of its own (record, branch, times; sources compare by their fields), and the text
+# a ready merge may change: anything else differing from main is more than a text change.
+COPY_FIELDS = frozenset({"id", "branchId", "branchStatus", "createdAt", "updatedAt", "sourceId", "sourceCount",
+                         "sources"})
+TEXT_FIELDS = frozenset({"content", "title"})
 # Test files whose suite CI does not publish to Tiden, so a marked test there has no identity to link yet.
 KEPT_SECONDS = 600  # the time kept tests may spend on link reads, so the later steps still run
 UNPUBLISHED: tuple[tuple[str, str], ...] = ()
@@ -559,31 +564,41 @@ def run(root: Path, sha: str | None, pr: int | None, repository: str, gh: str, c
 
 
 def ready_line(content: str) -> tuple[str | None, bool]:
-    """The first `Ready:` line of a spec outside fenced code and code spans, and whether a legacy `Accepted:` line is
-    there."""
+    """The first `Ready:` record of a spec outside code (fenced, indented, spans), without its bold or list mark, and
+    whether a legacy `Accepted:` record is there. A record without text after the colon is none."""
     found, legacy = None, False
-    for line, text in prose(content):
+    for _, text in prose(content):
         match = READY.match(text)
-        if match and match.group(1) == "Accepted":
+        value = " ".join(match.group(2).replace("*", " ").split()) if match else ""
+        if not match or not re.search(r"\w", value):
+            continue
+        if match.group(1) == "Accepted":
             legacy = True
-        elif match and found is None:
-            found = line.strip()
+        elif found is None:
+            found = f"Ready: {value}"
     return found, legacy
 
 
-def ready_merge(cli: str, product: str, name: str, report, dry: bool = False) -> int:
-    """Merge a branch of ready cards to Tiden main and read each spec back; any refusal names its cause."""
-    if not BRANCH_NAME.fullmatch(name):
-        raise StepFailed("branch", f"{shown(name)} is not a proposal/ or review/ branch name")
-    try:
-        status = branch_status(cli, product, name)
-    except Refused as error:
-        raise StepFailed("branch", str(error)) from None
-    if status == "merged":
-        report(f"ready merge: {name} is merged already; the run that merged it read it back.")
-        return 0
-    if status != "open":
-        raise StepFailed("branch", f"{name} is {'missing' if status is None else status}, not open")
+def structure(spec: dict) -> dict:
+    """A spec without its text and a copy's own record fields, with its sources by their fields: what a ready merge
+    leaves as main has it. An absent field and a null alike."""
+    value = {key: item for key, item in spec.items() if key not in COPY_FIELDS | TEXT_FIELDS and item is not None}
+    value["sources"] = sorted(normalized(source) for source in spec.get("sources") or [])
+    return value
+
+
+def card(spec: dict) -> dict:
+    """A spec as a ready merge checks it, text included, without a copy's own record fields."""
+    return structure(spec) | {key: spec.get(key) for key in TEXT_FIELDS}
+
+
+def differing(before: dict, after: dict, skip: frozenset = frozenset()) -> list[str]:
+    return sorted(key for key in set(before) | set(after) if key not in skip and before.get(key) != after.get(key))
+
+
+def ready_check(cli: str, product: str, name: str) -> tuple[set[int], dict[int, dict], dict[int, dict]]:
+    """Read and check a branch for a ready merge: the numbers it changes and both listings, or a refusal naming its
+    cause."""
     try:
         preview = tiden(cli, ["branch", "merge-preview", "--name", name], product, retry=True)
         numbers, forbidden = preview_numbers(preview, name)
@@ -592,11 +607,11 @@ def ready_merge(cli: str, product: str, name: str, report, dry: bool = False) ->
                                         f"({', '.join(forbidden)})")
         if not numbers:
             raise StepFailed("preview", f"the preview of {name} changes no spec")
-        modified = {preview_number(item) for item in preview.get("modifications", [])}
+        versions = {preview_number(item): item for item in preview.get("modifications", [])}
         branch, main = listing(cli, product, name), listing(cli, product, "main")
     except Refused as error:
         raise StepFailed("preview", str(error)) from None
-    problems, lines = [], {}
+    problems = []
     for number in sorted(numbers):
         spec = branch.get(number)
         if spec is None:
@@ -608,26 +623,67 @@ def ready_merge(cli: str, product: str, name: str, report, dry: bool = False) ->
         if number in main and main[number].get("status") != "Backlog":
             problems.append(f"ANYM-{number} is {main[number].get('status')} on main: a change to work in progress "
                             "goes on the review branch of the pull request that builds it")
-        if number in modified and number not in main:
+        if number in versions and number not in main:
             problems.append(f"ANYM-{number} is a text change of a spec that is not on main")
+        if number in main:
+            # The preview's two versions carry fields the listing has not (the parent); both must keep main's.
+            item = versions.get(number, {})
+            fields = set(differing(structure(main[number]), structure(spec)))
+            if isinstance(item.get("mainVersion"), dict) and isinstance(item.get("branchVersion"), dict):
+                fields |= set(differing(structure(item["mainVersion"]), structure(item["branchVersion"])))
+            if fields:
+                problems.append(f"ANYM-{number} changes more than its text on {name} ({', '.join(sorted(fields))})")
         if line is None:
             problems.append(f"ANYM-{number} has no `Ready:` line"
                             + (" (a legacy `Accepted:` card gets `Ready:` citing it first)" if legacy else ""))
         elif number in main and ready_line(main[number].get("content") or "")[0] == line:
             problems.append(f"ANYM-{number} keeps main's `Ready:` line; a reviewed change refreshes it")
-        lines[number] = line
     if problems:
         raise StepFailed("ready", "; ".join(problems))
+    return numbers, branch, main
+
+
+def records(specs: dict[int, dict]) -> dict[int, tuple[str, dict]]:
+    return {number: (spec["id"], card(spec)) for number, spec in specs.items()}
+
+
+def ready_merge(cli: str, product: str, name: str, report, dry: bool = False) -> int:
+    """Merge a branch of ready cards to Tiden main and read each spec back; any refusal names its cause."""
+    if not BRANCH_NAME.fullmatch(name):
+        raise StepFailed("branch", f"{shown(name)} is not a proposal/ or review/ branch name")
+    try:
+        status = branch_status(cli, product, name)
+    except Refused as error:
+        raise StepFailed("branch", str(error)) from None
+    if status == "merged":
+        # A merged branch can no longer be listed, so nothing here can show what the merge put on main.
+        raise StepFailed("branch", f"{name} is merged already and cannot be read back here: the receipt of the run "
+                                   "that merged it lists every spec; if that run failed, check those specs on main")
+    if status != "open":
+        raise StepFailed("branch", f"{name} is {'missing' if status is None else status}, not open")
+    numbers, branch, main = ready_check(cli, product, name)
     named = ", ".join(f"ANYM-{number}" for number in sorted(numbers))
     if dry:
         report(f"ready merge: would merge {name} ({named}).")
         report("Dry run: nothing was written.")
         return 0
+    # Tiden merges a branch by name, with no revision to hold it to: read it all again just before the merge, and
+    # after it check main against what was checked, so a write in between fails the run instead of passing it.
+    again = ready_check(cli, product, name)
+    if again[0] != numbers or records(again[1]) != records(branch) or records(again[2]) != records(main):
+        raise StepFailed("ready", f"{name} or main changed while it was checked; nothing was merged: dispatch the "
+                                  "ready merge again when no one writes to the branch")
     try:
         write(cli, ["branch", "merge", "--name", name], product)
     except Refused as error:
-        raise StepFailed("merge", f"{error}; dispatch the ready merge of {name} again: it reads the branch "
-                                  "back first") from None
+        try:
+            status = branch_status(cli, product, name)
+        except Refused:
+            status = None
+        if status != "merged":
+            raise StepFailed("merge", f"{error}; {name} is {status or 'unread'}: dispatch the ready merge of {name} "
+                                      "again once the branch list shows it open") from None
+        report(f"ready merge: the merge call failed ({error}), but {name} is merged; reading it back.")
     try:
         status = branch_status(cli, product, name)
         now = listing(cli, product, "main")
@@ -635,6 +691,9 @@ def ready_merge(cli: str, product: str, name: str, report, dry: bool = False) ->
         raise StepFailed("read-back", str(error)) from None
     if status != "merged":
         raise StepFailed("read-back", f"{name} is {status}, not merged")
+    lines = {number: ready_line(branch[number].get("content") or "")[0] for number in numbers}
+    problems = [f"ANYM-{number} is on main, but not on the checked branch" for number in sorted(set(now) - set(main)
+                                                                                                 - numbers)]
     for number in sorted(numbers):
         spec = now.get(number)
         if spec is None:
@@ -644,6 +703,18 @@ def ready_merge(cli: str, product: str, name: str, report, dry: bool = False) ->
             problems.append(f"ANYM-{number} is {spec.get('status')}, not Backlog")
         if ready_line(spec.get("content") or "")[0] != lines[number]:
             problems.append(f"ANYM-{number} does not hold the branch's `Ready:` line")
+        # A text change keeps main's record; a new spec keeps its branch record (no record is created on a merge).
+        expected = (main.get(number) or branch[number])["id"]
+        if spec["id"] != expected:
+            problems.append(f"ANYM-{number} is record {spec['id']} on main, not {expected}")
+        fields = differing(card(branch[number]), card(spec))
+        if fields:
+            problems.append(f"ANYM-{number} on main differs from the checked branch copy ({', '.join(fields)})")
+    for number in sorted(set(main) - numbers):
+        # A parent's child count follows a new spec; anything else of a spec the branch did not change stays.
+        if number not in now or now[number]["id"] != main[number]["id"] or differing(
+                card(main[number]), card(now[number]), frozenset({"childrenCount"})):
+            problems.append(f"ANYM-{number} changed on main, but not on the checked branch")
     if problems:
         raise StepFailed("read-back", "; ".join(problems))
     for number in sorted(numbers):

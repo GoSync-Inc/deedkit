@@ -415,7 +415,7 @@ commit, so `Tiden health` never takes it for the sync of one. It runs
 `scripts/tiden_sync.py --ready-branch <branch>`, which merges the branch to
 Tiden main only when:
 
-1. the branch is open (a merged one is reported and left alone);
+1. the branch is open;
 2. `branch merge-preview` holds spec additions or text changes alone, read by
    the parser of check A and sync B: no deletion, test or component change,
    conflict, intent or blocking session, `autoMerge`, `testDuplicates` or
@@ -423,15 +423,31 @@ Tiden main only when:
 3. every changed spec is `Backlog` on the branch, and on main when it is there
    already (a change to work in progress goes on the review branch of the pull
    request that builds it, which sync B merges);
-4. every changed spec has a `Ready:` line outside code: a legacy `Accepted:`
-   alone is refused (add `Ready:` citing it), and a text change of a spec on
-   main brings a new `Ready:` line, not main's.
+4. a text change changes the title and text alone: type, parent, component,
+   priority, position, status and sources (by their fields) stay as main has
+   them, in the listings and in the preview's two versions; only a branch
+   copy's own record ID, branch and times differ;
+5. every changed spec has a `Ready:` record outside code (fenced, indented by
+   four spaces or a tab, or a code span) with text after the colon: a legacy
+   `Accepted:` alone is refused (add `Ready:` citing it), and a text change of
+   a spec on main brings a new record, not main's in other bold or list markup.
 
-It then reads every spec back on main by its number (a branch copy has its own
-record ID): `Backlog` and the same `Ready:` line. Its output, each number with
+Tiden merges a branch by name, with no revision a merge can be held to, so the
+job reads the preview and both listings again just before the merge and
+refuses when anything differs from what it checked. The window between that
+read and the merge stays; the read-back closes it by detection, not
+prevention: main must then hold the specs it had (same record, same fields but
+a parent's child count), plus exactly the checked branch copies, a text change
+in main's record and a new spec in its branch record (no record is created on
+a merge: 2026-10-26, the main specs that merged branches changed kept their
+`createdAt`, and none was created at a merge). Its output, each number with
 its record ID, new or text changed, is the receipt. A refusal names its step
-(`branch`, `preview`, `ready`) and writes nothing; after a failed `merge` or
-`read-back` step, dispatch it again: it reads the branch back first.
+(`branch`, `preview`, `ready`) and writes nothing. When the merge call fails
+but the branch reads merged, the same run reads it back; when it reads open,
+dispatch again. A merged branch can no longer be listed, so a dispatch of one
+fails at `branch` and names the receipt of the run that merged it; a failed
+`read-back` is checked on main by hand (needs a maintenance window to fix).
+Nobody writes to a branch after its dispatch.
 
 It runs in the `tiden-sync` concurrency group, so it is no change by hand and
 needs no maintenance window; while one has the workflow disabled, it cannot be

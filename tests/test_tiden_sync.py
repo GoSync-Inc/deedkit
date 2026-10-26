@@ -834,10 +834,12 @@ def test_a_ready_merge_merges_a_branch_of_ready_cards_to_main_as_backlog_and_rea
     assert server.main(70)["status"] == "Backlog" and REFRESHED in server.main(60)["content"]
     assert "ready merge: ANYM-60 " in out and "(text changed)" in out and "ready merge: ANYM-70 " in out
     assert out.splitlines()[-1] == "Ready merge of proposal/ready done (ANYM-60, ANYM-70)."
-    # A dispatch dropped behind another run is dispatched again; the merged branch is reported and not merged twice.
+    # A text change keeps main's record, a new spec its branch record.
+    assert server.main(60)["id"].startswith("m-0060") and server.main(70)["id"].startswith("b-0070")
+    # A merged branch can no longer be listed: a second dispatch merges nothing and cannot pass as a read-back.
     server.set(log=[])
     code, out = ready_run(server)
-    assert code == 0 and "is merged already" in out and not server.writes()
+    assert code == 1 and "is merged already and cannot be read back here" in out and not server.writes()
 
 
 # spec: ANYM-405
@@ -925,12 +927,12 @@ def test_a_ready_merge_that_leaves_the_branch_open_or_loses_a_ready_line_fails_i
     def listing(cli, product, branch):
         specs = original(cli, product, branch)
         reads.append(branch)
-        if len(reads) == 3:  # main read back after the merge
+        if len(reads) == 5:  # main read back after the merge (the branch and main are read twice before it)
             specs[70] = dict(specs[70], content="Text without its readiness line.", status="Active")
         return specs
     monkeypatch.setattr(tiden_sync, "listing", listing)
     code, out = ready_run(server)
-    assert reads == ["proposal/ready", "main", "main"]
+    assert reads == ["proposal/ready", "main", "proposal/ready", "main", "main"]
     assert code == 1 and "Failed at step read-back: ANYM-70 is Active, not Backlog; ANYM-70 does not hold the " \
                          "branch's `Ready:` line" in out, out
 
@@ -982,3 +984,127 @@ def test_a_ready_merge_dispatch_runs_in_the_sync_group_titled_by_its_branch_and_
     assert steps[2]["if"] == "steps.guard.outputs.sha != ''"
     assert steps[-1]["env"]["BRANCH"] == "${{ steps.guard.outputs.branch }}"
     assert '--sha "$SHA" --ready-branch "$BRANCH"' in steps[-1]["run"]
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("content", [
+    f"New card.\n\n    {READY_LINE}\n",
+    f"New card.\n\t{READY_LINE}\n",
+    "New card.\n**Ready:**\n",
+    "New card.\n- **Ready:** **\n",
+    "New card.\nReady: `2026-10-26`\n",
+], ids=["indented", "tab", "bold-empty", "list-bold-empty", "code-span"])
+def test_a_ready_merge_refuses_a_readiness_record_in_indented_code_or_without_text(server, content):
+    ready_server(server, preview={"additions": [{"seqNum": 70}], "stats": {"additions": 1, "conflicts": 0}},
+                 branch=[spec(70, status="Backlog", content=content, branch=True)])
+    code, out = ready_run(server)
+    assert code == 1 and "Failed at step ready: ANYM-70 has no `Ready:` line" in out, out
+    assert not server.writes()
+
+
+# spec: ANYM-405
+def test_a_ready_merge_takes_main_s_readiness_record_in_other_markup_for_the_same_record(server):
+    ready_server(server, preview={"modifications": [{"seqNum": 60}], "stats": {"modifications": 1, "conflicts": 0}},
+                 branch=[spec(60, status="Backlog", content=f"Changed.\n- **{READY_LINE}**", branch=True)])
+    code, out = ready_run(server)
+    assert code == 1 and "ANYM-60 keeps main's `Ready:` line" in out, out
+    assert not server.writes()
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("change, preview, fields", [
+    ({"type": "Epic"}, None, "type"),
+    ({"componentId": "c-other"}, None, "componentId"),
+    ({"priority": "High"}, None, "priority"),
+    ({"sources": []}, None, "sources"),
+    ({}, ({"parentId": "p-main"}, {"parentId": "p-other"}), "parentId"),
+], ids=["type", "component", "priority", "sources", "parent"])
+def test_a_ready_merge_refuses_a_text_change_that_also_changes_the_spec_structure(server, change, preview, fields):
+    main = [spec(12), spec(60, status="Backlog", content=f"Criteria.\n{READY_LINE}\n", sources=[anchor("a.py")])]
+    copy = spec(60, status="Backlog", content=f"Changed criteria.\n{REFRESHED}\n", sources=[anchor("a.py")],
+                branch=True)
+    versions = preview or ({}, {})
+    ready_server(server, main=main, branch=[dict(copy, **change)],
+                 preview={"modifications": [{"mainVersion": {"seqNum": 60, **versions[0]},
+                                             "branchVersion": {"seqNum": 60, **versions[1]}}],
+                          "stats": {"modifications": 1, "conflicts": 0}})
+    code, out = ready_run(server)
+    assert code == 1 and f"ANYM-60 changes more than its text on proposal/ready ({fields})" in out, out
+    assert not server.writes()
+
+
+# spec: ANYM-405
+def test_a_ready_merge_refuses_a_branch_that_changes_between_its_check_and_the_merge(server, monkeypatch):
+    ready_server(server)
+    original, reads = tiden_sync.listing, []
+
+    def listing(cli, product, branch):
+        specs = original(cli, product, branch)
+        reads.append(branch)
+        if len(reads) == 3:  # the branch read again just before the merge
+            specs[70] = dict(specs[70], content=f"Another criterion.\n{READY_LINE}\n")
+        return specs
+    monkeypatch.setattr(tiden_sync, "listing", listing)
+    code, out = ready_run(server)
+    assert code == 1 and "Failed at step ready: proposal/ready or main changed while it was checked" in out, out
+    assert not server.writes()
+
+
+# spec: ANYM-405
+def test_a_ready_merge_fails_its_read_back_when_main_differs_from_the_checked_branch(server, monkeypatch):
+    ready_server(server)
+    original = tiden_sync.write
+
+    def write(cli, arguments, product):
+        # Someone writes to the branch after its last check: an unready card and another criterion.
+        state = server.state()
+        state["branch_specs"]["proposal/ready"][0]["content"] = f"Another criterion.\n{READY_LINE}\n"
+        state["branch_specs"]["proposal/ready"].append(spec(80, status="Backlog", branch=True))
+        server.set(branch_specs=state["branch_specs"])
+        original(cli, arguments, product)
+    monkeypatch.setattr(tiden_sync, "write", write)
+    code, out = ready_run(server)
+    assert code == 1 and "Failed at step read-back: ANYM-80 is on main, but not on the checked branch" in out, out
+    assert "ANYM-70 on main differs from the checked branch copy (content)" in out
+    assert "Ready merge of" not in out
+
+
+# spec: ANYM-405
+def test_a_ready_merge_fails_its_read_back_when_a_spec_comes_back_as_another_record(server, monkeypatch):
+    ready_server(server)
+    original, reads = tiden_sync.listing, []
+
+    def listing(cli, product, branch):
+        specs = original(cli, product, branch)
+        reads.append(branch)
+        if len(reads) == 5:
+            specs[60] = dict(specs[60], id="b-0060-0000-0000-0000-000000000000")
+            specs[12] = dict(specs[12], id="x-0012")
+        return specs
+    monkeypatch.setattr(tiden_sync, "listing", listing)
+    code, out = ready_run(server)
+    assert code == 1 and "ANYM-60 is record b-0060-0000-0000-0000-000000000000 on main, not m-0060-" in out, out
+    assert "ANYM-12 changed on main, but not on the checked branch" in out
+
+
+# spec: ANYM-405
+def test_a_ready_merge_whose_merge_call_fails_after_merging_reads_it_back_in_the_same_run(server, monkeypatch):
+    ready_server(server)
+    original = tiden_sync.write
+
+    def write(cli, arguments, product):
+        original(cli, arguments, product)
+        raise tiden_sync.Refused("tiden branch merge timed out")
+    monkeypatch.setattr(tiden_sync, "write", write)
+    code, out = ready_run(server)
+    assert code == 0, out
+    assert "the merge call failed (tiden branch merge timed out), but proposal/ready is merged" in out
+    assert [entry[:2] for entry in server.writes()] == [["branch", "merge"]]
+    assert out.splitlines()[-1] == "Ready merge of proposal/ready done (ANYM-60, ANYM-70)."
+    # A merge call that failed with the branch still open names no success and is not retried.
+    ready_server(server)
+    server.set(log=[], fault={"branch merge": "exit"})
+    monkeypatch.setattr(tiden_sync, "write", original)
+    code, out = ready_run(server)
+    assert code == 1 and "Failed at step merge" in out and "proposal/ready is open" in out, out
+    assert [entry[:2] for entry in server.writes()] == [["branch", "merge"]]
