@@ -1746,7 +1746,8 @@ def test_the_release_job_tolerates_only_an_unavailable_tiden(tmp_path):
     # Only the download may fail without failing the job, and it only downloads; no job-level suppression.
     assert [name for name, step in steps.items() if step.get("continue-on-error")] == [download]
     assert "continue-on-error" not in job and steps[download]["id"] == "download"
-    assert steps[download]["run"].startswith("curl ") and "\n" not in steps[download]["run"].strip()
+    assert "curl " in steps[download]["run"] and "sha256sum" not in steps[download]["run"] \
+        and "tar " not in steps[download]["run"]
     assert names.index(download) < names.index(install) < names.index(warn) < names.index(record)
     assert steps[install]["if"] == steps[record]["if"] == (
         "steps.config.outputs.enabled == 'true' && steps.download.outcome == 'success'")
@@ -1758,6 +1759,7 @@ def test_the_release_job_tolerates_only_an_unavailable_tiden(tmp_path):
         temp.mkdir(exist_ok=True)
         return subprocess.run(["bash", "-e", "-c", steps[step]["run"]], capture_output=True, text=True, env={
             "PATH": os.environ["PATH"], "RUNNER_TEMP": str(temp), "GITHUB_PATH": str(temp / "path"),
+            "GITHUB_WORKSPACE": str(root),
             "GITHUB_OUTPUT": str(temp / "output"), "GITHUB_STEP_SUMMARY": str(temp / "summary"), **env})
 
     # A failed download warns with a receipt that records no create call.
@@ -3002,3 +3004,45 @@ def test_both_shard_lines_deselect_exactly_the_nodes_the_module_steps_run():
     outcomes = next(step for step in jobs["verify"]["steps"] if step.get("name") == "Prepare honest CI evidence")["env"]
     pairs = re.findall(r'"(\w+)":"\$\{\{ steps\.(\w+)\.outcome \}\}"', outcomes["MODULE_OUTCOMES"])
     assert dict(pairs) == {name: name for name in FRAGMENTS["verify"][0]} and len(pairs) == len(FRAGMENTS["verify"][0])
+
+
+# spec: ANYM-154
+@pytest.mark.parametrize("pin, installs", [
+    ("TIDEN_CLI_VERSION=0.42.0\nTIDEN_CLI_SHA256_linux_amd64=" + "a" * 64 + "\n", True),
+    ("TIDEN_CLI_VERSION=0/../../../../../OWNER/REPO/releases/download/v1\nTIDEN_CLI_SHA256_linux_amd64="
+     + "a" * 64 + "\n", False),
+    ("TIDEN_CLI_VERSION=0.42.0 \nTIDEN_CLI_SHA256_linux_amd64=" + "a" * 64 + "\n", False),
+    ("TIDEN_CLI_VERSION=0.42.0\nTIDEN_CLI_SHA256_linux_amd64=" + "A" * 64 + "\n", False),
+    ("TIDEN_CLI_VERSION=0.42.0\nTIDEN_CLI_SHA256_linux_amd64=" + "a" * 63 + "\n", False),
+    ("TIDEN_CLI_VERSION=0.42.0\n", False),
+    ("", False),
+], ids=["valid", "path-escape", "trailing-space", "upper-hex", "short-checksum", "no-checksum", "empty"])
+def test_every_tiden_cli_install_accepts_only_a_well_formed_shared_pin(tmp_path, pin, installs):
+    import os
+    import subprocess
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    (tmp_path / "docs/harness").mkdir(parents=True)
+    (tmp_path / "docs/harness/tiden.md").write_text("# Tiden CLI version\n\n" + pin)
+    scripts = [step["run"] for path in sorted((root / ".github/workflows").glob("*.yml"))
+               for job in yaml.safe_load(path.read_text())["jobs"].values() for step in job.get("steps", [])
+               if "docs/harness/tiden.md" in step.get("run", "")]
+    assert len(scripts) == 8
+    for script in scripts:
+        lines = script.splitlines()
+        check = next(index for index, line in enumerate(lines) if line.startswith("[ -n \"$ver\" ]"))
+        # Every download names the vendor's release by the read version; every checksum check is strict.
+        assert all("releases/download/v$ver/" in line for line in lines if "releases/download" in line)
+        assert all("--strict" in line for line in lines if "sha256sum" in line)
+        result = subprocess.run(["bash", "-e", "-c", "\n".join(lines[:check + 1]) + '\necho "$ver $sum"'],
+                                capture_output=True, text=True,
+                                env={"PATH": os.environ["PATH"], "GITHUB_WORKSPACE": str(tmp_path)})
+        if installs:
+            assert (result.returncode, result.stdout) == (0, "0.42.0 " + "a" * 64 + "\n")
+        else:
+            assert result.returncode == 1 and "no valid Tiden pin" in result.stderr and not result.stdout
+    # The setup script reads the same pin with the same expressions.
+    setup = (root / "scripts/tiden_agent_setup.sh").read_text()
+    for expression in ("s/^TIDEN_CLI_VERSION=\\([0-9][0-9]*\\.[0-9][0-9]*\\.[0-9][0-9]*\\)$/\\1/p",
+                       "s/^TIDEN_CLI_SHA256_linux_amd64=\\([0-9a-f]\\{64\\}\\)$/\\1/p"):
+        assert all(expression in script for script in scripts) and expression in setup

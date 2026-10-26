@@ -4,8 +4,6 @@
 # as an argument and never writes it into the checkout. No hooks are installed.
 set -eu
 
-version=0.41.0
-checksum=d42fca58f868dc22be1aa01187105a1c442b4a32c88e9c47ac2f051ef05fb286
 base_url=${TIDEN_BASE_URL:-https://app.tiden.ai}
 # Product identifiers are not credentials; the CI reporting job uses the same ones.
 workspace=${TIDEN_WORKSPACE_ID:-1dc18e09-4a09-4d74-8300-cd4302622357}
@@ -17,6 +15,11 @@ if [ -z "${TIDEN_API_TOKEN:-}" ]; then
   exit 2
 fi
 cd "$(git rev-parse --show-toplevel)"
+# The shared pin (harness tiden.md, "Tiden CLI version"), the same one CI reads.
+pin=docs/harness/tiden.md
+version=$(sed -n 's/^TIDEN_CLI_VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$pin" | head -n 1)
+checksum=$(sed -n 's/^TIDEN_CLI_SHA256_linux_amd64=\([0-9a-f]\{64\}\)$/\1/p' "$pin" | head -n 1)
+[ -n "$version" ] && [ -n "$checksum" ] || { echo "no valid Tiden pin in $pin" >&2; exit 1; }
 
 if ! "$bin_dir/tiden" version 2>/dev/null | grep -q "$version"; then
   work=$(mktemp -d)

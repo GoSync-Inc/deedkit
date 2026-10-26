@@ -367,12 +367,22 @@ jobs:
         if: steps.config.outputs.enabled == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        run: curl --fail --silent --show-error --location https://github.com/qase-tms/homebrew-tap/releases/download/v0.41.0/tiden_linux_amd64.tar.gz -o "$RUNNER_TEMP/tiden.tar.gz"
+        run: |
+          pin="$GITHUB_WORKSPACE/docs/harness/tiden.md"
+          ver=$(sed -n 's/^TIDEN_CLI_VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$pin" | head -n 1)
+          sum=$(sed -n 's/^TIDEN_CLI_SHA256_linux_amd64=\([0-9a-f]\{64\}\)$/\1/p' "$pin" | head -n 1)
+          [ -n "$ver" ] && [ -n "$sum" ] || { echo "no valid Tiden pin in $pin" >&2; exit 1; }
+          curl --fail --silent --show-error --location -o "$RUNNER_TEMP/tiden.tar.gz" \
+            "https://github.com/qase-tms/homebrew-tap/releases/download/v$ver/tiden_linux_amd64.tar.gz"
       - name: Install pinned Tiden CLI with integrity check
         if: steps.config.outputs.enabled == 'true' && steps.download.outcome == 'success'
         timeout-minutes: 1
         run: |
-          echo "d42fca58f868dc22be1aa01187105a1c442b4a32c88e9c47ac2f051ef05fb286  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check
+          pin="$GITHUB_WORKSPACE/docs/harness/tiden.md"
+          ver=$(sed -n 's/^TIDEN_CLI_VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$pin" | head -n 1)
+          sum=$(sed -n 's/^TIDEN_CLI_SHA256_linux_amd64=\([0-9a-f]\{64\}\)$/\1/p' "$pin" | head -n 1)
+          [ -n "$ver" ] && [ -n "$sum" ] || { echo "no valid Tiden pin in $pin" >&2; exit 1; }
+          echo "$sum  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check --strict
           mkdir "$RUNNER_TEMP/tiden-bin"
           tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
           echo "$RUNNER_TEMP/tiden-bin" >> "$GITHUB_PATH"

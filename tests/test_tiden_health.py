@@ -1736,7 +1736,7 @@ def test_the_workflow_checks_out_main_without_credentials_and_pins_the_cli_as_ci
     ci = (ROOT / ".github/workflows/ci.yml").read_text()
     for line in install["run"].splitlines()[:2]:
         assert line.strip() in ci
-    assert "v0.41.0" in install["run"]
+    assert "docs/harness/tiden.md" in install["run"] and "TIDEN_CLI_VERSION" in install["run"]
     assert not any(name in step.get("run", "") for step in steps for name in ("GITHUB_PATH", "GITHUB_ENV"))
     # The token reaches the report step alone; no step reads the secret otherwise.
     holders = [step["name"] for step in steps
