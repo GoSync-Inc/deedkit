@@ -242,3 +242,44 @@ def test_worst_case_queue_rows_with_roles_stay_within_the_size_guard(recent_queu
     for row in result['items']:assert_each_fact_once(row)
     # The ANYM-269 guard holds with the role fields on every row.
     assert len(json.dumps(result,ensure_ascii=False))<=30000
+
+
+MALFORMED={
+    'admin_rights_not_an_object':channel(broadcast=True,admin_rights=types.ChatAdminRights(post_messages=True)),
+    'group_banned_rights_not_an_object':channel(megagroup=True),
+    'channel_admin_rights_without_post_flag':channel(broadcast=True),
+}
+
+
+# spec: ANYM-533
+@pytest.mark.parametrize('case',list(MALFORMED))
+def test_malformed_rights_read_unknown_and_never_grant_posting(case):
+    entity=MALFORMED[case]
+    # Swap in rights that no Telegram object has; the derivation must not read missing flags as false.
+    if case=='admin_rights_not_an_object':entity.admin_rights='broken'
+    elif case=='group_banned_rights_not_an_object':entity.banned_rights='broken'
+    else:entity.admin_rights=NS(edit_messages=True)
+    chat_type='group' if case.startswith('group') else 'channel'
+    assert derive(entity,chat_type)==('unknown',None)
+    assert observation(entity,chat_type)['my_role']=='unknown'
+
+
+# spec: ANYM-533
+def test_list_chats_refuses_an_empty_role_filter(worker):
+    w,s,key=worker
+    discover(w.state,CATALOG)
+    with pytest.raises(Exception,match='invalid_filter'):s.list_chats(key,my_roles=[])
+    with pytest.raises(Exception,match='invalid_filter'):s.list_chats(key,my_roles=[],chat_types=['channel'],can_post=True)
+
+
+# spec: ANYM-533
+def test_chat_info_result_reads_unknown_role_before_migration_046(database,tmp_path):
+    from messaging_service.chat_roles import gate_chat_info
+    answer={'outcome':'confirmed','data':{'provider_chat_id':'-1001','title':'Owner notes','my_role':'creator','can_post':True}}
+    with old_schema_store(database,tmp_path,45) as store,store.pool.connection() as c:
+        gated=gate_chat_info(c,answer)
+    assert gated['data']['my_role']=='unknown' and gated['data']['can_post'] is None and gated['data']['title']=='Owner notes'
+    with database.pool.connection() as c:
+        assert gate_chat_info(c,answer)==answer
+    with database.pool.connection() as c:
+        assert gate_chat_info(c,None) is None and gate_chat_info(c,{'outcome':'refused'})=={'outcome':'refused'}

@@ -191,7 +191,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     from .chat_roles import CHAT_ROLE_SCHEMA,ROLES
     from .store import schema_version
     my_roles=filter_values(my_roles);roles_ready=schema_version(c)>=CHAT_ROLE_SCHEMA
-    if my_roles is not None and any(r not in ROLES for r in my_roles) or can_post is not None and type(can_post) is not bool:
+    # An empty role list asks for nothing: refused, never an empty IN ().
+    if my_roles is not None and (not my_roles or any(r not in ROLES for r in my_roles)) or can_post is not None and type(can_post) is not bool:
         raise APIError('invalid_filter')
     role_sql="coalesce(c.my_role,'unknown')" if roles_ready else "'unknown'::text"
     lower,upper=date_bound(from_time),date_bound(to_time)

@@ -9,12 +9,20 @@ import re
 CHAT_ROLE_SCHEMA=46
 ROLES=('creator','admin','member','left','unknown')
 USERNAME=re.compile(r'[A-Za-z0-9_]{1,64}')
+MISSING=object()
 
 
 def flag(value):
     # A TL flag the server left unset reads None on a constructed object and False on a parsed one.
     if value is None or type(value) is bool:return bool(value)
     raise ValueError('malformed_flag')
+
+
+def rights_flag(rights,name):
+    # A rights object without the flag is not a Telegram rights object: unknown, never a guessed permission.
+    value=getattr(rights,name,MISSING)
+    if value is MISSING:raise ValueError('malformed_rights')
+    return flag(value)
 
 
 def _derive(entity,chat_type):
@@ -24,14 +32,15 @@ def _derive(entity,chat_type):
     if type(left) is not bool or type(creator) is not bool:return 'unknown',None
     if left:return 'left',None
     admin=getattr(entity,'admin_rights',None)
+    posts=rights_flag(admin,'post_messages') if admin is not None else False
     role='creator' if creator else 'admin' if admin is not None else 'member'
     if chat_type=='channel':
         # A broadcast channel: only the creator and an admin with post_messages write to it.
-        return role,True if role=='creator' else flag(getattr(admin,'post_messages',None)) if role=='admin' else False
+        return role,True if role=='creator' else posts if role=='admin' else False
     if role!='member':return role,True
     for name in ('banned_rights','default_banned_rights'):
         rights=getattr(entity,name,None)
-        if rights is not None and flag(getattr(rights,'send_messages',None)):return role,False
+        if rights is not None and rights_flag(rights,'send_messages'):return role,False
     return role,True
 
 
@@ -62,3 +71,11 @@ def valid(value):
             (value['can_post'] is None or value['my_role'] not in ('left','unknown'))):
         return value
     return {'my_role':'unknown','can_post':None,'username':None}
+
+
+def gate_chat_info(c,answer):
+    """Before migration 046 a chat_info result reads my_role unknown, as list_chats does (ANYM-533 criterion 2)."""
+    from .store import schema_version
+    if (not isinstance(answer,dict) or not isinstance(answer.get('data'),dict) or 'my_role' not in answer['data'] or
+            schema_version(c)>=CHAT_ROLE_SCHEMA):return answer
+    return {**answer,'data':{**answer['data'],'my_role':'unknown','can_post':None}}
