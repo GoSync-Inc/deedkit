@@ -425,7 +425,8 @@ Tiden main only when:
    request that builds it, which sync B merges);
 4. a text change changes the title and text alone: type, parent, component,
    priority, position, status and sources (by their fields) stay as main has
-   them, in the listings and in the preview's two versions; only a branch
+   them, in the listings and in the preview's two versions (the parent is in
+   the preview alone; it must name one for every changed spec); only a branch
    copy's own record ID, branch and times differ;
 5. every changed spec has a `Ready:` record outside code (fenced, indented by
    four spaces or a tab, or a code span) with text after the colon: a legacy
@@ -436,9 +437,11 @@ Tiden merges a branch by name, with no revision a merge can be held to, so the
 job reads the preview and both listings again just before the merge and
 refuses when anything differs from what it checked. The window between that
 read and the merge stays; the read-back closes it by detection, not
-prevention: main must then hold the specs it had (same record, same fields but
-a parent's child count), plus exactly the checked branch copies, a text change
-in main's record and a new spec in its branch record (no record is created on
+prevention: main must then hold the specs it had (same record, same fields, a
+parent's child count raised by each new spec under it), plus exactly the
+checked branch copies, a text change in main's record and a new spec in its
+branch record, each read again by `spec get` for the parent it was checked
+under (no record is created on
 a merge: 2026-10-26, the main specs that merged branches changed kept their
 `createdAt`, and none was created at a merge). Its output, each number with
 its record ID, new or text changed, is the receipt. A refusal names its step

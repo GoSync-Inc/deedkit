@@ -808,8 +808,9 @@ def ready_server(server, preview=None, branch=None, main=None):
                    spec(60, status="Backlog", content=f"Changed criteria.\n{REFRESHED}\n", branch=True)]},
                branches=[{"name": "main", "status": "open"}, {"name": "proposal/ready", "status": "open"}],
                previews={"proposal/ready": preview or {
-                   "additions": [{"seqNum": 70}],
-                   "modifications": [{"mainVersion": {"seqNum": 60}, "branchVersion": {"seqNum": 60}}],
+                   "additions": [{"seqNum": 70, "parentId": None}],
+                   "modifications": [{"mainVersion": {"seqNum": 60, "parentId": None},
+                                      "branchVersion": {"seqNum": 60, "parentId": None}}],
                    "deletions": [], "stats": {"additions": 1, "modifications": 1, "conflicts": 0},
                    "intentSession": None, "blockingSessions": 0, "hasRequirementChanges": True}})
 
@@ -993,9 +994,12 @@ def test_a_ready_merge_dispatch_runs_in_the_sync_group_titled_by_its_branch_and_
     "New card.\n**Ready:**\n",
     "New card.\n- **Ready:** **\n",
     "New card.\nReady: `2026-10-26`\n",
-], ids=["indented", "tab", "bold-empty", "list-bold-empty", "code-span"])
+    f"New card.\n\n>     {READY_LINE}\n",
+    f"New card.\n\n-     {READY_LINE}\n",
+], ids=["indented", "tab", "bold-empty", "list-bold-empty", "code-span", "quote-code", "list-code"])
 def test_a_ready_merge_refuses_a_readiness_record_in_indented_code_or_without_text(server, content):
-    ready_server(server, preview={"additions": [{"seqNum": 70}], "stats": {"additions": 1, "conflicts": 0}},
+    ready_server(server, preview={"additions": [{"seqNum": 70, "parentId": None}],
+                                  "stats": {"additions": 1, "conflicts": 0}},
                  branch=[spec(70, status="Backlog", content=content, branch=True)])
     code, out = ready_run(server)
     assert code == 1 and "Failed at step ready: ANYM-70 has no `Ready:` line" in out, out
@@ -1108,3 +1112,50 @@ def test_a_ready_merge_whose_merge_call_fails_after_merging_reads_it_back_in_the
     code, out = ready_run(server)
     assert code == 1 and "Failed at step merge" in out and "proposal/ready is open" in out, out
     assert [entry[:2] for entry in server.writes()] == [["branch", "merge"]]
+
+
+# spec: ANYM-405
+def test_a_ready_merge_reads_each_parent_from_the_preview_and_back_from_main(server, monkeypatch):
+    ready_server(server, preview={"additions": [{"seqNum": 70}], "stats": {"additions": 1, "conflicts": 0}},
+                 branch=[spec(70, status="Backlog", content=READY_LINE, branch=True)])
+    code, out = ready_run(server)
+    assert code == 1 and "the preview of proposal/ready names no parent of ANYM-70" in out and not server.writes()
+    # A new card under ANYM-12: main counts it as a child of ANYM-12, and the merge is done.
+    parent = server.main(12)["id"]
+    ready_server(server, preview={"additions": [{"seqNum": 70, "parentId": parent}],
+                                  "stats": {"additions": 1, "conflicts": 0}},
+                 branch=[dict(spec(70, status="Backlog", content=READY_LINE, branch=True), parentId=parent)])
+    server.set(log=[])
+    original = tiden_sync.write
+
+    def write(cli, arguments, product):
+        original(cli, arguments, product)
+        state = server.state()
+        for row in state["main"]:
+            row["childrenCount"] += row["seqNum"] == 12
+        server.set(main=state["main"])
+    monkeypatch.setattr(tiden_sync, "write", write)
+    code, out = ready_run(server)
+    assert code == 0 and "Ready merge of proposal/ready done (ANYM-70)." in out, out
+    assert ("spec", "get") in server.calls()
+
+
+# spec: ANYM-405
+def test_a_ready_merge_fails_its_read_back_when_a_spec_moved_parent_after_its_check(server, monkeypatch):
+    ready_server(server)
+    original = tiden_sync.write
+
+    def write(cli, arguments, product):
+        # The branch moves ANYM-60 under ANYM-12 after its last check, text and readiness record kept.
+        state = server.state()
+        state["branch_specs"]["proposal/ready"][1]["parentId"] = "m-0012-0000-0000-0000-000000000000"
+        server.set(branch_specs=state["branch_specs"])
+        original(cli, arguments, product)
+        state = server.state()
+        for row in state["main"]:
+            row["childrenCount"] += row["seqNum"] == 12
+        server.set(main=state["main"])
+    monkeypatch.setattr(tiden_sync, "write", write)
+    code, out = ready_run(server)
+    assert code == 1 and "ANYM-60 is under m-0012-0000-0000-0000-000000000000 on main, not None" in out, out
+    assert "ANYM-12 changed on main, but not on the checked branch" in out and "Ready merge of" not in out
