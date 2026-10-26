@@ -122,10 +122,14 @@ characters per field and 16 KiB per block. A contact message without the block
 `contact_details: "unavailable"` in full rows: an unknown card, never a card
 without a number. `display_text` shows one line per contact, `[Контакт] <name>:
 <first phone> (WhatsApp|Telegram) (+N)`, with `[обрезано]` when truncated. A query
-matches a card by contact name, or by phone digits: equal, or a suffix of at
-least 6 digits (leading zeros of the query dropped, so a local number finds the
-E.164 one). The block has the body's scopes, retention and deletion: a deleted
-message has no block.
+matches a card by contact name under the selected `query_mode` (a contact hit
+is a primary match, so `fuzzy` keeps the exact view), or by phone digits: equal,
+or a suffix of at least 6 digits, taken as typed and also without leading zeros
+(so `000001` is a suffix and a local `0812…` finds the E.164 one). The block has
+the body's scopes, retention and deletion: a deleted message has no block. Copies
+are the body's: capture spool, archive revisions, search, backups, and the event
+journal's metadata snapshot (kept under [event retention](SUBSCRIPTIONS.md#event-retention));
+subscription references omit the block.
 
 ### Forwarded messages
 
