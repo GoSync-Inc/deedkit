@@ -365,6 +365,9 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     existing=c.execute('SELECT * FROM outgoing_messages WHERE principal=%s AND request_id=%s',
         (p['id'],request_id)).fetchone()
     targets(p,[chat_id])
+    # A phone send (ANYM-532) reserves its request_id from the chat step on: never a chat_id send, even before its row.
+    if phone_hash is None and c.execute('SELECT 1 FROM messenger_commands WHERE principal=%s AND request_id=%s',
+            (p['id'],phone_step_id(request_id))).fetchone():raise APIError('idempotency_conflict',409)
     if existing:
         # Check saved intent BEFORE calling a renderer: upgrades or restarts must
         # neither alter nor reject an exact retry of an already queued action.
@@ -377,9 +380,6 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
                 existing.get('source_text')==text and existing.get('source_format')==format and
                 existing.get('render_policy')=={'link_preview':link_preview,'allow_lossy':allow_lossy} and
                 (existing.get('preview_digest') or '')==preview_digest)
-        # A phone send's request_id (ANYM-532) is never repeated as a chat_id send.
-        if matches and phone_hash is None and c.execute('SELECT 1 FROM messenger_commands WHERE principal=%s AND request_id=%s',
-                (p['id'],phone_step_id(request_id))).fetchone():matches=False
         if not matches:raise APIError('idempotency_conflict',409)
         return result(existing,c,p)
     if not default_policy and not preview_digest:raise APIError('preview_required',409)

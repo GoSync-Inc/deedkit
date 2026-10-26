@@ -32,7 +32,7 @@ LIVE_FOREGROUND_RESERVE = 1.0
 LIVE_EXECUTION_TIMEOUT = 8
 PHONE_LOOKUPS_PER_HOUR = 10
 # ANYM-532: server-set fields of a phone preview lookup or a phone send's chat step, never caller parameters.
-PHONE_INTERNAL = ('phone_preview','expected_lid','send_request_hash','preview_lookup')
+PHONE_INTERNAL = ('phone_preview','expected_lid','send_request_hash','preview_lookup','verified_name')
 OPEN_CHAT_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
     '--operations <current operations> open_chat_by_phone')
 log = logging.getLogger('anymsg.live_search')
@@ -776,12 +776,19 @@ class CommandWorker:
                     policy=c.execute('SELECT * FROM account_policies WHERE account=%s',(st.account,)).fetchone()
                     if not policy or not policy['discover_chats'] or not CollectorState.allows(policy,chat):
                         raise APIError('chat_not_collected')
+                    title=name
+                    if 'expected_lid' in row['payload']:
+                        # ANYM-532: a phone send's chat step opens only the previewed identity, under the
+                        # account's sending opt-in, titled with the preview's verified name.
+                        if chat!=row['payload']['expected_lid']:raise APIError('identity_changed')
+                        if not policy['enabled'] or not policy['send_enabled']:raise APIError('sending_disabled')
+                        title=name or row['payload'].get('verified_name')
                     chat_id=stable_id('chat',st.account,chat);public['provider_chat']=chat
                     existing=c.execute('SELECT 1 FROM chats WHERE id=%s',(chat_id,)).fetchone() is not None
                     if not existing and row['payload']['parameters'].get('create') is True:
                         existing=c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat)
                             VALUES(%s,%s,%s,'private',%s) ON CONFLICT DO NOTHING RETURNING id''',
-                            (chat_id,st.account,name or '+'+row['payload']['parameters']['phone'],chat)).fetchone() is None
+                            (chat_id,st.account,title or '+'+row['payload']['parameters']['phone'],chat)).fetchone() is None
                         public.update(chat_id=chat_id,existing=existing)
                     elif existing:public.update(chat_id=chat_id,existing=True)
                 status,result,code='succeeded',{'outcome':'confirmed','data':public},None
@@ -848,7 +855,7 @@ class CommandWorker:
             code=str(exc) if str(exc) in ('operation_expired','operation_disabled','operation_access_changed',
                 'operation_target_changed','sender_not_ready','attachment_unavailable','unsupported_operation',
                 'forbidden','not_found','operation_rejected','identity_unresolved','chat_not_collected',
-                'rate_limited','provider_timeout','invalid_phone','identity_changed','invite_invalid','invite_expired','chat_full',
+                'rate_limited','provider_timeout','invalid_phone','identity_changed','sending_disabled','invite_invalid','invite_expired','chat_full',
                 'join_not_allowed','already_member','invalid_cursor','invalid_anchor') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None

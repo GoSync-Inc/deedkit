@@ -371,7 +371,7 @@ class NodeProvider:
                 # ANYM-532: a phone send reuses its preview's lookup. The session store must still map
                 # the number to that LID, which then answers locally; any other answer asks for a new preview.
                 if lid!=job['expected_lid']:raise CommandRejected('identity_changed')
-                archived=True
+                archived=True;payload['lookup_allowed']=False  # never a second, counted lookup
             elif isinstance(lid,str) and re.fullmatch(r'[0-9]{1,30}@lid',lid):
                 try:archived=await asyncio.wait_for(job['_archived'](lid),max(deadline-time.monotonic(),0))
                 except TimeoutError:raise CommandRejected('provider_timeout') from None

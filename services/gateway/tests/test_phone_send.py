@@ -131,3 +131,22 @@ def test_gateway_schemas_take_chat_id_or_phone_and_describe_the_phone():
         assert schema["properties"]["phone"] == {"default": "", "title": "Phone", "type": "string"}
         assert "phone" in CATALOG[name]["description"]
     assert CATALOG["messages_preview_message"]["annotations"]["openWorldHint"] is True
+
+
+# The backend tool fields at the deployed release before ANYM-532 (54d0d5f), which reject unknown fields.
+OLD_FIELDS = {"preview_message": {"account", "chat_id", "text", "reply_to", "format", "link_preview", "allow_lossy"},
+              "send_message": {"account", "chat_id", "text", "request_id", "reply_to", "format", "preview_digest",
+                               "link_preview", "allow_lossy", "wait_s"}}
+
+
+# spec: ANYM-532
+def test_chat_id_calls_through_this_gateway_fit_the_backend_before_phone(tmp_path):
+    app, seen = setup(tmp_path)
+    chat = {"account": "synthetic", "chat_id": "chat_" + "b" * 32, "text": "Synthetic"}
+    with TestClient(app) as client:
+        for tool, extra in (("preview_message", {}), ("send_message", {"request_id": "synthetic-chat-send-2"})):
+            assert client.post("/v1/messages_" + tool, json={**chat, **extra}, headers=HEADERS).status_code == 200
+            assert rpc(client, "tools/call", {"name": "messages_" + tool, "arguments": {**chat, **extra}}).json()["result"]
+    assert len(seen) == 4
+    for operation, args in seen:
+        assert set(args) <= OLD_FIELDS[operation] and args["chat_id"] == chat["chat_id"], (operation, args)

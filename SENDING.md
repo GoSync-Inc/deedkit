@@ -103,8 +103,9 @@ chat in the same preview and send flow, with `phone` instead of `chat_id`:
    (`create=false`, up to 20 seconds) and returns the usual draft plus `phone`,
    `on_whatsapp`, `verified_name`, `chat_existed` (with `chat_id` only then),
    `chats_on_other_accounts`, `preview_contacts_provider: true` and
-   `preview_digest_expires_at`. The digest binds the account, the number, the
-   resolved WhatsApp ID (LID) and the rendered draft; it is valid for 10 minutes.
+   `preview_digest_expires_at`. The digest binds the account, the number, that
+   one lookup, the resolved WhatsApp ID (LID) and the rendered draft; it is valid
+   for 10 minutes, and a later lookup of the same number never revives it.
    A lookup still running gets `phone_lookup_pending` with `operation_id` and
    `next_action: repeat_preview_message`; the repeat reuses it, as does a new
    preview of the same number by the same key within the validity.
@@ -115,16 +116,17 @@ chat in the same preview and send flow, with `phone` instead of `chat_id`:
    `preview_expired`, a changed draft `preview_mismatch`, and a number whose
    WhatsApp ID no longer matches the preview `identity_changed`; each has
    `next_action: preview_message_again`. Otherwise the server opens or reuses
-   the canonical chat from the session store's mapping, without a second
-   lookup, then runs the unchanged send pipeline under the caller's
-   `request_id`. While the chat step runs, the result is `status: opening_chat`
+   the canonical chat of exactly that LID from the session store's mapping,
+   never with a second lookup, rechecks every guard and the digest's validity,
+   then runs the unchanged send pipeline under the caller's `request_id`, which
+   the phone send reserves from its first call. While the chat step runs, the result is `status: opening_chat`
    with `next_action: repeat_send_message_with_same_request_id`; the repeat
    with the same arguments continues it, other arguments get
    `idempotency_conflict`. The result adds `chat_id`, `chat_existed` and
    `verified_name`.
 
 Phone recipients need everything `open_chat_by_phone` needs: the `send`
-permission, a full-account key, the account opt-in and, through the gateway,
+permission (a phone preview also `read`, as every preview), a full-account key, the account opt-in and, through the gateway,
 the `open_chat_by_phone` action grant. A not-on-WhatsApp number gets
 `not_on_whatsapp`. The preview lookups share the account's budget of 10 WhatsApp
 lookups per rolling hour (local answers are free); `rate_limited` carries

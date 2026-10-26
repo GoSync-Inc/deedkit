@@ -77,9 +77,10 @@ def preview(s, key, state, jobs, result=answer(name='Synthetic Bakery'), **chang
 
 
 def local(job):
-    """The send's chat step: the session store still maps the number, so the adapter answers locally."""
+    """The send's chat step: the session store still maps the number, so the adapter answers locally,
+    and like operations.go's local path with no verified name."""
     assert job['expected_lid'] == LID and job['parameters'] == {'phone': PHONE, 'create': True}
-    return answer(lookup=False, name='Synthetic Bakery')
+    return answer(lookup=False)
 
 
 def send(s, key, state, jobs, digest, request_id='phone-send-0001', result=local, **changes):
@@ -371,6 +372,152 @@ def test_a_lost_provider_receipt_stays_unknown_and_never_dispatches_again(native
     assert count(s, 'outgoing_messages') == 1 and count(s, 'outgoing_messages', "status='queued'") == 0
 
 
+# spec: ANYM-532
+def test_guards_are_rechecked_after_the_chat_step_and_before_the_outbox(native):
+    s, archive, state, key = native
+    jobs = []
+    digest = preview(s, key, state, jobs)['preview_digest']
+    # The chat step committed, then the operation's opt-in went: the send is refused before the outbox.
+    arguments = {**draft(), 'request_id': 'phone-recheck-0001', 'preview_digest': digest}
+    step = s.phone_send_begin(key, **arguments)
+    dispatch(state, jobs, local)
+    s.set_messenger_operations(ACCOUNT, [])
+    refused(lambda: s.phone_send_finish(key, operation_id=step['operation_id'], **arguments), 'operation_disabled')
+    assert count(s, 'outgoing_messages') == 0
+    s.set_messenger_operations(ACCOUNT, ['open_chat_by_phone'])
+    with s.pool.connection() as c: c.execute('DELETE FROM chats WHERE id=%s', (CHAT,))
+    # Sending turned off after the step was queued: the chat step creates no chat.
+    arguments = {**arguments, 'request_id': 'phone-recheck-0002'}
+    step = s.phone_send_begin(key, **arguments)
+    archive.set_sending(ACCOUNT, False)
+    dispatch(state, jobs, local)
+    refused(lambda: s.phone_send_finish(key, operation_id=step['operation_id'], **arguments), 'sending_disabled')
+    assert count(s, 'chats', f"id='{CHAT}'") == 0 and count(s, 'outgoing_messages') == 0
+    archive.set_sending(ACCOUNT, True)
+    # A collection policy that excludes the number refuses both tools before any lookup.
+    with s.pool.connection() as c:
+        c.execute('UPDATE account_policies SET exclude_chats=%s WHERE account=%s', ([PN], ACCOUNT))
+    before = len(jobs)
+    refused(lambda: s.phone_preview_lookup(key, **draft(text='Excluded')), 'chat_not_collected')
+    refused(lambda: s.phone_send_begin(key, **draft(), request_id='phone-recheck-0003', preview_digest=digest),
+            'chat_not_collected')
+    assert len(jobs) == before and count(s, 'outgoing_messages') == 0
+
+
+# spec: ANYM-532
+def test_the_chat_step_opens_only_the_previewed_identity_titled_with_its_verified_name(native):
+    s, archive, state, key = native
+    jobs = []
+    digest = preview(s, key, state, jobs)['preview_digest']
+    other = '111222333444555@lid'
+    refused(lambda: send(s, key, state, jobs, digest, request_id='phone-identity-0001',
+                         result=answer(lookup=False, lid=other)), 'identity_changed')
+    assert count(s, 'chats', f"account='{ACCOUNT}'") == 0 and count(s, 'outgoing_messages') == 0
+    sent = send(s, key, state, jobs, digest, request_id='phone-identity-0002')
+    assert sent['verified_name'] == 'Synthetic Bakery'
+    with s.pool.connection() as c:
+        assert c.execute('SELECT title FROM chats WHERE id=%s', (CHAT,)).fetchone()['title'] == 'Synthetic Bakery'
+
+
+# spec: ANYM-532
+def test_an_expired_preview_never_sends_after_a_stopped_chat_step(native):
+    s, archive, state, key = native
+    jobs = []
+    digest = preview(s, key, state, jobs)['preview_digest']
+    arguments = {**draft(), 'request_id': 'phone-late-0001', 'preview_digest': digest}
+    step = s.phone_send_begin(key, **arguments)
+    dispatch(state, jobs, local)
+    with s.pool.connection() as c:
+        c.execute("UPDATE messenger_commands SET created_at=created_at-interval '11 minutes',"
+                  "finished_at=finished_at-interval '11 minutes' WHERE payload->>'phone_preview'='true'")
+    error = refused(lambda: s.phone_send_finish(key, operation_id=step['operation_id'], **arguments), 'preview_expired')
+    assert error['next_action'] == 'preview_message_again' and count(s, 'outgoing_messages') == 0
+    # A new lookup of the same identity never revives the old digest.
+    fresh = preview(s, key, state, jobs)['preview_digest']
+    assert fresh != digest
+    refused(lambda: send(s, key, state, jobs, digest, request_id='phone-late-0002'), 'preview_mismatch')
+    assert send(s, key, state, jobs, fresh, request_id='phone-late-0003')['status'] == 'queued'
+    assert count(s, 'outgoing_messages') == 1
+
+
+# spec: ANYM-532
+def test_a_pending_phone_send_reserves_its_request_id_for_the_principal(native):
+    s, archive, state, key = native
+    jobs = []
+    archive_chat(state, PN, 'PN1')
+    digest = preview(s, key, state, jobs)['preview_digest']
+    arguments = {**draft(), 'request_id': 'phone-reserve-0001', 'preview_digest': digest}
+    s.phone_send_begin(key, **arguments)
+    # Before any outbox row: a chat_id send and another key of the same principal both conflict.
+    refused(lambda: s.send_message(key, account=ACCOUNT, chat_id=stable_id('chat', ACCOUNT, PN), text='Other text',
+                                   request_id='phone-reserve-0001'), 'idempotency_conflict')
+    second = s.issue_key('phone-send-agent', [ACCOUNT], permissions=['read', 'send'])
+    refused(lambda: s.phone_send_begin(second, **arguments), 'idempotency_conflict')
+    assert count(s, 'outgoing_messages') == 0
+    assert count(s, 'messenger_commands', "request_id LIKE 'phone-send:%%'") == 1
+
+
+# spec: ANYM-532
+def test_a_pending_phone_lookup_leaves_ordinary_sends_and_collection_usable(native):
+    from messaging_service.outgoing import OutgoingWorker
+    s, archive, state, key = native
+    jobs = []
+    archive_chat(state, PN, 'PN1')
+    # A phone preview whose lookup never runs, and a phone send's chat step that never runs.
+    s.phone_preview_lookup(key, **draft(text='Stalled'))
+    digest = preview(s, key, state, jobs)['preview_digest']
+    s.phone_send_begin(key, **draft(), request_id='phone-stall-0001', preview_digest=digest)
+    queued = s.send_message(key, account=ACCOUNT, chat_id=stable_id('chat', ACCOUNT, PN), text=TEXT,
+                            request_id='ordinary-send-0001')
+    calls = []
+    async def provider(job):
+        calls.append(job); return {'provider_message_id': 'true_'+PN+'_SENT1'}
+    asyncio.run(OutgoingWorker(state, provider).once())
+    assert len(calls) == 1 and s.get_send_status(key, queued['send_id'])['status'] != 'queued'
+    archive_chat(state, PN, 'PN2')
+    assert count(s, 'messages', f"chat='{stable_id('chat', ACCOUNT, PN)}'") == 2
+
+
+# spec: ANYM-532
+def test_a_lost_receipt_from_the_phone_send_dispatch_is_unknown_and_never_retried(native):
+    from messaging_service.outgoing import OutgoingWorker
+    s, archive, state, key = native
+    jobs, calls = [], []
+    digest = preview(s, key, state, jobs)['preview_digest']
+    first = send(s, key, state, jobs, digest, request_id='phone-lost-0001')
+    async def provider(job):
+        calls.append(job); raise TimeoutError('synthetic lost receipt')
+    worker = OutgoingWorker(state, provider)
+    asyncio.run(worker.once())
+    assert s.get_send_status(key, first['send_id'])['status'] == 'unknown'
+    repeat = send(s, key, state, jobs, digest, request_id='phone-lost-0001', result=None)
+    asyncio.run(worker.once())
+    assert repeat['status'] == 'unknown' and repeat['send_id'] == first['send_id'] and len(calls) == 1
+    assert count(s, 'outgoing_messages') == 1 and len(jobs) == 2
+
+
+# spec: ANYM-532
+def test_a_waited_phone_send_keeps_its_chat_fields_and_old_chat_id_calls_work(native, monkeypatch):
+    from messaging_service import send_wait
+    s, archive, state, key = native
+    jobs = []
+    archive_chat(state, PN, 'PN1')
+    async def waited(store, token, send_id, wait_s): return {'send_id': send_id, 'status': 'sent'}
+    monkeypatch.setattr(send_wait, 'wait_for_send', waited)
+    result = lambda job: local(job) if job['parameters']['create'] else answer(name='Synthetic Bakery')
+    client, post = rest(s, key, monkeypatch, state, jobs, result)
+    with client:
+        digest = post('preview_message', draft(phone='+'+PHONE)).json()['preview_digest']
+        sent = post('send_message', {**draft(phone='+'+PHONE), 'request_id': 'phone-wait-0001',
+                                     'preview_digest': digest, 'wait_s': 1}).json()
+        assert sent['status'] == 'sent' and sent['chat_id'] == CHAT and sent['chat_existed'] is False
+        assert sent['verified_name'] == 'Synthetic Bakery'
+        # A gateway or client from before ANYM-532 sends no phone field at all.
+        old = {'account': ACCOUNT, 'chat_id': stable_id('chat', ACCOUNT, PN), 'text': TEXT}
+        assert post('preview_message', old).json()['preview_digest']
+        assert post('send_message', {**old, 'request_id': 'old-client-0001'}).json()['send_id']
+
+
 def provider(tmp_path, local_lid):
     node = NodeProvider({}, tmp_path/'unused', 3)
     node.process = SimpleNamespace(returncode=None, stdout=asyncio.StreamReader())
@@ -401,6 +548,7 @@ def test_the_collector_answers_the_send_step_only_from_the_previewed_identity(tm
         assert asked == [] and lines[0]['local_only'] is True
         if stored == LID:
             assert lines[1]['known_chats'] == [LID]  # a local answer, no counted lookup
+            assert lines[1]['lookup_allowed'] is False  # and never a provider fallback
         else:
             assert len(lines) == 1  # no provider lookup after a changed identity
         # Isolation: the adapter stays usable for the next ordinary send.

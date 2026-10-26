@@ -450,7 +450,9 @@ def create_app(store: Store, allowed_hosts: list[str]):
             else:result=await run_in_threadpool(store.send_message,token,**arguments)
             if wait_s and result.get('send_id'):
                 try:
-                    return await wait_for_send(store,token,result['send_id'],wait_s)
+                    waited=await wait_for_send(store,token,result['send_id'],wait_s)
+                    # A phone send keeps chat_id, chat_existed and verified_name beside the waited status.
+                    return waited if phone is None else {**result,**waited}
                 except APIError as error:
                     # The send is already committed; a failed observation must not hide its send_id.
                     if error.code not in ('send_wait_busy','send_status_timeout'):raise

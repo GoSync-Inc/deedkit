@@ -68,8 +68,16 @@ def _failure(receipt):
     return failure
 
 
-def _draft(c, p, account, phone, lid, text, reply_to, format, link_preview, allow_lossy):
-    """The ordinary rendered draft for the number's canonical chat, with a digest that also binds the number."""
+def _fresh(c, lookup_id):
+    """Whether the preview lookup a digest binds is still inside the digest's validity."""
+    row = c.execute("SELECT finished_at>clock_timestamp()-%s*interval '1 second' AS fresh FROM messenger_commands "
+                    "WHERE id=%s AND status='succeeded'", (DIGEST_VALID_SECONDS, lookup_id)).fetchone()
+    return bool(row and row['fresh'])
+
+
+def _draft(c, p, account, phone, lid, lookup_id, text, reply_to, format, link_preview, allow_lossy):
+    """The ordinary rendered draft for the number's canonical chat, with a digest that also binds the number
+    and the one lookup it came from (a later lookup of the same identity never revives an expired digest)."""
     from .outgoing import reviewed, target
     chat_id = stable_id('chat', account, lid)
     existed = c.execute('SELECT 1 FROM chats WHERE id=%s AND account=%s', (chat_id, account)).fetchone() is not None
@@ -80,7 +88,7 @@ def _draft(c, p, account, phone, lid, text, reply_to, format, link_preview, allo
     draft = reviewed(c, p, account, chat_id, text, reply_to, format, link_preview, allow_lossy,
                      {'platform': 'whatsapp', 'provider_chat': lid}, reply_id)
     digest = hashlib.sha256(canonical({'recipient': 'phone', 'account': account, 'phone': phone,
-                                       'draft': draft['preview_digest']})).hexdigest()
+                                       'lookup': str(lookup_id), 'draft': draft['preview_digest']})).hexdigest()
     return {**draft, 'preview_digest': digest}, chat_id, existed
 
 
@@ -118,8 +126,8 @@ def preview_result(store, c, p, account, phone, operation_id, text, reply_to, fo
         failure.phone, failure.next_action = '+'+phone, 'use_username_or_existing_chat'
         raise failure
     if not isinstance(data.get('provider_chat'), str): raise APIError('identity_unresolved', 409)
-    draft, chat_id, existed = _draft(c, p, account, phone, data['provider_chat'], text, reply_to, format,
-                                     link_preview, allow_lossy)
+    draft, chat_id, existed = _draft(c, p, account, phone, data['provider_chat'], operation_id, text, reply_to,
+                                     format, link_preview, allow_lossy)
     others = []
     for item in other_account_chats(c, p, account, phone):
         last = c.execute('''SELECT sent_at FROM messages WHERE account=%s AND chat=%s AND NOT deleted
@@ -141,9 +149,13 @@ def send_hash(account, phone, text, reply_to, format, preview_digest, link_previ
 
 
 def _step(c, p, request_id):
+    """The chat step reserving this request_id. Send request IDs are per principal, so another key's step
+    (taken under the same principal lock) is a conflict, never a second reservation."""
     from .outgoing import phone_step_id
-    return c.execute('SELECT * FROM messenger_commands WHERE principal=%s AND key_id=%s AND request_id=%s',
-                     (p['id'], p['key_id'], phone_step_id(request_id))).fetchone()
+    step = c.execute('SELECT * FROM messenger_commands WHERE principal=%s AND request_id=%s ORDER BY created_at LIMIT 1',
+                     (p['id'], phone_step_id(request_id))).fetchone()
+    if step and step['key_id'] != p['key_id']: raise APIError('idempotency_conflict', 409)
+    return step
 
 
 def _sent(store, c, p, row, step):
@@ -189,13 +201,15 @@ def send_begin(store, c, p, account, phone, text, request_id, reply_to, format, 
     if not lookup or not lookup['fresh'] or not isinstance(data.get('provider_chat'), str):
         failure = APIError('preview_expired', 409); failure.next_action = 'preview_message_again'
         raise failure
-    draft, _, _ = _draft(c, p, account, phone, data['provider_chat'], text, reply_to, format, link_preview, allow_lossy)
+    draft, _, _ = _draft(c, p, account, phone, data['provider_chat'], lookup['id'], text, reply_to, format,
+                         link_preview, allow_lossy)
     if draft['preview_digest'] != preview_digest:
         failure = APIError('preview_mismatch', 409); failure.next_action = 'preview_message_again'
         raise failure
     receipt = enqueue(store, c, p, account, 'open_chat_by_phone', parameters={'phone': '+'+phone, 'create': True},
                       request_id=phone_step_id(request_id), internal={'expected_lid': data['provider_chat'],
-                      'send_request_hash': expected, 'preview_lookup': lookup['id']})
+                      'send_request_hash': expected, 'preview_lookup': lookup['id'],
+                      'verified_name': data.get('verified_name')})
     return {'operation_id': receipt['operation_id']}
 
 
@@ -222,8 +236,13 @@ def send_finish(store, c, p, account, phone, operation_id, text, request_id, rep
     data = receipt['result']['data']
     if data.get('on_whatsapp') is not True or not isinstance(data.get('chat_id'), str):
         raise APIError('identity_unresolved', 409)
-    draft, chat_id, _ = _draft(c, p, account, phone, step['payload']['expected_lid'], text, reply_to, format,
-                               link_preview, allow_lossy)
+    # Before the first outbox insert: every guard again, and the preview still valid (a stop after the chat step).
+    _admit(store, c, p, account, phone, True)
+    if not _fresh(c, step['payload'].get('preview_lookup')):
+        failure = APIError('preview_expired', 409); failure.next_action = 'preview_message_again'
+        raise failure
+    draft, chat_id, _ = _draft(c, p, account, phone, step['payload']['expected_lid'],
+                               step['payload'].get('preview_lookup'), text, reply_to, format, link_preview, allow_lossy)
     if chat_id != data['chat_id'] or draft['preview_digest'] != preview_digest: raise APIError('preview_mismatch', 409)
     row = enqueue(c, p, account, chat_id, text, request_id, reply_to, format, preview_digest, link_preview,
                   allow_lossy, phone_hash=expected)
