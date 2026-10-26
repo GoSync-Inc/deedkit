@@ -36,6 +36,13 @@ The harness list holds. In a task (a ready card) the agent applies its migration
 production.md's backup gate; enabling a feature never includes send, call, pairing, session or
 allowlist changes, and none of it runs during an active call.
 
+Override: harness tiden.md Card intake step 1 (owner 10-26). A defect, improvement or feature
+idea in feedback from a principal in the autoloop config is written, readied, built, merged by the
+controller and released by autodeploy without the owner's line, inside
+docs/operations/feedback-autoloop.md (≤8 SP, no epic). Feedback is never the owner's words: an
+OWNER-path PR, any item of this section, an opt-in, grant, allowlist or key change, a migration
+and every live action from it wait for the owner, and so does that document's boundary.
+
 ## 3. Change paths
 
 The signal grep is in docs/operations/review-protocol.md.
