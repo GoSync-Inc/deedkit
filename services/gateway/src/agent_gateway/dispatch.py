@@ -2,7 +2,9 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import asyncio
 import logging
+import re
 from platform_contracts import Capability, safe_error
+from platform_contracts.agent import MAX_CANDIDATES, PLACEHOLDER_REQUEST_ID, validate_candidate
 from .adapters.calls import receipt_reference
 
 from .catalog import arguments, CATALOG, InvalidArguments
@@ -42,6 +44,93 @@ CALENDAR_CONSTRAINTS = {
     "atomic_cross_provider",
     "availability_sources",
 }
+
+
+# A request key that names something the caller already chose (an ID, an account, a mode); any other string the
+# caller sent is payload: message text, file names, phone numbers, queries.
+REFERENCE_KEY = re.compile(r"(?:^|_)(?:ids?|digest|ref|token)$|^(?:account|chat|person|sender|receipt|operation|"
+                           r"consumer|reply_to|network|kind|view|detail|direction|order|format|status|live|modules|tool)$")
+PHONE = re.compile(r"\+?\d(?:[\s().-]?\d){6,}")
+# A name, a dot and an extension of 1-10 letters or digits with at least one letter (.c, .7z, .sqlite3).
+FILE_NAME = re.compile(r"[\w-]+\.(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{1,10}\b")
+TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
+MIN_PAYLOAD, MIN_TOKEN = 4, 6
+
+
+def payload_strings(value, key=None):
+    """The non-empty strings of `value` that are not under a reference key, and their words of at least MIN_TOKEN
+    characters, so an echoed fragment (a file name inside the text) counts too."""
+    if isinstance(value, dict):
+        return {s for k, v in value.items() for s in payload_strings(v, k)}
+    if isinstance(value, list):
+        return {s for v in value for s in payload_strings(v, key)}
+    if isinstance(value, str) and value.strip() and not (key and REFERENCE_KEY.search(key)):
+        return {value} | {word for word in value.split() if len(word) >= MIN_TOKEN}
+    return set()
+
+
+def sensitive(text):
+    """A phone-shaped number or a file name, whoever wrote it: never relayed in backend guidance."""
+    return bool(PHONE.search(text) or FILE_NAME.search(text))
+
+
+def exposed(value, key=None):
+    """The strings of `value` outside a reference key; dict keys are field names, not values."""
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in exposed(v, k)]
+    if isinstance(value, list):
+        return [s for v in value for s in exposed(v, key)]
+    return [value] if isinstance(value, str) and not (key and REFERENCE_KEY.search(key)) else []
+
+
+def found(piece, text):
+    """A piece of payload in `text`: a substring, or a whole word when shorter than MIN_PAYLOAD."""
+    if len(piece) >= MIN_PAYLOAD:
+        return piece in text
+    return re.search(rf"(?<!\w){re.escape(piece)}(?!\w)", text) is not None
+
+
+def carries(value, payload):
+    """The caller's payload, a phone number or a file name in any string of `value` outside a reference key."""
+    return any(sensitive(s) or any(found(p, s) for p in payload) for s in exposed(value))
+
+
+def relayed_error(detail, runnable, read_only, payload):
+    """A backend error as the gateway relays it (ANYM-544). Every `next` (top level and per candidate) must run as
+    given for this caller and route; a `hint`, `next` or candidate with the caller's payload, a phone number or a
+    file name outside an ID or reference field is dropped. `selection_required` keeps a mutating continuation on
+    candidates only."""
+    detail = dict(detail)
+    if "hint" in detail and (not isinstance(detail["hint"], str) or carries(detail["hint"], payload)):
+        detail.pop("hint")
+
+    def safe(value):
+        return runnable(value) and not carries(value, payload)
+
+    if "next" in detail and not (safe(detail["next"]) and (detail.get("error") != "selection_required"
+                                                           or detail["next"]["tool"] in read_only)):
+        detail.pop("next")
+    if "candidates" in detail:
+        kept = []
+        for candidate in detail["candidates"] if isinstance(detail["candidates"], list) else []:
+            if isinstance(candidate, dict) and "next" in candidate and not safe(candidate["next"]):
+                candidate = {k: v for k, v in candidate.items() if k != "next"}
+            if (isinstance(candidate, dict) and "last_activity" in candidate
+                    and not (isinstance(candidate["last_activity"], str)
+                             and TIMESTAMP.fullmatch(candidate["last_activity"]))):
+                candidate = {k: v for k, v in candidate.items() if k != "last_activity"}
+            try:
+                validate_candidate(candidate)
+            except ValueError:
+                continue
+            if not carries({k: v for k, v in candidate.items() if k not in ("next", "last_activity")}, payload):
+                kept.append(candidate)
+        more = len(kept) > MAX_CANDIDATES or detail.get("more") is True
+        detail["candidates"] = kept[:MAX_CANDIDATES]
+        detail.pop("more", None)
+        if more and "next" in detail and detail["next"]["tool"] in read_only:
+            detail["more"] = True
+    return detail
 
 
 class Route:
@@ -337,6 +426,68 @@ class Dispatch:
         admitted.set(self.credential(agent))
         return snapshot, agent
 
+    def visible_to(self, key):
+        """The caller's own tool names, or none when the key does not authenticate."""
+        try:
+            return self.policy.visible(*self.policy.authenticate(key))
+        except Denied:
+            return []
+
+    def runnable(self, value, visible, module, snapshot, agent, caps):
+        """A `next` this caller can run as given on this route: a tool of its effective list with arguments its
+        schema accepts. Only the failing tool's module and the gateway's own tools can be checked without asking
+        another backend, so a `next` into any other module is not runnable here. It passes the same argument checks
+        as `call` (the placeholder request_id refusal and `argument_admission`)."""
+        try:
+            if not isinstance(value, dict) or set(value) != {"tool", "arguments"} or value["tool"] not in visible:
+                return False
+            target = CATALOG[value["tool"]]
+            checked = arguments(target, value["arguments"])
+            if checked.get("request_id") == PLACEHOLDER_REQUEST_ID:
+                return False
+            if target["module"] == "gateway":
+                return True
+            if target["module"] != module:
+                return False
+            self.argument_admission(target, checked, snapshot, agent, caps)
+            return True
+        except (Denied, TypeError, KeyError, ValueError):
+            return False
+
+    def argument_admission(self, tool, args, snapshot, agent, caps):
+        """The admission of one module call that depends on its backend's capabilities and on the arguments: scopes,
+        cursor-write for get_updates(start_from=now), the backend implementation, the calendar rules ceiling and the
+        action group. Returns the gateway actions the call may use; raises Denied otherwise."""
+        module = tool["module"]
+        if not set(tool["scopes"]) <= set(caps["permissions"]):
+            raise Denied()
+        if (module == "messaging" and tool["operation"] == "get_updates"
+                and args.get("start_from") == "now"
+                and "cursor-write" not in (set(agent["grants"].get(module, [])) & set(caps["permissions"]))):
+            raise Denied()
+        if not self.implemented(tool, snapshot, agent, caps, args.get("account")):
+            raise Denied()
+        rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
+        if (module == "calendar" and tool["operation"] == "plan"
+                and any(isinstance(a, dict) and (a.get("action") in ("project", "unproject")
+                                                 or (a.get("action") == "create" and "activity" in a))
+                        for a in args.get("actions", []))
+                and not rules_ceiling):
+            # A projection and its undo are planned from guardian rules: the assignment ceiling of rules in members.
+            raise Denied()
+        allowed_actions = self.actions(snapshot, agent, caps) if module == "messaging" else []
+        if tool["operation"] == "get_messenger_operation":
+            # Retained receipts are independent of current provider support.
+            allowed_actions = self.policy.actions(snapshot, agent, caps["permissions"])
+        if tool.get("action_group"):
+            if not allowed_actions or ("operation" in args and args["operation"] not in allowed_actions):
+                raise Denied()
+            if "account" in args:
+                allowed_actions = self.actions(snapshot, agent, caps, args["account"])
+                if "operation" in args and args["operation"] not in allowed_actions:
+                    raise Denied()
+        return allowed_actions
+
     def admit(self, key, name):
         return self.policy.authorize_agent(*self.authenticate(key), name)
 
@@ -347,22 +498,34 @@ class Dispatch:
         except Denied as error:
             # One body for a nonexistent name, a tool outside the profile and one of an undeployed module.
             if error.code == "not_found_or_forbidden" and error.status == 403:
-                error.detail = unknown_tool_denial()
+                error.detail = unknown_tool_denial("platform_capabilities" in self.visible_to(key))
             raise
         selected = self.selected(agent, snapshot["revision"], route)
         if selected is not None and tool["module"] not in selected | {"gateway"}:
             denied = Denied("module_not_selected", 403)
             denied.detail = {"error": "module_not_selected", "module": tool["module"],
                              "next_action": "select_module_or_use_its_connection_path"}
+            # Only the in-session selection can widen again; a module path excludes the module for good.
+            if ((route.modules is None or tool["module"] in route.modules)
+                    and "platform_select_modules" in self.policy.visible(snapshot, agent)):
+                chosen = self.selections.get((agent["id"], route.path)) or frozenset()
+                denied.detail["next"] = {"tool": "platform_select_modules",
+                                         "arguments": {"modules": sorted(chosen | {tool["module"]})}}
             raise denied
         try:
             args = arguments(tool, values)
+            if args.get("request_id") == PLACEHOLDER_REQUEST_ID:
+                # The placeholder of a `next` (ANYM-544) is never a key: refuse it before any backend sees it.
+                raise InvalidArguments([{"field": "request_id", "reason": "format"}])
         except InvalidArguments as error:
             denied = Denied("invalid_arguments", 422)
             if error.field_errors:
                 denied.detail = stale_arguments_hint(tool, {
                     "error": "invalid_arguments", "field_errors": error.field_errors,
                     "next_action": "check_parameters"})
+                if (error.field_errors == [{"field": "request_id", "reason": "required"}]
+                        and "request_id" in tool["inputSchema"].get("properties", {})):
+                    denied.detail["next"] = {"tool": name, "arguments": {**values, "request_id": PLACEHOLDER_REQUEST_ID}}
             raise denied from None
         except ValueError:
             raise Denied("invalid_arguments", 422) from None
@@ -409,33 +572,8 @@ class Dispatch:
                 error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                            phase="capabilities", read_only=read_only)
             raise
-        if not set(tool["scopes"]) <= set(caps["permissions"]):
-            raise Denied()
-        if (module == "messaging" and tool["operation"] == "get_updates"
-                and args.get("start_from") == "now"
-                and "cursor-write" not in (set(agent["grants"].get(module, [])) & set(caps["permissions"]))):
-            raise Denied()
-        if not self.implemented(tool, snapshot, agent, caps, args.get("account")):
-            raise Denied()
+        allowed_actions = self.argument_admission(tool, args, snapshot, agent, caps)
         rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
-        if (module == "calendar" and tool["operation"] == "plan"
-                and any(isinstance(a, dict) and (a.get("action") in ("project", "unproject")
-                                                 or (a.get("action") == "create" and "activity" in a))
-                        for a in args.get("actions", []))
-                and not rules_ceiling):
-            # A projection and its undo are planned from guardian rules: the assignment ceiling of rules in members.
-            raise Denied()
-        allowed_actions = self.actions(snapshot, agent, caps) if module == "messaging" else []
-        if tool["operation"] == "get_messenger_operation":
-            # Retained receipts are independent of current provider support.
-            allowed_actions = self.policy.actions(snapshot, agent, caps["permissions"])
-        if tool.get("action_group"):
-            if not allowed_actions or ("operation" in args and args["operation"] not in allowed_actions):
-                raise Denied()
-            if "account" in args:
-                allowed_actions = self.actions(snapshot, agent, caps, args["account"])
-                if "operation" in args and args["operation"] not in allowed_actions:
-                    raise Denied()
         if module == "calendar" and tool["operation"] == "plan":
             # Carried drives (and create with activity) are asked for only under this gateway's own rule-read
             # ceiling, and only from a backend that declares the field; an agent never sets it itself.
@@ -476,8 +614,15 @@ class Dispatch:
             elif error.code == "backend_unavailable":
                 error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                            phase="operation", read_only=True)
-            elif module == "messaging" and error.code == "backend_denied":
-                error.detail = self.next_call(getattr(error, "detail", None), snapshot, agent, caps)
+            elif error.code == "backend_denied" and isinstance(getattr(error, "detail", None), dict):
+                if module == "messaging":
+                    error.detail = self.next_call(error.detail, snapshot, agent, caps)
+                visible = [n for n in self.policy.visible(current, principal)
+                           if selected is None or CATALOG[n]["module"] in selected | {"gateway"}]
+                error.detail = relayed_error(
+                    error.detail, lambda value: self.runnable(value, visible, module, current, principal, caps),
+                    {n for n in visible if CATALOG[n].get("annotations", {}).get("readOnlyHint", False)},
+                    payload_strings(values))
             raise
         if module == "messaging":
             result = self.next_call(result, snapshot, agent, caps)

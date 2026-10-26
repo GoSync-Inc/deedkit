@@ -181,6 +181,8 @@ jobs:
         run: |
           uv sync --locked --group dev
           uv run pytest -q -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/gateway.xml"
+          # The shared contract package has no module report: gateway.xml cannot hold paths outside services/gateway.
+          uv run pytest -q -p no:cacheprovider ../../packages/platform-contracts/tests
           uv build --project ../../packages/platform-contracts --out-dir "$RUNNER_TEMP/gateway-dist"
           uv build --out-dir "$RUNNER_TEMP/gateway-dist"
           uv venv "$RUNNER_TEMP/gateway-installed" --python 3.13

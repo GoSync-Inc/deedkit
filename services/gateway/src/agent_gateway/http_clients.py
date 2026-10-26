@@ -10,8 +10,38 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .catalog import CATALOG
 from .policy import Denied
 from .diagnostics import CONSUMPTION_OPERATIONS, consumption_failure, failure_details
+
+
+def takes_wait(tool):
+    return "wait_s" in tool.get("inputSchema", {}).get("properties", {})
+
+
+# ANYM-544: every catalog tool that takes wait_s, and every other long wait, is admitted through a bounded wait pool,
+# never the metadata pool. An entry names the pool and when the arguments make the call wait; wait_s=0 stays a plain
+# call. A catalog tool with wait_s but no entry still waits in "waits" and fails test_wait_admission.
+WAIT_ADMISSION = {
+    ("messaging", "send_message"): ("waits", lambda a: (a.get("wait_s") or 0) > 0),
+    ("messaging", "wait_for_subscription_events"): ("waits", lambda a: True),
+    # ANYM-478: a live search waits up to 20 s in its own pool.
+    ("messaging", "search"): ("searches", lambda a: a.get("live", "off") != "off"),
+}
+
+
+def wait_tools(catalog):
+    return {(t["module"], t["operation"]) for t in catalog.values() if takes_wait(t)} | set(WAIT_ADMISSION)
+
+
+def admission(tools, module, operation, arguments):
+    """The pool of one call: uploads, searches, waits or metadata."""
+    if module == "messaging" and operation == "upload_file_chunk":
+        return "uploads"
+    if (module, operation) not in tools:
+        return "metadata"
+    pool, waits = WAIT_ADMISSION.get((module, operation), ("waits", lambda a: (a.get("wait_s") or 0) > 0))
+    return pool if waits(arguments) else "metadata"
 
 
 class Budget:
@@ -72,6 +102,7 @@ class Clients:
         self.waits, self.wait_budgets = {}, {}
         self.searches, self.search_budgets = {}, {}
         self.upload_rate = UploadRate()
+        self.wait_tools = wait_tools(CATALOG)
         self.closed = False
 
     async def __aenter__(self):
@@ -85,7 +116,9 @@ class Clients:
                               "host_header": target.get("host_header") or urlsplit(target["url"]).netloc}
                 pools = [(self.metadata, 8), (self.bulk, 2)]
                 if module == "messaging":
-                    pools.extend([(self.uploads, 2), (self.waits, 2), (self.searches, 4)])
+                    pools.extend([(self.uploads, 2), (self.searches, 4)])
+                if any(m == module for m, _ in self.wait_tools):
+                    pools.append((self.waits, 2))
                 for container, maximum in pools:
                     container[module] = httpx.AsyncClient(
                         base_url=target["url"].rstrip("/"),
@@ -97,9 +130,10 @@ class Clients:
                         headers={"Host": target["host_header"]} if target.get("host_header") else None,
                     )
                 self.budgets[module], self.bulk_budgets[module] = Budget(), Budget(2, 4)
+                if module in self.waits:
+                    self.wait_budgets[module] = Budget(2, 4)
                 if module == "messaging":
                     self.upload_budgets[module] = Budget(2, 4)
-                    self.wait_budgets[module] = Budget(2, 4)
                     # ANYM-478: a search with live waits up to 20 s; its own pool keeps sends and reads admitted.
                     self.search_budgets[module] = Budget(4, 4)
             return self
@@ -116,22 +150,15 @@ class Clients:
     async def call(self, module, operation, key, arguments):
         if module not in self.metadata:
             raise Denied("backend_unavailable", 503)
-        uploading = module == "messaging" and operation == "upload_file_chunk"
+        pool = admission(self.wait_tools, module, operation, arguments)
+        uploading = pool == "uploads"
         if uploading:
             self.upload_rate.admit(key)
-        waiting = module == "messaging" and (
-            operation == "wait_for_subscription_events"
-            or operation == "send_message" and arguments.get("wait_s", 0) > 0
-        )
-        searching = module == "messaging" and operation == "search" and arguments.get("live", "off") != "off"
-        if uploading:
-            budget, client = self.upload_budgets[module], self.uploads[module]
-        elif searching:
-            budget, client = self.search_budgets[module], self.searches[module]
-        elif waiting:
-            budget, client = self.wait_budgets[module], self.waits[module]
-        else:
-            budget, client = self.budgets[module], self.metadata[module]
+        budget, client = {
+            "uploads": (self.upload_budgets, self.uploads), "searches": (self.search_budgets, self.searches),
+            "waits": (self.wait_budgets, self.waits), "metadata": (self.budgets, self.metadata),
+        }[pool]
+        budget, client = budget[module], client[module]
         async with budget.slot():
             try:
                 async with (
