@@ -55,6 +55,19 @@ In the conversation view each message tool returns every message text once.
   timestamp precision and the complete conversation state. Unchanged by the
   compact and transcript levels, as is `view="archive"` compact output.
 
+### Own role in Telegram channels and groups
+
+`list_chats` rows carry `my_role` (`creator`, `admin`, `member`, `left`, `unknown`),
+`can_post` and `role_observed_at` from the last catalog pass; WhatsApp and private chats
+read `unknown`. Compact rows omit `my_role` when it is `unknown` and `can_post` when null;
+`role_observed_at` is in `detail=full`. `my_roles` and `can_post` filter rows and compose
+with `chat_types`, `accounts` and pagination: `list_chats(chat_types=['channel'],
+my_roles=['creator','admin'])` lists the owner's channels. With either filter, an
+`unknown_role_rows` count and `hint: role_captured_on_next_catalog_pass` report Telegram
+channels and groups the other filters keep whose role is not observed yet, so an empty
+list does not mean the owner has none. `query` also matches a channel @username, with or
+without the `@`.
+
 ### Compact queue rows
 
 A compact `list_chats` row in the conversation view states each fact once. When
