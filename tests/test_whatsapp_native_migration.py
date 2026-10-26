@@ -80,7 +80,7 @@ def test_schema29_upgrade_preserves_webjs_and_replays_both_native_provenances(sc
     for value in pending:
         assert state.apply(value)['outcome'] == 'duplicate'
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '45'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '46'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=29 ORDER BY version').fetchall() == migrations
         assert c.execute("SELECT * FROM whatsapp_identity_observations WHERE provenance='webjs_contact_cache_v1'").fetchall() == before
         assert {r['provenance'] for r in c.execute('SELECT provenance FROM whatsapp_identity_observations')} == PROVENANCES
@@ -94,10 +94,10 @@ def test_schema29_upgrade_preserves_webjs_and_replays_both_native_provenances(sc
     bundle = tmp_path / 'schema30-snapshot'
     create_snapshot(store, bundle, [sys.executable, '-c', 'print("SYNTHETIC_DUMP")'])
     manifest = verify_bundle(bundle)
-    assert manifest['schema_version'] == 45
+    assert manifest['schema_version'] == 46
     assert manifest['tables']['whatsapp_identity_observations']['rows'] == 3
     assert len(manifest['tables']) == 75
-    future = {**manifest, 'schema_version': 46}
+    future = {**manifest, 'schema_version': 47}
     bundle.joinpath('manifest.json').write_text(json.dumps(future))
     with pytest.raises(ValueError, match='unsupported_backup'):
         verify_bundle(bundle)

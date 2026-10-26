@@ -143,7 +143,9 @@ def _policy(c,account,operation,provider_chats=(),*,ready=False,live=False):
 def _chat(c,p,account,chat_id):
     if not isinstance(chat_id,str) or not 1<=len(chat_id)<=256 or not permitted(p,account,chat_id):
         raise APIError('not_found',404)
-    row=c.execute('SELECT * FROM chats WHERE id=%s AND account=%s',(chat_id,account)).fetchone()
+    # Named columns: a prepared SELECT * fails once a migration adds a chats column (046, ANYM-533).
+    row=c.execute('SELECT id,account,title,chat_type,provider_chat,purged_at FROM chats WHERE id=%s AND account=%s',
+                  (chat_id,account)).fetchone()
     if not row or not row['provider_chat']:raise APIError('not_found',404)
     return row
 
