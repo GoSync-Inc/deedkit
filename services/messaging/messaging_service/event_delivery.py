@@ -279,22 +279,35 @@ def beat(store):
 def delivery_transports(c, p):
     """Each way to consume subscription events: whether this caller may use it (`authorized`), has it set up
     (`configured`) and it works now (`operational`); `reason` names the first failing condition (ANYM-518)."""
+    import psycopg
     from .policy import OPERATION_PERMISSIONS
     permitted = set(p['permissions'])
-    beat_row = c.execute('''SELECT clock_timestamp()-beat_at<=make_interval(secs=>%s) AS fresh
-        FROM subscription_dispatcher_heartbeat WHERE id=1''', (HEARTBEAT_MAX_AGE_S,)).fetchone()
-    bound = c.execute('''SELECT coalesce(bool_or(r.enabled),false) AS enabled,count(*) AS n
-        FROM subscriptions s JOIN subscription_delivery d ON d.subscription=s.id
-        JOIN subscription_receivers r ON r.id=d.receiver
-        WHERE s.principal=%s AND s.key_id=%s AND s.state IN ('active','paused')''',
-        (p['id'], p['key_id'])).fetchone()
+    # Optional diagnostics: a failed read (timeout, privilege, missing table) marks webhook status
+    # unavailable inside its own savepoint and never fails capabilities, which every gateway call needs.
+    try:
+        with c.transaction():
+            beat_row = c.execute('''SELECT clock_timestamp()-beat_at<=make_interval(secs=>%s) AS fresh
+                FROM subscription_dispatcher_heartbeat WHERE id=1''', (HEARTBEAT_MAX_AGE_S,)).fetchone()
+            # Only bindings of subscriptions still valid for this key: not expired, same scope and permissions.
+            bound = c.execute('''SELECT coalesce(bool_or(r.enabled),false) AS enabled,count(*) AS n
+                FROM subscriptions s JOIN subscription_delivery d ON d.subscription=s.id
+                JOIN subscription_receivers r ON r.id=d.receiver
+                WHERE s.principal=%s AND s.key_id=%s AND s.state IN ('active','paused')
+                AND (s.expires_at IS NULL OR s.expires_at>clock_timestamp())
+                AND s.scope_version=%s AND s.key_permission_version=%s''',
+                (p['id'], p['key_id'], p['scope_version'], p['key_permission_version'])).fetchone()
+    except psycopg.Error:
+        beat_row = bound = None
     rows = []
     for name, tools in TRANSPORT_TOOLS.items():
         # Every consumption tool also needs read (the backend checks it before its own permission).
         authorized = all({'read', OPERATION_PERMISSIONS[tool]} <= permitted for tool in tools)
         failures = [] if authorized else ['not_authorized']
         configured = operational = True
-        if name == 'webhook':
+        if name == 'webhook' and bound is None:
+            configured = operational = False
+            failures.append('delivery_status_unavailable')
+        elif name == 'webhook':
             configured = bound['enabled']
             operational = configured and bool(beat_row and beat_row['fresh'])
             if not bound['n']:

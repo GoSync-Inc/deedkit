@@ -122,3 +122,43 @@ def test_dispatcher_pass_refreshes_the_heartbeat(seeded):
                 import psycopg
                 raise psycopg.OperationalError('synthetic')
     assert beat(Broken) is False
+
+
+# spec: ANYM-518
+def test_webhook_ignores_bindings_of_expired_or_changed_subscriptions(seeded,tmp_path):
+    from test_event_delivery import identity
+    s,_,_=seeded
+    token=identity(s);rid=bound_receiver(s,token,tmp_path);heartbeat(s,5)
+    assert transports(s,token)['webhook']['reason'] is None
+    bound='WHERE id IN (SELECT subscription FROM subscription_delivery WHERE receiver=%s)'
+    # Paused, then expired: capabilities never calls it configured, and never mutates it.
+    with s.pool.connection() as c:
+        c.execute("UPDATE subscriptions SET state='paused',expires_at=clock_timestamp()-interval '1 second' "+bound,(rid,))
+    hook=transports(s,token)['webhook']
+    assert (hook['configured'],hook['operational'],hook['reason'])==(False,False,'no_receiver_bound')
+    with s.pool.connection() as c:
+        assert c.execute('SELECT state FROM subscriptions '+bound,(rid,)).fetchone()['state']=='paused'
+        # Paused, not expired, but recorded under an older key permission version.
+        c.execute('UPDATE subscriptions SET expires_at=NULL,key_permission_version=key_permission_version+1 '+bound,(rid,))
+    assert transports(s,token)['webhook']['reason']=='no_receiver_bound'
+
+
+# spec: ANYM-518
+def test_webhook_status_read_failure_keeps_capabilities(seeded,tmp_path):
+    from test_event_delivery import identity
+    s,_,_=seeded
+    token=identity(s);bound_receiver(s,token,tmp_path);heartbeat(s,5)
+    full=s.capabilities(token)
+    # A failure confined to the delivery-status read (here: its table is gone).
+    with s.pool.connection() as c:c.execute('ALTER TABLE subscription_dispatcher_heartbeat RENAME TO heartbeat_moved')
+    try:
+        caps=s.capabilities(token)
+    finally:
+        with s.pool.connection() as c:c.execute('ALTER TABLE heartbeat_moved RENAME TO subscription_dispatcher_heartbeat')
+    rows={t['name']:t for t in caps['subscriptions']['transports']}
+    assert (rows['webhook']['configured'],rows['webhook']['operational'],rows['webhook']['reason'])==(
+        False,False,'delivery_status_unavailable')
+    assert rows['pull']==next(t for t in full['subscriptions']['transports'] if t['name']=='pull')
+    # Everything else is as before, including the operations the gateway admits by.
+    assert {k:v for k,v in caps.items() if k!='subscriptions'}=={k:v for k,v in full.items() if k!='subscriptions'}
+    assert s.capabilities(token)['subscriptions']['transports']==full['subscriptions']['transports']
