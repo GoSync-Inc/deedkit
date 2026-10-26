@@ -433,7 +433,9 @@ Tiden main only when:
    code and code spans; a spec with a raw `<pre>`, `<script>`, `<style>`,
    `<textarea>` or `<!--` block has none: a legacy
    `Accepted:` alone is refused (add `Ready:` citing it), and a text change of
-   a spec on main brings a new record, not main's in other bold or list markup.
+   a spec on main brings a new record, not main's text in any markup (main's
+   record is compared without the strict reading, and readiness text on main
+   that it cannot compare is refused until fixed by hand).
 
 Tiden merges a branch by name, with no revision a merge can be held to, so the
 job reads the preview and both listings again just before the merge and

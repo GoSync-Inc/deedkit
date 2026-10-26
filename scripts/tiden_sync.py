@@ -55,6 +55,8 @@ OPEN_CHECK = re.compile(r"\[open: (?:live|measured)\]")
 # indented, quoted or nested it may be code inside a container, and a raw HTML block may hide or quote it.
 READY = re.compile(r"(?:[-*] )?(?:\*\*)?(Ready|Accepted):(.*)")
 RAW_HTML = re.compile(r"<(?:pre|script|style|textarea|!--)", re.IGNORECASE)
+# Any readiness text at all: main's record is compared without the strict reading, which could hide it.
+ANY_READY = re.compile(r"\b(?:Ready|Accepted):")
 # What a branch copy of a spec has of its own (record, branch, times; sources compare by their fields), and the text
 # a ready merge may change: anything else differing from main is more than a text change.
 COPY_FIELDS = frozenset({"id", "branchId", "branchStatus", "createdAt", "updatedAt", "sourceId", "sourceCount",
@@ -584,6 +586,21 @@ def ready_line(content: str) -> tuple[str | None, bool]:
     return found, legacy
 
 
+def flat(text: str) -> str:
+    """Text without bold marks, with one space after a record's colon and between words."""
+    return " ".join(ANY_READY.sub(lambda match: match.group(0) + " ", text.replace("*", " ")).split())
+
+
+def stale_ready(main_content: str, line: str) -> str | None:
+    """Why a branch's `Ready:` line is no refreshed record of a spec on main: main's text has it in any markup, or main
+    has readiness text that the strict reading cannot compare."""
+    if flat(line) in flat(main_content):
+        return "keeps main's `Ready:` line; a reviewed change refreshes it"
+    if ANY_READY.search(main_content) and ready_line(main_content) == (None, False):
+        return "has a readiness record on main that cannot be compared; fix main's record by hand first"
+    return None
+
+
 def structure(spec: dict) -> dict:
     """A spec without its text and a copy's own record fields, with its sources by their fields: what a ready merge
     leaves as main has it. An absent field and a null alike."""
@@ -641,8 +658,8 @@ def ready_check(cli: str, product: str, name: str) -> tuple[set[int], dict[int, 
         if line is None:
             problems.append(f"ANYM-{number} has no `Ready:` line"
                             + (" (a legacy `Accepted:` card gets `Ready:` citing it first)" if legacy else ""))
-        elif number in main and ready_line(main[number].get("content") or "")[0] == line:
-            problems.append(f"ANYM-{number} keeps main's `Ready:` line; a reviewed change refreshes it")
+        elif number in main and (stale := stale_ready(main[number].get("content") or "", line)):
+            problems.append(f"ANYM-{number} {stale}")
     if problems:
         raise StepFailed("ready", "; ".join(problems))
     return numbers, branch, main

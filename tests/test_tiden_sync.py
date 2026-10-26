@@ -1022,6 +1022,22 @@ def test_a_ready_merge_takes_main_s_readiness_record_in_other_markup_for_the_sam
 
 
 # spec: ANYM-405
+@pytest.mark.parametrize("main_content, reason", [
+    (f"Criteria.\n+ {READY_LINE}\n", "keeps main's `Ready:` line"),
+    (f"Criteria.\n {READY_LINE}\n", "keeps main's `Ready:` line"),
+    (f"Criteria.\n\n<!-- note -->\n\n{READY_LINE}\n", "keeps main's `Ready:` line"),
+    ("Criteria.\n\n<!-- Ready: 2026-10-20, Fable r1 clean -->\n", "has a readiness record on main that cannot be"),
+], ids=["plus-item", "leading-space", "after-html-comment", "unreadable"])
+def test_a_ready_merge_compares_main_s_readiness_record_in_any_markup(server, main_content, reason):
+    ready_server(server, preview={"modifications": [{"seqNum": 60}], "stats": {"modifications": 1, "conflicts": 0}},
+                 main=[spec(12), spec(60, status="Backlog", content=main_content)],
+                 branch=[spec(60, status="Backlog", content=f"Changed criteria.\n{READY_LINE}\n", branch=True)])
+    code, out = ready_run(server)
+    assert code == 1 and f"ANYM-60 {reason}" in out, out
+    assert not server.writes()
+
+
+# spec: ANYM-405
 @pytest.mark.parametrize("change, preview, fields", [
     ({"type": "Epic"}, None, "type"),
     ({"componentId": "c-other"}, None, "componentId"),
