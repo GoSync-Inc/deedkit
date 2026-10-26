@@ -365,6 +365,23 @@ def _other_account_chat(c,p,account,phone):
     return None
 
 
+def _open_chat_refusal(c,p,account,phone,parameters):
+    """ANYM-531: why open_chat_by_phone with these parameters would be refused now, else None.
+    The admission checks of execution, as reads only; it never dispatches a lookup."""
+    if (set(_required_permissions('send','open_chat_by_phone',parameters))-set(p['permissions'])
+            or p['chat_ids'] is not None):return {'next_action':'key_cannot_open_new_chats'}
+    try:_policy(c,account,'open_chat_by_phone',ready=True)
+    except APIError as exc:
+        if exc.code=='operation_disabled':
+            return {'next_action':'ask_operator_to_enable_open_chat_by_phone','account':account}
+        return {'next_action':exc.code}
+    try:_phone_policy(c,account,phone)
+    except APIError:return {'next_action':'chat_not_collected'}
+    allowed,resets=_lookup_budget(c,account,'')
+    if not allowed:return {'next_action':'rate_limited','resets_in_seconds':resets}
+    return None
+
+
 def phone_next_step(c,p,account,reference):
     """ANYM-531: the exact next call for a phone reference that is not found, or why there is none.
     Archive and policy reads only: it never dispatches a lookup. Only the caller's normalized number is echoed."""
@@ -380,35 +397,34 @@ def phone_next_step(c,p,account,reference):
     if row['platform']!='whatsapp' or account_provider(c,account,row['platform'])!='whatsmeow':
         return {'hint':'native_whatsapp_accounts_only','next_action':'use_username_or_existing_chat'}
     parameters={'phone':'+'+phone,'create':False}
-    if (set(_required_permissions('send','open_chat_by_phone',parameters))-set(p['permissions'])
-            or p['chat_ids'] is not None):return {'next_action':'key_cannot_open_new_chats'}
-    policy=c.execute('SELECT enabled,operations_enabled FROM account_policies WHERE account=%s',(account,)).fetchone()
-    if not policy or not policy['enabled'] or 'open_chat_by_phone' not in policy['operations_enabled']:
-        return {'next_action':'ask_operator_to_enable_open_chat_by_phone','account':account}
-    try:_phone_policy(c,account,phone)
-    except APIError:return {'next_action':'chat_not_collected'}
-    allowed,resets=_lookup_budget(c,account,'')
-    if not allowed:return {'next_action':'rate_limited','resets_in_seconds':resets}
+    refusal=_open_chat_refusal(c,p,account,phone,parameters)
+    if refusal:return refusal
     return {'next_action':'open_chat_by_phone_then_follow_next_call',
         'next_call':{'tool':'execute_messenger_operation','arguments':{'account':account,
             'operation':'open_chat_by_phone','parameters':parameters},'caller_supplies':['request_id']}}
 
 
-def _open_chat_next(row,p=None):
-    """ANYM-531: the next call after an open_chat_by_phone receipt; the shortest permitted path."""
-    if row['operation']!='open_chat_by_phone':return None
+def _open_chat_next(row,c=None,p=None):
+    """ANYM-531: the next call after an open_chat_by_phone receipt, the shortest permitted path,
+    as (next_call, refusal); a create step that execution would refuse now gives its refusal instead."""
+    if row['operation']!='open_chat_by_phone':return None,None
     if row['status'] in ('queued','dispatching'):
-        return {'tool':'get_messenger_operation','arguments':{'operation_id':row['id']},'caller_supplies':[]}
+        return {'tool':'get_messenger_operation','arguments':{'operation_id':row['id']},'caller_supplies':[]},None
     data=(row['result'] or {}).get('data') if row['status']=='succeeded' else None
-    if not isinstance(data,dict) or data.get('on_whatsapp') is not True:return None
+    if not isinstance(data,dict) or data.get('on_whatsapp') is not True:return None,None
     if isinstance(data.get('chat_id'),str):
-        if p is not None and 'read' not in p['permissions']:return None
+        if p is not None and 'read' not in p['permissions']:return None,None
         return {'tool':'preview_message','arguments':{'account':row['account'],'chat_id':data['chat_id']},
-            'caller_supplies':['text']}
+            'caller_supplies':['text']},None
+    if c is None or p is None:return None,None
+    phone=row['payload']['parameters']['phone'];parameters={'phone':'+'+phone,'create':True}
+    try:
+        with c.transaction():refusal=_open_chat_refusal(c,p,row['account'],phone,parameters)
+    except Exception:return None,None  # The suggestion never makes a receipt unreadable.
+    if refusal:return None,refusal
     # A new stable request ID for this separately confirmed intent, never a replacement of an uncertain one.
     return {'tool':'execute_messenger_operation','arguments':{'account':row['account'],'operation':'open_chat_by_phone',
-        'parameters':{'phone':'+'+row['payload']['parameters']['phone'],'create':True}},
-        'caller_supplies':['request_id'],'owner_confirmation_required':True}
+        'parameters':parameters},'caller_supplies':['request_id'],'owner_confirmation_required':True},None
 
 
 def _digest(p,payload):
@@ -456,14 +472,15 @@ def _public(row,c=None,p=None):
         from .outgoing import project_reference
         actual,state=project_reference(c,p,row['account'],answer['data']['archive_reference'])
         answer={**answer,'data':{**answer['data'],'archive_reference':actual,'archive_reference_state':state}}
-    step=_open_chat_next(row,p)
-    return serial({**({'next_call':step} if step else {}),'operation_id':row['id'],'operation':row['operation'],'account':row['account'],
+    step,refusal=_open_chat_next(row,c,p)
+    return serial({**({'next_call':step} if step else {}),**{k:v for k,v in (refusal or {}).items() if k!='next_action'},'operation_id':row['id'],'operation':row['operation'],'account':row['account'],
         'chat_id':row['chat'],'message_id':row['message'],'expected_revision':row['expected_revision'],
         'status':row['status'],'created_at':row['created_at'],'expires_at':row['expires_at'],
         'finished_at':row['finished_at'],'error_code':row['error_code'],'result':answer,
         'request_id':row['request_id'],'preview_digest':row['preview_digest'],
         'owner_approval_verified_by_server':False,'automatic_retry':False,
-        'next_action':'get_messenger_operation' if row['status'] in ('queued','dispatching') else
+        'next_action':refusal['next_action'] if refusal else
+            'get_messenger_operation' if row['status'] in ('queued','dispatching') else
             'verify_provider_state_before_any_new_action' if row['status']=='unknown' else 'none'})
 
 

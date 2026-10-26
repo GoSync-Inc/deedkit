@@ -245,6 +245,7 @@ ever inside `arguments`. The only number echoed is the caller's own, normalized.
 | The operation is not enabled on the account | `next_action: ask_operator_to_enable_open_chat_by_phone`, `account` |
 | The key or the gateway lacks the operation, `send` or full-account scope | `next_action: key_cannot_open_new_chats` |
 | The hourly lookups are spent | `next_action: rate_limited`, `resets_in_seconds` |
+| The native collector is not connected | `next_action: sender_not_ready` |
 | The collection policy excludes the number | `next_action: chat_not_collected` |
 | The reference is not a valid international number | `next_action: invalid_phone` |
 | Telegram or a whatsapp-web.js account | `hint: native_whatsapp_accounts_only`, `next_action: use_username_or_existing_chat` |
@@ -253,7 +254,8 @@ The operation receipt carries `next_call` too: a queued or dispatching check nam
 `get_messenger_operation` with its `operation_id`; a registered number without a chat
 names the same operation with `create: true` and `owner_confirmation_required: true`
 (the owner confirms the number first; a new request ID, never a replacement of an
-uncertain one); a created or existing chat names `preview_message` with its
+uncertain one), only while execution would admit it now: otherwise the receipt has
+no `next_call` and its `next_action` is the refusal from the table above; a created or existing chat names `preview_message` with its
 `chat_id`. Building a suggestion reads the archive and policy only: it never
 dispatches a lookup, and if it fails the plain `not_found` is returned. A
 suggestion is not permission to send; the owner confirms before create and before send.

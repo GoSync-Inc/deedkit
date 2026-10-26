@@ -182,7 +182,7 @@ class Dispatch:
             usable = bool(allowed) and ("operation" not in arguments or arguments["operation"] in allowed)
         if usable:
             value["next_call"] = {**step, "tool": name}
-        elif value.get("error") == "not_found":
+        elif value.get("error") == "not_found" or arguments.get("operation") == "open_chat_by_phone":
             value["next_action"] = "key_cannot_open_new_chats"
         return value
 

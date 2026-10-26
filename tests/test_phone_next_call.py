@@ -226,6 +226,58 @@ def test_no_next_call_when_it_would_be_refused(native, refusal, expected):
     assert commands(s) == count
 
 
+def sender_down(s, state, how):
+    if how == 'disconnected':
+        state.phase('connection', 'retry_wait', 'provider_disconnected')
+    else:
+        with s.pool.connection() as c:
+            c.execute("UPDATE collector_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE account=%s",
+                      (ACCOUNT,))
+
+
+# spec: ANYM-531
+@pytest.mark.parametrize('how', ['disconnected', 'lease_expired'])
+def test_no_next_call_while_the_sender_is_not_ready(native, how):
+    s, archive, state, key = native
+    sender_down(s, state, how)
+    count = commands(s)
+    for error in both(s, key, '+'+PHONE):
+        assert error['error'] == 'not_found' and 'next_call' not in error
+        assert error['next_action'] == 'sender_not_ready' and error['hint'] == 'open_chat_by_phone'
+    # The suggestion would have been refused the same way.
+    with pytest.raises(APIError, match='sender_not_ready'):
+        s.execute_messenger_operation(key, **OPEN['arguments'], request_id='next-ready-0001')
+    assert commands(s) == count
+
+
+# spec: ANYM-531
+@pytest.mark.parametrize('change,expected', [
+    ('operation_disabled', {'next_action': 'ask_operator_to_enable_open_chat_by_phone', 'account': ACCOUNT}),
+    ('collection_excludes', {'next_action': 'chat_not_collected'}),
+    ('sender_disconnected', {'next_action': 'sender_not_ready'}),
+])
+def test_a_receipt_offers_the_create_step_only_while_it_would_be_admitted(native, change, expected):
+    s, archive, state, key = native
+    queued = s.execute_messenger_operation(key, **OPEN['arguments'], request_id='next-recheck-0001')
+    dispatch(state, answer())
+    assert s.get_messenger_operation(key, operation_id=queued['operation_id'])['next_call']['arguments'][
+        'parameters']['create'] is True
+    if change == 'operation_disabled':
+        s.set_messenger_operations(ACCOUNT, [])
+    elif change == 'collection_excludes':
+        with s.pool.connection() as c:
+            c.execute('UPDATE account_policies SET exclude_chats=%s WHERE account=%s', ([PN], ACCOUNT))
+    else:
+        sender_down(s, state, 'disconnected')
+    receipt = s.get_messenger_operation(key, operation_id=queued['operation_id'])
+    # The receipt stays readable; only the refused next step is withheld, with its reason.
+    assert receipt['status'] == 'succeeded' and receipt['result']['data']['on_whatsapp'] is True
+    assert 'next_call' not in receipt and {k: receipt.get(k) for k in expected} == expected
+    with pytest.raises(APIError):
+        s.execute_messenger_operation(key, **OPEN['arguments'] | {'parameters': {'phone': '+'+PHONE, 'create': True}},
+                                      request_id='next-recheck-0002')
+
+
 # spec: ANYM-531
 @pytest.mark.parametrize('platform', ['webjs', 'telegram'])
 def test_other_adapters_get_the_supported_kind_instead_of_a_call(seeded, platform):

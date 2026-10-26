@@ -16,6 +16,8 @@ HEADERS = {"Authorization": "Bearer gateway-a"}
 PHONE = "+12025550147"  # NANP fictional 555-01xx range
 OPEN = {"account": "synthetic", "operation": "open_chat_by_phone", "parameters": {"phone": PHONE, "create": False}}
 OPERATION_ID = "op_" + "a" * 32
+CREATE_ID = "op_" + "e" * 32
+CREATE = {**OPEN, "parameters": {"phone": PHONE, "create": True}}
 CHAT_ID = "chat_" + "b" * 32
 TOOLS = ["resolve_reference", "send_message", "preview_message", "execute_messenger_operation",
          "get_messenger_operation", "list_messenger_operations"]
@@ -34,15 +36,26 @@ def backend(request, seen):
             "next_action": "open_chat_by_phone_then_follow_next_call",
             "next_call": {"tool": "execute_messenger_operation", "arguments": OPEN, "caller_supplies": ["request_id"]}})
     if operation == "execute_messenger_operation":
+        # The check (create=false) and the creation (create=true) are separate operations.
+        operation_id = CREATE_ID if args["parameters"]["create"] else OPERATION_ID
         return httpx.Response(200, json={
-            "operation": "open_chat_by_phone", "operation_id": OPERATION_ID, "status": "queued",
+            "operation": "open_chat_by_phone", "operation_id": operation_id, "status": "queued",
             "request_id": args["request_id"], "next_action": "get_messenger_operation",
-            "next_call": {"tool": "get_messenger_operation", "arguments": {"operation_id": OPERATION_ID},
+            "next_call": {"tool": "get_messenger_operation", "arguments": {"operation_id": operation_id},
                           "caller_supplies": []}})
-    if operation == "get_messenger_operation":
+    if operation == "get_messenger_operation" and args["operation_id"] == OPERATION_ID:
+        # A registered number without a chat yet: the owner confirms the number before creation.
         return httpx.Response(200, json={
             "operation": "open_chat_by_phone", "operation_id": OPERATION_ID, "status": "succeeded",
+            "result": {"outcome": "confirmed", "data": {"on_whatsapp": True, "verified_name": None}},
+            "next_action": "none",
+            "next_call": {"tool": "execute_messenger_operation", "arguments": CREATE,
+                          "caller_supplies": ["request_id"], "owner_confirmation_required": True}})
+    if operation == "get_messenger_operation":
+        return httpx.Response(200, json={
+            "operation": "open_chat_by_phone", "operation_id": CREATE_ID, "status": "succeeded",
             "result": {"outcome": "confirmed", "data": {"on_whatsapp": True, "chat_id": CHAT_ID, "existing": False}},
+            "next_action": "none",
             "next_call": {"tool": "preview_message", "arguments": {"account": "synthetic", "chat_id": CHAT_ID},
                           "caller_supplies": ["text"]}})
     return httpx.Response(200, json={"account": args["account"], "chat_id": args["chat_id"], "preview_digest": "d" * 64})
@@ -99,8 +112,18 @@ def test_each_next_call_names_the_gateway_tool_and_runs_against_the_backend(tmp_
         assert seen[-1] == ("execute_messenger_operation", {**OPEN, "request_id": "synthetic-phone-1", "chat_id": "",
                             "message_id": "", "expected_revision": 0, "preview_digest": ""})
         assert queued["next_call"]["tool"] == "messages_get_messenger_operation"
-        done = follow(client, schemas, queued["next_call"])
+        checked = follow(client, schemas, queued["next_call"])
         assert seen[-1] == ("get_messenger_operation", {"operation_id": OPERATION_ID})
+        create = checked["next_call"]
+        assert create == {"tool": "messages_execute_messenger_operation", "arguments": CREATE,
+                          "caller_supplies": ["request_id"], "owner_confirmation_required": True}
+        # A new stable request ID for the separately confirmed creation.
+        created = follow(client, schemas, create, request_id="synthetic-phone-2")
+        assert seen[-1] == ("execute_messenger_operation", {**CREATE, "request_id": "synthetic-phone-2", "chat_id": "",
+                            "message_id": "", "expected_revision": 0, "preview_digest": ""})
+        assert created["next_call"]["arguments"] == {"operation_id": CREATE_ID}
+        done = follow(client, schemas, created["next_call"])
+        assert seen[-1] == ("get_messenger_operation", {"operation_id": CREATE_ID})
         assert done["next_call"]["tool"] == "messages_preview_message"
         follow(client, schemas, done["next_call"], text="Synthetic first message")
         assert seen[-1][0] == "preview_message" and seen[-1][1]["chat_id"] == CHAT_ID
@@ -121,6 +144,18 @@ def test_no_next_call_where_the_gateway_would_refuse_it(tmp_path, actions, permi
     assert "next_call" not in error.json() and error.json()["next_action"] == "key_cannot_open_new_chats"
     assert error.json()["hint"] == "open_chat_by_phone"
     assert [operation for operation, _ in seen] == ["resolve_reference"]
+
+
+# spec: ANYM-531
+def test_a_receipt_never_suggests_a_creation_the_gateway_would_refuse(tmp_path):
+    # The profile shows receipts but hides the operation tool.
+    app, seen = setup(tmp_path, tools=["resolve_reference", "get_messenger_operation"])
+    with TestClient(app) as client:
+        receipt = client.post("/v1/messages_get_messenger_operation", json={"operation_id": OPERATION_ID},
+                              headers=HEADERS)
+    assert receipt.status_code == 200 and receipt.json()["status"] == "succeeded"
+    assert "next_call" not in receipt.json() and receipt.json()["next_action"] == "key_cannot_open_new_chats"
+    assert [operation for operation, _ in seen] == ["get_messenger_operation"]
 
 
 # spec: ANYM-531
