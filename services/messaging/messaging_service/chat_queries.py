@@ -166,7 +166,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
         include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
         only_questions=False,only_unread=False,selected_chat=None,include_dismissed=False,
-        view='archive',exclude_likely_broadcasts=False,include_muted=False,promotional='exclude'):
+        view='archive',exclude_likely_broadcasts=False,include_muted=False,promotional='exclude',
+        my_roles=None,can_post=None):
     from .store import APIError,bounded,date_bound,serial
     bounded(limit);valid_text(after,4096);valid_text(query,200)
     options(view)
@@ -186,6 +187,13 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     exclude_chats=filter_values(exclude_chats);exclude_senders=filter_values(exclude_senders)
     if chat_types is not None and any(t not in ('private','group','channel','unknown') for t in chat_types):
         raise APIError('invalid_filter')
+    # ANYM-533: the account's own role in a Telegram channel or group; before migration 046 every row reads unknown.
+    from .chat_roles import CHAT_ROLE_SCHEMA,ROLES
+    from .store import schema_version
+    my_roles=filter_values(my_roles);roles_ready=schema_version(c)>=CHAT_ROLE_SCHEMA
+    if my_roles is not None and any(r not in ROLES for r in my_roles) or can_post is not None and type(can_post) is not bool:
+        raise APIError('invalid_filter')
+    role_sql="coalesce(c.my_role,'unknown')" if roles_ready else "'unknown'::text"
     lower,upper=date_bound(from_time),date_bound(to_time)
     if lower and upper and lower>=upper:raise APIError('invalid_date_range')
     scope,args=scope_filter(p,'c',chat_column='id');clauses=[scope]
@@ -230,13 +238,23 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     if not selected_chat:clauses.append('c.purged_at IS NULL')
     if query:
         pattern='%'+query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
-        match="(c.title ILIKE %s ESCAPE E'\\\\' OR "+raw_title_sql()+" AND "+peer_name_sql()+" ILIKE %s ESCAPE E'\\\\')"
+        match="(c.title ILIKE %s ESCAPE E'\\\\' OR "+raw_title_sql()+" AND "+peer_name_sql()+" ILIKE %s ESCAPE E'\\\\'"
+        matched=[pattern,pattern];name=query.removeprefix('@')
+        if roles_ready and name:
+            # A channel's @username, with or without the @ (ANYM-533).
+            match+=" OR c.username ILIKE %s ESCAPE E'\\\\'"
+            matched.append('%'+name.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%')
+        match+=')'
         # A listed row also matches by its hidden alias chat's title.
         found=[hidden[r['id']] for r in c.execute('SELECT c.id FROM chats c WHERE c.id=ANY(%s) AND '+match,
-            [list(hidden),pattern,pattern])] if hidden else []
+            [list(hidden),*matched])] if hidden else []
         clauses.append('('+match+(' OR c.id=ANY(%s)' if found else '')+')')
-        args.extend([pattern,pattern,*([found] if found else [])])
+        args.extend([*matched,*([found] if found else [])])
     if chat_types is not None:clauses.append("coalesce(c.chat_type,'unknown')=ANY(%s)");args.append(chat_types)
+    # Literals from ROLES, so the unknown-role count below can drop them without touching args.
+    role_clauses=[*([role_sql+' IN ('+','.join(sql_literal(r) for r in my_roles)+')'] if my_roles is not None else []),
+        *(['c.can_post IS '+('TRUE' if can_post else 'FALSE') if roles_ready else 'false'] if can_post is not None else [])]
+    clauses.extend(role_clauses)
     if exclude_channels:clauses.append("c.chat_type IS DISTINCT FROM 'channel'")
     if exclude_chats is not None:
         # Excluding either chat of a conversation excludes the conversation.
@@ -251,7 +269,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         **({'exclude_likely_broadcasts':True} if exclude_likely_broadcasts else {}),
         **({'include_muted':True} if include_muted else {}),
         **({'promotional':promotional} if awaiting_reply else {}),
-        **({'score_formula':SCORE_FORMULA} if order=='priority' else {})})
+        **({'score_formula':SCORE_FORMULA} if order=='priority' else {}),
+        **({'my_roles':my_roles} if my_roles is not None else {}),**({'can_post':can_post} if can_post is not None else {})})
     if view=='conversation':
         binding=cursor_binding(p,'chats-conversation-v1',{'archive_binding':binding})
     pos=decode_cursor(after,binding) if after and order!='id' else None
@@ -463,6 +482,13 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     if ranked:
         muted_total=c.execute('SELECT count(*) AS n'+base_for(ranked)+' AND '.join([*(unmuted_pending if v==pending else v for v in clauses),
             '('+chat_muted+' OR attention.mute_rank=1)']),[*ranked_base_args,*args]).fetchone()['n']
+    unknown_roles=None
+    if role_clauses:
+        # An empty filtered list must not read as "no such channels": count the Telegram channels and groups
+        # the other filters keep whose role is not observed yet (ANYM-533).
+        unknown_roles=c.execute('SELECT count(*) AS n'+base+' AND '.join([*(v for v in clauses if v not in role_clauses),
+            role_sql+"='unknown' AND c.chat_type IN ('group','channel') AND a.platform='telegram'"]),
+            [*base_args,*args]).fetchone()['n']
     if after:
         cid=valid_text(after,empty=False) if order=='id' else position_text(pos.get('id'))
         if not c.execute('SELECT 1 FROM chats c WHERE c.id=%s AND '+scope,[cid,*scope_filter(p,'c',chat_column='id')[1]]).fetchone():raise APIError('not_found',404)
@@ -487,6 +513,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         base=base.replace(' FROM chats c JOIN accounts a',' FROM chat_page c JOIN accounts a',1)
         query_args=[*args,limit+1,*base_args,limit+1];where='true'
     rows=c.execute(prefix+'''SELECT c.id,c.account,c.title,c.provider_chat AS provider_chat_id,c.chat_type AS type,
+        '''+role_sql+''' AS my_role,'''+('c.can_post,c.role_observed_at,' if roles_ready else
+          'NULL::boolean AS can_post,NULL::timestamptz AS role_observed_at,')+'''
         last.sent_at AS last_activity,last.id AS last_message_id,last.direction AS last_message_direction,
         last.snippet AS last_message_snippet,ro.unread_count AS provider_unread_count,ro.unread_count AS unread_count,
         '''+unread+''' AS provider_unread,ro.observed_at AS read_state_observed_at,ro.basis AS read_state_basis,
@@ -621,4 +649,5 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         'awaiting_reply_scope':'private_and_explicit_group_attention' if awaiting_reply else None,
         'group_attention_coverage':'observed_mentions_and_replies_only',
         'catalog_coverage':'archived_chats_only','provider_read_state':'per_chat_observation_or_unknown',
+        **({'unknown_role_rows':unknown_roles,'hint':'role_captured_on_next_catalog_pass'} if unknown_roles else {}),
         **coverage(store,c,p,include_coverage)})

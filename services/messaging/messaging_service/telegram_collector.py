@@ -348,7 +348,10 @@ class TelethonProvider:
                 'read_inbox_max_id':getattr(raw,'read_inbox_max_id',None),
                 'is_self_chat':bool(getattr(getattr(dialog,'entity',None),'is_self',False)),
                 'basis':'telegram_dialog'}
-            batch.append((str(dialog.id),kind,dialog.name or str(dialog.id),chat_type,observation))
+            # The account's role travels beside the read observation, from the entity this page loaded (ANYM-533).
+            from .chat_roles import observation as role
+            batch.append((str(dialog.id),kind,dialog.name or str(dialog.id),chat_type,observation,
+                None if chat_type=='private' else role(getattr(dialog,'entity',None),chat_type)))
             if len(batch)>=100:yield batch;batch=[]
         if batch:yield batch
 
