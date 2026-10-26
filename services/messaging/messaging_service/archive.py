@@ -119,6 +119,7 @@ class Archive:
                 e={**e,'deleted':True,'body':'','media':[],
                    'updated_at':max(tombstone,datetime.fromisoformat(e['updated_at'])).isoformat()}
                 if 'formatting' in e:e['formatting']=unknown_formatting()
+                if 'contact' in e.get('metadata',{}):e['metadata']={k:v for k,v in e['metadata'].items() if k!='contact'}
             previous=c.execute('SELECT outcome FROM ingest_receipts WHERE digest=%s',(receipt,)).fetchone()
             if previous: return {'outcome':'duplicate','message':mid}
             chat_type=e.get('metadata',{}).get('chat_type')

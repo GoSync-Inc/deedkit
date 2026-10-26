@@ -56,6 +56,25 @@ def sort_key(row):
     return row['sent_at'],number,row['id']
 
 
+def contact_lines(block):
+    """One line per shared contact (ANYM-529): name, first phone and its messenger, (+N) for more."""
+    if not isinstance(block,dict) or not isinstance(block.get('contacts'),list):return []
+    lines=[]
+    for contact in block['contacts']:
+        phones=contact.get('phones') or []
+        line='[Контакт] '+(contact.get('name') or '')
+        if phones:
+            first=phones[0]
+            line+=(': ' if contact.get('name') else '')+first['number']
+            if first.get('whatsapp_id'):line+=' (WhatsApp)'
+            elif contact.get('telegram_user_id'):line+=' (Telegram)'
+            if len(phones)>1:line+=' (+'+str(len(phones)-1)+')'
+        elif contact.get('telegram_user_id'):line+=' (Telegram)'
+        lines.append(line)
+    if lines and block.get('status')=='truncated':lines[-1]+=' [обрезано]'
+    return lines
+
+
 def present_message(row,position):
     body=row.get('body',row.get('snippet','')) or ''
     observed=row.get('message_kind')
@@ -92,7 +111,12 @@ def present_message(row,position):
             elif states & {'deferred'}:
                 label+='; файл доступен по запросу'
             else:label+='; файл пока недоступен'
-        row['display_text']=(body+'\n' if body else '')+'['+label+']'
+        lines=contact_lines(row.get('contact')) if kind=='contact' else []
+        if lines:
+            # WhatsApp sends the card's display name as the body; do not repeat it.
+            if body in {c.get('name') for c in row['contact']['contacts']}:body=''
+            row['display_text']=(body+'\n' if body else '')+'\n'.join(lines)
+        else:row['display_text']=(body+'\n' if body else '')+'['+label+']'
     else:row['display_text']=body
     row['timestamp_precision']=row.get('timestamp_resolution') or 'unknown'
     row.setdefault('order_basis','timestamp_only');row.setdefault('order_status','timestamp_only')

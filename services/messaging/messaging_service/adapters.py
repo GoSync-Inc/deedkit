@@ -8,7 +8,7 @@ import math
 import os
 import re
 
-from .envelope import validate
+from .envelope import E164, contact_block, validate
 from .incoming_formatting import telegram as telegram_formatting, unknown as unknown_formatting
 
 
@@ -78,6 +78,38 @@ def forward_origin_capture():
 def provider_flags_capture():
     # Off until the release a rollback would return to accepts sender_is_business_or_verified (ANYM-276).
     return os.environ.get('ANYMSG_CAPTURE_PROVIDER_FLAGS')=='1'
+
+
+def contact_card_capture():
+    # Off until the release a rollback would return to accepts metadata.contact (ANYM-529).
+    return os.environ.get('ANYMSG_CAPTURE_CONTACT_CARDS')=='1'
+
+
+def contact_text(value):
+    """One card display field, as whatsmeow's contactText: no control characters, at most 256 code points."""
+    value=re.sub(r'[\x00-\x1f\x7f]',' ',value if isinstance(value,str) else '').strip()
+    return value[:256],len(value)>256
+
+
+def normalize_phone(raw):
+    """E.164 only when written with + or 00; no country is guessed (whatsmeow normalizePhone)."""
+    value=raw.strip()
+    if value[:4].lower()=='tel:':value=value[4:].strip()
+    compact=re.sub(r'[ \t\-.()/ ]','',value)
+    if compact.startswith('00'):compact='+'+compact[2:]
+    return (compact,True) if E164.fullmatch(compact) else (raw.strip(),False)
+
+
+def telegram_contact(media):
+    """MessageMediaContact as stated by Telegram; never a lookup of the shared user."""
+    name,cut=contact_text(' '.join(x for x in (media.first_name,media.last_name) if isinstance(x,str) and x))
+    contact={'name':name,'phones':[]}
+    number,normalized=normalize_phone(media.phone_number if isinstance(media.phone_number,str) else '')
+    number,number_cut=contact_text(number)
+    if number:contact['phones'].append({'number':number,'normalized':normalized})
+    if type(media.user_id) is int and media.user_id>0:contact['telegram_user_id']=str(media.user_id)
+    if not name and not contact['phones']:return {'status':'unavailable','contacts':[]}
+    return {'status':'truncated' if cut or number_cut else 'parsed','contacts':[contact]}
 
 
 def telegram_forward_origin(message):
@@ -165,6 +197,8 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
     kind,provider_type=telegram_kind(message,media_kind)
     forwarded=getattr(message,'fwd_from',None) is not None
     forward=telegram_forward_origin(message) if forwarded and forward_origin_capture() else None
+    shared=getattr(message,'media',None)
+    contact=telegram_contact(shared) if isinstance(shared,types.MessageMediaContact) and contact_card_capture() else None
     return validate({'account':account,'platform':'telegram','chat':str(message.chat_id),
         'chat_title':(chat_title if chat_title and chat_title!=str(message.chat_id) else observed_title) or str(message.chat_id),
         'provider_id':str(message.id),
@@ -187,6 +221,7 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
             'mentions_owner':getattr(message,'mentioned',None),
             'forwarded':forwarded,
             **({'forward_origin':forward} if forward else {}),
+            **({'contact':contact} if contact else {}),
             # Only a stated flag is captured; an absent one is unknown, never "not verified".
             **({'sender_is_business_or_verified':True} if provider_flags_capture() and isinstance(entity,types.User)
                 and (getattr(entity,'verified',None) is True or getattr(entity,'support',None) is True) else {}),
@@ -229,6 +264,11 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
     forward=event.get('forwardOrigin') if event.get('forwarded') is True else None
     if isinstance(forward,dict) and 'sender_name' in forward:
         forward={**forward,'sender_name':display_text(forward['sender_name'],256) or None}
+    contact=event.get('contactCard') if kind=='contact' and change!='delete' else None
+    if contact is not None:
+        # A card the archive cannot accept never quarantines the message itself.
+        try:contact=contact_block(contact)
+        except ValueError:contact={'status':'parse_failed','contacts':[]}
     return validate({'account':account,'platform':'whatsapp','chat':event['chatId'],
         'chat_title':display_text(event.get('chatName'),512) or event['chatId'],'provider_id':event['messageId'],
         'sender':event.get('senderId') or '','body':body,
@@ -248,5 +288,6 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
                     'reply_to_owner':event.get('replyToOwner'),
                     'forwarded':event.get('forwarded'),
                     **({'forward_origin':forward} if forward is not None else {}),
+                    **({'contact':contact} if contact is not None else {}),
                     **({'sender_is_business_or_verified':True} if event.get('senderIsBusiness') is True else {}),
                     'media_kind':event.get('mediaKind')}})

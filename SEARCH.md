@@ -109,6 +109,24 @@ direction, and known reply/forward/media fields. Unknown metadata remains null.
 Older messages acquire provider metadata as they are observed again; this does
 not invent a new content revision.
 
+### Shared contact cards
+
+A contact message (`kind: contact`) carries the shared cards as a closed `contact`
+block (ANYM-529): `status` (`parsed`, `truncated`, `parse_failed`) and `contacts`,
+each `{name, vcard_name?, telegram_user_id?, phones: [{number, normalized, type?,
+whatsapp_id?}]}`. `number` is E.164 with `normalized: true` only when the card
+wrote it with `+` or `00`; otherwise it is the card's text with `normalized:
+false` (no country is guessed). At most 20 contacts, 10 phones each, 256
+characters per field and 16 KiB per block. A contact message without the block
+(archived before capture, or the collector could not read the card) has
+`contact_details: "unavailable"` in full rows: an unknown card, never a card
+without a number. `display_text` shows one line per contact, `[Контакт] <name>:
+<first phone> (WhatsApp|Telegram) (+N)`, with `[обрезано]` when truncated. A query
+matches a card by contact name, or by phone digits: equal, or a suffix of at
+least 6 digits (leading zeros of the query dropped, so a local number finds the
+E.164 one). The block has the body's scopes, retention and deletion: a deleted
+message has no block.
+
 ### Forwarded messages
 
 A forwarded message's `sender`, `sender_name` and `direction` describe the

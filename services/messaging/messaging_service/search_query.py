@@ -184,6 +184,11 @@ def shape_messages(rows, *, compact=False, body_chars=None):
         if body is not None and body_chars is not None:
             row['body_truncated']=len(body)>body_chars
             row['body']=body[:body_chars]
+        if 'contact' in row:
+            # ANYM-529: no block is "not captured", never "the card had no number".
+            if row['contact'] is None:
+                row.pop('contact')
+                if row.get('message_kind')=='contact' and not compact:row['contact_details']='unavailable'
         if compact:
             if body is not None:row.setdefault('snippet',body[:320])
             row.pop('body',None)

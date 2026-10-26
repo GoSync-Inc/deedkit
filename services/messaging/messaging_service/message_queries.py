@@ -1,6 +1,8 @@
 """Scoped message queries and presentation, separate from authentication/ACK."""
 from __future__ import annotations
 
+import re
+
 from .chat_queries import title_sql
 from .chat_titles import retitle
 from .policy import scope_filter, targets
@@ -41,10 +43,26 @@ META = '''nullif(sp.display_name,'') AS sender_name,nullif(sp.username,'') AS us
     coalesce(mm.metadata,mr.snapshot->'metadata')->>'timestamp_resolution' AS timestamp_resolution,
     CASE WHEN jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'media_duration_seconds')='number'
       THEN (coalesce(mm.metadata,mr.snapshot->'metadata')->>'media_duration_seconds')::double precision END AS media_duration_seconds,
+    CASE WHEN NOT m.deleted AND coalesce(mm.metadata,mr.snapshot->'metadata')->>'message_kind'='contact'
+        AND jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'contact')='object'
+      THEN coalesce(mm.metadata,mr.snapshot->'metadata')->'contact' END AS contact,
     (SELECT platform FROM accounts WHERE id=m.account) AS platform,
     (SELECT observed_at FROM message_revisions WHERE message=m.id AND revision=1) AS first_observed_at,
     'archive_revision_observation'::text AS first_observed_at_basis'''
 BASE = 'm.id,m.account,m.chat,m.sender,m.body,m.sent_at,m.revision,m.direction'
+# ANYM-529: a shared contact matches by name, or by phone digits: equal or a suffix of at least 6 digits.
+CONTACT_MATCH = '''EXISTS(SELECT 1 FROM jsonb_array_elements(x.metadata->'contact'->'contacts') ct
+    WHERE lower(ct->>'name') LIKE lower(q.literal_pattern) ESCAPE E'\\\\'
+      OR lower(ct->>'vcard_name') LIKE lower(q.literal_pattern) ESCAPE E'\\\\'
+      OR (%s::text IS NOT NULL AND EXISTS(SELECT 1 FROM jsonb_array_elements(ct->'phones') ph
+        WHERE regexp_replace(ph->>'number','[^0-9]','','g') LIKE '%%'||%s::text OR ph->>'whatsapp_id' LIKE '%%'||%s::text)))'''
+
+
+def contact_digits(query):
+    """Digits of a phone-like query, leading zeros dropped (00 prefix, local trunk 0); None below 6 digits."""
+    if not re.fullmatch(r'[0-9+()\-.\s]+',query):return None
+    digits=re.sub(r'[^0-9]','',query).lstrip('0')
+    return digits if len(digits)>=6 else None
 
 # ANYM-273: forwarded copies group only by the provider-stated origin, never by text alone. Keys:
 # p = origin chat and message ID, u = origin sender, second and text hash (one sender can post two
@@ -339,16 +357,23 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         match_type="'trigram_fallback'::text"
     else:
         condition=plan.predicate('m')
-    base_sql='SELECT m.id,m.sent_at,m.revision,'+(numeric_order_sql('m') if conversation else '0::bigint')+' AS source_order,'+score+' AS score FROM messages m '+extra_join+' CROSS JOIN search_query q WHERE '+\
+    head='SELECT m.id,m.sent_at,m.revision,'+(numeric_order_sql('m') if conversation else '0::bigint')+' AS source_order,'+score+' AS score FROM '
+    base_sql=head+'messages m '+extra_join+' CROSS JOIN search_query q WHERE '+\
         ' AND '.join(clauses)+' AND '+condition
-    ctes=[plan.cte]
+    ctes=[plan.cte];match_args=args
     if fuzzy_used:
         ctes.append('matches AS MATERIALIZED ('+base_sql+' ORDER BY score DESC,m.sent_at DESC,m.id DESC LIMIT 200)')
     elif plan.query:
+        # ANYM-529: a shared contact matches by its name or phone digits, under the same scope clauses.
+        digits=contact_digits(query)
+        contact_sql=head+'message_metadata x JOIN messages m ON m.id=x.message AND m.revision=x.revision '+extra_join+\
+            " CROSS JOIN search_query q WHERE x.metadata ? 'contact' AND NOT m.deleted AND "+' AND '.join(clauses)+' AND '+CONTACT_MATCH
+        match_args=[*args,*args,digits,digits,digits]
+        if plan.mode!='exact':match_type='coalesce('+match_type+",'contact'::text)"
         # Separate selective indexed matching from the chronological LIMIT.
         # Otherwise the planner may prefer walking the date index, expecting
         # early hits; a rare or absent query then traverses the entire archive.
-        ctes.append('matches AS MATERIALIZED ('+base_sql+')')
+        ctes.append('matches AS MATERIALIZED ('+base_sql+' UNION '+contact_sql+')')
     else:
         ctes.append('matches AS NOT MATERIALIZED ('+base_sql+')')
     cursor_clause='';cursor_args=[]
@@ -361,7 +386,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     def read_snapshot():
         value=c.execute('WITH '+','.join(snapshot_ctes)+''' SELECT count(*) AS n,
             coalesce(sum(hashtextextended(id||'|'||sent_at::text||'|'||revision::text||'|'||source_order::text,0)::numeric),0)::text AS checksum
-            FROM matches''',[*plan.params,*args]).fetchone()
+            FROM matches''',[*plan.params,*match_args]).fetchone()
         return fingerprint(value)
     if after or before:
         cursor=after or before
@@ -412,7 +437,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     projection=BASE if cap is None else BASE.replace('m.body','left(m.body,'+str(cap)+') AS body,length(m.body)>'+str(cap)+' AS body_truncated')
     rows=c.execute('WITH '+','.join(ctes)+' SELECT '+projection+','+META+',page.score,'+match_type+
         ' AS match_type,'+snippet+' AS snippet,page.source_order'+(',page.gkey,page.copies_total,page.latest_copy_at,page.id AS position_id,page.sent_at AS position_at,page.revision AS position_revision,listed.copy_ids,listed.copy_chats,listed.copy_senders,listed.copy_times' if collapsing else '')+(',view_snapshot.n AS snapshot_count,view_snapshot.checksum AS snapshot_checksum' if conversation else '')+' FROM page JOIN messages m ON m.id='+('coalesce(page.shown,page.id) ' if collapsing else 'page.id ')+JOINS+(' LEFT JOIN listed ON listed.gkey=page.gkey' if collapsing else '')+
-        ' CROSS JOIN search_query q'+(' CROSS JOIN view_snapshot' if conversation else '')+' ORDER BY '+final_sort,[*plan.params,*args,*cursor_args,limit+1]).fetchall()
+        ' CROSS JOIN search_query q'+(' CROSS JOIN view_snapshot' if conversation else '')+' ORDER BY '+final_sort,[*plan.params,*match_args,*cursor_args,limit+1]).fetchall()
     if conversation and rows:
         current_snapshot=fingerprint({'n':rows[0]['snapshot_count'],'checksum':rows[0]['snapshot_checksum']})
         if snapshot is not None and snapshot!=current_snapshot:raise APIError('cursor_changed',409)
