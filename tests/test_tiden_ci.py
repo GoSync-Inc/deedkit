@@ -852,6 +852,145 @@ def test_the_root_build_context_leaves_out_env_files_at_every_depth_but_keeps_th
 
 
 
+TRIAGE_FIXTURE = json.loads((Path(__file__).parent / "fixtures/tiden-run-triage-041.json").read_text())
+TRIAGE_SENTINELS = ("SENTINEL-OUTPUT-542", "SENTINEL-ERROR-542")
+
+
+def triage_cli(monkeypatch, tmp_path, status="failed", reply=None, mode=None):
+    """cli_fixture's synthetic Tiden publishing run 3 with `status`, then answering `run triage` once."""
+    import subprocess
+    calls, manifest = cli_fixture(monkeypatch, tmp_path, status=status)
+    synthetic = subprocess.run
+    timeouts = []
+    def run(args, **kwargs):
+        if args[1:3] == ["run", "triage"]:
+            calls.append(args)
+            timeouts.append(kwargs["timeout"])
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            if mode == "exit":
+                return subprocess.CompletedProcess(args, 1, stdout=TRIAGE_SENTINELS[0], stderr=TRIAGE_SENTINELS[1])
+            if mode == "malformed":
+                return subprocess.CompletedProcess(args, 0, stdout="<html>" + TRIAGE_SENTINELS[0], stderr="")
+            value = TRIAGE_FIXTURE["reply"] if reply is None else reply
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(value), stderr=TRIAGE_SENTINELS[1])
+        completed = synthetic(args, **kwargs)
+        if args[1:3] == ["run", "get"]:
+            completed.stdout = json.dumps({**json.loads(completed.stdout), "seqNum": 3, "branchName": "intent/feature",
+                                           "buildSha": "a" * 40})
+        return completed
+    monkeypatch.setattr(subprocess, "run", run)
+    (tmp_path / "manifest.json").write_text(json.dumps({**manifest, "event": "push"}))
+    return calls, timeouts
+
+
+def run_publish(monkeypatch, tmp_path, branch_map=None):
+    from scripts import tiden_ci
+    monkeypatch.setenv("TIDEN_BRANCH_MAP", json.dumps({"codex/feature": "intent/feature"}
+                                                      if branch_map is None else branch_map))
+    monkeypatch.setenv("TIDEN_PRODUCT_ID", PRODUCT)
+    monkeypatch.setenv("TIDEN_WORKSPACE_ID", WORKSPACE)
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+    monkeypatch.setattr(sys, "argv", ["tiden_ci.py", "publish", "--directory", str(tmp_path)])
+    return tiden_ci.main()
+
+
+def publication_files(tmp_path):
+    return {path.name: path.read_bytes() for path in tmp_path.glob("tiden-*.json") if path.name != "tiden-triage.json"}
+
+
+# spec: ANYM-542
+def test_a_failed_published_run_shows_its_failures_grouped_by_message(tmp_path, monkeypatch, capsys):
+    reply = json.loads(json.dumps(TRIAGE_FIXTURE["reply"]))
+    second = {**reply["clusters"][0], "count": 4, "message": "line one\nline\x1btwo " + "x" * 300,
+              "failures": [{"title": "tests/test_a.py::test\x07one"}, {"title": "tests/test_a.py::test_two"}]}
+    reply["clusters"].append(second)
+    calls, timeouts = triage_cli(monkeypatch, tmp_path, reply=reply)
+    # The publication's own result: run 3 failed, so the step fails as before.
+    assert run_publish(monkeypatch, tmp_path) == 1
+    triage = [call for call in calls if call[1:3] == ["run", "triage"]]
+    assert triage == [["tiden", "run", "triage", "3", "--limit", "10", "--cluster-exemplars", "3",
+                       "--failure-output-lines", "0", "--product-id", PRODUCT, "--format", "json"]]
+    assert "--baseline" not in triage[0] and 0 < timeouts[0] <= 60
+    # The triage comes after the publication's last call.
+    assert calls.index(triage[0]) == len(calls) - 1
+    lines = (tmp_path / "summary.md").read_text().splitlines()
+    assert lines == ["Tiden triage: 1 × CI verification: python: GitHub Actions step outcome: cancelled",
+                     "Tiden triage: 4 × tests/test_a.py::testone: " + ("line onelinetwo " + "x" * 300)[:200]]
+    assert json.loads((tmp_path / "tiden-triage.json").read_text()) == {"triage": {"groups": [
+        {"count": 1, "exemplar": "CI verification: python"}, {"count": 4, "exemplar": "tests/test_a.py::testone"}]}}
+    captured = capsys.readouterr()
+    assert json.loads(captured.out.splitlines()[-1])["status"] == "failed"
+    assert not any(sentinel in text for text in (captured.out, captured.err, *lines) for sentinel in TRIAGE_SENTINELS)
+
+
+# spec: ANYM-542
+@pytest.mark.parametrize("status, event, branch_map, code", [
+    ("passed", "push", None, 0),
+    # An ordinary pull request without a mapping or an intent link is skipped before any Tiden run.
+    ("failed", "pull_request", {}, 0),
+])
+def test_a_passed_or_skipped_publication_makes_no_triage_call(tmp_path, monkeypatch, status, event, branch_map, code):
+    calls, _ = triage_cli(monkeypatch, tmp_path, status=status)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    (tmp_path / "manifest.json").write_text(json.dumps({**manifest, "event": event, "pr_tiden_links": []}))
+    assert run_publish(monkeypatch, tmp_path, branch_map) == code
+    assert not any(call[1:3] == ["run", "triage"] for call in calls)
+    assert not (tmp_path / "tiden-triage.json").exists()
+
+
+# spec: ANYM-542
+@pytest.mark.parametrize("mode, reply, reason", [
+    ("exit", None, "exit 1"),
+    ("timeout", None, "timeout"),
+    ("malformed", None, "malformed"),
+    (None, {"clusters": [{"count": "1", "message": "m", "failures": [{"title": "t"}]}]}, "malformed"),
+    (None, {"clusters": [{"count": 1, "message": "m", "failures": []}]}, "malformed"),
+    (None, {"run": {}}, "malformed"),
+])
+def test_a_failed_triage_is_one_fixed_line_and_keeps_the_publication(tmp_path, monkeypatch, capsys, mode, reply,
+                                                                     reason):
+    calls, _ = triage_cli(monkeypatch, tmp_path, reply=reply, mode=mode)
+    published = {}
+    from scripts import tiden_ci
+    original = tiden_ci.triage
+    def recorded(directory, *arguments, **options):
+        # The publication's result and receipts are already saved when the triage starts.
+        published.update(publication_files(directory))
+        return original(directory, *arguments, **options)
+    monkeypatch.setattr(tiden_ci, "triage", recorded)
+    assert run_publish(monkeypatch, tmp_path) == 1
+    assert published and publication_files(tmp_path) == published
+    assert (tmp_path / "summary.md").read_text() == f"Tiden triage: not available ({reason})\n"
+    assert json.loads((tmp_path / "tiden-triage.json").read_text()) == {
+        "triage": {"state": "not available", "reason": reason}}
+    # Create, report and complete ran once each; nothing is repeated.
+    assert Counter(tuple(call[1:3]) for call in calls)[("run", "complete")] == 1
+    assert Counter(tuple(call[1:3]) for call in calls)[("run", "create")] == 1
+    captured = capsys.readouterr()
+    texts = [captured.out, captured.err, *(path.read_text() for path in tmp_path.glob("tiden-triage.json"))]
+    assert not any(sentinel in text for text in texts for sentinel in TRIAGE_SENTINELS)
+
+
+# spec: ANYM-542
+@pytest.mark.parametrize("elapsed, timeout", [(0, 60), (100, 50), (139, 11), (140, 10)])
+def test_the_triage_timeout_is_the_time_left_in_the_publish_step(tmp_path, monkeypatch, elapsed, timeout):
+    from scripts.tiden_ci import triage
+    calls, timeouts = triage_cli(monkeypatch, tmp_path)
+    triage(tmp_path, 3, PRODUCT, 1000.0, clock=lambda: 1000.0 + elapsed)
+    assert timeouts == [timeout]
+
+
+# spec: ANYM-542
+@pytest.mark.parametrize("elapsed", [140.5, 150, 400])
+def test_with_under_ten_seconds_left_the_triage_is_skipped(tmp_path, monkeypatch, elapsed):
+    from scripts.tiden_ci import triage
+    calls, timeouts = triage_cli(monkeypatch, tmp_path)
+    assert triage(tmp_path, 3, PRODUCT, 1000.0, clock=lambda: 1000.0 + elapsed) == [
+        "Tiden triage: not available (no time)"]
+    assert timeouts == [] and json.loads((tmp_path / "tiden-triage.json").read_text())["triage"]["reason"] == "no time"
+
+
 RELEASE_SHA = "a" * 40
 RUN_URL = "https://github.com/example/repo/actions/runs/7/attempts/1"
 CREATED = "2026-01-01T00:10:00.000000Z"

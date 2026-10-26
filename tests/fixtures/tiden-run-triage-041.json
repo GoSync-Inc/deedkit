@@ -1,0 +1,63 @@
+{
+  "cli": "0.41.0",
+  "command": "tiden run triage <seq> --limit 10 --cluster-exemplars 3 --failure-output-lines 0 -f json",
+  "exit": 0,
+  "reply": {
+    "run": {
+      "seq": 7,
+      "status": "failed",
+      "branch": "main",
+      "environment": "github-actions-synthetic",
+      "buildSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "liveDocStatus": "succeeded",
+      "stats": {
+        "total": 6387,
+        "passed": 6386,
+        "failed": 0,
+        "blocked": 1,
+        "invalid": 0,
+        "skipped": 0,
+        "muted": 0
+      }
+    },
+    "counts": {
+      "failures": 1,
+      "clusters": 1,
+      "retried": 0,
+      "muted": 0,
+      "touchingChangedFiles": 0,
+      "shown": 1,
+      "truncated": 0
+    },
+    "degraded": false,
+    "warnings": [],
+    "clusters": [
+      {
+        "message": "GitHub Actions step outcome: cancelled",
+        "count": 1,
+        "files": [
+          ".github/workflows/checks.yml"
+        ],
+        "failures": [
+          {
+            "title": "CI verification: python",
+            "suitePath": [
+              "CI verifications"
+            ],
+            "identityKey": "s:anymsg-ci::python",
+            "executionKey": "s:anymsg-ci::python|",
+            "status": "blocked",
+            "attempts": 1,
+            "message": "GitHub Actions step outcome: cancelled",
+            "filePath": ".github/workflows/checks.yml",
+            "testSeqNum": 1,
+            "resultId": "00000000-0000-4000-8000-000000000001"
+          }
+        ]
+      }
+    ],
+    "nextSteps": [
+      "tiden gate check --product-id 00000000-0000-4000-8000-000000000002 --format json"
+    ]
+  }
+}
