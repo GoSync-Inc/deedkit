@@ -45,8 +45,10 @@ list: release, deploy and `production.py`, sends and live provider-session code.
   (docs/operations/production.md).
 
 - Autoloop protected paths (docs/operations/feedback-autoloop.md), not a change-path signal: a
-  hit keeps an autoloop PR out of the controller merge. This is the one list.
+  hit keeps an autoloop PR out of the controller merge. This is the one list; it covers the
+  checks' own verifiers (load budgets, test config, release contracts, import shadowing).
 
   ```sh
-  git diff --no-renames --name-only origin/main... | grep -E '^(\.github/|scripts/|deploy/|tools/|config/|docs/(operations|harness)/|services/release-router/)|(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|conftest\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|requirements[^/]*\.(lock|in|txt))$'
+  git diff --no-renames --name-only origin/main... | grep -E '^(\.github/|scripts/|deploy/|tools/|config/|docs/(operations|harness)/|services/release-router/|packages/platform-contracts/|tests/platform/benchmarks/)|^[^/]+\.py$|^[^/]+/__init__\.py$|(^|/)(sitecustomize|usercustomize)\.py$|\.pth$|(^|/)(pytest\.ini|setup\.cfg|tox\.ini)$|(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|conftest\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|requirements[^/]*\.(lock|in|txt))$'
+  git diff --no-renames --diff-filter=D --name-only origin/main...   # any deleted file
   ```
