@@ -251,7 +251,8 @@ def test_a_new_card_brief_is_kept_scrubbed_in_the_private_state_and_a_refusal_wr
     run_read(states, decision(P3, 'reported-bug', reason_code='new-idea', new_card='group-receipts',
                               card_brief='Receipts stop in groups, see /var/log/x and `tail`.'))
     briefs = json.loads((a / 'briefs.json').read_text())
-    assert briefs == {P3: {'new_card': 'group-receipts', 'card_brief': 'Receipts stop in groups, see and'}}
+    assert briefs == {P3: {'new_card': 'group-receipts', 'card_brief': 'Receipts stop in groups, see and',
+                           'release': autoloop.RELEASE}}
     assert stat.S_IMODE((a / 'briefs.json').stat().st_mode) == 0o600
     assert stat.S_IMODE(a.stat().st_mode) == 0o700
     assert set(json.loads((t / 'inbox.json').read_text())) == {P1, P2}  # undecided items stay
@@ -299,8 +300,11 @@ def test_the_card_worker_gets_only_briefs_whose_item_is_in_the_ledger_with_the_s
                                                    P2: {'new_card': 'other', 'card_brief': 'y'}}))
     ledger = triage.load(t / 'ledger.json', {})
     triage.save(t / 'ledger.json', dict(ledger, **{P2: dict(ledger[P3], cluster='new:group-receipts')}))
-    assert autoloop.committed_briefs(a, t) == {P3: {'new_card': 'group-receipts',
+    assert autoloop.committed_briefs(a, t) == {P3: {'new_card': 'group-receipts', 'release': autoloop.RELEASE,
                                                     'card_brief': 'Receipts stop in groups.'}}
+    # A brief stored before the release checks (ANYM-571) is never committed.
+    triage.save(a / 'briefs.json', {P3: {'new_card': 'group-receipts', 'card_brief': 'Receipts stop in groups.'}})
+    assert autoloop.committed_briefs(a, t) == {}
 
 
 # spec: ANYM-570
@@ -1046,6 +1050,35 @@ def test_a_new_owner_agent_cluster_gets_one_card_worker_whose_prompt_and_project
 
 
 # spec: ANYM-571
+def test_a_hold_on_the_bound_card_spares_the_relaunch_and_cancels_the_ready_merge_on_the_first_branch(loop, template):
+    t, a, s = loop
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'groups lose names')])
+    new_card(fakes, {D1: ('group-names', BRIEF)})
+    created = creates(fakes, {'id': 'ws-00001'})
+    run_tick(loop, fakes)
+    name = card_name('new:group-names')
+    assert autoloop.main(['bind', name, '--card', 'ANYM-77', '--state', str(a)]) == 0
+    # Held while its worker is gone: no relaunch is reserved, so the release finds it still there.
+    autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW)
+    fakes.submissions = []
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert len(created()) == 1 and f'{name}-r1' not in autoloop.intents(a)
+    autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW, release=True)
+    run_tick(loop, fakes, now=NOW + timedelta(hours=2))
+    assert len(created()) == 2 and autoloop.intents(a)[f'{name}-r1']['branch'] == f'proposal/{name}'
+    # The relaunch dispatched a ready merge of the first branch; a hold now cancels it.
+    fakes.workspaces = [{'name': f'{name}-r1', 'id': 'ws-00001', 'projectName': 'deedkit'}]
+    fakes.runs = [{'databaseId': 9, 'status': 'in_progress', 'conclusion': None, 'updatedAt': '2026-10-26T14:01:00Z',
+                   'displayTitle': f'Tiden sync ready merge proposal/{name}'}]
+    autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW)
+    code, _ = run_tick(loop, fakes, now=NOW + timedelta(hours=3))
+    assert code == 0 and ('gh', ['run', 'cancel', '9']) in [(c[0], c[1][:3]) for c in fakes.calls]
+
+
+# spec: ANYM-571
 def test_a_brief_that_copies_feedback_is_never_released_and_no_slug_reaches_a_name_or_a_prompt(loop, template):
     t, a, s = loop
     template.parent.mkdir()
@@ -1058,7 +1091,8 @@ def test_a_brief_that_copies_feedback_is_never_released_and_no_slug_reaches_a_na
     created = creates(fakes, {'id': 'ws-00001'})
     run_tick(loop, fakes)
     released = 'Receipts stop after # renames, build #, phone #.'
-    assert triage.load(a / 'briefs.json', {}) == {D2: {'new_card': CANARY, 'card_brief': released}}
+    assert triage.load(a / 'briefs.json', {}) == {D2: {'new_card': CANARY, 'card_brief': released,
+                                                       'release': autoloop.RELEASE}}
     assert triage.load(a / 'plan.json', {})['cards'] == {f'new:{CANARY}': card_name(f'new:{CANARY}')}
     projection = (a / 'projections' / f"{card_name(f'new:{CANARY}')}.json").read_text()
     assert len(created()) == 1 and CANARY not in ' '.join(created()[0]) and CANARY not in projection
@@ -1067,7 +1101,7 @@ def test_a_brief_that_copies_feedback_is_never_released_and_no_slug_reaches_a_na
 
 # spec: ANYM-571
 @pytest.mark.parametrize('reply', [{'error': 'timeout'}, {'id': ''}, {'id': '   '}, {'workspace': {'id': 'ws 00001'}},
-                                   ['ws-00001']])
+                                   ['ws-00001'], {'id': 12345678}])
 def test_a_create_reply_without_a_workspace_id_leaves_the_intent_unknown_and_the_name_settles_it(loop, template, reply):
     t, a, s = loop
     template.parent.mkdir()
