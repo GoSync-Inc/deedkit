@@ -641,3 +641,118 @@ def test_line_breaks_follow_each_language_so_no_marker_authorizes_an_unrelated_t
     }, "Spec: ANYM-12")
     assert code == 0, out
     assert "test_cr_ok -> ANYM-12" in out and "ok -> ANYM-12" in out
+
+
+GATE_FIXTURE = json.loads((Path(ROOT_SCRIPT).parents[1] / "tests/fixtures/tiden-gate-branch-041.json").read_text())
+VERDICT = "Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun."
+
+
+class Clock:
+    """A fake monotonic clock: the first reading is the script's start, every later one is `later` seconds on."""
+    def __init__(self, later=0.0):
+        self.later, self.readings = later, 0
+
+    def __call__(self):
+        self.readings += 1
+        return 0.0 if self.readings == 1 else self.later
+
+
+def gated(server, monkeypatch, gate=None, later=0.0, fault=None):
+    """proposal/x holds ANYM-527 (Backlog) and ANYM-12 is on main; the gate replies `gate` ({exit, reply})."""
+    previewed(server, {"additions": [{"seqNum": 527}], "modifications": []}, (527,))
+    server.set(gate=gate, fault=fault or {})
+    monkeypatch.setattr(pr_check, "clock", Clock(later))
+
+
+def gate_calls(server):
+    return [entry for entry in server.state()["log"] if entry[:2] == ["gate", "check"]]
+
+
+PASSING = "Delivers: ANYM-527\nTiden branch: proposal/x"
+FAILING = "Delivers: ANYM-527\nSpec: ANYM-99\nTiden branch: proposal/x"
+PASS_REPLY = {"exit": 0, "reply": {"scope": "VERDICT_SCOPE_BRANCH", "status": "VERDICT_STATUS_PASS", "subjects": [
+    {"subjectType": "component", "status": "VERDICT_STATUS_PASS", "requirements": [
+        {"display": "ANYM-527", "state": "verified", "touched": "changed"},
+        {"display": "ANYM-12", "state": "verified", "touched": "neighbour"}]},
+    {"subjectType": "feature", "status": "VERDICT_STATUS_PASS", "requirements": [
+        {"display": "ANYM-527", "state": "verified", "touched": "changed"}]}]}}
+BLOCKED_REPLY = {"exit": 3, "reply": {"scope": "VERDICT_SCOPE_BRANCH", "status": "VERDICT_STATUS_BLOCKED",
+                                      "nextAction": "fix " + SECRET, "subjects": [{"requirements": [
+                                          {"display": "ANYM-527", "state": "failing", "touched": "changed",
+                                           "nextAction": "rerun " + SECRET}]}]}}
+
+
+# spec: ANYM-541
+@pytest.mark.parametrize("body, code, closing", [(PASSING, 0, "Passed."), (FAILING, 1, VERDICT)],
+                         ids=["check-passes", "check-fails"])
+@pytest.mark.parametrize("gate, later, fault, rows", [
+    (PASS_REPLY, 0.0, None, ["Tiden branch gate: PASS (advisory, never changes this check)",
+                             "- ANYM-12 Active verified (neighbour)", "- ANYM-527 Backlog verified"]),
+    ({"exit": GATE_FIXTURE["exit"], "reply": GATE_FIXTURE["reply"]}, 0.0, None,
+     ["Tiden branch gate: NOT VERIFIED (advisory, never changes this check)",
+      "- ANYM-527 Backlog no_test (planned)"]),
+    (BLOCKED_REPLY, 0.0, None, ["Tiden branch gate: BLOCKED (advisory, never changes this check)",
+                                "- ANYM-527 Backlog failing"]),
+    (None, 0.0, {"gate check": "garbage"}, ["Tiden branch gate: not checked (not JSON)"]),
+    (None, 0.0, {"gate check": "exit"}, ["Tiden branch gate: not checked (not JSON)"]),
+    ({"exit": 1, "reply": PASS_REPLY["reply"]}, 0.0, None, ["Tiden branch gate: not checked (exit 1)"]),
+    ({"exit": 0, "reply": {"scope": "VERDICT_SCOPE_MAIN", "status": "VERDICT_STATUS_PASS", "subjects": []}}, 0.0, None,
+     ["Tiden branch gate: not checked (unexpected shape)"]),
+    ({"exit": 3, "reply": {"scope": "VERDICT_SCOPE_BRANCH", "status": "VERDICT_STATUS_BLOCKED", "subjects": [
+        {"requirements": [{"display": "ANYM-527", "state": "failing\n" + SECRET}]}]}}, 0.0, None,
+     ["Tiden branch gate: not checked (unexpected shape)"]),
+    (PASS_REPLY, 411.0, None, ["Tiden branch gate: not checked (no time)"]),
+], ids=["passed", "no-test-exit-3", "blocked", "garbage", "exit-3-not-json", "exit-1", "main-scope",
+        "bad-state", "no-time"])
+def test_the_branch_gate_prints_advisory_rows_before_the_unchanged_last_line(
+        repo, server, monkeypatch, body, code, closing, gate, later, fault, rows):
+    gated(server, monkeypatch, gate, later, fault)
+    got, out = run(repo, server, {"README.md": "text\n"}, body)
+    lines = out.splitlines()
+    assert got == code and lines[-1] == closing, out
+    assert lines[-1 - len(rows):-1] == rows, out
+    assert SECRET not in out and "nextAction" not in out and "fix " not in out
+    assert gate_calls(server) == ([] if later else [
+        ["gate", "check", "--branch", "proposal/x", "--product-id", "product", "--format", "json"]])
+    assert not server.writes()
+
+
+# spec: ANYM-541
+@pytest.mark.parametrize("body, code, closing", [(PASSING, 0, "Passed."), (FAILING, 1, VERDICT)],
+                         ids=["check-passes", "check-fails"])
+def test_a_branch_gate_past_its_timeout_is_not_checked_and_keeps_the_outcome(
+        repo, server, monkeypatch, body, code, closing):
+    gated(server, monkeypatch, PASS_REPLY, fault={"gate check": "sleep"})
+    monkeypatch.setattr(pr_check, "GATE_TIMEOUT", 1)
+    got, out = run(repo, server, {"README.md": "text\n"}, body)
+    assert got == code and out.splitlines()[-2:] == ["Tiden branch gate: not checked (timeout)", closing], out
+
+
+# spec: ANYM-541
+@pytest.mark.parametrize("elapsed, budget", [(0, 60), (300, 60), (380, 40), (405, 15), (410, 10), (410.5, None),
+                                             (480, None)])
+def test_the_branch_gate_timeout_is_bounded_by_the_time_left_in_the_step(elapsed, budget):
+    assert pr_check.gate_budget(elapsed) == budget
+    step = next(step for step in pr_check_job()["steps"] if step.get("id") == "check")
+    assert pr_check.STEP_LIMIT == step["timeout-minutes"] * 60
+
+
+# spec: ANYM-541
+@pytest.mark.parametrize("later", [400.0, 411.0, 600.0])
+def test_a_failing_check_near_its_step_deadline_is_still_a_verdict_of_the_workflow(
+        repo, server, monkeypatch, capsys, tmp_path, later):
+    gated(server, monkeypatch, {"exit": GATE_FIXTURE["exit"], "reply": GATE_FIXTURE["reply"]}, later)
+    code, out = run_main(repo, server, FAILING, monkeypatch, capsys)
+    assert code == 1 and out.splitlines()[-1] == VERDICT
+    assert outcome(tmp_path, out.splitlines(), code) == "outcome=failed"
+    assert len(gate_calls(server)) == (1 if later == 400.0 else 0)
+
+
+# spec: ANYM-541
+def test_no_tiden_branch_line_makes_no_gate_call(repo, server, monkeypatch):
+    gated(server, monkeypatch, PASS_REPLY)
+    code, out = run(repo, server, {"README.md": "text\n"}, "Spec: ANYM-12")
+    assert code == 0 and out.splitlines()[-1] == "Passed." and "Tiden branch gate" not in out
+    code, out = run(repo, server, {"README.md": "more\n"}, "Spec: ANYM-12\nTiden branch: feature/x")
+    assert code == 1 and "Tiden branch gate" not in out
+    assert gate_calls(server) == []

@@ -97,7 +97,8 @@ On native WhatsApp accounts an agent can write to a number that has no archived
 chat: check it with the `open_chat_by_phone` messenger operation (`create=false`),
 show the owner the account, number, verified name and exact text, obtain
 confirmation, call it again with `create=true` for the `chat_id`, then send with
-`send_message`. Each account allows at most 10 WhatsApp lookups per rolling hour (local answers are free);
+`send_message`. A phone-shaped `chat_id` that is not found returns the exact `next_call` for each step, or
+the reason there is none. Each account allows at most 10 WhatsApp lookups per rolling hour (local answers are free);
 see [MESSENGER_OPERATIONS.md](MESSENGER_OPERATIONS.md#opening-a-whatsapp-chat-by-phone-number).
 Cold messages from a personal account to strangers can get it restricted or banned
 by WhatsApp, so keep them few and expected. New Telegram conversations by phone
@@ -166,3 +167,11 @@ outgoing messages. The audit records identities and resource IDs, not text.
 Provider references: [Telethon send_message](https://docs.telethon.dev/en/stable/modules/client.html),
 [Telegram random_id](https://core.telegram.org/method/messages.sendMessage),
 [WhatsApp send options](https://docs.wwebjs.dev/Client.js.html).
+
+## Deleted messages (schema 45)
+
+When a sent message is deleted in the messenger, the purge (ANYM-511) keeps the send record,
+its status and provider IDs; `body` and `source_text` read `[deleted]` and the render artifact
+is empty. The record is found by its verified wire reference (native WhatsApp) or, without
+one, by the requested chat and returned ID. A send receipt that arrives after the purge is
+stored the same way.

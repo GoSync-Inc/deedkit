@@ -10,7 +10,7 @@ from .adapters.calls import receipt_reference
 from .catalog import arguments, CATALOG, InvalidArguments
 from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, stale_arguments_hint, unavailable, unknown_tool_denial
 from .policy import Denied, key_from_file
-from .sections import capabilities_view
+from .sections import capabilities_view, subscription_blocks
 
 PLAIN_PATH = "/mcp"
 MODULE_PATH = "/mcp/modules/"
@@ -252,6 +252,28 @@ class Dispatch:
             "gateway_actions_excluded_by_account": excluded,
             "gateway_actions_basis": "granted_supported_and_available_for_account",
         }
+
+    def next_call(self, value, snapshot, agent, caps):
+        """ANYM-531: name the backend's suggested call by this gateway's own tool, or drop it where this
+        gateway would refuse it (hidden tool, missing scope or action grant for the account)."""
+        step = value.get("next_call") if isinstance(value, dict) else None
+        if not isinstance(step, dict):
+            return value
+        value = {k: v for k, v in value.items() if k != "next_call"}
+        arguments = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
+        name = next((n for n in self.policy.visible(snapshot, agent)
+                     if CATALOG[n]["module"] == "messaging" and CATALOG[n]["operation"] == step.get("tool")), None)
+        usable = (name is not None and set(CATALOG[name]["scopes"]) <= set(caps.get("permissions", []))
+                  and self.implemented(CATALOG[name], snapshot, agent, caps, arguments.get("account")))
+        if usable and CATALOG[name].get("action_group"):
+            allowed = (self.actions(snapshot, agent, caps, arguments["account"]) if "account" in arguments
+                       else self.policy.actions(snapshot, agent, caps.get("permissions", [])))
+            usable = bool(allowed) and ("operation" not in arguments or arguments["operation"] in allowed)
+        if usable:
+            value["next_call"] = {**step, "tool": name}
+        elif value.get("error") == "not_found" or arguments.get("operation") == "open_chat_by_phone":
+            value["next_action"] = "key_cannot_open_new_chats"
+        return value
 
     def implemented(self, tool, snapshot, agent, caps, account=None):
         if tool.get("required_manifest"):
@@ -593,6 +615,8 @@ class Dispatch:
                 error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                            phase="operation", read_only=True)
             elif error.code == "backend_denied" and isinstance(getattr(error, "detail", None), dict):
+                if module == "messaging":
+                    error.detail = self.next_call(error.detail, snapshot, agent, caps)
                 visible = [n for n in self.policy.visible(current, principal)
                            if selected is None or CATALOG[n]["module"] in selected | {"gateway"}]
                 error.detail = relayed_error(
@@ -600,6 +624,8 @@ class Dispatch:
                     {n for n in visible if CATALOG[n].get("annotations", {}).get("readOnlyHint", False)},
                     payload_strings(values))
             raise
+        if module == "messaging":
+            result = self.next_call(result, snapshot, agent, caps)
         if live_denied and isinstance(result, dict):
             # detail=transcript moves live and suggested_call from result_evidence to the top level.
             evidence = result["result_evidence"] if isinstance(result.get("result_evidence"), dict) else result
@@ -703,5 +729,5 @@ class Dispatch:
                 result.update(self.usable_actions(snapshot, agent, caps))
             result["gateway_policy_revision"] = snapshot["revision"]
             if module == "messaging":
-                result = capabilities_view(result, args)
+                result = capabilities_view(subscription_blocks(result, visible), args)
         return result

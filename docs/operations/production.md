@@ -632,6 +632,49 @@ ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 `promotable()` (the previous revision is no longer current `main`), does not run or
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
+Messaging migration 045 (`manual`, ANYM-511) adds the deletion purge: `messages.purged`
+(defaulted, a catalog change), `chats.purged_at`, the `message_purges`, `chat_tombstones`,
+`ingest_receipt_links` and `purge_state` tables without foreign keys, guard triggers that keep
+later writes of a purged message content-free, and the audit CHECK re-added `NOT VALID` with
+`message_purge`. Running schema-44 processes keep working: their writes pass through the guards
+unchanged. A schema-44 runtime refuses schema 45, so it ships with its release. Release steps, in
+order, outside an active call:
+0. As the owner, before `migrate`: `CREATE INDEX CONCURRENTLY IF NOT EXISTS events_message ON
+   events(message);` (no lock on event inserts; about 250k rows), then check that `\d events` lists
+   `events_message` without `INVALID` (a failed build: `DROP INDEX CONCURRENTLY events_message` and
+   build again). 045 refuses an index that is invalid, not ready or not a btree on `events(message)`;
+   without one it builds in place only on a table of at most 10k events and 8 MB, so a production
+   build never runs inside the migration transaction.
+1. Update the pinned backup and restore runtimes to the schema-45 release.
+2. Fresh verified backup (the backup gate), then `migrate`. 045 takes all its table locks in one
+   attempt that never queues, retried for 2 s; `LockNotAvailable` (busy tables) rolls everything
+   back: run `migrate` again. Then, as the owner, `CREATE INDEX CONCURRENTLY IF NOT EXISTS
+   messages_unpurged ON messages(account,chat) WHERE NOT purged;` (needs the new column; no lock on
+   message writes) and check `\d messages` lists it without `INVALID`. The chat visibility probe reads
+   it; without it a long chat's probe may run out of time and is retried each pass (`hide_pending` in
+   `purge-status`).
+3. As the owner: `purge_role.sql` (NOLOGIN role `messaging_purge`) and `gateway_role.sql`; deploy
+   the release.
+4. The worker's own login (owner decision 2026-10-26, «1) а»): as the owner create
+   `messaging_purge_runtime` with `LOGIN IN ROLE messaging_purge` and no other grants, with a
+   generated password passed to `psql` through a variable read from a 0600 file, never on the command
+   line; write its DSN (host and database as in the other private DSNs) to `private/message-purge.dsn`
+   with mode 0600, owned like them. Print or log no password. Undo: stop the service,
+   `DROP ROLE messaging_purge_runtime`, remove the file.
+5. Start the worker: add `deploy/compose.message-purge.yaml` to the project's compose files for
+   `production.py apply`, or `docker compose --profile message-purge up -d message-purge`. From here
+   every new deletion is purged within a minute: the point of no return for future deletions. Its
+   first passes link the receipts stored before 045; deletions wait pending until then (`pending`
+   in `get_sync_status` deletions) and are reported `purge_overdue` after 15 minutes; `purge-status`
+   shows `receipt_backfill` (`pending` until done).
+6. Read-only: `purge-deleted --preview` (counts per account of messages deleted before 045).
+7. After a fresh verified backup, `purge-deleted --apply`: the point of no return for past
+   deletions. `--apply` drains every due mark and exits non-zero while marks stay pending
+   (contention or failures); run it again.
+Steps 5 and 7 delete data and wait for the owner's words.
+The purge is irreversible: rolling back code or schema does not bring content back; only a
+restore of a backup taken before it does, and only while that backup is kept (about two days of
+daily verified backups). `purge-disable` stops the worker without a deploy.
 Messaging migration 044 (`expand`, ANYM-495) is additive: the new `api_key_operations` table
 (operation ID, request digest, key ID) without a foreign key, so it takes no lock on `api_keys`,
 which every authentication reads. It is not lock-free: like every `migrate`, the same transaction
@@ -1037,8 +1080,9 @@ no verdict (default budget 4 hours, because the timer starts no deploy from 13:0
 poll runs one constant ssh command that sends a fixed read-only script, which prints only `sha`,
 `status`, `reason` and `at` of `current.json`, `http-current.json` and `deploy.json`, the pause
 reason and the names of unfinished and serving attempts. The tool reads receipts; it does not probe containers.
-After `LIVE`, `python3 scripts/feedback_sync.py follow` (dry run, then `--apply`) moves agent
-feedback whose card that release delivers (ANYM-473, docs/operations/feedback-triage.md).
+After `LIVE`, the hourly `feedback_sync.py auto` moves agent feedback whose card that release
+delivers (ANYM-473, ANYM-536); run `python3 scripts/feedback_sync.py status` and, if it exits 1,
+fix the sync (docs/operations/feedback-triage.md, Hourly sync).
 
 ## Admin CLI
 

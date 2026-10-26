@@ -221,6 +221,16 @@ truncation, archive/entity bombs, real PDF and OCR, scope/pagination, text pages
 edits/deletion, lease fencing/retry, unsupported formats and missing originals.
 PostgreSQL tests require the existing isolated `messaging_probe_test` fixture.
 
+## Deleted messages (schema 45, ANYM-511)
+
+The purge of a deleted message deletes its `attachment_text`, `attachment_enrichment`
+(ASR segments included), `attachment_understanding` rows and their chunks, open download
+grants and the file name in `attachments` and `media_jobs`; digest, size and MIME stay.
+Queued and leased media jobs are superseded. A worker that leased text, transcription or
+understanding work before the purge finds no leased row and publishes nothing; a raw
+insert for a purged message is dropped by a guard trigger. The original bytes are story
+ANYM-512.
+
 ## Docling evaluation boundary
 
 Docling is a reasonable candidate for a separate structured-document adapter,

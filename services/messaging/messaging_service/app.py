@@ -508,6 +508,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
         checked against history before any newly approved send. Text only, provider
         payload at most 4000 UTF-16 units; source at most 16000 units subject to the
         16384-byte HTTP JSON envelope. No splitting or server human-approval gate.
+        A new WhatsApp number is reached with execute_messenger_operation operation
+        open_chat_by_phone; a phone-shaped not_found names the exact next_call.
         """
         return await async_call(ctx,'send_message',account=account,chat_id=chat_id,text=text,
             request_id=request_id,reply_to=reply_to,format=format,preview_digest=preview_digest,
@@ -923,6 +925,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
         Telegram chat ID uses marked form: users positive, groups negative, channels -100…;
         do not strip the sign or resolve a channel from an unmarked positive ID. WhatsApp uses
         the opaque provider chat/message IDs verbatim. Hidden and absent objects both not_found.
+        A new WhatsApp number is reached with execute_messenger_operation operation
+        open_chat_by_phone; a phone-shaped not_found names the exact next_call.
         """
         return call(ctx,'resolve_reference',account=account,provider_chat_id=provider_chat_id,
                     provider_message_id=provider_message_id)
