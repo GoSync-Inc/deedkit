@@ -224,6 +224,10 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     if hidden and not selected_chat:clauses.append('NOT c.id=ANY(%s)');args.append(list(hidden))
     if selected_chat:clauses.append('c.id=%s');args.append(selected_chat)
     if accounts is not None:clauses.append('c.account=ANY(%s)');args.append(accounts)
+    # A chat whose every archived message is purged stays unlisted until a new message arrives (ANYM-511).
+    # Only chats the purge marked pay for the check.
+    clauses.append('''(c.purged_at IS NULL OR EXISTS(SELECT 1 FROM messages pm
+        WHERE pm.account=c.account AND pm.chat=c.id AND NOT pm.purged))''')
     if query:
         pattern='%'+query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
         match="(c.title ILIKE %s ESCAPE E'\\\\' OR "+raw_title_sql()+" AND "+peer_name_sql()+" ILIKE %s ESCAPE E'\\\\')"

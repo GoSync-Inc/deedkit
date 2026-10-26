@@ -335,3 +335,20 @@ Operator config `history_since` is an ISO timestamp with a mandatory timezone, o
 `window_complete` means the set time bound was reached; `history_exhausted` is the end of the provider's available pages. These are different flags. Changing `history_since` resets only the first; the boundary of the last page is kept so that extending the period does not lose the part of a page that was cut off. Neither flag proves the completeness of old edits/deletions or the availability of all attachments. Discovery prints only the aggregated number of dialogs, the limit and history_since, with no names or messages.
 
 This is not a new general rate governor: the existing FloodWait handling is kept. A shared limit on all API/media requests remains separate work. The targeted expansion of a single chat on request is `request_chat_history` (MESSENGER_OPERATIONS.md).
+
+## Deleted messages (schema 45, ANYM-511)
+
+A deletion a collector reports (WhatsApp delete for everyone, a Telegram deletion it
+receives) is a tombstone, as before. The `message-purge` worker
+(`deploy/compose.message-purge.yaml`, role `messaging_purge`) then clears the message's
+text, file names, file text, transcripts, AI output, review references, send and command
+text within minutes and keeps a content-free `message_purges` mark. Collectors need no
+change: guard triggers keep a later import or backfill of a purged message content-free,
+its ingest receipt included. The worker takes `archive:<account>` with a try-lock, at most
+50 messages per transaction, a 2 s lock wait and a 10 s statement bound, so ingest is never
+held up; a busy account is retried on the next pass. Messages deleted before schema 45 are
+purged by the operator: `python -m messaging_service.message_purge --dsn-file <dsn> --role
+messaging_purge purge-deleted --preview`, then `--apply` after a fresh verified backup.
+`get_sync_status` shows `deletions` per account (guarantee, pending, failed, last purge);
+`purge-status` lists failed message IDs. Telegram's guarantee stays `best_effort`: it does
+not report every deletion.

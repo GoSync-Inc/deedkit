@@ -1,10 +1,15 @@
--- rollout: expand
+-- rollout: manual
+-- Manual: it seeds worker state, adds guard functions and triggers and re-adds the audit CHECK, so the
+-- release is the standing manual one (backup gate first); every change still adds, nothing drops data.
 -- Messenger deletion purge (ANYM-511). New tables carry no foreign keys (044 precedent: a key locks
 -- the referenced table at create). messages gains a defaulted flag (no rewrite; a brief lock under the
 -- 2 s migrate bound). events gains an index on message: its build holds SHARE on events, so event
 -- inserts wait for it (about 250k rows in production). Guard triggers keep every later write of a
 -- purged message content-free, so deployed schema-44 code keeps writing through them unchanged.
 ALTER TABLE messages ADD COLUMN purged boolean NOT NULL DEFAULT false;
+-- Set by the worker when a chat's last unpurged message is purged; the listing then hides the chat
+-- until it has an unpurged message again, so only marked chats pay for that check.
+ALTER TABLE chats ADD COLUMN purged_at timestamptz;
 CREATE INDEX events_message ON events(message);
 -- One row per deleted message: pending until the worker clears it, then the content-free mark.
 CREATE TABLE message_purges (
@@ -70,13 +75,14 @@ CREATE FUNCTION public.purged_envelope(e jsonb) RETURNS jsonb LANGUAGE sql IMMUT
    FROM jsonb_array_elements(e->'media') m) END))
   || '{"body":"","deleted":true,"purged":true}'::jsonb
 $$;
--- Live-search hits naming a purged message keep their identifiers and lose their text.
+-- Live-search hits naming a purged message keep their identifiers and lose their text. A stored
+-- receipt keeps them under data.hits (commands.py:70 safe_result, telegram_operations.py:1283,1397).
 CREATE FUNCTION public.purged_command_hits(acc text,result jsonb) RETURNS jsonb LANGUAGE sql STABLE AS $$
- SELECT CASE WHEN jsonb_typeof(result->'hits')<>'array' THEN result ELSE jsonb_set(result,'{hits}',
+ SELECT CASE WHEN jsonb_typeof(result#>'{data,hits}') IS DISTINCT FROM 'array' THEN result ELSE jsonb_set(result,'{data,hits}',
   (SELECT coalesce(jsonb_agg(CASE WHEN jsonb_typeof(h)='object' AND EXISTS(SELECT 1 FROM public.messages m
     WHERE m.account=acc AND m.provider_id=h->>'provider_id' AND m.chat=h->>'chat' AND m.purged)
    THEN h||'{"text":"","purged":true}'::jsonb ELSE h END ORDER BY n),'[]'::jsonb)
-   FROM jsonb_array_elements(result->'hits') WITH ORDINALITY AS x(h,n))) END
+   FROM jsonb_array_elements(result#>'{data,hits}') WITH ORDINALITY AS x(h,n))) END
 $$;
 -- Every finisher publishes through this guard: a write naming a purged message is stored
 -- content-free or dropped, so work leased before the purge cannot bring content back.
@@ -88,9 +94,10 @@ BEGIN
   INSERT INTO public.ingest_receipt_links(digest,account,provider_chat,provider_id)
    VALUES(NEW.digest,NEW.account,coalesce(NEW.envelope->>'chat',''),coalesce(NEW.envelope->>'provider_id',''))
    ON CONFLICT(digest) DO NOTHING;
-  IF EXISTS(SELECT 1 FROM public.message_purges p WHERE p.account=NEW.account
-    AND p.provider_chat=NEW.envelope->>'chat' AND p.provider_id=NEW.envelope->>'provider_id'
-    AND p.purged_at IS NOT NULL) THEN
+  -- The live flag decides: a mark left by a removed account never scrubs a new message.
+  IF EXISTS(SELECT 1 FROM public.message_purges p JOIN public.messages m ON m.id=p.message
+    WHERE p.account=NEW.account AND p.provider_chat=NEW.envelope->>'chat'
+    AND p.provider_id=NEW.envelope->>'provider_id' AND p.purged_at IS NOT NULL AND m.purged) THEN
    NEW.envelope := public.purged_envelope(NEW.envelope);
   END IF;
   RETURN NEW;
@@ -100,8 +107,9 @@ BEGIN
  ELSE
   SELECT a.message INTO target FROM public.attachments a WHERE a.id=NEW.attachment;
  END IF;
- IF TG_TABLE_NAME='messenger_commands' AND NEW.result IS NOT NULL THEN
-  NEW.result := public.purged_command_hits(NEW.account,NEW.result);
+ -- Nested: PL/pgSQL resolves NEW.result even when the left operand of AND is false.
+ IF TG_TABLE_NAME='messenger_commands' THEN
+  IF NEW.result IS NOT NULL THEN NEW.result := public.purged_command_hits(NEW.account,NEW.result); END IF;
  END IF;
  IF target IS NULL THEN RETURN NEW; END IF;
  SELECT m.purged INTO gone FROM public.messages m WHERE m.id=target;

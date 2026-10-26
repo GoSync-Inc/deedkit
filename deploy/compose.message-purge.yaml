@@ -1,0 +1,34 @@
+# Messenger deletion purge (ANYM-511): clears the content of messages deleted in the
+# messenger within minutes and keeps a content-free mark. Every transaction runs as the
+# messaging_purge role (purge_role.sql) through SET ROLE on the mounted DSN, so the DSN's
+# login needs membership in that role. Database only: no files, sessions or provider keys.
+# Stop it with `purge-disable` (state in purge_state) or by stopping this service.
+services:
+  message-purge:
+    profiles: [message-purge]
+    image: anymsg-api:${MESSAGING_VERSION:-0.9.9}
+    init: true
+    restart: unless-stopped
+    depends_on:
+      db: {condition: service_healthy}
+    command: [python, -m, messaging_service.message_purge, --dsn-file, /run/secrets/database_url,
+      --role, messaging_purge, run, --interval, "15"]
+    volumes:
+      - type: bind
+        source: ./private/message-purge.dsn
+        target: /run/secrets/database_url
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [backend]
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 32
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}

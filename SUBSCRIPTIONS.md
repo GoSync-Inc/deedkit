@@ -577,6 +577,13 @@ deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS
   gaps for subscriptions already pruned, so roll back only with that known loss of the
   gap signal or restore the pre-migration backup instead.
 
+## Deleted messages (schema 45)
+
+The purge (ANYM-511) keeps event IDs, kinds and positions: a consumer behind it receives
+the `message.created`/`message.edited` events and the `message.deleted` event of a purged
+message as content-free snapshots marked `deleted: true, purged: true`, never the old body.
+ACK positions and versions are unchanged, and hints stay content-free references.
+
 ## Remaining extensions and verification boundaries
 
 Coalescing across subscriptions of different keys, stream resource notifications,

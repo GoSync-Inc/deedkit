@@ -135,6 +135,9 @@ class Purger:
         c.execute('SELECT id FROM messages WHERE id=ANY(%s) AND account=%s FOR UPDATE',(ids,account))
         # The flag first: from here every guard trigger treats a late write as purged.
         counts={'messages':n("UPDATE messages SET body='',purged=true WHERE id=ANY(%s) AND account=%s",(ids,account))}
+        counts['hidden_chats']=n('''UPDATE chats ch SET purged_at=clock_timestamp() WHERE ch.account=%s
+            AND ch.id IN (SELECT chat FROM messages WHERE id=ANY(%s)) AND NOT EXISTS(SELECT 1 FROM messages m
+                WHERE m.account=ch.account AND m.chat=ch.id AND NOT m.purged)''',(account,ids))
         files=[r['id'] for r in c.execute('SELECT id FROM attachments WHERE message=ANY(%s)',(ids,))]
         counts['file_names']=n("UPDATE attachments SET filename='' WHERE message=ANY(%s) AND filename<>''",(ids,))
         derived=0
@@ -169,7 +172,7 @@ class Purger:
         hits=[json.dumps([{'chat':m['chat'],'provider_id':m['provider_id']}]) for m in
               c.execute('SELECT chat,provider_id FROM messages WHERE id=ANY(%s)',(ids,))]
         counts['live_results']=n('''UPDATE messenger_commands SET result=public.purged_command_hits(account,result)
-            WHERE account=%s AND jsonb_typeof(result->'hits')='array' AND result->'hits' @> ANY(%s::jsonb[])''',
+            WHERE account=%s AND jsonb_typeof(result#>'{data,hits}')='array' AND result#>'{data,hits}' @> ANY(%s::jsonb[])''',
             (account,hits))
         counts['reply_notes']=sum(n(sql.SQL('''UPDATE {} SET note=NULL WHERE note IS NOT NULL
             AND (message=ANY(%s) OR incoming_head=ANY(%s))''').format(sql.Identifier(t)),(ids,ids))

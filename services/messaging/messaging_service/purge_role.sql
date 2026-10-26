@@ -8,7 +8,8 @@ DO $$ BEGIN
  END IF;
 END $$;
 GRANT USAGE ON SCHEMA public TO messaging_purge;
-GRANT SELECT ON probe_metadata,accounts,chats,ingest_receipt_links TO messaging_purge;
+GRANT SELECT ON probe_metadata,accounts,ingest_receipt_links TO messaging_purge;
+GRANT SELECT,UPDATE(purged_at) ON chats TO messaging_purge;
 GRANT INSERT ON ingest_receipt_links TO messaging_purge;
 GRANT SELECT,INSERT,UPDATE ON message_purges,chat_tombstones TO messaging_purge;
 GRANT SELECT,UPDATE(value) ON purge_state TO messaging_purge;

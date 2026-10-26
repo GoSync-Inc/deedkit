@@ -632,6 +632,19 @@ ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 `promotable()` (the previous revision is no longer current `main`), does not run or
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
+Messaging migration 045 (`manual`, ANYM-511) adds the deletion purge: `messages.purged`
+(defaulted, no rewrite), an index on `events(message)` whose build holds a share lock on `events`
+(event inserts wait for it), the `message_purges`, `chat_tombstones`, `ingest_receipt_links` and
+`purge_state` tables without foreign keys, guard triggers that keep later writes of a purged
+message content-free, and the audit CHECK re-added `NOT VALID` with `message_purge`. Running
+schema-44 processes keep working: their writes pass through the guards unchanged. A schema-44
+runtime refuses schema 45, so it ships with its release; update the pinned backup and restore
+runtimes first. After `migrate`, run `purge_role.sql` (NOLOGIN role `messaging_purge`) and
+`gateway_role.sql` as the owner; the worker (`deploy/compose.message-purge.yaml`) sets that role
+on its DSN with `--role messaging_purge`. Messages deleted before 045 are purged only by
+`purge-deleted --apply`, after `--preview` and a fresh verified backup, outside an active call.
+The purge is irreversible: rolling back code or schema does not bring content back; only a
+restore of an earlier backup does. `purge-disable` stops the worker without a deploy.
 Messaging migration 044 (`expand`, ANYM-495) is additive: the new `api_key_operations` table
 (operation ID, request digest, key ID) without a foreign key, so it takes no lock on `api_keys`,
 which every authentication reads. It is not lock-free: like every `migrate`, the same transaction
