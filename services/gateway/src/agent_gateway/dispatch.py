@@ -51,7 +51,8 @@ CALENDAR_CONSTRAINTS = {
 REFERENCE_KEY = re.compile(r"(?:^|_)(?:ids?|digest|ref|token)$|^(?:account|chat|person|sender|receipt|operation|"
                            r"consumer|reply_to|network|kind|view|detail|direction|order|format|status|live|modules|tool)$")
 PHONE = re.compile(r"\+?\d(?:[\s().-]?\d){6,}")
-FILE_NAME = re.compile(r"[\w-]+\.[A-Za-z][A-Za-z0-9]{1,4}\b")
+# A name, a dot and an extension of 1-10 letters or digits with at least one letter (.c, .7z, .sqlite3).
+FILE_NAME = re.compile(r"[\w-]+\.(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{1,10}\b")
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
 MIN_PAYLOAD, MIN_TOKEN = 4, 6
 

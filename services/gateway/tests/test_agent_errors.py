@@ -305,3 +305,17 @@ def test_a_relayed_next_passes_the_same_argument_admission_as_the_call(gateway, 
         kept = relayed(client, "messages_search", {"query": "lookup"})
         refused = call(client, bad["tool"], bad["arguments"])
     assert "next" not in dropped and kept["next"] == good and refused["isError"]
+
+
+# spec: ANYM-544
+@pytest.mark.parametrize("name", ["canary-report.sqlite3", "canary-report.c", "canary clip.7z", "Canary.TAR"])
+def test_a_backend_file_name_with_any_extension_never_reaches_hint_next_or_candidates(gateway, name):
+    app, _, failures = gateway
+    failures["search"] = (409, {"error": "conflict", "hint": f"See {name}",
+                                "next": {"tool": "messages_search", "arguments": {"query": name}},
+                                "candidates": [{"id": "chat-1", "label": name, "kind": "chat"},
+                                               {"id": "chat-2", "label": "Synthetic 2", "kind": "chat"}]})
+    with TestClient(app) as client:
+        body = relayed(client, "messages_search", {"query": "lookup"})
+    assert "hint" not in body and "next" not in body
+    assert body["candidates"] == [{"id": "chat-2", "label": "Synthetic 2", "kind": "chat"}]
