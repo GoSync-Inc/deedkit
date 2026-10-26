@@ -157,6 +157,14 @@ the real command would succeed now, either creating the key or replaying the ope
 `key-info --operation-id` tells which. A validation failure exits with the same error as the real
 command (`operation_conflict`, `token_in_use`, ...), and an unreachable or refused database with
 its connection error, never `schema_not_ready`. Invocations without these options behave as before.
+`deedkit admin key issue NEW --like SOURCE` (docs/operations/production.md, Admin CLI) runs these
+commands to clone an agent's access into a new principal across every store. It passes
+`issue-key --new-principal`, which refuses `principal_exists` for a principal that already exists
+(after the operation replay check, so a rerun still replays) instead of rewriting its scope, and
+`issue-key --key-permissions-of KEY_ID`, which gives the new key that key's stored ceiling as is (a
+NULL legacy ceiling too; `unknown_key` if there is none, `key_permissions_conflict` together with
+`--key-permissions`). It reads the source with `principal-info --principal ID`, whose keys carry
+`effective_permissions` (the principal's permissions narrowed by the key's ceiling).
 
 A token is 32–256 printable ASCII characters without spaces (for example
 `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`). `/dev/stdin` may be a pipe or a

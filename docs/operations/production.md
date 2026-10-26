@@ -1054,7 +1054,9 @@ Docker's container log until `run --rm` removes them; on a timeout or an interru
 own uniquely named container (`docker stop`, 30 s bound), and the calendar reads carry a 5 s
 statement timeout. Filters: `--principal ID`, `--valid` (enabled, unexpired), `--expiring` (within
 the gateway's 7-day warning window or expired), `--all` (default); `--json` for machine output;
-`--strict` exits 1 when there are findings (exit 2 is an unreadable input).
+`--strict` exits 1 when there are findings (exit 2 is an unreadable input). There is no
+installed `deedkit` command: `deedkit admin ...` below and in the CLI's printed rerun and undo
+hints means `python3 scripts/deedkit.py admin ...` run from the host checkout.
 
 Findings, for every gateway principal, disabled and expired ones included (re-enabling one would
 expose them): `credential_missing`, `credential_revoked`, `credential_expired`,
@@ -1072,6 +1074,105 @@ calendar operator command prefixes. Every private file it reads must be a regula
 file (no group or other bits, no symlink). `admin key label ID TEXT` (1–80 printable characters,
 an existing gateway principal) writes the label to `labels.json` beside it, mode 0600, atomically;
 no service reads that file, so the enforced policy never changes.
+
+### Write subcommands (ANYM-493 shared rules)
+
+Running `key issue` or `undo` is the owner's decision (secrets and access); an agent runs them
+only on the owner's exact words. Every write subcommand follows these rules
+(tests/test_deedkit_admin_rules.py proves each):
+
+- (a) Locks: it takes the installed host tool's `production.host_locks` (global, HTTP and plan-A
+  locks, the set `deploy` holds) and then the calls-registry writer lock
+  (`/var/lib/deedkit-admin/calls-registry.lock`), in that order, for at most 30 s; then it refuses
+  "a deploy is running" and changes nothing. Under the locks it refuses while a release is
+  unresolved (`production.unresolved`, the same check `deploy` runs: an unfinished plan-A attempt or
+  rollback, an HTTP attempt neither `serving` nor `startup-failed`, a `serving` attempt
+  `http-current.json` does not name) or the deploy pause file exists. It loads `production.py`
+  from the installed tool (`/usr/local/lib/deedkit/current`), never a checkout, and refuses when
+  that copy has no `unresolved`: the first write needs a host-tool install from a commit with it.
+- (b) Active call: it reads the call state with `production.active_calls`, the probe `deploy` uses,
+  under the active deploy configuration (`production.active_config`; an admin config naming
+  `production_config` refuses), and also probes with `production.calls_in` every running container
+  that can read the calls registry (a mount of its directory or of any ancestor directory), so a
+  voice consumer outside that configuration counts too. An active call, a timeout or an unreadable
+  state refuses with no store changed; so does a container that cannot be probed.
+- (c) Validation: each candidate policy or registry is checked in the image of every running
+  consumer, that is every container with a mount of the file's directory or of an ancestor
+  (`deedkit-gateway --check` in each running gateway, `agent_api.py --check-registry` in the
+  running voice image), and, for the policy, in the image `production.py` would roll back to,
+  then renamed atomically into the mounted directory. Before any journal, token or backend write
+  the same checks run once on a copy of the live documents, so an image without the check refuses
+  with nothing written. Only a positive answer passes: the check's
+  last stdout line must be the JSON `{"valid": true}`; a rejection, any other output or an image
+  without the check refuses. An image without the check is updated first; a live document the
+  rollback image rejects clears once a deploy makes the current image the rollback one. It refuses
+  when a
+  running consumer mounts the policy or registry as a single file (ANYM-424): a rename would not
+  reach it.
+- (d) Containers: it never starts, stops or recreates a service container; its one-shot operator
+  and check containers run with `--rm` and a unique name and are removed on every exit path.
+- (e) Journal, rerun and undo: every operation has an ID and a journal
+  `/var/lib/deedkit-admin/ops/<op-id>.json` (directory 0700, file 0600) of public IDs, the hashes of
+  the entries it created and each step's state, written before and after each step. Each backend
+  credential has its own derived operation ID (`<op-id>/messaging`, `<op-id>/messaging-archive`,
+  `<op-id>/calendar`), journaled before the call. On a failure or uncertain outcome it stops and
+  prints two choices: rerun the same command with `--operation <op-id>` (finished steps replay by
+  their operation IDs, the rest continue; nothing is issued twice) or `deedkit admin undo <op-id>`.
+  Undo is compensation: it revokes only credentials whose records carry this operation's IDs,
+  disables only entries whose hash still matches what the operation wrote (compare-and-swap on the
+  file revision, refusing on a conflict), keeps every later change by others, and deletes the
+  token files the operation created. An interrupted undo is run again. Undo refuses while a
+  credential it would still revoke or disable has no readable token file of its own, or that file's
+  token no longer resolves in its store to the record undo revokes (calls: to the pin of the entry
+  the operation wrote), since then it cannot compare that credential with other principals'
+  references; put the operation's own token file back, or revoke the public IDs in its journal per
+  service as an approved manual step. Undo runs the (c) checks on copies of the documents it would
+  change before its first journal change.
+- (f) Exclusive credentials: undo refuses, listing the principals, when anything but this
+  operation's own entry references a credential it would revoke, by the token itself (a copy in
+  another file counts); a reference it cannot read (missing, unsafe mode, malformed) counts too.
+- (g) Secrets: no token, key hash or key-file content appears in stdout, stderr, child argv or
+  environment, logs or the journal; tokens reach operator commands on stdin.
+- (h) Versions: before any write, every service command it needs runs once with `--check`;
+  `schema_not_ready` or an unknown command or option refuses with the service named.
+
+### Issue a key like an existing one (ANYM-496)
+
+`deedkit admin key issue <new-id> --like <source-id> --days N [--label TEXT] [--dry-run]` creates
+a new principal with the source's access in every store: messaging accounts, chats, permissions
+and key permissions (and the calls archive key the same way); calendar calendars, scopes, member
+and visibility; the calls entry (all fields except ID, hash, expiry and archive configuration) with
+a new private archive configuration; the gateway profile, grants and actions. Each messaging key
+gets the source key's stored ceiling as is (`issue-key --key-permissions-of`, a NULL legacy or a
+wider ceiling included), so it may do exactly what the source key may. N is
+1–30 for every store (the card's bound: one N must fit every store, messaging allows 365 and
+calendar 183 days, and the gateway entry ends at the earliest backend expiry). `--dry-run` prints the plan (stores, public fields, policy and registry diff with hashes
+masked) and writes nothing. It refuses before any write when the source is unknown, disabled or
+expired, `<new-id>` or `<new-id>-calls-archive` exists in any store or names a journaled
+operation (an operation reserves its ID from its first write, so an undone ID stays taken), N is
+out of range, or a shared rule refuses. It never issues a key for an existing principal: the
+messaging `issue-key` runs with `--new-principal`, which refuses `principal_exists` under the
+principal lock.
+
+Order: every token is first written durably (0600, synced under a staging name, then published
+by a hard link that never replaces a file; the gateway token as
+`/root/deedkit-admin/tokens/<new-id>.token` in a 0700 directory, backend tokens where the policy
+and registry name them, owned by the consumer's UID); then each backend credential is issued with
+`--token-file /dev/stdin --operation-id`; then the calls registry and archive configuration; then
+the gateway policy, the activation point. The gateway `expires_at` is the earliest backend expiry
+read back, so the gateway never outlives a backend. No container restarts: the gateway and voice
+re-read their mounted directory on the next request. A token file is either absent or complete; a
+rerun removes the staging files an interrupted write left and continues from the journal.
+
+The output lists public IDs, expiries, the token file, the undo command and the next step for the
+Mac (copy the token file to `~/.config/deedkit/<new-id>.token`, then a `claude mcp add-json`
+command whose headers helper reads it). `undo` disables the gateway and calls entries and revokes
+the backend credentials; revoked records stay for audit, so `<new-id>` stays taken and a fresh
+attempt uses another ID. Its output lists `revoked` (store and public ID), `disabled` (entries),
+`deleted_files` and `next` (the `claude mcp remove` command for the Mac).
+
+Optional configuration keys, with the defaults above: `tool`, `journal`, `tokens`, `calls_lock`,
+`validators` and `docker` (the Docker command prefix).
 
 ## Record the production release
 

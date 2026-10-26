@@ -305,56 +305,62 @@ class AgentRegistry:
     def __init__(self, path):
         self.path, self.revision, self.digest = path, 0, ""
 
+    @staticmethod
+    def validate(raw, revision=0, previous=""):
+        """The registry document in `raw`, or ValueError/ValidationError; the running service's own rules. The
+        admin CLI runs it in the running calls image before a rename (ANYM-496, `--check-registry`)."""
+
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate_configuration_key")
+                result[key] = value
+            return result
+
+        doc = RegistryDocument.model_validate(
+            json.loads(raw, object_pairs_hook=unique)
+        )
+        digest = hashlib.sha256(raw).hexdigest()
+        if (
+            doc.version != 1
+            or doc.revision < revision
+            or (doc.revision == revision and digest != previous)
+        ):
+            raise ValueError("invalid_policy_revision")
+        ids, keys = set(), set()
+        for p in doc.principals:
+            expiry = datetime.fromisoformat(p.expires_at.replace("Z", "+00:00"))
+            if (
+                p.id in ids
+                or p.key_sha256 in keys
+                or expiry.tzinfo is None
+                or set(p.scopes) - SCOPES
+            ):
+                raise ValueError("invalid_principal")
+            if set(p.channels) - {
+                "browser",
+                "phone",
+                "sip",
+                "telegram",
+                "whatsapp",
+            }:
+                raise ValueError("invalid_channel")
+            if set(p.destinations) - set(p.channels) or any(
+                "*" in d for d in p.destinations.values()
+            ):
+                raise ValueError("invalid_destination")
+            if p.archive_config and not Path(p.archive_config).is_absolute():
+                raise ValueError("invalid_archive_configuration")
+            ids.add(p.id)
+            keys.add(p.key_sha256)
+        return doc, digest
+
     def authenticate(self, token):
         if not self.path:
             raise ServiceError("agent_access_not_configured", 401)
         try:
-            raw = private_bytes(self.path)
-
-            def unique(pairs):
-                result = {}
-                for key, value in pairs:
-                    if key in result:
-                        raise ValueError("duplicate_configuration_key")
-                    result[key] = value
-                return result
-
-            doc = RegistryDocument.model_validate(
-                json.loads(raw, object_pairs_hook=unique)
-            )
-            digest = hashlib.sha256(raw).hexdigest()
-            if (
-                doc.version != 1
-                or doc.revision < self.revision
-                or (doc.revision == self.revision and digest != self.digest)
-            ):
-                raise ValueError("invalid_policy_revision")
-            ids, keys = set(), set()
-            for p in doc.principals:
-                expiry = datetime.fromisoformat(p.expires_at.replace("Z", "+00:00"))
-                if (
-                    p.id in ids
-                    or p.key_sha256 in keys
-                    or expiry.tzinfo is None
-                    or set(p.scopes) - SCOPES
-                ):
-                    raise ValueError("invalid_principal")
-                if set(p.channels) - {
-                    "browser",
-                    "phone",
-                    "sip",
-                    "telegram",
-                    "whatsapp",
-                }:
-                    raise ValueError("invalid_channel")
-                if set(p.destinations) - set(p.channels) or any(
-                    "*" in d for d in p.destinations.values()
-                ):
-                    raise ValueError("invalid_destination")
-                if p.archive_config and not Path(p.archive_config).is_absolute():
-                    raise ValueError("invalid_archive_configuration")
-                ids.add(p.id)
-                keys.add(p.key_sha256)
+            doc, digest = self.validate(private_bytes(self.path), self.revision, self.digest)
             self.revision, self.digest = doc.revision, digest
         except (OSError, ValueError, ValidationError):
             raise ServiceError("agent_policy_unavailable", 503) from None
@@ -639,3 +645,24 @@ class AgentAPI:
             return JSONResponse({"error": "invalid_arguments"}, status_code=422)
         except Exception:
             return JSONResponse({"error": "service_unavailable"}, status_code=503)
+
+
+def check_registry(argv=None):
+    """`python agent_api.py --check-registry PATH`: validate a candidate registry as the running service reads it,
+    print its revision and principal count (never a hash), exit 1 when it is refused. Writes nothing."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Validate a calls agent registry")
+    parser.add_argument("--check-registry", required=True, type=Path)
+    args = parser.parse_args(argv)
+    try:
+        doc, _ = AgentRegistry.validate(private_bytes(args.check_registry))
+    except (OSError, ValueError, ValidationError) as exc:
+        print(json.dumps({"valid": False, "error": type(exc).__name__}))
+        return 1
+    print(json.dumps({"valid": True, "revision": doc.revision, "principals": len(doc.principals)}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(check_registry())

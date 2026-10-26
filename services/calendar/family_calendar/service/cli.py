@@ -120,7 +120,9 @@ def parser():
     info = sub.add_parser("agent-info")
     info.add_argument("--key-file", type=Path, help="One key per line; /dev/stdin for a batch")
     info.add_argument("--operation-id")
-    for command in (agent, revoke, extend, agents, info):
+    scope = sub.add_parser("agent-scope")
+    scope.add_argument("--id", required=True)
+    for command in (agent, revoke, extend, agents, info, scope):
         # ANYM-495: validate the arguments and report whether the schema is applied; writes nothing.
         command.add_argument("--check", action="store_true")
     disconnect = sub.add_parser("disconnect")
@@ -323,6 +325,9 @@ def dispatch(args, home, root, config, store):
         return {"principal_id": args.id, "previous_expires_at": previous.isoformat(), "expires_at": new.isoformat()}
     if args.action == "list-agents":
         return {"agents": store.list_agents()}
+    if args.action == "agent-scope":
+        # ANYM-496: read only; the scope a clone copies (member, scopes, calendars and their visibility).
+        return store.check_schema() if args.check else store.agent_scope(args.id)
     if args.action == "agent-info" and (args.key_file is None) == (args.operation_id is None):
         raise CalendarError("key_file_or_operation_id_required")
     if args.action == "agent-info":
