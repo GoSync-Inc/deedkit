@@ -1,5 +1,6 @@
 """`messages_capabilities` views (ANYM-270): the gateway's own payload as a summary, named sections or in full."""
 
+from .catalog import CATALOG
 from .policy import Denied
 
 # Same section names as the messaging backend; each holds the keys of the gateway payload
@@ -20,6 +21,60 @@ SECTIONS = {
                              "gateway_actions_excluded_by_account", "gateway_actions_basis"),
     "limits": ("limits", "unavailable"),
 }
+
+# ANYM-528: any spelling of a messaging call (backend operation or public name) -> its public gateway name.
+MESSAGING_CALLS = {spelling: name for name, tool in CATALOG.items() if tool["module"] == "messaging"
+                   for spelling in (tool["operation"], name)}
+HIDDEN = object()
+# Fields whose value is a call: kept only when it is one of the caller's listed tools.
+EVENT_CALL_FIELDS = ("fetch", "ack", "wait", "test")
+
+
+def named_calls(value, shown):
+    """`value` with each string naming a messaging call as its public name; a call `shown` lacks is HIDDEN
+    and dropped from the enclosing object or list."""
+    if isinstance(value, str):
+        name = MESSAGING_CALLS.get(value)
+        return value if name is None else name if name in shown else HIDDEN
+    if isinstance(value, dict):
+        return {k: v for k, item in value.items() if (v := named_calls(item, shown)) is not HIDDEN}
+    if isinstance(value, list):
+        return [v for item in value if (v := named_calls(item, shown)) is not HIDDEN]
+    return value
+
+
+def subscription_blocks(result, visible):
+    """The `subscriptions` and `events` blocks name only calls in the caller's tool list (ANYM-528).
+
+    A hidden call is omitted, `subscriptions.ack` becomes false, `wait_max_seconds` leaves with the wait
+    call (or an omitted `events.wait`) and `delivery_policy` with its tool. A call field naming no listed
+    tool (an unknown operation or a value of another type) is omitted too. A block that is not an object
+    is dropped, never passed on.
+    """
+    shown = set(visible)
+    for key in ("subscriptions", "events"):
+        if key not in result:
+            continue
+        if not isinstance(result[key], dict):
+            del result[key]
+            continue
+        block = named_calls(result[key], shown)
+        if "messages_wait_for_subscription_events" not in shown:
+            block.pop("wait_max_seconds", None)
+        if key == "events":
+            for field in EVENT_CALL_FIELDS:
+                if field in block and not (isinstance(block[field], str) and block[field] in shown):
+                    del block[field]
+            if "wait" not in block:
+                block.pop("wait_max_seconds", None)
+        if key == "subscriptions":
+            if "ack" in block:
+                block["ack"] = block["ack"] is True and "messages_ack_subscription_events" in shown
+            policy = block.get("delivery_policy")
+            if not isinstance(policy, dict) or not isinstance(policy.get("tool"), str) or policy["tool"] not in shown:
+                block.pop("delivery_policy", None)
+        result[key] = block
+    return result
 
 
 def capabilities_view(result, args):
