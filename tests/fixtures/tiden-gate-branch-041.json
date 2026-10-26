@@ -1,0 +1,177 @@
+{
+  "cli": "0.41.0",
+  "command": "tiden gate check --branch review/<name> -f json",
+  "exit": 3,
+  "reply": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "productId": "00000000-0000-4000-8000-000000000002",
+    "scope": "VERDICT_SCOPE_BRANCH",
+    "branchId": "00000000-0000-4000-8000-000000000003",
+    "status": "VERDICT_STATUS_NOT_VERIFIED",
+    "computedAt": "2026-01-01T00:00:00Z",
+    "components": [
+      {
+        "componentId": "",
+        "name": "No component",
+        "status": "VERDICT_STATUS_NOT_VERIFIED",
+        "criteria": [
+          {
+            "criterion": "coverage",
+            "status": "CRITERION_STATUS_NOT_VERIFIED",
+            "detail": {
+              "coverageGap": "ANYM-527 — no test linked"
+            }
+          },
+          {
+            "criterion": "pass_rate",
+            "status": "CRITERION_STATUS_PASS",
+            "detail": {}
+          },
+          {
+            "criterion": "risk",
+            "status": "CRITERION_STATUS_NOT_APPLICABLE",
+            "detail": {}
+          },
+          {
+            "criterion": "freshness",
+            "status": "CRITERION_STATUS_PASS",
+            "soft": true,
+            "detail": {}
+          },
+          {
+            "criterion": "prod_issues",
+            "status": "CRITERION_STATUS_NOT_APPLICABLE",
+            "detail": {}
+          }
+        ]
+      },
+      {
+        "componentId": "",
+        "name": "(product)",
+        "status": "VERDICT_STATUS_PASS",
+        "criteria": [
+          {
+            "criterion": "prod_issues",
+            "status": "CRITERION_STATUS_PASS",
+            "detail": {}
+          }
+        ]
+      }
+    ],
+    "subjects": [
+      {
+        "subjectType": "component",
+        "subjectId": "",
+        "name": "No component",
+        "status": "VERDICT_STATUS_NOT_VERIFIED",
+        "criteria": [
+          {
+            "criterion": "coverage",
+            "status": "CRITERION_STATUS_NOT_VERIFIED",
+            "detail": {
+              "coverageGap": "ANYM-527 — no test linked"
+            }
+          },
+          {
+            "criterion": "pass_rate",
+            "status": "CRITERION_STATUS_PASS",
+            "detail": {}
+          },
+          {
+            "criterion": "risk",
+            "status": "CRITERION_STATUS_NOT_APPLICABLE",
+            "detail": {}
+          },
+          {
+            "criterion": "freshness",
+            "status": "CRITERION_STATUS_PASS",
+            "soft": true,
+            "detail": {}
+          },
+          {
+            "criterion": "prod_issues",
+            "status": "CRITERION_STATUS_NOT_APPLICABLE",
+            "detail": {}
+          }
+        ],
+        "requirements": [
+          {
+            "requirementId": "00000000-0000-4000-8000-000000000004",
+            "display": "ANYM-527",
+            "state": "no_test",
+            "nextAction": "generate tests for ANYM-527 (generate-tests, then `tiden test push`, then `tiden run exec`)",
+            "touched": "changed",
+            "uncoveredOnMain": true
+          }
+        ],
+        "nextAction": "No component — generate tests for ANYM-527 (generate-tests, then `tiden test push`, then `tiden run exec`)"
+      },
+      {
+        "subjectType": "feature",
+        "subjectId": "00000000-0000-4000-8000-000000000005",
+        "name": "Synthetic feature",
+        "status": "VERDICT_STATUS_NOT_VERIFIED",
+        "criteria": [
+          {
+            "criterion": "coverage",
+            "status": "CRITERION_STATUS_NOT_VERIFIED",
+            "detail": {
+              "coverageGap": "ANYM-527 — no test linked"
+            }
+          },
+          {
+            "criterion": "pass_rate",
+            "status": "CRITERION_STATUS_PASS",
+            "detail": {}
+          },
+          {
+            "criterion": "risk",
+            "status": "CRITERION_STATUS_NOT_APPLICABLE",
+            "detail": {}
+          },
+          {
+            "criterion": "freshness",
+            "status": "CRITERION_STATUS_PASS",
+            "soft": true,
+            "detail": {}
+          },
+          {
+            "criterion": "prod_issues",
+            "status": "CRITERION_STATUS_NOT_APPLICABLE",
+            "detail": {}
+          }
+        ],
+        "requirements": [
+          {
+            "requirementId": "00000000-0000-4000-8000-000000000004",
+            "display": "ANYM-527",
+            "state": "no_test",
+            "nextAction": "generate tests for ANYM-527 (generate-tests, then `tiden test push`, then `tiden run exec`)",
+            "touched": "changed",
+            "uncoveredOnMain": true
+          }
+        ],
+        "nextAction": "Synthetic feature — generate tests for ANYM-527 (generate-tests, then `tiden test push`, then `tiden run exec`)"
+      }
+    ],
+    "fixHints": [
+      {
+        "component": "No component",
+        "action": "No component — generate tests for ANYM-527 (generate-tests, then `tiden test push`, then `tiden run exec`)"
+      },
+      {
+        "component": "Synthetic feature",
+        "action": "Synthetic feature — generate tests for ANYM-527 (generate-tests, then `tiden test push`, then `tiden run exec`)"
+      }
+    ],
+    "nextAction": "No component — generate tests for ANYM-527 (generate-tests, then `tiden test push`, then `tiden run exec`)",
+    "scopeInfo": {
+      "source": "branch_delta",
+      "touchedRequirements": 1,
+      "touchedComponents": 1,
+      "bySource": {
+        "changed": 1
+      }
+    }
+  }
+}

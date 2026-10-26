@@ -13,7 +13,8 @@ Tiden main and the body names no spec, when an added test has no marker and is n
 an existing story-level spec on Tiden main or the named branch, or when the named branch is not an open proposal or
 review branch, or when that open branch's merge preview changes a spec the body does not name, changes no spec or
 holds more than spec changes (one preview parser, shared with the main sync). A failed read or an unknown or
-malformed preview is a refusal, not a verdict, except that a forbidden class is judged before the spec numbers. It prints the anchor matches for the job summary. The main-push sync
+malformed preview is a refusal, not a verdict, except that a forbidden class is judged before the spec numbers. It prints the anchor matches for the job summary. After the outcome is fixed it prints Tiden's own
+verdict for the named branch (`gate check --branch`) as advisory lines that never change it. The main-push sync
 (scripts/tiden_sync.py) later anchors, links and merges from the same lines and markers.
 """
 from __future__ import annotations
@@ -28,6 +29,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import ANCHOR_REPOSITORIES, Refused, excluded, shown, tiden  # noqa: E402
@@ -65,6 +67,14 @@ PREVIEW_OTHER = ("stats", "intentSession", "blockingSessions", "hasRequirementCh
 # Tests that verify no spec, as `<path>::<test>` patterns with the reason; widening it is a reviewed code change.
 NO_SPEC: tuple[tuple[str, str], ...] = ()
 TIMEOUT = 120
+# The advisory branch gate runs after the outcome is fixed, inside the check step's limit (checks.yml, step `check`):
+# at most GATE_TIMEOUT seconds and never past STEP_LIMIT - GATE_MARGIN from the script's start; with less than
+# GATE_MIN seconds left it is skipped, so a slow gate cannot get the step killed and turn a verdict into "unchecked".
+STEP_LIMIT, GATE_MARGIN, GATE_TIMEOUT, GATE_MIN = 480, 60, 60, 10
+GATE_STATUS = re.compile(r"VERDICT_STATUS_([A-Z]+(?:_[A-Z]+)*)")
+GATE_STATE = re.compile(r"[a-z]+(?:_[a-z]+)*")
+SPEC_STATUS = re.compile(r"[A-Za-z]+(?: [A-Za-z]+)*")
+clock = time.monotonic
 
 
 @dataclass
@@ -399,7 +409,75 @@ def preview_problems(cli: str, product: str, lines: Lines, main: dict[int, dict]
     return numbers
 
 
-def check(root: Path, base: str, head: str, body: str, cli: str, product: str, report) -> int:
+def gate_budget(elapsed: float) -> float | None:
+    """The branch gate's timeout `elapsed` seconds after the script started, or None when too little time is left."""
+    left = STEP_LIMIT - GATE_MARGIN - elapsed
+    return None if left < GATE_MIN else min(GATE_TIMEOUT, left)
+
+
+def gate_rows(reply: object, known: dict[int, dict]) -> list[str] | None:
+    """The advisory lines of a CLI 0.41.0 branch verdict (read 2026-10-26, tests/fixtures/tiden-gate-branch-041.json):
+    one per spec, `ref status state`; None for any other shape. Only the verdict, numbers and states are printed."""
+    if not isinstance(reply, dict) or reply.get("scope") != "VERDICT_SCOPE_BRANCH":
+        return None
+    status, subjects = reply.get("status"), reply.get("subjects")
+    if not isinstance(status, str) or not GATE_STATUS.fullmatch(status) or not isinstance(subjects, list):
+        return None
+    found: dict[int, tuple[str, bool]] = {}
+    for subject in subjects:
+        requirements = subject.get("requirements", []) if isinstance(subject, dict) else None
+        if not isinstance(requirements, list):
+            return None
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                return None
+            ref, state = requirement.get("display"), requirement.get("state")
+            if not isinstance(ref, str) or not SPEC_ID.fullmatch(ref) or not isinstance(state, str) \
+                    or not GATE_STATE.fullmatch(state):
+                return None
+            found.setdefault(int(ref[5:]), (state, requirement.get("touched") not in (None, "changed")))
+    rows = [f"Tiden branch gate: {GATE_STATUS.fullmatch(status)[1].replace('_', ' ')} "
+            "(advisory, never changes this check)"]
+    for number, (state, neighbour) in sorted(found.items()):
+        spec_status = (known.get(number) or {}).get("status")
+        spec_status = spec_status if isinstance(spec_status, str) and SPEC_STATUS.fullmatch(spec_status) else "unknown"
+        note = " (planned)" if (spec_status, state) == ("Backlog", "no_test") else " (neighbour)" if neighbour else ""
+        rows.append(f"- ANYM-{number} {spec_status} {state}{note}")
+    return rows
+
+
+def branch_gate(cli: str, product: str, branch: str, known: dict[int, dict], started: float) -> list[str]:
+    """Tiden's verdict for the specs `branch` changes, as advisory lines; any failure is one fixed line."""
+    def unchecked(reason: str) -> list[str]:
+        return [f"Tiden branch gate: not checked ({reason})"]
+
+    try:
+        budget = gate_budget(clock() - started)
+        if budget is None:
+            return unchecked("no time")
+        try:
+            completed = subprocess.run([cli, "gate", "check", "--branch", branch, "--product-id", product,
+                                        "--format", "json"], capture_output=True, timeout=budget)
+        except subprocess.TimeoutExpired:
+            return unchecked("timeout")
+        except OSError:
+            return unchecked("the CLI did not start")
+        # A verdict that is not a pass exits 3 with the verdict on stdout; any other nonzero exit is a failure.
+        if completed.returncode not in (0, 3):
+            return unchecked(f"exit {completed.returncode}")
+        try:
+            reply = json.loads(completed.stdout)
+        except ValueError:
+            return unchecked("not JSON")
+        rows = gate_rows(reply, known)
+        return unchecked("unexpected shape") if rows is None else rows
+    except Exception:  # noqa: BLE001 - advisory: never change the outcome, never echo data the error may hold
+        return unchecked("unexpected error")
+
+
+def check(root: Path, base: str, head: str, body: str, cli: str, product: str, report,
+          started: float | None = None) -> int:
+    started = clock() if started is None else started
     failures: list[str] = []
     lines = parse_body(body)
     failures.extend(lines.errors)
@@ -464,13 +542,18 @@ def check(root: Path, base: str, head: str, body: str, cli: str, product: str, r
             failures.append(f"ANYM-{number} (named by {places[0]}) is a {spec['type']} with child specs or an Epic; "
                             "name the story that holds the criterion")
 
+    # The outcome and the closing line are fixed before the advisory gate, which only adds lines above that line.
     if failures:
         report(f"{len(failures)} problem(s):")
         report("\n".join(f"- {failure}" for failure in failures))
-        report("Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun.")
-        return 1
-    report("Passed.")
-    return 0
+        code, closing = 1, "Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun."
+    else:
+        code, closing = 0, "Passed."
+    if lines.branch:
+        for line in branch_gate(cli, product, lines.branch, known, started):
+            report(line)
+    report(closing)
+    return code
 
 
 def event(path: str | None) -> dict:
@@ -512,6 +595,7 @@ def main() -> int:
     parser.add_argument("--body-file", type=Path, help="read the body from a file instead of the event")
     parser.add_argument("--cli", default="tiden")
     args = parser.parse_args()
+    started = clock()
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
 
     def report(line: str) -> None:
@@ -532,7 +616,8 @@ def main() -> int:
         base = args.base or merged_base(args.root.resolve(), args.head, pull) or (pull.get("base") or {}).get("sha")
         if not base:
             raise Refused("no base commit: pass --base")
-        return check(args.root.resolve(), base, args.head, body, args.cli, os.environ["TIDEN_PRODUCT_ID"], report)
+        return check(args.root.resolve(), base, args.head, body, args.cli, os.environ["TIDEN_PRODUCT_ID"], report,
+                     started)
     except Refused as error:
         report(f"Refused: {error}")
         return 1
