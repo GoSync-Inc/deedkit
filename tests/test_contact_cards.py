@@ -271,3 +271,26 @@ def test_no_contact_field_reaches_log_lines(wa,caplog):
 def validate_capture(value):
     from messaging_service.collector_state import validate_capture as validate_one
     return validate_one(value)
+
+
+# spec: ANYM-529
+def test_migration_047_indexes_only_contact_metadata_and_repeats_over_schema46_rows(database,tmp_path):
+    from test_extend_key import old_schema_store
+    with old_schema_store(database,tmp_path,46) as store:
+        Archive(store).register('cards-wa','whatsapp','Synthetic cards',discover=True)
+        for provider_id in ('1','2'):
+            Archive(store).ingest(archive_event(account='cards-wa',platform='whatsapp',chat='chat-1',provider_id=provider_id))
+        with store.pool.connection() as c:
+            card,plain=[r['id'] for r in c.execute('SELECT id FROM messages ORDER BY provider_id')]
+            c.execute('INSERT INTO message_metadata(message,revision,metadata) VALUES (%s,1,%s),(%s,1,%s)',
+                (card,json.dumps({'contact':CARD}),plain,json.dumps({'summary':'synthetic'})))
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='46'
+            assert c.execute("SELECT to_regclass('message_metadata_contact') AS i").fetchone()['i'] is None
+        store.migrate();store.migrate()
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='47'
+            assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=47').fetchone()['n']==1
+            index=c.execute('''SELECT i.indisvalid,i.indisready,pg_get_expr(i.indpred,i.indrelid) AS predicate
+                FROM pg_index i WHERE i.indexrelid='message_metadata_contact'::regclass''').fetchone()
+            assert index['indisvalid'] and index['indisready'] and "'contact'" in index['predicate']
+            assert [r['message'] for r in c.execute("SELECT message FROM message_metadata WHERE metadata ? 'contact'")]==[card]
