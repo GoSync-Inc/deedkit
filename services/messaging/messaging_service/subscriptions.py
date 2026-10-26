@@ -273,7 +273,8 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50):
             'sender',e.snapshot->'sender','provider_id',e.snapshot->'provider_id',
             'sent_at',e.snapshot->'sent_at','direction',e.snapshot->'direction',
             'deleted',e.snapshot->'deleted','processing',e.snapshot->'processing',
-            'metadata',e.snapshot->'metadata','reply_evidence',e.snapshot->'reply_evidence')) AS snapshot
+            -- ANYM-529: a shared contact card is message content: the journal keeps it, references do not.
+            'metadata',(e.snapshot->'metadata')-'contact','reply_evidence',e.snapshot->'reply_evidence')) AS snapshot
         FROM subscription_matches sm JOIN events e ON e.id=sm.event
         WHERE sm.subscription=%s AND sm.event>%s ORDER BY sm.event LIMIT %s''',
         (row['id'], after, limit + 1)).fetchall()

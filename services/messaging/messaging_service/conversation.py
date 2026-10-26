@@ -113,9 +113,9 @@ def present_message(row,position):
             else:label+='; файл пока недоступен'
         lines=contact_lines(row.get('contact')) if kind=='contact' else []
         if lines:
-            # WhatsApp sends the card's display name as the body; do not repeat it.
-            if body in {c.get('name') for c in row['contact']['contacts']}:body=''
-            row['display_text']=(body+'\n' if body else '')+'\n'.join(lines)
+            # A contact message has no caption: its body is the display name (native) or the raw
+            # vCard (fallback), which stays in body; display shows only the structured lines.
+            row['display_text']='\n'.join(lines)
         else:row['display_text']=(body+'\n' if body else '')+'['+label+']'
     else:row['display_text']=body
     row['timestamp_precision']=row.get('timestamp_resolution') or 'unknown'

@@ -102,6 +102,12 @@ class SearchPlan:
             return 'lower('+(text_sql or alias+'.body')+") LIKE lower(q.literal_pattern) ESCAPE E'\\\\'"
         return '('+' OR '.join(self.vector(alias,lang)+' @@ q.'+lang for lang in self.languages)+')'
 
+    def text_predicate(self, text_sql):
+        """The query mode's predicate over an unindexed text expression (ANYM-529: contact names)."""
+        if self.mode=='exact':
+            return self.predicate(None,text_sql)
+        return '('+' OR '.join("to_tsvector('"+lang+"',"+text_sql+') @@ q.'+lang for lang in self.languages)+')'
+
     def rank(self, alias, text_sql=None):
         if not self.query or self.mode=='exact':
             return '0::bigint'

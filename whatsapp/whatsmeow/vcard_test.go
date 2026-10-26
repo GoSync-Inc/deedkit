@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -245,5 +247,43 @@ func TestNativeContactCardCaptureIsOffByDefaultAndLogsNothing(t *testing.T) {
 	}
 	if strings.Contains(logged.String(), "81200000001") {
 		t.Fatal("a contact field reached the log")
+	}
+}
+
+// spec: ANYM-529
+func TestNativeContactCardMatchesTheSharedParserFixture(t *testing.T) {
+	raw, err := os.ReadFile("../../tests/fixtures/contact-card-parser-outputs.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Cases []struct {
+			Name  string `json:"name"`
+			Cards []struct {
+				DisplayName string `json:"displayName"`
+				Vcard       string `json:"vcard"`
+			} `json:"cards"`
+			Block any `json:"block"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range fixture.Cases {
+		cards := []sharedContact{}
+		for _, card := range c.Cards {
+			cards = append(cards, sharedContact{card.DisplayName, card.Vcard})
+		}
+		data, err := json.Marshal(contactBlock(cards))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got any
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, c.Block) {
+			t.Fatalf("%s: native block %s differs from the fixture", c.Name, data)
+		}
 	}
 }

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {contactBlock,event} from '../capture.mjs';
 
 const CARD='BEGIN:VCARD\r\nVERSION:3.0\r\nN:;Deskha;;;\r\nFN:Deskha\r\n'+
@@ -67,4 +68,10 @@ test('contact capture is off by default, so collection is unchanged',()=>{
   const e=withCapture(undefined,()=>event(message()));
   assert.equal('contactCard' in e,false);
   assert.equal('contactCard' in withCapture('1',()=>event(message({type:'chat',body:'hi',vCards:[]}))),false);
+});
+
+// spec: ANYM-529
+test('the fallback parser emits the shared fixture blocks the server test ingests',()=>{
+  const fixture=JSON.parse(readFileSync(new URL('../../tests/fixtures/contact-card-parser-outputs.json',import.meta.url),'utf8'));
+  for(const c of fixture.cases)assert.deepEqual(contactBlock(c.cards),c.block,c.name);
 });

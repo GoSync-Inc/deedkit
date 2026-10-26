@@ -50,19 +50,21 @@ META = '''nullif(sp.display_name,'') AS sender_name,nullif(sp.username,'') AS us
     (SELECT observed_at FROM message_revisions WHERE message=m.id AND revision=1) AS first_observed_at,
     'archive_revision_observation'::text AS first_observed_at_basis'''
 BASE = 'm.id,m.account,m.chat,m.sender,m.body,m.sent_at,m.revision,m.direction'
-# ANYM-529: a shared contact matches by name, or by phone digits: equal or a suffix of at least 6 digits.
-CONTACT_MATCH = '''EXISTS(SELECT 1 FROM jsonb_array_elements(x.metadata->'contact'->'contacts') ct
-    WHERE lower(ct->>'name') LIKE lower(q.literal_pattern) ESCAPE E'\\\\'
-      OR lower(ct->>'vcard_name') LIKE lower(q.literal_pattern) ESCAPE E'\\\\'
-      OR (%s::text IS NOT NULL AND EXISTS(SELECT 1 FROM jsonb_array_elements(ct->'phones') ph
-        WHERE regexp_replace(ph->>'number','[^0-9]','','g') LIKE '%%'||%s::text OR ph->>'whatsapp_id' LIKE '%%'||%s::text)))'''
+def contact_match(plan):
+    """ANYM-529: a shared contact matches by name under the query mode, or by phone digits: equal or a
+    suffix of at least 6 digits. Takes three parameters, each contact_digits(query)."""
+    names=plan.text_predicate("coalesce(ct->>'name','')||' '||coalesce(ct->>'vcard_name','')")
+    return '''EXISTS(SELECT 1 FROM jsonb_array_elements(x.metadata->'contact'->'contacts') ct
+    WHERE '''+names+''' OR (%s::text[] IS NOT NULL AND EXISTS(SELECT 1 FROM jsonb_array_elements(ct->'phones') ph
+        WHERE regexp_replace(ph->>'number','[^0-9]','','g') LIKE ANY(%s::text[]) OR ph->>'whatsapp_id' LIKE ANY(%s::text[]))))'''
 
 
 def contact_digits(query):
-    """Digits of a phone-like query, leading zeros dropped (00 prefix, local trunk 0); None below 6 digits."""
+    """Suffix patterns of a phone-like query: its digits as typed, and also without leading zeros
+    (00 prefix, local trunk 0). Only candidates of at least 6 digits; None when none is left."""
     if not re.fullmatch(r'[0-9+()\-.\s]+',query):return None
-    digits=re.sub(r'[^0-9]','',query).lstrip('0')
-    return digits if len(digits)>=6 else None
+    digits=re.sub(r'[^0-9]','',query)
+    return ['%'+d for d in dict.fromkeys((digits,digits.lstrip('0'))) if len(d)>=6] or None
 
 # ANYM-273: forwarded copies group only by the provider-stated origin, never by text alone. Keys:
 # p = origin chat and message ID, u = origin sender, second and text hash (one sender can post two
@@ -342,10 +344,19 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         **({'view':view,'include_system':include_system,'conversation_version':1} if conversation else {})})
     extra_join=' LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision' if conversation else ''
     if conversation and not include_system:clauses.append(visible_sql('m','cmd'))
-    fuzzy_used=False
+    fuzzy_used=False;contact_from=None;contact_args=[]
+    if plan.query:
+        # ANYM-529: a shared contact matches by its name or phone digits, under the same scope clauses.
+        digits=contact_digits(query)
+        contact_from='message_metadata x JOIN messages m ON m.id=x.message AND m.revision=x.revision '+extra_join+\
+            " CROSS JOIN search_query q WHERE x.metadata ? 'contact' AND NOT m.deleted AND "+' AND '.join(clauses)+' AND '+contact_match(plan)
+        contact_args=[*args,digits,digits,digits]
     if fuzzy:
         has_primary=c.execute('WITH '+plan.cte+' SELECT 1 FROM messages m '+extra_join+' CROSS JOIN search_query q WHERE '+
             ' AND '.join(clauses)+' AND '+plan.predicate('m')+' LIMIT 1',[*plan.params,*args]).fetchone()
+        # A contact hit is a primary match too: it keeps the exact view.
+        if not has_primary and contact_from:
+            has_primary=c.execute('WITH '+plan.cte+' SELECT 1 FROM '+contact_from+' LIMIT 1',[*plan.params,*contact_args]).fetchone()
         fuzzy_used=not bool(has_primary)
     score=plan.rank('m','m.body');match_type=plan.match_type('m')
     if fuzzy_used:
@@ -364,11 +375,8 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     if fuzzy_used:
         ctes.append('matches AS MATERIALIZED ('+base_sql+' ORDER BY score DESC,m.sent_at DESC,m.id DESC LIMIT 200)')
     elif plan.query:
-        # ANYM-529: a shared contact matches by its name or phone digits, under the same scope clauses.
-        digits=contact_digits(query)
-        contact_sql=head+'message_metadata x JOIN messages m ON m.id=x.message AND m.revision=x.revision '+extra_join+\
-            " CROSS JOIN search_query q WHERE x.metadata ? 'contact' AND NOT m.deleted AND "+' AND '.join(clauses)+' AND '+CONTACT_MATCH
-        match_args=[*args,*args,digits,digits,digits]
+        contact_sql=head+contact_from
+        match_args=[*args,*contact_args]
         if plan.mode!='exact':match_type='coalesce('+match_type+",'contact'::text)"
         # Separate selective indexed matching from the chronological LIMIT.
         # Otherwise the planner may prefer walking the date index, expecting
