@@ -4,7 +4,7 @@ requires = []
 project = "deedkit-calls"
 compose = "deploy/compose.calls.yaml"
 services = ["calls"]
-required_files = ["deploy/private/calls.env", "deploy/private/calls-agents.json"]
+required_files = ["deploy/private/calls.env", "deploy/private/calls-agents/agents.json"]
 env_file = "deploy/private/calls.env"
 
 [connectors.calls-phone]

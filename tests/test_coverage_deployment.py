@@ -6,12 +6,13 @@ The Chromium preflight is run against injected offline browser collaborators.
 import atexit
 import json
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import subprocess
 import sys
 import threading
+import tomllib
 from types import SimpleNamespace
 
 import pytest
@@ -174,6 +175,23 @@ def test_calls_overlay_passes_the_trusted_host_peer_and_keeps_loopback_publishin
     assert up[up.index('--env-file') + 1] == str(ROOT / 'deploy/private/calls.env')
     assert 'CALLS_TRUSTED_PEERS' in (ROOT / 'docs/operations/production.md').read_text()
 
+
+
+# spec: ANYM-496
+def test_calls_registry_is_mounted_through_its_directory_so_a_rename_is_live():
+    unit = document('deploy/compose.calls.yaml')['services']['calls']
+    registry = PurePosixPath(unit['environment']['VOICE_AGENT_REGISTRY'])
+    # Exactly one read-only bind covers the registry, and it is the registry's own directory.
+    covering = [v for v in volumes(unit)
+                if registry == PurePosixPath(v['target']) or PurePosixPath(v['target']) in registry.parents]
+    assert covering == [{'type': 'bind', 'source': './private/calls-agents', 'target': str(registry.parent),
+                         'read_only': True, 'bind': {'create_host_path': False}}]
+    # The launcher preflight checks the file the service reads through that mount.
+    module = tomllib.loads((ROOT / 'config/modules/calls.toml').read_text())
+    assert f'deploy/private/calls-agents/{registry.name}' in module['required_files']
+    admin = json.loads((ROOT / 'deploy/admin.example.json').read_text())
+    assert admin['calls_registry'].endswith(f'/deploy/private/calls-agents/{registry.name}')
+    assert admin['paths'][str(registry.parent)].endswith('/deploy/private/calls-agents')
 
 def docker_stages():
     # Parse Dockerfile instructions after folding continuations; do not execute builds.
