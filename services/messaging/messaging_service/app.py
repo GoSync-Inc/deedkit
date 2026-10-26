@@ -663,7 +663,9 @@ def create_app(store: Store, allowed_hosts: list[str]):
                    awaiting_reply_days: StrictInt=14,exclude_chats: list[StrictStr] | None=None,
                    exclude_senders: list[StrictStr] | None=None,only_questions: bool=False,only_unread: bool=False,
                    view: ConversationView='conversation',exclude_likely_broadcasts: bool=False,
-                   include_muted: bool=False,promotional: Literal['exclude','include','only']='exclude') -> dict[str, Any]:
+                   include_muted: bool=False,promotional: Literal['exclude','include','only']='exclude',
+                   my_roles: list[Literal['creator','admin','member','left','unknown']] | None=None,
+                   can_post: StrictBool | None=None) -> dict[str, Any]:
         """List permitted chats. order: activity (default) or last_activity_desc = recent first;
         id = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,
         or explicit group owner mention/reply; heuristic, not obligation. Attention expires after
@@ -703,6 +705,11 @@ def create_app(store: Store, allowed_hosts: list[str]):
         retry_after_s: seconds left of a rate limit. catchup (WhatsApp, beside coverage): state moving, queued, stalled or unknown.
         Rows without type omit nothing.
         limit defaults to 25 (maximum 100); continue with next_cursor.
+        my_role: the account's own role in a Telegram channel or group (creator, admin, member, left, unknown;
+        WhatsApp and private chats: unknown), from the last catalog pass at role_observed_at; can_post null = unknown.
+        my_roles and can_post filter by them. With either filter, unknown_role_rows counts Telegram channels and
+        groups that match the other filters but have no observed role yet (hint: role_captured_on_next_catalog_pass).
+        query also matches a channel @username, with or without the @. Compact rows omit my_role when unknown.
         """
         return call(ctx,'list_chats',detail=detail,after=after,limit=limit,accounts=accounts,query=query,chat_types=chat_types,
                     order=order,exclude_channels=exclude_channels,awaiting_reply=awaiting_reply,
@@ -710,7 +717,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     awaiting_reply_days=awaiting_reply_days,exclude_chats=exclude_chats,exclude_senders=exclude_senders,
                     only_questions=only_questions,only_unread=only_unread,view=view,
                     exclude_likely_broadcasts=exclude_likely_broadcasts,include_muted=include_muted,
-                    promotional=promotional)
+                    promotional=promotional,my_roles=my_roles,can_post=can_post)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=False, idempotentHint=True, openWorldHint=False))

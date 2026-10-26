@@ -203,6 +203,12 @@ def _own_head(message):
     return message.get('direction')=='outgoing' and isinstance(sender,str) and (sender.isdigit() or bool(personal_id(sender)))
 
 
+def chat_role(row):
+    # ANYM-533: an absent my_role means unknown; role_observed_at is in detail=full.
+    if row.get('my_role') in (None,'unknown'):return {}
+    return {'my_role':row['my_role'],**({'can_post':row['can_post']} if row.get('can_post') is not None else {})}
+
+
 def lean_chat(row):
     result={k:row[k] for k in ('id','account','title','title_basis','type','last_activity') if row.get(k) is not None}
     result['title']=result['title'][:64]
@@ -211,6 +217,7 @@ def lean_chat(row):
         result['alias_chats']=[{k:a[k] for k in ('id','last_activity') if a.get(k) is not None} for a in row['alias_chats']]
         result.update(alias_provenance=row.get('alias_provenance'),alias_confidence=row.get('alias_confidence'))
     if row.get('peer_phone'):result.update(peer_phone=row['peer_phone'],peer_phone_provenance=row.get('peer_phone_provenance'))
+    result.update(chat_role(row))
     state=row.get('conversation')
     latest=(state or {}).get('latest_known_meaningful_message')
     kind=row.get('type')
@@ -453,6 +460,9 @@ def render(method, result, detail):
             row.pop('sync',None)
             row.pop('awaiting_reply_confidence',None)
             row.pop('awaiting_reply_priority_components',None)  # ANYM-276: itemized score on request (detail=full) only
+            role=chat_role(row)
+            for key in ('my_role','can_post','role_observed_at'):row.pop(key,None)
+            row.update(role)
             if not result.get('awaiting_reply_scope'):
                 for key in tuple(row):
                     if key.startswith('awaiting_reply_'):row.pop(key,None)

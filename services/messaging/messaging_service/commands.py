@@ -486,6 +486,9 @@ def _public(row,c=None,p=None):
         from .outgoing import project_reference
         actual,state=project_reference(c,p,row['account'],answer['data']['archive_reference'])
         answer={**answer,'data':{**answer['data'],'archive_reference':actual,'archive_reference_state':state}}
+    if row['operation']=='chat_info':
+        from .chat_roles import gate_chat_info
+        answer=gate_chat_info(c,answer)
     step,refusal=_open_chat_next(row,c,p)
     return serial({**({'next_call':step} if step else {}),**{k:v for k,v in (refusal or {}).items() if k!='next_action'},'operation_id':row['id'],'operation':row['operation'],'account':row['account'],
         'chat_id':row['chat'],'message_id':row['message'],'expected_revision':row['expected_revision'],

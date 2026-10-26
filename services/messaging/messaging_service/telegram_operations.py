@@ -599,7 +599,11 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             entities = getattr(full, 'chats', None) or getattr(full, 'users', None) or []
             observed = next((e for e in entities if peer_id(e) == str(chat)), None)
             settings = group_settings(observed, details) if (channel or basic_chat) and observed is not None else None
-            return {'outcome': 'confirmed', 'provider_chat_id': str(chat),
+            # The account's own role, by the catalog's rules, from the entity this request returned (ANYM-533).
+            from .chat_roles import derive
+            my_role, can_post = derive(observed, 'private' if not (channel or basic_chat) else
+                                       'group' if basic_chat or getattr(observed, 'megagroup', False) else 'channel')
+            return {'outcome': 'confirmed', 'provider_chat_id': str(chat), 'my_role': my_role, 'can_post': can_post,
                     'title': safe_text(getattr(observed, 'title', None), 512),
                     'username': safe_text(getattr(observed, 'username', None), 128),
                     'description': safe_text(getattr(details, 'about', None), 2048),

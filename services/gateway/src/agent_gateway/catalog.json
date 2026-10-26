@@ -161,7 +161,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "List permitted chats. order: activity (default) or last_activity_desc = recent first;\nid = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,\nor explicit group owner mention/reply; heuristic, not obligation. Attention expires after\nawaiting_reply_days (default 14; 0 = no age limit), based on the attention message time.\nGroup evidence survives others' chatter and clears after owner writes. No provider read changes.\npriority requires awaiting_reply=true; score/reasons are transparent heuristics.\nexclude_chats takes archive IDs, exclude_senders account-scoped provider sender IDs.\nonly_questions uses question punctuation; private-only uses chat_types=['private'].\nonly_unread includes fresh known chat read observations only; unknown/stale count is explicit.\nexclude_likely_broadcasts (queue only, default false) drops one-way chats, including a first contact the owner\nhas not answered, and provider business/verified senders; it reports excluded_likely_broadcasts_total within\nscope. promotional (queue only): exclude (default) leaves out likely promotional rows (a one-way private chat\nfrom a non-contact that is a business/verified sender or wrote on 3+ UTC days) and reports\nexcluded_promotional_total within scope (absent means none); include returns them with awaiting_reply.likely_promotional and promotional_basis\n(business_sender or repeated_days); only\nlists just them; not combinable with exclude_likely_broadcasts. A group owner mention without a question\nmark scores owner_request. detail=full adds awaiting_reply_priority_components (points per reason).\nWhile this agent has a mute the queue reports muted_total (rows mutes remove); include_muted=true\n(queue only) returns them with awaiting_reply.muted chat or sender. A due snooze returns with\nsnoozed_until and snooze_due.\nCompact rows omit values the row fixes; an absent field means the value below.\nlast_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;\nelse the shown head's direction (owner/peer; a head hint: peer).\nsuggested_action and basis on channel and self_chat rows: not_applicable, channel_or_self_chat. On a group without a hint, suggested_action, basis and\nowner_attention: not_applicable, no_observed_owner_attention (no owner attention observed).\nowner_attention on a group with a hint: last_turn peer (the peer wrote last).\nA question is question_mark in reasons. A private hint's basis: last_archived_message_incoming.\nsender_name on an outgoing head without sender_id: the owner. head_freshness: stale.\nWithout conversation.basis beside a hint, the hint's confidence, else its basis, gives the reason.\nnext_step: provider_head_stale, provider_head_not_verified, history_has_gaps -> answer_with_caveat.\nnext_step: ambiguous_message_order, ambiguous_attention_reply_order, head_candidates_truncated -> answer_with_caveat.\nnext_step: message_revision_changed_during_read, message_version_conflict -> reread_now.\nnext_step: rate_limited, provider_temporarily_unavailable -> wait_for_provider_cooldown.\nnext_step: provider_unavailable, provider_chat_error -> check_provider_access.\nnext_step: unclassified_latest_message, chat_type_unknown, any other code -> get_context.\nnext_step: no_archived_messages -> wait_for_history.\nretry_after_s: seconds left of a rate limit. catchup (WhatsApp, beside coverage): state moving, queued, stalled or unknown.\nRows without type omit nothing.\nlimit defaults to 25 (maximum 100); continue with next_cursor.\n",
+    "description": "List permitted chats. order: activity (default) or last_activity_desc = recent first;\nid = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,\nor explicit group owner mention/reply; heuristic, not obligation. Attention expires after\nawaiting_reply_days (default 14; 0 = no age limit), based on the attention message time.\nGroup evidence survives others' chatter and clears after owner writes. No provider read changes.\npriority requires awaiting_reply=true; score/reasons are transparent heuristics.\nexclude_chats takes archive IDs, exclude_senders account-scoped provider sender IDs.\nonly_questions uses question punctuation; private-only uses chat_types=['private'].\nonly_unread includes fresh known chat read observations only; unknown/stale count is explicit.\nexclude_likely_broadcasts (queue only, default false) drops one-way chats, including a first contact the owner\nhas not answered, and provider business/verified senders; it reports excluded_likely_broadcasts_total within\nscope. promotional (queue only): exclude (default) leaves out likely promotional rows (a one-way private chat\nfrom a non-contact that is a business/verified sender or wrote on 3+ UTC days) and reports\nexcluded_promotional_total within scope (absent means none); include returns them with awaiting_reply.likely_promotional and promotional_basis\n(business_sender or repeated_days); only\nlists just them; not combinable with exclude_likely_broadcasts. A group owner mention without a question\nmark scores owner_request. detail=full adds awaiting_reply_priority_components (points per reason).\nWhile this agent has a mute the queue reports muted_total (rows mutes remove); include_muted=true\n(queue only) returns them with awaiting_reply.muted chat or sender. A due snooze returns with\nsnoozed_until and snooze_due.\nCompact rows omit values the row fixes; an absent field means the value below.\nlast_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;\nelse the shown head's direction (owner/peer; a head hint: peer).\nsuggested_action and basis on channel and self_chat rows: not_applicable, channel_or_self_chat. On a group without a hint, suggested_action, basis and\nowner_attention: not_applicable, no_observed_owner_attention (no owner attention observed).\nowner_attention on a group with a hint: last_turn peer (the peer wrote last).\nA question is question_mark in reasons. A private hint's basis: last_archived_message_incoming.\nsender_name on an outgoing head without sender_id: the owner. head_freshness: stale.\nWithout conversation.basis beside a hint, the hint's confidence, else its basis, gives the reason.\nnext_step: provider_head_stale, provider_head_not_verified, history_has_gaps -> answer_with_caveat.\nnext_step: ambiguous_message_order, ambiguous_attention_reply_order, head_candidates_truncated -> answer_with_caveat.\nnext_step: message_revision_changed_during_read, message_version_conflict -> reread_now.\nnext_step: rate_limited, provider_temporarily_unavailable -> wait_for_provider_cooldown.\nnext_step: provider_unavailable, provider_chat_error -> check_provider_access.\nnext_step: unclassified_latest_message, chat_type_unknown, any other code -> get_context.\nnext_step: no_archived_messages -> wait_for_history.\nretry_after_s: seconds left of a rate limit. catchup (WhatsApp, beside coverage): state moving, queued, stalled or unknown.\nRows without type omit nothing.\nlimit defaults to 25 (maximum 100); continue with next_cursor.\nmy_role: the account's own role in a Telegram channel or group (creator, admin, member, left, unknown;\nWhatsApp and private chats: unknown), from the last catalog pass at role_observed_at; can_post null = unknown.\nmy_roles and can_post filter by them. With either filter, unknown_role_rows counts Telegram channels and\ngroups that match the other filters but have no observed role yet (hint: role_captured_on_next_catalog_pass).\nquery also matches a channel @username, with or without the @. Compact rows omit my_role when unknown.\n",
     "inputSchema": {
       "properties": {
         "after": {
@@ -340,6 +340,40 @@
           ],
           "title": "Promotional",
           "type": "string"
+        },
+        "my_roles": {
+          "anyOf": [
+            {
+              "items": {
+                "enum": [
+                  "creator",
+                  "admin",
+                  "member",
+                  "left",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "My Roles"
+        },
+        "can_post": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Can Post"
         }
       },
       "type": "object",

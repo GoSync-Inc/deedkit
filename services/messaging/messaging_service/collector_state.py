@@ -403,6 +403,9 @@ class CollectorState:
                 policy=c.execute('SELECT * FROM account_policies WHERE account=%s AND enabled',
                                  (self.account,)).fetchone()
                 if not policy: raise RuntimeError('collection_disabled')
+                from .chat_roles import CHAT_ROLE_SCHEMA,valid
+                from .store import schema_version
+                roles=discovery and schema_version(c)>=CHAT_ROLE_SCHEMA
                 stored=0
                 for dialog in dialogs[offset:offset+100]:
                     chat,kind,title=dialog[:3]
@@ -425,6 +428,11 @@ class CollectorState:
                     if len(dialog)>=5 and dialog[4] is not None:
                         from .reply_state import observe
                         observe(c,self.account,chat,dialog[4])
+                    if discovery and roles and len(dialog)>=6 and dialog[5] is not None:
+                        # Only a discovery pass observes the role; a cached replay keeps role_observed_at (ANYM-533).
+                        role=valid(dialog[5])
+                        c.execute('''UPDATE chats SET my_role=%s,can_post=%s,username=%s,role_observed_at=clock_timestamp()
+                            WHERE id=%s''',(role['my_role'],role['can_post'],role['username'],stable_id('chat',self.account,chat)))
                     stored+=1
                 if discovery:
                     c.execute('''UPDATE collector_health SET discovery_count=discovery_count+%s,
@@ -527,6 +535,13 @@ class CollectorState:
             self.archive.fence(c,self.account,self.lease)
             c.execute('''UPDATE collector_health SET discovery_completed_at=clock_timestamp(),
                 discovery_limited=%s,updated_at=clock_timestamp() WHERE account=%s''',(limited,self.account))
+            from .chat_roles import CHAT_ROLE_SCHEMA
+            from .store import schema_version
+            if schema_version(c)>=CHAT_ROLE_SCHEMA:
+                # A chat this pass did not list has no current role (ANYM-533); its last observation time stays.
+                c.execute('''UPDATE chats SET my_role='unknown',can_post=NULL WHERE account=%s
+                    AND role_observed_at<(SELECT discovery_started_at FROM collector_health WHERE account=%s)
+                    AND my_role IS DISTINCT FROM 'unknown' ''',(self.account,self.account))
 
     def apply(self,capture):
         capture=validate_capture(capture)
