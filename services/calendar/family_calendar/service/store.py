@@ -358,6 +358,23 @@ class Store:
             ).fetchall()
         return [dict(row, expires_at=row["expires_at"].isoformat()) for row in rows]
 
+    def agent_scope(self, principal_id):
+        # ANYM-496: an agent's scope, so the admin CLI can clone it; public fields only, never the key hash.
+        with self.transaction() as conn:
+            conn.execute("SET LOCAL statement_timeout = '5s'")
+            row = conn.execute(
+                "SELECT id AS principal_id,group_id,person_id,scopes,NOT enabled AS revoked,expires_at "
+                "FROM principals WHERE id=%s",
+                (principal_id,),
+            ).fetchone()
+            if row is None:
+                return {"found": False, "principal_id": principal_id}
+            calendars = conn.execute(
+                "SELECT calendar_ref AS ref,visibility FROM agent_calendars WHERE principal_id=%s ORDER BY calendar_ref",
+                (principal_id,),
+            ).fetchall()
+        return dict(row, found=True, expires_at=row["expires_at"].isoformat(), calendars=[dict(c) for c in calendars])
+
     def agent_info(self, keys):
         # ANYM-494: an agent's public record by its key, in input order; the hash never leaves this method.
         if not isinstance(keys, list) or not 1 <= len(keys) <= 100:

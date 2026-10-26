@@ -125,11 +125,11 @@ def operation_name(value):
     return value
 
 
-def issue_request(principal,accounts,days,chats,permissions,key_permissions):
+def issue_request(principal,accounts,days,chats,permissions,key_permissions,key_of=None):
     # The request as given, so a replay with other arguments is refused even when the result would match.
     def given(value):return 'unset' if value is UNSET else None if value is None else sorted(value)
     return hashlib.sha256(json.dumps([principal,sorted(accounts or []),days,given(chats),given(permissions),
-        given(key_permissions)]).encode()).hexdigest()
+        given(key_permissions)]+([['key_permissions_of',key_of]] if key_of else [])).encode()).hexdigest()
 
 
 class OperationTaken(Exception):
@@ -1168,10 +1168,16 @@ class Store:
             END $$''')
 
     def issue_key(self, principal, accounts, days=7, *, chats=UNSET, permissions=UNSET,
-                  key_permissions=UNSET, token=None, operation_id=None, check=False):
+                  key_permissions=UNSET, token=None, operation_id=None, check=False, new_principal=False,
+                  key_permissions_of=None):
         """A new key; returns its token. With the caller's token and an operation ID (ANYM-495) it stores
-        only the digest and returns public fields, and the same request again returns the same record."""
+        only the digest and returns public fields, and the same request again returns the same record.
+        `new_principal` (ANYM-496) refuses an existing principal under its lock instead of rewriting its scope;
+        `key_permissions_of` (ANYM-496) gives the new key that key's stored ceiling as is, a NULL legacy one too."""
         principal_id(principal)
+        if key_permissions_of is not None:
+            key_permissions_of=key_id(key_permissions_of)
+            if key_permissions is not UNSET:raise ValueError('key_permissions_conflict')
         # Up to one year (owner 2026-10-24, ANYM-499); the default stays 7 days.
         if type(days) is not int or not 1<=days<=365:
             raise ValueError('invalid_key_lifetime')
@@ -1179,11 +1185,12 @@ class Store:
         if once!=(token is not None):raise ValueError('token_and_operation_id_required')
         if once:
             token,operation_id=caller_token(token),operation_name(operation_id)
-            request=issue_request(principal,accounts,days,chats,permissions,key_permissions)
+            request=issue_request(principal,accounts,days,chats,permissions,key_permissions,key_permissions_of)
         else:token = 'pos_probe_'+secrets.token_urlsafe(32)
         try:
             issued,replayed=self._issue_key(principal,accounts,days,chats,permissions,key_permissions,token,
-                                            (operation_id,request) if once else None,check)
+                                            (operation_id,request) if once else None,check,new_principal,
+                                            key_permissions_of)
         except OperationTaken:
             # A concurrent call won the operation ID or the token (either commit is visible now).
             with self.pool.connection() as c:issued=key_operation(c,operation_id)
@@ -1197,20 +1204,29 @@ class Store:
         return serial({'key_id':issued['id'],'principal':issued['principal'],'expires_at':issued['expires_at'],
                        'revoked':issued['revoked'],'operation_id':operation_id,'replayed':replayed})
 
-    def _issue_key(self,principal,accounts,days,chats,permissions,key_permissions,token,operation,check=False):
+    def _issue_key(self,principal,accounts,days,chats,permissions,key_permissions,token,operation,check=False,
+                   new_principal=False,key_of=None):
         with self.pool.connection() as c:
             if operation:require_schema(c,KEY_OPERATION_SCHEMA)
             lock_principal(c,principal)
             if operation and (prior:=key_operation(c,operation[0])) is not None:return prior,True
             old = c.execute('SELECT * FROM principals WHERE id=%s FOR UPDATE', (principal,)).fetchone()
+            if new_principal and old:raise ValueError('principal_exists')
             if chats is UNSET:chats=old['chat_ids'] if old else None
             if permissions is UNSET:permissions=old['permissions'] if old else DEFAULT_PERMISSIONS
             accounts,chats,permissions=normalize_policy(c,accounts,chats,permissions)
-            implicit_ceiling=key_permissions is UNSET
-            if implicit_ceiling:key_permissions=sorted(LEGACY_PERMISSIONS|set(permissions))
-            key_permissions=normalize_list(key_permissions,maximum=len(PERMISSIONS))
-            if set(key_permissions)-(set(permissions)|(LEGACY_PERMISSIONS if implicit_ceiling else set())):
-                raise ValueError('invalid_key_permissions')
+            if key_of is not None:
+                # A clone repeats the source key's stored ceiling, never wider: effective access is still the
+                # principal's permissions narrowed by it, exactly as for the source.
+                like=c.execute('SELECT permissions FROM api_keys WHERE id=%s',(key_of,)).fetchone()
+                if like is None:raise ValueError('unknown_key')
+                key_permissions=like['permissions']
+            else:
+                implicit_ceiling=key_permissions is UNSET
+                if implicit_ceiling:key_permissions=sorted(LEGACY_PERMISSIONS|set(permissions))
+                key_permissions=normalize_list(key_permissions,maximum=len(PERMISSIONS))
+                if set(key_permissions)-(set(permissions)|(LEGACY_PERMISSIONS if implicit_ceiling else set())):
+                    raise ValueError('invalid_key_permissions')
             if check:
                 # ANYM-495 check mode: the same validation as an issue, then nothing is written.
                 if operation and c.execute('SELECT 1 FROM api_keys WHERE digest=%s',(digest(token),)).fetchone():
@@ -1344,6 +1360,21 @@ class Store:
                 FROM api_key_operations o JOIN api_keys k ON k.id=o.key_id WHERE o.operation_id=%s''',
                 (operation_id,)).fetchone()
         return [serial({'found':True,**row}) if row else {'found':False,'operation_id':operation_id}]
+
+    def principal_info(self,principal):
+        # ANYM-496: a principal's scope and its keys' public fields, so the admin CLI can clone them; no digest.
+        principal_id(principal)
+        with self.pool.connection() as c:
+            row=c.execute('SELECT id,accounts,chat_ids,permissions,enabled FROM principals WHERE id=%s',
+                          (principal,)).fetchone()
+            if not row:return {'found':False,'principal':principal}
+            keys=c.execute('''SELECT id AS key_id,permissions,expires_at,revoked FROM api_keys WHERE principal=%s
+                ORDER BY expires_at,id''',(principal,)).fetchall()
+        for key in keys:
+            # What the key may do (a NULL legacy ceiling included): a clone issues exactly this, explicitly.
+            key['effective_permissions']=effective_permissions(row['permissions'],key['permissions'])
+        return serial({'found':True,'principal':row['id'],'enabled':row['enabled'],'accounts':row['accounts'],
+                       'chat_ids':row['chat_ids'],'permissions':row['permissions'],'keys':keys})
 
     def check_schema(self,version=KEY_OPERATION_SCHEMA):
         # ANYM-495 check mode: reads only the schema version, writes nothing.

@@ -36,7 +36,8 @@ def main():
         'replay','snapshot','verify-restore','quarantine-restore','register-account',
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
         'set-messenger-operations','extend-key','set-feedback-status','export-feedback','release-retention-hold',
-        'set-subscription-retention','link-person','unlink-person','delete-person','list-people','key-info'])
+        'set-subscription-retention','link-person','unlink-person','delete-person','list-people','key-info',
+        'principal-info'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -44,7 +45,7 @@ def main():
     parser.add_argument('--token-file',type=Path,help='issue-key: an existing owner-only file (or /dev/stdin) with the caller\'s token')
     parser.add_argument('--operation-id',help='issue-key, key-info: 1-128 of [A-Za-z0-9._/-]; the same request again replays')
     parser.add_argument('--check',action='store_true',
-        help='issue-key, extend-key, revoke-key, list-keys, key-info: validate and report the schema, write nothing')
+        help='issue-key, extend-key, revoke-key, list-keys, key-info, principal-info: validate and report the schema, write nothing')
     parser.add_argument('--all',action='store_true',dest='all_keys',help='list-keys: every key of every principal')
     group=parser.add_mutually_exclusive_group()
     group.add_argument('--chats',nargs='*',default=UNSET)
@@ -58,6 +59,10 @@ def main():
     state.add_argument('--enable',action='store_true')
     state.add_argument('--disable',action='store_true')
     parser.add_argument('--limit',type=int,default=50)
+    parser.add_argument('--key-permissions-of',metavar='KEY_ID',
+        help='issue-key: the new key gets this key\'s stored ceiling as is, NULL included (ANYM-496)')
+    parser.add_argument('--new-principal',action='store_true',
+        help='issue-key: refuse principal_exists instead of rewriting an existing principal (ANYM-496)')
     parser.add_argument('--days',type=int,help='issue-key: 1-365 (default 7); extend-key: required, 1-365')
     parser.add_argument('--input',type=Path)
     parser.add_argument('--spool',type=Path)
@@ -154,7 +159,8 @@ def main():
             if bool(args.token_file)!=bool(args.operation_id):parser.error('--token-file and --operation-id go together')
             days=7 if args.days is None else args.days
             options=dict(chats=None if args.all_chats else args.chats,permissions=args.permissions,
-                         key_permissions=args.key_permissions)
+                         key_permissions=args.key_permissions,new_principal=args.new_principal,
+                         key_permissions_of=args.key_permissions_of)
             if args.check:
                 # The issue's own validation (accounts, chats, permission ceilings, operation replay), no write.
                 principal_id(args.principal)
@@ -251,6 +257,11 @@ def main():
             if args.check:print(json.dumps(store.check_schema()))
             elif args.operation_id:print(json.dumps({'keys':store.key_operation_info(args.operation_id)}))
             else:print(json.dumps({'keys':store.key_info(tokens)}))
+        elif args.command=='principal-info':
+            # ANYM-496: read only; the scope a clone copies (accounts, chats, permissions, each key's permissions).
+            if not args.principal:parser.error('principal-info requires --principal')
+            principal_id(args.principal)
+            print(json.dumps(store.check_schema() if args.check else store.principal_info(args.principal)))
         elif args.command=='audit-tail':
             print(json.dumps(store.audit_tail(args.principal or '',args.limit)))
         else:

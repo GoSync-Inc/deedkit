@@ -27,7 +27,7 @@ docs/operations/parallel-development.md.
 - Never change applied migrations, provider IDs, existing test paths, names or parameters (Tiden
   IDs) or the seven `anymsg-ci::*` checks.
 - Production changes only via `scripts/production.py` from a green `main` SHA
-  (docs/operations/production.md); never prune shared Docker data; SSH is read-only except `production.py` and approved steps. Merged source is not live verification.
+  (docs/operations/production.md); never prune shared Docker data; SSH is read-only except `production.py`, `deedkit admin` and approved steps. Merged source is not live verification.
 - Backups: over the tailnet to the shared backup server only; no public backup port.
 
 ## 2. What the owner keeps

@@ -13,16 +13,23 @@ output or logs; the calls registry is matched by hashing in memory. Only public 
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
+import fcntl
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
+import secrets
+import shlex
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from uuid import uuid4
 
 CONFIG = Path("/opt/deedkit/deploy/private/admin/config.json")
@@ -33,6 +40,18 @@ LIMIT = 1024 * 1024  # bytes of one private JSON or key file
 BATCH = 100  # keys per lookup, the operator commands' own bound
 LOOKUP = {"messaging": ["key-info", "--key-file", "/dev/stdin"], "calendar": ["agent-info", "--key-file", "/dev/stdin"]}
 INVENTORY = {"messaging": ["list-keys", "--all"], "calendar": ["list-agents"]}
+# Write subcommands (ANYM-493 shared rules, production.md "Admin CLI").
+TOOL = Path("/usr/local/lib/deedkit/current")  # the installed host tool whose locks and checks `deploy` uses
+JOURNAL = Path("/var/lib/deedkit-admin/ops")
+TOKENS = Path("/root/deedkit-admin/tokens")
+CALLS_LOCK = Path("/var/lib/deedkit-admin/calls-registry.lock")
+LOCK_WAIT = 30  # seconds to get every lock before refusing "a deploy is running"
+DAYS = (1, 30)  # ANYM-496: one N for every store, within each store's own limit (messaging 365, calendar 183)
+NAME = re.compile(r"[a-z0-9][a-z0-9.-]{0,49}")  # fits every store's ID rule with the -calls-archive suffix
+OPERATION = re.compile(r"[a-z0-9.-]{1,100}")
+VALIDATORS = {"policy": ["deedkit-gateway", "--check", "--policy", "{path}", "--public-url", "https://check.invalid"],
+              "registry": ["python", "agent_api.py", "--check-registry", "{path}"]}
+BACKENDS = ("messaging", "calendar", "calls")
 
 
 class AdminError(Exception):
@@ -131,10 +150,11 @@ def runner(config: dict):
     return run
 
 
-def stop(name: str) -> None:
+def stop(name: str, prefix: list[str] | None = None) -> None:
     """Stop only this invocation's uniquely named container, bounded; `run --rm` makes the daemon remove it."""
     try:
-        subprocess.run(["docker", "stop", "--time", "5", name], capture_output=True, timeout=CLEANUP, check=False)
+        subprocess.run([*(prefix or ["docker"]), "stop", "--time", "5", name], capture_output=True, timeout=CLEANUP,
+                       check=False)
     except (OSError, subprocess.TimeoutExpired):
         pass
 
@@ -368,6 +388,914 @@ def set_label(config: dict, principal: str, text: str) -> dict:
     return {"principal": principal, "label": text}
 
 
+# --- Write subcommands: `key issue --like` and `undo` (ANYM-496) under the shared rules (ANYM-493) ---------------
+
+
+class Stopped(AdminError):
+    """A failure after the journal exists: the operation stays resumable (rerun) and compensable (undo)."""
+
+
+def checkpoint(step: str, phase: str) -> None:
+    """Called after every write and every backend commit; a no-op that tests replace to crash at that point."""
+
+
+def entry_digest(entry: dict) -> str:
+    """The hash of a policy or registry entry this operation created, for the compare-and-swap of undo."""
+    return hashlib.sha256(json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class Document:
+    """A policy or registry read once: its bytes' digest (the compare-and-swap) and its parsed value."""
+
+    def __init__(self, path: str | Path, what: str):
+        self.path, self.what = Path(path), what
+        try:
+            self.raw = read_private(self.path)
+            self.value = json.loads(self.raw)
+        except (OSError, ValueError):
+            raise AdminError(f"{what} unreadable: {path}") from None
+        self.digest = hashlib.sha256(self.raw).hexdigest()
+        rows = self.value.get("principals") if isinstance(self.value, dict) else None
+        if type(self.value.get("revision") if isinstance(self.value, dict) else None) is not int or not (
+                isinstance(rows, list) and all(isinstance(row, dict) for row in rows)):
+            raise AdminError(f"{what} has no revision or principal list: {path}")
+
+    def entry(self, name: str) -> dict | None:
+        return next((row for row in self.value["principals"] if row.get("id") == name), None)
+
+    def with_entry(self, name: str, entry: dict) -> dict:
+        """The next revision with `entry` added, or replacing the entry `name`; every other entry unchanged."""
+        rows = [row for row in self.value["principals"] if row.get("id") != name]
+        index = next((i for i, row in enumerate(self.value["principals"]) if row.get("id") == name), len(rows))
+        return {**self.value, "revision": self.value["revision"] + 1, "principals": rows[:index] + [entry] + rows[index:]}
+
+
+class Host:
+    """The installed production tool: the locks, release checks and call probe `deploy` uses (rules (a), (b))."""
+
+    def __init__(self, tool, s, settings: dict, http: dict):
+        self.tool, self.s, self.settings, self.http = tool, s, settings, http
+
+
+def load_host(config: dict) -> Host:
+    """production.py and seamless_release.py as installed on the host (`production.py deploy` runs them), never this
+    checkout's copy: a write follows the rules the deploy that may run beside it follows."""
+    if "production_config" in config:
+        raise AdminError("production_config is not an admin setting: writes always use the deploy configuration "
+                         "autodeploy selects (production.active_config); nothing changed")
+    directory = Path(config.get("tool", TOOL))
+    modules = {}
+    for name in ("production", "seamless_release"):
+        spec = importlib.util.spec_from_file_location(name, directory / f"{name}.py")
+        if spec is None or spec.loader is None:
+            raise AdminError(f"the host tool is not installed in {directory}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module  # seamless_release imports the production module beside it
+        try:
+            spec.loader.exec_module(module)
+        except (OSError, ImportError) as exc:
+            raise AdminError(f"the host tool in {directory} does not load ({type(exc).__name__})") from None
+        modules[name] = module
+    tool, s = modules["production"], modules["seamless_release"]
+    if not callable(getattr(tool, "unresolved", None)):
+        raise AdminError(f"the host tool in {directory} has no shared release check (production.unresolved); "
+                         "install the host tool of a release that has it first; nothing changed")
+    try:
+        # The plan A configuration autodeploy reads (DEEDKIT_DEPLOY_CONFIG, autodeploy.env), so the locks, release
+        # state and rollback snapshot are the ones a running deploy uses.
+        settings = tool.config(tool.active_config())
+        http = s.validate_settings(tool.config(config.get("http_config", tool.HTTP_CONFIG)))
+    except (tool.Refused, OSError, ValueError, KeyError, TypeError) as exc:
+        raise AdminError(f"the production configuration is refused ({type(exc).__name__}); nothing changed") from None
+    return Host(tool, s, settings, http)
+
+
+def retrying(deadline: float, attempt, refusal: str) -> None:
+    while not attempt():
+        if time.monotonic() >= deadline:
+            raise AdminError(refusal)
+        time.sleep(0.2)
+
+
+@contextmanager
+def guarded(config: dict, host: Host, docker):
+    """Rules (a) and (b): deploy's global, HTTP and plan A locks, then the calls-registry writer lock, in that order and
+    within LOCK_WAIT seconds; then no unresolved release (deploy's own check), no deploy pause and no active call in
+    deploy's calls targets or in any running container that mounts the calls registry."""
+    tool, deadline = host.tool, time.monotonic() + LOCK_WAIT
+    state = Path(host.settings["state_directory"])
+    with ExitStack() as held:
+        def deploy_locks():
+            try:
+                held.enter_context(tool.host_locks(host.settings, host.http, host.s))
+            except tool.Busy:
+                return False
+            except tool.Refused as exc:
+                raise AdminError(f"{exc}; nothing changed") from None
+            return True
+        retrying(deadline, deploy_locks, "a deploy is running: a release lock stayed held; nothing changed")
+        path = Path(config.get("calls_lock", CALLS_LOCK))
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        handle = held.enter_context(path.open("a"))
+
+        def writer_lock():
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return True
+        retrying(deadline, writer_lock, "another admin write holds the calls-registry writer lock; nothing changed")
+        try:
+            reason = tool.unresolved(state, Path(host.http["state_directory"]), lambda: tool.main_history(state))
+        except tool.Refused as exc:
+            reason = str(exc)
+        if reason:
+            raise AdminError(f"{reason}; nothing changed")
+        if tool.PAUSE.exists():
+            raise AdminError(f"deploys are paused ({tool.PAUSE}); nothing changed")
+        try:
+            calls = tool.active_calls(host.settings)
+            if config.get("calls_registry"):
+                # Deploy's own per-container probe, also for a voice consumer outside the deploy configuration.
+                until = time.monotonic() + tool.CALL_PROBE
+                for item in consumers(running(docker), config["calls_registry"], "calls registry"):
+                    calls += [call for call in tool.calls_in(item["id"], until) if call not in calls]
+        except (tool.Refused, OSError, ValueError) as exc:
+            reason = str(exc) if isinstance(exc, tool.Refused) else type(exc).__name__
+            raise AdminError(f"the call state is unreadable ({reason}); nothing changed") from None
+        if calls:
+            raise AdminError("a call is active (" + ", ".join(calls) + "); nothing changed")
+        yield
+
+
+def dockers(config: dict):
+    """Docker for inspection and one-shot check containers only (rule (d)): never a service container."""
+    prefix = config.get("docker", ["docker"])
+
+    def call(args: list[str], name: str | None = None) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(prefix + args, stdin=subprocess.DEVNULL, capture_output=True, timeout=TIMEOUT,
+                                  check=False)
+        except OSError as exc:
+            raise AdminError(f"docker: {type(exc).__name__}; nothing changed") from None
+        except BaseException as exc:
+            if name:
+                stop(name, prefix)
+            if isinstance(exc, subprocess.TimeoutExpired):
+                raise AdminError("docker: TimeoutExpired") from None
+            raise
+    return call
+
+
+def running(docker) -> list[dict]:
+    listed = docker(["ps", "-q", "--no-trunc"])
+    ids = listed.stdout.decode().split() if not listed.returncode else None
+    if ids is None:
+        raise AdminError("docker ps failed; nothing changed")
+    if not ids:
+        return []
+    found = docker(["inspect", *ids])
+    try:
+        value = json.loads(found.stdout) if not found.returncode else None
+    except ValueError:
+        value = None
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise AdminError("docker inspect failed; nothing changed")
+    return value
+
+
+def consumers(containers: list[dict], path: str, what: str) -> list[dict]:
+    """The running containers that can read `path`: every one with a mount of its directory or of any ancestor (the
+    deepest such mount; "target" is the directory's path inside it). Each counts as a consumer, so a container that
+    cannot answer a check or a call probe refuses rather than goes unchecked. A single-file bind of `path` pins the
+    inode it started with, so no rename reaches it (ANYM-424): refused."""
+    live, found = os.path.realpath(path), []
+    folder = os.path.dirname(live)
+    for container in containers:
+        best = None
+        for mount in container.get("Mounts") or []:
+            if not mount.get("Source") or not mount.get("Destination"):
+                continue
+            source = os.path.realpath(mount["Source"])
+            if source == live:
+                raise AdminError(f"{str(container.get('Name', '?')).lstrip('/')} mounts the {what} as a single file, "
+                                 "so a rename never reaches it (ANYM-424): mount its directory; nothing changed")
+            if (folder == source or folder.startswith(source.rstrip("/") + "/")) and (
+                    best is None or len(source) > len(best[0])):
+                best = (source, mount)
+        if best is not None:
+            source, mount = best
+            found.append({"id": container.get("Id"), "name": str(container.get("Name", "")).lstrip("/"),
+                          "image": container.get("Image"), "user": (container.get("Config") or {}).get("User") or "",
+                          "source": mount["Source"], "mount": mount["Destination"],
+                          "target": str(PurePosixPath(mount["Destination"]) / os.path.relpath(folder, source))})
+    if not found:
+        raise AdminError(f"no running container mounts the {what} directory, so none can validate it; nothing changed")
+    return found
+
+
+def rollback_images(host: Host) -> list[str]:
+    """The gateway images `production.py rollback` would restore: the current release's before-release snapshot."""
+    state = Path(host.settings["state_directory"])
+    try:
+        sha = str(json.loads((state / "current.json").read_text()).get("sha", ""))
+    except (OSError, ValueError, AttributeError):
+        return []
+    images = []
+    for project in host.settings.get("projects", []):
+        for service, target in project.get("services", {}).items():
+            before = state / sha / (project["name"] + ".before.json")
+            if target != "gateway" or not re.fullmatch(r"[0-9a-f]{40}", sha) or not before.exists():
+                continue
+            try:
+                images.append(json.loads(before.read_text())["services"][service]["image"])
+            except (OSError, ValueError, KeyError, TypeError):
+                raise AdminError(f"the rollback snapshot {before} is unreadable; nothing changed") from None
+    return images
+
+
+def validate(config: dict, docker, kind: str, staging: Path, found: list[dict], extra: list[str],
+             outcome: str = "not renamed") -> None:
+    """Rule (c): the candidate in each running consumer's image (and the rollback images), read through that
+    consumer's own directory mount, in a disposable container without network; any refusal refuses."""
+    command = {**VALIDATORS, **config.get("validators", {})}[kind]
+    for consumer, image in [(item, item["image"]) for item in found] + [(found[0], image) for image in extra]:
+        name = "deedkit-admin-" + uuid4().hex[:12]
+        argv = [part.replace("{path}", str(PurePosixPath(consumer["target"]) / staging.name)) for part in command]
+        done = docker(["run", "--rm", "--name", name, "--network", "none", "--read-only", "--tmpfs", "/tmp",
+                       "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pull", "never",
+                       "--mount", f"type=bind,source={consumer['source']},target={consumer['mount']},readonly",
+                       *(["--user", consumer["user"]] if consumer["user"] else []),
+                       "--entrypoint", argv[0], image, *argv[1:]], name)
+        try:  # a positive answer only: an older image without the check may exit 0 having read nothing
+            answer = json.loads(done.stdout.decode().strip().splitlines()[-1]) if not done.returncode else None
+        except (ValueError, IndexError, UnicodeDecodeError):
+            answer = None
+        if not isinstance(answer, dict) or answer.get("valid") is not True:
+            raise AdminError(f"the {kind} candidate is refused by image {image} ({consumer['name']}), or the image "
+                             f"has no such check; {outcome}")
+
+
+@contextmanager
+def staged(live: Path, data: bytes):
+    """`data` under a private staging name beside `live`, owned like it and synced; removed on exit unless renamed."""
+    info = os.stat(live)
+    staging = live.with_name(f".{live.name}.admin-{uuid4().hex[:12]}")
+    fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            if (info.st_uid, info.st_gid) != (os.geteuid(), os.getegid()):
+                os.fchown(out.fileno(), info.st_uid, info.st_gid)
+            os.fsync(out.fileno())
+        yield staging
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def preflight(config: dict, docker, document: Document, kind: str, found: list[dict], extra: list[str]) -> None:
+    """Rules (c) and (h) before any write: every validator a later rename needs answers {"valid": true} on a copy of
+    the live document, so an image without the check refuses before a journal, token or backend write."""
+    with staged(document.path, read_private(document.path)) as staging:
+        validate(config, docker, kind, staging, found, extra, "nothing changed")
+
+
+def replace(config: dict, docker, document: Document, value: dict, kind: str, found: list[dict],
+            extra: list[str]) -> None:
+    """`value` over the live file by a rename in its mounted directory after rule (c), as a compare-and-swap on the
+    bytes read under the locks: a change by anyone since refuses. The new file keeps the live file's owner."""
+    live = document.path
+    with staged(live, (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()) as staging:
+        validate(config, docker, kind, staging, found, extra)
+        if hashlib.sha256(read_private(live)).hexdigest() != document.digest:
+            raise AdminError(f"{live} changed during this operation; not renamed")
+        os.rename(staging, live)
+        sync_directory(live.parent)
+
+
+def private_directory(path: Path) -> None:
+    """`path` as a 0700 directory of this user (created if missing); anything wider refuses."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.stat()
+    if info.st_mode & 0o077 or info.st_uid != os.geteuid():
+        raise AdminError(f"{path} must be private (0700) and owned by this user; nothing changed")
+
+
+def write_secret(path: Path, value: str, owner: tuple[int, int]) -> None:
+    """A new owner-only file, durable before any store names it: written and synced under a staging name, then
+    published by link() (which never replaces an existing file), so `path` is either absent or complete."""
+    staging = path.with_name(f".{path.name}.admin-{uuid4().hex[:12]}")
+    fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(value + "\n")
+            out.flush()
+            if owner != (os.geteuid(), os.getegid()):
+                os.fchown(out.fileno(), *owner)
+            os.fsync(out.fileno())
+        checkpoint(path.name, "staged")
+        os.link(staging, path)
+    finally:
+        staging.unlink(missing_ok=True)
+    sync_directory(path.parent)
+
+
+def stale_staging(path: Path) -> None:
+    """The staging files an interrupted write_secret left beside `path` (never published, never named by a store)."""
+    for leftover in path.parent.glob(f".{path.name}.admin-*"):
+        leftover.unlink(missing_ok=True)
+
+
+class Journal:
+    """Rule (e): `<journal>/<op-id>.json` (directory 0700, file 0600) with public IDs, the hashes of the entries the
+    operation created and each step's state, saved before and after each step. Never a token or a key hash."""
+
+    def __init__(self, config: dict, operation: str):
+        if not OPERATION.fullmatch(operation):
+            raise AdminError("an operation ID is 1-100 of [a-z0-9.-]")
+        self.directory = Path(config.get("journal", JOURNAL))
+        self.path, self.data = self.directory / f"{operation}.json", {}
+
+    def load(self) -> dict:
+        if not self.path.exists():
+            raise AdminError(f"no operation journal {self.path}")
+        self.data = load_json(self.path, "operation journal")
+        return self.data
+
+    def create(self, data: dict) -> None:
+        private_directory(self.directory)
+        if self.path.exists():
+            raise AdminError(f"operation journal {self.path} exists; nothing changed")
+        self.data = data
+        self.save()
+
+    def save(self) -> None:
+        fd, temporary = tempfile.mkstemp(dir=self.directory, prefix=".op-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w") as out:  # mkstemp creates it 0600
+                json.dump(self.data, out, indent=2)
+                out.write("\n")
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temporary, self.path)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+        sync_directory(self.directory)
+
+    def step(self, name: str, state: str, **fields) -> dict:
+        self.data["steps"][name] = {**self.data["steps"].get(name, {}), **fields, "state": state}
+        self.save()
+        return self.data["steps"][name]
+
+
+def ask(run, service: str, args: list[str], data: bytes | None = None):
+    try:
+        return run(service, args, data)
+    except Unavailable as exc:
+        raise AdminError(str(exc)) from None
+
+
+def checked(run, service: str, args: list[str], data: bytes | None = None) -> None:
+    """Rule (h): the command's no-write check mode answers `ok` only where the binary has it and its schema is
+    applied; an unknown command or option, or `schema_not_ready`, refuses naming the service."""
+    try:
+        reply = run(service, args + ["--check"], data)
+    except Unavailable as exc:
+        raise AdminError(f"{exc}: the {service} image does not answer `{args[0]} --check`; update it first; "
+                         "nothing changed") from None
+    if not isinstance(reply, dict) or reply.get("check") != "ok":
+        answer = reply.get("check") if isinstance(reply, dict) else "no result"
+        raise AdminError(f"{service}: `{args[0]} --check` answered {answer}; nothing changed")
+
+
+def one(run, service: str, args: list[str], data: bytes | None = None) -> dict:
+    reply = ask(run, service, args, data)
+    rows = reply.get("keys" if service == "messaging" else "agents") if isinstance(reply, dict) else None
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise AdminError(f"{service}: malformed reply to {args[0]}")
+    return rows[0]
+
+
+def live_until(value) -> datetime | None:
+    moment = instant(value)
+    return moment if moment is not None and moment > datetime.now(timezone.utc) else None
+
+
+def messaging_scope(run, token: str, what: str) -> dict:
+    record = one(run, "messaging", LOOKUP["messaging"], (token + "\n").encode())
+    if not record.get("found") or record.get("revoked") or live_until(record.get("expires_at")) is None:
+        raise AdminError(f"the source's {what} key is missing, revoked or expired; nothing changed")
+    info = ask(run, "messaging", ["principal-info", "--principal", str(record.get("principal"))])
+    key = next((k for k in info.get("keys", []) if k.get("key_id") == record.get("key_id")), None) \
+        if isinstance(info, dict) and info.get("found") else None
+    if key is None or info.get("enabled") is not True or not info.get("accounts"):
+        raise AdminError(f"the source's {what} principal is unknown, disabled or has no account; nothing changed")
+    # The clone's key repeats this key's stored ceiling as is (issue-key --key-permissions-of), a NULL legacy one
+    # included; "key_permissions" is only shown in the plan.
+    return {"accounts": info["accounts"], "chat_ids": info["chat_ids"], "permissions": info["permissions"],
+            "key_of": str(record.get("key_id")), "key_permissions": key.get("permissions")}
+
+
+def source_scope(config: dict, run, policy: Document, registry: Document | None, source: str) -> dict:
+    """The source principal's access in every store, from each store's own read command (public fields only)."""
+    entry = policy.entry(source)
+    if entry is None:
+        raise AdminError(f"no gateway principal {source!r}; nothing changed")
+    if entry.get("enabled") is not True or live_until(entry.get("expires_at")) is None:
+        raise AdminError(f"the source {source!r} is disabled or expired; nothing changed")
+    credentials = entry.get("credentials") if isinstance(entry.get("credentials"), dict) else {}
+    if set(credentials) - set(BACKENDS) or not all(isinstance(c, dict) for c in credentials.values()):
+        raise AdminError(f"the source {source!r} has a credential this command cannot clone; nothing changed")
+    tokens = {}
+    for backend, credential in credentials.items():
+        token = read_token(config, credential.get("key_file", ""))
+        if token is None or not pinned(token, credential.get("key_sha256")):
+            raise AdminError(f"the source's {backend} key file is unreadable or does not match its pin; nothing changed")
+        tokens[backend] = token
+    scope = {"gateway": entry}
+    if "messaging" in tokens:
+        scope["messaging"] = messaging_scope(run, tokens["messaging"], "messaging")
+    if "calendar" in tokens:
+        record = one(run, "calendar", LOOKUP["calendar"], (tokens["calendar"] + "\n").encode())
+        if not record.get("found") or record.get("revoked") or live_until(record.get("expires_at")) is None:
+            raise AdminError("the source's calendar key is missing, revoked or expired; nothing changed")
+        info = ask(run, "calendar", ["agent-scope", "--id", str(record.get("principal_id"))])
+        visibility = {row.get("visibility") for row in info.get("calendars", [])} if isinstance(info, dict) else set()
+        if not isinstance(info, dict) or not info.get("found") or len(visibility) > 1:
+            raise AdminError("the source's calendar agent is unknown or mixes calendar visibilities; nothing changed")
+        scope["calendar"] = {"group": info["group_id"], "member": info["person_id"], "scopes": info["scopes"],
+                             "calendars": [row["ref"] for row in info["calendars"]],
+                             "visibility": visibility.pop() if visibility else "details"}
+    if "calls" in tokens:
+        if registry is None:
+            raise AdminError("the source has a calls key but no calls registry is configured; nothing changed")
+        digest = hashlib.sha256(tokens["calls"].encode()).hexdigest()
+        calls = next((row for row in registry.value["principals"] if row.get("key_sha256") == digest), None)
+        if calls is None or calls.get("enabled") is not True or live_until(calls.get("expires_at")) is None:
+            raise AdminError("the source's calls entry is missing, disabled or expired; nothing changed")
+        scope["calls"] = calls
+        if calls.get("archive_config"):
+            try:
+                settings = json.loads(read_private(host_path(config, calls["archive_config"]), 65536))
+                token = read_token(config, settings["token_file"])
+            except (OSError, ValueError, KeyError, TypeError, AdminError):
+                token = None
+            if token is None:
+                raise AdminError("the source's calls archive configuration is unreadable; nothing changed")
+            scope["archive"] = {"settings": settings, "config": calls["archive_config"],
+                                "messaging": messaging_scope(run, token, "calls archive")}
+    return scope
+
+
+def layout(config: dict, new: str, scope: dict) -> dict:
+    """Where each new secret goes: beside the source's own file (so its consumer reads it), owned like it."""
+    def beside(container: str, name: str) -> dict:
+        path = PurePosixPath(container).parent / name
+        source = os.stat(host_path(config, container))
+        return {"container": str(path), "host": host_path(config, str(path)), "owner": [source.st_uid, source.st_gid]}
+    files = {"gateway": {"container": None, "host": str(Path(config.get("tokens", TOKENS)) / f"{new}.token"),
+                         "owner": [os.geteuid(), os.getegid()]}}
+    for backend, credential in scope["gateway"]["credentials"].items():
+        files[backend] = beside(credential["key_file"], f"{new}-{backend}.key")
+    if "archive" in scope:
+        files["archive-token"] = beside(scope["archive"]["settings"]["token_file"], f"{new}-calls-archive.token")
+        files["archive-config"] = beside(scope["archive"]["config"], f"{new}-calls-archive.json")
+    return files
+
+
+def messaging_issue(principal: str, scope: dict, days: int, operation: str) -> list[str]:
+    chats = ["--all-chats"] if scope["chat_ids"] is None else ["--chats", *scope["chat_ids"]]
+    return ["issue-key", "--principal", principal, "--accounts", *scope["accounts"], *chats,
+            "--permissions", *scope["permissions"], "--key-permissions-of", scope["key_of"],
+            "--days", str(days), "--new-principal", "--token-file", "/dev/stdin", "--operation-id", operation]
+
+
+def calendar_issue(principal: str, scope: dict, days: int, operation: str) -> list[str]:
+    return ["agent-key", "--id", principal, "--group", scope["group"], "--member", scope["member"],
+            *[part for ref in scope["calendars"] for part in ("--calendar", ref)],
+            "--scopes", ",".join(scope["scopes"]), "--visibility", scope["visibility"], "--days", str(days),
+            "--token-file", "/dev/stdin", "--operation-id", operation]
+
+
+def backend_steps(new: str, scope: dict, days: int, operation: str) -> list[tuple[str, str, str, list[str]]]:
+    """(step, service, secret, argv) in order; each credential has its own operation ID derived from the parent."""
+    steps = []
+    if "messaging" in scope:
+        steps.append(("messaging", "messaging", "messaging",
+                      messaging_issue(new, scope["messaging"], days, f"{operation}/messaging")))
+    if "archive" in scope:
+        steps.append(("messaging-archive", "messaging", "archive-token",
+                      messaging_issue(f"{new}-calls-archive", scope["archive"]["messaging"], days,
+                                      f"{operation}/messaging-archive")))
+    if "calendar" in scope:
+        steps.append(("calendar", "calendar", "calendar",
+                      calendar_issue(new, scope["calendar"], days, f"{operation}/calendar")))
+    return steps
+
+
+def taken(config: dict, run, policy: Document, registry: Document | None, new: str, files: dict) -> None:
+    """Refuse an ID any store holds; a disabled or revoked record is a retired ID (undo keeps it for audit)."""
+    found = []
+    for principal in (new, f"{new}-calls-archive"):
+        if (entry := policy.entry(principal)) is not None:
+            found.append((f"gateway policy ({principal})", entry.get("enabled") is not True))
+        if registry is not None and (entry := registry.entry(principal)) is not None:
+            found.append((f"calls registry ({principal})", entry.get("enabled") is not True))
+        info = ask(run, "messaging", ["principal-info", "--principal", principal])
+        if isinstance(info, dict) and info.get("found"):
+            found.append((f"messaging ({principal})", info.get("enabled") is not True
+                          or all(k.get("revoked") for k in info.get("keys", []))))
+        if config.get("calendar"):
+            info = ask(run, "calendar", ["agent-scope", "--id", principal])
+            if isinstance(info, dict) and info.get("found"):
+                found.append((f"calendar ({principal})", bool(info.get("revoked"))))
+    # An operation reserves its ID from its first write: an undone one keeps it retired even when no store holds it.
+    directory = Path(config.get("journal", JOURNAL))
+    for path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
+        try:
+            command = load_json(path, "operation journal").get("command", {})
+        except AdminError:
+            raise AdminError(f"the operation journal {path} is unreadable; nothing changed") from None
+        if command.get("id") == new:
+            found.append((f"operation {path.stem}", True))
+    if found:
+        retired = all(flag for _, flag in found)
+        raise AdminError(f"{new!r} exists in " + ", ".join(name for name, _ in found)
+                         + (" and is retired (revoked records stay for audit): use another ID" if retired else "")
+                         + "; nothing changed")
+    if existing := sorted(file["host"] for file in files.values() if os.path.lexists(file["host"])):
+        raise AdminError("a file this command would create exists: " + ", ".join(existing) + "; nothing changed")
+
+
+def identity(scope: dict) -> dict:
+    """The source's access a clone copies, without the source's own file locations (never copied to the clone), so
+    moving a source key file does not change an operation's identity."""
+    scope = masked(scope)
+    scope["gateway"] = {**scope["gateway"], "credentials": {
+        backend: {k: v for k, v in credential.items() if k != "key_file"}
+        for backend, credential in scope["gateway"].get("credentials", {}).items()}}
+    if "archive" in scope:
+        scope["archive"] = {**scope["archive"], "config": None,
+                            "settings": {**scope["archive"]["settings"], "token_file": None}}
+    if "calls" in scope:
+        scope["calls"] = {**scope["calls"], "archive_config": None}
+    return scope
+
+
+def masked(entry: dict) -> dict:
+    """An entry for the dry-run plan: every hash replaced by a placeholder."""
+    def mask(value):
+        if isinstance(value, dict):
+            return {k: ("<sha256 of the new key>" if k == "key_sha256" else mask(v)) for k, v in value.items()}
+        return value
+    return mask(entry)
+
+
+def entries(scope: dict, new: str, files: dict, tokens: dict, expires_at: str) -> tuple[dict, dict | None]:
+    """The new gateway principal and calls entry: the source's fields with the new ID, keys, files and expiry."""
+    def pin(name):
+        return hashlib.sha256(tokens[name].encode()).hexdigest()
+    source = scope["gateway"]
+    gateway = {**{k: v for k, v in source.items() if k not in ("id", "key_sha256", "expires_at", "credentials")},
+               "id": new, "key_sha256": pin("gateway"), "enabled": True, "expires_at": expires_at,
+               "credentials": {backend: {**credential, "key_file": files[backend]["container"],
+                                         "key_sha256": pin(backend)}
+                               for backend, credential in source["credentials"].items()}}
+    calls = None
+    if "calls" in scope:
+        calls = {**{k: v for k, v in scope["calls"].items()
+                    if k not in ("id", "key_sha256", "expires_at", "archive_config")},
+                 "id": new, "key_sha256": pin("calls"), "enabled": True, "expires_at": expires_at}
+        if "archive" in scope:
+            calls["archive_config"] = files["archive-config"]["container"]
+    return gateway, calls
+
+
+def secrets_for(files: dict, journal: Journal | None) -> dict:
+    """The new tokens: generated once, read back from their files on a rerun (never regenerated for a written file)."""
+    tokens = {}
+    for name, file in files.items():
+        if name == "archive-config":
+            continue
+        if journal is not None and os.path.lexists(file["host"]):
+            token = read_token({}, file["host"])
+            if token is None:
+                raise AdminError(f"{file['host']} is not this operation's key file; nothing changed")
+            tokens[name] = token
+        else:
+            tokens[name] = ("pos_probe_" if name in ("messaging", "archive-token") else "dk_") + secrets.token_urlsafe(32)
+    return tokens
+
+
+def issue(config: dict, run, docker, host_factory, args) -> dict:
+    new, source, days = args.new, args.like, args.days
+    if not NAME.fullmatch(new) or new == source:
+        raise AdminError("a new ID is 1-50 of [a-z0-9.-], starting with a letter or digit, and not the source's")
+    if not DAYS[0] <= days <= DAYS[1]:
+        raise AdminError(f"--days is {DAYS[0]}-{DAYS[1]} for every store; nothing changed")
+    if args.label is not None and not (1 <= len(args.label) <= 80 and args.label.isprintable()):
+        raise AdminError("a label is 1-80 printable characters; nothing changed")
+    command = {"verb": "issue", "id": new, "like": source, "days": days, "label": args.label}
+    operation = args.operation or f"issue-{new}-{datetime.now(timezone.utc):%Y%m%dt%H%M%S}-{secrets.token_hex(3)}"
+    journal = Journal(config, operation)
+    if args.operation:
+        data = journal.load()
+        if data.get("command") != command:
+            raise AdminError(f"operation {operation} was started with other arguments; nothing changed")
+        if data.get("state") in ("undoing", "undone"):
+            raise AdminError(f"operation {operation} was undone; issue again with another ID; nothing changed")
+        if data.get("state") == "done":
+            return data["result"]
+    host = None if args.dry_run else host_factory()
+    with ExitStack() as held:
+        if host is not None:
+            held.enter_context(guarded(config, host, docker))
+        policy = Document(config["policy"], "gateway policy")
+        registry = Document(config["calls_registry"], "calls registry") if config.get("calls_registry") else None
+        containers = running(docker)
+        found = {"policy": consumers(containers, config["policy"], "gateway policy")}
+        if registry is not None:
+            found["registry"] = consumers(containers, config["calls_registry"], "calls registry")
+        for service, read in (("messaging", ["principal-info", "--principal", new]),
+                              ("messaging", ["key-info", "--operation-id", f"{operation}/messaging"]),
+                              ("calendar", ["agent-scope", "--id", new]),
+                              ("calendar", ["agent-info", "--operation-id", f"{operation}/calendar"])):
+            if config.get(service):
+                checked(run, service, read)
+        scope = source_scope(config, run, policy, registry, source)
+        # A rerun keeps the operation's identity: the file layout it journaled, and the source's access unchanged.
+        shape = entry_digest(identity(scope))
+        files = journal.data["layout"] if args.operation else layout(config, new, scope)
+        if args.operation and journal.data.get("scope") != shape:
+            raise AdminError(f"the source {source!r} changed since operation {operation} started; "
+                             f"run `deedkit admin undo {operation}`; nothing changed")
+        if not args.operation:
+            taken(config, run, policy, registry, new, files)
+        tokens = secrets_for(files, journal if args.operation else None)
+        steps = backend_steps(new, scope, days, operation)
+        for _, service, secret, argv in steps:
+            checked(run, service, argv, (tokens[secret] + "\n").encode())
+        bound = journal.data.get("bound") or (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+        if args.dry_run:
+            gateway, calls = entries(scope, new, files, tokens, bound)
+            return {"dry_run": True, "principal": new, "like": source, "days": days,
+                    "steps": ["key files"] + [step for step, *_ in steps]
+                    + (["calls archive configuration"] if "archive" in scope else [])
+                    + (["calls registry"] if calls else []) + ["gateway policy"],
+                    "files": sorted(file["host"] for file in files.values()),
+                    "gateway_policy": {"revision": policy.value["revision"] + 1, "add": masked(gateway)},
+                    **({"calls_registry": {"revision": registry.value["revision"] + 1, "add": masked(calls)}}
+                       if calls else {})}
+        _, calls = entries(scope, new, files, tokens, bound)
+        preflight(config, docker, policy, "policy", found["policy"], rollback_images(host))
+        if calls and registry is not None:
+            preflight(config, docker, registry, "registry", found["registry"], [])
+        if not args.operation:
+            private_directory(Path(files["gateway"]["host"]).parent)
+            journal.create({"version": 1, "operation": operation, "command": command, "state": "running",
+                            "bound": bound, "files": {name: file["host"] for name, file in files.items()},
+                            "layout": files, "scope": shape, "steps": {}})
+        try:
+            return run_issue(config, run, docker, host, journal, scope, files, tokens, steps, found)
+        except (AdminError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, AdminError) else type(exc).__name__
+            journal.data.update(state="failed", error=reason)
+            journal.save()
+            raise Stopped(f"operation {operation} stopped: {reason}. Either rerun the same command with "
+                          f"`--operation {operation}` (finished steps replay by their operation IDs), or run "
+                          f"`deedkit admin undo {operation}`") from None
+
+
+def run_issue(config, run, docker, host, journal: Journal, scope, files, tokens, steps, found) -> dict:
+    data, new = journal.data, journal.data["command"]["id"]
+    if data["steps"].get("key files", {}).get("state") == "done" and (missing := sorted(
+            file["host"] for name, file in files.items() if name != "archive-config"
+            and not os.path.lexists(file["host"]))):
+        raise AdminError("a key file this operation wrote is gone: " + ", ".join(missing))
+    journal.step("key files", "started")
+    for name, file in files.items():
+        stale_staging(Path(file["host"]))
+        if name != "archive-config" and not os.path.lexists(file["host"]):
+            write_secret(Path(file["host"]), tokens[name], tuple(file["owner"]))
+            checkpoint("key files", name)
+    journal.step("key files", "done")
+    expiries = [data["bound"]]
+    for step, service, secret, argv in steps:
+        journal.step(step, "started", operation_id=argv[-1])
+        reply = ask(run, service, argv, (tokens[secret] + "\n").encode())
+        checkpoint(step, "committed")
+        public = reply.get("key_id") or reply.get("principal_id") if isinstance(reply, dict) else None
+        if not public or instant(reply.get("expires_at")) is None or reply.get("revoked"):
+            raise AdminError(f"{service}: {argv[0]} returned no live record")
+        journal.step(step, "done", public_id=public, expires_at=reply["expires_at"])
+        expiries.append(reply["expires_at"])
+    # The gateway never outlives a backend: every entry ends at the earliest backend expiry read back.
+    expires_at = min(expiries, key=instant)
+    gateway, calls = entries(scope, new, files, tokens, expires_at)
+    if "archive" in scope:
+        file = files["archive-config"]
+        journal.step("calls archive configuration", "started")
+        settings = {**scope["archive"]["settings"], "token_file": files["archive-token"]["container"]}
+        if not os.path.lexists(file["host"]):
+            write_secret(Path(file["host"]), json.dumps(settings), tuple(file["owner"]))
+            checkpoint("calls archive configuration", "written")
+        elif json.loads(read_private(file["host"])) != settings:
+            raise AdminError(f"{file['host']} differs from what this operation wrote")
+        journal.step("calls archive configuration", "done")
+    for name, entry, what, extra in (("calls registry", calls, "registry", []),
+                                     ("gateway policy", gateway, "policy", rollback_images(host))):
+        if entry is None:
+            continue
+        document = Document(config["policy" if what == "policy" else "calls_registry"], name)
+        journal.step(name, "started", entry=entry_digest(entry))
+        current = document.entry(new)
+        if current is None:
+            replace(config, docker, document, document.with_entry(new, entry), what, found[what], extra)
+            checkpoint(name, "renamed")
+        elif entry_digest(current) != entry_digest(entry):
+            raise AdminError(f"the {name} entry {new!r} differs from what this operation wrote")
+        journal.step(name, "done", entry=entry_digest(entry))
+    if data["command"]["label"]:
+        set_label(config, new, data["command"]["label"])
+    token, url = files["gateway"]["host"], host.http["http_release"]["gateway_public_url"].rstrip("/") + "/mcp"
+    helper = f'printf \'{{"Authorization":"Bearer %s"}}\' "$(cat ~/.config/deedkit/{new}.token)"'
+    server = json.dumps({"type": "http", "url": url, "headersHelper": helper})
+    data["result"] = {
+        "operation": data["operation"], "principal": new, "like": data["command"]["like"], "expires_at": expires_at,
+        "credentials": [{"store": step, "public_id": data["steps"][step]["public_id"],
+                         "expires_at": data["steps"][step]["expires_at"]} for step, *_ in steps]
+        + ([{"store": "calls", "public_id": new, "expires_at": expires_at}] if calls else []),
+        "token_file": token, "undo": f"deedkit admin undo {data['operation']}",
+        "next": [f"mkdir -p ~/.config/deedkit && scp <host>:{shlex.quote(token)} ~/.config/deedkit/{new}.token "
+                 f"&& chmod 600 ~/.config/deedkit/{new}.token",
+                 f"claude mcp add-json deedkit-{new} {shlex.quote(server)}"]}
+    data["state"] = "done"
+    journal.save()
+    return data["result"]
+
+
+def references(config: dict, policy: Document, registry: Document | None, new: str, data: dict,
+               tokens: dict) -> list[str]:
+    """Rule (f): principals other than this operation's own entry that use a credential it created, by pin, key file,
+    archive configuration or archive token, compared by the token itself (a copy in another file counts). A reference
+    that cannot be read cannot be ruled out, so it counts too."""
+    digests = {hashlib.sha256(token.encode()).hexdigest() for token in tokens.values()}
+    paths = set(data["files"].values())
+
+    def holds(container: str) -> bool | None:
+        if host_path(config, container) in paths:
+            return True
+        token = read_token(config, container)
+        if token is None:  # unreadable, missing or malformed: its credential cannot be ruled out
+            return None
+        return hashlib.sha256(token.encode()).hexdigest() in digests
+    users = set()
+    for entry in policy.value["principals"]:
+        for credential in (entry.get("credentials") or {}).values() if entry.get("id") != new else []:
+            if not isinstance(credential, dict):
+                continue
+            used = credential.get("key_sha256") in digests or holds(str(credential.get("key_file")))
+            if used is not False:
+                users.add(str(entry.get("id")) + ("" if used else " (unreadable key file)"))
+    for entry in registry.value["principals"] if registry is not None else []:
+        if entry.get("id") == new:
+            continue
+        used = entry.get("key_sha256") in digests
+        if entry.get("archive_config"):
+            archive = host_path(config, entry["archive_config"])
+            try:
+                nested = json.loads(read_private(archive, 65536))["token_file"]
+                used = used or archive in paths or holds(nested)
+            except (OSError, ValueError, KeyError, TypeError, AdminError):
+                used = None
+        if used is not False:
+            users.add(f"{entry.get('id')} (calls" + (")" if used else ", unreadable archive configuration)"))
+    return sorted(users)
+
+
+UNDO_FILES = {"messaging": "messaging", "messaging-archive": "archive-token", "calendar": "calendar"}
+
+
+def owned(data: dict, name: str, entry: dict | None, new: str) -> str:
+    """The state of this operation's policy or registry entry: "absent", "created" (exactly as the operation wrote
+    it) or "disabled" (exactly as its own undo wrote it); anything else is someone else's change and refuses."""
+    if entry is None:
+        return "absent"
+    digest = entry_digest(entry)
+    if digest == data["steps"].get(name, {}).get("entry") and entry.get("enabled") is True:
+        return "created"
+    if digest == data["steps"].get("undo " + name, {}).get("entry"):
+        return "disabled"
+    raise AdminError(f"the {name} entry {new!r} changed since this operation wrote it; nothing changed")
+
+
+def undo(config: dict, run, docker, host_factory, operation: str) -> dict:
+    """Compensation, not restoration: disable the entries this operation created, revoke the backend records that carry
+    its operation IDs, delete its key files. Later changes by others stay; a conflict refuses."""
+    journal = Journal(config, operation)
+    data = journal.load()
+    if data.get("command", {}).get("verb") != "issue":
+        raise AdminError(f"operation {operation} is not an issue; nothing changed")
+    new = data["command"]["id"]
+    result = {"operation": operation, "principal": new, "undone": True,
+              "note": f"{new!r} is retired: revoked records stay for audit, so a new key needs another ID"}
+    if data.get("state") == "undone":
+        return {**result, **data.get("undo", {})}
+    host = host_factory()
+    with guarded(config, host, docker):
+        policy = Document(config["policy"], "gateway policy")
+        registry = Document(config["calls_registry"], "calls registry") if config.get("calls_registry") else None
+        containers = running(docker)
+        found = {"policy": consumers(containers, config["policy"], "gateway policy")}
+        if registry is not None:
+            found["registry"] = consumers(containers, config["calls_registry"], "calls registry")
+        records = []
+        for step, service in (("messaging", "messaging"), ("messaging-archive", "messaging"),
+                              ("calendar", "calendar")):
+            if step in data["steps"]:
+                checked(run, service, [LOOKUP[service][0], "--operation-id", f"{operation}/{step}"])
+                row = one(run, service, [LOOKUP[service][0], "--operation-id", f"{operation}/{step}"])
+                if row.get("found") and not row.get("revoked"):
+                    revoke = (["revoke-key", "--key-id", str(row.get("key_id"))] if service == "messaging"
+                              else ["revoke-agent", "--id", str(row.get("principal_id"))])
+                    checked(run, service, revoke)
+                    records.append((step, service, revoke))
+        states = {name: owned(data, name, document.entry(new), new)
+                  for name, document in (("gateway policy", policy), ("calls registry", registry)) if document is not None}
+        # Rule (f) compares other principals' references with the tokens of every credential undo would still revoke
+        # or disable; without such a token exclusivity cannot be proven, so undo refuses.
+        tokens = {name: token for name, path in data["files"].items() if name != "archive-config"
+                  and os.path.lexists(path) and (token := read_token({}, path)) is not None}
+        needed = [UNDO_FILES[step] for step, _, _ in records]
+        needed += ["calls"] if states.get("calls registry") == "created" else []
+        if missing := sorted(data["files"][name] for name in needed if name in data["files"] and name not in tokens):
+            raise AdminError("the key file " + ", ".join(missing) + " this operation wrote is unreadable or gone, so "
+                             "undo cannot prove no other principal uses its credential; nothing changed")
+        # A readable file is not yet this operation's credential: each token must resolve in its own store to the record
+        # undo revokes, and the calls token must match the pin of the entry this operation wrote.
+        replaced = [data["files"][UNDO_FILES[step]] for step, service, revoke in records if UNDO_FILES[step] in tokens
+                    and public_id(service, one(run, service, LOOKUP[service],
+                                               (tokens[UNDO_FILES[step]] + "\n").encode())) != revoke[-1]]
+        if states.get("calls registry") == "created" and "calls" in tokens and registry is not None \
+                and not pinned(tokens["calls"], (registry.entry(new) or {}).get("key_sha256")):
+            replaced.append(data["files"]["calls"])
+        if replaced:
+            raise AdminError("the key file " + ", ".join(sorted(replaced)) + " no longer holds the credential this "
+                             "operation created, so undo cannot prove no other principal uses it; nothing changed")
+        if users := references(config, policy, registry, new, data, tokens):
+            raise AdminError("a credential this operation created is used by " + ", ".join(users) + "; nothing changed")
+        # Rules (c) and (h) before the first journal change: every validator a later rename needs answers.
+        images = rollback_images(host)
+        if states["gateway policy"] == "created":
+            preflight(config, docker, policy, "policy", found["policy"], images)
+        if states.get("calls registry") == "created":
+            preflight(config, docker, registry, "registry", found["registry"], [])
+        data["state"] = "undoing"
+        journal.save()
+        disabled, deleted = [], []
+        try:
+            for name, what, extra in (("gateway policy", "policy", images), ("calls registry", "registry", [])):
+                if what == "registry" and registry is None:
+                    continue
+                # Ownership is checked on the very document the compare-and-swap replaces.
+                document = Document(config["policy" if what == "policy" else "calls_registry"], name)
+                entry = document.entry(new)
+                if owned(data, name, entry, new) == "created":
+                    after = {**entry, "enabled": False}
+                    journal.step("undo " + name, "started", entry=entry_digest(after))
+                    replace(config, docker, document, document.with_entry(new, after), what, found[what], extra)
+                    checkpoint("undo " + name, "renamed")
+                    journal.step("undo " + name, "done")
+                    disabled.append(name)
+            for step, service, revoke in records:
+                journal.step("undo " + step, "started", public_id=revoke[-1])
+                ask(run, service, revoke)
+                checkpoint("undo " + step, "committed")
+                journal.step("undo " + step, "done")
+            for path in data["files"].values():
+                if os.path.lexists(path):
+                    Path(path).unlink()
+                    deleted.append(path)
+        except (AdminError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, AdminError) else type(exc).__name__
+            raise Stopped(f"undo of {operation} stopped: {reason}; run `deedkit admin undo {operation}` again") from None
+        data["state"] = "undone"
+        data["undo"] = {"revoked": [{"store": step, "public_id": revoke[-1]} for step, _, revoke in records],
+                        "disabled": disabled, "deleted_files": deleted}
+        journal.save()
+    return {**result, **data["undo"], "next": f"on the Mac: claude mcp remove deedkit-{new}"}
+
+
 def render(view: dict) -> str:
     lines = []
     for row in view["principals"]:
@@ -391,7 +1319,7 @@ def line(indent: str, credential: dict) -> str:
             f"  expires {credential['expires_at'] or '-'}{note}")
 
 
-def main(argv: list[str] | None = None, run=None) -> int:
+def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int:
     parser = argparse.ArgumentParser(prog="deedkit admin", description="DeedKit admin CLI (ANYM-491)")
     parser.add_argument("--config", type=Path, default=CONFIG, help=f"private admin configuration (default {CONFIG})")
     nouns = parser.add_subparsers(dest="noun", required=True)
@@ -407,14 +1335,34 @@ def main(argv: list[str] | None = None, run=None) -> int:
     label = verbs.add_parser("label", help="set a principal's label in the private admin file")
     label.add_argument("principal")
     label.add_argument("text")
+    issuing = verbs.add_parser("issue", help="a new principal with the same access as an existing one (ANYM-496)")
+    issuing.add_argument("new")
+    issuing.add_argument("--like", required=True)
+    issuing.add_argument("--days", type=int, required=True, help=f"{DAYS[0]}-{DAYS[1]}, for every store")
+    issuing.add_argument("--label")
+    issuing.add_argument("--dry-run", action="store_true", help="print the plan, write nothing")
+    issuing.add_argument("--operation", help="rerun a stopped operation: finished steps replay, the rest continue")
+    undoing = nouns.add_parser("undo", help="compensate an operation: disable, revoke and delete what it created")
+    undoing.add_argument("operation")
     args = parser.parse_args(argv)
     try:
         config = load_json(args.config, "admin configuration")
+        if args.noun == "undo" or args.verb == "issue":
+            os.umask(0o077)
+            run, docker = run or runner(config), docker or dockers(config)
+            factory = (lambda: host) if host is not None else (lambda: load_host(config))
+            result = (undo(config, run, docker, factory, args.operation) if args.noun == "undo"
+                      else issue(config, run, docker, factory, args))
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         if args.verb == "label":
             print(json.dumps(set_label(config, args.principal, args.text), ensure_ascii=False))
             return 0
         now = datetime.now(timezone.utc)
         view = select(collect(config, run or runner(config), now), args.principal, args.scope or "all", now)
+    except Stopped as exc:
+        print(f"deedkit admin: {exc}", file=sys.stderr)
+        return 1
     except (AdminError, KeyError) as exc:
         print(f"deedkit admin: {exc}", file=sys.stderr)
         return 2

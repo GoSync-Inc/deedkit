@@ -2277,6 +2277,33 @@ def deploy_counts(last):
     return started, failures, misses, waits
 
 
+def unresolved(state, http_state, history=None, serving=None):
+    """Why no release-changing write may start, or None: the checks `deploy` runs before it changes anything, shared
+    with `deedkit admin` (ANYM-493). `history` returns the main mirror and `serving` is the serving HTTP release's
+    SHA (http-current.json's when omitted); without `history` the interrupted-publication check is skipped."""
+    if blocked := unfinished(state):
+        return "an apply or rollback is unfinished: " + ", ".join(blocked) + "; inspect it before any recovery"
+    attempts = {path.parent.name: read(path).get("status") for path in http_state.glob("*/http-attempted.json")}
+    # An HTTP attempt that neither serves nor failed before admission has an unknown router or retirement outcome.
+    if pending := sorted(name for name, status in attempts.items() if status not in ("serving", "startup-failed")):
+        return ("an HTTP release attempt is unresolved: " + ", ".join(pending)
+                + "; inspect seamless_release.py status --sha <sha>")
+    attempts = sorted(name for name, status in attempts.items() if status == "serving")
+    if history is None or not attempts:
+        return None
+    if serving is None:
+        current = http_state / "http-current.json"
+        serving = read(current).get("sha", "") if current.exists() else ""
+    # promote marks an attempt `serving` before it publishes http-current.json: a serving attempt the serving release
+    # does not contain is an interrupted publication, and the router may already admit that generation.
+    mirror, sha = history(), re.compile(r"[0-9a-f]{40}")
+    if unpublished := [name for name in attempts
+                       if not (sha.fullmatch(name) and sha.fullmatch(serving) and on_main(mirror, name, serving))]:
+        return ("an HTTP release attempt serves, but http-current.json does not name it: " + ", ".join(unpublished)
+                + "; inspect seamless_release.py status --sha <sha>")
+    return None
+
+
 def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs):
     state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
     # A tool update that stopped between `activating` and `active` is settled before anything else.
@@ -2294,13 +2321,8 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         last = {key: value for key, value in last.items() if key != "call_waits"}
         if not dry_run:
             write(state / "deploy.json", last)
-    if blocked := unfinished(state):
-        return halt("an apply or rollback is unfinished: " + ", ".join(blocked) + "; inspect it before any recovery")
-    # An HTTP attempt that neither serves nor failed before admission has an unknown router or retirement outcome.
-    if unresolved := sorted(path.parent.name for path in http_state.glob("*/http-attempted.json")
-                            if read(path).get("status") not in ("serving", "startup-failed")):
-        return halt("an HTTP release attempt is unresolved: " + ", ".join(unresolved)
-                    + "; inspect seamless_release.py status --sha <sha>")
+    if reason := unresolved(state, http_state):
+        return halt(reason)
     current = read(state / "current.json") if (state / "current.json").exists() else {}
     serving = read(http_state / "http-current.json") if (http_state / "http-current.json").exists() else {}
     if current.get("status") != "applied" or not re.fullmatch(r"[0-9a-f]{40}", current.get("sha", "")):
@@ -2344,14 +2366,8 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     head = run(["git", "-C", str(mirror), "rev-parse", "refs/heads/main"]).strip()
     if not on_main(mirror, base, head) or not on_main(mirror, serving["sha"], base):
         return halt("the current release is not on main, or the serving HTTP release is not an ancestor of it")
-    # promote marks an attempt `serving` before it publishes http-current.json: a serving attempt the serving release
-    # does not contain is an interrupted publication, and the router may already admit that generation.
-    if unpublished := sorted(path.parent.name for path in http_state.glob("*/http-attempted.json")
-                             if read(path).get("status") == "serving" and not (
-                                 re.fullmatch(r"[0-9a-f]{40}", path.parent.name)
-                                 and on_main(mirror, path.parent.name, serving["sha"]))):
-        return halt("an HTTP release attempt serves, but http-current.json does not name it: " + ", ".join(unpublished)
-                    + "; inspect seamless_release.py status --sha <sha>")
+    if reason := unresolved(state, http_state, lambda: mirror, serving["sha"]):
+        return halt(reason)
     if drift := configuration_drift(settings, http, current, serving):
         return halt(drift + "; apply the next release by hand")
     installed = {"scripts/production.py": RUNNING, "scripts/seamless_release.py": s.__file__,
