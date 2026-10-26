@@ -6,6 +6,7 @@ reader (ANYM-570).
     autoloop.py gate|finish INTENT [--state DIR]
     autoloop.py decline INTENT --reason CODE | large INTENT [--state DIR] [--triage-state DIR]
     autoloop.py bind INTENT --card ANYM-n [--state DIR]
+    autoloop.py report [--state DIR] [--triage-state DIR]
     autoloop.py hold|release CARD [--state DIR]
     autoloop.py read [--state DIR] [--triage-state DIR]
 
@@ -26,6 +27,11 @@ reject, by reason code) or `large` (an epic, a card over 8 SP or a branch it doe
 comes of it. Status notes the agent can act
 on (over a daily cap, paused, declined, queued as a large card) go out as dispositions files that the ANYM-536
 `auto` applies, each note once per item.
+
+`report` (also at the end of each good tick) writes `report/<day>.md` (ANYM-573) in Russian from the local state
+only: changes with feedback IDs, the card's title, PR, merge SHA, live or not and the undo; owner items with one
+question each; the orchestrator's queue (large cards, parked intents, missing receipts); declines with reasons in the
+loop's fixed wording; caps used. A quiet day is one line. No feedback text, and nothing is sent.
 `gate` exits 1 on PAUSE, a held card, a dropped item or no live intent; `status` exits 1 when the last good tick is
 older than 2 hours, the stop is not effective or an audit paused the loop.
 
@@ -997,6 +1003,166 @@ def card_end(state, triage_state, name, result, now):
     return notify(state, triage_state, {i: (status, note) for i in intent['feedback']}, now)
 
 
+# --- the daily report (ANYM-573) ---------------------------------------------------------------------------------
+PAUSE_DEPLOY = f'ssh {triage.HOST} sudo touch /etc/deedkit/autodeploy.pause'
+QUESTIONS = {'opt-in': 'включить уже готовую функцию {ref} для агента?', 'grant': 'выдать доступ для {ref}?',
+             'owner path': 'смержить PR по карточке {ref} (путь OWNER)?', 'epic': 'взять эпик {ref} в работу?'}
+SPEC_REF = re.compile(r'ANYM-[1-9][0-9]{0,5}')
+SHA40 = re.compile(r'[0-9a-f]{40}')
+REPORT_DAYS = 7  # at most this many days back are rebuilt after a gap
+
+
+def plain(note):
+    """A note as the report may print it: the loop's and the reader's fixed wording only. Anything else (an answer,
+    a proposed slug) may carry words of the feedback and is not printed."""
+    note = str(note or '')
+    if re.fullmatch(r'waits for the owner: (opt-in|grant|owner path|epic)( \(ANYM-[1-9][0-9]*\))?', note) \
+            or re.fullmatch(r'over daily cap, next run \d{4}-\d\d-\d\d', note) \
+            or note.removeprefix('declined by review: ') in DECLINED.values():
+        return note
+    if note.startswith('answered, no change needed'):
+        return 'answered, no change needed'
+    return note if note in (*REASONS.values(), WITHDRAWN, PAUSED, LARGE, 'autoloop control') else '(other note)'
+
+
+def day_of(text, zone):
+    try:
+        return triage.when(text).astimezone(zone).date().isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def title(ref, specs):
+    """A card by its ID and its Tiden title on one line, at most 80 characters, with no Markdown or HTML."""
+    if not isinstance(ref, str) or not SPEC_REF.fullmatch(ref):
+        return 'карточка ещё не создана'
+    name = re.sub(r'[^\w .,:;!?+-]+', ' ', str((specs.get(ref) or {}).get('title') or '')).strip()
+    name = re.sub(r'\s+', ' ', name)[:80]
+    return f'{ref} «{name}»' if name else ref
+
+
+def effective(triage_state, zone, day, dropped):
+    """{feedback ID: (status, printable note)} of the day: each item's last disposition (by its decision time); a
+    dropped item counts as withdrawn whatever came before. Unreadable files and malformed rows are counted."""
+    rows, bad = [], 0
+    for path in sorted((triage_state / 'dispositions').glob('*.json')):
+        try:
+            listed = triage.load(path, [])
+        except (ValueError, OSError):
+            bad += 1
+            continue
+        for row in listed if isinstance(listed, list) else []:
+            if isinstance(row, dict) and triage.UUID.fullmatch(str(row.get('id'))) \
+                    and day_of(row.get('decided_at'), zone) == day:
+                rows.append((triage.when(row['decided_at']), row))
+            elif not isinstance(row, dict) or not triage.UUID.fullmatch(str(row.get('id'))):
+                bad += 1
+    last = {}
+    for _, row in sorted(rows, key=lambda pair: pair[0]):
+        last[row['id']] = (row.get('status'), plain(row.get('note')), row.get('spec_ref'))
+    for i in last:
+        if i in dropped:
+            last[i] = ('declined', WITHDRAWN, None)
+    return last, bad
+
+
+def report_text(state, triage_state, cfg, day):
+    zone, specs = cfg['zone'], triage.known(triage.load(triage_state / 'snapshot.json', {'main': [], 'branches': {}}))
+    known, dropped = intents(state), holds(state)['items']
+    todays = {n: i for n, i in known.items() if day in (i.get('day'), day_of(i.get('ended_at'), zone))}
+    used = (triage.load(state / 'ledger.json', {}).get('days') or {}).get(day) or {}
+    changes, merged, owner, queue, declines = [], [], [], [], []
+    for name, i in sorted(todays.items()):
+        ids = ', '.join(f for f in i.get('feedback', []) if triage.UUID.fullmatch(str(f))) or '-'
+        ref, sha, pr = i.get('ref') if i['kind'] == 'card' else i.get('card'), i.get('merge_sha'), i.get('pr')
+        ref = ref if isinstance(ref, str) and SPEC_REF.fullmatch(ref) else None
+        sha, pr = (sha if isinstance(sha, str) and SHA40.fullmatch(sha) else None), (pr if type(pr) is int else None)
+        outcome = i.get('outcome') if i.get('outcome') in (*DECLINED, 'large') else None
+        kind = 'карточка' if i['kind'] == 'card' else 'сборка'
+        line = f"- {kind} {title(ref, specs)}: {name}, статус {i['status']}" \
+            + (f', итог {outcome}' if outcome else '') + f'; отзывы {ids}'
+        if sha:
+            live = {True: 'в проде', False: 'ещё не в проде'}.get(i.get('live'), 'в проде или нет — неизвестно')
+            line += (f"; PR #{pr or '?'}, слит {sha[:12]}, {live}; отмена: `git revert {sha}` через PR, "
+                     f'автодеплой на паузу: `{PAUSE_DEPLOY}`')
+            if ref and specs.get(ref, {}).get('status') != 'Done':
+                merged.append(f'- {title(ref, specs)}: слит {sha[:12]}, карточка ещё не Done')
+        elif pr:
+            line += f'; PR #{pr} не слит; отмена: `python3 scripts/autoloop.py hold {ref}`, `gh pr close {pr}`'
+        elif ref:
+            line += f'; отмена: `python3 scripts/autoloop.py hold {ref}` (перенос или удаление карточки — владелец)'
+        if i['status'] == 'finished' and not (sha or pr or (i['kind'] == 'card' and (ref or outcome))):
+            queue.append(f'- {name}: нет квитанции (завершён без карточки, итога, PR и SHA слияния)')
+        changes.append(line)
+    for name, i in sorted(known.items()):
+        mine = [j for j in known.values() if j['kind'] == i['kind'] and j['card'] == i['card']]
+        if i['status'] in RETRY and not i.get('outcome') and len(mine) > 1 \
+                and all(j['created_at'] <= i['created_at'] for j in mine):
+            queue.append(f"- {name}: перезапуск израсходован ({i['status']}), нужен оркестратор")
+    last, bad = effective(triage_state, zone, day, dropped)
+    for i, (status, note, spec_ref) in sorted(last.items()):
+        if note.startswith('waits for the owner: '):
+            found = re.search(r'ANYM-[1-9][0-9]*', note)
+            ref = found.group(0) if found else spec_ref if isinstance(spec_ref, str) and SPEC_REF.fullmatch(
+                spec_ref) else 'по отзыву'
+            kind = note.removeprefix('waits for the owner: ').split(' (')[0]
+            owner.append(f'- {i}: ' + QUESTIONS[kind].format(ref=ref))
+        elif note == LARGE:
+            queue.append(f'- {i}: большая карточка, её ведёт оркестратор')
+        elif status == 'declined':
+            declines.append(f'- {i}: {note}')
+    if bad:
+        queue.append(f'- нечитаемых файлов или строк решений: {bad}')
+    caps = cfg['caps']
+    limits = [f"- триаж: запусков {used.get('reader_runs', 0)} из {caps['reader_runs']}, "
+              f"отзывов {len(used.get('items', {}))}",
+              f"- карточки: {used.get('card', 0)} из {caps['card_launches']}; сборки: {used.get('build', 0)} из "
+              f"{caps['build_launches']}; часы воркеров: {round(used.get('seconds', 0) / 3600, 1)} из "
+              f"{caps['worker_hours']}"]
+    if not (changes or owner or queue or declines or used.get('reader_runs') or used.get('items')):
+        return f'# Автоцикл {day}: тихий день, изменений нет.\n'
+    sections = [('Изменения', changes), ('Слито, карточка ещё не Done', merged),
+                ('Ждёт владельца (один вопрос на пункт)', owner), ('Очередь оркестратора', queue),
+                ('Отклонено', declines), ('Лимиты', limits)]
+    return f'# Автоцикл {day}\n\nТолько ID и статусы, без текста отзывов. Ничего не отправлено.\n' + ''.join(
+        f'\n## {head}\n\n' + '\n'.join(lines or ['- нет']) + '\n' for head, lines in sections)
+
+
+def marker(state):
+    """report.json: the last reported day and whether the last report was written; unreadable counts as none."""
+    try:
+        mark = triage.load(state / 'report.json', {})
+    except (ValueError, OSError):
+        return {}
+    return mark if isinstance(mark, dict) else {}
+
+
+def report(state, triage_state, now, day=None):
+    """`report/<day>.md` (0600), in Russian, from the local state only: nothing is read from a service and nothing is
+    sent. Without `day`, every day from the last reported one (at most REPORT_DAYS back) to today is rebuilt, so a
+    change logged just before midnight lands in its own day. Returns today's (or `day`'s) path."""
+    cfg = config(state)
+    today = now.astimezone(cfg['zone']).date()
+    if day:
+        days = [day]
+    else:
+        try:
+            start = datetime.fromisoformat(marker(state)['day']).date()
+        except (KeyError, TypeError, ValueError):
+            start = today
+        start = min(today, max(today - timedelta(days=REPORT_DAYS), start))  # a future or broken mark: today
+        days = [(start + timedelta(days=n)).isoformat() for n in range((today - start).days + 1)]
+    for one in days:
+        path = state / 'report' / f'{one}.md'
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.NamedTemporaryFile('w', dir=path.parent, delete=False) as handle:  # mkstemp: mode 0600
+            handle.write(report_text(state, triage_state, cfg, one))
+        os.replace(handle.name, path)
+    if not day:
+        triage.save(state / 'report.json', {'day': today.isoformat(), 'ok': True})
+    return state / 'report' / f'{days[-1]}.md'
+
+
 # --- provenance, caps, tick, status ------------------------------------------------------------------------------
 def provenance(ledger, principals):
     """owner-agent for a cluster whose every item comes from a listed principal; any other item makes it report-only."""
@@ -1092,6 +1258,11 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
         triage.save(state / 'plan.json', plan)
         if not withheld:  # a withhold not done is no good tick: `status` reports it and the last good time stays
             heartbeat(state, now, 'live' if cfg['live'] else 'plan')
+            try:
+                report(state, triage_state, now)
+            except (Refused, triage.Refused, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
+                # The tick's work stands; `status` exits 1 until a report is written again.
+                triage.save(state / 'report.json', dict(marker(state), ok=False, error=type(error).__name__))
         return 1 if withheld else 0, (
             f"tick {'live' if cfg['live'] else 'plan only'}: pulled {fresh}, read {count}, over cap {len(over)}, "
             f"dropped {len(drops)}, withhold not done {len(withheld)}, "
@@ -1108,6 +1279,8 @@ def status(state, now):
         problems.append('paused by an audit')
     if paused and not (triage.load(state / 'fence.json', None) or {}).get('effective'):
         problems.append('the stop is not effective yet (fence.json)')
+    if marker(state).get('ok') is False:
+        problems.append('the daily report failed (report.json)')
     if not paused and (triage.load(state / 'plan.json', None) or {}).get('withheld'):
         problems.append('a hold or drop is not withheld yet (plan.json withheld)')
     line = f"last tick {last['at'] if last else 'never'} ({last['outcome'] if last else '-'}); " + \
@@ -1118,7 +1291,7 @@ def status(state, now):
 def main(argv_=None):
     parser = argparse.ArgumentParser(description='Feedback autoloop driver (docs/operations/feedback-autoloop.md).')
     parser.add_argument('action', choices=['tick', 'fence', 'resume', 'status', 'gate', 'finish', 'hold', 'release', 'read',
-                                           'decline', 'large', 'bind'])
+                                           'decline', 'large', 'bind', 'report'])
     parser.add_argument('name', nargs='?',
                         help='the intent (gate, finish, decline, large, bind) or the card (hold, release)')
     parser.add_argument('--reason', choices=sorted(DECLINED), help='decline: the reason code of the review reject')
@@ -1127,7 +1300,7 @@ def main(argv_=None):
     parser.add_argument('--triage-state', type=Path,
                         default=Path(os.environ.get('FEEDBACK_TRIAGE_STATE', triage.STATE)))
     args = parser.parse_args(argv_)
-    if (args.name is None) != (args.action in ('tick', 'fence', 'resume', 'status', 'read')):
+    if (args.name is None) != (args.action in ('tick', 'fence', 'resume', 'status', 'read', 'report')):
         parser.error(f'{args.action} takes {"no argument" if args.name else "one argument"}')
     if (args.reason is None) == (args.action == 'decline'):
         parser.error('--reason goes with decline only, and decline needs it')
@@ -1160,10 +1333,14 @@ def main(argv_=None):
             why = gate(args.state, args.name)
             print(f'STOP {why}' if why else 'go', file=sys.stderr if why else sys.stdout)
             return 1 if why else 0
+        if args.action == 'report':
+            with own_lock(args.state):
+                print(f'report {report(args.state, args.triage_state, now)}')
+            return 0
         if args.action == 'read':
             with triage.locked(args.triage_state), own_lock(args.state):
-                count, report = read(args.state, args.triage_state)
-                print(f'read {count} decisions; report {report}' if report else 'inbox empty')
+                count, written = read(args.state, args.triage_state)
+                print(f'read {count} decisions; report {written}' if written else 'inbox empty')
             return 0
         with own_lock(args.state):
             if args.action == 'finish':

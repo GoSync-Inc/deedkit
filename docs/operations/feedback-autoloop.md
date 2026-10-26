@@ -148,10 +148,31 @@ the owner's words. Undo: set `live` back to false, or `PAUSE`.
 | Deployed | pause autodeploy, then the revert's deploy (docs/operations/production.md) |
 | Feedback status | `feedback_sync.py apply` with the corrected status (ANYM-536) |
 
-Each merge's revert and pause commands are in the day's report (`~/.deedkit/autoloop/report/`,
-Russian, no feedback text), which the orchestrator reads at its wake. `autoloop.py status` exits 1
-when the last good tick is older than 2 hours, a fence read-back failed or an audit paused the
-loop.
+Each merge's revert and pause commands are in the day's report. The orchestrator reads that report
+at its wake and relays the owner items. `autoloop.py status` exits 1 when the last good tick is
+older than 2 hours, a fence read-back failed or an audit paused the loop.
+
+## Daily report (ANYM-573)
+
+`autoloop.py report` writes `~/.deedkit/autoloop/report/<day>.md` (0600). Each good tick also
+writes it. The report is in Russian. It is built from the local state only: intents, the
+dispositions files of the day, the ledger and the last snapshot. Nothing is read from a service,
+and nothing is sent. It has six sections:
+
+- **Changes.** The card or build, its feedback IDs and the card's title. For a merge: the PR, the
+  merge SHA, whether it is live, and the undo (`git revert <SHA>` through a PR, plus the
+  autodeploy pause command). For a card: `hold ANYM-n`.
+- **Merged, card not Done yet.** Listed separately.
+- **Owner items.** One question each: opt-in, grant, OWNER path or epic.
+- **The orchestrator's queue.** Large cards, intents with their relaunch spent, and missing
+  receipts: a worker that ended with no card and no outcome, or a build with no PR and no merge
+  SHA.
+- **Declines.** Each with its reason.
+- **Caps used.**
+
+Notes print only in the loop's and the reader's fixed wording. Any other note, such as an answer
+or a proposed slug, prints as "(other note)", so no feedback text reaches the report. A quiet day
+is one line.
 
 ## Known residual (owner-accepted 10-26)
 
