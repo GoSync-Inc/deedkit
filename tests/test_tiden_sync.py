@@ -996,7 +996,13 @@ def test_a_ready_merge_dispatch_runs_in_the_sync_group_titled_by_its_branch_and_
     "New card.\nReady: `2026-10-26`\n",
     f"New card.\n\n>     {READY_LINE}\n",
     f"New card.\n\n-     {READY_LINE}\n",
-], ids=["indented", "tab", "bold-empty", "list-bold-empty", "code-span", "quote-code", "list-code"])
+    f"New card.\n\n- ~~~\n  + {READY_LINE}\n  ~~~\n",
+    f"New card.\n\n- ~~~\n  - {READY_LINE}\n  ~~~\n",
+    f"New card.\n\n> ~~~\n> {READY_LINE}\n> ~~~\n",
+    f"New card.\n\n<pre>\n{READY_LINE}\n</pre>\n",
+    f"New card.\n\n<!--\n{READY_LINE}\n-->\n",
+], ids=["indented", "tab", "bold-empty", "list-bold-empty", "code-span", "quote-code", "list-code", "list-fence-plus",
+        "list-fence-dash", "quote-fence", "html-pre", "html-comment"])
 def test_a_ready_merge_refuses_a_readiness_record_in_indented_code_or_without_text(server, content):
     ready_server(server, preview={"additions": [{"seqNum": 70, "parentId": None}],
                                   "stats": {"additions": 1, "conflicts": 0}},
@@ -1115,17 +1121,11 @@ def test_a_ready_merge_whose_merge_call_fails_after_merging_reads_it_back_in_the
 
 
 # spec: ANYM-405
-def test_a_ready_merge_reads_each_parent_from_the_preview_and_back_from_main(server, monkeypatch):
-    ready_server(server, preview={"additions": [{"seqNum": 70}], "stats": {"additions": 1, "conflicts": 0}},
-                 branch=[spec(70, status="Backlog", content=READY_LINE, branch=True)])
-    code, out = ready_run(server)
-    assert code == 1 and "the preview of proposal/ready names no parent of ANYM-70" in out and not server.writes()
-    # A new card under ANYM-12: main counts it as a child of ANYM-12, and the merge is done.
-    parent = server.main(12)["id"]
+def test_a_ready_merge_counts_a_new_card_as_a_child_of_its_parent_on_main(server, monkeypatch):
+    parent = "m-0012-0000-0000-0000-000000000000"
     ready_server(server, preview={"additions": [{"seqNum": 70, "parentId": parent}],
                                   "stats": {"additions": 1, "conflicts": 0}},
                  branch=[dict(spec(70, status="Backlog", content=READY_LINE, branch=True), parentId=parent)])
-    server.set(log=[])
     original = tiden_sync.write
 
     def write(cli, arguments, product):
@@ -1137,7 +1137,7 @@ def test_a_ready_merge_reads_each_parent_from_the_preview_and_back_from_main(ser
     monkeypatch.setattr(tiden_sync, "write", write)
     code, out = ready_run(server)
     assert code == 0 and "Ready merge of proposal/ready done (ANYM-70)." in out, out
-    assert ("spec", "get") in server.calls()
+    assert server.main(70)["parentId"] == parent
 
 
 # spec: ANYM-405
@@ -1157,5 +1157,25 @@ def test_a_ready_merge_fails_its_read_back_when_a_spec_moved_parent_after_its_ch
         server.set(main=state["main"])
     monkeypatch.setattr(tiden_sync, "write", write)
     code, out = ready_run(server)
-    assert code == 1 and "ANYM-60 is under m-0012-0000-0000-0000-000000000000 on main, not None" in out, out
+    assert code == 1 and "ANYM-60 on main differs from the checked branch copy (parentId)" in out, out
     assert "ANYM-12 changed on main, but not on the checked branch" in out and "Ready merge of" not in out
+
+
+# spec: ANYM-405
+def test_a_ready_merge_fails_its_read_back_when_unchanged_specs_swap_parents_after_its_check(server, monkeypatch):
+    first, second = "m-0012-0000-0000-0000-000000000000", "m-0013-0000-0000-0000-000000000000"
+    ready_server(server, main=[spec(12, children=1), spec(13, children=1),
+                               spec(60, status="Backlog", content=f"Criteria.\n{READY_LINE}\n"),
+                               dict(spec(80), parentId=first), dict(spec(81), parentId=second)])
+    original = tiden_sync.write
+
+    def write(cli, arguments, product):
+        # After the last check the branch swaps the parents of two specs it did not change: both counts stay.
+        state = server.state()
+        state["branch_specs"]["proposal/ready"] += [dict(spec(80), parentId=second), dict(spec(81), parentId=first)]
+        server.set(branch_specs=state["branch_specs"])
+        original(cli, arguments, product)
+    monkeypatch.setattr(tiden_sync, "write", write)
+    code, out = ready_run(server)
+    assert code == 1 and "ANYM-80 changed on main, but not on the checked branch; ANYM-81 changed on main" in out, out
+    assert "Ready merge of" not in out

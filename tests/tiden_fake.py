@@ -11,7 +11,7 @@ import sys
 import textwrap
 
 SECRET = "tfy_sentinel_secret_value"
-READS = {("spec", "list"), ("spec", "get"), ("branch", "list"), ("branch", "merge-preview"), ("test", "list"), ("test", "links")}
+READS = {("spec", "list"), ("branch", "list"), ("branch", "merge-preview"), ("test", "list"), ("test", "links")}
 FAKE = textwrap.dedent(f"""\
     #!{sys.executable}
     import json, os, sys, uuid
@@ -31,14 +31,13 @@ FAKE = textwrap.dedent(f"""\
         ("test", "links"): {{"--format"}},
         ("test", "link-spec"): {{"--spec-id", "--format"}},
         ("spec", "update"): {{"--id", "--sources-file", "--status", "--format"}},
-        ("spec", "get"): {{"--product-id", "--format"}},
     }}
     command = tuple(args[:2])
     if command not in FLAGS:
         sys.exit(64)
     rest = args[2:]
     positional = []
-    if command in {{("test", "links"), ("test", "link-spec"), ("spec", "get")}}:
+    if command in {{("test", "links"), ("test", "link-spec")}}:
         positional, rest = rest[:1], rest[1:]
     options, index = {{}}, 0
     while index < len(rest):
@@ -105,8 +104,6 @@ FAKE = textwrap.dedent(f"""\
         if fault != "noop":
             state.setdefault("links", {{}}).setdefault(positional[0], []).append(options["--spec-id"])
         save(); print(json.dumps({{"id": str(uuid.uuid4())}}))
-    elif command == ("spec", "get"):
-        print(json.dumps(find(positional[0])))
     elif command == ("spec", "update"):
         spec = find(options["--id"])
         if "--status" in options and fault != "noop":

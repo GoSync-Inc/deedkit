@@ -425,11 +425,13 @@ Tiden main only when:
    request that builds it, which sync B merges);
 4. a text change changes the title and text alone: type, parent, component,
    priority, position, status and sources (by their fields) stay as main has
-   them, in the listings and in the preview's two versions (the parent is in
-   the preview alone; it must name one for every changed spec); only a branch
-   copy's own record ID, branch and times differ;
-5. every changed spec has a `Ready:` record outside code (fenced, indented by
-   four spaces or a tab, or a code span) with text after the colon: a legacy
+   them, in the listings (which name a parent, absent for none) and in the
+   preview's two versions; only a branch copy's own record ID, branch and
+   times differ;
+5. every changed spec has a `Ready:` record with text after the colon that
+   starts its line (bold, or a top-level `- ` item at most), outside fenced
+   code and code spans; a spec with a raw `<pre>`, `<script>`, `<style>`,
+   `<textarea>` or `<!--` block has none: a legacy
    `Accepted:` alone is refused (add `Ready:` citing it), and a text change of
    a spec on main brings a new record, not main's in other bold or list markup.
 
@@ -439,9 +441,8 @@ refuses when anything differs from what it checked. The window between that
 read and the merge stays; the read-back closes it by detection, not
 prevention: main must then hold the specs it had (same record, same fields, a
 parent's child count raised by each new spec under it), plus exactly the
-checked branch copies, a text change in main's record and a new spec in its
-branch record, each read again by `spec get` for the parent it was checked
-under (no record is created on
+checked branch copies (parent included), a text change in main's record and
+a new spec in its branch record (no record is created on
 a merge: 2026-10-26, the main specs that merged branches changed kept their
 `createdAt`, and none was created at a merge). Its output, each number with
 its record ID, new or text changed, is the receipt. A refusal names its step
