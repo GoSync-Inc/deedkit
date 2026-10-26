@@ -79,6 +79,54 @@ unknown launch is reconciled from `superset workspaces list` by its stable name,
 build reserves its card's lane and expected paths and waits while another live intent, an open PR
 or a pushed branch of a live workspace touches them (details: ANYM-569, ANYM-572).
 
+## Card worker (ANYM-571)
+
+With `live: true`, the tick gives each new owner-agent cluster that has a released card brief one
+card worker within the caps. The worker is a local Superset workspace `autoloop-card-c<hash>` with
+the worker preset. Names, branches and prompts use an opaque key (a hash of the cluster), so no
+word of the reader's slug reaches them. The prompt names `~/deedkit-orchestrator/briefs/autoloop-card.md`
+(the template, outside Git), common.md, the intent, the opaque key, the feedback IDs and the
+projection path. The projection (`projections/<intent>.json`, 0600) holds the proposal branch, the
+bound card, IDs, principal labels, classifications and the released briefs. No feedback text is in
+it, and none is in the command. With no template, nothing starts.
+
+A brief is released only after two checks. It is scrubbed, and every number of two or more digits
+becomes `#`. A brief that repeats five consecutive words of any item in its batch is not released
+at all: its cluster waits for the orchestrator.
+
+The worker writes one card, only on the projection's branch `proposal/autoloop-card-c<hash>`. A
+relaunch keeps that branch. Right after the spec exists, the worker runs `autoloop.py bind <intent>
+--card ANYM-n`. From then on, `hold ANYM-n` stops this worker and any relaunch. The card has
+`Feedback:` and `Source: autoloop <principal>` lines. The worker runs the reviews by kind and fills
+`Ready:` "asked by agent <principal> via feedback <id> (AGENTS.md autoloop override)". It
+dispatches the ready merge only when `tiden branch merge-preview` shows its one card and nothing
+else, then reads the merge back. It runs `autoloop.py gate <intent>` before each Tiden write and
+before the dispatch. It ends with `autoloop.py finish <intent>`. When no Ready card comes of it, two commands record why, and both
+pass the gate first:
+
+- `autoloop.py decline <intent> --reason not-needed|covered|out-of-scope|unclear` (a Fable
+  reject): the items become `declined`.
+- `autoloop.py large <intent>` (an epic, over 8 SP, or a branch that holds more than its card):
+  the items keep `received` with "queued: large card, built by the orchestrator".
+
+A cluster with an outcome never gets another card worker. A lost, interrupted, cancelled or stopped
+one gets its one relaunch.
+
+Status notes go through a dispositions file that the ANYM-536 `auto` applies. The sync's
+never-down rule keeps an item that is further along. Each note goes to an item once. No note goes
+to a dropped item, and none follows a declined or large outcome:
+
+| Note | When |
+|---|---|
+| over daily cap, next run <date> | the item is over its principal's daily cap, or its cluster is over the launch or worker-hour cap |
+| paused | PAUSE closed its worker, or PAUSE came between the reservation and the start |
+| declined by review: <reason> | `decline` |
+| queued: large card, built by the orchestrator | `large` |
+| withdrawn by the reporter | `AUTOLOOP DROP` (ANYM-569) |
+
+The reader writes "waits for the owner: opt-in" (ANYM-570). The build stage adds the grant and
+owner-path notes (ANYM-572).
+
 ## The live switch
 
 `~/.deedkit/autoloop/config.json` (directory 0700, files 0600, refused inside a Git checkout) is

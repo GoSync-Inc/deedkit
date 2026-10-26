@@ -251,7 +251,8 @@ def test_a_new_card_brief_is_kept_scrubbed_in_the_private_state_and_a_refusal_wr
     run_read(states, decision(P3, 'reported-bug', reason_code='new-idea', new_card='group-receipts',
                               card_brief='Receipts stop in groups, see /var/log/x and `tail`.'))
     briefs = json.loads((a / 'briefs.json').read_text())
-    assert briefs == {P3: {'new_card': 'group-receipts', 'card_brief': 'Receipts stop in groups, see and'}}
+    assert briefs == {P3: {'new_card': 'group-receipts', 'card_brief': 'Receipts stop in groups, see and',
+                           'release': autoloop.RELEASE}}
     assert stat.S_IMODE((a / 'briefs.json').stat().st_mode) == 0o600
     assert stat.S_IMODE(a.stat().st_mode) == 0o700
     assert set(json.loads((t / 'inbox.json').read_text())) == {P1, P2}  # undecided items stay
@@ -299,8 +300,11 @@ def test_the_card_worker_gets_only_briefs_whose_item_is_in_the_ledger_with_the_s
                                                    P2: {'new_card': 'other', 'card_brief': 'y'}}))
     ledger = triage.load(t / 'ledger.json', {})
     triage.save(t / 'ledger.json', dict(ledger, **{P2: dict(ledger[P3], cluster='new:group-receipts')}))
-    assert autoloop.committed_briefs(a, t) == {P3: {'new_card': 'group-receipts',
+    assert autoloop.committed_briefs(a, t) == {P3: {'new_card': 'group-receipts', 'release': autoloop.RELEASE,
                                                     'card_brief': 'Receipts stop in groups.'}}
+    # A brief stored before the release checks (ANYM-571) is never committed.
+    triage.save(a / 'briefs.json', {P3: {'new_card': 'group-receipts', 'card_brief': 'Receipts stop in groups.'}})
+    assert autoloop.committed_briefs(a, t) == {}
 
 
 # spec: ANYM-570
@@ -944,3 +948,267 @@ def test_status_exits_1_on_a_stale_tick_or_an_audit_pause(loop):
 def test_the_sync_lock_is_the_feedback_sync_state():
     import scripts.feedback_sync as sync
     assert autoloop.SYNC_STATE == sync.STATE
+
+
+# --- the card launcher and status notes (ANYM-571) ---------------------------------------------------------------
+BRIEF = 'Group names vanish after a rename.'
+
+
+def new_card(fakes, cards):
+    """The reader proposes a new card for each item in `cards` ({feedback ID: (slug, brief)}); the rest are not
+    actionable."""
+    def runner(projected):
+        fakes.runner_calls.append([row['id'] for row in projected['items']])
+        return stream(answer(*[decision(row['id'], 'reported-bug', reason_code='new-idea', new_card=cards[row['id']][0],
+                                        card_brief=cards[row['id']][1]) if row['id'] in cards
+                               else decision(row['id'], 'not-actionable', reason_code='not-actionable')
+                               for row in projected['items']]))
+    fakes.runner = runner
+
+
+def creates(fakes, reply):
+    real = fakes.superset
+
+    def superset(argv):
+        if argv[:2] == ['workspaces', 'create']:
+            fakes.calls.append(('superset', argv))
+            return reply
+        return real(argv)
+    fakes.superset = superset
+    return lambda: [c[1] for c in fakes.calls if c[0] == 'superset' and c[1][:2] == ['workspaces', 'create']]
+
+
+def notes(t):
+    """The status notes the loop handed to the ANYM-536 apply path, each file checked by its own reader."""
+    import scripts.feedback_sync as sync
+    rows = {}
+    for path in sorted((t / 'dispositions').glob('autoloop-note-*.json'), key=lambda p: p.stat().st_mtime_ns):
+        sync.dispositions(path)
+        rows.update({r['id']: (r['status'], r['note']) for r in json.loads(path.read_text())})
+    return rows
+
+
+def card_name(cluster):
+    return 'autoloop-card-' + autoloop.opaque(cluster).removeprefix('new:')
+
+
+@pytest.fixture
+def template(tmp_path, monkeypatch):
+    path = tmp_path / 'briefs' / 'autoloop-card.md'
+    monkeypatch.setattr(autoloop, 'CARD_BRIEF', path)
+    return path
+
+
+# spec: ANYM-571
+def test_a_new_owner_agent_cluster_gets_one_card_worker_whose_prompt_and_projection_carry_no_feedback_text(
+        loop, template, capsys):
+    t, a, s = loop
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, HOSTILE), submission(D2, CANARY + ' stranger idea', STRANGER, 1)])
+    new_card(fakes, {D1: ('group-names', BRIEF), D2: ('stranger-idea', BRIEF)})
+    created = creates(fakes, {'id': 'ws-00001', 'name': 'x'})
+    # No template: nothing starts, and the next tick takes the cluster from the ledger.
+    assert run_tick(loop, fakes)[0] == 0 and created() == []
+    assert triage.load(a / 'plan.json', {})['cards'] == {'*': 'no card brief template'}
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    fakes.submissions = []
+    code, line = run_tick(loop, fakes, now=NOW + timedelta(minutes=5))
+    assert code == 0 and 'card workers 1' in line and len(created()) == 1
+    argv, name, key = created()[0], card_name('new:group-names'), autoloop.opaque('new:group-names')
+    projection = a / 'projections' / f'{name}.json'
+    assert argv[argv.index('--name') + 1] == name and argv[argv.index('--agent') + 1] == autoloop.PRESET
+    assert argv[argv.index('--project') + 1] == autoloop.PROJECT_ID
+    assert argv[argv.index('--prompt') + 1] == (
+        f"Read and follow {autoloop.BRIEFS / 'common.md'} and {template}. Intent: {name}. Cluster: {key}. "
+        f"Feedback: {D1}. Projection: {projection}.")
+    assert json.loads(projection.read_text()) == {
+        'intent': name, 'cluster': key, 'branch': f'proposal/{name}', 'ref': None, 'feedback': [D1],
+        'principals': [OWNER], 'classifications': {D1: 'reported-bug'}, 'briefs': {D1: BRIEF}}
+    assert stat.S_IMODE(projection.stat().st_mode) == 0o600
+    # The stranger's cluster is report-only; no command or file of the loop carries feedback text.
+    assert triage.load(a / 'plan.json', {})['cards'] == {'new:group-names': name}
+    assert not any(CANARY in ' '.join(c[1]) or 'ssh' in ' '.join(c[1]) for c in fakes.calls if c[0] == 'superset')
+    assert not any(CANARY in p.read_text() for p in a.rglob('*.json')) and CANARY not in str(capsys.readouterr())
+    started = autoloop.intents(a)[name]
+    assert (started['status'], started['workspace'], started['cluster']) == ('started', 'ws-00001', 'new:group-names')
+    # A running worker is never started twice.
+    fakes.workspaces = [{'name': name, 'id': 'ws-00001', 'projectName': 'deedkit'}]
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert len(created()) == 1 and triage.load(a / 'plan.json', {})['cards'] == {}
+    # The card it bound follows the cluster: an interrupted worker's relaunch keeps the branch and the card, and
+    # `hold ANYM-n` stops it.
+    assert autoloop.main(['bind', name, '--card', 'ANYM-77', '--state', str(a)]) == 0
+    assert autoloop.main(['bind', name, '--card', 'ANYM-78', '--state', str(a)]) == 1
+    fakes.workspaces = []
+    run_tick(loop, fakes, now=NOW + timedelta(hours=2))
+    relaunch = json.loads((a / 'projections' / f'{name}-r1.json').read_text())
+    assert len(created()) == 2 and (relaunch['branch'], relaunch['ref']) == (f'proposal/{name}', 'ANYM-77')
+    assert autoloop.gate(a, f'{name}-r1') is None
+    autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW)
+    assert autoloop.gate(a, f'{name}-r1') == 'card held'
+
+
+# spec: ANYM-571
+def test_a_hold_on_the_bound_card_spares_the_relaunch_and_cancels_the_ready_merge_on_the_first_branch(loop, template):
+    t, a, s = loop
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'groups lose names')])
+    new_card(fakes, {D1: ('group-names', BRIEF)})
+    created = creates(fakes, {'id': 'ws-00001'})
+    run_tick(loop, fakes)
+    name = card_name('new:group-names')
+    assert autoloop.main(['bind', name, '--card', 'ANYM-77', '--state', str(a)]) == 0
+    # Held while its worker is gone: no relaunch is reserved, so the release finds it still there.
+    autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW)
+    fakes.submissions = []
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert len(created()) == 1 and f'{name}-r1' not in autoloop.intents(a)
+    autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW, release=True)
+    run_tick(loop, fakes, now=NOW + timedelta(hours=2))
+    assert len(created()) == 2 and autoloop.intents(a)[f'{name}-r1']['branch'] == f'proposal/{name}'
+    # The relaunch dispatched a ready merge of the first branch; a hold now cancels it.
+    fakes.workspaces = [{'name': f'{name}-r1', 'id': 'ws-00001', 'projectName': 'deedkit'}]
+    fakes.runs = [{'databaseId': 9, 'status': 'in_progress', 'conclusion': None, 'updatedAt': '2026-10-26T14:01:00Z',
+                   'displayTitle': f'Tiden sync ready merge proposal/{name}'}]
+    autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW)
+    code, _ = run_tick(loop, fakes, now=NOW + timedelta(hours=3))
+    assert code == 0 and ('gh', ['run', 'cancel', '9']) in [(c[0], c[1][:3]) for c in fakes.calls]
+
+
+# spec: ANYM-571
+def test_a_brief_that_copies_feedback_is_never_released_and_no_slug_reaches_a_name_or_a_prompt(loop, template):
+    t, a, s = loop
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    configure(a, live=True)
+    copied = 'Please call Ivan Petrov at 8 916 123 45 67 when groups lose their names'
+    fakes = Fakes([submission(D1, copied), submission(D2, HOSTILE, OWNER, 1)])
+    new_card(fakes, {D1: ('group-names', 'Call Ivan Petrov when groups lose their names.'),
+                     D2: (CANARY, 'Receipts stop after 12 renames, build 2026-10, phone +7 916 123-45-67.')})
+    created = creates(fakes, {'id': 'ws-00001'})
+    run_tick(loop, fakes)
+    released = 'Receipts stop after # renames, build #, phone #.'
+    assert triage.load(a / 'briefs.json', {}) == {D2: {'new_card': CANARY, 'card_brief': released,
+                                                       'release': autoloop.RELEASE}}
+    assert triage.load(a / 'plan.json', {})['cards'] == {f'new:{CANARY}': card_name(f'new:{CANARY}')}
+    projection = (a / 'projections' / f"{card_name(f'new:{CANARY}')}.json").read_text()
+    assert len(created()) == 1 and CANARY not in ' '.join(created()[0]) and CANARY not in projection
+    assert 'Ivan' not in projection and '916' not in projection
+
+
+# spec: ANYM-571
+@pytest.mark.parametrize('reply', [{'error': 'timeout'}, {'id': ''}, {'id': '   '}, {'workspace': {'id': 'ws 00001'}},
+                                   ['ws-00001'], {'id': 12345678}])
+def test_a_create_reply_without_a_workspace_id_leaves_the_intent_unknown_and_the_name_settles_it(loop, template, reply):
+    t, a, s = loop
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'groups lose names')])
+    new_card(fakes, {D1: ('group-names', BRIEF)})
+    created = creates(fakes, reply)
+    run_tick(loop, fakes)
+    name = card_name('new:group-names')
+    assert triage.load(a / 'plan.json', {})['cards'] == {'new:group-names': 'start unknown'}
+    assert autoloop.intents(a)[name]['status'] == 'unknown'
+    fakes.submissions = []
+    fakes.workspaces = [{'name': name, 'id': 'ws-00009', 'projectName': 'deedkit', 'createdAt': '2026-10-26T12:00:20Z'}]
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert len(created()) == 1 and autoloop.intents(a)[name]['workspace'] == 'ws-00009'
+
+
+# spec: ANYM-571
+def test_a_review_reject_declines_with_its_reason_code_and_a_large_card_is_queued_once_each(loop, capsys):
+    t, a, s = loop
+    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started', [D1, D2])
+    intent(a, 'autoloop-card-epic', autoloop.opaque('new:epic'), 'started', [D3])
+    common = ['--state', str(a), '--triage-state', str(t)]
+    with pytest.raises(SystemExit):
+        autoloop.main(['decline', 'autoloop-card-xyz', '--reason', 'because the chat said so', *common])
+    with pytest.raises(SystemExit):
+        autoloop.main(['large', 'autoloop-card-epic', '--reason', 'covered', *common])
+    with pytest.raises(SystemExit):
+        autoloop.main(['bind', 'autoloop-card-epic', *common])
+    assert autoloop.main(['decline', 'autoloop-card-xyz', '--reason', 'covered', *common]) == 0
+    assert autoloop.main(['large', 'autoloop-card-epic', *common]) == 0
+    declined = ('declined', 'declined by review: an existing card covers it')
+    assert notes(t) == {D1: declined, D2: declined, D3: ('received', autoloop.LARGE)}
+    assert len(list((t / 'dispositions').glob('*.json'))) == 2
+    # Sent once, never overwritten by a later note; the cluster never gets a second card worker, also after its
+    # worker ends without `finish`.
+    assert autoloop.main(['large', 'autoloop-card-epic', *common]) == 0
+    assert autoloop.notify(a, t, {D3: ('received', autoloop.PAUSED)}, NOW) == 0
+    assert len(list((t / 'dispositions').glob('*.json'))) == 2
+    autoloop.put(a, dict(autoloop.intents(a)['autoloop-card-epic'], status='interrupted'))
+    triage.save(t / 'ledger.json', {D3: {'cluster': 'new:epic', 'principal': OWNER, 'classification': 'feature'}})
+    triage.save(a / 'briefs.json', {D3: {'new_card': 'epic', 'card_brief': 'x'}})
+    assert autoloop.card_clusters(a, t, {OWNER}) == {}
+    # The gate comes first: a dropped item, PAUSE, or the tick holding the lock: nothing is written, the exit is 1.
+    intent(a, 'autoloop-card-late', 'new:late', 'started', [D4, P1])
+    with autoloop.own_lock(a):
+        assert autoloop.main(['large', 'autoloop-card-late', *common]) == 1
+    triage.save(a / 'holds.json', {'cards': {}, 'items': {P1: {'by': P2}}})
+    assert autoloop.main(['large', 'autoloop-card-late', *common]) == 1
+    triage.save(a / 'holds.json', {'cards': {}, 'items': {}})
+    (a / 'PAUSE').touch()
+    assert autoloop.main(['large', 'autoloop-card-late', *common]) == 1
+    assert autoloop.main(['bind', 'autoloop-card-late', '--card', 'ANYM-5', *common]) == 1
+    assert D4 not in notes(t) and 'BUSY' in capsys.readouterr().err
+    assert 'ref' not in autoloop.intents(a)['autoloop-card-late']
+
+
+# spec: ANYM-571
+def test_items_over_a_daily_cap_and_items_of_a_worker_the_stop_closed_get_their_note_once(loop, template):
+    t, a, s = loop
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    configure(a, live=True, caps={'items_per_principal': 1, 'card_launches': 0})
+    fakes = Fakes([submission(D1, 'groups lose names'), submission(D2, 'b', OWNER, 1)])
+    new_card(fakes, {D1: ('group-names', BRIEF)})
+    created = creates(fakes, {'id': 'ws-00001'})
+    run_tick(loop, fakes)
+    over = ('received', 'over daily cap, next run 2026-10-27')
+    assert notes(t) == {D1: over, D2: over} and created() == []
+    sent = sorted((t / 'dispositions').glob('autoloop-note-*.json'))
+    fakes.submissions = []
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert sorted((t / 'dispositions').glob('autoloop-note-*.json')) == sent
+    # The stop: the items of the worker it closed are "paused", but a dropped item keeps its withdrawal and an item
+    # whose worker recorded an outcome keeps that outcome, also before the sync has applied either.
+    intent(a, 'autoloop-card-xyz', 'new:xyz', 'started', [D3, P1], workspace='w1')
+    intent(a, 'autoloop-card-done', 'new:done', 'started', [P2], workspace='w2')
+    autoloop.put(a, dict(autoloop.intents(a)['autoloop-card-done'], outcome='covered'))
+    triage.save(a / 'holds.json', {'cards': {}, 'items': {P1: {'by': P3}}})
+    fakes.workspaces = [{'name': 'autoloop-card-xyz', 'id': 'w1', 'projectName': 'deedkit'},
+                        {'name': 'autoloop-card-done', 'id': 'w2', 'projectName': 'deedkit'}]
+    fakes.terminals = {'w1': ['t1'], 'w2': ['t2']}
+    paused(a, NOW + timedelta(hours=1, minutes=30))
+    code, _ = run_tick(loop, fakes, now=NOW + timedelta(hours=2))
+    assert code == 0 and notes(t)[D3] == ('received', autoloop.PAUSED) and P1 not in notes(t) and P2 not in notes(t)
+    assert autoloop.intents(a)['autoloop-card-xyz']['status'] == 'stopped'
+
+
+# spec: ANYM-571
+def test_a_hold_on_the_card_only_a_relaunch_bound_cancels_the_ready_merge_of_the_first_branch(loop, template):
+    t, a, s = loop
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'groups lose names')])
+    new_card(fakes, {D1: ('group-names', BRIEF)})
+    created = creates(fakes, {'id': 'ws-00001'})
+    run_tick(loop, fakes)
+    name = card_name('new:group-names')
+    fakes.submissions = []
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1))  # the first worker is gone unbound: one relaunch
+    assert len(created()) == 2 and not autoloop.intents(a)[name].get('ref')
+    assert autoloop.main(['bind', f'{name}-r1', '--card', 'ANYM-77', '--state', str(a)]) == 0
+    fakes.workspaces = [{'name': f'{name}-r1', 'id': 'ws-00001', 'projectName': 'deedkit'}]
+    fakes.runs = [{'databaseId': 9, 'status': 'in_progress', 'conclusion': None, 'updatedAt': '2026-10-26T13:01:00Z',
+                   'displayTitle': f'Tiden sync ready merge proposal/{name}'}]
+    autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW)
+    code, _ = run_tick(loop, fakes, now=NOW + timedelta(hours=2))
+    assert code == 0 and ('gh', ['run', 'cancel', '9']) in [(c[0], c[1][:3]) for c in fakes.calls]

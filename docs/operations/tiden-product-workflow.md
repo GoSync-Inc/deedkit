@@ -39,6 +39,12 @@ Steps 1–4, the template and the scales: harness `tiden.md`. DeedKit's steps 5 
    only; an ID in History, a quote, a code block or a comment does not link (ANYM-536,
    docs/operations/feedback-triage.md).
 
+8. **Autoloop card.** A card worker started by the autoloop writes the card for a new cluster from
+   the owner's agents (ANYM-571, [feedback-autoloop.md](feedback-autoloop.md), Card worker). It
+   uses the opaque `proposal/autoloop-card-c<hash>` and adds a `Source: autoloop <principal>` line. Its
+   `Ready:` cites the agent and feedback ID under the AGENTS.md autoloop override. It dispatches
+   its own ready merge, so the orchestrator does not.
+
 The card template, categories and estimation scales are harness `tiden.md`. DeedKit's Effort
 reference pull requests: 1 = #59, 2 = #66, 3 = #52, 5 = #68, 8 = #40. `History:` names the DK-*
 identity. `How others solve it` studies include the built-ins of Docker, Caddy, Postgres or
