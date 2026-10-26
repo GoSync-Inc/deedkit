@@ -37,7 +37,7 @@ SSH_TIMEOUT = 120
 TIDEN_TIMEOUT = 120
 OVERLAP_MINUTES = 10
 MAX_PAGES = 100
-CLASSES = ('reported-bug', 'feature', 'question', 'not-actionable')
+CLASSES = ('reported-bug', 'feature', 'question', 'not-actionable', 'enable-only')
 VERDICTS = ('accepted', 'declined')
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 SPEC = re.compile(r'ANYM-[1-9][0-9]*')
@@ -277,6 +277,13 @@ def clean(text, limit=NOTE_LIMIT):
 def disposition(decision, specs):
     """The status hand-off of one item (ANYM-343 vocabulary; `fixed` and later come from the sync tool)."""
     reason, primary = decision['reason'], decision.get('primary')
+    if decision['classification'] == 'enable-only':
+        # Delivered but off: the item waits for the owner, not for its card (ANYM-570); no link, so no follow.
+        return {'status': 'received', 'spec_ref': None, 'duplicate_of': None,
+                'note': f'waits for the owner: opt-in ({primary})'}
+    if decision.get('answer'):
+        return {'status': 'declined', 'spec_ref': None, 'duplicate_of': None,
+                'note': 'answered, no change needed: ' + decision['answer']}
     if decision.get('duplicate_of'):
         return {'status': 'duplicate', 'spec_ref': primary, 'duplicate_of': decision['duplicate_of'], 'note': reason}
     matched = decision.get('specs') or []
@@ -319,6 +326,12 @@ def checked(decision, specs, keys):
     if matched and any(s['verdict'] == 'accepted' for s in matched) and \
             next(s for s in matched if s['ref'] == primary)['verdict'] != 'accepted':
         raise Refused(f"{decision['id']}: the primary spec must be an accepted one")
+    if decision['classification'] == 'enable-only' and (len(matched) != 1 or matched[0]['verdict'] != 'accepted'):
+        raise Refused(f"{decision['id']}: enable-only needs exactly one accepted spec")
+    answer = decision.get('answer')
+    if answer is not None and (decision['classification'] != 'question' or matched or not isinstance(answer, str)
+                               or not answer.strip() or '\n' in answer or len(answer) > 250):
+        raise Refused(f"{decision['id']}: answer is one line of 1-250 characters on a question without specs")
     duplicate = decision.get('duplicate_of')
     if duplicate is not None and (duplicate == decision['id'] or keys.get(duplicate) is None
                                   or keys[duplicate] != keys[decision['id']]):

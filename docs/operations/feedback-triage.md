@@ -41,11 +41,12 @@ One run at a time (a lock). A pull with no new feedback writes an empty report a
 nothing else.
 
 Decision per item: `{"id", "classification", "reason", "specs": [{"ref", "verdict"}], "primary",
-"duplicate_of"?, "new_card"?, "verdict_of"?}`.
+"duplicate_of"?, "new_card"?, "verdict_of"?, "answer"?}`.
 
 - `classification`: `reported-bug` (contradicts a maintained spec; unverified), `feature`,
-  `question` (answered by existing documentation) or `not-actionable`. The agent's own category
-  never decides it. `reason`: one line.
+  `question` (answered by existing documentation), `not-actionable` or `enable-only` (exactly one
+  accepted spec: delivered, waits for the owner's opt-in). The agent's own category never decides
+  it. `reason`: one line. `answer`: a question's one-line answer (≤250 characters, no spec).
 - `specs`: every matched spec from the snapshot with `accepted` or `declined`; `primary` is the
   card that removes the reported failure. An unmatched bug or feature names `new_card` (a slug):
   the proposed card is its cluster. `duplicate_of` names a known item of the same key. A verdict
@@ -67,7 +68,9 @@ Disposition rule (ANYM-343 item 3): any accepted spec gives `accepted` with the 
 `spec_ref`, a note naming a declined part and, when only some accepted specs are delivered, what
 is delivered and what is still awaited; all declined gives `declined`; a duplicate gives
 `duplicate`; a question or a not-actionable item without a spec gives `declined`; an unmatched
-bug or feature stays `received` with the proposed card in its note. `fixed` and
+bug or feature stays `received` with the proposed card in its note; an answered question gives
+`declined` "answered, no change needed: <answer>"; `enable-only` stays `received` with no
+`spec_ref` and "waits for the owner: opt-in (<spec>)", so it does not follow its Done card. `fixed` and
 `verify_requested` are not set here: they follow the cards' delivery and deployment.
 
 Each run writes `reports/<time>.md` (items, classes, clusters, items that need the owner and the
@@ -179,3 +182,31 @@ launchctl bootout gui/$(id -u)/ai.deedkit.feedback-follow      # undo; then dele
 
 Stopping it ends future runs only; writes already made stay. A hand `apply` or `follow` stays
 possible (same lock).
+
+## Tool-less reader (ANYM-570)
+
+For the feedback autoloop (docs/operations/feedback-autoloop.md) the decisions come from
+`scripts/autoloop.py read` instead of a session: after `snapshot`, `pull` and `match` it gives at
+most 20 inbox items with their candidates, on stdin, to the pinned Claude Code CLI on the owner's
+subscription login with `--tools ""`, `--setting-sources ""`, `--strict-mcp-config` and an empty
+MCP config, `--disable-slash-commands`, `--no-session-persistence` and stream-json output, with
+only `PATH`, `HOME` and `USER` (the login keychain needs it) in an empty temporary directory. It
+takes the triage lock and its own (`~/.deedkit/autoloop`, or `AUTOLOOP_STATE`).
+
+- Before any answer is used, the stream's `init` must match the profile pinned with the CLI
+  version: no tools, MCP servers, slash commands or skills; plugins and agents exactly the pinned
+  built-in sets (plugins with `path: builtin`). Any other event than init, assistant text,
+  rate-limit events and one result (a hook event, a tool call) refuses the run; nothing is
+  recorded.
+- The answer is closed: `{"decisions": [...]}` with `id`, `classification` (the classes above
+  plus `already-live`), `specs`, `primary`, `duplicate_of`, `new_card`, `reason_code` (an enum;
+  the ledger reason is the code's fixed text), `answer` and `card_brief`. An unknown field, an ID
+  outside the input or twice, a spec outside the snapshot or a bad slug refuses the whole answer.
+  `already-live` needs one accepted Done spec on main and is recorded as an accepted bug or
+  feature, which the ANYM-536 follower moves to `verify_requested`.
+- `answer` and `card_brief` lose URLs, code fences, shell patterns and paths and stay untrusted;
+  card briefs go to `briefs.json` in the autoloop state for the card worker (ANYM-571).
+- A new CLI version needs a new pin: update `CLI_VERSION` and `PROFILE` in `scripts/autoloop.py`
+  after the canary run on the Mac: `AUTOLOOP_CANARY=1 uv run pytest tests/platform/test_autoloop.py
+  -k canary` (hostile settings, hook, MCP config, plugin, memory file and symlink around the
+  reader's directory; a read and a write outside asked by the item; one valid decision expected).
