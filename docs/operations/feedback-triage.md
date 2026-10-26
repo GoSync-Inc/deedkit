@@ -228,7 +228,8 @@ holds the boundary, caps and undo). It takes the triage lock, the sync lock
 triage, the ANYM-536 `auto`, another tick) it prints `busy: …`, writes nothing and exits 0.
 Dispositions stay in the triage state; the tick keeps no second copy. Its state
 (`~/.deedkit/autoloop`, or `AUTOLOOP_STATE`) must be 0700 outside every Git checkout, its files
-are 0600, and `config.json` must be 0600:
+are 0600 (the empty `lock` too: created once, never truncated; a busy run writes nothing else),
+and `config.json` must be 0600:
 
 ```json
 {"live": false, "principals": ["<agent principal from list-keys>"], "tz": "Europe/Moscow",
@@ -240,20 +241,29 @@ Every key is optional (the values above are the defaults, with `tz` `UTC` and no
 One tick:
 
 1. `PAUSE` present: fence only (below), no read, triage or launch.
-2. Reads, all before the first write: the workspace list (only when an intent is open), Tiden main
-   and open branches, the feedback export. A failed, truncated or timed-out read ends the tick with
-   no write (exit 1).
-3. Writes the snapshot, pulls into the inbox, matches; settles `unknown` intents by workspace name.
-4. Control, from principals in `config.json` only and as the whole item text: `AUTOLOOP STOP`
-   writes `PAUSE` and fences; `AUTOLOOP DROP <feedback-id>` (an item of the same principal) holds
-   the item and its card and declines it "withdrawn by the reporter" (an inbox item with the batch,
-   a triaged one through an `autoloop-drop-*.json` dispositions file that `auto` applies). Control
-   items are recorded as declined `autoloop control`. Any other text, `AUTOLOOP START` included, is
-   ordinary feedback: nothing resumes by feedback.
-5. `live: true`: the reader (above) gets the oldest items within each principal's daily item cap,
-   if a reader run is left today; the run is counted before it starts and never refunded.
-   `live: false`: nothing runs; the plan lists what would.
-6. Writes `plan.json` (IDs, counts, statuses, cluster provenance: `owner-agent` when every item of
+2. The feedback export, read whole and checked (every item has a feedback ID) before any write. An
+   owner-principal `AUTOLOOP STOP` in it writes `PAUSE` at once and fences: it needs neither Tiden
+   nor Superset. Its ID goes to `stops.json` (also from the `PAUSE` text, if the tick stopped in
+   between), so after the resume the same item is recorded as declined `autoloop control` and
+   never pauses again.
+3. Reads, all before the first write: the workspace list (only when an intent is open), Tiden main
+   and open branches. A failed, truncated or timed-out read ends the tick with no write (exit 1).
+4. Writes: pulls into the inbox, the snapshot, matches; settles `unknown` intents by workspace name.
+5. Control, from principals in `config.json` only and as the whole item text: `AUTOLOOP DROP
+   <feedback-id>` (an item of the same principal) holds the item and its card and declines it
+   "withdrawn by the reporter" (an inbox item with the batch, a triaged one through an
+   `autoloop-drop-*.json` dispositions file that `auto` applies). Control items are recorded as
+   declined `autoloop control`. Any other text, `AUTOLOOP START` included, is ordinary feedback:
+   nothing resumes by feedback.
+6. Withhold, every tick: each intent of a held card or a dropped item loses auto-merge, its merge
+   queue entry and its active ready merges; the open PR of an intent built on a dropped item is
+   closed. Nothing merged is reverted. What failed or is still alive is in `plan.json` `withheld`
+   and the tick exits 1; the next tick tries again.
+7. `live: true`: the reader (above) gets the oldest items within each principal's daily item cap,
+   if a reader run is left today; the run and its items (`items`: feedback ID → principal) are
+   charged before it starts and never refunded, so a crash after the triage commit cannot pass the
+   cap twice. `live: false`: nothing runs; the plan lists what would.
+8. Writes `plan.json` (IDs, counts, statuses, cluster provenance: `owner-agent` when every item of
    the cluster comes from a listed principal, else `report-only`) and `last-tick.json`.
 
 The tick prints one line of IDs, counts and statuses, never feedback text. Days for the caps run
@@ -261,15 +271,23 @@ in `tz`.
 
 - Launches (ANYM-571, ANYM-572) go through `admit`: the in-flight, daily-launch and worker-hour
   caps, then an intent `intents/autoloop-<card|build>-<card>.json` with its full wall-clock
-  reservation (card 2 h, build 4 h) is written before the start. A start writes `unknown` before
-  its call; an `unknown` intent becomes `started` or `lost` by its workspace name in
-  `superset workspaces list`, never by a second start. A started intent whose workspace is gone
+  reservation (card 2 h, build 4 h) is written before the start. An intent name is never reused:
+  a card whose name is taken (`new:anym-5` after ANYM-5, `new:demo-r1` after a relaunch of
+  `new:demo`) is refused. `launch <intent>` reads the intent back from `intents/` under the lock,
+  checks the gate again (`PAUSE`, a held card or a dropped item cancel it and return its
+  reservation) and writes `unknown` with the start time before its call; an `unknown` intent
+  becomes `started` (keeping that time) or `lost` by its workspace name in the deedkit project
+  of `superset workspaces list`, never by a second start. A started intent whose workspace is gone
   without `autoloop.py finish <intent>` is `interrupted`. Lost and interrupted runs keep their
-  reservation; `finish` returns the unused part to the day it started. One relaunch per card
-  (`-r1`), as a new reservation.
-- Fence (`PAUSE`): closes the terminals of workspaces named by `intents/` only, cancels queued or
-  running ready merges (`tiden-sync.yml` dispatch) of `proposal/autoloop-` branches, disables
-  auto-merge on and dequeues open `autoloop-` PRs, then reads all three back. `fence.json` says
+  reservation; `finish` returns the unused part to the day it started, once (the day's `refunds`
+  journal). One relaunch per card (`-r1`), as a new reservation.
+- Fence (`PAUSE`): acts only on what belongs to an intent in `intents/`, never on a name prefix:
+  closes the terminals of its workspace (deedkit project, the recorded workspace ID), cancels
+  queued or running ready merges (`tiden-sync.yml` dispatch) of its `proposal/<intent>` branch,
+  disables auto-merge on and dequeues the open PRs whose head is its branch in this repository
+  (not a fork's), then reads all three back. With no intent it reads and touches nothing. The run
+  list is read whole (every page since the day before the oldest intent); a short or moving
+  listing is a failed read. `fence.json` says
   whether the stop is effective (clean read-back, nothing alive, no failed call) and lists what
   landed after the `PAUSE` time (merged PRs with their revert, successful ready merges) and holds
   those cards. Intents with no live terminal become `stopped`. The tick exits 1 while the stop is
@@ -289,9 +307,11 @@ the local deedkit workspace on `main`:
 ```sh
 superset automations create --name deedkit-autoloop --rrule 'FREQ=HOURLY;BYMINUTE=20' --local \
   --workspace <local deedkit workspace on main> --agent claude \
-  --prompt 'Run exactly: git pull --ff-only && uv run python scripts/autoloop.py tick. Reply with its exit code and its last output line only. Run nothing else.'
+  --prompt 'Run exactly: uv run python scripts/autoloop.py fence; git pull --ff-only && uv run python scripts/autoloop.py tick. Reply with both exit codes and the last output line only. Run nothing else.'
 ```
 
-The orchestrator's wake check runs `uv run python scripts/autoloop.py status`. Undo:
+`autoloop.py fence` runs first from the installed revision: with `PAUSE` it fences (as the tick
+does), without it reads and writes nothing; a failed `git pull` then skips only the tick, never
+the fence. The orchestrator's wake check runs `uv run python scripts/autoloop.py status`. Undo:
 `superset automations pause deedkit-autoloop` (or `delete`); `touch ~/.deedkit/autoloop/PAUSE`
 stops the loop itself.

@@ -94,6 +94,7 @@ No other field."""
 PROMPT = 'Decide every item of the JSON on stdin. Reply with the JSON object only.'
 SYNC_STATE = Path.home() / '.deedkit' / 'feedback-sync'  # feedback_sync.STATE: the lock of its ANYM-536 `auto`
 REPO = 'GoSync-Inc/deedkit'
+PROJECT = 'deedkit'  # the Superset project of the loop's workspaces
 CALL_TIMEOUT = 120
 STALE = timedelta(hours=2)
 CAPS = {'items_per_principal': 20, 'reader_runs': 24, 'card_launches': 5, 'build_launches': 3, 'card_in_flight': 2,
@@ -107,11 +108,8 @@ WORKSPACE = re.compile(r'autoloop-(card|build)-[a-z0-9][a-z0-9-]{2,60}')
 CARD = re.compile(r'ANYM-[1-9][0-9]*|new:[a-z0-9][a-z0-9-]{2,39}')
 READY = 'Tiden sync ready merge '  # tiden-sync.yml run-name of a ready merge
 ACTIVE = ('queued', 'in_progress', 'waiting', 'requested', 'pending')
-PULLS = """query { repository(owner: "GoSync-Inc", name: "deedkit") {
-  open: pullRequests(states: OPEN, first: 100) { pageInfo { hasNextPage }
-    nodes { number id headRefName autoMergeRequest { enabledAt } mergeQueueEntry { state } } }
-  merged: pullRequests(states: MERGED, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) {
-    nodes { number headRefName mergedAt mergeCommit { oid } } } } }"""
+PR = ('number id state headRefName mergedAt mergeCommit { oid } autoMergeRequest { enabledAt } '
+      'mergeQueueEntry { state } headRepository { nameWithOwner }')
 DEQUEUE = 'mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }'
 
 
@@ -130,12 +128,16 @@ def own_lock(state):
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if state.stat().st_mode & 0o077:
         raise Refused('the autoloop state directory must be 0700')
-    with open(state / 'lock', 'w') as handle:
+    # The empty lock file is the only file a refused or busy run may create; never truncated, 0600.
+    descriptor = os.open(state / 'lock', os.O_RDWR | os.O_CREAT, 0o600)
+    try:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise Busy('busy: another autoloop run holds the lock') from None
         yield
+    finally:
+        os.close(descriptor)
 
 
 # --- the model run -----------------------------------------------------------------------------------------------
@@ -369,11 +371,18 @@ def counters(ledger, cfg, now):
     for old in sorted(days)[:-31]:
         days.pop(old)
     return days.setdefault(now.astimezone(cfg['zone']).date().isoformat(),
-                           {'reader_runs': 0, 'items': {}, 'card': 0, 'build': 0, 'seconds': 0})
+                           {'reader_runs': 0, 'items': {}, 'card': 0, 'build': 0, 'seconds': 0, 'refunds': {}})
 
 
 def intents(state):
-    return {path.stem: json.loads(path.read_text()) for path in sorted((state / 'intents').glob('*.json'))}
+    known = {path.stem: json.loads(path.read_text()) for path in sorted((state / 'intents').glob('*.json'))}
+    if any(not WORKSPACE.fullmatch(name) or i.get('name') != name for name, i in known.items()):
+        raise Refused('intents/: a file whose name is not its intent')
+    return known
+
+
+def stored(state, name):
+    return triage.load(state / 'intents' / f'{name}.json', None) if WORKSPACE.fullmatch(name) else None
 
 
 def put(state, intent):
@@ -406,6 +415,8 @@ def admit(state, cfg, kind, card, feedback, now):
     if len(earlier) > 1:
         return None, 'relaunch used'
     name = f"autoloop-{kind}-{card.removeprefix('new:').lower()}" + ('-r1' if earlier else '')
+    if name in known:  # `new:demo` relaunched and `new:demo-r1`, or `new:anym-5` and ANYM-5: never overwritten
+        return None, 'name taken'
     today[kind] += 1
     today['seconds'] += LIMITS[kind]
     triage.save(state / 'ledger.json', ledger)
@@ -416,27 +427,52 @@ def admit(state, cfg, kind, card, feedback, now):
     return intent, None
 
 
-def launch(state, intent, start, now):
-    """Start a reserved intent once. It is `unknown` before the call, so a crash or a lost response is settled by
-    `reconcile` from the workspace list by name, never by a second start."""
-    if intent['status'] != 'reserved':
-        raise Refused(f"{intent['name']}: only a reserved intent starts")
-    put(state, dict(intent, status='unknown'))
+def refund(state, intent, seconds):
+    """Give `seconds` back to the intent's day once: the day's `refunds` journal makes a retry after a crash a no-op."""
+    ledger = triage.load(state / 'ledger.json', {})
+    day = ledger.get('days', {}).get(intent['day'])
+    if day is None:
+        return 0
+    journal = day.setdefault('refunds', {})
+    if intent['name'] not in journal:
+        journal[intent['name']] = seconds
+        day['seconds'] = max(0, day['seconds'] - seconds)
+        triage.save(state / 'ledger.json', ledger)
+    return journal[intent['name']]
+
+
+def launch(state, name, start, now):
+    """Start a reserved intent once, under the tick lock. The intent is read back from intents/ (never a caller's
+    copy) and the gate is checked again: PAUSE, a held card or a dropped item cancel it and return its reservation.
+    It is `unknown` before the call, so a crash or a lost response is settled by `reconcile` from the workspace
+    list, never by a second start."""
+    intent = stored(state, name)
+    if not intent or intent['status'] != 'reserved':
+        raise Refused(f'{name}: only a reserved intent starts')
+    why = gate(state, name, ('reserved',))
+    if why:
+        refund(state, intent, intent['reserved'])
+        put(state, dict(intent, status='cancelled', ended_at=triage.stamp(now)))
+        return None, why
+    put(state, dict(intent, status='unknown', started_at=triage.stamp(now)))  # the earliest possible start
     workspace = start(intent)
     intent.update(status='started', workspace=workspace, started_at=triage.stamp(now))
     put(state, intent)
-    return intent
+    return intent, None
 
 
 def reconcile(state, listing, now):
     """An `unknown` intent is started or lost by its workspace name; a started one whose workspace is gone without
-    `finish` is interrupted. Lost and interrupted runs keep their whole reservation."""
-    by_name = {w.get('name'): w for w in listing if isinstance(w, dict) and not w.get('archivedAt')}
+    `finish` is interrupted. Lost and interrupted runs keep their whole reservation; a found one keeps the time
+    `launch` stamped before its call, never the time it was found."""
+    by_name = {w.get('name'): w for w in listing if isinstance(w, dict) and not w.get('archivedAt')
+               and w.get('projectName') == PROJECT}
     changed = []
     for name, intent in intents(state).items():
         found = by_name.get(name)
         if intent['status'] == 'unknown' and found:
-            intent.update(status='started', workspace=found.get('id'), started_at=triage.stamp(now))
+            intent.update(status='started', workspace=found.get('id'),
+                          started_at=intent.get('started_at') or intent['created_at'])
         elif intent['status'] == 'unknown':
             intent.update(status='lost')
         elif intent['status'] == 'started' and not found:
@@ -450,25 +486,21 @@ def reconcile(state, listing, now):
 
 def finish(state, name, now):
     """A worker's clean end: the unused part of its reservation goes back to the day it started."""
-    intent = triage.load(state / 'intents' / f'{name}.json', None) if WORKSPACE.fullmatch(name) else None
+    intent = stored(state, name)
     if not intent or intent['status'] != 'started':
         raise Refused(f'{name}: no started intent')
-    refund = max(0, int(intent['reserved'] - (now - triage.when(intent['started_at'])).total_seconds()))
-    ledger = triage.load(state / 'ledger.json', {})
-    day = ledger.get('days', {}).get(intent['day'])
-    if day:
-        day['seconds'] = max(0, day['seconds'] - refund)
-        triage.save(state / 'ledger.json', ledger)
+    returned = refund(state, intent,
+                      max(0, int(intent['reserved'] - (now - triage.when(intent['started_at'])).total_seconds())))
     intent.update(status='finished', ended_at=triage.stamp(now))
     put(state, intent)
-    return refund
+    return returned
 
 
-def gate(state, name):
+def gate(state, name, running=('unknown', 'started')):
     """None when a worker may go on, else why not: PAUSE, a held card, a dropped item or no live intent."""
     if (state / 'PAUSE').exists():
         return 'paused'
-    intent = triage.load(state / 'intents' / f'{name}.json', None) if WORKSPACE.fullmatch(name) else None
+    intent = stored(state, name)
     if not intent:
         return 'unknown intent'
     held = holds(state)
@@ -477,7 +509,7 @@ def gate(state, name):
     if set(intent['feedback']) & set(held['items']):
         return 'feedback dropped'
     # `unknown`: the worker runs before the tick has recorded its start.
-    return None if intent['status'] in ('unknown', 'started') else f"intent {intent['status']}"
+    return None if intent['status'] in running else f"intent {intent['status']}"
 
 
 def hold(state, card, by, now, release=False):
@@ -497,10 +529,10 @@ def quiet(i, reason):
             'duplicate_of': None, 'new_card': None}
 
 
-def control(triage_state, cfg):
+def control(inbox, ledger, cfg, consumed=()):
     """Owner-principal STOP and DROP items: (stop item or None, {target: drop item}, decisions that take every
-    control item out of the inbox). Any other text, `AUTOLOOP START` included, is ordinary feedback."""
-    inbox, ledger = triage.load(triage_state / 'inbox.json', {}), triage.load(triage_state / 'ledger.json', {})
+    control item out of the inbox). A STOP in `consumed` (stops.json) already paused the loop: it is only recorded.
+    Any other text, `AUTOLOOP START` included, is ordinary feedback."""
     stop, drops, decisions = None, {}, []
     for i, item in sorted(inbox.items(), key=lambda pair: (pair[1].get('created_at') or '', pair[0])):
         command = CONTROL.fullmatch(str(item.get('description') or '').strip())
@@ -508,13 +540,34 @@ def control(triage_state, cfg):
             continue
         target, reason = command.group(2), 'autoloop control'
         if command.group(1) == 'STOP':
-            stop = stop or i
+            stop = stop or (None if i in consumed else i)
         elif target != i and (inbox.get(target) or ledger.get(target) or {}).get('principal') == item['principal']:
             drops[target] = i
         else:
             reason = 'autoloop control refused: not an item of the same principal'
         decisions.append(quiet(i, reason))
     return stop, drops, decisions
+
+
+def incoming(triage_state, items):
+    """The inbox as `merge` will leave it, written nowhere; an item without a feedback ID refuses the tick here."""
+    ledger, inbox = triage.load(triage_state / 'ledger.json', {}), triage.load(triage_state / 'inbox.json', {})
+    for item in items:
+        if not triage.UUID.fullmatch(str(item.get('id'))):
+            raise triage.Refused('export: item without a feedback ID')
+        if item['id'] not in ledger:
+            inbox.setdefault(item['id'], item)
+    return inbox, ledger
+
+
+def consumed(state):
+    """STOP items that already paused the loop (stops.json); the PAUSE a STOP wrote names its item."""
+    stops = set(triage.load(state / 'stops.json', []))
+    named = re.match(r'stop by feedback (\S+) ', (state / 'PAUSE').read_text()) if (state / 'PAUSE').exists() else None
+    if named and named.group(1) not in stops:
+        stops.add(named.group(1))
+        triage.save(state / 'stops.json', sorted(stops))
+    return stops
 
 
 def withdraw(state, triage_state, drops, decisions, now):
@@ -549,12 +602,14 @@ def gh_cli(argv):
 
 
 def loop_workspaces(known, superset):
-    """{name: workspace id} of the loop's own workspaces: names from intents/ only, never another workspace."""
+    """{name: workspace id} of the given intents' workspaces in the deedkit project; one whose ID is not the one
+    `launch` or `reconcile` recorded is not the loop's."""
     listing = superset(['workspaces', 'list', '--local', '--search', 'autoloop-'])
-    if not isinstance(listing, list):
+    if not isinstance(listing, list) or any(not isinstance(w, dict) for w in listing):
         raise Refused('superset workspaces list: unexpected reply')
     return {w['name']: w['id'] for w in listing
-            if isinstance(w, dict) and w.get('name') in known and isinstance(w.get('id'), str)}
+            if w.get('name') in known and w.get('projectName') == PROJECT and isinstance(w.get('id'), str)
+            and known[w['name']].get('workspace') in (None, w['id'])}
 
 
 def live_terminals(superset, workspace):
@@ -564,35 +619,95 @@ def live_terminals(superset, workspace):
     return [s['terminalId'] for s in reply['sessions'] if isinstance(s, dict) and not s.get('exited')]
 
 
-def ready_runs(gh):
-    """The ready-merge runs (tiden-sync.yml dispatch, TIDEN-CI.md) of autoloop proposal branches."""
-    rows = triage.parse(gh(['run', 'list', '-R', REPO, '--workflow', 'tiden-sync.yml', '--event', 'workflow_dispatch',
-                            '--limit', '100', '--json', 'databaseId,status,conclusion,displayTitle,updatedAt']),
-                        'gh run list')
-    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
-        raise Refused('gh run list: unexpected reply')
-    return [dict(r, branch=r['displayTitle'][len(READY):]) for r in rows
-            if str(r.get('displayTitle')).startswith(READY + 'proposal/autoloop-')]
-
-
-def pulls(gh):
-    """(open autoloop PRs, recently merged autoloop PRs); a truncated open list is a failed read."""
-    reply = triage.parse(gh(['api', 'graphql', '-f', 'query=' + PULLS]), 'gh api graphql')
+def ready_runs(known, gh):
+    """The ready-merge runs (tiden-sync.yml dispatch, TIDEN-CI.md) of the given intents' proposal branches, every
+    page since the day before the oldest intent; a short listing or one that moved while read is a failed read."""
+    since = min(triage.when(i['created_at']) for i in known.values()) - timedelta(days=1)
+    pages = triage.parse(gh(['api', '--paginate', '--slurp',
+                             f'repos/{REPO}/actions/workflows/tiden-sync.yml/runs?event=workflow_dispatch'
+                             f'&per_page=100&created=%3E%3D{since.date().isoformat()}']), 'gh api runs')
     try:
-        repo = reply['data']['repository']
-        if repo['open']['pageInfo']['hasNextPage']:
-            raise Refused('gh: more than 100 open pull requests')
-        return ([p for p in repo['open']['nodes'] if p['headRefName'].startswith('autoloop-')],
-                [p for p in repo['merged']['nodes'] if p['headRefName'].startswith('autoloop-')])
+        totals = {page['total_count'] for page in pages}
+        rows = {r['id']: r for page in pages for r in page['workflow_runs']}
+        if len(totals) != 1 or len(rows) < totals.pop():
+            raise Refused('gh api runs: an incomplete listing')
+        titles = {READY + 'proposal/' + name: 'proposal/' + name for name in known}
+        return [{'databaseId': r['id'], 'status': r['status'], 'conclusion': r['conclusion'],
+                 'updatedAt': r['updated_at'], 'branch': titles[r['display_title']]}
+                for _, r in sorted(rows.items()) if r.get('display_title') in titles]
     except (KeyError, TypeError, AttributeError):
-        raise Refused('gh api graphql: unexpected reply') from None
+        raise Refused('gh api runs: unexpected reply') from None
 
 
-def running(known, superset, gh):
-    """What the loop has: its workspaces, their live terminals, its ready-merge runs, open and merged PRs."""
-    loop = loop_workspaces(known, superset) if known else {}
-    terminals = {name: live_terminals(superset, ws) for name, ws in loop.items()}
-    return (loop, terminals, ready_runs(gh), *pulls(gh))
+def pulls(known, gh):
+    """Every PR whose head is an intent's branch of this repository (a fork's same-named branch is not), read whole."""
+    names, prs = sorted(known), []
+    for first in range(0, len(names), 50):
+        chunk = names[first:first + 50]  # names match WORKSPACE (intents()), so they are safe in the query
+        query = 'query { repository(owner: "GoSync-Inc", name: "deedkit") { ' + ' '.join(
+            f'p{n}: pullRequests(headRefName: "{name}", first: 20) {{ pageInfo {{ hasNextPage }} nodes {{ {PR} }} }}'
+            for n, name in enumerate(chunk)) + ' } }'
+        reply = triage.parse(gh(['api', 'graphql', '-f', 'query=' + query]), 'gh api graphql')
+        try:
+            repo = reply['data']['repository']
+            for n, name in enumerate(chunk):
+                if repo[f'p{n}']['pageInfo']['hasNextPage']:
+                    raise Refused(f'gh: more than 20 pull requests from {name}')
+                prs += [p for p in repo[f'p{n}']['nodes']
+                        if p['headRefName'] == name and (p['headRepository'] or {}).get('nameWithOwner') == REPO]
+        except (KeyError, TypeError, AttributeError):
+            raise Refused('gh api graphql: unexpected reply') from None
+    return prs
+
+
+def running(known, superset, gh, terminals=True):
+    """What the given intents have: workspaces, live terminals, ready-merge runs and PRs; no intent reads nothing."""
+    if not known:
+        return {}, {}, [], []
+    loop = loop_workspaces(known, superset) if terminals else {}
+    return loop, {name: live_terminals(superset, ws) for name, ws in loop.items()}, ready_runs(known, gh), \
+        pulls(known, gh)
+
+
+def stop_work(known, superset, gh, close=(), terminals=True):
+    """Close the given intents' terminals, cancel their active ready merges, disarm and dequeue their open PRs and
+    close the open PRs of the intents in `close`, then read back. Mutations touch only resources read for these
+    intents, by ID. A failed first read raises; a failed read-back keeps the first read."""
+    failed = []
+
+    def attempt(what, call, argv):
+        try:
+            call(argv)
+        except (Refused, triage.Refused) as error:
+            failed.append(f'{what}: {error}')
+
+    loop, live, runs, prs = running(known, superset, gh, terminals)
+    for name, ids in live.items():
+        for terminal in ids:
+            attempt(f'close {name}', superset,
+                    ['terminals', 'close', '--local', '--workspace', loop[name], '--terminal', terminal])
+    for run in runs:
+        if run.get('status') in ACTIVE:
+            attempt(f"cancel run {run['databaseId']}", gh, ['run', 'cancel', str(run['databaseId']), '-R', REPO])
+    for pr in prs:
+        if pr.get('state') != 'OPEN':
+            continue
+        if pr.get('autoMergeRequest'):
+            attempt(f"disarm #{pr['number']}", gh, ['pr', 'merge', str(pr['number']), '-R', REPO, '--disable-auto'])
+        if pr.get('mergeQueueEntry'):
+            attempt(f"dequeue #{pr['number']}", gh, ['api', 'graphql', '-f', 'query=' + DEQUEUE, '-f', f"id={pr['id']}"])
+        if pr['headRefName'] in close:
+            attempt(f"close #{pr['number']}", gh, ['pr', 'close', str(pr['number']), '-R', REPO])
+    try:
+        _, live, runs, prs = running(known, superset, gh, terminals)
+        read_back = 'clean'
+    except (Refused, triage.Refused) as error:
+        read_back = f'failed: {error}'
+    alive = [f'terminal {name}' for name, ids in live.items() if ids] + \
+        [f"run {r['databaseId']}" for r in runs if r.get('status') in ACTIVE] + \
+        [f"PR #{p['number']}" for p in prs if p.get('state') == 'OPEN'
+         and (p.get('autoMergeRequest') or p.get('mergeQueueEntry') or p['headRefName'] in close)]
+    return {'read_back': read_back, 'alive': alive, 'failed': failed, 'terminals': live, 'runs': runs, 'prs': prs}
 
 
 def utc(text):
@@ -603,65 +718,57 @@ def fence(state, now, superset, gh):
     """PAUSE: close the loop's terminals, cancel its ready merges, disarm and dequeue its PRs, then read back.
     The stop is effective only after a clean read-back; writes that landed after the PAUSE time are listed."""
     paused_at = datetime.fromtimestamp((state / 'PAUSE').stat().st_mtime, timezone.utc)
-    known, failed = intents(state), []
-
-    def attempt(what, call, argv):
-        try:
-            call(argv)
-        except (Refused, triage.Refused) as error:
-            failed.append(f'{what}: {error}')
-
+    known = intents(state)
     try:
-        loop, terminals, runs, open_prs, merged = running(known, superset, gh)
+        work = stop_work(known, superset, gh)
     except (Refused, triage.Refused) as error:
         result = {'effective': False, 'read_back': f'failed: {error}', 'alive': [], 'failed': [], 'after_stop': []}
     else:
-        for name, ids in terminals.items():
-            for terminal in ids:
-                attempt(f'close {name}', superset,
-                        ['terminals', 'close', '--local', '--workspace', loop[name], '--terminal', terminal])
-        for run in runs:
-            if run.get('status') in ACTIVE:
-                attempt(f"cancel run {run['databaseId']}", gh, ['run', 'cancel', str(run['databaseId']), '-R', REPO])
-        for pr in open_prs:
-            if pr.get('autoMergeRequest'):
-                attempt(f"disarm #{pr['number']}", gh, ['pr', 'merge', str(pr['number']), '-R', REPO, '--disable-auto'])
-            if pr.get('mergeQueueEntry'):
-                attempt(f"dequeue #{pr['number']}", gh, ['api', 'graphql', '-f', 'query=' + DEQUEUE, '-f', f"id={pr['id']}"])
-        try:
-            loop, terminals, runs, open_prs, merged = running(known, superset, gh)
-            read_back = 'clean'
-        except (Refused, triage.Refused) as error:
-            read_back = f'failed: {error}'
-        still = [f'terminal {name}' for name, ids in terminals.items() if ids] + \
-            [f"run {r['databaseId']}" for r in runs if r.get('status') in ACTIVE] + \
-            [f"PR #{p['number']}" for p in open_prs if p.get('autoMergeRequest') or p.get('mergeQueueEntry')]
         after = [{'pr': p['number'], 'branch': p['headRefName'], 'merged_at': p['mergedAt'],
                   'undo': f"git revert {(p.get('mergeCommit') or {}).get('oid')} through a PR; pause autodeploy "
                           '(docs/operations/production.md)'}
-                 for p in merged if p.get('mergedAt') and utc(p['mergedAt']) > paused_at]
+                 for p in work['prs'] if p.get('state') == 'MERGED' and p.get('mergedAt')
+                 and utc(p['mergedAt']) > paused_at]
         after += [{'run': r['databaseId'], 'branch': r['branch'], 'undo': "card held; its Tiden move is the owner's"}
-                  for r in runs if r.get('conclusion') == 'success' and utc(r.get('updatedAt')) > paused_at]
+                  for r in work['runs'] if r.get('conclusion') == 'success' and utc(r.get('updatedAt')) > paused_at]
         for name in sorted({a['branch'].removeprefix('proposal/') for a in after} & set(known)):
             hold(state, known[name]['card'], 'written after stop', now)
-        if read_back == 'clean':
+        if work['read_back'] == 'clean':
             for name, intent in known.items():
-                if intent['status'] in LIVE and not terminals.get(name):
+                if intent['status'] in LIVE and not work['terminals'].get(name):
                     put(state, dict(intent, status='stopped', ended_at=triage.stamp(now)))
-        result = {'effective': read_back == 'clean' and not still and not failed, 'read_back': read_back,
-                  'alive': still, 'failed': failed, 'after_stop': after}
+        result = {'effective': work['read_back'] == 'clean' and not work['alive'] and not work['failed'],
+                  'read_back': work['read_back'], 'alive': work['alive'], 'failed': work['failed'], 'after_stop': after}
     result.update(at=triage.stamp(now), paused_at=triage.stamp(paused_at))
     triage.save(state / 'fence.json', result)
     return result
 
 
 def fenced(state, now, superset, gh):
+    consumed(state)  # a STOP that wrote PAUSE never pauses again after the owner resumes
     result = fence(state, now, superset, gh)
     heartbeat(state, now, 'paused')
     if result['effective']:
         return 0, f"paused: stop effective; written after stop {len(result['after_stop'])}"
     return 1, (f"paused: stop NOT effective (read-back {result['read_back'][:80]}; alive {len(result['alive'])}, "
                f"failed {len(result['failed'])}); see {state / 'fence.json'}")
+
+
+def withhold(state, superset, gh):
+    """Every tick: the intents of a held card or a dropped item lose auto-merge, their merge queue entry and active
+    ready merges; the open PR of an intent built on a dropped item is closed. Nothing merged is reverted.
+    Returns what failed or is still alive ([] when done); the next tick tries again."""
+    held = holds(state)
+    affected = {name: i for name, i in intents(state).items()
+                if i['card'] in held['cards'] or set(i['feedback']) & set(held['items'])}
+    if not affected:
+        return []
+    try:
+        work = stop_work(affected, superset, gh, close={name for name, i in affected.items()
+                                                         if set(i['feedback']) & set(held['items'])}, terminals=False)
+    except (Refused, triage.Refused) as error:
+        return [f'read failed: {error}']
+    return work['alive'] + work['failed'] + ([] if work['read_back'] == 'clean' else [work['read_back']])
 
 
 # --- provenance, caps, tick, status ------------------------------------------------------------------------------
@@ -674,16 +781,19 @@ def provenance(ledger, principals):
 
 
 def admitted(inbox, today, caps):
-    """The oldest inbox items within each principal's daily item cap (at most MAX_ITEMS), and the ones over it."""
-    left, chosen, over = {}, [], []
+    """The oldest inbox items within each principal's daily item cap (at most MAX_ITEMS), and the ones over it.
+    An item already charged today (`items`: {feedback ID: principal}) is not charged again."""
+    used, chosen, over = {}, [], []
+    for p in today['items'].values():
+        used[p] = used.get(p, 0) + 1
     for i, item in sorted(inbox.items(), key=lambda pair: (pair[1].get('created_at') or '', pair[0])):
         p = str(item.get('principal'))
-        left.setdefault(p, caps['items_per_principal'] - today['items'].get(p, 0))
-        if left[p] <= 0:
+        if i not in today['items'] and used.get(p, 0) >= caps['items_per_principal']:
             over.append(i)
         elif len(chosen) < MAX_ITEMS:
             chosen.append(i)
-            left[p] -= 1
+            if i not in today['items']:
+                used[p] = used.get(p, 0) + 1
     return chosen, over
 
 
@@ -703,27 +813,32 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
         cfg = config(state)
         if (state / 'PAUSE').exists():
             return fenced(state, now, superset, gh)
-        known = intents(state)
+        # The export first and checked whole: an owner STOP in it writes PAUSE (the one write before the other
+        # reads) and needs neither Tiden nor Superset. Its item is recorded by the first tick after the resume.
+        items, head = triage.export_pages(host, triage.since(triage_state), ssh)
+        stop, _, _ = control(*incoming(triage_state, items), cfg, consumed(state))
+        if stop:
+            triage.private_write(state / 'PAUSE', f'stop by feedback {stop} at {triage.stamp(now)}\n')
+            return fenced(state, now, superset, gh)
         # Reads: each finishes before the first write; a failed, truncated or timed-out one ends the tick here.
+        known = intents(state)
         listing = superset(['workspaces', 'list', '--local', '--search', 'autoloop-']) \
             if any(i['status'] in ('unknown', 'started') for i in known.values()) else None
         if listing is not None and not isinstance(listing, list):
             raise Refused('superset workspaces list: unexpected reply')
         snap = triage.collect(read_tiden)
-        items, head = triage.export_pages(host, triage.since(triage_state), ssh)
         # Writes.
-        triage.save(triage_state / 'snapshot.json', snap)
         fresh, _ = triage.merge(triage_state, items, head)
+        triage.save(triage_state / 'snapshot.json', snap)
         triage.match(triage_state)
         if listing is not None:
             reconcile(state, listing, now)
-        stop, drops, decisions = control(triage_state, cfg)
+        _, drops, decisions = control(triage.load(triage_state / 'inbox.json', {}),
+                                      triage.load(triage_state / 'ledger.json', {}), cfg, consumed(state))
         withdraw(state, triage_state, drops, decisions, now)
         if decisions:
             triage.record(triage_state, decisions, now)
-        if stop:
-            triage.private_write(state / 'PAUSE', f'stop by feedback {stop} at {triage.stamp(now)}\n')
-            return fenced(state, now, superset, gh)
+        withheld = withhold(state, superset, gh)
         ledger = triage.load(state / 'ledger.json', {})
         today = counters(ledger, cfg, now)
         chosen, over = admitted(triage.load(triage_state / 'inbox.json', {}), today, cfg['caps'])
@@ -731,23 +846,23 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
         if cfg['live'] and chosen and today['reader_runs'] >= cfg['caps']['reader_runs']:
             reader = 'over the daily reader cap'
         elif cfg['live'] and chosen:
-            today['reader_runs'] += 1  # reserved before the run, never refunded
+            # The run and its items are charged before the run and never refunded: a crash after the triage
+            # commit cannot let the same items through the cap twice.
+            inbox = triage.load(triage_state / 'inbox.json', {})
+            today['reader_runs'] += 1
+            today['items'].update({i: str(inbox[i].get('principal')) for i in chosen})
             triage.save(state / 'ledger.json', ledger)
-            before = set(triage.load(triage_state / 'ledger.json', {}))
             count, _ = read(state, triage_state, runner, chosen)
-            for i, entry in triage.load(triage_state / 'ledger.json', {}).items():
-                if i not in before:
-                    today['items'][str(entry.get('principal'))] = today['items'].get(str(entry.get('principal')), 0) + 1
-            triage.save(state / 'ledger.json', ledger)
             reader = 'ran'
         plan = {'at': triage.stamp(now), 'live': cfg['live'], 'pulled': fresh, 'reader': reader, 'read': count,
-                'stop': stop, 'dropped': sorted(drops), 'waiting': [] if count else chosen, 'over_cap': over,
+                'dropped': sorted(drops), 'withheld': withheld, 'waiting': [] if count else chosen, 'over_cap': over,
                 'today': today, 'clusters': provenance(triage.load(triage_state / 'ledger.json', {}), cfg['principals']),
                 'intents': {name: i['status'] for name, i in intents(state).items()}}
         triage.save(state / 'plan.json', plan)
         heartbeat(state, now, 'live' if cfg['live'] else 'plan')
-        return 0, (f"tick {'live' if cfg['live'] else 'plan only'}: pulled {fresh}, read {count}, "
-                   f"over cap {len(over)}, dropped {len(drops)}; reader {reader}; plan {state / 'plan.json'}")
+        return 1 if withheld else 0, (
+            f"tick {'live' if cfg['live'] else 'plan only'}: pulled {fresh}, read {count}, over cap {len(over)}, "
+            f"dropped {len(drops)}, withhold not done {len(withheld)}; reader {reader}; plan {state / 'plan.json'}")
 
 
 def status(state, now):
@@ -766,18 +881,26 @@ def status(state, now):
 
 def main(argv_=None):
     parser = argparse.ArgumentParser(description='Feedback autoloop driver (docs/operations/feedback-autoloop.md).')
-    parser.add_argument('action', choices=['tick', 'status', 'gate', 'finish', 'hold', 'release', 'read'])
+    parser.add_argument('action', choices=['tick', 'fence', 'status', 'gate', 'finish', 'hold', 'release', 'read'])
     parser.add_argument('name', nargs='?', help='the intent (gate, finish) or the card (hold, release)')
     parser.add_argument('--state', type=Path, default=Path(os.environ.get('AUTOLOOP_STATE', STATE)))
     parser.add_argument('--triage-state', type=Path,
                         default=Path(os.environ.get('FEEDBACK_TRIAGE_STATE', triage.STATE)))
     args = parser.parse_args(argv_)
-    if (args.name is None) != (args.action in ('tick', 'status', 'read')):
+    if (args.name is None) != (args.action in ('tick', 'fence', 'status', 'read')):
         parser.error(f'{args.action} takes {"no argument" if args.name else "one argument"}')
     now = datetime.now(timezone.utc)
     try:
         if args.action == 'tick':
             code, line = tick(args.state, args.triage_state, now=now)
+            print(line, file=sys.stdout if code == 0 else sys.stderr)
+            return code
+        if args.action == 'fence':
+            # Before `git pull` in the automation: an existing PAUSE is fenced by the installed revision even when
+            # the update fails. No PAUSE: nothing is read or written.
+            with own_lock(args.state):
+                code, line = fenced(args.state, now, superset_cli, gh_cli) if (args.state / 'PAUSE').exists() \
+                    else (0, 'not paused')
             print(line, file=sys.stdout if code == 0 else sys.stderr)
             return code
         if args.action == 'status':
