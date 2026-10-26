@@ -226,6 +226,33 @@ def test_extend_and_revoke_refuse_a_gateway_that_enforces_another_policy_file(si
 
 
 # spec: ANYM-497
+@pytest.mark.parametrize("cmd", [
+    ["--policy", "/etc/deedkit-gateway/policy.json", "--policy", "/etc/deedkit-gateway/active.json"],
+    ["--policy", "/etc/deedkit-gateway/policy.json", "--pol=/etc/deedkit-gateway/active.json"]],
+    ids=["repeated", "abbreviated"])
+def test_revoke_refuses_a_gateway_whose_policy_argument_is_ambiguous(site, capsys, cmd):
+    # argparse takes the last value and accepts a unique prefix: the first `--policy` is not what it enforces.
+    site.gateway["Config"]["Cmd"] = [*cmd, "--port", "13240"]
+    unchanged(site, capsys, lambda: revoke(site, capsys), "--policy 2 times")
+
+
+# spec: ANYM-497
+def test_a_rerun_never_moves_a_gateway_changed_since_the_crash_earlier(site, capsys, monkeypatch):
+    site.operator.change(lambda state: state["offset_hours"].update(messaging=3, calendar=3))
+    crash_at(monkeypatch, ("calls registry", "renamed"))
+    with pytest.raises(Crash):
+        site.main("key", "extend", "src", "--days", "120")
+    monkeypatch.setattr(admin, "checkpoint", lambda step, phase: None)
+    # Another authorized policy change moves the gateway past what the backends read back.
+    moved = (datetime.now(timezone.utc) + timedelta(days=120, hours=-2)).isoformat()
+    site.principals[0]["expires_at"] = moved
+    site.write_policy()
+    code, _, err = extend(site, capsys, "--operation", started(site))
+    assert code == 1 and "never move earlier" in err, err
+    assert entry(site.policy(), "src")["expires_at"] == moved
+
+
+# spec: ANYM-497
 @pytest.mark.parametrize("sharing", ["direct", "nested archive"])
 @pytest.mark.parametrize("verb", ["extend", "revoke"])
 def test_extend_and_revoke_refuse_a_credential_another_principal_uses(site, capsys, sharing, verb):

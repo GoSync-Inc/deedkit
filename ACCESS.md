@@ -160,7 +160,9 @@ its connection error, never `schema_not_ready`. Invocations without these option
 `deedkit admin key issue NEW --like SOURCE` (docs/operations/production.md, Admin CLI) runs these
 commands to clone an agent's access into a new principal across every store. `deedkit admin key
 extend ID --days N` and `key revoke ID` run `extend-key` and `revoke-key` on each of the principal's
-keys (the calls archive key too) together with the calendar, calls and gateway stores. It passes
+keys (the calls archive key too) together with the calendar, calls and gateway stores;
+`extend-key --check` validates no expiry, so the CLI checks by the host clock with a one-hour
+margin, and a larger database clock skew stops it with the gateway unchanged. `key issue` passes
 `issue-key --new-principal`, which refuses `principal_exists` for a principal that already exists
 (after the operation replay check, so a rerun still replays) instead of rewriting its scope, and
 `issue-key --key-permissions-of KEY_ID`, which gives the new key that key's stored ceiling as is (a

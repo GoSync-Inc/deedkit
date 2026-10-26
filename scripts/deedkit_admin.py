@@ -603,6 +603,7 @@ def consumers(containers: list[dict], path: str, what: str) -> list[dict]:
             found.append({"id": container.get("Id"), "name": str(container.get("Name", "")).lstrip("/"),
                           "image": container.get("Image"), "user": (container.get("Config") or {}).get("User") or "",
                           "command": (container.get("Config") or {}).get("Cmd") or [],
+                          "entrypoint": (container.get("Config") or {}).get("Entrypoint") or [],
                           "source": mount["Source"], "mount": mount["Destination"],
                           "target": str(PurePosixPath(mount["Destination"]) / os.path.relpath(folder, source))})
     if not found:
@@ -1346,11 +1347,16 @@ print(json.dumps({"statuses": statuses}))
 
 def policy_read(config: dict, gateway: dict) -> str:
     """The path inside `gateway` of the policy file it enforces: its `--policy` must name the configured file through
-    its directory mount, else a write or a digest proof would concern a file it does not read."""
-    command = [str(part) for part in gateway["command"]]
-    value = next((command[i + 1] for i, part in enumerate(command[:-1]) if part == "--policy"),
-                 next((part.partition("=")[2] for part in command if part.startswith("--policy=")), None))
+    its directory mount, else a write or a digest proof would concern a file it does not read. The gateway's argparse
+    takes the last `--policy` and any unique prefix of it (`--pol`), so anything but exactly one refuses."""
+    command = [str(part) for part in [*gateway["entrypoint"], *gateway["command"]]]
+    values = [part.partition("=")[2] if "=" in part else (command[i + 1] if i + 1 < len(command) else None)
+              for i, part in enumerate(command)
+              if len(name := part.partition("=")[0]) >= 5 and "--policy".startswith(name)]
+    value = values[0] if len(values) == 1 else None
     expected = str(PurePosixPath(gateway["target"]) / Path(config["policy"]).name)
+    if len(values) > 1:
+        raise AdminError(f"{gateway['name']} names --policy {len(values)} times; nothing changed")
     if value is None or posixpath.normpath(value) != expected:
         raise AdminError(f"{gateway['name']} enforces {value or 'no --policy'}, not the configured policy {expected}; "
                          "nothing changed")
@@ -1586,12 +1592,15 @@ def run_extend(config, run, docker, host, journal: Journal, target: dict, writes
         after["calls"] = data["bound"]
     # The gateway never outlives a backend: it ends at the earliest expiry read back, whatever the delays or clocks.
     after["gateway"] = min([data["bound"], *after.values()], key=instant)
-    previous = data["stores"]["gateway"]["previous_expires_at"]
+    # Compared with the entry as this run read it (a rerun may follow someone else's change), and published only over
+    # that same entry.
+    previous = target["stores"]["gateway"]["expires_at"]
     if previous and instant(after["gateway"]) < instant(previous):
         raise AdminError(f"a store read back an expiry before the gateway's {previous} (its clock runs behind), so "
                          "the gateway is left unchanged: expiries never move earlier")
     swap(config, docker, journal, "gateway policy", "policy", principal,
-         lambda entry: {**entry, "expires_at": after["gateway"]}, found["policy"], rollback_images(host))
+         lambda entry: {**entry, "expires_at": after["gateway"]}, found["policy"], rollback_images(host),
+         expect=entry_digest(target["entry"]))
     data["result"] = {
         "operation": data["operation"], "principal": principal, "days": data["command"]["days"],
         "expires_at": after["gateway"],
