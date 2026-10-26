@@ -79,6 +79,10 @@ def assert_truthful(listed, blocks, platform):
         assert ("delivery_policy" in subscriptions) is ("messages_configure_subscription_delivery" in listed)
     if isinstance(events, dict):
         assert ("wait_max_seconds" in events) is ("messages_wait_for_subscription_events" in listed)
+        # Call fields are checked against tools/list directly, not through the catalog's names.
+        assert all(events[f] in listed for f in ("fetch", "ack", "wait", "test") if f in events)
+    if isinstance(subscriptions, dict) and "delivery_policy" in subscriptions:
+        assert subscriptions["delivery_policy"]["tool"] in listed
 
 
 def exposed(profile):
@@ -145,3 +149,16 @@ def test_missing_or_malformed_blocks_never_break_capabilities(tmp_path, backend)
     with TestClient(app(tmp_path, tools, **backend)) as client:
         other = client.post("/v1/messages_list_subscriptions", json={}, headers=HEADERS)
     assert other.status_code == 200 and other.json()["synthetic"] is True
+
+
+# spec: ANYM-528
+@pytest.mark.parametrize("backend", [
+    {"subscriptions": {"ack": True, "delivery_policy": {"tool": "configure_subscription_delivery_v2"}},
+     "events": {"wait": "wait_for_subscription_events_v2", "fetch": "messages_fetch_subscription_events_v2"}},
+    {"subscriptions": {"delivery_policy": {"tool": 7}}, "events": {"ack": None, "test": "test_subscription"}},
+], ids=["unknown_operations", "malformed_call_fields"])
+def test_call_fields_never_name_an_unlisted_or_unknown_call(tmp_path, backend):
+    tools = ["platform_capabilities", "messages_capabilities", "messages_list_subscriptions"]
+    listed, blocks, platform = observed(tmp_path, tools, **backend)
+    assert_truthful(listed, blocks, platform)
+    assert blocks["events"] == {} and "delivery_policy" not in blocks["subscriptions"]

@@ -26,6 +26,8 @@ SECTIONS = {
 MESSAGING_CALLS = {spelling: name for name, tool in CATALOG.items() if tool["module"] == "messaging"
                    for spelling in (tool["operation"], name)}
 HIDDEN = object()
+# Fields whose value is a call: kept only when it is one of the caller's listed tools.
+EVENT_CALL_FIELDS = ("fetch", "ack", "wait", "test")
 
 
 def named_calls(value, shown):
@@ -45,7 +47,8 @@ def subscription_blocks(result, visible):
     """The `subscriptions` and `events` blocks name only calls in the caller's tool list (ANYM-528).
 
     A hidden call is omitted, `subscriptions.ack` becomes false, `wait_max_seconds` leaves with the wait
-    call and `delivery_policy` with its tool. A block that is not an object is dropped, never passed on.
+    call and `delivery_policy` with its tool. A call field naming no listed tool (an unknown operation or
+    a value of another type) is omitted too. A block that is not an object is dropped, never passed on.
     """
     shown = set(visible)
     for key in ("subscriptions", "events"):
@@ -57,10 +60,15 @@ def subscription_blocks(result, visible):
         block = named_calls(result[key], shown)
         if "messages_wait_for_subscription_events" not in shown:
             block.pop("wait_max_seconds", None)
+        if key == "events":
+            for field in EVENT_CALL_FIELDS:
+                if field in block and not (isinstance(block[field], str) and block[field] in shown):
+                    del block[field]
         if key == "subscriptions":
             if "ack" in block:
                 block["ack"] = block["ack"] is True and "messages_ack_subscription_events" in shown
-            if not isinstance(block.get("delivery_policy"), dict) or "tool" not in block["delivery_policy"]:
+            policy = block.get("delivery_policy")
+            if not isinstance(policy, dict) or not isinstance(policy.get("tool"), str) or policy["tool"] not in shown:
                 block.pop("delivery_policy", None)
         result[key] = block
     return result
