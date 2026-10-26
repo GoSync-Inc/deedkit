@@ -94,12 +94,47 @@ read; WhatsApp uses `sendSeen: false`.
 ### New WhatsApp conversations by phone number
 
 On native WhatsApp accounts an agent can write to a number that has no archived
-chat: check it with the `open_chat_by_phone` messenger operation (`create=false`),
-show the owner the account, number, verified name and exact text, obtain
-confirmation, call it again with `create=true` for the `chat_id`, then send with
-`send_message`. A phone-shaped `chat_id` that is not found returns the exact `next_call` for each step, or
-the reason there is none. Each account allows at most 10 WhatsApp lookups per rolling hour (local answers are free);
-see [MESSENGER_OPERATIONS.md](MESSENGER_OPERATIONS.md#opening-a-whatsapp-chat-by-phone-number).
+chat in the same preview and send flow, with `phone` instead of `chat_id`:
+
+1. `preview_message(account, phone, text)`: `phone` is an international number
+   (`+` optional, 8–15 digits, or a `…@c.us`/`…@s.whatsapp.net` ID). Exactly one
+   of `chat_id` and `phone` is given, else `invalid_arguments` with
+   `fields: [chat_id, phone]`. The preview runs one `open_chat_by_phone` lookup
+   (`create=false`, up to 20 seconds) and returns the usual draft plus `phone`,
+   `on_whatsapp`, `verified_name`, `chat_existed` (with `chat_id` only then),
+   `chats_on_other_accounts`, `preview_contacts_provider: true` and
+   `preview_digest_expires_at`. The digest binds the account, the number, that
+   one lookup, the resolved WhatsApp ID (LID) and the rendered draft; it is valid
+   for 10 minutes, and a later lookup of the same number never revives it.
+   A lookup still running gets `phone_lookup_pending` with `operation_id` and
+   `next_action: repeat_preview_message`; the repeat reuses it, as does a new
+   preview of the same number by the same key within the validity.
+2. Show the owner the account, number, verified name and exact text; obtain
+   confirmation, as for any send.
+3. `send_message(account, phone, text, request_id, preview_digest=…)`. The digest
+   is required (`preview_required`). An expired or missing lookup gets
+   `preview_expired`, a changed draft `preview_mismatch`, and a number whose
+   WhatsApp ID no longer matches the preview `identity_changed`; each has
+   `next_action: preview_message_again`. Otherwise the server opens or reuses
+   the canonical chat of exactly that LID from the session store's mapping,
+   never with a second lookup, rechecks every guard and the digest's validity,
+   then runs the unchanged send pipeline under the caller's `request_id`, which
+   the phone send reserves from its first call. While the chat step runs, the result is `status: opening_chat`
+   with `next_action: repeat_send_message_with_same_request_id`; the repeat
+   with the same arguments continues it, other arguments get
+   `idempotency_conflict`. The result adds `chat_id`, `chat_existed` and
+   `verified_name`.
+
+Phone recipients need everything `open_chat_by_phone` needs: the `send`
+permission (a phone preview also `read`, as every preview), a full-account key, the account opt-in and, through the gateway,
+the `open_chat_by_phone` action grant. A not-on-WhatsApp number gets
+`not_on_whatsapp`. The preview lookups share the account's budget of 10 WhatsApp
+lookups per rolling hour (local answers are free); `rate_limited` carries
+`resets_in_seconds`. The separate `open_chat_by_phone` operation (`create=true`
+for a `chat_id`, then `send_message`) still works. A phone-shaped `chat_id` that
+is not found returns the exact `next_call` for each step, or the reason there is
+none. `capabilities.sending.recipients` lists `chat_id` and `phone`; see
+[MESSENGER_OPERATIONS.md](MESSENGER_OPERATIONS.md#opening-a-whatsapp-chat-by-phone-number).
 Cold messages from a personal account to strangers can get it restricted or banned
 by WhatsApp, so keep them few and expected. New Telegram conversations by phone
 number or username are not implemented.

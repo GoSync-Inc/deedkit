@@ -23,7 +23,9 @@ def takes_wait(tool):
 # never the metadata pool. An entry names the pool and when the arguments make the call wait; wait_s=0 stays a plain
 # call. A catalog tool with wait_s but no entry still waits in "waits" and fails test_wait_admission.
 WAIT_ADMISSION = {
-    ("messaging", "send_message"): ("waits", lambda a: (a.get("wait_s") or 0) > 0),
+    # ANYM-532: a phone recipient also waits, for its open_chat_by_phone lookup.
+    ("messaging", "send_message"): ("waits", lambda a: (a.get("wait_s") or 0) > 0 or bool(a.get("phone"))),
+    ("messaging", "preview_message"): ("waits", lambda a: bool(a.get("phone"))),
     ("messaging", "wait_for_subscription_events"): ("waits", lambda a: True),
     # ANYM-478: a live search waits up to 20 s in its own pool.
     ("messaging", "search"): ("searches", lambda a: a.get("live", "off") != "off"),

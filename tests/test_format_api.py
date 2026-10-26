@@ -1,4 +1,6 @@
 """Formatting API parity, authorization and passive previews; synthetic only."""
+import json
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -67,9 +69,16 @@ def test_required_format_arguments_rejected_equally(operation,missing):
     with TestClient(create_app(store,['testserver'])) as client:
         rest=client.post('/v1/'+operation,headers={'Authorization':'Bearer synthetic-token'},json=args)
         mcp=rpc(client,operation,args)
-    assert rest.status_code==400 and rest.json()['fields']==[missing]
-    assert mcp.json()['error']['code']==-32602
-    assert mcp.json()['error']['data']['fields']==[missing]
+    if missing=='chat_id':
+        # ANYM-532: the recipient is chat_id or phone; neither is refused before the store.
+        assert rest.status_code==400 and rest.json()['error']=='invalid_arguments'
+        assert rest.json()['fields']==['chat_id','phone']
+        result=mcp.json()['result']
+        assert result['isError'] and json.loads(result['content'][0]['text'].split(': ',1)[1])['fields']==['chat_id','phone']
+    else:
+        assert rest.status_code==400 and rest.json()['fields']==[missing]
+        assert mcp.json()['error']['code']==-32602
+        assert mcp.json()['error']['data']['fields']==[missing]
     assert 'synthetic-private-draft' not in rest.text+mcp.text
     assert store.calls==[]
 
@@ -102,8 +111,9 @@ def test_preview_registry_is_read_only_and_has_strict_required_arguments():
             'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':2,'method':'tools/list'})
     tool=next(item for item in response.json()['result']['tools'] if item['name']=='preview_message')
     assert tool['annotations']['readOnlyHint'] is True
-    assert tool['annotations']['openWorldHint'] is False
-    assert set(tool['inputSchema']['required'])=={'account','chat_id','text'}
+    # ANYM-532: a phone preview does one provider lookup; the recipient is chat_id or phone.
+    assert tool['annotations']['openWorldHint'] is True
+    assert set(tool['inputSchema']['required'])=={'account','text'}
     assert tool['inputSchema']['additionalProperties'] is False
 
 

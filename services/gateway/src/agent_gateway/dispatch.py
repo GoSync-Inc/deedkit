@@ -15,6 +15,7 @@ from .sections import capabilities_view, subscription_blocks
 PLAIN_PATH = "/mcp"
 MODULE_PATH = "/mcp/modules/"
 LIVE_SEARCH = "search_messages_live"
+OPEN_CHAT_BY_PHONE = "open_chat_by_phone"
 # One line each for an agent choosing what to load (ANYM-271); the ids are the deployable modules.
 # No ", " or ": ": the MCP text block is compact JSON (ANYM-408).
 MODULE_PURPOSES = {
@@ -269,6 +270,10 @@ class Dispatch:
             allowed = (self.actions(snapshot, agent, caps, arguments["account"]) if "account" in arguments
                        else self.policy.actions(snapshot, agent, caps.get("permissions", [])))
             usable = bool(allowed) and ("operation" not in arguments or arguments["operation"] in allowed)
+        if usable and arguments.get("phone"):
+            # ANYM-532: a phone recipient is the open_chat_by_phone lookup, under its action grant.
+            usable = ("send" in caps.get("permissions", [])
+                      and OPEN_CHAT_BY_PHONE in self.actions(snapshot, agent, caps, arguments.get("account")))
         if usable:
             value["next_call"] = {**step, "tool": name}
         elif value.get("error") == "not_found" or arguments.get("operation") == "open_chat_by_phone":
@@ -486,6 +491,11 @@ class Dispatch:
                 allowed_actions = self.actions(snapshot, agent, caps, args["account"])
                 if "operation" in args and args["operation"] not in allowed_actions:
                     raise Denied()
+        if (module == "messaging" and tool["operation"] in ("preview_message", "send_message") and args.get("phone")
+                and ("send" not in caps["permissions"]
+                     or OPEN_CHAT_BY_PHONE not in self.actions(snapshot, agent, caps, args.get("account")))):
+            # ANYM-532: a phone recipient needs the same action grant as the separate operation.
+            raise Denied()
         return allowed_actions
 
     def admit(self, key, name):
@@ -574,6 +584,9 @@ class Dispatch:
             raise
         allowed_actions = self.argument_admission(tool, args, snapshot, agent, caps)
         rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
+        if module == "messaging" and tool["operation"] in ("preview_message", "send_message"):
+            # An empty recipient field is not sent, so a backend from before ANYM-532 keeps taking chat_id calls.
+            args = {k: v for k, v in args.items() if k not in ("chat_id", "phone") or v != ""}
         if module == "calendar" and tool["operation"] == "plan":
             # Carried drives (and create with activity) are asked for only under this gateway's own rule-read
             # ceiling, and only from a backend that declares the field; an agent never sets it itself.

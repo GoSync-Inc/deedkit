@@ -212,6 +212,11 @@ account opt-in and, through the gateway, the `open_chat_by_phone` action grant.
    the collection policy against the resolved WhatsApp ID; the contact sees nothing.
 4. Send with `send_message(account, chat_id, text, request_id)` as usual.
 
+`preview_message` and `send_message` with `phone` instead of `chat_id` run these
+steps for the caller under the same guards and budget: the preview's lookup is
+step 1, its digest binds the resolved WhatsApp ID, and the send opens the chat from
+the session store's mapping without a second lookup ([SENDING.md](SENDING.md#new-whatsapp-conversations-by-phone-number)).
+
 The canonical chat is the contact's LID (`<digits>@lid`), where the native sender
 archives its echo. A registered number without a LID gets `identity_unresolved`;
 a policy that excludes the number or its LID, or `discover_chats` off, gets
@@ -233,14 +238,15 @@ and kept in the operation row and in the session store's PN/LID mapping; it is n
 `send_message`, `preview_message` and `resolve_reference` add
 `hint: open_chat_by_phone` to `not_found` for a phone-shaped chat reference, and
 name what the caller may do next. Each `next_call` has the transport's own `tool`
-(`execute_messenger_operation` direct, `messages_execute_messenger_operation`
-through the gateway), the exact `arguments` and `caller_supplies`, the fields the
-caller adds itself (a new stable `request_id`, or the `text`); no placeholder is
-ever inside `arguments`. The only number echoed is the caller's own, normalized.
+(`preview_message` or `execute_messenger_operation` direct, with the `messages_`
+prefix through the gateway), the exact `arguments` and `caller_supplies`, the
+fields the caller adds itself (the `text` for a phone preview, whose
+`caller_may_supply` lists `format` and `reply_to`; a new stable `request_id` for
+the operation's own steps); no placeholder is ever inside `arguments`. The only number echoed is the caller's own, normalized.
 
 | Situation | Response |
 |---|---|
-| A call would be accepted | `next_call` open_chat_by_phone with `create: false`, `next_action: open_chat_by_phone_then_follow_next_call` |
+| A call would be accepted | `next_call` preview_message with `phone`, `next_action: preview_message_then_send_message_with_its_digest` |
 | The key reads a chat of this number on another account (archive only) | `found_on_other_account: {account, chat_id}`, `next_action: use_existing_chat`, no `next_call` |
 | The operation is not enabled on the account | `next_action: ask_operator_to_enable_open_chat_by_phone`, `account` |
 | The key or the gateway lacks the operation, `send` or full-account scope | `next_action: key_cannot_open_new_chats` |

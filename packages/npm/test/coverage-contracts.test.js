@@ -73,9 +73,9 @@ test('every public convenience helper delegates the exact operation and retains 
 
 test('typed action definitions retain required identities and optional reviewed fields',()=>{
   const fields={
-    MessageDraft:['account: string','chat_id: string','text: string','reply_to?: string',
+    MessageContent:['account: string','text: string','reply_to?: string',
       'format?: MessageFormat','link_preview?: boolean','allow_lossy?: boolean'],
-    MessageAction:['request_id: string','preview_digest?: string'],
+    MessageActionFields:['request_id: string','preview_digest?: string'],
     MessengerOperationPreview:['account: string','operation: string','chat_id?: string',
       'message_id?: string','expected_revision?: number','parameters?: Arguments'],
     MessengerOperationAction:['request_id: string','preview_digest?: string'],

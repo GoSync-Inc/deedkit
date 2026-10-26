@@ -23,6 +23,9 @@ PN = PHONE+'@c.us'
 LID = '987654321012399@lid'
 OPEN = {'tool': 'execute_messenger_operation', 'arguments': {'account': ACCOUNT, 'operation': 'open_chat_by_phone',
         'parameters': {'phone': '+'+PHONE, 'create': False}}, 'caller_supplies': ['request_id']}
+# ANYM-532: the not_found suggestion is the phone preview; the separate operation keeps its receipt chain.
+PREVIEW = {'tool': 'preview_message', 'arguments': {'account': ACCOUNT, 'phone': '+'+PHONE},
+           'caller_supplies': ['text'], 'caller_may_supply': ['format', 'reply_to']}
 
 
 def connect(s, archive, account):
@@ -102,8 +105,8 @@ def valid(tools, step, **supplied):
 def test_not_found_phone_names_the_exact_open_chat_call(native, reference):
     s, archive, state, key = native
     for error in both(s, key, reference):
-        assert error['hint'] == 'open_chat_by_phone' and error['next_call'] == OPEN
-        assert error['next_action'] == 'open_chat_by_phone_then_follow_next_call'
+        assert error['hint'] == 'open_chat_by_phone' and error['next_call'] == PREVIEW
+        assert error['next_action'] == 'preview_message_then_send_message_with_its_digest'
         assert 'found_on_other_account' not in error
         # Only the caller's own number, normalized, is echoed.
         assert json.dumps(error).count(PHONE) == 1
@@ -114,7 +117,9 @@ def test_not_found_phone_names_the_exact_open_chat_call(native, reference):
 def test_each_step_names_the_next_call_until_the_preview(native):
     s, archive, state, key = native
     tools = schemas()
-    step = both(s, key, '+'+PHONE)[0]['next_call']
+    assert both(s, key, '+'+PHONE)[0]['next_call'] == PREVIEW
+    jsonschema.validate({**PREVIEW['arguments'], 'text': 'Synthetic'}, tools['preview_message']['inputSchema'])
+    step = OPEN
     queued = s.execute_messenger_operation(key, **valid(tools, step, request_id='next-check-0001'))
     # Pending: poll by the returned operation ID, which is not the request ID.
     assert queued['operation_id'] != 'next-check-0001'

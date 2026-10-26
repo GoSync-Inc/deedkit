@@ -28,16 +28,19 @@ export type ListChatsResult = Record<string, unknown> & {
   excluded_likely_broadcasts_total?: number;
   muted_total?: number};
 export type MessageFormat = 'plain' | 'markdown' | 'html';
-export interface MessageDraft {
+export interface MessageContent {
   account: string;
-  chat_id: string;
   text: string;
   reply_to?: string;
   format?: MessageFormat;
   link_preview?: boolean;
   allow_lossy?: boolean;
 }
-export interface MessageAction extends MessageDraft {
+/** Exactly one recipient: an archive chat_id, or a phone number on a native WhatsApp account (ANYM-532). */
+export type MessageRecipient = {chat_id: string; phone?: never} | {phone: string; chat_id?: never};
+export type MessageDraft = MessageContent & MessageRecipient;
+export type MessageAction = MessageDraft & MessageActionFields;
+export interface MessageActionFields {
   request_id: string;
   preview_digest?: string;
   /** Bounded receipt wait, 0–25 seconds. Zero is omitted for older servers. */

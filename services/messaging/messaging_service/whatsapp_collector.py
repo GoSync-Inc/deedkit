@@ -367,13 +367,25 @@ class NodeProvider:
             local=await self._call_unlocked('messenger_operation',{**payload,'local_only':True,'known_chats':[]},sending=True)
             lid=local.get('data',{}).get('local_lid') if isinstance(local,dict) and isinstance(local.get('data'),dict) else None
             archived=False
-            if isinstance(lid,str) and re.fullmatch(r'[0-9]{1,30}@lid',lid):
+            if job.get('expected_lid') is not None:
+                # ANYM-532: a phone send reuses its preview's lookup. The session store must still map
+                # the number to that LID, which then answers locally; any other answer asks for a new preview.
+                if lid!=job['expected_lid']:raise CommandRejected('identity_changed')
+                archived=True;payload['lookup_allowed']=False  # never a second, counted lookup
+            elif isinstance(lid,str) and re.fullmatch(r'[0-9]{1,30}@lid',lid):
                 try:archived=await asyncio.wait_for(job['_archived'](lid),max(deadline-time.monotonic(),0))
                 except TimeoutError:raise CommandRejected('provider_timeout') from None
             payload['known_chats']=[lid] if archived else []
             remaining=int((deadline-time.monotonic())*1000)
             if remaining<100:raise CommandRejected('provider_timeout')
             payload['lookup_ms']=remaining
+            if job.get('expected_lid') is not None:
+                # With no lookup allowed, the adapter answers rate_limited when the LID left its
+                # chat list between the two calls: that is a changed identity, not a quota.
+                try:return await self._call_unlocked('messenger_operation',payload,sending=True)
+                except CommandRejected as exc:
+                    if str(exc)=='rate_limited':raise CommandRejected('identity_changed') from None
+                    raise
         return await self._call_unlocked('messenger_operation',payload,sending=True)
     async def chunks(self,source,descriptor):
         complete=False

@@ -466,6 +466,12 @@ class Store:
                         'link_preview_default':False,'automatic_splitting':False,
                         'whatsapp_link_preview_control':'provider_multi_device_limitation',
                         'whatsapp_plain_native_markup':'provider_may_interpret_delimiters'},
+                    # ANYM-532: chat_id or phone; a phone preview does one open_chat_by_phone lookup.
+                    'recipients':{'chat_id':{'preview_contacts_provider':False},
+                        'phone':{'platforms':['whatsapp_native'],'preview_contacts_provider':True,
+                            'requires':['send','full_account','open_chat_by_phone','gateway_action_grant'],
+                            'send_requires_preview_digest':True,'digest_binds_identity':True,
+                            'lookup_quota':'shared_with_open_chat_by_phone'}},
                     'ambiguous_result_policy':'unknown_no_automatic_retry',
                     'delivery_observations':{'telegram':'private_outbox_read_boundary',
                         'whatsapp':'message_ack_private_or_group_aggregate',
@@ -505,6 +511,33 @@ class Store:
         from .outgoing import enqueue
         with self.authorized(token,'send_message') as (c,p):
             return enqueue(c,p,account,chat_id,text,request_id,reply_to,format,
+                preview_digest,link_preview,allow_lossy)
+
+    # ANYM-532: a phone recipient; phone_send.preview and phone_send.send wait between these short reads.
+    def phone_preview_lookup(self,token,account,phone,text,reply_to='',format='plain',
+                             link_preview=False,allow_lossy=False):
+        from .phone_send import preview_lookup
+        with self.authorized(token,'preview_message') as (c,p):
+            return preview_lookup(self,c,p,account,phone,text,reply_to,format,link_preview,allow_lossy)
+
+    def phone_preview_result(self,token,account,phone,operation_id,text,reply_to='',format='plain',
+                             link_preview=False,allow_lossy=False):
+        from .phone_send import preview_result
+        with self.authorized(token,'preview_message') as (c,p):
+            return preview_result(self,c,p,account,phone,operation_id,text,reply_to,format,link_preview,allow_lossy)
+
+    def phone_send_begin(self,token,account,phone,text,request_id,reply_to='',format='plain',
+                         preview_digest='',link_preview=False,allow_lossy=False):
+        from .phone_send import send_begin
+        with self.authorized(token,'send_message') as (c,p):
+            return send_begin(self,c,p,account,phone,text,request_id,reply_to,format,preview_digest,
+                link_preview,allow_lossy)
+
+    def phone_send_finish(self,token,account,phone,operation_id,text,request_id,reply_to='',format='plain',
+                          preview_digest='',link_preview=False,allow_lossy=False):
+        from .phone_send import send_finish
+        with self.authorized(token,'send_message') as (c,p):
+            return send_finish(self,c,p,account,phone,operation_id,text,request_id,reply_to,format,
                 preview_digest,link_preview,allow_lossy)
 
     def get_send_status(self,token,send_id):

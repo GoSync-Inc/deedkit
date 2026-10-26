@@ -27,7 +27,8 @@ def payload(error,operation='',request_id=None):
     for name in ('hint','resets_in_seconds'):  # Reviewed constants and counters, never input values.
         if hasattr(error,name):info[name]=getattr(error,name)
     # ANYM-531: the caller's own account and normalized number, and archive IDs the key may read.
-    for name in ('next_call','found_on_other_account','account'):
+    # ANYM-532: the normalized number the caller sent and the phone lookup's operation_id.
+    for name in ('next_call','found_on_other_account','account','phone','operation_id'):
         if hasattr(error,name):info[name]=getattr(error,name)
     if retry:info['retry_after_seconds']=2
     if code in EXPECTED:info['expected']=EXPECTED[code]
@@ -36,7 +37,7 @@ def payload(error,operation='',request_id=None):
     if operation in ('search','search_files') and retry:
         info['next_action']='narrow_account_chat_or_date_filters'
         info['fallback']='get_messages_for_known_chat_then_get_context' if operation=='search' else 'get_file_text_for_known_attachment_then_get_context'
-    elif code=='not_found' and hasattr(error,'next_action'):info['next_action']=error.next_action
+    elif hasattr(error,'next_action'):info['next_action']=error.next_action
     elif code in ('not_found','forbidden'):
         info['next_action']='check_reference_and_permitted_scope'
     elif code=='cursor_changed':info['next_action']='restart_query_without_cursor'
