@@ -120,7 +120,7 @@ Calendar (buildable only after the change journal exists):
 |---|---|---|
 | `calendar.event.created` | a diff of a re-read window finds an occurrence not seen before | `calendar_ref, event_ref, start_at, version` |
 | `calendar.event.changed` | etag or start/end differ | same + `changed: [start, end, details]` (field names only) |
-| `calendar.event.cancelled` | the provider marks the occurrence cancelled, or its identity is absent from every stored window after a complete re-read of the window that held it and the provider says nothing else (a move is `changed`; an unlocated move produces no event; failed or partial coverage is no evidence) | `calendar_ref, event_ref, start_at` (taken from the stored row; the ref cannot be rebuilt otherwise, providers.py:225) |
+| `calendar.event.cancelled` | the provider marks the occurrence cancelled, or the provider reports it removed (absence from the stored windows alone is never cancellation: a located move is `changed`, an unlocated disappearance produces no event, failed or partial coverage is no evidence) | `calendar_ref, event_ref, start_at` (taken from the stored row; the ref cannot be rebuilt otherwise, providers.py:225) |
 | `calendar.event.starting` | `start_at - now <= N minutes`, N set per subscription (default 15), once per `(event_ref, start_at, N)` | `calendar_ref, event_ref, start_at, lead_minutes` |
 | invite response | **declined for now**: no attendee data exists (Google `guests` is a bool, iCloud checks `ATTENDEE` presence only; invitations unsupported) | needs an attendee model first (card candidate, not written) |
 
