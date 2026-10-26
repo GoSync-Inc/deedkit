@@ -78,7 +78,8 @@ def assert_truthful(listed, blocks, platform):
         assert ("wait_max_seconds" in subscriptions) is ("messages_wait_for_subscription_events" in listed)
         assert ("delivery_policy" in subscriptions) is ("messages_configure_subscription_delivery" in listed)
     if isinstance(events, dict):
-        assert ("wait_max_seconds" in events) is ("messages_wait_for_subscription_events" in listed)
+        # The wait limit leaves with the wait field, which is kept only when its call is listed.
+        assert ("wait_max_seconds" in events) is ("wait" in events)
         # Call fields are checked against tools/list directly, not through the catalog's names.
         assert all(events[f] in listed for f in ("fetch", "ack", "wait", "test") if f in events)
     if isinstance(subscriptions, dict) and "delivery_policy" in subscriptions:
@@ -153,12 +154,16 @@ def test_missing_or_malformed_blocks_never_break_capabilities(tmp_path, backend)
 
 # spec: ANYM-528
 @pytest.mark.parametrize("backend", [
-    {"subscriptions": {"ack": True, "delivery_policy": {"tool": "configure_subscription_delivery_v2"}},
-     "events": {"wait": "wait_for_subscription_events_v2", "fetch": "messages_fetch_subscription_events_v2"}},
-    {"subscriptions": {"delivery_policy": {"tool": 7}}, "events": {"ack": None, "test": "test_subscription"}},
+    {"subscriptions": {"ack": True, "wait_max_seconds": 25,
+                       "delivery_policy": {"tool": "configure_subscription_delivery_v2"}},
+     "events": {"wait": "wait_for_subscription_events_v2", "wait_max_seconds": 25,
+                "fetch": "messages_fetch_subscription_events_v2"}},
+    {"subscriptions": {"wait_max_seconds": 25, "delivery_policy": {"tool": 7}},
+     "events": {"ack": None, "test": "test_subscription"}},
 ], ids=["unknown_operations", "malformed_call_fields"])
 def test_call_fields_never_name_an_unlisted_or_unknown_call(tmp_path, backend):
-    tools = ["platform_capabilities", "messages_capabilities", "messages_list_subscriptions"]
+    tools = ["platform_capabilities", "messages_capabilities", "messages_list_subscriptions",
+             "messages_wait_for_subscription_events"]
     listed, blocks, platform = observed(tmp_path, tools, **backend)
     assert_truthful(listed, blocks, platform)
     assert blocks["events"] == {} and "delivery_policy" not in blocks["subscriptions"]

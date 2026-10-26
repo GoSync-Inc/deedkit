@@ -47,8 +47,9 @@ def subscription_blocks(result, visible):
     """The `subscriptions` and `events` blocks name only calls in the caller's tool list (ANYM-528).
 
     A hidden call is omitted, `subscriptions.ack` becomes false, `wait_max_seconds` leaves with the wait
-    call and `delivery_policy` with its tool. A call field naming no listed tool (an unknown operation or
-    a value of another type) is omitted too. A block that is not an object is dropped, never passed on.
+    call (or an omitted `events.wait`) and `delivery_policy` with its tool. A call field naming no listed
+    tool (an unknown operation or a value of another type) is omitted too. A block that is not an object
+    is dropped, never passed on.
     """
     shown = set(visible)
     for key in ("subscriptions", "events"):
@@ -64,6 +65,8 @@ def subscription_blocks(result, visible):
             for field in EVENT_CALL_FIELDS:
                 if field in block and not (isinstance(block[field], str) and block[field] in shown):
                     del block[field]
+            if "wait" not in block:
+                block.pop("wait_max_seconds", None)
         if key == "subscriptions":
             if "ack" in block:
                 block["ack"] = block["ack"] is True and "messages_ack_subscription_events" in shown
