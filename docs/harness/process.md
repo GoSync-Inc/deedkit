@@ -35,7 +35,7 @@ And without a diff: a restore, rollback over data or other production change tha
 new credentials, roles, host access; money; deleting records, or data outside a task; moving cards;
 deleting cards (agents may on the owner's quote naming them); publishing a package, rewriting
 history or irreversible steps outside a task; accepting a known risk (open blocking or major finding); product direction
-(which features or epics to build, weakening a ready card's criterion).
+(weakening a ready card's criterion).
 A standing approval holds only while all its conditions do; manual releases need one.
 
 A task is a ready card (tiden.md, Card intake) whose criteria name the step;
@@ -51,7 +51,7 @@ reviewers (Astra for access and data), summary to the owner.
 Path: from the changed files and section 2 (grep signals: reviews.md, Pull request lines), never a card's label; PR
 line `Change path: <path> (<rule>)`. Never lower it; in doubt, OWNER.
 
-- AUTO (docs, tests only): merge on green required checks.
+- AUTO (tests, non-process docs; reviews.md, Rounds 8): merge on green required checks.
 - AUTO+review (any other file): plus one review round (reviews.md, Routing).
 - OWNER (section 2): plus the owner's words; a quoted request naming the change counts, checked against the diff by the reviewer.
 

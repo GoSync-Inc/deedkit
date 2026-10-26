@@ -6,14 +6,17 @@ rounds and the verdict. A project's review notes add its deployed-version list, 
 
 ## Routing
 
-- Code r1: Codex Sol for normal, CI, Tiden, release and docs pull requests:
+- Code r1: Codex Sol for normal, CI, Tiden and release pull requests:
   `codex exec --disable hooks -m gpt-6.1-sol -c model_reasoning_effort=xhigh -c service_tier="default" "<task>" </dev/null`.
   Astra (`-m gpt-6-astra`, process.md section 5) only for r1 on security, access, data,
-  owner-level or product-behaviour changes. (DeedKit orchestrator, standing approval item 13, 10-19; owner 10-19 09:1xZ.)
+  owner-level or product-behaviour changes. (standing approval, owner 10-19.)
 - One Codex reviewer per round: Astra or Sol, never both on the same item. A scoped recheck (r2),
   also of a card and also after an Astra r1, runs on Sol, not an Anthropic subagent (owner 10-21, 10-23).
-- Test-only pull requests and process or rule text: no Codex; an Opus subagent reviewer, plus Fable
-  for process text.
+- Process text (Rounds 8): no Codex; an Opus subagent reviewer plus Fable. Test-only pull
+  requests (test files and their fixtures only), Codex-written too, are AUTO (process.md section
+  3): no review round, in this harness too (Rounds 8).
+- VISION.md (tiden.md, Brainstorm and vision): AUTO+review, one Fable round, no Codex; it is
+  never the AUTO of non-process docs.
 - Codex-written code: an Opus subagent. Product cards: one Fable round (Card review below).
 - Name the model in the pull request's `Review record:`; put `Model: <model> <effort>` (the
   author's) in every pull request description.
@@ -27,12 +30,12 @@ history.
 
 - `task.md`: the task goal and the card's criteria, the round, and for a recheck the open
   findings of r1. An Astra task starts with the four fixed questions of process.md section 5,
-  verbatim with the project's values filled in (its AGENTS.md section 5), before any task-specific question. A code packet names the deployed versions for
+  verbatim with the project's values filled in (the `Harness values:` of its AGENTS.md), before any task-specific question. A code packet names the deployed versions for
   question 3 (`<deployed consumers>`, from the project's review notes or the orchestrator).
 - `diff.patch`: `git diff <merge-base>..<head>`; for a recheck, only the fix range. A criterion
   edit or settle text on the PR's `Tiden branch:` goes in as previous and proposed text.
 - `specs.md`: the full text of the specs the PR delivers, flags in `Spec impact:` or changes; IDs
-  and titles for the other specs it names or touches. A project helper that lists them (DeedKit:
+  and titles for the other specs it names or touches. A project helper that lists them (for example
   `scripts/spec_impact.py`) only helps the author choose. An unflagged `named (Spec)` line whose
   criteria the PR changed still gets its full text.
 - `pr.md`: the pull request description.
@@ -49,7 +52,7 @@ failure modes, security, compatibility and whether text matches code.
 
 ### Card review
 
-A Fable product review (the project's Fable prompt; DeedKit:
+A Fable product review (the project's Fable prompt, for example
 `docs/operations/prompts/fable-product-review.md`) is one round on a product card; it gets the
 owner's request in the owner's words, the card and the proposed user-visible behaviour. No code.
 Fable does not review the finished behaviour; a product PR states what the owner will notice in
@@ -84,7 +87,9 @@ VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <
 ## Rounds
 
 1. One round covers the whole packet: code and criterion text together. One run per round:
-   never a duplicate run; an empty or failed run goes to the orchestrator, not to a rerun.
+   never a duplicate run; an empty or failed run goes to the orchestrator, not to a rerun. The one
+   exception is `bin/review-codex.sh`'s own single retry when Codex is at capacity before any
+   report; it is the same run.
 2. Scope freezes when the round starts; an optional addition goes to a follow-up card. A stop
    order or a change to what the owner keeps reaches the author at once.
 3. The author fixes every finding in one pass and searches for every term the fixes changed.
@@ -102,23 +107,40 @@ VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <
 6. Cards: a contract card gets Astra r1 and at most one scoped recheck on Sol; a small card gets only
    the author's self-check.
 7. A production operation plan gets Astra r1 and at most one Sol recheck before the owner authorizes it.
-8. Process text (AGENTS.md, CLAUDE.md, `.claude/`, the project's operations docs and Tiden CI
-   document, and this harness) gets the author's checklist: each changed rule matches the
-   documents that refer to it, nothing from process.md section 2 changes without the owner's
-   quoted words, process.md and AGENTS.md stay within their word budgets and the PR names the
-   words it replaced. Astra reviews it only when it changes how a gate works.
+8. Process text (AGENTS.md, CLAUDE.md, `.claude/`, skills, brief and prompt templates, the
+   project's operations docs and Tiden CI document, and this harness's documents and templates; its
+   scripts are code and a test-only PR here is AUTO, Routing) is never AUTO (process.md section 3)
+   and gets the author's checklist: each changed rule matches the documents that refer to it,
+   nothing from process.md section 2 changes without the owner's quoted words, process.md and
+   AGENTS.md stay within their word budgets and the PR names the words it replaced. Astra reviews
+   it only when it changes how a gate works. VISION.md is never AUTO either (Routing: one Fable
+   round).
+9. Epic review: when an epic closes after 4 or more merged PRs (its stories and refactor-slot PRs)
+   or a wave that ran stories in parallel, the orchestrator starts one Sol run (Rounds 1, its
+   capacity retry included) once the last squash's `main` run is green, on
+   `git diff <base>..<last squash> -- <paths those PRs changed>`
+   (base: the parent of the first of them to merge). Its packet is `task.md` (the stories with
+   their PRs, the other PRs that changed those paths in the range, the question: only cross-PR
+   issues no single PR review could see, such as contracts that disagree, duplicated or dead code,
+   an epic criterion no PR covers), `diff.patch` and `specs.md` (the epic's specs); no `pr.md` or
+   `context.md`. An epic of process text gets an Opus subagent instead; over the Codex line it
+   waits for the next window as a STATE.md NEXT line. It counts in no PR's rounds and does not
+   hold the close; its verdict line is appended to the archived PLAN block. A blocking or major
+   finding is a current defect (a review branch, tiden.md; first in the queue, Card intake step 5)
+   and an open known risk on the owner page (a revert is one option); never a reopened PR. The
+   orchestrator files or drops minor ones and skips a gap P7 already carded.
 
 ## Codex budget
 
 Codex reviews and the owner's other Codex work share one weekly meter across all projects (owner
-10-21: DeedKit, the Between production bot and fintrack use one Codex subscription); a point is
+10-21: the owner's projects use one Codex subscription); a point is
 one percent. The line is the shared pace, 100% over the meter's window, plus the add-on
 (`CODEX_LINE_OFFSET`, 90), capped at 100. With 90 the line reaches 100 after about a tenth of the
 window (about 17 h of 7 days), so the gate can fire only in a fresh window, when the meter is
 already above 90%; after that every review starts, and risk-path and other reviews differ only
 by reviewer routing. The reason: Codex always stays with a large reserve and limits reset unused
-(owner 10-23; 10-24 «Набавку надо везде сделать»; harness D5 10-24 «не нужно единый лимит, либо
-его надо сильно увеличить»); the line stays as a stop for a meter nearly used up at the window's
+(owner 10-23; 10-24: the add-on in every project; 10-24: no single limit is needed, or it must be
+much larger); the line stays as a stop for a meter nearly used up at the window's
 start, the owner's other Codex work being what can use it up. Every project runs this same line; the
 meter has no per-project split, so a project's share cannot be measured on it
 (incident 10-22: a points line read OVER at 28% after 2.2 of 7 days). A points line
