@@ -191,9 +191,14 @@ Collectors record a shared contact card's names, phone numbers and WhatsApp or
 Telegram ID (`contact`, [SEARCH.md](SEARCH.md#shared-contact-cards)) by default
 (native WhatsApp, the whatsapp-web.js fallback and Telegram read the same
 variable). `ANYMSG_CAPTURE_CONTACT_CARDS=0` on the collector services is the kill
-switch: their contact messages then carry no block, as before. The server always
-accepts, returns and searches a captured card; a server older than the contact
-card release (0f173c2) rejects one, so a rollback past it sets the kill switch first.
+switch for new captures only: contact messages captured after it carry no block,
+as before, while cards already in a capture spool or the native journal keep
+theirs. The server always accepts, returns and searches a captured card. A server,
+collector or drainer older than the contact card release (0f173c2) rejects a
+card and quarantines it, and a full quarantine stops the drain, so rollback
+targets stay at or after that release. Going older needs its own reviewed
+procedure for the pending spools and native journal exports; the variable alone
+is not one.
 
 ### Provider business and verified flags
 
