@@ -15,12 +15,19 @@ health` report (TIDEN-CI.md) fails on a `Done` spec that carries an `[open: live
 
 ## Card intake
 
-Steps 1–4, the template and the scales: harness `tiden.md`. DeedKit's step 5:
+Steps 1–4, the template and the scales: harness `tiden.md`. DeedKit's steps 5 and 6:
 
 5. **Queue.** Current breakages and deadlines first; then about 70% product and 30% engineering
    by Effort, at least one refactor when one is ready, each share by Score. From 10-19 no new
    meta-research or process tooling is queued until ten product cards are delivered, unless the
    owner asks; incident fixes are allowed.
+6. **Component.** The card writer sets each new spec's component on its branch, the component
+   that owns the card's expected paths (ARCHITECTURE.md): `tiden spec update --id <id> --branch
+   <branch> --component-id <uuid>`. After the branch merges, the agent that dispatched the merge
+   (for a pull request's own branch, the agent that merged the pull request, once sync B read it
+   back) reads `componentId` of its specs on main and sets a missing one with `tiden spec update
+   --id <id> --component-id <uuid>`, nothing else on that call (ANYM-506); `tiden spec attribute`
+   is not used, since it adds the worktree's changed files as component edges.
 
 The card template, categories and estimation scales are harness `tiden.md`. DeedKit's Effort
 reference pull requests: 1 = #59, 2 = #66, 3 = #52, 5 = #68, 8 = #40. `History:` names the DK-*
