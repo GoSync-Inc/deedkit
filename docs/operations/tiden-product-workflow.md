@@ -15,7 +15,7 @@ health` report (TIDEN-CI.md) fails on a `Done` spec that carries an `[open: live
 
 ## Card intake
 
-Steps 1–4, the template and the scales: harness `tiden.md`. DeedKit's steps 5 and 6:
+Steps 1–4, the template and the scales: harness `tiden.md`. DeedKit's steps 5 to 7:
 
 5. **Queue.** Current breakages and deadlines first; then about 70% product and 30% engineering
    by Effort, at least one refactor when one is ready, each share by Score. From 10-19 no new
@@ -33,6 +33,10 @@ Steps 1–4, the template and the scales: harness `tiden.md`. DeedKit's steps 5 
    Main sync). A missing component is not set by a `spec update` on main (harness `tiden.md`,
    Commands): the reader reports it to the orchestrator, which lists it in STATE.md and sets it
    in the next maintenance window (TIDEN-CI.md, Main sync).
+
+7. **Feedback link.** A card written from agent feedback carries one line `Feedback: <id>[, <id>]`
+   with the full feedback IDs it covers. The hourly sync links those items to the card by that line
+   only; an ID in History or a quote does not link (ANYM-536, docs/operations/feedback-triage.md).
 
 The card template, categories and estimation scales are harness `tiden.md`. DeedKit's Effort
 reference pull requests: 1 = #59, 2 = #66, 3 = #52, 5 = #68, 8 = #40. `History:` names the DK-*

@@ -477,3 +477,276 @@ def test_a_malformed_pending_record_never_unblocks_writes(tmp_path, record):
                                                         **record)))
     assert apply(tmp_path, prod, {B: disp('declined')}, '--apply') == 1
     assert prod.writes == [] and (state / 'pending.json').exists()
+
+
+# --- auto, status (ANYM-536) -------------------------------------------------------------------------------------
+
+def triage_dir(tmp_path):
+    return tmp_path / 'triage-state'
+
+
+def publish(tmp_path, name, rows, decided=None, legacy=False):
+    """A dispositions file as triage publishes it; `legacy` is the ANYM-473 shape without `decided_at`."""
+    directory = triage_dir(tmp_path) / 'dispositions'
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(json.dumps([dict(d, id=i) if legacy else dict(d, id=i, decided_at=decided.isoformat())
+                                for i, d in rows.items()]))
+    return path
+
+
+def main_of(*specs):
+    return {'requirements': list(specs), 'pagination': {'nextPageToken': '', 'totalCount': len(specs)}}
+
+
+def carded(n, content, status='Active'):
+    return dict(spec(n, status), content=content)
+
+
+def auto(tmp_path, prod, *extra, main=MAIN, run=None, gh=None):
+    def read(*argv):
+        assert argv == ('spec', 'list', '--branch', 'main')
+        return main
+    return sync.main(['auto', '--state', str(state_dir(tmp_path)), '--triage-state', str(triage_dir(tmp_path)), *extra],
+                     ssh=prod.ssh, read=read, live=lambda commit: None, gh=gh or (lambda argv: '[]'),
+                     run=run or prod.run, root=tmp_path, fetch=False)
+
+
+def synced(tmp_path, name):
+    return json.loads((state_dir(tmp_path) / name).read_text())
+
+
+def written_ids(prod):
+    return [flags(argv)['--id'] for argv in prod.writes]
+
+
+def triage_state(tmp_path, ids):
+    path = triage_dir(tmp_path)
+    path.mkdir(parents=True, exist_ok=True)
+    sync.triage.snapshot(path, lambda *argv: {'branches': []} if argv[:2] == ('branch', 'list')
+                         else main_of(spec(10, 'Active')))
+    sync.triage.save(path / 'inbox.json', {i: {'id': i, 'key_id': 'k1', 'principal': 'agent-a',
+                                               'created_at': START.isoformat()} for i in ids})
+    return path
+
+
+def decision(i):
+    return {'id': i, 'classification': 'reported-bug', 'reason': 'contradicts the card',
+            'specs': [{'ref': 'ANYM-10', 'verdict': 'accepted'}], 'primary': 'ANYM-10'}
+
+
+def crash_on_second_call(prod):
+    sent = []
+
+    def run(host, argv):
+        sent.append(argv)
+        if len(sent) == 2:
+            raise KeyboardInterrupt  # the process dies before the second call is answered
+        return prod.run(host, argv)
+    return run
+
+
+# spec: ANYM-536
+def test_auto_lists_a_file_without_decided_at_as_legacy_and_writes_nothing(tmp_path):
+    prod = Prod({A: dict(disp(), at=None)})
+    path = publish(tmp_path, '2026-10-26T051125.282458Z.json', {A: disp('declined', note='hand-made')}, legacy=True)
+    assert auto(tmp_path, prod, '--apply') == 0
+    assert prod.writes == [] and synced(tmp_path, 'last-run.json')['files']['legacy'] == [path.name]
+    assert synced(tmp_path, 'applied.json') == {'files': {}}
+    # It stays a hand `apply`; `auto --retire` records it complete without a write.
+    assert auto(tmp_path, prod, '--retire', str(path)) == 0
+    assert auto(tmp_path, prod, '--apply') == 0
+    assert prod.writes == [] and synced(tmp_path, 'last-run.json')['files']['legacy'] == []
+    assert synced(tmp_path, 'applied.json')['files'][path.name]['retired'] is True
+
+
+# spec: ANYM-536
+def test_a_legacy_decision_republished_after_a_triage_crash_writes_nothing(tmp_path, monkeypatch):
+    state = triage_state(tmp_path, [A])
+    report = sync.triage.report
+
+    def crash(*argv):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(sync.triage, 'report', crash)
+    with pytest.raises(KeyboardInterrupt):
+        sync.triage.record(state, [decision(A)], now=START)  # decided 09:00, crash before publication
+    monkeypatch.setattr(sync.triage, 'report', report)
+    ledger = json.loads((state / 'ledger.json').read_text())
+    del ledger[A]['decided_at']  # an entry written before this card
+    sync.triage.save(state / 'ledger.json', ledger)
+    prod = Prod({A: disp('declined', note='hand correction')})  # at 10:00
+    sync.triage.record(state, [], now=START + timedelta(hours=2))  # published at 11:00
+    (published,) = (state / 'dispositions').iterdir()
+    assert json.loads(published.read_text())[0]['decided_at'] is None
+    assert auto(tmp_path, prod, '--apply') == 0
+    assert prod.writes == [] and synced(tmp_path, 'last-run.json')['files']['legacy'] == [published.name]
+    assert shown(prod, A) == disp('declined', note='hand correction')
+
+
+# spec: ANYM-536
+def test_a_crash_after_the_first_of_two_batches_writes_only_the_second_next_run(tmp_path):
+    prod = Prod({A: dict(disp(), at=None), B: dict(disp(), at=None)})
+    path = publish(tmp_path, 'one.json', {A: disp('accepted', 'ANYM-12'), B: disp('declined')}, START)
+    with pytest.raises(KeyboardInterrupt):
+        auto(tmp_path, prod, '--apply', run=crash_on_second_call(prod))
+    assert written_ids(prod) == [[A]]
+    assert synced(tmp_path, 'applied.json')['files'][path.name]['rows'][A]['outcome'] == 'written'
+    prod.writes.clear()
+    assert auto(tmp_path, prod, '--apply') == 1 and prod.writes == []  # the unknown call blocks writes
+    prod.clock += timedelta(minutes=20)  # past its not-after bound: it can no longer land
+    assert auto(tmp_path, prod, '--apply') == 0
+    assert written_ids(prod) == [[B]] and shown(prod, B) == disp('declined')
+    assert synced(tmp_path, 'applied.json')['files'][path.name]['complete'] is True
+    assert synced(tmp_path, 'last-run.json')['files']['complete'] == [path.name]
+
+
+# spec: ANYM-536
+def test_a_hand_correction_between_runs_is_kept(tmp_path):
+    prod = Prod({A: dict(disp(), at=None), B: dict(disp(), at=None)})
+    path = publish(tmp_path, 'one.json', {A: disp('accepted', 'ANYM-12'), B: disp('declined')}, START)
+    with pytest.raises(KeyboardInterrupt):
+        auto(tmp_path, prod, '--apply', run=crash_on_second_call(prod))
+    prod.rows[B] = dict(disp('accepted', 'ANYM-11', note='hand correction'), at=prod.tick())
+    prod.writes.clear()
+    prod.clock += timedelta(minutes=20)
+    assert auto(tmp_path, prod, '--apply') == 0
+    assert prod.writes == [] and shown(prod, B) == disp('accepted', 'ANYM-11', note='hand correction')
+    entry = synced(tmp_path, 'applied.json')['files'][path.name]
+    assert entry['rows'][B]['outcome'] == 'superseded' and entry['complete'] is True
+
+
+# spec: ANYM-536
+def test_a_row_republished_after_apply_and_a_hand_correction_writes_nothing(tmp_path):
+    state = triage_state(tmp_path, [A])
+    sync.triage.record(state, [decision(A)], now=START)
+    ledger = json.loads((state / 'ledger.json').read_text())
+    ledger[A]['reported'] = False  # triage stopped after publication, before it marked the entry reported
+    sync.triage.save(state / 'ledger.json', ledger)
+    prod = Prod({A: dict(disp(), at=None)})
+    assert auto(tmp_path, prod, '--apply') == 0
+    assert shown(prod, A) == disp('accepted', 'ANYM-10', note='contradicts the card')
+    prod.rows[A] = dict(disp('declined', 'ANYM-10', note='hand correction'), at=prod.tick())
+    sync.triage.record(state, [], now=START + timedelta(hours=2))  # the same row under a newer file name
+    first, second = sorted((state / 'dispositions').iterdir())
+    assert json.loads(second.read_text())[0]['decided_at'] == START.isoformat()
+    prod.writes.clear()
+    assert auto(tmp_path, prod, '--apply') == 0
+    assert prod.writes == [] and shown(prod, A) == disp('declined', 'ANYM-10', note='hand correction')
+    files = synced(tmp_path, 'applied.json')['files']
+    assert files[second.name]['rows'][A]['outcome'] == 'superseded' and files[second.name]['complete'] is True
+
+
+# spec: ANYM-536
+def test_a_guard_window_skip_completes_on_the_next_run(tmp_path, capsys):
+    prod = Prod({A: disp('received', note='earlier')})
+    prod.rows[A]['at'] = START + timedelta(hours=1, minutes=1) - timedelta(seconds=5)  # 5 s before the head
+    path = publish(tmp_path, 'one.json', {A: disp('declined')}, START + timedelta(hours=1, minutes=1))
+    assert auto(tmp_path, prod, '--apply') == 0
+    assert prod.writes == [] and f'{A} received -> no change (changed during read)' in capsys.readouterr().out
+    assert synced(tmp_path, 'last-run.json')['files']['open'] == [path.name]
+    assert auto(tmp_path, prod, '--apply') == 0
+    assert written_ids(prod) == [[A]] and shown(prod, A) == disp('declined')
+    assert synced(tmp_path, 'last-run.json')['files']['complete'] == [path.name]
+
+
+# spec: ANYM-536
+def test_an_edited_ledgered_file_is_refused_while_a_second_file_applies(tmp_path, capsys):
+    prod = Prod({A: dict(disp(), at=None), B: dict(disp(), at=None)})
+    first = publish(tmp_path, 'one.json', {A: disp('declined')}, START)
+    assert auto(tmp_path, prod, '--apply') == 0 and written_ids(prod) == [[A]]
+    publish(tmp_path, 'one.json', {A: disp('declined', note='edited later')}, START)
+    publish(tmp_path, 'two.json', {B: disp('accepted', 'ANYM-12')}, START)
+    prod.writes.clear()
+    assert auto(tmp_path, prod, '--apply') == 1
+    assert written_ids(prod) == [[B]] and shown(prod, A) == disp('declined')
+    report = synced(tmp_path, 'last-run.json')
+    assert list(report['files']['refused']) == [first.name] and f'REFUSED {first.name}' in capsys.readouterr().err
+    assert report['exit'] == 1 and report['files']['complete'] == ['two.json']
+
+
+# spec: ANYM-536
+def test_an_auto_dry_run_records_nothing_and_hand_apply_takes_a_timed_file(tmp_path, capsys):
+    prod = Prod({A: dict(disp(), at=None)})
+    path = publish(tmp_path, 'one.json', {A: disp('declined')}, START)
+    assert auto(tmp_path, prod) == 0
+    assert prod.writes == [] and 'dry run' in capsys.readouterr().out
+    assert sorted(p.name for p in state_dir(tmp_path).iterdir()) == ['lock']
+    assert sync.main(['apply', '--dispositions', str(path), '--state', str(state_dir(tmp_path)), '--apply'],
+                     ssh=prod.ssh, run=prod.run) == 0
+    assert shown(prod, A) == disp('declined')
+
+
+LINK = main_of(carded(30, f'Problem: x\nFeedback: {A}, {B}\nHistory: owner 10-26'),
+               carded(31, f'History: carded from {C}\n> Feedback: {E}\nFeedback: {D}'),
+               carded(32, f'Feedback: {D}'))
+
+
+# spec: ANYM-536
+def test_a_feedback_line_on_exactly_one_card_links_and_other_mentions_do_not(tmp_path):
+    prod = Prod({i: disp('received', note='proposed new card agent-platform') for i in (A, B, C, D, E)})
+    assert auto(tmp_path, prod, '--apply', main=LINK) == 0
+    note = 'Carded as ANYM-30; it follows that card.'
+    assert written_ids(prod) == [[A, B]]
+    assert shown(prod, A) == shown(prod, B) == disp('accepted', 'ANYM-30', note=note)
+    for unlinked in (C, D, E):  # an ID in History or a quote, and an ID on two cards
+        assert prod.rows[unlinked]['status'] == 'received'
+    report = synced(tmp_path, 'last-run.json')
+    assert report['reasons']['several cards'] == [{'feedback': D, 'card': None}]
+    assert [row['feedback'] for row in report['waiting_for_card']] == [C, E]
+    assert 'proposed new card' not in (state_dir(tmp_path) / 'last-run.json').read_text()  # no note text
+
+
+# spec: ANYM-536
+def test_a_card_seen_then_absent_is_missing_and_a_never_seen_card_waits_for_main(tmp_path):
+    prod = Prod({A: disp('accepted', 'ANYM-40'), B: disp('accepted', 'ANYM-41')})
+    assert auto(tmp_path, prod, '--apply', main=main_of(spec(40, 'Active'))) == 0
+    assert set(synced(tmp_path, 'cards.json')['seen']) == {'ANYM-40'}
+    assert auto(tmp_path, prod, '--apply', main=main_of(spec(39, 'Active'))) == 0
+    report = synced(tmp_path, 'last-run.json')
+    assert report['reasons']['card missing'] == [{'feedback': A, 'card': 'ANYM-40'}]
+    assert report['waiting_for_main'] == [{'feedback': B, 'card': 'ANYM-41', 'age_hours': 1.0}]
+    assert prod.writes == [] and prod.rows[A]['status'] == prod.rows[B]['status'] == 'accepted'
+
+
+# spec: ANYM-536
+@pytest.mark.parametrize('bad', ['truncated', 'not-json'])
+def test_a_failed_tiden_read_with_a_queued_disposition_writes_and_records_nothing(tmp_path, bad):
+    prod = Prod({A: dict(disp(), at=None)})
+    publish(tmp_path, 'one.json', {A: disp('declined')}, START)
+    if bad == 'truncated':
+        main = {'requirements': [spec(10, 'Done')], 'pagination': {'nextPageToken': 'more', 'totalCount': 2}}
+        assert auto(tmp_path, prod, '--apply', main=main) == 1
+    else:
+        def read(*argv):
+            raise sync.Refused('tiden spec list: not JSON')
+        assert sync.main(['auto', '--apply', '--state', str(state_dir(tmp_path)), '--triage-state',
+                          str(triage_dir(tmp_path))], ssh=prod.ssh, read=read, run=prod.run) == 1
+    assert prod.writes == [] and not (state_dir(tmp_path) / 'applied.json').exists()
+    assert not (state_dir(tmp_path) / 'cards.json').exists()
+    report = synced(tmp_path, 'last-run.json')
+    assert report['exit'] == 1 and report['error'] and report['last_ok'] is None
+
+
+# spec: ANYM-536
+def test_status_exits_1_when_the_last_good_run_is_stale_or_a_call_blocks_writes(tmp_path, capsys):
+    prod = Prod({})
+    state = str(state_dir(tmp_path))
+    assert sync.main(['status', '--state', state]) == 1  # no run yet
+    assert auto(tmp_path, prod, '--apply') == 0
+    assert sync.main(['status', '--state', state]) == 0
+    report = synced(tmp_path, 'last-run.json')
+    later = datetime.fromisoformat(report['last_ok']) + timedelta(hours=3, minutes=1)
+    capsys.readouterr()
+    assert sync.status_report(state_dir(tmp_path), now=later) == 1
+    assert 'ATTENTION no exit-0' in capsys.readouterr().err
+    # A failed run keeps the last good time; a call with an unknown outcome blocks writes.
+    publish(tmp_path, 'one.json', {A: disp('declined')}, START)
+
+    def timeout(host, argv):
+        raise sync.Uncertain('TimeoutExpired')
+    assert auto(tmp_path, prod, '--apply', run=timeout) == 1
+    blocked = synced(tmp_path, 'last-run.json')
+    assert blocked['last_ok'] == report['last_ok'] and blocked['pending']['ids'] == [A]
+    assert sync.main(['status', '--state', state]) == 1
+    assert 'ATTENTION a call with an unknown outcome blocks writes' in capsys.readouterr().err
+    assert oct((state_dir(tmp_path) / 'last-run.json').stat().st_mode & 0o777) == '0o600'

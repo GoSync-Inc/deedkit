@@ -1037,8 +1037,9 @@ no verdict (default budget 4 hours, because the timer starts no deploy from 13:0
 poll runs one constant ssh command that sends a fixed read-only script, which prints only `sha`,
 `status`, `reason` and `at` of `current.json`, `http-current.json` and `deploy.json`, the pause
 reason and the names of unfinished and serving attempts. The tool reads receipts; it does not probe containers.
-After `LIVE`, `python3 scripts/feedback_sync.py follow` (dry run, then `--apply`) moves agent
-feedback whose card that release delivers (ANYM-473, docs/operations/feedback-triage.md).
+After `LIVE`, the hourly `feedback_sync.py auto` moves agent feedback whose card that release
+delivers (ANYM-473, ANYM-536); run `python3 scripts/feedback_sync.py status` and, if it exits 1,
+fix the sync (docs/operations/feedback-triage.md, Hourly sync).
 
 ## Admin CLI
 
