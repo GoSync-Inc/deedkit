@@ -10,11 +10,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
+import tarfile
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "services/gateway/src"))
@@ -50,6 +52,19 @@ def options(args: list[str]) -> dict:
 def expiry(state: dict, service: str, days: int) -> str:
     hours = state["offset_hours"].get(service, 0)
     return (datetime.now(timezone.utc) + timedelta(days=days, hours=-hours)).replace(microsecond=0).isoformat()
+
+
+def extended(state: dict, service: str, record: dict, o: dict, **public) -> dict:
+    """extend-key and extend-agent: now + days by the store's own clock; never earlier, never a revoked or expired
+    record (ACCESS.md "Extending a key")."""
+    new = expiry(state, service, int(o["days"][0]))
+    if record["revoked"] or datetime.fromisoformat(record["expires_at"]) <= datetime.now(timezone.utc):
+        raise Refusal("key_revoked")
+    if datetime.fromisoformat(new) < datetime.fromisoformat(record["expires_at"]):
+        raise Refusal("key_lifetime_would_shorten")
+    previous, record["expires_at"] = record["expires_at"], new
+    state["extended"].append(next(iter(public.values())))
+    return {**public, "previous_expires_at": previous, "expires_at": new}
 
 
 def handle(state: dict, service: str, args: list[str], stdin: str):
@@ -121,6 +136,8 @@ def handle(state: dict, service: str, args: list[str], stdin: str):
                 return answer
             keys[o["key-id"][0]]["revoked"] = True
             return {"revoked": 1}
+        if command == "extend-key":
+            return answer if "check" in o else extended(state, service, keys[o["key-id"][0]], o, key_id=o["key-id"][0])
     if service == "calendar":
         agents = state["calendar"]["agents"]
 
@@ -169,6 +186,8 @@ def handle(state: dict, service: str, args: list[str], stdin: str):
                 return answer
             agents[o["id"][0]]["revoked"] = True
             return {"revoked": True}
+        if command == "extend-agent":
+            return answer if "check" in o else extended(state, service, agents[o["id"][0]], o, principal_id=o["id"][0])
     raise Refusal(f"unknown command {command}")
 
 
@@ -227,11 +246,32 @@ class Docker:
 
     def __init__(self, containers: list[dict], images: dict):
         self.containers, self.images, self.calls = containers, images, []
+        self.bearer = lambda container, token: 401  # a gateway's answer to MCP initialize; Site sets the policy's
+        self.inside = {}  # container ID: the policy bytes it reads, when not its mount's file (a stale copy)
+        self.probes = []  # (container ID, number of tokens on stdin) of each bearer probe
 
-    def __call__(self, args: list[str], name: str | None = None) -> subprocess.CompletedProcess:
+    def __call__(self, args: list[str], name: str | None = None, data: bytes | None = None
+                 ) -> subprocess.CompletedProcess:
         self.calls.append(list(args))
         out, code = b"", 0
-        if args[0] == "ps":
+        if args[0] == "cp":
+            ident, path = args[1].split(":", 1)
+            found = next(c for c in self.containers if c["Id"] == ident)
+            mount = next(m for m in found["Mounts"] if path.startswith(m["Destination"] + "/"))
+            content = self.inside.get(ident) or (Path(mount["Source"]) / PurePosixPath(path).relative_to(
+                mount["Destination"])).read_bytes()
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w") as archive:
+                member = tarfile.TarInfo(PurePosixPath(path).name)
+                member.size = len(content)
+                archive.addfile(member, io.BytesIO(content))
+            out = buffer.getvalue()
+        elif args[0] == "run" and any(part.startswith("container:") for part in args):
+            ident = next(part for part in args if part.startswith("container:")).split(":", 1)[1]
+            tokens = (data or b"").decode().split()
+            self.probes.append((ident, len(tokens)))
+            out = json.dumps({"statuses": [self.bearer(ident, token) for token in tokens]}).encode() + b"\n"
+        elif args[0] == "ps":
             out = "\n".join(c["Id"] for c in self.containers).encode()
         elif args[0] == "inspect":
             out = json.dumps([c for c in self.containers if c["Id"] in args[1:]]).encode()
@@ -276,7 +316,7 @@ class Site:
                        "tokens": str(root / "admin-tokens"), "calls_lock": str(root / "locks/calls-registry.lock"),
                        "paths": {"/run/deedkit/keys": str(self.keys), "/run/secrets": str(self.voice)},
                        "messaging": ["operator"], "calendar": ["operator"]}
-        state = {"messaging": {"principals": {}, "keys": {}}, "calendar": {"agents": {}}, "log": [], "issued": [],
+        state = {"messaging": {"principals": {}, "keys": {}}, "calendar": {"agents": {}}, "log": [], "issued": [], "extended": [],
                  "violations": [], "missing": {}, "fail": {}, "schema": {}, "offset_hours": {}}
         self.principals, self.registry = [], []
         for name in ("src", "other"):
@@ -303,12 +343,24 @@ class Site:
         self.operator = Operator(private(root / "operator.json", state))
         self.gateway = container("deedkit-gateway-1", "gateway:new", (self.gw, "/etc/deedkit-gateway"),
                                  (self.keys, "/run/deedkit/keys"))
+        self.gateway["Config"]["Cmd"] = ["--policy", "/etc/deedkit-gateway/policy.json", "--port", "13240"]
         self.voice_container = container("personal-os-voice-voice-1", "voice:1", (self.voice, "/run/secrets"))
         self.docker = Docker([self.gateway, self.voice_container, container("deedkit-api-1", "api:1")],
                              {"gateway:new": gateway_rule(strict=False), "gateway:old": gateway_rule(strict=True),
                               "voice:1": registry_rule})
+        self.docker.bearer = self.answer
+        # The revoke probe's control: a live bystander's own gateway token (ANYM-497).
+        self.config["probe_control"] = str(private(root / "admin/control.token", self.tokens["other-gateway"] + "\n"))
         self.host_tool(monkeypatch)
         private(root / "admin/config.json", self.config)
+
+    def answer(self, container: str, token: str) -> int:
+        """The gateway's MCP initialize status for `token` under the policy file it reads now."""
+        rows = json.loads(Path(self.config["policy"]).read_text())["principals"]
+        row = next((r for r in rows if r["key_sha256"] == sha(token)), None)
+        live = row is not None and row["enabled"] and datetime.fromisoformat(row["expires_at"]) > datetime.now(
+            timezone.utc)
+        return 200 if live else 401
 
     def secret(self, name: str) -> str:
         self.tokens[name] = f"synthetic-{name}-" + sha(name)[:40]

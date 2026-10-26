@@ -5,7 +5,9 @@
 messaging `list-keys --all` / `key-info`, calendar `list-agents` / `agent-info`) into one row per gateway
 principal, and reports where the stores disagree. It is read-only: no lock, no write, safe during a call.
 `key label` keeps a human label in a private admin file that no service reads, so the enforced policy schema
-never changes (an older gateway image rejects unknown fields). Host only, standard library only.
+never changes (an older gateway image rejects unknown fields). `key issue --like` (ANYM-496), `key extend`
+and `key revoke` (ANYM-497) and `undo` write every store under the shared rules of ANYM-493. Host only, standard
+library only.
 
 Secrets: key files are read here and passed to the operator commands on stdin, never in argv, environment,
 output or logs; the calls registry is matched by hashing in memory. Only public IDs are printed.
@@ -19,6 +21,7 @@ import fcntl
 import hashlib
 import hmac
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -28,8 +31,10 @@ import shlex
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 CONFIG = Path("/opt/deedkit/deploy/private/admin/config.json")
@@ -540,10 +545,11 @@ def dockers(config: dict):
     """Docker for inspection and one-shot check containers only (rule (d)): never a service container."""
     prefix = config.get("docker", ["docker"])
 
-    def call(args: list[str], name: str | None = None) -> subprocess.CompletedProcess:
+    def call(args: list[str], name: str | None = None, data: bytes | None = None) -> subprocess.CompletedProcess:
+        # A secret only ever on stdin (rule (g)); no stdin at all otherwise.
+        feed = {"input": data} if data is not None else {"stdin": subprocess.DEVNULL}
         try:
-            return subprocess.run(prefix + args, stdin=subprocess.DEVNULL, capture_output=True, timeout=TIMEOUT,
-                                  check=False)
+            return subprocess.run(prefix + args, capture_output=True, timeout=TIMEOUT, check=False, **feed)
         except OSError as exc:
             raise AdminError(f"docker: {type(exc).__name__}; nothing changed") from None
         except BaseException as exc:
@@ -595,6 +601,7 @@ def consumers(containers: list[dict], path: str, what: str) -> list[dict]:
             source, mount = best
             found.append({"id": container.get("Id"), "name": str(container.get("Name", "")).lstrip("/"),
                           "image": container.get("Image"), "user": (container.get("Config") or {}).get("User") or "",
+                          "command": (container.get("Config") or {}).get("Cmd") or [],
                           "source": mount["Source"], "mount": mount["Destination"],
                           "target": str(PurePosixPath(mount["Destination"]) / os.path.relpath(folder, source))})
     if not found:
@@ -1145,10 +1152,11 @@ def run_issue(config, run, docker, host, journal: Journal, scope, files, tokens,
 
 
 def references(config: dict, policy: Document, registry: Document | None, new: str, data: dict,
-               tokens: dict) -> list[str]:
+               tokens: dict, calls_id: str | None = None) -> list[str]:
     """Rule (f): principals other than this operation's own entry that use a credential it created, by pin, key file,
     archive configuration or archive token, compared by the token itself (a copy in another file counts). A reference
-    that cannot be read cannot be ruled out, so it counts too."""
+    that cannot be read cannot be ruled out, so it counts too. `calls_id` is the principal's own calls entry when its
+    ID differs from the gateway principal's."""
     digests = {hashlib.sha256(token.encode()).hexdigest() for token in tokens.values()}
     paths = set(data["files"].values())
 
@@ -1168,7 +1176,7 @@ def references(config: dict, policy: Document, registry: Document | None, new: s
             if used is not False:
                 users.add(str(entry.get("id")) + ("" if used else " (unreadable key file)"))
     for entry in registry.value["principals"] if registry is not None else []:
-        if entry.get("id") == new:
+        if entry.get("id") == (calls_id or new):
             continue
         used = entry.get("key_sha256") in digests
         if entry.get("archive_config"):
@@ -1204,7 +1212,13 @@ def undo(config: dict, run, docker, host_factory, operation: str) -> dict:
     its operation IDs, delete its key files. Later changes by others stay; a conflict refuses."""
     journal = Journal(config, operation)
     data = journal.load()
-    if data.get("command", {}).get("verb") != "issue":
+    verb = data.get("command", {}).get("verb")
+    if verb == "extend":
+        raise AdminError(f"operation {operation} is an extend: expiries never move earlier, so it has no undo "
+                         "(to end the key, run `deedkit admin key revoke`); nothing changed")
+    if verb == "revoke":
+        return undo_revoke(config, run, docker, host_factory, journal)
+    if verb != "issue":
         raise AdminError(f"operation {operation} is not an issue; nothing changed")
     new = data["command"]["id"]
     result = {"operation": operation, "principal": new, "undone": True,
@@ -1296,6 +1310,472 @@ def undo(config: dict, run, docker, host_factory, operation: str) -> dict:
     return {**result, **data["undo"], "next": f"on the Mac: claude mcp remove deedkit-{new}"}
 
 
+# --- `key extend` and `key revoke` (ANYM-497) under the same shared rules -----------------------------------------
+
+
+EXTEND_DAYS = (1, 183)  # ANYM-497: within every store's extend limit (365) and the calendar's issue lifetime (183)
+STEPS = ("messaging", "messaging-archive", "calendar")  # the backend records, in their order
+ORDER = ("gateway", "messaging", "messaging-archive", "calendar", "calls")
+DOCUMENT_STEPS = {"gateway": "gateway policy", "calls": "calls registry"}
+# One MCP initialize per bearer on stdin, from a disposable container in the gateway's own network namespace; prints
+# only the HTTP statuses (0 for no answer), never a reply body.
+PROBE = r"""
+import json, sys, urllib.error, urllib.request
+host, port = sys.argv[1], int(sys.argv[2])
+body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "deedkit-admin", "version": "1"}}})
+opener, statuses = urllib.request.build_opener(urllib.request.ProxyHandler({})), []
+for token in sys.stdin.read().split():
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/mcp", data=body.encode(), method="POST", headers={
+        "Host": host, "Authorization": "Bearer " + token, "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream"})
+    try:
+        with opener.open(request, timeout=10) as response:
+            statuses.append(response.status)
+    except urllib.error.HTTPError as exc:
+        statuses.append(exc.code)
+    except OSError:
+        statuses.append(0)
+print(json.dumps({"statuses": statuses}))
+"""
+
+
+def documents(config: dict, docker) -> tuple[Document, Document | None, dict]:
+    policy = Document(config["policy"], "gateway policy")
+    registry = Document(config["calls_registry"], "calls registry") if config.get("calls_registry") else None
+    containers = running(docker)
+    found = {"policy": consumers(containers, config["policy"], "gateway policy")}
+    if registry is not None:
+        found["registry"] = consumers(containers, config["calls_registry"], "calls registry")
+    return policy, registry, found
+
+
+def record_of(run, service: str, token: str) -> dict:
+    """The store's own public record of a token (rule (h): its lookup answers in check mode first)."""
+    checked(run, service, LOOKUP[service], (token + "\n").encode())
+    record = one(run, service, LOOKUP[service], (token + "\n").encode())
+    found = record if record.get("found") else None
+    return {"public_id": public_id(service, record) if found else None,
+            "expires_at": record.get("expires_at") if found else None,
+            "status": status(found, datetime.now(timezone.utc))}
+
+
+def holdings(config: dict, run, policy: Document, registry: Document | None, principal: str) -> dict:
+    """The principal's credential in every store, found through its own key files: each store's public ID, expiry
+    and state. The tokens and their host files stay in memory (lookups and rule (f)), never in the journal."""
+    entry = policy.entry(principal)
+    if entry is None:
+        raise AdminError(f"no gateway principal {principal!r}; nothing changed")
+    credentials = entry.get("credentials") if isinstance(entry.get("credentials"), dict) else {}
+    if set(credentials) - set(BACKENDS) or not all(isinstance(c, dict) for c in credentials.values()):
+        raise AdminError(f"{principal!r} has a credential this command does not know; nothing changed")
+    now, tokens, files, calls = datetime.now(timezone.utc), {}, {}, None
+    stores = {"gateway": {"public_id": principal, "expires_at": entry.get("expires_at"), "status": status(
+        {"revoked": entry.get("enabled") is not True, "expires_at": entry.get("expires_at")}, now)}}
+    for backend, credential in sorted(credentials.items()):
+        token = read_token(config, credential.get("key_file", ""))
+        if token is None or not pinned(token, credential.get("key_sha256")):
+            raise AdminError(f"the {backend} key file of {principal!r} is unreadable or does not match its pin, so its "
+                             "credential cannot be identified; nothing changed")
+        tokens[backend], files[backend] = token, host_path(config, credential["key_file"])
+    for backend in ("messaging", "calendar"):
+        if backend in tokens:
+            stores[backend] = record_of(run, backend, tokens[backend])
+    if "calls" in tokens:
+        if registry is None:
+            raise AdminError(f"{principal!r} has a calls key but no calls registry is configured; nothing changed")
+        digest = hashlib.sha256(tokens["calls"].encode()).hexdigest()
+        calls = next((row for row in registry.value["principals"] if row.get("key_sha256") == digest), None)
+        if calls is None:
+            raise AdminError(f"the calls key of {principal!r} has no calls registry entry; nothing changed")
+        stores["calls"] = {"public_id": calls.get("id"), "expires_at": calls.get("expires_at"), "status": status(
+            {"revoked": calls.get("enabled") is not True, "expires_at": calls.get("expires_at")}, now)}
+        if calls.get("archive_config"):
+            archive = host_path(config, calls["archive_config"])
+            try:
+                settings = json.loads(read_private(archive, 65536))
+                token = read_token(config, settings["token_file"])
+            except (OSError, ValueError, KeyError, TypeError, AdminError):
+                token = None
+            if token is None:
+                raise AdminError(f"the calls archive configuration of {principal!r} is unreadable; nothing changed")
+            tokens["archive-token"] = token
+            files.update({"archive-config": archive, "archive-token": host_path(config, settings["token_file"])})
+            stores["messaging-archive"] = record_of(run, "messaging", token)
+    return {"entry": entry, "calls": calls, "stores": stores, "tokens": tokens, "files": files}
+
+
+def exclusive(config: dict, policy: Document, registry: Document | None, principal: str, held: dict) -> None:
+    """Rule (f): extend and revoke act only on credentials no other principal references (directly or through a calls
+    archive configuration); an unreadable reference cannot be ruled out and counts."""
+    if users := references(config, policy, registry, principal, {"files": held["files"]}, held["tokens"],
+                           held["calls"].get("id") if held["calls"] else None):
+        raise AdminError(f"a credential of {principal!r} is also used by " + ", ".join(users)
+                         + ": extend and revoke act only on a credential one principal holds; nothing changed")
+
+
+def resume(config: dict, args, command: dict) -> Journal:
+    """The operation's journal: a new ID, or a rerun of `--operation` with the same arguments."""
+    slug = re.sub(r"[^a-z0-9.-]+", "-", args.principal.lower()).strip("-.")[:50] or "principal"
+    operation = args.operation or (f"{command['verb']}-{slug}-{datetime.now(timezone.utc):%Y%m%dt%H%M%S}-"
+                                   f"{secrets.token_hex(3)}")
+    journal = Journal(config, operation)
+    if args.operation:
+        data = journal.load()
+        if data.get("command") != command:
+            raise AdminError(f"operation {operation} was started with other arguments; nothing changed")
+        if data.get("state") in ("undoing", "undone"):
+            raise AdminError(f"operation {operation} was undone; nothing changed")
+    return journal
+
+
+def public_ids(held: dict) -> dict:
+    return {name: row["public_id"] for name, row in held["stores"].items()}
+
+
+def stopped(journal: Journal, exc: Exception, undo: bool = True) -> Stopped:
+    reason = str(exc) if isinstance(exc, AdminError) else type(exc).__name__
+    journal.data.update(state="failed", error=reason)
+    journal.save()
+    operation = journal.data["operation"]
+    rerun = (f"rerun the same command with `--operation {operation}` (a step already sent is read back from its "
+             "store, never repeated blind)")
+    return Stopped(f"operation {operation} stopped: {reason}. "
+                   + (f"Either {rerun}, or run `deedkit admin undo {operation}`" if undo else rerun.capitalize()))
+
+
+def swap(config: dict, docker, journal: Journal, name: str, what: str, ident: str, change, found: list[dict],
+         extra: list[str], expect: str | None = None) -> bool:
+    """One policy or registry entry changed by `change`, as a compare-and-swap: the entry as this step first read it
+    ("before", or `expect`) or as it wrote it ("entry"); anything else is someone else's change and refuses."""
+    document = Document(config["policy" if what == "policy" else "calls_registry"], name)
+    current = document.entry(ident)
+    if current is None:
+        raise AdminError(f"the {name} entry {ident!r} is gone")
+    step, digest = journal.data["steps"].get(name), entry_digest(current)
+    if step is not None and digest == step["entry"]:
+        if step["state"] != "done":
+            journal.step(name, "done")
+        return step["changed"]
+    if digest != (step["before"] if step is not None else expect or digest):
+        raise AdminError(f"the {name} entry {ident!r} changed since this operation read it")
+    after = change(current)
+    journal.step(name, "started", before=digest, entry=entry_digest(after), changed=after != current)
+    if after != current:
+        replace(config, docker, document, document.with_entry(ident, after), what, found, extra)
+        checkpoint(name, "renamed")
+    journal.step(name, "done")
+    return after != current
+
+
+def backend_write(step: str, row: dict, argv: list[str]) -> tuple[str, list[str]]:
+    service = "calendar" if step == "calendar" else "messaging"
+    head = {"extend": {"messaging": ["extend-key", "--key-id"], "calendar": ["extend-agent", "--id"]},
+            "revoke": {"messaging": ["revoke-key", "--key-id"], "calendar": ["revoke-agent", "--id"]}}[argv[0]]
+    return service, [*head[service], str(row["public_id"]), *argv[1:]]
+
+
+def extend(config: dict, run, docker, host_factory, args) -> dict:
+    principal, days = args.principal, args.days
+    if not EXTEND_DAYS[0] <= days <= EXTEND_DAYS[1]:
+        raise AdminError(f"--days is {EXTEND_DAYS[0]}-{EXTEND_DAYS[1]} for every store; nothing changed")
+    command = {"verb": "extend", "id": principal, "days": days}
+    journal = resume(config, args, command)
+    if journal.data.get("state") == "done":
+        return journal.data["result"]
+    host = None if args.dry_run else host_factory()
+    with ExitStack() as held:
+        if host is not None:
+            held.enter_context(guarded(config, host, docker))
+        policy, registry, found = documents(config, docker)
+        target = holdings(config, run, policy, registry, principal)
+        exclusive(config, policy, registry, principal, target)
+        if args.operation and {name: row["public_id"] for name, row in journal.data.get("stores", {}).items()} \
+                != public_ids(target):
+            raise AdminError(f"the credentials of {principal!r} changed since operation {journal.data['operation']} "
+                             "started; nothing changed")
+        bound = journal.data.get("bound") or (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+        steps = journal.data.get("steps", {})
+        for name in (name for name in ORDER if name in target["stores"]):
+            row, step = target["stores"][name], DOCUMENT_STEPS.get(name, name)
+            if steps.get(step, {}).get("state") == "done":
+                continue
+            if row["status"] != "live":
+                raise AdminError(f"the {name} credential is {row['status']}: extend refuses a revoked or expired "
+                                 "credential (issue a new key instead); nothing changed")
+            # A step already sent is read back from its store on a rerun; only an unsent one is compared.
+            if step not in steps and instant(row["expires_at"]) > instant(bound):
+                raise AdminError(f"the {name} credential ends {row['expires_at']}, later than {days} days from now, "
+                                 "so extend would move it earlier (expiries never move earlier); nothing changed")
+        writes = [(step, *backend_write(step, target["stores"][step], ["extend", "--days", str(days)]))
+                  for step in STEPS if step in target["stores"]]
+        for _, service, argv in writes:
+            checked(run, service, argv)
+        if args.dry_run:
+            return {"dry_run": True, "principal": principal, "days": days,
+                    "steps": [step for step, *_ in writes] + [DOCUMENT_STEPS[name] for name in ("calls", "gateway")
+                                                               if name in target["stores"]],
+                    "stores": [{"store": name, "public_id": target["stores"][name]["public_id"],
+                                "previous_expires_at": target["stores"][name]["expires_at"],
+                                "planned_expires_at": bound} for name in ORDER if name in target["stores"]],
+                    "note": "the gateway ends at the earliest expiry the stores read back"}
+        preflight(config, docker, policy, "policy", found["policy"], rollback_images(host))
+        if target["calls"] is not None and registry is not None:
+            preflight(config, docker, registry, "registry", found["registry"], [])
+        if not args.operation:
+            journal.create({"version": 1, "operation": journal.path.stem, "command": command, "state": "running",
+                            "bound": bound, "steps": {},
+                            "stores": {name: {"public_id": row["public_id"], "previous_expires_at": row["expires_at"]}
+                                       for name, row in target["stores"].items()}})
+        try:
+            return run_extend(config, run, docker, host, journal, target, writes, found)
+        except (AdminError, OSError) as exc:
+            raise stopped(journal, exc, undo=False) from None
+
+
+def run_extend(config, run, docker, host, journal: Journal, target: dict, writes, found) -> dict:
+    data, principal = journal.data, journal.data["command"]["id"]
+    for step, service, argv in writes:
+        if data["steps"].get(step, {}).get("state") == "done":
+            continue
+        previous = instant(data["stores"][step]["previous_expires_at"])
+        token = target["tokens"]["archive-token" if step == "messaging-archive" else step]
+        # A step sent before a crash committed when the store's expiry moved since the journal's read.
+        if data["steps"].get(step) is None or instant(target["stores"][step]["expires_at"]) == previous:
+            journal.step(step, "started", public_id=argv[2])
+            ask(run, service, argv)
+            checkpoint(step, "committed")
+        row = record_of(run, service, token)
+        if row["status"] != "live" or row["public_id"] != argv[2] or instant(row["expires_at"]) <= previous:
+            raise AdminError(f"{service}: {argv[0]} did not read back a later expiry for {argv[2]}")
+        journal.step(step, "done", expires_at=row["expires_at"])
+    after = {step: data["steps"][step]["expires_at"] for step, *_ in writes}
+    if target["calls"] is not None:
+        swap(config, docker, journal, "calls registry", "registry", target["calls"]["id"],
+             lambda entry: {**entry, "expires_at": data["bound"]}, found["registry"], [])
+        after["calls"] = data["bound"]
+    # The gateway never outlives a backend: it ends at the earliest expiry read back, whatever the delays or clocks.
+    after["gateway"] = min([data["bound"], *after.values()], key=instant)
+    swap(config, docker, journal, "gateway policy", "policy", principal,
+         lambda entry: {**entry, "expires_at": after["gateway"]}, found["policy"], rollback_images(host))
+    data["result"] = {
+        "operation": data["operation"], "principal": principal, "days": data["command"]["days"],
+        "expires_at": after["gateway"],
+        "stores": [{"store": name, "public_id": data["stores"][name]["public_id"],
+                    "previous_expires_at": data["stores"][name]["previous_expires_at"], "expires_at": after[name]}
+                   for name in ORDER if name in data["stores"]],
+        "note": "tokens and key hashes are unchanged, so no client changes; an extend has no undo"}
+    data["state"] = "done"
+    journal.save()
+    return data["result"]
+
+
+def bearer(docker, gateway: dict, public_url: str, tokens: list[str]) -> list[int]:
+    """The gateway's HTTP status for one MCP initialize per token, from a disposable container in its network
+    namespace; the tokens go on stdin only."""
+    command = [str(part) for part in gateway["command"]]
+    value = {part: command[i + 1] for i, part in enumerate(command[:-1]) if part in ("--port", "--public-url")}
+    port, origin = value.get("--port", ""), urlsplit(value.get("--public-url", public_url)).netloc
+    if not port.isdigit() or not origin:
+        raise AdminError(f"{gateway['name']} names no --port or public URL, so no bearer probe can reach it")
+    name = "deedkit-admin-" + uuid4().hex[:12]
+    done = docker(["run", "--rm", "-i", "--name", name, "--network", f"container:{gateway['id']}", "--read-only",
+                   "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pull", "never",
+                   *(["--user", gateway["user"]] if gateway["user"] else []),
+                   "--entrypoint", "python", gateway["image"], "-c", PROBE, origin, port], name,
+                  ("\n".join(tokens) + "\n").encode())
+    try:
+        statuses = json.loads(done.stdout.decode().strip().splitlines()[-1])["statuses"] if not done.returncode else None
+    except (ValueError, IndexError, KeyError, TypeError, UnicodeDecodeError):
+        statuses = None
+    if not isinstance(statuses, list) or len(statuses) != len(tokens) or not all(type(s) is int for s in statuses):
+        raise AdminError(f"{gateway['name']}: the bearer probe gave no answer")
+    return statuses
+
+
+def inside(docker, gateway: dict, path: str) -> bytes | None:
+    """The file a running gateway reads at `path`, copied out by the daemon (`docker cp`, no process started)."""
+    copied = docker(["cp", f"{gateway['id']}:{path}", "-"])
+    if copied.returncode:
+        return None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(copied.stdout)) as archive:
+            files = [member for member in archive.getmembers() if member.isfile()]
+            handle = archive.extractfile(files[0]) if len(files) == 1 and files[0].size <= LIMIT else None
+            return handle.read() if handle is not None else None
+    except (tarfile.TarError, OSError):
+        return None
+
+
+def proof(config: dict, docker, host: Host, gateways: list[dict], principal: str, token: str | None,
+          control: str | None) -> dict:
+    """Revocation evidence: every running gateway reads the published policy (its in-container copy has the same
+    digest), which disables the principal; with the principal's token, its MCP initialize answers 401 at each gateway
+    right after a live control principal's initialize answered 200 there, so a 401 for another reason never counts."""
+    published = read_private(config["policy"])
+    value = json.loads(published)
+    row = next((row for row in value.get("principals", []) if row.get("id") == principal), None)
+    if row is None or row.get("enabled") is not False:
+        raise AdminError(f"the published policy does not disable {principal!r}: revocation not proven")
+    digest = hashlib.sha256(published).hexdigest()
+    for gateway in gateways:
+        copy = inside(docker, gateway, str(PurePosixPath(gateway["target"]) / Path(config["policy"]).name))
+        if copy is None or hashlib.sha256(copy).hexdigest() != digest:
+            raise AdminError(f"{gateway['name']} does not read the published policy (its in-container copy differs or "
+                             "is unreadable): revocation not proven")
+    names = [gateway["name"] for gateway in gateways]
+    evidence = {"gateways": names, "policy_revision": value.get("revision")}
+    if token is None or control is None:
+        return {**evidence, "bearer_probe": "the bearer probe was not run (no --token-file): the evidence is each "
+                                            "running gateway's in-container policy, which disables the principal"}
+    for gateway in gateways:
+        first, second = bearer(docker, gateway, host.http["http_release"]["gateway_public_url"], [control, token])
+        if first != 200:
+            raise AdminError(f"{gateway['name']}: the control principal's initialize answered {first}, so a 401 would "
+                             "prove nothing: revocation not proven")
+        if second != 401:
+            raise AdminError(f"{gateway['name']}: the revoked bearer's initialize answered {second}, not 401: "
+                             "revocation not proven")
+    return {**evidence, "bearer_probe": f"rejected (401) by {len(names)} running gateway(s), each right after a "
+                                        "control principal's initialize answered 200"}
+
+
+def revoke(config: dict, run, docker, host_factory, args) -> dict:
+    principal = args.principal
+    command = {"verb": "revoke", "id": principal, "token_file": str(args.token_file) if args.token_file else None}
+    journal = resume(config, args, command)
+    if journal.data.get("state") == "done":
+        return journal.data["result"]
+    host = None if args.dry_run else host_factory()
+    with ExitStack() as held:
+        if host is not None:
+            held.enter_context(guarded(config, host, docker))
+        policy, registry, found = documents(config, docker)
+        target = holdings(config, run, policy, registry, principal)
+        token = control = None
+        if args.token_file is not None:
+            token = read_token({}, str(args.token_file))
+            if token is None:
+                raise AdminError(f"the token file {args.token_file} is unreadable or not one token; nothing changed")
+            if not pinned(token, target["entry"].get("key_sha256")):
+                raise AdminError(f"the token file does not match the key_sha256 of {principal!r}; nothing changed")
+            control = read_token(config, config["probe_control"]) if config.get("probe_control") else None
+            if control is None or pinned(control, target["entry"].get("key_sha256")):
+                raise AdminError("the bearer probe needs `probe_control` in the admin configuration: the token file of "
+                                 "another live principal; nothing changed")
+        exclusive(config, policy, registry, principal, target)
+        if args.operation and {name: row["public_id"] for name, row in journal.data.get("stores", {}).items()} \
+                != public_ids(target):
+            raise AdminError(f"the credentials of {principal!r} changed since operation {journal.data['operation']} "
+                             "started; nothing changed")
+        writes = [(step, *backend_write(step, target["stores"][step], ["revoke"])) for step in STEPS
+                  if step in target["stores"] and target["stores"][step]["status"] not in ("revoked", "missing")]
+        for _, service, argv in writes:
+            checked(run, service, argv)
+        steps = ["gateway policy", *(step for step in STEPS if step in target["stores"])] + (
+            ["calls registry"] if target["calls"] is not None else [])
+        if args.dry_run:
+            return {"dry_run": True, "principal": principal, "steps": steps,
+                    "stores": [{"store": name, "public_id": target["stores"][name]["public_id"],
+                                "status": target["stores"][name]["status"]} for name in ORDER
+                               if name in target["stores"]],
+                    "bearer_probe": "planned" if token else "not run (no --token-file)"}
+        images = rollback_images(host)
+        preflight(config, docker, policy, "policy", found["policy"], images)
+        if target["calls"] is not None and registry is not None:
+            preflight(config, docker, registry, "registry", found["registry"], [])
+        if not args.operation:
+            journal.create({"version": 1, "operation": journal.path.stem, "command": command, "state": "running",
+                            "steps": {}, "stores": {name: {"public_id": row["public_id"], "status": row["status"]}
+                                                    for name, row in target["stores"].items()}})
+        try:
+            return run_revoke(config, run, docker, host, journal, target, found, images, token, control)
+        except (AdminError, OSError) as exc:
+            raise stopped(journal, exc) from None
+
+
+def run_revoke(config, run, docker, host, journal: Journal, target: dict, found, images, token, control) -> dict:
+    data, principal = journal.data, journal.data["command"]["id"]
+    # The gateway first: access ends on the next request, before any backend record changes.
+    swap(config, docker, journal, "gateway policy", "policy", principal, lambda entry: {**entry, "enabled": False},
+         found["policy"], images)
+    for step in (step for step in STEPS if step in target["stores"]):
+        row = target["stores"][step]
+        if data["steps"].get(step, {}).get("state") == "done":
+            continue
+        if row["status"] in ("revoked", "missing"):  # read from the store: already revoked, or sent before a crash
+            journal.step(step, "done", public_id=row["public_id"], found=row["status"])
+            continue
+        service, argv = backend_write(step, row, ["revoke"])
+        journal.step(step, "started", public_id=row["public_id"])
+        ask(run, service, argv)
+        checkpoint(step, "committed")
+        if record_of(run, service, target["tokens"]["archive-token" if step == "messaging-archive" else step]
+                     )["status"] != "revoked":
+            raise AdminError(f"{service}: {argv[0]} did not read back {row['public_id']} revoked")
+        journal.step(step, "done")
+    if target["calls"] is not None:
+        swap(config, docker, journal, "calls registry", "registry", target["calls"]["id"],
+             lambda entry: {**entry, "enabled": False}, found["registry"], [])
+    evidence = proof(config, docker, host, found["policy"], principal, token, control)
+    data["result"] = {
+        "operation": data["operation"], "principal": principal,
+        "revoked": [{"store": name, "public_id": data["stores"][name]["public_id"]} for name in ORDER
+                    if name in data["stores"]],
+        "evidence": evidence, "undo": f"deedkit admin undo {data['operation']}",
+        "note": "records stay for audit; deleting them is a separate owner decision"}
+    data["state"] = "done"
+    journal.save()
+    return data["result"]
+
+
+def undo_revoke(config: dict, run, docker, host_factory, journal: Journal) -> dict:
+    """Compensation of a revoke: enable again only the gateway and calls entries this operation disabled, each as a
+    compare-and-swap on the entry it wrote; messaging and calendar revocations are final."""
+    data = journal.data
+    principal = data["command"]["id"]
+    result = {"operation": data["operation"], "principal": principal, "undone": True,
+              "note": "messaging and calendar revocations are final (records stay for audit): only the gateway and "
+                      "calls entries are enabled again, so a working key needs `deedkit admin key issue`"}
+    if data.get("state") == "undone":
+        return {**result, **data.get("undo", {})}
+    host = host_factory()
+    with guarded(config, host, docker):
+        policy, registry, found = documents(config, docker)
+        images, plan = rollback_images(host), []
+        for name, what, document, ident in (
+                ("gateway policy", "policy", policy, principal),
+                ("calls registry", "registry", registry, data["stores"].get("calls", {}).get("public_id"))):
+            step = data["steps"].get(name, {})
+            if document is None or not step.get("changed"):
+                continue
+            current = document.entry(ident)
+            digest = entry_digest(current) if current is not None else None
+            if digest in (step["before"], data["steps"].get("undo " + name, {}).get("entry")):
+                continue  # never renamed, or already enabled again by this undo
+            if digest != step["entry"]:
+                raise AdminError(f"the {name} entry {ident!r} changed since this operation disabled it; nothing changed")
+            preflight(config, docker, document, what, found[what], images if what == "policy" else [])
+            plan.append((name, what, ident, digest))
+        data["state"] = "undoing"
+        journal.save()
+        try:
+            for name, what, ident, digest in plan:
+                swap(config, docker, journal, "undo " + name, what, ident, lambda entry: {**entry, "enabled": True},
+                     found[what], images if what == "policy" else [], expect=digest)
+        except (AdminError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, AdminError) else type(exc).__name__
+            raise Stopped(f"undo of {data['operation']} stopped: {reason}; run `deedkit admin undo "
+                          f"{data['operation']}` again") from None
+        data["state"] = "undone"
+        enabled = [name for name in ("gateway policy", "calls registry")
+                   if data["steps"].get("undo " + name, {}).get("changed")]
+        data["undo"] = {"enabled": enabled, "final": [{"store": step, "public_id": data["stores"][step]["public_id"]}
+                                                      for step in STEPS if step in data["steps"]]}
+        journal.save()
+    return {**result, **data["undo"]}
+
+
 def render(view: dict) -> str:
     lines = []
     for row in view["principals"]:
@@ -1342,17 +1822,27 @@ def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int
     issuing.add_argument("--label")
     issuing.add_argument("--dry-run", action="store_true", help="print the plan, write nothing")
     issuing.add_argument("--operation", help="rerun a stopped operation: finished steps replay, the rest continue")
+    extending = verbs.add_parser("extend", help="extend a principal's key in every store (ANYM-497)")
+    extending.add_argument("principal")
+    extending.add_argument("--days", type=int, required=True, help=f"{EXTEND_DAYS[0]}-{EXTEND_DAYS[1]}, for every store")
+    extending.add_argument("--dry-run", action="store_true", help="print the plan, write nothing")
+    extending.add_argument("--operation", help="rerun a stopped operation: finished steps are read back, the rest continue")
+    revoking = verbs.add_parser("revoke", help="revoke a principal's key in every store, the gateway first (ANYM-497)")
+    revoking.add_argument("principal")
+    revoking.add_argument("--token-file", type=Path, help="the principal's own gateway token: prove a 401 afterwards")
+    revoking.add_argument("--dry-run", action="store_true", help="print the plan, write nothing")
+    revoking.add_argument("--operation", help="rerun a stopped operation: finished steps are read back, the rest continue")
     undoing = nouns.add_parser("undo", help="compensate an operation: disable, revoke and delete what it created")
     undoing.add_argument("operation")
     args = parser.parse_args(argv)
     try:
         config = load_json(args.config, "admin configuration")
-        if args.noun == "undo" or args.verb == "issue":
+        if args.noun == "undo" or args.verb in ("issue", "extend", "revoke"):
             os.umask(0o077)
             run, docker = run or runner(config), docker or dockers(config)
             factory = (lambda: host) if host is not None else (lambda: load_host(config))
-            result = (undo(config, run, docker, factory, args.operation) if args.noun == "undo"
-                      else issue(config, run, docker, factory, args))
+            command = undo if args.noun == "undo" else {"issue": issue, "extend": extend, "revoke": revoke}[args.verb]
+            result = command(config, run, docker, factory, args.operation if args.noun == "undo" else args)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
         if args.verb == "label":
