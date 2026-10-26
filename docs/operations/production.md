@@ -640,11 +640,14 @@ later writes of a purged message content-free, and the audit CHECK re-added `NOT
 unchanged. A schema-44 runtime refuses schema 45, so it ships with its release. Release steps, in
 order, outside an active call:
 0. As the owner, before `migrate`: `CREATE INDEX CONCURRENTLY IF NOT EXISTS events_message ON
-   events(message);` (no lock on event inserts; about 250k rows). Without it, 045 refuses on a
-   table of more than 100k events, so the build never runs inside the migration transaction.
+   events(message);` (no lock on event inserts; about 250k rows), then check that `\d events` lists
+   `events_message` without `INVALID` (a failed build: `DROP INDEX CONCURRENTLY events_message` and
+   build again). Without it, or with an INVALID one, 045 refuses on a table of more than 100k events
+   or 50 MB, so the build never runs inside the migration transaction.
 1. Update the pinned backup and restore runtimes to the schema-45 release.
 2. Fresh verified backup (the backup gate), then `migrate`.
-3. As the owner: `purge_role.sql` (NOLOGIN role `messaging_purge`) and `gateway_role.sql`.
+3. As the owner: `purge_role.sql` (NOLOGIN role `messaging_purge`) and `gateway_role.sql`; deploy
+   the release.
 4. The worker's own login (owner decision 2026-10-26, «1) а»): as the owner create
    `messaging_purge_runtime` with `LOGIN IN ROLE messaging_purge` and no other grants, with a
    generated password passed to `psql` through a variable read from a 0600 file, never on the command
@@ -654,9 +657,11 @@ order, outside an active call:
 5. Start the worker: add `deploy/compose.message-purge.yaml` to the project's compose files for
    `production.py apply`, or `docker compose --profile message-purge up -d message-purge`. From here
    every new deletion is purged within a minute: the point of no return for future deletions.
-6. `purge-deleted --preview`, then after a fresh verified backup `purge-deleted --apply` for the
-   messages deleted before 045: the point of no return for past deletions. `--apply` drains every
-   due mark and exits non-zero while marks stay pending (contention or failures); run it again.
+6. Read-only: `purge-deleted --preview` (counts per account of messages deleted before 045).
+7. After a fresh verified backup, `purge-deleted --apply`: the point of no return for past
+   deletions. `--apply` drains every due mark and exits non-zero while marks stay pending
+   (contention or failures); run it again.
+Steps 5 and 7 delete data and wait for the owner's words.
 The purge is irreversible: rolling back code or schema does not bring content back; only a
 restore of a backup taken before it does, and only while that backup is kept (about two days of
 daily verified backups). `purge-disable` stops the worker without a deploy.

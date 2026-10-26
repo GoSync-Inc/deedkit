@@ -23,6 +23,7 @@ log=logging.getLogger('messaging_service.message_purge')
 BATCH=50
 APPLY_BATCH=500
 APPLY_RETRIES=3
+PASS_SECONDS=10
 EVENT_WINDOW=5000
 LINK_CHUNK=5000
 OVERDUE_SECONDS=900
@@ -91,10 +92,12 @@ class Purger:
 
         A message purged before its receipts were linked is scrubbed here, chunk by chunk. The chunk
         holds `purge-backfill` exclusively and every purge holds it shared, so a purge and a chunk
-        never miss each other's uncommitted rows."""
+        never miss each other's uncommitted rows. A purge in progress makes the chunk wait for the
+        next call instead of failing on the lock bound."""
         with self.tx() as c:
             if self.state(c,'receipt_backfill')=='complete':return True
-            c.execute(sql.SQL('SELECT pg_advisory_xact_lock({})').format(lock_key('purge-backfill')))
+            if not c.execute(sql.SQL('SELECT pg_try_advisory_xact_lock({}) AS ok').format(
+                    lock_key('purge-backfill'))).fetchone()['ok']:return False
             cursor=self.state(c,'receipt_cursor')
             row=c.execute('''WITH chunk AS (SELECT digest,account,coalesce(envelope->>'chat','') AS provider_chat,
                     coalesce(envelope->>'provider_id','') AS provider_id FROM ingest_receipts
@@ -237,7 +240,13 @@ class Purger:
         # messages purged before their link existed.
         totals['links_complete']=self.backfill_links()
         for account in self.pending_accounts():
-            for key,value in self.purge_account(account).items():totals[key]+=value
+            started=time.monotonic()
+            # Drain the account while it makes progress, within one pass: after a failure the
+            # batches are single messages, and one per pass would leave a backlog for minutes.
+            while True:
+                result=self.purge_account(account)
+                for key,value in result.items():totals[key]+=value
+                if not result['purged'] or time.monotonic()-started>=PASS_SECONDS:break
         return {**totals,'enabled':True}
 
     def preview(self):
@@ -252,7 +261,7 @@ class Purger:
     def apply(self):
         """Purge messages already marked deleted (reason existing_deleted), queued in passes of at most
         500, and drain every due pending mark, including marks an interrupted run left queued."""
-        while not self.backfill_links():pass
+        while not self.backfill_links():time.sleep(0.05)
         totals={'queued':0,'purged':0,'gave_way':0,'failed':0,'passes':0}
         retries=0
         while True:
@@ -358,12 +367,16 @@ def main(argv=None):
                     log.warning('message_purge pass_failed %s',type(exc).__name__);result=None
                 if args.once:out(result);return 0 if result is not None else 1
                 time.sleep(args.interval)
-        if args.command=='purge-deleted':
-            if args.preview:out(purger.preview());return 0
-            result=purger.apply();out(result)
-            return 0 if result['complete'] else 1
-        elif args.command=='purge-status':out(purger.status())
-        else:out(purger.set_enabled(args.command=='purge-enable'))
+        try:
+            if args.command=='purge-deleted':
+                if args.preview:out(purger.preview());return 0
+                result=purger.apply();out(result)
+                return 0 if result['complete'] else 1
+            elif args.command=='purge-status':out(purger.status())
+            else:out(purger.set_enabled(args.command=='purge-enable'))
+        except psycopg.Error as exc:
+            # The operator gets a code and runs the command again; nothing is half-applied.
+            out({'error':type(exc).__name__});return 1
         return 0
     finally:
         store.close()

@@ -4,18 +4,26 @@
 -- Messenger deletion purge (ANYM-511). New tables carry no foreign keys (044 precedent: a key locks
 -- the referenced table at create). The events index is built before this file, outside its transaction
 -- (`CREATE INDEX CONCURRENTLY IF NOT EXISTS events_message ON events(message)`, release step 0): built
--- here it would hold SHARE on events and every lock taken after it for the whole build. A small test
--- database builds it in place; a large one without it refuses. After that every statement only changes
--- the catalog: the defaulted flag on messages is a metadata change, each lock waits at most the 2 s
--- migrate bound. Guard triggers keep every later write of a purged message content-free, so deployed
--- schema-44 code keeps writing through them unchanged.
+-- here it would hold SHARE on events and every lock taken after it for the whole build. With the index
+-- present this file takes no lock on events for it (a plain IF NOT EXISTS would still take SHARE); a
+-- small test database builds it in place; a large one without it, or with an INVALID one left by a
+-- failed concurrent build, refuses. After that every statement only changes the catalog: the
+-- defaulted flag on messages is a metadata change, each lock waits at most the 2 s migrate bound.
+-- Guard triggers keep every later write of a purged message content-free, so deployed schema-44 code
+-- keeps writing through them unchanged.
 DO $$ BEGIN
- IF to_regclass('public.events_message') IS NULL
-   AND (SELECT reltuples FROM pg_class WHERE oid='public.events'::regclass)>100000 THEN
-  RAISE EXCEPTION 'events_message missing: run CREATE INDEX CONCURRENTLY IF NOT EXISTS events_message ON events(message) first';
+ IF EXISTS(SELECT 1 FROM pg_index WHERE indexrelid=to_regclass('public.events_message') AND NOT indisvalid) THEN
+  RAISE EXCEPTION 'events_message is INVALID: DROP INDEX CONCURRENTLY events_message, then rebuild it CONCURRENTLY';
+ END IF;
+ IF to_regclass('public.events_message') IS NULL THEN
+  -- reltuples is -1 on a restored table not yet analysed; the size test covers that case.
+  IF (SELECT reltuples FROM pg_class WHERE oid='public.events'::regclass)>100000
+    OR pg_relation_size('public.events')>50*1024*1024 THEN
+   RAISE EXCEPTION 'events_message missing: run CREATE INDEX CONCURRENTLY IF NOT EXISTS events_message ON events(message) first';
+  END IF;
+  CREATE INDEX events_message ON events(message);
  END IF;
 END $$;
-CREATE INDEX IF NOT EXISTS events_message ON events(message);
 ALTER TABLE messages ADD COLUMN purged boolean NOT NULL DEFAULT false;
 -- Set by the worker when a chat's last unpurged message is purged; the listing hides the chat while
 -- it is set, and the next archived message of the chat clears it (purge_chat_reopen below).

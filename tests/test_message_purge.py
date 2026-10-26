@@ -487,8 +487,11 @@ def test_slow_purge_is_cut_at_its_transaction_bound_while_ingest_continues(purge
         c.execute('UPDATE message_purges SET next_attempt_at=clock_timestamp()')
     assert marks==[{'failure_code':'transaction_timeout','attempts':1}]*2
     monkeypatch.undo()
-    # After a failure the batch shrinks to one message per transaction.
-    assert p.run_once()['purged']==1 and p.run_once()['purged']==1
+    # After a failure the batch shrinks to one message per transaction, and one pass drains them.
+    assert p.run_once()['purged']==2
+    with s.pool.connection() as c:
+        audit=c.execute("SELECT resource_ids FROM audit_log WHERE operation='message_purge'").fetchall()
+    assert sorted(len(r['resource_ids']) for r in audit)==[1,1]
     assert leaks(s,'sentinel-a')=={}
 
 
