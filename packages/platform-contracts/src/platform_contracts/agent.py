@@ -124,7 +124,7 @@ def validate_result(value):
     return value
 
 
-def _candidate(value):
+def validate_candidate(value):
     if not isinstance(value, dict) or not CANDIDATE_KEYS.issuperset(value):
         raise ValueError("invalid_candidate")
     if not (_text(value.get("id"), MAX_ID) and _text(value.get("label"), MAX_LABEL) and _text(value.get("kind"), 64)):
@@ -134,6 +134,7 @@ def _candidate(value):
             raise ValueError("invalid_candidate")
     if value.get("next") is not None:
         validate_next(value["next"])
+    return value
 
 
 def validate_error(value, *, read_only=frozenset()):
@@ -158,7 +159,7 @@ def validate_error(value, *, read_only=frozenset()):
         if not isinstance(candidates, list) or len(candidates) > MAX_CANDIDATES:
             raise ValueError("too_many_candidates")
         for candidate in candidates:
-            _candidate(candidate)
+            validate_candidate(candidate)
     if "more" in value:
         if type(value["more"]) is not bool or candidates is None:
             raise ValueError("invalid_more")

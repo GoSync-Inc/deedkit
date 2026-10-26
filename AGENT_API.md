@@ -45,7 +45,8 @@ error; the ANYM-295 privacy allowlist is unchanged.
 - Missing on a live effect: `invalid_arguments` with `field_errors: [{field: "request_id", reason: "required"}]` and a
   `next` that repeats the call with `request_id: "REPLACE_WITH_YOUR_ID"`. Every tool refuses that placeholder (the
   gateway before any backend sees it), so the `next` can never run verbatim. Every tool description says the field is
-  required for live effects.
+  required for live effects. This `next` intentionally copies the caller's own arguments back to the same caller: it
+  is the one gateway `next` that carries payload, and it never comes from a backend.
 
 ## `dry_run` and `confirm_token`
 
@@ -116,5 +117,13 @@ The gateway's own errors keep their keys and add `next` when one exists:
 - Missing `request_id`: the placeholder `next` above.
 - Expired or revoked key: no `next`.
 
-A `next` or candidate `next` relayed from a backend error is checked against the caller's own tool list and the target
-tool's input schema; one that fails is dropped.
+A backend error is relayed through these filters; each drops a field and never repairs it:
+
+- A `next` (top level or on a candidate) must run as given for this caller on this route: a tool of the caller's
+  effective list (module selection included), arguments the target's input schema accepts, and a target in the failing
+  tool's module or the gateway itself, with its scopes, backend implementation and messenger operation in place.
+- A `hint`, `next` or candidate that carries the caller's payload is dropped: a string the caller sent outside an ID or
+  reference field (message text, file names, queries), or a word of it of 6 or more characters. A `hint` or `next`
+  argument with a phone-shaped number is dropped too.
+- `selection_required` keeps a top-level `next` only when it is read-only; a mutating one stays on candidates only.
+- Candidates must pass the shared shape and are cut at 10; `more: true` stays only with a read-only top-level `next`.

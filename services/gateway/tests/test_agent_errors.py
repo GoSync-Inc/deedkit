@@ -9,7 +9,6 @@ from starlette.testclient import TestClient
 
 from agent_gateway.app import create_app
 from agent_gateway.catalog import CATALOG, arguments
-from agent_gateway.dispatch import runnable_next
 from platform_contracts.agent import PLACEHOLDER_REQUEST_ID, validate_error
 from test_module_selection import call, mcp
 from test_policy import config
@@ -164,20 +163,107 @@ def test_backend_error_payload_never_reaches_hint_next_or_logs(gateway, caplog, 
         assert not any(canary in text for canary in CANARIES)
 
 
+
+SEARCH = {"tool": "messages_search", "arguments": {"query": "synthetic"}}
+SENT = {**SEND, "request_id": "req-synthetic-1"}
+
+
+def relayed(client, tool, args, path="/mcp"):
+    """The REST body and the MCP structured error of one call, after asserting they agree."""
+    rest = client.post("/v1/" + tool, json=args, headers=HEADERS).json() if path == "/mcp" else None
+    result = call(client, tool, args, path=path)
+    assert result["isError"]
+    if rest is not None:
+        assert result["structuredContent"] == rest
+    return result["structuredContent"]
+
+
 # spec: ANYM-544
-def test_a_relayed_backend_next_survives_only_when_the_caller_can_run_it(gateway):
+def test_an_ordinary_backend_conflict_never_relays_the_callers_payload(gateway):
     app, _, failures = gateway
-    runnable = {"tool": "messages_search", "arguments": {"query": "synthetic"}}
-    failures["send_message"] = (409, {"error": "selection_required", "request_id": "c" * 32, "next": runnable,
-                                      "candidates": payload_body()["candidates"]
-                                      + [{"id": "chat-2", "label": "Synthetic 2", "kind": "chat", "next": runnable}]})
+    sent = {**SENT, "text": f"{TEXT} {FILENAME} {PHONE}"}
+    failures["send_message"] = (409, {
+        "error": "conflict", "request_id": "c" * 32, "hint": f"Resend {TEXT}",
+        "next": {"tool": "messages_search", "arguments": {"query": FILENAME}},
+        "candidates": [{"id": "chat-1", "label": TEXT, "kind": "chat"},
+                       {"id": "chat-2", "label": "Synthetic 2", "kind": "chat",
+                        "next": {"tool": "messages_search", "arguments": {"query": PHONE}}},
+                       {"id": "chat-3", "label": "Synthetic 3", "kind": "chat", "next": SEARCH}]})
     with TestClient(app) as client:
-        body = client.post("/v1/messages_send_message", json={**SEND, "request_id": "req-synthetic-1"},
-                           headers=HEADERS).json()
-    assert body["next"] == runnable and body["candidates"][1]["next"] == runnable
-    assert "next" not in body["candidates"][0] and FILENAME not in json.dumps(body)
-    # A tool outside the caller's list, an unknown argument or a malformed value is dropped, never repaired.
-    for bad in ({"tool": "calls_stop_call", "arguments": {"call_id": "x"}},
-                {"tool": "messages_search", "arguments": {"query": "x", "phone": PHONE}},
-                {"tool": "messages_search"}, "messages_search"):
-        assert "next" not in runnable_next({"error": "x", "next": bad}, TOOLS)
+        body = relayed(client, "messages_send_message", sent)
+    shown = json.dumps({k: body.get(k) for k in ("hint", "next", "candidates")})
+    assert not any(canary in shown for canary in CANARIES)
+    assert "hint" not in body and "next" not in body
+    # Only the clean candidate keeps its continuation; the one labelled with the caller's text is gone.
+    assert body["candidates"] == [{"id": "chat-2", "label": "Synthetic 2", "kind": "chat"},
+                                  {"id": "chat-3", "label": "Synthetic 3", "kind": "chat", "next": SEARCH}]
+
+
+# spec: ANYM-544
+def test_a_phone_shaped_hint_or_next_argument_is_dropped_even_when_the_caller_never_sent_it(gateway):
+    app, _, failures = gateway
+    failures["search"] = (409, {"error": "conflict", "hint": f"Call {PHONE}",
+                                "next": {"tool": "messages_search", "arguments": {"query": PHONE}}})
+    with TestClient(app) as client:
+        body = relayed(client, "messages_search", {"query": "lookup"})
+    assert "hint" not in body and "next" not in body and PHONE not in json.dumps(body)
+
+
+# spec: ANYM-544
+def test_a_relayed_next_into_another_module_is_dropped_and_an_emitted_one_runs(gateway):
+    app, requests, failures = gateway
+    other = {"tool": "calendar_calendars", "arguments": {}}
+    with TestClient(app) as client:
+        for path in ("/mcp", "/mcp/modules/messaging"):
+            failures["search"] = (409, {"error": "conflict", "next": other})
+            assert "next" not in relayed(client, "messages_search", {"query": "lookup"}, path)
+            failures["search"] = (409, {"error": "conflict", "next": SEARCH})
+            following = relayed(client, "messages_search", {"query": "lookup"}, path)["next"]
+            assert following == SEARCH
+            failures.pop("search")
+            assert not call(client, following["tool"], following["arguments"], path=path).get("isError")
+    assert ("calendar", "calendars") not in requests
+
+
+# spec: ANYM-544
+def test_selection_required_keeps_a_mutating_next_on_candidates_only(gateway):
+    app, _, failures = gateway
+    mutating = {"tool": "messages_send_message", "arguments": {**SENT, "chat_id": "chat-1", "text": "other reply"}}
+    failures["send_message"] = (409, {"error": "selection_required", "request_id": "c" * 32, "next": mutating,
+                                      "candidates": [{"id": "chat-1", "label": "Synthetic", "kind": "chat",
+                                                      "next": mutating}]})
+    with TestClient(app) as client:
+        body = relayed(client, "messages_send_message", SENT)
+    assert "next" not in body
+    assert body["candidates"] == [{"id": "chat-1", "label": "Synthetic", "kind": "chat", "next": mutating}]
+    validate_error(body, read_only=frozenset(n for n in TOOLS if CATALOG[n]["annotations"].get("readOnlyHint")))
+
+
+# spec: ANYM-544
+@pytest.mark.parametrize("bad", [
+    {"tool": "calls_stop_call", "arguments": {"call_id": "x"}},
+    {"tool": "messages_search", "arguments": {"query": "x", "phone": "synthetic"}},
+    {"tool": "messages_search", "arguments": {"query": 7}},
+    {"tool": "messages_search"},
+    "messages_search",
+])
+def test_a_relayed_next_the_caller_cannot_run_as_given_is_dropped_never_repaired(gateway, bad):
+    app, _, failures = gateway
+    failures["search"] = (409, {"error": "conflict", "next": bad,
+                                "candidates": [{"id": "chat-1", "label": "Synthetic", "kind": "chat", "next": bad}]})
+    with TestClient(app) as client:
+        body = relayed(client, "messages_search", {"query": "lookup"})
+    assert "next" not in body and body["candidates"] == [{"id": "chat-1", "label": "Synthetic", "kind": "chat"}]
+
+
+# spec: ANYM-544
+def test_more_than_ten_candidates_are_cut_and_more_needs_a_read_only_next(gateway):
+    app, _, failures = gateway
+    many = [{"id": f"chat-{i}", "label": f"Synthetic {i}", "kind": "chat"} for i in range(12)]
+    with TestClient(app) as client:
+        failures["search"] = (409, {"error": "selection_required", "next": SEARCH, "candidates": many})
+        listed = relayed(client, "messages_search", {"query": "lookup"})
+        failures["search"] = (409, {"error": "selection_required", "candidates": many, "more": True})
+        bare = relayed(client, "messages_search", {"query": "lookup"})
+    assert listed["candidates"] == many[:10] and listed["more"] is True and listed["next"] == SEARCH
+    assert len(bare["candidates"]) == 10 and "more" not in bare

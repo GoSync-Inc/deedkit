@@ -2,8 +2,9 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import asyncio
 import logging
+import re
 from platform_contracts import Capability, safe_error
-from platform_contracts.agent import PLACEHOLDER_REQUEST_ID
+from platform_contracts.agent import MAX_CANDIDATES, PLACEHOLDER_REQUEST_ID, validate_candidate
 from .adapters.calls import receipt_reference
 
 from .catalog import arguments, CATALOG, InvalidArguments
@@ -45,28 +46,71 @@ CALENDAR_CONSTRAINTS = {
 }
 
 
-def checked_next(value, visible):
-    """A `next` the caller can run as given: a tool of its own list and arguments its input schema accepts."""
-    try:
-        if set(value) == {"tool", "arguments"} and value["tool"] in visible:
-            arguments(CATALOG[value["tool"]], value["arguments"])
-            return value
-    except (TypeError, KeyError, ValueError):
-        pass
-    return None
+# A request key that names something the caller already chose (an ID, an account, a mode); any other string the
+# caller sent is payload: message text, file names, phone numbers, queries.
+REFERENCE_KEY = re.compile(r"(?:^|_)(?:ids?|digest|ref|token)$|^(?:account|chat|person|sender|receipt|operation|"
+                           r"consumer|reply_to|network|kind|view|detail|direction|order|format|status|live|modules|tool)$")
+PHONE = re.compile(r"\+?\d(?:[\s().-]?\d){6,}")
+MIN_PAYLOAD, MIN_TOKEN = 4, 6
 
 
-def runnable_next(detail, visible):
-    """A backend error with every `next` (top level and per candidate) checked; one that fails is dropped (ANYM-544)."""
-    if "next" not in detail and not isinstance(detail.get("candidates"), list):
-        return detail
+def payload_strings(value, key=None):
+    """The strings of `value` that are not under a reference key, at least MIN_PAYLOAD characters long, and their
+    words of at least MIN_TOKEN characters, so an echoed fragment (a file name inside the text) counts too."""
+    if isinstance(value, dict):
+        return {s for k, v in value.items() for s in payload_strings(v, k)}
+    if isinstance(value, list):
+        return {s for v in value for s in payload_strings(v, key)}
+    if isinstance(value, str) and len(value) >= MIN_PAYLOAD and not (key and REFERENCE_KEY.search(key)):
+        return {value} | {word for word in value.split() if len(word) >= MIN_TOKEN}
+    return set()
+
+
+def exposed(value, key=None):
+    """The strings of `value` outside a reference key; dict keys are field names, not values."""
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in exposed(v, k)]
+    if isinstance(value, list):
+        return [s for v in value for s in exposed(v, key)]
+    return [value] if isinstance(value, str) and not (key and REFERENCE_KEY.search(key)) else []
+
+
+def carries(value, payload):
+    return any(p in s for s in exposed(value) for p in payload)
+
+
+def relayed_error(detail, runnable, read_only, payload):
+    """A backend error as the gateway relays it (ANYM-544). Every `next` (top level and per candidate) must run as
+    given for this caller and route, and none carries the caller's payload or a phone number in a payload field; a
+    `hint` with either is dropped. `selection_required` keeps a mutating continuation on candidates only."""
     detail = dict(detail)
-    if "next" in detail and checked_next(detail["next"], visible) is None:
+    if "hint" in detail and (not isinstance(detail["hint"], str) or carries(detail["hint"], payload)
+                             or PHONE.search(detail["hint"])):
+        detail.pop("hint")
+
+    def safe(value):
+        return (runnable(value) and not carries(value, payload)
+                and not any(PHONE.search(s) for s in payload_strings(value["arguments"])))
+
+    if "next" in detail and not (safe(detail["next"]) and (detail.get("error") != "selection_required"
+                                                           or detail["next"]["tool"] in read_only)):
         detail.pop("next")
-    if isinstance(detail.get("candidates"), list):
-        detail["candidates"] = [
-            {k: v for k, v in c.items() if k != "next" or checked_next(v, visible) is not None}
-            if isinstance(c, dict) else c for c in detail["candidates"]]
+    if "candidates" in detail:
+        kept = []
+        for candidate in detail["candidates"] if isinstance(detail["candidates"], list) else []:
+            if isinstance(candidate, dict) and "next" in candidate and not safe(candidate["next"]):
+                candidate = {k: v for k, v in candidate.items() if k != "next"}
+            try:
+                validate_candidate(candidate)
+            except ValueError:
+                continue
+            if not carries({k: v for k, v in candidate.items() if k != "next"}, payload):
+                kept.append(candidate)
+        more = len(kept) > MAX_CANDIDATES or detail.get("more") is True
+        detail["candidates"] = kept[:MAX_CANDIDATES]
+        detail.pop("more", None)
+        if more and "next" in detail and detail["next"]["tool"] in read_only:
+            detail["more"] = True
     return detail
 
 
@@ -348,6 +392,30 @@ class Dispatch:
         except Denied:
             return []
 
+    def runnable(self, value, visible, module, snapshot, agent, caps):
+        """A `next` this caller can run as given on this route: a tool of its effective list with arguments its
+        schema accepts. Only the failing tool's module and the gateway's own tools can be checked without asking
+        another backend, so a `next` into any other module is not runnable here."""
+        try:
+            if not isinstance(value, dict) or set(value) != {"tool", "arguments"} or value["tool"] not in visible:
+                return False
+            target = CATALOG[value["tool"]]
+            checked = arguments(target, value["arguments"])
+            if target["module"] == "gateway":
+                return True
+            if (target["module"] != module or not set(target["scopes"]) <= set(caps["permissions"])
+                    or not self.implemented(target, snapshot, agent, caps, checked.get("account"))):
+                return False
+            if not target.get("action_group"):
+                return True
+            allowed = (self.policy.actions(snapshot, agent, caps["permissions"])
+                       if target["operation"] == "get_messenger_operation"
+                       else self.actions(snapshot, agent, caps, checked.get("account")) if module == "messaging"
+                       else [])
+            return bool(allowed) and ("operation" not in checked or checked["operation"] in allowed)
+        except (TypeError, KeyError, ValueError):
+            return False
+
     def admit(self, key, name):
         return self.policy.authorize_agent(*self.authenticate(key), name)
 
@@ -500,7 +568,12 @@ class Dispatch:
                 error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                            phase="operation", read_only=True)
             elif error.code == "backend_denied" and isinstance(getattr(error, "detail", None), dict):
-                error.detail = runnable_next(error.detail, self.policy.visible(snapshot, agent))
+                visible = [n for n in self.policy.visible(current, principal)
+                           if selected is None or CATALOG[n]["module"] in selected | {"gateway"}]
+                error.detail = relayed_error(
+                    error.detail, lambda value: self.runnable(value, visible, module, current, principal, caps),
+                    {n for n in visible if CATALOG[n].get("annotations", {}).get("readOnlyHint", False)},
+                    payload_strings(values))
             raise
         if live_denied and isinstance(result, dict):
             # detail=transcript moves live and suggested_call from result_evidence to the top level.

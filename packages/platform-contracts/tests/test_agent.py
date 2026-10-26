@@ -157,3 +157,30 @@ def test_the_matrix_covers_the_card_cases():
     assert {"tampered_token", "other_principal", "other_tool", "expiry", "drift", "revocation",
             "concurrent_consumption", "crash_after_binding", "replay_with_other_request_id",
             "lost_response_replay"} <= set(CASES)
+
+
+class ResolvesBeforeReplay(MemoryIntents):
+    """A broken store: a same-key replay is compared with a fresh resolution, so drift turns it into a conflict."""
+
+    def _admit(self, principal, tool, arguments):
+        bound = self.keys.get(("caller", principal, arguments.get("request_id")))
+        if bound is not None and "confirm_token" not in arguments and self._resolve(arguments) != self.intents[bound]["resolution"]:
+            return agent.agent_error("idempotency_conflict")
+        return super()._admit(principal, tool, arguments)
+
+
+class StaleConsumedToken(MemoryIntents):
+    """A broken store: a consumed token is checked for freshness again instead of returning its intent."""
+
+    def _admit(self, principal, tool, arguments):
+        record = self.tokens.get(arguments.get("confirm_token"))
+        if record is not None and record["intent"] is not None and self._resolve(record["arguments"]) != record["resolution"]:
+            return agent.agent_error("preview_stale", changed=["target_id"])
+        return super()._admit(principal, tool, arguments)
+
+
+# spec: ANYM-544
+@pytest.mark.parametrize("broken", [ResolvesBeforeReplay, StaleConsumedToken])
+def test_the_matrix_fails_a_store_whose_replay_depends_on_drift(broken):
+    with pytest.raises(AssertionError):
+        run_matrix(broken, ["replay_after_drift"])

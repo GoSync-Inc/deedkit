@@ -67,8 +67,10 @@ class MemoryIntents:
 
     def _bind(self, origin, principal, tool, key, request_id, resolution):
         intent_id = "intent-" + secrets.token_hex(8)
+        # The binding keeps the canonical payload: a replay is compared with it, never with a fresh resolution.
         self.intents[intent_id] = {"principal": principal, "tool": tool, "resolution": resolution,
-                                   "request_id": request_id, "result": None, "crashed": False}
+                                   "payload": resolution["payload"], "request_id": request_id, "result": None,
+                                   "crashed": False}
         if key is not None:
             self.keys[(origin, principal, key)] = intent_id
         return intent_id
@@ -132,11 +134,14 @@ class MemoryIntents:
             return record["intent"]
         if request_id is None:
             return missing_request_id(tool, arguments)
-        resolution = self._resolve(arguments)
         if bound is not None:
-            if self.intents[bound]["resolution"] != resolution or self.intents[bound]["tool"] != tool:
+            # Same key: compare the submitted tool and payload with the binding first, so drift never turns a
+            # replay into a conflict.
+            payload = {k: v for k, v in sorted(arguments.items()) if k not in CONTROL}
+            if self.intents[bound]["payload"] != payload or self.intents[bound]["tool"] != tool:
                 return agent_error("idempotency_conflict")
             return self._saved(bound)
+        resolution = self._resolve(arguments)
         if resolution["target_id"] is None:
             return agent_error("not_found_or_forbidden")
         return self._bind("caller", principal, tool, request_id, request_id, resolution)
@@ -213,6 +218,17 @@ def case_drift(h):
     _check(h.effects == 0, "a stale token has no effect")
     _check(validate_result(h.call("p1", "t_send", {"confirm_token": stale["confirm_token"]}))["state"] == "succeeded",
            "the fresh token executes")
+
+
+def case_replay_after_drift(h):
+    token = _preview(h)
+    by_token = validate_result(h.call("p1", "t_send", {"confirm_token": token}))
+    by_key = validate_result(h.call("p1", "t_send", {**ARGS, "request_id": "req-drift-1"}))
+    h.drift()
+    _check(h.call("p1", "t_send", {"confirm_token": token}) == by_token, "a consumed token replays after drift")
+    _check(h.call("p1", "t_send", {**ARGS, "request_id": "req-drift-1"}) == by_key,
+           "the same request_id and payload replay after drift")
+    _check(h.effects == 2, "neither replay after drift has an effect")
 
 
 def case_revocation(h):
