@@ -102,6 +102,12 @@ class SearchPlan:
             return 'lower('+(text_sql or alias+'.body')+") LIKE lower(q.literal_pattern) ESCAPE E'\\\\'"
         return '('+' OR '.join(self.vector(alias,lang)+' @@ q.'+lang for lang in self.languages)+')'
 
+    def text_predicate(self, text_sql):
+        """The query mode's predicate over an unindexed text expression (ANYM-529: contact names)."""
+        if self.mode=='exact':
+            return self.predicate(None,text_sql)
+        return '('+' OR '.join("to_tsvector('"+lang+"',"+text_sql+') @@ q.'+lang for lang in self.languages)+')'
+
     def rank(self, alias, text_sql=None):
         if not self.query or self.mode=='exact':
             return '0::bigint'
@@ -184,6 +190,11 @@ def shape_messages(rows, *, compact=False, body_chars=None):
         if body is not None and body_chars is not None:
             row['body_truncated']=len(body)>body_chars
             row['body']=body[:body_chars]
+        if 'contact' in row:
+            # ANYM-529: no block is "not captured", never "the card had no number".
+            if row['contact'] is None:
+                row.pop('contact')
+                if row.get('message_kind')=='contact' and not compact:row['contact_details']='unavailable'
         if compact:
             if body is not None:row.setdefault('snippet',body[:320])
             row.pop('body',None)

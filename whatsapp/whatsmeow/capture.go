@@ -362,7 +362,7 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 	m := e.Message
 	body, kind, media := "", "unknown", ""
 	var filename, mime, size, duration, reply, mentions, replyOwner, forwarded, edited any
-	var forwardOrigin map[string]any
+	var forwardOrigin, contactCard map[string]any
 	if e.IsEdit && e.Info.MsgBotInfo.EditSenderTimestampMS.UnixMilli() > 0 {
 		edited = envelopeEditStamp(e.Info.MsgBotInfo.EditSenderTimestampMS.UnixMilli(), e.Info.Timestamp.Unix())
 	}
@@ -435,10 +435,21 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 			mime = v.GetMimetype()
 			size = v.GetFileLength()
 		case m.GetContactMessage() != nil:
+			v := m.GetContactMessage()
 			kind = "vcard"
-			body = m.GetContactMessage().GetDisplayName()
+			body = v.GetDisplayName()
+			if contactCardCapture() {
+				contactCard = contactBlock([]sharedContact{{v.GetDisplayName(), v.GetVcard()}})
+			}
 		case m.GetContactsArrayMessage() != nil:
 			kind = "multi_vcard"
+			if contactCardCapture() {
+				var cards []sharedContact
+				for _, v := range m.GetContactsArrayMessage().GetContacts() {
+					cards = append(cards, sharedContact{v.GetDisplayName(), v.GetVcard()})
+				}
+				contactCard = contactBlock(cards)
+			}
 		case m.GetLocationMessage() != nil:
 			kind = "location"
 			body = m.GetLocationMessage().GetName()
@@ -571,6 +582,10 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 	if forwardOrigin != nil {
 		// Present only when captured, so an older reader never meets the field (rollback).
 		value["forwardOrigin"] = forwardOrigin
+	}
+	// Present only when captured, so an older reader never meets the field (rollback).
+	if contactCard != nil {
+		value["contactCard"] = contactCard
 	}
 	// Only a stated certificate is captured; no VerifiedName is unknown, never "not a business".
 	if providerFlagsCapture() && !e.Info.IsFromMe && e.Info.VerifiedName != nil {

@@ -1,0 +1,427 @@
+{
+ "//": "ANYM-529: synthetic shared contact cards and the block both WhatsApp parsers emit for them. Go (vcard_test.go) and Node (contact-cards.test.mjs) assert their parser output equals \"block\"; tests/test_contact_cards.py ingests these blocks.",
+ "cases": [
+  {
+   "name": "single",
+   "cards": [
+    {
+     "displayName": "Synthetic Friend",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic Friend\nTEL;TYPE=CELL;waid=6281200000001:+62 812-0000-0001\nEND:VCARD"
+    }
+   ],
+   "block": {
+    "status": "parsed",
+    "contacts": [
+     {
+      "name": "Synthetic Friend",
+      "phones": [
+       {
+        "number": "+6281200000001",
+        "normalized": true,
+        "type": "cell",
+        "whatsapp_id": "6281200000001"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "array with differing vcard name",
+   "cards": [
+    {
+     "displayName": "Synthetic Friend",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Friend Card\nTEL;TYPE=CELL;waid=6281200000001:+62 812-0000-0001\nEND:VCARD"
+    },
+    {
+     "displayName": "",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Second Synthetic\nTEL:+62 812-0000-0002\nEND:VCARD"
+    }
+   ],
+   "block": {
+    "status": "parsed",
+    "contacts": [
+     {
+      "name": "Synthetic Friend",
+      "vcard_name": "Friend Card",
+      "phones": [
+       {
+        "number": "+6281200000001",
+        "normalized": true,
+        "type": "cell",
+        "whatsapp_id": "6281200000001"
+       }
+      ]
+     },
+     {
+      "name": "Second Synthetic",
+      "phones": [
+       {
+        "number": "+6281200000002",
+        "normalized": true
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "folded lines",
+   "cards": [
+    {
+     "displayName": "",
+     "vcard": "BEGIN:VCARD\r\nFN:Synthetic\r\n  Folded\r\nTEL;waid=62812000\r\n 00003:+62812000\r\n\t00003\r\nEND:VCARD"
+    }
+   ],
+   "block": {
+    "status": "parsed",
+    "contacts": [
+     {
+      "name": "Synthetic Folded",
+      "phones": [
+       {
+        "number": "+6281200000003",
+        "normalized": true,
+        "whatsapp_id": "6281200000003"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "local format",
+   "cards": [
+    {
+     "displayName": "Synthetic Local",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic Local\nTEL;CELL:0812-0000-0004\nEND:VCARD"
+    }
+   ],
+   "block": {
+    "status": "parsed",
+    "contacts": [
+     {
+      "name": "Synthetic Local",
+      "phones": [
+       {
+        "number": "0812-0000-0004",
+        "normalized": false,
+        "type": "cell"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "no TEL",
+   "cards": [
+    {
+     "displayName": "Synthetic Nophone",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic Nophone\nEND:VCARD"
+    }
+   ],
+   "block": {
+    "status": "parsed",
+    "contacts": [
+     {
+      "name": "Synthetic Nophone",
+      "phones": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "malformed",
+   "cards": [
+    {
+     "displayName": "Synthetic Broken",
+     "vcard": "garbage"
+    }
+   ],
+   "block": {
+    "status": "parse_failed",
+    "contacts": [
+     {
+      "name": "Synthetic Broken",
+      "phones": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "over the contact bound",
+   "cards": [
+    {
+     "displayName": "Synthetic 0",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 0\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 1",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 1\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 2",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 2\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 3",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 3\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 4",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 4\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 5",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 5\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 6",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 6\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 7",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 7\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 8",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 8\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 9",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 9\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 10",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 10\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 11",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 11\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 12",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 12\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 13",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 13\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 14",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 14\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 15",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 15\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 16",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 16\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 17",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 17\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 18",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 18\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 19",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 19\nTEL:+62 812-0000-0005\nEND:VCARD"
+    },
+    {
+     "displayName": "Synthetic 20",
+     "vcard": "BEGIN:VCARD\nVERSION:3.0\nFN:Synthetic 20\nTEL:+62 812-0000-0005\nEND:VCARD"
+    }
+   ],
+   "block": {
+    "status": "truncated",
+    "contacts": [
+     {
+      "name": "Synthetic 0",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 1",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 2",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 3",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 4",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 5",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 6",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 7",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 8",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 9",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 10",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 11",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 12",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 13",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 14",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 15",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 16",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 17",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 18",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     },
+     {
+      "name": "Synthetic 19",
+      "phones": [
+       {
+        "number": "+6281200000005",
+        "normalized": true
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}

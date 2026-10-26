@@ -57,6 +57,48 @@ def forward_origin(value):
     return result
 
 
+CONTACT_STATUSES = ('parsed','truncated','parse_failed','unavailable')
+CONTACT_TEXT = re.compile(r'[^\x00-\x1f\x7f]{1,256}')
+CONTACT_ID = re.compile(r'[0-9]{1,32}')
+E164 = re.compile(r'\+[1-9][0-9]{7,14}')
+
+
+def contact_block(value):
+    """Shared contact cards (ANYM-529): bounded display text and phones as the provider stated them."""
+    def bounded(item,pattern=CONTACT_TEXT):
+        if not isinstance(item,str) or not pattern.fullmatch(item):raise ValueError('invalid_metadata')
+        return item
+    if not isinstance(value,dict) or set(value)!={'status','contacts'} or value['status'] not in CONTACT_STATUSES \
+            or not isinstance(value['contacts'],list) or len(value['contacts'])>20:
+        raise ValueError('invalid_metadata')
+    contacts=[]
+    for contact in value['contacts']:
+        if not isinstance(contact,dict) or set(contact)-{'name','vcard_name','telegram_user_id','phones'} \
+                or not isinstance(contact.get('phones'),list) or len(contact['phones'])>10:
+            raise ValueError('invalid_metadata')
+        name=contact.get('name')
+        item={'name':'' if name=='' else bounded(name),'phones':[]}
+        if 'vcard_name' in contact:item['vcard_name']=bounded(contact['vcard_name'])
+        if 'telegram_user_id' in contact:item['telegram_user_id']=bounded(contact['telegram_user_id'],CONTACT_ID)
+        for phone in contact['phones']:
+            if not isinstance(phone,dict) or set(phone)-{'number','normalized','type','whatsapp_id'} \
+                    or type(phone.get('normalized')) is not bool:
+                raise ValueError('invalid_metadata')
+            number=bounded(phone.get('number'))
+            # normalized means E.164 as the sender wrote it, never a guessed country.
+            if phone['normalized'] and not E164.fullmatch(number):raise ValueError('invalid_metadata')
+            entry={'number':number,'normalized':phone['normalized']}
+            if 'type' in phone:entry['type']=bounded(phone['type'])
+            if 'whatsapp_id' in phone:entry['whatsapp_id']=bounded(phone['whatsapp_id'],CONTACT_ID)
+            item['phones'].append(entry)
+        if not item['name'] and not item['phones']:raise ValueError('invalid_metadata')
+        contacts.append(item)
+    if value['status']=='unavailable' and contacts:raise ValueError('invalid_metadata')
+    result={'status':value['status'],'contacts':contacts}
+    if len(canonical(result))>16*1024:raise ValueError('invalid_metadata')
+    return result
+
+
 def text(value, maximum, name, empty=False):
     if not isinstance(value, str) or '\x00' in value or len(value)>maximum or (not empty and not value):
         raise ValueError('invalid_'+name)
@@ -93,7 +135,7 @@ def validate(data):
     if 'metadata' in data:
         metadata=data['metadata']
         if not isinstance(metadata,dict) or set(metadata)-{'reply_to_provider_id','forwarded','media_kind','mentions_owner','reply_to_owner','sender_is_bot','chat_type','sender_identity_basis','is_service','is_self_chat','sender_is_contact','sender_is_business_or_verified',
-                'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin'}:
+                'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin','contact'}:
             raise ValueError('invalid_metadata')
         result['metadata']={}
         for key,value in metadata.items():
@@ -104,6 +146,12 @@ def validate(data):
                 if value is not None:
                     if metadata.get('forwarded') is not True:raise ValueError('invalid_metadata')
                     value=forward_origin(value)
+            elif key=='contact':
+                # Only a contact message carries a card; "unavailable" is stored as no block.
+                if value is None:continue
+                if metadata.get('message_kind')!='contact':raise ValueError('invalid_metadata')
+                value=contact_block(value)
+                if value['status']=='unavailable':continue
             elif key=='media_duration_seconds':
                 if value is not None and (type(value) not in (int,float) or not 0<=value<=86400 or not math.isfinite(value)):
                     raise ValueError('invalid_metadata')
@@ -147,6 +195,8 @@ def validate(data):
             validate_formatting(data['formatting'],result['body'],result['platform'])
     if result['deleted']:
         result['body']=''; result['media']=[]
+        # A deleted message keeps no shared names or phone numbers.
+        result.get('metadata',{}).pop('contact',None)
     return result
 
 

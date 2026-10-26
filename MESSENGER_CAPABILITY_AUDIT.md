@@ -47,11 +47,13 @@ refresh group membership or change messenger read state.
 
 The new live operations query the existing session owner under separately granted
 permissions. They do **not** imply that reaction actors/counts, poll options/votes,
-album/topic IDs, contact-card/location contents, current group roles or profile
+album/topic IDs, location contents, current group roles or profile
 changes have been continuously captured and indexed in the archive. These need
 their own bounded schemas, observation time, revision/coverage rules and refresh
 jobs. In particular, a live Telegram poll/topic result is not yet a searchable,
-complete passive poll/topic archive.
+complete passive poll/topic archive. Shared contact cards (names, phones,
+WhatsApp/Telegram IDs) are captured as a bounded block when
+`ANYMSG_CAPTURE_CONTACT_CARDS=1` ([SEARCH.md](SEARCH.md#shared-contact-cards)).
 
 ## Capability-extension design reference
 

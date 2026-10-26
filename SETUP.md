@@ -185,6 +185,16 @@ collector services only once the release a rollback would return to already
 contains forward origin support: an older server rejects such a capture and the
 collector skips that message.
 
+### Shared contact cards
+
+Collectors record a shared contact card's names, phone numbers and WhatsApp or
+Telegram ID (`contact`, [SEARCH.md](SEARCH.md#shared-contact-cards)) only when
+their environment sets `ANYMSG_CAPTURE_CONTACT_CARDS=1`; it is off by default
+(native WhatsApp, the whatsapp-web.js fallback and Telegram read the same
+variable). The server always accepts, returns and searches a captured card. Set
+it on the collector services only once the release a rollback would return to
+already accepts the block: an older server rejects such a capture.
+
 ### Provider business and verified flags
 
 Collectors record that a sender is a WhatsApp business (`VerifiedName`) or a

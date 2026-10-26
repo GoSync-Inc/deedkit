@@ -46,6 +46,8 @@ In the conversation view each message tool returns every message text once.
   is `user`, `chat`, `channel`, `hidden_user`, `newsletter`, `unknown` or
   `not_captured` (archived before origin capture; `status` is reserved); fields, enums and the access
   rule are in [SEARCH.md](SEARCH.md#forwarded-messages).
+  A shared contact card carries a `contact` block, or `contact_details:
+  "unavailable"` when none was captured ([SEARCH.md](SEARCH.md#shared-contact-cards)).
 - `detail="transcript"`: only the numbered transcript with message IDs, its
   warnings, cursors and file references (`files`). Message text defaults to
   2000 characters; `body_chars` changes it. Requires `view="conversation"`.

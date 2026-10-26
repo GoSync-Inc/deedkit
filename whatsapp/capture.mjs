@@ -70,6 +70,112 @@ function envelopeFilename(value) {
   const dot=name.lastIndexOf('.'),ext=dot>0 && [...name.slice(dot)].length<=16?name.slice(dot):'';
   return envelopeText(name.slice(0,name.length-ext.length),MAX_FILENAME-[...ext].length)+ext;
 }
+// Shared contact card block (ANYM-529), the same rules as whatsmeow vcard.go and
+// envelope.contact_block: FN, N and TEL (TYPE, waid) only; no field is logged.
+const MAX_CONTACTS=20,MAX_CONTACT_PHONES=10,MAX_CONTACT_TEXT=256,MAX_CONTACT_BLOCK=16*1024,MAX_VCARD=64*1024;
+function contactText(value) {
+  // [text,cut]: well formed, no control characters, at most 256 code points.
+  const chars=[...String(value).toWellFormed().replace(/[\x00-\x1f\x7f]/g,' ').trim()];
+  return chars.length<=MAX_CONTACT_TEXT?[chars.join(''),false]:[chars.slice(0,MAX_CONTACT_TEXT).join(''),true];
+}
+export function normalizePhone(raw) {
+  // E.164 only for a number written internationally; no country is guessed.
+  let value=raw.trim();
+  if(/^tel:/i.test(value))value=value.slice(4).trim();
+  let compact=value.replace(/[ \t\-.()/\u00a0]/g,'');
+  if(compact.startsWith('00'))compact='+'+compact.slice(2);
+  return /^\+[1-9][0-9]{7,14}$/.test(compact)?[compact,true]:[raw.trim(),false];
+}
+function splitUnescaped(value,separator) {
+  const parts=[];let start=0;
+  for(let i=0;i<value.length;i++){
+    if(value[i]==='\\')i++;
+    else if(value[i]===separator){parts.push(value.slice(start,i));start=i+1;}
+  }
+  parts.push(value.slice(start));
+  return parts;
+}
+function vcardUnescape(value) {
+  return value.replace(/\\(.)/g,(_,c)=>c==='n'||c==='N'?' ':c);
+}
+export function parseVcard(text) {
+  // RFC 6350 section 3.2 unfolding; null when malformed (no BEGIN/END, or a line without a value).
+  if(typeof text!=='string' || Buffer.byteLength(text)>MAX_VCARD || !text.isWellFormed())return null;
+  const lines=[];
+  for(const line of text.replace(/\r\n?/g,'\n').split('\n')){
+    if((line.startsWith(' ')||line.startsWith('\t')) && lines.length)lines[lines.length-1]+=line.slice(1);
+    else lines.push(line);
+  }
+  let begun=false,ended=false,fn='',n='',cut=false;const phones=[];
+  for(const line of lines){
+    if(!line.trim())continue;
+    let colon=-1,quoted=false;
+    for(let i=0;i<line.length;i++){
+      if(line[i]==='"')quoted=!quoted;
+      else if(line[i]===':' && !quoted){colon=i;break;}
+    }
+    if(colon<=0)return null;
+    const params=line.slice(0,colon).split(';');
+    const name=params[0].toUpperCase().split('.').pop(),value=line.slice(colon+1);
+    if(name==='BEGIN' && value.trim().toUpperCase()==='VCARD')begun=true;
+    else if(name==='END' && value.trim().toUpperCase()==='VCARD')ended=begun;
+    else if(!begun || ended)continue;
+    else if(name==='FN' && !fn)fn=vcardUnescape(value);
+    else if(name==='N' && !n){
+      // family;given;additional;prefix;suffix, shown as prefix given additional family suffix.
+      const parts=splitUnescaped(value,';');
+      n=[3,1,2,0,4].map(i=>vcardUnescape((parts[i]||'').replaceAll('\\,','\0')).replaceAll(',',' ').trim().replaceAll('\0',','))
+        .filter(Boolean).join(' ');
+    } else if(name==='TEL'){
+      const raw=vcardUnescape(value).trim();
+      if(!raw)continue;
+      if(phones.length===MAX_CONTACT_PHONES){cut=true;continue;}
+      const types=[];let waid='';
+      for(const param of params.slice(1)){
+        const at=param.indexOf('='),key=at<0?'':param.slice(0,at).toLowerCase(),val=at<0?'':param.slice(at+1).replace(/^"|"$/g,'');
+        if(key==='waid')waid=val;
+        else if(key==='type')types.push(...val.split(',').map(t=>t.trim().toLowerCase()));
+        else if(at<0 && param)types.push(param.trim().toLowerCase());  // vCard 2.1 bare type
+      }
+      const [normalizedNumber,normalized]=normalizePhone(raw);
+      const [number,numberCut]=contactText(normalizedNumber);
+      cut||=numberCut;
+      const phone={number,normalized};
+      const kinds=[...new Set(types.filter(Boolean))];
+      if(kinds.length){const [kind,kindCut]=contactText(kinds.join(','));cut||=kindCut;phone.type=kind;}
+      if(/^[0-9]{1,32}$/.test(waid))phone.whatsapp_id=waid;
+      if(number)phones.push(phone);
+    }
+  }
+  if(!begun || !ended)return null;
+  return {name:fn.trim()?fn:n,phones,cut};
+}
+export function contactBlock(cards) {
+  // A malformed card keeps its display name and makes the status parse_failed.
+  let failed=false,cut=cards.length>MAX_CONTACTS,contacts=[];
+  for(const card of cards.slice(0,MAX_CONTACTS)){
+    let [name,nameCut]=contactText(typeof card.displayName==='string'?card.displayName:'');
+    cut||=nameCut;
+    const fields=parseVcard(card.vcard);
+    if(!fields){failed=true;if(name)contacts.push({name,phones:[]});continue;}
+    const [vcardName,vcardCut]=contactText(fields.name);
+    cut||=fields.cut||vcardCut;
+    if(!name)name=vcardName;
+    if(!name && !fields.phones.length)continue;
+    contacts.push({name,...(vcardName && vcardName!==name?{vcard_name:vcardName}:{}),phones:fields.phones});
+  }
+  const size=list=>Buffer.byteLength(JSON.stringify({contacts:list,status:'parse_failed'}));
+  while(contacts.length && size(contacts)>MAX_CONTACT_BLOCK){contacts=contacts.slice(0,-1);cut=true;}
+  return {status:failed?'parse_failed':cut?'truncated':'parsed',contacts};
+}
+function sharedContacts(message,raw) {
+  // Only vCards whatsapp-web.js already holds; nothing is fetched. Without them the block says unavailable.
+  if(Array.isArray(raw.vcardList) && raw.vcardList.length)
+    return contactBlock(raw.vcardList.map(item=>({displayName:item?.displayName,vcard:item?.vcard})));
+  const cards=Array.isArray(message.vCards)?message.vCards.filter(v=>typeof v==='string'):[];
+  if(!cards.length)return {status:'unavailable',contacts:[]};
+  return contactBlock(cards.map(vcard=>({displayName:cards.length===1?raw.vcardFormattedName:'',vcard})));
+}
 export function event(message, body=undefined, ownerIds=[]) {
   const raw=message._data || message;
   const mime=envelopeMime(raw.mimetype);
@@ -110,6 +216,9 @@ export function event(message, body=undefined, ownerIds=[]) {
     value.forwardOrigin={kind:'unknown',basis:'whatsapp_web_js_message',
       ...(Number.isSafeInteger(score) && score>=0 && score<2**32?{forwarding_score:score}:{})};
   }
+  // Off until the release a rollback would return to accepts contactCard (ANYM-529).
+  if (['vcard','multi_vcard'].includes(type) && process.env.ANYMSG_CAPTURE_CONTACT_CARDS==='1')
+    value.contactCard=sharedContacts(message,raw);
   if (!Number.isSafeInteger(value.timestamp) || value.timestamp<=0 || value.timestamp>MAX_UNIX)
     throw new Error('invalid_provider_time');
   if (!envelopeReference(value.messageId) || (value.senderId!=='' && !envelopeReference(value.senderId,MAX_SENDER)) ||
