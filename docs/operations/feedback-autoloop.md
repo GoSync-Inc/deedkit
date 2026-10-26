@@ -74,7 +74,10 @@ reporter", "paused" and "answered, no change needed" (ANYM-573).
 Config defaults (owner-set): 20 items per principal per day into triage; 24 reader runs a day;
 5 card and 3 build launches a day; 2 card and 2 build workers in flight; 12 worker hours a day
 (card 2 h, build 4 h each, reserved before the start); one relaunch per card; Codex reviews also
-obey the Codex line (review-protocol.md). Reservation and lane rules: ANYM-569 and ANYM-572.
+obey the Codex line (review-protocol.md). An interrupted or unknown run keeps its reservation; an
+unknown launch is reconciled from `superset workspaces list` by its stable name, never retried. A
+build reserves its card's lane and expected paths and waits while another live intent, an open PR
+or a pushed branch of a live workspace touches them (details: ANYM-569, ANYM-572).
 
 ## The live switch
 

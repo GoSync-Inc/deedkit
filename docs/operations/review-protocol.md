@@ -48,5 +48,5 @@ list: release, deploy and `production.py`, sends and live provider-session code.
   hit keeps an autoloop PR out of the controller merge. This is the one list.
 
   ```sh
-  git diff --no-renames --name-only origin/main... | grep -E '^(\.github/|scripts/|deploy/|tools/|config/|docs/(operations|harness)/|services/release-router/)|(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|conftest\.py|uv\.lock|package-lock\.json|go\.sum|requirements[^/]*\.(lock|in|txt))$'
+  git diff --no-renames --name-only origin/main... | grep -E '^(\.github/|scripts/|deploy/|tools/|config/|docs/(operations|harness)/|services/release-router/)|(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|conftest\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|requirements[^/]*\.(lock|in|txt))$'
   ```
