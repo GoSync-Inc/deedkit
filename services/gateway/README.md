@@ -261,10 +261,11 @@ wait up to 25 seconds, fetch a page with its receipt, handle every item, then AC
 that receipt. A crash before the ACK makes the next fetch return the same page.
 `messages_capabilities` lists `subscriptions.transports` (`pull`, `long_poll`,
 `webhook`) only when this profile exposes every tool of the transport. That filter is
-the gateway's: deploy a gateway at ANYM-528 (f6c78c4) or later no later than this
-backend, and roll the two back together. `production.py` deploys both images from
-one SHA. A pre-528 gateway in front of this backend passes every transport through
-unfiltered; its admission still refuses the hidden tools.
+the gateway's, and it ships in the same change (ANYM-518), not with ANYM-528: deploy
+the gateway from the same SHA as this backend, never after it, and roll the two back
+together. `production.py` deploys both images from one SHA. An older gateway in front
+of this backend passes the transport rows through (ANYM-528 empties their `tools`
+but keeps the rows); its admission still refuses the hidden tools.
 
 Long subscription waits and sends with positive `wait_s` use a separate pool with
 2 active and 4 waiting requests; ordinary messaging reads retain their own pool.

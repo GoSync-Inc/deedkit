@@ -162,3 +162,27 @@ def test_webhook_status_read_failure_keeps_capabilities(seeded,tmp_path):
     # Everything else is as before, including the operations the gateway admits by.
     assert {k:v for k,v in caps.items() if k!='subscriptions'}=={k:v for k,v in full.items() if k!='subscriptions'}
     assert s.capabilities(token)['subscriptions']['transports']==full['subscriptions']['transports']
+
+
+# spec: ANYM-518
+def test_locked_heartbeat_answers_capabilities_well_inside_the_discovery_deadline(seeded,tmp_path):
+    import time
+    from test_event_delivery import identity
+    s,_,_=seeded
+    token=identity(s);bound_receiver(s,token,tmp_path);heartbeat(s,5)
+    full=s.capabilities(token)
+    # Another session holds the heartbeat table; the gateway's discovery gives capabilities 2 s.
+    with s.pool.connection() as holder:
+        with holder.transaction():
+            holder.execute('LOCK TABLE subscription_dispatcher_heartbeat IN ACCESS EXCLUSIVE MODE')
+            started=time.monotonic();caps=s.capabilities(token);elapsed=time.monotonic()-started
+    rows={t['name']:t for t in caps['subscriptions']['transports']}
+    assert rows['webhook']['reason']=='delivery_status_unavailable' and rows['pull']['operational'] is True
+    assert elapsed<1.5,elapsed
+    assert {k:v for k,v in caps.items() if k!='subscriptions'}=={k:v for k,v in full.items() if k!='subscriptions'}
+    # The caller's own limits are back after the diagnostic reads.
+    from messaging_service.event_delivery import delivery_transports
+    with s.authorized(token,'capabilities') as (c,p):
+        c.execute("SET LOCAL statement_timeout='4s'")
+        assert delivery_transports(c,p)==full['subscriptions']['transports']
+        assert c.execute("SELECT current_setting('statement_timeout') AS t").fetchone()['t']=='4s'

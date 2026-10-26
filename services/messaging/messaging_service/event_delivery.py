@@ -260,6 +260,9 @@ def _transport(endpoint, body, headers, *, resolved, timeout=5):
 
 # ANYM-518: webhook delivery counts as working while the dispatcher's last pass is this recent.
 HEARTBEAT_MAX_AGE_S = 120
+# Budget of each optional delivery-status read in capabilities (two reads, so at most 0.4 s).
+DIAGNOSTIC_STATEMENT_MS = 200
+DIAGNOSTIC_LOCK_MS = 100
 TRANSPORT_TOOLS = {'pull': ['fetch_subscription_events', 'ack_subscription_events'],
     'long_poll': ['wait_for_subscription_events'], 'webhook': ['configure_subscription_delivery']}
 
@@ -282,10 +285,14 @@ def delivery_transports(c, p):
     import psycopg
     from .policy import OPERATION_PERMISSIONS
     permitted = set(p['permissions'])
-    # Optional diagnostics: a failed read (timeout, privilege, missing table) marks webhook status
-    # unavailable inside its own savepoint and never fails capabilities, which every gateway call needs.
+    # Optional diagnostics: a failed or slow read (lock, timeout, privilege, missing table) marks webhook status
+    # unavailable inside its own savepoint and never fails capabilities, which every gateway call needs (gateway
+    # discovery waits 2 s). Each read gets DIAGNOSTIC_STATEMENT_MS; the caller's limits come back afterwards.
+    limits = c.execute("SELECT current_setting('statement_timeout') AS s,current_setting('lock_timeout') AS l").fetchone()
     try:
         with c.transaction():
+            c.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
+                (f'{DIAGNOSTIC_STATEMENT_MS}ms', f'{DIAGNOSTIC_LOCK_MS}ms'))
             beat_row = c.execute('''SELECT clock_timestamp()-beat_at<=make_interval(secs=>%s) AS fresh
                 FROM subscription_dispatcher_heartbeat WHERE id=1''', (HEARTBEAT_MAX_AGE_S,)).fetchone()
             # Only bindings of subscriptions still valid for this key: not expired, same scope and permissions.
@@ -296,7 +303,10 @@ def delivery_transports(c, p):
                 AND (s.expires_at IS NULL OR s.expires_at>clock_timestamp())
                 AND s.scope_version=%s AND s.key_permission_version=%s''',
                 (p['id'], p['key_id'], p['scope_version'], p['key_permission_version'])).fetchone()
+            c.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
+                (limits['s'], limits['l']))
     except psycopg.Error:
+        # The savepoint's rollback also restores the caller's limits.
         beat_row = bound = None
     rows = []
     for name, tools in TRANSPORT_TOOLS.items():
