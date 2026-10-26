@@ -1189,3 +1189,26 @@ def test_items_over_a_daily_cap_and_items_of_a_worker_the_stop_closed_get_their_
     code, _ = run_tick(loop, fakes, now=NOW + timedelta(hours=2))
     assert code == 0 and notes(t)[D3] == ('received', autoloop.PAUSED) and P1 not in notes(t) and P2 not in notes(t)
     assert autoloop.intents(a)['autoloop-card-xyz']['status'] == 'stopped'
+
+
+# spec: ANYM-571
+def test_a_hold_on_the_card_only_a_relaunch_bound_cancels_the_ready_merge_of_the_first_branch(loop, template):
+    t, a, s = loop
+    template.parent.mkdir()
+    template.write_text('brief\n')
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'groups lose names')])
+    new_card(fakes, {D1: ('group-names', BRIEF)})
+    created = creates(fakes, {'id': 'ws-00001'})
+    run_tick(loop, fakes)
+    name = card_name('new:group-names')
+    fakes.submissions = []
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1))  # the first worker is gone unbound: one relaunch
+    assert len(created()) == 2 and not autoloop.intents(a)[name].get('ref')
+    assert autoloop.main(['bind', f'{name}-r1', '--card', 'ANYM-77', '--state', str(a)]) == 0
+    fakes.workspaces = [{'name': f'{name}-r1', 'id': 'ws-00001', 'projectName': 'deedkit'}]
+    fakes.runs = [{'databaseId': 9, 'status': 'in_progress', 'conclusion': None, 'updatedAt': '2026-10-26T13:01:00Z',
+                   'displayTitle': f'Tiden sync ready merge proposal/{name}'}]
+    autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW)
+    code, _ = run_tick(loop, fakes, now=NOW + timedelta(hours=2))
+    assert code == 0 and ('gh', ['run', 'cancel', '9']) in [(c[0], c[1][:3]) for c in fakes.calls]
