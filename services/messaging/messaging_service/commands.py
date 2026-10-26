@@ -349,6 +349,68 @@ def _lookup_budget(c,account,command):
         %s::timestamptz+interval '1 hour'-clock_timestamp())))::int AS s''',(rows[-1]['at'],)).fetchone()['s']
 
 
+def _other_account_chat(c,p,account,phone):
+    """ANYM-531: an archived chat of this number on another account the key reads; archive only."""
+    from .policy import scope_filter
+    from .whatsapp_identity import resolve_alias
+    if 'read' not in p['permissions']:return None
+    for other in sorted(set(p['accounts'])-{account}):
+        where,args=scope_filter({**p,'accounts':[other]},'c',chat_column='id')
+        row=c.execute("SELECT c.id FROM chats c JOIN accounts a ON a.id=c.account WHERE a.platform='whatsapp' "
+            'AND c.provider_chat=%s AND '+where+' ORDER BY c.id LIMIT 1',[phone+'@c.us',*args]).fetchone()
+        if not row:
+            try:row=resolve_alias(c,p,other,phone+'@c.us')
+            except APIError:row=None  # Ambiguous evidence names nothing.
+        if row:return {'account':other,'chat_id':row['id']}
+    return None
+
+
+def phone_next_step(c,p,account,reference):
+    """ANYM-531: the exact next call for a phone reference that is not found, or why there is none.
+    Archive and policy reads only: it never dispatches a lookup. Only the caller's normalized number is echoed."""
+    from .messenger_operations import phone_digits
+    from .whatsapp_capabilities import account_provider
+    if not isinstance(account,str) or account not in p['accounts']:return {}
+    row=c.execute('SELECT platform FROM accounts WHERE id=%s',(account,)).fetchone()
+    if not row:return {}
+    phone,_=phone_digits(reference.split('@',1)[0])
+    if phone is None:return {'next_action':'invalid_phone'}
+    found=_other_account_chat(c,p,account,phone)
+    if found:return {'found_on_other_account':found,'next_action':'use_existing_chat'}
+    if row['platform']!='whatsapp' or account_provider(c,account,row['platform'])!='whatsmeow':
+        return {'hint':'native_whatsapp_accounts_only','next_action':'use_username_or_existing_chat'}
+    parameters={'phone':'+'+phone,'create':False}
+    if (set(_required_permissions('send','open_chat_by_phone',parameters))-set(p['permissions'])
+            or p['chat_ids'] is not None):return {'next_action':'key_cannot_open_new_chats'}
+    policy=c.execute('SELECT enabled,operations_enabled FROM account_policies WHERE account=%s',(account,)).fetchone()
+    if not policy or not policy['enabled'] or 'open_chat_by_phone' not in policy['operations_enabled']:
+        return {'next_action':'ask_operator_to_enable_open_chat_by_phone','account':account}
+    try:_phone_policy(c,account,phone)
+    except APIError:return {'next_action':'chat_not_collected'}
+    allowed,resets=_lookup_budget(c,account,'')
+    if not allowed:return {'next_action':'rate_limited','resets_in_seconds':resets}
+    return {'next_action':'open_chat_by_phone_then_follow_next_call',
+        'next_call':{'tool':'execute_messenger_operation','arguments':{'account':account,
+            'operation':'open_chat_by_phone','parameters':parameters},'caller_supplies':['request_id']}}
+
+
+def _open_chat_next(row,p=None):
+    """ANYM-531: the next call after an open_chat_by_phone receipt; the shortest permitted path."""
+    if row['operation']!='open_chat_by_phone':return None
+    if row['status'] in ('queued','dispatching'):
+        return {'tool':'get_messenger_operation','arguments':{'operation_id':row['id']},'caller_supplies':[]}
+    data=(row['result'] or {}).get('data') if row['status']=='succeeded' else None
+    if not isinstance(data,dict) or data.get('on_whatsapp') is not True:return None
+    if isinstance(data.get('chat_id'),str):
+        if p is not None and 'read' not in p['permissions']:return None
+        return {'tool':'preview_message','arguments':{'account':row['account'],'chat_id':data['chat_id']},
+            'caller_supplies':['text']}
+    # A new stable request ID for this separately confirmed intent, never a replacement of an uncertain one.
+    return {'tool':'execute_messenger_operation','arguments':{'account':row['account'],'operation':'open_chat_by_phone',
+        'parameters':{'phone':'+'+row['payload']['parameters']['phone'],'create':True}},
+        'caller_supplies':['request_id'],'owner_confirmation_required':True}
+
+
 def _digest(p,payload):
     return hashlib.sha256(canonical({'principal':p['id'],'key_id':str(p['key_id']),
         'scope_version':p['scope_version'],'key_permission_version':p['key_permission_version'],
@@ -394,7 +456,8 @@ def _public(row,c=None,p=None):
         from .outgoing import project_reference
         actual,state=project_reference(c,p,row['account'],answer['data']['archive_reference'])
         answer={**answer,'data':{**answer['data'],'archive_reference':actual,'archive_reference_state':state}}
-    return serial({'operation_id':row['id'],'operation':row['operation'],'account':row['account'],
+    step=_open_chat_next(row,p)
+    return serial({**({'next_call':step} if step else {}),'operation_id':row['id'],'operation':row['operation'],'account':row['account'],
         'chat_id':row['chat'],'message_id':row['message'],'expected_revision':row['expected_revision'],
         'status':row['status'],'created_at':row['created_at'],'expires_at':row['expires_at'],
         'finished_at':row['finished_at'],'error_code':row['error_code'],'result':answer,

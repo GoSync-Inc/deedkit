@@ -121,7 +121,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Send exact confirmed content using this account's existing collector.\n\nFor rich formatting or nondefault policies, call preview_message first and\npass its matching preview_digest. Show account, recipient, visible text,\nformatting, warnings, link destinations and reply target to the owner and\nobtain explicit confirmation. Digest is not approval. Requires send permission\nand operator opt-in. plain remains the default and native WhatsApp delimiters\ncan still be interpreted by WhatsApp.\nchat_id/reply_to are archive IDs; account must be explicit. request_id is a\nunique 8\u2013128 character key for this approved action; reuse it after network\nfailure with the SAME payload. queued is not sent. Poll get_send_status.\nsent means provider accepted, not recipient read/delivered. unknown must be\nchecked against history before any newly approved send. Text only, provider\npayload at most 4000 UTF-16 units; source at most 16000 units subject to the\n16384-byte HTTP JSON envelope. No splitting or server human-approval gate.\n",
+      "description": "Send exact confirmed content using this account's existing collector.\n\nFor rich formatting or nondefault policies, call preview_message first and\npass its matching preview_digest. Show account, recipient, visible text,\nformatting, warnings, link destinations and reply target to the owner and\nobtain explicit confirmation. Digest is not approval. Requires send permission\nand operator opt-in. plain remains the default and native WhatsApp delimiters\ncan still be interpreted by WhatsApp.\nchat_id/reply_to are archive IDs; account must be explicit. request_id is a\nunique 8\u2013128 character key for this approved action; reuse it after network\nfailure with the SAME payload. queued is not sent. Poll get_send_status.\nsent means provider accepted, not recipient read/delivered. unknown must be\nchecked against history before any newly approved send. Text only, provider\npayload at most 4000 UTF-16 units; source at most 16000 units subject to the\n16384-byte HTTP JSON envelope. No splitting or server human-approval gate.\nA new WhatsApp number is reached with execute_messenger_operation operation\nopen_chat_by_phone; a phone-shaped not_found names the exact next_call.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -2041,7 +2041,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Exact account + provider chat ID, optionally provider message ID, to archive objects.\nTelegram chat ID uses marked form: users positive, groups negative, channels -100\u2026;\ndo not strip the sign or resolve a channel from an unmarked positive ID. WhatsApp uses\nthe opaque provider chat/message IDs verbatim. Hidden and absent objects both not_found.\n",
+      "description": "Exact account + provider chat ID, optionally provider message ID, to archive objects.\nTelegram chat ID uses marked form: users positive, groups negative, channels -100\u2026;\ndo not strip the sign or resolve a channel from an unmarked positive ID. WhatsApp uses\nthe opaque provider chat/message IDs verbatim. Hidden and absent objects both not_found.\nA new WhatsApp number is reached with execute_messenger_operation operation\nopen_chat_by_phone; a phone-shaped not_found names the exact next_call.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

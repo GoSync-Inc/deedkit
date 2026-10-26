@@ -46,7 +46,7 @@ def resolve_chat(c,p,account,provider_chat_id):
             'requested_provider_chat_id':provider_chat_id,'original_provider_chat_id':row['provider_chat']}}
     if not row:
         from .outgoing import phone_not_found
-        raise phone_not_found(provider_chat_id)
+        raise phone_not_found(provider_chat_id,c,p,account)
     # ANYM-361: the same self-chat label as list_chats; the stored title is not returned for it.
     from .chat_queries import SELF_CHAT_TITLE,self_chat_sql
     if c.execute("SELECT c.chat_type='private' AND "+self_chat_sql()+' AS self FROM chats c WHERE c.id=%s',

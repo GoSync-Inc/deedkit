@@ -93,11 +93,19 @@ def format_options(format,link_preview,allow_lossy,preview_digest=''):
         raise APIError('preview_mismatch',409)
 
 
-def phone_not_found(value):
-    """not_found; a phone-shaped reference also names the operation that opens it."""
+def phone_not_found(value,c=None,p=None,account=None):
+    """not_found; a phone-shaped reference also names the operation that opens it
+    and, given the caller's scope, the exact next call or why there is none (ANYM-531)."""
     from .messenger_operations import PHONE_SHAPED
     failure=APIError('not_found',404)
-    if isinstance(value,str) and PHONE_SHAPED.fullmatch(value):failure.hint='open_chat_by_phone'
+    if isinstance(value,str) and PHONE_SHAPED.fullmatch(value):
+        failure.hint='open_chat_by_phone'
+        if c is not None:
+            from . import commands
+            try:
+                with c.transaction():step=commands.phone_next_step(c,p,account,value)
+            except Exception:step={}  # The suggestion never turns not_found into another error.
+            for name,item in step.items():setattr(failure,name,item)
     return failure
 
 
@@ -106,10 +114,10 @@ def target(c,p,account,chat_id,reply_to):
         raise APIError('not_found',404)
     if not isinstance(reply_to,str) or len(reply_to)>256:
         raise APIError('not_found',404)
-    if not permitted(p,account,chat_id):raise phone_not_found(chat_id)
+    if not permitted(p,account,chat_id):raise phone_not_found(chat_id,c,p,account)
     chat=c.execute('''SELECT c.*,a.platform FROM chats c JOIN accounts a ON a.id=c.account
         WHERE c.id=%s AND c.account=%s''',(chat_id,account)).fetchone()
-    if not chat or not chat['provider_chat']:raise phone_not_found(chat_id)
+    if not chat or not chat['provider_chat']:raise phone_not_found(chat_id,c,p,account)
     reply_id=None
     if reply_to:
         source=c.execute('SELECT provider_id FROM messages WHERE id=%s AND chat=%s AND account=%s AND NOT deleted',

@@ -225,10 +225,38 @@ refusals do not. When the budget is spent, a local answer still succeeds and a
 lookup is refused before any query: the operation fails with `rate_limited` and
 `result.data.resets_in_seconds`. The session-store reads and the lookup share a
 10-second deadline; `provider_timeout` is a failed read with
-`result.data.retry: true`, never an unknown send. `send_message`
-and `resolve_reference` add `hint: open_chat_by_phone` to `not_found` for a
-phone-shaped chat reference. The number is sent to WhatsApp and kept in the
-operation row and in the session store's PN/LID mapping; it is not logged.
+`result.data.retry: true`, never an unknown send. The number is sent to WhatsApp
+and kept in the operation row and in the session store's PN/LID mapping; it is not logged.
+
+### The next call at each step
+
+`send_message`, `preview_message` and `resolve_reference` add
+`hint: open_chat_by_phone` to `not_found` for a phone-shaped chat reference, and
+name what the caller may do next. Each `next_call` has the transport's own `tool`
+(`execute_messenger_operation` direct, `messages_execute_messenger_operation`
+through the gateway), the exact `arguments` and `caller_supplies`, the fields the
+caller adds itself (a new stable `request_id`, or the `text`); no placeholder is
+ever inside `arguments`. The only number echoed is the caller's own, normalized.
+
+| Situation | Response |
+|---|---|
+| A call would be accepted | `next_call` open_chat_by_phone with `create: false`, `next_action: open_chat_by_phone_then_follow_next_call` |
+| The key reads a chat of this number on another account (archive only) | `found_on_other_account: {account, chat_id}`, `next_action: use_existing_chat`, no `next_call` |
+| The operation is not enabled on the account | `next_action: ask_operator_to_enable_open_chat_by_phone`, `account` |
+| The key or the gateway lacks the operation, `send` or full-account scope | `next_action: key_cannot_open_new_chats` |
+| The hourly lookups are spent | `next_action: rate_limited`, `resets_in_seconds` |
+| The collection policy excludes the number | `next_action: chat_not_collected` |
+| The reference is not a valid international number | `next_action: invalid_phone` |
+| Telegram or a whatsapp-web.js account | `hint: native_whatsapp_accounts_only`, `next_action: use_username_or_existing_chat` |
+
+The operation receipt carries `next_call` too: a queued or dispatching check names
+`get_messenger_operation` with its `operation_id`; a registered number without a chat
+names the same operation with `create: true` and `owner_confirmation_required: true`
+(the owner confirms the number first; a new request ID, never a replacement of an
+uncertain one); a created or existing chat names `preview_message` with its
+`chat_id`. Building a suggestion reads the archive and policy only: it never
+dispatches a lookup, and if it fails the plain `not_found` is returned. A
+suggestion is not permission to send; the owner confirms before create and before send.
 
 Enable per account after the API and the native collectors run one release (an
 older native adapter refuses the operation); without it, `operation_disabled`
