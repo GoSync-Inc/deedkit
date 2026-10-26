@@ -21,16 +21,16 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 BASE = ["compose.yaml", "compose.collectors.yaml", "compose.whatsapp.yaml", "compose.indexer.yaml",
         "compose.enrichment.yaml", "compose.subscriptions.yaml", "compose.operator.yaml",
-        "compose.file-lifecycle.yaml", "compose.file-understanding.yaml"]
+        "compose.file-lifecycle.yaml", "compose.file-understanding.yaml", "compose.message-purge.yaml"]
 NATIVE = "compose.whatsapp-native.yaml"
 APPLICATIONS = {"api", "telegram", "whatsapp1", "whatsapp2", "indexer", "enricher", "enricher-local",
                 "operator", "subscriptions", "file-lifecycle", "cold-archive", "cold-restore",
-                "file-understanding"}
+                "file-understanding", "message-purge"}
 COLLECTORS = {"telegram", "whatsapp1", "whatsapp2"}
 SECRET_DIRECTORIES = ["processing-locks", "telegram-session", "whatsapp1-session", "whatsapp2-session",
                       "issued-keys", "cold-archive-identity", "cold-archive-ssh", "enrichment-models"]
 SECRET_FILES = ["app.dsn", "collector.dsn", "indexer.dsn", "owner.dsn", "subscriptions.dsn", "enrichment.dsn",
-                "enrichment-local.dsn", "file-lifecycle.dsn", "cold-archive.dsn", "file-understanding.dsn",
+                "enrichment-local.dsn", "file-lifecycle.dsn", "cold-archive.dsn", "file-understanding.dsn", "message-purge.dsn",
                 "enrichment.keys", "enrichment.json", "enrichment-local.json", "file-understanding.json",
                 "cold-archive.json", "telegram.json", "telegram.credentials.json", "telegram.permit.json",
                 "whatsapp1.json", "whatsapp1.permit.json", "whatsapp2.json", "whatsapp2.permit.json"]

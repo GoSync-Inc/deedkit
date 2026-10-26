@@ -145,8 +145,8 @@ def test_large_stream_keeps_original_ciphertext_source_distinct_from_tar_members
     assert hashlib.sha256((tmp_path/'large-restore/files'/digest).read_bytes()).hexdigest()==digest
 
 
-# The id '36-36' is a Tiden case ID; since schema 44 the first unsupported schema is 45.
-@pytest.mark.parametrize('actual,manifest',[('34',31),('31',34),pytest.param('45',45,id='36-36'),('corrupt',34),(None,34)])
+# The id '36-36' is a Tiden case ID; since schema 45 the first unsupported schema is 46.
+@pytest.mark.parametrize('actual,manifest',[('34',31),('31',34),pytest.param('46',46,id='36-36'),('corrupt',34),(None,34)])
 def test_restored_database_schema_must_match_manifest_before_quarantine_or_proof(actual,manifest):
     from messaging_service import backup_restore_worker as worker
     class Lease:
@@ -162,6 +162,16 @@ def test_restored_database_schema_reports_actual_verified_version():
         def __enter__(self):return SimpleNamespace(execute=lambda query:SimpleNamespace(fetchone=lambda:{'value':'34'}))
         def __exit__(self,*args):pass
     assert worker.restored_schema_version(SimpleNamespace(pool=SimpleNamespace(connection=Lease)),34)==34
+
+
+# spec: ANYM-511
+@pytest.mark.parametrize('version',[44,45],ids=['n-1','current'])
+def test_restored_database_schema_accepts_the_current_and_previous_schema(version):
+    from messaging_service import backup_restore_worker as worker
+    class Lease:
+        def __enter__(self):return SimpleNamespace(execute=lambda query:SimpleNamespace(fetchone=lambda:{'value':str(version)}))
+        def __exit__(self,*args):pass
+    assert worker.restored_schema_version(SimpleNamespace(pool=SimpleNamespace(connection=Lease)),version)==version
 
 
 def test_worker_mismatched_dump_schema_never_enters_inventory_quarantine_or_result(tmp_path,monkeypatch):

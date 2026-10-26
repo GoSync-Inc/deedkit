@@ -481,3 +481,13 @@ receipt = client.execute_messenger_operation(
 )
 status = client.get_messenger_operation(operation_id=receipt["operation_id"])
 ```
+
+## Deleted messages (schema 45)
+
+When the message an operation targets, or the message it produced (`send_poll`, `send_file`,
+`send_contact`, `send_location`, `forward_message`), is deleted in the messenger, the purge
+(ANYM-511) keeps the operation: its ID, request ID, status, routing and authorization stay, so
+`get_messenger_operation` and a repeat of the same request ID still answer. Its text parameters
+become `[deleted]` and its result keeps only `outcome`, the provider message ID and the archive
+reference, plus `purged: true`. A live-search hit naming a purged message keeps its IDs and
+reads `text: ""`, `purged: true`.

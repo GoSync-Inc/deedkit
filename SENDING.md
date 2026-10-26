@@ -166,3 +166,11 @@ outgoing messages. The audit records identities and resource IDs, not text.
 Provider references: [Telethon send_message](https://docs.telethon.dev/en/stable/modules/client.html),
 [Telegram random_id](https://core.telegram.org/method/messages.sendMessage),
 [WhatsApp send options](https://docs.wwebjs.dev/Client.js.html).
+
+## Deleted messages (schema 45)
+
+When a sent message is deleted in the messenger, the purge (ANYM-511) keeps the send record,
+its status and provider IDs; `body` and `source_text` read `[deleted]` and the render artifact
+is empty. The record is found by its verified wire reference (native WhatsApp) or, without
+one, by the requested chat and returned ID. A send receipt that arrives after the purge is
+stored the same way.

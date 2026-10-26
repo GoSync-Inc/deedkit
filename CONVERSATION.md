@@ -329,3 +329,10 @@ is when the catch-up cursor last moved older (or finished); `state` is:
   unreadable one.
 
 There is no ETA. Telegram rows show `history_has_gaps` and `answer_with_caveat` only.
+
+## Deleted messages
+
+Reads keep hiding deleted messages. A direct read by message ID (`get_context`,
+`resolve_reference`) returns `deleted: true` with `purged: false` until the purge worker
+has cleared it, then `purged: true` and an empty body (ANYM-511). A chat whose every
+archived message is purged is not listed until a new message arrives.

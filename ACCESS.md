@@ -1,6 +1,6 @@
 # Agent access and audit
 
-Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 44. Setup is done by the operator through the local CLI
+Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 45. Setup is done by the operator through the local CLI
 or SSH with the owner DSN. There are no remote MCP/REST methods for managing keys and permissions.
 Provider sessions, the owner DSN and the backup decryption key are not given to agents.
 
@@ -285,6 +285,11 @@ change ACLs/keys, run DDL or manage collectors. The owner applies
 The account/chat ACL is checked by the shared Store layer for MCP and REST; this is not PostgreSQL RLS.
 Compromise of the gateway process itself is a separate threat boundary, since its
 DB role reads the archive. This DSN is not available to the agent.
+
+The deletion purge (schema 45, ANYM-511) runs as `messaging_purge` (`purge_role.sql`) through
+its own login `messaging_purge_runtime`: it reads the archive and updates only content columns
+of deleted messages, deletes their derived text and open download grants, and inserts only its
+own audit rows. It cannot delete messages or events, insert reviews, run DDL or reach sessions.
 
 Audit retention is not enabled yet: rows are kept and included in the encrypted
 backup. Before significant load, growth measurement and an agreed retention

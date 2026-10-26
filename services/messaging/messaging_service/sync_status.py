@@ -233,6 +233,10 @@ def get_sync_status(c, p):
             count(*) FILTER(WHERE mc.resolved_at IS NOT NULL) AS historical_conflicts
             FROM message_conflicts mc JOIN messages m ON m.id=mc.message
             WHERE m.account=ANY(%s) GROUP BY m.account''', ([row['account'] for row in sources],))}
+    deletion_status = {}
+    if sources and not scoped:
+        from .message_purge import deletions
+        deletion_status = deletions(c, [row['account'] for row in sources])
     for row in sources:
         account = row['account']
         data = messages.get(account, {})
@@ -245,6 +249,7 @@ def get_sync_status(c, p):
             row['historical_conflicts']=counts.get('historical_conflicts',0)
             if row.get('archive_detail_code')=='version_conflict' and not row['active_conflicts']:
                 row['archive_detail_code']='coverage_not_reconciled'
+            row['deletions']=deletion_status.get(account) or {}
             row['detail']=describe(row.get('detail_code'))
             row['archive_detail']=describe(row.get('archive_detail_code'))
             row['alerts']=[]

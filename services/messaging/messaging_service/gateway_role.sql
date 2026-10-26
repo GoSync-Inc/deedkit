@@ -78,3 +78,5 @@ GRANT UPDATE(restore_state,restore_attachment,restore_requested_at,restore_finis
     ON attachment_cold_copies TO messaging_gateway;
 -- Owner-made person links (ANYM-283): read only; the owner CLI writes them.
 GRANT SELECT ON person_links TO messaging_gateway;
+-- Deletion status in get_sync_status (ANYM-511): content-free purge marks and chat cutoffs.
+GRANT SELECT ON message_purges,chat_tombstones TO messaging_gateway;
