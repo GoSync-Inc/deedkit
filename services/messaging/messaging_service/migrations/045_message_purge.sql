@@ -38,7 +38,10 @@ DO $$ DECLARE ix regclass := to_regclass('public.events_message'); ok boolean; B
   CREATE INDEX events_message ON events(message);
  ELSE
   SELECT i.indisvalid AND i.indisready AND i.indrelid='public.events'::regclass AND i.indpred IS NULL
-    AND i.indexprs IS NULL AND i.indnkeyatts=1 AND i.indkey[0]=a.attnum AND am.amname='btree' INTO ok
+    AND i.indexprs IS NULL AND i.indnkeyatts=1 AND i.indkey[0]=a.attnum AND am.amname='btree'
+    -- The purge's `message=ANY(...)` uses the column's collation and the type's default equality.
+    AND i.indcollation[0]=a.attcollation AND EXISTS(SELECT 1 FROM pg_opclass o WHERE o.oid=i.indclass[0]
+     AND o.opcmethod=am.oid AND o.opcintype=a.atttypid AND o.opcdefault) INTO ok
    FROM pg_index i JOIN pg_class ic ON ic.oid=i.indexrelid JOIN pg_am am ON am.oid=ic.relam
    JOIN pg_attribute a ON a.attrelid='public.events'::regclass AND a.attname='message'
    WHERE i.indexrelid=ix;
@@ -49,6 +52,16 @@ DO $$ DECLARE ix regclass := to_regclass('public.events_message'); ok boolean; B
  END IF;
 END $$;
 ALTER TABLE messages ADD COLUMN purged boolean NOT NULL DEFAULT false;
+-- The chat visibility probe (is any message of this chat left unpurged?) reads this index, however
+-- long the chat's purged history. It needs the new column, so production builds it right after
+-- `migrate`, CONCURRENTLY (release step 2); only a small database builds it here, in the locked phase.
+-- Without it a slow probe leaves the chat to the worker's hide retry (message_purges.hide_pending).
+DO $$ BEGIN
+ IF pg_relation_size('public.messages')<=8*1024*1024
+   AND (SELECT count(*) FROM (SELECT 1 FROM messages LIMIT 10001) s)<=10000 THEN
+  CREATE INDEX messages_unpurged ON messages(account,chat) WHERE NOT purged;
+ END IF;
+END $$;
 -- Set by the worker when a chat's last unpurged message is purged; the listing hides the chat while
 -- it is set, and the next archived message of the chat clears it (purge_chat_reopen below).
 ALTER TABLE chats ADD COLUMN purged_at timestamptz;
@@ -65,9 +78,12 @@ CREATE TABLE message_purges (
  counts jsonb NOT NULL DEFAULT '{}' CHECK(jsonb_typeof(counts)='object'),
  attempts integer NOT NULL DEFAULT 0 CHECK(attempts>=0),
  failure_code text CHECK(failure_code ~ '^[a-z_]{1,64}$'),
- next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp()
+ next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ -- Purged, but its chat's visibility probe ran out of time: the worker retries the hide.
+ hide_pending boolean NOT NULL DEFAULT false
 );
 CREATE INDEX message_purges_pending ON message_purges(account,next_attempt_at) WHERE purged_at IS NULL;
+CREATE INDEX message_purges_hide ON message_purges(account) WHERE hide_pending;
 CREATE INDEX message_purges_provider ON message_purges(account,provider_chat,provider_id) WHERE purged_at IS NOT NULL;
 -- A whole-chat deletion or history clear (stories ANYM-514, ANYM-515): a cutoff, never content.
 CREATE TABLE chat_tombstones (

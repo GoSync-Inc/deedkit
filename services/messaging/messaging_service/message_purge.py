@@ -31,7 +31,8 @@ AUDIT_IDS=100
 PURGE_STATEMENT='2s'
 PURGE_TRANSACTION='3s'
 HIDE_STATEMENT='500ms'
-# The listing hides a chat whose every message is purged; it reads only this mark.
+# The listing hides a chat whose every message is purged; it reads only this mark. The probe
+# matches the partial index messages_unpurged (045).
 HIDE_CHATS='''UPDATE chats ch SET purged_at=clock_timestamp() WHERE ch.account=%s
     AND ch.id IN (SELECT chat FROM messages WHERE id=ANY(%s)) AND NOT EXISTS(SELECT 1 FROM messages m
         WHERE m.account=ch.account AND m.chat=ch.id AND NOT m.purged)'''
@@ -98,11 +99,11 @@ class Purger:
         No purge completes before this returns True (purge_account checks it in its transaction): an
         unlinked receipt would keep a purged message's text past the deadline. The guard trigger links
         every receipt stored after the migration. Concurrent callers (worker, apply) take turns on
-        `purge-backfill` without waiting."""
+        `purge-backfill` without waiting; None means another caller holds it."""
         with self.tx() as c:
             if self.state(c,'receipt_backfill')=='complete':return True
             if not c.execute(sql.SQL('SELECT pg_try_advisory_xact_lock({}) AS ok').format(
-                    lock_key('purge-backfill'))).fetchone()['ok']:return False
+                    lock_key('purge-backfill'))).fetchone()['ok']:return None
             cursor=self.state(c,'receipt_cursor')
             row=c.execute('''WITH chunk AS (SELECT digest,account,coalesce(envelope->>'chat','') AS provider_chat,
                     coalesce(envelope->>'provider_id','') AS provider_id FROM ingest_receipts
@@ -116,9 +117,11 @@ class Purger:
     def backfill(self,seconds=PASS_SECONDS):
         """Link chunks until every receipt is linked (True) or `seconds` pass (False)."""
         started=time.monotonic()
-        while not self.backfill_links():
+        while True:
+            done=self.backfill_links()
+            if done:return True
             if time.monotonic()-started>=seconds:return False
-        return True
+            if done is None:time.sleep(0.2)  # the other caller is linking; do not spin on its lock
 
     def pending_accounts(self):
         with self.tx() as c:
@@ -150,8 +153,8 @@ class Purger:
                 if retried:rows=retried[:1]
                 ids=[r['message'] for r in rows]
                 counts=self.scrub(c,account,rows)
-                c.execute('''UPDATE message_purges SET purged_at=clock_timestamp(),counts=%s,failure_code=NULL
-                    WHERE message=ANY(%s)''',(json.dumps(counts),ids))
+                c.execute('''UPDATE message_purges SET purged_at=clock_timestamp(),counts=%s,failure_code=NULL,
+                    hide_pending=%s WHERE message=ANY(%s)''',(json.dumps(counts),'hidden_chats_skipped' in counts,ids))
                 for start in range(0,len(ids),AUDIT_IDS):
                     c.execute('''INSERT INTO audit_log(actor,operation,outcome,resource_ids)
                         VALUES('operator','message_purge','ok',%s)''',(ids[start:start+AUDIT_IDS],))
@@ -233,25 +236,39 @@ class Purger:
         counts['reply_notes']=sum(n(sql.SQL('''UPDATE {} SET note=NULL WHERE note IS NOT NULL
             AND (message=ANY(%s) OR incoming_head=ANY(%s))''').format(sql.Identifier(t)),(ids,ids))
             for t in ('reply_dismissals','reply_snoozes'))
-        # Last, in a savepoint with its own short bound: proving that a chat has no unpurged message
-        # left reads its purged history (message_chat_date index), which in a long chat may not fit.
-        # Then the content purge still commits and only the chat stays listed (hidden_chats_skipped).
-        try:
-            with c.transaction():
-                c.execute(sql.SQL('SET LOCAL statement_timeout={}').format(sql.Literal(HIDE_STATEMENT)))
-                counts['hidden_chats']=n(HIDE_CHATS,(account,ids))
-        except psycopg.errors.QueryCanceled:
-            counts['hidden_chats']=0;counts['hidden_chats_skipped']=1
-        # A released savepoint keeps its SET LOCAL until the transaction ends.
-        c.execute(sql.SQL('SET LOCAL statement_timeout={}').format(sql.Literal(PURGE_STATEMENT)))
+        counts.update(hide(c,account,ids))
         return counts
 
+    def retry_hides(self,account):
+        """Run the visibility probe again for marks whose probe ran out of time, one per transaction,
+        within one pass; a hide that fits clears the mark's hide_pending. Returns the cleared count."""
+        started=time.monotonic();cleared=0
+        with self.tx() as c:
+            ids=[r['message'] for r in c.execute('''SELECT message FROM message_purges WHERE account=%s AND hide_pending
+                ORDER BY message LIMIT %s''',(account,AUDIT_IDS))]
+        for message in ids:
+            if time.monotonic()-started>=PASS_SECONDS:break
+            try:
+                with self.tx(PURGE_STATEMENT,PURGE_TRANSACTION) as c:
+                    for name in ('purge:'+account,'archive:'+account):
+                        if not c.execute(sql.SQL('SELECT pg_try_advisory_xact_lock({}) AS ok').format(lock_key(name))
+                                         ).fetchone()['ok']:return cleared
+                    if 'hidden_chats_skipped' in hide(c,account,[message]):continue
+                    cleared+=c.execute('UPDATE message_purges SET hide_pending=false WHERE message=%s AND hide_pending',
+                                       (message,)).rowcount
+            except psycopg.Error as exc:
+                log.warning('message_purge hide_retry_failed %s',type(exc).__name__);return cleared
+        return cleared
+
     def run_once(self):
-        totals={'discovered':0,'purged':0,'gave_way':0,'failed':0,'links_complete':False}
+        totals={'discovered':0,'purged':0,'gave_way':0,'failed':0,'links_complete':False,'hides_retried':0}
         if not self.enabled():return {**totals,'enabled':False}
         totals['discovered']=self.discover()
         # Purges wait until every older receipt is linked; until then their marks stay pending.
-        totals['links_complete']=self.backfill()
+        try:totals['links_complete']=self.backfill()
+        except psycopg.Error as exc:
+            # The cause reaches the log and purge-status (receipt_backfill); the marks turn overdue.
+            log.warning('message_purge backfill_failed %s',type(exc).__name__)
         if not totals['links_complete']:return {**totals,'enabled':True}
         for account in self.pending_accounts():
             started=time.monotonic()
@@ -259,8 +276,12 @@ class Purger:
             # batches are single messages, and one per pass would leave a backlog for minutes.
             while True:
                 result=self.purge_account(account)
-                for key,value in result.items():totals[key]+=value
+                for key in ('purged','gave_way','failed'):totals[key]+=result[key]
                 if not result['purged'] or time.monotonic()-started>=PASS_SECONDS:break
+        with self.tx() as c:
+            accounts=[r['account'] for r in c.execute(
+                'SELECT DISTINCT account FROM message_purges WHERE hide_pending ORDER BY account')]
+        for account in accounts:totals['hides_retried']+=self.retry_hides(account)
         return {**totals,'enabled':True}
 
     def preview(self):
@@ -314,7 +335,27 @@ class Purger:
                 FROM message_purges WHERE purged_at IS NULL AND (failure_code IS NOT NULL
                     OR observed_at<clock_timestamp()-make_interval(secs=>%s)) ORDER BY account,message''',
                 (OVERDUE_SECONDS,OVERDUE_SECONDS))],
+                    # Why marks stay pending (the backfill) or a purged chat stays listed (hide retries).
+                    'receipt_backfill':self.state(c,'receipt_backfill'),
+                    'hide_pending':c.execute('SELECT count(*) AS n FROM message_purges WHERE hide_pending').fetchone()['n'],
                     'accounts':deletions(c,[r['id'] for r in c.execute('SELECT id FROM accounts ORDER BY id')])}
+
+
+def hide(c,account,ids):
+    """Hide the chats of `ids` left with no unpurged message (inside the caller's archive lock).
+
+    In a savepoint with its own short bound: the probe reads messages_unpurged; before that index is
+    built (release step 2) it reads the chat's purged history, which may not fit. Then only the
+    savepoint rolls back: the caller's purge still commits and the mark keeps hide_pending."""
+    try:
+        with c.transaction():
+            c.execute(sql.SQL('SET LOCAL statement_timeout={}').format(sql.Literal(HIDE_STATEMENT)))
+            result={'hidden_chats':c.execute(HIDE_CHATS,(account,ids)).rowcount}
+    except psycopg.errors.QueryCanceled:
+        result={'hidden_chats':0,'hidden_chats_skipped':1}
+    # A released savepoint keeps its SET LOCAL until the transaction ends.
+    c.execute(sql.SQL('SET LOCAL statement_timeout={}').format(sql.Literal(PURGE_STATEMENT)))
+    return result
 
 
 def deletions(c,accounts):

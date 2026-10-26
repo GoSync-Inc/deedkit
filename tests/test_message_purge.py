@@ -562,7 +562,8 @@ def test_reply_controls_keep_working_in_a_fully_purged_chat(purge):
 
 
 # spec: ANYM-511
-def test_no_purge_completes_before_every_older_receipt_is_linked(purge,monkeypatch):
+def test_receipts_linked_after_the_purge_are_scrubbed_by_the_backfill(purge,monkeypatch):
+    # Name kept for the Tiden case identity; since Astra r2 B3 no purge completes before the backfill.
     from messaging_service import message_purge
     ar,s,key,p=purge
     ar.ingest(event(body='sentinel-a first'))
@@ -694,12 +695,16 @@ def test_a_slow_chat_visibility_check_does_not_stop_the_purge(purge,monkeypatch)
     with s.pool.connection() as c:
         counts=c.execute('SELECT counts FROM message_purges').fetchone()['counts']
     assert counts['hidden_chats']==0 and counts['hidden_chats_skipped']==1 and counts['messages']==1
-    assert [c['id'] for c in s.list_chats(key)['items']]==[CHAT]  # listed, content-free
+    assert [c['id'] for c in s.list_chats(key)['items']]==[CHAT]  # listed for now, content-free
+    assert p.status()['hide_pending']==1
+    # Still slow: the retry leaves the mark pending; nothing else changes.
+    assert p.run_once()['hides_retried']==0 and p.status()['hide_pending']==1
     monkeypatch.undo()
-    # The chat's next message and its deletion: the probe fits again and hides the chat; a later one reopens it.
-    ar.ingest(event(provider_id='30',body='sentinel-c next',sent_at='2026-10-02T12:00:00Z',updated_at='2026-10-02T12:00:00Z'))
-    delete(ar,provider_id='30',at='2026-10-02T12:05:00Z',sent_at='2026-10-02T12:00:00Z')
-    assert p.run_once()['purged']==1 and s.list_chats(key)['items']==[]
+    # The next pass retries the hide without any new message; the probe fits and the chat is hidden.
+    result=p.run_once()
+    assert result['hides_retried']==1 and result['purged']==0 and p.status()['hide_pending']==0
+    assert s.list_chats(key)['items']==[]
+    # A new message reopens it (the AFTER INSERT trigger, under the archive lock).
     ar.ingest(event(provider_id='31',body='reopened',sent_at='2026-10-03T12:00:00Z',updated_at='2026-10-03T12:00:00Z'))
     assert [c['id'] for c in s.list_chats(key)['items']]==[CHAT]
 
@@ -710,7 +715,7 @@ def schema44(database,tmp_path):
 
 
 # spec: ANYM-511
-@pytest.mark.parametrize('index',['invalid','other_key'])
+@pytest.mark.parametrize('index',['invalid','other_key','collation'])
 def test_migration_refuses_an_unusable_events_message_index(database,tmp_path,index):
     with schema44(database,tmp_path) as store:
         with store.pool.connection() as c:
@@ -718,7 +723,9 @@ def test_migration_refuses_an_unusable_events_message_index(database,tmp_path,in
                 # What an interrupted CREATE INDEX CONCURRENTLY leaves behind.
                 c.execute('CREATE INDEX events_message ON events(message)')
                 c.execute("UPDATE pg_index SET indisvalid=false WHERE indexrelid='events_message'::regclass")
-            else:c.execute('CREATE INDEX events_message ON events(kind)')
+            elif index=='other_key':c.execute('CREATE INDEX events_message ON events(kind)')
+            # The purge's message=ANY(...) compares with the column collation: this index cannot serve it.
+            else:c.execute('CREATE INDEX events_message ON events(message COLLATE "C")')
         with pytest.raises(psycopg.errors.RaiseException,match='not a valid btree index'):store.migrate()
         with store.pool.connection() as c:
             assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='44'
@@ -726,6 +733,8 @@ def test_migration_refuses_an_unusable_events_message_index(database,tmp_path,in
         store.migrate()
         with store.pool.connection() as c:
             assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='45'
+            # A small database also gets the visibility probe's index in place (production: release step 2).
+            assert c.execute("SELECT to_regclass('messages_unpurged') IS NOT NULL AS ok").fetchone()['ok']
 
 
 def migrate_attempted(watcher):

@@ -648,7 +648,11 @@ order, outside an active call:
 1. Update the pinned backup and restore runtimes to the schema-45 release.
 2. Fresh verified backup (the backup gate), then `migrate`. 045 takes all its table locks in one
    attempt that never queues, retried for 2 s; `LockNotAvailable` (busy tables) rolls everything
-   back: run `migrate` again.
+   back: run `migrate` again. Then, as the owner, `CREATE INDEX CONCURRENTLY IF NOT EXISTS
+   messages_unpurged ON messages(account,chat) WHERE NOT purged;` (needs the new column; no lock on
+   message writes) and check `\d messages` lists it without `INVALID`. The chat visibility probe reads
+   it; without it a long chat's probe may run out of time and is retried each pass (`hide_pending` in
+   `purge-status`).
 3. As the owner: `purge_role.sql` (NOLOGIN role `messaging_purge`) and `gateway_role.sql`; deploy
    the release.
 4. The worker's own login (owner decision 2026-10-26, «1) а»): as the owner create
@@ -661,7 +665,8 @@ order, outside an active call:
    `production.py apply`, or `docker compose --profile message-purge up -d message-purge`. From here
    every new deletion is purged within a minute: the point of no return for future deletions. Its
    first passes link the receipts stored before 045; deletions wait pending until then (`pending`
-   in `get_sync_status` deletions) and are reported `purge_overdue` after 15 minutes.
+   in `get_sync_status` deletions) and are reported `purge_overdue` after 15 minutes; `purge-status`
+   shows `receipt_backfill` (`pending` until done).
 6. Read-only: `purge-deleted --preview` (counts per account of messages deleted before 045).
 7. After a fresh verified backup, `purge-deleted --apply`: the point of no return for past
    deletions. `--apply` drains every due mark and exits non-zero while marks stay pending
