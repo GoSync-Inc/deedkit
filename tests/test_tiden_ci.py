@@ -1542,13 +1542,14 @@ def test_no_or_an_ambiguous_predecessor_makes_no_issues_call(tmp_path, monkeypat
 
 
 # spec: ANYM-540
-def test_an_undated_release_created_before_the_predecessor_is_provably_older(tmp_path, monkeypatch):
+def test_an_undated_release_created_before_the_predecessor_is_still_ambiguous(tmp_path, monkeypatch):
+    # A repeated create keeps `createdAt` but moves the release time, so `createdAt` bounds nothing.
     recorded_production_release(monkeypatch, tmp_path)
     calls = issues_cli(monkeypatch, [production_release("previous", "2026-01-01T00:10:00Z"),
                                      production_release("undated", created="2026-01-01T00:09:00Z")])
     assert run_issues(monkeypatch, tmp_path) == 0
-    assert previous_issues(tmp_path)["predecessor"]["id"] == "previous"
-    assert calls[-1][1:4] == ["release", "issues", "previous"]
+    assert previous_issues(tmp_path)["state"] == "ambiguous predecessor"
+    assert [call[1:3] for call in calls] == [["release", "list"]]
 
 
 # spec: ANYM-540
@@ -1577,8 +1578,6 @@ def test_a_failed_issues_read_writes_a_fixed_reason_and_keeps_the_record(tmp_pat
 # spec: ANYM-540
 @pytest.mark.parametrize("listing", [
     "<html>" + SENTINELS[0],
-    json.dumps({"releases": [production_release("previous", "2026-01-01T00:10:00Z")],
-                "pagination": {"nextPageToken": "2"}}),
     json.dumps({"releases": [{**production_release("previous", "2026-01-01T00:10:00Z"), "version": SENTINELS[0] + " x"}],
                 "pagination": {}}),
 ])
@@ -1591,6 +1590,46 @@ def test_an_unreadable_release_listing_is_malformed(tmp_path, monkeypatch, capsy
     assert run_issues(monkeypatch, tmp_path) == 1
     assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "malformed"}
     assert_no_sentinel(tmp_path, capsys.readouterr())
+
+
+# spec: ANYM-540
+def test_a_listing_with_more_pages_cannot_prove_the_predecessor(tmp_path, monkeypatch, capsys):
+    import subprocess
+    recorded_production_release(monkeypatch, tmp_path)
+    listing = {"releases": [production_release("previous", "2026-01-01T00:10:00Z")],
+               "pagination": {"nextPageToken": "2"}}
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(listing), stderr="")
+    monkeypatch.setattr(subprocess, "run", run)
+    capsys.readouterr()
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "more pages"}
+    assert capsys.readouterr().out == "Tiden previous-release issues: unavailable (more pages)\n"
+    assert [call[1:3] for call in calls] == [["release", "list"]]
+
+
+# spec: ANYM-540
+@pytest.mark.parametrize("releases, reply", [
+    # A timestamp without a zone cannot be compared with the UTC release time.
+    ([production_release("previous", "2026-01-01T00:10:00")], None),
+    ([production_release("previous", "2026-01-01T00:10:00Z"), {**production_release("other"), "releasedAt": 5}],
+     None),
+    ([production_release("previous", "2026-01-01T00:10:00Z"), production_release("other", SENTINELS[0])], None),
+    # A count too long to be a count.
+    ([production_release("previous", "2026-01-01T00:10:00Z")], {"newIssues": [], "seenCount": "9" * 5000}),
+])
+def test_malformed_timestamps_and_counts_write_a_fixed_reason(tmp_path, monkeypatch, capsys, releases, reply):
+    before, _ = recorded_production_release(monkeypatch, tmp_path)
+    issues_cli(monkeypatch, releases, reply)
+    capsys.readouterr()
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "malformed"}
+    captured = capsys.readouterr()
+    assert captured.out == "Tiden previous-release issues: unavailable (malformed)\n"
+    assert_no_sentinel(tmp_path, captured)
+    assert (tmp_path / "tiden-release-receipt.json").read_bytes() == before
 
 
 # spec: ANYM-540

@@ -762,14 +762,17 @@ release's, excluding this release's ID. It then calls `release issues <its ID>`,
 by ID because the same version also exists in `github-actions-synthetic`.
 Rollbacks are not modelled: the predecessor is the release recorded last before,
 not the one that was live. Two releases at the same time, another release at this
-release's own time, or one without `releasedAt` whose `createdAt` is not earlier
-than the chosen one's give `state: ambiguous predecessor` and no issues call. The
+release's own time, or any other release without `releasedAt` (a repeated create
+keeps `createdAt`, so it bounds nothing) give `state: ambiguous predecessor` and
+no issues call. The
 reply is projected in memory to `{predecessor: {id, version}, newIssues: [issue
 IDs], seenCount}`; only that goes to `tiden-previous-issues.json` in the
 `tiden-release-receipt` artifact and one summary line `first seen in
 deedkit@<12 hex>: N issues: <IDs>`. Titles, messages and CLI error text stay in
 Tiden. A failed, slow or malformed read writes `state: unavailable` with a fixed
-reason (`timeout`, `exit <n>`, `malformed`, `no recorded release`) and fails only
+reason (`timeout`, `exit <n>`, `malformed`, `no recorded release`, `more pages`:
+the CLI has no page token for `release list`, so a partial list proves no
+predecessor; a timestamp without a zone is `malformed`) and fails only
 this step; the record, its receipt and the job outcome are unchanged. The daily
 issue triage (orchestrator side, outside Git) starts from the newest
 `tiden-previous-issues.json` of the latest production release run, or from

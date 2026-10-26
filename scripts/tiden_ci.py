@@ -1071,30 +1071,36 @@ class IssuesUnavailable(RuntimeError):
     """A release-issues read failed; the message is one fixed reason, never CLI output."""
 
 
+def aware(value: object) -> datetime | None:
+    """A timezone-aware timestamp, or None for a missing one; any other value is malformed."""
+    if value is None:
+        return None
+    try:
+        stamp = when(value) if isinstance(value, str) else None
+    except ValueError:
+        stamp = None
+    if stamp is None or stamp.tzinfo is None:
+        raise IssuesUnavailable("malformed")
+    return stamp
+
+
 def previous_release(releases: list, release_id: str, released_at: str) -> tuple[dict | None, bool]:
     """The production release recorded last before `released_at`, other than `release_id`, and whether that choice
-    is ambiguous: two releases at the same time, one at this release's own time, or one without `releasedAt` that is
-    not provably older (a release is created after its apply, so its `createdAt` bounds a missing `releasedAt`)."""
-    target = when(released_at)
-    dated, undated = [], []
+    is ambiguous: two releases at the same time, one at this release's own time, or one without `releasedAt` (a
+    repeated create keeps `createdAt`, so nothing bounds a missing release time)."""
+    target, dated, ambiguous = when(released_at), [], False
     for release in releases:
         if release["id"] == release_id:
             continue
-        try:
-            dated.append((when(release["releasedAt"]), release))
-        except (KeyError, TypeError, AttributeError, ValueError):
-            undated.append(release)
+        stamp = aware(release.get("releasedAt"))
+        if stamp is None:
+            ambiguous = True
+        else:
+            dated.append((stamp, release))
     earlier = [(stamp, release) for stamp, release in dated if stamp < target]
     latest = max((stamp for stamp, _ in earlier), default=None)
     chosen = [release for stamp, release in earlier if stamp == latest]
-    ambiguous = len(chosen) > 1 or any(stamp == target for stamp, _ in dated)
-    for release in undated:
-        try:
-            created = when(release["createdAt"])
-        except (KeyError, TypeError, AttributeError, ValueError):
-            created = None
-        if created is None or latest is None or created >= latest:
-            ambiguous = True
+    ambiguous = ambiguous or len(chosen) > 1 or any(stamp == target for stamp, _ in dated)
     return (chosen[0] if chosen else None), ambiguous
 
 
@@ -1131,7 +1137,12 @@ def release_issues(directory: Path, released_at: str, product: str, cli: str = "
         listing = read(["release", "list", "--environment", "production"])
         releases = listing.get("releases") if isinstance(listing, dict) else None
         pagination = listing.get("pagination") if isinstance(listing, dict) else None
-        if (not isinstance(releases, list) or not isinstance(pagination, dict) or pagination.get("nextPageToken")
+        if not isinstance(pagination, dict):
+            raise IssuesUnavailable("malformed")
+        if pagination.get("nextPageToken"):
+            # The CLI (0.41.0, 0.42.0) has no page token for `release list`; a partial list cannot prove the predecessor.
+            raise IssuesUnavailable("more pages")
+        if (not isinstance(releases, list)
                 or not all(isinstance(release, dict) and isinstance(release.get("id"), str) and release["id"]
                            and isinstance(release.get("version"), str)
                            and RELEASE_VERSION.fullmatch(release["version"]) for release in releases)):
@@ -1146,12 +1157,15 @@ def release_issues(directory: Path, released_at: str, product: str, cli: str = "
             seen = reply.get("seenCount") if isinstance(reply, dict) else None
             if (not isinstance(issues, list) or not all(isinstance(issue, dict) and isinstance(issue.get("id"), str)
                                                         and ISSUE_ID.fullmatch(issue["id"]) for issue in issues)
-                    or not (type(seen) is int or isinstance(seen, str) and seen.isascii() and seen.isdigit())):
+                    or not (type(seen) is int or isinstance(seen, str) and seen.isascii() and seen.isdigit() and len(seen) <= 12)):
                 raise IssuesUnavailable("malformed")
             result = {"state": "listed", "predecessor": {"id": predecessor["id"], "version": predecessor["version"]},
                       "newIssues": [issue["id"] for issue in issues], "seenCount": int(seen)}
     except IssuesUnavailable as exc:
         result = {"state": "unavailable", "reason": str(exc)}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        # Unexpected input or a failed CLI start keeps the fixed-reason contract; the exception text stays out.
+        result = {"state": "unavailable", "reason": "malformed"}
     (directory / PREVIOUS_ISSUES).write_text(json.dumps(result, indent=2))
     return result
 
