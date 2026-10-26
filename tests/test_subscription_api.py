@@ -320,3 +320,30 @@ def test_receipt_issuing_reads_say_so_and_gateway_text_equals_backend():
         assert catalog['messages_'+name]['description']==text,name
         for phrase in ('short-lived receipt','safe to retry','oldest receipt','128','fails closed'):
             assert phrase in text.lower(),(name,phrase)
+
+
+# spec: ANYM-518
+@pytest.mark.parametrize('transport',['rest','mcp'])
+def test_subscriber_waits_fetches_and_acks_over_rest_and_mcp(seeded,transport):
+    from messaging_service.subscriptions import match_subscriptions
+    from tests.test_capabilities_summary import structured
+    from tests.test_client_contract import rpc as tool_call
+    from tests.test_event_delivery import emit,identity
+    store,_,_=seeded
+    key=identity(store,'subscriber-'+transport)
+    with TestClient(create_app(store,['testserver'])) as client:
+        def tool(name,**arguments):
+            if transport=='mcp':return structured(tool_call(client,key,name,arguments))
+            response=client.post('/v1/'+name,headers={'Authorization':'Bearer '+key},json=arguments)
+            assert response.status_code==200,response.text
+            return response.json()
+        sid=tool('create_subscription',chat_ids=['telegram-demo-chat'])['subscription_id']
+        event=emit(store);match_subscriptions(store)
+        assert tool('wait_for_subscription_events',subscription_id=sid,timeout=1)['wait_status']=='events_available'
+        page=tool('fetch_subscription_events',subscription_id=sid)
+        assert [e['event_id'] for e in page['items']]==[event] and page['receipt']
+        ack=tool('ack_subscription_events',subscription_id=sid,receipt=page['receipt'],version=page['ack_version'])
+        assert ack['acked_through']>page['acked_through']
+        again=tool('fetch_subscription_events',subscription_id=sid)
+        assert again['items']==[] and again['receipt'] is None
+        assert tool('get_subscription',subscription_id=sid)['acked_through']==ack['acked_through']

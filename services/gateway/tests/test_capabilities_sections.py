@@ -113,3 +113,31 @@ def test_gateway_summary_keeps_the_backend_key_expiry_and_each_owner_id(tmp_path
     assert not error and summary == rest and summary["detail"] == "summary"
     assert summary["expires_at"] == "2027-04-19T22:37:50.000000Z"
     assert summary["accounts"] == [{k: row[k] for k in ("id", "platform", "label", "self_provider_id")} for row in rows]
+
+
+# Synthetic copy of the backend's `subscriptions.transports` rows (ANYM-518).
+TRANSPORTS = [
+    {"name": "pull", "tools": ["fetch_subscription_events", "ack_subscription_events"],
+     "authorized": True, "configured": True, "operational": True, "reason": None},
+    {"name": "long_poll", "tools": ["wait_for_subscription_events"], "max_wait_s": 25,
+     "authorized": True, "configured": True, "operational": True, "reason": None},
+    {"name": "webhook", "tools": ["configure_subscription_delivery"], "authorized": True,
+     "configured": False, "operational": False, "reason": "no_receiver_bound", "registration": "operator_only"},
+]
+
+
+# spec: ANYM-518
+def test_gateway_omits_a_transport_whose_tools_the_profile_lacks(tmp_path):
+    from test_capability_subscription_blocks import PROFILES, SUBSCRIPTIONS, app, exposed
+    subscriber = exposed(next(p for p in PROFILES if p.stem == "messaging-subscriber"))
+    without_wait = [n for n in subscriber if n != "messages_wait_for_subscription_events"]
+    for tools, names in ((subscriber, ["pull", "long_poll", "webhook"]), (without_wait, ["pull", "webhook"])):
+        with TestClient(app(tmp_path, tools, subscriptions=SUBSCRIPTIONS | {"transports": TRANSPORTS})) as client:
+            mcp, error = call(client, {"sections": ["subscriptions"]})
+            rest = client.post("/v1/messages_capabilities", json={"sections": ["subscriptions"]}, headers=HEADERS).json()
+        assert not error and mcp == rest
+        rows = rest["subscriptions"]["transports"]
+        assert [row["name"] for row in rows] == names
+        # Long polling also names the gateway's wait pool.
+        assert all(("wait_pool" in row) is (row["name"] == "long_poll") for row in rows)
+        assert all(row["wait_pool"] == {"active": 2, "waiting": 4} for row in rows if row["name"] == "long_poll")

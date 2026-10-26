@@ -251,10 +251,23 @@ an agent ran a turn and does not acknowledge any event. Feedback submission requ
 `read` plus `feedback-write`, stays private to the exact backend credential and
 never publishes an external issue or message. Each new tool also requires an exact
 backend manifest entry. Existing profiles gain none of these names automatically.
+The `config/profiles/messaging-subscriber.toml` profile (ANYM-518) exposes the
+messaging-reader tools plus `messages_create_subscription`,
+`messages_update_subscription`, `messages_configure_subscription_delivery` and the
+three consumption tools `messages_wait_for_subscription_events`,
+`messages_fetch_subscription_events` and `messages_ack_subscription_events`;
+messaging-reader is unchanged. The recommended loop is wait, fetch, handle, ACK:
+wait up to 25 seconds, fetch a page with its receipt, handle every item, then ACK
+that receipt. A crash before the ACK makes the next fetch return the same page.
+`messages_capabilities` lists `subscriptions.transports` (`pull`, `long_poll`,
+`webhook`) only when this profile exposes every tool of the transport.
 
 Long subscription waits and sends with positive `wait_s` use a separate pool with
 2 active and 4 waiting requests; ordinary messaging reads retain their own pool.
 Both waits are bounded to 25 seconds. Cancellation releases waiting capacity.
+When this pool is full, `messages_wait_for_subscription_events` returns
+`wait_status: "busy"` with `retry_after_s` and the pool size instead of a bare 503;
+the `long_poll` transport in capabilities shows the same `wait_pool`.
 `messages_get_updates(start_from="now")` requires `cursor-write` both locally and
 upstream, initializes only a new consumer, and cannot reset an existing consumer's
 ACK state. The legacy default remains `start_from="beginning"`.

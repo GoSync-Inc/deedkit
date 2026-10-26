@@ -182,6 +182,16 @@ response deadline. A deadline before any authorized page returns
 `subscription_wait_timeout`; a normal empty authorized page returns
 `wait_status=timeout`. No connection is retained while waiting for new events.
 
+Through the gateway, the `messaging-subscriber` profile exposes the three consumption
+tools (ANYM-518). The recommended loop is wait, fetch, handle, ACK; the gateway's wait
+pool holds 2 active and 4 waiting requests and, when full, returns
+`wait_status=busy` with `retry_after_s`. `get_subscription` returns `acked_through`.
+Capabilities list `subscriptions.transports`: `pull` (fetch and ACK), `long_poll`
+(wait, at most 25 s) and `webhook`, each with `authorized`, `configured`,
+`operational` and the first failing `reason`. A webhook works while the dispatcher
+heartbeat is under 120 s old and an enabled receiver is bound; until self-service
+registration ships, it says `registration: "operator_only"`.
+
 Creation accepts optional `wake_rules`, an OR selection of `incoming_message`,
 `owner_mention`, `reply_to_owner` and `reply_to_confirmed_send`. Reasons come from
 immutable event snapshots of validated native metadata on incoming

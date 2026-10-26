@@ -18,6 +18,10 @@ def test_direct_subscription_blocks_are_unchanged(seeded,permissions):
     # The backend names its own operations; the gateway's filter and public names never reach it.
     assert expected['events']['wait']=='wait_for_subscription_events' and expected['subscriptions']['ack'] is True
     assert expected['subscriptions']['delivery_policy']['tool']=='configure_subscription_delivery'
+    if permissions is not None:
+        # Transports follow the key's permissions (ANYM-518): a reader may wait, not ACK or configure delivery.
+        for row in expected['subscriptions']['transports']:
+            if row['name']!='long_poll':row.update(authorized=False,reason='not_authorized')
     with TestClient(create_app(s,['testserver'])) as client:
         mcp=structured(rpc(client,key,'capabilities',{'sections':['subscriptions']}))
         rest=client.post('/v1/capabilities',json={'sections':['subscriptions']},headers={'Authorization':'Bearer '+key}).json()
