@@ -1212,3 +1212,61 @@ def test_a_hold_on_the_card_only_a_relaunch_bound_cancels_the_ready_merge_of_the
     autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW)
     code, _ = run_tick(loop, fakes, now=NOW + timedelta(hours=2))
     assert code == 0 and ('gh', ['run', 'cancel', '9']) in [(c[0], c[1][:3]) for c in fakes.calls]
+
+
+# --- the daily report (ANYM-573) ---------------------------------------------------------------------------------
+def disposition_file(t, name, rows, at=NOW):
+    triage.save(t / 'dispositions' / f'{name}.json',
+                [dict({'spec_ref': None, 'duplicate_of': None, 'fixed_in': None, 'decided_at': triage.stamp(at)}, **r)
+                 for r in rows])
+
+
+# spec: ANYM-573
+def test_a_busy_day_report_lists_changes_undo_owner_questions_the_queue_declines_and_caps_without_feedback_text(
+        loop, capsys):
+    t, a, s = loop
+    configure(a, live=True)
+    triage.save(t / 'snapshot.json', SNAPSHOT)
+    intent(a, 'autoloop-card-cabc', 'new:cabc', 'finished', [D1])
+    autoloop.put(a, dict(autoloop.intents(a)['autoloop-card-cabc'], ref='ANYM-10'))
+    intent(a, 'autoloop-build-anym-10', 'ANYM-10', 'finished', [D1])
+    autoloop.put(a, dict(autoloop.intents(a)['autoloop-build-anym-10'], pr=412, merge_sha='a' * 40, live=False))
+    intent(a, 'autoloop-build-anym-11', 'ANYM-11', 'finished', [D2])  # ended with no PR and no merge SHA
+    intent(a, 'autoloop-card-xyz', 'new:xyz', 'interrupted', [D3], started=NOW - timedelta(hours=5))
+    intent(a, 'autoloop-card-xyz-r1', 'new:xyz', 'lost', [D3], started=NOW - timedelta(hours=2))
+    disposition_file(t, 'autoloop-note-1', [
+        {'id': D1, 'status': 'received', 'note': 'waits for the owner: opt-in (ANYM-12)'},
+        {'id': D2, 'status': 'received', 'note': autoloop.LARGE},
+        {'id': D3, 'status': 'declined', 'note': 'declined by review: not needed now'},
+        {'id': D4, 'status': 'declined', 'note': 'answered, no change needed: call +7 916 ' + CANARY},
+        {'id': P1, 'status': 'declined', 'note': CANARY}])
+    disposition_file(t, 'old', [{'id': P2, 'status': 'declined', 'note': 'not actionable'}],
+                     at=NOW - timedelta(days=1))
+    triage.save(a / 'ledger.json', {'days': {'2026-10-26': {'reader_runs': 3, 'items': {D1: OWNER}, 'card': 1,
+                                                            'build': 2, 'seconds': 36000, 'refunds': {}}}})
+    assert autoloop.main(['report', '--state', str(a), '--triage-state', str(t)]) == 0
+    path = autoloop.report(a, t, NOW)
+    text = path.read_text()
+    assert path == a / 'report' / '2026-10-26.md' and stat.S_IMODE(path.stat().st_mode) == 0o600
+    for line in [
+            '- карточка ANYM-10 «Participants of a group chat»: autoloop-card-cabc, статус finished; отзывы ' + D1 +
+            '; отмена: `python3 scripts/autoloop.py hold ANYM-10`',
+            f"PR #412, слит {'a' * 12}, ещё не в проде; отмена: `git revert {'a' * 40}` через PR, автодеплой на паузу: "
+            '`ssh deedkit-prod sudo touch /etc/deedkit/autodeploy.pause`',
+            f"## Слито, карточка ещё не Done\n\n- ANYM-10 «Participants of a group chat»: слит {'a' * 12}",
+            f'- {D1}: включить уже готовую функцию ANYM-12 для агента?',
+            '- autoloop-build-anym-11: нет квитанции', '- autoloop-card-xyz-r1: перезапуск израсходован (lost)',
+            f'- {D2}: большая карточка, её ведёт оркестратор', f'- {D3}: declined by review: not needed now',
+            f'- {D4}: answered, no change needed', f'- {P1}: (other note)',
+            'триаж: запусков 3 из 24, отзывов 1', 'карточки: 1 из 5; сборки: 2 из 3; часы воркеров: 10.0 из 12']:
+        assert line in text, line
+    assert CANARY not in text and '916' not in text and P2 not in text and 'autoloop-card-xyz:' not in text
+
+
+# spec: ANYM-573
+def test_a_quiet_day_is_one_line_and_the_tick_writes_the_report(loop):
+    t, a, s = loop
+    configure(a)
+    assert autoloop.report(a, t, NOW).read_text() == '# Автоцикл 2026-10-26: тихий день, изменений нет.\n'
+    run_tick(loop, Fakes())
+    assert (a / 'report' / '2026-10-26.md').read_text() == '# Автоцикл 2026-10-26: тихий день, изменений нет.\n'
