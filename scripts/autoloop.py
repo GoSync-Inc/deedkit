@@ -1006,7 +1006,10 @@ def card_end(state, triage_state, name, result, now):
 # --- the daily report (ANYM-573) ---------------------------------------------------------------------------------
 PAUSE_DEPLOY = f'ssh {triage.HOST} sudo touch /etc/deedkit/autodeploy.pause'
 QUESTIONS = {'opt-in': 'включить уже готовую функцию {ref} для агента?', 'grant': 'выдать доступ для {ref}?',
-             'owner path': 'смержить PR {ref} (путь OWNER)?', 'epic': 'взять эпик {ref} в работу?'}
+             'owner path': 'смержить PR по карточке {ref} (путь OWNER)?', 'epic': 'взять эпик {ref} в работу?'}
+SPEC_REF = re.compile(r'ANYM-[1-9][0-9]{0,5}')
+SHA40 = re.compile(r'[0-9a-f]{40}')
+REPORT_DAYS = 7  # at most this many days back are rebuilt after a gap
 
 
 def plain(note):
@@ -1029,86 +1032,123 @@ def day_of(text, zone):
         return None
 
 
-def report(state, triage_state, now, day=None):
-    """`report/<day>.md` (0600), in Russian, from the local state only: nothing is read from a service and nothing is
-    sent. Changes with feedback IDs, the card's title, PR, merge SHA, live or not, and their undo; owner items with
-    one question each; the orchestrator's queue; declines with reasons; caps used. A quiet day is one line."""
-    cfg = config(state)
-    zone, day = cfg['zone'], day or now.astimezone(cfg['zone']).date().isoformat()
-    specs = triage.known(triage.load(triage_state / 'snapshot.json', {'main': [], 'branches': {}}))
-    known = intents(state)
-    todays = {n: i for n, i in known.items() if day in (i.get('day'), day_of(i.get('ended_at'), zone))}
-    rows = []
-    for path in sorted((triage_state / 'dispositions').glob('*.json')):
-        listed = triage.load(path, [])
-        rows += [row for row in listed if isinstance(row, dict) and day_of(row.get('decided_at'), zone) == day] \
-            if isinstance(listed, list) else []
-    used = (triage.load(state / 'ledger.json', {}).get('days') or {}).get(day) or {}
+def title(ref, specs):
+    """A card by its ID and its Tiden title on one line, at most 80 characters, with no Markdown or HTML."""
+    if not isinstance(ref, str) or not SPEC_REF.fullmatch(ref):
+        return 'карточка ещё не создана'
+    name = re.sub(r'[^\w .,:;!?+-]+', ' ', str((specs.get(ref) or {}).get('title') or '')).strip()
+    name = re.sub(r'\s+', ' ', name)[:80]
+    return f'{ref} «{name}»' if name else ref
 
-    def title(ref):
-        return f"{ref} «{specs[ref]['title']}»" if ref in specs else (ref or 'карточка ещё не создана')
-    changes, merged, owner, queue = [], [], [], []
-    for name, i in sorted(todays.items()):
-        ids = ', '.join(i['feedback']) or '-'
-        if i['kind'] == 'card':
-            ref = i.get('ref')
-            line = f"- карточка {title(ref)}: {name}, статус {i['status']}" + \
-                (f", итог {i['outcome']}" if i.get('outcome') else '') + f"; отзывы {ids}"
-            if ref:
-                line += f"; отмена: `python3 scripts/autoloop.py hold {ref}` (перенос или удаление карточки — владелец)"
-            elif i['status'] == 'finished' and not i.get('outcome'):
-                queue.append(f'- {name}: нет квитанции (воркер завершился без карточки и без итога)')
-            changes.append(line)
+
+def effective(triage_state, zone, day, dropped):
+    """{feedback ID: (status, printable note)} of the day: each item's last disposition (by its decision time); a
+    dropped item counts as withdrawn whatever came before. Unreadable files and malformed rows are counted."""
+    rows, bad = [], 0
+    for path in sorted((triage_state / 'dispositions').glob('*.json')):
+        try:
+            listed = triage.load(path, [])
+        except ValueError:
+            bad += 1
             continue
-        sha, pr = i.get('merge_sha'), i.get('pr')
-        line = f"- сборка {title(i['card'])}: {name}, статус {i['status']}; отзывы {ids}"
+        for row in listed if isinstance(listed, list) else []:
+            if isinstance(row, dict) and triage.UUID.fullmatch(str(row.get('id'))) \
+                    and day_of(row.get('decided_at'), zone) == day:
+                rows.append((triage.when(row['decided_at']), row))
+            elif not isinstance(row, dict) or not triage.UUID.fullmatch(str(row.get('id'))):
+                bad += 1
+    last = {}
+    for _, row in sorted(rows, key=lambda pair: pair[0]):
+        last[row['id']] = (row.get('status'), plain(row.get('note')), row.get('spec_ref'))
+    for i in last:
+        if i in dropped:
+            last[i] = ('declined', WITHDRAWN, None)
+    return last, bad
+
+
+def report_text(state, triage_state, cfg, day):
+    zone, specs = cfg['zone'], triage.known(triage.load(triage_state / 'snapshot.json', {'main': [], 'branches': {}}))
+    known, dropped = intents(state), holds(state)['items']
+    todays = {n: i for n, i in known.items() if day in (i.get('day'), day_of(i.get('ended_at'), zone))}
+    used = (triage.load(state / 'ledger.json', {}).get('days') or {}).get(day) or {}
+    changes, merged, owner, queue, declines = [], [], [], [], []
+    for name, i in sorted(todays.items()):
+        ids = ', '.join(f for f in i.get('feedback', []) if triage.UUID.fullmatch(str(f))) or '-'
+        ref, sha, pr = i.get('ref') if i['kind'] == 'card' else i.get('card'), i.get('merge_sha'), i.get('pr')
+        ref = ref if isinstance(ref, str) and SPEC_REF.fullmatch(ref) else None
+        sha, pr = (sha if isinstance(sha, str) and SHA40.fullmatch(sha) else None), (pr if type(pr) is int else None)
+        outcome = i.get('outcome') if i.get('outcome') in (*DECLINED, 'large') else None
+        kind = 'карточка' if i['kind'] == 'card' else 'сборка'
+        line = f"- {kind} {title(ref, specs)}: {name}, статус {i['status']}" \
+            + (f', итог {outcome}' if outcome else '') + f'; отзывы {ids}'
         if sha:
             live = {True: 'в проде', False: 'ещё не в проде'}.get(i.get('live'), 'в проде или нет — неизвестно')
-            line += (f"; PR #{pr}, слит {sha[:12]}, {live}; отмена: `git revert {sha}` через PR, "
-                     f"автодеплой на паузу: `{PAUSE_DEPLOY}`")
-            if specs.get(i['card'], {}).get('status') != 'Done':
-                merged.append(f"- {title(i['card'])}: слит {sha[:12]}, карточка ещё не Done")
-        elif i['status'] == 'finished':
-            queue.append(f'- {name}: нет квитанции (сборка завершилась без PR и SHA слияния)')
+            line += (f"; PR #{pr or '?'}, слит {sha[:12]}, {live}; отмена: `git revert {sha}` через PR, "
+                     f'автодеплой на паузу: `{PAUSE_DEPLOY}`')
+            if ref and specs.get(ref, {}).get('status') != 'Done':
+                merged.append(f'- {title(ref, specs)}: слит {sha[:12]}, карточка ещё не Done')
+        elif pr:
+            line += f'; PR #{pr} не слит; отмена: `python3 scripts/autoloop.py hold {ref}`, `gh pr close {pr}`'
+        elif ref:
+            line += f'; отмена: `python3 scripts/autoloop.py hold {ref}` (перенос или удаление карточки — владелец)'
+        if i['status'] == 'finished' and not (sha or pr or (i['kind'] == 'card' and (ref or outcome))):
+            queue.append(f'- {name}: нет квитанции (завершён без карточки, итога, PR и SHA слияния)')
         changes.append(line)
     for name, i in sorted(known.items()):
-        later = [j for j in known.values() if j['card'] == i['card'] and j['created_at'] > i['created_at']]
-        if i['status'] in ('lost', 'interrupted', 'stopped') and not later and \
-                sum(j['card'] == i['card'] for j in known.values()) > 1:
+        mine = [j for j in known.values() if j['kind'] == i['kind'] and j['card'] == i['card']]
+        if i['status'] in RETRY and not i.get('outcome') and len(mine) > 1 \
+                and all(j['created_at'] <= i['created_at'] for j in mine):
             queue.append(f"- {name}: перезапуск израсходован ({i['status']}), нужен оркестратор")
-    declines = []
-    for row in rows:
-        note = plain(row.get('note'))
+    last, bad = effective(triage_state, zone, day, dropped)
+    for i, (status, note, spec_ref) in sorted(last.items()):
         if note.startswith('waits for the owner: '):
-            kind = note.removeprefix('waits for the owner: ').split(' (')[0]
             found = re.search(r'ANYM-[1-9][0-9]*', note)
-            ref = found.group(0) if found else row.get('spec_ref') or 'по отзыву'
-            question = QUESTIONS.get(kind, 'решение владельца?').format(ref=ref)
-            owner.append(f"- {row['id']}: {question}")
+            ref = found.group(0) if found else spec_ref if isinstance(spec_ref, str) and SPEC_REF.fullmatch(
+                spec_ref) else 'по отзыву'
+            kind = note.removeprefix('waits for the owner: ').split(' (')[0]
+            owner.append(f'- {i}: ' + QUESTIONS[kind].format(ref=ref))
         elif note == LARGE:
-            queue.append(f"- {row['id']}: большая карточка, её ведёт оркестратор")
-        elif row.get('status') == 'declined':
-            declines.append(f"- {row['id']}: {note}")
+            queue.append(f'- {i}: большая карточка, её ведёт оркестратор')
+        elif status == 'declined':
+            declines.append(f'- {i}: {note}')
+    if bad:
+        queue.append(f'- нечитаемых файлов или строк решений: {bad}')
     caps = cfg['caps']
-    limits = [f"триаж: запусков {used.get('reader_runs', 0)} из {caps['reader_runs']}, "
+    limits = [f"- триаж: запусков {used.get('reader_runs', 0)} из {caps['reader_runs']}, "
               f"отзывов {len(used.get('items', {}))}",
-              f"карточки: {used.get('card', 0)} из {caps['card_launches']}; сборки: {used.get('build', 0)} из "
+              f"- карточки: {used.get('card', 0)} из {caps['card_launches']}; сборки: {used.get('build', 0)} из "
               f"{caps['build_launches']}; часы воркеров: {round(used.get('seconds', 0) / 3600, 1)} из "
               f"{caps['worker_hours']}"]
-    path = state / 'report' / f'{day}.md'
     if not (changes or owner or queue or declines or used.get('reader_runs') or used.get('items')):
-        text = f'# Автоцикл {day}: тихий день, изменений нет.\n'
+        return f'# Автоцикл {day}: тихий день, изменений нет.\n'
+    sections = [('Изменения', changes), ('Слито, карточка ещё не Done', merged),
+                ('Ждёт владельца (один вопрос на пункт)', owner), ('Очередь оркестратора', queue),
+                ('Отклонено', declines), ('Лимиты', limits)]
+    return f'# Автоцикл {day}\n\nТолько ID и статусы, без текста отзывов. Ничего не отправлено.\n' + ''.join(
+        f'\n## {head}\n\n' + '\n'.join(lines or ['- нет']) + '\n' for head, lines in sections)
+
+
+def report(state, triage_state, now, day=None):
+    """`report/<day>.md` (0600), in Russian, from the local state only: nothing is read from a service and nothing is
+    sent. Without `day`, every day from the last reported one (at most REPORT_DAYS back) to today is rebuilt, so a
+    change logged just before midnight lands in its own day. Returns today's (or `day`'s) path."""
+    cfg = config(state)
+    today = now.astimezone(cfg['zone']).date()
+    if day:
+        days = [day]
     else:
-        sections = [('Изменения', changes), ('Слито, карточка ещё не Done', merged),
-                    ('Ждёт владельца (один вопрос на пункт)', owner), ('Очередь оркестратора', queue),
-                    ('Отклонено', declines), ('Лимиты', [f'- {line}' for line in limits])]
-        text = f'# Автоцикл {day}\n\nТолько ID и статусы, без текста отзывов. Ничего не отправлено.\n' + ''.join(
-            f'\n## {head}\n\n' + '\n'.join(lines or ['- нет']) + '\n' for head, lines in sections)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with tempfile.NamedTemporaryFile('w', dir=path.parent, delete=False) as handle:  # mkstemp: mode 0600
-        handle.write(text)
-    os.replace(handle.name, path)
-    return path
+        mark = (triage.load(state / 'report.json', None) or {}).get('day')
+        start = max(today - timedelta(days=REPORT_DAYS), datetime.fromisoformat(mark).date() if mark else today)
+        days = [(start + timedelta(days=n)).isoformat() for n in range((today - start).days + 1)]
+    for one in days:
+        path = state / 'report' / f'{one}.md'
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.NamedTemporaryFile('w', dir=path.parent, delete=False) as handle:  # mkstemp: mode 0600
+            handle.write(report_text(state, triage_state, cfg, one))
+        os.replace(handle.name, path)
+    if not day:
+        triage.save(state / 'report.json', {'day': today.isoformat(), 'ok': True})
+    return state / 'report' / f'{days[-1]}.md'
 
 
 # --- provenance, caps, tick, status ------------------------------------------------------------------------------
@@ -1206,7 +1246,12 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
         triage.save(state / 'plan.json', plan)
         if not withheld:  # a withhold not done is no good tick: `status` reports it and the last good time stays
             heartbeat(state, now, 'live' if cfg['live'] else 'plan')
-        report(state, triage_state, now)
+            try:
+                report(state, triage_state, now)
+            except (Refused, triage.Refused, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
+                # The tick's work stands; `status` exits 1 until a report is written again.
+                mark = triage.load(state / 'report.json', None) or {}
+                triage.save(state / 'report.json', dict(mark, ok=False, error=type(error).__name__))
         return 1 if withheld else 0, (
             f"tick {'live' if cfg['live'] else 'plan only'}: pulled {fresh}, read {count}, over cap {len(over)}, "
             f"dropped {len(drops)}, withhold not done {len(withheld)}, "
@@ -1223,6 +1268,8 @@ def status(state, now):
         problems.append('paused by an audit')
     if paused and not (triage.load(state / 'fence.json', None) or {}).get('effective'):
         problems.append('the stop is not effective yet (fence.json)')
+    if (triage.load(state / 'report.json', None) or {}).get('ok') is False:
+        problems.append('the daily report failed (report.json)')
     if not paused and (triage.load(state / 'plan.json', None) or {}).get('withheld'):
         problems.append('a hold or drop is not withheld yet (plan.json withheld)')
     line = f"last tick {last['at'] if last else 'never'} ({last['outcome'] if last else '-'}); " + \
