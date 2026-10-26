@@ -54,10 +54,10 @@
     {
       "annotations": {
         "destructiveHint": false,
-        "openWorldHint": false,
+        "openWorldHint": true,
         "readOnlyHint": true
       },
-      "description": "Render an authorized draft without sending, queuing or contacting providers.\n\nRequires read permission for the account/chat and any reply target, with no\nsending-policy or connected-collector requirement. Returns visible/wire text,\nstructured entities, warnings, link destinations, UTF-16 lengths, renderer\nversion and a preview_digest bound to this principal, scope and exact payload.\nThe digest is not owner approval. Explicitly review lossy conversions before\nallowing them. To send rich content, use these SAME source/format/policy/target\nvalues and digest after obtaining exact owner confirmation. No automatic splitting.\n",
+      "description": "Render an authorized draft without sending or queuing.\n\nPass exactly one recipient: chat_id (archive ID) or phone (native WhatsApp: E.164\nwith or without +, or a @c.us/@s.whatsapp.net JID). A chat_id preview contacts no\nprovider and requires read permission for the account/chat and any reply target,\nwith no sending-policy or connected-collector requirement. A phone preview\ncontacts the provider: it does one open_chat_by_phone lookup (send key, full\naccount, the operation enabled; shared hourly quota), writes no chat and returns\non_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest\nbound to the number and its WhatsApp identity, valid 10 minutes. Returns visible/wire text,\nstructured entities, warnings, link destinations, UTF-16 lengths, renderer\nversion and a preview_digest bound to this principal, scope and exact payload.\nThe digest is not owner approval. Explicitly review lossy conversions before\nallowing them. To send rich content, use these SAME source/format/policy/target\nvalues and digest after obtaining exact owner confirmation. No automatic splitting.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -71,6 +71,7 @@
             "type": "boolean"
           },
           "chat_id": {
+            "default": "",
             "title": "Chat Id",
             "type": "string"
           },
@@ -89,6 +90,11 @@
             "title": "Link Preview",
             "type": "boolean"
           },
+          "phone": {
+            "default": "",
+            "title": "Phone",
+            "type": "string"
+          },
           "reply_to": {
             "default": "",
             "title": "Reply To",
@@ -101,7 +107,6 @@
         },
         "required": [
           "account",
-          "chat_id",
           "text"
         ],
         "title": "preview_messageArguments",
@@ -121,7 +126,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Send exact confirmed content using this account's existing collector.\n\nFor rich formatting or nondefault policies, call preview_message first and\npass its matching preview_digest. Show account, recipient, visible text,\nformatting, warnings, link destinations and reply target to the owner and\nobtain explicit confirmation. Digest is not approval. Requires send permission\nand operator opt-in. plain remains the default and native WhatsApp delimiters\ncan still be interpreted by WhatsApp.\nchat_id/reply_to are archive IDs; account must be explicit. request_id is a\nunique 8\u2013128 character key for this approved action; reuse it after network\nfailure with the SAME payload. queued is not sent. Poll get_send_status.\nsent means provider accepted, not recipient read/delivered. unknown must be\nchecked against history before any newly approved send. Text only, provider\npayload at most 4000 UTF-16 units; source at most 16000 units subject to the\n16384-byte HTTP JSON envelope. No splitting or server human-approval gate.\nA new WhatsApp number is reached with execute_messenger_operation operation\nopen_chat_by_phone; a phone-shaped not_found names the exact next_call.\n",
+      "description": "Send exact confirmed content using this account's existing collector.\n\nFor rich formatting or nondefault policies, call preview_message first and\npass its matching preview_digest. Show account, recipient, visible text,\nformatting, warnings, link destinations and reply target to the owner and\nobtain explicit confirmation. Digest is not approval. Requires send permission\nand operator opt-in. plain remains the default and native WhatsApp delimiters\ncan still be interpreted by WhatsApp.\nchat_id/reply_to are archive IDs; account must be explicit. request_id is a\nunique 8\u2013128 character key for this approved action; reuse it after network\nfailure with the SAME payload. queued is not sent. Poll get_send_status.\nsent means provider accepted, not recipient read/delivered. unknown must be\nchecked against history before any newly approved send. Text only, provider\npayload at most 4000 UTF-16 units; source at most 16000 units subject to the\n16384-byte HTTP JSON envelope. No splitting or server human-approval gate.\nPass exactly one recipient, chat_id or phone. A new WhatsApp number: preview_message\nwith phone, then send_message with the same phone and that preview_digest; it opens\nor reuses the chat with no second lookup and returns chat_id, chat_existed and\nverified_name. status opening_chat: repeat with the same request_id. A changed\nidentity or expired digest asks for a new preview. Opening the chat without a message\nstays execute_messenger_operation operation open_chat_by_phone.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -135,6 +140,7 @@
             "type": "boolean"
           },
           "chat_id": {
+            "default": "",
             "title": "Chat Id",
             "type": "string"
           },
@@ -152,6 +158,11 @@
             "default": false,
             "title": "Link Preview",
             "type": "boolean"
+          },
+          "phone": {
+            "default": "",
+            "title": "Phone",
+            "type": "string"
           },
           "preview_digest": {
             "default": "",
@@ -181,7 +192,6 @@
         },
         "required": [
           "account",
-          "chat_id",
           "text",
           "request_id"
         ],

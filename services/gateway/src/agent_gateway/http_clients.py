@@ -122,6 +122,8 @@ class Clients:
         waiting = module == "messaging" and (
             operation == "wait_for_subscription_events"
             or operation == "send_message" and arguments.get("wait_s", 0) > 0
+            # ANYM-532: a phone recipient waits for its open_chat_by_phone lookup.
+            or operation in ("preview_message", "send_message") and bool(arguments.get("phone"))
         )
         searching = module == "messaging" and operation == "search" and arguments.get("live", "off") != "off"
         if uploading:

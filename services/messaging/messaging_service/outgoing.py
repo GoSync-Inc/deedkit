@@ -72,6 +72,11 @@ async def finish_durably(finish,*args,attempts=4):
             await asyncio.sleep(2**attempt)
 
 
+def phone_step_id(request_id):
+    """The request_id of a phone send's chat step: one per caller request_id, so a repeat opens nothing twice."""
+    return 'phone-send:'+hashlib.sha256(request_id.encode()).hexdigest()[:40]
+
+
 def valid_text(text):
     if not isinstance(text, str) or not text.strip() or any(
             ord(c)<32 and c not in '\n\r\t' or 0xD800<=ord(c)<=0xDFFF for c in text):
@@ -342,7 +347,8 @@ def result(row,c=None,p=None):
 
 
 def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
-            preview_digest='',link_preview=False,allow_lossy=False):
+            preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None):
+    """phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash."""
     format_options(format,link_preview,allow_lossy,preview_digest)
     # Source length is bounded by the renderer; the actual provider wire payload
     # must satisfy the conservative 4000 UTF-16-unit limit.
@@ -362,7 +368,8 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     if existing:
         # Check saved intent BEFORE calling a renderer: upgrades or restarts must
         # neither alter nor reject an exact retry of an already queued action.
-        if existing.get('render_artifact') is None:
+        if phone_hash is not None:matches=existing['request_hash']==phone_hash
+        elif existing.get('render_artifact') is None:
             matches=default_policy and not preview_digest and existing['request_hash']==legacy_hash
         else:
             matches=(existing['account']==account and existing['chat']==chat_id and
@@ -370,14 +377,18 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
                 existing.get('source_text')==text and existing.get('source_format')==format and
                 existing.get('render_policy')=={'link_preview':link_preview,'allow_lossy':allow_lossy} and
                 (existing.get('preview_digest') or '')==preview_digest)
+        # A phone send's request_id (ANYM-532) is never repeated as a chat_id send.
+        if matches and phone_hash is None and c.execute('SELECT 1 FROM messenger_commands WHERE principal=%s AND request_id=%s',
+                (p['id'],phone_step_id(request_id))).fetchone():matches=False
         if not matches:raise APIError('idempotency_conflict',409)
         return result(existing,c,p)
     if not default_policy and not preview_digest:raise APIError('preview_required',409)
     draft=reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id)
-    if preview_digest and preview_digest!=draft['preview_digest']:raise APIError('preview_mismatch',409)
+    if phone_hash is None and preview_digest and preview_digest!=draft['preview_digest']:
+        raise APIError('preview_mismatch',409)
     artifact={name:draft[name] for name in ('format','source_text','rendered_text','provider_text','entities',
         'provider_payload','warnings','links','utf16_units','renderer_version')}
-    request_hash=legacy_hash if default_policy else hashlib.sha256(canonical([
+    request_hash=phone_hash or legacy_hash if default_policy else phone_hash or hashlib.sha256(canonical([
         account,chat_id,chat['provider_chat'],reply_id,artifact,draft['render_policy'],preview_digest])).hexdigest()
     policy=c.execute('SELECT * FROM account_policies WHERE account=%s',(account,)).fetchone()
     if not policy or not policy['enabled'] or not policy['send_enabled']:

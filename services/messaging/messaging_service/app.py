@@ -436,11 +436,19 @@ def create_app(store: Store, allowed_hosts: list[str]):
                 return await live_search(store,token,arguments,**live)
             from .live_search import validate
             validate('off',live.get('wait_s'),live.get('request_id',''))
+        if method in ('preview_message','send_message'):
+            # ANYM-532: exactly one recipient; a phone goes through the lookup and its digest.
+            from . import phone_send
+            phone=phone_send.recipient(arguments.get('chat_id',''),arguments.pop('phone',''))
+            if phone is not None:arguments.pop('chat_id',None);arguments['phone']=phone
+        if method == 'preview_message' and phone is not None:
+            return await phone_send.preview(store,token,arguments)
         if method == 'send_message':
             from .send_wait import validate_wait_s, wait_for_send
             wait_s=validate_wait_s(arguments.pop('wait_s', 0))
-            result=await run_in_threadpool(store.send_message,token,**arguments)
-            if wait_s:
+            if phone is not None:result=await phone_send.send(store,token,arguments)
+            else:result=await run_in_threadpool(store.send_message,token,**arguments)
+            if wait_s and result.get('send_id'):
                 try:
                     return await wait_for_send(store,token,result['send_id'],wait_s)
                 except APIError as error:
@@ -470,27 +478,34 @@ def create_app(store: Store, allowed_hosts: list[str]):
         """Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter."""
         return call(ctx,'capabilities',detail=detail,**({} if sections is None else {'sections':sections}))
 
-    @mcp.tool(structured_output=True, annotations=read)
-    def preview_message(ctx: Context,account: StrictStr,chat_id: StrictStr,text: StrictStr,
-                        reply_to: StrictStr='',format: MessageFormat='plain',
+    # ANYM-532: a phone preview contacts the provider (one lookup).
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,openWorldHint=True))
+    async def preview_message(ctx: Context,account: StrictStr,text: StrictStr,chat_id: StrictStr='',
+                        phone: StrictStr='',reply_to: StrictStr='',format: MessageFormat='plain',
                         link_preview: StrictBool=False,allow_lossy: StrictBool=False) -> dict[str,Any]:
-        """Render an authorized draft without sending, queuing or contacting providers.
+        """Render an authorized draft without sending or queuing.
 
-        Requires read permission for the account/chat and any reply target, with no
-        sending-policy or connected-collector requirement. Returns visible/wire text,
+        Pass exactly one recipient: chat_id (archive ID) or phone (native WhatsApp: E.164
+        with or without +, or a @c.us/@s.whatsapp.net JID). A chat_id preview contacts no
+        provider and requires read permission for the account/chat and any reply target,
+        with no sending-policy or connected-collector requirement. A phone preview
+        contacts the provider: it does one open_chat_by_phone lookup (send key, full
+        account, the operation enabled; shared hourly quota), writes no chat and returns
+        on_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest
+        bound to the number and its WhatsApp identity, valid 10 minutes. Returns visible/wire text,
         structured entities, warnings, link destinations, UTF-16 lengths, renderer
         version and a preview_digest bound to this principal, scope and exact payload.
         The digest is not owner approval. Explicitly review lossy conversions before
         allowing them. To send rich content, use these SAME source/format/policy/target
         values and digest after obtaining exact owner confirmation. No automatic splitting.
         """
-        return call(ctx,'preview_message',account=account,chat_id=chat_id,text=text,
+        return await async_call(ctx,'preview_message',account=account,chat_id=chat_id,phone=phone,text=text,
             reply_to=reply_to,format=format,link_preview=link_preview,allow_lossy=allow_lossy)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=True,idempotentHint=True,openWorldHint=True))
-    async def send_message(ctx: Context,account: StrictStr,chat_id: StrictStr,text: StrictStr,
-                     request_id: StrictStr,reply_to: StrictStr='',format: MessageFormat='plain',
+    async def send_message(ctx: Context,account: StrictStr,text: StrictStr,request_id: StrictStr,
+                     chat_id: StrictStr='',phone: StrictStr='',reply_to: StrictStr='',format: MessageFormat='plain',
                      preview_digest: StrictStr='',link_preview: StrictBool=False,
                      allow_lossy: StrictBool=False, wait_s: WaitSeconds=0) -> dict[str,Any]:
         """Send exact confirmed content using this account's existing collector.
@@ -508,10 +523,14 @@ def create_app(store: Store, allowed_hosts: list[str]):
         checked against history before any newly approved send. Text only, provider
         payload at most 4000 UTF-16 units; source at most 16000 units subject to the
         16384-byte HTTP JSON envelope. No splitting or server human-approval gate.
-        A new WhatsApp number is reached with execute_messenger_operation operation
-        open_chat_by_phone; a phone-shaped not_found names the exact next_call.
+        Pass exactly one recipient, chat_id or phone. A new WhatsApp number: preview_message
+        with phone, then send_message with the same phone and that preview_digest; it opens
+        or reuses the chat with no second lookup and returns chat_id, chat_existed and
+        verified_name. status opening_chat: repeat with the same request_id. A changed
+        identity or expired digest asks for a new preview. Opening the chat without a message
+        stays execute_messenger_operation operation open_chat_by_phone.
         """
-        return await async_call(ctx,'send_message',account=account,chat_id=chat_id,text=text,
+        return await async_call(ctx,'send_message',account=account,chat_id=chat_id,phone=phone,text=text,
             request_id=request_id,reply_to=reply_to,format=format,preview_digest=preview_digest,
             link_preview=link_preview,allow_lossy=allow_lossy,wait_s=wait_s)
 

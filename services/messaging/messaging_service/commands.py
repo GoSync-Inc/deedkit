@@ -31,6 +31,8 @@ LIVE_FOREGROUND_RESERVE = 1.0
 # Preflight, governor waits and the request end this long after the claim; the rest is the receipt's.
 LIVE_EXECUTION_TIMEOUT = 8
 PHONE_LOOKUPS_PER_HOUR = 10
+# ANYM-532: server-set fields of a phone preview lookup or a phone send's chat step, never caller parameters.
+PHONE_INTERNAL = ('phone_preview','expected_lid','send_request_hash','preview_lookup')
 OPEN_CHAT_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
     '--operations <current operations> open_chat_by_phone')
 log = logging.getLogger('anymsg.live_search')
@@ -285,7 +287,9 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
         if provider=='whatsmeow' and (mode=='sticker' and mime!='image/webp' or
             mode in ('audio','voice','sticker') and parameters['caption']):raise APIError('unsupported_operation')
     _policy(c,account,operation,provider_chats,ready=ready,live=live_read(operation,account_row['platform']))
-    if operation=='open_chat_by_phone':_phone_policy(c,account,parameters['phone'])
+    if operation=='open_chat_by_phone':
+        _phone_policy(c,account,parameters['phone'])
+        if saved is not None:payload.update({k:saved[k] for k in PHONE_INTERNAL if k in saved})
     if operation=='join_chat':
         # Saved intent keeps the chat the owner confirmed; a new preview binds the key's latest check.
         payload['expected_chat']=saved.get('expected_chat') if saved is not None else _link_check(c,p,account,parameters['link'])
@@ -351,9 +355,15 @@ def _lookup_budget(c,account,command):
 
 def _other_account_chat(c,p,account,phone):
     """ANYM-531: an archived chat of this number on another account the key reads; archive only."""
+    return next(other_account_chats(c,p,account,phone),None)
+
+
+def other_account_chats(c,p,account,phone):
+    """Archived chats of this number on the key's other accounts, by account and chat authorization;
+    archive only, never a provider call (ANYM-531, ANYM-532)."""
     from .policy import scope_filter
     from .whatsapp_identity import resolve_alias
-    if 'read' not in p['permissions']:return None
+    if 'read' not in p['permissions']:return
     for other in sorted(set(p['accounts'])-{account}):
         where,args=scope_filter({**p,'accounts':[other]},'c',chat_column='id')
         row=c.execute("SELECT c.id FROM chats c JOIN accounts a ON a.id=c.account WHERE a.platform='whatsapp' "
@@ -361,8 +371,7 @@ def _other_account_chat(c,p,account,phone):
         if not row:
             try:row=resolve_alias(c,p,other,phone+'@c.us')
             except APIError:row=None  # Ambiguous evidence names nothing.
-        if row:return {'account':other,'chat_id':row['id']}
-    return None
+        if row:yield {'account':other,'chat_id':row['id']}
 
 
 def _open_chat_refusal(c,p,account,phone,parameters):
@@ -396,12 +405,12 @@ def phone_next_step(c,p,account,reference):
     if found:return {'found_on_other_account':found,'next_action':'use_existing_chat'}
     if row['platform']!='whatsapp' or account_provider(c,account,row['platform'])!='whatsmeow':
         return {'hint':'native_whatsapp_accounts_only','next_action':'use_username_or_existing_chat'}
-    parameters={'phone':'+'+phone,'create':False}
-    refusal=_open_chat_refusal(c,p,account,phone,parameters)
+    refusal=_open_chat_refusal(c,p,account,phone,{'phone':'+'+phone,'create':False})
     if refusal:return refusal
-    return {'next_action':'open_chat_by_phone_then_follow_next_call',
-        'next_call':{'tool':'execute_messenger_operation','arguments':{'account':account,
-            'operation':'open_chat_by_phone','parameters':parameters},'caller_supplies':['request_id']}}
+    # ANYM-532: the phone preview does the lookup; its digest then sends to the number.
+    return {'next_action':'preview_message_then_send_message_with_its_digest',
+        'next_call':{'tool':'preview_message','arguments':{'account':account,'phone':'+'+phone},
+            'caller_supplies':['text'],'caller_may_supply':['format','reply_to']}}
 
 
 def _open_chat_next(row,c=None,p=None):
@@ -468,6 +477,9 @@ def manifest(c,p,account):
 
 def _public(row,c=None,p=None):
     answer=row['result']
+    if row['operation']=='open_chat_by_phone' and isinstance(answer,dict) and isinstance(answer.get('data'),dict):
+        # ANYM-532: the resolved LID stays server-side; it binds a phone preview's digest.
+        answer={**answer,'data':{k:v for k,v in answer['data'].items() if k!='provider_chat'}}
     if isinstance(answer,dict) and isinstance(answer.get('data'),dict) and 'archive_reference' in answer['data']:
         from .outgoing import project_reference
         actual,state=project_reference(c,p,row['account'],answer['data']['archive_reference'])
@@ -496,7 +508,7 @@ def _input(account,operation,chat_id,message_id,expected_revision,parameters,pre
 
 
 def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revision=0,parameters=None,
-            request_id='',preview_digest=''):
+            request_id='',preview_digest='',internal=None):
     if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id):
         raise APIError('invalid_request_id')
     if not isinstance(preview_digest,str) or (preview_digest and not re.fullmatch(r'[a-f0-9]{64}',preview_digest)):
@@ -506,11 +518,14 @@ def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
     existing=c.execute('SELECT * FROM messenger_commands WHERE principal=%s AND key_id=%s AND request_id=%s',
         (p['id'],p['key_id'],request_id)).fetchone()
     if existing:
-        if existing['request_hash']!=request_hash:raise APIError('idempotency_conflict',409)
+        if existing['request_hash']!=request_hash or any(
+                existing['payload'].get(k)!=v for k,v in (internal or {}).items()):
+            raise APIError('idempotency_conflict',409)
         _check_saved(store,c,p,existing,ready=False,check_versions=False)
         return _public(existing,c,p)
     payload,spec=_resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,parameters,
                          ready=True,verify_file=True)
+    if internal:payload.update({k:v for k,v in internal.items() if k in PHONE_INTERNAL})
     expected=_digest(p,payload)
     if spec['mutation'] and not preview_digest:raise APIError('preview_required',409)
     if preview_digest and preview_digest!=expected:raise APIError('preview_mismatch',409)
@@ -761,7 +776,7 @@ class CommandWorker:
                     policy=c.execute('SELECT * FROM account_policies WHERE account=%s',(st.account,)).fetchone()
                     if not policy or not policy['discover_chats'] or not CollectorState.allows(policy,chat):
                         raise APIError('chat_not_collected')
-                    chat_id=stable_id('chat',st.account,chat)
+                    chat_id=stable_id('chat',st.account,chat);public['provider_chat']=chat
                     existing=c.execute('SELECT 1 FROM chats WHERE id=%s',(chat_id,)).fetchone() is not None
                     if not existing and row['payload']['parameters'].get('create') is True:
                         existing=c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat)
@@ -833,7 +848,7 @@ class CommandWorker:
             code=str(exc) if str(exc) in ('operation_expired','operation_disabled','operation_access_changed',
                 'operation_target_changed','sender_not_ready','attachment_unavailable','unsupported_operation',
                 'forbidden','not_found','operation_rejected','identity_unresolved','chat_not_collected',
-                'rate_limited','provider_timeout','invalid_phone','invite_invalid','invite_expired','chat_full',
+                'rate_limited','provider_timeout','invalid_phone','identity_changed','invite_invalid','invite_expired','chat_full',
                 'join_not_allowed','already_member','invalid_cursor','invalid_anchor') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None

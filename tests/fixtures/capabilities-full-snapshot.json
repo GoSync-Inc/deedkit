@@ -486,6 +486,26 @@
   "implemented": true,
   "legacy_send_message_text_only": true,
   "read_permission_does_not_allow_send": true,
+  "recipients": {
+   "chat_id": {
+    "preview_contacts_provider": false
+   },
+   "phone": {
+    "digest_binds_identity": true,
+    "lookup_quota": "shared_with_open_chat_by_phone",
+    "platforms": [
+     "whatsapp_native"
+    ],
+    "preview_contacts_provider": true,
+    "requires": [
+     "send",
+     "full_account",
+     "open_chat_by_phone",
+     "gateway_action_grant"
+    ],
+    "send_requires_preview_digest": true
+   }
+  },
   "request_id_required": true,
   "server_approval_gate": false,
   "text_only": false,
