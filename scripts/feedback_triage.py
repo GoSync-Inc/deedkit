@@ -61,7 +61,9 @@ class Refused(Exception):
 
 def run(argv, timeout, stdin=None):
     try:
-        done = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=timeout)
+        # stdin is never the terminal, so an unattended run cannot wait on a prompt (ANYM-536).
+        done = subprocess.run(argv, input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise Refused(f'{argv[0]} failed: {type(error).__name__}') from None
     if done.returncode:
@@ -343,6 +345,7 @@ def write_ledger(state, ledger):
 
 
 def record(state, decisions, now=None):
+    now = now or datetime.now(timezone.utc)
     snap = load(state / 'snapshot.json', None)
     if snap is None:
         raise Refused('no snapshot: run `snapshot` first')
@@ -376,7 +379,10 @@ def record(state, decisions, now=None):
                      'classification': decision['classification'], 'reason': clean(decision['reason'], 200),
                      'specs': [{'ref': s['ref'], 'verdict': s['verdict']} for s in decision.get('specs') or []],
                      'primary': decision.get('primary'), 'cluster': cluster, 'disposition': disp,
-                     'verdict_of': decision.get('verdict_of'), 'reported': False}
+                     'verdict_of': decision.get('verdict_of'), 'reported': False,
+                     # The decision time travels with the entry, so a report republished after a crash keeps it and
+                     # the sync tool never overwrites a disposition changed after it (ANYM-536).
+                     'decided_at': stamp(now)}
         write_ledger(state, ledger)
         inbox.pop(i)
         save(state / 'inbox.json', inbox)
@@ -384,7 +390,7 @@ def record(state, decisions, now=None):
         save(state / 'state.json', meta)
     # Entries of a stopped run that never reached a report are reported now.
     done = sorted(i for i, entry in ledger.items() if entry.get('reported') is False)
-    path = report(state, ledger, done, inbox, now or datetime.now(timezone.utc))
+    path = report(state, ledger, done, inbox, now)
     for i in done:
         ledger[i]['reported'] = True
     write_ledger(state, ledger)
@@ -418,7 +424,8 @@ def report(state, ledger, done, inbox, now):
     commands = [command(disp, ids[k:k + 100]) for _, (disp, ids) in sorted(grouped.items())
                 for k in range(0, len(ids), 100)]
     dispositions = [{'id': i, 'status': e['disposition']['status'], 'spec_ref': e['disposition']['spec_ref'],
-                     'duplicate_of': e['disposition']['duplicate_of'], 'fixed_in': None, 'note': e['disposition']['note']}
+                     'duplicate_of': e['disposition']['duplicate_of'], 'fixed_in': None, 'note': e['disposition']['note'],
+                     'decided_at': e.get('decided_at')}
                     for i, e in sorted(rows.items())]
     lines = [f'# Feedback triage {name}', '', f'Processed: {len(rows)}. Still in the inbox: {len(inbox)}.',
              'Agents are counted by key: the store has no agent session ID.', '']

@@ -3,6 +3,9 @@
 
     feedback_sync.py apply --dispositions FILE [--apply] [--host deedkit-prod] [--state DIR]
     feedback_sync.py follow [--apply] [--host deedkit-prod] [--state DIR]
+    feedback_sync.py auto [--apply] [--triage-state DIR] [--host deedkit-prod] [--state DIR]
+    feedback_sync.py auto --retire FILE [--state DIR]
+    feedback_sync.py status [--state DIR]
 
 
 Both actions first read every disposition from production (the full `export-feedback --changed-since` inventory,
@@ -18,11 +21,18 @@ are never changed. Every write call is recorded in `pending.json` before it is s
 call with an unknown outcome stops the run, is never retried, and blocks writes until a later inventory shows it
 landed or, read after D + 10 s, that it can no longer land. Runs on the orchestrator machine (Tiden token, gh, git, the owner's SSH); exit 0 done,
 1 refused or stopped, 2 usage.
+
+`auto` is the unattended hourly run (ANYM-536): every triage dispositions file the ledger `applied.json` does not
+record as complete, each row written only when its item is unchanged since the row's `decided_at`; a `received`
+item named in the `Feedback:` line of exactly one card on Tiden main is linked to it; then `follow`; a card that left
+main is reported, never guessed. All reads finish before the first write, and `--apply` writes `last-run.json`, which
+`status` prints (exit 1 when the last good run is older than 3 hours or a call with an unknown outcome blocks writes).
 """
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -60,6 +70,12 @@ UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 SPEC = re.compile(r'ANYM-[1-9][0-9]{0,5}')
 FIXED_IN = re.compile(r'deedkit@[0-9a-f]{40}')
 SHA = re.compile(r'[0-9a-f]{40}')
+# ANYM-536: the card line that links feedback to it; the ID anywhere else in a card (History, a quote) does not.
+FEEDBACK_LINE = re.compile(r'^Feedback: ({0}(?:, {0})*)[ \t]*\r?$'.format(UUID.pattern), re.MULTILINE)
+FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
+STALE = timedelta(hours=3)
+# Queue outcomes that close a row: written, already so, newer than its decision, or kept by the never-down rule.
+CLOSED = ('written', 'unchanged', 'superseded', 'further along', 'agent verdict kept')
 OPERATOR = [('deedkit-feedback-sync' if word == 'deedkit-feedback-export' else word) for word in triage.EXPORT]
 Refused = triage.Refused
 
@@ -98,23 +114,30 @@ def problems(row):
     return out
 
 
-def dispositions(path):
+def dispositions(path, text=None):
+    """id -> target; with `text` (the bytes `auto` hashed) also id -> the row's decision time or None (ANYM-536)."""
     if triage.in_git(path):
         raise Refused('the dispositions file must be outside every Git checkout')
-    rows = triage.parse(path.read_text(), 'dispositions')
+    rows = triage.parse(path.read_text() if text is None else text, 'dispositions')
     if not isinstance(rows, list):
         raise Refused('dispositions must be a JSON list')
-    targets = {}
+    targets, decided = {}, {}
     for n, row in enumerate(rows):
-        if not isinstance(row, dict) or set(row) != {'id', *FIELDS} or not UUID.fullmatch(str(row['id'])):
+        if not isinstance(row, dict) or set(row) - {'decided_at'} != {'id', *FIELDS} or not UUID.fullmatch(str(row['id'])):
             raise Refused(f'row {n}: needs exactly id, {", ".join(FIELDS)} with a lower-case feedback UUID')
         if row['id'] in targets:
             raise Refused(f'row {n}: {row["id"]} appears twice')
         wrong = problems(row)
+        if row.get('decided_at') is not None:
+            try:
+                moment(row['decided_at'], 'decided_at')
+            except Refused:
+                wrong.append('decided_at')
         if wrong:
             raise Refused(f'row {n} ({row["id"]}): invalid {", ".join(wrong)}')
         targets[row['id']] = {field: row[field] for field in FIELDS}
-    return targets
+        decided[row['id']] = row.get('decided_at')
+    return targets if text is None else (targets, decided)
 
 
 # --- reads -------------------------------------------------------------------------------------------------------
@@ -349,6 +372,7 @@ def set_command(digest, target, ids, since, until):
 REFUSALS = re.compile(r'^ValueError: (changed_since_plan|not_after_passed|unknown_feedback|duplicate_of_\w+|'
                       r'invalid_\w+|\w+_required|feedback_ids_1_to_100|status_reserved_for_reporting_agent)\b',
                       re.MULTILINE)
+UNLINKABLE = re.compile(r'refused: (unknown_feedback|changed_since_plan)$')
 USAGE = re.compile(r': error: unrecognized arguments: --(unchanged-since|not-after)')
 
 
@@ -390,9 +414,10 @@ def pending_clear(state):
     (state / 'pending.json').unlink(missing_ok=True)
 
 
-def pending_check(state, state_now, head):
+def pending_check(state, state_now, head, settle=True):
     """True when writes may go on: no recorded call, or one this inventory resolves conclusively (ANYM-473
-    criterion 8): it landed, or it can no longer land because the head is past its not-after bound plus GUARD."""
+    criterion 8): it landed, or it can no longer land because the head is past its not-after bound plus GUARD.
+    `settle` False (an `auto` dry run) only answers and records nothing."""
     path = state / 'pending.json'
     if not path.exists():
         return True
@@ -414,13 +439,15 @@ def pending_check(state, state_now, head):
         print(f'PENDING a call for {len(ids)} items has an unknown outcome and has not landed; writes stay blocked '
               f'until it lands or the export head passes {entry["not_after"]} + 10 s', file=sys.stderr)
         return False
+    if not settle:
+        return True
     audit(state, dict(summary, outcome=outcome))
     pending_clear(state)
     print(f'the recorded call for {len(ids)} items {outcome}')
     return True
 
 
-def write(state, host, digest, action, rows, since, until, run=remote_write):
+def write(state, host, digest, action, rows, since, until, run=remote_write, done=None):
     before = {i: now['status'] for i, now, target, _ in rows if target}
     for target, ids in groups(rows):
         entry = {'action': action, 'ids': ids, 'from': {i: before[i] for i in ids}, 'to': target['status'],
@@ -447,21 +474,342 @@ def write(state, host, digest, action, rows, since, until, run=remote_write):
             raise Refused('set-feedback-status: unexpected reply; not retried')
         pending_clear(state)
         audit(state, dict(entry, outcome='ok'))
+        if done:
+            done(ids)
+
+
+# --- auto (ANYM-536) ---------------------------------------------------------------------------------------------
+
+def digest_of(target):
+    return hashlib.sha256(json.dumps({field: target[field] for field in FIELDS}, sort_keys=True).encode()).hexdigest()
+
+
+def ledger_load(state):
+    ledger = triage.load(state / 'applied.json', {'files': {}})
+    decided = ledger.get('decided', {}) if isinstance(ledger, dict) else None
+    if not isinstance(ledger, dict) or not isinstance(ledger.get('files'), dict) or not isinstance(decided, dict) or \
+            not all(isinstance(keys, dict) and all(isinstance(text, str) for text in keys.values())
+                    for keys in decided.values()):
+        raise Refused('applied.json is malformed; nothing is written until it is inspected')
+    return ledger
+
+
+def queue(directory, ledger):
+    """The triage dispositions files: (open {name: (sha256, targets, decided)}, legacy names, refused {name: why}).
+    A ledgered file is hashed first and refused when it changed; a complete one is not read further."""
+    files, legacy, refused = {}, [], {}
+    for path in sorted(directory.glob('*.json')) if directory.is_dir() else []:
+        raw = path.read_bytes()
+        sha, known = hashlib.sha256(raw).hexdigest(), ledger['files'].get(path.name)
+        if known and known.get('sha256') != sha:
+            refused[path.name] = 'changed after it was ledgered'
+        elif not (known and known.get('complete')):
+            try:
+                targets, decided = dispositions(path, raw.decode())
+            except (Refused, UnicodeDecodeError) as error:
+                refused[path.name] = str(error)
+                continue
+            if any(value is None for value in decided.values()):
+                legacy.append(path.name)  # written before decided_at: a hand `apply` or `auto --retire`
+            else:
+                files[path.name] = (sha, targets, decided)
+    return files, legacy, refused
+
+
+def plan_queue(files, ledger, state_now, since):
+    """One entry per item with an open row: (i, now, target, reason, unchanged_since, members, older). `members` are
+    the open rows equal to the decision that stands, `older` the open rows a newer decision for the item replaced.
+    The earliest decision time of every row seen goes to the ledger's `decided`, saved before any call, so it
+    outlives a refused or removed source file."""
+    earliest = {}
+
+    def seen(key, text):
+        value = moment(text, 'decided_at')
+        earliest[key] = min(earliest.get(key, value), value)
+    for i, keys in ledger.get('decided', {}).items():
+        for key, text in keys.items():
+            seen((i, key), text)
+    for entry in ledger['files'].values():
+        for i, row in (entry.get('rows') or {}).items():
+            if row.get('decided_at'):
+                seen((i, row['target']), row['decided_at'])
+    opened = {}
+    for name, (_, targets, decided) in files.items():
+        done = (ledger['files'].get(name) or {}).get('rows') or {}
+        for i, target in targets.items():
+            seen((i, digest_of(target)), decided[i])  # a republished equal row keeps the earliest decision time
+            if i not in done:
+                opened.setdefault(i, []).append((name, digest_of(target), target))
+    remembered = {}
+    for (i, key), value in sorted(earliest.items()):
+        remembered.setdefault(i, {})[key] = value.isoformat()
+    if remembered:
+        ledger['decided'] = remembered
+    bound, out = datetime.fromisoformat(since), []
+    for i, rows in sorted(opened.items()):
+        name, key, target = max(rows, key=lambda row: (earliest[i, row[1]], row[0]))
+        decided = earliest[i, key]
+        members = [(n, k, decided) for n, k, _ in rows if k == key]
+        older = [(n, k, earliest[i, k]) for n, k, _ in rows if k != key]
+        now = state_now.get(i, received())
+        chosen, reason = decide(now, target) if settled(now, since) else (None, 'changed during read')
+        if chosen and now['changed_at'] is not None and now['changed_at'] > decided:
+            chosen, reason = None, 'superseded'  # a hand correction or a later run stands
+        out.append((i, now, chosen, 'disposition' if chosen else reason, min(decided, bound).isoformat(), members, older))
+    return out
+
+
+def ledger_mark(ledger, files, name, i, key, decided, outcome):
+    entry = ledger['files'].setdefault(name, {'sha256': files[name][0], 'complete': False, 'rows': {}})
+    entry['rows'][i] = {'outcome': outcome, 'decided_at': decided.isoformat(), 'target': key}
+    entry['complete'] = set(entry['rows']) >= set(files[name][1])
+
+
+def prose(text):
+    """The lines of a card outside fenced code (CommonMark: a fence closes on the same character, at least as long,
+    with nothing after it) and HTML comments; a line that opens, holds or closes a comment is dropped."""
+    fence, comment = None, False
+    for line in text.splitlines():
+        mark = FENCE.match(line)
+        if fence:
+            if mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence) and \
+                    not line[mark.end():].strip():
+                fence = None
+            continue
+        if mark and not comment and not (mark.group(1)[0] == '`' and '`' in line[mark.end():]):
+            fence = mark.group(1)  # a backtick fence's info string holds no backtick
+            continue
+        rest, touched = line, comment or '<!--' in line
+        while True:
+            cut = rest.find('-->' if comment else '<!--')
+            if cut < 0:
+                break
+            rest, comment = rest[cut + (3 if comment else 4):], not comment
+        if not touched:
+            yield line
+
+
+def links(main):
+    """feedback ID -> the cards on main whose own `Feedback: <id>[, <id>]` line names it; a line in a fenced block,
+    an HTML comment or a quote is an example, not a link."""
+    out = {}
+    for spec in main:
+        for line in FEEDBACK_LINE.finditer('\n'.join(prose(spec['text']))):
+            for i in line.group(1).split(', '):
+                out.setdefault(i, set()).add(spec['ref'])
+    return out
+
+
+def plan_link(state_now, linked, since, busy):
+    """An item the inventory lacks was never set (or set after the head, which the setter refuses)."""
+    rows = []
+    for i in sorted(linked):
+        now = state_now.get(i, received())
+        if i in busy or now['status'] != 'received' or now['spec_ref']:
+            continue
+        refs = sorted(linked[i])
+        if len(refs) > 1:
+            rows.append((i, now, None, 'several cards'))
+        elif not settled(now, since):
+            rows.append((i, now, None, 'changed during read'))
+        else:
+            rows.append((i, now, dict(now, status='accepted', spec_ref=refs[0],
+                                      note=f'Carded as {refs[0]}; it follows that card.'), 'carded'))
+    return rows
+
+
+def age(now, head):
+    return round((head - now['changed_at']).total_seconds() / 3600, 1) if now['changed_at'] else None
+
+
+def auto(args, ssh, read, live, gh, run, root, fetch):
+    """The unattended run under the sync lock; `--apply` always ends by writing last-run.json."""
+    state, started = args.state, datetime.now(timezone.utc)
+    try:
+        previous = triage.load(state / 'last-run.json', {})
+    except ValueError:
+        previous = {}  # a damaged report never stops the run that replaces it
+    report = {'version': 1, 'at': started.isoformat(), 'exit': 1, 'export_head': None, 'written': 0, 'error': None,
+              'reasons': {}, 'waiting_for_card': [], 'waiting_for_main': [], 'pending': None,
+              'files': {'complete': [], 'open': [], 'legacy': [], 'refused': {}},
+              'last_ok': previous.get('last_ok') if isinstance(previous, dict) else None}
+    try:
+        code = auto_run(args, ssh, read, live, gh, run, root, fetch, report)
+    except (Refused, ValueError) as error:
+        print(f'REFUSED {error}', file=sys.stderr)
+        report['error'], code = str(error), 1
+    except Exception as error:  # a malformed read never skips the report; only the type, never read content
+        print(f'REFUSED unexpected {type(error).__name__}', file=sys.stderr)
+        report['error'], code = f'unexpected {type(error).__name__}', 1
+    if args.apply:
+        if (state / 'pending.json').exists():
+            try:
+                entry = triage.load(state / 'pending.json', {})
+            except ValueError:
+                entry = None
+            report['pending'] = {key: entry.get(key) for key in ('action', 'ids', 'to', 'not_after')} \
+                if isinstance(entry, dict) else {'malformed': True}
+        report['exit'] = code
+        if code == 0:
+            report['last_ok'] = report['at']
+        triage.save(state / 'last-run.json', report)
+    return code
+
+
+def auto_run(args, ssh, read, live, gh, run, root, fetch, report):
+    state, files_report = args.state, report['files']
+    # An unattended run never waits on a prompt: ssh runs with BatchMode, git and gh with prompts off.
+    os.environ['GIT_TERMINAL_PROMPT'], os.environ['GH_PROMPT_DISABLED'] = '0', '1'
+    ledger = ledger_load(state)
+    files, files_report['legacy'], files_report['refused'] = queue(args.triage_state / 'dispositions', ledger)
+    known = triage.load(state / 'cards.json', {'seen': {}})
+    if not isinstance(known, dict) or not isinstance(known.get('seen'), dict):
+        raise Refused('cards.json is malformed')
+    # Every read comes before the first write: inventory, Tiden main, gh and git, the receipts.
+    digest = image(args.host, ssh)
+    state_now, head = current(args.host, digest, ssh)
+    report['export_head'] = head.isoformat()
+    since, until = (head - GUARD).isoformat(), (head + WINDOW).isoformat()
+    free = pending_check(state, state_now, head, settle=args.apply)
+    main = triage.flatten((read or triage.tiden)('spec', 'list', '--branch', 'main'), 'main')
+    status = {spec['ref']: spec['status'] for spec in main}
+    queued = plan_queue(files, ledger, state_now, since)
+    busy = {entry[0] for entry in queued if entry[2]}
+    cards_of = links(main)
+    linked = plan_link(state_now, cards_of, since, busy)
+    rest = {i: now for i, now in state_now.items() if i not in busy | {row[0] for row in linked}}
+    refs = {ref for ref in wanted(rest, since) if status.get(ref) == 'Done'}
+    followed = []
+    for i, now, target, reason in plan_follow(rest, status, delivering(refs, root, fetch, gh) if refs else {},
+                                              live or live_probe(args.host, root), since):
+        if reason == 'card not on main' and now['status'] in ('received', 'accepted'):
+            reason = 'card missing' if now['spec_ref'] in known['seen'] else 'waiting for main'
+            if reason == 'waiting for main':
+                report['waiting_for_main'].append({'feedback': i, 'card': now['spec_ref'], 'age_hours': age(now, head)})
+        elif reason == 'no card' and now['status'] == 'received':
+            reason = 'waiting for a card'
+            report['waiting_for_card'].append({'feedback': i, 'age_hours': age(now, head)})
+        followed.append((i, now, target, reason))
+    sections = (('apply queue', [entry[:4] for entry in queued]), ('link', linked), ('follow', followed))
+    writes = 0
+    for title, rows in sections:
+        print(f'## {title}')
+        writes += show(rows)
+        for i, now, target, reason in rows:
+            row = {'feedback': i, 'card': (target or now)['spec_ref']}
+            report['reasons'].setdefault(reason, []).append(dict(row, cards=sorted(cards_of[i])) if
+                                                            reason == 'several cards' else row)
+    code = 1 if files_report['refused'] else 0
+    for name, why in sorted(files_report['refused'].items()):
+        print(f'REFUSED {name}: {why}', file=sys.stderr)
+    if not args.apply:
+        print('dry run: nothing written or recorded (add --apply)')
+        return code
+    known['seen'].update({ref: head.isoformat() for ref in status if ref not in known['seen']})
+    triage.save(state / 'cards.json', known)
+    members = {}
+    for i, _, target, reason, _, rows, older in queued:
+        members[i] = rows
+        for name, key, decided in older:
+            ledger_mark(ledger, files, name, i, key, decided, 'superseded')
+        for name, key, decided in rows if reason in CLOSED else ():
+            ledger_mark(ledger, files, name, i, key, decided, reason)
+    for name in files:
+        ledger['files'].setdefault(name, {'sha256': files[name][0], 'complete': not files[name][1], 'rows': {}})
+    triage.save(state / 'applied.json', ledger)
+    try:
+        if writes and not free:
+            raise Refused('a call with an unknown outcome blocks writes')
+
+        def done(ids):
+            for i in ids:
+                for name, key, decided in members.get(i, ()):
+                    ledger_mark(ledger, files, name, i, key, decided, 'written')
+            triage.save(state / 'applied.json', ledger)
+            counted(ids)
+
+        def counted(ids):  # link and follow calls close no queue row
+            report['written'] += len(ids)
+        buckets = {}
+        for i, now, target, _, unchanged, _, _ in queued:
+            if target:
+                buckets.setdefault(unchanged, []).append((i, now, target, 'disposition'))
+        for unchanged in sorted(buckets, key=datetime.fromisoformat):
+            write(state, args.host, digest, 'apply', buckets[unchanged], unchanged, until, run, done)
+        known_rows = [row for row in linked if row[0] in state_now]
+        if any(row[2] for row in known_rows):
+            write(state, args.host, digest, 'link', known_rows, since, until, run, counted)
+        for row in linked:
+            if row[2] and row[0] not in state_now:  # one call each: an unknown ID refuses only its own call
+                try:
+                    write(state, args.host, digest, 'link', [row], since, until, run, counted)
+                except Refused as error:
+                    if not UNLINKABLE.search(str(error)):
+                        raise
+                    report['reasons'].setdefault('not linked', []).append({'feedback': row[0], 'card': row[2]['spec_ref']})
+        if any(row[2] for row in followed):
+            write(state, args.host, digest, 'follow', followed, since, until, run, counted)
+    finally:
+        for name in sorted(files):
+            files_report['complete' if ledger['files'][name]['complete'] else 'open'].append(name)
+    print(f'written {report["written"]}')
+    return code
+
+
+def retire(state, path):
+    if triage.in_git(path):
+        raise Refused('the dispositions file must be outside every Git checkout')
+    ledger = ledger_load(state)
+    ledger['files'][path.name] = {'sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'complete': True,
+                                  'retired': True, 'rows': {}}
+    triage.save(state / 'applied.json', ledger)
+    print(f'retired {path.name}: `auto` never applies it')
+
+
+def status_report(state, now=None):
+    """Prints last-run.json; exit 1 when the last exit-0 `auto --apply` run is older than STALE or a call with an
+    unknown outcome blocks writes."""
+    now, path = now or datetime.now(timezone.utc), state / 'last-run.json'
+    last = triage.parse(path.read_text(), 'last-run.json') if path.exists() else {}
+    print(json.dumps(last, indent=1, sort_keys=True))
+    alerts = []
+    try:
+        ok = triage.when(last['last_ok']) if isinstance(last, dict) and last.get('last_ok') else None
+    except (TypeError, ValueError):
+        ok = None
+    if ok is None or now - ok > STALE:
+        alerts.append(f'no exit-0 `auto --apply` run in the last {STALE.total_seconds() / 3600:.0f} hours')
+    if (state / 'pending.json').exists() or (isinstance(last, dict) and last.get('pending')):
+        alerts.append('a call with an unknown outcome blocks writes')
+    for alert in alerts:
+        print(f'ATTENTION {alert}', file=sys.stderr)
+    return 1 if alerts else 0
 
 
 def main(argv=None, ssh=None, read=None, live=None, gh=None, run=remote_write, root=ROOT, fetch=True):
-    parser = argparse.ArgumentParser(description='Feedback follows its card (ANYM-473).')
-    parser.add_argument('action', choices=['apply', 'follow'])
+    parser = argparse.ArgumentParser(description='Feedback follows its card (ANYM-473, ANYM-536).')
+    parser.add_argument('action', choices=['apply', 'follow', 'auto', 'status'])
     parser.add_argument('--dispositions', type=Path)
     parser.add_argument('--apply', action='store_true', help='write; without it the run only prints the plan')
     parser.add_argument('--state', type=Path, default=Path(os.environ.get('FEEDBACK_SYNC_STATE', STATE)))
+    parser.add_argument('--triage-state', type=Path, default=Path(os.environ.get('FEEDBACK_TRIAGE_STATE', triage.STATE)))
+    parser.add_argument('--retire', type=Path, help='auto: record a legacy dispositions file complete without a write')
     parser.add_argument('--host', default=HOST)
     args = parser.parse_args(argv)
     if (args.action == 'apply') != bool(args.dispositions):
-        parser.error('apply needs --dispositions, follow takes none')
+        parser.error('apply needs --dispositions, the other actions take none')
+    if args.retire and args.action != 'auto':
+        parser.error('--retire is an auto option')
+    if args.action == 'status':
+        return status_report(args.state)
     ssh = ssh or triage.remote
     try:
         with triage.locked(args.state):
+            if args.action == 'auto':
+                if args.retire:
+                    retire(args.state, args.retire)
+                    return 0
+                return auto(args, ssh, read, live, gh, run, root, fetch)
             targets = dispositions(args.dispositions) if args.action == 'apply' else None
             digest = image(args.host, ssh)
             state_now, head = current(args.host, digest, ssh)

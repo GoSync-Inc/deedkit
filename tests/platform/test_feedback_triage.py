@@ -1,4 +1,5 @@
 """Owner-started private feedback triage: ledger, lock, local match, dispositions, no outbound writes (ANYM-264)."""
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -263,10 +264,35 @@ def test_report_lists_the_exact_status_commands_and_writes_a_dispositions_file(s
          '--duplicate-of', P1, '--note', 'answered in ACCESS.md']]
     (dispositions,) = (state / 'dispositions').iterdir()
     rows = json.loads(dispositions.read_text())
-    assert [set(row) for row in rows] == [{'id', 'status', 'spec_ref', 'duplicate_of', 'fixed_in', 'note'}] * 3
+    assert [set(row) for row in rows] == [{'id', 'status', 'spec_ref', 'duplicate_of', 'fixed_in', 'note', 'decided_at'}] * 3
     assert oct(path.stat().st_mode & 0o777) == '0o600'
     assert oct(dispositions.stat().st_mode & 0o777) == '0o600'
 
+
+
+# spec: ANYM-536
+def test_the_decision_time_is_in_the_ledger_and_each_row_and_survives_a_republish(state, monkeypatch):
+    triage.pull(state, 'deedkit-prod', exporter([item(P1, 1)], []))
+    decided = datetime(2026, 10, 26, 9, 0, tzinfo=timezone.utc)
+    write = triage.write_ledger
+
+    def stop_after_the_report(path, ledger):
+        write(path, ledger)
+        if all(entry['reported'] for entry in ledger.values()):
+            raise KeyboardInterrupt
+    monkeypatch.setattr(triage, 'write_ledger', stop_after_the_report)
+    with pytest.raises(KeyboardInterrupt):
+        triage.record(state, [decide(P1)], now=decided)
+    assert read(state, 'ledger.json')[P1]['decided_at'] == decided.isoformat()
+    # A stop after publication, before the entry is marked reported: the next run republishes it, same time.
+    ledger = read(state, 'ledger.json')
+    ledger[P1]['reported'] = False
+    write(state, ledger)
+    monkeypatch.setattr(triage, 'write_ledger', write)
+    triage.record(state, [], now=datetime(2026, 10, 26, 11, 0, tzinfo=timezone.utc))
+    files = sorted((state / 'dispositions').iterdir())
+    assert len(files) == 2
+    assert [json.loads(path.read_text())[0]['decided_at'] for path in files] == [decided.isoformat()] * 2
 
 STUB = '''#!{python}
 import json, os, sys
