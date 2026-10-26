@@ -80,3 +80,5 @@ GRANT UPDATE(restore_state,restore_attachment,restore_requested_at,restore_finis
 GRANT SELECT ON person_links TO messaging_gateway;
 -- Deletion status in get_sync_status (ANYM-511): content-free purge marks and chat cutoffs.
 GRANT SELECT ON message_purges,chat_tombstones TO messaging_gateway;
+-- Schema 48: the hint dispatcher's liveness row (ANYM-518), read by capabilities.
+GRANT SELECT ON subscription_dispatcher_heartbeat TO messaging_gateway;

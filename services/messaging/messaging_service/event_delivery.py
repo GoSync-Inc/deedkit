@@ -258,11 +258,71 @@ def _transport(endpoint, body, headers, *, resolved, timeout=5):
             return int(match[1])
 
 
+# ANYM-518: webhook delivery counts as working while the dispatcher's last pass is this recent.
+HEARTBEAT_MAX_AGE_S = 120
+TRANSPORT_TOOLS = {'pull': ['fetch_subscription_events', 'ack_subscription_events'],
+    'long_poll': ['wait_for_subscription_events'], 'webhook': ['configure_subscription_delivery']}
+
+
+def beat(store):
+    """The dispatcher's liveness row; a failed write never stops hint delivery (schema 48)."""
+    import psycopg
+    try:
+        with store.pool.connection() as c:
+            c.execute('''INSERT INTO subscription_dispatcher_heartbeat(id,beat_at) VALUES(1,clock_timestamp())
+                ON CONFLICT(id) DO UPDATE SET beat_at=EXCLUDED.beat_at''')
+        return True
+    except psycopg.Error:
+        return False
+
+
+def delivery_transports(c, p):
+    """Each way to consume subscription events: whether this caller may use it (`authorized`), has it set up
+    (`configured`) and it works now (`operational`); `reason` names the first failing condition (ANYM-518)."""
+    from .policy import OPERATION_PERMISSIONS
+    permitted = set(p['permissions'])
+    beat_row = c.execute('''SELECT clock_timestamp()-beat_at<=make_interval(secs=>%s) AS fresh
+        FROM subscription_dispatcher_heartbeat WHERE id=1''', (HEARTBEAT_MAX_AGE_S,)).fetchone()
+    bound = c.execute('''SELECT coalesce(bool_or(r.enabled),false) AS enabled,count(*) AS n
+        FROM subscriptions s JOIN subscription_delivery d ON d.subscription=s.id
+        JOIN subscription_receivers r ON r.id=d.receiver
+        WHERE s.principal=%s AND s.key_id=%s AND s.state IN ('active','paused')''',
+        (p['id'], p['key_id'])).fetchone()
+    rows = []
+    for name, tools in TRANSPORT_TOOLS.items():
+        # Every consumption tool also needs read (the backend checks it before its own permission).
+        authorized = all({'read', OPERATION_PERMISSIONS[tool]} <= permitted for tool in tools)
+        failures = [] if authorized else ['not_authorized']
+        configured = operational = True
+        if name == 'webhook':
+            configured = bound['enabled']
+            operational = configured and bool(beat_row and beat_row['fresh'])
+            if not bound['n']:
+                failures.append('no_receiver_bound')
+            elif not configured:
+                failures.append('receiver_disabled')
+            if beat_row is None:
+                failures.append('dispatcher_heartbeat_absent')
+            elif not beat_row['fresh']:
+                failures.append('dispatcher_heartbeat_stale')
+        row = {'name': name, 'tools': tools, 'authorized': authorized, 'configured': configured,
+            'operational': operational, 'reason': failures[0] if failures else None}
+        if name == 'long_poll':
+            row['max_wait_s'] = 25
+        if name == 'webhook':
+            # Until self-service endpoints ship (ANYM-519), only the operator registers a receiver.
+            row.update(registration='operator_only', next_step='ask the operator to register a receiver',
+                heartbeat_max_age_s=HEARTBEAT_MAX_AGE_S)
+        rows.append(row)
+    return rows
+
+
 def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses):
     """Leased at-least-once hints, independently reauthorized before each send."""
     from .policy import lock_principal
     from .store import bounded
     bounded(limit, 100)
+    beat(store)
     stats = dict(delivered=0, retried=0, dead_letter=0, cancelled=0, deferred=0)
     holds = []
     for _ in range(limit):

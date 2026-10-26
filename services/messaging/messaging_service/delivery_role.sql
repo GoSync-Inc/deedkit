@@ -17,3 +17,5 @@ GRANT UPDATE(state,attempts,next_attempt_at,lease_token,lease_until,finished_at,
     ON subscription_outbox TO messaging_event_delivery;
 -- Schema 38: per-key admission before the first POST of a hint ID.
 GRANT UPDATE(admitted_at) ON subscription_outbox TO messaging_event_delivery;
+-- Schema 48: the dispatcher's liveness row (ANYM-518).
+GRANT SELECT,INSERT,UPDATE ON subscription_dispatcher_heartbeat TO messaging_event_delivery;
