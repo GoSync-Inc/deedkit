@@ -166,9 +166,17 @@ def export_pages(host, since, ssh=None):
     raise Refused(f'export: more than {MAX_PAGES} pages')
 
 
-def pull(state, host, ssh=None):
+def since(state):
     position = load(state / 'state.json', {}).get('position')
-    items, head = export_pages(host, when(position) if position else None, ssh)
+    return when(position) if position else None
+
+
+def pull(state, host, ssh=None):
+    return merge(state, *export_pages(host, since(state), ssh))
+
+
+def merge(state, items, head):
+    """The export's new items into the inbox; `export_pages` reads and writes nothing (ANYM-569)."""
     ledger, inbox = load(state / 'ledger.json', {}), load(state / 'inbox.json', {})
     fresh = 0
     for item in items:
@@ -211,6 +219,13 @@ def complete(reply, count, what):
 
 
 def snapshot(state, read=None):
+    snap = collect(read)
+    save(state / 'snapshot.json', snap)
+    return len(snap['main']), len(snap['branches'])
+
+
+def collect(read=None):
+    """Tiden main and every open branch, read whole; nothing is written (ANYM-569)."""
     read = read or tiden
     main = flatten(read('spec', 'list', '--branch', 'main', '--include-sources'), 'main')
     branches = read('branch', 'list')
@@ -221,8 +236,7 @@ def snapshot(state, read=None):
     open_names = sorted(b['name'] for b in branches['branches'] if b.get('status') == 'open' and b.get('name') != 'main')
     # Every open branch is kept whole, branch versions of main specs too; the file is replaced only after all reads.
     branch_specs = {name: flatten(read('spec', 'list', '--branch', name), name) for name in open_names}
-    save(state / 'snapshot.json', {'main': main, 'branches': branch_specs})
-    return len(main), len(branch_specs)
+    return {'main': main, 'branches': branch_specs}
 
 
 def known(snap):
