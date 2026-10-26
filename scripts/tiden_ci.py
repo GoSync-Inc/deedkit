@@ -25,6 +25,8 @@ REPORTS = {"python": "python.xml", "collector": "collector.xml", "npm": "npm.xml
 MODULE_REPORTS = {
     "load": ("load.xml", "python", ""),
     "gateway": ("gateway.xml", "python", "services/gateway"),
+    # The shared contract package the gateway depends on, run from its own directory in its own verify step.
+    "platform_contracts": ("platform-contracts.xml", "python", "packages/platform-contracts"),
     "calendar": ("calendar.xml", "python", "services/calendar"),
     "calls": ("calls.xml", "python", "services/calls"),
     "calls_frontend": ("calls-frontend.xml", "node", "services/calls/frontend"),

@@ -2480,6 +2480,24 @@ def module_rows(tmp_path, reports, outcome="success"):
     return {row["signature"]: row for row in json.loads((tmp_path / "ci-checks.json").read_text())}
 
 
+# spec: ANYM-213
+def test_the_shared_contract_package_publishes_its_own_module_report_under_its_repository_path(tmp_path):
+    # Its tests ran inside the gateway step without a report, so Tiden had no case to link them to (sync B `links`).
+    import yaml
+    assert MODULE_REPORTS["platform_contracts"] == ("platform-contracts.xml", "python", "packages/platform-contracts")
+    assert "platform_contracts" in FRAGMENTS["verify"][0] and "platform-contracts.xml" in FRAGMENTS["verify"][1]
+    root = Path(__file__).resolve().parents[1]
+    steps = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]["verify"]["steps"]
+    step = next(step for step in steps if step.get("id") == "platform_contracts")
+    assert step["working-directory"] == "packages/platform-contracts"
+    assert '--junitxml="$RUNNER_TEMP/ci-evidence/platform-contracts.xml"' in step["run"]
+    assert "platform-contracts/tests" not in next(step for step in steps if step.get("id") == "gateway")["run"]
+    rows = module_rows(tmp_path, {"platform_contracts": node_report("tests/test_agent.py::test_valid_results_pass")})
+    assert rows["deedkit-ci::platform_contracts"]["execution"]["status"] == "passed"
+    case = ET.fromstring((tmp_path / "normalized-platform_contracts.xml").read_bytes()).find("testcase")
+    assert (case.get("file"), case.get("classname")) == ("packages/platform-contracts/tests/test_agent.py",
+                                                         "packages.platform-contracts.tests.test_agent")
+
 # spec: ANYM-429
 def test_the_root_only_and_native_audio_modules_require_exactly_their_root_suite_nodes():
     assert REQUIRED_EXECUTIONS == {"root_session_lock": {ROOT_NODE}, "enricher_audio": set(AUDIO_NODES)}
