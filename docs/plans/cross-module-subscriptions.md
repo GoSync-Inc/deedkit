@@ -9,8 +9,7 @@ Recommendation: **option (a), staged: every module keeps a small append-only eve
 messaging side *pulls* from the modules over HTTP and publishes content-free references into messaging's journal.**
 Build calls first (cheap, high value: the owner request inbox is pull-only today), calendar second (needs new change
 detection that does not exist), and decline invite responses and "source disconnected" for now. Options (b) and (c) are
-rejected with evidence below. Five child cards are recommended (section 7); the riskiest, the journal generalisation, needs
-an Astra review and a migration.
+rejected with evidence below. Seven child cards are recommended (section 7); the journal, links and router need an Astra review and migrations.
 
 Three facts decide it:
 
@@ -72,11 +71,11 @@ what is deployed (N-1 schema, installed gateway), effort.
 
 - Calls: read-only `GET /v1/events?after=<seq>&limit=<n>` over `voice_events` plus terminal-state projection. Calendar: a new `change_journal` table written inside the same transaction that replaces a window; same read endpoint. Contract: CloudEvents-named envelope, content-free `data`.
 - Router: `messaging_service/event_router.py`, a worker like `subscription_worker` with its own restricted DB role and private read tokens, polling each module with a timeout, persisting `(module, last_seq)`, publishing through a fenced SECURITY DEFINER function (pattern: `publish_file_text_event`, collector_role.sql:50) with `event_key = source:id` for idempotent retry.
-- **Failure isolation:** modules never call out (pull), so calendar's serial worker loop (`worker.py:411`) and the calls event loop cannot hang on messaging. A module outage makes the router back off; the router's publish is one short transaction, so the `feed_counter` lock is held for milliseconds. A router crash loses nothing: cursor and `event_key` make replay idempotent. Module read handlers share the module's lock/loop: the calls handler must be O(limit) on the `seq` index and obey the single `RLock` (`core.py:376`), which is the only live-call risk (a test must show a 10k-row backlog read does not delay a transcript write beyond a bound).
-- **Data egress:** nothing leaves the host; references only (ids, kind, timestamps, enumerated reason); no titles, locations, transcripts, destinations. Module read tokens are new secrets (owner-kept).
+- **Failure isolation:** modules never call out (pull), so calendar's serial worker loop (`worker.py:411`) and the calls event loop cannot hang on messaging. A module outage makes the router back off; the router publishes into a separate module journal with its own counter (decision a2 below), so it takes no part in the `feed_counter` lock and cannot stall a message hint; its publish is a short database-only transaction with a deadline, and all network work happens before it. A router crash loses nothing: cursor and `event_key` make replay idempotent. Module read handlers share the module's lock/loop: the calls handler must be O(limit) on the `seq` index and obey the single `RLock` (`core.py:376`), which is the only live-call risk (a test must show a 10k-row backlog read does not delay a transcript write beyond a bound).
+- **Data egress:** module-to-router HTTP stays on the host; the journal, cursors and backups hold references only (ids, kind, timestamps, enumerated reason), no titles, locations, transcripts or destinations. A delivered hint reaches the subscriber's configured receiver, so it leaves the host: it carries kind, the `subject` ref and the module name only, and the card for the router states and tests that payload. Background calendar refresh contacts Google or CalDAV. Module read tokens are new secrets (owner-kept).
 - **Schema/roles:** messaging: generalise `events` (nullable `account`/`message` for non-message sources, a `source` column) or add a separate journal (sub-option below); `subscription_sources` gets a scope kind beyond `(account, chat)`; router role; a link table `(messaging principal, module, module principal)` set by the operator. Calendar: `change_journal`. Calls: reuse `voice_events` or one small table.
-- **Compatibility:** the risky part. Named consumers of `events` that assume a message: the matcher (`subscriptions.py:351-356` reads `account` and `snapshot->chat`), `get_updates`/consumers, retention and the backup table map (backup.py:28). Sub-option a1 generalises `events` (least code, needs a gate old readers respect: the S5 review found that rolling back to a plain `paused` state lets the old API resume a dynamic definition, Astra r2 M8); sub-option a2 adds a separate `module_events` journal with its own counter and matches (old code never sees it, but position semantics of `subscription_outbox.through_position` need a second dimension). Both must pass "old matcher, old get_updates and old retention ignore the new rows" as a test.
-- **Effort:** contract + router + journal generalisation 8, calls producer 5, calendar producer 8, links/scope 5, capabilities/gateway 3.
+- **Compatibility:** the risky part. Named consumers of `events` that assume a message: the matcher (`subscriptions.py:351-356` reads `account` and `snapshot->chat`), `get_updates`/consumers, retention and the backup table map (backup.py:28). Sub-option a1 generalises `events` (least code, but shares the `feed_counter` lock with every message hint and needs a gate old readers respect: the S5 review found that rolling back to a plain `paused` state lets the old API resume a dynamic definition, Astra r2 M8); sub-option a2 adds a separate `module_events` journal with its own counter and matches (old code never sees it and no lock is shared, but position semantics of `subscription_outbox.through_position` need a second dimension). **Decision after card review: a2.** Either way the probe "old matcher, old get_updates and old retention ignore the new rows" is a test, and the backup table inventory must cover the new tables (the deployed backup rejects a schema above its own, backup.py:70, as for any migration).
+- **Effort:** journal and contract 5, router and deployment 5, calls producer 5, links/scope 8, calendar change journal 8, calendar refresh and reminders 5, capabilities/gateway 3.
 
 ### (b) Each module runs its own subscriptions and dispatcher under a shared contract
 
@@ -107,15 +106,13 @@ what is deployed (N-1 schema, installed gateway), effort.
 
 Envelope (CloudEvents attribute names): `specversion: "1.0"`, `id` (`<module>:<seq>`), `source` (`deedkit:calendar` or
 `deedkit:calls`), `type`, `subject` (the primary ref), `time` (when it happened, UTC), `data` (refs only). No titles,
-locations, descriptions, guest names, destinations, transcripts or owner answers. The hint a subscriber receives is the
-existing content-free hint with the refs added; the agent then calls the module's own read tool (`calendar_agenda`,
+locations, descriptions, guest names, destinations, transcripts or owner answers. The hint a subscriber receives carries the kind, the `subject` ref and the module name only; the agent then calls the module's own read tool (`calendar_agenda`,
 `calls_get_call_result`), which applies the module's own access rules.
 
 Shared references used, soft-linked to the platform epic: `event_ref` and `calendar_ref` (calendar), `call_id` (calls),
 `person_id` (messaging person cards, ANYM-283). `person_id` is **not** in any payload now: calendar has no attendee
 identities and a call's target is a destination, not a person; add it when the epic's S8a gives a mapping. Errors use the
-epic's shape (S1: `state`, `error`, `next`); a module outage shows up in the subscription's health as the existing
-`blocked_reason`, not as an event.
+epic's shape (S1: `state`, `error`, `next`); a module outage shows up in the subscription's health as a per-source, self-clearing `module_unreachable since <time>` entry (the matcher's `blocked_reason` allows only `match_budget` and `journal_gap` and is rewritten each pass), not as an event. Every event also carries `urgency` (`now` or `batch`) and `expires_at`, so that an owner request is not held by batching and a `starting` reminder is not delivered after the start.
 
 Calendar (buildable only after the change journal exists):
 
@@ -164,7 +161,7 @@ module events each key needs an entitlement that messaging cannot read from the 
 ## 6. Self-check for the PR/card review (AGENTS.md section 5)
 
 1. Failure isolation: (a) pull model, module handlers bounded; lines to defend are `store.py:1424` (lock) and `worker.py:411` (serial loop).
-2. Data egress: references only; nothing leaves the host; the only new secrets are module read tokens (owner-kept).
+2. Data egress: references only in storage; a delivered hint (kind, subject ref, module name) leaves the host to the configured receiver; calendar refresh contacts the providers; the only new secrets are module read tokens (owner-kept).
 3. Deployed-version compatibility: N-1 matcher, `get_updates`, retention and backup must ignore the new rows; named consumers in section 3(a). The installed gateway profile gains nothing (README:244-253).
 4. Tests: the cards name them; the first failing test per card is the cross-version one.
 
@@ -172,20 +169,23 @@ Not measured: Google/iCloud poll cost for a refresh cadence; the calls read-hand
 
 ## 7. Child cards
 
-The card text, criteria and status are kept in Tiden only; this list is the recommendation's shape. Priority order: K1, K2.
+The card text, criteria and status are kept in Tiden only; this list is the recommendation's shape. Review of the cards by Fable and Astra changed the first draft: the journal and the router are two cards, the calendar side is two, and the access card carries the scope and revocation protocol.
 
 | Card | Title | Value | Effort | Depends |
 |---|---|---|---|---|
-| K1 | Module event contract and router | 5 | 8 | none |
-| K2 | Calls event producer (`GET /v1/events` over `voice_events`) | 5 | 5 | K1 for delivery |
-| K3 | Principal-to-module links and scoped sources | 4 | 5 | K1 |
-| K4 | Calendar change journal and starting-soon | 4 | 8 | journal independent; delivery needs K1 |
-| K5 | Capabilities and gateway catalog for module kinds | 3 | 3 | K1, K3, push S1 |
+| ANYM-562 | Module events have a journal of their own in messaging: storage, contract, backup, old-reader safety | 5 | 5 | none |
+| ANYM-575 | A router carries module events into messaging without stalling message hints | 5 | 5 | ANYM-562 |
+| ANYM-563 | Call events: terminal events, `GET /v1/events` | 5 | 5 | ANYM-562 and ANYM-564 for delivery |
+| ANYM-564 | Links, scoped sources, authoritative scope and revocation | 4 | 8 | ANYM-562 |
+| ANYM-565 | Calendar passive change journal and endpoint | 4 | 8 | delivery needs ANYM-562 and ANYM-564 |
+| ANYM-576 | Scheduled refresh of configured calendars and starting reminders | 3 | 5 | ANYM-565 |
+| ANYM-566 | Capabilities and gateway catalog for module kinds | 3 | 3 | ANYM-562, ANYM-564 |
 
+First owner-visible wake (call finished, owner request): ANYM-562, 575, 563, 564 (calls scope) and 566 (calls kinds). Calendar kinds follow.
 Declined, with reason: (1) invite-response events: calendar has no attendee data, so an attendee model comes first.
 (2) Calls "source disconnected": no stored transition; ask again after S6. (3) A separate `call.report.ready`: model-analysis
 egress and no owner request. (4) Google Calendar push channels: needs public ingress to a loopback-only service and a channel
-renewal job; the diff cursor in K4 gives the same result without ingress. (5) Options (b) and (c), section 3.
+renewal job; the provider's incremental sync (Google `syncToken`) or a window diff in ANYM-565 gives the same result without ingress. (5) Options (b) and (c), section 3.
 
-Not decided here: whether K4 should wait until an owner needs calendar wakes at all. K2 alone delivers the owner-request and
-finished-call wakes the feedback named first; K1 and K3 are its prerequisites.
+Not decided here: whether the calendar cards should wait until an owner needs calendar wakes at all. The calls card alone delivers the owner-request and
+finished-call wakes the feedback named first; the journal, router and links are its prerequisites.
