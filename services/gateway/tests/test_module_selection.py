@@ -23,6 +23,8 @@ GRANTS = {"messaging": ["read"], "calendar": ["agenda:read", "availability:read"
 ACCEPT = {"Accept": "application/json, text/event-stream"}
 SELECT_ERROR = {"error": "module_not_selected", "module": "messaging",
                 "next_action": "select_module_or_use_its_connection_path"}
+# ANYM-544: after a selection narrowed the plain path, the error names the selection that widens it again.
+RESELECT = {**SELECT_ERROR, "next": {"tool": "platform_select_modules", "arguments": {"modules": ["calendar", "messaging"]}}}
 
 
 def principal(tmp_path, name, modules):
@@ -294,7 +296,7 @@ def test_unselected_mcp_call_denied_without_backend(gateway):
         selected = call(client, "messages_search", arguments)
         other = call(client, "messages_search", arguments, key="b")
     assert on_path["isError"] and selected["isError"]
-    assert on_path["structuredContent"] == selected["structuredContent"] == SELECT_ERROR
+    assert on_path["structuredContent"] == SELECT_ERROR and selected["structuredContent"] == RESELECT
     assert not other.get("isError")
     # Only principal b's call reached the messaging backend.
     assert calls_to(requests, "messaging").count("/v1/search") == 1
@@ -311,7 +313,7 @@ def test_rest_ignores_selection(gateway):
         capabilities = client.post("/v1/platform_capabilities", json={}, headers=headers).json()
     assert selected.status_code == 200 and selected.json()["effective_modules"] == ["calendar"]
     assert rest.status_code == 200 and "/v1/search" in calls_to(requests, "messaging")
-    assert mcp_call["structuredContent"] == SELECT_ERROR
+    assert mcp_call["structuredContent"] == RESELECT
     assert "messages_search" in capabilities["tools"]
     assert capabilities["selected_modules"] == ["calendar"]
 

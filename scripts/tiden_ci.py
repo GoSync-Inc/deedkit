@@ -92,6 +92,15 @@ CLI_TIMEOUT = 120
 CI_RELEASE_DEADLINE = 270
 CI_RECORD_MARGIN = 10
 RELEASE_RECEIPT = "tiden-release-receipt.json"
+# After a published run fails, its failures grouped by message (`run triage`, no baseline), as advisory summary lines
+# (TIDEN-CI.md). The call ends PUBLISH_MARGIN before the publish step's 3-minute timeout (checks.yml step `publish`),
+# measured from the script's start, so a slow triage never turns into a killed publish step.
+TRIAGE = "tiden-triage.json"
+PUBLISH_STEP_LIMIT = 180
+PUBLISH_MARGIN = 30
+TRIAGE_TIMEOUT = 60
+TRIAGE_MINIMUM = 10
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # A main push run that reused the merge queue's verification of its commit (scripts/ci_reuse.py) publishes that
 # run's unchanged evidence with this record of itself as publisher, and these check rows under its own run URL.
 PUBLICATION = "publication.json"
@@ -837,6 +846,64 @@ def publish(directory: Path, manifest: dict, branch: str | None, product: str, c
             call(["run", "abort", seq], "abort")
 
 
+class TriageUnavailable(RuntimeError):
+    """A triage read failed; the message is one fixed reason, never CLI output."""
+
+
+def triage_budget(started: float, now: float) -> float:
+    return min(TRIAGE_TIMEOUT, PUBLISH_STEP_LIMIT - PUBLISH_MARGIN - (now - started))
+
+
+def plain(text: str) -> str:
+    return CONTROL_CHARACTERS.sub("", text)[:200]
+
+
+def triage(directory: Path, seq: int, product: str, started: float, cli: str = "tiden",
+           clock=time.monotonic) -> list[str]:
+    """Group a failed published run's failures by message: summary lines, and only `{count, exemplar}` per group in
+    the receipt. Any failure is one fixed line; it never changes the publication result."""
+    try:
+        timeout = triage_budget(started, clock())
+        if timeout < TRIAGE_MINIMUM:
+            raise TriageUnavailable("no time")
+        try:
+            completed = subprocess.run([cli, "run", "triage", str(seq), "--limit", "10", "--cluster-exemplars", "3",
+                                        "--failure-output-lines", "0", "--product-id", product, "--format", "json"],
+                                       capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise TriageUnavailable("timeout") from None
+        except OSError:
+            raise TriageUnavailable("CLI not started") from None
+        if completed.returncode:
+            raise TriageUnavailable(f"exit {completed.returncode}")
+        try:
+            reply = json.loads(completed.stdout)
+        except ValueError:
+            raise TriageUnavailable("malformed") from None
+        clusters = reply.get("clusters") if isinstance(reply, dict) else None
+        if not isinstance(clusters, list) or not all(
+                isinstance(cluster, dict) and type(cluster.get("count")) is int and cluster["count"] > 0
+                and isinstance(cluster.get("message"), str) and isinstance(cluster.get("failures"), list)
+                and cluster["failures"] and isinstance(cluster["failures"][0], dict)
+                and isinstance(cluster["failures"][0].get("title"), str) for cluster in clusters):
+            raise TriageUnavailable("malformed")
+        groups = [{"count": cluster["count"], "exemplar": plain(cluster["failures"][0]["title"])}
+                  for cluster in clusters[:10]]
+        lines = [f"Tiden triage: {group['count']} × {group['exemplar']}: {plain(cluster['message'])}"
+                 for group, cluster in zip(groups, clusters)] or ["Tiden triage: no failure groups"]
+        record = {"groups": groups}
+    except TriageUnavailable as exc:
+        record, lines = {"state": "not available", "reason": str(exc)}, [f"Tiden triage: not available ({exc})"]
+    except Exception:
+        reason = "unexpected error"
+        record, lines = {"state": "not available", "reason": reason}, [f"Tiden triage: not available ({reason})"]
+    try:
+        (directory / TRIAGE).write_text(json.dumps({"triage": record}, indent=2))
+    except OSError:
+        lines = [*lines, "Tiden triage: receipt not written"]
+    return lines
+
+
 class StaleRelease(RuntimeError):
     """The latest completed main run is not this commit's, so a new release would capture another gate."""
 
@@ -994,6 +1061,7 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
 
 
 def main() -> int:
+    started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["assemble", "prepare", "verdict", "publish", "queue-receipt", "release"])
     parser.add_argument("--directory", type=Path, required=True)
@@ -1054,6 +1122,15 @@ def main() -> int:
         # Only a verified passed run counts as published; a skip published nothing (ci.yml release record).
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             output.write("verified=true\n")
+    if result["status"] == "failed" and result.get("seqNum") is not None:
+        # Advisory, after the result and receipts are saved: the step's result stays the publication's.
+        lines = triage(directory, result["seqNum"], os.environ["TIDEN_PRODUCT_ID"], started)
+        try:
+            if os.environ.get("GITHUB_STEP_SUMMARY"):
+                with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                    summary.write("".join(line + "\n" for line in lines))
+        except OSError:
+            print("Tiden triage: summary not written")
     return 0 if result["status"] in {"passed", "skipped"} else 1
 
 
