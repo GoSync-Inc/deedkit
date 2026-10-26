@@ -41,7 +41,7 @@ Steps 1–4, the template and the scales: harness `tiden.md`. DeedKit's steps 5 
 
 8. **Autoloop card.** A card worker started by the autoloop writes the card for a new cluster from
    the owner's agents (ANYM-571, [feedback-autoloop.md](feedback-autoloop.md), Card worker). It
-   uses `proposal/autoloop-card-<slug>` and adds a `Source: autoloop <principal>` line. Its
+   uses the opaque `proposal/autoloop-card-c<hash>` and adds a `Source: autoloop <principal>` line. Its
    `Ready:` cites the agent and feedback ID under the AGENTS.md autoloop override. It dispatches
    its own ready merge, so the orchestrator does not.
 
