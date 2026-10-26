@@ -121,9 +121,11 @@ A backend error is relayed through these filters; each drops a field and never r
 
 - A `next` (top level or on a candidate) must run as given for this caller on this route: a tool of the caller's
   effective list (module selection included), arguments the target's input schema accepts, and a target in the failing
-  tool's module or the gateway itself, with its scopes, backend implementation and messenger operation in place.
-- A `hint`, `next` or candidate that carries the caller's payload is dropped: a string the caller sent outside an ID or
-  reference field (message text, file names, queries), or a word of it of 6 or more characters. A `hint` or `next`
-  argument with a phone-shaped number is dropped too.
+  tool's module or the gateway itself, and the same argument checks the call itself gets (scopes, backend
+  implementation, messenger operation, cursor-write for `start_from: "now"`, the placeholder `request_id` refusal).
+- A `hint`, `next` or candidate is dropped when a string of it outside an ID or reference field carries the caller's
+  payload (a string the caller sent outside an ID or reference field, or a word of it of 6 or more characters; a
+  payload shorter than 4 characters counts as a whole word), a phone-shaped number or a file name, whoever wrote it.
+  A candidate's `last_activity` that is not a timestamp is dropped.
 - `selection_required` keeps a top-level `next` only when it is read-only; a mutating one stays on candidates only.
 - Candidates must pass the shared shape and are cut at 10; `more: true` stays only with a read-only top-level `next`.

@@ -16,7 +16,7 @@ from test_policy import config
 MODULES = ("calendar", "messaging")
 GRANTS = {"messaging": ["read", "send"], "calendar": ["agenda:read", "availability:read"]}
 TOOLS = ["platform_capabilities", "platform_select_modules", "messages_capabilities", "messages_search",
-         "messages_send_message", "messages_list_feedback", "calendar_calendars"]
+         "messages_send_message", "messages_list_feedback", "messages_get_updates", "calendar_calendars"]
 HEADERS = {"Authorization": "Bearer gateway-a"}
 SEND = {"account": "synthetic", "chat_id": "chat-synthetic", "text": "synthetic text"}
 TEXT, FILENAME, PHONE = "canary message text 7f3a", "canary-report-7f3a.pdf", "+15550107734"
@@ -267,3 +267,41 @@ def test_more_than_ten_candidates_are_cut_and_more_needs_a_read_only_next(gatewa
         bare = relayed(client, "messages_search", {"query": "lookup"})
     assert listed["candidates"] == many[:10] and listed["more"] is True and listed["next"] == SEARCH
     assert len(bare["candidates"]) == 10 and "more" not in bare
+
+
+# spec: ANYM-544
+def test_a_backend_file_name_phone_label_or_short_payload_word_never_reaches_hint_next_or_candidates(gateway):
+    app, _, failures = gateway
+    failures["search"] = (409, {
+        "error": "conflict", "hint": f"See {FILENAME}",
+        "next": {"tool": "messages_search", "arguments": {"query": FILENAME}},
+        "candidates": [{"id": "chat-1", "label": PHONE, "kind": "chat"},
+                       {"id": "chat-2", "label": "Reply ok later", "kind": "chat"},
+                       {"id": "chat-3", "label": "Booking", "kind": "chat", "last_activity": "see notes"},
+                       {"id": "chat-4", "label": "Synthetic 4", "kind": "chat",
+                        "last_activity": "2026-10-26T08:11:07Z"}]})
+    with TestClient(app) as client:
+        body = relayed(client, "messages_search", {"query": "ok"})
+    assert "hint" not in body and "next" not in body
+    # A short caller word counts as a whole word only ("Booking" stays); a malformed last_activity is dropped.
+    assert body["candidates"] == [{"id": "chat-3", "label": "Booking", "kind": "chat"},
+                                  {"id": "chat-4", "label": "Synthetic 4", "kind": "chat",
+                                   "last_activity": "2026-10-26T08:11:07Z"}]
+
+
+# spec: ANYM-544
+@pytest.mark.parametrize("bad, good", [
+    ({"tool": "messages_get_updates", "arguments": {"start_from": "now"}},
+     {"tool": "messages_get_updates", "arguments": {"start_from": "beginning"}}),
+    ({"tool": "messages_send_message", "arguments": {**SEND, "request_id": PLACEHOLDER_REQUEST_ID}},
+     {"tool": "messages_send_message", "arguments": {**SEND, "request_id": "req-synthetic-2"}}),
+])
+def test_a_relayed_next_passes_the_same_argument_admission_as_the_call(gateway, bad, good):
+    app, _, failures = gateway
+    with TestClient(app) as client:
+        failures["search"] = (409, {"error": "conflict", "next": bad})
+        dropped = relayed(client, "messages_search", {"query": "lookup"})
+        failures["search"] = (409, {"error": "conflict", "next": good})
+        kept = relayed(client, "messages_search", {"query": "lookup"})
+        refused = call(client, bad["tool"], bad["arguments"])
+    assert "next" not in dropped and kept["next"] == good and refused["isError"]
