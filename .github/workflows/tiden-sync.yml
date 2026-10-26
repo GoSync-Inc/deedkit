@@ -1,6 +1,7 @@
 name: Tiden sync
 # The run title names the commit the run processes, so Tiden health can find the sync of its TARGET (ANYM-438).
-run-name: Tiden sync ${{ github.event.workflow_run.head_sha || inputs.sha }}
+# A ready merge (TIDEN-CI.md, Ready merge) is titled by its branch, which never equals a commit.
+run-name: Tiden sync ${{ github.event.workflow_run.head_sha || inputs.sha || format('ready merge {0}', inputs.branch) }}
 on:
   # Sync B (ANYM-405, TIDEN-CI.md): after the CI run of every main push, write the merged pull request's Tiden
   # bookkeeping to Tiden main. A workflow of its own, so a red or dropped sync never touches the `CI` push run that
@@ -8,13 +9,18 @@ on:
   workflow_run:  # zizmor: ignore[dangerous-triggers] only main pushes pass the guards; it checks out main, not the upstream head
     workflows: [CI]
     types: [completed]
-  # A hand rerun for one main commit, for example a waiting run that GitHub dropped.
+  # A hand rerun for one main commit, for example a waiting run that GitHub dropped, or the ready merge of one
+  # proposal or review branch of ready cards (harness tiden.md, Ready merge). A dispatch names exactly one of them.
   workflow_dispatch:
     inputs:
       sha:
         description: 'The exact main commit to sync'
         type: string
-        required: true
+        required: false
+      branch:
+        description: 'A proposal/ or review/ branch of ready cards to merge to Tiden main (instead of sha)'
+        type: string
+        required: false
 permissions:
   contents: read
 concurrency:
@@ -49,6 +55,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           UPSTREAM_SHA: ${{ github.event.workflow_run.head_sha }}
           INPUT_SHA: ${{ inputs.sha }}
+          INPUT_BRANCH: ${{ inputs.branch }}
         run: |
           test "$REF" = refs/heads/main
           if [ "$EVENT" = workflow_run ]; then
@@ -58,6 +65,12 @@ jobs:
             sha=$UPSTREAM_SHA
           else
             test "$EVENT" = workflow_dispatch
+            if [ -n "$INPUT_BRANCH" ]; then
+              test -z "$INPUT_SHA"
+              [[ "$INPUT_BRANCH" =~ ^(proposal|review)/[a-z0-9]+([/_-][a-z0-9]+)*$ ]] || exit 1
+              echo "branch=$INPUT_BRANCH" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             sha=$INPUT_SHA
           fi
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
@@ -71,6 +84,7 @@ jobs:
           ref: main
           fetch-depth: 0
       - name: Require the commit on main
+        if: steps.guard.outputs.sha != ''
         env:
           SHA: ${{ steps.guard.outputs.sha }}
         run: git merge-base --is-ancestor "$SHA" HEAD
@@ -84,7 +98,8 @@ jobs:
           mkdir "$RUNNER_TEMP/tiden-bin"
           tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
       # It writes since check A ran green on three pull requests (#136, #137, #138; ANYM-405). Without
-      # TIDEN_API_TOKEN the sync fails, so a missing credential is never green.
+      # TIDEN_API_TOKEN the sync fails, so a missing credential is never green. A ready merge passes its branch and
+      # an empty SHA; the script then merges that branch alone.
       - name: Merge the named branch, link the marked tests, anchor the files and set the status
         env:
           TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
@@ -93,4 +108,5 @@ jobs:
           TIDEN_BASE_URL: https://app.tiden.ai
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ steps.guard.outputs.sha }}
-        run: python scripts/tiden_sync.py --sha "$SHA" --cli "$RUNNER_TEMP/tiden-bin/tiden"
+          BRANCH: ${{ steps.guard.outputs.branch }}
+        run: python scripts/tiden_sync.py --sha "$SHA" --ready-branch "$BRANCH" --cli "$RUNNER_TEMP/tiden-bin/tiden"

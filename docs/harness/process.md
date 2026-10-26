@@ -32,18 +32,18 @@ the orchestrator; never your own input box). Diff items:
 
 And without a diff: a restore, rollback over data or other production change than
 `<deploy command>` and the task steps below; live provider actions; secrets or
-new credentials, roles, host access; money; deleting records, or data outside an accepted task; moving cards;
+new credentials, roles, host access; money; deleting records, or data outside a task; moving cards;
 deleting cards (agents may on the owner's quote naming them); publishing a package, rewriting
 history or irreversible steps outside a task; accepting a known risk (open blocking or major finding); product direction
-(accepting feature or epic cards, weakening an accepted criterion).
+(which features or epics to build, weakening a ready card's criterion).
 A standing approval holds only while all its conditions do; manual releases need one.
 
-An accepted task is a card accepted per tiden.md (Card intake) whose criteria name the step;
+A task is a ready card (tiden.md, Card intake) whose criteria name the step;
 cardless work has none. Inside one the agent applies its migration (the project's backup gate),
-deletes the data or files the card names, and ships its owner-accepted feature enabled: after merge and deploy it
+deletes the data or files the card names, and ships an owner-asked feature enabled: after merge and deploy it
 sets the card's flag or operation opt-in and grants only what the criteria name, never the live-action
 changes the project lists. It reports commands and undo. None of this runs
-during a live activity the project names; check read-only first. An owner-accepted card's role SQL and release steps go to the level's
+during a live activity the project names; check read-only first. An owner-asked card's role SQL and release steps go to the level's
 reviewers (Astra for access and data), summary to the owner.
 
 ## 3. Change paths
@@ -62,7 +62,7 @@ Done: the squash's `main` push run is green.
 
 - First step of any task touching product code, specs or tests: `tiden intent skip`, the card
   and `product-context`, then code.
-- Spec, tests, code: the accepted card is the spec; failing tests come first. Each new test has
+- Spec, tests, code: the ready card is the spec; failing tests come first. Each new test has
   `# spec: <PREFIX>-n` (Python) or `// spec: <PREFIX>-n` (JS, TS, Go) directly above it and its
   decorators, naming a story-level spec, or sits in the project's unlinked-tests list. Defects, infra and refactors
   need no card: a marked regression test and a `Spec:` line.

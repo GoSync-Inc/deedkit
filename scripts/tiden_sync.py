@@ -17,6 +17,13 @@ recovery is a rerun of the job or a dispatch of the SHA, both inside the workflo
 not overlap: the anchors step reads the spec again right before it replaces the source list, but only one writer at a
 time makes that safe. So a change on Tiden by hand (a conflicted branch, a source repair) waits for a maintenance
 window with the workflow disabled and no run in progress.
+
+`--ready-branch <name>` runs the ready merge instead (harness tiden.md, Ready merge; TIDEN-CI.md, Ready merge): it merges
+a proposal or review branch of ready cards to Tiden main before any pull request names them. It merges only when the
+merge preview holds spec additions or text changes alone and every changed spec is `Backlog` on the branch and on main
+with a `Ready:` line outside code (a text change a new one, not main's); then it reads each spec back on main by its
+number (a branch copy has its own record ID): `Backlog` and the same `Ready:` line. It is a dispatch of the same
+workflow, so it runs inside the sync's one concurrency group and is no change by hand.
 """
 from __future__ import annotations
 
@@ -35,12 +42,17 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiden_drift import REPOSITORY, Refused, excluded, shown, tiden  # noqa: E402
 from tiden_ci import go_module_path  # noqa: E402
-from tiden_pr_check import (GO_TEST, Test, anchor_map, blob, branch_status, changed, diff_tests, language,  # noqa: E402
-                            listing, marker, parse_body, preview_numbers, source_lines, story)
+from tiden_health import prose  # noqa: E402
+from tiden_pr_check import (BRANCH_NAME, GO_TEST, Test, anchor_map, blob, branch_status, changed,  # noqa: E402
+                            diff_tests, language, listing, marker, parse_body, preview_number, preview_numbers,
+                            source_lines, story)
 
 SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 SHA = re.compile(r"[0-9a-f]{40}")
 OPEN_CHECK = re.compile(r"\[open: (?:live|measured)\]")
+# A card's readiness record (harness tiden.md template), also as a list item or in bold. A legacy `Accepted:` alone is
+# no `Ready:` line: such a card gets `Ready:` citing it first.
+READY = re.compile(r"[ \t]*(?:[-*>][ \t]+)?(?:\*\*)?(Ready|Accepted):(?:\*\*)?[ \t]*\S")
 # Test files whose suite CI does not publish to Tiden, so a marked test there has no identity to link yet.
 KEPT_SECONDS = 600  # the time kept tests may spend on link reads, so the later steps still run
 UNPUBLISHED: tuple[tuple[str, str], ...] = ()
@@ -546,6 +558,101 @@ def run(root: Path, sha: str | None, pr: int | None, repository: str, gh: str, c
     return sync(root, sha, pr, value.get("body") or "", cli, product, report, dry)
 
 
+def ready_line(content: str) -> tuple[str | None, bool]:
+    """The first `Ready:` line of a spec outside fenced code and code spans, and whether a legacy `Accepted:` line is
+    there."""
+    found, legacy = None, False
+    for line, text in prose(content):
+        match = READY.match(text)
+        if match and match.group(1) == "Accepted":
+            legacy = True
+        elif match and found is None:
+            found = line.strip()
+    return found, legacy
+
+
+def ready_merge(cli: str, product: str, name: str, report, dry: bool = False) -> int:
+    """Merge a branch of ready cards to Tiden main and read each spec back; any refusal names its cause."""
+    if not BRANCH_NAME.fullmatch(name):
+        raise StepFailed("branch", f"{shown(name)} is not a proposal/ or review/ branch name")
+    try:
+        status = branch_status(cli, product, name)
+    except Refused as error:
+        raise StepFailed("branch", str(error)) from None
+    if status == "merged":
+        report(f"ready merge: {name} is merged already; the run that merged it read it back.")
+        return 0
+    if status != "open":
+        raise StepFailed("branch", f"{name} is {'missing' if status is None else status}, not open")
+    try:
+        preview = tiden(cli, ["branch", "merge-preview", "--name", name], product, retry=True)
+        numbers, forbidden = preview_numbers(preview, name)
+        if forbidden:
+            raise StepFailed("preview", f"the preview of {name} holds more than spec additions or text changes "
+                                        f"({', '.join(forbidden)})")
+        if not numbers:
+            raise StepFailed("preview", f"the preview of {name} changes no spec")
+        modified = {preview_number(item) for item in preview.get("modifications", [])}
+        branch, main = listing(cli, product, name), listing(cli, product, "main")
+    except Refused as error:
+        raise StepFailed("preview", str(error)) from None
+    problems, lines = [], {}
+    for number in sorted(numbers):
+        spec = branch.get(number)
+        if spec is None:
+            problems.append(f"ANYM-{number} is not on {name}")
+            continue
+        line, legacy = ready_line(spec.get("content") or "")
+        if spec.get("status") != "Backlog":
+            problems.append(f"ANYM-{number} is {spec.get('status')} on {name}, not Backlog")
+        if number in main and main[number].get("status") != "Backlog":
+            problems.append(f"ANYM-{number} is {main[number].get('status')} on main: a change to work in progress "
+                            "goes on the review branch of the pull request that builds it")
+        if number in modified and number not in main:
+            problems.append(f"ANYM-{number} is a text change of a spec that is not on main")
+        if line is None:
+            problems.append(f"ANYM-{number} has no `Ready:` line"
+                            + (" (a legacy `Accepted:` card gets `Ready:` citing it first)" if legacy else ""))
+        elif number in main and ready_line(main[number].get("content") or "")[0] == line:
+            problems.append(f"ANYM-{number} keeps main's `Ready:` line; a reviewed change refreshes it")
+        lines[number] = line
+    if problems:
+        raise StepFailed("ready", "; ".join(problems))
+    named = ", ".join(f"ANYM-{number}" for number in sorted(numbers))
+    if dry:
+        report(f"ready merge: would merge {name} ({named}).")
+        report("Dry run: nothing was written.")
+        return 0
+    try:
+        write(cli, ["branch", "merge", "--name", name], product)
+    except Refused as error:
+        raise StepFailed("merge", f"{error}; dispatch the ready merge of {name} again: it reads the branch "
+                                  "back first") from None
+    try:
+        status = branch_status(cli, product, name)
+        now = listing(cli, product, "main")
+    except Refused as error:
+        raise StepFailed("read-back", str(error)) from None
+    if status != "merged":
+        raise StepFailed("read-back", f"{name} is {status}, not merged")
+    for number in sorted(numbers):
+        spec = now.get(number)
+        if spec is None:
+            problems.append(f"ANYM-{number} is not on main")
+            continue
+        if spec.get("status") != "Backlog":
+            problems.append(f"ANYM-{number} is {spec.get('status')}, not Backlog")
+        if ready_line(spec.get("content") or "")[0] != lines[number]:
+            problems.append(f"ANYM-{number} does not hold the branch's `Ready:` line")
+    if problems:
+        raise StepFailed("read-back", "; ".join(problems))
+    for number in sorted(numbers):
+        report(f"ready merge: ANYM-{number} {now[number]['id']} Backlog on main"
+               + (" (text changed)." if number in main else " (new)."))
+    report(f"Ready merge of {name} done ({named}).")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Write a merged pull request's Tiden bookkeeping to Tiden main.")
     parser.add_argument("--root", type=Path, default=Path.cwd())
@@ -554,6 +661,8 @@ def main() -> int:
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", "GoSync-Inc/deedkit"))
     parser.add_argument("--gh", default="gh")
     parser.add_argument("--cli", default="tiden")
+    parser.add_argument("--ready-branch", help="merge this proposal or review branch of ready cards to Tiden main "
+                                               "instead (empty: the main sync)")
     parser.add_argument("--dry-run", action="store_true", help="read and report, write nothing to Tiden")
     args = parser.parse_args()
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -565,6 +674,10 @@ def main() -> int:
                 stream.write(line + "\n")
 
     try:
+        if args.ready_branch:
+            if args.sha or args.pr is not None:
+                raise StepFailed("branch", "a ready merge takes a branch alone, no commit or pull request")
+            return ready_merge(args.cli, os.environ["TIDEN_PRODUCT_ID"], args.ready_branch, report, args.dry_run)
         return run(args.root.resolve(), args.sha, args.pr, args.repository, args.gh, args.cli,
                    os.environ["TIDEN_PRODUCT_ID"], report, args.dry_run)
     except StepFailed as error:

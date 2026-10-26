@@ -27,13 +27,35 @@ reference pull requests: 1 = #59, 2 = #66, 3 = #52, 5 = #68, 8 = #40. `History:`
 identity. `How others solve it` studies include the built-ins of Docker, Caddy, Postgres or
 GitHub.
 
+## Ready merge
+
+The flow is harness `tiden.md` (Card intake step 4, Ready merge; owner D6, 2026-10-26: a card that
+passed its reviews goes to main and into work with no separate approval). A draft stays on its
+proposal branch until clean reviews make it ready; the writer then fills `Ready:` (legacy
+`Accepted:` counts as ready, but the job needs a `Ready:` line citing it) and, before any pull
+request names the card, dispatches DeedKit's ready-merge job:
+
+```sh
+gh workflow run tiden-sync.yml --ref main -f branch=<proposal/... or review/...>
+```
+
+The orchestrator dispatches it for a package. The job, its checks and recovery are in
+[TIDEN-CI.md](../../TIDEN-CI.md) (Main sync, Ready merge); its run output is the receipt. The cards
+land on main as `Backlog`, and step 5 queues them. A pull request on a ready card names its
+stories on main and no proposal branch. A later criterion edit goes on a `review/<name>`
+branch: the pull request's own while coding (sync B merges it with the squash); before work
+starts, one reviewed like the card, with a new `Ready:` line, merged by the same job. A card the
+building pull request writes itself (one story under a parent on main) skips the job: that pull
+request names its branch.
+
 ## One Tiden branch per pull request
 
 `scripts/spec_impact.py <base> --body-file <body>` builds the `Spec impact:` list (harness
 `tiden.md`). Maintenance windows are in TIDEN-CI.md.
 
 Close only an intent branch whose pull request merged or closed and whose session is closed;
-proposal and review branches stay open until implemented, and an intent branch with an open
+a proposal or review branch stays open until the ready merge or sync B merges it (a draft until
+it is ready), and an intent branch with an open
 session or pull request stays open (closing it closes the session). Such a branch can stay
 `open` when its auto-merge status (`autoMerge` in `branch merge-preview`) never sees the merge,
 for example `no_merged_pr`. Close it with `tiden branch close --name <branch>` (CLI 0.40 or

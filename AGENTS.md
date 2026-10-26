@@ -1,6 +1,6 @@
 # DeedKit agent rules
 
-Process: harness egerev/agent-harness @ 0.11.0, ~/agent-harness; this file adds project rules.
+Process: harness egerev/agent-harness @ 0.14.0, ~/agent-harness; this file adds project rules.
 Claude Code loads harness process.md through the SessionStart hook (`.claude/hooks/harness.sh`:
 merged `origin/main`, else the pinned copy). Codex and cloud agents read the pinned copy
 docs/harness/process.md first. If no harness text is in context, stop and report BLOCKED. Each
@@ -32,7 +32,7 @@ docs/operations/parallel-development.md.
 
 ## 2. What the owner keeps
 
-The harness list holds. In an accepted task the agent applies its migration under
+The harness list holds. In a task (a ready card) the agent applies its migration under
 production.md's backup gate; enabling a feature never includes send, call, pairing, session or
 allowlist changes, and none of it runs during an active call.
 
