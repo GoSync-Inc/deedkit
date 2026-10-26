@@ -19,8 +19,9 @@ through `scripts/feedback_sync.py` (ANYM-536).
   report-only: triaged, never carded. A cluster with one report-only item is report-only.
 - Raw text is read only by the tool-less reader on the owner's workstation (ANYM-570: no tools,
   settings, MCP, plugins, hooks or memory; a closed JSON answer). Card workers get feedback IDs,
-  the cluster key and the closed projection; build workers get the card ID and intent only. Card text is in the worker's own words with no quote,
-  name, phone number or message content (SUBSCRIPTIONS.md, owner Q1b).
+  the cluster key and the closed projection; build workers get the card ID and intent only. Card
+  text is in the worker's own words with no quote, name, phone number or message content
+  (SUBSCRIPTIONS.md, owner Q1b).
 - Tick output, logs and the report never carry feedback text.
 
 ## Envelope
