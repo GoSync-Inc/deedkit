@@ -2988,7 +2988,7 @@ def test_both_shard_lines_deselect_exactly_the_nodes_the_module_steps_run():
     assert dict(pairs) == {name: name for name in FRAGMENTS["verify"][0]} and len(pairs) == len(FRAGMENTS["verify"][0])
 
 
-# spec: ANYM-139
+# spec: ANYM-154
 @pytest.mark.parametrize("pin, installs", [
     ("TIDEN_CLI_VERSION=0.42.0\nTIDEN_CLI_SHA256_linux_amd64=" + "a" * 64 + "\n", True),
     ("TIDEN_CLI_VERSION=0/../../../../../OWNER/REPO/releases/download/v1\nTIDEN_CLI_SHA256_linux_amd64="
