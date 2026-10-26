@@ -826,3 +826,15 @@ def test_a_superseded_queue_row_stays_superseded_when_follow_moves_the_item(tmp_
                      fetch=False) == 0
     assert prod.rows[A]['status'] == 'fixed' and flags(prod.writes[0])['--status'] == 'fixed'
     assert synced(tmp_path, 'applied.json')['files'][path.name]['rows'][A]['outcome'] == 'superseded'
+
+
+# spec: ANYM-536
+def test_a_nested_fence_hides_its_lines_and_a_comment_opener_in_code_hides_nothing(tmp_path):
+    prod = Prod({i: disp('received') for i in (A, B, C, D, E)})
+    main = main_of(carded(35, f'````markdown\n```text\nFeedback: {A}\n```\n````\n'
+                              f'~~~~\n~~~\nFeedback: {B}\n~~~ not a close\n~~~~\n'
+                              f'```html\n<!-- example\n```\nFeedback: {D}'),
+                   carded(36, f'<!--\nFeedback: {C}\n-->\n<!-- unclosed\nFeedback: {E}'))
+    assert auto(tmp_path, prod, '--apply', main=main) == 0
+    assert written_ids(prod) == [[D]] and prod.rows[D]['spec_ref'] == 'ANYM-35'
+    assert [prod.rows[i]['status'] for i in (A, B, C, E)] == ['received'] * 4

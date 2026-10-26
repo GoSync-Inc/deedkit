@@ -72,8 +72,7 @@ FIXED_IN = re.compile(r'deedkit@[0-9a-f]{40}')
 SHA = re.compile(r'[0-9a-f]{40}')
 # ANYM-536: the card line that links feedback to it; the ID anywhere else in a card (History, a quote) does not.
 FEEDBACK_LINE = re.compile(r'^Feedback: ({0}(?:, {0})*)[ \t]*\r?$'.format(UUID.pattern), re.MULTILINE)
-FENCE = re.compile(r'^ {0,3}(```|~~~)')
-COMMENT = re.compile(r'<!--.*?(?:-->|\Z)', re.DOTALL)
+FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
 STALE = timedelta(hours=3)
 # Queue outcomes that close a row: written, already so, newer than its decision, or kept by the never-down rule.
 CLOSED = ('written', 'unchanged', 'superseded', 'further along', 'agent verdict kept')
@@ -566,19 +565,36 @@ def ledger_mark(ledger, files, name, i, key, decided, outcome):
     entry['complete'] = set(entry['rows']) >= set(files[name][1])
 
 
+def prose(text):
+    """The lines of a card outside fenced code (CommonMark: a fence closes on the same character, at least as long,
+    with nothing after it) and HTML comments; a line that opens, holds or closes a comment is dropped."""
+    fence, comment = None, False
+    for line in text.splitlines():
+        mark = FENCE.match(line)
+        if fence:
+            if mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence) and \
+                    not line[mark.end():].strip():
+                fence = None
+            continue
+        if mark and not comment and not (mark.group(1)[0] == '`' and '`' in line[mark.end():]):
+            fence = mark.group(1)  # a backtick fence's info string holds no backtick
+            continue
+        rest, touched = line, comment or '<!--' in line
+        while True:
+            cut = rest.find('-->' if comment else '<!--')
+            if cut < 0:
+                break
+            rest, comment = rest[cut + (3 if comment else 4):], not comment
+        if not touched:
+            yield line
+
+
 def links(main):
     """feedback ID -> the cards on main whose own `Feedback: <id>[, <id>]` line names it; a line in a fenced block,
     an HTML comment or a quote is an example, not a link."""
     out = {}
     for spec in main:
-        kept, fence = [], None
-        for line in COMMENT.sub('', spec['text']).splitlines():
-            mark = FENCE.match(line)
-            if fence or mark:
-                fence = None if fence and mark and mark.group(1) == fence else fence or mark.group(1)
-                continue
-            kept.append(line)
-        for line in FEEDBACK_LINE.finditer('\n'.join(kept)):
+        for line in FEEDBACK_LINE.finditer('\n'.join(prose(spec['text']))):
             for i in line.group(1).split(', '):
                 out.setdefault(i, set()).add(spec['ref'])
     return out
