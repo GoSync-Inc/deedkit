@@ -101,6 +101,13 @@ PUBLISH_MARGIN = 30
 TRIAGE_TIMEOUT = 60
 TRIAGE_MINIMUM = 10
 CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# The advisory list after a production release is recorded (production-release.yml): the issues Tiden first saw in
+# the previous production release, as a projection only, never the raw reply (titles and messages stay in Tiden).
+PREVIOUS_ISSUES = "tiden-previous-issues.json"
+# Inside the step's 1-minute timeout, so the script, not the runner, ends a hang and writes its fixed reason.
+ISSUES_DEADLINE = 45
+ISSUE_ID = re.compile(r"[0-9A-Za-z-]{1,64}")
+RELEASE_VERSION = re.compile(r"[0-9A-Za-z@._+-]{1,80}")
 # A main push run that reused the merge queue's verification of its commit (scripts/ci_reuse.py) publishes that
 # run's unchanged evidence with this record of itself as publisher, and these check rows under its own run URL.
 PUBLICATION = "publication.json"
@@ -1060,10 +1067,124 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
     return receipt
 
 
+class IssuesUnavailable(RuntimeError):
+    """A release-issues read failed; the message is one fixed reason, never CLI output."""
+
+
+def aware(value: object) -> datetime | None:
+    """A timezone-aware timestamp, or None for a missing one; any other value is malformed."""
+    if value is None:
+        return None
+    try:
+        stamp = when(value) if isinstance(value, str) else None
+    except ValueError:
+        stamp = None
+    if stamp is None or stamp.tzinfo is None:
+        raise IssuesUnavailable("malformed")
+    return stamp
+
+
+def previous_release(releases: list, release_id: str, released_at: str) -> tuple[dict | None, bool]:
+    """The production release recorded last before `released_at`, other than `release_id`, and whether that choice
+    is ambiguous: two releases at the same time, one at this release's own time, or one without `releasedAt` (a
+    repeated create keeps `createdAt`, so nothing bounds a missing release time)."""
+    target, dated, ambiguous = when(released_at), [], False
+    for release in releases:
+        if release["id"] == release_id:
+            continue
+        stamp = aware(release.get("releasedAt"))
+        if stamp is None:
+            ambiguous = True
+        else:
+            dated.append((stamp, release))
+    earlier = [(stamp, release) for stamp, release in dated if stamp < target]
+    latest = max((stamp for stamp, _ in earlier), default=None)
+    chosen = [release for stamp, release in earlier if stamp == latest]
+    ambiguous = ambiguous or len(chosen) > 1 or any(stamp == target for stamp, _ in dated)
+    return (chosen[0] if chosen else None), ambiguous
+
+
+def release_issues(directory: Path, released_at: str, product: str, cli: str = "tiden",
+                   deadline: float | None = None) -> dict:
+    """Project the issues first seen in the previous production release and write only that projection."""
+    deadline = time.monotonic() + ISSUES_DEADLINE if deadline is None else deadline
+
+    def read(arguments: list[str]) -> object:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise IssuesUnavailable("timeout")
+        try:
+            completed = subprocess.run([cli, *arguments, "--product-id", product, "--format", "json"],
+                                       capture_output=True, text=True, timeout=left)
+        except subprocess.TimeoutExpired:
+            raise IssuesUnavailable("timeout") from None
+        if completed.returncode:
+            raise IssuesUnavailable(f"exit {completed.returncode}")
+        try:
+            return json.loads(completed.stdout)
+        except ValueError:
+            raise IssuesUnavailable("malformed") from None
+
+    try:
+        try:
+            receipt = json.loads((directory / RELEASE_RECEIPT).read_text())
+        except (OSError, ValueError):
+            receipt = None
+        release_id = receipt.get("releaseId") if isinstance(receipt, dict) else None
+        if not isinstance(receipt, dict) or receipt.get("state") != "recorded" or not isinstance(release_id, str) \
+                or not release_id or not RELEASED_AT.fullmatch(released_at):
+            raise IssuesUnavailable("no recorded release")
+        listing = read(["release", "list", "--environment", "production"])
+        releases = listing.get("releases") if isinstance(listing, dict) else None
+        pagination = listing.get("pagination") if isinstance(listing, dict) else None
+        if not isinstance(pagination, dict):
+            raise IssuesUnavailable("malformed")
+        if pagination.get("nextPageToken"):
+            # The CLI (0.41.0, 0.42.0) has no page token for `release list`; a partial list cannot prove the predecessor.
+            raise IssuesUnavailable("more pages")
+        if (not isinstance(releases, list)
+                or not all(isinstance(release, dict) and isinstance(release.get("id"), str) and release["id"]
+                           and isinstance(release.get("version"), str)
+                           and RELEASE_VERSION.fullmatch(release["version"]) for release in releases)):
+            raise IssuesUnavailable("malformed")
+        predecessor, ambiguous = previous_release(releases, release_id, released_at)
+        if ambiguous or predecessor is None:
+            result = {"state": "ambiguous predecessor" if ambiguous else "no predecessor", "predecessor": None,
+                      "newIssues": [], "seenCount": None}
+        else:
+            reply = read(["release", "issues", predecessor["id"]])
+            issues = reply.get("newIssues") if isinstance(reply, dict) else None
+            seen = reply.get("seenCount") if isinstance(reply, dict) else None
+            if (not isinstance(issues, list) or not all(isinstance(issue, dict) and isinstance(issue.get("id"), str)
+                                                        and ISSUE_ID.fullmatch(issue["id"]) for issue in issues)
+                    or not (type(seen) is int or isinstance(seen, str) and seen.isascii() and seen.isdigit() and len(seen) <= 12)):
+                raise IssuesUnavailable("malformed")
+            result = {"state": "listed", "predecessor": {"id": predecessor["id"], "version": predecessor["version"]},
+                      "newIssues": [issue["id"] for issue in issues], "seenCount": int(seen)}
+    except IssuesUnavailable as exc:
+        result = {"state": "unavailable", "reason": str(exc)}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        # Unexpected input or a failed CLI start keeps the fixed-reason contract; the exception text stays out.
+        result = {"state": "unavailable", "reason": "malformed"}
+    (directory / PREVIOUS_ISSUES).write_text(json.dumps(result, indent=2))
+    return result
+
+
+def issues_line(result: dict) -> str:
+    if result["state"] == "listed":
+        version, issues = result["predecessor"]["version"], result["newIssues"]
+        shown = version[:20] if version.startswith("deedkit@") else version
+        return f"first seen in {shown}: {len(issues)} issues" + (": " + ", ".join(issues) if issues else "")
+    if result["state"] == "unavailable":
+        return f"Tiden previous-release issues: unavailable ({result['reason']})"
+    return f"Tiden previous-release issues: none listed ({result['state']})"
+
+
 def main() -> int:
     started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["assemble", "prepare", "verdict", "publish", "queue-receipt", "release"])
+    parser.add_argument("command", choices=["assemble", "prepare", "verdict", "publish", "queue-receipt", "release",
+                                            "release-issues"])
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--fragments", type=Path)
     parser.add_argument("--producer", action="append", default=[], help="<job>:<job result>:<captured source SHA>")
@@ -1076,6 +1197,17 @@ def main() -> int:
     directory = args.directory.resolve()
     if args.command == "release":
         return release(args, directory)
+    if args.command == "release-issues":
+        if args.environment != "production":
+            raise ValueError("only a production release lists the previous release's issues")
+        result = release_issues(directory, args.released_at or "", os.environ.get("TIDEN_PRODUCT_ID", ""))
+        line = issues_line(result)
+        print(line)
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                summary.write(line + "\n")
+        # A failed read fails only this continue-on-error step, so the run shows it; the record is unchanged.
+        return 1 if result["state"] == "unavailable" else 0
     if args.command == "queue-receipt":
         # A merge queue run publishes nothing; its receipt needs no evidence download (ANYM-500).
         directory.mkdir(parents=True, exist_ok=True)

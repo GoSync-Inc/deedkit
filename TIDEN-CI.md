@@ -751,7 +751,36 @@ metric, `sync_backlog` included; a FAIL, UNKNOWN or
 missing report resets the streak. Then a pull request makes a Tiden error in
 the release record fail the job again (ANYM-411 criterion 6). The
 `production` release is recorded by the dispatch in
-[production.md](docs/operations/production.md). `synthetic` is
+[production.md](docs/operations/production.md).
+
+After that record succeeds, an advisory step (ANYM-540, `continue-on-error`,
+one minute) lists the issues Tiden first saw in the previous production release:
+errors arrive after a release goes live, so the useful list is the one before.
+`tiden_ci.py release-issues` reads `release list --environment production` and
+takes the newest release whose `releasedAt` is strictly earlier than this
+release's, excluding this release's ID. It then calls `release issues <its ID>`,
+by ID because the same version also exists in `github-actions-synthetic`.
+Rollbacks are not modelled: the predecessor is the release recorded last before,
+not the one that was live. Two releases at the same time, another release at this
+release's own time, or any other release without `releasedAt` (a repeated create
+keeps `createdAt`, so it bounds nothing) give `state: ambiguous predecessor` and
+no issues call. The
+reply is projected in memory to `{predecessor: {id, version}, newIssues: [issue
+IDs], seenCount}`; only that goes to `tiden-previous-issues.json` in the
+`tiden-release-receipt` artifact and one summary line `first seen in
+deedkit@<12 hex>: N issues: <IDs>`. Titles, messages and CLI error text stay in
+Tiden. A failed, slow or malformed read writes `state: unavailable` with a fixed
+reason (`timeout`, `exit <n>`, `malformed`, `no recorded release`, `more pages`:
+the CLI has no page token for `release list`, so a partial list proves no
+predecessor; a timestamp without a zone is `malformed`) and fails only
+this step; the record, its receipt and the job outcome are unchanged. The daily
+issue triage (orchestrator side, outside Git) starts from the newest
+`tiden-previous-issues.json` of the latest production release run, or from
+`release issues` for the current production release, lists those issues first as
+"first seen in the last release", and says so when the file is missing or older
+than the current release.
+
+`synthetic` is
 historical: release 0.9.16 is attached to it, so keep it, but send no new runs
 there. Tiden creates an environment for any unknown slug, so a misspelled or new
 name silently makes a duplicate. One environment per kind of run keeps the

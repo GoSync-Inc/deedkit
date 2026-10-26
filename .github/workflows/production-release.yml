@@ -29,7 +29,7 @@ jobs:
     # Only the reviewed workflow and tools on main may use the Tiden credential.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       # Expression comparisons ignore case; this one does not, and runs before any repository code.
       - name: Require the main branch exactly
@@ -55,6 +55,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
           echo "$RUNNER_TEMP/tiden-bin" >> "$GITHUB_PATH"
       - name: Record the production release in Tiden
+        id: record
         env:
           TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
           TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
@@ -68,6 +69,21 @@ jobs:
           mkdir "$RUNNER_TEMP/release"
           python scripts/tiden_ci.py release --directory "$RUNNER_TEMP/release" --environment "$ENVIRONMENT" \
             --sha "$SHA" --url "$RUN_URL" --released-at "$RELEASED_AT"
+      # Advisory (ANYM-540): errors arrive after a release goes live, so it lists the previous production release's
+      # first-seen issues, as a projection only (TIDEN-CI.md, Environments). It never changes the record.
+      - name: List the issues first seen in the previous production release
+        if: steps.record.outcome == 'success' && inputs.environment == 'production'
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          TIDEN_API_TOKEN: ${{ secrets.TIDEN_API_TOKEN }}
+          TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
+          TIDEN_WORKSPACE_ID: ${{ vars.TIDEN_WORKSPACE_ID }}
+          TIDEN_BASE_URL: https://app.tiden.ai
+          RELEASED_AT: ${{ inputs.released_at }}
+        run: |
+          python scripts/tiden_ci.py release-issues --directory "$RUNNER_TEMP/release" --environment production \
+            --released-at "$RELEASED_AT"
       - name: Retain the release receipt
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

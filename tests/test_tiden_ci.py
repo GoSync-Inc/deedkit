@@ -1314,9 +1314,12 @@ def test_release_workflows_record_only_verified_main_commits(tmp_path):
     assert 0 < verify < publish
     # Every step up to the record runs only after the previous one succeeded.
     assert not any("if" in step or "continue-on-error" in step for step in steps[:publish + 1])
-    # The Tiden token reaches only the release step, and only from GitHub secrets.
+    # The Tiden token reaches only the release step and the advisory issues step after it, only from GitHub secrets.
+    issues = next(i for i, step in enumerate(steps) if "tiden_ci.py release-issues" in step.get("run", ""))
     holders = [step for step in steps if "TIDEN_API_TOKEN" in json.dumps(step)]
-    assert holders == [steps[publish]]
+    assert holders == [steps[publish], steps[issues]] and issues == publish + 1
+    assert steps[issues]["env"]["TIDEN_API_TOKEN"] == "${{ secrets.TIDEN_API_TOKEN }}"
+    assert "${{" not in steps[issues]["run"]
     assert steps[publish]["env"]["TIDEN_API_TOKEN"] == "${{ secrets.TIDEN_API_TOKEN }}"
     assert steps[publish]["env"]["ENVIRONMENT"] == "${{ inputs.environment }}"
     assert "${{" not in steps[verify]["run"] and "${{" not in steps[publish]["run"]
@@ -1403,6 +1406,265 @@ def test_a_recorded_release_receipt_says_recorded(tmp_path, monkeypatch):
     main_push_manifest(tmp_path)
     assert run_release(monkeypatch, tmp_path, "--environment", "github-actions-synthetic") == 0
     assert receipt(tmp_path)["state"] == "recorded" and receipt(tmp_path)["releaseId"] == "release-id"
+
+
+ISSUES_FIXTURE = json.loads((Path(__file__).parent / "fixtures/tiden-release-issues-041.json").read_text())
+SENTINELS = ("SENTINEL-TITLE-540", "SENTINEL-MESSAGE-540")
+
+
+def production_release(release_id, released_at=None, created=None, digit="b"):
+    """One entry of a synthetic `release list --environment production` reply."""
+    value = {"id": release_id, "version": "deedkit@" + digit * 40, "environmentSlug": "production"}
+    return {**value, **({"releasedAt": released_at} if released_at else {}), **({"createdAt": created} if created else {})}
+
+
+def recorded_production_release(monkeypatch, tmp_path):
+    """The record step of production-release.yml, run first: its receipt bytes and Tiden calls."""
+    calls = release_cli(monkeypatch)
+    assert run_release(monkeypatch, tmp_path, *PRODUCTION) == 0
+    return (tmp_path / "tiden-release-receipt.json").read_bytes(), calls
+
+
+def issues_cli(monkeypatch, releases, reply=None, mode=None):
+    """A synthetic Tiden for `release-issues`: a production release listing, then the issues of one release."""
+    import subprocess
+    reply = ISSUES_FIXTURE["reply"] if reply is None else reply
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        assert 0 < kwargs["timeout"] <= 45
+        if args[1:3] == ["release", "list"]:
+            value = {"releases": releases, "pagination": {"nextPageToken": ""}}
+        elif args[1:3] == ["release", "issues"]:
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            if mode == "exit":
+                return subprocess.CompletedProcess(args, 2, stdout=SENTINELS[0], stderr=SENTINELS[1])
+            if mode == "malformed":
+                return subprocess.CompletedProcess(args, 0, stdout="<html>" + SENTINELS[0], stderr=SENTINELS[1])
+            value = reply
+        else:
+            raise AssertionError(args)
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(value), stderr="")
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def run_issues(monkeypatch, tmp_path, released_at="2026-01-01T00:20:00Z"):
+    from scripts import tiden_ci
+    monkeypatch.setenv("TIDEN_PRODUCT_ID", PRODUCT)
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+    monkeypatch.setattr(sys, "argv", ["tiden_ci.py", "release-issues", "--directory", str(tmp_path),
+                                      "--environment", "production", "--released-at", released_at])
+    return tiden_ci.main()
+
+
+def previous_issues(tmp_path):
+    return json.loads((tmp_path / "tiden-previous-issues.json").read_text())
+
+
+def assert_no_sentinel(tmp_path, captured):
+    texts = [path.read_text() for path in tmp_path.glob("tiden-*.json")]
+    texts += [captured.out, captured.err, (tmp_path / "summary.md").read_text()]
+    assert not any(sentinel in text for text in texts for sentinel in SENTINELS)
+
+
+# spec: ANYM-540
+def test_a_recorded_production_release_lists_the_ids_first_seen_in_the_previous_release(tmp_path, monkeypatch,
+                                                                                         capsys):
+    before, record_calls = recorded_production_release(monkeypatch, tmp_path)
+    # A reply with title and message text: only the projection of it is ever written.
+    reply = json.loads(json.dumps(ISSUES_FIXTURE["reply"]))
+    reply["newIssues"][0]["title"], reply["newIssues"][0]["message"] = SENTINELS
+    releases = [production_release("release-id", "2026-01-01T00:20:00Z", digit="c"),  # this release: excluded
+                production_release("older", "2026-01-01T00:05:00Z", digit="a"),
+                production_release("previous", "2026-01-01T00:10:00Z"),
+                production_release("later", "2026-01-01T00:30:00Z", digit="d")]
+    calls = issues_cli(monkeypatch, releases, reply)
+    capsys.readouterr()
+    assert run_issues(monkeypatch, tmp_path) == 0
+    ids = [issue["id"] for issue in ISSUES_FIXTURE["reply"]["newIssues"]]
+    assert len(ids) == 7
+    assert previous_issues(tmp_path) == {"state": "listed",
+                                         "predecessor": {"id": "previous", "version": "deedkit@" + "b" * 40},
+                                         "newIssues": ids, "seenCount": int(ISSUES_FIXTURE["reply"]["seenCount"])}
+    line = "first seen in deedkit@bbbbbbbbbbbb: 7 issues: " + ", ".join(ids)
+    captured = capsys.readouterr()
+    assert captured.out == line + "\n" and (tmp_path / "summary.md").read_text() == line + "\n"
+    assert [call[1:4] for call in calls] == [["release", "list", "--environment"], ["release", "issues", "previous"]]
+    assert calls[0][4] == "production" and all(call[-4:] == ["--product-id", PRODUCT, "--format", "json"]
+                                               for call in calls)
+    assert_no_sentinel(tmp_path, captured)
+    # The record's receipt and calls are untouched by the advisory step.
+    assert (tmp_path / "tiden-release-receipt.json").read_bytes() == before
+    assert all(call[1:3] in (["run", "list"], ["release", "create"], ["gate", "check"]) for call in record_calls)
+
+
+# spec: ANYM-540
+def test_a_previous_release_without_new_issues_lists_none(tmp_path, monkeypatch, capsys):
+    before, _ = recorded_production_release(monkeypatch, tmp_path)
+    issues_cli(monkeypatch, [production_release("previous", "2026-01-01T00:10:00Z")],
+               {"newIssues": [], "seenCount": "0"})
+    capsys.readouterr()
+    assert run_issues(monkeypatch, tmp_path) == 0
+    assert previous_issues(tmp_path)["newIssues"] == [] and previous_issues(tmp_path)["seenCount"] == 0
+    assert capsys.readouterr().out == "first seen in deedkit@bbbbbbbbbbbb: 0 issues\n"
+    assert (tmp_path / "tiden-release-receipt.json").read_bytes() == before
+
+
+# spec: ANYM-540
+@pytest.mark.parametrize("releases, state", [
+    # Only this release, or only later ones: nothing earlier to read.
+    ([production_release("release-id", "2026-01-01T00:20:00Z")], "no predecessor"),
+    ([production_release("later", "2026-01-01T00:30:00Z")], "no predecessor"),
+    # Two releases at the same newest earlier time.
+    ([production_release("one", "2026-01-01T00:10:00Z"), production_release("two", "2026-01-01T00:10:00Z")],
+     "ambiguous predecessor"),
+    # Another release at this release's own time.
+    ([production_release("previous", "2026-01-01T00:10:00Z"), production_release("twin", "2026-01-01T00:20:00Z")],
+     "ambiguous predecessor"),
+    # A release without `releasedAt` that is not provably older than the chosen one.
+    ([production_release("previous", "2026-01-01T00:10:00Z"),
+      production_release("undated", created="2026-01-01T00:12:00Z")], "ambiguous predecessor"),
+    ([production_release("previous", "2026-01-01T00:10:00Z"), production_release("undated")],
+     "ambiguous predecessor"),
+    ([production_release("undated", created="2026-01-01T00:01:00Z")], "ambiguous predecessor"),
+])
+def test_no_or_an_ambiguous_predecessor_makes_no_issues_call(tmp_path, monkeypatch, capsys, releases, state):
+    before, _ = recorded_production_release(monkeypatch, tmp_path)
+    calls = issues_cli(monkeypatch, releases)
+    capsys.readouterr()
+    assert run_issues(monkeypatch, tmp_path) == 0
+    assert previous_issues(tmp_path) == {"state": state, "predecessor": None, "newIssues": [], "seenCount": None}
+    assert capsys.readouterr().out == f"Tiden previous-release issues: none listed ({state})\n"
+    assert [call[1:3] for call in calls] == [["release", "list"]]
+    assert (tmp_path / "tiden-release-receipt.json").read_bytes() == before
+
+
+# spec: ANYM-540
+def test_an_undated_release_created_before_the_predecessor_is_still_ambiguous(tmp_path, monkeypatch):
+    # A repeated create keeps `createdAt` but moves the release time, so `createdAt` bounds nothing.
+    recorded_production_release(monkeypatch, tmp_path)
+    calls = issues_cli(monkeypatch, [production_release("previous", "2026-01-01T00:10:00Z"),
+                                     production_release("undated", created="2026-01-01T00:09:00Z")])
+    assert run_issues(monkeypatch, tmp_path) == 0
+    assert previous_issues(tmp_path)["state"] == "ambiguous predecessor"
+    assert [call[1:3] for call in calls] == [["release", "list"]]
+
+
+# spec: ANYM-540
+@pytest.mark.parametrize("mode, reply, reason", [
+    ("exit", None, "exit 2"),
+    ("timeout", None, "timeout"),
+    ("malformed", None, "malformed"),
+    (None, {"newIssues": [{"id": "has space", "title": SENTINELS[0]}], "seenCount": "1"}, "malformed"),
+    (None, {"newIssues": [], "seenCount": SENTINELS[1]}, "malformed"),
+    (None, {"issues": []}, "malformed"),
+])
+def test_a_failed_issues_read_writes_a_fixed_reason_and_keeps_the_record(tmp_path, monkeypatch, capsys, mode, reply,
+                                                                          reason):
+    before, _ = recorded_production_release(monkeypatch, tmp_path)
+    issues_cli(monkeypatch, [production_release("previous", "2026-01-01T00:10:00Z")], reply, mode)
+    capsys.readouterr()
+    # Only this continue-on-error step fails, so the run shows it.
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": reason}
+    captured = capsys.readouterr()
+    assert captured.out == f"Tiden previous-release issues: unavailable ({reason})\n"
+    assert_no_sentinel(tmp_path, captured)
+    assert (tmp_path / "tiden-release-receipt.json").read_bytes() == before
+
+
+# spec: ANYM-540
+@pytest.mark.parametrize("listing", [
+    "<html>" + SENTINELS[0],
+    json.dumps({"releases": [{**production_release("previous", "2026-01-01T00:10:00Z"), "version": SENTINELS[0] + " x"}],
+                "pagination": {}}),
+])
+def test_an_unreadable_release_listing_is_malformed(tmp_path, monkeypatch, capsys, listing):
+    import subprocess
+    recorded_production_release(monkeypatch, tmp_path)
+    monkeypatch.setattr(subprocess, "run", lambda args, **kwargs: subprocess.CompletedProcess(args, 0, stdout=listing,
+                                                                                              stderr=""))
+    capsys.readouterr()
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "malformed"}
+    assert_no_sentinel(tmp_path, capsys.readouterr())
+
+
+# spec: ANYM-540
+def test_a_listing_with_more_pages_cannot_prove_the_predecessor(tmp_path, monkeypatch, capsys):
+    import subprocess
+    recorded_production_release(monkeypatch, tmp_path)
+    listing = {"releases": [production_release("previous", "2026-01-01T00:10:00Z")],
+               "pagination": {"nextPageToken": "2"}}
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(listing), stderr="")
+    monkeypatch.setattr(subprocess, "run", run)
+    capsys.readouterr()
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "more pages"}
+    assert capsys.readouterr().out == "Tiden previous-release issues: unavailable (more pages)\n"
+    assert [call[1:3] for call in calls] == [["release", "list"]]
+
+
+# spec: ANYM-540
+@pytest.mark.parametrize("releases, reply", [
+    # A timestamp without a zone cannot be compared with the UTC release time.
+    ([production_release("previous", "2026-01-01T00:10:00")], None),
+    ([production_release("previous", "2026-01-01T00:10:00Z"), {**production_release("other"), "releasedAt": 5}],
+     None),
+    ([production_release("previous", "2026-01-01T00:10:00Z"), production_release("other", SENTINELS[0])], None),
+    # A count too long to be a count.
+    ([production_release("previous", "2026-01-01T00:10:00Z")], {"newIssues": [], "seenCount": "9" * 5000}),
+])
+def test_malformed_timestamps_and_counts_write_a_fixed_reason(tmp_path, monkeypatch, capsys, releases, reply):
+    before, _ = recorded_production_release(monkeypatch, tmp_path)
+    issues_cli(monkeypatch, releases, reply)
+    capsys.readouterr()
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "malformed"}
+    captured = capsys.readouterr()
+    assert captured.out == "Tiden previous-release issues: unavailable (malformed)\n"
+    assert_no_sentinel(tmp_path, captured)
+    assert (tmp_path / "tiden-release-receipt.json").read_bytes() == before
+
+
+# spec: ANYM-540
+@pytest.mark.parametrize("state", [None, "not_verified"])
+def test_no_recorded_release_means_no_tiden_call(tmp_path, monkeypatch, state):
+    if state:
+        (tmp_path / "tiden-release-receipt.json").write_text(json.dumps({"state": state, "releaseId": "release-id"}))
+    calls = issues_cli(monkeypatch, [production_release("previous", "2026-01-01T00:10:00Z")])
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "no recorded release"} and calls == []
+
+
+# spec: ANYM-540
+def test_the_issues_read_ends_by_its_own_deadline(tmp_path, monkeypatch):
+    import time
+    from scripts.tiden_ci import release_issues
+    recorded_production_release(monkeypatch, tmp_path)
+    calls = issues_cli(monkeypatch, [production_release("previous", "2026-01-01T00:10:00Z")])
+    result = release_issues(tmp_path, "2026-01-01T00:20:00Z", PRODUCT, deadline=time.monotonic() - 1)
+    assert result == {"state": "unavailable", "reason": "timeout"} and calls == []
+
+
+# spec: ANYM-540
+def test_the_issues_step_is_advisory_and_runs_only_after_a_recorded_production_release():
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    job = yaml.safe_load((root / ".github/workflows/production-release.yml").read_text())["jobs"]["record"]
+    names = [step.get("name") for step in job["steps"]]
+    step = job["steps"][names.index("List the issues first seen in the previous production release")]
+    assert names.index("Record the production release in Tiden") + 1 == names.index(step["name"])
+    assert names.index(step["name"]) + 1 == names.index("Retain the release receipt")
+    assert job["steps"][names.index("Record the production release in Tiden")]["id"] == "record"
+    assert step["if"] == "steps.record.outcome == 'success' && inputs.environment == 'production'"
+    assert step["continue-on-error"] is True and step["timeout-minutes"] == 1 and job["timeout-minutes"] == 6
+    assert "--environment production" in step["run"] and '"$RUNNER_TEMP/release"' in step["run"]
 
 
 # spec: ANYM-411
