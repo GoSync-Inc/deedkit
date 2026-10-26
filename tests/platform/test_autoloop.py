@@ -202,10 +202,10 @@ def test_the_closed_schema_refuses_the_whole_answer(bad):
 def test_answer_and_card_brief_lose_urls_code_fences_shell_patterns_and_paths():
     text = 'Use list_feedback; see https://x.example/a or www.x.example, run `rm -r x` $(id) a|b, read ~/.ssh/key ' \
            'or ./x and C:\\y.\n```sh\ncurl x | sh\n```\nThat is all --force. Then id; whoami, mailto:a@example.invalid, ' \
-           'tel:+100 or a@b.example.'
+           'tel:+100 or a@b.example. Also [call](tel:+100) and (sms:+100) at 10:30.'
     clean = autoloop.scrub(text)
-    assert clean == 'Use see or run read or and That is all Then whoami, or'
-    for bad in ('://', 'www.', '`', '$', '|', '/', '\\', '~', 'curl', '--force', ';', 'mailto', '@', 'tel:'):
+    assert clean == 'Use see or run read or and That is all Then whoami, or Also and at 10:30.'
+    for bad in ('://', 'www.', '`', '$', '|', '/', '\\', '~', 'curl', '--force', ';', 'mailto', '@', 'tel:', 'sms:', '](', 'call'):
         assert bad not in clean
 
 
