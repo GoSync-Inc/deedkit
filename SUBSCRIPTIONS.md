@@ -323,7 +323,7 @@ model provider. Only that session, or the autoloop's tool-less reader on the sam
 reads raw text; nothing derived from it goes to Tiden, GitHub or another sink
 (docs/operations/feedback-triage.md). Exception (owner 10-26, ANYM-568): for feedback from a
 principal in the autoloop config, a card written in the card worker's own words, with no quote,
-name, number or message content, goes to Tiden and GitHub (docs/operations/feedback-autoloop.md).
+name, phone number or message content, goes to Tiden and GitHub (docs/operations/feedback-autoloop.md).
 
 A rejected `submit_feedback` names what to fix. Over REST and MCP the schema check
 returns `invalid_parameters` with the existing `fields` list plus `field_errors`; the

@@ -7,8 +7,7 @@ step 1, owner 10-26). Changing it is an OWNER change.
 
 The driver is `scripts/autoloop.py` (ANYM-569 tick, ANYM-570 reader, ANYM-571 card launcher,
 ANYM-572 build launcher and controller merge, ANYM-573 status and report); feedback statuses move
-through `scripts/feedback_sync.py` (ANYM-536). Until all of them and this document are merged,
-`live` stays false.
+through `scripts/feedback_sync.py` (ANYM-536).
 
 ## Boundary
 
@@ -19,10 +18,10 @@ through `scripts/feedback_sync.py` (ANYM-536). Until all of them and this docume
   from `list-keys`; the shared worker key `claude-code` is excluded). Any other principal's item is
   report-only: triaged, never carded. A cluster with one report-only item is report-only.
 - Raw text is read only by the tool-less reader on the owner's workstation (ANYM-570: no tools,
-  settings, MCP, plugins, hooks or memory; a closed JSON answer). Card workers and build workers
-  get IDs and the closed projection only. Card text is in the worker's own words with no quote,
-  name, number or message content (SUBSCRIPTIONS.md, owner Q1b).
-- Tick output, logs and the report carry IDs, counts and statuses, never feedback text.
+  settings, MCP, plugins, hooks or memory; a closed JSON answer). Card workers get feedback IDs,
+  the cluster key and the closed projection; build workers get the card ID and intent only. Card text is in the worker's own words with no quote,
+  name, phone number or message content (SUBSCRIPTIONS.md, owner Q1b).
+- Tick output, logs and the report never carry feedback text.
 
 ## Envelope
 
@@ -30,9 +29,13 @@ The loop builds and merges a card only when all hold:
 
 - a Ready defect, improvement or feature card of at most 8 SP from an owner-agent cluster;
 - not an epic; no `review/` branch (no criterion edit);
-- the real diff at the PR's exact head (renames and deletions included) has no OWNER signal and
-  no protected path: both are the signal grep in docs/operations/review-protocol.md, the third line
-  being the loop's protected paths. That grep is the one list; the controller uses it as written.
+- no OWNER change path (the PR's `Change path:` line and its review), and the real diff at the
+  PR's exact head, renames and deletions included, hits neither the change-path signal grep nor
+  the autoloop protected paths (both in docs/operations/review-protocol.md; that list is the one
+  list, used as written);
+- required checks green, `Autoloop:` and `Spec:` lines present, and the latest review verdict
+  (routing by harness reviews.md) names that exact head with no open blocking or major finding.
+  Build workers never merge; the controller arms the merge for that head only.
 
 Anything else stays in the orchestrator queue, and the item's note says why.
 
@@ -43,11 +46,15 @@ an OWNER change path; any item of harness process.md section 2 or AGENTS.md sect
 grant, allowlist or key change; a migration; a live action (send, call, ACK, pairing, provider
 session); secrets or new credentials; destructive or irreversible data changes; required checks
 or the ruleset; weakening a criterion; accepting a risk; an epic; a change to this document. The
-loop enables nothing after deploy.
+override covers only choosing, writing and readying a card inside the envelope; every other
+product direction and card move stays the owner's. The loop enables nothing after deploy: a
+feature behind a flag or opt-in ships off and its item says "waits for the owner: opt-in". The
+other notes the agent sees are "queued: large card", "over daily cap", "withdrawn by the
+reporter", "paused" and "answered, no change needed" (ANYM-573).
 
 ## Stop, withdraw, hold
 
-- `touch ~/.deedkit/autoloop/PAUSE` (the owner, or the orchestrator on the owner's words), or
+- `touch ~/.deedkit/autoloop/PAUSE` (the owner, or the orchestrator on its own), or
   `AUTOLOOP STOP` in feedback from an owner principal: no new launch, triage, Tiden write or
   merge. The next tick fences: closes the terminals of the loop's own `autoloop-` workspaces
   only, cancels autoloop ready-merge runs, disables auto-merge and dequeues autoloop PRs, then
@@ -61,16 +68,12 @@ loop enables nothing after deploy.
 - `autoloop.py hold|release ANYM-n`: the orchestrator's per-card control.
 - Resume: remove `PAUSE` (the owner, or the orchestrator on the owner's words), never by feedback.
 
-## Caps and reservations
+## Caps
 
 Config defaults (owner-set): 20 items per principal per day into triage; 24 reader runs a day;
-5 card and 3 build launches a day; 2 card and 2 build workers in flight; 12 worker hours a day.
-A launch reserves its slot and full wall-clock limit (card 2 h, build 4 h) before it starts; a
-clean end returns the unused part; an interrupted or unknown run keeps it. One relaunch per card.
-An unknown launch outcome is reconciled from `superset workspaces list` by its stable name, never
-retried. A build reserves its card's lane and expected paths; it waits while another live intent,
-any open PR or a pushed branch of a live workspace touches them. Codex reviews also obey the
-Codex line (review-protocol.md).
+5 card and 3 build launches a day; 2 card and 2 build workers in flight; 12 worker hours a day
+(card 2 h, build 4 h each, reserved before the start); one relaunch per card; Codex reviews also
+obey the Codex line (review-protocol.md). Reservation and lane rules: ANYM-569 and ANYM-572.
 
 ## The live switch
 

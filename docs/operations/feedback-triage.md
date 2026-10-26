@@ -19,6 +19,8 @@ writes a private report. It writes nothing to Tiden, GitHub, git or production.
   placed on the production host.
 - State is private and outside Git: `~/.deedkit/feedback-triage` (or `FEEDBACK_TRIAGE_STATE`;
   a directory inside the repository is refused), files mode 0600.
+- For principals in the autoloop config these steps run unattended, with a tool-less reader in
+  place of this session (docs/operations/feedback-autoloop.md, ANYM-568).
 
 ## Run
 

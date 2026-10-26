@@ -37,13 +37,16 @@ list: release, deploy and `production.py`, sends and live provider-session code.
 - `Change path:` signal grep:
 
   ```sh
-  git diff --name-only origin/main... | grep -E '^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|\.claude/settings\.json|^AGENTS\.md$'
+  git diff --no-renames --name-only origin/main... | grep -E '^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$'
   git diff -U5 origin/main... | grep -E -i '^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|RENAME)\b|ALTER )'
-  git diff --name-only origin/main... | grep -E '^(\.github/|\.claude/|(AGENTS|CLAUDE|SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|docs/(operations|harness)/|deploy/|tools/|config/)|migrations/|\.sql$|hatch_build\.py$|(^|/)(uv\.lock|package-lock\.json|go\.sum)$|^scripts/(build|production|seamless_release|deedkit_admin|publish_images|scan_image|ci_reuse|docs_only|python_shards|spec_impact|receipt_watch|(verify|check|tiden|feedback)_[a-z_]+|autoloop[a-z_]*)\.'
   ```
-
-  The third line is the feedback autoloop's protected paths (docs/operations/feedback-autoloop.md):
-  a hit is not an OWNER signal by itself, but it keeps an autoloop PR out of the controller merge.
 
   A host-tool change still waits for the owner to install it before autodeploy resumes
   (docs/operations/production.md).
+
+- Autoloop protected paths (docs/operations/feedback-autoloop.md), not a change-path signal: a
+  hit keeps an autoloop PR out of the controller merge. This is the one list.
+
+  ```sh
+  git diff --no-renames --name-only origin/main... | grep -E '^(\.github/|scripts/|deploy/|tools/|config/|docs/(operations|harness)/|services/release-router/)|(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|conftest\.py|uv\.lock|package-lock\.json|go\.sum|requirements[^/]*\.(lock|in|txt))$'
+  ```
