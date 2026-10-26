@@ -1048,7 +1048,7 @@ def effective(triage_state, zone, day, dropped):
     for path in sorted((triage_state / 'dispositions').glob('*.json')):
         try:
             listed = triage.load(path, [])
-        except ValueError:
+        except (ValueError, OSError):
             bad += 1
             continue
         for row in listed if isinstance(listed, list) else []:
@@ -1128,6 +1128,15 @@ def report_text(state, triage_state, cfg, day):
         f'\n## {head}\n\n' + '\n'.join(lines or ['- нет']) + '\n' for head, lines in sections)
 
 
+def marker(state):
+    """report.json: the last reported day and whether the last report was written; unreadable counts as none."""
+    try:
+        mark = triage.load(state / 'report.json', {})
+    except (ValueError, OSError):
+        return {}
+    return mark if isinstance(mark, dict) else {}
+
+
 def report(state, triage_state, now, day=None):
     """`report/<day>.md` (0600), in Russian, from the local state only: nothing is read from a service and nothing is
     sent. Without `day`, every day from the last reported one (at most REPORT_DAYS back) to today is rebuilt, so a
@@ -1137,8 +1146,11 @@ def report(state, triage_state, now, day=None):
     if day:
         days = [day]
     else:
-        mark = (triage.load(state / 'report.json', None) or {}).get('day')
-        start = max(today - timedelta(days=REPORT_DAYS), datetime.fromisoformat(mark).date() if mark else today)
+        try:
+            start = datetime.fromisoformat(marker(state)['day']).date()
+        except (KeyError, TypeError, ValueError):
+            start = today
+        start = min(today, max(today - timedelta(days=REPORT_DAYS), start))  # a future or broken mark: today
         days = [(start + timedelta(days=n)).isoformat() for n in range((today - start).days + 1)]
     for one in days:
         path = state / 'report' / f'{one}.md'
@@ -1250,8 +1262,7 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
                 report(state, triage_state, now)
             except (Refused, triage.Refused, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
                 # The tick's work stands; `status` exits 1 until a report is written again.
-                mark = triage.load(state / 'report.json', None) or {}
-                triage.save(state / 'report.json', dict(mark, ok=False, error=type(error).__name__))
+                triage.save(state / 'report.json', dict(marker(state), ok=False, error=type(error).__name__))
         return 1 if withheld else 0, (
             f"tick {'live' if cfg['live'] else 'plan only'}: pulled {fresh}, read {count}, over cap {len(over)}, "
             f"dropped {len(drops)}, withhold not done {len(withheld)}, "
@@ -1268,7 +1279,7 @@ def status(state, now):
         problems.append('paused by an audit')
     if paused and not (triage.load(state / 'fence.json', None) or {}).get('effective'):
         problems.append('the stop is not effective yet (fence.json)')
-    if (triage.load(state / 'report.json', None) or {}).get('ok') is False:
+    if marker(state).get('ok') is False:
         problems.append('the daily report failed (report.json)')
     if not paused and (triage.load(state / 'plan.json', None) or {}).get('withheld'):
         problems.append('a hold or drop is not withheld yet (plan.json withheld)')

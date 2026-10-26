@@ -1334,3 +1334,23 @@ def test_a_failed_report_leaves_the_tick_done_and_status_exits_1(loop, monkeypat
     monkeypatch.undo()
     run_tick(loop, Fakes(), now=NOW + timedelta(minutes=5))
     assert autoloop.status(a, NOW + timedelta(minutes=5))[0] == 0
+
+
+# spec: ANYM-573
+def test_a_future_or_corrupt_mark_and_an_unreadable_file_never_stop_the_report(loop):
+    t, a, s = loop
+    configure(a)
+    triage.save(a / 'report.json', {'day': '2026-11-30', 'ok': True})  # a later clock wrote it
+    assert autoloop.report(a, t, NOW).name == '2026-10-26.md'
+    (a / 'report.json').write_text('{')
+    assert autoloop.report(a, t, NOW).name == '2026-10-26.md'
+    disposition_file(t, 'autoloop-note-1', [{'id': D1, 'status': 'received', 'note': autoloop.LARGE}])
+    (t / 'dispositions' / 'autoloop-note-1.json').chmod(0)
+    try:
+        text = autoloop.report(a, t, NOW).read_text()
+    finally:
+        (t / 'dispositions' / 'autoloop-note-1.json').chmod(0o600)
+    assert '- нечитаемых файлов или строк решений: 1' in text
+    (a / 'report.json').write_text('[')
+    code, _ = run_tick(loop, Fakes())
+    assert code == 0 and autoloop.marker(a) == {'day': '2026-10-26', 'ok': True}
