@@ -1746,7 +1746,8 @@ def test_the_release_job_tolerates_only_an_unavailable_tiden(tmp_path):
     # Only the download may fail without failing the job, and it only downloads; no job-level suppression.
     assert [name for name, step in steps.items() if step.get("continue-on-error")] == [download]
     assert "continue-on-error" not in job and steps[download]["id"] == "download"
-    assert steps[download]["run"].startswith("curl ") and "\n" not in steps[download]["run"].strip()
+    assert "curl " in steps[download]["run"] and "sha256sum" not in steps[download]["run"] \
+        and "tar " not in steps[download]["run"]
     assert names.index(download) < names.index(install) < names.index(warn) < names.index(record)
     assert steps[install]["if"] == steps[record]["if"] == (
         "steps.config.outputs.enabled == 'true' && steps.download.outcome == 'success'")
@@ -1758,6 +1759,7 @@ def test_the_release_job_tolerates_only_an_unavailable_tiden(tmp_path):
         temp.mkdir(exist_ok=True)
         return subprocess.run(["bash", "-e", "-c", steps[step]["run"]], capture_output=True, text=True, env={
             "PATH": os.environ["PATH"], "RUNNER_TEMP": str(temp), "GITHUB_PATH": str(temp / "path"),
+            "GITHUB_WORKSPACE": str(root),
             "GITHUB_OUTPUT": str(temp / "output"), "GITHUB_STEP_SUMMARY": str(temp / "summary"), **env})
 
     # A failed download warns with a receipt that records no create call.
