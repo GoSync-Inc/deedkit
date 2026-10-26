@@ -691,7 +691,7 @@ def test_a_feedback_line_on_exactly_one_card_links_and_other_mentions_do_not(tmp
     for unlinked in (C, D, E):  # an ID in History or a quote, and an ID on two cards
         assert prod.rows[unlinked]['status'] == 'received'
     report = synced(tmp_path, 'last-run.json')
-    assert report['reasons']['several cards'] == [{'feedback': D, 'card': None}]
+    assert report['reasons']['several cards'] == [{'feedback': D, 'card': None, 'cards': ['ANYM-31', 'ANYM-32']}]
     assert [row['feedback'] for row in report['waiting_for_card']] == [C, E]
     assert 'proposed new card' not in (state_dir(tmp_path) / 'last-run.json').read_text()  # no note text
 
@@ -750,3 +750,79 @@ def test_status_exits_1_when_the_last_good_run_is_stale_or_a_call_blocks_writes(
     assert sync.main(['status', '--state', state]) == 1
     assert 'ATTENTION a call with an unknown outcome blocks writes' in capsys.readouterr().err
     assert oct((state_dir(tmp_path) / 'last-run.json').stat().st_mode & 0o777) == '0o600'
+
+
+# spec: ANYM-536
+def test_a_decision_time_outlives_its_refused_file_after_an_uncertain_call(tmp_path):
+    prod = Prod({A: dict(disp(), at=None)})
+    publish(tmp_path, 'one.json', {A: disp('declined')}, START)  # decided 09:00
+
+    def timeout(host, argv):
+        raise sync.Uncertain('TimeoutExpired')
+    assert auto(tmp_path, prod, '--apply', run=timeout) == 1
+    prod.rows[A] = dict(disp('accepted', 'ANYM-11', note='hand correction'), at=prod.tick())  # 10:02
+    publish(tmp_path, 'one.json', {A: disp('declined', note='edited later')}, START)  # refused from now on
+    publish(tmp_path, 'two.json', {A: disp('declined')}, START + timedelta(hours=2))  # an equal row, decided 11:00
+    prod.clock += timedelta(minutes=20)  # the uncertain call can no longer land
+    assert auto(tmp_path, prod, '--apply') == 1
+    assert prod.writes == [] and shown(prod, A) == disp('accepted', 'ANYM-11', note='hand correction')
+    assert synced(tmp_path, 'applied.json')['files']['two.json']['rows'][A]['outcome'] == 'superseded'
+
+
+# spec: ANYM-536
+def test_a_never_set_item_links_and_an_unknown_id_refuses_only_its_own_call(tmp_path):
+    unknown = IDS[20]
+    prod = Prod({A: dict(disp(), at=None)})
+
+    def run(host, argv):
+        if unknown in flags(argv)['--id']:
+            raise sync.Refused('set-feedback-status refused: unknown_feedback')
+        return prod.run(host, argv)
+    main = main_of(carded(30, f'Feedback: {A}'), carded(31, f'Feedback: {unknown}'))
+    assert auto(tmp_path, prod, '--apply', main=main, run=run) == 0
+    assert shown(prod, A) == disp('accepted', 'ANYM-30', note='Carded as ANYM-30; it follows that card.')
+    report = synced(tmp_path, 'last-run.json')
+    assert report['reasons']['not linked'] == [{'feedback': unknown, 'card': 'ANYM-31'}] and report['written'] == 1
+    assert not (state_dir(tmp_path) / 'pending.json').exists()
+
+
+# spec: ANYM-536
+def test_a_feedback_line_in_a_fence_a_comment_or_a_quote_is_not_a_link(tmp_path):
+    prod = Prod({i: disp('received') for i in (A, B, C, D)})
+    main = main_of(carded(33, f'History: example\n```text\nFeedback: {A}\n```\n<!-- Feedback: {B} -->\n'
+                              f'~~~\nFeedback: {C}\n~~~\nFeedback: {D}'),
+                   carded(34, f'> Feedback: {D}\n```\nFeedback: {D}\n```'))
+    assert auto(tmp_path, prod, '--apply', main=main) == 0
+    assert written_ids(prod) == [[D]] and prod.rows[D]['spec_ref'] == 'ANYM-33'
+    assert [prod.rows[i]['status'] for i in (A, B, C)] == ['received'] * 3
+
+
+# spec: ANYM-536
+@pytest.mark.parametrize('bad', ['pending', 'tiden'])
+def test_a_malformed_pending_record_or_tiden_reply_still_replaces_the_report(tmp_path, bad):
+    prod = Prod({})
+    assert auto(tmp_path, prod, '--apply') == 0
+    good = synced(tmp_path, 'last-run.json')
+    if bad == 'pending':
+        (state_dir(tmp_path) / 'pending.json').write_text('{')
+        assert auto(tmp_path, prod, '--apply') == 1
+    else:
+        main = {'requirements': [None], 'pagination': {'nextPageToken': '', 'totalCount': 1}}
+        assert auto(tmp_path, prod, '--apply', main=main) == 1
+    report = synced(tmp_path, 'last-run.json')
+    assert report['at'] != good['at'] and report['exit'] == 1 and report['error']
+    assert report['last_ok'] == good['last_ok']
+    assert report['pending'] == ({'malformed': True} if bad == 'pending' else None)
+
+
+# spec: ANYM-536
+def test_a_superseded_queue_row_stays_superseded_when_follow_moves_the_item(tmp_path):
+    root, shas = repo(tmp_path, ['one'])
+    gh, _ = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', shas['one'])]})
+    prod = Prod({A: disp('accepted', 'ANYM-10')})  # a hand decision at 09:00
+    path = publish(tmp_path, 'one.json', {A: disp('declined')}, START - timedelta(hours=1))
+    assert sync.main(['auto', '--apply', '--state', str(state_dir(tmp_path)), '--triage-state', str(triage_dir(tmp_path))],
+                     ssh=prod.ssh, read=lambda *argv: MAIN, live=lambda commit: None, gh=gh, run=prod.run, root=root,
+                     fetch=False) == 0
+    assert prod.rows[A]['status'] == 'fixed' and flags(prod.writes[0])['--status'] == 'fixed'
+    assert synced(tmp_path, 'applied.json')['files'][path.name]['rows'][A]['outcome'] == 'superseded'

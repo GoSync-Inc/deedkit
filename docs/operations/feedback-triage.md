@@ -119,14 +119,17 @@ python3 scripts/feedback_sync.py status
   `~/.deedkit/feedback-triage`) that `applied.json` (file name, SHA-256, rows done) does not
   record as complete. A row is written with `--unchanged-since` at its `decided_at` (at most the
   export head minus 10 s); an item changed after that time is `superseded` and keeps its value, so
-  a hand correction stands. An equal row republished later keeps the earliest decision time. A
+  a hand correction stands. An equal row republished later keeps the earliest decision time, which
+  `applied.json` keeps before any call, also after its file is refused or removed. A
   file with a row without `decided_at` (from before ANYM-536) is listed `legacy` and stays a hand
   `apply`; `--retire` records it complete without a write. A row skipped as `changed during read`
   or behind a pending call keeps its file open. A ledgered file whose SHA-256 changed is refused
   and named (exit 1); the other files and `follow` still run.
 - Link: a `received` item without a card whose full ID is in a `Feedback:` line of exactly one
   card on Tiden main becomes `accepted` with that card and the note "Carded as ANYM-n; it follows
-  that card."; the next run follows the card. Two or more cards: `several cards`, no write.
+  that card."; the next run follows the card. Two or more cards: `several cards` with their IDs, no
+  write. A line in a fenced block, an HTML comment or a quote does not link. An item never set is
+  linked too, one call each; an unknown ID is reported `not linked` and the run goes on.
 - Follow: as `follow` above. A card on main is recorded in `cards.json` with the first time seen;
   an `accepted` or `received` item whose card was seen and is gone is `card missing`, one whose
   card was never on main (a proposal branch match) is `waiting for main` with its age. Neither

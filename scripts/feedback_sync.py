@@ -72,6 +72,8 @@ FIXED_IN = re.compile(r'deedkit@[0-9a-f]{40}')
 SHA = re.compile(r'[0-9a-f]{40}')
 # ANYM-536: the card line that links feedback to it; the ID anywhere else in a card (History, a quote) does not.
 FEEDBACK_LINE = re.compile(r'^Feedback: ({0}(?:, {0})*)[ \t]*\r?$'.format(UUID.pattern), re.MULTILINE)
+FENCE = re.compile(r'^ {0,3}(```|~~~)')
+COMMENT = re.compile(r'<!--.*?(?:-->|\Z)', re.DOTALL)
 STALE = timedelta(hours=3)
 # Queue outcomes that close a row: written, already so, newer than its decision, or kept by the never-down rule.
 CLOSED = ('written', 'unchanged', 'superseded', 'further along', 'agent verdict kept')
@@ -371,6 +373,7 @@ def set_command(digest, target, ids, since, until):
 REFUSALS = re.compile(r'^ValueError: (changed_since_plan|not_after_passed|unknown_feedback|duplicate_of_\w+|'
                       r'invalid_\w+|\w+_required|feedback_ids_1_to_100|status_reserved_for_reporting_agent)\b',
                       re.MULTILINE)
+UNLINKABLE = re.compile(r'refused: (unknown_feedback|changed_since_plan)$')
 USAGE = re.compile(r': error: unrecognized arguments: --(unchanged-since|not-after)')
 
 
@@ -484,7 +487,10 @@ def digest_of(target):
 
 def ledger_load(state):
     ledger = triage.load(state / 'applied.json', {'files': {}})
-    if not isinstance(ledger, dict) or not isinstance(ledger.get('files'), dict):
+    decided = ledger.get('decided', {}) if isinstance(ledger, dict) else None
+    if not isinstance(ledger, dict) or not isinstance(ledger.get('files'), dict) or not isinstance(decided, dict) or \
+            not all(isinstance(keys, dict) and all(isinstance(text, str) for text in keys.values())
+                    for keys in decided.values()):
         raise Refused('applied.json is malformed; nothing is written until it is inspected')
     return ledger
 
@@ -513,12 +519,17 @@ def queue(directory, ledger):
 
 def plan_queue(files, ledger, state_now, since):
     """One entry per item with an open row: (i, now, target, reason, unchanged_since, members, older). `members` are
-    the open rows equal to the decision that stands, `older` the open rows a newer decision for the item replaced."""
+    the open rows equal to the decision that stands, `older` the open rows a newer decision for the item replaced.
+    The earliest decision time of every row seen goes to the ledger's `decided`, saved before any call, so it
+    outlives a refused or removed source file."""
     earliest = {}
 
     def seen(key, text):
         value = moment(text, 'decided_at')
         earliest[key] = min(earliest.get(key, value), value)
+    for i, keys in ledger.get('decided', {}).items():
+        for key, text in keys.items():
+            seen((i, key), text)
     for entry in ledger['files'].values():
         for i, row in (entry.get('rows') or {}).items():
             if row.get('decided_at'):
@@ -530,6 +541,11 @@ def plan_queue(files, ledger, state_now, since):
             seen((i, digest_of(target)), decided[i])  # a republished equal row keeps the earliest decision time
             if i not in done:
                 opened.setdefault(i, []).append((name, digest_of(target), target))
+    remembered = {}
+    for (i, key), value in sorted(earliest.items()):
+        remembered.setdefault(i, {})[key] = value.isoformat()
+    if remembered:
+        ledger['decided'] = remembered
     bound, out = datetime.fromisoformat(since), []
     for i, rows in sorted(opened.items()):
         name, key, target = max(rows, key=lambda row: (earliest[i, row[1]], row[0]))
@@ -551,19 +567,29 @@ def ledger_mark(ledger, files, name, i, key, decided, outcome):
 
 
 def links(main):
-    """feedback ID -> the cards on main whose own `Feedback: <id>[, <id>]` line names it."""
+    """feedback ID -> the cards on main whose own `Feedback: <id>[, <id>]` line names it; a line in a fenced block,
+    an HTML comment or a quote is an example, not a link."""
     out = {}
     for spec in main:
-        for line in FEEDBACK_LINE.finditer(spec['text']):
+        kept, fence = [], None
+        for line in COMMENT.sub('', spec['text']).splitlines():
+            mark = FENCE.match(line)
+            if fence or mark:
+                fence = None if fence and mark and mark.group(1) == fence else fence or mark.group(1)
+                continue
+            kept.append(line)
+        for line in FEEDBACK_LINE.finditer('\n'.join(kept)):
             for i in line.group(1).split(', '):
                 out.setdefault(i, set()).add(spec['ref'])
     return out
 
 
 def plan_link(state_now, linked, since, busy):
+    """An item the inventory lacks was never set (or set after the head, which the setter refuses)."""
     rows = []
-    for i, now in sorted(state_now.items()):
-        if i in busy or i not in linked or now['status'] != 'received' or now['spec_ref']:
+    for i in sorted(linked):
+        now = state_now.get(i, received())
+        if i in busy or now['status'] != 'received' or now['spec_ref']:
             continue
         refs = sorted(linked[i])
         if len(refs) > 1:
@@ -596,9 +622,15 @@ def auto(args, ssh, read, live, gh, run, root, fetch):
     except (Refused, ValueError) as error:
         print(f'REFUSED {error}', file=sys.stderr)
         report['error'], code = str(error), 1
+    except Exception as error:  # a malformed read never skips the report; only the type, never read content
+        print(f'REFUSED unexpected {type(error).__name__}', file=sys.stderr)
+        report['error'], code = f'unexpected {type(error).__name__}', 1
     if args.apply:
         if (state / 'pending.json').exists():
-            entry = triage.load(state / 'pending.json', {})
+            try:
+                entry = triage.load(state / 'pending.json', {})
+            except ValueError:
+                entry = None
             report['pending'] = {key: entry.get(key) for key in ('action', 'ids', 'to', 'not_after')} \
                 if isinstance(entry, dict) else {'malformed': True}
         report['exit'] = code
@@ -627,7 +659,8 @@ def auto_run(args, ssh, read, live, gh, run, root, fetch, report):
     status = {spec['ref']: spec['status'] for spec in main}
     queued = plan_queue(files, ledger, state_now, since)
     busy = {entry[0] for entry in queued if entry[2]}
-    linked = plan_link(state_now, links(main), since, busy)
+    cards_of = links(main)
+    linked = plan_link(state_now, cards_of, since, busy)
     rest = {i: now for i, now in state_now.items() if i not in busy | {row[0] for row in linked}}
     refs = {ref for ref in wanted(rest, since) if status.get(ref) == 'Done'}
     followed = []
@@ -647,7 +680,9 @@ def auto_run(args, ssh, read, live, gh, run, root, fetch, report):
         print(f'## {title}')
         writes += show(rows)
         for i, now, target, reason in rows:
-            report['reasons'].setdefault(reason, []).append({'feedback': i, 'card': (target or now)['spec_ref']})
+            row = {'feedback': i, 'card': (target or now)['spec_ref']}
+            report['reasons'].setdefault(reason, []).append(dict(row, cards=sorted(cards_of[i])) if
+                                                            reason == 'several cards' else row)
     code = 1 if files_report['refused'] else 0
     for name, why in sorted(files_report['refused'].items()):
         print(f'REFUSED {name}: {why}', file=sys.stderr)
@@ -675,6 +710,9 @@ def auto_run(args, ssh, read, live, gh, run, root, fetch, report):
                 for name, key, decided in members.get(i, ()):
                     ledger_mark(ledger, files, name, i, key, decided, 'written')
             triage.save(state / 'applied.json', ledger)
+            counted(ids)
+
+        def counted(ids):  # link and follow calls close no queue row
             report['written'] += len(ids)
         buckets = {}
         for i, now, target, _, unchanged, _, _ in queued:
@@ -682,9 +720,19 @@ def auto_run(args, ssh, read, live, gh, run, root, fetch, report):
                 buckets.setdefault(unchanged, []).append((i, now, target, 'disposition'))
         for unchanged in sorted(buckets, key=datetime.fromisoformat):
             write(state, args.host, digest, 'apply', buckets[unchanged], unchanged, until, run, done)
-        for action, rows in (('link', linked), ('follow', followed)):
-            if any(row[2] for row in rows):
-                write(state, args.host, digest, action, rows, since, until, run, done)
+        known_rows = [row for row in linked if row[0] in state_now]
+        if any(row[2] for row in known_rows):
+            write(state, args.host, digest, 'link', known_rows, since, until, run, counted)
+        for row in linked:
+            if row[2] and row[0] not in state_now:  # one call each: an unknown ID refuses only its own call
+                try:
+                    write(state, args.host, digest, 'link', [row], since, until, run, counted)
+                except Refused as error:
+                    if not UNLINKABLE.search(str(error)):
+                        raise
+                    report['reasons'].setdefault('not linked', []).append({'feedback': row[0], 'card': row[2]['spec_ref']})
+        if any(row[2] for row in followed):
+            write(state, args.host, digest, 'follow', followed, since, until, run, counted)
     finally:
         for name in sorted(files):
             files_report['complete' if ledger['files'][name]['complete'] else 'open'].append(name)
