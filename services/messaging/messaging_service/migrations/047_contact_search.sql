@@ -6,6 +6,8 @@
 CREATE INDEX IF NOT EXISTS message_metadata_contact ON message_metadata(message) WHERE metadata ? 'contact';
 -- An interrupted concurrent build leaves an INVALID index that IF NOT EXISTS then skips.
 DO $$ BEGIN
+ -- The expected text is the default deparse; quote_all_identifiers=on would quote every name.
+ PERFORM set_config('quote_all_identifiers','off',true);
  IF NOT coalesce((SELECT i.indisvalid AND i.indisready AND pg_get_indexdef(i.indexrelid)=
    'CREATE INDEX message_metadata_contact ON public.message_metadata USING btree (message) WHERE (metadata ? ''contact''::text)'
    FROM pg_index i WHERE i.indexrelid='public.message_metadata_contact'::regclass),false) THEN

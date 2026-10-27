@@ -296,18 +296,20 @@ def test_migration_047_indexes_only_contact_metadata_and_repeats_over_schema46_r
             assert [r['message'] for r in c.execute("SELECT message FROM message_metadata WHERE metadata ? 'contact'")]==[card]
 
 
-def build_contact_index(store,valid):
+def build_contact_index(store,shape):
     with store.pool.connection() as c:
-        c.execute("CREATE INDEX message_metadata_contact ON message_metadata(message) WHERE metadata ? 'contact'")
+        index={'other_key':'message_metadata(revision)',
+            'no_predicate':'message_metadata(message)'}.get(shape,"message_metadata(message) WHERE metadata ? 'contact'")
+        c.execute('CREATE INDEX message_metadata_contact ON '+index)
         # What an interrupted CREATE INDEX CONCURRENTLY leaves behind.
-        if not valid:c.execute("UPDATE pg_index SET indisvalid=false WHERE indexrelid='message_metadata_contact'::regclass")
+        if shape=='invalid':c.execute("UPDATE pg_index SET indisvalid=false WHERE indexrelid='message_metadata_contact'::regclass")
 
 
 # spec: ANYM-529
 def test_migration_047_keeps_an_index_built_before_it(database,tmp_path):
     from test_extend_key import old_schema_store
     with old_schema_store(database,tmp_path,46) as store:
-        build_contact_index(store,True)
+        build_contact_index(store,'valid')
         with store.pool.connection() as c:
             before=c.execute("SELECT 'message_metadata_contact'::regclass::oid AS i").fetchone()['i']
         store.migrate();store.migrate()
@@ -318,11 +320,12 @@ def test_migration_047_keeps_an_index_built_before_it(database,tmp_path):
 
 
 # spec: ANYM-529
-def test_migration_047_refuses_an_invalid_prebuilt_index(database,tmp_path):
+@pytest.mark.parametrize('shape',['invalid','other_key','no_predicate'])
+def test_migration_047_refuses_an_unusable_prebuilt_index(database,tmp_path,shape):
     import psycopg
     from test_extend_key import old_schema_store
     with old_schema_store(database,tmp_path,46) as store:
-        build_contact_index(store,False)
+        build_contact_index(store,shape)
         with pytest.raises(psycopg.errors.RaiseException,match='not a valid index'):store.migrate()
         with store.pool.connection() as c:
             assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='46'
