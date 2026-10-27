@@ -132,3 +132,36 @@ def test_absent_file_query_reads_bounded_file_candidates(seeded):
     assert result['items']==[]
     assert measured.plans and sum(visited(plan,{'attachment_text','attachments','attachment_text_chunks',
         'attachment_enrichment','attachment_enrichment_chunks','messages'}) for plan in measured.plans)<100, [scans(plan) for plan in measured.plans]
+
+
+def nodes(node):
+    return [node]+sum((nodes(child) for child in node.get('Plans',[])),[])
+
+
+# spec: ANYM-579
+def test_common_caption_file_query_joins_caption_candidates(seeded):
+    from test_file_index import add_file
+    s,a,b=seeded
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='60s'")
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
+            SELECT 'caption-common-'||n,'telegram-demo','telegram-demo-chat','caption-common-'||n,'fixture',
+                'commoncaptionneedle report',now()+n*interval '1 second'
+            FROM generate_series(1,3000) n''')
+        # Distinct digests: a shared digest would let attachment_occurrences seek by message.
+        c.execute('''INSERT INTO attachments(id,message,digest,filename,mime,bytes)
+            SELECT 'caption-file-'||n,'caption-common-'||n,md5(n::text)||md5('d'||n),'scan.jpg','image/jpeg',1
+            FROM generate_series(2,3000) n''')
+    add_file(s,'caption-visible','caption-common-1',b'synthetic caption scan','scan.jpg','image/jpeg')
+    with s.pool.connection() as c:
+        for table in ('messages','attachments','attachment_text'):c.execute('ANALYZE '+table)
+    with s.authorized(b,'search_files') as (c,p):
+        measured=Measured(c)
+        result=search_files(s,measured,p,query='commoncaptionneedle')
+    assert [item['attachment_id'] for item in result['items']]==['caption-visible']
+    assert result['items'][0]['match_sources']==['message_context']
+    found=[node for plan in measured.plans for node in nodes(plan) if node.get('Relation Name')=='attachments']
+    # A per-row array compare costs attachments x caption matches (5.9 s in production, ANYM-579).
+    assert not [node for node in found if 'message = ANY' in node.get('Filter','')+node.get('Index Cond','')], [scans(plan) for plan in measured.plans]
+    caption_scans=[node for node in found if node.get('Alias')=='ca']
+    assert caption_scans and all(node.get('Actual Loops')==1 for node in caption_scans), caption_scans
