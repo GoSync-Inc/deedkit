@@ -109,22 +109,42 @@ def _view(c, row):
 
 
 def _delivery_view(c, row):
-    binding = c.execute('SELECT receiver FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
+    # Every column: before schema 49 the binding has no endpoint column (rolling upgrade).
+    binding = c.execute('SELECT * FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
     counts = c.execute('''SELECT state,count(*) AS n FROM subscription_outbox WHERE subscription=%s
         GROUP BY state''', (row['id'],)).fetchall()
     # An unbound subscription reads no policy state, so its view needs no schema-38 column.
     from .delivery_policy import UNBOUND, delivery_state
-    return {'passive_read': True, 'ack': True, 'push': binding is not None,
-        'receiver_id': str(binding['receiver']) if binding else None, 'host_wakeup': 'unverified',
+    view = {'passive_read': True, 'ack': True, 'push': binding is not None,
+        'receiver_id': str(binding['receiver']) if binding and binding['receiver'] else None, 'host_wakeup': 'unverified',
         'host_turn_verified': False, 'hint_counts': {item['state']: item['n'] for item in counts},
         **(delivery_state(c, row) if binding else UNBOUND)}
+    if binding and binding.get('endpoint'):
+        # ANYM-519: a deleted endpoint leaves the subscription pull-only; a paused one names its state.
+        endpoint = c.execute('SELECT state FROM delivery_endpoints WHERE id=%s', (binding['endpoint'],)).fetchone()
+        state = endpoint['state'] if endpoint else 'deleted'
+        view.update(endpoint_id=str(binding['endpoint']), target='endpoint', push=state == 'enabled',
+            reason=None if state == 'enabled' else 'endpoint_deleted' if state == 'deleted' else state)
+        if state == 'deleted':
+            view.update(target='none', endpoint_id=None)
+    return view
 
 
 def create_subscription(store, c, p, chat_ids, *, sender_ids=None, kinds=None,
-        direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None):
+        direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None,
+        delivery=None):
     from .store import APIError, date_bound
     if 'read' not in p['permissions']:
         raise APIError('forbidden', 403)
+    if delivery is not None:
+        # ANYM-519: bind a self-service endpoint in the same transaction (configure_subscription_delivery's checks).
+        if not isinstance(delivery, dict) or 'endpoint_id' not in delivery or set(delivery) - {'endpoint_id', 'delivery_policy'}:
+            raise APIError('invalid_parameters')
+        from .delivery_endpoints import gate_on
+        if 'delivery-write' not in p['permissions']:
+            raise APIError('forbidden', 403)
+        if not gate_on(c):
+            raise APIError('delivery_disabled', 409)
     chats = _ids(chat_ids, required=True)
     senders = _ids(sender_ids)
     kinds = _ids(['message.created'] if kinds is None else kinds, required=True)
@@ -204,6 +224,12 @@ def create_subscription(store, c, p, chat_ids, *, sender_ids=None, kinds=None,
         c.execute('INSERT INTO subscription_sources(subscription,account,chat,sender_ids) VALUES(%s,%s,%s,%s)',
             (row['id'], source['account'], source['id'], selected))
     targets(p, [str(row['id'])])
+    if delivery is not None:
+        from .event_delivery import configure_subscription_delivery
+        result = configure_subscription_delivery(store, c, p, str(row['id']), row['version'], None,
+            delivery.get('delivery_policy'), delivery['endpoint_id'])
+        targets(p, [str(row['id'])])
+        return result
     return _view(c, row)
 
 

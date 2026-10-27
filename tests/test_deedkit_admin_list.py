@@ -471,3 +471,28 @@ def test_the_deedkit_launcher_routes_admin_to_the_admin_cli(stores, capsys, monk
     assert done.value.code == 0
     assert [row["id"] for row in json.loads(capsys.readouterr().out)["principals"]] == ["claude-code"]
 
+
+
+# spec: ANYM-519
+def test_delivery_endpoints_list_disable_enable_run_the_messaging_operator_commands(tmp_path, capsys):
+    config = tmp_path / "admin.json"
+    config.write_text("{}")
+    config.chmod(0o600)
+    calls = []
+    def run(service, args, data=None):
+        calls.append((service, args))
+        if args[0] == "delivery-endpoints-list":
+            return {"items": [{"endpoint_id": "synthetic", "header_names": ["Authorization"]}]}
+        return {"endpoint_id": args[-1], "state": "operator_disabled" if args[0].startswith("disable") else "enabled"}
+    endpoint = "5f0c2a8e-2b8f-4c1d-9d36-0e6b1c1f9a01"
+    base = ["--config", str(config), "delivery-endpoints"]
+    assert admin.main(base + ["list", "--principal", "endpoint-agent"], run=run) == 0
+    assert json.loads(capsys.readouterr().out)["items"][0]["header_names"] == ["Authorization"]
+    assert admin.main(base + ["disable", endpoint], run=run) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "operator_disabled"
+    assert admin.main(base + ["enable", endpoint.upper()], run=run) == 0
+    assert calls == [("messaging", ["delivery-endpoints-list", "--principal", "endpoint-agent"]),
+        ("messaging", ["disable-delivery-endpoint", "--id", endpoint]),
+        ("messaging", ["enable-delivery-endpoint", "--id", endpoint])]
+    # A malformed ID never reaches the operator command.
+    assert admin.main(base + ["disable", "not-a-uuid"], run=run) == 2 and len(calls) == 3

@@ -41,6 +41,9 @@ SAFE_ERROR_CODES = frozenset({
     'subscription_wait_timeout','subscription_receipt_limit','invalid_feedback','feedback_limit',
     'invalid_receiver','delivery_not_configured','consumer_already_initialized',
     'send_wait_busy','send_status_timeout','send_access_changed','send_expired','send_result_unknown',
+    # ANYM-519: self-service webhook endpoints.
+    'delivery_disabled','delivery_policy_unset','unsafe_endpoint','invalid_signing_secret','invalid_header','reserved_header',
+    'rotation_in_progress','endpoint_limit','endpoint_conflict','operator_disabled','invalid_endpoint_state','endpoint_paused','endpoint_auto_paused',
 })
 
 _UPLOAD_CHUNK_BYTES = 262144
@@ -127,7 +130,7 @@ _MESSENGER_FIELDS = {
 _OMITTED = object()
 _SUBSCRIPTION_FIELDS = {
     'create_subscription': ({'chat_ids'}, {'chat_ids','sender_ids','kinds','direction','origins','label','expires_at',
-        'wake_rules','reply_to_send'}),
+        'wake_rules','reply_to_send','delivery'}),
     'list_subscriptions': (set(), {'limit'}),
     'get_subscription': ({'subscription_id'}, {'subscription_id'}),
     'update_subscription': ({'subscription_id','version','action'},
@@ -136,8 +139,14 @@ _SUBSCRIPTION_FIELDS = {
     'fetch_subscription_events': ({'subscription_id'}, {'subscription_id','limit'}),
     'ack_subscription_events': ({'subscription_id','receipt','version'}, {'subscription_id','receipt','version'}),
     'wait_for_subscription_events': ({'subscription_id'}, {'subscription_id','timeout','limit'}),
-    'configure_subscription_delivery': ({'subscription_id','version'}, {'subscription_id','version','receiver_id','delivery_policy'}),
+    'configure_subscription_delivery': ({'subscription_id','version'}, {'subscription_id','version','receiver_id','delivery_policy','endpoint_id'}),
     'test_subscription': ({'subscription_id','request_id'}, {'subscription_id','request_id'}),
+    # ANYM-519: the caller's own webhook endpoints. Secrets and header values are write-only.
+    'register_delivery_endpoint': ({'request_id','url','signing_secret'}, {'request_id','url','signing_secret','label','headers'}),
+    'list_delivery_endpoints': (set(), set()),
+    'update_delivery_endpoint': ({'endpoint_id','version','action'}, {'endpoint_id','version','action','new_secret','headers'}),
+    'delete_delivery_endpoint': ({'endpoint_id','version'}, {'endpoint_id','version'}),
+    'test_delivery_endpoint': ({'endpoint_id','request_id'}, {'endpoint_id','request_id'}),
 }
 _FEEDBACK_STATUSES = ('received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened')
 _FEEDBACK_FIELDS = {
@@ -158,6 +167,15 @@ def _wait_seconds(value):
     if type(value) not in (int,float) or not math.isfinite(value) or not 0<=value<=25:
         raise ValueError('invalid_parameters')
     return value
+
+
+def _uuid(value):
+    return isinstance(value,str) and bool(re.fullmatch(
+        r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',value))
+
+
+def _signing_secret(value):
+    return isinstance(value,str) and bool(re.fullmatch(r'whsec_[A-Za-z0-9+/=]{32,96}',value))
 
 
 def _request_id(value):
@@ -186,16 +204,26 @@ def _subscription_parameters(operation, parameters):
         elif name=='receipt':valid=isinstance(value,str) and 32<=len(value)<=128
         elif name=='timeout':_wait_seconds(value)
         elif name=='request_id':valid=_request_id(value)
-        elif name=='receiver_id':
-            valid=value is None or isinstance(value,str) and bool(re.fullmatch(
-                r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',value))
+        elif name=='receiver_id':valid=value is None or _uuid(value)
+        elif name=='endpoint_id':valid=(value is None and operation=='configure_subscription_delivery') or _uuid(value)
+        elif name=='url':valid=isinstance(value,str) and 1<=len(value)<=2048
+        elif name in ('signing_secret','new_secret'):valid=(value is None and name=='new_secret') or _signing_secret(value)
+        # The server checks header names, reserved names and values (invalid_header, reserved_header).
+        elif name=='headers':
+            valid=value is None or isinstance(value,dict) and len(value)<=4 and all(
+                isinstance(k,str) and isinstance(v,str) for k,v in value.items())
+        elif name=='delivery':
+            valid=value is None or (isinstance(value,dict) and 'endpoint_id' in value
+                and not value.keys()-{'endpoint_id','delivery_policy'} and _uuid(value['endpoint_id'])
+                and isinstance(value.get('delivery_policy',{}),dict) and len(json.dumps(value))<=4096)
         elif name=='reply_to_send':valid=value is None or isinstance(value,str) and 1<=len(value)<=128
         # The server validates fields and bounds (invalid_delivery_policy); the envelope is a small object.
         elif name=='delivery_policy':valid=value is None or isinstance(value,dict) and len(json.dumps(value))<=4096
         elif name=='label':valid=isinstance(value,str) and len(value)<=128 and not re.search(r'[\x00-\x1f\x7f]',value)
         elif name in ('action','direction','resume_policy'):
             valid=isinstance(value,str) and value in {
-                'action':('pause','resume','close'), 'direction':('','incoming','outgoing'),
+                'action':('pause','resume','close') if operation=='update_subscription'
+                    else ('rotate_secret','set_headers','pause','resume'), 'direction':('','incoming','outgoing'),
                 'resume_policy':('catch_up','skip')}[name]
         elif name=='expires_at':
             if value is None:continue
@@ -544,16 +572,18 @@ class Client:
 
     def create_subscription(self, *, chat_ids, sender_ids=None, kinds=None,
                             direction='incoming', origins=None, label='', expires_at=None,
-                            wake_rules=None, reply_to_send=None):
+                            wake_rules=None, reply_to_send=None, delivery=None):
         """Persist explicit archived sources from the committed boundary; no push or provider action.
 
         Requires read and explicit subscription-write. A timeout can leave creation
         uncertain: inspect list_subscriptions before retrying. Names are not sender IDs.
+        delivery={'endpoint_id': ..., 'delivery_policy': ...} binds your own endpoint (delivery-write).
         """
         parameters=dict(chat_ids=chat_ids,sender_ids=sender_ids,kinds=kinds,direction=direction,
             origins=origins,label=label,expires_at=expires_at)
         if wake_rules is not None:parameters['wake_rules']=wake_rules
         if reply_to_send is not None:parameters['reply_to_send']=reply_to_send
+        if delivery is not None:parameters['delivery']=delivery
         return self.call('create_subscription',parameters)
 
     def list_subscriptions(self, *, limit=50):
@@ -585,15 +615,46 @@ class Client:
         """Wait up to 25 seconds without ACK or provider polling. Explicit client timeouts apply."""
         return self.call('wait_for_subscription_events',dict(subscription_id=subscription_id,timeout=timeout,limit=limit))
 
-    def configure_subscription_delivery(self, *, subscription_id, version, receiver_id=None, delivery_policy=None):
-        """Bind an operator-registered receiver, or disable with None. URLs are not accepted."""
+    def configure_subscription_delivery(self, *, subscription_id, version, receiver_id=None, delivery_policy=None,
+                                        endpoint_id=None):
+        """Bind an operator-registered receiver or your own endpoint_id (not both), or disable with None. URLs are not accepted."""
         arguments = dict(subscription_id=subscription_id,version=version,receiver_id=receiver_id)
         if delivery_policy is not None: arguments['delivery_policy'] = delivery_policy
+        if endpoint_id is not None: arguments['endpoint_id'] = endpoint_id
         return self.call('configure_subscription_delivery',arguments)
 
     def test_subscription(self, *, subscription_id, request_id):
         """Queue an idempotent synthetic hint; receiver success never proves a host turn."""
         return self.call('test_subscription',dict(subscription_id=subscription_id,request_id=request_id))
+
+    def register_delivery_endpoint(self, *, request_id, url, signing_secret, label='', headers=None):
+        """Register your own HTTPS endpoint inside the operator's host policy; returns a signed test's result.
+
+        Requires read and explicit delivery-write. signing_secret (whsec_<base64>) and header
+        values are write-only and never returned. Repeat the same request_id to recover a lost response.
+        """
+        arguments=dict(request_id=request_id,url=url,signing_secret=signing_secret,label=label)
+        if headers is not None:arguments['headers']=headers
+        return self.call('register_delivery_endpoint',arguments)
+
+    def list_delivery_endpoints(self):
+        """This key's endpoints with header names and fingerprints, never secrets or header values."""
+        return self.call('list_delivery_endpoints',{})
+
+    def update_delivery_endpoint(self, *, endpoint_id, version, action, new_secret=None, headers=None):
+        """Version-checked rotate_secret (new_secret), set_headers (headers), pause or resume of your endpoint."""
+        arguments=dict(endpoint_id=endpoint_id,version=version,action=action)
+        if new_secret is not None:arguments['new_secret']=new_secret
+        if headers is not None:arguments['headers']=headers
+        return self.call('update_delivery_endpoint',arguments)
+
+    def delete_delivery_endpoint(self, *, endpoint_id, version):
+        """Delete your endpoint; bound subscriptions become pull-only."""
+        return self.call('delete_delivery_endpoint',dict(endpoint_id=endpoint_id,version=version))
+
+    def test_delivery_endpoint(self, *, endpoint_id, request_id):
+        """Send one signed test delivery; the same request_id reads the same test back."""
+        return self.call('test_delivery_endpoint',dict(endpoint_id=endpoint_id,request_id=request_id))
 
     def submit_feedback(self, *, request_id, category, description, operation=None, refs=None):
         """Record bounded private feedback locally. Never forwards or publishes it."""

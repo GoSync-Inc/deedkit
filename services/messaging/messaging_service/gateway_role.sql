@@ -82,3 +82,15 @@ GRANT SELECT ON person_links TO messaging_gateway;
 GRANT SELECT ON message_purges,chat_tombstones TO messaging_gateway;
 -- Schema 48: the hint dispatcher's liveness row (ANYM-518), read by capabilities.
 GRANT SELECT ON subscription_dispatcher_heartbeat TO messaging_gateway;
+-- Schema 49 (ANYM-519): self-service endpoints. Header values and signing secrets are write-only here:
+-- INSERT and UPDATE, never SELECT (no RETURNING or SET reads them either); only the dispatcher reads them.
+-- signing_secret UPDATE exists only to clear it on delete. Privilege separation, not encryption.
+GRANT SELECT(id,principal,key_id,request_id,request_hash,url,host,label,header_names,headers_fingerprint,
+    secret_fingerprint,pending_fingerprint,rotation_started_at,state,version,created_at,updated_at)
+    ON delivery_endpoints TO messaging_gateway;
+GRANT INSERT(principal,key_id,request_id,request_hash,url,host,label,header_names,headers_fingerprint,
+    secret_fingerprint,header_values,signing_secret) ON delivery_endpoints TO messaging_gateway;
+GRANT UPDATE(header_names,headers_fingerprint,header_values,pending_secret,pending_fingerprint,rotation_started_at,
+    signing_secret,state,version,updated_at) ON delivery_endpoints TO messaging_gateway;
+GRANT SELECT,INSERT ON delivery_endpoint_tests TO messaging_gateway;
+GRANT UPDATE(state,finished_at,error_code) ON delivery_endpoint_tests TO messaging_gateway;

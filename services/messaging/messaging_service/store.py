@@ -374,6 +374,8 @@ class Store:
                 features['subscription-ack']=['ack_subscription_events']
                 features['feedback-write']=['submit_feedback']
                 features['subscription-write']=['create_subscription','update_subscription','configure_subscription_delivery','test_subscription']
+                from .delivery_endpoints import TOOLS as delivery_tools
+                features['delivery-write']=list(delivery_tools)
             available=[feature for permission,names in features.items() if permission in p['permissions'] for feature in names]
             if {'read','send','upload'}<=set(p['permissions']):
                 available.extend(['prepare_file_upload','upload_file_chunk','get_file_upload'])
@@ -1022,11 +1024,13 @@ class Store:
                 expected_ack_version=expected_ack_version,start_from=start_from,view=view)
 
     def create_subscription(self, token, chat_ids, *, sender_ids=None, kinds=None,
-                            direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None):
+                            direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None,
+                            delivery=None):
         from .subscriptions import create_subscription
         with self.authorized(token, 'create_subscription') as (c, p):
             return create_subscription(self, c, p, chat_ids, sender_ids=sender_ids, kinds=kinds,
-                direction=direction, origins=origins, label=label, expires_at=expires_at, wake_rules=wake_rules, reply_to_send=reply_to_send)
+                direction=direction, origins=origins, label=label, expires_at=expires_at, wake_rules=wake_rules, reply_to_send=reply_to_send,
+                delivery=delivery)
 
     def list_subscriptions(self, token, *, limit=50):
         from .subscriptions import list_subscriptions
@@ -1059,10 +1063,78 @@ class Store:
         with self.authorized(token, 'ack_subscription_events') as (c, p):
             return ack_subscription_events(self, c, p, subscription_id, receipt, version)
 
-    def configure_subscription_delivery(self, token, subscription_id, version, receiver_id, delivery_policy=None):
+    def configure_subscription_delivery(self, token, subscription_id, version, receiver_id=None, delivery_policy=None,
+                                        endpoint_id=None):
         from .event_delivery import configure_subscription_delivery
         with self.authorized(token, 'configure_subscription_delivery') as (c, p):
-            return configure_subscription_delivery(self, c, p, subscription_id, version, receiver_id, delivery_policy)
+            return configure_subscription_delivery(self, c, p, subscription_id, version, receiver_id, delivery_policy,
+                endpoint_id)
+
+    # ANYM-519: self-service endpoints. Each sync method returns at once; a staged test is pending until
+    # the dispatcher sends it (delivery_endpoints.finish_inline_test waits for it).
+    def endpoint_authorized(self, token, operation):
+        # Before schema 49 (rolling upgrade) the audit CHECK has no endpoint operation: the denial is audited as
+        # http_boundary (in schema 48's CHECK) for the caller, on REST and MCP alike, and answers delivery_disabled.
+        from .delivery_endpoints import schema_ready
+        with self.pool.connection() as c:
+            ready = schema_ready(c)
+        if not ready:
+            with self.authorized(token) as (c, p):
+                audit(c, p, 'http_boundary', 'denied', 'delivery_disabled')
+            error = APIError('delivery_disabled', 409)
+            error.operation, error.audited = operation, True
+            raise error
+        return self.authorized(token, operation)
+
+    def register_delivery_endpoint(self, token, request_id, url, signing_secret, label='', headers=None, *, resolver=None):
+        from .delivery_endpoints import register_delivery_endpoint
+        with self.endpoint_authorized(token, 'register_delivery_endpoint') as (c, p):
+            return register_delivery_endpoint(self, c, p, request_id, url, signing_secret, label, headers, resolver=resolver)
+
+    def list_delivery_endpoints(self, token):
+        from .delivery_endpoints import list_delivery_endpoints
+        with self.endpoint_authorized(token, 'list_delivery_endpoints') as (c, p):
+            return list_delivery_endpoints(self, c, p)
+
+    def update_delivery_endpoint(self, token, endpoint_id, version, action, new_secret=None, headers=None):
+        from .delivery_endpoints import update_delivery_endpoint
+        with self.endpoint_authorized(token, 'update_delivery_endpoint') as (c, p):
+            return update_delivery_endpoint(self, c, p, endpoint_id, version, action, new_secret, headers)
+
+    def delete_delivery_endpoint(self, token, endpoint_id, version):
+        from .delivery_endpoints import delete_delivery_endpoint
+        with self.endpoint_authorized(token, 'delete_delivery_endpoint') as (c, p):
+            return delete_delivery_endpoint(self, c, p, endpoint_id, version)
+
+    def test_delivery_endpoint(self, token, endpoint_id, request_id):
+        from .delivery_endpoints import test_delivery_endpoint
+        with self.endpoint_authorized(token, 'test_delivery_endpoint') as (c, p):
+            return test_delivery_endpoint(self, c, p, endpoint_id, request_id)
+
+    def delivery_endpoint_test(self, token, endpoint_id, request_id):
+        # The inline-test poll: read only and unaudited, like the wait loop's reads.
+        from .delivery_endpoints import endpoint_test
+        with self.authorized(token) as (c, p):
+            return endpoint_test(c, p, endpoint_id, request_id)
+
+    def set_delivery_features(self, enabled):
+        # Operator only (ANYM-534 adds the CLI); disabling cancels queued endpoint hints and tests.
+        from .delivery_endpoints import set_delivery_features
+        return set_delivery_features(self, enabled)
+
+    def reload_delivery_policy(self):
+        # Operator only, after editing DELIVERY_POLICY_FILE: waits for in-flight POSTs, cancels refused hosts' hints.
+        from .delivery_endpoints import reload_delivery_policy
+        return reload_delivery_policy(self)
+
+    def list_delivery_endpoints_admin(self, principal=None):
+        from .delivery_endpoints import list_endpoints_admin
+        if principal is not None:principal_id(principal)
+        return list_endpoints_admin(self, principal)
+
+    def set_delivery_endpoint_operator_state(self, endpoint_id, enabled):
+        from .delivery_endpoints import set_operator_state
+        return set_operator_state(self, endpoint_id, enabled)
 
     def test_subscription(self, token, subscription_id, request_id):
         from .event_delivery import test_subscription
@@ -1176,8 +1248,8 @@ class Store:
                 lock_replay_tables(c)
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
-            if version>48: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql')]:
+            if version>49: raise RuntimeError('database_newer_than_runtime')
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
@@ -1199,6 +1271,10 @@ class Store:
                  REVOKE ALL ON FUNCTION public.publish_processing_event(text[],text,text,text,text,jsonb),
                   public.publish_file_text_event(text,text,text,text,jsonb),
                   public.publish_file_enrichment_event(text,text,text,text,jsonb) FROM PUBLIC;
+                END IF;
+                IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(
+                    'public.subscription_hint_references(uuid,bigint,bigint,text[],text[])')),'USAGE') THEN
+                 REVOKE ALL ON FUNCTION public.subscription_hint_references(uuid,bigint,bigint,text[],text[]) FROM PUBLIC;
                 END IF;
             END $$''')
 

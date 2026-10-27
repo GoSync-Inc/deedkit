@@ -771,3 +771,114 @@ def test_fence_hold_excludes_waiting_for_the_principal_lock(seeded, tmp_path, mo
     assert stats['delivered'] == 1
     assert time.monotonic() - started >= 2.5
     assert 1000 <= stats['fence_hold_ms'][0] < 2000
+
+
+# spec: ANYM-519
+@pytest.mark.parametrize('address', ['ff0e::1', '64:ff9b::a9fe:a9fe', '64:ff9b:1::a00:1', '2002:c000:204::1',
+    '2001:0:4136:e378:8000:63bf:3fff:fdd2', '::ffff:93.184.216.34', '100.64.0.1', '224.0.0.251'])
+def test_address_check_refuses_nat64_6to4_teredo_mapped_multicast_and_cgnat(address):
+    from messaging_service.event_delivery import validate_endpoint
+    with pytest.raises(ValueError, match='unsafe_receiver'):
+        validate_endpoint('https://hooks.example.test/wake', resolver=lambda *a, **k: ['93.184.216.34', address])
+    assert validate_endpoint('https://hooks.example.test/wake', resolver=lambda *a, **k: ['2606:2800:220:1::1'])[1] == [
+        '2606:2800:220:1::1']
+
+
+def endpoint_setup(store, tmp_path, monkeypatch, *, events=1):
+    import base64
+    policy = tmp_path / 'delivery-policy.json'
+    policy.write_text(json.dumps({'allow_hosts': ['example.test']}))
+    policy.chmod(0o600)
+    monkeypatch.setenv('DELIVERY_POLICY_FILE', str(policy))
+    store.set_delivery_features(True)
+    permissions = ['read', 'subscription-write', 'subscription-ack', 'delivery-write']
+    token = store.issue_key('endpoint-reader', ['telegram-demo'], permissions=permissions, key_permissions=permissions)
+    secret = 'whsec_' + base64.b64encode(b'synthetic-endpoint-secret-0123456789').decode()
+    endpoint = store.register_delivery_endpoint(token, 'endpoint-request-1', 'https://hooks.example.test/hook', secret,
+        resolver=lambda *a, **k: ['93.184.216.34'])
+    with store.pool.connection() as c:
+        # Only the hint is under test here, not the inline test.
+        c.execute("UPDATE delivery_endpoint_tests SET state='cancelled' WHERE endpoint=%s", (endpoint['endpoint_id'],))
+    sid = store.create_subscription(token, ['telegram-demo-chat'], label='Synthetic endpoint',
+        delivery={'endpoint_id': endpoint['endpoint_id']})['subscription_id']
+    with store.pool.connection() as c:
+        ids = [store.append_event(c, 'telegram-demo', 'demo-tg-1', origin='live') for _ in range(events)]
+    match_subscriptions(store)
+    return token, endpoint, sid, ids
+
+
+# spec: ANYM-519
+def test_endpoint_hint_body_pins_the_reference_fields_and_the_cap(seeded, tmp_path, monkeypatch):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    try:
+        token, endpoint, sid, ids = endpoint_setup(store, tmp_path, monkeypatch, events=25)
+        sent = []
+        assert dispatch_hints(store, transport=lambda url, body, headers, **k: sent.append((body, headers)) or 204,
+            resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    finally:
+        store.set_delivery_features(False)
+    body, headers = sent[0]
+    payload = json.loads(body)
+    assert len(body) <= 4096 and set(payload) == {'type', 'hint_id', 'subscription_id', 'version', 'label', 'references',
+        'references_omitted', 'next_call'}
+    assert payload['type'] == 'events' and payload['label'] == 'Synthetic endpoint' and payload['version'] == 2
+    # At most 20 references, dropped from the end into references_omitted until the body fits 4 KiB.
+    listed = [ref['event_id'] for ref in payload['references']]
+    assert 1 <= len(listed) <= 20 and listed == ids[:len(listed)] and payload['references_omitted'] == 25 - len(listed)
+    assert {key for ref in payload['references'] for key in ref} == {'event_id', 'kind', 'occurred_at', 'wake_reason',
+        'account_id', 'chat_id', 'message_id', 'sender_id'}
+    assert payload['references'][0]['wake_reason'] == ['incoming_message']
+    assert payload['next_call'] == {'tool': 'messages_fetch_subscription_events', 'subscription_id': sid}
+    assert set(headers) == {'Content-Type', 'webhook-id', 'webhook-timestamp', 'webhook-signature'}
+    assert not any(name.lower().startswith('x-deedkit') for name in headers) and b'host_turn_verified' not in body
+
+
+# spec: ANYM-519
+@pytest.mark.parametrize('change', ['operator_disable', 'delivery_write_lost', 'feature_disable', 'policy_reload'])
+def test_endpoint_change_waits_for_the_inflight_post_and_no_post_after(seeded, tmp_path, monkeypatch, change):
+    import threading
+    import time
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    try:
+        token, endpoint, sid, _ = endpoint_setup(store, tmp_path, monkeypatch)
+        changed, ended, threads = [], [], []
+        def apply():
+            if change == 'operator_disable':
+                store.set_delivery_endpoint_operator_state(endpoint['endpoint_id'], False)
+            elif change == 'feature_disable':
+                store.set_delivery_features(False)
+            elif change == 'policy_reload':
+                # The operator replaces the policy file, then reloads: the change counts as made when it returns.
+                (tmp_path / 'delivery-policy.json').write_text(json.dumps({'allow_hosts': ['example.test'],
+                    'deny_hosts': ['hooks.example.test']}))
+                store.reload_delivery_policy()
+            else:
+                store.set_access('endpoint-reader', permissions=['read', 'subscription-write', 'subscription-ack'])
+            changed.append(time.monotonic())
+        def transport(*args, **kwargs):
+            threads.append(threading.Thread(target=apply))
+            threads[0].start()
+            with store.pool.connection() as c:
+                deadline = time.monotonic() + 5
+                while not c.execute("SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted").fetchone():
+                    assert time.monotonic() < deadline, 'the change never waited on the fence'
+                    time.sleep(0.02)
+            time.sleep(0.5)
+            ended.append(time.monotonic())
+            return 204
+        try:
+            assert dispatch_hints(store, transport=transport, resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+        finally:
+            for thread in threads:
+                thread.join(10)
+        assert changed and changed[0] >= ended[0]
+        with store.pool.connection() as c:
+            c.execute("""UPDATE subscription_outbox SET state='pending',next_attempt_at=clock_timestamp(),finished_at=NULL
+                WHERE subscription=%s""", (sid,))
+        after = dispatch_hints(store, transport=lambda *a, **k: pytest.fail('POST after the change committed'),
+            resolver=lambda *a, **k: ['93.184.216.34'])
+        assert after['cancelled'] == 1
+    finally:
+        store.set_delivery_features(False)

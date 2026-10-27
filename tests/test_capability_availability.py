@@ -83,7 +83,7 @@ def test_webhook_needs_a_bound_enabled_receiver_and_a_fresh_dispatcher(seeded,tm
     hook=transports(s,token)['webhook']
     # No endpoint.
     assert hook['tools']==['configure_subscription_delivery'] and hook['authorized'] is True
-    assert (hook['configured'],hook['operational'],hook['reason'])==(False,False,'no_receiver_bound')
+    assert (hook['configured'],hook['operational'],hook['reason'])==(False,False,'delivery_disabled')
     assert hook['registration']=='operator_only' and hook['next_step']=='ask the operator to register a receiver'
     rid=bound_receiver(s,token,tmp_path)
     # Absent heartbeat: no dispatcher has run.
@@ -98,11 +98,11 @@ def test_webhook_needs_a_bound_enabled_receiver_and_a_fresh_dispatcher(seeded,tm
     hook=transports(s,token)['webhook']
     assert (hook['configured'],hook['operational'],hook['reason'])==(True,True,None)
     # Another key of the same principal has no receiver of its own.
-    assert transports(s,identity(s))['webhook']['reason']=='no_receiver_bound'
+    assert transports(s,identity(s))['webhook']['reason']=='delivery_disabled'
     # Paused endpoint: the operator disabled the bound receiver.
     disable_receiver(s,rid)
     hook=transports(s,token)['webhook']
-    assert (hook['configured'],hook['operational'],hook['reason'])==(False,False,'receiver_disabled')
+    assert (hook['configured'],hook['operational'],hook['reason'])==(False,False,'delivery_disabled')
 
 
 # spec: ANYM-518
@@ -135,12 +135,12 @@ def test_webhook_ignores_bindings_of_expired_or_changed_subscriptions(seeded,tmp
     with s.pool.connection() as c:
         c.execute("UPDATE subscriptions SET state='paused',expires_at=clock_timestamp()-interval '1 second' "+bound,(rid,))
     hook=transports(s,token)['webhook']
-    assert (hook['configured'],hook['operational'],hook['reason'])==(False,False,'no_receiver_bound')
+    assert (hook['configured'],hook['operational'],hook['reason'])==(False,False,'delivery_disabled')
     with s.pool.connection() as c:
         assert c.execute('SELECT state FROM subscriptions '+bound,(rid,)).fetchone()['state']=='paused'
         # Paused, not expired, but recorded under an older key permission version.
         c.execute('UPDATE subscriptions SET expires_at=NULL,key_permission_version=key_permission_version+1 '+bound,(rid,))
-    assert transports(s,token)['webhook']['reason']=='no_receiver_bound'
+    assert transports(s,token)['webhook']['reason']=='delivery_disabled'
 
 
 # spec: ANYM-518
@@ -186,3 +186,59 @@ def test_locked_heartbeat_answers_capabilities_well_inside_the_discovery_deadlin
         c.execute("SET LOCAL statement_timeout='4s'")
         assert delivery_transports(c,p)==full['subscriptions']['transports']
         assert c.execute("SELECT current_setting('statement_timeout') AS t").fetchone()['t']=='4s'
+
+
+def endpoint_policy(tmp_path,monkeypatch):
+    import json
+    path=tmp_path/'delivery-policy.json';path.write_text(json.dumps({'allow_hosts':['example.test']}));path.chmod(0o600)
+    monkeypatch.setenv('DELIVERY_POLICY_FILE',str(path))
+
+
+# spec: ANYM-519
+def test_webhook_gate_off_is_delivery_disabled_even_with_a_bound_endpoint(seeded,tmp_path,monkeypatch):
+    from test_delivery_endpoints import identity,register
+    s,_,_=seeded
+    endpoint_policy(tmp_path,monkeypatch);heartbeat(s,5)
+    token=identity(s)
+    s.set_delivery_features(True)
+    try:
+        endpoint=register(s,token)
+        s.create_subscription(token,['telegram-demo-chat'],delivery={'endpoint_id':endpoint['endpoint_id']})
+        assert transports(s,token)['webhook']['reason'] is None
+    finally:
+        s.set_delivery_features(False)
+    hook=transports(s,token)['webhook']
+    assert (hook['configured'],hook['operational'],hook['reason'])==(False,False,'delivery_disabled')
+    assert hook['registration']=='operator_only' and hook['self_service']['enabled'] is False
+    assert hook['self_service']['policy_set'] is True and hook['self_service']['max_endpoints']==4
+
+
+# spec: ANYM-519
+def test_webhook_policy_unset_then_a_bound_self_service_endpoint(seeded,tmp_path,monkeypatch):
+    from test_delivery_endpoints import identity,register
+    s,_,_=seeded
+    monkeypatch.delenv('DELIVERY_POLICY_FILE',raising=False)
+    heartbeat(s,5)
+    s.set_delivery_features(True)
+    try:
+        token=identity(s)
+        hook=transports(s,token)['webhook']
+        assert (hook['configured'],hook['operational'],hook['reason'])==(False,False,'delivery_policy_unset')
+        assert hook['registration']=='operator_only' and hook['self_service']['policy_set'] is False
+        endpoint_policy(tmp_path,monkeypatch)
+        hook=transports(s,token)['webhook']
+        assert hook['reason']=='no_receiver_bound' and hook['registration']=='self_service'
+        assert hook['self_service']['tools']==['register_delivery_endpoint','list_delivery_endpoints',
+            'update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint']
+        endpoint=register(s,token)
+        s.create_subscription(token,['telegram-demo-chat'],delivery={'endpoint_id':endpoint['endpoint_id']})
+        hook=transports(s,token)['webhook']
+        assert (hook['configured'],hook['operational'],hook['reason'])==(True,True,None)
+        s.update_delivery_endpoint(token,endpoint['endpoint_id'],1,'pause')
+        hook=transports(s,token)['webhook']
+        assert (hook['configured'],hook['operational'],hook['reason'])==(False,False,'receiver_disabled')
+        caps=s.capabilities(token)
+        assert {'register_delivery_endpoint','test_delivery_endpoint'}<=set(caps['available'])
+        assert 'register_delivery_endpoint' not in s.capabilities(s.issue_key('endpoint-legacy',['telegram-demo']))['available']
+    finally:
+        s.set_delivery_features(False)

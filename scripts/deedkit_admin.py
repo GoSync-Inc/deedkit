@@ -36,7 +36,7 @@ import tarfile
 import tempfile
 import time
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 CONFIG = Path("/opt/deedkit/deploy/private/admin/config.json")
 WINDOW = timedelta(days=7)  # the gateway's expiry warning window (ANYM-289, WARNING_WINDOW_DAYS)
@@ -1993,6 +1993,17 @@ def line(indent: str, credential: dict) -> str:
             f"  expires {credential['expires_at'] or '-'}{note}")
 
 
+def delivery_endpoints(run, args) -> dict:
+    """The messaging operator commands for self-service endpoints (ANYM-519); a UUID is checked before any run."""
+    if args.verb == "list":
+        return ask(run, "messaging", ["delivery-endpoints-list"] + (["--principal", args.principal] if args.principal else []))
+    try:
+        endpoint_id = str(UUID(args.endpoint_id))
+    except ValueError:
+        raise AdminError("delivery-endpoints: the endpoint ID is not a UUID; nothing changed") from None
+    return ask(run, "messaging", [args.verb + "-delivery-endpoint", "--id", endpoint_id])
+
+
 def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int:
     parser = argparse.ArgumentParser(prog="deedkit admin", description="DeedKit admin CLI (ANYM-491)")
     parser.add_argument("--config", type=Path, default=CONFIG, help=f"private admin configuration (default {CONFIG})")
@@ -2035,9 +2046,19 @@ def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int
     tools.add_argument("--operation", help="rerun a stopped operation: a finished step is read back, the rest continue")
     undoing = nouns.add_parser("undo", help="compensate an operation: disable, revoke and delete what it created")
     undoing.add_argument("operation")
+    endpoints = nouns.add_parser("delivery-endpoints", help="agent webhook endpoints: the operator's disable (ANYM-519)")
+    endpoint_verbs = endpoints.add_subparsers(dest="verb", required=True)
+    endpoint_list = endpoint_verbs.add_parser("list", help="every self-service endpoint, read-only, no secret")
+    endpoint_list.add_argument("--principal")
+    for verb in ("disable", "enable"):
+        endpoint_verbs.add_parser(verb, help=f"{verb} one endpoint; only an operator changes operator_disabled") \
+            .add_argument("endpoint_id")
     args = parser.parse_args(argv)
     try:
         config = load_json(args.config, "admin configuration")
+        if args.noun == "delivery-endpoints":
+            print(json.dumps(delivery_endpoints(run or runner(config), args), ensure_ascii=False, indent=2))
+            return 0
         if args.noun in ("undo", "profile") or args.verb in ("issue", "extend", "revoke"):
             os.umask(0o077)
             run, docker = run or runner(config), docker or dockers(config)

@@ -19,3 +19,15 @@ GRANT UPDATE(state,attempts,next_attempt_at,lease_token,lease_until,finished_at,
 GRANT UPDATE(admitted_at) ON subscription_outbox TO messaging_event_delivery;
 -- Schema 48: the dispatcher's liveness row (ANYM-518).
 GRANT SELECT,INSERT,UPDATE ON subscription_dispatcher_heartbeat TO messaging_event_delivery;
+-- Schema 49 (ANYM-519): the only reader of endpoint secrets and header values; it promotes a rotation
+-- after 24 h, records test results and reads the operator's activation (delivery_features).
+GRANT SELECT ON probe_metadata TO messaging_event_delivery;
+GRANT SELECT ON delivery_endpoints TO messaging_event_delivery;
+GRANT UPDATE(signing_secret,pending_secret,secret_fingerprint,pending_fingerprint,rotation_started_at,updated_at)
+    ON delivery_endpoints TO messaging_event_delivery;
+GRANT SELECT ON delivery_endpoint_tests TO messaging_event_delivery;
+GRANT SELECT(subscription,acked_through) ON subscription_consumption TO messaging_event_delivery;
+-- References without message text: IDs, timing and native wake evidence only (049).
+GRANT EXECUTE ON FUNCTION public.subscription_hint_references(uuid,bigint,bigint,text[],text[]) TO messaging_event_delivery;
+GRANT UPDATE(state,lease_token,lease_until,http_status,latency_ms,error_code,finished_at)
+    ON delivery_endpoint_tests TO messaging_event_delivery;

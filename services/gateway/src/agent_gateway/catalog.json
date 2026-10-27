@@ -2947,7 +2947,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Persist selection of explicit authorized archive chats; no send or provider request.\n\nRequires read + explicit subscription-write. The subscription belongs to the\noriginating credential; another key for the same principal cannot adopt it.\nchat_ids are 1–64 archive IDs resolved through list_chats/resolve_reference.\nOptional sender_ids are exact account-scoped IDs from search_people, not names.\nStarts at the committed event boundary; default message.created/incoming/live.\nHistorical events require explicit backfill/reconcile origins. File readiness\nis independent of message arrival. Optional expiry is a future zoned ISO time\nwithin 366 days. Label is only a correlation hint, not authority to wake a task.\nDelivery uses separate fetch/ACK and configured signed hints; no provider read-state mutation.\nA timeout can leave creation uncertain: inspect list_subscriptions before retrying.\n",
+    "description": "Persist selection of explicit authorized archive chats; no send or provider request.\n\nRequires read + explicit subscription-write. The subscription belongs to the\noriginating credential; another key for the same principal cannot adopt it.\nchat_ids are 1–64 archive IDs resolved through list_chats/resolve_reference.\nOptional sender_ids are exact account-scoped IDs from search_people, not names.\nStarts at the committed event boundary; default message.created/incoming/live.\nHistorical events require explicit backfill/reconcile origins. File readiness\nis independent of message arrival. Optional expiry is a future zoned ISO time\nwithin 366 days. Label is only a correlation hint, not authority to wake a task.\nDelivery uses separate fetch/ACK and configured signed hints; no provider read-state mutation.\nOptional delivery={endpoint_id, delivery_policy?} binds your own endpoint from register_delivery_endpoint;\nit needs delivery-write and the operator's delivery switch.\nA timeout can leave creation uncertain: inspect list_subscriptions before retrying.\n",
     "inputSchema": {
       "properties": {
         "chat_ids": {
@@ -3101,6 +3101,17 @@
           ],
           "default": null,
           "title": "Reply To Send"
+        },
+        "delivery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SubscriptionEndpoint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -3108,7 +3119,149 @@
       ],
       "type": "object",
       "title": "create_subscriptionArguments",
-      "additionalProperties": false
+      "additionalProperties": false,
+      "$defs": {
+        "DeliveryPolicy": {
+          "additionalProperties": false,
+          "properties": {
+            "batch_count": {
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Batch Count",
+              "type": "integer"
+            },
+            "batch_window_s": {
+              "maximum": 86400,
+              "minimum": 0,
+              "title": "Batch Window S",
+              "type": "integer"
+            },
+            "debounce_s": {
+              "maximum": 600,
+              "minimum": 0,
+              "title": "Debounce S",
+              "type": "integer"
+            },
+            "expect_reply_within_s": {
+              "maximum": 1209600,
+              "minimum": 60,
+              "title": "Expect Reply Within S",
+              "type": "integer"
+            },
+            "max_wait_s": {
+              "maximum": 3600,
+              "minimum": 1,
+              "title": "Max Wait S",
+              "type": "integer"
+            },
+            "quiet_bypass": {
+              "items": {
+                "enum": [
+                  "incoming_message",
+                  "owner_mention",
+                  "reply_to_owner",
+                  "reply_to_confirmed_send",
+                  "silence"
+                ],
+                "type": "string"
+              },
+              "maxItems": 5,
+              "minItems": 1,
+              "title": "Quiet Bypass",
+              "type": "array"
+            },
+            "quiet_hours": {
+              "$ref": "#/$defs/QuietHours"
+            }
+          },
+          "title": "DeliveryPolicy",
+          "type": "object"
+        },
+        "QuietHours": {
+          "additionalProperties": false,
+          "properties": {
+            "timezone": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Timezone",
+              "type": "string"
+            },
+            "windows": {
+              "items": {
+                "$ref": "#/$defs/QuietWindow"
+              },
+              "maxItems": 4,
+              "minItems": 1,
+              "title": "Windows",
+              "type": "array"
+            }
+          },
+          "required": [
+            "timezone",
+            "windows"
+          ],
+          "title": "QuietHours",
+          "type": "object"
+        },
+        "QuietWindow": {
+          "additionalProperties": false,
+          "properties": {
+            "days": {
+              "items": {
+                "enum": [
+                  "mon",
+                  "tue",
+                  "wed",
+                  "thu",
+                  "fri",
+                  "sat",
+                  "sun"
+                ],
+                "type": "string"
+              },
+              "maxItems": 7,
+              "minItems": 1,
+              "title": "Days",
+              "type": "array"
+            },
+            "end": {
+              "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$",
+              "title": "End",
+              "type": "string"
+            },
+            "start": {
+              "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$",
+              "title": "Start",
+              "type": "string"
+            }
+          },
+          "required": [
+            "days",
+            "start",
+            "end"
+          ],
+          "title": "QuietWindow",
+          "type": "object"
+        },
+        "SubscriptionEndpoint": {
+          "additionalProperties": false,
+          "properties": {
+            "delivery_policy": {
+              "$ref": "#/$defs/DeliveryPolicy"
+            },
+            "endpoint_id": {
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              "title": "Endpoint Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "endpoint_id"
+          ],
+          "title": "SubscriptionEndpoint",
+          "type": "object"
+        }
+      }
     },
     "name": "messages_create_subscription",
     "outputSchema": {
@@ -4672,7 +4825,7 @@
       "subscription-write"
     ],
     "required_manifest": true,
-    "description": "Select an operator-registered receiver ID for signed hints; null disables. Optional delivery_policy times hints only (debounce or batch, quiet hours, expected-reply silence timer). Never accepts URLs or grants access.",
+    "description": "Select an operator-registered receiver ID or your own endpoint_id (register_delivery_endpoint, needs delivery-write) for signed hints, not both; null disables. Optional delivery_policy times hints only (debounce or batch, quiet hours, expected-reply silence timer). Never accepts URLs or grants access.",
     "inputSchema": {
       "properties": {
         "subscription_id": {
@@ -4711,6 +4864,19 @@
             }
           ],
           "default": null
+        },
+        "endpoint_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Endpoint Id"
         }
       },
       "required": [
@@ -4896,6 +5062,281 @@
       "type": "object",
       "additionalProperties": true,
       "title": "test_subscriptionDictOutput"
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "messages_register_delivery_endpoint",
+    "module": "messaging",
+    "operation": "register_delivery_endpoint",
+    "scopes": [
+      "read",
+      "delivery-write"
+    ],
+    "required_manifest": true,
+    "description": "Register your own HTTPS webhook endpoint for subscription hints, then send it one signed test delivery.\n\nRequires read + explicit delivery-write, and the operator's delivery switch (else delivery_disabled).\nThe operator sets the host policy, never an agent: url must be https on port 443 at a public host the\npolicy allows (else unsafe_endpoint or delivery_policy_unset). signing_secret is your own whsec_<base64>\n(24-64 bytes) for Standard Webhooks signatures; optional headers (at most 4) go with every delivery.\nSecrets and header values are write-only: no response, list, log or error returns them.\nThe endpoint belongs to this exact key. Waits up to 10 s for the test; test_status pending names the\ntest_delivery_endpoint call. A failed test still creates the endpoint. Repeat the same request_id and\narguments to recover a lost response.\n",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "headers": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "maxProperties": 4,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Headers"
+        },
+        "label": {
+          "default": "",
+          "maxLength": 128,
+          "pattern": "^[^\\x00-\\x1f\\x7f]*$",
+          "title": "Label",
+          "type": "string"
+        },
+        "request_id": {
+          "maxLength": 128,
+          "minLength": 8,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "title": "Request Id",
+          "type": "string"
+        },
+        "signing_secret": {
+          "pattern": "^whsec_[A-Za-z0-9+/=]{32,96}$",
+          "title": "Signing Secret",
+          "type": "string"
+        },
+        "url": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id",
+        "url",
+        "signing_secret"
+      ],
+      "title": "register_delivery_endpointArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "register_delivery_endpointDictOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "messages_list_delivery_endpoints",
+    "module": "messaging",
+    "operation": "list_delivery_endpoints",
+    "scopes": [
+      "read",
+      "delivery-write"
+    ],
+    "required_manifest": true,
+    "description": "List this exact key's webhook endpoints with state, health, last test and fingerprints; never secrets or header values.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "list_delivery_endpointsArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "list_delivery_endpointsDictOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "messages_update_delivery_endpoint",
+    "module": "messaging",
+    "operation": "update_delivery_endpoint",
+    "scopes": [
+      "read",
+      "delivery-write"
+    ],
+    "required_manifest": true,
+    "description": "Version-checked change of your own endpoint: rotate_secret (new_secret), set_headers (headers; {} clears), pause or resume.\n\nRequires read + explicit delivery-write. During a rotation deliveries carry both signatures for 24 hours,\nthen the new secret alone. Resume works from agent_paused or auto_paused; only the operator lifts\noperator_disabled. Write-only values are never returned.\n",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "rotate_secret",
+            "set_headers",
+            "pause",
+            "resume"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "headers": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "maxProperties": 4,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Headers"
+        },
+        "new_secret": {
+          "anyOf": [
+            {
+              "pattern": "^whsec_[A-Za-z0-9+/=]{32,96}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "New Secret"
+        },
+        "version": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "endpoint_id",
+        "version",
+        "action"
+      ],
+      "title": "update_delivery_endpointArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "update_delivery_endpointDictOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "messages_delete_delivery_endpoint",
+    "module": "messaging",
+    "operation": "delete_delivery_endpoint",
+    "scopes": [
+      "read",
+      "delivery-write"
+    ],
+    "required_manifest": true,
+    "description": "Delete your own endpoint; queued hints and tests are cancelled and bound subscriptions become pull-only. Requires read + explicit delivery-write.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "endpoint_id": {
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "version": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "endpoint_id",
+        "version"
+      ],
+      "title": "delete_delivery_endpointArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "delete_delivery_endpointDictOutput",
+      "type": "object"
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "messages_test_delivery_endpoint",
+    "module": "messaging",
+    "operation": "test_delivery_endpoint",
+    "scopes": [
+      "read",
+      "delivery-write"
+    ],
+    "required_manifest": true,
+    "description": "Send one signed test delivery to your own endpoint and wait up to 10 s for http_status and latency_ms.\n\nRequires read + explicit delivery-write; at most one test per minute per key. The same request_id\nreads back the same test; use a new one after fixing the receiver. No archive event or message send.\n",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "endpoint_id": {
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "request_id": {
+          "maxLength": 128,
+          "minLength": 8,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "title": "Request Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "endpoint_id",
+        "request_id"
+      ],
+      "title": "test_delivery_endpointArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "test_delivery_endpointDictOutput",
+      "type": "object"
     },
     "annotations": {
       "destructiveHint": false,

@@ -136,7 +136,7 @@ def test_subscription_manifest_has_strict_schemas_and_passive_event_read():
             'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
             'method':'tools/list','params':{}}).json()['result']['tools']
     tools={tool['name']:tool for tool in listed}
-    assert len(tools)==46
+    assert len(tools)==51
     for method in METHODS:
         tool=tools[method]
         assert tool['inputSchema']['additionalProperties'] is False
@@ -347,3 +347,81 @@ def test_subscriber_waits_fetches_and_acks_over_rest_and_mcp(seeded,transport):
         again=tool('fetch_subscription_events',subscription_id=sid)
         assert again['items']==[] and again['receipt'] is None
         assert tool('get_subscription',subscription_id=sid)['acked_through']==ack['acked_through']
+
+
+ENDPOINT_TOOLS=('register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint',
+    'delete_delivery_endpoint','test_delivery_endpoint')
+
+
+class EndpointStore(RecordingStore):
+    def _endpoint(self,method,token,params):
+        self.calls.append((method,params))
+        return {'endpoint_id':'11111111-1111-4111-8111-111111111111','test':{'test_status':'pending'}}
+    def register_delivery_endpoint(self,token,**params):return self._endpoint('register_delivery_endpoint',token,params)
+    def list_delivery_endpoints(self,token,**params):return self._endpoint('list_delivery_endpoints',token,params)
+    def update_delivery_endpoint(self,token,**params):return self._endpoint('update_delivery_endpoint',token,params)
+    def delete_delivery_endpoint(self,token,**params):return self._endpoint('delete_delivery_endpoint',token,params)
+    def test_delivery_endpoint(self,token,**params):return self._endpoint('test_delivery_endpoint',token,params)
+    def configure_subscription_delivery(self,token,**params):return self._endpoint('configure_subscription_delivery',token,params)
+
+
+# spec: ANYM-519
+def test_endpoint_tools_match_the_gateway_catalog_and_client_lists():
+    root=Path(__file__).resolve().parents[1]
+    catalog={row['name']:row for row in json.loads(
+        (root/'services/gateway/src/agent_gateway/catalog.json').read_text())}
+    client={row['name']:row['read_only'] for row in json.loads((root/'packages/deedkit/lib/tools.json').read_text())}
+    with TestClient(create_app(RecordingStore(),['testserver'])) as http:
+        listed=http.post('/mcp',headers={'Authorization':'Bearer synthetic-token',
+            'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
+            'method':'tools/list','params':{}}).json()['result']['tools']
+    backend={tool['name']:tool for tool in listed}
+    for name in (*ENDPOINT_TOOLS,'create_subscription','configure_subscription_delivery'):
+        for field in ('description','inputSchema','annotations'):
+            assert catalog['messages_'+name][field]==backend[name][field],(name,field)
+    for name in ENDPOINT_TOOLS:
+        read=name=='list_delivery_endpoints'
+        assert backend[name]['annotations']['readOnlyHint'] is read and client['messages_'+name] is read
+        assert catalog['messages_'+name]['scopes']==['read','delivery-write']
+    for name in ('register_delivery_endpoint','update_delivery_endpoint'):
+        assert 'write-only' in backend[name]['description'].lower()
+    assert 'operator sets the host policy' in backend['register_delivery_endpoint']['description']
+
+
+# spec: ANYM-519
+@pytest.mark.parametrize('transport',['rest','mcp'])
+def test_endpoint_calls_drop_omitted_options_and_wait_for_the_inline_test(transport,monkeypatch):
+    from messaging_service import delivery_endpoints
+    waited=[]
+    async def finish(store,token,result,*,wait_s=10.0):
+        waited.append(token);return {**result,'test':{'test_status':'delivered'}}
+    monkeypatch.setattr(delivery_endpoints,'finish_inline_test',finish)
+    store=EndpointStore()
+    endpoint='11111111-1111-4111-8111-111111111111'
+    secret='whsec_'+'A'*32
+    calls=[('register_delivery_endpoint',{'request_id':'synthetic-endpoint','url':'https://hooks.example','signing_secret':secret}),
+        ('update_delivery_endpoint',{'endpoint_id':endpoint,'version':1,'action':'pause'}),
+        ('test_delivery_endpoint',{'endpoint_id':endpoint,'request_id':'synthetic-probe'}),
+        ('list_delivery_endpoints',{}),
+        ('configure_subscription_delivery',{'subscription_id':'sub_synthetic','version':1,'endpoint_id':endpoint})]
+    results=[]
+    with TestClient(create_app(store,['testserver'])) as http:
+        for name,values in calls:
+            if transport=='rest':
+                response=http.post('/v1/'+name,headers={'Authorization':'Bearer synthetic-token'},json=values)
+                assert response.status_code==200,response.text;results.append(response.json())
+            else:
+                body=http.post('/mcp',headers={'Authorization':'Bearer synthetic-token',
+                    'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
+                    'method':'tools/call','params':{'name':name,'arguments':values}}).json()['result']
+                assert not body.get('isError'),body;results.append(body['structuredContent'])
+    assert store.calls==[
+        ('register_delivery_endpoint',{'request_id':'synthetic-endpoint','url':'https://hooks.example','signing_secret':secret,'label':''}),
+        ('update_delivery_endpoint',{'endpoint_id':endpoint,'version':1,'action':'pause'}),
+        ('test_delivery_endpoint',{'endpoint_id':endpoint,'request_id':'synthetic-probe'}),
+        ('list_delivery_endpoints',{}),
+        ('configure_subscription_delivery',{'subscription_id':'sub_synthetic','version':1,'receiver_id':None,'endpoint_id':endpoint})]
+    # Only register and test wait for the dispatcher's result.
+    assert waited==['synthetic-token']*2
+    assert [r['test']['test_status'] for r in results]==['delivered','pending','delivered','pending','pending']
+    assert all(secret not in json.dumps(r) for r in results)

@@ -1,6 +1,6 @@
 # Agent access and audit
 
-Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 48. Setup is done by the operator through the local CLI
+Introduced in Messaging 0.5 / schema 5; current source 0.9.19 / schema 49. Setup is done by the operator through the local CLI
 or SSH with the owner DSN. There are no remote MCP/REST methods for managing keys and permissions.
 Provider sessions, the owner DSN and the backup decryption key are not given to agents.
 
@@ -25,6 +25,7 @@ pasted into conversations or saved in tracked Git files.
 | `subscription-write` together with `read` | Creating/changing own subscriptions, binding a pre-registered receiver and a synthetic test hint |
 | `subscription-ack` together with `read` | ACK of an issued page of an own subscription; a separate position for the exact key |
 | `feedback-write` together with `read` | A local private feedback record with verified source references; no external sending |
+| `delivery-write` together with `read` | Registering, listing, changing, testing and deleting the key's own webhook endpoints inside the operator's host policy, and binding them to own subscriptions (ANYM-519) |
 | `capabilities` | Available to any valid key, including one without operational permissions |
 
 A chat the account joins later (`join_chat`, ANYM-243) is visible to no existing
@@ -351,8 +352,21 @@ A revocation or ACL change waits for a hint attempt in flight (about 5 s: its TL
 and new requests of that principal queue behind the waiting revocation; see its
 revocation fence there.
 
-The gateway can bind only an operator-registered opaque receiver belonging to
-that exact principal/key; it cannot read endpoint URLs or signing-secret paths.
+The gateway can bind an operator-registered opaque receiver belonging to
+that exact principal/key; it cannot read operator receiver URLs or signing-secret paths.
+
+`delivery-write` (ANYM-519, schema 49) lets a key register its own webhook
+endpoints. Effective permission is the principal's AND the key ceiling's; no
+existing key ceiling, including a NULL legacy one, inherits it. All five endpoint
+tools also need `read`, and they answer `delivery_disabled` until the operator
+turns the delivery switch on. An endpoint belongs to the exact principal and key:
+another key, even of the same principal, gets `not_found`, and a reissued key
+(ANYM-495) starts without the old key's endpoints. The operator, never an agent,
+sets the host policy file and lifts `operator_disabled`
+(`deedkit admin delivery-endpoints list | disable ID | enable ID`). The
+`messaging-subscriber` gateway profile lists the five tools;
+`messaging-reader` does not. Signing secrets and header values are write-only for
+the API role ([SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#self-service-webhook-endpoints-schema-49)).
 The internal matcher can enqueue opaque hints but has no receiver/secret grants
 or public egress. A separate `messaging_event_delivery` role can deliver hints;
 it cannot read message bodies, API token hashes, subscription page receipts or

@@ -122,6 +122,8 @@ def linked_catalogue(s,start,stop,history=30):
             SELECT 'wa-scale','wa-lid-'||lpad(n::text,4,'0')||'-1',(70000+n)||'@lid',(10000000+n)||'@c.us',(70000+n)||'@lid',
                 'whatsmeow_message_alt_v1',now(),now() FROM generate_series(%s::int,%s::int) n''',(start,stop))
         c.execute('ANALYZE messages');c.execute('ANALYZE chats');c.execute('ANALYZE whatsapp_identity_observations')
+        # Every table the pair statements read gets fresh statistics: an earlier module's leftovers must not pick the plan.
+        c.execute('ANALYZE accounts');c.execute('ANALYZE sender_profiles')
 
 
 # spec: ANYM-278

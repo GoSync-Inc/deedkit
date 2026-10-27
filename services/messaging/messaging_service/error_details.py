@@ -30,6 +30,9 @@ def payload(error,operation='',request_id=None):
     # ANYM-532: the normalized number the caller sent and the phone lookup's operation_id.
     for name in ('next_call','found_on_other_account','account','phone','operation_id'):
         if hasattr(error,name):info[name]=getattr(error,name)
+    # ANYM-519: reviewed counters, states, steps and a header NAME, never a header value or secret.
+    for name in ('retry_after_s','next_step','state','header'):
+        if hasattr(error,name):info[name]=getattr(error,name)
     if retry:info['retry_after_seconds']=2
     if code in EXPECTED:info['expected']=EXPECTED[code]
     if operation in ('search','search_files'):info['results_state']='not_returned_due_to_error'

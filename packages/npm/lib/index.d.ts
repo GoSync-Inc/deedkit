@@ -129,6 +129,8 @@ export interface SubscriptionSelection {
   wake_rules?: SubscriptionWakeRule[] | null;
   /** This credential's confirmed sent reference; required by reply_to_confirmed_send. */
   reply_to_send?: string | null;
+  /** Your own endpoint from registerDeliveryEndpoint; needs delivery-write. */
+  delivery?: {endpoint_id: string; delivery_policy?: Record<string,unknown>} | null;
 }
 export interface SubscriptionLifecycleAction {
   subscription_id: string;
@@ -157,6 +159,28 @@ export interface SubscriptionDelivery {
   version: number;
   /** Opaque operator-registered UUID. Null or omission disables; never a URL. */
   receiver_id?: string | null;
+  /** Your own endpoint UUID instead of receiver_id (never both); needs delivery-write. */
+  endpoint_id?: string | null;
+}
+export interface DeliveryEndpointRegistration {
+  /** 8–128 characters; repeat it with the same arguments to recover a lost response. */
+  request_id: string;
+  /** https on port 443 at a public host the operator's policy allows. */
+  url: string;
+  /** Your own whsec_<base64> secret (24–64 bytes); write-only, never returned. */
+  signing_secret: string;
+  label?: string;
+  /** At most 4 headers sent with every delivery; values are write-only. */
+  headers?: Record<string,string> | null;
+}
+export interface DeliveryEndpointUpdate {
+  endpoint_id: string;
+  version: number;
+  action: 'rotate_secret' | 'set_headers' | 'pause' | 'resume';
+  /** rotate_secret only; both signatures are sent for 24 hours. */
+  new_secret?: string | null;
+  /** set_headers only; {} clears them. */
+  headers?: Record<string,string> | null;
 }
 export interface FeedbackReferences {
   /** At most 32 authorized archive IDs per reference type. */
@@ -255,6 +279,16 @@ export declare class AnyMsgClient {
   configureSubscriptionDelivery(args: SubscriptionDelivery, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
   /** Queue a synthetic hint without creating an archive event or acknowledging it. */
   testSubscription(args: {subscription_id:string; request_id:string}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
+  /** Register your own endpoint inside the operator's host policy; returns a signed test's result. */
+  registerDeliveryEndpoint(args: DeliveryEndpointRegistration, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
+  /** This credential's endpoints with header names and fingerprints, never secrets or header values. */
+  listDeliveryEndpoints(args?: Record<string,never>, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
+  /** Version-checked secret rotation, header change, pause or resume of your own endpoint. */
+  updateDeliveryEndpoint(args: DeliveryEndpointUpdate, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
+  /** Delete your own endpoint; bound subscriptions become pull-only. */
+  deleteDeliveryEndpoint(args: {endpoint_id:string; version:number}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
+  /** One signed test delivery; the same request_id reads the same test back. */
+  testDeliveryEndpoint(args: {endpoint_id:string; request_id:string}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
   /** Store local private feedback; never forwards or publishes the description. */
   submitFeedback(args: PrivateFeedback, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
   /** Only the current credential's records, without former source references. */

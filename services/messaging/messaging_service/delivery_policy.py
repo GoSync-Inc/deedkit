@@ -126,9 +126,14 @@ def _now(c):
     return c.execute('SELECT clock_timestamp() AS t').fetchone()['t']
 
 
-def _binding(c, row):
-    return c.execute('''SELECT receiver,policy,policy_version,silence_deadline,configured_at FROM subscription_delivery
-        WHERE subscription=%s''', (row['id'],)).fetchone()
+def _binding(c, row, *, stageable=True):
+    # Every column: before schema 49 there is no endpoint column (rolling upgrade).
+    binding = c.execute('SELECT * FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
+    # ANYM-519: an endpoint binding stages nothing while the endpoint is not enabled or the gate is off.
+    if stageable and binding is not None and binding.get('endpoint') is not None:
+        from .delivery_endpoints import endpoint_stageable
+        return binding if endpoint_stageable(c, binding['endpoint']) else None
+    return binding
 
 
 def _armed(row, binding):
@@ -194,10 +199,12 @@ def _bypass(policy, reasons):
 
 
 def _emit(c, row, binding, window, kind, through, bypass):
-    hint = c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,receiver,
+    # The target column is a constant: receiver, or (schema 49) endpoint.
+    target = 'receiver' if binding['receiver'] is not None else 'endpoint'
+    hint = c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,''' + target + ''',
         through_position,kind,window_id,quiet_bypass) VALUES(%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT DO NOTHING RETURNING id''',
-        (row['id'], row['version'], binding['receiver'], through, kind, window['next_window'], bypass)).fetchone()
+        (row['id'], row['version'], binding[target], through, kind, window['next_window'], bypass)).fetchone()
     window['next_window'] += 1
     return hint is not None
 
@@ -351,7 +358,7 @@ def carry_window(c, row, previous_version):
 
 def delivery_state(c, row):
     """Content-free policy, held state and silence timer for get_subscription."""
-    binding = _binding(c, row)
+    binding = _binding(c, row, stageable=False)
     if binding is None:
         return dict(UNBOUND)
     window = c.execute('SELECT * FROM subscription_hint_windows WHERE subscription=%s', (row['id'],)).fetchone()

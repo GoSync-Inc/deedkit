@@ -29,6 +29,9 @@ WAIT_ADMISSION = {
     ("messaging", "wait_for_subscription_events"): ("waits", lambda a: True),
     # ANYM-478: a live search waits up to 20 s in its own pool.
     ("messaging", "search"): ("searches", lambda a: a.get("live", "off") != "off"),
+    # ANYM-519: register and test wait up to 10 s for the signed test delivery's result.
+    ("messaging", "register_delivery_endpoint"): ("waits", lambda a: True),
+    ("messaging", "test_delivery_endpoint"): ("waits", lambda a: True),
 }
 
 

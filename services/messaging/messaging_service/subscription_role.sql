@@ -27,3 +27,6 @@ GRANT SELECT ON subscription_delivery TO messaging_subscriptions;
 GRANT SELECT,INSERT ON subscription_outbox TO messaging_subscriptions;
 -- Schema 38: durable held hints and silence timers (debounce, batch, quiet hours, budget).
 GRANT SELECT,INSERT,UPDATE ON subscription_hint_windows TO messaging_subscriptions;
+-- Schema 49 (ANYM-519): an endpoint binding stages a hint only while its endpoint is enabled; no
+-- secret, header value or URL column.
+GRANT SELECT(id,state) ON delivery_endpoints TO messaging_subscriptions;

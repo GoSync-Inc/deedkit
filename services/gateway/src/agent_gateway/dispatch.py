@@ -85,6 +85,10 @@ def exposed(value, key=None):
     return [value] if isinstance(value, str) and not (key and REFERENCE_KEY.search(key)) else []
 
 
+# ANYM-519: write-only arguments of the endpoint tools; no gateway response repeats them.
+WRITE_ONLY_ARGUMENTS = frozenset({"signing_secret", "new_secret", "headers"})
+
+
 def found(piece, text):
     """A piece of payload in `text`: a substring, or a whole word when shorter than MIN_PAYLOAD."""
     if len(piece) >= MIN_PAYLOAD:
@@ -471,6 +475,11 @@ class Dispatch:
                 and args.get("start_from") == "now"
                 and "cursor-write" not in (set(agent["grants"].get(module, [])) & set(caps["permissions"]))):
             raise Denied()
+        if (module == "messaging" and tool["operation"] in ("create_subscription", "configure_subscription_delivery")
+                and (args.get("delivery") is not None or args.get("endpoint_id") is not None)
+                and "delivery-write" not in (set(agent["grants"].get(module, [])) & set(caps["permissions"]))):
+            # ANYM-519: binding a self-service endpoint needs the local delivery-write grant too.
+            raise Denied()
         if not self.implemented(tool, snapshot, agent, caps, args.get("account")):
             raise Denied()
         rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
@@ -534,8 +543,10 @@ class Dispatch:
                 denied.detail = stale_arguments_hint(tool, {
                     "error": "invalid_arguments", "field_errors": error.field_errors,
                     "next_action": "check_parameters"})
+                # ANYM-519: a signing secret or header values are never echoed back, even to their sender.
                 if (error.field_errors == [{"field": "request_id", "reason": "required"}]
-                        and "request_id" in tool["inputSchema"].get("properties", {})):
+                        and "request_id" in tool["inputSchema"].get("properties", {})
+                        and not WRITE_ONLY_ARGUMENTS.intersection(values)):
                     denied.detail["next"] = {"tool": name, "arguments": {**values, "request_id": PLACEHOLDER_REQUEST_ID}}
             raise denied from None
         except ValueError:

@@ -25,7 +25,7 @@ test('all seven consumption and feedback helpers preserve wire arguments',async(
     assert.deepEqual(await client[method](args),{future_field:{verified:false}});
     assert.ok(tools.includes(operation),operation);
   }
-  assert.equal(tools.length,46);
+  assert.equal(tools.length,51);
   assert.deepEqual(seen,Object.values(methods).map(([operation,args])=>[
     `https://archive.example/prefix/v1/${operation}`,args]));
 });
@@ -167,3 +167,71 @@ test('feedback operation accepts the longest tool name before transport',async()
   assert.deepEqual(seen.map(body=>body.operation),['calendar_'+'a'.repeat(120)]);
 });
 
+
+const ENDPOINT='11111111-1111-4111-8111-111111111111';
+const SECRET='whsec_'+'c3ludGhldGljLXNlY3JldC1vbmx5LWZvci10ZXN0cw==';
+const endpointMethods={
+  registerDeliveryEndpoint:['register_delivery_endpoint',{request_id:'synthetic-endpoint',url:'https://hooks.example/in',
+    signing_secret:SECRET,label:'synthetic',headers:{'X-Api-Key':'synthetic-canary-value'}}],
+  listDeliveryEndpoints:['list_delivery_endpoints',{}],
+  updateDeliveryEndpoint:['update_delivery_endpoint',{endpoint_id:ENDPOINT,version:2,action:'rotate_secret',new_secret:SECRET}],
+  deleteDeliveryEndpoint:['delete_delivery_endpoint',{endpoint_id:ENDPOINT,version:3}],
+  testDeliveryEndpoint:['test_delivery_endpoint',{endpoint_id:ENDPOINT,request_id:'synthetic-probe'}],
+};
+
+// spec: ANYM-519
+test('the five endpoint helpers send their wire arguments to the REST operations',async()=>{
+  const seen=[];
+  const client=new AnyMsgClient({...options,fetch:async(url,request)=>{
+    seen.push([String(url),JSON.parse(request.body)]);return Response.json({});
+  }});
+  for(const [method,[operation,args]] of Object.entries(endpointMethods)){
+    assert.ok(tools.includes(operation),operation);
+    await client[method](args);
+  }
+  await client.listDeliveryEndpoints();
+  await client.createSubscription({chat_ids:['chat_synthetic'],delivery:{endpoint_id:ENDPOINT,delivery_policy:{debounce_s:5}}});
+  await client.configureSubscriptionDelivery({subscription_id:'sub_synthetic',version:2,endpoint_id:ENDPOINT});
+  assert.deepEqual(seen,[...Object.values(endpointMethods).map(([operation,args])=>[
+    `https://archive.example/prefix/v1/${operation}`,args]),
+    ['https://archive.example/prefix/v1/list_delivery_endpoints',{}],
+    ['https://archive.example/prefix/v1/create_subscription',{chat_ids:['chat_synthetic'],
+      delivery:{endpoint_id:ENDPOINT,delivery_policy:{debounce_s:5}}}],
+    ['https://archive.example/prefix/v1/configure_subscription_delivery',{subscription_id:'sub_synthetic',version:2,endpoint_id:ENDPOINT}]]);
+});
+
+const ENDPOINT_ARGUMENT_CASES=[
+  ['registerDeliveryEndpoint',{request_id:'synthetic-endpoint',url:'https://hooks.example',signing_secret:'plain-secret'}],
+  ['registerDeliveryEndpoint',{request_id:'synthetic-endpoint',url:'',signing_secret:SECRET}],
+  ['registerDeliveryEndpoint',{request_id:'synthetic-endpoint',url:'https://hooks.example/'+'x'.repeat(2048),signing_secret:SECRET}],
+  ['registerDeliveryEndpoint',{request_id:'synthetic-endpoint',url:'https://hooks.example',signing_secret:SECRET,
+    headers:{a:'1',b:'2',c:'3',d:'4',e:'5'}}],
+  ['registerDeliveryEndpoint',{request_id:'synthetic-endpoint',url:'https://hooks.example',signing_secret:SECRET,headers:{a:1}}],
+  ['registerDeliveryEndpoint',{url:'https://hooks.example',signing_secret:SECRET}],
+  ['registerDeliveryEndpoint',{request_id:'synthetic-endpoint',url:'https://hooks.example',signing_secret:SECRET,receiver_id:ENDPOINT}],
+  ['updateDeliveryEndpoint',{endpoint_id:ENDPOINT,version:1,action:'close'}],
+  ['updateDeliveryEndpoint',{endpoint_id:'not-a-uuid',version:1,action:'pause'}],
+  ['updateDeliveryEndpoint',{endpoint_id:ENDPOINT,version:0,action:'pause'}],
+  ['deleteDeliveryEndpoint',{endpoint_id:null,version:1}],
+  ['testDeliveryEndpoint',{endpoint_id:ENDPOINT,request_id:'short'}],
+  ['listDeliveryEndpoints',{limit:5}],
+  ['createSubscription',{chat_ids:['chat_synthetic'],delivery:{endpoint_id:'x'}}],
+  ['createSubscription',{chat_ids:['chat_synthetic'],delivery:{endpoint_id:ENDPOINT,url:'https://hooks.example'}}],
+  ['configureSubscriptionDelivery',{subscription_id:'sub_synthetic',version:1,endpoint_id:'x'}],
+];
+// spec: ANYM-519
+test('endpoint arguments are validated before the transport',()=>{
+  const client=new AnyMsgClient({...options,fetch:async()=>assert.fail('invalid input reached transport')});
+  for(const [index,[method,args]] of ENDPOINT_ARGUMENT_CASES.entries())
+    assert.throws(()=>client[method](args),error=>error instanceof TypeError && !String(error).includes(SECRET),
+      'case '+index);
+});
+
+// spec: ANYM-519
+test('update_subscription keeps its own actions and endpoint errors are safe codes',async()=>{
+  const client=new AnyMsgClient({...options,fetch:async()=>Response.json(
+    {error:'reserved_header',detail:'synthetic-private-source',request_id:'b'.repeat(32)},{status:400})});
+  assert.throws(()=>client.updateSubscription({subscription_id:'sub_synthetic',version:1,action:'rotate_secret'}),TypeError);
+  await assert.rejects(client.listDeliveryEndpoints(),error=>error instanceof AnyMsgError && error.code==='reserved_header' &&
+    !String(error).includes('synthetic-private-source'));
+});

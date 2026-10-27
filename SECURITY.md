@@ -18,3 +18,15 @@ Provider authentication is done only in an owner's terminal.
 Backup delivery is distinct from successful restoration. Verify a copy in an isolated
 installation before pruning recovery points. A same-provider backup is not protection
 against losing access to that provider account. Preserve recovery keys independently.
+
+Self-service webhook endpoints (ANYM-519) send data to a host the agent names, inside
+the operator's host policy file. A receiver host learns subscription, event, account,
+chat, message and sender IDs, event kinds and times, the delivery timing and the
+agent's own headers; never message text, names or file content. SSRF controls: https
+on port 443, every resolved address public (no private, loopback, CGNAT, multicast,
+NAT64, 6to4, Teredo or IPv4-mapped answers), resolution again before each attempt with
+the address pinned, TLS hostname verification, no redirects, no proxies, and the
+host policy rechecked before each attempt. Signing secrets and header values are
+write-only for the API role and never returned, logged or audited. This is privilege
+separation, not encryption: database owners and anyone who can decrypt a backup can
+read them. Details: [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#self-service-webhook-endpoints-schema-49).

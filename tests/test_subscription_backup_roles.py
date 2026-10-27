@@ -29,9 +29,9 @@ def test_schema26_manifest_includes_definitions_sources_and_exact_match_referenc
     _, definition, event = _subscription(store, 'synthetic-manifest-subscriber')
     match_subscriptions(store)
     with store.pool.connection() as connection:
-        assert connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '48'
+        assert connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '49'
         manifest = database_manifest(connection)
-    assert len(manifest) == 76
+    assert len(manifest) == 78
     assert all(manifest[name]['rows'] == 1 for name in (
         'subscriptions', 'subscription_sources', 'subscription_matches'))
     assert all(len(manifest[name]['sha256']) == 64 for name in (
@@ -114,7 +114,7 @@ def test_native_schema26_quarantine_closes_versions_preserves_refs_and_revokes_r
             assert connection.execute('SELECT count(*) AS n FROM subscription_receipts').fetchone()['n'] == 0
             assert after['subscription_consumption'] == before['subscription_consumption']
             assert after['agent_feedback'] == before['agent_feedback']
-        assert len(after) == 76 and after['subscriptions']['rows'] == 2
+        assert len(after) == 78 and after['subscriptions']['rows'] == 2
         assert all(row['state'] == 'closed' and row['version'] == before_versions[str(row['id'])] + 1
             for row in definitions)
         assert after['subscription_sources'] == before['subscription_sources']
@@ -189,3 +189,43 @@ def test_dedicated_matcher_role_matches_without_credentials_or_provider_mutation
             with store.pool.connection() as connection:
                 connection.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
                 connection.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
+# spec: ANYM-519
+def test_quarantine_restore_disables_every_self_service_endpoint(database, tmp_path):
+    """Never quarantine the fixture source: own an isolated *_restore_test DB."""
+    base_dsn = database.pool.conninfo
+    restore_name = 'anymsg_endpoint_' + uuid4().hex + '_restore_test'
+    restored, created = None, False
+    try:
+        with psycopg.connect(base_dsn, autocommit=True) as owner:
+            owner.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(restore_name)))
+        created = True
+        restored = Store(make_conninfo(base_dsn, dbname=restore_name), tmp_path / 'synthetic-originals', 'http://testserver')
+        restored.migrate()
+        restored.seed()
+        token = restored.issue_key('synthetic-endpoint-owner', ['telegram-demo'])
+        key_id = restored.capabilities(token)['credential_id']
+        with restored.pool.connection() as connection:
+            for index, state in enumerate(('enabled', 'agent_paused', 'auto_paused', 'deleted')):
+                endpoint = connection.execute("""INSERT INTO delivery_endpoints(principal,key_id,request_id,request_hash,
+                    url,host,state,signing_secret) VALUES('synthetic-endpoint-owner',%s,%s,%s,
+                    'https://hooks.example.test/hook','hooks.example.test',%s,%s) RETURNING id""",
+                    (key_id, f'synthetic-request-{index}', 'b' * 64, state, None if state == 'deleted' else
+                     'whsec_c3ludGhldGljLXJlc3RvcmUtc2VjcmV0LTAxMjM0NTY3')).fetchone()['id']
+                connection.execute('INSERT INTO delivery_endpoint_tests(endpoint,request_id) VALUES(%s,%s)',
+                    (endpoint, f'synthetic-test-{index}'))
+            before = database_manifest(connection)
+        assert before['delivery_endpoints']['rows'] == 4 and before['delivery_endpoint_tests']['rows'] == 4
+        quarantine_restore(restored)
+        with restored.pool.connection() as connection:
+            states = sorted(row['state'] for row in connection.execute('SELECT state FROM delivery_endpoints'))
+            tests = connection.execute('SELECT DISTINCT state,error_code FROM delivery_endpoint_tests').fetchall()
+        assert states == ['deleted', 'operator_disabled', 'operator_disabled', 'operator_disabled']
+        assert tests == [{'state': 'cancelled', 'error_code': 'restored_disabled'}]
+    finally:
+        if restored is not None:
+            restored.close()
+        if created:
+            with psycopg.connect(base_dsn, autocommit=True) as owner:
+                owner.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(restore_name)))
