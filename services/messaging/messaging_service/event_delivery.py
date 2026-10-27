@@ -22,6 +22,15 @@ from .subscriptions import _owned, _state, _view, _worker_identity
 
 _DNS_SLOTS = threading.BoundedSemaphore(4)
 _DNS_TIMEOUT_S = 2
+# ANYM-519: is_global accepts these; they translate to or embed another (possibly internal) address.
+_REFUSED_V6 = tuple(ipaddress.ip_network(net) for net in ('64:ff9b::/96', '64:ff9b:1::/48', '2002::/16', '2001::/32'))
+
+
+def _refused(address):
+    if not address.is_global or address.is_multicast:
+        return True
+    return isinstance(address, ipaddress.IPv6Address) and bool(address.ipv4_mapped or address.sixtofour or
+        address.teredo or any(address in net for net in _REFUSED_V6))
 
 
 def _addresses(host, port):
@@ -70,7 +79,7 @@ def validate_endpoint(endpoint, *, resolver=_addresses):
         if not addresses or len(addresses) > 32:
             raise ValueError
         addresses = [str(ipaddress.ip_address(address)) for address in addresses]
-        if any(not ipaddress.ip_address(address).is_global for address in addresses):
+        if any(_refused(ipaddress.ip_address(address)) for address in addresses):
             raise ValueError
         return host, addresses, parsed.path or '/'
     except (ValueError, UnicodeError, TypeError):
@@ -129,10 +138,20 @@ def disable_receiver(store, receiver_id):
             WHERE receiver=%s AND state IN ('pending','leased')""", (receiver_id,))
     return {'receiver_id': receiver_id, 'enabled': False}
 
-def configure_subscription_delivery(store, c, p, subscription_id, version, receiver_id, delivery_policy=None):
+def configure_subscription_delivery(store, c, p, subscription_id, version, receiver_id=None, delivery_policy=None,
+        endpoint_id=None):
     from .store import APIError
     if 'read' not in p['permissions']:
         raise APIError('forbidden', 403)
+    if receiver_id is not None and endpoint_id is not None:
+        raise APIError('invalid_parameters')
+    if endpoint_id is not None:
+        # ANYM-519: a self-service endpoint needs delivery-write and the operator's activation.
+        from .delivery_endpoints import gate_on
+        if 'delivery-write' not in p['permissions']:
+            raise APIError('forbidden', 403)
+        if not gate_on(c):
+            raise APIError('delivery_disabled', 409)
     if type(version) is not int or not 1 <= version <= 2**53 - 1:
         raise APIError('invalid_version')
     row = _owned(c, p, subscription_id)
@@ -144,11 +163,22 @@ def configure_subscription_delivery(store, c, p, subscription_id, version, recei
         raise APIError('subscription_conflict', 409)
     from .delivery_policy import carry_window, normalize_policy
     policy = normalize_policy(c, delivery_policy, row['selector'])
-    if policy is not None and receiver_id is None:
+    if policy is not None and receiver_id is None and endpoint_id is None:
         raise APIError('invalid_delivery_policy')
-    previous = c.execute('SELECT receiver FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
-    if receiver_id is None:
+    previous = c.execute('SELECT * FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
+    if receiver_id is None and endpoint_id is None:
         c.execute('DELETE FROM subscription_delivery WHERE subscription=%s', (row['id'],))
+    elif endpoint_id is not None:
+        from .delivery_endpoints import _endpoint_id, _state_error, lock_endpoint
+        endpoint_id = _endpoint_id(endpoint_id)
+        # Shared, so a concurrent pause, delete or operator disable commits before or after this binding.
+        lock_endpoint(c, endpoint_id, shared=True)
+        endpoint = c.execute("""SELECT id,state FROM delivery_endpoints WHERE id=%s AND principal=%s AND key_id=%s
+            AND state<>'deleted'""", (endpoint_id, p['id'], p['key_id'])).fetchone()
+        if endpoint is None:
+            raise APIError('not_found', 404)
+        if endpoint['state'] != 'enabled':
+            raise _state_error(endpoint)
     else:
         try:
             receiver_id = str(UUID(receiver_id))
@@ -158,24 +188,34 @@ def configure_subscription_delivery(store, c, p, subscription_id, version, recei
             AND key_id=%s AND enabled''', (receiver_id, p['id'], p['key_id'])).fetchone()
         if allowed is None:
             raise APIError('not_found', 404)
+    if receiver_id is not None or endpoint_id is not None:
         # The whole delivery configuration belongs to the next version; a silence timer starts
         # at this commit and any later version change cancels it.
         expect = (policy or {}).get('expect_reply_within_s')
-        c.execute('''INSERT INTO subscription_delivery(subscription,receiver,policy,policy_version,silence_deadline)
-            VALUES(%s,%s,%s,%s,CASE WHEN %s::integer IS NULL THEN NULL
+        # Before schema 49 there is no endpoint column; a receiver binding then writes only its own.
+        endpoint_column = endpoint_id is not None or 'endpoint' in (previous or {})
+        c.execute('''INSERT INTO subscription_delivery(subscription,receiver,''' + ('endpoint,' if endpoint_column else '') +
+            '''policy,policy_version,silence_deadline)
+            VALUES(%s,%s,''' + ('%s,' if endpoint_column else '') + '''%s,%s,CASE WHEN %s::integer IS NULL THEN NULL
                 ELSE clock_timestamp()+%s::integer*interval '1 second' END)
-            ON CONFLICT(subscription) DO UPDATE SET receiver=excluded.receiver,configured_at=clock_timestamp(),
-            policy=excluded.policy,policy_version=excluded.policy_version,silence_deadline=excluded.silence_deadline''',
-            (row['id'], receiver_id, Jsonb(policy) if policy else None, row['version'] + 1, expect, expect))
+            ON CONFLICT(subscription) DO UPDATE SET receiver=excluded.receiver,''' +
+            ('endpoint=excluded.endpoint,' if endpoint_column else '') + '''
+            configured_at=clock_timestamp(),policy=excluded.policy,policy_version=excluded.policy_version,
+            silence_deadline=excluded.silence_deadline''',
+            (row['id'], receiver_id, *([endpoint_id] if endpoint_column else []), Jsonb(policy) if policy else None,
+             row['version'] + 1, expect, expect))
     row = c.execute('''UPDATE subscriptions SET version=version+1,updated_at=clock_timestamp()
         WHERE id=%s RETURNING *''', (row['id'],)).fetchone()
     c.execute("""UPDATE subscription_outbox SET state='cancelled',finished_at=clock_timestamp(),
         error_code='configuration_changed' WHERE subscription=%s AND state IN ('pending','leased')""", (row['id'],))
-    if previous is not None and str(previous['receiver']) == receiver_id:
+    if previous is not None and (receiver_id or endpoint_id) is not None and (
+            str(previous['receiver']), str(previous.get('endpoint'))) == (str(receiver_id), str(endpoint_id)):
         carry_window(c, row, version)
     result = _view(c, row)
-    result['delivery'] = {'passive_read': True, 'ack': True, 'push': receiver_id is not None,
+    result['delivery'] = {'passive_read': True, 'ack': True, 'push': receiver_id is not None or endpoint_id is not None,
         'receiver_id': receiver_id, 'host_wakeup': 'unverified', 'host_turn_verified': False}
+    if endpoint_id is not None:
+        result['delivery'].update(endpoint_id=endpoint_id, target='endpoint')
     if row['state'] != 'access_changed':
         from .delivery_policy import delivery_state
         from .store import serial
@@ -183,15 +223,25 @@ def configure_subscription_delivery(store, c, p, subscription_id, version, recei
     return result
 
 
+def _hint_target(c, row):
+    """(receiver, endpoint) of a binding that may stage a hint now, else None (ANYM-519 gate)."""
+    binding = c.execute('SELECT * FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
+    if binding is None or binding.get('endpoint') is None:
+        return binding
+    from .delivery_endpoints import endpoint_stageable
+    return binding if endpoint_stageable(c, binding['endpoint']) else None
+
+
 def enqueue_hint(c, row, through, *, kind='events', request_id=''):
-    binding = c.execute('SELECT receiver FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
+    binding = _hint_target(c, row)
     if binding is None:
         return None
-    return c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,receiver,
+    target = 'receiver' if binding['receiver'] is not None else 'endpoint'
+    return c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,''' + target + ''',
         through_position,kind,request_id) VALUES(%s,%s,%s,%s,%s,%s)
         ON CONFLICT(subscription,subscription_version,kind,through_position,request_id)
         DO NOTHING RETURNING *''',
-        (row['id'], row['version'], binding['receiver'], through, kind, request_id)).fetchone()
+        (row['id'], row['version'], binding[target], through, kind, request_id)).fetchone()
 
 
 def _probe_view(row):
@@ -296,18 +346,30 @@ def delivery_transports(c, p):
             beat_row = c.execute('''SELECT clock_timestamp()-beat_at<=make_interval(secs=>%s) AS fresh
                 FROM subscription_dispatcher_heartbeat WHERE id=1''', (HEARTBEAT_MAX_AGE_S,)).fetchone()
             # Only bindings of subscriptions still valid for this key: not expired, same scope and permissions.
-            bound = c.execute('''SELECT coalesce(bool_or(r.enabled),false) AS enabled,count(*) AS n
+            # ANYM-519: a bound enabled self-service endpoint counts as configured too (schema 49).
+            from .delivery_endpoints import gate_on, schema_ready
+            endpoints = schema_ready(c)
+            bound = c.execute('''SELECT coalesce(bool_or(r.enabled),false) AS enabled,''' + ('''
+                coalesce(bool_or(e.state='enabled'),false)''' if endpoints else 'false') + ''' AS endpoint,count(*) AS n
                 FROM subscriptions s JOIN subscription_delivery d ON d.subscription=s.id
-                JOIN subscription_receivers r ON r.id=d.receiver
+                LEFT JOIN subscription_receivers r ON r.id=d.receiver''' + (''' LEFT JOIN delivery_endpoints e ON e.id=d.endpoint'''
+                if endpoints else '') + '''
                 WHERE s.principal=%s AND s.key_id=%s AND s.state IN ('active','paused')
                 AND (s.expires_at IS NULL OR s.expires_at>clock_timestamp())
                 AND s.scope_version=%s AND s.key_permission_version=%s''',
                 (p['id'], p['key_id'], p['scope_version'], p['key_permission_version'])).fetchone()
+            gate = gate_on(c, fence=False)
             c.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
                 (limits['s'], limits['l']))
     except psycopg.Error:
         # The savepoint's rollback also restores the caller's limits.
-        beat_row = bound = None
+        beat_row = bound = gate = None
+    from .delivery_endpoints import TOOLS, load_policy, max_endpoints
+    policy_set = load_policy() is not None
+    try:
+        limit = max_endpoints()
+    except ValueError:
+        limit = None
     rows = []
     for name, tools in TRANSPORT_TOOLS.items():
         # Every consumption tool also needs read (the backend checks it before its own permission).
@@ -318,8 +380,12 @@ def delivery_transports(c, p):
             configured = operational = False
             failures.append('delivery_status_unavailable')
         elif name == 'webhook':
-            configured = bound['enabled']
+            configured = bound['enabled'] or bool(bound['endpoint'] and gate and policy_set)
             operational = configured and bool(beat_row and beat_row['fresh'])
+            if not bound['enabled'] and not gate:
+                failures.append('delivery_disabled')
+            if not bound['enabled'] and not policy_set:
+                failures.append('delivery_policy_unset')
             if not bound['n']:
                 failures.append('no_receiver_bound')
             elif not configured:
@@ -333,9 +399,15 @@ def delivery_transports(c, p):
         if name == 'long_poll':
             row['max_wait_s'] = 25
         if name == 'webhook':
-            # Until self-service endpoints ship (ANYM-519), only the operator registers a receiver.
-            row.update(registration='operator_only', next_step='ask the operator to register a receiver',
-                heartbeat_max_age_s=HEARTBEAT_MAX_AGE_S)
+            # ANYM-519: self-service once the operator enables the feature and sets the host policy.
+            self_service = bool(gate) and policy_set
+            row.update(registration='self_service' if self_service else 'operator_only',
+                next_step=('register_delivery_endpoint, then create_subscription with delivery {endpoint_id}'
+                    if self_service else 'ask the operator to register a receiver'),
+                heartbeat_max_age_s=HEARTBEAT_MAX_AGE_S,
+                self_service={'enabled': bool(gate), 'policy_set': policy_set, 'tools': list(TOOLS),
+                    'max_endpoints': limit, 'signature_scheme': 'standard_webhooks_v1',
+                    'reissued_key_carries_endpoints': False})
         rows.append(row)
     return rows
 
@@ -348,6 +420,17 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
     beat(store)
     stats = dict(delivered=0, retried=0, dead_letter=0, cancelled=0, deferred=0)
     holds = []
+    # ANYM-519: rotation promotion and endpoint tests; a failure there never stops operator hints.
+    try:
+        from .delivery_endpoints import dispatch_tests, promote_rotations, schema_ready
+        with store.pool.connection() as c:
+            ready = schema_ready(c) and promote_rotations(c) is not None
+        if ready:
+            stats['endpoint_tests'] = dispatch_tests(store, transport=transport, resolver=resolver)
+    except Exception as error:
+        from .telemetry import capture
+        capture(error, 'endpoint_tests_failed')
+        print(json.dumps({'error': 'endpoint_tests_failed', 'class': type(error).__name__}), flush=True)
     for _ in range(limit):
         lease = uuid4()
         with store.pool.connection() as c:
@@ -399,9 +482,17 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
         # are immutable; the fence rechecks the exact binding. The body carries the hint's
         # version, which the fence requires to equal the locked subscription's.
         state, error, prepared, unsafe = 'pending', 'receiver_unavailable', None, False
-        with store.pool.connection() as c:
-            registered = c.execute('SELECT endpoint,secret_file FROM subscription_receivers WHERE id=%s AND enabled',
-                (hint['receiver'],)).fetchone()
+        target = refused = None
+        if hint.get('endpoint') is not None:
+            # ANYM-519: a self-service endpoint; DNS and the host policy here, secrets and body inside the fence.
+            from .delivery_endpoints import prepare
+            registered, (target, problem) = None, prepare(store, hint['endpoint'], resolver)
+            unsafe = problem == 'unsafe_endpoint'
+            refused = problem if problem in ('endpoint_policy_refused', 'access_or_configuration_changed') else None
+        else:
+            with store.pool.connection() as c:
+                registered = c.execute('SELECT endpoint,secret_file FROM subscription_receivers WHERE id=%s AND enabled',
+                    (hint['receiver'],)).fetchone()
         if registered is not None:
             try:
                 prepared = (validate_endpoint(registered['endpoint'], resolver=resolver),
@@ -433,6 +524,16 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 (hint['subscription'], hint['receiver'])).fetchone()
             if p is not None and row is not None:
                 row = _state(c, row, p)
+            endpoint = None
+            if hint.get('endpoint') is not None:
+                from .delivery_endpoints import fenced as fence_endpoint
+                endpoint, refused = (None, refused) if refused else fence_endpoint(c, p, hint['endpoint'],
+                    target[0] if target else None)
+                bound = c.execute('SELECT 1 FROM subscription_delivery WHERE subscription=%s AND endpoint=%s',
+                    (hint['subscription'], hint['endpoint'])).fetchone()
+                receiver = endpoint if bound else None
+                if receiver is not None:
+                    receiver = {'principal': p['id'], 'key_id': p['key_id']}
             eligible = (p is not None and row is not None and row['state'] == 'active' and
                 row['version'] == hint['subscription_version'] and receiver is not None and
                 receiver['principal'] == p['id'] and receiver['key_id'] == p['key_id'] and
@@ -442,13 +543,28 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 AND lease_token=%s AND lease_until>clock_timestamp() FOR UPDATE""", (hint['id'], lease)).fetchone()
             if live:
                 if not eligible:
-                    state, error = 'cancelled', 'access_or_configuration_changed'
+                    state, error = 'cancelled', refused or 'access_or_configuration_changed'
                 # The retry age starts at admission: waiting for a budget slot or quiet hours never expires a hint.
                 elif hint['attempts'] >= 8 or c.execute("SELECT %s<clock_timestamp()-interval '7 days' AS expired",
                         (hint['admitted_at'] or now,)).fetchone()['expired']:
                     state, error = 'dead_letter', 'delivery_budget_exhausted'
                 elif unsafe:
-                    state, error = 'dead_letter', 'unsafe_receiver_configuration'
+                    state, error = 'dead_letter', 'unsafe_endpoint' if endpoint else 'unsafe_receiver_configuration'
+                elif endpoint is not None and target is not None:
+                    from .delivery_endpoints import caller_headers, hint_body, signed_headers
+                    body = hint_body(c, hint, row, p)
+                    headers = signed_headers((endpoint['signing_secret'], endpoint['pending_secret']), hint['id'], body,
+                        caller_headers(endpoint))
+                    try:
+                        status = transport(endpoint['url'], body, headers, resolved=target[1], timeout=5)
+                        if type(status) is int and 200 <= status < 300:
+                            state, error = 'delivered', None
+                        elif type(status) is int and 300 <= status < 400:
+                            state, error = 'dead_letter', 'redirect_rejected'
+                    except (OSError, TimeoutError):
+                        pass
+                    except ValueError:
+                        state, error = 'dead_letter', 'unsafe_endpoint'
                 elif prepared is not None:
                     resolved, secret, body = prepared
                     try:

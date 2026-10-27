@@ -1,6 +1,7 @@
 """Selected consumption, delivery configuration and private feedback contracts."""
 import asyncio
 import json
+import logging
 
 import httpx
 import pytest
@@ -347,3 +348,221 @@ def test_full_wait_pool_returns_busy_not_a_bare_503(tmp_path, monkeypatch):
     assert rest.status_code == 200 and rest.json() == expected
     assert not mcp.get("isError") and mcp["structuredContent"] == expected
     assert fetch.status_code == 503
+
+
+ENDPOINT = "11111111-1111-4111-8111-111111111111"
+SECRET_CANARY = "whsec_" + "U3ludGhldGljQ2FuYXJ5U2VjcmV0T25seUZvclRlc3Rz"
+HEADER_CANARY = "synthetic-header-value-canary"
+ENDPOINT_PERMISSIONS = ["read", "delivery-write"]
+ENDPOINT_TOOLS = [
+    ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "https://hooks.example/in",
+                                    "signing_secret": SECRET_CANARY, "label": "synthetic",
+                                    "headers": {"X-Api-Key": HEADER_CANARY}}),
+    ("list_delivery_endpoints", {}),
+    ("update_delivery_endpoint", {"endpoint_id": ENDPOINT, "version": 2, "action": "rotate_secret",
+                                  "new_secret": SECRET_CANARY}),
+    ("update_delivery_endpoint", {"endpoint_id": ENDPOINT, "version": 2, "action": "set_headers",
+                                  "headers": {"X-Api-Key": HEADER_CANARY}}),
+    ("update_delivery_endpoint", {"endpoint_id": ENDPOINT, "version": 2, "action": "pause"}),
+    ("delete_delivery_endpoint", {"endpoint_id": ENDPOINT, "version": 3}),
+    ("test_delivery_endpoint", {"endpoint_id": ENDPOINT, "request_id": "synthetic-probe"}),
+    ("create_subscription", {"chat_ids": ["chat-synthetic"], "delivery": {"endpoint_id": ENDPOINT,
+                                                                           "delivery_policy": {"debounce_s": 5}}}),
+    ("configure_subscription_delivery", {"subscription_id": "subscription-1", "version": 1, "endpoint_id": ENDPOINT}),
+]
+VIEW = {"endpoint_id": ENDPOINT, "version": 1, "state": "enabled", "header_names": ["x-api-key"],
+        "headers_fingerprint": "0a1b2c3d", "secret_fingerprint": "4e5f6a7b"}
+
+
+def endpoint_app(tmp_path, operation, respond):
+    seen = []
+
+    def backend(request):
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json={"permissions": ENDPOINT_PERMISSIONS + ["subscription-write"],
+                                            "tool_manifest": {"names": [operation]}})
+        seen.append((request.url.path, json.loads(request.content)))
+        return respond(request)
+
+    app, _, _ = configured(tmp_path, backend, module="messaging", tools=["messages_" + operation],
+                           grants=ENDPOINT_PERMISSIONS + ["subscription-write"])
+    return app, seen
+
+
+def both(client, name, values):
+    rest = client.post("/v1/" + name, json=values, headers=HEADERS)
+    mcp = rpc(client, "tools/call", {"name": name, "arguments": values}).json()["result"]
+    return rest, mcp
+
+
+# spec: ANYM-519
+@pytest.mark.parametrize("operation,values", ENDPOINT_TOOLS)
+def test_endpoint_tools_forward_exact_arguments_and_never_echo_write_only_values(tmp_path, caplog, operation, values):
+    caplog.set_level(logging.DEBUG)
+    app, seen = endpoint_app(tmp_path, operation, lambda request: httpx.Response(200, json=VIEW))
+    name = "messages_" + operation
+    with TestClient(app) as client:
+        assert [t["name"] for t in rpc(client, "tools/list").json()["result"]["tools"]] == [name]
+        rest, mcp = both(client, name, values)
+    assert rest.status_code == 200 and not mcp.get("isError")
+    assert rest.json() == mcp["structuredContent"] == VIEW
+    # The gateway adds schema defaults; the backend drops the None ones (app.drop_omitted).
+    assert seen[0] == seen[1] and seen[0][0] == "/v1/" + operation
+    assert {k: v for k, v in seen[0][1].items() if k in values} == values
+    assert all(v is None or k in ('label', 'direction') for k, v in seen[0][1].items() if k not in values)
+    for text in (rest.text, json.dumps(mcp), caplog.text):
+        assert SECRET_CANARY not in text and HEADER_CANARY not in text
+
+
+# spec: ANYM-519
+@pytest.mark.parametrize("operation,values", ENDPOINT_TOOLS[:7])
+def test_endpoint_tools_need_delivery_write_and_fail_closed_without_manifest(tmp_path, operation, values):
+    name = "messages_" + operation
+    assert CATALOG[name]["scopes"] == ["read", "delivery-write"]
+    for permissions, manifest in ((["read"], [operation]), (ENDPOINT_PERMISSIONS, None)):
+        def backend(request):
+            assert request.url.path == "/v1/capabilities"
+            return httpx.Response(200, json={"permissions": permissions,
+                                            **({"tool_manifest": {"names": manifest}} if manifest else {})})
+        app, _, _ = configured(tmp_path, backend, module="messaging", tools=[name], grants=permissions)
+        with TestClient(app) as client:
+            assert rpc(client, "tools/list").json()["result"]["tools"] == []
+            rest, mcp = both(client, name, values)
+        assert rest.status_code == 403 and mcp["isError"]
+
+
+# spec: ANYM-519
+@pytest.mark.parametrize("operation,values", [
+    ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "https://hooks.example", "signing_secret": "plain"}),
+    ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "https://hooks.example",
+                                    "signing_secret": "whsec_" + "A" * 31}),
+    ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "https://hooks.example",
+                                    "signing_secret": "whsec_" + "A" * 97}),
+    ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "", "signing_secret": SECRET_CANARY}),
+    ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "https://h.example/" + "x" * 2048,
+                                    "signing_secret": SECRET_CANARY}),
+    ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "https://hooks.example",
+                                    "signing_secret": SECRET_CANARY, "headers": {f"X-{i}": "v" for i in range(5)}}),
+    ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "https://hooks.example",
+                                    "signing_secret": SECRET_CANARY, "headers": {"X-Api-Key": 1}}),
+    ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "https://hooks.example",
+                                    "signing_secret": SECRET_CANARY, "label": "x" * 129}),
+    ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "https://hooks.example",
+                                    "signing_secret": SECRET_CANARY, "receiver_id": ENDPOINT}),
+    ("list_delivery_endpoints", {"limit": 5}),
+    ("update_delivery_endpoint", {"endpoint_id": ENDPOINT, "version": 1, "action": "close"}),
+    ("update_delivery_endpoint", {"endpoint_id": ENDPOINT, "version": 1, "action": "enable"}),
+    ("update_delivery_endpoint", {"endpoint_id": "endpoint-1", "version": 1, "action": "pause"}),
+    ("update_delivery_endpoint", {"endpoint_id": ENDPOINT, "version": 0, "action": "pause"}),
+    ("delete_delivery_endpoint", {"endpoint_id": ENDPOINT}),
+    ("test_delivery_endpoint", {"endpoint_id": ENDPOINT, "request_id": "short"}),
+    ("create_subscription", {"chat_ids": ["c"], "delivery": {"endpoint_id": "e"}}),
+    ("create_subscription", {"chat_ids": ["c"], "delivery": {"endpoint_id": ENDPOINT, "url": "https://hooks.example"}}),
+    ("configure_subscription_delivery", {"subscription_id": "s", "version": 1, "endpoint_id": "e"}),
+])
+def test_endpoint_arguments_are_bounded_before_any_backend(operation, values):
+    with pytest.raises(ValueError):
+        arguments(CATALOG["messages_" + operation], values)
+
+
+# spec: ANYM-519
+def test_invalid_secret_and_missing_request_id_never_return_the_secret(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    app, seen = endpoint_app(tmp_path, "register_delivery_endpoint", lambda request: pytest.fail("reached backend"))
+    name = "messages_register_delivery_endpoint"
+    invalid = {"request_id": "synthetic-endpoint", "url": "https://hooks.example", "signing_secret": "whsec_!" + HEADER_CANARY}
+    missing = {"url": "https://hooks.example", "signing_secret": SECRET_CANARY, "headers": {"X-Api-Key": HEADER_CANARY}}
+    with TestClient(app) as client:
+        for values in (invalid, missing):
+            rest, mcp = both(client, name, values)
+            assert rest.status_code == 422 and mcp["isError"] and rest.json()["error"] == "invalid_arguments"
+            # The ANYM-544 retry hint would repeat every argument; a tool with write-only ones gets none.
+            assert "next" not in rest.json()
+            for text in (rest.text, json.dumps(mcp), caplog.text):
+                assert SECRET_CANARY not in text and HEADER_CANARY not in text
+    assert seen == []
+
+
+URL_HINT = "https on port 443, a public address, a host the operator allows"
+RELAY_NEXT = "for a tailnet or private host ask the operator for the wake relay (ANYM-228)"
+
+
+# spec: ANYM-519
+@pytest.mark.parametrize("operation,values,body,relayed", [
+    ("register_delivery_endpoint", ENDPOINT_TOOLS[0][1],
+     {"error": "unsafe_endpoint", "field_errors": [{"field": "url", "reason": "format", "expected": URL_HINT}],
+      "next_step": RELAY_NEXT},
+     {"field_errors": [{"field": "url", "reason": "format", "expected": URL_HINT}], "next_step": RELAY_NEXT}),
+    ("register_delivery_endpoint", ENDPOINT_TOOLS[0][1],
+     {"error": "rate_limited", "retry_after_s": 42}, {"retry_after_s": 42}),
+    ("register_delivery_endpoint", ENDPOINT_TOOLS[0][1],
+     {"error": "reserved_header", "header": "Content-Type"}, {"header": "Content-Type"}),
+    ("update_delivery_endpoint", ENDPOINT_TOOLS[2][1],
+     {"error": "rotation_in_progress", "retry_after_s": 3600}, {"retry_after_s": 3600}),
+    ("update_delivery_endpoint", ENDPOINT_TOOLS[4][1],
+     {"error": "operator_disabled", "state": "operator_disabled"}, {"state": "operator_disabled"}),
+    ("configure_subscription_delivery", ENDPOINT_TOOLS[8][1],
+     {"error": "endpoint_paused", "state": "agent_paused", "next_step": "call update_delivery_endpoint with action resume"},
+     {"state": "agent_paused", "next_step": "call update_delivery_endpoint with action resume"}),
+    ("list_delivery_endpoints", {}, {"error": "delivery_disabled"}, {}),
+    ("register_delivery_endpoint", ENDPOINT_TOOLS[0][1], {"error": "delivery_policy_unset"}, {}),
+    # Anything not a reviewed constant, counter or header name is dropped, including echoed input.
+    ("register_delivery_endpoint", ENDPOINT_TOOLS[0][1],
+     {"error": "invalid_header", "header": "X-Api-Key: " + HEADER_CANARY, "next_step": HEADER_CANARY,
+      "state": [HEADER_CANARY], "retry_after_s": True, "detail": SECRET_CANARY,
+      "field_errors": [{"field": "headers", "reason": "format", "expected": HEADER_CANARY}]}, {}),
+    ("register_delivery_endpoint", ENDPOINT_TOOLS[0][1],
+     {"error": "invalid_signing_secret", "retry_after_s": 10**9, "state": "secret", "next_step": {"tool": "x"},
+      "secret": SECRET_CANARY}, {}),
+])
+def test_endpoint_errors_relay_only_reviewed_extras(tmp_path, caplog, operation, values, body, relayed):
+    caplog.set_level(logging.DEBUG)
+    status = 429 if body["error"] == "rate_limited" else 400 if "header" in body["error"] or "secret" in body["error"] \
+        or body["error"] == "unsafe_endpoint" else 409
+    app, _ = endpoint_app(tmp_path, operation, lambda request: httpx.Response(
+        status, json={**body, "request_id": "c" * 32, "next_action": "PRIVATE BACKEND INSTRUCTION"}))
+    with TestClient(app) as client:
+        rest, mcp = both(client, "messages_" + operation, values)
+    assert rest.status_code == status and mcp["isError"]
+    assert rest.json() == mcp["structuredContent"] == {
+        "error": body["error"], "backend_status": status, "request_id": "c" * 32, **relayed}
+    for text in (rest.text, json.dumps(mcp), caplog.text):
+        assert SECRET_CANARY not in text and HEADER_CANARY not in text
+
+
+# spec: ANYM-519
+def test_register_and_test_wait_in_the_wait_pool_not_the_metadata_pool():
+    from agent_gateway.http_clients import admission, wait_tools
+    tools = wait_tools(CATALOG)
+    for operation, values in ENDPOINT_TOOLS[:7]:
+        expected = "waits" if operation in ("register_delivery_endpoint", "test_delivery_endpoint") else "metadata"
+        assert admission(tools, "messaging", operation, values) == expected, operation
+
+
+# spec: ANYM-519
+@pytest.mark.parametrize("operation,values", [
+    ("create_subscription", {"chat_ids": ["telegram-demo-chat"],
+                             "delivery": {"endpoint_id": "00000000-0000-4000-8000-000000000001"}}),
+    ("configure_subscription_delivery", {"subscription_id": "00000000-0000-4000-8000-000000000002", "version": 1,
+                                         "endpoint_id": "00000000-0000-4000-8000-000000000001"})])
+@pytest.mark.parametrize("local,upstream", [(["read", "subscription-write"], ENDPOINT_PERMISSIONS + ["subscription-write"]),
+                                            (ENDPOINT_PERMISSIONS + ["subscription-write"], ["read", "subscription-write"])])
+def test_binding_an_endpoint_needs_delivery_write_on_both_sides(tmp_path, operation, values, local, upstream):
+    name = "messages_" + operation
+    seen = []
+
+    def backend(request):
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json={"permissions": upstream, "tool_manifest": {"names": [operation]}})
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"subscription_id": values.get("subscription_id")})
+
+    app, _, _ = configured(tmp_path, backend, module="messaging", tools=[name], grants=local)
+    with TestClient(app) as client:
+        rest, mcp = both(client, name, values)
+        assert rest.status_code == 403 and mcp["isError"] and seen == []
+        # Without an endpoint the same grants still reach the backend (operator receivers stay as before).
+        plain = {k: v for k, v in values.items() if k not in ("delivery", "endpoint_id")}
+        if operation == "configure_subscription_delivery":
+            plain["receiver_id"] = "00000000-0000-4000-8000-000000000003"
+        assert client.post("/v1/" + name, json=plain, headers=HEADERS).status_code == 200 and seen

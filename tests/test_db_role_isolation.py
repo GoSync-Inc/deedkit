@@ -451,7 +451,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '48'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '49'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:
@@ -768,3 +768,87 @@ def test_publication_refuses_an_attachment_deactivated_while_it_waits(seeded):
                 'id': newest, 'counter': newest}
     finally:
         remove(s, role)
+
+
+# spec: ANYM-519
+def test_gateway_role_writes_endpoint_secrets_and_headers_but_never_reads_them(seeded, tmp_path, monkeypatch):
+    import base64
+    import json
+    from copy import copy
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    policy = tmp_path / 'delivery-policy.json'
+    policy.write_text(json.dumps({'allow_hosts': ['example.test']}))
+    policy.chmod(0o600)
+    monkeypatch.setenv('DELIVERY_POLICY_FILE', str(policy))
+    public = lambda *a, **k: ['93.184.216.34']  # noqa: E731
+    secret = 'whsec_' + base64.b64encode(b'synthetic-endpoint-secret-0123456789').decode()
+    permissions = ['read', 'subscription-write', 'delivery-write']
+    token = store.issue_key('endpoint-role-agent', ['telegram-demo'], permissions=permissions, key_permissions=permissions)
+    store.set_delivery_features(True)
+    api_role = install(store, 'gateway_role.sql', 'messaging_gateway')
+    dispatcher_role = install(store, 'delivery_role.sql', 'messaging_event_delivery')
+    member = 'anym519_member_' + uuid4().hex[:10]
+    try:
+        api, worker = copy(store), copy(store)
+        api.pool, worker.pool = RolePool(store, api_role), RolePool(store, dispatcher_role)
+        # The API's real calls succeed with write-only columns.
+        created = api.register_delivery_endpoint(token, 'endpoint-request-1', 'https://hooks.example.test/hook', secret,
+            headers={'X-Auth': 'synthetic-auth'}, resolver=public)
+        eid = created['endpoint_id']
+        assert [item['endpoint_id'] for item in api.list_delivery_endpoints(token)['items']] == [eid]
+        api.update_delivery_endpoint(token, eid, 1, 'set_headers', headers={'X-Auth': 'synthetic-auth-2'})
+        api.update_delivery_endpoint(token, eid, 2, 'rotate_secret', new_secret='whsec_' + base64.b64encode(b'r' * 32).decode())
+        api.update_delivery_endpoint(token, eid, 3, 'pause')
+        api.update_delivery_endpoint(token, eid, 4, 'resume')
+        with store.pool.connection() as c:
+            c.execute("UPDATE delivery_endpoint_tests SET created_at=created_at-interval '2 minutes' WHERE endpoint=%s", (eid,))
+        assert api.test_delivery_endpoint(token, eid, 'endpoint-test-1')['test_status'] == 'pending'
+        # Only the dispatcher reads them: it signs and sends the test with the caller's header.
+        sent = []
+        dispatch_hints(worker, transport=lambda url, body, headers, **k: sent.append(headers) or 204, resolver=public)
+        assert sent and sent[0]['X-Auth'] == 'synthetic-auth-2' and len(sent[0]['webhook-signature'].split(' ')) == 2
+        for column in ('signing_secret', 'pending_secret', 'header_values'):
+            refused(store, api_role, 'SELECT ' + column + ' FROM delivery_endpoints')
+            refused(store, api_role, 'UPDATE delivery_endpoints SET label=' + column + ' WHERE id=%s', (eid,))
+            refused(store, api_role, 'UPDATE delivery_endpoints SET state=state WHERE id=%s RETURNING ' + column, (eid,))
+            refused(store, api_role, '''INSERT INTO delivery_endpoints(principal,key_id,request_id,request_hash,url,host,
+                signing_secret) VALUES('x','00000000-0000-4000-8000-000000000000','synthetic-1',%s,'u','h','s')
+                RETURNING ''' + column, ('a' * 64,))
+        refused(store, api_role, 'SELECT * FROM delivery_endpoints')
+        # An inherited grant reads no more than the role it inherits.
+        with store.pool.connection() as c:
+            c.execute(sql.SQL('CREATE ROLE {} NOLOGIN IN ROLE {}').format(sql.Identifier(member), sql.Identifier(api_role)))
+        refused(store, member, 'SELECT signing_secret FROM delivery_endpoints')
+        refused(store, member, 'SELECT header_values FROM delivery_endpoints')
+        assert api.delete_delivery_endpoint(token, eid, 5)['deleted'] is True
+        with store.pool.connection() as c:
+            assert c.execute('SELECT signing_secret,pending_secret,header_values FROM delivery_endpoints WHERE id=%s',
+                (eid,)).fetchone() == {'signing_secret': None, 'pending_secret': None, 'header_values': None}
+    finally:
+        store.set_delivery_features(False)
+        with store.pool.connection() as c:
+            c.execute(sql.SQL('DROP ROLE IF EXISTS {}').format(sql.Identifier(member)))
+        remove(store, api_role)
+        remove(store, dispatcher_role)
+
+
+# spec: ANYM-519
+def test_hint_references_ignore_the_dispatchers_temporary_objects(seeded):
+    """The definer function reads the real tables even when the caller shadows them with temporary ones."""
+    store, _, _ = seeded
+    dispatcher_role = install(store, 'delivery_role.sql', 'messaging_event_delivery')
+    subscription = str(uuid4())
+    try:
+        with as_role(store, dispatcher_role) as c:
+            c.execute('''CREATE TEMP TABLE subscription_matches(subscription uuid, event bigint)''')
+            c.execute('''CREATE TEMP TABLE events(id bigint, kind text, origin text, account text,
+                created_at timestamptz, snapshot jsonb)''')
+            c.execute('INSERT INTO subscription_matches VALUES(%s,1)', (subscription,))
+            c.execute('''INSERT INTO events VALUES(1,'message.created','live','telegram-demo',clock_timestamp(),
+                '{"chat":"synthetic-forged-chat"}')''')
+            rows = c.execute('SELECT * FROM public.subscription_hint_references(%s,0,10,%s,NULL)',
+                (subscription, ['telegram-demo'])).fetchall()
+        assert rows == []
+    finally:
+        remove(store, dispatcher_role)

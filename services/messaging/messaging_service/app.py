@@ -9,7 +9,7 @@ import logging
 import time
 from urllib.parse import urlsplit
 from datetime import datetime
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, Required, TypedDict
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
@@ -86,6 +86,24 @@ class DeliveryPolicy(TypedDict, total=False):
     quiet_bypass: Annotated[list[Literal['incoming_message','owner_mention','reply_to_owner',
         'reply_to_confirmed_send','silence']], Field(min_length=1,max_length=5)]
     expect_reply_within_s: Annotated[StrictInt, Field(ge=60,le=1209600)]
+# ANYM-519: an agent's own webhook endpoint. delivery_endpoints.py checks URL, secret and headers again.
+EndpointReference = ReceiverReference
+EndpointUrl = Annotated[StrictStr, Field(min_length=1,max_length=2048)]
+SigningSecret = Annotated[StrictStr, Field(pattern=r'^whsec_[A-Za-z0-9+/=]{32,96}$')]
+EndpointHeaders = Annotated[dict[StrictStr,StrictStr], Field(max_length=4)]
+EndpointLabel = Annotated[StrictStr, Field(max_length=128,pattern=r'^[^\x00-\x1f\x7f]*$')]
+class SubscriptionEndpoint(TypedDict, total=False):
+    __pydantic_config__ = ConfigDict(extra='forbid')
+    endpoint_id: Required[EndpointReference]
+    delivery_policy: DeliveryPolicy
+# Optional arguments dropped when None, so payloads and audit records of callers that omit them stay unchanged.
+OMITTED_WHEN_NONE = {'create_subscription':('wake_rules','reply_to_send','delivery'),
+    'configure_subscription_delivery':('delivery_policy','endpoint_id'),
+    'register_delivery_endpoint':('headers',),'update_delivery_endpoint':('new_secret','headers')}
+def drop_omitted(method, arguments):
+    for name in OMITTED_WHEN_NONE.get(method,()):
+        if arguments.get(name) is None:arguments.pop(name,None)
+    return arguments
 
 
 PROMOTIONAL_BASIS="business_sender or repeated_days; absent when not promotional."
@@ -406,9 +424,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
     def call(ctx, method, **kwargs):
         try:
             arguments,detail=options(method,kwargs)
-            if method=='create_subscription':
-                for name in ('wake_rules','reply_to_send'):
-                    if arguments.get(name) is None:arguments.pop(name,None)
+            drop_omitted(method,arguments)
             return render(method,getattr(store,method)(bearer(ctx.request_context.request.headers),**arguments),detail)
         except APIError as error:
             detail=payload(error,method)
@@ -422,9 +438,12 @@ def create_app(store: Store, allowed_hosts: list[str]):
             raise ToolError(json.dumps(detail)) from None
 
     async def invoke(method, token, arguments):
-        if method=='create_subscription':
-            for name in ('wake_rules','reply_to_send'):
-                if arguments.get(name) is None:arguments.pop(name,None)
+        drop_omitted(method,arguments)
+        if method in ('register_delivery_endpoint','test_delivery_endpoint'):
+            # ANYM-519: the test job commits first; then wait up to 10 s for the dispatcher's result.
+            from .delivery_endpoints import finish_inline_test
+            result=await run_in_threadpool(getattr(store,method),token,**arguments)
+            return await finish_inline_test(store,token,result)
         if method == 'wait_for_subscription_events':
             from .subscription_consumption import wait_for_subscription_events
             return await wait_for_subscription_events(store, token, **arguments)
@@ -1042,7 +1061,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                             label: Annotated[StrictStr,Field(max_length=128,
                                 pattern=r'^[^\x00-\x1f\x7f]*$')]='',
                             expires_at: SubscriptionExpiry | None=None,
-        wake_rules: WakeRules | None=None, reply_to_send: SendReference | None=None) -> dict[str,Any]:
+        wake_rules: WakeRules | None=None, reply_to_send: SendReference | None=None,
+        delivery: SubscriptionEndpoint | None=None) -> dict[str,Any]:
         """Persist selection of explicit authorized archive chats; no send or provider request.
 
         Requires read + explicit subscription-write. The subscription belongs to the
@@ -1054,10 +1074,13 @@ def create_app(store: Store, allowed_hosts: list[str]):
         is independent of message arrival. Optional expiry is a future zoned ISO time
         within 366 days. Label is only a correlation hint, not authority to wake a task.
         Delivery uses separate fetch/ACK and configured signed hints; no provider read-state mutation.
+        Optional delivery={endpoint_id, delivery_policy?} binds your own endpoint from register_delivery_endpoint;
+        it needs delivery-write and the operator's delivery switch.
         A timeout can leave creation uncertain: inspect list_subscriptions before retrying.
         """
         return call(ctx,'create_subscription',chat_ids=chat_ids,sender_ids=sender_ids,
-            kinds=kinds,direction=direction,origins=origins,label=label,expires_at=expires_at,wake_rules=wake_rules,reply_to_send=reply_to_send)
+            kinds=kinds,direction=direction,origins=origins,label=label,expires_at=expires_at,wake_rules=wake_rules,reply_to_send=reply_to_send,
+            delivery=delivery)
 
     @mcp.tool(structured_output=True,annotations=read)
     def list_subscriptions(ctx: Context,limit: SubscriptionLimit=50) -> dict[str,Any]:
@@ -1125,15 +1148,61 @@ def create_app(store: Store, allowed_hosts: list[str]):
         return await async_call(ctx,'wait_for_subscription_events',subscription_id=subscription_id,timeout=timeout,limit=limit)
 
     @mcp.tool(structured_output=True,annotations=upload_write)
-    def configure_subscription_delivery(ctx: Context,subscription_id: SubscriptionReference,version: SubscriptionVersion,receiver_id: ReceiverReference | None=None,delivery_policy: DeliveryPolicy | None=None) -> dict[str,Any]:
-        """Select an operator-registered receiver ID for signed hints; null disables. Optional delivery_policy times hints only (debounce or batch, quiet hours, expected-reply silence timer). Never accepts URLs or grants access."""
-        # An omitted policy keeps the schema-37 payload, so existing audit records and callers are unchanged.
-        return call(ctx,'configure_subscription_delivery',subscription_id=subscription_id,version=version,receiver_id=receiver_id,**({} if delivery_policy is None else {'delivery_policy':delivery_policy}))
+    def configure_subscription_delivery(ctx: Context,subscription_id: SubscriptionReference,version: SubscriptionVersion,receiver_id: ReceiverReference | None=None,delivery_policy: DeliveryPolicy | None=None,endpoint_id: EndpointReference | None=None) -> dict[str,Any]:
+        """Select an operator-registered receiver ID or your own endpoint_id (register_delivery_endpoint, needs delivery-write) for signed hints, not both; null disables. Optional delivery_policy times hints only (debounce or batch, quiet hours, expected-reply silence timer). Never accepts URLs or grants access."""
+        # An omitted policy or endpoint keeps the schema-37 payload, so existing audit records and callers are unchanged.
+        return call(ctx,'configure_subscription_delivery',subscription_id=subscription_id,version=version,receiver_id=receiver_id,delivery_policy=delivery_policy,endpoint_id=endpoint_id)
 
     @mcp.tool(structured_output=True,annotations=upload_write)
     def test_subscription(ctx: Context,subscription_id: SubscriptionReference,request_id: RequestReference) -> dict[str,Any]:
         """Queue a rate-bounded synthetic hint to an existing receiver. No fake archive event, message send or event ACK."""
         return call(ctx,'test_subscription',subscription_id=subscription_id,request_id=request_id)
+
+    @mcp.tool(structured_output=True,annotations=upload_write)
+    async def register_delivery_endpoint(ctx: Context,request_id: RequestReference,url: EndpointUrl,signing_secret: SigningSecret,label: EndpointLabel='',headers: EndpointHeaders | None=None) -> dict[str,Any]:
+        """Register your own HTTPS webhook endpoint for subscription hints, then send it one signed test delivery.
+
+        Requires read + explicit delivery-write, and the operator's delivery switch (else delivery_disabled).
+        The operator sets the host policy, never an agent: url must be https on port 443 at a public host the
+        policy allows (else unsafe_endpoint or delivery_policy_unset). signing_secret is your own whsec_<base64>
+        (24-64 bytes) for Standard Webhooks signatures; optional headers (at most 4) go with every delivery.
+        Secrets and header values are write-only: no response, list, log or error returns them.
+        The endpoint belongs to this exact key. Waits up to 10 s for the test; test_status pending names the
+        test_delivery_endpoint call. A failed test still creates the endpoint. Repeat the same request_id and
+        arguments to recover a lost response.
+        """
+        return await async_call(ctx,'register_delivery_endpoint',request_id=request_id,url=url,signing_secret=signing_secret,label=label,headers=headers)
+
+    @mcp.tool(structured_output=True,annotations=read)
+    def list_delivery_endpoints(ctx: Context) -> dict[str,Any]:
+        """List this exact key's webhook endpoints with state, health, last test and fingerprints; never secrets or header values."""
+        return call(ctx,'list_delivery_endpoints')
+
+    @mcp.tool(structured_output=True,annotations=upload_write)
+    def update_delivery_endpoint(ctx: Context,endpoint_id: EndpointReference,version: SubscriptionVersion,
+                                 action: Literal['rotate_secret','set_headers','pause','resume'],
+                                 new_secret: SigningSecret | None=None,headers: EndpointHeaders | None=None) -> dict[str,Any]:
+        """Version-checked change of your own endpoint: rotate_secret (new_secret), set_headers (headers; {} clears), pause or resume.
+
+        Requires read + explicit delivery-write. During a rotation deliveries carry both signatures for 24 hours,
+        then the new secret alone. Resume works from agent_paused or auto_paused; only the operator lifts
+        operator_disabled. Write-only values are never returned.
+        """
+        return call(ctx,'update_delivery_endpoint',endpoint_id=endpoint_id,version=version,action=action,new_secret=new_secret,headers=headers)
+
+    @mcp.tool(structured_output=True,annotations=upload_write)
+    def delete_delivery_endpoint(ctx: Context,endpoint_id: EndpointReference,version: SubscriptionVersion) -> dict[str,Any]:
+        """Delete your own endpoint; queued hints and tests are cancelled and bound subscriptions become pull-only. Requires read + explicit delivery-write."""
+        return call(ctx,'delete_delivery_endpoint',endpoint_id=endpoint_id,version=version)
+
+    @mcp.tool(structured_output=True,annotations=upload_write)
+    async def test_delivery_endpoint(ctx: Context,endpoint_id: EndpointReference,request_id: RequestReference) -> dict[str,Any]:
+        """Send one signed test delivery to your own endpoint and wait up to 10 s for http_status and latency_ms.
+
+        Requires read + explicit delivery-write; at most one test per minute per key. The same request_id
+        reads back the same test; use a new one after fixing the receiver. No archive event or message send.
+        """
+        return await async_call(ctx,'test_delivery_endpoint',endpoint_id=endpoint_id,request_id=request_id)
 
     @mcp.tool(structured_output=True,annotations=upload_write)
     def submit_feedback(ctx: Context,request_id: RequestReference,category: Literal['bug','feature','quality','other'],description: FeedbackDescription,operation: FeedbackOperation | None=None,refs: FeedbackReferences | None=None) -> dict[str,Any]:
@@ -1153,7 +1222,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     'list_messenger_operations','preview_messenger_operation','execute_messenger_operation','get_messenger_operation',
                     'prepare_file_upload','upload_file_chunk','get_file_upload',
                     'create_subscription','list_subscriptions','get_subscription','update_subscription','get_subscription_events',
-                    'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events','configure_subscription_delivery','test_subscription','submit_feedback','list_feedback'}
+                    'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events','configure_subscription_delivery','test_subscription','submit_feedback','list_feedback',
+                    'register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint'}
         method=request.path_params['operation']
         if method not in operations: raise APIError('not_found',404)
         try:
@@ -1164,8 +1234,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
             if method in ('list_chats','search','get_messages','get_context'):
                 params.setdefault('view','archive')
             params=validate_arguments(models,method,params)
-            # An omitted delivery policy keeps the schema-37 payload (same rule as the MCP tool).
-            if method=='configure_subscription_delivery' and params.get('delivery_policy') is None: params.pop('delivery_policy',None)
+            # An omitted delivery policy keeps the schema-37 payload (same rule as the MCP tool); likewise ANYM-519's options.
+            drop_omitted(method,params)
             # An omitted status filter keeps the schema-38 payload (same rule as the MCP tool).
             if method=='list_feedback' and params.get('status') is None: params.pop('status',None)
             arguments,detail=options(method,params)

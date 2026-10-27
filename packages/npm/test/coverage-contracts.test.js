@@ -40,11 +40,16 @@ const actions={
   waitForSubscriptionEvents:{subscription_id:'sub_synthetic',timeout:0.25,limit:4},
   configureSubscriptionDelivery:{subscription_id:'sub_synthetic',version:2,receiver_id:null},
   testSubscription:{subscription_id:'sub_synthetic',request_id:'synthetic-probe'},
+  registerDeliveryEndpoint:{request_id:'synthetic-endpoint',url:'https://hooks.example/in',signing_secret:'whsec_'+'A'.repeat(32)},
+  listDeliveryEndpoints:{},
+  updateDeliveryEndpoint:{endpoint_id:'11111111-1111-4111-8111-111111111111',version:2,action:'pause'},
+  deleteDeliveryEndpoint:{endpoint_id:'11111111-1111-4111-8111-111111111111',version:2},
+  testDeliveryEndpoint:{endpoint_id:'11111111-1111-4111-8111-111111111111',request_id:'synthetic-probe'},
   submitFeedback:{request_id:'synthetic-feedback',category:'quality',description:'Synthetic issue'},
   listFeedback:{limit:4},
 };
 const defaults=new Set(['capabilities','listChats','search','searchPeople','searchFiles',
-  'getSyncStatus','getUpdates','listSubscriptions','listFeedback']);
+  'getSyncStatus','getUpdates','listSubscriptions','listFeedback','listDeliveryEndpoints']);
 const camel=operation=>operation.replace(/_([a-z])/g,(_,letter)=>letter.toUpperCase());
 
 test('every public convenience helper delegates the exact operation and retains server JSON',async()=>{

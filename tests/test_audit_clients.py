@@ -242,3 +242,60 @@ def test_python_feedback_operation_accepts_the_longest_tool_name():
         client.submit_feedback(**{**METHODS['submit_feedback'], 'operation': 'calendar_' + 'a' * 120})
     assert [body['operation'] for body in seen] == ['calendar_' + 'a' * 120]
 
+
+
+ENDPOINT = '11111111-1111-4111-8111-111111111111'
+SECRET = 'whsec_' + 'c3ludGhldGljLXNlY3JldC1vbmx5LWZvci10ZXN0cw=='
+ENDPOINT_METHODS = {
+    'register_delivery_endpoint': {'request_id': 'synthetic-endpoint', 'url': 'https://hooks.example/in',
+        'signing_secret': SECRET, 'label': 'synthetic', 'headers': {'X-Api-Key': 'synthetic-canary'}},
+    'list_delivery_endpoints': {},
+    'update_delivery_endpoint': {'endpoint_id': ENDPOINT, 'version': 2, 'action': 'rotate_secret', 'new_secret': SECRET},
+    'delete_delivery_endpoint': {'endpoint_id': ENDPOINT, 'version': 3},
+    'test_delivery_endpoint': {'endpoint_id': ENDPOINT, 'request_id': 'synthetic-probe'},
+}
+
+
+# spec: ANYM-519
+@pytest.mark.parametrize('operation', ENDPOINT_METHODS)
+def test_python_endpoint_helpers_preserve_exact_wire_arguments(operation):
+    seen = []
+    def transport(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={'endpoint_id': ENDPOINT})
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(transport)) as client:
+        assert getattr(client, operation)(**ENDPOINT_METHODS[operation]) == {'endpoint_id': ENDPOINT}
+        # Omitted optional arguments are not sent, so the server keeps its old payloads.
+        client.create_subscription(chat_ids=['chat_synthetic'])
+        client.create_subscription(chat_ids=['chat_synthetic'], delivery={'endpoint_id': ENDPOINT})
+        client.configure_subscription_delivery(subscription_id='sub_synthetic', version=2, endpoint_id=ENDPOINT)
+        client.update_delivery_endpoint(endpoint_id=ENDPOINT, version=2, action='pause')
+    assert seen[0] == ('/v1/' + operation, ENDPOINT_METHODS[operation])
+    assert 'delivery' not in seen[1][1] and seen[2][1]['delivery'] == {'endpoint_id': ENDPOINT}
+    assert seen[3][1] == {'subscription_id': 'sub_synthetic', 'version': 2, 'receiver_id': None, 'endpoint_id': ENDPOINT}
+    assert seen[4][1] == {'endpoint_id': ENDPOINT, 'version': 2, 'action': 'pause'}
+
+
+# spec: ANYM-519
+@pytest.mark.parametrize('operation,arguments', [
+    ('register_delivery_endpoint', {'request_id': 'synthetic-endpoint', 'url': 'https://hooks.example', 'signing_secret': 'plain'}),
+    ('register_delivery_endpoint', {'request_id': 'synthetic-endpoint', 'url': '', 'signing_secret': SECRET}),
+    ('register_delivery_endpoint', {'request_id': 'synthetic-endpoint', 'url': 'https://hooks.example', 'signing_secret': SECRET,
+        'headers': {f'X-{i}': 'v' for i in range(5)}}),
+    ('register_delivery_endpoint', {'request_id': 'synthetic-endpoint', 'url': 'https://hooks.example', 'signing_secret': SECRET,
+        'headers': {'X-Api-Key': 1}}),
+    ('update_delivery_endpoint', {'endpoint_id': ENDPOINT, 'version': 1, 'action': 'close'}),
+    ('update_delivery_endpoint', {'endpoint_id': 'endpoint-1', 'version': 1, 'action': 'pause'}),
+    ('update_subscription', {'subscription_id': 'sub_synthetic', 'version': 1, 'action': 'rotate_secret'}),
+    ('delete_delivery_endpoint', {'endpoint_id': ENDPOINT, 'version': 0}),
+    ('test_delivery_endpoint', {'endpoint_id': ENDPOINT, 'request_id': 'short'}),
+    ('create_subscription', {'chat_ids': ['chat_synthetic'], 'delivery': {'endpoint_id': 'e'}}),
+    ('create_subscription', {'chat_ids': ['chat_synthetic'], 'delivery': {'endpoint_id': ENDPOINT, 'url': 'https://hooks.example'}}),
+    ('configure_subscription_delivery', {'subscription_id': 'sub_synthetic', 'version': 1, 'endpoint_id': 'e'}),
+])
+def test_python_endpoint_validation_rejects_before_transport_without_echoing_the_secret(operation, arguments):
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(
+            lambda _: pytest.fail('Invalid input reached transport'))) as client:
+        with pytest.raises(ValueError) as failure:
+            client.call(operation, arguments)
+    assert SECRET not in str(failure.value) and 'synthetic-canary' not in str(failure.value)

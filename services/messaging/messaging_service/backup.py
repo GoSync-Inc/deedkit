@@ -60,6 +60,9 @@ V43_TABLES={'person_links':'account,sender'}
 V44_TABLES={'api_key_operations':'operation_id'}
 V45_TABLES={'message_purges':'message','chat_tombstones':'id','ingest_receipt_links':'digest','purge_state':'name'}
 V48_TABLES={'subscription_dispatcher_heartbeat':'id'}
+V49_TABLES={'delivery_endpoints':'id','delivery_endpoint_tests':'id'}
+# Every schema this runtime can capture, verify and restore (one ceiling for capture and verify_bundle).
+SCHEMAS=range(2,50)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
@@ -69,7 +72,7 @@ V15_TABLES={'message_metadata':'message','attachment_enrichment':'attachment','e
 def database_manifest(c):
     tables={}
     version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
-    if version not in range(2,49): raise ValueError('unsupported_backup_schema')
+    if version not in SCHEMAS: raise ValueError('unsupported_backup_schema')
     for name,order in {**TABLES,**(V3_TABLES if version>=3 else {}),**(V4_TABLES if version>=4 else {}),
                        **(V5_TABLES if version>=5 else {}),**(V6_TABLES if version>=6 else {}),
                        **(V8_TABLES if version>=8 else {}),**(V9_TABLES if version>=9 else {}),
@@ -83,7 +86,7 @@ def database_manifest(c):
                        **(V35_TABLES if version>=35 else {}),
                        **(V37_TABLES if version>=37 else {}),
                        **(V38_TABLES if version>=38 else {}),**(V41_TABLES if version>=41 else {}),**(V42_TABLES if version>=42 else {}),**(V43_TABLES if version>=43 else {}),
-                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {})}.items():
+                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {})}.items():
         query=sql.SQL('SELECT row_to_json(t) AS record FROM {} t ORDER BY {}').format(
             sql.Identifier(name),sql.SQL(',').join(sql.Identifier(part) for part in order.split(',')))
         sha=hashlib.sha256(); count=0
@@ -220,7 +223,7 @@ def create_snapshot(store,destination,dump_command,recovery_config=None,*,captur
 def verify_bundle(directory,*,blob_root=None):
     from .recovery_state import read_manifest,verify_recovery
     directory=Path(directory); manifest=read_manifest(directory)
-    if manifest.get('format') not in (1,2) or manifest.get('schema_version') not in range(2,49): raise ValueError('unsupported_backup')
+    if manifest.get('format') not in (1,2) or manifest.get('schema_version') not in SCHEMAS: raise ValueError('unsupported_backup')
     verify_recovery(directory,manifest)
     if (directory/'database.dump').is_symlink(): raise ValueError('invalid_backup_file')
     fd=os.open(directory/'database.dump',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
@@ -317,6 +320,10 @@ def quarantine_restore(store):
             c.execute('UPDATE subscription_receivers SET enabled=false')
             c.execute("UPDATE subscription_outbox SET state='cancelled',lease_token=NULL,lease_until=NULL,finished_at=clock_timestamp(),error_code='restored_disabled' WHERE state IN ('pending','leased')")
             c.execute('DELETE FROM subscription_receipts')
+        if version>=49:
+            # Self-service endpoints stay off until the operator enables each one (ANYM-519).
+            c.execute("UPDATE delivery_endpoints SET state='operator_disabled',version=version+1,updated_at=clock_timestamp() WHERE state<>'deleted'")
+            c.execute("UPDATE delivery_endpoint_tests SET state='cancelled',lease_token=NULL,lease_until=NULL,finished_at=clock_timestamp(),error_code='restored_disabled' WHERE state IN ('pending','leased')")
         if version>=38:
             # Held hints and silence timers never fire from a restored snapshot.
             c.execute("""UPDATE subscription_hint_windows SET first_match_at=NULL,last_match_at=NULL,match_count=0,

@@ -80,6 +80,8 @@ def failure_details(status, value, header_request_id=None):
 CONSUMPTION_OPERATIONS = frozenset({
     "fetch_subscription_events", "ack_subscription_events", "wait_for_subscription_events",
     "configure_subscription_delivery", "test_subscription", "submit_feedback", "list_feedback",
+    "register_delivery_endpoint", "list_delivery_endpoints", "update_delivery_endpoint", "delete_delivery_endpoint",
+    "test_delivery_endpoint",
 })
 CONSUMPTION_ERRORS = frozenset({
     "unauthorized", "forbidden", "not_found", "invalid_limit", "invalid_version", "invalid_receipt",
@@ -87,7 +89,33 @@ CONSUMPTION_ERRORS = frozenset({
     "subscription_access_changed", "subscription_closed", "subscription_conflict", "subscription_limit",
     "subscription_receipt_limit", "invalid_feedback", "feedback_limit", "invalid_receiver",
     "delivery_not_configured", "rate_limited", "invalid_request_id",
+    "delivery_disabled", "delivery_policy_unset", "unsafe_endpoint", "invalid_signing_secret", "invalid_header",
+    "reserved_header", "rotation_in_progress", "endpoint_limit", "endpoint_conflict", "operator_disabled",
+    "invalid_endpoint_state", "endpoint_paused", "endpoint_auto_paused",
 })
+# ANYM-519: the endpoint errors' bounded extras. Values are reviewed constants, counters or a header name
+# (never a header value or secret); anything else is dropped.
+ENDPOINT_STATES = frozenset({"enabled", "agent_paused", "auto_paused", "operator_disabled", "deleted"})
+ENDPOINT_NEXT_STEPS = frozenset({
+    "for a tailnet or private host ask the operator for the wake relay (ANYM-228)",
+    "fix the receiver, then call test_delivery_endpoint with a new request_id",
+    "ask the operator to enable the endpoint", "call update_delivery_endpoint with action resume",
+})
+HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}\Z")
+
+
+def endpoint_extras(value):
+    result = {}
+    retry = value.get("retry_after_s")
+    if type(retry) is int and 0 < retry <= 86400:
+        result["retry_after_s"] = retry
+    if isinstance(value.get("state"), str) and value["state"] in ENDPOINT_STATES:
+        result["state"] = value["state"]
+    if isinstance(value.get("header"), str) and HEADER_NAME.match(value["header"]):
+        result["header"] = value["header"]
+    if isinstance(value.get("next_step"), str) and value["next_step"] in ENDPOINT_NEXT_STEPS:
+        result["next_step"] = value["next_step"]
+    return result
 
 
 def _node(schema, node):
@@ -237,6 +265,8 @@ def consumption_failure(status, value, header_request_id=None, operation=None):
         field_errors = reviewed_field_errors(operation, value.get("field_errors"))
         if field_errors:
             result["field_errors"] = field_errors
+        if operation.endswith("_delivery_endpoint") or operation in ("list_delivery_endpoints", "configure_subscription_delivery"):
+            result.update(endpoint_extras(value))
     return result
 
 

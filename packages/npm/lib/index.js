@@ -18,6 +18,7 @@ const METHODS = Object.freeze([
   'create_subscription','list_subscriptions','get_subscription','update_subscription','get_subscription_events',
   'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events',
   'configure_subscription_delivery','test_subscription','submit_feedback','list_feedback',
+  'register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint',
   'prepare_file_upload','upload_file_chunk','get_file_upload',
 ]);
 export const tools = METHODS;
@@ -45,6 +46,9 @@ const SAFE_ERRORS = new Set([
   'subscription_wait_timeout','subscription_receipt_limit','invalid_feedback','feedback_limit',
   'invalid_receiver','delivery_not_configured','consumer_already_initialized',
   'send_wait_busy','send_status_timeout','send_access_changed','send_expired','send_result_unknown',
+  // ANYM-519: self-service webhook endpoints.
+  'delivery_disabled','delivery_policy_unset','unsafe_endpoint','invalid_signing_secret','invalid_header','reserved_header',
+  'rotation_in_progress','endpoint_limit','endpoint_conflict','operator_disabled','invalid_endpoint_state','endpoint_paused','endpoint_auto_paused',
 ]);
 
 const UPLOAD_FIELDS = Object.freeze({
@@ -129,7 +133,7 @@ const MESSENGER_FIELDS = Object.freeze({
 });
 const SUBSCRIPTION_FIELDS = Object.freeze({
   create_subscription: [['chat_ids'],['chat_ids','sender_ids','kinds','direction','origins','label','expires_at',
-    'wake_rules','reply_to_send']],
+    'wake_rules','reply_to_send','delivery']],
   list_subscriptions: [[],['limit']],
   get_subscription: [['subscription_id'],['subscription_id']],
   update_subscription: [['subscription_id','version','action'],['subscription_id','version','action','resume_policy']],
@@ -137,8 +141,14 @@ const SUBSCRIPTION_FIELDS = Object.freeze({
   fetch_subscription_events: [['subscription_id'],['subscription_id','limit']],
   ack_subscription_events: [['subscription_id','receipt','version'],['subscription_id','receipt','version']],
   wait_for_subscription_events: [['subscription_id'],['subscription_id','timeout','limit']],
-  configure_subscription_delivery: [['subscription_id','version'],['subscription_id','version','receiver_id']],
+  configure_subscription_delivery: [['subscription_id','version'],['subscription_id','version','receiver_id','endpoint_id']],
   test_subscription: [['subscription_id','request_id'],['subscription_id','request_id']],
+  // ANYM-519: the caller's own webhook endpoints. Secrets and header values are write-only.
+  register_delivery_endpoint: [['request_id','url','signing_secret'],['request_id','url','signing_secret','label','headers']],
+  list_delivery_endpoints: [[],[]],
+  update_delivery_endpoint: [['endpoint_id','version','action'],['endpoint_id','version','action','new_secret','headers']],
+  delete_delivery_endpoint: [['endpoint_id','version'],['endpoint_id','version']],
+  test_delivery_endpoint: [['endpoint_id','request_id'],['endpoint_id','request_id']],
 });
 const FEEDBACK_STATUSES = Object.freeze(['received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened']);
 const FEEDBACK_FIELDS = Object.freeze({
@@ -229,6 +239,12 @@ function sendWaitArguments(args) {
   }
   return args;
 }
+function uuid(value) {
+  return typeof value==='string' && /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
+}
+function signingSecret(value) {
+  return typeof value==='string' && /^whsec_[A-Za-z0-9+\/=]{32,96}$/.test(value);
+}
 function subscriptionArguments(method,args) {
   const [required,allowed]=SUBSCRIPTION_FIELDS[method];
   if (!plainObject(args) || !operationJson(args) || required.some(key=>!Object.hasOwn(args,key)) ||
@@ -250,12 +266,21 @@ function subscriptionArguments(method,args) {
     else if (key==='receipt') valid=typeof value==='string' && [...value].length>=32 && [...value].length<=128;
     else if (key==='timeout') waitSeconds(value);
     else if (key==='request_id') valid=requestId(value);
-    else if (key==='receiver_id') valid=value===null || typeof value==='string' &&
-      /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
+    else if (key==='receiver_id') valid=value===null || uuid(value);
+    else if (key==='endpoint_id') valid=value===null && method==='configure_subscription_delivery' || uuid(value);
+    else if (key==='url') valid=typeof value==='string' && value.length>=1 && value.length<=2048;
+    else if (key==='signing_secret' || key==='new_secret') valid=value===null && key==='new_secret' || signingSecret(value);
+    // The server checks header names, reserved names and values (invalid_header, reserved_header).
+    else if (key==='headers') valid=value===null || plainObject(value) && Object.keys(value).length<=4 &&
+      Object.values(value).every(item=>typeof item==='string');
+    else if (key==='delivery') valid=value===null || plainObject(value) && Object.hasOwn(value,'endpoint_id') &&
+      Object.keys(value).every(name=>['endpoint_id','delivery_policy'].includes(name)) && uuid(value.endpoint_id) &&
+      (value.delivery_policy===undefined || plainObject(value.delivery_policy)) && JSON.stringify(value).length<=4096;
     else if (key==='reply_to_send') valid=value===null || typeof value==='string' && [...value].length>=1 && [...value].length<=128;
     else if (key==='label') valid=typeof value==='string' && [...value].length<=128 && !/[\x00-\x1f\x7f]/.test(value);
     else if (['action','direction','resume_policy'].includes(key))
-      valid=typeof value==='string' && {action:['pause','resume','close'],
+      valid=typeof value==='string' && {action:method==='update_subscription'?['pause','resume','close']:
+          ['rotate_secret','set_headers','pause','resume'],
         direction:['','incoming','outgoing'],resume_policy:['catch_up','skip']}[key].includes(value);
     else if (key==='expires_at') {
       if (value===null) continue;
@@ -539,6 +564,21 @@ export class AnyMsgClient {
   }
   testSubscription(args,options) {
     return this.call('test_subscription',subscriptionArguments('test_subscription',args),options);
+  }
+  registerDeliveryEndpoint(args,options) {
+    return this.call('register_delivery_endpoint',subscriptionArguments('register_delivery_endpoint',args),options);
+  }
+  listDeliveryEndpoints(args={},options) {
+    return this.call('list_delivery_endpoints',subscriptionArguments('list_delivery_endpoints',args),options);
+  }
+  updateDeliveryEndpoint(args,options) {
+    return this.call('update_delivery_endpoint',subscriptionArguments('update_delivery_endpoint',args),options);
+  }
+  deleteDeliveryEndpoint(args,options) {
+    return this.call('delete_delivery_endpoint',subscriptionArguments('delete_delivery_endpoint',args),options);
+  }
+  testDeliveryEndpoint(args,options) {
+    return this.call('test_delivery_endpoint',subscriptionArguments('test_delivery_endpoint',args),options);
   }
   submitFeedback(args,options) {
     return this.call('submit_feedback',feedbackArguments('submit_feedback',args),options);

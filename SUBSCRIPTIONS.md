@@ -189,8 +189,10 @@ pool holds 2 active and 4 waiting requests and, when full, returns
 Capabilities list `subscriptions.transports`: `pull` (fetch and ACK), `long_poll`
 (wait, at most 25 s) and `webhook`, each with `authorized`, `configured`,
 `operational` and the first failing `reason`. A webhook works while the dispatcher
-heartbeat is under 120 s old and an enabled receiver is bound; until self-service
-registration ships, it says `registration: "operator_only"`.
+heartbeat is under 120 s old and an enabled receiver or endpoint is bound. It says
+`registration: "self_service"` when the operator's delivery switch is on and the host
+policy is set, otherwise `"operator_only"`; its `self_service` block names the five
+endpoint tools and `max_endpoints` ([Self-service webhook endpoints](#self-service-webhook-endpoints-schema-49)).
 
 Creation accepts optional `wake_rules`, an OR selection of `incoming_message`,
 `owner_mention`, `reply_to_owner` and `reply_to_confirmed_send`. Reasons come from
@@ -216,8 +218,10 @@ match because it identifies a quote to another participant. Historical events ha
 and do not satisfy live wake rules. Existing selectors without these rules keep
 their behavior. There are no quiet-hours or silence timers in this version.
 
-A webhook receiver is an **operator registration**, not an agent-supplied URL.
-The operator installs `delivery_role.sql` and supplies a separate restricted
+A webhook receiver is either an **operator registration** (this section) or an
+endpoint the key registers itself inside the operator's host policy
+([Self-service webhook endpoints](#self-service-webhook-endpoints-schema-49), ANYM-519).
+For an operator receiver, the operator installs `delivery_role.sql` and supplies a separate restricted
 LOGIN inheriting `messaging_event_delivery`. A private JSON registration contains
 `receiver_id` (fresh UUID), `principal`, `key_id`, `endpoint` (HTTPS, port 443,
 no credentials/query/fragment), and `secret_file` (absolute private regular file,
@@ -444,6 +448,129 @@ match times, an on-time reply) before it settles the range or a silence timer.
 Automatic wake scheduling (ANYM-228) depends on these rules and the per-key budget: they are the
 server-side gate before a relay fires an agent run.
 
+## Self-service webhook endpoints (schema 49)
+
+A key with `read` and the explicit `delivery-write` permission (ANYM-519,
+[ACCESS.md](ACCESS.md)) registers where its own hints go. The operator only sets
+the switch, the host policy and the limits.
+
+| Tool | Arguments | Behavior |
+| --- | --- | --- |
+| `register_delivery_endpoint` | `request_id`, `url`, `signing_secret`; optional `label`, `headers` | Check the URL, store the endpoint, send one signed test and wait up to 10 s for it |
+| `list_delivery_endpoints` | none | This key's endpoints that are not deleted, newest first, with `max_endpoints` |
+| `update_delivery_endpoint` | `endpoint_id`, current `version`, `action`; `new_secret` for `rotate_secret`, `headers` for `set_headers` | Rotate the secret, replace headers (`{}` clears), `pause` or `resume` |
+| `delete_delivery_endpoint` | `endpoint_id`, current `version` | Delete; bound subscriptions become pull-only |
+| `test_delivery_endpoint` | `endpoint_id`, `request_id` | One signed test delivery, at most one per minute per key |
+
+`create_subscription` accepts `delivery: {endpoint_id, delivery_policy?}` and
+`configure_subscription_delivery` accepts `endpoint_id` beside `receiver_id` (not
+both), with the same version check and fence as a receiver.
+
+**Switch.** Every endpoint tool, the `delivery` field and endpoint staging answer
+`delivery_disabled` until the operator enables the feature (S2b). With the switch
+off no endpoint hint is staged, and turning it off cancels queued endpoint hints
+and tests. The webhook transport in capabilities then shows `operational: false`
+with reason `delivery_disabled`.
+
+**Host policy.** `DELIVERY_POLICY_FILE` names a private JSON file (absolute path,
+regular file, no symlink, mode 0600 or tighter, at most 64 KiB):
+
+```json
+{"allow_hosts": ["hooks.example.com"], "deny_hosts": ["internal.example.com"], "allow_any_public": false}
+```
+
+Hosts are IDNA-canonicalized (UTS 46, lowercase, one trailing dot removed). A
+suffix matches on a DNS label boundary (`example.com` matches `a.example.com`, not
+`badexample.com`) and deny wins. A missing or invalid file, unknown keys or an
+empty allowlist without `allow_any_public: true` leave the policy unset:
+registration answers `delivery_policy_unset` and the webhook transport shows
+reason `delivery_policy_unset`. Set `allow_any_public: true` only after S2b's
+isolation test passes. The policy is read again before every attempt; a host that
+leaves it cancels the hint (`endpoint_policy_refused`). After editing the file, run
+`python -m messaging_service reload-delivery-policy`: it waits for every in-flight
+POST and registration that read the old file, then cancels queued hints and tests of
+hosts the new file refuses. The change counts as made when that command returns.
+The stored URL and the TLS name and Host header use the same A-label host as the
+policy check (`https://faß.example/` is kept as `https://xn--fa-hia.example/`).
+
+**Address check.** The URL is https on port 443 without credentials, query or
+fragment. Every resolved address must be public: multicast, NAT64 (`64:ff9b::/96`,
+`64:ff9b:1::/48`), 6to4 (`2002::/16`), Teredo (`2001::/32`), IPv4-mapped and
+CGNAT answers are refused. Resolution runs at registration and before each
+attempt, the connection is pinned to the checked address, TLS verifies the
+hostname, redirects fail and proxy variables are ignored. A refusal is
+`unsafe_endpoint` with the field error "https on port 443, a public address, a
+host the operator allows"; a tailnet or private host also gets the next step to
+ask the operator for the wake relay (ANYM-228).
+
+**Secret and headers.** The caller supplies `signing_secret` as
+`whsec_<base64>` (24–64 decoded bytes); DeedKit never generates or returns one.
+At most 4 `headers` are sent with every delivery: names are RFC 9110 tokens,
+values 1–1024 visible ASCII characters. `Host`, `Content-Type`,
+`Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`, `Trailer`,
+`Cookie` and any `webhook-*`, `x-deedkit-*` or `mcp-*` name are
+`reserved_header`. Secrets and header values are write-only: no tool, REST
+route, log, audit row, telemetry or error returns them. Views show
+`header_names`, `headers_fingerprint` and `secret_fingerprint` (the first 4 bytes
+of SHA-256, 8 hex). The API role may insert and update those columns but not
+select them; only the dispatcher role reads them. This is privilege separation,
+not encryption: database owners and backup readers can read the values, and
+backups carry them inside the existing encrypted bundle. Quarantine restore
+disables every self-service endpoint.
+
+**Retries.** The same `request_id` with the same request (compared by a stored
+hash, with the secret and header values hashed) returns the stored endpoint, so a
+lost response is recovered by repeating the call; a changed request is
+`idempotency_conflict`.
+
+**Signing (Standard Webhooks).** Each delivery carries `webhook-id` (the hint
+ID, stable across retries; the test ID for a test), `webhook-timestamp` (the
+attempt time in seconds) and `webhook-signature: v1,<base64 HMAC-SHA256>` over
+`id.timestamp.body` with the decoded secret. `rotate_secret` stores `new_secret`
+as pending; for 24 hours deliveries carry both signatures separated by a space,
+then the dispatcher promotes the new secret. A second rotation inside that window
+is `rotation_in_progress` with `retry_after_s`. Operator receivers keep the
+`X-DeedKit-*` format.
+
+**Payload.** No message text, names or file content, and no `host_turn_verified`.
+An `events` hint is `{type, hint_id, subscription_id, version, label, references,
+references_omitted, next_call}` within 4 KiB: at most 20 references, each
+`{event_id, kind, occurred_at, wake_reason, account_id, chat_id, message_id,
+sender_id, reply_to_send_id?}`, the rest counted in `references_omitted`;
+`next_call` is `messages_fetch_subscription_events`. References are rechecked at
+dispatch under the revocation fence. A `silence` hint carries the anchor `send_id`
+and `next_call` `messages_get_subscription`. A test is `{type: "test", test_id,
+endpoint_id}`. The receiver host learns these IDs, the delivery timing and the
+agent's own headers.
+
+**Onboarding test.** Registration stages a signed test; the dispatcher sends it
+and records `http_status` and `latency_ms`. Past 10 s the result says
+`test_status: pending` with `next_step` naming `test_delivery_endpoint` and the
+same `request_id`. A failed test still creates the endpoint (state `enabled`,
+health `failing`), so a retry needs no new request ID.
+
+**States.** `enabled`, `agent_paused`, `auto_paused` (set by S3) and
+`operator_disabled`. The agent may pause, and resume from `agent_paused` or
+`auto_paused`; resume and test on `operator_disabled` answer `operator_disabled`.
+Only the operator disables or enables (`deedkit admin delivery-endpoints list |
+disable ID | enable ID`). Disable, delete, a policy change, key revocation and
+loss of `delivery-write` cancel queued and in-flight hints and tests under the
+same fence as receivers: no POST starts after the change commits.
+
+**Limits.** At most `DELIVERY_MAX_ENDPOINTS_PER_KEY` endpoints per key (default 4,
+1–32) that are not deleted (`endpoint_limit`); registration and test each at most
+once per minute per key (`rate_limited` with `retry_after_s`). Endpoint hints
+count toward `SUBSCRIPTION_MAX_HINTS_PER_HOUR`.
+
+**Decided edge cases.** Deleting a bound endpoint leaves the subscription
+pull-only; `get_subscription` shows `delivery.target: "none"` with reason
+`endpoint_deleted`. The same URL under another request ID is a separate endpoint
+and counts toward the cap. Two keys may share a receiver URL, each signing with
+its own secret. Binding a paused or disabled endpoint answers its state
+(`endpoint_paused`, `endpoint_auto_paused`, `operator_disabled`) and a next step.
+Endpoints and subscriptions do not carry over to a reissued key (ANYM-495): the
+new key registers its own.
+
 ## Host receivers (wake relay)
 
 `packages/wake-relay/` (Node 24, `node:crypto` and `node:sqlite` only) is a host
@@ -608,7 +735,8 @@ retention of outbox rows and closed definitions, and text/model relevance predic
 are not implemented. Without a
 policy a hint is eligible after each bounded matcher pass, within the per-key budget;
 retry/delivery progress remains separate from event ACK.
-There is no arbitrary agent URL registration, provider polling on demand, remote
+An agent registers a URL only as a self-service endpoint inside the operator's host
+policy. There is no provider polling on demand, remote
 task execution or automatic MCP host scheduling. A host adapter must verify its
 own receipt handling, deduplication and actual turn creation with explicit live
 session authority before anyone claims end-to-end delivery.

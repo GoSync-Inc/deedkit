@@ -26,6 +26,8 @@ HINT_TEXTS = frozenset((
     "no control characters", "set when wake_rules has reply_to_confirmed_send", "a documented operation name",
     "a tool name from tools/list, with or without the messages_ prefix",
     "8–128 characters: letters, digits and _ . : -", "no control characters except newline and tab",
+    # ANYM-519: unsafe_endpoint on a self-service webhook URL.
+    "https on port 443, a public address, a host the operator allows",
 ))
 HINT_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"[0-9]{1,6}–[0-9]{1,6} characters",

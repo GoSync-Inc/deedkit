@@ -9,7 +9,9 @@ MESSENGER_PERMISSIONS = frozenset(('read-live', 'contacts-read', 'profile-read',
     'chat-manage', 'contacts-manage', 'groups-manage', 'profile-manage'))
 SUBSCRIPTION_PERMISSIONS = frozenset(('subscription-write', 'subscription-ack', 'feedback-write'))
 UPLOAD_PERMISSIONS = frozenset(('upload',))
-PERMISSIONS = LEGACY_PERMISSIONS | MESSENGER_PERMISSIONS | SUBSCRIPTION_PERMISSIONS | UPLOAD_PERMISSIONS
+# ANYM-519: agent self-registered webhook endpoints; no existing key ceiling inherits it.
+DELIVERY_PERMISSIONS = frozenset(('delivery-write',))
+PERMISSIONS = LEGACY_PERMISSIONS | MESSENGER_PERMISSIONS | SUBSCRIPTION_PERMISSIONS | UPLOAD_PERMISSIONS | DELIVERY_PERMISSIONS
 
 
 def effective_permissions(principal_permissions, key_permissions):
@@ -38,6 +40,9 @@ OPERATION_PERMISSIONS = {
     'wait_for_subscription_events':'read','configure_subscription_delivery':'subscription-write',
     'test_subscription':'subscription-write','submit_feedback':'feedback-write','list_feedback':'read',
     'prepare_file_upload':'upload','upload_file_chunk':'upload','get_file_upload':'upload',
+    'register_delivery_endpoint':'delivery-write','list_delivery_endpoints':'delivery-write',
+    'update_delivery_endpoint':'delivery-write','delete_delivery_endpoint':'delivery-write',
+    'test_delivery_endpoint':'delivery-write',
 }
 AUDIT_OPERATIONS = frozenset(OPERATION_PERMISSIONS) | {
     'issue_key', 'revoke_key', 'set_access', 'http_boundary', 'send_dispatch', 'set_sending',
@@ -66,6 +71,9 @@ AUDIT_CODES = frozenset({
     'subscription_wait_timeout','consumer_already_initialized','media_request_limit','subscription_receipt_limit','invalid_feedback','feedback_limit',
     'invalid_receiver','delivery_not_configured','invalid_phone','chat_not_collected',
     'identity_unresolved','provider_timeout','session_unavailable','invalid_anchor',
+    'delivery_disabled','delivery_policy_unset','unsafe_endpoint','invalid_signing_secret','invalid_header',
+    'reserved_header','rotation_in_progress','endpoint_limit','endpoint_conflict','operator_disabled',
+    'invalid_endpoint_state','endpoint_paused','endpoint_auto_paused',
 })
 UNSET = object()
 

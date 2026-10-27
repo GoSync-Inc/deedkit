@@ -67,10 +67,20 @@ Creation optionally accepts `wake_rules` (`incoming_message`, `owner_mention`,
 and timestamps cannot establish a reply anchor.
 
 `configureSubscriptionDelivery({subscription_id, version, receiver_id})` binds
-only an operator-registered receiver UUID; passing `null` or omitting the ID
-disables delivery. `testSubscription({subscription_id, request_id})` queues a
-bounded synthetic hint. Receiver success does not verify a host turn or ACK any
-event. Clients cannot register arbitrary URLs or schedule another task.
+an operator-registered receiver UUID, or `endpoint_id` binds your own endpoint;
+passing `null` or omitting both disables delivery.
+`testSubscription({subscription_id, request_id})` queues a bounded synthetic
+hint. Receiver success does not verify a host turn or ACK any event.
+
+With explicit `delivery-write` and the operator's delivery switch on, a key
+registers its own endpoint: `registerDeliveryEndpoint({request_id, url,
+signing_secret, label?, headers?})` checks the URL against the operator's host
+policy and sends one signed test. `listDeliveryEndpoints()`,
+`updateDeliveryEndpoint({endpoint_id, version, action, new_secret?, headers?})`,
+`deleteDeliveryEndpoint({endpoint_id, version})` and
+`testDeliveryEndpoint({endpoint_id, request_id})` manage it. The signing secret
+and header values are write-only. Clients cannot set the host policy or
+schedule another task.
 
 `submitFeedback({request_id, category, description, operation?, refs?})` records
 local private feedback with explicit `feedback-write`. Categories are `bug`,

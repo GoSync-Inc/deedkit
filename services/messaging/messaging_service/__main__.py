@@ -37,7 +37,8 @@ def main():
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
         'set-messenger-operations','extend-key','set-feedback-status','export-feedback','release-retention-hold',
         'set-subscription-retention','link-person','unlink-person','delete-person','list-people','key-info',
-        'principal-info'])
+        'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
+        'reload-delivery-policy'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -76,7 +77,8 @@ def main():
     parser.add_argument('--exclude-chats',nargs='*',default=[])
     parser.add_argument('--discover-chats',action='store_true')
     parser.add_argument('--synthetic',action='store_true')
-    parser.add_argument('--id',nargs='+',dest='feedback_ids',help='set-feedback-status: 1-100 feedback UUIDs')
+    parser.add_argument('--id',nargs='+',dest='feedback_ids',
+        help='set-feedback-status: 1-100 feedback UUIDs; disable-/enable-delivery-endpoint: one endpoint UUID')
     parser.add_argument('--status',help='set-feedback-status: received, accepted, declined, duplicate, fixed or verify_requested')
     parser.add_argument('--fixed-in',help='set-feedback-status: deedkit@<40-hex SHA> or anymsg@<semver>')
     parser.add_argument('--spec',help='set-feedback-status: ANYM-<n>')
@@ -262,6 +264,16 @@ def main():
             if not args.principal:parser.error('principal-info requires --principal')
             principal_id(args.principal)
             print(json.dumps(store.check_schema() if args.check else store.principal_info(args.principal)))
+        elif args.command=='delivery-endpoints-list':
+            # ANYM-519: metadata and fingerprints only; never a secret or header value.
+            print(json.dumps(store.list_delivery_endpoints_admin(args.principal)))
+        elif args.command=='reload-delivery-policy':
+            # ANYM-519: a host policy change counts as made when this returns (exclusive delivery fence).
+            print(json.dumps(store.reload_delivery_policy()))
+        elif args.command in ('disable-delivery-endpoint','enable-delivery-endpoint'):
+            if not args.feedback_ids or len(args.feedback_ids)!=1:parser.error(args.command+' requires one --id')
+            print(json.dumps(store.set_delivery_endpoint_operator_state(args.feedback_ids[0],
+                args.command=='enable-delivery-endpoint')))
         elif args.command=='audit-tail':
             print(json.dumps(store.audit_tail(args.principal or '',args.limit)))
         else:
