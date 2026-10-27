@@ -30,3 +30,10 @@ GRANT SELECT,INSERT,UPDATE ON subscription_hint_windows TO messaging_subscriptio
 -- Schema 49 (ANYM-519): an endpoint binding stages a hint only while its endpoint is enabled; no
 -- secret, header value or URL column.
 GRANT SELECT(id,state) ON delivery_endpoints TO messaging_subscriptions;
+-- Schema 50 (ANYM-534): only this component's heartbeat row (row-level security).
+GRANT SELECT,INSERT,UPDATE ON component_heartbeats TO messaging_subscriptions;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_policies WHERE tablename='component_heartbeats' AND policyname='messaging_subscriptions_beat') THEN
+        CREATE POLICY messaging_subscriptions_beat ON component_heartbeats TO messaging_subscriptions USING (component='matcher') WITH CHECK (component='matcher');
+    END IF;
+END $$;

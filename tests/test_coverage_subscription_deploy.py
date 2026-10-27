@@ -76,3 +76,65 @@ def test_subscription_overlay_is_opt_in_and_has_bounded_runtime_authority(tmp_pa
     assert service['stop_grace_period'] == '15s'
     assert service['logging'] == {'driver': 'json-file',
                                    'options': {'max-size': '5m', 'max-file': '2'}}
+
+
+# spec: ANYM-534
+@pytest.mark.skipif(
+    shutil.which('docker') is None and not os.environ.get('CI'),
+    reason='Compose rendering needs the host Docker CLI; the isolated test image intentionally has no Docker CLI or socket.',
+)
+def test_delivery_overlay_isolates_the_dispatcher_database_path_and_egress(tmp_path):
+    assert shutil.which('docker') is not None, 'CI must provide the Docker CLI for the Compose deployment proof'
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, 'PROBE_PUBLIC_URL': 'https://example.invalid', 'PROBE_ALLOWED_HOSTS': 'example.invalid'}
+    raw = yaml.safe_load((root / 'deploy/compose.delivery.yaml').read_text())
+    for name in ('delivery', 'api'):
+        # Raw Compose defaults host-path creation to true: require explicit false on every bind.
+        assert all(volume['bind']['create_host_path'] is False for volume in raw['services'][name]['volumes']), name
+    base = yaml.safe_load((root / 'deploy/compose.yaml').read_text())
+    fixture_env = tmp_path / 'postgres.synthetic.env'
+    fixture_env.write_text('POSTGRES_USER=synthetic\nPOSTGRES_PASSWORD=synthetic\nPOSTGRES_DB=synthetic\n')
+    base['services']['db']['env_file'] = str(fixture_env)
+    fixture_base = tmp_path / 'compose.synthetic.yaml'
+    fixture_base.write_text(yaml.safe_dump(base, sort_keys=False))
+    command = ['docker', 'compose', '--project-directory', str(root / 'deploy'), '-f', str(fixture_base)]
+    for name in ('compose.subscriptions.yaml', 'compose.delivery.yaml'):
+        command += ['-f', str(root / 'deploy' / name)]
+    result = subprocess.run(command + ['config', '--format', 'json'], env=env, text=True, capture_output=True, timeout=20)
+    assert result.returncode == 0, f'Compose render failed ({result.returncode}): {result.stderr}'
+    config = json.loads(result.stdout)
+    services, networks = config['services'], config['networks']
+    service = services['delivery']
+    assert service['command'] == ['python', '-m', 'messaging_service.delivery_worker']
+    assert service['build']['target'] == 'runtime' and service['init'] is True and service['restart'] == 'unless-stopped'
+    # A database-only internal network plus its own egress bridge; never the backend network of the API and matcher.
+    assert set(service['networks']) == {'delivery_db', 'delivery_egress'}
+    assert {name for name, item in services.items() if 'delivery_db' in item['networks']} == {'db', 'delivery'}
+    assert {name for name, item in services.items() if 'delivery_egress' in item['networks']} == {'delivery'}
+    assert set(services['db']['networks']) == {'backend', 'delivery_db'}
+    assert set(services['subscriptions']['networks']) == {'backend'}
+    assert networks['delivery_db']['internal'] is True and networks['delivery_db'].get('enable_ipv6') is False
+    assert networks['delivery_db']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-deliverydb0'}
+    # Explicit dns: Docker queries it from the container namespace, where the host rules apply.
+    assert service['dns'] == ['1.1.1.1']
+    assert not networks['delivery_egress'].get('internal') and networks['delivery_egress'].get('enable_ipv6') is False
+    assert networks['delivery_egress']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-delivery0'}
+    assert not service.get('ports')
+    assert service['environment'] == {'DATABASE_URL_FILE': '/run/secrets/database_url',
+                                      'DELIVERY_POLICY_FILE': '/run/secrets/delivery-policy.json'}
+    mounts = {volume['target']: volume for volume in service['volumes']}
+    assert set(mounts) == {'/run/secrets/database_url', '/run/secrets/delivery-policy.json', '/run/secrets/receivers'}
+    assert all(volume['type'] == 'bind' and volume['read_only'] is True for volume in mounts.values())
+    assert Path(mounts['/run/secrets/database_url']['source']) == root / 'deploy/private/delivery.dsn'
+    assert Path(mounts['/run/secrets/delivery-policy.json']['source']) == root / 'deploy/private/delivery-policy.json'
+    assert Path(mounts['/run/secrets/receivers']['source']) == root / 'deploy/private/delivery-receivers'
+    assert service['read_only'] is True and service['user'] == '10001:10001' and service['cap_drop'] == ['ALL']
+    assert 'no-new-privileges:true' in service['security_opt']
+    assert service['tmpfs'] == ['/tmp:size=16m,noexec,nosuid']
+    assert int(service['mem_limit']) == 256 * 1024**2 and service['cpu_shares'] == 512 and service['pids_limit'] == 64
+    assert service['logging'] == {'driver': 'json-file', 'options': {'max-size': '5m', 'max-file': '2'}}
+    # The API reads the same host policy for registration; nothing else of the API changes.
+    api = services['api']
+    assert api['environment']['DELIVERY_POLICY_FILE'] == '/run/secrets/delivery-policy.json'
+    policy = [volume for volume in api['volumes'] if volume['target'] == '/run/secrets/delivery-policy.json']
+    assert len(policy) == 1 and policy[0]['read_only'] is True

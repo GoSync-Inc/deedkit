@@ -38,7 +38,7 @@ def main():
         'set-messenger-operations','extend-key','set-feedback-status','export-feedback','release-retention-hold',
         'set-subscription-retention','link-person','unlink-person','delete-person','list-people','key-info',
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
-        'reload-delivery-policy'])
+        'reload-delivery-policy','set-delivery-features'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -267,6 +267,14 @@ def main():
         elif args.command=='delivery-endpoints-list':
             # ANYM-519: metadata and fingerprints only; never a secret or header value.
             print(json.dumps(store.list_delivery_endpoints_admin(args.principal)))
+        elif args.command=='set-delivery-features':
+            # ANYM-534: --enable refuses unless the API, matcher and dispatcher heartbeats agree on this version;
+            # --disable is the rollback: it cancels queued endpoint hints and tests under the fence.
+            if not (args.enable or args.disable):
+                parser.error('set-delivery-features requires --enable or --disable')
+            result=store.set_delivery_features(args.enable,verify_components=True)
+            print(json.dumps(result))
+            if 'error' in result:raise SystemExit(1)
         elif args.command=='reload-delivery-policy':
             # ANYM-519: a host policy change counts as made when this returns (exclusive delivery fence).
             print(json.dumps(store.reload_delivery_policy()))

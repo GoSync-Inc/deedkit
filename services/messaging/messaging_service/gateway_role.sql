@@ -94,3 +94,10 @@ GRANT UPDATE(header_names,headers_fingerprint,header_values,pending_secret,pendi
     signing_secret,state,version,updated_at) ON delivery_endpoints TO messaging_gateway;
 GRANT SELECT,INSERT ON delivery_endpoint_tests TO messaging_gateway;
 GRANT UPDATE(state,finished_at,error_code) ON delivery_endpoint_tests TO messaging_gateway;
+-- Schema 50 (ANYM-534): only this component's heartbeat row (row-level security).
+GRANT SELECT,INSERT,UPDATE ON component_heartbeats TO messaging_gateway;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_policies WHERE tablename='component_heartbeats' AND policyname='messaging_gateway_beat') THEN
+        CREATE POLICY messaging_gateway_beat ON component_heartbeats TO messaging_gateway USING (component='api') WITH CHECK (component='api');
+    END IF;
+END $$;

@@ -1,0 +1,76 @@
+# Opt-in overlay (ANYM-534), after compose.subscriptions.yaml. Install delivery_role.sql as owner and
+# configure a separate LOGIN inheriting messaging_event_delivery; never use the gateway or matcher DSN.
+# The dispatcher reaches PostgreSQL only over delivery_db (internal bridge dk-deliverydb0, no API, matcher,
+# gateway or collector) and the internet only over its own bridge dk-delivery0. The host rules from
+# `scripts/delivery_egress_check.py rules` drop host-bound packets on both bridges and restrict dk-delivery0 to
+# DNS on DELIVERY_RESOLVER and public 443 (docs/operations/production.md). An explicit `dns` makes Docker's
+# embedded resolver query DELIVERY_RESOLVER from the container namespace, so those rules apply to DNS too.
+services:
+  delivery:
+    image: anymsg-delivery:${MESSAGING_VERSION:-0.9.19}
+    build:
+      context: ..
+      target: runtime
+    command: [python, -m, messaging_service.delivery_worker]
+    init: true
+    restart: unless-stopped
+    depends_on:
+      db: {condition: service_healthy}
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      DELIVERY_POLICY_FILE: /run/secrets/delivery-policy.json
+    volumes:
+      - type: bind
+        source: ./private/delivery.dsn
+        target: /run/secrets/database_url
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./private/delivery-policy.json
+        target: /run/secrets/delivery-policy.json
+        read_only: true
+        bind: {create_host_path: false}
+      # Operator receiver secret files (subscription_receivers.secret_file names /run/secrets/receivers/<file>).
+      - type: bind
+        source: ./private/delivery-receivers
+        target: /run/secrets/receivers
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [delivery_db, delivery_egress]
+    dns: ["${DELIVERY_RESOLVER:-1.1.1.1}"]
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    mem_limit: 256m
+    cpu_shares: 512
+    pids_limit: 64
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}
+  db:
+    networks: [delivery_db]
+  # Self-service registration checks the same host allowlist as the dispatcher.
+  api:
+    environment:
+      DELIVERY_POLICY_FILE: /run/secrets/delivery-policy.json
+    volumes:
+      - type: bind
+        source: ./private/delivery-policy.json
+        target: /run/secrets/delivery-policy.json
+        read_only: true
+        bind: {create_host_path: false}
+
+networks:
+  delivery_db:
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: dk-deliverydb0
+  delivery_egress:
+    driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: dk-delivery0

@@ -31,3 +31,10 @@ GRANT SELECT(subscription,acked_through) ON subscription_consumption TO messagin
 GRANT EXECUTE ON FUNCTION public.subscription_hint_references(uuid,bigint,bigint,text[],text[]) TO messaging_event_delivery;
 GRANT UPDATE(state,lease_token,lease_until,http_status,latency_ms,error_code,finished_at)
     ON delivery_endpoint_tests TO messaging_event_delivery;
+-- Schema 50 (ANYM-534): only this component's heartbeat row (row-level security).
+GRANT SELECT,INSERT,UPDATE ON component_heartbeats TO messaging_event_delivery;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_policies WHERE tablename='component_heartbeats' AND policyname='messaging_event_delivery_beat') THEN
+        CREATE POLICY messaging_event_delivery_beat ON component_heartbeats TO messaging_event_delivery USING (component='dispatcher') WITH CHECK (component='dispatcher');
+    END IF;
+END $$;

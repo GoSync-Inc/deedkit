@@ -1300,11 +1300,21 @@ def create_app(store: Store, allowed_hosts: list[str]):
                         await run_in_threadpool(store.cleanup_file_uploads)
                 except Exception:log.error('upload_cleanup_unavailable')
                 await asyncio.sleep(60)
+        async def heartbeat():
+            # ANYM-534: the API's version heartbeat gates set-delivery-features; record() never raises on SQL errors.
+            from .heartbeats import HEARTBEAT_S,record
+            while True:
+                try:
+                    if release is None or release.phase == 'active':
+                        await run_in_threadpool(record,store,'api')
+                except Exception:log.error('heartbeat_unavailable')
+                await asyncio.sleep(HEARTBEAT_S)
         async with sdk_lifespan(application) as state:
-            task=asyncio.create_task(sweep_uploads()) if hasattr(store,'cleanup_file_uploads') else None
+            tasks=[asyncio.create_task(job()) for job,ready in ((sweep_uploads,hasattr(store,'cleanup_file_uploads')),
+                (heartbeat,hasattr(store,'pool'))) if ready]
             try:yield state
             finally:
-                if task:
+                for task in tasks:
                     task.cancel()
                     with suppress(asyncio.CancelledError):await task
     app.router.lifespan_context=lifespan

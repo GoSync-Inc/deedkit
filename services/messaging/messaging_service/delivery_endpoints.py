@@ -547,10 +547,17 @@ async def finish_inline_test(store, token, result, *, wait_s=10.0):
     return result
 
 
-def set_delivery_features(store, enabled):
-    """Operator only. Disabling cancels every queued endpoint hint and test under each endpoint's lock."""
+def set_delivery_features(store, enabled, *, verify_components=False):
+    """Operator only. Disabling cancels every queued endpoint hint and test under each endpoint's lock. With
+    verify_components (the CLI), enabling refuses unless the API, matcher and dispatcher heartbeats are fresh and
+    report this version on the current schema (ANYM-534); the refusal names the first component and changes nothing."""
     with store.pool.connection() as c:
         c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', (FEATURES_LOCK,))
+        if enabled and verify_components:
+            from .heartbeats import mismatch
+            problem = mismatch(c)
+            if problem is not None:
+                return problem
         c.execute('''INSERT INTO probe_metadata(name,value) VALUES('delivery_features',%s)
             ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value''', ('enabled' if enabled else 'disabled',))
         cancelled = 0
@@ -701,17 +708,22 @@ def _compact(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
 
 
-def dispatch_tests(store, *, limit=8, transport, resolver):
-    """One attempt per staged test; the result is the endpoint's health. Same fence as hints."""
+def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
+    """One attempt per staged test; the result is the endpoint's health. Same fence as hints.
+
+    ANYM-534: picked by the endpoint lanes' scheduler (next_endpoint_item; served: the lanes' shared
+    {(principal, key_id): turn}), so a key's test never runs beside its hint or ahead of a waiting key's turn.
+    """
+    from .event_delivery import next_endpoint_item
     from .subscriptions import _worker_identity
     stats = dict(delivered=0, failed=0, cancelled=0)
+    strict, served = served is not None, {} if served is None else served
     for _ in range(limit):
         lease = uuid4()
         with store.pool.connection() as c:
-            test = c.execute('''SELECT t.*,e.principal,e.key_id FROM delivery_endpoint_tests t
-                JOIN delivery_endpoints e ON e.id=t.endpoint
-                WHERE t.state='pending' OR t.state='leased' AND t.lease_until<=clock_timestamp()
-                ORDER BY t.created_at,t.id LIMIT 1 FOR UPDATE OF t SKIP LOCKED''').fetchone()
+            # Without lanes (served None, the serial pass) tests skip keys whose next item is a hint.
+            test = next_endpoint_item(c, served, 'test', '''SELECT t.*,e.principal,e.key_id FROM delivery_endpoint_tests t
+                JOIN delivery_endpoints e ON e.id=t.endpoint WHERE t.id=%s FOR UPDATE OF t SKIP LOCKED''', strict)
             if test is None:
                 break
             if c.execute("SELECT %s<clock_timestamp()-interval '5 minutes' AS old", (test['created_at'],)).fetchone()['old']:

@@ -242,9 +242,22 @@ A receiver HTTP success is not a verified host turn; all hints and probes report
 `host_turn_verified=false`. Host adapters must separately prove that integration.
 
 Run `python -m messaging_service.delivery_worker` using only the dispatcher DSN
-and private receiver secret mounts. `--once` is a bounded operator pass. Keep the
-matcher on its existing internal-only network; public HTTPS egress belongs to a
-separate dispatcher deployment. No dispatcher is started by installing the
+and private receiver secret mounts; in production `deploy/compose.delivery.yaml`
+runs it (docs/operations/production.md, migration 050). `--once` is one serial
+bounded operator pass. Otherwise it runs separate lanes (ANYM-534): one for operator
+receivers, with its own DNS lookup slots, and three for self-service endpoints. An
+endpoint lane leases at most one attempt per key at a time, counting the key's
+endpoint tests, and serves the least recently served key first. A key holds at
+most 32 queued endpoint hints across its subscriptions and hint kinds: past it a
+due hint stays held (`held_reason` `budget`) and fires on a later tick, and
+`test_subscription` answers `rate_limited` (events stay fetchable). So endpoints that hang for the full timeout never delay operator
+receivers, and a failing endpoint never stops a lane. The dispatcher heartbeat is
+written every 30 s and only while every lane finished a pass within 60 s. The
+dispatcher reaches PostgreSQL only over an internal network that holds nothing
+else, and the internet over its own bridge, which host rules restrict to DNS on
+the one configured resolver and public port 443; host-bound packets are dropped on
+both of its bridges (`scripts/delivery_egress_check.py`). Keep the matcher on its
+existing internal-only network. No dispatcher is started by installing the
 package. Operator `--disable-receiver UUID` uses the same authorization fence as
 in-flight delivery and cancels queued hints. No internal/private IP exceptions
 are enabled.
@@ -467,7 +480,11 @@ the switch, the host policy and the limits.
 both), with the same version check and fence as a receiver.
 
 **Switch.** Every endpoint tool, the `delivery` field and endpoint staging answer
-`delivery_disabled` until the operator enables the feature (S2b). With the switch
+`delivery_disabled` until the operator enables the feature with
+`python -m messaging_service set-delivery-features --enable` (ANYM-534). That refuses
+until the API, the matcher and the dispatcher report this version and schema
+through fresh heartbeats (`component_heartbeats`, under 120 s); `--disable` is the
+rollback. With the switch
 off no endpoint hint is staged, and turning it off cancels queued endpoint hints
 and tests. The webhook transport in capabilities then shows `operational: false`
 with reason `delivery_disabled`.
@@ -484,8 +501,8 @@ suffix matches on a DNS label boundary (`example.com` matches `a.example.com`, n
 `badexample.com`) and deny wins. A missing or invalid file, unknown keys or an
 empty allowlist without `allow_any_public: true` leave the policy unset:
 registration answers `delivery_policy_unset` and the webhook transport shows
-reason `delivery_policy_unset`. Set `allow_any_public: true` only after S2b's
-isolation test passes. The policy is read again before every attempt; a host that
+reason `delivery_policy_unset`. Set `allow_any_public: true` only after the
+dispatcher's egress check passes (production.md, migration 050). The policy is read again before every attempt; a host that
 leaves it cancels the hint (`endpoint_policy_refused`). After editing the file, run
 `python -m messaging_service reload-delivery-policy`: it waits for every in-flight
 POST and registration that read the old file, then cancels queued hints and tests of

@@ -632,6 +632,103 @@ ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 `promotable()` (the previous revision is no longer current `main`), does not run or
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
+Messaging migration 050 (`manual`, ANYM-534) adds `component_heartbeats`: one row each for the
+API, the matcher and the dispatcher (package version, schema), each role limited to its own row by
+row-level security. Additive; older runtimes write nothing there. With it the matcher and the
+delivery dispatcher run in production. Nothing here runs during an active call (check read-only
+first).
+1. Fresh verified backup (the backup gate), then `migrate`; the pinned backup and restore runtimes
+   move to the schema-50 release.
+2. Role SQL (reviewed with the release): `gateway_role.sql`, `subscription_role.sql` and
+   `delivery_role.sql`. Logins as in step 4 of 045: `messaging_subscriptions_runtime` (`LOGIN IN
+   ROLE messaging_subscriptions`) and `messaging_event_delivery_runtime` (`LOGIN IN ROLE
+   messaging_event_delivery`), DSNs in `private/subscriptions.dsn` and `private/delivery.dsn`,
+   mode 0600, owned like the other DSNs. Undo: stop the service, `DROP ROLE <login>`, remove the file.
+3. Private files, owned by uid 10001: `private/delivery-policy.json` (mode 0600; SUBSCRIPTIONS.md,
+   Host policy) and the directory `private/delivery-receivers/` (mode 0700, its files 0600) holding
+   operator receiver secrets; a receiver's `secret_file` is `/run/secrets/receivers/<file>`.
+4. Resolver and host egress rules (a host step the owner approves). Set `DELIVERY_RESOLVER=<ip>` in
+   the project's env file, `<ip>` being the host's current upstream resolver (`/etc/resolv.conf`, or
+   `/run/systemd/resolve/resolv.conf` behind systemd-resolved; not a new third party). The overlay
+   passes it as the dispatcher's `dns`, so Docker's embedded resolver queries it from the container
+   namespace, where the rules apply. `python3 scripts/delivery_egress_check.py rules --resolver <ip>`
+   (the same IP) prints the commands; as root, apply them before the dispatcher first starts (they
+   match bridge names, which may not exist yet) and save them with the host's firewall persistence.
+   They drop host-bound packets from both bridges, `dk-delivery0` (egress) and `dk-deliverydb0` (the
+   internal database network, which still has a host gateway address), and, from `dk-delivery0`, the
+   tailnet (100.64.0.0/10), RFC 1918, link-local and metadata (169.254.0.0/16), loopback and every
+   IPv6 packet; they allow DNS to `<ip>` and TCP 443 to public addresses. Undo: `rules --undo`.
+5. First enrollment (owner-authorized, once; `production.py` cannot do it: a selected service must
+   already run, `snapshot`, and databases are never restarted). The host is on a release with this
+   code, applied by `production.py`; `I=deedkit-production-runtime:<that sha>` is its verified image
+   (`docker image inspect` it; never `--build`). `F` is the project's Compose arguments (its `files`
+   and env files) plus `-f compose.subscriptions.yaml -f compose.delivery.yaml`.
+   1. `docker tag $I anymsg-subscriptions:enroll-<sha>` and `docker tag $I anymsg-delivery:enroll-<sha>`
+      (new tags, never a production tag).
+   2. `MESSAGING_VERSION=enroll-<sha> docker compose $F up --no-start --no-build --pull never --no-deps
+      subscriptions delivery` creates both networks and containers without starting them.
+   3. `docker network connect --alias db <project>_delivery_db <db container>`: the running database
+      joins the dispatcher's network; its backend attachment and identity are unchanged.
+   4. `docker compose $F start subscriptions delivery`.
+   5. Append both overlays, in this order, to the project's `files` in `/etc/deedkit/production.json`
+      and select their services (backup of the file first):
+      ```json
+      "files": ["...existing files...", "/srv/deedkit/deploy/compose.subscriptions.yaml",
+                "/srv/deedkit/deploy/compose.delivery.yaml"],
+      "services": {"api": "runtime", "subscriptions": "runtime", "delivery": "runtime"}
+      ```
+      The serving API is plan B, which reads its own `/etc/deedkit/http-production.json`
+      (`seamless_release.py --config`, its own `prepare` snapshots): append the same two overlays,
+      in the same order, to the messaging project's `files` there too (back it up first) and keep
+      its `services` exactly the API and the gateway. Autodeploy pauses on these configuration
+      changes; under the pause file apply the next green `main` SHA S2 by hand:
+      `production.py prepare --sha S2` and `apply --sha S2` (plan A: both enrollment containers become
+      release images), then `seamless_release.py prepare --sha S2` and `promote --sha S2` (plan B),
+      `status`; check that the serving API container has `DELIVERY_POLICY_FILE` and its mount
+      (`docker inspect`); remove the pause. Later deploys include them.
+   Undo before the S2 apply, in reverse: restore both configuration backups; `docker compose $F
+   stop subscriptions delivery` and `rm subscriptions delivery`; `docker network disconnect
+   <project>_delivery_db <db container>`; `docker network rm <project>_delivery_db
+   <project>_delivery_egress`; `docker image rm` both enroll tags. After it, the receipts name the
+   overlays and S2 can never be prepared again, so the undo is a release at a newer green `main`
+   SHA: restore both configuration backups, stop and remove both services, the same hand apply
+   (plan A and plan B) at that SHA, then disconnect and remove the networks. Until such a SHA
+   exists, `set-delivery-features --disable` and `docker compose $F stop delivery` hold.
+6. Check they run: `docker compose $F ps subscriptions delivery` shows both running with no
+   restarts; their logs show no repeated `subscription_match_failed`, `delivery_lane_failed` or
+   `delivery_heartbeat_failed`; `SELECT component,version,schema_version,clock_timestamp()-beat_at
+   FROM component_heartbeats` (operator DSN) has three rows younger than 120 s on the deployed
+   version and schema 50; an agent's `get_capabilities` shows the webhook transport
+   `operational: true` once a receiver or endpoint is configured.
+7. Connectivity check (the receipt keeps the JSON). Blocked targets are IP literals read with
+   `docker inspect`/`ip addr` first; a name, an unresolvable or malformed target fails. The matcher
+   has no listener, so start a bounded synthetic one in its namespace: `docker compose $F exec -T
+   subscriptions python -I - listen --port 18080 --seconds 300 < scripts/delivery_egress_check.py &`.
+   `<alt>` is a public resolver other than `DELIVERY_RESOLVER` (8.8.8.8, or 9.9.9.9 if that is the
+   configured one). First the positive control from the `api` container: every listener answers.
+   ```sh
+   docker compose $F exec -T api python -I - check --open <matcher ip>:18080 --open <gateway ip>:13240 \
+     --open <host public ip>:22 --open <tailnet ip>:22 --open-dns <alt> < scripts/delivery_egress_check.py
+   ```
+   Then from the dispatcher; it exits 0 only when every open target connects or answers and every
+   blocked one times out or has no route:
+   ```sh
+   docker compose $F exec -T delivery python -I - check --open db:5432 --open example.com:443 \
+     --open-dns $DELIVERY_RESOLVER --blocked <api ip>:8080 --blocked <gateway ip>:13240 \
+     --blocked <matcher ip>:18080 --blocked <host public ip>:22 --blocked <tailnet ip>:22 \
+     --blocked <dk-delivery0 gateway ip>:22 --blocked <dk-deliverydb0 gateway ip>:22 \
+     --blocked 169.254.169.254:80 --blocked <alt>:53 --blocked-dns <alt> \
+     --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
+   ```
+   `example.com` resolves through Docker's embedded resolver (explicit `dns`); `--open-dns` and
+   `--blocked-dns` query a resolver directly over UDP, `<alt>:53` over TCP. Stop the listener after.
+8. `python -m messaging_service set-delivery-features --enable` (operator DSN) switches
+   self-service delivery on. It refuses (exit 1, `component_heartbeat_absent|stale`,
+   `component_version_mismatch`, `component_schema_mismatch` with the component) until the API,
+   matcher and dispatcher all report this version on schema 50. Undo: `--disable`; queued
+   endpoint hints and tests are cancelled under the delivery fence and events stay fetchable.
+Rollback: `--disable`, then step 5's undo and `rules --undo`. 050 stays; a schema-49 runtime
+ignores the table, but its `migrate` refuses a schema-50 database.
 Messaging migration 045 (`manual`, ANYM-511) adds the deletion purge: `messages.purged`
 (defaulted, a catalog change), `chats.purged_at`, the `message_purges`, `chat_tombstones`,
 `ingest_receipt_links` and `purge_state` tables without foreign keys, guard triggers that keep

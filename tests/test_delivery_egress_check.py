@@ -1,0 +1,113 @@
+"""The dispatcher's egress check and host rules (ANYM-534); local sockets only, no firewall is changed."""
+import json
+from pathlib import Path
+import socket
+import subprocess
+import sys
+
+SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/delivery_egress_check.py'
+
+
+def run(*args):
+    result = subprocess.run([sys.executable, '-I', str(SCRIPT), *args], text=True, capture_output=True, timeout=30)
+    return result.returncode, result.stdout
+
+
+# spec: ANYM-534
+def test_check_passes_only_when_open_targets_connect_and_blocked_ones_never_answer():
+    with socket.socket() as closed:
+        # A port nobody holds: every OS refuses it (a bound, non-listening one times out on macOS).
+        closed.bind(('127.0.0.1', 0))
+        refused_target = f'127.0.0.1:{closed.getsockname()[1]}'
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen()
+        open_target = f'127.0.0.1:{listener.getsockname()[1]}'
+        # TEST-NET-1 has no route or no answer: what a DROP looks like from inside the dispatcher.
+        code, out = run('check', '--timeout', '1', '--open', open_target, '--blocked', '192.0.2.1:8080')
+        report = json.loads(out)
+        assert code == 0 and report['passed'] is True
+        assert [(r['target'], r['expect'], r['passed']) for r in report['results']] == [
+            (open_target, 'open', True), ('192.0.2.1:8080', 'blocked', True)]
+        assert report['results'][0]['outcome'] == 'connected' and report['results'][1]['outcome'] in ('timeout', 'unreachable')
+        # A name sends no packet when it does not resolve, so a blocked target must be an IP literal: names and
+        # malformed targets fail instead of passing as "nothing answered".
+        code, out = run('check', '--timeout', '1', '--blocked', 'api.invalid:8080', '--blocked', 'api:8080',
+                        '--blocked', '127.0.0.1:http')
+        report = json.loads(out)
+        assert code == 1 and [(r['outcome'], r['passed']) for r in report['results']] == [('malformed', False)] * 3
+        # A refused connection proves the address answers: a DROP rule never sends a reset, so this fails.
+        code, out = run('check', '--timeout', '1', '--blocked', refused_target, '--blocked', open_target)
+        report = json.loads(out)
+        assert code == 1 and report['passed'] is False
+        assert [(r['outcome'], r['passed']) for r in report['results']] == [('refused', False), ('connected', False)]
+    # An open target that does not connect fails too.
+    code, out = run('check', '--timeout', '1', '--open', 'db.invalid:5432')
+    assert code == 1 and json.loads(out)['results'][0]['outcome'] == 'unresolved'
+
+
+# spec: ANYM-534
+def test_dns_probes_need_an_answer_or_silence_and_the_listener_is_a_positive_control():
+    import threading
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as resolver, \
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as silent:
+        resolver.bind(('127.0.0.1', 0))
+        silent.bind(('127.0.0.1', 0))
+        def answer():
+            query, peer = resolver.recvfrom(512)
+            resolver.sendto(query[:2] + b'\x81\x80' + query[4:], peer)
+        thread = threading.Thread(target=answer, daemon=True)
+        thread.start()
+        allowed, other = (f'127.0.0.1:{s.getsockname()[1]}' for s in (resolver, silent))
+        code, out = run('check', '--timeout', '1', '--open-dns', allowed, '--blocked-dns', other)
+        thread.join(5)
+    assert code == 0, out
+    assert [(r['expect'], r['outcome']) for r in json.loads(out)['results']] == [('open-dns', 'answered'), ('blocked-dns', 'timeout')]
+    # A resolver that does not answer (the port is closed now) fails as open; a name is malformed.
+    code, out = run('check', '--timeout', '1', '--open-dns', other, '--blocked-dns', 'resolver.invalid')
+    results = json.loads(out)['results']
+    assert code == 1 and results[0]['outcome'] in ('refused', 'timeout') and not results[0]['passed']
+    assert (results[1]['outcome'], results[1]['passed']) == ('malformed', False)
+    # The synthetic listener (run in the matcher container) accepts until its time is up.
+    listener = subprocess.Popen([sys.executable, '-I', str(SCRIPT), 'listen', '--port', '0', '--seconds', '10'],
+                                stdout=subprocess.PIPE, text=True)
+    try:
+        port = json.loads(listener.stdout.readline())['listening']
+        code, out = run('check', '--timeout', '1', '--open', f'127.0.0.1:{port}')
+        assert code == 0 and json.loads(out)['results'][0]['outcome'] == 'connected'
+    finally:
+        listener.kill()
+        listener.wait(5)
+
+
+# spec: ANYM-534
+def test_rules_drop_private_tailnet_metadata_and_host_and_allow_only_dns_and_443():
+    code, out = run('rules', '--resolver', '1.1.1.1')
+    assert code == 0
+    lines = out.splitlines()
+    chain = [line for line in lines if line.startswith('iptables -A DEEDKIT-DELIVERY')]
+    for network in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '100.64.0.0/10', '169.254.0.0/16', '127.0.0.0/8'):
+        assert f'iptables -A DEEDKIT-DELIVERY -d {network} -j DROP' in chain, network
+    dns = [line for line in chain if '--dport 53' in line]
+    assert dns and all('-d 1.1.1.1' in line and line.endswith('-j RETURN') for line in dns)
+    # DNS first, then the private drops, then public 443, then drop everything else.
+    assert chain.index(dns[-1]) < chain.index('iptables -A DEEDKIT-DELIVERY -d 10.0.0.0/8 -j DROP')
+    assert chain[-2:] == ['iptables -A DEEDKIT-DELIVERY -p tcp --dport 443 -j RETURN', 'iptables -A DEEDKIT-DELIVERY -j DROP']
+    assert 'iptables -I DOCKER-USER -i dk-delivery0 -j DEEDKIT-DELIVERY' in lines
+    # The host itself (INPUT, not forwarded) and every IPv6 packet (ULA, NAT64) are dropped.
+    # The internal database bridge has a host gateway address too: host-bound packets drop on both bridges.
+    for bridge in ('dk-delivery0', 'dk-deliverydb0'):
+        assert f'iptables -I INPUT -i {bridge} -j DROP' in lines and f'ip6tables -I INPUT -i {bridge} -j DROP' in lines
+    assert 'ip6tables -I DOCKER-USER -i dk-delivery0 -j DROP' in lines
+    # The undo removes every inserted rule and the chain.
+    code, out = run('rules', '--undo')
+    assert code == 0
+    undo = out.splitlines()
+    inserted = [line.replace(' -I ', ' -D ', 1) for line in lines if ' -I ' in line]
+    assert sorted(line for line in undo if ' -D ' in line) == sorted(inserted)
+    assert undo[-2:] == ['iptables -F DEEDKIT-DELIVERY', 'iptables -X DEEDKIT-DELIVERY']
+    # A resolver inside a dropped range (a tailnet DNS) is allowed only on port 53, before the drops.
+    code, out = run('rules', '--resolver', '100.100.100.100')
+    assert code == 0 and 'iptables -A DEEDKIT-DELIVERY -d 100.100.100.100 -p udp --dport 53 -j RETURN' in out
+    code, _ = run('rules', '--resolver', 'not-an-address')
+    assert code != 0

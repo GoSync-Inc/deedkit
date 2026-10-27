@@ -26,7 +26,9 @@ agent's own headers; never message text, names or file content. SSRF controls: h
 on port 443, every resolved address public (no private, loopback, CGNAT, multicast,
 NAT64, 6to4, Teredo or IPv4-mapped answers), resolution again before each attempt with
 the address pinned, TLS hostname verification, no redirects, no proxies, and the
-host policy rechecked before each attempt. Signing secrets and header values are
+host policy rechecked before each attempt. The dispatcher (ANYM-534) shares a network
+only with PostgreSQL and egresses over its own bridge, which host rules limit to DNS on one configured resolver and
+public port 443 (no host, tailnet, private, link-local, metadata or IPv6 address). Signing secrets and header values are
 write-only for the API role and never returned, logged or audited. This is privilege
 separation, not encryption: database owners and anyone who can decrypt a backup can
 read them. Details: [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#self-service-webhook-endpoints-schema-49).

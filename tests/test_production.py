@@ -4888,3 +4888,26 @@ def test_a_missing_configuration_file_is_named_in_the_refusal(tmp_path, monkeypa
     # Plain lines with spaces around = and paired quotes read as systemd reads them.
     (tmp_path / "autodeploy.env").write_text('; note\nOTHER = "x y"\nDEEDKIT_DEPLOY_CONFIG = "/etc/deedkit/b.json"\n')
     assert p.active_config() == "/etc/deedkit/b.json"
+
+
+# spec: ANYM-534
+def test_config_promotes_the_matcher_and_dispatcher_overlays(tmp_path, monkeypatch):
+    settings, _, _ = fixture(tmp_path, monkeypatch)
+    project = settings["projects"][0]
+    for name in ("compose.subscriptions.yaml", "compose.delivery.yaml"):
+        (Path(project["directory"]) / name).write_text("services: {}\n")
+        project["files"].append(str(Path(project["directory"]) / name))
+    project["services"].update({"subscriptions": "runtime", "delivery": "runtime"})
+    filename = tmp_path / "production.json"
+    filename.write_text(json.dumps(settings))
+    filename.chmod(0o600)
+    loaded = p.config(filename)["projects"][0]
+    command = p.compose(loaded)
+    files = [command[i + 1] for i, part in enumerate(command) if part == "-f"]
+    assert files == project["files"] and files[-2:] == [str(tmp_path / "compose.subscriptions.yaml"),
+                                                       str(tmp_path / "compose.delivery.yaml")]
+    assert {"subscriptions", "delivery"} <= set(loaded["services"])
+    # The documented host file list names both overlays (docs/operations/production.md).
+    docs = (Path(__file__).resolve().parents[1] / "docs/operations/production.md").read_text()
+    assert "compose.subscriptions.yaml" in docs and "compose.delivery.yaml" in docs
+    assert '"subscriptions": "runtime"' in docs and '"delivery": "runtime"' in docs

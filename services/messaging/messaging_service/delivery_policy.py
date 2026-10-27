@@ -104,6 +104,10 @@ def _slot(c, owner, column, now):
     return None if charged is None else charged['t'] + timedelta(hours=1)
 
 
+# ANYM-534: how long a key at ENDPOINT_QUEUE_PER_KEY queued hints holds a due one before the next try.
+QUEUE_RETRY = timedelta(minutes=1)
+
+
 def budget_slot(c, row, now):
     """None if the key may commit a hint now, else when its next hourly slot opens.
 
@@ -178,11 +182,12 @@ def _due(policy, window):
     return first, None
 
 
-def _gate(c, row, policy, due, reason, bypass, now):
+def _gate(c, row, policy, due, reason, bypass, now, endpoint=False):
     """(None, None) if a due hint may be committed now, else (next time, held reason).
 
     Aggregation sets due; quiet hours hold a due hint to the window end (even past max_wait);
-    the budget holds it to the next slot. Each tick re-plans, so an overdue hint fires once.
+    the budget holds it to the next slot, and (ANYM-534) a key whose endpoint queue is full holds it
+    for QUEUE_RETRY. Each tick re-plans, so an overdue hint fires once.
     """
     if not bypass:
         quiet = quiet_until(c, policy, max(due, now))
@@ -191,7 +196,11 @@ def _gate(c, row, policy, due, reason, bypass, now):
     if due > now:
         return due, reason
     slot = budget_slot(c, row, now)
-    return (slot, 'budget') if slot else (None, None)
+    if slot:
+        return slot, 'budget'
+    # Under budget_slot's per-key lock, so the count and the insert are one step for every writer.
+    from .event_delivery import endpoint_queue_full
+    return (now + QUEUE_RETRY, 'budget') if endpoint and endpoint_queue_full(c, row) else (None, None)
 
 
 def _bypass(policy, reasons):
@@ -211,12 +220,13 @@ def _emit(c, row, binding, window, kind, through, bypass):
 
 def _settle(c, row, binding, window, now, through):
     policy = binding['policy'] or {}
+    endpoint = binding['receiver'] is None
     emitted = 0
     if window['first_match_at'] is not None:
         due, reason = _due(policy, window)
         # The current policy decides the bypass from the range's reasons, also after a reconfiguration.
         bypass = _bypass(policy, window['reasons'])
-        window['due_at'], window['held_reason'] = _gate(c, row, policy, due, reason, bypass, now)
+        window['due_at'], window['held_reason'] = _gate(c, row, policy, due, reason, bypass, now, endpoint)
         if window['due_at'] is None:
             emitted += _emit(c, row, binding, window, 'events', window['through_position'], bypass)
             window['hinted_through'] = max(window['hinted_through'] or 0, window['through_position'])
@@ -227,7 +237,8 @@ def _settle(c, row, binding, window, now, through):
             window['silence_state'], window['silence_fired_at'] = 'fired', now
         if window['silence_state'] == 'fired':
             bypass = 'silence' in policy.get('quiet_bypass', ())
-            window['silence_due_at'], window['silence_held_reason'] = _gate(c, row, policy, now, None, bypass, now)
+            window['silence_due_at'], window['silence_held_reason'] = _gate(c, row, policy, now, None, bypass, now,
+                endpoint)
             if window['silence_due_at'] is None:
                 emitted += _emit(c, row, binding, window, 'silence', through, bypass)
                 window['silence_state'] = 'hinted'

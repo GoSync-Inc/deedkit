@@ -242,3 +242,22 @@ def test_webhook_policy_unset_then_a_bound_self_service_endpoint(seeded,tmp_path
         assert 'register_delivery_endpoint' not in s.capabilities(s.issue_key('endpoint-legacy',['telegram-demo']))['available']
     finally:
         s.set_delivery_features(False)
+
+
+# spec: ANYM-534
+def test_a_lane_worker_pulse_keeps_webhook_operational_for_120_seconds(seeded,tmp_path):
+    import time
+    from messaging_service import delivery_worker
+    from test_event_delivery import identity
+    s,_,_=seeded
+    token=identity(s)
+    bound_receiver(s,token,tmp_path)
+    with s.pool.connection() as c:c.execute('DELETE FROM subscription_dispatcher_heartbeat WHERE id=1')
+    now=time.monotonic()
+    assert delivery_worker.pulse(s,{'operator':now,'endpoint-0':now},now=now)
+    assert transports(s,token)['webhook']['operational'] is True
+    heartbeat(s,delivery_worker.HEARTBEAT_S*3)
+    assert transports(s,token)['webhook']['operational'] is True
+    heartbeat(s,121)
+    webhook=transports(s,token)['webhook']
+    assert webhook['operational'] is False and webhook['reason']=='dispatcher_heartbeat_stale'
