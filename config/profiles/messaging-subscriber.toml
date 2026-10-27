@@ -1,0 +1,9 @@
+version = 1
+id = "messaging-subscriber"
+revision = 1
+[deployment]
+modules = ["messaging"]
+connectors = []
+external = []
+[exposure]
+tools = ["platform_capabilities", "messages_capabilities", "messages_list_chats", "messages_search", "messages_get_messages", "messages_get_context", "messages_get_attachment", "messages_get_updates", "messages_ack_updates", "messages_list_subscriptions", "messages_get_subscription", "messages_get_subscription_events", "messages_create_subscription", "messages_update_subscription", "messages_configure_subscription_delivery", "messages_fetch_subscription_events", "messages_wait_for_subscription_events", "messages_ack_subscription_events"]

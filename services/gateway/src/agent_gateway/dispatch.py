@@ -9,6 +9,7 @@ from .adapters.calls import receipt_reference
 
 from .catalog import arguments, CATALOG, InvalidArguments
 from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, stale_arguments_hint, unavailable, unknown_tool_denial
+from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
 from .sections import capabilities_view, subscription_blocks
 
@@ -618,6 +619,9 @@ class Dispatch:
                 else await self.clients.call(module, tool["operation"], credential, args)
             )
         except Denied as error:
+            if error.code == "backend_busy" and module == "messaging" and tool["operation"] == "wait_for_subscription_events":
+                # ANYM-518: a full wait pool is a wait outcome, not a bare 503.
+                return {"wait_status": "busy", "retry_after_s": WAIT_RETRY_AFTER_S, "wait_pool": WAIT_POOL}
             if error.code in {"backend_unavailable", "backend_response_too_large"} and not read_only:
                 diagnostics = getattr(error, "detail", {})
                 error.detail = {

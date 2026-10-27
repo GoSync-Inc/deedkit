@@ -627,6 +627,43 @@
   "source_scope_change": "masked_access_changed_recreate_required",
   "source_selection": "frozen_explicit_chats_and_account_scoped_sender_ids",
   "start_boundary": "committed_archive_frontier",
+  "transports": [
+   {
+    "authorized": true,
+    "configured": true,
+    "name": "pull",
+    "operational": true,
+    "reason": null,
+    "tools": [
+     "fetch_subscription_events",
+     "ack_subscription_events"
+    ]
+   },
+   {
+    "authorized": true,
+    "configured": true,
+    "max_wait_s": 25,
+    "name": "long_poll",
+    "operational": true,
+    "reason": null,
+    "tools": [
+     "wait_for_subscription_events"
+    ]
+   },
+   {
+    "authorized": true,
+    "configured": false,
+    "heartbeat_max_age_s": 120,
+    "name": "webhook",
+    "next_step": "ask the operator to register a receiver",
+    "operational": false,
+    "reason": "no_receiver_bound",
+    "registration": "operator_only",
+    "tools": [
+     "configure_subscription_delivery"
+    ]
+   }
+  ],
   "verified_host": false,
   "wait_max_seconds": 25
  },

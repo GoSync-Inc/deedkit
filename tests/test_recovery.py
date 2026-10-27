@@ -35,7 +35,7 @@ def recovery_fixture(store,path):
 def test_full_recovery_roundtrip_quarantines_without_source_paths(seeded,tmp_path):
     s,*_=seeded;cfg=recovery_fixture(s,tmp_path)
     create_snapshot(s,tmp_path/'snapshot',DUMP,cfg)
-    assert verify_snapshot(s,tmp_path/'snapshot')['tables']==75
+    assert verify_snapshot(s,tmp_path/'snapshot')['tables']==76
     text=(tmp_path/'snapshot/manifest.json').read_text();manifest=json.loads(text)
     assert manifest['format']==2 and manifest['includes_provider_sessions'] is True
     assert str(tmp_path) not in text and 'FAKE_SESSION_BYTES' not in text
@@ -176,7 +176,7 @@ def test_encrypted_bundle_shape_checks_with_transport_stub(seeded,tmp_path):
     create_snapshot(s,target,DUMP,cfg)
     encrypt_snapshot(target,tmp_path/'bundle','fake',age=str(age))
     decrypt_snapshot(tmp_path/'bundle','fake',tmp_path/'restored',age=str(age))
-    assert verify_snapshot(s,tmp_path/'restored')['tables']==75
+    assert verify_snapshot(s,tmp_path/'restored')['tables']==76
     # Valid tar framing cannot smuggle a path or quietly omit a recovery blob.
     for attack in ['path','duplicate','omit']:
         with tarfile.open(tmp_path/'bundle','r:') as src,tarfile.open(tmp_path/attack,'w:') as out:

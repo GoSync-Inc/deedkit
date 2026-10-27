@@ -89,12 +89,17 @@ def _view(c, row):
     head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
     count = c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
         (row['id'],)).fetchone()['n']
+    # ANYM-518: the consumer's ACK position; before its first fetch, the start.
+    consumption = c.execute('SELECT acked_through FROM subscription_consumption WHERE subscription=%s',
+        (row['id'],)).fetchone()
     return serial({'subscription_id': row['id'], 'state': row['state'], 'version': row['version'],
         'label': row['label'], **row['selector'], 'created_at': row['created_at'],
         'updated_at': row['updated_at'], 'expires_at': row['expires_at'],
         'start_position': row['start_position'], 'matched_through': row['matched_through'],
         'matcher_caught_up': row['state'] == 'active' and row['matched_through'] == head,
-        'matched_event_count': count, 'blocked_reason': row['blocked_reason'], 'gap': row['gap'],
+        'matched_event_count': count,
+        'acked_through': consumption['acked_through'] if consumption else row['start_position'],
+        'blocked_reason': row['blocked_reason'], 'gap': row['gap'],
         'matching_evidence': 'exact_event_revision',
         'missing_revision_evidence_events': row['missing_evidence'],
         'last_matched_at': row['last_matched_at'], 'scope_masked': False,

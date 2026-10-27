@@ -269,3 +269,81 @@ def test_consumption_field_errors_pattern_hint_must_be_the_reviewed_pattern(tmp_
 def test_consumption_field_errors_dropped_with_an_unlisted_error_code(tmp_path):
     rest = feedback_failure(tmp_path, 422, {"error": "private_internal_error", "field_errors": GOOD_FIELD_ERRORS})
     assert rest.json() == {"error": "backend_denied", "backend_status": 422}
+
+
+SUBSCRIBER = ["messages_create_subscription", "messages_wait_for_subscription_events",
+              "messages_fetch_subscription_events", "messages_ack_subscription_events", "messages_get_subscription"]
+SUBSCRIBER_PERMISSIONS = ["read", "subscription-write", "subscription-ack"]
+
+
+def subscriber_backend():
+    """A synthetic backend with one subscription and one event, consumed by fetch and ACK."""
+    state = {"acked_through": 0, "event": 7}
+
+    def backend(request):
+        operation = request.url.path.removeprefix("/v1/")
+        if operation == "capabilities":
+            return httpx.Response(200, json={"permissions": SUBSCRIBER_PERMISSIONS, "tool_manifest": {
+                "names": [n.removeprefix("messages_") for n in SUBSCRIBER]}})
+        body = json.loads(request.content)
+        pending = state["event"] > state["acked_through"]
+        if operation == "create_subscription":
+            return httpx.Response(200, json={"subscription_id": "subscription-1", "version": 1})
+        if operation == "wait_for_subscription_events":
+            assert 0 <= body["timeout"] <= 25
+            return httpx.Response(200, json={"wait_status": "events_available" if pending else "timeout"})
+        if operation == "fetch_subscription_events":
+            return httpx.Response(200, json={
+                "items": [{"event_id": "event-1", "position": state["event"]}] if pending else [],
+                "receipt": "r" * 43 if pending else None, "ack_version": 1, "acked_through": state["acked_through"]})
+        if operation == "ack_subscription_events":
+            assert body["receipt"] == "r" * 43
+            state["acked_through"] = state["event"]
+            return httpx.Response(200, json={"subscription_id": "subscription-1", "acked_through": state["acked_through"]})
+        assert operation == "get_subscription"
+        return httpx.Response(200, json={"subscription_id": "subscription-1", "acked_through": state["acked_through"]})
+    return backend
+
+
+# spec: ANYM-518
+@pytest.mark.parametrize("transport", ["rest", "mcp"])
+def test_subscriber_waits_fetches_and_acks_through_the_gateway(tmp_path, transport):
+    app, _, _ = configured(tmp_path, subscriber_backend(), module="messaging", tools=SUBSCRIBER, grants=SUBSCRIBER_PERMISSIONS)
+    with TestClient(app) as client:
+        def tool(name, **values):
+            if transport == "rest":
+                response = client.post("/v1/messages_" + name, json=values, headers=HEADERS)
+                assert response.status_code == 200, response.text
+                return response.json()
+            result = rpc(client, "tools/call", {"name": "messages_" + name, "arguments": values}).json()["result"]
+            assert not result.get("isError"), result
+            return result["structuredContent"]
+        sid = tool("create_subscription", chat_ids=["chat-synthetic"])["subscription_id"]
+        assert tool("wait_for_subscription_events", subscription_id=sid, timeout=25)["wait_status"] == "events_available"
+        page = tool("fetch_subscription_events", subscription_id=sid)
+        assert [item["event_id"] for item in page["items"]] == ["event-1"] and page["receipt"]
+        ack = tool("ack_subscription_events", subscription_id=sid, receipt=page["receipt"], version=page["ack_version"])
+        assert tool("fetch_subscription_events", subscription_id=sid)["items"] == []
+        assert tool("get_subscription", subscription_id=sid)["acked_through"] == ack["acked_through"] == 7
+
+
+# spec: ANYM-518
+def test_full_wait_pool_returns_busy_not_a_bare_503(tmp_path, monkeypatch):
+    original = Clients.call
+
+    async def full(self, module, operation, credential, values):
+        if operation in {"wait_for_subscription_events", "fetch_subscription_events"}:
+            raise Denied("backend_busy", 503)
+        return await original(self, module, operation, credential, values)
+    monkeypatch.setattr(Clients, "call", full)
+    app, _, _ = configured(tmp_path, subscriber_backend(), module="messaging", tools=SUBSCRIBER, grants=SUBSCRIBER_PERMISSIONS)
+    values = {"subscription_id": "subscription-1", "timeout": 25}
+    expected = {"wait_status": "busy", "retry_after_s": 5, "wait_pool": {"active": 2, "waiting": 4}}
+    with TestClient(app) as client:
+        rest = client.post("/v1/messages_wait_for_subscription_events", json=values, headers=HEADERS)
+        mcp = rpc(client, "tools/call", {"name": "messages_wait_for_subscription_events", "arguments": values}).json()["result"]
+        # Other calls keep the bare busy error.
+        fetch = client.post("/v1/messages_fetch_subscription_events", json={"subscription_id": "subscription-1"}, headers=HEADERS)
+    assert rest.status_code == 200 and rest.json() == expected
+    assert not mcp.get("isError") and mcp["structuredContent"] == expected
+    assert fetch.status_code == 503

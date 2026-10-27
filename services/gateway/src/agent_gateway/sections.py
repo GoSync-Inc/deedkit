@@ -1,6 +1,7 @@
 """`messages_capabilities` views (ANYM-270): the gateway's own payload as a summary, named sections or in full."""
 
 from .catalog import CATALOG
+from .http_clients import WAIT_POOL
 from .policy import Denied
 
 # Same section names as the messaging backend; each holds the keys of the gateway payload
@@ -43,13 +44,25 @@ def named_calls(value, shown):
     return value
 
 
+def transports(rows, shown):
+    """ANYM-518: a delivery transport is listed only when the caller's tool list has every tool of it;
+    long polling also shows the gateway's wait pool."""
+    kept = []
+    for row in rows if isinstance(rows, list) else ():
+        tools = row.get("tools") if isinstance(row, dict) else None
+        if (isinstance(tools, list) and tools
+                and all(isinstance(t, str) and MESSAGING_CALLS.get(t) in shown for t in tools)):
+            kept.append(row | {"wait_pool": WAIT_POOL} if row.get("name") == "long_poll" else row)
+    return kept
+
+
 def subscription_blocks(result, visible):
     """The `subscriptions` and `events` blocks name only calls in the caller's tool list (ANYM-528).
 
     A hidden call is omitted, `subscriptions.ack` becomes false, `wait_max_seconds` leaves with the wait
-    call (or an omitted `events.wait`) and `delivery_policy` with its tool. A call field naming no listed
-    tool (an unknown operation or a value of another type) is omitted too. A block that is not an object
-    is dropped, never passed on.
+    call (or an omitted `events.wait`), `delivery_policy` with its tool and a transport with any of its
+    tools. A call field naming no listed tool (an unknown operation or a value of another type) is omitted
+    too. A block that is not an object is dropped, never passed on.
     """
     shown = set(visible)
     for key in ("subscriptions", "events"):
@@ -58,7 +71,10 @@ def subscription_blocks(result, visible):
         if not isinstance(result[key], dict):
             del result[key]
             continue
-        block = named_calls(result[key], shown)
+        block = result[key]
+        if key == "subscriptions" and "transports" in block:
+            block = {**block, "transports": transports(block["transports"], shown)}
+        block = named_calls(block, shown)
         if "messages_wait_for_subscription_events" not in shown:
             block.pop("wait_max_seconds", None)
         if key == "events":

@@ -46,6 +46,11 @@ def admission(tools, module, operation, arguments):
     return pool if waits(arguments) else "metadata"
 
 
+# ANYM-518: subscription waits and waiting sends share this pool; capabilities show its size.
+WAIT_POOL = {"active": 2, "waiting": 4}
+WAIT_RETRY_AFTER_S = 5
+
+
 class Budget:
     def __init__(self, concurrency=8, waiting=24):
         self.semaphore = asyncio.Semaphore(concurrency)
@@ -133,7 +138,7 @@ class Clients:
                     )
                 self.budgets[module], self.bulk_budgets[module] = Budget(), Budget(2, 4)
                 if module in self.waits:
-                    self.wait_budgets[module] = Budget(2, 4)
+                    self.wait_budgets[module] = Budget(WAIT_POOL["active"], WAIT_POOL["waiting"])
                 if module == "messaging":
                     self.upload_budgets[module] = Budget(2, 4)
                     # ANYM-478: a search with live waits up to 20 s; its own pool keeps sends and reads admitted.
