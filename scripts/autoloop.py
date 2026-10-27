@@ -1356,11 +1356,13 @@ def review_of(state, name, intent, pr, head, spec, now, review, failed):
     new review (the task first, then the record, then the detached run); a result for another head is never used."""
     record = intent.get('review') or {}
     paths = review_paths(state, name, head)
-    if record.get('head') != head:
+    if record.get('head') != head or record.get('card') != card_digest(spec):
         paths['dir'].mkdir(mode=0o700, parents=True, exist_ok=True)
-        paths['result'].unlink(missing_ok=True)
+        for old in ('result', 'task'):  # a restart (Codex line, changed card) writes its task again
+            paths[old].unlink(missing_ok=True)
         triage.private_write(paths['task'], review_task(intent, pr, head, spec))
-        put(state, dict(intent, review={'head': head, 'pr': pr['number'], 'started_at': triage.stamp(now)}))
+        put(state, dict(intent, review={'head': head, 'pr': pr['number'], 'card': card_digest(spec),
+                                        'started_at': triage.stamp(now)}))
         try:
             review(state, name, head)
         except (OSError, Refused, triage.Refused) as error:
@@ -1383,6 +1385,11 @@ def review_of(state, name, intent, pr, head, spec, now, review, failed):
     return 'approve'
 
 
+def card_digest(spec):
+    """The card text a review and an approval are bound to: a changed card is reviewed again."""
+    return hashlib.sha256(str((spec or {}).get('text') or '').encode()).hexdigest()
+
+
 def checks_green(pr, head):
     """Every required check of `head` concluded SUCCESS; a missing, pending or other one is not green."""
     try:
@@ -1398,8 +1405,8 @@ def checks_green(pr, head):
 
 
 def reserve_hits(state, name, intent, number, files, others):
-    """(reason, path) for each changed name outside the intent's reserved paths (an added test file aside) or inside
-    another live build's reservation or another open PR's files."""
+    """(reason, path) for each changed name outside the intent's reserved paths (tests too: a card lists its test
+    files) or inside another live build's reservation or another open PR's files."""
     mine = intent.get('paths') or []
     taken = [p for n, (_, paths) in claims(state).items() if n != name for p in paths] + \
         [p for n, paths in others.items() if n != number for p in paths]
@@ -1407,8 +1414,7 @@ def reserve_hits(state, name, intent, number, files, others):
     for f in files:
         old = f.get('previous_filename')
         for n in [f['filename']] + ([old] if isinstance(old, str) else []):
-            new_test = f.get('status') == 'added' and TEST_DIR.search(n) and TEST_FILE.search(n)
-            if not new_test and not any(overlaps(n, p) for p in mine):
+            if not any(overlaps(n, p) for p in mine):
                 hits.append(('outside reserved paths', n))
             if any(overlaps(n, p) for p in taken):
                 hits.append(('path reserved by another', n))
@@ -1595,10 +1601,15 @@ def controller(state, cfg, snap, now, gh, prs, review=None):
         if hits:
             out[name] = park(hits[0][0], [' '.join(filter(None, hit)) for hit in hits])
             continue
-        if armed:
-            out[name] = 'armed'  # its approved head, checked again just now
-            continue
         spec = next((s for s in snap.get('main', []) if s.get('ref') == i['card']), None)
+        if armed and approved[head].get('card') == card_digest(spec):
+            out[name] = 'armed'  # its approved head and card, checked again just now
+            continue
+        if armed:  # the card changed under an approved head: out of the queue, reviewed again
+            if not disarm(gh, pr, failed):
+                out[name] = 'disarm failed'
+                continue
+            armed = False
         seen = review_of(state, name, i, pr, head, spec, now, review, failed)
         if seen != 'approve':
             out[name] = seen if seen in ('reviewing', 'waiting') else park(seen)
@@ -1606,7 +1617,7 @@ def controller(state, cfg, snap, now, gh, prs, review=None):
         if not checks_green(pr, head):
             out[name] = 'waiting for checks'  # armed only when green: the PR then goes straight into the queue
             continue
-        approved[head] = {'pr': pr['number'], 'intent': name, 'at': triage.stamp(now)}
+        approved[head] = {'pr': pr['number'], 'intent': name, 'card': card_digest(spec), 'at': triage.stamp(now)}
         triage.save(state / 'approved.json', approved)  # first: a merge the audit sees is always one approved here
         try:
             gh(['api', 'graphql', '-f', 'query=' + ENQUEUE, '-f', f"id={pr['id']}", '-f', f'head={head}'])

@@ -1441,7 +1441,8 @@ def finished_build(a, status='finished'):
 
 def reviewed(a, head=H1, word='APPROVE', blocking=0, major=0, code=0, at=NOW):
     """The controller's own review of `head` has run and left its result."""
-    autoloop.put(a, dict(autoloop.intents(a)[BUILD], review={'head': head, 'pr': 7, 'started_at': triage.stamp(at)}))
+    autoloop.put(a, dict(autoloop.intents(a)[BUILD], review={'head': head, 'pr': 7, 'started_at': triage.stamp(at),
+                                                             'card': autoloop.card_digest(ready(30))}))
     paths = autoloop.review_paths(a, BUILD, head)
     paths['dir'].mkdir(parents=True, exist_ok=True)
     triage.save(paths['result'], {'head': head, 'exit': code, **({'verdict': {
@@ -1653,6 +1654,41 @@ def test_an_armed_pr_is_checked_again_each_tick_and_dequeued_when_its_lines_or_c
 
 
 # spec: ANYM-572
+def test_a_card_changed_on_main_under_an_armed_head_dequeues_it_and_starts_a_new_review(tmp_path):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    reviewed(a)
+    triage.save(a / 'approved.json', {H1: {'pr': 7, 'intent': BUILD, 'card': autoloop.card_digest(ready(30)),
+                                           'at': triage.stamp(NOW)}})
+    fakes = Fakes(open_prs=[build_pr(mergeQueueEntry={'state': 'QUEUED'})])
+    fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified')]}
+    started = []
+
+    def tick(card):
+        return autoloop.controller(a, cfg(), snap(card), NOW, fakes.gh, fakes.prs, lambda *args: started.append(args))
+    assert tick(ready(30)) == ({BUILD: 'armed'}, [])
+    changed = ready(30, CARD_TEXT.replace('names stay after a rename', 'names stay and the old one is kept'))
+    assert tick(changed) == ({BUILD: 'reviewing'}, []) and fakes.prs[0]['mergeQueueEntry'] is None
+    assert started == [(a, BUILD, H1)] and 'the old one is kept' in \
+        autoloop.review_paths(a, BUILD, H1)['task'].read_text()
+
+
+# spec: ANYM-572
+def test_an_added_test_file_outside_the_reserved_paths_parks_the_pr(tmp_path):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    reviewed(a)
+    fakes = Fakes(open_prs=[build_pr()])
+    fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified'),
+                           changed_file('services/calls/tests/test_other.py')]}
+    assert autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs, lambda *args: None)[0] == \
+        {BUILD: 'parked'}
+    assert autoloop.intents(a)[BUILD]['parked_detail'] == ['outside reserved paths services/calls/tests/test_other.py']
+
+
+# spec: ANYM-572
 def test_a_pr_armed_without_the_controllers_approval_is_disarmed_and_parked_when_live(tmp_path):
     a = tmp_path / 'autoloop'
     a.mkdir(mode=0o700)
@@ -1788,7 +1824,10 @@ def test_the_controller_reviews_the_exact_head_itself_in_a_clean_worktree_and_ta
     # The PR moved on GitHub: no review runs, and the result carries no verdict.
     fetched['head'] = H2
     assert autoloop.review_run(a, BUILD, H1, git, run) == {'head': H1, 'error': 'head moved'} and len(runs) == 1
-    # Over the Codex line: the controller starts the review again on a later tick.
+    # Over the Codex line: the controller starts the review again on a later tick, its task written again.
+    record = dict(autoloop.intents(a)[BUILD]['review'], card=autoloop.card_digest(ready(30)))
+    autoloop.put(a, dict(autoloop.intents(a)[BUILD], review=record))
+    paths['task'].write_text('the first launch\n')
     triage.save(paths['result'], {'head': H1, 'exit': 6})
     fakes = Fakes(open_prs=[build_pr()])
     fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified')]}
@@ -1797,6 +1836,7 @@ def test_the_controller_reviews_the_exact_head_itself_in_a_clean_worktree_and_ta
                                        lambda *args: started.append(args))[0]
     assert tick() == {BUILD: 'waiting'} and autoloop.intents(a)[BUILD]['review'] is None
     assert tick() == {BUILD: 'reviewing'} and started == [(a, BUILD, H1)] and not paths['result'].exists()
+    assert f'at exactly head {H1}' in paths['task'].read_text()
 
 
 # spec: ANYM-572
