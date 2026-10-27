@@ -297,8 +297,10 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
             'CROSS JOIN search_query q WHERE NOT m.deleted AND '+scope+' AND '+base_context+')')
         _, caption_scope_args = scope_filter(p, 'm')
         candidate_args.extend(caption_scope_args)
-        candidates.append('SELECT ca.id AS attachment FROM attachments ca WHERE ca.active '
-            'AND ca.message=ANY(ARRAY(SELECT id FROM caption_candidates))')
+        # A join, not message=ANY(ARRAY(...)): attachments has no message index,
+        # and an array from a subquery is compared linearly per row (ANYM-579).
+        candidates.append('SELECT ca.id AS attachment FROM attachments ca '
+            'JOIN caption_candidates cc ON cc.id=ca.message WHERE ca.active')
         search_ctes.append('file_candidates AS MATERIALIZED ('+' UNION '.join(candidates)+')')
         # An InitPlan evaluates the candidate IDs before a passage lookup. A
         # plain inner join can still choose every attachment as its outer side,
