@@ -368,7 +368,7 @@ def submission(i, description, principal=OWNER, minute=0, category='bug'):
 
 def tiden_reply(specs):
     return {'requirements': [{'seqNum': int(s['ref'].split('-')[1]), 'title': s['title'], 'status': s['status'],
-                               'content': '', 'sources': []} for s in specs],
+                               'content': s.get('text', ''), 'sources': []} for s in specs],
             'pagination': {'totalCount': len(specs), 'nextPageToken': None}}
 
 
@@ -382,6 +382,9 @@ class Fakes:
         self.prs = [dict({'state': 'OPEN', 'headRepository': {'nameWithOwner': autoloop.REPO}}, **p) for p in open_prs] + \
             [dict({'state': 'MERGED', 'headRepository': {'nameWithOwner': autoloop.REPO}}, **p) for p in merged]
         self.calls, self.fail, self.truncate, self.runner_calls, self.runs_missing = [], set(), False, [], 0
+        # The build stage (ANYM-572): Tiden main, compare files by head, pushed branches, open PRs' files.
+        self.specs, self.compares, self.branches, self.pr_files = list(SNAPSHOT['main']), {}, [], {}
+        self.rest_files = {}  # {PR number: REST file rows} of PRs with a rename
 
     def ssh(self, host, argv):
         self.calls.append(('ssh', argv[:2]))
@@ -395,7 +398,7 @@ class Fakes:
     def tiden(self, *argv):
         if argv[:2] == ('branch', 'list'):
             return {'branches': []}
-        reply = tiden_reply(SNAPSHOT['main'])
+        reply = tiden_reply(self.specs)
         if self.truncate:
             reply['pagination']['nextPageToken'] = 'more'
         return reply
@@ -414,6 +417,10 @@ class Fakes:
 
     def gh(self, argv):
         self.calls.append(('gh', argv))
+        if argv[:2] == ['api', '--paginate'] and '/branches?' in argv[3]:
+            return json.dumps([[{'name': b} for b in self.branches]])
+        if argv[0] == 'api' and '/compare/main...' in argv[1]:
+            return json.dumps({'files': self.compares.get(argv[1].split('...', 1)[1], [])})
         if argv[:2] == ['api', '--paginate']:
             rows = [{'id': r['databaseId'], 'status': r['status'], 'conclusion': r['conclusion'],
                      'updated_at': r['updatedAt'], 'display_title': r['displayTitle']} for r in self.runs]
@@ -421,11 +428,31 @@ class Fakes:
         if argv[:2] == ['run', 'cancel']:
             next(r for r in self.runs if str(r['databaseId']) == argv[2]).update(status='completed', conclusion='cancelled')
         elif argv[:2] == ['pr', 'merge']:
-            next(p for p in self.prs if str(p['number']) == argv[2])['autoMergeRequest'] = None
+            next(p for p in self.prs if str(p['number']) == argv[2])['autoMergeRequest'] = \
+                {'enabledAt': 'now', 'head': argv[-1]} if '--squash' in argv else None
         elif argv[:2] == ['pr', 'close']:
             next(p for p in self.prs if str(p['number']) == argv[2]).update(state='CLOSED', mergeQueueEntry=None)
         elif argv[:2] == ['api', 'graphql'] and 'dequeue' in argv[3]:
+            if 'dequeue' in self.fail:
+                raise triage.Refused('gh failed')
             next(p for p in self.prs if f"id={p['id']}" == argv[5])['mergeQueueEntry'] = None
+        elif argv[:2] == ['api', 'graphql'] and 'enqueuePullRequest' in argv[3]:
+            pr = next(p for p in self.prs if f"id={p['id']}" == argv[5])
+            pr['mergeQueueEntry'] = {'state': 'QUEUED', 'head': argv[7].removeprefix('head=')}
+            return json.dumps({'data': {'enqueuePullRequest': {'mergeQueueEntry': {'state': 'QUEUED'}}}})
+        elif argv[:2] == ['api', 'graphql'] and 'search(' in argv[3]:
+            found = [p for p in self.prs if p['state'] == 'MERGED']
+            return json.dumps({'data': {'search': {'pageInfo': {'hasNextPage': False, 'endCursor': None},
+                                                   'nodes': found}}})
+        elif argv[0] == 'api' and re.fullmatch(r'repos/[^/]+/[^/]+/pulls/\d+/files\?per_page=100', argv[1]):
+            return json.dumps(self.rest_files.get(int(argv[1].split('/')[4]), []))
+        elif argv[:2] == ['api', 'graphql'] and 'pullRequests(states: OPEN' in argv[3]:
+            return json.dumps({'data': {'repository': {'pullRequests': {'pageInfo': {'hasNextPage': False}, 'nodes': [
+                {'number': p['number'], 'headRefName': p['headRefName'],
+                 'files': {'pageInfo': {'hasNextPage': False},
+                           'nodes': [{'path': f, 'changeType': 'RENAMED' if p['number'] in self.rest_files
+                                      else 'MODIFIED'} for f in self.pr_files.get(p['headRefName'], [])]}}
+                for p in self.prs if p['state'] == 'OPEN']}}}})
         elif argv[:2] == ['api', 'graphql']:
             names = re.findall(r'(p\d+): pullRequests\(headRefName: "([^"]+)"', argv[3])
             return json.dumps({'data': {'repository': {
@@ -1354,3 +1381,515 @@ def test_a_future_or_corrupt_mark_and_an_unreadable_file_never_stop_the_report(l
     (a / 'report.json').write_text('[')
     code, _ = run_tick(loop, Fakes())
     assert code == 0 and autoloop.marker(a) == {'day': '2026-10-26', 'ok': True}
+
+
+# --- the build launcher and the controller merge (ANYM-572) -----------------------------------------------------
+CARD_TEXT = ('Title: names stay after a rename\nCategory: defect\n'
+             'Lane: messaging   Expected paths: services/messaging/groups.py, tests/test_groups.py (new)\n'
+             'Value: 3   Effort: 3   Score: 1.00\nReady: 2026-10-26, Fable approve; asked by agent-grok\n')
+H1, H2 = 'b' * 40, 'c' * 40
+BUILD = 'autoloop-build-anym-30'
+BODY = f'Autoloop: {BUILD}\nSpec: ANYM-30\nChange path: AUTO+review (code)\n'
+
+
+def ready(n, text=CARD_TEXT, status='Backlog'):
+    return dict(spec(n, f'Card {n}', status), text=text)
+
+
+def carded(t, a, ref='ANYM-30', cluster='new:group-names', feedback=(D1,), principal=OWNER):
+    """A card worker of an owner-agent cluster that bound `ref` and finished with no outcome."""
+    t.mkdir(exist_ok=True)
+    ledger = triage.load(t / 'ledger.json', {})
+    ledger.update({i: {'cluster': cluster, 'principal': principal, 'classification': 'reported-bug'} for i in feedback})
+    triage.save(t / 'ledger.json', ledger)
+    name = card_name(cluster)
+    intent(a, name, autoloop.opaque(cluster), 'finished', feedback)
+    autoloop.put(a, dict(autoloop.intents(a)[name], cluster=cluster, ref=ref))
+
+
+@pytest.fixture
+def build_template(tmp_path, monkeypatch):
+    path = tmp_path / 'briefs' / 'autoloop-build.md'
+    path.parent.mkdir(exist_ok=True)
+    path.write_text('brief\n')
+    monkeypatch.setattr(autoloop, 'BUILD_BRIEF', path)
+    return path
+
+
+def snap(*specs, branches=None):
+    return {'main': list(specs), 'branches': branches or {}}
+
+
+def changed_file(name, status='added', patch='+x = 1', old=None):
+    return dict({'filename': name, 'status': status, 'patch': patch, 'changes': 1},
+                **({'previous_filename': old} if old else {}))
+
+
+def build_pr(number=7, head=H1, body=BODY, green=True, **extra):
+    checks = [{'name': n, 'conclusion': 'SUCCESS' if green else None} for n in autoloop.REQUIRED]
+    return dict({'number': number, 'id': f'PR_{number}', 'headRefName': BUILD, 'headRefOid': head,
+                 'baseRefName': 'main', 'isDraft': False, 'body': body, 'autoMergeRequest': None,
+                 'mergeQueueEntry': None, 'commits': {'nodes': [{'commit': {
+                     'oid': head, 'statusCheckRollup': {'contexts': {'nodes': checks}}}}]}}, **extra)
+
+
+def finished_build(a, status='finished'):
+    intent(a, BUILD, 'ANYM-30', status, [D1])
+    autoloop.put(a, dict(autoloop.intents(a)[BUILD], lane='messaging',
+                         paths=['services/messaging/groups.py', 'tests/test_groups.py']))
+
+
+def reviewed(a, head=H1, word='APPROVE', blocking=0, major=0, code=0, at=NOW):
+    """The controller's own review of `head` has run and left its result."""
+    card = autoloop.card_digest(ready(30))
+    autoloop.put(a, dict(autoloop.intents(a)[BUILD], review={'head': head, 'pr': 7, 'started_at': triage.stamp(at),
+                                                             'card': card, 'attempt': 'a1b2c3d4'}))
+    paths = autoloop.review_paths(a, BUILD, head, 'a1b2c3d4')
+    paths['dir'].mkdir(parents=True, exist_ok=True)
+    triage.save(paths['result'], {'head': head, 'attempt': 'a1b2c3d4', 'card': card, 'exit': code, **({'verdict': {
+        'verdict': word, 'blocking': blocking, 'major': major, 'minor': 0}} if code == 0 else {})})
+
+
+def review_files(a, head=H1):
+    """The files of the review attempt the controller recorded last."""
+    return autoloop.review_paths(a, BUILD, head, autoloop.intents(a)[BUILD]['review']['attempt'])
+
+
+def enqueued(fakes):
+    return [c[1] for c in fakes.calls if c[0] == 'gh' and c[1][:2] == ['api', 'graphql'] and
+            'enqueuePullRequest' in c[1][3]]
+
+
+# spec: ANYM-572
+def test_a_ready_card_from_an_owner_agent_card_worker_gets_one_build_worker_whose_prompt_names_only_card_and_intent(
+        loop, build_template):
+    t, a, s = loop
+    configure(a, live=True)
+    carded(t, a)
+    carded(t, a, 'ANYM-31', 'new:big-one', (D2,))
+    carded(t, a, 'ANYM-32', 'new:infra-one', (D3,))
+    carded(t, a, 'ANYM-33', 'new:stranger', (D4,), principal=STRANGER)
+    carded(t, a, 'ANYM-34', 'new:edited', (P1,))
+    fakes = Fakes()
+    fakes.specs = [ready(30), ready(31, CARD_TEXT.replace('Effort: 3', 'Effort: 13')),
+                   ready(32, CARD_TEXT.replace('defect', 'infra')), ready(33), ready(34)]
+    real_tiden = fakes.tiden
+
+    def tiden(*argv):  # an open review branch edits ANYM-34's criteria
+        if argv[:2] == ('branch', 'list'):
+            return {'branches': [{'name': 'review/x', 'status': 'open'}]}
+        if '--branch' in argv and argv[argv.index('--branch') + 1] == 'review/x':
+            return tiden_reply([ready(34)])
+        return real_tiden(*argv)
+    fakes.tiden = tiden
+    created = creates(fakes, {'id': 'ws-00009'})
+    code, line = run_tick(loop, fakes)
+    assert code == 0, line
+    assert len(created()) == 1
+    argv = created()[0]
+    assert argv[argv.index('--name') + 1] == BUILD and argv[argv.index('--branch') + 1] == BUILD
+    assert argv[argv.index('--prompt') + 1] == (
+        f"Read and follow {autoloop.BRIEFS / 'common.md'} and {build_template}. Intent: {BUILD}. Card: ANYM-30.")
+    built = autoloop.intents(a)[BUILD]
+    assert (built['status'], built['lane'], built['paths']) == (
+        'started', 'messaging', ['services/messaging/groups.py', 'tests/test_groups.py'])
+    assert triage.load(a / 'plan.json', {})['builds']['launched'] == {
+        'ANYM-30': BUILD, 'ANYM-31': 'epic or over 8 SP', 'ANYM-32': 'category', 'ANYM-34': 'criterion edit'}
+    # A running build is never started twice.
+    fakes.workspaces = [{'name': BUILD, 'id': 'ws-00009', 'projectName': 'deedkit'}]
+    run_tick(loop, fakes, now=NOW + timedelta(minutes=5))
+    assert len(created()) == 1
+
+
+# spec: ANYM-572
+def test_an_open_pr_or_a_pushed_branch_of_a_live_workspace_on_the_same_path_blocks_the_build_launch(
+        tmp_path, build_template):
+    t, a = tmp_path / 'triage', tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    carded(t, a)
+    fakes = Fakes(open_prs=[{'number': 5, 'id': 'PR_5', 'headRefName': 'someone-else'}])
+    fakes.pr_files = {'someone-else': ['services/messaging/groups.py']}
+    created = creates(fakes, {'id': 'ws-00009'})
+    tiden = snap(ready(30))
+
+    def run():
+        return autoloop.launch_builds(a, t, cfg(), tiden, NOW, fakes.superset, fakes.gh)
+    assert run() == {'ANYM-30': 'paths reserved'} and created() == []
+    fakes.pr_files = {'someone-else': ['services/calls/app.py']}
+    fakes.workspaces = [{'name': 'other-task', 'id': 'ws-00002', 'branch': 'other-task', 'projectName': 'deedkit'},
+                        {'name': 'archived', 'id': 'ws-00003', 'branch': 'old', 'archivedAt': 'x',
+                         'projectName': 'deedkit'}]
+    fakes.branches = ['other-task', 'old']
+    fakes.compares = {'other-task': [changed_file('services/messaging/groups.py', 'modified')],
+                      'old': [changed_file('services/messaging/groups.py', 'modified')]}
+    assert run() == {'ANYM-30': 'paths reserved'} and created() == []
+    fakes.compares['other-task'] = [changed_file('services/messaging/other.py', 'modified')]
+    assert run() == {'ANYM-30': BUILD} and len(created()) == 1  # the archived workspace's branch does not block
+
+
+# spec: ANYM-572
+def test_reservations_are_released_on_merge_close_decline_drop_and_a_vanished_worker_parks_the_card(tmp_path):
+    t, a = tmp_path / 'triage', tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    t.mkdir()
+    for n, (status, extra) in enumerate([('started', {}), ('finished', {'pr_state': 'OPEN'}),
+                                         ('finished', {'pr_state': 'MERGED'}), ('finished', {'pr_state': 'CLOSED'}),
+                                         ('started', {'outcome': 'large'}), ('started', {}), ('started', {}),
+                                         ('interrupted', {})]):
+        name = f'autoloop-build-anym-{40 + n}'
+        intent(a, name, f'ANYM-{40 + n}', status, [f'33333333-3333-4333-8333-{n:012d}'])
+        autoloop.put(a, dict(autoloop.intents(a)[name], lane=f'lane{n}', paths=[f'p{n}/x.py'], **extra))
+    autoloop.hold(a, 'ANYM-45', 'orchestrator', NOW)
+    triage.save(a / 'holds.json', dict(autoloop.holds(a), items={'33333333-3333-4333-8333-000000000006': {}}))
+    assert sorted(autoloop.claims(a)) == ['autoloop-build-anym-40', 'autoloop-build-anym-41']
+    done, failed = autoloop.controller(a, cfg(), snap(), NOW, Fakes().gh, [])
+    assert done == {'autoloop-build-anym-47': 'parked'} and failed == []
+    assert autoloop.intents(a)['autoloop-build-anym-47']['parked'] == 'worker gone with no PR'
+    assert 'autoloop-build-anym-47: остановлен (worker gone with no PR), нужен оркестратор' in \
+        autoloop.report_text(a, t, cfg(), '2026-10-26')
+    # A merge seen by the controller records the receipt and releases the open-PR reservation.
+    prs = [dict(build_pr(9, headRefName='autoloop-build-anym-41'), state='MERGED', mergeCommit={'oid': 'd' * 40})]
+    autoloop.controller(a, cfg(), snap(), NOW, Fakes().gh, prs)
+    got = autoloop.intents(a)['autoloop-build-anym-41']
+    assert (got['pr'], got['pr_state'], got['merge_sha'], got['live']) == (9, 'MERGED', 'd' * 40, False)
+    assert sorted(autoloop.claims(a)) == ['autoloop-build-anym-40']
+
+
+# spec: ANYM-572
+@pytest.mark.parametrize('case', [
+    'workflow', 'scripts', 'lockfile', 'conftest', 'agents', 'migration', 'content signal', 'deleted',
+    'rename into protected', 'changed test', 'test helper', 'no patch', 'too large',
+    'review major', 'review failed', 'outside reservation', 'reserved by open PR', 'criterion edit', 'owner path',
+    'autoloop line', 'spec line', 'card epic now'])
+def test_the_controller_parks_a_pr_outside_the_envelope_at_its_exact_head(tmp_path, case):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    reviewed(a, major=1 if case == 'review major' else 0, code=3 if case == 'review failed' else 0)
+    body = {'criterion edit': BODY + 'Tiden branch: review/anym-30-x\n',
+            'owner path': BODY.replace('AUTO+review (code)', 'OWNER (AGENTS.md)'),
+            'autoloop line': BODY.replace(BUILD, 'autoloop-build-anym-31'),
+            'spec line': BODY.replace('ANYM-30', 'ANYM-31')}.get(case, BODY)
+    files = {'workflow': [changed_file('.github/workflows/checks.yml', 'modified')],
+             'scripts': [changed_file('scripts/production.py', 'modified')],
+             'lockfile': [changed_file('services/calls/uv.lock', 'modified')],
+             'conftest': [changed_file('services/messaging/tests/conftest.py')],
+             'agents': [changed_file('services/calendar/AGENTS.md', 'modified')],
+             'migration': [changed_file('services/messaging/migrations/0048.sql')],
+             'content signal': [changed_file('services/messaging/groups.py', 'modified', '+token = secret_value')],
+             'deleted': [changed_file('services/messaging/old.py', 'removed', '-x = 1')],
+             'rename into protected': [
+                 changed_file('scripts/groups.py', 'renamed', '', 'services/messaging/groups.py')],
+             'changed test': [changed_file('tests/test_existing.py', 'modified')],
+             'test helper': [changed_file('tests/helpers.py')],
+             'no patch': [dict(changed_file('services/messaging/blob.bin'), patch=None)],
+             'too large': [changed_file(f'services/messaging/f{n}.py') for n in range(300)],
+             'outside reservation': [changed_file('services/messaging/send.py', 'modified')]}.get(
+        case, [changed_file('services/messaging/groups.py', 'modified'), changed_file('tests/test_groups.py')])
+    fakes = Fakes(open_prs=[build_pr(body=body)] + ([{'number': 5, 'id': 'PR_5', 'headRefName': 'someone-else'}]
+                                                    if case == 'reserved by open PR' else []))
+    fakes.pr_files = {'someone-else': ['tests/test_groups.py']}
+    fakes.compares = {H1: files}
+    text = CARD_TEXT + ('Not in scope: everything else\n' if case == 'card epic now' else '')
+    done, failed = autoloop.controller(a, cfg(), snap(ready(30, text)), NOW, fakes.gh, fakes.prs)
+    got = autoloop.intents(a)[BUILD]
+    assert done == {BUILD: 'parked'} and failed == [] and got['parked_head'] == H1
+    assert enqueued(fakes) == [] and triage.load(a / 'approved.json', {}) == {}
+    assert autoloop.plain_park(got['parked']) == got['parked'], got['parked']
+    if case == 'rename into protected':
+        assert {'deleted file services/messaging/groups.py', 'protected path scripts/groups.py'} <= \
+            set(got['parked_detail'])
+    if case == 'reserved by open PR':
+        assert got['parked_detail'] == ['path reserved by another tests/test_groups.py']
+    if case == 'outside reservation':
+        assert got['parked_detail'] == ['outside reserved paths services/messaging/send.py']
+    # A parked PR stays parked on the next tick.
+    assert autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs)[0] == {BUILD: 'parked'}
+
+
+# spec: ANYM-572
+def test_a_clean_pr_is_armed_for_its_exact_head_and_a_new_push_is_disarmed_and_checked_again(tmp_path):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    fakes = Fakes(open_prs=[build_pr(green=False)])
+    fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified'),
+                           changed_file('tests/test_groups.py')]}
+    tiden, started = snap(ready(30, status='Active')), []
+
+    def tick(at=NOW):
+        return autoloop.controller(a, cfg(), tiden, at, fakes.gh, fakes.prs, lambda *args: started.append(args))[0]
+    assert autoloop.controller(a, dict(cfg(), live=False), tiden, NOW, fakes.gh, fakes.prs)[0] == \
+        {BUILD: 'waiting'}  # live: false reviews and arms nothing
+    # The controller starts its own review of the exact head; the task is its own text, the card as data.
+    assert tick() == {BUILD: 'reviewing'} and started == [(a, BUILD, H1)]
+    task = review_files(a)['task'].read_text()
+    assert f'PR #7 at exactly head {H1}' in task and 'Expected paths: services/messaging/groups.py' in task
+    assert tick(NOW + timedelta(minutes=30)) == {BUILD: 'reviewing'} and len(started) == 1
+    reviewed(a)
+    assert tick() == {BUILD: 'waiting for checks'} and enqueued(fakes) == []  # armed only on green checks
+    fakes.prs[0]['commits'] = build_pr()['commits']
+    assert tick() == {BUILD: 'armed'}
+    assert enqueued(fakes) == [['api', 'graphql', '-f', 'query=' + autoloop.ENQUEUE, '-f', 'id=PR_7', '-f',
+                                f'head={H1}']]
+    assert triage.load(a / 'approved.json', {})[H1]['pr'] == 7 and fakes.prs[0]['mergeQueueEntry']['head'] == H1
+    assert tick() == {BUILD: 'armed'} and len(enqueued(fakes)) == 1  # checked again, never enqueued twice
+    # A new push after the approval: dequeued and read back; the new head gets a new controller review.
+    fakes.prs[0].update(headRefOid=H2, commits=build_pr(head=H2)['commits'])
+    fakes.compares[H2] = fakes.compares[H1]
+    assert tick() == {BUILD: 'reviewing'} and fakes.prs[0]['mergeQueueEntry'] is None
+    assert started[-1] == (a, BUILD, H2) and len(enqueued(fakes)) == 1
+    # A result for another head is never used, and a review with no result is parked after its limit.
+    assert tick(NOW + timedelta(minutes=autoloop.REVIEW_MINUTES + 31)) == {BUILD: 'parked'}
+    assert autoloop.intents(a)[BUILD]['parked'] == 'review lost'
+
+
+# spec: ANYM-572
+def test_an_armed_pr_is_checked_again_each_tick_and_dequeued_when_its_lines_or_card_change(tmp_path):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    reviewed(a)
+    triage.save(a / 'approved.json', {H1: {'pr': 7, 'intent': BUILD, 'at': triage.stamp(NOW)}})
+    fakes = Fakes(open_prs=[build_pr(mergeQueueEntry={'state': 'QUEUED'},
+                                     body=BODY + 'Tiden branch: review/anym-30-x\n')])
+    fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified')]}
+    done, failed = autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs, lambda *args: None)
+    assert done == {BUILD: 'parked'} and failed == [] and fakes.prs[0]['mergeQueueEntry'] is None
+    assert autoloop.intents(a)[BUILD]['parked'] == 'criterion edit'
+
+
+# spec: ANYM-572
+def test_a_card_changed_on_main_under_an_armed_head_dequeues_it_and_starts_a_new_review(tmp_path):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    reviewed(a)
+    triage.save(a / 'approved.json', {H1: {'pr': 7, 'intent': BUILD, 'card': autoloop.card_digest(ready(30)),
+                                           'at': triage.stamp(NOW)}})
+    fakes = Fakes(open_prs=[build_pr(mergeQueueEntry={'state': 'QUEUED'})])
+    fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified')]}
+    started = []
+
+    def tick(card):
+        return autoloop.controller(a, cfg(), snap(card), NOW, fakes.gh, fakes.prs, lambda *args: started.append(args))
+    assert tick(ready(30)) == ({BUILD: 'armed'}, [])
+    changed = ready(30, CARD_TEXT.replace('names stay after a rename', 'names stay and the old one is kept'))
+    assert tick(changed) == ({BUILD: 'reviewing'}, []) and fakes.prs[0]['mergeQueueEntry'] is None
+    assert started == [(a, BUILD, H1)] and 'the old one is kept' in \
+        review_files(a)['task'].read_text()
+
+
+# spec: ANYM-572
+def test_an_added_test_file_outside_the_reserved_paths_parks_the_pr(tmp_path):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    reviewed(a)
+    fakes = Fakes(open_prs=[build_pr()])
+    fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified'),
+                           changed_file('services/calls/tests/test_other.py')]}
+    assert autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs, lambda *args: None)[0] == \
+        {BUILD: 'parked'}
+    assert autoloop.intents(a)[BUILD]['parked_detail'] == ['outside reserved paths services/calls/tests/test_other.py']
+
+
+# spec: ANYM-572
+def test_a_pr_armed_without_the_controllers_approval_is_disarmed_and_parked_when_live(tmp_path):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a, status='started')
+    fakes = Fakes(open_prs=[build_pr(autoMergeRequest={'enabledAt': 'x'}, mergeQueueEntry={'state': 'QUEUED'})])
+    fakes.fail = {'dequeue'}
+    done, failed = autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs)
+    assert done == {BUILD: 'disarm failed'} and failed and not autoloop.intents(a)[BUILD].get('parked')
+    fakes.fail = set()
+    assert autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs)[0] == {BUILD: 'parked'}
+    assert fakes.prs[0]['autoMergeRequest'] is None and fakes.prs[0]['mergeQueueEntry'] is None
+    assert autoloop.intents(a)[BUILD]['parked'] == 'armed without approval'
+
+
+# spec: ANYM-572
+def test_a_merged_loop_pr_whose_head_was_not_approved_pauses_the_loop_with_an_owner_revert_item(loop):
+    t, a, s = loop
+    configure(a, live=True)
+    finished_build(a)
+    triage.save(a / 'approved.json', {H1: {'pr': 7, 'intent': BUILD, 'at': triage.stamp(NOW)}})
+    fakes = Fakes(merged=[dict(build_pr(head=H1), mergeCommit={'oid': 'd' * 40}),
+                          dict(build_pr(8, head=H2, headRefName='manual-fix', body='Autoloop: x\nSpec: ANYM-30\n'),
+                               mergeCommit={'oid': 'e' * 40}),
+                          dict(build_pr(9, head='f' * 40, headRefName='autoloop-card-c0123456789', body='no line'),
+                               mergeCommit={'oid': '1' * 40}),
+                          dict(build_pr(10, head='2' * 40, headRefName='someone-else', body='unrelated'),
+                               mergeCommit={'oid': '3' * 40})])
+    real_save = triage.save
+
+    def crash(path, data):  # a crash right after PAUSE: the findings are not saved, so they are found again
+        if path.name == 'audit.json' and data.get('findings'):
+            raise OSError('disk')
+        return real_save(path, data)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(autoloop.triage, 'save', crash)
+        with pytest.raises(OSError):
+            autoloop.audit(a, fakes.prs, NOW)
+    assert (a / 'PAUSE').exists() and not (a / 'audit.json').exists()
+    (a / 'PAUSE').unlink()
+    code, line = run_tick(loop, fakes)
+    assert code == 0, line
+    assert (a / 'PAUSE').read_text().startswith('audit: merged without approval: PR #8, #9')
+    assert list(triage.load(a / 'audit.json', {})['findings']) == ['8', '9']
+    assert 'paused by an audit' in autoloop.status(a, NOW)[1]
+    text = autoloop.report(a, t, NOW).read_text()
+    assert (f"- PR #8 слит без одобрения контроллера, цикл на паузе: откатить `git revert {'e' * 40}` через PR и "
+            f'поставить автодеплой на паузу `{autoloop.PAUSE_DEPLOY}`?') in text
+    # The owner resumes: the same PR never pauses the loop again, and PR 7's approved head is no finding.
+    (a / 'PAUSE').unlink()
+    assert run_tick(loop, fakes, now=NOW + timedelta(hours=1))[0] == 0
+    assert not (a / 'PAUSE').exists() and autoloop.intents(a)[BUILD]['merge_sha'] == 'd' * 40
+
+
+# spec: ANYM-572
+def test_after_deploy_nothing_is_enabled_and_a_paused_autodeploy_is_reported_not_handled(loop, monkeypatch):
+    t, a, s = loop
+    configure(a)
+    finished_build(a)
+    autoloop.put(a, dict(autoloop.intents(a)[BUILD], pr=7, pr_state='MERGED', merge_sha='d' * 40, live=False))
+    triage.save(a / 'approved.json', {H1: {'pr': 7, 'intent': BUILD, 'at': triage.stamp(NOW)}})
+    fakes = Fakes(merged=[dict(build_pr(head=H1), mergeCommit={'oid': 'd' * 40})])
+    pause = {'present': True, 'reason': 'migration'}
+    probes = []
+
+    def probe(host):
+        probes.append(host)
+        return {'plan_a': None, 'http': None, 'deploy': None, 'pause': dict(pause), 'unresolved': [], 'served': []}
+    code, line = run_tick(loop, fakes, probe=probe)
+    assert code == 0 and probes == [triage.HOST], line
+    got = autoloop.intents(a)[BUILD]
+    assert (got['live'], got['autodeploy_paused']) == (False, True)
+    assert triage.load(a / 'plan.json', {})['builds']['deploy'] == 'autodeploy paused'
+    assert f"{BUILD}: слит {'d' * 12}, автодеплой на паузе — снимает владелец" in \
+        autoloop.report(a, t, NOW).read_text()
+    mutations = [c for c in fakes.calls if c[0] == 'gh' and c[1][0] in ('pr', 'run')] + \
+        [c for c in fakes.calls if c[0] == 'superset' and c[1][:2] != ['workspaces', 'list']] + \
+        [c for c in fakes.calls if c[0] == 'ssh' and c[1][:2] not in (['docker', 'inspect'], ['docker', 'run'])]
+    assert mutations == []  # no pause removal, no opt-in, grant or other enablement
+    monkeypatch.setattr(autoloop.receipt_watch.Watch, 'verdict', lambda self, snapshot: ('LIVE', 'x'))
+    pause['present'] = False
+    run_tick(loop, fakes, now=NOW + timedelta(hours=1), probe=probe)
+    assert autoloop.intents(a)[BUILD]['live'] is True
+    run_tick(loop, fakes, now=NOW + timedelta(hours=2), probe=probe)
+    assert len(probes) == 2  # a live build is not read again
+
+
+# spec: ANYM-572
+def test_the_protected_paths_and_signals_are_the_review_protocol_lists_as_written():
+    doc = (ROOT / 'docs/operations/review-protocol.md').read_text()
+    patterns = re.findall(r"grep -E (?:-i |-v -E )?'([^']+)'", doc) + re.findall(r"grep -v -E '([^']+)'", doc)
+    for compiled in (autoloop.SIGNAL_PATHS, autoloop.SIGNAL_TEXT, autoloop.PROTECTED, autoloop.TEST_DIR,
+                     autoloop.CODE_FILE, autoloop.TEST_FILE):
+        assert compiled.pattern in patterns, compiled.pattern
+    ruleset = json.loads((ROOT / 'deploy/main-ruleset.json').read_text())
+    required = [c['context'] for r in ruleset['rules'] if r['type'] == 'required_status_checks'
+                for c in r['parameters']['required_status_checks']]
+    assert sorted(autoloop.REQUIRED) == sorted(required)
+
+
+# spec: ANYM-572
+def test_the_controller_reviews_the_exact_head_itself_in_a_clean_worktree_and_takes_no_verdict_from_the_worker(
+        tmp_path, capsys):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    with pytest.raises(SystemExit):
+        autoloop.main(['verdict', BUILD, '--head', H1, '--report', str(tmp_path / 'r.md'), '--state', str(a)])
+    assert autoloop.main(['review-run', BUILD, '--head', H1, '--attempt', 'a1b2c3d4', '--state', str(a)]) == 1
+    assert 'no controller review' in capsys.readouterr().err  # no review was started
+    card = autoloop.card_digest(ready(30))
+    autoloop.put(a, dict(autoloop.intents(a)[BUILD], review={'head': H1, 'pr': 7, 'started_at': triage.stamp(NOW),
+                                                             'card': card, 'attempt': 'a1b2c3d4'}))
+    paths = autoloop.review_paths(a, BUILD, H1, 'a1b2c3d4')
+    paths['dir'].mkdir(parents=True)
+    calls, runs, fetched = [], [], {'head': H1}
+
+    def git(argv):
+        calls.append(argv)
+        return fetched['head'] + '\n' if argv[0] == 'rev-parse' else ''
+
+    def run(argv):
+        runs.append(argv)
+        Path(argv[3]).write_text('VERDICT: CHANGES REQUIRED — 1 blocking, 0 major, 0 minor — r1\n'
+                                 'VERDICT: APPROVE — 0 blocking, 0 major, 2 minor — r1\n')
+        return 0
+    got = autoloop.review_run(a, BUILD, H1, 'a1b2c3d4', git, run)
+    assert got == {'head': H1, 'attempt': 'a1b2c3d4', 'card': card, 'exit': 0,
+                   'verdict': {'verdict': 'APPROVE', 'blocking': 0, 'major': 0, 'minor': 2}}
+    assert calls == [['fetch', '--no-tags', 'origin', 'main'], ['fetch', '--no-tags', 'origin', 'refs/pull/7/head'],
+                     ['rev-parse', 'FETCH_HEAD^{commit}'],
+                     ['worktree', 'add', '--detach', str(paths['checkout']), H1],
+                     ['worktree', 'remove', '--force', str(paths['checkout'])]]
+    assert runs == [[str(autoloop.REVIEW_CODEX), 'astra', str(paths['task']), str(paths['report']), '--minutes', '45',
+                     '--cd', str(paths['checkout'])]]
+    assert triage.load(paths['result'], {}) == got
+    # The PR moved on GitHub: no review runs, and the result carries no verdict.
+    fetched['head'] = H2
+    assert autoloop.review_run(a, BUILD, H1, 'a1b2c3d4', git, run) == \
+        {'head': H1, 'attempt': 'a1b2c3d4', 'card': card, 'error': 'head moved'} and len(runs) == 1
+    # Over the Codex line: the controller starts the review again on a later tick, with a task of its own.
+    paths['task'].write_text('the first launch\n')
+    triage.save(paths['result'], {'head': H1, 'attempt': 'a1b2c3d4', 'card': card, 'exit': 6})
+    fakes = Fakes(open_prs=[build_pr()])
+    fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified')]}
+    started = []
+    tick = lambda: autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs,  # noqa: E731
+                                       lambda *args: started.append(args))[0]
+    assert tick() == {BUILD: 'waiting'} and autoloop.intents(a)[BUILD]['review'] is None
+    assert tick() == {BUILD: 'reviewing'} and started == [(a, BUILD, H1)]
+    again = review_files(a)
+    assert again['task'] != paths['task'] and not again['result'].exists()
+    assert f'at exactly head {H1}' in again['task'].read_text()
+
+
+# spec: ANYM-572
+def test_a_review_that_finishes_after_its_card_changed_approves_nothing(tmp_path):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    fakes = Fakes(open_prs=[build_pr()])
+    fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified')]}
+    started = []
+    changed = ready(30, CARD_TEXT.replace('names stay after a rename', 'names stay and the old one is kept'))
+
+    def tick(card):
+        return autoloop.controller(a, cfg(), snap(card), NOW, fakes.gh, fakes.prs,
+                                   lambda *args: started.append(args))[0]
+    assert tick(ready(30)) == {BUILD: 'reviewing'}
+    first = dict(autoloop.intents(a)[BUILD]['review'])
+    old = autoloop.review_paths(a, BUILD, H1, first['attempt'])
+
+    def run(argv):  # the card changes on Tiden main while the first review still runs
+        assert tick(changed) == {BUILD: 'reviewing'} and len(started) == 2
+        Path(argv[3]).write_text('VERDICT: APPROVE — 0 blocking, 0 major, 0 minor — r1\n')
+        return 0
+    git = lambda argv: H1 + '\n' if argv[0] == 'rev-parse' else ''  # noqa: E731
+    assert autoloop.review_run(a, BUILD, H1, first['attempt'], git, run)['verdict']['verdict'] == 'APPROVE'
+    second = autoloop.intents(a)[BUILD]['review']
+    new = autoloop.review_paths(a, BUILD, H1, second['attempt'])
+    assert second['attempt'] != first['attempt'] and second['card'] != first['card']
+    assert old['result'].exists() and not new['result'].exists() and new['checkout'] != old['checkout']
+    # The old approval is never read for the new card: still reviewing, nothing approved or enqueued.
+    assert tick(changed) == {BUILD: 'reviewing'} and enqueued(fakes) == []
+    assert triage.load(a / 'approved.json', {}) == {}
+    # A result in the new attempt's file that names another attempt or card is not used either.
+    triage.save(new['result'], {**triage.load(old['result'], {}), 'attempt': second['attempt']})
+    assert tick(changed) == {BUILD: 'reviewing'} and enqueued(fakes) == []
+
+
+# spec: ANYM-572
+def test_open_pr_reservations_are_keyed_by_pr_and_hold_both_names_of_a_rename(tmp_path):
+    fakes = Fakes(open_prs=[{'number': 5, 'id': 'PR_5', 'headRefName': 'same'},
+                            {'number': 6, 'id': 'PR_6', 'headRefName': 'same'}])
+    fakes.pr_files = {'same': ['services/messaging/new_name.py']}
+    fakes.rest_files = {6: [{'filename': 'services/messaging/new_name.py',
+                             'previous_filename': 'services/messaging/old_name.py'}]}
+    assert autoloop.open_files(fakes.gh) == {5: ['services/messaging/new_name.py'],
+                                             6: ['services/messaging/new_name.py', 'services/messaging/old_name.py']}
