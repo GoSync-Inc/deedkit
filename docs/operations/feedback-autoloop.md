@@ -50,7 +50,9 @@ session); secrets or new credentials; destructive or irreversible data changes; 
 or the ruleset; weakening a criterion; accepting a risk; an epic; a change to this document. The
 override covers only choosing, writing and readying a card inside the envelope; every other
 product direction and card move stays the owner's. The loop enables nothing after deploy: a
-feature behind a flag or opt-in ships off and its item says "waits for the owner: opt-in". The
+feature behind a flag or opt-in ships off and its item says "waits for the owner: opt-in". A build
+that meets any other owner item ends with `large` ("queued: large card"), and the orchestrator
+raises it with the owner. The
 other notes the agent sees are "queued: large card", "over daily cap", "withdrawn by the
 reporter", "paused" and "answered, no change needed" (ANYM-573).
 
@@ -140,8 +142,9 @@ the PR goes into the merge queue and autodeploy ships it; nothing is enabled aft
 Anything else is parked: it never merges and shows in the orchestrator's queue of the daily
 report. An OWNER path, grant or other owner item found while building ends the build with
 `large`: the item says "queued: large card" and the orchestrator brings it to you. To stop one
-build: `autoloop.py hold ANYM-n` takes its PR out of the queue and makes the worker's `gate` fail,
-so it pushes nothing more; `gh pr close <n>` ends it. To stop everything: `PAUSE` (Stop, withdraw,
+build: `autoloop.py hold ANYM-n` takes its PR out of the queue on every tick and the controller
+never arms it; the worker's `gate` fails and its brief tells it to stop (detected, not prevented:
+Known residual); `gh pr close <n>` ends it. To stop everything: `PAUSE` (Stop, withdraw,
 hold).
 
 **Order.** When there are build intents or `live: true`, each tick runs the build stage before the
@@ -173,8 +176,8 @@ ends with `finish`, after `large` (outside the envelope) or `decline --reason` w
 nothing.
 
 **The controller.** Each tick it records each build's PR (number, state, head, merge SHA). With
-`live: false` it does nothing else but take an armed PR whose head it did not approve out of the
-queue when it approved another head of that PR. With `live: true` it checks a finished worker's
+`live: false` it only parks a lost or interrupted worker with no PR and takes a PR out of the
+queue when it is armed at a head other than the one the controller approved. With `live: true` it checks a finished worker's
 open PR at its exact head on every tick, armed or not, and parks it when the worker is gone or
 ended with `large` or `decline`, when someone else armed it, or when any check fails:
 
@@ -252,8 +255,9 @@ and nothing is sent. It has six sections:
   merge SHA, whether it is live, and the undo (`git revert <SHA>` through a PR, plus the
   autodeploy pause command). For a card: `hold ANYM-n`.
 - **Merged, card not Done yet.** Listed separately.
-- **Owner items.** One question each: opt-in, grant, OWNER path or epic, and a loop PR merged
-  without the controller's approval (with its revert command).
+- **Owner items.** One question each: opt-in or epic, and a loop PR merged without the
+  controller's approval (with its revert command). The report also has a question for a grant or
+  an OWNER path, but the build stage records none: a build that meets one ends with `large`.
 - **The orchestrator's queue.** Large cards, intents with their relaunch spent, and missing
   receipts: a worker that ended with no card and no outcome, or a build with no PR and no merge
   SHA.
