@@ -177,9 +177,11 @@ nothing.
 
 **The controller.** Each tick it records each build's PR (number, state, head, merge SHA). With
 `live: false` it only parks a lost or interrupted worker with no PR and takes a PR out of the
-queue when it is armed at a head other than the one the controller approved. With `live: true` it checks a finished worker's
-open PR at its exact head on every tick, armed or not, and parks it when the worker is gone or
-ended with `large` or `decline`, when someone else armed it, or when any check fails:
+queue when it is armed at a head other than one the controller approved for that PR; a PR armed
+with no approval at all stays armed until `live: true`, and the post-merge audit pauses the loop
+if it merges. With `live: true` it checks a finished worker's open PR at its exact head on every
+tick, armed or not, and parks it when the worker is gone or ended with `large` or `decline`, when
+someone else armed it, or when any check fails:
 
 - base `main`, not a draft; `Autoloop:` names the intent; `Spec:` names the card; `Change path:`
   is AUTO or AUTO+review, not OWNER; no `Tiden branch: review/…`; the card still inside the
