@@ -688,3 +688,87 @@ def test_endpoint_silence_hint_and_recovery_from_auto_paused(gate, policy, monke
     with store.pool.connection() as c:
         c.execute("UPDATE delivery_endpoints SET state='auto_paused' WHERE id=%s", (eid,))
     assert store.update_delivery_endpoint(token, eid, version + 1, 'pause')['state'] == 'agent_paused'
+
+
+def features_cli(store, tmp_path, monkeypatch, capsys, *args):
+    """Run `python -m messaging_service set-delivery-features` on the test database; (exit code, JSON)."""
+    import sys
+    import messaging_service.__main__ as cli
+    dsn = tmp_path / 'operator.dsn'
+    dsn.write_text(store.pool.conninfo)
+    dsn.chmod(0o600)
+    class BorrowedStore:
+        def __getattr__(self, name):
+            return getattr(store, name)
+        def close(self):
+            pass  # The seeded fixture owns this connection pool.
+    monkeypatch.setattr(cli, 'Store', lambda *_: BorrowedStore())
+    monkeypatch.setenv('DATABASE_URL_FILE', str(dsn))
+    monkeypatch.setattr(sys, 'argv', ['messaging_service', 'set-delivery-features', *args])
+    capsys.readouterr()
+    try:
+        cli.main()
+        code = 0
+    except SystemExit as exit:
+        code = exit.code
+    return code, json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+
+def beats(store, **components):
+    """Synthetic heartbeats: component=(version, schema_version, age_s); None deletes the row."""
+    with store.pool.connection() as c:
+        for name, value in components.items():
+            c.execute('DELETE FROM component_heartbeats WHERE component=%s', (name,))
+            if value is not None:
+                c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
+                    VALUES(%s,%s,%s,clock_timestamp()-make_interval(secs=>%s))''', (name, *value))
+
+
+def gate_state(store):
+    with store.pool.connection() as c:
+        row = c.execute("SELECT value FROM probe_metadata WHERE name='delivery_features'").fetchone()
+    return row and row['value']
+
+
+# spec: ANYM-534
+def test_enable_refuses_until_api_matcher_and_dispatcher_report_one_version(seeded, policy, tmp_path, monkeypatch,
+                                                                             capsys):
+    from messaging_service import __version__
+    from messaging_service.store import RUNTIME_SCHEMA
+    store = seeded[0]
+    current = (__version__, RUNTIME_SCHEMA, 0)
+    store.set_delivery_features(False)
+    try:
+        # An older matcher writes no heartbeat at all; one that does reports its own version.
+        for matcher, reason in ((None, 'component_heartbeat_absent'), (('0.0.1', RUNTIME_SCHEMA, 0), 'component_version_mismatch'),
+                                ((__version__, RUNTIME_SCHEMA - 1, 0), 'component_schema_mismatch'),
+                                ((__version__, RUNTIME_SCHEMA, 121), 'component_heartbeat_stale')):
+            beats(store, api=current, dispatcher=current, matcher=matcher)
+            code, result = features_cli(store, tmp_path, monkeypatch, capsys, '--enable')
+            assert code != 0 and result['error'] == reason and result['component'] == 'matcher', matcher
+            assert gate_state(store) == 'disabled'
+        beats(store, matcher=current)
+        assert features_cli(store, tmp_path, monkeypatch, capsys, '--enable') == (0, {'delivery_features': 'enabled',
+            'cancelled': 0})
+        assert gate_state(store) == 'enabled'
+    finally:
+        store.set_delivery_features(False)
+        beats(store, api=None, matcher=None, dispatcher=None)
+
+
+# spec: ANYM-534
+def test_disable_cancels_queued_endpoint_hints_and_events_stay_fetchable(gate, policy, tmp_path, monkeypatch, capsys):
+    store = gate
+    token = identity(store)
+    endpoint = register(store, token)
+    sid = store.create_subscription(token, ['telegram-demo-chat'], delivery={'endpoint_id': endpoint['endpoint_id']})[
+        'subscription_id']
+    event, = emit(store)
+    match_subscriptions(store)
+    code, result = features_cli(store, tmp_path, monkeypatch, capsys, '--disable')
+    assert code == 0 and result['delivery_features'] == 'disabled' and result['cancelled'] >= 1
+    with store.pool.connection() as c:
+        assert not c.execute("""SELECT 1 FROM subscription_outbox WHERE endpoint=%s AND state IN ('pending','leased')""",
+            (endpoint['endpoint_id'],)).fetchone()
+    assert dispatch_hints(store, transport=lambda *a, **k: pytest.fail('POST after disable'), resolver=PUBLIC)['delivered'] == 0
+    assert [item['event_id'] for item in store.fetch_subscription_events(token, sid)['items']] == [event]

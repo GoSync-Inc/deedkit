@@ -61,8 +61,9 @@ V44_TABLES={'api_key_operations':'operation_id'}
 V45_TABLES={'message_purges':'message','chat_tombstones':'id','ingest_receipt_links':'digest','purge_state':'name'}
 V48_TABLES={'subscription_dispatcher_heartbeat':'id'}
 V49_TABLES={'delivery_endpoints':'id','delivery_endpoint_tests':'id'}
+V50_TABLES={'component_heartbeats':'component'}
 # Every schema this runtime can capture, verify and restore (one ceiling for capture and verify_bundle).
-SCHEMAS=range(2,50)
+SCHEMAS=range(2,51)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
@@ -86,7 +87,7 @@ def database_manifest(c):
                        **(V35_TABLES if version>=35 else {}),
                        **(V37_TABLES if version>=37 else {}),
                        **(V38_TABLES if version>=38 else {}),**(V41_TABLES if version>=41 else {}),**(V42_TABLES if version>=42 else {}),**(V43_TABLES if version>=43 else {}),
-                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {})}.items():
+                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {})}.items():
         query=sql.SQL('SELECT row_to_json(t) AS record FROM {} t ORDER BY {}').format(
             sql.Identifier(name),sql.SQL(',').join(sql.Identifier(part) for part in order.split(',')))
         sha=hashlib.sha256(); count=0

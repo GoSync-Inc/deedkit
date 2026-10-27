@@ -21,16 +21,18 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 BASE = ["compose.yaml", "compose.collectors.yaml", "compose.whatsapp.yaml", "compose.indexer.yaml",
         "compose.enrichment.yaml", "compose.subscriptions.yaml", "compose.operator.yaml",
-        "compose.file-lifecycle.yaml", "compose.file-understanding.yaml", "compose.message-purge.yaml"]
+        "compose.file-lifecycle.yaml", "compose.file-understanding.yaml", "compose.message-purge.yaml",
+        "compose.delivery.yaml"]
 NATIVE = "compose.whatsapp-native.yaml"
 APPLICATIONS = {"api", "telegram", "whatsapp1", "whatsapp2", "indexer", "enricher", "enricher-local",
                 "operator", "subscriptions", "file-lifecycle", "cold-archive", "cold-restore",
-                "file-understanding", "message-purge"}
+                "file-understanding", "message-purge", "delivery"}
 COLLECTORS = {"telegram", "whatsapp1", "whatsapp2"}
 SECRET_DIRECTORIES = ["processing-locks", "telegram-session", "whatsapp1-session", "whatsapp2-session",
-                      "issued-keys", "cold-archive-identity", "cold-archive-ssh", "enrichment-models"]
+                      "issued-keys", "cold-archive-identity", "cold-archive-ssh", "enrichment-models", "delivery-receivers"]
 SECRET_FILES = ["app.dsn", "collector.dsn", "indexer.dsn", "owner.dsn", "subscriptions.dsn", "enrichment.dsn",
                 "enrichment-local.dsn", "file-lifecycle.dsn", "cold-archive.dsn", "file-understanding.dsn", "message-purge.dsn",
+                "delivery.dsn", "delivery-policy.json",
                 "enrichment.keys", "enrichment.json", "enrichment-local.json", "file-understanding.json",
                 "cold-archive.json", "telegram.json", "telegram.credentials.json", "telegram.permit.json",
                 "whatsapp1.json", "whatsapp1.permit.json", "whatsapp2.json", "whatsapp2.permit.json"]
@@ -159,6 +161,10 @@ def networks_of(container):
     return set(container["NetworkSettings"]["Networks"])
 
 
+def members_of(containers):
+    return {name: networks_of(container) for name, container in containers.items()}
+
+
 def assert_runtime(stack, declared, native):
     containers = stack.containers()
     assert set(containers) == APPLICATIONS | {"db"}
@@ -169,9 +175,13 @@ def assert_runtime(stack, declared, native):
     db = containers["db"]
     assert db["State"]["Running"]
     assert db["HostConfig"]["LogConfig"] == {"Type": "json-file", "Config": {"max-size": "5m", "max-file": "2"}}
-    assert networks_of(db) == {f"{stack.project}_backend"}
+    assert networks_of(db) == {f"{stack.project}_backend", f"{stack.project}_delivery_db"}
     assert stack.network("backend")["Internal"] is True
-    members = {name: networks_of(container) for name, container in containers.items()}
+    # ANYM-534: the dispatcher shares only the database network, and its egress bridge with nobody.
+    assert {name for name, joined in members_of(containers).items() if f"{stack.project}_delivery_db" in joined} == {"db", "delivery"}
+    assert networks_of(containers["delivery"]) == {f"{stack.project}_delivery_db", f"{stack.project}_delivery_egress"}
+    assert stack.network("delivery_db")["Internal"] is True and stack.network("delivery_egress")["Internal"] is False
+    members = members_of(containers)
     assert {name for name, joined in members.items() if f"{stack.project}_collector_egress" in joined} == COLLECTORS
     assert {name for name, joined in members.items() if f"{stack.project}_cold_archive_egress" in joined} == {"cold-archive", "cold-restore"}
     assert stack.network("collector_egress")["Internal"] is False

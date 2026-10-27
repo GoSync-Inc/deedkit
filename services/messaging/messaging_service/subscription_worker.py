@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import signal
 import threading
+import time
 
+from . import heartbeats
 from .store import Store
 from .delivery_policy import flush_hints
 from .subscriptions import acked_retention_days, match_subscriptions, prune_subscriptions
@@ -36,6 +38,7 @@ def main():
     dsn = Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
     store = Store(dsn, Path(os.environ.get('PROBE_FILES', '/tmp/unused-files')),
                   'http://localhost')
+    last_beat = None
     try:
         while not stop.is_set():
             if not args.once:
@@ -51,6 +54,10 @@ def main():
                 if args.once:
                     print(json.dumps(result))
                     return
+                # ANYM-534: the version heartbeat follows a successful match; a failed write never stops matching.
+                if last_beat is None or time.monotonic() - last_beat >= heartbeats.HEARTBEAT_S:
+                    heartbeats.record(store, 'matcher')
+                    last_beat = time.monotonic()
             except Exception as error:
                 capture(error, 'subscription_match_failed')
                 # No SQL, DSN, content, selectors or subscription IDs in logs.

@@ -21,7 +21,18 @@ from .subscriptions import _owned, _state, _view, _worker_identity
 
 
 _DNS_SLOTS = threading.BoundedSemaphore(4)
+# ANYM-534: operator receivers resolve from their own slots, so hanging agent endpoint lookups never starve them.
+OPERATOR_DNS_SLOTS = threading.BoundedSemaphore(2)
 _DNS_TIMEOUT_S = 2
+# ANYM-534: queued self-service hints per key; past it, a subscription that already has one queued stages no more.
+ENDPOINT_QUEUE_PER_KEY = 32
+ENDPOINT_LANE_LOCK = 'deedkit-delivery-endpoint-lane'
+# A live leased endpoint hint or endpoint test of the key: one attempt in flight per key across both (ANYM-534).
+KEY_IN_FLIGHT = '''(EXISTS (SELECT 1 FROM subscription_outbox f JOIN subscriptions k ON k.id=f.subscription
+    WHERE f.endpoint IS NOT NULL AND f.state='leased' AND f.lease_until>clock_timestamp()
+    AND k.principal={principal} AND k.key_id={key_id})
+    OR EXISTS (SELECT 1 FROM delivery_endpoint_tests f JOIN delivery_endpoints k ON k.id=f.endpoint
+    WHERE f.state='leased' AND f.lease_until>clock_timestamp() AND k.principal={principal} AND k.key_id={key_id}))'''
 # ANYM-519: is_global accepts these; they translate to or embed another (possibly internal) address.
 _REFUSED_V6 = tuple(ipaddress.ip_network(net) for net in ('64:ff9b::/96', '64:ff9b:1::/48', '2002::/16', '2001::/32'))
 
@@ -33,10 +44,11 @@ def _refused(address):
         address.teredo or any(address in net for net in _REFUSED_V6))
 
 
-def _addresses(host, port):
+def _addresses(host, port, *, slots=None):
     # libc DNS may outlive a socket deadline. Bound response latency and retain
     # one of four slots until that lookup really ends, without an unbounded queue.
-    if not _DNS_SLOTS.acquire(blocking=False):
+    slots = _DNS_SLOTS if slots is None else slots
+    if not slots.acquire(blocking=False):
         raise OSError('receiver_dns_busy')
     finished = threading.Event()
     result = {}
@@ -47,12 +59,12 @@ def _addresses(host, port):
         except OSError:
             result['error'] = True
         finally:
-            _DNS_SLOTS.release()
+            slots.release()
             finished.set()
     try:
         threading.Thread(target=lookup, daemon=True, name='deedkit-receiver-dns').start()
     except BaseException:
-        _DNS_SLOTS.release()
+        slots.release()
         raise
     if not finished.wait(_DNS_TIMEOUT_S) or result.get('error'):
         raise OSError('receiver_dns_unavailable')
@@ -232,11 +244,25 @@ def _hint_target(c, row):
     return binding if endpoint_stageable(c, binding['endpoint']) else None
 
 
+def endpoint_queue_full(c, row):
+    """True when the key holds ENDPOINT_QUEUE_PER_KEY queued endpoint hints of any kind and subscription.
+
+    Callers hold the key's subscription-hints lock (budget_slot), so no writer passes the count concurrently.
+    """
+    return c.execute('''SELECT count(*)>=%s AS full
+        FROM subscription_outbox o JOIN subscriptions s ON s.id=o.subscription WHERE o.endpoint IS NOT NULL
+        AND o.state IN ('pending','leased') AND s.principal=%s AND s.key_id=%s''',
+        (ENDPOINT_QUEUE_PER_KEY, row['principal'], row['key_id'])).fetchone()['full']
+
+
 def enqueue_hint(c, row, through, *, kind='events', request_id=''):
     binding = _hint_target(c, row)
     if binding is None:
         return None
     target = 'receiver' if binding['receiver'] is not None else 'endpoint'
+    if target == 'endpoint' and endpoint_queue_full(c, row):
+        from .store import APIError
+        raise APIError('rate_limited', 429)
     return c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,''' + target + ''',
         through_position,kind,request_id) VALUES(%s,%s,%s,%s,%s,%s)
         ON CONFLICT(subscription,subscription_version,kind,through_position,request_id)
@@ -412,32 +438,89 @@ def delivery_transports(c, p):
     return rows
 
 
-def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses):
-    """Leased at-least-once hints, independently reauthorized before each send."""
-    from .policy import lock_principal
-    from .store import bounded
-    bounded(limit, 100)
-    beat(store)
-    stats = dict(delivered=0, retried=0, dead_letter=0, cancelled=0, deferred=0)
-    holds = []
-    # ANYM-519: rotation promotion and endpoint tests; a failure there never stops operator hints.
+def endpoint_tests(store, *, transport=_transport, resolver=_addresses, limit=8, served=None):
+    """ANYM-519 rotation promotion and endpoint tests; a failure there never stops hints (None)."""
     try:
         from .delivery_endpoints import dispatch_tests, promote_rotations, schema_ready
         with store.pool.connection() as c:
             ready = schema_ready(c) and promote_rotations(c) is not None
         if ready:
-            stats['endpoint_tests'] = dispatch_tests(store, transport=transport, resolver=resolver)
+            return dispatch_tests(store, transport=transport, resolver=resolver, limit=limit, served=served)
     except Exception as error:
         from .telemetry import capture
         capture(error, 'endpoint_tests_failed')
         print(json.dumps({'error': 'endpoint_tests_failed', 'class': type(error).__name__}), flush=True)
+    return None
+
+
+_DUE = "(o.state='pending' AND o.next_attempt_at<=clock_timestamp() OR o.state='leased' AND o.lease_until<=clock_timestamp())"
+
+
+# Each key's oldest due endpoint hint or pending endpoint test, keys with an attempt in flight left out (ANYM-534).
+_ENDPOINT_QUEUE = '''SELECT DISTINCT ON (q.principal,q.key_id) q.kind,q.id,q.principal,q.key_id FROM (
+    SELECT 'hint' AS kind,o.id,s.principal,s.key_id,o.next_attempt_at AS due,o.created_at
+    FROM subscription_outbox o JOIN subscriptions s ON s.id=o.subscription WHERE o.endpoint IS NOT NULL AND ''' + _DUE + '''
+    UNION ALL SELECT 'test',t.id,e.principal,e.key_id,t.created_at,t.created_at
+    FROM delivery_endpoint_tests t JOIN delivery_endpoints e ON e.id=t.endpoint
+    WHERE t.state='pending' OR t.state='leased' AND t.lease_until<=clock_timestamp()) q
+    WHERE NOT ''' + KEY_IN_FLIGHT.format(principal='q.principal', key_id='q.key_id') + '''
+    ORDER BY q.principal,q.key_id,q.due,q.created_at,q.id'''
+
+
+def next_endpoint_item(c, served, kind, lock, strict=True):
+    """The endpoint lanes' one scheduler over hints and endpoint tests: lock the item of the least recently served key.
+
+    One endpoint lane (or the endpoint test pass) picks at a time, so a key never has two attempts in flight.
+    Strict: when the next key's item is of the other kind, None, so neither queue overtakes a waiting key (the
+    first endpoint lane runs a hint pick and a test pick each pass). Non-strict skips to this kind's keys.
+    """
+    c.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (ENDPOINT_LANE_LOCK,))
+    for row in sorted(c.execute(_ENDPOINT_QUEUE).fetchall(), key=lambda row: served.get((row['principal'], row['key_id']), 0)):
+        if row['kind'] != kind:
+            if strict:
+                return None
+            continue
+        picked = c.execute(lock, (row['id'],)).fetchone()
+        if picked is not None:
+            served[(row['principal'], row['key_id'])] = max(served.values(), default=0) + 1
+            return picked
+    return None
+
+
+def _next_endpoint_hint(c, served):
+    """ANYM-534 endpoint lane: the due hint of the least recently served key with no attempt in flight."""
+    return next_endpoint_item(c, served, 'hint', 'SELECT * FROM subscription_outbox WHERE id=%s FOR UPDATE SKIP LOCKED')
+
+
+def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses, lane=None, served=None):
+    """Leased at-least-once hints, independently reauthorized before each send.
+
+    lane None is one serial pass over every hint (with the heartbeat and endpoint tests, as before ANYM-534);
+    'operator' takes only operator receiver hints and 'endpoint' only self-service ones, one key at a time,
+    least recently served key first (served: the lane's shared {(principal, key_id): turn}).
+    """
+    from .policy import lock_principal
+    from .store import bounded
+    bounded(limit, 100)
+    if lane not in (None, 'operator', 'endpoint'):
+        raise ValueError('unknown_lane')
+    stats = dict(delivered=0, retried=0, dead_letter=0, cancelled=0, deferred=0)
+    if lane is None:
+        beat(store)
+        tests = endpoint_tests(store, transport=transport, resolver=resolver)
+        if tests is not None:
+            stats['endpoint_tests'] = tests
+    served = {} if served is None else served
+    holds = []
     for _ in range(limit):
         lease = uuid4()
         with store.pool.connection() as c:
-            hint = c.execute('''SELECT * FROM subscription_outbox WHERE
-                (state='pending' AND next_attempt_at<=clock_timestamp() OR
-                 state='leased' AND lease_until<=clock_timestamp())
-                ORDER BY next_attempt_at,created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED''').fetchone()
+            if lane == 'endpoint':
+                hint = _next_endpoint_hint(c, served)
+            else:
+                hint = c.execute('''SELECT o.* FROM subscription_outbox o WHERE ''' + _DUE +
+                    (" AND o.receiver IS NOT NULL" if lane == 'operator' else '') +
+                    ''' ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT 1 FOR UPDATE SKIP LOCKED''').fetchone()
             if hint is None:
                 break
             if hint['attempts'] >= 8:

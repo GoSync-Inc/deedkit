@@ -290,7 +290,7 @@ def test_migration_checksum_and_restart_preserve_revisions(archive):
     ar.ingest(event()); s.migrate(); s.migrate()
     assert len(s.get_updates(key,'main')['items'])==1
     with s.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='49'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='50'
         saved=c.execute('SELECT sha256 FROM archive_migrations WHERE version=2').fetchone()['sha256']
         c.execute("UPDATE archive_migrations SET sha256='wrong' WHERE version=2")
     try:

@@ -882,3 +882,343 @@ def test_endpoint_change_waits_for_the_inflight_post_and_no_post_after(seeded, t
         assert after['cancelled'] == 1
     finally:
         store.set_delivery_features(False)
+
+
+PUBLIC = lambda *a, **k: ['93.184.216.34']  # noqa: E731
+
+
+def endpoint_keys(store, tmp_path, monkeypatch, subscriptions):
+    """One key per item, each with one bound self-service endpoint and that many subscriptions (ANYM-534)."""
+    import base64
+    policy = tmp_path / 'delivery-policy.json'
+    policy.write_text(json.dumps({'allow_hosts': ['example.test']}))
+    policy.chmod(0o600)
+    monkeypatch.setenv('DELIVERY_POLICY_FILE', str(policy))
+    store.set_delivery_features(True)
+    permissions = ['read', 'subscription-write', 'subscription-ack', 'delivery-write']
+    keys = []
+    for n, count in enumerate(subscriptions):
+        token = store.issue_key(f'lane-agent-{n}', ['telegram-demo'], permissions=permissions, key_permissions=permissions)
+        secret = 'whsec_' + base64.b64encode(b'synthetic-lane-secret-%02d-0123456789' % n).decode()
+        endpoint = store.register_delivery_endpoint(token, f'lane-request-{n}', f'https://slow{n}.example.test/hook',
+            secret, resolver=PUBLIC)
+        sids = [store.create_subscription(token, ['telegram-demo-chat'], label=f'Lane {n}.{i}',
+            delivery={'endpoint_id': endpoint['endpoint_id']})['subscription_id'] for i in range(count)]
+        keys.append((token, endpoint['endpoint_id'], sids))
+    with store.pool.connection() as c:
+        # Only hints are under test here, not the inline registration tests.
+        c.execute("UPDATE delivery_endpoint_tests SET state='cancelled' WHERE state<>'cancelled'")
+    emit(store)
+    match_subscriptions(store)
+    return keys
+
+
+# spec: ANYM-534
+def test_operator_receiver_hint_is_on_time_while_four_endpoints_hang(seeded, tmp_path, monkeypatch):
+    import threading
+    import time
+    from messaging_service import delivery_worker
+    store, _, _ = seeded
+    try:
+        endpoint_keys(store, tmp_path, monkeypatch, [1, 1, 1, 1, 1])
+        token = identity(store)
+        sid = subscription(store, token)
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+        # The endpoint hints are older, so a serial dispatcher would POST all of them first.
+        emit(store)
+        match_subscriptions(store)
+        due, sent, hung = time.monotonic(), {}, []
+        def transport(url, body, headers, *, resolved, timeout):
+            if url.startswith('https://slow0.'):
+                raise RuntimeError('synthetic endpoint bug')
+            if url.startswith('https://slow'):
+                hung.append(url)
+                time.sleep(timeout)
+                raise TimeoutError
+            sent[url] = time.monotonic()
+            return 204
+        stop = threading.Event()
+        worker = threading.Thread(target=delivery_worker.run, args=(store, stop),
+            kwargs={'transport': transport, 'resolver': PUBLIC, 'interval': 0.2})
+        worker.start()
+        try:
+            while 'https://hooks.example.test/wake' not in sent and time.monotonic() < due + 15:
+                time.sleep(0.05)
+            assert worker.is_alive(), 'an endpoint failure stopped the dispatcher'
+        finally:
+            stop.set()
+            worker.join(30)
+        assert not worker.is_alive()
+        assert sent['https://hooks.example.test/wake'] - due < 15 and hung
+    finally:
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-534
+def test_endpoint_lane_keeps_one_attempt_per_key_in_flight_and_serves_keys_in_turn(seeded, tmp_path, monkeypatch):
+    import threading
+    import time
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    try:
+        endpoint_keys(store, tmp_path, monkeypatch, [3, 1])
+        served, inflight, release = {}, [], threading.Event()
+        def blocking(url, body, headers, **kwargs):
+            inflight.append(url)
+            assert release.wait(10)
+            return 204
+        def lane():
+            dispatch_hints(store, lane='endpoint', limit=1, served=served, transport=blocking, resolver=PUBLIC)
+        threads = []
+        for n in (1, 2):
+            threads.append(threading.Thread(target=lane))
+            threads[-1].start()
+            deadline = time.monotonic() + 10
+            while len(inflight) < n:
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+        # Both keys have one attempt in flight: key 0's other two hints wait, and the operator lane sees none.
+        idle = dispatch_hints(store, lane='endpoint', limit=1, served=served,
+            transport=lambda *a, **k: pytest.fail('a second attempt for a key in flight'), resolver=PUBLIC)
+        assert idle['delivered'] == idle['retried'] == 0
+        assert dispatch_hints(store, lane='operator', transport=lambda *a, **k: pytest.fail('endpoint hint in the operator lane'),
+            resolver=PUBLIC)['delivered'] == 0
+        release.set()
+        for thread in threads:
+            thread.join(10)
+        assert sorted(url.split('.')[0] for url in inflight) == ['https://slow0', 'https://slow1']
+        rest = []
+        for _ in range(3):
+            dispatch_hints(store, lane='endpoint', limit=1, served=served,
+                transport=lambda url, *a, **k: rest.append(url) or 204, resolver=PUBLIC)
+        assert [url.split('.')[0] for url in rest] == ['https://slow0', 'https://slow0']
+    finally:
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-534
+def test_the_least_recently_served_key_goes_first(seeded, tmp_path, monkeypatch):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    try:
+        endpoint_keys(store, tmp_path, monkeypatch, [3, 2])
+        served, order = {}, []
+        for _ in range(5):
+            dispatch_hints(store, lane='endpoint', limit=1, served=served,
+                transport=lambda url, *a, **k: order.append(url.split('.')[0]) or 204, resolver=PUBLIC)
+        # Key 0's three hints are as old as key 1's, yet the keys take turns.
+        assert order in (['https://slow0', 'https://slow1', 'https://slow0', 'https://slow1', 'https://slow0'],
+                         ['https://slow1', 'https://slow0', 'https://slow1', 'https://slow0', 'https://slow0'])
+    finally:
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-534
+def test_a_key_endpoint_queue_is_bounded_and_events_stay_fetchable(seeded, tmp_path, monkeypatch):
+    from messaging_service import event_delivery
+    from messaging_service.delivery_policy import flush_hints
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    monkeypatch.setattr(event_delivery, 'ENDPOINT_QUEUE_PER_KEY', 2)
+    try:
+        [(token, _, sids)] = endpoint_keys(store, tmp_path, monkeypatch, [3])
+        def queued():
+            with store.pool.connection() as c:
+                return c.execute("""SELECT count(*) AS n FROM subscription_outbox WHERE endpoint IS NOT NULL
+                    AND state IN ('pending','leased')""").fetchone()['n']
+        def held():
+            with store.pool.connection() as c:
+                return c.execute("""SELECT subscription FROM subscription_hint_windows WHERE held_reason='budget'
+                    AND first_match_at IS NOT NULL""").fetchall()
+        # The bound is key-wide, across subscriptions: the third subscription's wake is held, not dropped.
+        assert queued() == 2 and len(held()) == 1
+        for _ in range(3):
+            emit(store)
+            match_subscriptions(store)
+            assert queued() <= 2
+        # An explicit test of a full key is refused like an over-budget one.
+        with pytest.raises(APIError, match='rate_limited'):
+            call(store, token, 'test_subscription', sids[0], 'full-queue-probe')
+        assert queued() == 2
+        assert len(call(store, token, 'fetch_subscription_events', sids[0])['items']) == 4
+        # After each drain the held windows fire on their next tick, never more than the bound at once.
+        def drain_and_tick():
+            dispatch_hints(store, lane='endpoint', limit=8, transport=lambda *a, **k: 204, resolver=PUBLIC)
+            assert queued() == 0
+            with store.pool.connection() as c:
+                c.execute("UPDATE subscription_hint_windows SET due_at=clock_timestamp() WHERE due_at IS NOT NULL")
+            flush_hints(store)
+        drain_and_tick()
+        assert queued() == 2 and len(held()) == 1
+        drain_and_tick()
+        assert queued() == 1 and not held()
+    finally:
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-534
+def test_a_key_never_has_an_endpoint_test_and_a_hint_in_flight_together(seeded, tmp_path, monkeypatch):
+    import base64
+    from messaging_service.event_delivery import dispatch_hints, endpoint_tests
+    store, _, _ = seeded
+    try:
+        [(token, _, _)] = endpoint_keys(store, tmp_path, monkeypatch, [1])
+        # A second endpoint of the same key stages its registration test: a different URL, the same key.
+        with store.pool.connection() as c:
+            # Past the per-key registration and test rate limits (one a minute).
+            c.execute("UPDATE delivery_endpoints SET created_at=created_at-interval '2 minutes' WHERE state<>'deleted'")
+            c.execute("UPDATE delivery_endpoint_tests SET created_at=created_at-interval '2 minutes' WHERE state='cancelled'")
+        store.register_delivery_endpoint(token, 'lane-request-second', 'https://second.example.test/hook',
+            'whsec_' + base64.b64encode(b'synthetic-second-secret-0123456789').decode(), resolver=PUBLIC)
+        def tests(state):
+            with store.pool.connection() as c:
+                return c.execute('SELECT count(*) AS n FROM delivery_endpoint_tests WHERE state=%s', (state,)).fetchone()['n']
+        assert tests('pending') == 1
+        seen = []
+        def hint_transport(url, *a, **k):
+            # While the key's hint is in flight, the test pass leaves the key's test pending.
+            seen.append(('hint', url))
+            assert endpoint_tests(store, transport=lambda *a, **k: pytest.fail('test POST beside the hint'),
+                resolver=PUBLIC)['delivered'] == 0
+            return 204
+        assert dispatch_hints(store, lane='endpoint', limit=1, served={}, transport=hint_transport,
+            resolver=PUBLIC)['delivered'] == 1
+        assert tests('pending') == 1
+        emit(store)
+        match_subscriptions(store)
+        def test_transport(url, *a, **k):
+            # And while the key's test is in flight, the endpoint lane leaves the key's hint pending.
+            seen.append(('test', url))
+            assert dispatch_hints(store, lane='endpoint', limit=1, served={},
+                transport=lambda *a, **k: pytest.fail('hint POST beside the test'), resolver=PUBLIC)['delivered'] == 0
+            return 204
+        assert endpoint_tests(store, transport=test_transport, resolver=PUBLIC)['delivered'] == 1
+        assert [kind for kind, _ in seen] == ['hint', 'test'] and seen[1][1] == 'https://second.example.test/hook'
+        # An expired test lease is not in flight: the hint goes.
+        with store.pool.connection() as c:
+            c.execute("""INSERT INTO delivery_endpoint_tests(endpoint,request_id,state,lease_token,lease_until)
+                SELECT endpoint,'expired-lease','leased',gen_random_uuid(),clock_timestamp()-interval '1 second'
+                FROM delivery_endpoint_tests LIMIT 1""")
+        assert dispatch_hints(store, lane='endpoint', limit=1, served={}, transport=lambda *a, **k: 204,
+            resolver=PUBLIC)['delivered'] == 1
+    finally:
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-534
+def test_endpoint_tests_take_the_lanes_least_recently_served_key_order(seeded, tmp_path, monkeypatch):
+    from messaging_service.event_delivery import dispatch_hints, endpoint_tests
+    store, _, _ = seeded
+    try:
+        [(_, first, _), (_, second, _)] = endpoint_keys(store, tmp_path, monkeypatch, [1, 0])
+        served, order = {}, []
+        record = lambda url, *a, **k: order.append(url.split('.')[0]) or 204  # noqa: E731
+        assert dispatch_hints(store, lane='endpoint', limit=1, served=served, transport=record, resolver=PUBLIC)['delivered'] == 1
+        with store.pool.connection() as c:
+            # Key 0's two tests are older than key 1's.
+            for endpoint, request, age in ((first, 'fairness-a1', 30), (first, 'fairness-a2', 20), (second, 'fairness-b1', 10)):
+                c.execute("""INSERT INTO delivery_endpoint_tests(endpoint,request_id,created_at)
+                    VALUES(%s,%s,clock_timestamp()-make_interval(secs=>%s))""", (endpoint, request, age))
+        # Key 0 was just served by its hint: key 1's newer test goes before key 0's older ones.
+        assert endpoint_tests(store, transport=record, resolver=PUBLIC, limit=3, served=served)['delivered'] == 3
+        assert order == ['https://slow0', 'https://slow1', 'https://slow0', 'https://slow0']
+    finally:
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-534
+def test_hints_and_endpoint_tests_share_one_key_order(seeded, tmp_path, monkeypatch):
+    from messaging_service.event_delivery import dispatch_hints, endpoint_tests
+    store, _, _ = seeded
+    try:
+        [(_, first, _), (_, second, _)] = endpoint_keys(store, tmp_path, monkeypatch, [1, 1])
+        with store.pool.connection() as c:
+            keys = [tuple(c.execute('SELECT principal,key_id FROM delivery_endpoints WHERE id=%s', (endpoint,)).fetchone().values())
+                for endpoint in (first, second)]
+            c.execute("""INSERT INTO delivery_endpoint_tests(endpoint,request_id,created_at)
+                VALUES(%s,'shared-order-a1',clock_timestamp()-interval '1 minute')""", (first,))
+        order = []
+        record = lambda url, *a, **k: order.append(url.split('.')[0]) or 204  # noqa: E731
+        def hint(served):
+            return dispatch_hints(store, lane='endpoint', limit=1, served=served, transport=record, resolver=PUBLIC)['delivered']
+        def test(served):
+            return endpoint_tests(store, transport=record, resolver=PUBLIC, limit=1, served=served)['delivered']
+        # Key 0 was just served; key 1 waits with a hint only: key 0's test does not overtake it.
+        served = {keys[0]: 1}
+        assert test(served) == 0 and hint(served) == 1 and order == ['https://slow1']
+        assert test(served) == 1 and order[-1] == 'https://slow0'
+        # Now key 1 waits with a test only, key 0 with a hint: key 0's hint does not overtake it.
+        with store.pool.connection() as c:
+            c.execute("""INSERT INTO delivery_endpoint_tests(endpoint,request_id,created_at)
+                VALUES(%s,'shared-order-b1',clock_timestamp()-interval '1 minute')""", (second,))
+        served = {keys[0]: 1, keys[1]: 0}
+        assert hint(served) == 0 and test(served) == 1 and order[-1] == 'https://slow1'
+        assert hint(served) == 1 and order[-1] == 'https://slow0'
+    finally:
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-534
+def test_dispatcher_heartbeat_reports_version_and_stops_when_a_lane_stalls(seeded):
+    import time
+    from messaging_service import __version__, delivery_worker
+    from messaging_service.store import RUNTIME_SCHEMA
+    store, _, _ = seeded
+    assert delivery_worker.HEARTBEAT_S == 30
+    def rows():
+        with store.pool.connection() as c:
+            return (c.execute('SELECT * FROM subscription_dispatcher_heartbeat').fetchall(),
+                c.execute("SELECT * FROM component_heartbeats WHERE component='dispatcher'").fetchall())
+    with store.pool.connection() as c:
+        c.execute('DELETE FROM subscription_dispatcher_heartbeat WHERE id=1')
+        c.execute("DELETE FROM component_heartbeats WHERE component IS NOT NULL")
+    now = time.monotonic()
+    assert delivery_worker.pulse(store, {'operator': now - 5, 'endpoint-0': now - delivery_worker.LANE_STALL_S - 1},
+        now=now) is False
+    assert rows() == ([], [])
+    assert delivery_worker.pulse(store, {'operator': now - 5, 'endpoint-0': now}, now=now) is True
+    legacy, [component] = rows()
+    assert len(legacy) == 1
+    assert (component['version'], component['schema_version']) == (__version__, RUNTIME_SCHEMA)
+
+
+# spec: ANYM-534
+def test_each_role_writes_only_its_own_component_heartbeat(seeded):
+    from contextlib import contextmanager
+    from copy import copy
+    import psycopg
+    from psycopg import sql
+    from messaging_service.heartbeats import record
+    store, _, _ = seeded
+    files = {'dispatcher': ('delivery_role.sql', 'messaging_event_delivery'),
+             'matcher': ('subscription_role.sql', 'messaging_subscriptions'),
+             'api': ('gateway_role.sql', 'messaging_gateway')}
+    roles = []
+    try:
+        for component, (filename, name) in files.items():
+            role = 'synthetic_' + component + '_' + uuid4().hex
+            roles.append(role)
+            ddl = Path('services/messaging/messaging_service', filename).read_text().replace(name, role)
+            with store.pool.connection() as c:
+                c.execute(ddl)
+            class RestrictedPool:
+                @contextmanager
+                def connection(self, role=role):
+                    with store.pool.connection() as c:
+                        c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+                        yield c
+            worker = copy(store)
+            worker.pool = RestrictedPool()
+            assert record(worker, component) is True
+            for other in set(files) - {component}:
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    with worker.pool.connection() as c:
+                        c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
+                            VALUES(%s,'0.0.0',1,clock_timestamp()) ON CONFLICT(component) DO UPDATE
+                            SET beat_at=EXCLUDED.beat_at''', (other,))
+    finally:
+        with store.pool.connection() as c:
+            for role in roles:
+                c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
+                c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))

@@ -5,8 +5,80 @@ import os
 from pathlib import Path
 import signal
 import threading
-from .event_delivery import dispatch_hints, register_receiver, disable_receiver
+import time
+from . import heartbeats
+from .event_delivery import (OPERATOR_DNS_SLOTS, _addresses, _transport, beat, dispatch_hints, disable_receiver,
+    endpoint_tests, register_receiver)
 from .store import Store
+
+HEARTBEAT_S = heartbeats.HEARTBEAT_S
+# A lane that has not finished a pass for this long stops the heartbeat, so capabilities report webhook down.
+LANE_STALL_S = 60
+ENDPOINT_LANES = 3
+
+
+def pulse(store, progress, *, now=None):
+    """Write both heartbeats only while every lane has finished a pass within LANE_STALL_S (ANYM-534)."""
+    now = time.monotonic() if now is None else now
+    if any(now - last > LANE_STALL_S for last in list(progress.values())):
+        return False
+    alive = beat(store)
+    return heartbeats.record(store, 'dispatcher') and alive
+
+
+def _lane(store, stop, name, progress, interval, step):
+    while not stop.is_set():
+        busy = False
+        try:
+            result = step()
+            busy = any(result.get(key) for key in ('delivered', 'retried', 'dead_letter', 'cancelled', 'deferred'))
+            if busy or result.get('endpoint_tests'):
+                print(json.dumps(dict(result, lane=name), default=str), flush=True)
+        except Exception as error:
+            # One endpoint's failure (or a database blip) never stops the lane; its lease expires and retries.
+            print(json.dumps({'error': 'delivery_lane_failed', 'lane': name, 'class': type(error).__name__}), flush=True)
+        finally:
+            progress[name] = time.monotonic()
+        if not busy:
+            stop.wait(interval)
+
+
+def run(store, stop, *, transport=_transport, resolver=None, interval=2):
+    """Operator receivers and self-service endpoints in separate lanes until stop is set (ANYM-534)."""
+    operator_resolver = resolver or (lambda host, port: _addresses(host, port, slots=OPERATOR_DNS_SLOTS))
+    resolver = resolver or _addresses
+    served = {}
+    def endpoint_step(first):
+        def step():
+            result = dispatch_hints(store, lane='endpoint', limit=1, served=served, transport=transport,
+                resolver=resolver)
+            if first:
+                # One test per pass, in the lanes' shared key order: a key's tests never run a batch ahead.
+                tests = endpoint_tests(store, transport=transport, resolver=resolver, limit=1, served=served)
+                if tests is not None:
+                    result['endpoint_tests'] = tests
+            return result
+        return step
+    steps = {'operator': lambda: dispatch_hints(store, lane='operator', transport=transport, resolver=operator_resolver)}
+    steps.update({f'endpoint-{n}': endpoint_step(n == 0) for n in range(ENDPOINT_LANES)})
+    started = time.monotonic()
+    progress = dict.fromkeys(steps, started)
+    threads = [threading.Thread(target=_lane, args=(store, stop, name, progress, interval, step), daemon=True,
+        name='deedkit-delivery-' + name) for name, step in steps.items()]
+    for thread in threads:
+        thread.start()
+    try:
+        while not stop.is_set():
+            try:
+                pulse(store, progress)
+            except Exception as error:
+                # Local stdout only: the class, never the message (it can hold a DSN or an endpoint).
+                print(json.dumps({'error': 'delivery_heartbeat_failed', 'class': type(error).__name__}), flush=True)
+            stop.wait(HEARTBEAT_S)
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join()
 
 
 def main():
@@ -36,11 +108,10 @@ def main():
         if args.disable_receiver:
             print(json.dumps(disable_receiver(store, args.disable_receiver)))
             return
-        while not stop.is_set():
+        if args.once:
             print(json.dumps(dispatch_hints(store)), flush=True)
-            if args.once:
-                break
-            stop.wait(2)
+            return
+        run(store, stop)
     finally:
         store.close()
 
