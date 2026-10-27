@@ -39,7 +39,7 @@ The loop builds and merges a card only when all hold:
   worker's review rounds do not count). Build workers never merge; the controller puts that head
   only into the merge queue.
 
-Anything else stays in the orchestrator queue, and the item's note says why.
+Anything else stays in the orchestrator queue; the item's note or the daily report says why.
 
 ## Owner items
 
@@ -125,93 +125,96 @@ to a dropped item, and none follows a declined or large outcome:
 | queued: large card, built by the orchestrator | `large` |
 | withdrawn by the reporter | `AUTOLOOP DROP` (ANYM-569) |
 
-The reader writes "waits for the owner: opt-in" (ANYM-570). The build stage writes no status note:
-a parked build goes to the orchestrator's queue in the daily report.
+The reader writes "waits for the owner: opt-in" (ANYM-570). A build worker's `decline` and `large`
+write the same notes as a card worker's, and a fenced build worker gets "paused". A parked build PR
+writes no item note: its reason is in the orchestrator's queue of the daily report.
 
 ## Build worker and controller merge (ANYM-572)
 
-Each tick runs the build stage before the card launches, in this order: post-merge audit,
-controller, new launches (only with `live: true`), deploy read. When the audit pauses the loop, the
-rest of the stage is skipped. A failed GitHub, Superset, git or probe read lands in the tick's
-failures (exit 1, no heartbeat, so `status` reports it) and does not stop the card stage.
+**For the owner.** With `live: true`, a Ready card from your own agents' feedback is built by a
+worker and merged with no step of yours only when all of this holds at the PR's exact head: the
+change path is AUTO or AUTO+review, the real diff touches no change-path signal, protected path,
+existing test or path outside what the card reserved, the card text is unchanged, the
+controller's own Astra review of that head approves it, and both required checks are green. Then
+the PR goes into the merge queue and autodeploy ships it; nothing is enabled after deploy.
+Anything else is parked: it never merges and shows in the orchestrator's queue of the daily
+report. An OWNER path, grant or other owner item found while building ends the build with
+`large`: the item says "queued: large card" and the orchestrator brings it to you. To stop one
+build: `autoloop.py hold ANYM-n` takes its PR out of the queue and makes the worker's `gate` fail,
+so it pushes nothing more; `gh pr close <n>` ends it. To stop everything: `PAUSE` (Stop, withdraw,
+hold).
 
-**Which cards.** A card worker of a cluster that is still owner-agent bound the card and finished
-with no outcome. The card is not held, no item of it is dropped, and no build intent holds it
-(a lost, interrupted, cancelled or stopped one with no PR and no outcome gets its one relaunch).
-The card must be inside the envelope on Tiden main: Backlog with a `Ready:` line, a defect,
-improvement or feature, at most 8 SP, no epic, no open `review/` branch that lists it, and
-`Expected paths` to reserve, its test files included. A card outside waits with its reason in the
-plan.
+**Order.** When there are build intents or `live: true`, each tick runs the build stage before the
+card launches: post-merge audit, controller, new launches (live only), deploy read. When the
+audit pauses the loop, the rest of the stage is skipped. A failed GitHub or Superset read ends the
+tick with exit 1 and no heartbeat (so `status` reports it) and does not stop the card stage; a
+failed receipt probe reads as deploy `unknown`; a failed git step of a review parks that PR as
+"review failed".
 
-**Reservations.** A build reserves the card's `Lane` and `Expected paths`. A launch waits while
-another live build intent has the same lane or an overlapping path, while any open PR (any author)
-changes an overlapping file (both names of a rename), or while the pushed branch of a live
-Superset workspace does (GitHub compare `main...<branch>`). Open-PR reservations are keyed by PR
-number. A reservation ends when its intent ends: PR merged or closed, card declined, held or
-dropped, or worker gone with no PR (then the intent is parked "worker gone with no PR"). Unpushed
-local work of other workers is invisible here; a conflict at rebase parks the PR.
+**Launch.** A finished card worker with no outcome bound the card, and its cluster is still from
+an owner agent (provenance is checked here, at launch only). The card is not held, no item of it is
+dropped, and no other build intent holds it (a lost, interrupted, cancelled or stopped one with no
+PR and no outcome allows one relaunch). On Tiden main the card is inside the envelope: Backlog with
+a `Ready:` line, a defect, improvement or feature, at most 8 SP, no epic, no open `review/` branch
+that lists it, and `Expected paths`, its test files included. A card outside waits with its reason
+in `plan.json`. The launch reserves the card's `Lane` and `Expected paths` and waits while another
+live build has the same lane or an overlapping path, while any open PR (any author) changes an
+overlapping file (both names of a rename), or while the pushed branch of a live Superset workspace
+does. The reservation ends with the intent: PR merged or closed, card declined, held or dropped,
+or the worker gone (a lost or interrupted one with no PR is parked "worker gone with no PR").
+Unpushed local work of other workers is invisible here.
 
-**The worker.** A Superset workspace `autoloop-build-anym-<n>` with the worker preset. Its prompt
+**The worker.** A Superset workspace `autoloop-build-anym-<n>` with the worker preset; its prompt
 names `~/deedkit-orchestrator/briefs/autoloop-build.md` (outside Git), common.md, the intent and the
-card ID, nothing else. With no brief template, nothing starts. It builds as the harness says
-(failing test first, its own review rounds by routing). The PR carries `Autoloop: <intent>`,
-`Spec: ANYM-n` and `Change path: AUTO…` lines. It runs `autoloop.py gate <intent>` before every
-push and never runs `gh pr merge`. It hands in no verdict: the merge decision rests on the
-controller's own review below. It ends with `finish`, or with `large` (outside the envelope) or
-`decline --reason`.
+card ID, nothing else (no brief template, no start). It builds as the harness says, with its own
+review rounds. The PR carries `Autoloop: <intent>`, `Spec: ANYM-n` and `Change path: AUTO…` lines.
+It runs `gate` before every push and never merges, arms or enqueues. It hands in no verdict. It
+ends with `finish`, after `large` (outside the envelope) or `decline --reason` when it builds
+nothing.
 
-**The controller.** For each build intent the tick records the PR (number, state, head, merge
-SHA). For a finished worker it checks the open PR at its exact head on every tick, armed or not.
-A PR is parked, never merged, when its worker is gone or ended with an outcome, when it was armed
-by anyone but the controller, or when any check fails at that head:
+**The controller.** Each tick it records each build's PR (number, state, head, merge SHA). With
+`live: false` it does nothing else but take an armed PR whose head it did not approve out of the
+queue when it approved another head of that PR. With `live: true` it checks a finished worker's
+open PR at its exact head on every tick, armed or not, and parks it when the worker is gone or
+ended with `large` or `decline`, when someone else armed it, or when any check fails:
 
-- base `main`, not a draft; the `Autoloop:` line names the intent; `Spec:` names the card;
-  `Change path:` is AUTO or AUTO+review and not OWNER; no `Tiden branch: review/…`;
-- the card is still inside the envelope (Backlog or Active);
-- the real diff (GitHub compare `main...<head>`, renames and deletions included): no deleted or
-  renamed file, no change-path signal path or text line (the review-protocol.md grep), no
-  protected path (the list in Envelope, old and new name of a rename), no changed existing test
-  file, no new non-test code file under a test directory, every file with a patch, fewer than
-  300 files;
-- every changed name, tests included, is inside the intent's reserved paths and outside every
-  other live build's reservation and every other open PR's files.
+- base `main`, not a draft; `Autoloop:` names the intent; `Spec:` names the card; `Change path:`
+  is AUTO or AUTO+review, not OWNER; no `Tiden branch: review/…`; the card still inside the
+  envelope (Backlog or Active);
+- the real diff (GitHub compare `main...<head>`): no deleted or renamed file, no change-path
+  signal path or text line (the review-protocol.md grep), no protected path (old and new name),
+  no modified file in a test directory, no new non-test code file there, every file with a patch,
+  fewer than 300 files;
+- every changed name is inside the build's reserved paths and outside every other live build's
+  reservation and every other open PR's files.
 
-**The controller's review.** When those checks pass, the controller reviews the head itself; the
-worker's own rounds do not count. Each attempt (a new head, a changed card text, a restart) gets a
-random ID in the intent's review record and files of its own under
-`~/.deedkit/autoloop/reviews/<intent>/`: a task the controller writes (fixed text, the PR number,
-the head, the card's text as data), a report, a result and a checkout. The tick starts
-`autoloop.py review-run <intent> --head <sha> --attempt <id>` detached. That run refuses an attempt
-the tick did not record, fetches `refs/pull/<n>/head` and checks it is exactly the head, reviews a
-clean detached worktree of it with `review-codex.sh astra --minutes 45`, and writes the report's
-last `VERDICT:` line to the result with the head, the attempt and the card digest. A result counts
-only when all three match the intent's current record, so a review that ends after a push or a
-card change approves nothing. Exit 6 (over the Codex line) or 8 (another review of the packet
-runs): a new attempt on a later tick. Exit 7 (round cap), no verdict, CHANGES REQUIRED, a blocking
-or major finding, or no result 75 minutes after the start: parked.
+Then the controller reviews the head itself. Each attempt (a new head, a changed card text, a
+restart) has its own ID and files under `~/.deedkit/autoloop/reviews/<intent>/`; a detached
+`autoloop.py review-run` checks that GitHub's PR ref is exactly that head and runs
+`review-codex.sh astra` on a clean checkout of it with the controller's own task (the card text as
+data). Its result counts only when head, attempt and card digest match the current attempt, so a
+review that ends after a push or a card change approves nothing. Over the Codex line or a parallel
+review: a new attempt later. Round cap, no verdict, CHANGES REQUIRED, a blocking or major finding,
+or no result after 75 minutes: parked.
 
-**Arming.** An approved head waits until both required checks (`checks / verify`, `CI gate`, the
-names in deploy/main-ruleset.json) are SUCCESS on that head. Then the head and the card digest go
-into `approved.json` first, and the controller puts the PR into the merge queue with GraphQL
-`enqueuePullRequest(expectedHeadOid: <head>)`; the ruleset sets the squash. No auto-merge request
-is left behind: a push takes the PR out of the queue and nothing arms it again until its new head
-is approved. An armed PR whose head or card text changed is taken out of the queue and reviewed
-again. To disarm, the controller dequeues, then runs `gh pr merge --disable-auto`, then reads the
-PR back; a failure keeps the PR counted as armed (tick exit 1) and never marks it parked.
-`hold ANYM-n` disarms it and takes it out of the queue; `AUTOLOOP DROP` of one of its items also
-closes it. The parked reason (fixed wording) and up to 20 paths are kept on the intent for the
+**Arming.** An approved head waits for both required checks (`checks / verify`, `CI gate`, as in
+deploy/main-ruleset.json) to be SUCCESS on it. The head and card digest go into `approved.json`
+first; then GraphQL `enqueuePullRequest(expectedHeadOid)` puts the PR into the merge queue bound to
+that head (the ruleset squashes). No auto-merge request is left: a push takes the PR out of the
+queue, and a new head or a changed card is reviewed again. Disarm is dequeue, `--disable-auto`,
+read back; a failure keeps the PR counted as armed (tick exit 1). A PR that GitHub refuses to
+enqueue (a conflict) is not parked: each tick tries again and exits 1 until the orchestrator holds
+or closes it. The parked reason (fixed wording) and up to 20 paths stay on the intent for the
 report.
 
-**Post-merge audit.** Each tick lists every merged PR of the repository since the last audit
-(paginated search, forks too) and picks those from `autoloop-` branches or with an `Autoloop:`
-line. One whose head is not in `approved.json` writes `PAUSE` first
-(`audit: merged without approval: PR #n`), then the finding, once per PR, so the owner's resume
-holds; it becomes an owner item with the revert command. `status` exits 1 while that PAUSE stands.
+**Post-merge audit.** Every merged PR of the repository since the day before the last audit
+(forks too) from an `autoloop-` branch or with an `Autoloop:` line whose head is not in
+`approved.json` writes `PAUSE` first, then the finding, once per PR, so the owner's resume holds.
+It becomes an owner item with the revert command; `status` exits 1 while that PAUSE stands.
 
 **Release.** Plain autodeploy. The tick reads one read-only receipt snapshot (receipt_watch's
-LIVE rule) and sets each merged build's `live`; its ancestry check may `git fetch origin main` in
-the deedkit checkout. A paused autodeploy is recorded for the report and never touched. The loop
-enables nothing after deploy: no opt-in, grant or flag.
+LIVE rule; its ancestry check may `git fetch origin main` in the deedkit checkout) and marks each
+merged build live. A paused autodeploy is recorded for the report and never touched.
 
 ## The live switch
 
@@ -249,7 +252,8 @@ and nothing is sent. It has six sections:
   merge SHA, whether it is live, and the undo (`git revert <SHA>` through a PR, plus the
   autodeploy pause command). For a card: `hold ANYM-n`.
 - **Merged, card not Done yet.** Listed separately.
-- **Owner items.** One question each: opt-in, grant, OWNER path or epic.
+- **Owner items.** One question each: opt-in, grant, OWNER path or epic, and a loop PR merged
+  without the controller's approval (with its revert command).
 - **The orchestrator's queue.** Large cards, intents with their relaunch spent, and missing
   receipts: a worker that ended with no card and no outcome, or a build with no PR and no merge
   SHA.
