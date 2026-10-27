@@ -9,6 +9,7 @@ reader (ANYM-570).
     autoloop.py report [--state DIR] [--triage-state DIR]
     autoloop.py hold|release CARD [--state DIR]
     autoloop.py read [--state DIR] [--triage-state DIR]
+    autoloop.py verdict INTENT --head SHA --report PATH [--state DIR]
 
 `tick` takes the triage lock, the feedback-sync lock and its own, non-blocking in that order, and ends as busy with
 no write if one is held. With `PAUSE` it only fences: it closes the terminals of the loop's own workspaces (names
@@ -27,6 +28,13 @@ reject, by reason code) or `large` (an epic, a card over 8 SP or a branch it doe
 comes of it. Status notes the agent can act
 on (over a daily cap, paused, declined, queued as a large card) go out as dispositions files that the ANYM-536
 `auto` applies, each note once per item.
+
+Each tick runs the build stage (ANYM-572) first: the post-merge audit (a merged loop PR whose head is not in
+`approved.json` writes PAUSE), the controller (each build's PR is checked at its exact head: lines, envelope, the
+verdict the worker recorded with `verdict`, and the real diff against the change-path and protected-path lists; a
+clean one is approved, then armed with `--match-head-commit`; anything else is parked), new build workers for Ready
+cards whose lane and paths are free (live only; prompt: the card ID and the intent) and one read-only receipt read
+that marks merged builds live. A paused autodeploy is reported, never handled; nothing is enabled after a deploy.
 
 `report` (also at the end of each good tick) writes `report/<day>.md` (ANYM-573) in Russian from the local state
 only: changes with feedback IDs, the card's title, PR, merge SHA, live or not and the undo; owner items with one
@@ -55,6 +63,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 import fcntl
+import fnmatch
 import getpass
 import hashlib
 import json
@@ -64,10 +73,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import feedback_triage as triage  # noqa: E402
+import receipt_watch  # noqa: E402
 
 STATE = Path.home() / '.deedkit' / 'autoloop'
 CLI_VERSION = '2.1.310'
@@ -127,8 +138,8 @@ WORKSPACE = re.compile(r'autoloop-(card|build)-[a-z0-9][a-z0-9-]{2,60}')
 CARD = re.compile(r'ANYM-[1-9][0-9]*|new:[a-z0-9][a-z0-9-]{2,39}')
 READY = 'Tiden sync ready merge '  # tiden-sync.yml run-name of a ready merge
 ACTIVE = ('queued', 'in_progress', 'waiting', 'requested', 'pending')
-PR = ('number id state headRefName mergedAt mergeCommit { oid } autoMergeRequest { enabledAt } '
-      'mergeQueueEntry { state } headRepository { nameWithOwner }')
+PR = ('number id state headRefName headRefOid baseRefName isDraft body mergedAt mergeCommit { oid } '
+      'autoMergeRequest { enabledAt } mergeQueueEntry { state } headRepository { nameWithOwner }')
 DEQUEUE = 'mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }'
 # The card worker (ANYM-571): a local workspace of the deedkit project with the worker preset (worker settings, empty
 # MCP config); its brief template stays in the harness, outside Git.
@@ -926,22 +937,25 @@ def card_projection(state, triage_state, intent):
     return path
 
 
+def create(superset, intent, prompt):
+    """One worker's workspace (worker preset, branch = intent name); a reply without a workspace ID leaves the
+    intent `unknown` for `reconcile`."""
+    reply = superset(['workspaces', 'create', '--local', '--project', PROJECT_ID, '--name', intent['name'],
+                      '--branch', intent['name'], '--skip-branch-prefix', '--base-branch', 'main',
+                      '--agent', PRESET, '--model', MODEL, '--effort', EFFORT, '--prompt', prompt])
+    found = reply.get('workspace', reply) if isinstance(reply, dict) else None
+    workspace = found.get('id') if isinstance(found, dict) else None
+    if not isinstance(workspace, str) or not WORKSPACE_ID.fullmatch(workspace):
+        raise Refused('superset workspaces create: no workspace ID in the reply')
+    return workspace
+
+
 def card_start(superset, projection_path):
     """The start of one card worker; its prompt holds the intent, the cluster key, the feedback IDs and the
-    projection path only. A reply without a workspace ID leaves the intent `unknown` for `reconcile`."""
-    def start(intent):
-        prompt = (f"Read and follow {BRIEFS / 'common.md'} and {CARD_BRIEF}. Intent: {intent['name']}. "
-                  f"Cluster: {intent['card']}. Feedback: {', '.join(intent['feedback'])}. "
-                  f"Projection: {projection_path}.")
-        reply = superset(['workspaces', 'create', '--local', '--project', PROJECT_ID, '--name', intent['name'],
-                          '--branch', intent['name'], '--skip-branch-prefix', '--base-branch', 'main',
-                          '--agent', PRESET, '--model', MODEL, '--effort', EFFORT, '--prompt', prompt])
-        found = reply.get('workspace', reply) if isinstance(reply, dict) else None
-        workspace = found.get('id') if isinstance(found, dict) else None
-        if not isinstance(workspace, str) or not WORKSPACE_ID.fullmatch(workspace):
-            raise Refused('superset workspaces create: no workspace ID in the reply')
-        return workspace
-    return start
+    projection path only."""
+    return lambda intent: create(superset, intent, (
+        f"Read and follow {BRIEFS / 'common.md'} and {CARD_BRIEF}. Intent: {intent['name']}. "
+        f"Cluster: {intent['card']}. Feedback: {', '.join(intent['feedback'])}. Projection: {projection_path}."))
 
 
 def launch_cards(state, triage_state, cfg, now, superset):
@@ -975,12 +989,12 @@ def launch_cards(state, triage_state, cfg, now, superset):
     return out
 
 
-def card_intent(state, name):
-    """A running card worker's intent, after the gate: PAUSE, a held card or a dropped item refuses it."""
+def card_intent(state, name, kinds=('card',)):
+    """A running worker's intent of one of `kinds`, after the gate: PAUSE, a held card or a dropped item refuses it."""
     why = gate(state, name)
     intent = stored(state, name)
-    if why or intent is None or intent['kind'] != 'card':
-        raise Refused(f"{name}: {why or 'not a card intent'}")
+    if why or intent is None or intent['kind'] not in kinds:
+        raise Refused(f"{name}: {why or 'not a ' + ' or '.join(kinds) + ' intent'}")
     return intent
 
 
@@ -994,13 +1008,452 @@ def bind(state, name, ref):
 
 def card_end(state, triage_state, name, result, now):
     """A card worker's end without a Ready card: a Fable reject (`declined` with its reason code), or an epic, a card
-    over 8 SP or a branch it does not own alone (`large`, for the orchestrator)."""
-    intent = card_intent(state, name)
+    over 8 SP or a branch it does not own alone (`large`, for the orchestrator). A build worker ends the same way when
+    its card cannot be built inside the envelope; either outcome releases its reservations."""
+    intent = card_intent(state, name, ('card', 'build'))
     if result != 'large' and result not in DECLINED:
         raise Refused(f"a reason code is one of {', '.join(DECLINED)}")
     status, note = ('received', LARGE) if result == 'large' else ('declined', f'declined by review: {DECLINED[result]}')
     put(state, dict(intent, outcome=result))  # first: no later note can overwrite the outcome's
     return notify(state, triage_state, {i: (status, note) for i in intent['feedback']}, now)
+
+
+# --- the build launcher and the controller merge (ANYM-572) -----------------------------------------------------
+BUILD_BRIEF = BRIEFS / 'autoloop-build.md'
+ROOT = Path(__file__).resolve().parents[1]
+# docs/operations/review-protocol.md, used as written (one list; a test compares these with the document): the
+# change-path signal grep (file names, then changed lines) and the autoloop protected paths with their test-directory
+# rules.
+SIGNAL_PATHS = re.compile(r'^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|'
+                          r'\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$')
+SIGNAL_TEXT = re.compile(r'^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|'
+                         r'RENAME)\b|ALTER )', re.I)
+PROTECTED = re.compile(
+    r'^(\.github/|scripts/|deploy/|tools/|config/|docs/(operations|harness)/|services/release-router/|'
+    r'packages/platform-contracts/|tests/platform/benchmarks/)|^[^/]+\.py$|^[^/]+/__init__\.py$|'
+    r'(^|/)(sitecustomize|usercustomize)\.py$|\.pth$|(^|/)(pytest\.ini|setup\.cfg|tox\.ini)$|'
+    r'(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|'
+    r'\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|'
+    r'conftest\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|'
+    r'requirements[^/]*\.(lock|in|txt))$')
+TEST_DIR = re.compile(r'(^|/)tests?/')
+CODE_FILE = re.compile(r'\.(py|pyi|js|mjs|cjs|ts|tsx|go|sh)$')
+TEST_FILE = re.compile(r'(^|/)test_[^/]*\.py$|\.test\.[^/]+$|_test\.go$')
+ENVELOPE = ('defect', 'improvement', 'feature')
+MAX_SP = 8
+MAX_FILES = 300  # GitHub's compare lists at most 300 files: a longer diff cannot be checked whole
+VERDICT = re.compile(r'VERDICT: (APPROVE|CHANGES REQUIRED) \S+ (\d+) blocking, (\d+) major, (\d+) minor')
+BRANCH = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,199}')
+
+
+def line_of(text, key):
+    found = re.search(rf'^{key}:[ \t]*(.*)$', str(text or ''), re.M)
+    return found.group(1).strip() if found else None
+
+
+def card_fields(spec):
+    """What the envelope reads from a card's text (harness tiden.md template): category, Effort, epic, Ready, lane and
+    expected paths. A path is a token with a slash or a file suffix; parenthesised notes are dropped."""
+    text = spec.get('text') or ''
+    effort = re.search(r'\bEffort:[ \t]*([0-9]+)\b', text)
+    lane = re.match(r'[A-Za-z0-9][A-Za-z0-9/_.-]*', line_of(text, 'Lane') or '')
+    found = re.search(r'Expected paths:[ \t]*(.*)$', text, re.M)
+    paths = re.sub(r'\([^)]*\)', ' ', found.group(1) if found else '')
+    paths = sorted({t.rstrip('.') for t in re.findall(r'[\w.*-]+(?:/[\w.*-]*)*', paths)
+                    if '/' in t or re.search(r'\w\.[A-Za-z]\w*$', t.rstrip('.'))})
+    return {'category': (line_of(text, 'Category') or '').split(' ')[0].lower(),
+            'effort': int(effort.group(1)) if effort else None, 'epic': line_of(text, 'Not in scope') is not None,
+            'ready': line_of(text, 'Ready') is not None, 'lane': lane.group(0).rstrip('/.') if lane else None,
+            'paths': paths}
+
+
+def outside(snap, ref, merging=False):
+    """None when a card is inside the envelope, else why not: on Tiden main, Ready (Backlog with `Ready:`; Active is
+    allowed once its PR exists), a defect, improvement or feature of at most 8 SP, no epic, no open `review/` branch
+    (a criterion edit) and, for a launch, expected paths to reserve."""
+    spec = next((s for s in snap.get('main', []) if s.get('ref') == ref), None)
+    if spec is None:
+        return 'not on Tiden main'
+    fields = card_fields(spec)
+    if spec.get('status') not in (('Backlog', 'Active') if merging else ('Backlog',)) or not fields['ready']:
+        return 'not Ready'
+    if fields['category'] not in ENVELOPE:
+        return 'category'
+    if fields['epic'] or fields['effort'] is None or fields['effort'] > MAX_SP:
+        return 'epic or over 8 SP'
+    if any(name.startswith('review/') and any(s.get('ref') == ref for s in listed)
+           for name, listed in snap.get('branches', {}).items()):
+        return 'criterion edit'
+    if not merging and not fields['paths']:
+        return 'no expected paths'
+    return None
+
+
+def overlaps(a, b):
+    a, b = (re.sub(r'(/\*\*?)+$|/+$', '', p) for p in (a, b))
+    return a == b or a.startswith(b + '/') or b.startswith(a + '/') or fnmatch.fnmatch(a, b) or fnmatch.fnmatch(b, a)
+
+
+def claims(state, known=None):
+    """{intent name: (lane, paths)} of the builds holding a reservation: a live worker, or an open PR. A merged or
+    closed PR, an outcome (decline, large), a held card, a dropped item or a gone worker with no PR releases it."""
+    held, out = holds(state), {}
+    for name, i in (known or intents(state)).items():
+        if i['kind'] != 'build' or i.get('outcome') or identities(i) & set(held['cards']) \
+                or set(i['feedback']) & set(held['items']):
+            continue
+        if i['status'] in LIVE or i.get('pr_state') == 'OPEN':
+            out[name] = (i.get('lane'), i.get('paths') or [])
+    return out
+
+
+def open_files(gh):
+    """{PR number: changed paths} of every open PR of the repository, any author; a PR with more files than one page
+    claims everything ('*')."""
+    query = ('query { repository(owner: "GoSync-Inc", name: "deedkit") { pullRequests(states: OPEN, first: 100) { '
+             'pageInfo { hasNextPage } nodes { number headRefName files(first: 100) { pageInfo { hasNextPage } '
+             'nodes { path } } } } } }')
+    reply = triage.parse(gh(['api', 'graphql', '-f', 'query=' + query]), 'gh api graphql')
+    try:
+        listing = reply['data']['repository']['pullRequests']
+        if listing['pageInfo']['hasNextPage']:
+            raise Refused('gh: more than 100 open pull requests')
+        return {p['headRefName']: ['*'] if p['files']['pageInfo']['hasNextPage']
+                else [f['path'] for f in p['files']['nodes']] for p in listing['nodes']}
+    except (KeyError, TypeError, AttributeError):
+        raise Refused('gh api graphql: unexpected reply') from None
+
+
+def compare(gh, head):
+    """The files of `main...head` (GitHub compare, three dots: what the branch changes), each with its status,
+    previous name and patch."""
+    reply = triage.parse(gh(['api', f'repos/{REPO}/compare/main...{urllib.parse.quote(head, safe="")}']),
+                         'gh api compare')
+    if not isinstance(reply, dict) or not isinstance(reply.get('files'), list) \
+            or any(not isinstance(f, dict) or not isinstance(f.get('filename'), str) for f in reply['files']):
+        raise Refused('gh api compare: unexpected reply')
+    return reply['files']
+
+
+def branch_files(superset, gh):
+    """{branch: changed paths} of the pushed branches of live (unarchived) deedkit workspaces; unpushed local work is
+    invisible here (a conflict at rebase parks that PR instead)."""
+    listing = superset(['workspaces', 'list', '--local'])
+    if not isinstance(listing, list) or any(not isinstance(w, dict) for w in listing):
+        raise Refused('superset workspaces list: unexpected reply')
+    names = {w.get('branch') for w in listing if w.get('projectName') == PROJECT and not w.get('archivedAt')} \
+        - {None, 'main'}
+    pages = triage.parse(gh(['api', '--paginate', '--slurp', f'repos/{REPO}/branches?per_page=100']), 'gh api branches')
+    try:
+        pushed = {b['name'] for page in pages for b in page}
+    except (KeyError, TypeError):
+        raise Refused('gh api branches: unexpected reply') from None
+    out = {}
+    for name in sorted(names & pushed):
+        if not isinstance(name, str) or not BRANCH.fullmatch(name):
+            out[str(name)] = ['*']
+            continue
+        files = compare(gh, name)
+        out[name] = ['*'] if len(files) >= MAX_FILES else sorted(
+            {f['filename'] for f in files} | {f['previous_filename'] for f in files if f.get('previous_filename')})
+    return out
+
+
+def build_cards(state, triage_state, principals):
+    """{card: feedback IDs} of the Ready cards a build worker may take: a card worker of a still owner-agent cluster
+    bound the card and finished with no outcome; the card is not held, no item is dropped and no build intent holds
+    it but a lost, interrupted, cancelled or stopped one with no PR and no outcome (`admit` allows one relaunch)."""
+    kinds = provenance(triage.load(triage_state / 'ledger.json', {}), principals)
+    held, known = holds(state), intents(state).values()
+    out = {}
+    for i in known:
+        ref = i.get('ref')
+        if i['kind'] == 'card' and i['status'] == 'finished' and not i.get('outcome') and isinstance(ref, str) \
+                and re.fullmatch(r'ANYM-[1-9][0-9]*', ref) and kinds.get(i.get('cluster')) == 'owner-agent':
+            out.setdefault(ref, set()).update(i['feedback'])
+    return {ref: sorted(ids) for ref, ids in out.items()
+            if ref not in held['cards'] and not ids & set(held['items'])
+            and not any(b['kind'] == 'build' and b['card'] == ref
+                        and (b['status'] not in RETRY or b.get('outcome') or b.get('pr')) for b in known)}
+
+
+def build_start(superset):
+    """The start of one build worker; its prompt holds the intent and the card ID only."""
+    return lambda intent: create(superset, intent, (
+        f"Read and follow {BRIEFS / 'common.md'} and {BUILD_BRIEF}. Intent: {intent['name']}. Card: {intent['card']}."))
+
+
+def launch_builds(state, triage_state, cfg, snap, now, superset, gh):
+    """One build worker per Ready card inside the envelope whose lane and expected paths no other live build intent,
+    open PR (any author) or pushed branch of a live workspace touches: {card: intent name or why it waits}."""
+    if not BUILD_BRIEF.is_file():
+        return {'*': 'no build brief template'}
+    out, prs, branches = {}, None, None
+    for ref, ids in build_cards(state, triage_state, cfg['principals']).items():
+        why = outside(snap, ref)
+        if why:
+            out[ref] = why
+            continue
+        fields = card_fields(next(s for s in snap['main'] if s['ref'] == ref))
+        mine = [fields['lane'], fields['paths']]
+        taken = next((n for n, (lane, paths) in claims(state).items() if (lane and lane == mine[0])
+                      or any(overlaps(a, b) for a in paths for b in mine[1])), None)
+        if taken is None:
+            prs = open_files(gh) if prs is None else prs
+            taken = next((f'open PR from {h}' for h, files in prs.items()
+                          if any(overlaps(a, b) for a in files for b in mine[1])), None)
+        if taken is None:
+            branches = branch_files(superset, gh) if branches is None else branches
+            taken = next((f'branch {b}' for b, files in branches.items()
+                          if any(overlaps(a, p) for a in files for p in mine[1])), None)
+        if taken:
+            out[ref] = 'paths reserved'
+            continue
+        intent, why = admit(state, cfg, 'build', ref, ids, now)
+        if intent:
+            intent.update(lane=mine[0], paths=mine[1])
+            put(state, intent)
+            try:
+                intent, why = launch(state, intent['name'], build_start(superset), now)
+            except (Refused, triage.Refused):
+                intent, why = None, 'start unknown'  # settled from the workspace list by `reconcile`, never retried
+        out[ref] = intent['name'] if intent else why
+    return out
+
+
+def verdict(state, name, head, report_path):
+    """A build worker records the verdict line of its latest review round and the exact head it reviewed; only the
+    latest one counts."""
+    intent = card_intent(state, name, ('build',))
+    if not SHA40.fullmatch(head or ''):
+        raise Refused('--head is a full 40-character commit SHA')
+    try:
+        found = VERDICT.findall(Path(report_path).read_text(errors='replace'))
+    except OSError as error:
+        raise Refused(f'report unreadable: {type(error).__name__}') from None
+    if not found:
+        raise Refused('no VERDICT line in the report')
+    word, blocking, major, minor = found[-1]
+    put(state, dict(intent, verdict={'head': head, 'verdict': word, 'blocking': int(blocking), 'major': int(major),
+                                     'minor': int(minor), 'report': str(report_path)}))
+    return word
+
+
+def diff_hits(files):
+    """(reason, path) for each way a PR's real diff leaves the envelope (review-protocol.md lists; renames and deletions
+    included)."""
+    hits = []
+    if len(files) >= MAX_FILES:
+        return [('diff too large', None)]
+    for f in files:
+        status, name, old = f.get('status'), f['filename'], f.get('previous_filename')
+        names = [name] + ([old] if isinstance(old, str) else [])
+        if status in ('removed', 'renamed'):
+            hits.append(('deleted file', old or name))  # `--no-renames`: a rename deletes its old name
+        hits += [('change-path signal', n) for n in names if SIGNAL_PATHS.search(n)]
+        hits += [('protected path', n) for n in names if PROTECTED.search(n)]
+        if status in ('modified', 'changed') and TEST_DIR.search(name):
+            hits.append(('changed test file', name))
+        if status in ('added', 'copied', 'renamed') and TEST_DIR.search(name) and CODE_FILE.search(name) \
+                and not TEST_FILE.search(name):
+            hits.append(('test helper', name))
+        patch = f.get('patch')
+        if not isinstance(patch, str):
+            if f.get('changes', 1) or status in ('added', 'removed'):
+                hits.append(('no patch', name))
+        elif any(SIGNAL_TEXT.search(row) for row in patch.splitlines() if not row.startswith(('+++', '---'))):
+            hits.append(('change-path signal', name))
+    return hits
+
+
+def pr_hits(intent, pr, snap):
+    """The reasons a loop PR's lines, card and review verdict leave the envelope, at the PR's exact head (fixed
+    wording, safe to print)."""
+    body, head, hits = str(pr.get('body') or ''), pr.get('headRefOid'), []
+    if pr.get('baseRefName') != 'main' or pr.get('isDraft'):
+        hits.append('base or draft')
+    if line_of(body, 'Autoloop') != intent['name']:
+        hits.append('Autoloop line')
+    if intent['card'] not in re.split(r'[,\s]+', line_of(body, 'Spec') or ''):
+        hits.append('Spec line')
+    path = line_of(body, 'Change path') or ''
+    if not re.match(r'AUTO(\+review)?\b', path) or 'OWNER' in path.upper():
+        hits.append('change path')
+    if (line_of(body, 'Tiden branch') or '').startswith('review/'):
+        hits.append('criterion edit')
+    why = outside(snap, intent['card'], merging=True)
+    if why:
+        hits.append(f'envelope: {why}')
+    seen = intent.get('verdict') or {}
+    if seen.get('head') != head:
+        hits.append('no verdict for this head')
+    elif seen.get('verdict') != 'APPROVE' or seen.get('blocking') or seen.get('major'):
+        hits.append('open blocking or major')
+    return hits
+
+
+def pr_of(prs, name):
+    """An intent's PR: its open one, else its latest."""
+    mine = [p for p in prs if p.get('headRefName') == name]
+    return next((p for p in mine if p.get('state') == 'OPEN'), None) or \
+        max(mine, key=lambda p: int(p.get('number') or 0), default=None)
+
+
+def disarm(gh, pr, failed):
+    try:
+        gh(['pr', 'merge', str(pr['number']), '-R', REPO, '--disable-auto'])
+    except (Refused, triage.Refused) as error:
+        failed.append(f"disarm #{pr['number']}: {error}")
+
+
+def search_merged(gh, since):
+    """Merged PRs of the repository with an `Autoloop:` line since `since`, read whole."""
+    query = ('query($q: String!) { search(query: $q, type: ISSUE, first: 100) { issueCount nodes { ... on PullRequest '
+             f'{{ {PR} }} }} }} }}')
+    q = f'repo:{REPO} is:pr is:merged "Autoloop:" in:body merged:>={since.date().isoformat()}'
+    reply = triage.parse(gh(['api', 'graphql', '-f', 'query=' + query, '-f', 'q=' + q]), 'gh api graphql search')
+    try:
+        found = reply['data']['search']
+        if found['issueCount'] > len(found['nodes']):
+            raise Refused('gh: more than 100 merged autoloop pull requests to audit')
+        return [p for p in found['nodes'] if (p.get('headRepository') or {}).get('nameWithOwner') == REPO]
+    except (KeyError, TypeError, AttributeError):
+        raise Refused('gh api graphql search: unexpected reply') from None
+
+
+def audit(state, prs, now):
+    """Every merged PR from a loop branch or with an `Autoloop:` line whose head the controller did not approve:
+    PAUSE (written once per PR, so the owner's resume holds) and an owner item with the revert command."""
+    approved, seen = triage.load(state / 'approved.json', {}), triage.load(state / 'audit.json', {'findings': {}})
+    new = []
+    for p in prs:
+        loop = str(p.get('headRefName') or '').startswith('autoloop-') or line_of(p.get('body'), 'Autoloop')
+        if p.get('state') == 'MERGED' and loop and p.get('headRefOid') not in approved \
+                and str(p['number']) not in seen['findings']:
+            sha = (p.get('mergeCommit') or {}).get('oid')
+            seen['findings'][str(p['number'])] = {
+                'head': p.get('headRefOid'), 'merge_sha': sha if SHA40.fullmatch(str(sha)) else None,
+                'at': triage.stamp(now)}
+            new.append(p['number'])
+    if new:
+        triage.save(state / 'audit.json', seen)
+        if not (state / 'PAUSE').exists():
+            triage.private_write(state / 'PAUSE', f"audit: merged without approval: PR #{', #'.join(map(str, new))} "
+                                                  f'at {triage.stamp(now)}\n')
+    return new
+
+
+def controller(state, cfg, snap, now, gh, prs):
+    """The controller merge, each tick: records each build's PR (number, state, head, merge SHA), parks a PR whose
+    worker is gone, and for a finished worker checks the PR at its exact head (diff, lines, envelope, verdict) and
+    arms `--match-head-commit` for that head only; a head that moved is disarmed and checked again; a mismatch parks
+    the PR. Returns {intent: what happened}."""
+    out, failed = {}, []
+    approved = triage.load(state / 'approved.json', {})
+    for name, i in intents(state).items():
+        pr = pr_of(prs, name) if i['kind'] == 'build' else None
+        if pr is None:
+            if i['kind'] == 'build' and i['status'] in ('lost', 'interrupted') and not i.get('parked') \
+                    and not i.get('pr'):
+                put(state, dict(i, parked='worker gone with no PR'))
+                out[name] = 'parked'
+            continue
+        sha = (pr.get('mergeCommit') or {}).get('oid')
+        record = {'pr': pr['number'], 'pr_state': pr.get('state'), 'head': pr.get('headRefOid')}
+        if pr.get('state') == 'MERGED' and SHA40.fullmatch(str(sha)):
+            record.update(merge_sha=sha, live=i.get('live', False))
+        if any(i.get(k) != v for k, v in record.items()):
+            i.update(record)
+            put(state, i)
+        if pr.get('state') != 'OPEN':
+            out[name] = pr.get('state', '').lower()
+            continue
+        head, armed = pr.get('headRefOid'), pr.get('autoMergeRequest')
+        mine = {sha for sha, a in approved.items() if a.get('pr') == pr['number']}
+        if armed and head not in mine and (mine or cfg['live']):
+            disarm(gh, pr, failed)  # a new push after the approval (checked again below), or armed by someone else
+            armed = None
+            if not mine and not i.get('parked'):
+                i = dict(i, parked='armed without approval')
+                put(state, i)
+        if i.get('parked') or i['status'] in LIVE or not cfg['live']:
+            out[name] = 'parked' if i.get('parked') else 'waiting'
+            continue
+        if i['status'] != 'finished' or i.get('outcome'):
+            put(state, dict(i, parked='worker gone' if i['status'] != 'finished' else 'worker ended without a build'))
+            out[name] = 'parked'
+            continue
+        if gate(state, name, ('finished',)):
+            out[name] = 'held'  # `withhold` disarms and closes it
+            continue
+        if armed:
+            out[name] = 'armed'
+            continue
+        try:
+            hits = [(why, None) for why in pr_hits(i, pr, snap)] or diff_hits(compare(gh, head)) \
+                if SHA40.fullmatch(str(head)) else [('no head', None)]
+        except (Refused, triage.Refused) as error:
+            failed.append(f'{name}: {error}')
+            continue
+        if hits:
+            put(state, dict(i, parked=hits[0][0], parked_head=head,
+                            parked_detail=[' '.join(filter(None, hit)) for hit in hits[:20]]))
+            out[name] = 'parked'
+            continue
+        approved[head] = {'pr': pr['number'], 'intent': name, 'at': triage.stamp(now)}
+        triage.save(state / 'approved.json', approved)  # first: a merge the audit sees is always one approved here
+        try:
+            gh(['pr', 'merge', str(pr['number']), '-R', REPO, '--squash', '--auto', '--match-head-commit', head])
+            out[name] = 'armed'
+        except (Refused, triage.Refused) as error:
+            failed.append(f"arm #{pr['number']}: {error}")
+    return out, failed
+
+
+def deployed(state, host, probe):
+    """Each merged build's `live` from one read-only receipt snapshot (receipt_watch's LIVE rule); a paused autodeploy
+    is recorded for the report, never handled. Returns 'live n', 'none', 'autodeploy paused' or 'unknown'."""
+    waiting = {n: i for n, i in intents(state).items() if i['kind'] == 'build' and i.get('merge_sha')
+               and i.get('live') is not True}
+    if not waiting:
+        return 'none'
+    try:
+        snapshot = probe(host)
+    except (ValueError, OSError):
+        return 'unknown'
+    if not receipt_watch.valid(snapshot) or snapshot == {'unstable': True}:
+        return 'unknown'
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=120)
+    paused, count = bool((snapshot.get('pause') or {}).get('present')), 0
+    for i in waiting.values():
+        seen = receipt_watch.Watch(i['merge_sha'], ROOT,
+                                   lambda: (deadline - datetime.now(timezone.utc)).total_seconds()).verdict(snapshot)
+        live = bool(seen and seen[0] == 'LIVE')
+        count += live
+        if live != i.get('live') or i.get('autodeploy_paused') != paused:
+            put(state, dict(i, live=live, autodeploy_paused=paused and not live))
+    return 'autodeploy paused' if paused else f'live {count}'
+
+
+def builds(state, triage_state, cfg, snap, now, superset, gh, probe, host):
+    """The build stage of a tick: audit first (an unapproved merge pauses before anything is armed), then the
+    controller, then new launches (live only), then the deploy read. Returns the plan's `builds` entry and what
+    failed."""
+    known = {n: i for n, i in intents(state).items() if i['kind'] == 'build'}
+    if not known and not cfg['live']:
+        return {}, []
+    prs = pulls(known, gh) if known else []
+    mark = triage.load(state / 'audit.json', {'findings': {}})
+    since = triage.when(mark['at']) if mark.get('at') else \
+        min([triage.when(i['created_at']) for i in known.values()] or [now])
+    prs_all = prs + [p for p in search_merged(gh, since - timedelta(days=1)) if p not in prs]
+    paused = audit(state, prs_all, now)
+    triage.save(state / 'audit.json', dict(triage.load(state / 'audit.json', {'findings': {}}), at=triage.stamp(now)))
+    if paused:
+        return {'audit': paused}, []
+    done, failed = controller(state, cfg, snap, now, gh, prs)
+    launched = launch_builds(state, triage_state, cfg, snap, now, superset, gh) if cfg['live'] else {}
+    return {'prs': done, 'launched': launched, 'deploy': deployed(state, host, probe)}, failed
 
 
 # --- the daily report (ANYM-573) ---------------------------------------------------------------------------------
@@ -1023,6 +1476,16 @@ def plain(note):
     if note.startswith('answered, no change needed'):
         return 'answered, no change needed'
     return note if note in (*REASONS.values(), WITHDRAWN, PAUSED, LARGE, 'autoloop control') else '(other note)'
+
+
+def plain_park(reason):
+    """A park reason as the report may print it: the controller's fixed wording only, never a path."""
+    reason = str(reason or '')
+    fixed = ('worker gone', 'worker ended without a build', 'worker gone with no PR', 'base or draft', 'Autoloop line',
+             'Spec line', 'change path', 'criterion edit', 'no verdict for this head', 'open blocking or major',
+             'diff too large', 'deleted file', 'change-path signal', 'protected path', 'changed test file',
+             'test helper', 'no patch', 'no head', 'armed without approval')
+    return reason if reason in fixed or re.fullmatch(r'envelope: [a-zA-Z0-9 ]+', reason) else 'другая причина'
 
 
 def day_of(text, zone):
@@ -1099,6 +1562,19 @@ def report_text(state, triage_state, cfg, day):
         if i['status'] in RETRY and not i.get('outcome') and len(mine) > 1 \
                 and all(j['created_at'] <= i['created_at'] for j in mine):
             queue.append(f"- {name}: перезапуск израсходован ({i['status']}), нужен оркестратор")
+        if i.get('parked') and i.get('pr_state') not in ('MERGED', 'CLOSED'):
+            pr = i.get('pr') if type(i.get('pr')) is int else None
+            queue.append(f"- {name}: остановлен ({plain_park(i['parked'])})" + (f', PR #{pr}' if pr else '')
+                         + ', нужен оркестратор')
+        if i.get('autodeploy_paused') and i.get('live') is not True and SHA40.fullmatch(str(i.get('merge_sha'))):
+            queue.append(f"- {name}: слит {i['merge_sha'][:12]}, автодеплой на паузе — снимает владелец "
+                         '(docs/operations/production.md); цикл паузу не трогает')
+    for number, found in sorted((triage.load(state / 'audit.json', {}).get('findings') or {}).items()):
+        sha = found.get('merge_sha') if SHA40.fullmatch(str(found.get('merge_sha'))) else None
+        if str(number).isdigit() and day_of(found.get('at'), zone) == day:
+            owner.append(f'- PR #{number} слит без одобрения контроллера, цикл на паузе: откатить '
+                         + (f'`git revert {sha}` через PR' if sha else 'его слияние через PR')
+                         + f' и поставить автодеплой на паузу `{PAUSE_DEPLOY}`?')
     last, bad = effective(triage_state, zone, day, dropped)
     for i, (status, note, spec_ref) in sorted(last.items()):
         if note.startswith('waits for the owner: '):
@@ -1194,7 +1670,7 @@ def heartbeat(state, now, outcome):
 
 
 def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=None, runner=run_reader, superset=None,
-         gh=None, host=triage.HOST):
+         gh=None, host=triage.HOST, probe=None):
     """One hourly run: (exit code, one line of IDs, counts and statuses; never feedback text)."""
     now = now or datetime.now(timezone.utc)
     superset, gh = superset or superset_cli, gh or gh_cli
@@ -1246,26 +1722,32 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
             triage.save(state / 'ledger.json', ledger)
             count, _ = read(state, triage_state, runner, chosen)
             reader = 'ran'
+        try:  # the build stage (ANYM-572): a failed read there leaves the card stage and the reader as they are
+            built, failed = builds(state, triage_state, cfg, snap, now, superset, gh, probe or receipt_watch.probe,
+                                   host)
+        except (Refused, triage.Refused) as error:
+            built, failed = {}, [f'build stage: {error}']
         cards = launch_cards(state, triage_state, cfg, now, superset) if cfg['live'] else {}
         if cfg['live'] and over:
             next_day = (now.astimezone(cfg['zone']).date() + timedelta(days=1)).isoformat()
             notify(state, triage_state, {i: ('received', OVER_CAP.format(next_day)) for i in over}, now)
         plan = {'at': triage.stamp(now), 'live': cfg['live'], 'pulled': fresh, 'reader': reader, 'read': count,
-                'dropped': sorted(drops), 'withheld': withheld, 'cards': cards, 'waiting': [] if count else chosen,
+                'dropped': sorted(drops), 'withheld': withheld, 'cards': cards, 'builds': built,
+                'build_failed': failed, 'waiting': [] if count else chosen,
                 'over_cap': over,
                 'today': today, 'clusters': provenance(triage.load(triage_state / 'ledger.json', {}), cfg['principals']),
                 'intents': {name: i['status'] for name, i in intents(state).items()}}
         triage.save(state / 'plan.json', plan)
-        if not withheld:  # a withhold not done is no good tick: `status` reports it and the last good time stays
+        if not withheld and not failed:  # a withhold or build step not done is no good tick: `status` reports it
             heartbeat(state, now, 'live' if cfg['live'] else 'plan')
             try:
                 report(state, triage_state, now)
             except (Refused, triage.Refused, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
                 # The tick's work stands; `status` exits 1 until a report is written again.
                 triage.save(state / 'report.json', dict(marker(state), ok=False, error=type(error).__name__))
-        return 1 if withheld else 0, (
+        return 1 if withheld or failed else 0, (
             f"tick {'live' if cfg['live'] else 'plan only'}: pulled {fresh}, read {count}, over cap {len(over)}, "
-            f"dropped {len(drops)}, withhold not done {len(withheld)}, "
+            f"dropped {len(drops)}, withhold not done {len(withheld)}, build steps failed {len(failed)}, "
             f"card workers {sum(v in intents(state) for v in cards.values())}; "
             f"reader {reader}; plan {state / 'plan.json'}")
 
@@ -1283,6 +1765,8 @@ def status(state, now):
         problems.append('the daily report failed (report.json)')
     if not paused and (triage.load(state / 'plan.json', None) or {}).get('withheld'):
         problems.append('a hold or drop is not withheld yet (plan.json withheld)')
+    if not paused and (triage.load(state / 'plan.json', None) or {}).get('build_failed'):
+        problems.append('a build step failed (plan.json build_failed)')
     line = f"last tick {last['at'] if last else 'never'} ({last['outcome'] if last else '-'}); " + \
         ('paused' if paused else 'running')
     return (1, line + '; ' + '; '.join(problems)) if problems else (0, line)
@@ -1291,11 +1775,13 @@ def status(state, now):
 def main(argv_=None):
     parser = argparse.ArgumentParser(description='Feedback autoloop driver (docs/operations/feedback-autoloop.md).')
     parser.add_argument('action', choices=['tick', 'fence', 'resume', 'status', 'gate', 'finish', 'hold', 'release', 'read',
-                                           'decline', 'large', 'bind', 'report'])
+                                           'decline', 'large', 'bind', 'report', 'verdict'])
     parser.add_argument('name', nargs='?',
-                        help='the intent (gate, finish, decline, large, bind) or the card (hold, release)')
+                        help='the intent (gate, finish, decline, large, bind, verdict) or the card (hold, release)')
     parser.add_argument('--reason', choices=sorted(DECLINED), help='decline: the reason code of the review reject')
     parser.add_argument('--card', help='bind: the card ANYM-n the worker created')
+    parser.add_argument('--head', help='verdict: the exact commit the review round read')
+    parser.add_argument('--report', type=Path, help='verdict: the review report with its VERDICT line')
     parser.add_argument('--state', type=Path, default=Path(os.environ.get('AUTOLOOP_STATE', STATE)))
     parser.add_argument('--triage-state', type=Path,
                         default=Path(os.environ.get('FEEDBACK_TRIAGE_STATE', triage.STATE)))
@@ -1306,6 +1792,9 @@ def main(argv_=None):
         parser.error('--reason goes with decline only, and decline needs it')
     if (args.card is None) == (args.action == 'bind'):
         parser.error('--card goes with bind only, and bind needs it')
+    if (args.head is None or args.report is None) == (args.action == 'verdict') \
+            or (args.head is None) != (args.report is None):
+        parser.error('--head and --report go with verdict only, and verdict needs both')
     now = datetime.now(timezone.utc)
     try:
         if args.action == 'tick':
@@ -1345,6 +1834,9 @@ def main(argv_=None):
         with own_lock(args.state):
             if args.action == 'finish':
                 print(f'finished; {finish(args.state, args.name, now)} s returned')
+            elif args.action == 'verdict':
+                word = verdict(args.state, args.name, args.head, args.report)
+                print(f'verdict: {args.name} {word} at {str(args.head)[:12]}')
             elif args.action == 'bind':
                 bind(args.state, args.name, args.card)
                 print(f'bound: {args.name} {args.card}')
