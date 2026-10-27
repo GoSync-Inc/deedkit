@@ -1886,8 +1886,9 @@ def profile_tools(config: dict, run, docker, host_factory, args) -> dict:
         for gateway in found["policy"]:
             policy_read(config, gateway)
         current = profile_of(policy, name)
-        # A rerun keeps the plan of the first run: its tools may already be listed since.
-        plan = journal.data.get("plan") or {"before": list(current["tools"]),
+        # A rerun keeps the plan of the first run (its tools may already be listed since) and the digest of the profile
+        # that plan was made from: the first write, even a resumed one, refuses a profile changed after it.
+        plan = journal.data.get("plan") or {"digest": entry_digest(current), "before": list(current["tools"]),
                                             "added": [tool for tool in add if tool not in current["tools"]],
                                             "removed": [tool for tool in remove if tool in current["tools"]]}
         users = [{"principal": row.get("id"), "enabled": row.get("enabled") is True}
@@ -1898,10 +1899,10 @@ def profile_tools(config: dict, run, docker, host_factory, args) -> dict:
                     "already_listed": [tool for tool in add if tool not in plan["added"]],
                     "not_listed": [tool for tool in remove if tool not in plan["removed"]]}
         images = rollback_images(host)
+        # Rules (c) and (h) before the journal: the live document in every image, then the candidate itself.
+        preflight(config, docker, policy, "policy", found["policy"], images)
         candidate = retooled(current, add, remove)
-        if candidate == current:  # nothing to write (or a rerun whose rename already happened): the live copy
-            preflight(config, docker, policy, "policy", found["policy"], images)
-        else:  # rules (c) and (h) on the candidate itself, before the journal: every image must accept the new list
+        if candidate != current:
             text = (json.dumps(policy.with_profile(name, candidate), ensure_ascii=False, indent=2) + "\n").encode()
             with staged(policy.path, text) as staging:
                 validate(config, docker, "policy", staging, found["policy"], images, "nothing changed")
@@ -1910,7 +1911,8 @@ def profile_tools(config: dict, run, docker, host_factory, args) -> dict:
                             "plan": plan, "steps": {}})
         try:
             swap_profile(config, docker, journal, "gateway policy", name,
-                         lambda profile: retooled(profile, add, remove), found["policy"], images)
+                         lambda profile: retooled(profile, add, remove), found["policy"], images,
+                         expect=plan["digest"])
             data = journal.data
             data["result"] = {"operation": data["operation"], "profile": name, "added": plan["added"],
                               "removed": plan["removed"], "principals": users,
@@ -1937,13 +1939,17 @@ def undo_profile(config: dict, docker, host_factory, journal: Journal) -> dict:
     with guarded(config, host, docker):
         policy = Document(config["policy"], "gateway policy")
         found = consumers(running(docker), config["policy"], "gateway policy")
+        for gateway in found:  # the file the gateways enforce, as on the way forward
+            policy_read(config, gateway)
         images, step = rollback_images(host), data["steps"].get("gateway policy", {})
+        undo_step = data["steps"].get("undo gateway policy")
         current = entry_digest(profile_of(policy, name))
-        done = data["steps"].get("undo gateway policy", {}).get("entry")
-        needed = bool(step.get("changed")) and current not in (step["before"], done)
-        if needed and current != step["entry"]:
+        # Nothing to restore when the change never renamed, or the profile already is its starting list; an undo step
+        # that exists (an interrupted undo) is finished and its recorded outcome reported.
+        needed = bool(step.get("changed")) and (undo_step is not None or current != step["before"])
+        if needed and undo_step is None and current != step["entry"]:
             raise AdminError(f"the gateway profile {name!r} changed since this operation wrote it; nothing changed")
-        if needed:
+        if needed and (undo_step is None or current == undo_step["before"]):
             preflight(config, docker, policy, "policy", found, images)
         data["state"] = "undoing"
         journal.save()
@@ -1956,9 +1962,10 @@ def undo_profile(config: dict, docker, host_factory, journal: Journal) -> dict:
             reason = str(exc) if isinstance(exc, AdminError) else type(exc).__name__
             raise Stopped(f"undo of {data['operation']} stopped: {reason}; run `deedkit admin undo "
                           f"{data['operation']}` again") from None
+        restored = bool(data["steps"].get("undo gateway policy", {}).get("changed"))
         data["state"] = "undone"
-        data["undo"] = {"restored": needed, "added_back": data["plan"]["removed"] if needed else [],
-                        "taken_out": data["plan"]["added"] if needed else []}
+        data["undo"] = {"restored": restored, "added_back": data["plan"]["removed"] if restored else [],
+                        "taken_out": data["plan"]["added"] if restored else []}
         journal.save()
     return {**result, **data["undo"]}
 

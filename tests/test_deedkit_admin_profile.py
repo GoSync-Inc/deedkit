@@ -187,3 +187,56 @@ def test_a_rerun_with_other_arguments_is_refused(site, capsys, monkeypatch):
     (path,) = (site.root / "ops").glob("*.json")
     code, _, err = tools(site, capsys, "--add", MUTE, "--operation", path.stem)
     assert code == 2 and "started with other arguments" in err, err
+
+
+# spec: ANYM-493
+def test_a_resumed_operation_never_writes_over_a_profile_changed_after_its_plan(site, capsys, monkeypatch):
+    original = admin.Journal.create
+
+    def crash_after_create(journal, data):
+        original(journal, data)
+        raise Crash()
+    with monkeypatch.context() as patch:
+        patch.setattr(admin.Journal, "create", crash_after_create)
+        with pytest.raises(Crash):
+            site.main("profile", "tools", "reader", "--add", RESTORE)
+    (path,) = (site.root / "ops").glob("*.json")
+    assert tools(site, capsys, "--remove", "messages_dismiss_reply")[0] == 0  # a second operation, after the plan
+    code, _, err = tools(site, capsys, "--add", RESTORE, "--operation", path.stem)
+    assert code == 1 and "changed since this operation read it" in err, err
+    assert site.policy()["profiles"]["reader"]["tools"] == ["platform_capabilities", "messages_capabilities"]
+
+
+# spec: ANYM-493
+def test_undo_refuses_a_gateway_that_enforces_another_policy_file(site, capsys):
+    code, result, err = tools(site, capsys, "--add", RESTORE)
+    assert code == 0, err
+    site.gateway["Config"]["Cmd"] = ["--policy", "/etc/deedkit-gateway/active.json", "--port", "13240"]
+    before = site.snapshot()
+    code, _, err = call(site, capsys, "undo", result["operation"])
+    assert code == 2 and "not the configured policy" in err, err
+    assert site.snapshot() == before
+
+
+# spec: ANYM-493
+def test_profile_tools_checks_the_live_policy_in_every_image_before_the_candidate(site, capsys):
+    # The rollback image rejects the policy as it is now (it lists platform_capabilities) but would accept its removal.
+    site.docker.images["gateway:old"] = lambda path: "platform_capabilities" not in json.loads(
+        path.read_text())["profiles"]["reader"]["tools"]
+    unchanged(site, capsys, "refused by image gateway:old", "--remove", "platform_capabilities")
+
+
+# spec: ANYM-493
+def test_an_interrupted_undo_is_finished_and_reports_what_it_restored(site, capsys, monkeypatch):
+    code, result, err = tools(site, capsys, "--add", RESTORE)
+    assert code == 0, err
+    monkeypatch.setattr(admin, "checkpoint", lambda step, phase: (_ for _ in ()).throw(Crash())
+                        if (step, phase) == ("undo gateway policy", "renamed") else None)
+    with pytest.raises(Crash):
+        site.main("undo", result["operation"])
+    monkeypatch.setattr(admin, "checkpoint", lambda step, phase: None)
+    code, undone, err = call(site, capsys, "undo", result["operation"])
+    assert code == 0, err
+    assert site.policy()["profiles"]["reader"]["tools"] == BASE
+    assert undone["restored"] and undone["taken_out"] == [RESTORE]
+    assert site.journal(result["operation"])["steps"]["undo gateway policy"]["state"] == "done"

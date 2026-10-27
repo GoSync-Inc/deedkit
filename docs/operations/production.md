@@ -1272,10 +1272,12 @@ policy is checked, before any journal, in the image of every running gateway and
 predates the tool clears once a deploy makes the current image the rollback one); a gateway that enforces another
 policy file refuses; the rename is a compare-and-swap on the bytes read under the locks and raises `revision` by one;
 (e) the journal keeps the profile's tool list before the change, the added and removed names, and the step digests.
-A stopped run is finished with `--operation`; the plan of the first run is kept.
+A stopped run is finished with `--operation`; the plan of the first run is kept with the digest of the profile it
+was made from, and even the first write of a resumed run refuses a profile changed since.
 
 `deedkit admin undo <op-id>` sets the profile back to the tool list it started from, only while the profile is still
-exactly what this operation wrote; a later change by anyone refuses it (`changed since this operation wrote it`).
+exactly what this operation wrote; a later change by anyone refuses it (`changed since this operation wrote it`), and
+it refuses a gateway that enforces another policy file like the change does. An interrupted undo is run again.
 The undo is a new revision, never an older one. No backend store, key or token is touched.
 
 Optional configuration keys, with the defaults above: `tool`, `journal`, `tokens`, `calls_lock`,
