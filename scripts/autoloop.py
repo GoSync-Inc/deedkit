@@ -9,7 +9,7 @@ reader (ANYM-570).
     autoloop.py report [--state DIR] [--triage-state DIR]
     autoloop.py hold|release CARD [--state DIR]
     autoloop.py read [--state DIR] [--triage-state DIR]
-    autoloop.py review-run INTENT --head SHA [--state DIR]
+    autoloop.py review-run INTENT --head SHA --attempt ID [--state DIR]
 
 `tick` takes the triage lock, the feedback-sync lock and its own, non-blocking in that order, and ends as busy with
 no write if one is held. With `PAUSE` it only fences: it closes the terminals of the loop's own workspaces (names
@@ -72,6 +72,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -1271,13 +1272,14 @@ def launch_builds(state, triage_state, cfg, snap, now, superset, gh):
     return out
 
 
-def review_paths(state, name, head):
-    """The controller's review files of one head: one directory per build intent, so review-codex.sh counts the
-    rounds of that build across its heads."""
-    base = state / REVIEWS / name
-    return {'dir': base, 'task': base / f'task-{head[:12]}.md', 'report': base / f'report-{head[:12]}.md',
-            'result': base / f'result-{head[:12]}.json', 'log': base / f'run-{head[:12]}.log',
-            'checkout': base / f'checkout-{head[:12]}'}
+def review_paths(state, name, head, attempt):
+    """The controller's review files of one attempt at one head: one directory per build intent, so review-codex.sh
+    counts the rounds of that build across its heads; each attempt (a new head, a changed card, a restart) has its own
+    task, report, result and checkout, so a superseded run can never write the current attempt's result."""
+    base, key = state / REVIEWS / name, f'{head[:12]}-{attempt}'
+    return {'dir': base, 'task': base / f'task-{key}.md', 'report': base / f'report-{key}.md',
+            'result': base / f'result-{key}.json', 'log': base / f'run-{key}.log',
+            'checkout': base / f'checkout-{key}'}
 
 
 def review_task(intent, pr, head, spec):
@@ -1289,13 +1291,15 @@ def review_task(intent, pr, head, spec):
 
 
 def spawn_review(state, name, head):
-    """Starts `autoloop.py review-run` detached, so it outlives the tick; the tick only reads its result file."""
-    paths = review_paths(state, name, head)
+    """Starts `autoloop.py review-run` detached for the attempt the tick just recorded, so it outlives the tick; the
+    tick only reads that attempt's result file."""
+    attempt = intents(state)[name]['review']['attempt']
+    paths = review_paths(state, name, head, attempt)
     fd = os.open(paths['log'], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'review-run', name, '--head', head,
-                          '--state', str(state)], cwd=ROOT, stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
-                         start_new_session=True)
+                          '--attempt', attempt, '--state', str(state)], cwd=ROOT, stdin=subprocess.DEVNULL,
+                         stdout=fd, stderr=fd, start_new_session=True)
     finally:
         os.close(fd)
 
@@ -1319,15 +1323,18 @@ def review_cli(argv):
         return 3
 
 
-def review_run(state, name, head, git=None, run=None):
+def review_run(state, name, head, attempt, git=None, run=None):
     """The controller's review of one head, run detached from the tick: the PR's ref is fetched from GitHub and must
     be exactly `head`; a clean detached worktree of it gets review-codex.sh with the controller's task; the last
-    VERDICT line of the report goes to the result file. The worker hands in nothing that is used here."""
+    VERDICT line of the report goes to the attempt's result file with the head, the attempt and the card digest of
+    the task it reviewed. The worker hands in nothing that is used here."""
     git, run = git or git_cli, run or review_cli
     record = (intents(state).get(name) or {}).get('review') or {}
-    if not SHA40.fullmatch(head or '') or record.get('head') != head:
+    if not SHA40.fullmatch(head or '') or record.get('head') != head or not ATTEMPT.fullmatch(attempt or '') \
+            or record.get('attempt') != attempt:
         raise Refused('no controller review was started for this head')
-    paths, outcome = review_paths(state, name, head), {'head': head}
+    paths = review_paths(state, name, head, attempt)
+    outcome = {'head': head, 'attempt': attempt, 'card': record.get('card')}
     try:
         git(['fetch', '--no-tags', 'origin', 'main'])
         git(['fetch', '--no-tags', 'origin', f"refs/pull/{int(record['pr'])}/head"])
@@ -1355,21 +1362,20 @@ def review_of(state, name, intent, pr, head, spec, now, review, failed):
     """The controller's review of `head`: 'approve', 'reviewing', 'waiting' or a park reason. A new head starts a
     new review (the task first, then the record, then the detached run); a result for another head is never used."""
     record = intent.get('review') or {}
-    paths = review_paths(state, name, head)
-    if record.get('head') != head or record.get('card') != card_digest(spec):
+    if record.get('head') != head or record.get('card') != card_digest(spec) or not record.get('attempt'):
+        attempt = secrets.token_hex(4)  # a new head, a changed card or a restart: files of its own
+        paths = review_paths(state, name, head, attempt)
         paths['dir'].mkdir(mode=0o700, parents=True, exist_ok=True)
-        for old in ('result', 'task'):  # a restart (Codex line, changed card) writes its task again
-            paths[old].unlink(missing_ok=True)
         triage.private_write(paths['task'], review_task(intent, pr, head, spec))
         put(state, dict(intent, review={'head': head, 'pr': pr['number'], 'card': card_digest(spec),
-                                        'started_at': triage.stamp(now)}))
+                                        'attempt': attempt, 'started_at': triage.stamp(now)}))
         try:
             review(state, name, head)
         except (OSError, Refused, triage.Refused) as error:
             failed.append(f'review {name}: {type(error).__name__}')  # no result: parked as lost after the limit
         return 'reviewing'
-    result = triage.load(paths['result'], None)
-    if not isinstance(result, dict) or result.get('head') != head:
+    result = triage.load(review_paths(state, name, head, record['attempt'])['result'], None)
+    if not isinstance(result, dict) or any(result.get(key) != record[key] for key in ('head', 'attempt', 'card')):
         late = now - triage.when(record['started_at']) > timedelta(minutes=REVIEW_MINUTES + 30)
         return 'review lost' if late else 'reviewing'
     if result.get('exit') in (6, 8):  # over the Codex line or another review of the packet runs: start again later
@@ -1679,6 +1685,7 @@ QUESTIONS = {'opt-in': 'включить уже готовую функцию {r
              'owner path': 'смержить PR по карточке {ref} (путь OWNER)?', 'epic': 'взять эпик {ref} в работу?'}
 SPEC_REF = re.compile(r'ANYM-[1-9][0-9]{0,5}')
 SHA40 = re.compile(r'[0-9a-f]{40}')
+ATTEMPT = re.compile(r'[0-9a-f]{8}')
 REPORT_DAYS = 7  # at most this many days back are rebuilt after a gap
 
 
@@ -1999,6 +2006,7 @@ def main(argv_=None):
     parser.add_argument('--reason', choices=sorted(DECLINED), help='decline: the reason code of the review reject')
     parser.add_argument('--card', help='bind: the card ANYM-n the worker created')
     parser.add_argument('--head', help='review-run: the exact commit the controller reviews')
+    parser.add_argument('--attempt', help='review-run: the review attempt the tick recorded for that head')
     parser.add_argument('--state', type=Path, default=Path(os.environ.get('AUTOLOOP_STATE', STATE)))
     parser.add_argument('--triage-state', type=Path,
                         default=Path(os.environ.get('FEEDBACK_TRIAGE_STATE', triage.STATE)))
@@ -2009,8 +2017,8 @@ def main(argv_=None):
         parser.error('--reason goes with decline only, and decline needs it')
     if (args.card is None) == (args.action == 'bind'):
         parser.error('--card goes with bind only, and bind needs it')
-    if (args.head is None) == (args.action == 'review-run'):
-        parser.error('--head goes with review-run only, and review-run needs it')
+    if (args.head is None) == (args.action == 'review-run') or (args.attempt is None) == (args.action == 'review-run'):
+        parser.error('--head and --attempt go with review-run only, and review-run needs both')
     now = datetime.now(timezone.utc)
     try:
         if args.action == 'tick':
@@ -2048,7 +2056,7 @@ def main(argv_=None):
                 print(f'read {count} decisions; report {written}' if written else 'inbox empty')
             return 0
         if args.action == 'review-run':  # detached from the tick for up to an hour: it holds no lock
-            outcome = review_run(args.state, args.name, args.head)
+            outcome = review_run(args.state, args.name, args.head, args.attempt)
             print(f"review {args.name} {str(args.head)[:12]}: {outcome.get('verdict') or outcome.get('error')}")
             return 0
         with own_lock(args.state):

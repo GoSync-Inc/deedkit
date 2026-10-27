@@ -1441,12 +1441,18 @@ def finished_build(a, status='finished'):
 
 def reviewed(a, head=H1, word='APPROVE', blocking=0, major=0, code=0, at=NOW):
     """The controller's own review of `head` has run and left its result."""
+    card = autoloop.card_digest(ready(30))
     autoloop.put(a, dict(autoloop.intents(a)[BUILD], review={'head': head, 'pr': 7, 'started_at': triage.stamp(at),
-                                                             'card': autoloop.card_digest(ready(30))}))
-    paths = autoloop.review_paths(a, BUILD, head)
+                                                             'card': card, 'attempt': 'a1b2c3d4'}))
+    paths = autoloop.review_paths(a, BUILD, head, 'a1b2c3d4')
     paths['dir'].mkdir(parents=True, exist_ok=True)
-    triage.save(paths['result'], {'head': head, 'exit': code, **({'verdict': {
+    triage.save(paths['result'], {'head': head, 'attempt': 'a1b2c3d4', 'card': card, 'exit': code, **({'verdict': {
         'verdict': word, 'blocking': blocking, 'major': major, 'minor': 0}} if code == 0 else {})})
+
+
+def review_files(a, head=H1):
+    """The files of the review attempt the controller recorded last."""
+    return autoloop.review_paths(a, BUILD, head, autoloop.intents(a)[BUILD]['review']['attempt'])
 
 
 def enqueued(fakes):
@@ -1617,7 +1623,7 @@ def test_a_clean_pr_is_armed_for_its_exact_head_and_a_new_push_is_disarmed_and_c
         {BUILD: 'waiting'}  # live: false reviews and arms nothing
     # The controller starts its own review of the exact head; the task is its own text, the card as data.
     assert tick() == {BUILD: 'reviewing'} and started == [(a, BUILD, H1)]
-    task = autoloop.review_paths(a, BUILD, H1)['task'].read_text()
+    task = review_files(a)['task'].read_text()
     assert f'PR #7 at exactly head {H1}' in task and 'Expected paths: services/messaging/groups.py' in task
     assert tick(NOW + timedelta(minutes=30)) == {BUILD: 'reviewing'} and len(started) == 1
     reviewed(a)
@@ -1671,7 +1677,7 @@ def test_a_card_changed_on_main_under_an_armed_head_dequeues_it_and_starts_a_new
     changed = ready(30, CARD_TEXT.replace('names stay after a rename', 'names stay and the old one is kept'))
     assert tick(changed) == ({BUILD: 'reviewing'}, []) and fakes.prs[0]['mergeQueueEntry'] is None
     assert started == [(a, BUILD, H1)] and 'the old one is kept' in \
-        autoloop.review_paths(a, BUILD, H1)['task'].read_text()
+        review_files(a)['task'].read_text()
 
 
 # spec: ANYM-572
@@ -1796,10 +1802,12 @@ def test_the_controller_reviews_the_exact_head_itself_in_a_clean_worktree_and_ta
     finished_build(a)
     with pytest.raises(SystemExit):
         autoloop.main(['verdict', BUILD, '--head', H1, '--report', str(tmp_path / 'r.md'), '--state', str(a)])
-    assert autoloop.main(['review-run', BUILD, '--head', H1, '--state', str(a)]) == 1  # no review was started
-    assert 'no controller review' in capsys.readouterr().err
-    autoloop.put(a, dict(autoloop.intents(a)[BUILD], review={'head': H1, 'pr': 7, 'started_at': triage.stamp(NOW)}))
-    paths = autoloop.review_paths(a, BUILD, H1)
+    assert autoloop.main(['review-run', BUILD, '--head', H1, '--attempt', 'a1b2c3d4', '--state', str(a)]) == 1
+    assert 'no controller review' in capsys.readouterr().err  # no review was started
+    card = autoloop.card_digest(ready(30))
+    autoloop.put(a, dict(autoloop.intents(a)[BUILD], review={'head': H1, 'pr': 7, 'started_at': triage.stamp(NOW),
+                                                             'card': card, 'attempt': 'a1b2c3d4'}))
+    paths = autoloop.review_paths(a, BUILD, H1, 'a1b2c3d4')
     paths['dir'].mkdir(parents=True)
     calls, runs, fetched = [], [], {'head': H1}
 
@@ -1812,8 +1820,9 @@ def test_the_controller_reviews_the_exact_head_itself_in_a_clean_worktree_and_ta
         Path(argv[3]).write_text('VERDICT: CHANGES REQUIRED — 1 blocking, 0 major, 0 minor — r1\n'
                                  'VERDICT: APPROVE — 0 blocking, 0 major, 2 minor — r1\n')
         return 0
-    got = autoloop.review_run(a, BUILD, H1, git, run)
-    assert got == {'head': H1, 'exit': 0, 'verdict': {'verdict': 'APPROVE', 'blocking': 0, 'major': 0, 'minor': 2}}
+    got = autoloop.review_run(a, BUILD, H1, 'a1b2c3d4', git, run)
+    assert got == {'head': H1, 'attempt': 'a1b2c3d4', 'card': card, 'exit': 0,
+                   'verdict': {'verdict': 'APPROVE', 'blocking': 0, 'major': 0, 'minor': 2}}
     assert calls == [['fetch', '--no-tags', 'origin', 'main'], ['fetch', '--no-tags', 'origin', 'refs/pull/7/head'],
                      ['rev-parse', 'FETCH_HEAD^{commit}'],
                      ['worktree', 'add', '--detach', str(paths['checkout']), H1],
@@ -1823,20 +1832,56 @@ def test_the_controller_reviews_the_exact_head_itself_in_a_clean_worktree_and_ta
     assert triage.load(paths['result'], {}) == got
     # The PR moved on GitHub: no review runs, and the result carries no verdict.
     fetched['head'] = H2
-    assert autoloop.review_run(a, BUILD, H1, git, run) == {'head': H1, 'error': 'head moved'} and len(runs) == 1
-    # Over the Codex line: the controller starts the review again on a later tick, its task written again.
-    record = dict(autoloop.intents(a)[BUILD]['review'], card=autoloop.card_digest(ready(30)))
-    autoloop.put(a, dict(autoloop.intents(a)[BUILD], review=record))
+    assert autoloop.review_run(a, BUILD, H1, 'a1b2c3d4', git, run) == \
+        {'head': H1, 'attempt': 'a1b2c3d4', 'card': card, 'error': 'head moved'} and len(runs) == 1
+    # Over the Codex line: the controller starts the review again on a later tick, with a task of its own.
     paths['task'].write_text('the first launch\n')
-    triage.save(paths['result'], {'head': H1, 'exit': 6})
+    triage.save(paths['result'], {'head': H1, 'attempt': 'a1b2c3d4', 'card': card, 'exit': 6})
     fakes = Fakes(open_prs=[build_pr()])
     fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified')]}
     started = []
     tick = lambda: autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs,  # noqa: E731
                                        lambda *args: started.append(args))[0]
     assert tick() == {BUILD: 'waiting'} and autoloop.intents(a)[BUILD]['review'] is None
-    assert tick() == {BUILD: 'reviewing'} and started == [(a, BUILD, H1)] and not paths['result'].exists()
-    assert f'at exactly head {H1}' in paths['task'].read_text()
+    assert tick() == {BUILD: 'reviewing'} and started == [(a, BUILD, H1)]
+    again = review_files(a)
+    assert again['task'] != paths['task'] and not again['result'].exists()
+    assert f'at exactly head {H1}' in again['task'].read_text()
+
+
+# spec: ANYM-572
+def test_a_review_that_finishes_after_its_card_changed_approves_nothing(tmp_path):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    fakes = Fakes(open_prs=[build_pr()])
+    fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified')]}
+    started = []
+    changed = ready(30, CARD_TEXT.replace('names stay after a rename', 'names stay and the old one is kept'))
+
+    def tick(card):
+        return autoloop.controller(a, cfg(), snap(card), NOW, fakes.gh, fakes.prs,
+                                   lambda *args: started.append(args))[0]
+    assert tick(ready(30)) == {BUILD: 'reviewing'}
+    first = dict(autoloop.intents(a)[BUILD]['review'])
+    old = autoloop.review_paths(a, BUILD, H1, first['attempt'])
+
+    def run(argv):  # the card changes on Tiden main while the first review still runs
+        assert tick(changed) == {BUILD: 'reviewing'} and len(started) == 2
+        Path(argv[3]).write_text('VERDICT: APPROVE — 0 blocking, 0 major, 0 minor — r1\n')
+        return 0
+    git = lambda argv: H1 + '\n' if argv[0] == 'rev-parse' else ''  # noqa: E731
+    assert autoloop.review_run(a, BUILD, H1, first['attempt'], git, run)['verdict']['verdict'] == 'APPROVE'
+    second = autoloop.intents(a)[BUILD]['review']
+    new = autoloop.review_paths(a, BUILD, H1, second['attempt'])
+    assert second['attempt'] != first['attempt'] and second['card'] != first['card']
+    assert old['result'].exists() and not new['result'].exists() and new['checkout'] != old['checkout']
+    # The old approval is never read for the new card: still reviewing, nothing approved or enqueued.
+    assert tick(changed) == {BUILD: 'reviewing'} and enqueued(fakes) == []
+    assert triage.load(a / 'approved.json', {}) == {}
+    # A result in the new attempt's file that names another attempt or card is not used either.
+    triage.save(new['result'], {**triage.load(old['result'], {}), 'attempt': second['attempt']})
+    assert tick(changed) == {BUILD: 'reviewing'} and enqueued(fakes) == []
 
 
 # spec: ANYM-572
