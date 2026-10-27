@@ -1521,6 +1521,7 @@ def test_reservations_are_released_on_merge_close_decline_drop_and_a_vanished_wo
     assert sorted(autoloop.claims(a)) == ['autoloop-build-anym-40']
 
 
+# spec: ANYM-572
 @pytest.mark.parametrize('case', [
     'workflow', 'scripts', 'lockfile', 'conftest', 'agents', 'migration', 'content signal', 'deleted',
     'rename into protected', 'changed test', 'test helper', 'no patch', 'too large',
