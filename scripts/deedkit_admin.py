@@ -6,8 +6,8 @@ messaging `list-keys --all` / `key-info`, calendar `list-agents` / `agent-info`)
 principal, and reports where the stores disagree. It is read-only: no lock, no write, safe during a call.
 `key label` keeps a human label in a private admin file that no service reads, so the enforced policy schema
 never changes (an older gateway image rejects unknown fields). `key issue --like` (ANYM-496), `key extend`
-and `key revoke` (ANYM-497) and `undo` write every store under the shared rules of ANYM-493. Host only, standard
-library only.
+and `key revoke` (ANYM-497), `profile tools` (the tool names of one gateway profile) and `undo` write under the
+shared rules of ANYM-493. Host only, standard library only.
 
 Secrets: key files are read here and passed to the operator commands on stdin, never in argv, environment,
 output or logs; the calls registry is matched by hashing in memory. Only public IDs are printed.
@@ -55,6 +55,7 @@ LOCK_WAIT = 30  # seconds to get every lock before refusing "a deploy is running
 DAYS = (1, 30)  # ANYM-496: one N for every store, within each store's own limit (messaging 365, calendar 183)
 NAME = re.compile(r"[a-z0-9][a-z0-9.-]{0,49}")  # fits every store's ID rule with the -calls-archive suffix
 OPERATION = re.compile(r"[a-z0-9.-]{1,100}")
+TOOL_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")  # a gateway catalog tool name; the gateway's own check knows which exist
 VALIDATORS = {"policy": ["deedkit-gateway", "--check", "--policy", "{path}", "--public-url", "https://check.invalid"],
               "registry": ["python", "agent_api.py", "--check-registry", "{path}"]}
 BACKENDS = ("messaging", "calendar", "calls")
@@ -436,6 +437,10 @@ class Document:
 
     def entry(self, name: str) -> dict | None:
         return next((row for row in self.value["principals"] if row.get("id") == name), None)
+
+    def with_profile(self, name: str, profile: dict) -> dict:
+        """The next revision with the profile `name` replaced; every other profile and every principal unchanged."""
+        return {**self.value, "revision": self.value["revision"] + 1, "profiles": {**self.value["profiles"], name: profile}}
 
     def with_entry(self, name: str, entry: dict) -> dict:
         """The next revision with `entry` added, or replacing the entry `name`; every other entry unchanged."""
@@ -1220,6 +1225,8 @@ def undo(config: dict, run, docker, host_factory, operation: str) -> dict:
                          "(to end the key, run `deedkit admin key revoke`); nothing changed")
     if verb == "revoke":
         return undo_revoke(config, run, docker, host_factory, journal)
+    if verb == "profile":
+        return undo_profile(config, docker, host_factory, journal)
     if verb != "issue":
         raise AdminError(f"operation {operation} is not an issue; nothing changed")
     new = data["command"]["id"]
@@ -1439,7 +1446,7 @@ def exclusive(config: dict, policy: Document, registry: Document | None, princip
 
 def resume(config: dict, args, command: dict) -> Journal:
     """The operation's journal: a new ID, or a rerun of `--operation` with the same arguments."""
-    slug = re.sub(r"[^a-z0-9.-]+", "-", args.principal.lower()).strip("-.")[:50] or "principal"
+    slug = re.sub(r"[^a-z0-9.-]+", "-", command["id"].lower()).strip("-.")[:50] or "principal"
     operation = args.operation or (f"{command['verb']}-{slug}-{datetime.now(timezone.utc):%Y%m%dt%H%M%S}-"
                                    f"{secrets.token_hex(3)}")
     journal = Journal(config, operation)
@@ -1821,6 +1828,148 @@ def undo_revoke(config: dict, run, docker, host_factory, journal: Journal) -> di
     return {**result, **data["undo"]}
 
 
+# --- `profile tools`: the tool names a gateway profile exposes, under the same shared rules -----------------------
+
+
+def profile_of(document: Document, name: str) -> dict:
+    profiles = document.value.get("profiles")
+    profile = profiles.get(name) if isinstance(profiles, dict) else None
+    if not isinstance(profile, dict) or not isinstance(profile.get("tools"), list) \
+            or not all(isinstance(tool, str) for tool in profile["tools"]):
+        raise AdminError(f"no gateway profile {name!r} with a tool list; nothing changed")
+    return profile
+
+
+def retooled(profile: dict, add: list[str], remove: list[str]) -> dict:
+    """The profile with `remove` taken out and the missing `add` appended; its other fields and the order kept."""
+    kept = [tool for tool in profile["tools"] if tool not in remove]
+    return {**profile, "tools": kept + [tool for tool in add if tool not in kept]}
+
+
+def swap_profile(config: dict, docker, journal: Journal, step_name: str, name: str, change, found: list[dict],
+                 extra: list[str], expect: str | None = None) -> bool:
+    """`swap` for one profile: compare-and-swap on the profile as this step first read it ("before", or `expect`) or as
+    it wrote it ("entry"); anything else is someone else's change and refuses."""
+    document = Document(config["policy"], "gateway policy")
+    current = profile_of(document, name)
+    step, digest = journal.data["steps"].get(step_name), entry_digest(current)
+    if step is not None and digest == step["entry"]:
+        if step["state"] != "done":
+            journal.step(step_name, "done")
+        return step["changed"]
+    if digest != (step["before"] if step is not None else expect or digest):
+        raise AdminError(f"the gateway profile {name!r} changed since this operation read it")
+    after = change(current)
+    journal.step(step_name, "started", before=digest, entry=entry_digest(after), changed=after != current)
+    if after != current:
+        replace(config, docker, document, document.with_profile(name, after), "policy", found, extra)
+        checkpoint(step_name, "renamed")
+    journal.step(step_name, "done")
+    return after != current
+
+
+def profile_tools(config: dict, run, docker, host_factory, args) -> dict:
+    name, add, remove = args.profile, args.add or [], args.remove or []
+    if not (add or remove) or len(set(add)) != len(add) or len(set(remove)) != len(remove) or set(add) & set(remove) \
+            or not all(TOOL_NAME.fullmatch(tool) for tool in add + remove):
+        raise AdminError("give --add and/or --remove with distinct tool names, none in both; nothing changed")
+    command = {"verb": "profile", "id": name, "add": add, "remove": remove}
+    journal = resume(config, args, command)
+    if journal.data.get("state") == "done":
+        return journal.data["result"]
+    host = None if args.dry_run else host_factory()
+    with ExitStack() as held:
+        if host is not None:
+            held.enter_context(guarded(config, host, docker))
+        policy = Document(config["policy"], "gateway policy")
+        found = {"policy": consumers(running(docker), config["policy"], "gateway policy")}
+        for gateway in found["policy"]:
+            policy_read(config, gateway)
+        current = profile_of(policy, name)
+        # A rerun keeps the plan of the first run (its tools may already be listed since) and the digest of the profile
+        # that plan was made from: the first write, even a resumed one, refuses a profile changed after it.
+        plan = journal.data.get("plan") or {"digest": entry_digest(current), "before": list(current["tools"]),
+                                            "added": [tool for tool in add if tool not in current["tools"]],
+                                            "removed": [tool for tool in remove if tool in current["tools"]]}
+        users = [{"principal": row.get("id"), "enabled": row.get("enabled") is True}
+                 for row in policy.value["principals"] if row.get("profile") == name]
+        if args.dry_run:
+            return {"dry_run": True, "profile": name, "revision": policy.value["revision"],
+                    "added": plan["added"], "removed": plan["removed"], "principals": users,
+                    "already_listed": [tool for tool in add if tool not in plan["added"]],
+                    "not_listed": [tool for tool in remove if tool not in plan["removed"]]}
+        images = rollback_images(host)
+        # Rules (c) and (h) before the journal: the live document in every image, then the candidate itself.
+        preflight(config, docker, policy, "policy", found["policy"], images)
+        candidate = retooled(current, add, remove)
+        if candidate != current:
+            text = (json.dumps(policy.with_profile(name, candidate), ensure_ascii=False, indent=2) + "\n").encode()
+            with staged(policy.path, text) as staging:
+                validate(config, docker, "policy", staging, found["policy"], images, "nothing changed")
+        if not args.operation:
+            journal.create({"version": 1, "operation": journal.path.stem, "command": command, "state": "running",
+                            "plan": plan, "steps": {}})
+        try:
+            swap_profile(config, docker, journal, "gateway policy", name,
+                         lambda profile: retooled(profile, add, remove), found["policy"], images,
+                         expect=plan["digest"])
+            data = journal.data
+            data["result"] = {"operation": data["operation"], "profile": name, "added": plan["added"],
+                              "removed": plan["removed"], "principals": users,
+                              "revision": Document(config["policy"], "gateway policy").value["revision"],
+                              "undo": f"deedkit admin undo {data['operation']}",
+                              "note": "every principal of the profile gets only the tools its own grants allow; "
+                                      "reconnect clients that cache the tool list"}
+            data["state"] = "done"
+            journal.save()
+            return data["result"]
+        except (AdminError, OSError) as exc:
+            raise stopped(journal, exc) from None
+
+
+def undo_profile(config: dict, docker, host_factory, journal: Journal) -> dict:
+    """Compensation of a profile change: the tool list it started from, only while the profile is still exactly what
+    this operation wrote (compare-and-swap); a later change by anyone refuses."""
+    data = journal.data
+    name = data["command"]["id"]
+    result = {"operation": data["operation"], "profile": name, "undone": True}
+    if data.get("state") == "undone":
+        return {**result, **data.get("undo", {})}
+    host = host_factory()
+    with guarded(config, host, docker):
+        policy = Document(config["policy"], "gateway policy")
+        found = consumers(running(docker), config["policy"], "gateway policy")
+        for gateway in found:  # the file the gateways enforce, as on the way forward
+            policy_read(config, gateway)
+        images, step = rollback_images(host), data["steps"].get("gateway policy", {})
+        undo_step = data["steps"].get("undo gateway policy")
+        current = entry_digest(profile_of(policy, name))
+        # Nothing to restore when the change never renamed, or the profile already is its starting list; an undo step
+        # that exists (an interrupted undo) is finished and its recorded outcome reported.
+        needed = bool(step.get("changed")) and (undo_step is not None or current != step["before"])
+        if needed and undo_step is None and current != step["entry"]:
+            raise AdminError(f"the gateway profile {name!r} changed since this operation wrote it; nothing changed")
+        if needed and (undo_step is None or current == undo_step["before"]):
+            preflight(config, docker, policy, "policy", found, images)
+        data["state"] = "undoing"
+        journal.save()
+        try:
+            if needed:
+                swap_profile(config, docker, journal, "undo gateway policy", name,
+                             lambda profile: {**profile, "tools": list(data["plan"]["before"])}, found, images,
+                             expect=current)
+        except (AdminError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, AdminError) else type(exc).__name__
+            raise Stopped(f"undo of {data['operation']} stopped: {reason}; run `deedkit admin undo "
+                          f"{data['operation']}` again") from None
+        restored = bool(data["steps"].get("undo gateway policy", {}).get("changed"))
+        data["state"] = "undone"
+        data["undo"] = {"restored": restored, "added_back": data["plan"]["removed"] if restored else [],
+                        "taken_out": data["plan"]["added"] if restored else []}
+        journal.save()
+    return {**result, **data["undo"]}
+
+
 def render(view: dict) -> str:
     lines = []
     for row in view["principals"]:
@@ -1877,16 +2026,24 @@ def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int
     revoking.add_argument("--token-file", type=Path, help="the principal's own gateway token: prove a 401 afterwards")
     revoking.add_argument("--dry-run", action="store_true", help="print the plan, write nothing")
     revoking.add_argument("--operation", help="rerun a stopped operation: finished steps are read back, the rest continue")
+    profiles = nouns.add_parser("profile", help="gateway profiles").add_subparsers(dest="verb", required=True)
+    tools = profiles.add_parser("tools", help="add or remove tool names in one gateway profile")
+    tools.add_argument("profile")
+    tools.add_argument("--add", nargs="+", metavar="TOOL", help="tool names to list (already listed: unchanged)")
+    tools.add_argument("--remove", nargs="+", metavar="TOOL", help="tool names to unlist (not listed: unchanged)")
+    tools.add_argument("--dry-run", action="store_true", help="print the plan, write nothing")
+    tools.add_argument("--operation", help="rerun a stopped operation: a finished step is read back, the rest continue")
     undoing = nouns.add_parser("undo", help="compensate an operation: disable, revoke and delete what it created")
     undoing.add_argument("operation")
     args = parser.parse_args(argv)
     try:
         config = load_json(args.config, "admin configuration")
-        if args.noun == "undo" or args.verb in ("issue", "extend", "revoke"):
+        if args.noun in ("undo", "profile") or args.verb in ("issue", "extend", "revoke"):
             os.umask(0o077)
             run, docker = run or runner(config), docker or dockers(config)
             factory = (lambda: host) if host is not None else (lambda: load_host(config))
-            command = undo if args.noun == "undo" else {"issue": issue, "extend": extend, "revoke": revoke}[args.verb]
+            command = undo if args.noun == "undo" else {"issue": issue, "extend": extend, "revoke": revoke,
+                                                        "tools": profile_tools}[args.verb]
             result = command(config, run, docker, factory, args.operation if args.noun == "undo" else args)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0

@@ -1121,7 +1121,7 @@ no service reads that file, so the enforced policy never changes.
 
 ### Write subcommands (ANYM-493 shared rules)
 
-Running `key issue`, `key extend`, `key revoke` or `undo` is the owner's decision (secrets and access); an agent runs them
+Running `key issue`, `key extend`, `key revoke`, `profile tools` or `undo` is the owner's decision (secrets and access); an agent runs them
 only on the owner's exact words. Every write subcommand follows these rules
 (tests/test_deedkit_admin_rules.py proves each):
 
@@ -1255,6 +1255,30 @@ then 401, so a 401 for another reason never counts. Without `--token-file` the o
 bearer probe was not run. `undo` of a revoke enables again only the gateway and calls entries this
 operation disabled (compare-and-swap on the entry it wrote) and says that the messaging and
 calendar revocations are final: a working key then needs `key issue`.
+
+### Add or remove tools in a gateway profile
+
+`deedkit admin profile tools <profile> [--add TOOL...] [--remove TOOL...] [--dry-run] [--operation ID]` changes
+only `profiles.<profile>.tools` in the gateway policy: tools in `--add` that are missing are appended, tools in
+`--remove` that are listed are taken out, the order of the rest and every other field (the profile's `actions`, the
+other profiles, all principals) stay. A tool is visible to a key only when the profile lists it and the principal's
+own grants allow it, so a listed tool never gives a principal more than its grants; it does reach every principal
+of the profile, and `--dry-run` and the result list them. Tool names are `[a-z][a-z0-9_]*`, distinct, none in both
+options. Nothing to change writes no revision.
+
+It follows the shared rules above: (a) and (b) locks, no unresolved release, no active call; (c) the candidate
+policy is checked, before any journal, in the image of every running gateway and in the rollback image (`gateway
+--check` refuses an unknown tool name, so an image that does not know a new tool refuses it; a rollback image that
+predates the tool clears once a deploy makes the current image the rollback one); a gateway that enforces another
+policy file refuses; the rename is a compare-and-swap on the bytes read under the locks and raises `revision` by one;
+(e) the journal keeps the profile's tool list before the change, the added and removed names, and the step digests.
+A stopped run is finished with `--operation`; the plan of the first run is kept with the digest of the profile it
+was made from, and even the first write of a resumed run refuses a profile changed since.
+
+`deedkit admin undo <op-id>` sets the profile back to the tool list it started from, only while the profile is still
+exactly what this operation wrote; a later change by anyone refuses it (`changed since this operation wrote it`), and
+it refuses a gateway that enforces another policy file like the change does. An interrupted undo is run again.
+The undo is a new revision, never an older one. No backend store, key or token is touched.
 
 Optional configuration keys, with the defaults above: `tool`, `journal`, `tokens`, `calls_lock`,
 `validators`, `docker` (the Docker command prefix) and `probe_control` (`key revoke --token-file`;
