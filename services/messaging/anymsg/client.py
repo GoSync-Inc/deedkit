@@ -567,12 +567,12 @@ class Client:
 
         Named live-read permissions are separate. For every mutation, the acting
         agent obtains exact owner confirmation; the digest only binds the payload.
-        wait_s (0-25 s, ANYM-549) waits for the receipt; 0 is not sent.
+        wait_s (0-25 s, ANYM-549) waits for the receipt; it is validated, and 0 is not sent.
         """
         return self.call('execute_messenger_operation', dict(account=account, operation=operation,
             chat_id=chat_id, message_id=message_id, expected_revision=expected_revision,
             parameters={} if parameters is _OMITTED else parameters,
-            request_id=request_id, preview_digest=preview_digest, **({'wait_s': wait_s} if wait_s else {})))
+            request_id=request_id, preview_digest=preview_digest, wait_s=wait_s))
 
     def get_messenger_operation(self, *, operation_id):
         """Read this key's scoped operation receipt without invoking the provider again."""

@@ -24,7 +24,8 @@ REACTION = {"account": "synthetic", "operation": "send_reaction", "chat_id": "ch
 def setup(tmp_path, actions, wait_bound=None):
     value = config()
     value["deployment"] = {"modules": ["messaging"], "backends": {"messaging": {"url": "http://backend.test"}}}
-    value["profiles"]["reader"] = {"tools": RISK_TOOLS + LOW_LEVEL, "actions": {"messenger_operations": actions}}
+    value["profiles"]["reader"] = {"tools": RISK_TOOLS + LOW_LEVEL + ["messages_capabilities"],
+                                   "actions": {"messenger_operations": actions}}
     agent = value["principals"][0]
     # The key holds every scope; only the action ceiling narrows it.
     agent["grants"] = {"messaging": ["message-react", "message-edit", "message-delete", "contacts-read"]}
@@ -66,7 +67,10 @@ def test_a_react_only_key_sees_one_risk_class_tool_with_only_its_operation(tmp_p
     app, seen = setup(tmp_path, ["send_reaction"])
     with TestClient(app) as c:
         tools = {t["name"]: t for t in rpc(c, "tools/list").json()["result"]["tools"]}
+        advertised = c.post("/v1/messages_capabilities", json={"detail": "full"}, headers=HEADERS).json()["gateway_tools"]
     assert set(tools) & set(RISK_TOOLS) == {"messages_change_message"}
+    # Capabilities never advertise a risk-class tool this key cannot use.
+    assert set(advertised) & set(RISK_TOOLS) == {"messages_change_message"}
     assert tools["messages_change_message"]["inputSchema"]["properties"]["operation"]["enum"] == ["send_reaction"]
     assert seen == []
 

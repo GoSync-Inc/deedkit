@@ -10,6 +10,7 @@ from starlette.testclient import TestClient
 
 from anymsg.client import Client
 from messaging_service.app import create_app
+from messaging_service.store import APIError
 from messaging_service.messenger_operations import (ADVANCED_ONLY, LOCAL_WRITE_OPERATIONS, OPERATION_TOOLS,
                                                      OPERATIONS)
 from test_operations_api import RecordingStore, arguments, rpc
@@ -126,3 +127,54 @@ def test_python_sdk_sends_preview_request_id_and_execute_wait_only_when_given():
     for wait_s in ('5', -1, 26, float('nan'), True):
         with pytest.raises(ValueError):
             client.execute_messenger_operation(**execute, wait_s=wait_s)
+
+
+class FailingWaitStore(RecordingStore):
+    """execute queues; every status read fails with the given error."""
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+    def get_messenger_operation(self, token, operation_id):
+        raise self.error
+
+
+# spec: ANYM-549
+@pytest.mark.parametrize('transport', ['rest', 'mcp'])
+@pytest.mark.parametrize('error,code', [(APIError('query_timeout', 503), 'query_timeout'),
+                                        (APIError('service_unavailable', 503), 'service_unavailable'),
+                                        (RuntimeError('synthetic pool timeout'), 'status_unavailable')])
+def test_a_failed_wait_keeps_the_queued_receipt(transport, error, code):
+    store = FailingWaitStore(error)
+    params = arguments('execute_messenger_operation')
+    with TestClient(create_app(store, ['testserver'])) as client:
+        if transport == 'rest':
+            response = client.post('/v1/execute_messenger_operation', headers=HEADERS, json={**params, 'wait_s': 5})
+            assert response.status_code == 200
+            result = response.json()
+        else:
+            result = rpc(client, 'execute_messenger_operation', {**params, 'wait_s': 5}).json()['result']
+            assert not result.get('isError')
+            result = result['structuredContent']
+    assert store.calls == [('execute_messenger_operation', params)]
+    assert result['operation_id'] == 'op_synthetic' and result['status'] == 'queued'
+    assert result['wait_timed_out'] is True and result['wait_error'] == code
+
+
+# spec: ANYM-549
+def test_a_wait_refused_by_authorization_stays_refused():
+    store = FailingWaitStore(APIError('forbidden', 403))
+    with TestClient(create_app(store, ['testserver'])) as client:
+        response = client.post('/v1/execute_messenger_operation', headers=HEADERS,
+                               json={**arguments('execute_messenger_operation'), 'wait_s': 5})
+    assert response.status_code == 403 and len(store.calls) == 1
+
+
+# spec: ANYM-549
+@pytest.mark.parametrize('wait_s', [None, False, '', [], {}])
+def test_python_sdk_rejects_a_falsy_invalid_wait_without_a_request(wait_s):
+    sent = []
+    client = Client('http://127.0.0.1', 'synthetic-token',
+                    transport=httpx.MockTransport(lambda request: sent.append(request) or httpx.Response(200, json={})))
+    with pytest.raises(ValueError):
+        client.execute_messenger_operation(**arguments('execute_messenger_operation'), wait_s=wait_s)
+    assert sent == []

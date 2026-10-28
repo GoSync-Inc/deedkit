@@ -469,10 +469,12 @@ def create_app(store: Store, allowed_hosts: list[str]):
             result=await run_in_threadpool(store.execute_messenger_operation,token,**arguments)
             if wait_s and result.get('operation_id') and result.get('status') in ('queued','dispatching'):
                 try:return await wait_for_operation(store,token,result['operation_id'],wait_s)
-                except APIError as error:
-                    # The operation is already queued; a failed observation must not hide its operation_id.
-                    if error.code not in ('send_wait_busy','send_status_timeout'):raise
-                    return {**result,'wait_timed_out':True,'wait_error':error.code}
+                except Exception as error:
+                    # The operation is already queued: a failed observation (busy, deadline, a database or pool
+                    # error) must not hide its operation_id or invite a new execute. Authorization stays fail-closed.
+                    if isinstance(error,APIError) and error.status in (401,403,404):raise
+                    code=error.code if isinstance(error,APIError) else 'status_unavailable'
+                    return {**result,'wait_timed_out':True,'wait_error':code}
             return result
         if method == 'preview_message' and phone is not None:
             return await phone_send.preview(store,token,arguments)
