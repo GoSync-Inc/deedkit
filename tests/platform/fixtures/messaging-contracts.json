@@ -2135,6 +2135,55 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "description": "Any identifier to one exact target, or candidates to choose from (read-only, archive only).\nto: person UUID, chat_ or msg_ ID (its chat; its sender with sender=true; a contact card's\ncontact), a phone in any format, @username, WhatsApp JID, or a name. Exact IDs return\ntarget {person?, account, chat_id, phone?, network, label, how_resolved}; a phone with no chat\non one opted-in account returns chat_id null and opens_chat=true (send_message with phone).\nA name or fragment never resolves alone: error selection_required with up to 10 candidates\nby last activity, each with its own next; more=true names messages_search_people. Hidden and\nmissing are the same not_found, whose next is a read-only listing. account narrows the search.\n",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "default": "",
+            "title": "Account",
+            "type": "string"
+          },
+          "purpose": {
+            "default": "message",
+            "enum": [
+              "message",
+              "call"
+            ],
+            "title": "Purpose",
+            "type": "string"
+          },
+          "sender": {
+            "default": false,
+            "title": "Sender",
+            "type": "boolean"
+          },
+          "to": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "to"
+        ],
+        "title": "resolve_targetArguments",
+        "type": "object"
+      },
+      "name": "resolve_target",
+      "outputSchema": {
+        "additionalProperties": true,
+        "title": "resolve_targetDictOutput",
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Find permitted occurrences of the same original, anchored by a visible attachment ID.",
       "inputSchema": {
         "additionalProperties": false,
