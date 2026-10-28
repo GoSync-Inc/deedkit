@@ -187,6 +187,22 @@ def test_two_generation_rotation_and_lost_delete_result_retry_only_exact_cloud_k
     assert len([key for key in cloud.objects if '/objects/' in key])==1
 
 
+# spec: ANYM-629
+def test_a_previous_point_of_the_wrong_size_at_rotation_keeps_its_corruption_code_in_the_status(operator,monkeypatch):
+    from test_backup_r2 import receive,THIRD,BID
+    v,config,receiver,cloud,engine,_=operator
+    v.run(config,client=cloud,engine=engine);receive(receiver,cloud,bid=THIRD);original=r2.rotate
+    def rotate(*args,**kw):
+        # The previous object changes size after candidate selection, right before rotation.
+        key=next(k for k in cloud.objects if '/objects/' in k and BID in k);cloud.objects[key]+=b'x'
+        return original(*args,**kw)
+    monkeypatch.setattr(r2,'rotate',rotate)
+    with pytest.raises(ValueError,match='protected_backup_corrupt'):v.run(config,client=cloud,engine=engine)
+    root=Path(config['directory'])
+    for name in ('status.json','last-failure.json'):assert json.loads((root/name).read_text())['error']=='protected_backup_corrupt'
+    assert 'delete_object' not in cloud.calls
+
+
 @pytest.mark.parametrize('failure',['mpu','orphan','unresolved','corrupt_body','unowned_resource'])
 def test_unresolved_or_corrupt_candidate_never_protects_or_removes_old_data(operator,failure):
     v,config,receiver,cloud,engine,_=operator
