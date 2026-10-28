@@ -18,8 +18,11 @@ def resume(c,account):
     if not row or row['operations'].get('connection',{}).get('state')!='blocked':
         raise ValueError('connection_not_blocked')
     value=row['operations'];now=row['observed'].isoformat()
+    # The connect count survives a resume (ANYM-535 source.health).
+    count=value['connection'].get('connect_count')
     value['connection']={'state':'stopped','reason_code':'operator_resumed','next_action':None,
-        'retry_at':None,'retry_attempts':0,'changed_at':now,'observed_at':now}
+        'retry_at':None,'retry_attempts':0,'changed_at':now,'observed_at':now,
+        **({'connect_count':count} if count is not None else {})}
     c.execute('UPDATE collector_health SET operations=%s,updated_at=clock_timestamp() WHERE account=%s',
         (Jsonb(value),account))
 

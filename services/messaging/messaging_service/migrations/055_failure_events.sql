@@ -6,13 +6,15 @@
 SET LOCAL lock_timeout='2s';
 ALTER TABLE events ALTER COLUMN message DROP NOT NULL;
 
--- The matcher's memory of the last source.health status journaled per account, with the connection
--- change time and lease epoch it saw. Only journal_source_health writes it, never a collector, so
--- no collector row is locked for this bookkeeping. Derived state: not in the backup table set; after
--- a restore the first observation is again a baseline.
+-- The matcher's memory of the last source.health status journaled per account, with the collector's
+-- connect count, connection change time and lease epoch it saw. Only journal_source_health writes
+-- it, never a collector, so no collector row is locked for this bookkeeping. Derived state: not in
+-- the backup manifest's table inventory; a full-database dump carries it, and a restore's
+-- quarantine closes every subscription anyway.
 CREATE TABLE source_health_journal (
  account text PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
  status text NOT NULL CHECK(status IN ('connected','disconnected','auth_required','stale')),
+ connect_count bigint,
  connection_changed_at text,
  lease_epoch bigint,
  observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
@@ -42,14 +44,18 @@ CREATE FUNCTION public.source_health_status(p_operations jsonb, p_status text, p
 REVOKE ALL ON FUNCTION public.source_health_status(jsonb,text,timestamptz,integer) FROM PUBLIC;
 
 -- The matcher's only journal write: source.health rows (account and status only) for each account
--- whose class changed since the last call. A connection that changed (its change time or the lease
--- epoch moved) while both samples are connected or stale lost its connection in between: that is
--- journaled as disconnected, then the current class. The first observation is a baseline. Reads no
+-- whose class changed since the last call. The collector counts every connect
+-- (operations.connection.connect_count); n connects since the last call replay the alternating
+-- history from the last journaled class: disconnected first when it was connected or stale, then
+-- connected, (disconnected, connected) for each further connect (at most three in all), then the
+-- current class when it is not connected. A change of the connect time or lease epoch between two
+-- connected or stale samples counts as at least one connect (a collector without the count, or a
+-- restart that reported connected again). The first observation is a baseline. Reads no
 -- row lock a collector holds and locks no collector row; the feed counter is the publishers' shared
 -- serialization, and the caller bounds the whole transaction (subscriptions.journal_source_health).
 CREATE FUNCTION public.journal_source_health(p_stale_seconds integer) RETURNS integer
  LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE r record; seq bigint; status text; statuses text[]; journaled integer := 0;
+DECLARE r record; seq bigint; status text; statuses text[]; connects bigint; journaled integer := 0;
 BEGIN
  IF p_stale_seconds IS NULL OR p_stale_seconds NOT BETWEEN 60 AND 86400 THEN
   RAISE EXCEPTION 'invalid_stale_threshold';
@@ -59,17 +65,26 @@ BEGIN
   RETURN 0;
  END IF;
  FOR r IN SELECT h.account,j.status AS previous,j.connection_changed_at AS previous_change,
-   j.lease_epoch AS previous_epoch,h.operations->'connection'->>'changed_at' AS change,l.epoch,
+   j.lease_epoch AS previous_epoch,j.connect_count AS previous_count,
+   h.operations->'connection'->>'changed_at' AS change,l.epoch,
+   CASE WHEN jsonb_typeof(h.operations->'connection'->'connect_count')='number'
+    THEN (h.operations->'connection'->>'connect_count')::numeric::bigint END AS count,
    public.source_health_status(h.operations,h.status,l.expires_at,p_stale_seconds) AS current
   FROM public.collector_health h LEFT JOIN public.collector_leases l ON l.account=h.account
   LEFT JOIN public.source_health_journal j ON j.account=h.account ORDER BY h.account LOOP
   CONTINUE WHEN r.previous IS NOT DISTINCT FROM r.current AND r.previous_change IS NOT DISTINCT FROM r.change
-   AND r.previous_epoch IS NOT DISTINCT FROM r.epoch;
+   AND r.previous_epoch IS NOT DISTINCT FROM r.epoch AND r.previous_count IS NOT DISTINCT FROM r.count;
   statuses := '{}';
   IF r.previous IS NOT NULL THEN
-   IF r.previous IN ('connected','stale') AND r.current IN ('connected','stale')
-     AND (r.previous_change IS DISTINCT FROM r.change OR r.previous_epoch IS DISTINCT FROM r.epoch) THEN
-    statuses := ARRAY['disconnected',r.current];
+   connects := greatest(
+    CASE WHEN r.count IS NOT NULL AND r.previous_count IS NOT NULL THEN r.count-r.previous_count ELSE 0 END,
+    CASE WHEN r.previous IN ('connected','stale') AND r.current IN ('connected','stale')
+     AND (r.previous_change IS DISTINCT FROM r.change OR r.previous_epoch IS DISTINCT FROM r.epoch) THEN 1 ELSE 0 END);
+   IF connects>0 THEN
+    IF r.previous IN ('connected','stale') THEN statuses := ARRAY['disconnected']; END IF;
+    statuses := statuses||'connected'::text;
+    FOR i IN 2..least(connects,3) LOOP statuses := statuses||ARRAY['disconnected','connected']; END LOOP;
+    IF r.current<>'connected' THEN statuses := statuses||r.current; END IF;
    ELSIF r.previous IS DISTINCT FROM r.current THEN
     statuses := ARRAY[r.current];
    END IF;
@@ -80,9 +95,9 @@ BEGIN
     VALUES(seq,r.account,NULL,'source.health',1,'live',jsonb_build_object('account',r.account,'status',status));
    journaled := journaled+1;
   END LOOP;
-  INSERT INTO public.source_health_journal(account,status,connection_changed_at,lease_epoch)
-   VALUES(r.account,r.current,r.change,r.epoch) ON CONFLICT(account) DO UPDATE SET status=excluded.status,
-   connection_changed_at=excluded.connection_changed_at,lease_epoch=excluded.lease_epoch,
+  INSERT INTO public.source_health_journal(account,status,connect_count,connection_changed_at,lease_epoch)
+   VALUES(r.account,r.current,r.count,r.change,r.epoch) ON CONFLICT(account) DO UPDATE SET status=excluded.status,
+   connect_count=excluded.connect_count,connection_changed_at=excluded.connection_changed_at,lease_epoch=excluded.lease_epoch,
    observed_at=clock_timestamp();
  END LOOP;
  RETURN journaled;

@@ -257,6 +257,11 @@ class CollectorState:
             row=self._operations(c);value=row['operations']
             connected=name=='connection' and state=='connected'
             extra={'retry_at':None,'retry_attempts':0} if connected else {}
+            previous=value.get('connection',{})
+            if connected and previous.get('state')!='connected':
+                # ANYM-535: counts every connect, so source.health sees a reconnect between two samples.
+                count=previous.get('connect_count',0)
+                extra['connect_count']=(count if type(count) is int and count>=0 else 0)+1
             self._phase(value,name,state,code,row['observed'],**extra)
             if connected:self._start_period(c)
             elif name in ('connection','live_capture') and state!='receiving':self._end_period(c)

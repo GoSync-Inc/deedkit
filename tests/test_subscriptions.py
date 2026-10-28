@@ -535,6 +535,10 @@ def test_source_health_journals_status_changes_for_account_readers(seeded):
     assert journal_source_health(store) == 0  # The first observation is a baseline.
     state.connection_failed('provider_disconnected')
     assert journal_source_health(store) == 1 and journal_source_health(store) == 0
+    # A connect and a new disconnect between two calls are not lost (the collector counts connects).
+    state.phase('connection', 'connected', 'provider_ready')
+    state.connection_failed('provider_disconnected')
+    assert journal_source_health(store) == 2
     state.phase('connection', 'connected', 'provider_ready')
     assert journal_source_health(store) == 1
     # A disconnect and reconnect between two calls is not lost.
@@ -565,7 +569,8 @@ def test_source_health_journals_status_changes_for_account_readers(seeded):
     items = store.get_subscription_events(reader, selected)['items']
     assert [(item['kind'], item['account'], item['status']) for item in items] == [
         ('source.health', 'telegram-demo', status) for status in ('disconnected', 'connected', 'disconnected',
-            'connected', 'disconnected', 'connected', 'stale', 'connected', 'auth_required')]
+            'connected', 'disconnected', 'connected', 'disconnected', 'connected', 'stale', 'connected',
+            'auth_required')]
     assert all(not {'chat', 'message', 'sender', 'send_id', 'error_code'} & set(item) for item in items)
     assert 'provider_disconnected' not in json.dumps(items, default=str)
     for token, sid in ((reader, default), (restricted, narrow), (elsewhere, other)):
