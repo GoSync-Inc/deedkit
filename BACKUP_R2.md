@@ -346,15 +346,39 @@ The generic [oneshot service](deploy/deedkit-backup-r2-verifier.service) and
 [timer](deploy/deedkit-backup-r2-verifier.timer) run the receiver coordinator as
 root. They do not schedule source captures or deploy services. Install them only
 after adapting paths and reviewing configuration and image provenance. The
-timer waits 15 minutes after an invocation ends, plus its configured random delay
-and timer accuracy, so a delayed daily upload or transient verification failure
-can be picked up without an operator Mac.
+timer waits 2 minutes after an invocation ends, plus up to 30 seconds of random
+delay and timer accuracy, so a committed upload is picked up within about 2.5
+minutes and a transient verification failure is retried without an operator Mac.
+An idle run (no candidate) creates nothing and holds the receiver lock only for
+its inventory; an upload arriving in that moment is answered `receiver_busy`
+before storage and retried by the producer after 60 seconds (ANYM-489).
+
+A new run that meets an upload's receiver lock before it journals anything
+retries the non-blocking lock every 15 seconds for at most `busy_wait_seconds`
+(verifier config, optional, 0-900, default 300), holding no receiver or host lock
+while it waits; the restore deadline pauses meanwhile. If the upload still holds
+it, the run writes `status.json` as
+`{"v":1,"status":"busy","code":"receiver_busy","checked_at":...}`, leaves
+`last-failure.json` unchanged, prints that line and exits 0: the unit does not
+fail. A run started while another invocation of the same profile holds its
+verifier lock prints `{"v":1,"status":"busy","code":"verifier_busy"}`, writes no
+status file (the holder owns it) and exits 0. A run that already journaled (a
+retry in progress) or a promotion that meets the receiver lock still fails
+with `receiver_busy`.
+
+Undo of the 2-minute timers: install the previous timer and service files
+(`OnUnitInactiveSec=15min`, `RandomizedDelaySec=1min`, `TimeoutStartSec=25500s`)
+and run `systemctl daemon-reload`. Remove `busy_wait_seconds` from the verifier
+configs before installing an older verifier, whose parser refuses it. Install
+the 2-minute timers only after the production host backup runner carries
+ANYM-489's busy retry.
 Systemd does not start a second copy of the same oneshot service while it runs;
 the coordinator's durable state/locking remains necessary for manual invocations
-and crash recovery. The 25500-second service start limit covers the configured
+and crash recovery. The 26400-second service start limit covers the configured
 21600-second job deadline, the host lock's 3600-second wait
-([Two verifiers on one receiver](#two-verifiers-on-one-receiver)) and a cleanup
-margin. Match these values if changing the deadline or the wait; do not shorten
+([Two verifiers on one receiver](#two-verifiers-on-one-receiver)), the receiver
+lock's wait (at most 900 seconds) and a cleanup margin. Match these values if
+changing the deadline or the waits; do not shorten
 the service timeout below the actual restore budget plus the wait.
 See the [systemd timer contract](https://github.com/systemd/systemd/blob/main/man/systemd.timer.xml)
 for monotonic timing and active-unit behavior.

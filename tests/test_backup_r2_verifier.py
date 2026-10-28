@@ -1297,7 +1297,7 @@ def test_calendar_units_run_the_same_module_with_their_own_config_and_messaging_
     assert {k:v for k,v in service.items() if k not in ('ExecStart','Description')}=={
         k:v for k,v in messaging.items() if k not in ('ExecStart','Description')}
     timer=unit('deedkit-calendar-backup-r2-verifier.timer');messaging_timer=unit('deedkit-backup-r2-verifier.timer')
-    assert timer['OnUnitInactiveSec']==['15min'] and timer['Unit']==['deedkit-calendar-backup-r2-verifier.service']
+    assert timer['OnUnitInactiveSec']==['2min'] and timer['Unit']==['deedkit-calendar-backup-r2-verifier.service']
     assert {k:v for k,v in timer.items() if k not in ('Unit','Description')}=={
         k:v for k,v in messaging_timer.items() if k not in ('Unit','Description')}
     example=r2.unique_json((root/'calendar-backup-r2-verifier.example.json').read_bytes())
@@ -1594,7 +1594,7 @@ def test_verifier_units_allow_the_host_wait_on_top_of_the_restore_deadline_and_t
     v=module();root=Path(__file__).resolve().parents[1]/'deploy'
     for name in ('deedkit-backup-r2-verifier.service','deedkit-calendar-backup-r2-verifier.service'):
         limit=[line.split('=',1)[1] for line in (root/name).read_text().splitlines() if line.startswith('TimeoutStartSec=')]
-        assert limit==['25500s'] and 25500>=21600+v.VERIFY_WAIT_SECONDS+180
+        assert limit==['26400s'] and 26400>=21600+v.VERIFY_WAIT_SECONDS+v.BUSY_WAIT_MAX+180
     example=root/'backup-r2-instances.example.json'
     monkeypatch.setattr(v,'private_file',lambda path,limit:Path(path).read_bytes())
     assert f.read_instances(example)==[Path(p) for p in r2.unique_json(example.read_bytes())['verifier_configs']]
@@ -1740,3 +1740,120 @@ def test_a_pin_step_failing_after_its_commit_point_never_rolls_back(pins,monkeyp
     monkeypatch.setattr(os,'unlink',unlink);monkeypatch.setattr(os,'replace',replace)
     with pytest.raises(OSError):s.update()
     assert committed and s.pairs()==[(NEW_IMAGE,HEAD)]*2 and not (s.host/'pins-switch.json').exists()
+
+
+def receiver_held(receiver):
+    import contextlib
+    holder=contextlib.ExitStack();holder.enter_context(r2.local.locked(receiver['state_directory']))
+    return holder
+
+def busy_main(v,config,cloud,engine,monkeypatch):
+    real=v.run
+    monkeypatch.setattr(v,'load_config',lambda path:config)
+    monkeypatch.setattr(v,'run',lambda value,path=None:real(value,client=cloud,engine=engine,path=None))
+
+# spec: ANYM-632
+def test_a_receiver_lock_busy_for_40_seconds_is_waited_out_and_the_candidate_verified(operator,monkeypatch):
+    v,config,receiver,cloud,engine,_=operator
+    holder=receiver_held(receiver);slept=[]
+    def sleep(seconds):
+        assert not (Path(config['directory'])/'active.json').exists() and not engine.resources
+        slept.append(seconds)
+        if sum(slept)>=40:holder.close()
+    monkeypatch.setattr(v.time,'sleep',sleep)
+    assert v.run(config,client=cloud,engine=engine)['status']=='verified'
+    assert slept==[15,15,15] and len(engine.runs)==1
+
+# spec: ANYM-632
+def test_a_receiver_lock_busy_past_the_wait_ends_busy_exit_0_and_keeps_the_last_failure(operator,monkeypatch,capsys):
+    import time
+    v,config,receiver,cloud,engine,write_json=operator
+    directory=Path(config['directory']);write_json(directory/'last-failure.json',{'v':1,'status':'failed','error':'synthetic'})
+    before=(directory/'last-failure.json').read_bytes();real_sleep=time.sleep;slept=[]
+    monkeypatch.setattr(v.time,'sleep',lambda seconds:(slept.append(seconds),real_sleep(min(seconds,0.05))))
+    config={**config,'busy_wait_seconds':1};busy_main(v,config,cloud,engine,monkeypatch)
+    holder=receiver_held(receiver)
+    assert v.main(['--config','/synthetic'])==0
+    holder.close()
+    status=json.loads((directory/'status.json').read_bytes())
+    assert {k:status[k] for k in ('v','status','code')}=={'v':1,'status':'busy','code':'receiver_busy'} and set(status)=={'v','status','code','checked_at'}
+    out=capsys.readouterr().out.splitlines()
+    assert len(out)==1 and {k:json.loads(out[0])[k] for k in ('status','code')}=={'status':'busy','code':'receiver_busy'}
+    assert (directory/'last-failure.json').read_bytes()==before and not (directory/'active.json').exists()
+    assert slept and all(s<=15 for s in slept) and not engine.runs and not engine.resources
+
+# spec: ANYM-632
+def test_verifier_busy_leaves_the_holders_own_status_and_exits_0(operator,monkeypatch,capsys):
+    v,config,receiver,cloud,engine,write_json=operator
+    directory=Path(config['directory']);busy_main(v,config,cloud,engine,monkeypatch)
+    with v.verifier_lock(config['directory']):
+        write_json(directory/'status.json',{'v':1,'status':'verified','backup_id':'holder','verification_id':'1'*32,'verified_at':'synthetic'})
+        before=(directory/'status.json').read_bytes()
+        assert v.main(['--config','/synthetic'])==0
+        assert (directory/'status.json').read_bytes()==before
+    out=capsys.readouterr().out.splitlines()
+    assert len(out)==1 and {k:json.loads(out[0])[k] for k in ('status','code')}=={'status':'busy','code':'verifier_busy'}
+    assert not (directory/'last-failure.json').exists() and not engine.runs
+
+# spec: ANYM-632
+def test_a_receiver_busy_answer_during_promotion_still_ends_failed(operator,monkeypatch):
+    v,config,receiver,cloud,engine,_=operator
+    original=r2.protect
+    def protect(*args,**kw):
+        with r2.local.locked(receiver['state_directory']):return original(*args,**kw)
+    monkeypatch.setattr(r2,'protect',protect)
+    monkeypatch.setattr(v.time,'sleep',lambda seconds:pytest.fail('promotion must not wait'))
+    with pytest.raises(RuntimeError,match='receiver_busy'):v.run(config,client=cloud,engine=engine)
+    directory=Path(config['directory'])
+    for name in ('status.json','last-failure.json'):
+        value=json.loads((directory/name).read_bytes());assert value['status']=='failed' and value['error']=='receiver_busy'
+    assert (directory/'active.json').exists()
+
+# spec: ANYM-632
+def test_a_retry_in_progress_meeting_the_receiver_lock_keeps_the_failure_path(operator,monkeypatch):
+    v,config,receiver,cloud,engine,_=operator
+    engine.failure=RuntimeError('restore_quarantine_failed')
+    with pytest.raises(RuntimeError):v.run(config,client=cloud,engine=engine)
+    monkeypatch.setattr(v.time,'sleep',lambda seconds:pytest.fail('a retry must not wait'))
+    holder=receiver_held(receiver)
+    with pytest.raises(RuntimeError,match='receiver_busy'):v.run(config,client=cloud,engine=engine)
+    holder.close()
+    assert json.loads((Path(config['directory'])/'status.json').read_bytes())['error']=='receiver_busy'
+
+# spec: ANYM-632
+def test_the_restore_deadline_pauses_while_the_run_waits_for_the_receiver_lock(operator,monkeypatch):
+    import time
+    v,config,receiver,cloud,engine,_=operator
+    holder=receiver_held(receiver);real_sleep=time.sleep;waited=[]
+    def sleep(seconds):
+        # The upload holds the lock for longer than this run's whole (real SIGALRM) deadline.
+        real_sleep(0.25);waited.append(0.25)
+        if sum(waited)>=1.5:holder.close()
+    monkeypatch.setattr(v.time,'sleep',sleep)
+    assert v.run({**config,'timeout_seconds':1},client=cloud,engine=engine)['status']=='verified' and sum(waited)>=1.5
+
+# spec: ANYM-632
+def test_an_idle_run_creates_no_docker_resource_and_writes_idle(operator):
+    v,config,receiver,cloud,engine,_=operator
+    assert v.run(config,client=cloud,engine=engine)['status']=='verified'
+    runs=list(engine.runs);deleted=list(engine.deleted)
+    assert v.run(config,client=cloud,engine=engine)['status']=='idle'
+    assert engine.runs==runs and engine.deleted==deleted and not engine.resources
+    status=json.loads((Path(config['directory'])/'status.json').read_bytes())
+    assert status['status']=='idle' and not (Path(config['directory'])/'active.json').exists()
+
+# spec: ANYM-632
+@pytest.mark.parametrize('value,accepted',[(0,True),(300,True),(900,True),(901,False),(-1,False),(True,False),('300',False)])
+def test_busy_wait_seconds_is_an_optional_bounded_integer(operator,value,accepted):
+    v,config,receiver,cloud,engine,write_json=operator
+    path=Path(config['receiver_config_file']).parent/'verifier.json';write_json(path,{**config,'busy_wait_seconds':value})
+    if accepted:assert v.load_config(path)['busy_wait_seconds']==value
+    else:
+        with pytest.raises(ValueError,match='invalid_verifier_limits'):v.load_config(path)
+
+# spec: ANYM-632
+def test_both_verifier_timers_start_two_minutes_after_the_last_run():
+    root=Path(__file__).resolve().parents[1]/'deploy'
+    for name in ('deedkit-backup-r2-verifier.timer','deedkit-calendar-backup-r2-verifier.timer'):
+        lines=(root/name).read_text().splitlines()
+        assert 'OnUnitInactiveSec=2min' in lines and 'RandomizedDelaySec=30s' in lines and 'OnBootSec=10min' in lines

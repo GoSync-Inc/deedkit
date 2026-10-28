@@ -42,6 +42,11 @@ ADMISSION = 'admission.json'
 PINS_SWITCH = 'pins-switch.json'
 PINS_PREVIOUS = 'pins-previous.json'
 VERIFY_WAIT_SECONDS = 3600
+# A new run that meets an upload's receiver lock retries it (ANYM-632): every BUSY_POLL_SECONDS
+# for at most `busy_wait_seconds` (verifier config, 0..BUSY_WAIT_MAX), then ends `busy`.
+BUSY_WAIT_SECONDS = 300
+BUSY_WAIT_MAX = 900
+BUSY_POLL_SECONDS = 15
 # Every verifier config on this receiver, for the pin step: {"v": 1, "verifier_configs": [paths]}.
 INSTANCES_FILE = Path('/etc/deedkit-backup-r2/instances.json')
 
@@ -68,9 +73,10 @@ def load_config(path):
     defaults={'max_plaintext_bytes':40*GIB,'postgres_headroom_bytes':8*GIB,'reserve_bytes':2*GIB,'timeout_seconds':21600}
     # Optional `profile` (ANYM-606): absent is messaging, exactly as before; `calendar` selects the calendar
     # helper checks and proof. It comes only from this root config and must equal its receiver config's.
-    # Optional `host_directory` and `verify_wait_seconds` (ANYM-609) are read through host_settings.
+    # Optional `host_directory` and `verify_wait_seconds` (ANYM-609) are read through host_settings;
+    # optional `busy_wait_seconds` (ANYM-632) through busy_wait.
     if (not isinstance(value,dict) or not required<=set(value) or
-            set(value)-required-set(defaults)-{'profile','host_directory','verify_wait_seconds'} or
+            set(value)-required-set(defaults)-{'profile','host_directory','verify_wait_seconds','busy_wait_seconds'} or
             type(value['v']) is not int or value['v']!=1 or
             ('profile' in value and (not isinstance(value['profile'],str) or value['profile'] not in r2.PROFILES))):
         raise ValueError('invalid_verifier_config')
@@ -85,6 +91,7 @@ def load_config(path):
         raise ValueError('invalid_verifier_limits')
     host,wait=host_settings(value)
     if type(wait) is not int or not 0<=wait<=21600:raise ValueError('invalid_verifier_limits')
+    if type(busy_wait(value)) is not int or not 0<=busy_wait(value)<=BUSY_WAIT_MAX:raise ValueError('invalid_verifier_limits')
     for key in ('receiver_config_file','directory','identity_file','protected_file'):
         if not isinstance(value[key],str) or not Path(value[key]).is_absolute() or '..' in Path(value[key]).parts:
             raise ValueError('invalid_verifier_path')
@@ -133,6 +140,42 @@ def verifier_lock(directory):
 
 def host_settings(config):
     return config.get('host_directory',HOST_DIRECTORY),config.get('verify_wait_seconds',VERIFY_WAIT_SECONDS)
+
+
+def busy_wait(config):return config.get('busy_wait_seconds',BUSY_WAIT_SECONDS)
+
+
+class ReceiverBusy(RuntimeError):
+    """A new run's wait for the receiver lock ran out before it journaled or created anything."""
+
+
+@contextmanager
+def receiver_lock(state_fd,wait=None):
+    """The receiver's non-blocking lock. With `wait` (a new run only) it retries every
+    BUSY_POLL_SECONDS while holding no receiver or host lock, then raises ReceiverBusy;
+    without it the first `receiver_busy` stays the run's failure, as before."""
+    ends=time.monotonic()+(wait or 0)
+    with ExitStack() as held:
+        while True:
+            try:held.enter_context(r2.shared_lock(state_fd));break
+            except RuntimeError as error:
+                if str(error)!='receiver_busy' or wait is None:raise
+                left=ends-time.monotonic()
+                if left<=0:raise ReceiverBusy('receiver_busy') from None
+                time.sleep(min(BUSY_POLL_SECONDS,left))
+        yield
+
+
+def untimed(engine,stack,context):
+    """Enter `context` with the restore deadline paused, so a lock wait never spends the restore's
+    budget; SIGTERM still stops the wait."""
+    started=time.monotonic();left=signal.getitimer(signal.ITIMER_REAL)[0]
+    signal.setitimer(signal.ITIMER_REAL,0)
+    try:value=stack.enter_context(context)
+    finally:
+        if left>0:signal.setitimer(signal.ITIMER_REAL,left)
+    if isinstance(engine,Docker):engine.ends+=time.monotonic()-started
+    return value
 
 
 @contextmanager
@@ -671,7 +714,9 @@ def run(config,*,client=None,engine=None,path=None):
                     if any(journal[k]!=config[k] for k in ('helper_image','helper_revision')):
                         raise ValueError('restore_image_changed_during_retry')
                     if journal['protected_file']!=config['protected_file']:raise ValueError('verifier_control_changed_during_retry')
-                with local.trusted_directory(receiver['state_directory'],archive=True) as state_fd,r2.shared_lock(state_fd):
+                with local.trusted_directory(receiver['state_directory'],archive=True) as state_fd,ExitStack() as held:
+                    # Only a run that journaled nothing waits out an upload (ANYM-632); a retry fails as before.
+                    untimed(engine,held,receiver_lock(state_fd,busy_wait(config) if journal is None else None))
                     prior,marker=read_marker(receiver,config['protected_file'])
                     candidate=select_candidate(receiver,client,state_fd,marker)
                     pending=journal
@@ -686,12 +731,7 @@ def run(config,*,client=None,engine=None,path=None):
                         # record ours, all before a new run's journal or any scratch resource exists.
                         # The wait has its own bound (verify_wait_seconds): the restore deadline pauses while
                         # it waits, so the restore keeps its whole budget; SIGTERM still stops the wait.
-                        started=time.monotonic();left=signal.getitimer(signal.ITIMER_REAL)[0]
-                        signal.setitimer(signal.ITIMER_REAL,0)
-                        try:lock=host.enter_context(host_lock(config))
-                        finally:
-                            if left>0:signal.setitimer(signal.ITIMER_REAL,left)
-                        if isinstance(engine,Docker):engine.ends+=time.monotonic()-started
+                        lock=untimed(engine,host,host_lock(config))
                         # A refused admission keeps the record it could not clear for the next holder.
                         admit(engine,lock,profile,pending['run'],run_resources(pending['run'],profile));admitted=lock
                     if journal is None:
@@ -721,6 +761,11 @@ def run(config,*,client=None,engine=None,path=None):
                 os.unlink('active.json',dir_fd=fd);local.fsync_dir(fd)
                 return status
         except BaseException as error:
+            if isinstance(error,ReceiverBusy) and journal is None:
+                # An upload still holds the receiver: not a failure. Nothing was journaled or created,
+                # and last-failure.json keeps the last real failure.
+                status={'v':1,'status':'busy','code':'receiver_busy','checked_at':now()}
+                local.write_maintenance_json('status.json',status,dir_fd=fd);return status
             # Generic safe codes only; SDK errors, DSNs and stderr never enter
             # durable status. Keep journal/proof and the old protected recovery point.
             cleanup_ok=True
@@ -795,9 +840,13 @@ def main(argv=None):
         # Only the outcome: config paths and the image ID stay in the root-private records.
         print(json.dumps({k:result[k] for k in ('v','status','helper_revision')},separators=(',',':')));return 0
     if not args.config:parser.error('--config is required')
-    try:run(load_config(args.config),path=args.config)
+    try:status=run(load_config(args.config),path=args.config)
     except Exception as error:
+        if failure_code(error)=='verifier_busy':
+            # Another invocation of this profile runs: it owns status.json, so this one writes nothing.
+            print(json.dumps({'v':1,'status':'busy','code':'verifier_busy'},separators=(',',':')));return 0
         print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
+    if status['status']=='busy':print(json.dumps(status,separators=(',',':')))
     return 0
 
 
