@@ -118,8 +118,7 @@ def test_delivery_overlay_isolates_the_dispatcher_database_path_and_egress(tmp_p
     # Explicit dns: Docker queries it from the container namespace, where the host rules apply.
     assert service['dns'] == ['1.1.1.1']
     assert not networks['delivery_egress'].get('internal') and networks['delivery_egress'].get('enable_ipv6') is False
-    assert networks['delivery_egress']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-delivery0',
-                                                          'com.docker.network.bridge.enable_ip_masquerade': 'false'}
+    assert networks['delivery_egress']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-delivery0'}
     assert not service.get('ports')
     assert service['environment'] == {'DATABASE_URL_FILE': '/run/secrets/database_url',
                                       'DELIVERY_POLICY_FILE': '/run/secrets/delivery-policy.json'}
