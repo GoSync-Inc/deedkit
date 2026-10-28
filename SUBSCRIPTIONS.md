@@ -507,6 +507,10 @@ leaves it cancels the hint (`endpoint_policy_refused`). After editing the file, 
 `python -m messaging_service reload-delivery-policy`: it waits for every in-flight
 POST and registration that read the old file, then cancels queued hints and tests of
 hosts the new file refuses. The change counts as made when that command returns.
+In Compose the dispatcher reaches receivers only through the `delivery-egress` proxy
+(ANYM-581), which reads the same file per request: operator receiver hosts must be in
+`allow_hosts` too (or covered by `allow_any_public`), else their hints retry and dead-letter
+as unreachable. A host outside the file or with a non-public DNS answer gets no tunnel.
 The stored URL and the TLS name and Host header use the same A-label host as the
 policy check (`https://faß.example/` is kept as `https://xn--fa-hia.example/`).
 

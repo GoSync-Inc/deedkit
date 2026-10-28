@@ -111,3 +111,104 @@ def test_rules_drop_private_tailnet_metadata_and_host_and_allow_only_dns_and_443
     assert code == 0 and 'iptables -A DEEDKIT-DELIVERY -d 100.100.100.100 -p udp --dport 53 -j RETURN' in out
     code, _ = run('rules', '--resolver', 'not-an-address')
     assert code != 0
+
+
+# spec: ANYM-581
+def test_rules_also_drop_host_bound_packets_from_the_proxy_bridge():
+    code, out = run('rules', '--resolver', '1.1.1.1')
+    lines = out.splitlines()
+    assert code == 0
+    assert 'iptables -I INPUT -i dk-deliverypx0 -j DROP' in lines and 'ip6tables -I INPUT -i dk-deliverypx0 -j DROP' in lines
+    code, out = run('rules', '--undo')
+    undo = out.splitlines()
+    assert code == 0
+    assert 'iptables -D INPUT -i dk-deliverypx0 -j DROP' in undo and 'ip6tables -D INPUT -i dk-deliverypx0 -j DROP' in undo
+
+
+# spec: ANYM-581
+def test_proxied_probes_need_a_tunnel_or_the_proxys_refusal():
+    import threading
+    from messaging_service import egress_proxy
+    upstream = socket.create_server(('127.0.0.1', 0))
+    proxy = egress_proxy.Proxy(resolver=lambda host, port, slots=None: ['1.1.1.1'],
+        connector=lambda address: socket.create_connection(upstream.getsockname(), timeout=2),
+        policy=lambda: {'allow': ['hooks.example'], 'deny': [], 'allow_any_public': False}, log=lambda record: None)
+    server = socket.create_server(('127.0.0.1', 0))
+    threading.Thread(target=proxy.serve, args=(server,), daemon=True).start()
+    address = '127.0.0.1:%d' % server.getsockname()[1]
+    try:
+        code, out = run('check', '--proxy', address, '--open-proxied', 'hooks.example', '--refused-proxied', 'other.example')
+        assert code == 0, out
+        assert [item['outcome'] for item in json.loads(out)['results']] == ['tunnel', 'refused']
+        # Reversed expectations fail, and so does a proxied target with no proxy at all.
+        code, out = run('check', '--proxy', address, '--open-proxied', 'other.example', '--refused-proxied', 'hooks.example')
+        assert code == 1 and not any(item['passed'] for item in json.loads(out)['results'])
+        code, out = run('check', '--open-proxied', 'hooks.example')
+        assert code == 1 and json.loads(out)['results'][0]['outcome'] == 'no_proxy'
+    finally:
+        proxy.stop.set()
+        server.close()
+        upstream.close()
+
+
+# spec: ANYM-581
+def test_proxied_probe_reads_a_fragmented_body_whole_and_stops_at_its_deadline():
+    import threading
+    import time
+    server = socket.create_server(('127.0.0.1', 0))
+    stall = threading.Event()
+
+    def serve():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                request = conn.recv(4096)
+                if request.startswith(b'RESOLVE'):
+                    body = b'["1.1.1.1"]'
+                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n' % len(body) + body[:3])
+                    if stall.is_set():
+                        time.sleep(5)
+                    else:
+                        time.sleep(0.3)
+                    conn.sendall(body[3:])
+                else:
+                    conn.sendall(b'HTTP/1.1 200 OK\r\n\r\n')
+
+    threading.Thread(target=serve, daemon=True).start()
+    address = '127.0.0.1:%d' % server.getsockname()[1]
+    try:
+        # The body arrives in two segments: the probe waits for all of it, then tunnels.
+        code, out = run('check', '--proxy', address, '--open-proxied', 'hooks.example')
+        assert code == 0 and json.loads(out)['results'][0]['outcome'] == 'tunnel', out
+        # A body that stalls past the deadline fails the probe within the timeout, not after the stall.
+        stall.set()
+        started = time.monotonic()
+        code, out = run('check', '--proxy', address, '--timeout', '1', '--open-proxied', 'hooks.example')
+        assert code == 1 and json.loads(out)['results'][0]['outcome'] == 'unreachable', out
+        assert time.monotonic() - started < 4
+    finally:
+        server.close()
+
+
+# spec: ANYM-581
+def test_unreached_targets_accept_a_local_refusal_but_never_a_connection():
+    listener = socket.create_server(('127.0.0.1', 0))
+    closed = socket.create_server(('127.0.0.1', 0))
+    refused = '127.0.0.1:%d' % closed.getsockname()[1]
+    closed.close()
+    try:
+        # An isolated bridge's subnet .1 refuses locally: --unreached passes where --blocked (a firewall DROP) fails.
+        code, out = run('check', '--unreached', refused)
+        assert code == 0 and json.loads(out)['results'][0]['outcome'] == 'refused', out
+        code, out = run('check', '--blocked', refused)
+        assert code == 1, out
+        # A listener behind the address is reached: --unreached fails.
+        code, out = run('check', '--unreached', '127.0.0.1:%d' % listener.getsockname()[1])
+        assert code == 1 and json.loads(out)['results'][0]['outcome'] == 'connected', out
+        code, out = run('check', '--unreached', 'localhost:22')
+        assert code == 1 and json.loads(out)['results'][0]['outcome'] == 'malformed', out
+    finally:
+        listener.close()

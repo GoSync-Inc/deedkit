@@ -1,10 +1,12 @@
 # Opt-in overlay (ANYM-534), after compose.subscriptions.yaml. Install delivery_role.sql as owner and
 # configure a separate LOGIN inheriting messaging_event_delivery; never use the gateway or matcher DSN.
-# The dispatcher reaches PostgreSQL only over delivery_db (internal bridge dk-deliverydb0, no API, matcher,
-# gateway or collector) and the internet only over its own bridge dk-delivery0. The host rules from
-# `scripts/delivery_egress_check.py rules` drop host-bound packets on both bridges and restrict dk-delivery0 to
-# DNS on DELIVERY_RESOLVER and public 443 (docs/operations/production.md). An explicit `dns` makes Docker's
-# embedded resolver query DELIVERY_RESOLVER from the container namespace, so those rules apply to DNS too.
+# ANYM-581: the dispatcher joins only internal networks, delivery_db (bridge dk-deliverydb0, PostgreSQL only) and
+# delivery_proxy (dk-deliverypx0, the proxy only), both with gateway mode `isolated` (no host address on the bridge,
+# Docker 28.2+), so it has no route and no DNS to anything else, the host included, whatever the host firewall
+# holds. Its one way out is `delivery-egress`, which alone joins the egress bridge dk-delivery0 and
+# resolves and connects only to public addresses of hosts in DELIVERY_POLICY_FILE. The host rules from
+# `scripts/delivery_egress_check.py rules` stay as a second layer (docs/operations/production.md). The proxy's
+# explicit `dns` makes Docker's embedded resolver query DELIVERY_RESOLVER from its namespace, where they apply.
 services:
   delivery:
     image: anymsg-delivery:${MESSAGING_VERSION:-0.9.19}
@@ -16,9 +18,11 @@ services:
     restart: unless-stopped
     depends_on:
       db: {condition: service_healthy}
+      delivery-egress: {condition: service_started}
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
       DELIVERY_POLICY_FILE: /run/secrets/delivery-policy.json
+      DELIVERY_EGRESS_PROXY: delivery-egress:3128
     volumes:
       - type: bind
         source: ./private/delivery.dsn
@@ -36,8 +40,7 @@ services:
         target: /run/secrets/receivers
         read_only: true
         bind: {create_host_path: false}
-    networks: [delivery_db, delivery_egress]
-    dns: ["${DELIVERY_RESOLVER:-1.1.1.1}"]
+    networks: [delivery_db, delivery_proxy]
     read_only: true
     user: "10001:10001"
     cap_drop: [ALL]
@@ -47,6 +50,34 @@ services:
     cpu_shares: 512
     pids_limit: 64
     stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}
+  # No database, no secret: the delivery host policy only (ANYM-581).
+  delivery-egress:
+    image: anymsg-delivery:${MESSAGING_VERSION:-0.9.19}
+    command: [python, -m, messaging_service.egress_proxy]
+    init: true
+    restart: unless-stopped
+    environment:
+      DELIVERY_POLICY_FILE: /run/secrets/delivery-policy.json
+    volumes:
+      - type: bind
+        source: ./private/delivery-policy.json
+        target: /run/secrets/delivery-policy.json
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [delivery_proxy, delivery_egress]
+    dns: ["${DELIVERY_RESOLVER:-1.1.1.1}"]
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    mem_limit: 128m
+    cpu_shares: 512
+    pids_limit: 128
+    stop_grace_period: 5s
     logging:
       driver: json-file
       options: {max-size: 5m, max-file: "2"}
@@ -69,6 +100,15 @@ networks:
     enable_ipv6: false
     driver_opts:
       com.docker.network.bridge.name: dk-deliverydb0
+      # No host address on the bridge: the host is unreachable even without host rules (ANYM-581).
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+  delivery_proxy:
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: dk-deliverypx0
+      # No host address on the bridge: the host is unreachable even without host rules (ANYM-581).
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
   delivery_egress:
     driver: bridge
     enable_ipv6: false

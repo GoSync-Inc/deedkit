@@ -693,17 +693,21 @@ first).
 3. Private files, owned by uid 10001: `private/delivery-policy.json` (mode 0600; SUBSCRIPTIONS.md,
    Host policy) and the directory `private/delivery-receivers/` (mode 0700, its files 0600) holding
    operator receiver secrets; a receiver's `secret_file` is `/run/secrets/receivers/<file>`.
-4. Resolver and host egress rules (a host step the owner approves). Set `DELIVERY_RESOLVER=<ip>` in
-   the project's env file, `<ip>` being the host's current upstream resolver (`/etc/resolv.conf`, or
-   `/run/systemd/resolve/resolv.conf` behind systemd-resolved; not a new third party). The overlay
-   passes it as the dispatcher's `dns`, so Docker's embedded resolver queries it from the container
-   namespace, where the rules apply. `python3 scripts/delivery_egress_check.py rules --resolver <ip>`
-   (the same IP) prints the commands; as root, apply them before the dispatcher first starts (they
-   match bridge names, which may not exist yet) and save them with the host's firewall persistence.
-   They drop host-bound packets from both bridges, `dk-delivery0` (egress) and `dk-deliverydb0` (the
-   internal database network, which still has a host gateway address), and, from `dk-delivery0`, the
-   tailnet (100.64.0.0/10), RFC 1918, link-local and metadata (169.254.0.0/16), loopback and every
-   IPv6 packet; they allow DNS to `<ip>` and TCP 443 to public addresses. Undo: `rules --undo`.
+4. Egress (ANYM-581). The dispatcher joins only internal networks (`delivery_db`, `delivery_proxy`):
+   no DNS, no other bridge, no internet, whatever the host firewall holds. Its one way out is the
+   `delivery-egress` proxy, which alone joins the egress bridge and resolves and connects only to
+   public addresses of hosts allowed by `private/delivery-policy.json`; operator receiver hosts must
+   be in `allow_hosts` too (SUBSCRIPTIONS.md, Host policy). Set `DELIVERY_RESOLVER=<ip>` in the
+   project's env file, `<ip>` being the host's current upstream resolver (`/etc/resolv.conf`, or
+   `/run/systemd/resolve/resolv.conf` behind systemd-resolved; not a new third party); the overlay
+   passes it as the proxy's `dns`. The host rules are the second layer (a host step):
+   `python3 scripts/delivery_egress_check.py rules --resolver <ip>` (the same IP) prints them; as
+   root, apply them before the first start (they match bridge names, which may not exist yet) and
+   save them with the host's firewall persistence. They drop host-bound packets from all three
+   bridges, `dk-delivery0` (egress), `dk-deliverydb0` and `dk-deliverypx0` (internal networks in gateway
+   mode `isolated` have no host address; the rules are the second layer), and, from `dk-delivery0`, the tailnet (100.64.0.0/10), RFC 1918,
+   link-local and metadata (169.254.0.0/16), loopback and every IPv6 packet; they allow DNS to `<ip>`
+   and TCP 443 to public addresses. Undo: `rules --undo`.
 5. First enrollment (owner-authorized, once; `production.py` cannot do it: a selected service must
    already run, `snapshot`, and databases are never restarted). The host is on a release with this
    code, applied by `production.py`; `I=deedkit-production-runtime:<that sha>` is its verified image
@@ -712,16 +716,18 @@ first).
    1. `docker tag $I anymsg-subscriptions:enroll-<sha>` and `docker tag $I anymsg-delivery:enroll-<sha>`
       (new tags, never a production tag).
    2. `MESSAGING_VERSION=enroll-<sha> docker compose $F up --no-start --no-build --pull never --no-deps
-      subscriptions delivery` creates both networks and containers without starting them.
+      subscriptions delivery-egress delivery` creates the networks and containers without starting
+      them.
    3. `docker network connect --alias db <project>_delivery_db <db container>`: the running database
       joins the dispatcher's network; its backend attachment and identity are unchanged.
-   4. `docker compose $F start subscriptions delivery`.
+   4. `docker compose $F start subscriptions delivery-egress delivery`.
    5. Append both overlays, in this order, to the project's `files` in `/etc/deedkit/production.json`
       and select their services (backup of the file first):
       ```json
       "files": ["...existing files...", "/srv/deedkit/deploy/compose.subscriptions.yaml",
                 "/srv/deedkit/deploy/compose.delivery.yaml"],
-      "services": {"api": "runtime", "subscriptions": "runtime", "delivery": "runtime"}
+      "services": {"api": "runtime", "subscriptions": "runtime", "delivery-egress": "runtime",
+                   "delivery": "runtime"}
       ```
       The serving API is plan B, which reads its own `/etc/deedkit/http-production.json`
       (`seamless_release.py --config`, its own `prepare` snapshots): append the same two overlays,
@@ -733,15 +739,16 @@ first).
       `status`; check that the serving API container has `DELIVERY_POLICY_FILE` and its mount
       (`docker inspect`); remove the pause. Later deploys include them.
    Undo before the S2 apply, in reverse: restore both configuration backups; `docker compose $F
-   stop subscriptions delivery` and `rm subscriptions delivery`; `docker network disconnect
-   <project>_delivery_db <db container>`; `docker network rm <project>_delivery_db
-   <project>_delivery_egress`; `docker image rm` both enroll tags. After it, the receipts name the
+   stop subscriptions delivery delivery-egress` and `rm subscriptions delivery delivery-egress`;
+   `docker network disconnect <project>_delivery_db <db container>`; `docker network rm
+   <project>_delivery_db <project>_delivery_proxy <project>_delivery_egress`; `docker image rm`
+   both enroll tags. After it, the receipts name the
    overlays and S2 can never be prepared again, so the undo is a release at a newer green `main`
    SHA: restore both configuration backups, stop and remove both services, the same hand apply
    (plan A and plan B) at that SHA, then disconnect and remove the networks. Until such a SHA
    exists, `set-delivery-features --disable` and `docker compose $F stop delivery` hold.
-6. Check they run: `docker compose $F ps subscriptions delivery` shows both running with no
-   restarts; their logs show no repeated `subscription_match_failed`, `delivery_lane_failed` or
+6. Check they run: `docker compose $F ps subscriptions delivery-egress delivery` shows them running
+   with no restarts; the proxy logs `{"egress": "listening", ...}`; their logs show no repeated `subscription_match_failed`, `delivery_lane_failed` or
    `delivery_heartbeat_failed`; `SELECT component,version,schema_version,clock_timestamp()-beat_at
    FROM component_heartbeats` (operator DSN) has three rows younger than 120 s on the deployed
    version and schema 50; an agent's `get_capabilities` shows the webhook transport
@@ -756,18 +763,31 @@ first).
    docker compose $F exec -T api python -I - check --open <matcher ip>:18080 --open <gateway ip>:13240 \
      --open <host public ip>:22 --open <tailnet ip>:22 --open-dns <alt> < scripts/delivery_egress_check.py
    ```
-   Then from the dispatcher; it exits 0 only when every open target connects or answers and every
-   blocked one times out or has no route:
+   Then from the dispatcher; it exits 0 only when every open target connects or answers, every
+   blocked one times out or has no route, the proxy opens a tunnel to `<allowed host>` (the first
+   `allow_hosts` entry, such as the owner's receiver host) and refuses `example.com` (outside the
+   policy):
    ```sh
-   docker compose $F exec -T delivery python -I - check --open db:5432 --open example.com:443 \
-     --open-dns $DELIVERY_RESOLVER --blocked <api ip>:8080 --blocked <gateway ip>:13240 \
+   docker compose $F exec -T delivery python -I - check --open db:5432 --proxy delivery-egress:3128 \
+     --open-proxied <allowed host> --refused-proxied example.com --blocked 1.1.1.1:443 \
+     --blocked-dns $DELIVERY_RESOLVER --blocked <api ip>:8080 --blocked <gateway ip>:13240 \
      --blocked <matcher ip>:18080 --blocked <host public ip>:22 --blocked <tailnet ip>:22 \
-     --blocked <dk-delivery0 gateway ip>:22 --blocked <dk-deliverydb0 gateway ip>:22 \
-     --blocked 169.254.169.254:80 --blocked <alt>:53 --blocked-dns <alt> \
-     --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
+     --unreached <dk-deliverydb0 subnet .1>:22 --unreached <dk-deliverypx0 subnet .1>:22 \
+     --blocked <docker0 gateway ip>:22 --blocked 169.254.169.254:80 --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
    ```
-   `example.com` resolves through Docker's embedded resolver (explicit `dns`); `--open-dns` and
-   `--blocked-dns` query a resolver directly over UDP, `<alt>:53` over TCP. Stop the listener after.
+   The subnet `.1` and `docker0` targets pass with or without the host rules: both internal networks
+   use gateway mode `isolated`, so their bridges hold no host address. `--unreached` accepts the local
+   refusal an isolated subnet `.1` gives, never a connection; port 22 is the positive control, so first
+   check that sshd listens on every host address (`ss -Hltn "sport = :22"` shows `0.0.0.0:22`). Then the second layer from the proxy, which has the egress bridge:
+   ```sh
+   docker compose $F exec -T delivery-egress python -I - check --open <allowed host>:443 \
+     --open-dns $DELIVERY_RESOLVER --blocked <host public ip>:22 --blocked <tailnet ip>:22 \
+     --blocked <dk-delivery0 gateway ip>:22 --unreached <dk-deliverypx0 subnet .1>:22 \
+     --blocked <matcher ip>:18080 --blocked 169.254.169.254:80 --blocked <alt>:53 \
+     --blocked-dns <alt> --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
+   ```
+   `--open-dns` and `--blocked-dns` query a resolver directly over UDP, `<alt>:53` over TCP. Stop the
+   listener after.
 8. `python -m messaging_service set-delivery-features --enable` (operator DSN) switches
    self-service delivery on. It refuses (exit 1, `component_heartbeat_absent|stale`,
    `component_version_mismatch`, `component_schema_mismatch` with the component) until the API,

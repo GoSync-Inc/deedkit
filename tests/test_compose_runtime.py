@@ -26,7 +26,7 @@ BASE = ["compose.yaml", "compose.collectors.yaml", "compose.whatsapp.yaml", "com
 NATIVE = "compose.whatsapp-native.yaml"
 APPLICATIONS = {"api", "telegram", "whatsapp1", "whatsapp2", "indexer", "enricher", "enricher-local",
                 "operator", "subscriptions", "file-lifecycle", "cold-archive", "cold-restore",
-                "file-understanding", "message-purge", "delivery"}
+                "file-understanding", "message-purge", "delivery", "delivery-egress"}
 COLLECTORS = {"telegram", "whatsapp1", "whatsapp2"}
 SECRET_DIRECTORIES = ["processing-locks", "telegram-session", "whatsapp1-session", "whatsapp2-session",
                       "issued-keys", "cold-archive-identity", "cold-archive-ssh", "enrichment-models", "delivery-receivers"]
@@ -177,10 +177,14 @@ def assert_runtime(stack, declared, native):
     assert db["HostConfig"]["LogConfig"] == {"Type": "json-file", "Config": {"max-size": "5m", "max-file": "2"}}
     assert networks_of(db) == {f"{stack.project}_backend", f"{stack.project}_delivery_db"}
     assert stack.network("backend")["Internal"] is True
-    # ANYM-534: the dispatcher shares only the database network, and its egress bridge with nobody.
-    assert {name for name, joined in members_of(containers).items() if f"{stack.project}_delivery_db" in joined} == {"db", "delivery"}
-    assert networks_of(containers["delivery"]) == {f"{stack.project}_delivery_db", f"{stack.project}_delivery_egress"}
-    assert stack.network("delivery_db")["Internal"] is True and stack.network("delivery_egress")["Internal"] is False
+    # ANYM-534/581: the dispatcher joins only internal networks; only the egress proxy joins the egress bridge.
+    members = members_of(containers)
+    assert {name for name, joined in members.items() if f"{stack.project}_delivery_db" in joined} == {"db", "delivery"}
+    assert networks_of(containers["delivery"]) == {f"{stack.project}_delivery_db", f"{stack.project}_delivery_proxy"}
+    assert {name for name, joined in members.items() if f"{stack.project}_delivery_proxy" in joined} == {"delivery", "delivery-egress"}
+    assert {name for name, joined in members.items() if f"{stack.project}_delivery_egress" in joined} == {"delivery-egress"}
+    assert stack.network("delivery_db")["Internal"] is True and stack.network("delivery_proxy")["Internal"] is True
+    assert stack.network("delivery_egress")["Internal"] is False
     members = members_of(containers)
     assert {name for name, joined in members.items() if f"{stack.project}_collector_egress" in joined} == COLLECTORS
     assert {name for name, joined in members.items() if f"{stack.project}_cold_archive_egress" in joined} == {"cold-archive", "cold-restore"}
