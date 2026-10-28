@@ -611,7 +611,9 @@ class ExitedHelper:
     (r2.encoded({'v':1,'status':'failed','error':'restore_database_failed'}),False,'restore_database_failed'),
     (None,False,'isolated_restore_failed'),
     (r2.encoded({'v':1,'status':'failed','error':'storage_unavailable'}),False,'isolated_restore_failed'),
-    (None,True,'restore_deadline')],ids=['named','missing','invalid','hang'])
+    (r2.encoded({'v':1,'status':'failed','error':[]}),False,'isolated_restore_failed'),
+    (r2.encoded({'v':1,'status':'failed','error':{}}),False,'isolated_restore_failed'),
+    (None,True,'restore_deadline')],ids=['named','missing','invalid','array-error','object-error','hang'])
 def test_helper_exit_mid_stream_reports_its_failure_fact_not_a_generic_code(operator,monkeypatch,fact,hangs,code):
     v,config,receiver,cloud,engine,_=operator
     docker=v.Docker(0.3 if hangs else 60);helpers=[]

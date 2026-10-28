@@ -261,7 +261,7 @@ class Docker:
                     fact=r2.unique_json(private_file(payload/'failure.json',4096))
                     safe={'restore_decryption_failed','restore_database_failed','restore_snapshot_failed','restore_quarantine_failed'}
                     if (isinstance(fact,dict) and set(fact)=={'v','status','error'} and
-                            type(fact['v']) is int and fact['v']==1 and fact['status']=='failed' and fact['error'] in safe):failure=fact['error']
+                            type(fact['v']) is int and fact['v']==1 and fact['status']=='failed' and type(fact['error']) is str and fact['error'] in safe):failure=fact['error']
                 except (OSError,ValueError):pass
                 raise RuntimeError(failure)
         finally:
