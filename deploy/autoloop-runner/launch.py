@@ -21,6 +21,7 @@ has a bound. What it cannot apply stays pending:
 """
 import argparse
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -64,6 +65,7 @@ MAX_REQUESTS, MAX_LINE = 10, 512
 MAX_OUTBOX = MAX_REQUESTS * (MAX_LINE + 1)  # bytes of the outbox file the host reads
 OUTBOX = f'{MOUNT}/outbox/requests.jsonl'
 ATTEMPTS, RETRY = 40, 30  # applying a request while a tick holds the lock: up to 20 minutes
+LEASES = []  # this process's proxy marks, open with a shared lock until it exits
 BUILD = re.compile(r'autoloop-build-[a-z0-9][a-z0-9-]{2,60}')
 CARD = re.compile(r'ANYM-[1-9][0-9]*')
 
@@ -146,10 +148,10 @@ def proxy_argv(name):
             '--entrypoint', 'python3', name, '/opt/runner/proxy.py']
 
 
-def network(name, docker=call, runs=RUNS, clock=time.time):
+def network(name, docker=call, runs=None, clock=time.time):
     """The internal network (no route out) and this image's proxy, the one container on both it and the default
-    bridge; its name is returned. Another image's proxy is stopped only when no container uses it and no launcher
-    has named it for IDLE seconds (each launcher stamps its proxy's mark before its container starts)."""
+    bridge; its name is returned. Another image's proxy is stopped only when no launcher holds its mark, none has
+    named it for IDLE seconds and no container uses it (each launcher leases its proxy's mark before it starts it)."""
     try:
         docker(['docker', 'network', 'inspect', NETWORK])
     except Refused:
@@ -159,10 +161,11 @@ def network(name, docker=call, runs=RUNS, clock=time.time):
             pass  # a second launcher created it meanwhile: the inspect below decides
     if json.loads(docker(['docker', 'network', 'inspect', NETWORK]))[0].get('Internal') is not True:
         raise Refused(f'network {NETWORK} is not internal')
+    runs = runs or RUNS
     proxy, marks = proxy_name(name), runs / 'proxies'
     for path in (runs, marks):
         path.mkdir(mode=0o700, exist_ok=True)
-    (marks / proxy).touch()
+    lease(marks / proxy)
     if proxy_image(docker, proxy) != name:
         try:
             docker(proxy_argv(name))
@@ -174,23 +177,58 @@ def network(name, docker=call, runs=RUNS, clock=time.time):
     return proxy
 
 
+def lease(mark, wait=CALL):
+    """A shared lock on a proxy's mark, held while this process lives, and the mark's time refreshed: retire() never
+    stops a proxy a running launcher holds. A mark retire() removed meanwhile is opened again."""
+    end = time.monotonic() + wait
+    while True:
+        fd = os.open(mark, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            if os.path.samestat(os.fstat(fd), os.stat(mark)):
+                os.utime(fd)
+                LEASES.append(fd)
+                return fd
+        except (BlockingIOError, FileNotFoundError):
+            pass  # a retire() holds it, or has just removed it
+        os.close(fd)
+        if time.monotonic() > end:
+            raise Refused(f'the proxy mark {mark.name} stays locked')
+        time.sleep(0.2)
+
+
 def retire(mine, docker, marks, clock):
-    """Stop the other images' idle proxies; one still in use, or one this cannot tell about, is kept."""
+    """Stop the other images' idle proxies; one still in use, or one this cannot tell about, is kept. The checks and
+    the stop run under an exclusive lock on the proxy's mark, so no launcher can lease it in between."""
     try:
         others = docker(['docker', 'ps', '--all', '--filter', 'label=deedkit.autoloop=proxy', '--format',
                          '{{.Names}}']).split()
     except Refused:
         return
     for other in others:
+        if other == mine:
+            continue
         mark = marks / other
         try:
-            if other == mine or (mark.exists() and clock() - mark.stat().st_mtime < IDLE) or docker(
+            try:
+                fd, made = os.open(mark, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600), True
+            except FileExistsError:
+                fd, made = os.open(mark, os.O_RDWR), False
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # refused while a launcher holds the mark
+            if made:
+                os.utime(fd, (0, 0))  # made here: no launcher has named it
+            if clock() - os.fstat(fd).st_mtime < IDLE or docker(
                     ['docker', 'ps', '--all', '--quiet', '--filter', f'label=deedkit.autoloop.proxy={other}']).strip():
                 continue
             docker(['docker', 'stop', other], timeout=STOP_SECONDS + 30)
             mark.unlink(missing_ok=True)
         except (Refused, OSError):
             continue
+        finally:
+            os.close(fd)
 
 
 def proxy_image(docker=call, proxy=PROXY):
@@ -449,7 +487,8 @@ def report(codes, pending):
 
 def watch(state, intent, control, name, done, deadline, docker=call, clock=time.monotonic, cancelled=None):
     """Every POLL seconds: the host gate into the gate file; a stop (PAUSE, a held card, a dropped item, an ended
-    intent), a cancel (a closed terminal), the time limit or any failure of this check stops the container."""
+    intent), a cancel (a closed terminal), the time limit or any failure of this check stops the container, again
+    every POLL seconds until the build client has returned (`done`)."""
     try:
         while not done.wait(POLL):
             why = ('cancelled' if cancelled is not None and cancelled.is_set() else None) \
@@ -463,8 +502,10 @@ def watch(state, intent, control, name, done, deadline, docker=call, clock=time.
     except Exception as error:  # a gate that cannot be checked is a stop
         print(f'runner: STOP gate check failed ({type(error).__name__}); stopping the container', file=sys.stderr,
               flush=True)
-    while not stop(name, docker) and not done.wait(POLL):
-        pass  # keep trying until the container is confirmed stopped or the run has ended
+    while True:  # a container gone is no end while the client runs: it may still create it
+        stop(name, docker)
+        if done.wait(POLL):
+            return
 
 
 def stop(name, docker=call):
@@ -510,7 +551,7 @@ def build(intent, card, state=autoloop.STATE, now=None):
     refused, code = None, 1
     try:
         code = contained(intent, card, state, now, done, cancelled)
-    except Refused as error:
+    except Exception as error:  # any failure (a refusal, a missing brief) still ends the intent below
         refused = error
     finally:
         try:

@@ -2244,6 +2244,8 @@ def test_a_failed_gate_check_or_the_time_limit_stops_the_container(tmp_path, mon
 
     def docker(argv, timeout=None):
         calls.append(argv[:2])
+        if argv[:2] == ['docker', 'stop']:
+            done.set()  # the stopped container's client returns
         if argv[:2] == ['docker', 'inspect']:
             return 'false\n'
         return ''
@@ -2256,6 +2258,7 @@ def test_a_failed_gate_check_or_the_time_limit_stops_the_container(tmp_path, mon
     launcher.watch(tmp_path, BUILD, tmp_path, BUILD, done, float('inf'), docker)
     assert ['docker', 'stop'] in calls
     calls.clear()
+    done.clear()
     monkeypatch.setattr(launcher.autoloop, 'gate', lambda state, intent: None)
     launcher.watch(tmp_path, BUILD, tmp_path, BUILD, done, 0, docker, clock=lambda: 1)
     assert (tmp_path / 'gate').read_text() == 'time limit\n' and ['docker', 'stop'] in calls
@@ -2561,10 +2564,9 @@ def test_a_build_that_ends_without_finish_is_interrupted_on_the_host_and_frees_i
 
 
 # spec: ANYM-574
-def test_a_new_runner_image_gets_its_own_proxy_and_an_older_one_is_stopped_only_when_idle(tmp_path):
-    proxies = {launcher.proxy_name('img:old'): 'img:old'}
-    users, calls = {launcher.proxy_name('img:old')}, []
-
+def proxy_docker(proxies, users, calls, arrive=None):
+    """A fake docker CLI for the proxies: `proxies` maps each proxy to its image, `users` holds the proxies a
+    labelled container uses; `arrive` runs at the in-use check."""
     def docker(argv, timeout=None):
         calls.append(argv)
         if argv[:3] == ['docker', 'network', 'inspect']:
@@ -2578,21 +2580,37 @@ def test_a_new_runner_image_gets_its_own_proxy_and_an_older_one_is_stopped_only_
         if argv[:2] == ['docker', 'stop']:
             proxies.pop(argv[-1])
         if argv[:2] == ['docker', 'ps'] and '--quiet' in argv:
+            if arrive:
+                arrive()
             return 'c1\n' if argv[-1].split('=', 2)[2] in users else ''
         if argv[:2] == ['docker', 'ps']:
             return '\n'.join(proxies)
         return ''
-    old, new = launcher.proxy_name('img:old'), launcher.proxy_name('img:new')
-    runs = tmp_path / 'runs'
-    assert launcher.network('img:old', docker, runs) == old and not any(c[1] == 'stop' for c in calls)
+    return docker
+
+
+def test_a_new_runner_image_gets_its_own_proxy_and_an_older_one_is_stopped_only_when_idle(tmp_path, monkeypatch):
+    old, new = 'deedkit_autoloop_proxy_old', 'deedkit_autoloop_proxy_new'  # the images img:old and img:new
+    proxies, users, calls = {}, {old}, []
+    docker = proxy_docker(proxies, users, calls)
+    monkeypatch.setattr(launcher, 'RUNS', tmp_path / 'runs')
+    monkeypatch.setattr(launcher, 'LEASES', [], raising=False)
+    launcher.network('img:old', docker)
+    launcher.network('img:new', docker)  # the runner changed while a build of the old image runs
+    assert not any(c[:2] == ['docker', 'stop'] for c in calls) and proxies == {old: 'img:old', new: 'img:new'}
+    for fd in launcher.LEASES:
+        os.close(fd)  # both launchers have exited; the old image's build container is still there
+    launcher.LEASES.clear()
     clock = time.time() + launcher.IDLE + 60  # an hour later: the old proxy is idle but a build still uses it
-    assert launcher.network('img:new', docker, runs, clock=lambda: clock) == new and set(proxies) == {old, new}
+    assert launcher.network('img:new', docker, clock=lambda: clock) == new and set(proxies) == {old, new}
     users.clear()  # that build's container is gone
-    assert launcher.network('img:new', docker, runs, clock=lambda: clock) == new and set(proxies) == {new}
+    assert launcher.network('img:new', docker, clock=lambda: clock) == new and set(proxies) == {new}
     assert ['docker', 'stop', old] in calls and ['docker', 'stop', new] not in calls
     values = launcher.settings(BUILD, 'ANYM-30', PROD, proxy=new)
     argv = launcher.run_argv(BUILD, 'img:new', sorted(values), proxy=new)
     assert values['HTTPS_PROXY'] == f'http://{new}:3128' and f'deedkit.autoloop.proxy={new}' in argv
+    for fd in launcher.LEASES:
+        os.close(fd)
 
 
 # spec: ANYM-574
@@ -2620,3 +2638,74 @@ def test_a_container_docker_reports_missing_in_its_own_words_counts_as_gone():
                 raise launcher.Refused(message)
             raise launcher.Refused('docker stop: exit 1: Error response from daemon: No such container: x')
         assert launcher.running(BUILD, gone) is None and launcher.stop(BUILD, gone) is True, message
+
+
+# spec: ANYM-574
+def test_a_cancel_while_docker_still_creates_the_container_stops_it_once_it_appears(tmp_path, monkeypatch):
+    box = {'exists': False, 'running': False, 'asked': 0}
+    done, cancelled = threading.Event(), threading.Event()
+
+    def docker(argv, timeout=None):
+        if argv[:2] == ['docker', 'inspect']:
+            if not box['exists']:
+                box['asked'] += 1
+                box['exists'] = box['running'] = True  # the pending `docker create` lands right after this answer
+                raise launcher.Refused('docker inspect: exit 1: Error: No such object: ' + BUILD)
+            return 'true\n' if box['running'] else 'false\n'
+        if argv[1] in ('stop', 'kill'):
+            if not box['exists']:
+                raise launcher.Refused('No such container')
+            box['running'] = False
+            done.set()  # the attached client returns once its container stopped
+        return ''
+    monkeypatch.setattr(launcher, 'POLL', 0.01)
+    monkeypatch.setattr(launcher.autoloop, 'gate', lambda state, intent: None)
+    cancelled.set()  # the terminal closed after the pre-start check
+    watcher = threading.Thread(target=launcher.watch, args=(tmp_path, BUILD, tmp_path, BUILD, done, float('inf'),
+                                                            docker), kwargs={'cancelled': cancelled}, daemon=True)
+    watcher.start()
+    watcher.join(5)
+    assert box['asked'] == 1 and box['running'] is False and not watcher.is_alive()
+
+
+# spec: ANYM-574
+def test_a_build_that_fails_with_an_unexpected_error_before_its_container_still_ends_the_intent(tmp_path, monkeypatch):
+    a, c, real_apply, real_prepare = tmp_path / 'a', cfg(build_in_flight=1), launcher.apply, launcher.prepare
+    a.mkdir(mode=0o700)
+    reserved, _ = autoloop.admit(a, c, 'build', 'ANYM-30', [], NOW)
+    autoloop.put(a, dict(reserved, status='started', started_at=triage.stamp(NOW), lane='messaging',
+                         paths=['services/messaging/x.py']))
+    events = []
+    runner_build(monkeypatch, tmp_path, events,
+                 prepare=lambda intent: real_prepare(intent, tmp_path / 'runs', tmp_path / 'no-briefs'))
+    monkeypatch.setattr(launcher, 'apply', real_apply)
+    monkeypatch.setenv('AUTOLOOP_STATE', str(a))
+    monkeypatch.delenv('AUTOLOOP_RUNNER', raising=False)
+    with pytest.raises(FileNotFoundError):  # a brief is missing: the original error still reaches the terminal
+        launcher.build(BUILD, 'ANYM-30', a)
+    assert ('stop', BUILD) in events and autoloop.intents(a)[BUILD]['status'] == 'interrupted'
+    assert autoloop.claims(a) == {} and autoloop.admit(a, c, 'build', 'ANYM-31', [], NOW)[1] is None
+
+
+# spec: ANYM-574
+def test_a_proxy_another_launcher_takes_while_it_is_being_retired_is_running_for_that_build(tmp_path, monkeypatch):
+    old, new = 'deedkit_autoloop_proxy_old', 'deedkit_autoloop_proxy_new'
+    proxies, calls, arrivals = {old: 'img:old'}, [], []
+    marks = tmp_path / 'runs' / 'proxies'
+    marks.mkdir(parents=True)
+    (marks / old).touch()
+    os.utime(marks / old, (0, 0))  # no launcher has named the old proxy for long
+    monkeypatch.setattr(launcher, 'LEASES', [], raising=False)
+
+    def arrive():  # a launcher of the old image starts right after retire()'s idle check
+        if not arrivals:
+            arrivals.append(threading.Thread(target=launcher.network, args=('img:old', docker, tmp_path / 'runs'),
+                                             daemon=True))
+            arrivals[0].start()
+            arrivals[0].join(1)
+    docker = proxy_docker(proxies, set(), calls, arrive)
+    launcher.retire(new, docker, marks, time.time)
+    arrivals[0].join(10)
+    assert not arrivals[0].is_alive() and proxies.get(old) == 'img:old'  # that launcher's build has its proxy
+    for fd in launcher.LEASES:
+        os.close(fd)

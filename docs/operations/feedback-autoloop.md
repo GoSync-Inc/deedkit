@@ -245,8 +245,13 @@ directory, Docker socket or login directory); the one mount is a read-only contr
   name that resolves to a private, loopback, link-local or tailnet address or to an IPv6 address
   that carries an IPv4 one (NAT64, 6to4, Teredo, mapped), and the tunnel's TLS ClientHello must
   name the same host. A new runner image starts its own proxy; another image's proxy is stopped
-  only when no container uses it and no launcher has named it for an hour, so a running build
-  keeps its proxy. The check is on the CONNECT name and the TLS server name only: the proxy cannot
+  only when no launcher holds its mark, none has named it for an hour and no container uses it,
+  so a running build keeps its proxy. The mark is an empty file,
+  `~/.cache/deedkit-autoloop-runner/proxies/<proxy name>` (owner-only directory; only its time
+  is used): each launcher keeps a shared lock on its proxy's mark while it runs, and the stop
+  takes an exclusive lock, then removes the mark. Docker labels (`docker inspect`, visible to the
+  owner's user) say what is what: `deedkit.autoloop=proxy` or `runner`, and on a runner
+  `deedkit.autoloop.proxy=<proxy name>`; they hold names only. The check is on the CONNECT name and the TLS server name only: the proxy cannot
   see the HTTP host inside TLS, so an upstream that serves several sites on one address and
   routes by that host (a CDN front) could carry a request to a site not on the list. What the
   proxy does stop is any route to the production host, the tailnet and private addresses; a
@@ -265,15 +270,17 @@ directory, Docker socket or login directory); the one mount is a read-only contr
   control directory and an outbox file inside the container: `gate` reads the gate file, which
   the launcher rewrites from the host state every 30 s; a stop there (`PAUSE`, a held card, a
   dropped item), a failed gate check or a closed terminal (fence, hold) stops the container
-  (`docker kill` if `stop` does not; a container still running then is said in the terminal). A
-  terminal closed before the container starts cancels the start. Every exit of the launcher stops
+  (`docker kill` if `stop` does not; a container still running then is said in the terminal),
+  and the launcher keeps stopping it every 30 s until the build client has returned, so a
+  container Docker creates late is stopped too. A terminal closed before the container starts
+  cancels the start. Every exit of the launcher stops
   the container (confirmed by Docker) before it reads the outbox.
   `finish`, `decline` and `large` for this intent go to the outbox. After the container ends the
   launcher copies out the outbox with `docker cp` (one regular file of at most 5 KiB, else
   nothing), keeps the valid requests in `~/.cache/deedkit-autoloop-runner/<intent>/pending.json`,
   removes the container and applies them on the host, retrying for 20 minutes while a tick holds
   the lock, then `autoloop.py end <intent>` (launcher only, refused inside): a run that did not
-  `finish` (a failed start, a stop, the time limit) is `interrupted`, keeps its whole reservation
+  `finish` (a failed start, also an unexpected error, a stop, the time limit) is `interrupted`, keeps its whole reservation
   and frees its slot, lane and paths; the controller parks it like a vanished worker. What it
   could not apply stays in that file, the terminal says so, and `launch.py apply <intent>` applies
   it later; a new build of the intent waits until then.
