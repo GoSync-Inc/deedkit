@@ -309,7 +309,11 @@ def _start(store, c, p, row, step):
         else:
             written = c.execute("SELECT payload->>'provider_chat' AS provider_chat FROM messenger_commands WHERE id=%s",
                                 (handle['operation_id'],)).fetchone()
-            same = True
+            # A file is not sent as a reply, yet a bound reply that now maps elsewhere is a changed preview too.
+            reply = resolution['reply_to']
+            source = reply and c.execute('SELECT provider_id FROM messages WHERE id=%s AND NOT deleted',
+                                         (reply['message_id'],)).fetchone()
+            same = not reply or bool(source) and source['provider_id'] == reply['provider_id']
         if not same or written['provider_chat'] != resolution['target']['provider_chat']:
             raise _error('identity_changed', 409)
     return handle

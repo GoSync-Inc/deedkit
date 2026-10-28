@@ -526,6 +526,23 @@ def test_a_remap_committed_just_before_the_enqueue_read_sends_nothing(world, mon
 
 
 # spec: ANYM-546
+def test_a_reply_remapped_before_a_resumed_file_step_sends_nothing(world):
+    upload = world.upload(b'Synthetic reply file', 'synthetic-upload-0001')
+    world.reject.add(upload)
+    arguments = {'reply_to': MESSAGE, 'files': [{'upload_id': upload}], 'request_id': 'synthetic-replyfile-01'}
+    assert world.drive(**arguments)['state'] == 'failed'
+    world.reject.clear()
+    with world.s.pool.connection() as c:
+        c.execute("UPDATE messages SET provider_id='2' WHERE id=%s", (MESSAGE,))
+    result = world.drive(**arguments, resume=True)
+    assert result['state'] == 'failed' and result['steps'][0]['error'] == 'identity_changed'
+    world.work()
+    assert not world.files
+    with world.s.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM messenger_commands WHERE operation='send_file'").fetchone()['n'] == 1
+
+
+# spec: ANYM-546
 def test_a_payload_sent_with_a_token_must_equal_the_preview(world):
     token = world.call(to=CHAT, text='Synthetic approved', dry_run=True)['confirm_token']
     for changed in ({'to': CHAT, 'text': 'Synthetic other'}, {'to': OTHER_CHAT, 'text': 'Synthetic approved'}):
