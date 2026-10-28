@@ -8,4 +8,4 @@ Every network mutation has a durable intent and provider-supported preconditions
 
 Stop owned temporary processes when no longer needed. Preserve other tasks' changes. Use test-first implementation and run relevant checks before committing.
 
-A new `schema_vN.sql` (N from 6) starts with `-- rollout: expand` or `-- rollout: manual`; autodeploy runs only an `expand` file in `migration_rollout.py`'s unattended language and roles.sql text appended in its GRANT forms, through `service migrate-expand` (ANYM-586).
+A new `schema_vN.sql` (N from 6) starts with `-- rollout: expand` or `-- rollout: manual`; autodeploy runs only an `expand` file in `migration_rollout.py`'s unattended language and roles.sql text appended in its GRANT forms, through `service migrate-expand`, then `db-roles` and `db-roles --check` (ANYM-586; production.md "Calendar").

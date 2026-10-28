@@ -634,9 +634,9 @@ receiver) and `rehearsal_limit_ms` (default 1000, at most 4000). Undo: remove `u
 `databases.messaging`) and every SQL change pauses again.
 
 What qualifies (M1): every SQL inventory path of the range is an added
-`services/messaging/messaging_service/migrations/NNN_*.sql` or a modified messaging `*_role.sql`
-(`schema.sql`, `deploy/*.sql`, calendar SQL, a new, deleted or renamed role file and an edited applied
-migration pause); the candidate's `migration_rollout.py`, in the classifier's isolated process, names each
+`services/messaging/messaging_service/migrations/NNN_*.sql` or a modified messaging `*_role.sql`,
+or a calendar path of "Calendar" below (`schema.sql`, `deploy/*.sql`, other calendar SQL, a new, deleted or
+renamed role file and an edited applied migration pause); the candidate's `migration_rollout.py`, in the classifier's isolated process, names each
 added file `expand` by `unattended_class` (no DROP of any kind, so the CHECK widening pair pauses) and each
 role file `additive` by `role_class`; the added versions follow the base's highest without a gap.
 
@@ -700,6 +700,39 @@ features are enabled). The pause reads "plan A of <sha> failed its health wait a
 versions, fixed codes and object names, never a DSN, a row value or PostgreSQL's message (the containers
 log nothing and their stderr is discarded). The copy's dumps stay for its retention (48 hours, Database
 copies).
+
+Calendar (ANYM-586): the same phases apply to the calendar database. Configuration: `databases.calendar`
+and `unattended_calendar` = `{network, runtime_file}` (the calendar database's Docker network, e.g.
+`deedkit-calendar_calendar-backend`, and `<CALENDAR_STATE_DIR>/service/runtime.json`, the owner DSN file the
+calendar CLI reads: mode 0600, owned by the image user 10001). Undo: remove `unattended_calendar` and calendar
+SQL pauses again. A calendar range qualifies when every calendar path is an added
+`services/calendar/family_calendar/service/schema_vN.sql` or the modified `roles.sql`, and the candidate's
+calendar `migration_rollout.py` `plan` (in the same isolated child) accepts it: versions without a gap,
+every applied file unchanged, each new file `expand` in the unattended language, `roles.sql` additive (K1).
+Admission reads the base release's calendar `store.py` (`"prepare_threshold": None`, K0) and the live
+`fcs.migrations`, which must equal the base's files from version 1. Calendar has no backup receiver or
+producer gate (its backups take any `fcs.migrations` version). The rehearsal runs the candidate's calendar
+image (`family-calendar --home /data service migrate-expand`) on the copy with a rehearsal runtime.json;
+`fcs.migrations` has no `applied_at`, so the rehearsal's time is the copy database's `active_time +
+idle_in_transaction_time` its session added (an overestimate by the reads between). The data check allows
+only the new `fcs.migrations` rows. The final gate reads the identity through the mounted runtime.json.
+Apply runs `deedkit-calendar-migrate-<sha12>` once, then `db-roles` (the whole roles.sql) and then the
+read-only `db-roles --check` (ANYM-601), each in the calendar image with the same flags; a non-zero exit
+of either pauses "calendar migrated to <n>; roles: <code>" (a drift line never reaches a receipt), and
+messaging is not applied. Evidence files are `calendar-migrate-plan.json` and
+`calendar-migration-catalog.json`.
+
+A range touching both databases copies and rehearses both before either is migrated (a failed copy or
+rehearsal of either applies neither), then applies calendar (with its roles steps) and then messaging.
+`migration.json` keeps the last database's summary at the top and each database's phase under `phases`
+(`rehearsed`, `planned`, `migrated`, calendar's `roles`: `running`, `ok` or a code). A messaging failure
+after calendar committed pauses "calendar migrated to <n>; messaging not applied: <code>"; the base code
+runs on the new calendar schema (expand only). A run that finds `planned`: a database whose migrate-expand
+may have run is decided from its evidence as above, and calendar's roles then run once if they had not
+started; roles that were `running` pause "roles: interrupted"; a database that never started after an
+earlier one committed pauses "<database> not applied: interrupted" (migrate it by hand). The calendar copy
+is calendar's only pre-migration copy (there is no scheduled calendar backup before it), kept 48 hours
+(ANYM-588 C6); restore from it with the gated restore procedure.
 
 ## Apply and verify
 

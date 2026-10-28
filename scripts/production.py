@@ -2574,6 +2574,14 @@ class MigrationRefused(Refused):
     """A migration gate or phase that pauses with this reason; the reason holds names, versions and codes only."""
 
 
+def rehearsal_limit(settings):
+    section = settings.get("migration")
+    limit = section.get("rehearsal_limit_ms", REHEARSAL_LIMIT_MS) if isinstance(section, dict) else REHEARSAL_LIMIT_MS
+    if type(limit) is not int or not 1 <= limit <= 4000:
+        raise Refused("migration.rehearsal_limit_ms must be 1 to 4000")
+    return limit
+
+
 def unattended_settings(settings):
     """`migration.unattended` {network, dsn_file, runner_config}: the database's Docker network, the owner DSN file
     the migration container mounts and the backup runner's runner.json; with `migration.rehearsal_limit_ms`."""
@@ -2584,11 +2592,121 @@ def unattended_settings(settings):
             or not all(HOST_PATH.fullmatch(found[key]) and ".." not in found[key].split("/")
                        for key in ("dsn_file", "runner_config"))):
         raise Refused("migration.unattended must name the database network, the owner DSN file and runner.json")
-    assert isinstance(section, dict)
-    limit = section.get("rehearsal_limit_ms", REHEARSAL_LIMIT_MS)
-    if type(limit) is not int or not 1 <= limit <= 4000:
-        raise Refused("migration.rehearsal_limit_ms must be 1 to 4000")
-    return {**found, "rehearsal_limit_ms": limit}
+    return {**found, "rehearsal_limit_ms": rehearsal_limit(settings)}
+
+
+# Calendar (ANYM-586 K3): the same phases for the calendar database. Its migrations are the service package's
+# `schema.sql` (version 1) and `schema_vN.sql`, its grants the whole `roles.sql`; the candidate's calendar image runs
+# `family-calendar --home /data service migrate-expand`, then `db-roles` and the read-only `db-roles --check`, with
+# the owner's runtime.json mounted read-only. In a range touching both databases calendar goes first.
+CALENDAR = "calendar"
+CALENDAR_PACKAGE = "services/calendar/family_calendar/service/"
+CALENDAR_FILE = re.compile(r"schema(?:_v([1-9][0-9]*))?\.sql")
+CALENDAR_ROLES = CALENDAR_PACKAGE + "roles.sql"
+CALENDAR_CLASSIFIER, CALENDAR_STORE = CALENDAR_PACKAGE + "migration_rollout.py", CALENDAR_PACKAGE + "store.py"
+CALENDAR_TARGET = "calendar"
+CALENDAR_RUNTIME = "/data/service/runtime.json"
+# K0: the calendar Store's pool prepares no statement server-side either.
+CALENDAR_UNPREPARED = re.compile(r"ConnectionPool\([^)]*\"prepare_threshold\": None")
+CALENDAR_CODES = EXPAND_CODES + ("database_unavailable", "usage", "db_roles_drift", "existing_runtime_configuration_required",
+                                 "unsafe_private_path", "unsafe_private_permissions")
+# The candidate's calendar classifier (`plan`, K1) in the isolated child; hashlib is imported before the audit hook.
+CALENDAR_PLAN = "import hashlib\n" + CLASSIFY_PRELUDE + '''base, after = ({int(v): t for v, t in side.items()} for side in data["files"])
+found, created = module["plan"](base, after, *data["roles"]), {}
+for version in sorted(set(after) - set(base)):
+    created = module["new_tables"](after[version], created)
+print(json.dumps({"plan": found, "tables": sorted(created)}))
+'''
+CALENDAR_LEDGER = r"""SELECT json_build_object('schema_version', coalesce(max(version), 0),
+  'applied', coalesce(json_object_agg(version::text, checksum ORDER BY version), '{}'::json))::text FROM fcs.migrations;"""
+# The calendar data ledger on the copy: fcs.migrations and each table's write counters.
+CALENDAR_DATA = r"""SELECT line FROM (
+  SELECT json_build_object('k', json_build_array('ledger', version::text), 'v', checksum)::text AS line FROM fcs.migrations
+  UNION ALL SELECT json_build_object('k', json_build_array('writes', format('%I.%I', schemaname, relname)), 'v',
+         json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables) AS lines ORDER BY line;"""
+# fcs.migrations has no applied_at: the rehearsal's transaction time is the database's active and idle-in-transaction
+# milliseconds its session added (counted at its exit), plus the few reads between (an overestimate).
+BUSY = ("SELECT round(active_time + idle_in_transaction_time) FROM pg_stat_database "
+        "WHERE datname = current_database();")
+
+
+def calendar_settings(settings):
+    """`migration.unattended_calendar` {network, runtime_file}: the calendar database's Docker network and the
+    owner's runtime.json (`<CALENDAR_STATE_DIR>/service/runtime.json`, the image user's own 0600 file)."""
+    section = settings.get("migration")
+    found = section.get("unattended_calendar") if isinstance(section, dict) else None
+    if (not isinstance(found, dict) or set(found) != {"network", "runtime_file"}
+            or not all(isinstance(value, str) for value in found.values()) or not DOCKER_NAME.fullmatch(found["network"])
+            or not HOST_PATH.fullmatch(found["runtime_file"]) or ".." in found["runtime_file"].split("/")):
+        raise Refused("migration.unattended_calendar must name the calendar database network and its runtime.json")
+    return dict(found)
+
+
+def calendar_plan(settings, mirror, base, candidate, sql):
+    """K1 in deploy: the calendar plan of `base..candidate` (`sql` holds its calendar SQL paths), else None. The
+    configuration has `migration.databases.calendar` and `migration.unattended_calendar`; every path is an added
+    `schema_vN.sql` or the modified roles.sql; the candidate's `migration_rollout.plan` qualifies the range."""
+    try:
+        copy_source(settings, CALENDAR)
+        calendar_settings(settings)
+        rehearsal_limit(settings)
+    except Refused:
+        return None
+    git = ["git", "-C", str(mirror)]
+    try:
+        def changed(kind):
+            return set(run([*git, "diff", "--name-only", "--no-renames", "--diff-filter=" + kind, "-z", base,
+                            candidate]).split("\0")) - {""}
+        def content(sha, path):
+            return run([*git, "cat-file", "blob", f"{sha}:{path}"], binary=True)
+        def versions(sha):
+            names = set(run([*git, "ls-tree", "--name-only", "-z", f"{sha}:{CALENDAR_PACKAGE}"]).split("\0")) - {""}
+            found = {int(match[1] or 1): name for name in names if (match := CALENDAR_FILE.fullmatch(name))}
+            if "schema_v1.sql" in names or "roles.sql" not in names:
+                raise ValueError("schema_v1.sql or no roles.sql")
+            return found
+        added, modified = changed("A"), changed("M")
+        before, after = versions(base), versions(candidate)
+        pending = sorted(set(after) - set(before))
+        files = {CALENDAR_PACKAGE + after[version] for version in pending}
+        if (set(sql) - files - {CALENDAR_ROLES} or not files <= added & set(sql)
+                or (CALENDAR_ROLES in sql and CALENDAR_ROLES not in modified)
+                or any(after.get(version) != name for version, name in before.items())):
+            return None
+        texts = [{version: content(sha, CALENDAR_PACKAGE + names[version]) for version in names}
+                 for sha, names in ((base, before), (candidate, after))]
+        roles = [content(base, CALENDAR_ROLES), content(candidate, CALENDAR_ROLES)]
+        source = content(candidate, CALENDAR_CLASSIFIER)
+        if sum(map(len, [source, *roles, *texts[0].values(), *texts[1].values()])) > CLASSIFY_INPUT_LIMIT:
+            return None
+        found = classifier_child(CALENDAR_PLAN, {
+            "source": source.decode(), "roles": [data.decode() for data in roles],
+            "files": [{str(version): data.decode() for version, data in side.items()} for side in texts]})
+        plan = found.get("plan") if isinstance(found, dict) else None
+        if (not isinstance(plan, dict) or set(plan) != {"base", "target", "roles"}
+                or (plan["base"], plan["target"]) != (max(before), max(after))
+                or plan["roles"] != {"bytes": len(roles[0]), "sha256": hashlib.sha256(roles[0]).hexdigest()}
+                or not isinstance(found.get("tables"), list)
+                or not all(isinstance(table, str) and SQL_NAME.fullmatch(table) for table in found["tables"])):
+            return None
+    except Exception:  # Refused, a decode error, the child's bounds: the range pauses as before
+        return None
+    return {"database": CALENDAR, "base": plan["base"], "target": plan["target"],
+            "files": [after[version] for version in pending],
+            "roles_changed": ["roles.sql"] if CALENDAR_ROLES in sql else [],
+            "pending": {str(version): hashlib.sha256(texts[1][version]).hexdigest() for version in pending},
+            "ledger": {str(version): hashlib.sha256(data).hexdigest() for version, data in sorted(texts[0].items())},
+            "tables": found["tables"], "roles": plan["roles"]}
+
+
+def migration_plans(settings, mirror, base, candidate, sql):
+    """M1 for every database the range touches (K3): [calendar's plan, messaging's plan], calendar first, each for its
+    own SQL paths; None when either does not qualify (the range pauses as before)."""
+    calendar = [path for path in sql if path.startswith(CALENDAR_PACKAGE)]
+    messaging = [path for path in sql if path not in calendar]
+    plans = ([calendar_plan(settings, mirror, base, candidate, calendar)] if calendar else []) + (
+        [unattended_plan(settings, mirror, base, candidate, messaging)] if messaging else [])
+    return plans if plans and all(plans) else None
 
 
 def unattended_plan(settings, mirror, base, candidate, sql):
@@ -2669,7 +2787,7 @@ def live_lines(source, step, text):
                               "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-U", source["owner"], "-d",
                               source["database"]], timeout=60, text=text)
     if status != 0:
-        raise MigrationRefused(f"the {AUTO_DATABASE} database could not be read ({step})")
+        raise MigrationRefused(f"the {source['database']} database could not be read ({step})")
     return [line for line in output.splitlines() if line]
 
 
@@ -2680,6 +2798,15 @@ def live_ledger(source):
         return int(found["schema_version"]), dict(found["applied"])
     except (ValueError, KeyError, TypeError, IndexError) as exc:
         raise MigrationRefused(f"the live {AUTO_DATABASE} ledger could not be read") from exc
+
+
+def calendar_ledger(source):
+    """(max version, {version: checksum}) of the live calendar ledger, fcs.migrations."""
+    try:
+        found = json.loads(live_lines(source, "calendar ledger", CALENDAR_LEDGER)[0])
+        return int(found["schema_version"]), dict(found["applied"])
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        raise MigrationRefused("the live calendar ledger could not be read") from exc
 
 
 def catalog_map(lines):
@@ -2773,6 +2900,18 @@ def data_unchanged(before, after, plan):
     return None
 
 
+def calendar_data_unchanged(before, after, plan):
+    """The calendar data check: the first reason the copy's data changed beyond the migration's own ledger rows."""
+    def ledger(rows):
+        return {key[1]: value for key, value in rows.items() if key[0] == "ledger"}
+    if set(plan["pending"]) & set(ledger(before)) or ledger(after) != {**ledger(before), **plan["pending"]}:
+        return "fcs.migrations changed beyond the pending versions"
+    for key, value in sorted(before.items(), key=json.dumps):
+        if key[0] == "writes" and key[1] != "fcs.migrations" and after.get(key) != value:
+            return f"rows of {key[1]} were written"
+    return None
+
+
 def scratch_lines(copy, copied, step, text):
     """The lines `text` prints on the copy's scratch database (names, digests and counts, never a row)."""
     try:
@@ -2817,12 +2956,79 @@ def container_json(name, image, network, dsn_file, command, *, label=None, mount
         return None
 
 
+def calendar_run(name, image, network, runtime_file, arguments, *, label=None, mounts=(), entrypoint=None):
+    """(exit status, its JSON) of one candidate calendar container with MIGRATE_FLAGS, `runtime_file` mounted
+    read-only as the image's runtime.json and PGAPPNAME=<name>, at most MIGRATE_TIMEOUT seconds; (None, None) when
+    the answer is lost (a deadline kills the container). The JSON is the whole output (db-roles indents it) or else
+    its last line."""
+    argv = ["docker", "run", "--rm", "--name", name, *(["--label", label] if label else []), "--network", network,
+            *MIGRATE_FLAGS, "-e", "PGAPPNAME=" + name, "--mount",
+            f"type=bind,src={runtime_file},dst={CALENDAR_RUNTIME},readonly", *mounts,
+            *(["--entrypoint", entrypoint] if entrypoint else []), image, *arguments]
+    code, output = bounded(argv, timeout=MIGRATE_TIMEOUT)
+    if code is None:
+        with suppress(Exception):
+            run(["docker", "kill", name], timeout=30)
+        return None, None
+    for text in (output, (output.strip().splitlines() or ["null"])[-1]):
+        try:
+            return code, json.loads(text)
+        except ValueError:
+            pass
+    return code, None
+
+
+def calendar_code(found):
+    """A calendar answer's fixed code, never its details (a drift line names roles and tables)."""
+    error = found.get("error") if isinstance(found, dict) else None
+    return error if error in CALENDAR_CODES else "failed"
+
+
+def calendar_expand(name, image, network, runtime_file, plan_file, *, label=None, status=False):
+    """`service migrate-expand --plan` (or `--status`) in the calendar image: {"schema_version": N}, {"error": code}
+    or None when the answer is lost, as expand_run."""
+    mounts = [] if status else ["--mount", f"type=bind,src={plan_file},dst=/run/deedkit/plan.json,readonly"]
+    _, found = calendar_run(name, image, network, runtime_file,
+                            ["migrate-expand", *(["--status"] if status else ["--plan", "/run/deedkit/plan.json"])],
+                            label=label, mounts=mounts)
+    if isinstance(found, dict) and set(found) == {"schema_version"} and type(found["schema_version"]) is int:
+        return found
+    return {"error": calendar_code(found)} if isinstance(found, dict) and "error" in found else None
+
+
+def calendar_identity(name, image, network, runtime_file):
+    """[system identifier, database name, database OID] of the database the calendar runtime.json reaches, or None."""
+    _, found = calendar_run(name, image, network, runtime_file, ["-c", CALENDAR_IDENTITY], entrypoint="python")
+    return found if isinstance(found, list) and len(found) == 3 and all(isinstance(item, str) for item in found) else None
+
+
+def calendar_roles(settings, candidate, image, target):
+    """K3 after calendar's commit: `db-roles` (the whole roles.sql), then the read-only `db-roles --check` (ANYM-601);
+    None when both exit 0 with their answer, else the first one's code."""
+    found = calendar_settings(settings)
+    for suffix, arguments in (("roles", ["db-roles"]), ("check", ["db-roles", "--check"])):
+        code, answer = calendar_run(f"deedkit-calendar-{suffix}-{candidate[:12]}", image, found["network"],
+                                    found["runtime_file"], arguments)
+        if code is None:
+            return "no answer"
+        expected = (isinstance(answer, dict) and "db_roles" in answer if suffix == "roles"
+                    else answer == {"db_roles_check": "ok", "schema_version": target})
+        if code != 0 or not expected:
+            return calendar_code(answer)
+    return None
+
+
 IDENTITY_SQL = ("SELECT json_build_array((SELECT system_identifier::text FROM pg_control_system()), current_database()::text,"
                 " (SELECT oid::text FROM pg_database WHERE datname = current_database()))::text")
 # The database the owner DSN file reaches, read through that DSN in the candidate image (psycopg; no psql there).
 IDENTITY = ("import json, os, psycopg\n"
             "with psycopg.connect(open(os.environ['DATABASE_URL_FILE']).read().strip(), connect_timeout=5) as c:\n"
             f"    print(c.execute({IDENTITY_SQL!r}).fetchone()[0])\n")
+# The calendar database the owner's runtime.json reaches, read in the candidate calendar image.
+CALENDAR_IDENTITY = ("import json, psycopg\n"
+                     f"dsn = json.load(open({CALENDAR_RUNTIME!r}))['dsn']\n"
+                     "with psycopg.connect(dsn, connect_timeout=5) as c:\n"
+                     f"    print(c.execute({IDENTITY_SQL!r}).fetchone()[0])\n")
 
 
 def database_identity(name, image, network, dsn_file):
@@ -2847,18 +3053,18 @@ def migration_settled(source, name):
         time.sleep(1)
 
 
-def stable_data(copy, copied):
-    """MIGRATION_DATA once no other session is left on the copy and two reads half a second apart agree: an
-    ended session's write counters are flushed as it exits."""
+def stable_data(copy, copied, query=MIGRATION_DATA):
+    """`query` (MIGRATION_DATA or CALENDAR_DATA) once no other session is left on the copy and two reads half a second
+    apart agree: an ended session's write counters are flushed as it exits."""
     deadline = copy_clock() + 10
     while scratch_lines(copy, copied, "sessions", OTHER_SESSIONS) != ["0"]:
         if copy_clock() >= deadline:
             raise MigrationRefused("the rehearsal's session did not end")
         time.sleep(0.2)
-    found = scratch_lines(copy, copied, "data", MIGRATION_DATA)
+    found = scratch_lines(copy, copied, "data", query)
     for _ in range(10):
         time.sleep(0.5)
-        again = scratch_lines(copy, copied, "data", MIGRATION_DATA)
+        again = scratch_lines(copy, copied, "data", query)
         if again == found:
             return catalog_map(found)
         found = again
@@ -2876,31 +3082,47 @@ def rehearse(copied, plan, image, limit):
     run(["docker", "network", "create", "--internal", "--label", "deedkit-copy=" + copy["id"], network], timeout=60)
     run(["docker", "network", "disconnect", "none", scratch], timeout=60)
     run(["docker", "network", "connect", network, scratch], timeout=60)
+    calendar = plan.get("database") == CALENDAR
     before = catalog_map(scratch_lines(copy, copied, "before", CATALOG))
     identity = json.loads(scratch_lines(copy, copied, "identity", IDENTITY_SQL + ";")[0])
-    data = stable_data(copy, copied)
+    data = stable_data(copy, copied, CALENDAR_DATA if calendar else MIGRATION_DATA)
     directory = Path(copy["directory"])
-    dsn, plan_file = directory / "rehearsal.dsn", directory / "rehearsal-plan.json"
-    # Trust on the internal network: the DSN names no password. Image user 10001 reads both files.
-    for path, text in ((dsn, f"postgresql://{copy['source']['owner']}@{scratch}:5432/{copied['database']}\n"),
-                       (plan_file, json.dumps(expand_plan(plan, identity)) + "\n")):
-        path.write_text(text)
-        path.chmod(0o644)
+    plan_file = directory / "rehearsal-plan.json"
+    plan_file.write_text(json.dumps(expand_plan(plan, identity)) + "\n")
+    plan_file.chmod(0o644)
+    # Trust on the internal network: the DSN names no password. Image user 10001 reads the files.
+    spent = 0
+    dsn = f"postgresql://{copy['source']['owner']}@{scratch}:5432/{copied['database']}"
+    if calendar:
+        # The calendar CLI reads only an owner-only runtime.json of its own user (private_files.read_private).
+        secret = directory / "rehearsal-runtime.json"
+        secret.write_text(json.dumps({"dsn": dsn, "port": 1}) + "\n")
+        secret.chmod(0o600)
+        os.chown(secret, 10001, 10001)
+        spent = int(float(scratch_lines(copy, copied, "busy", BUSY)[0]))
+    else:
+        secret = directory / "rehearsal.dsn"
+        secret.write_text(dsn + "\n")
+        secret.chmod(0o644)
     container = network + "-migrate"
     claim(copy, "container", container)
-    answer = expand_run(container, image, network, dsn, plan_file, label="deedkit-copy=" + copy["id"])
+    answer = (calendar_expand if calendar else expand_run)(container, image, network, str(secret), plan_file,
+                                                           label="deedkit-copy=" + copy["id"])
     if answer != {"schema_version": plan["target"]}:
         raise MigrationRefused("the rehearsal of migrate-expand failed: "
                                + (answer or {}).get("error", "no answer" if answer is None else "wrong version"))
     took = None
-    if plan["pending"]:
+    if plan["pending"] and not calendar:
         took = int(scratch_lines(copy, copied, "took", "SELECT coalesce(round(extract(epoch FROM clock_timestamp()"
                                  f" - max(applied_at)) * 1000), -1) FROM archive_migrations WHERE version > {int(plan['base'])};")[0])
-        if not 0 <= took <= limit:
-            raise MigrationRefused(f"too slow for an unattended lock: the rehearsal took {took} ms, over {limit} ms")
-    after_data = stable_data(copy, copied)
+    after_data = stable_data(copy, copied, CALENDAR_DATA if calendar else MIGRATION_DATA)
+    if plan["pending"] and calendar:
+        took = int(float(scratch_lines(copy, copied, "busy", BUSY)[0])) - spent
+    if took is not None and not 0 <= took <= limit:
+        raise MigrationRefused(f"too slow for an unattended lock: the rehearsal took {took} ms, over {limit} ms")
     after = catalog_map(scratch_lines(copy, copied, "after", CATALOG))
-    if reason := not_additive(before, after) or data_unchanged(data, after_data, plan):
+    if reason := not_additive(before, after) or (calendar_data_unchanged if calendar else data_unchanged)(
+            data, after_data, plan):
         raise MigrationRefused("not additive: " + reason)
     return {"took_ms": took, "difference": catalog_difference(digested(before), digested(after))}
 
@@ -2931,6 +3153,8 @@ def migration_gate(settings, http, plan, mirror, base, serving):
     wait_for_calls(settings, time.monotonic() + CALL_POLL)
     if reason := unresolved(Path(settings["state_directory"]), Path(http["state_directory"]), lambda: mirror, serving):
         raise MigrationRefused(reason)
+    if plan["database"] == CALENDAR:
+        return calendar_gate(settings, plan, mirror, base)
     try:
         store = run(["git", "-C", str(mirror), "cat-file", "blob", f"{base}:{STORE_SOURCE}"])
     except Refused:
@@ -2946,19 +3170,63 @@ def migration_gate(settings, http, plan, mirror, base, serving):
                                "migrate by hand (production.md)")
 
 
+def calendar_gate(settings, plan, mirror, base):
+    """The calendar part of M2 (K3): the base release's calendar Store prepares no statement server-side (K0) and the
+    live calendar ledger is exactly the base's. Calendar has no backup receiver or producer pin to wait for (its
+    backups take any fcs.migrations version)."""
+    try:
+        store = run(["git", "-C", str(mirror), "cat-file", "blob", f"{base}:{CALENDAR_STORE}"])
+    except Refused:
+        store = ""
+    if not CALENDAR_UNPREPARED.search(store):
+        raise MigrationRefused("the running calendar release would fail on the new columns: deploy ANYM-586 K0 first")
+    version, applied = calendar_ledger(copy_source(settings, CALENDAR)[0])
+    if version != plan["base"] or applied != plan["ledger"]:
+        raise MigrationRefused(f"the live calendar ledger is not the base's schema {plan['base']}; "
+                               "migrate by hand (production.md)")
+
+
 def migration_receipt(release, plan, status, **fields):
-    record = {"database": AUTO_DATABASE, "base": plan["base"], "target": plan["target"], "files": plan["files"],
+    """`<sha>/migration.json`: the overall status with the summary of `plan` (the range's last database) at the top,
+    as ANYM-449 wrote it, and each database's own phase under `phases` (K3)."""
+    record = {"database": plan["database"], "base": plan["base"], "target": plan["target"], "files": plan["files"],
               "roles": plan["roles_changed"], "tables": plan["tables"], "status": status, "at": now(), **fields}
     write_record(release / "migration.json", record)
     return record
 
 
-def migration_image(release, candidate):
-    """The candidate's verified API image (plan B's target), pulled or reused under its production tag."""
-    return build_image(release / "source", candidate, PROOF_TARGET)
+def migration_image(release, candidate, name=AUTO_DATABASE):
+    """The candidate's verified API image (plan B's target), or its calendar image, pulled or reused under its
+    production tag."""
+    return build_image(release / "source", candidate, CALENDAR_TARGET if name == CALENDAR else PROOF_TARGET)
 
 
 NO_CHANGE = {"removed": [], "changed": [], "added": []}
+
+
+def step_name(name, step):
+    """A live read's step: messaging's as ANYM-449 named them, calendar's prefixed."""
+    return step if name == AUTO_DATABASE else f"{name} {step}"
+
+
+def container_name(name, kind, candidate):
+    return f"deedkit-{kind}-{candidate[:12]}" if name == AUTO_DATABASE else f"deedkit-{name}-{kind}-{candidate[:12]}"
+
+
+def evidence_file(release, name, kind):
+    """migrate-plan.json and migration-catalog.json for messaging, calendar-… for calendar."""
+    return release / (kind if name == AUTO_DATABASE else f"{name}-{kind}")
+
+
+def expand_answer(settings, plan, candidate, image, plan_file=None):
+    """One production `migrate-expand` (or `--status` without `plan_file`) on `plan`'s database."""
+    status, kind = plan_file is None, "status" if plan_file is None else "migrate"
+    name = container_name(plan["database"], kind, candidate)
+    if plan["database"] == CALENDAR:
+        found = calendar_settings(settings)
+        return calendar_expand(name, image, found["network"], found["runtime_file"], plan_file, status=status)
+    found = unattended_settings(settings)
+    return expand_run(name, image, found["network"], found["dsn_file"], plan_file, status=status)
 
 
 def migration_outcome(settings, plan, candidate, image, expected):
@@ -2967,15 +3235,15 @@ def migration_outcome(settings, plan, candidate, image, expected):
     when ledger and catalog are still the copy's; `diverged` when the ledger moved but the catalog differs; else
     `uncertain`. `expected` is migration-catalog.json: the digests of the live catalog at the copy and the
     rehearsal's change between digests."""
-    unattended, source = unattended_settings(settings), copy_source(settings, AUTO_DATABASE)[0]
-    if not migration_settled(source, "deedkit-migrate-" + candidate[:12]):
+    name = plan.get("database", AUTO_DATABASE)
+    source = copy_source(settings, name)[0]
+    if not migration_settled(source, container_name(name, "migrate", candidate)):
         return "uncertain"
-    answer = expand_run("deedkit-status-" + candidate[:12], image, unattended["network"], unattended["dsn_file"], None,
-                        status=True)
+    answer = expand_answer(settings, plan, candidate, image)
     try:
-        version, applied = live_ledger(source)
+        version, applied = (calendar_ledger if name == CALENDAR else live_ledger)(source)
         effect = catalog_difference({tuple(key): value for key, value in expected["before"]},
-                                    digested(catalog_map(live_lines(source, "effect", CATALOG))))
+                                    digested(catalog_map(live_lines(source, step_name(name, "effect"), CATALOG))))
     except (Refused, ValueError, KeyError, TypeError):
         return "uncertain"
     at_target = (answer == {"schema_version": plan["target"]} == {"schema_version": version}
@@ -2988,36 +3256,101 @@ def migration_outcome(settings, plan, candidate, image, expected):
     return "diverged" if at_target else "uncertain"
 
 
-def resumed_migration(settings, plan, candidate, release):
+def outcome_text(candidate, outcome, code=None, name=AUTO_DATABASE):
+    if outcome == "not-applied":
+        return (f"migration of {candidate} did not apply" if name == AUTO_DATABASE
+                else f"the {name} migration of {candidate} did not apply") + (f": {code}" if code else "")
+    if outcome == "diverged":
+        return (f"the migration of {candidate} changed {name} differently from its rehearsal; inspect it "
+                "before any recovery")
+    return (f"the migration of {candidate} is uncertain" if name == AUTO_DATABASE
+            else f"the {name} migration of {candidate} is uncertain") + "; inspect the ledger before any recovery"
+
+
+class Progress:
+    """The phases of one range's databases (K3) and the receipt that records them: `rehearsed`, `planned` (its one
+    migrate-expand may have run), then `migrated` (calendar adds `roles`: `running`, `ok` or a code) or how it ended.
+    The pause of a database after an earlier one committed names that commit first."""
+
+    def __init__(self, release, plans, phases=None, **fields):
+        self.release, self.plans, self.phases, self.fields = release, plans, phases if phases is not None else {}, fields
+
+    def record(self, status, **fields):
+        return migration_receipt(self.release, self.plans[-1], status, phases=self.phases, **self.fields, **fields)
+
+    def update(self, name, **fields):
+        self.phases[name] = {**self.phases.get(name, {}), **fields}
+
+    def committed(self, before):
+        """"calendar migrated to 6; " for each database migrated before `before`."""
+        return "".join(f"{plan['database']} migrated to {plan['target']}; " for plan in self.plans
+                       if plan["database"] != before and self.phases.get(plan["database"], {}).get("status") == "migrated")
+
+    def refused(self, name, status, text, **fields):
+        prefix = self.committed(name)
+        if prefix and status == "not-applied":
+            text = f"{name} not applied: {fields.get('code') or 'not-applied'}"
+        self.record(status, **fields)
+        return MigrationRefused(prefix + text)
+
+    def roles(self, settings, plan, candidate, image):
+        """K3: db-roles and db-roles --check after calendar's commit; a non-zero exit pauses before messaging."""
+        self.update(CALENDAR, roles="running")
+        self.record("planned")
+        code = calendar_roles(settings, candidate, image, plan["target"])
+        self.update(CALENDAR, roles=code or "ok")
+        if code:
+            self.record("roles-failed", code=code)
+            raise MigrationRefused(f"calendar migrated to {plan['target']}; roles: {code}")
+        self.record("planned")
+
+
+def resumed_migration(settings, plans, candidate, release):
     """A run that finds `migration.json`: True when it records `migrated` (or --status shows it), else
-    MigrationRefused; nothing is retried. False when there is none."""
+    MigrationRefused; nothing is retried. False when there is none. A database whose migrate-expand may have run is
+    decided from its evidence; calendar's db-roles then runs when it had not started; a database that never
+    started after an earlier one committed pauses (K3)."""
     if not (release / "migration.json").exists():
         return False
-    status = read(release / "migration.json").get("status")
+    record = read(release / "migration.json")
+    status = record.get("status")
     if status == "migrated":
         return True
-    if status != "planned" or plan is None:
+    if status != "planned" or plans is None:
         raise MigrationRefused(f"the unattended migration of {candidate} ended {status}; inspect "
                                f"{release / 'migration.json'} and migrate by hand (production.md)")
-    try:
-        expected = read(release / "migration-catalog.json")
-    except (OSError, ValueError):
-        expected = None
-    outcome = migration_outcome(settings, plan, candidate, migration_image(release, candidate), expected) \
-        if isinstance(expected, dict) else "uncertain"
-    migration_receipt(release, plan, outcome, resumed=True)
-    if outcome != "migrated":
-        raise MigrationRefused(outcome_text(candidate, outcome))
+    phases = record.get("phases")
+    if not isinstance(phases, dict):  # an ANYM-449 receipt: messaging only
+        phases = {plans[-1]["database"]: {"status": "planned"}}
+    progress = Progress(release, plans, phases, resumed=True)
+    for plan in plans:
+        name = plan["database"]
+        phase = found if isinstance(found := phases.get(name), dict) else {}
+        phases[name] = phase
+        if phase.get("status") == "planned":
+            try:
+                expected = read(evidence_file(release, name, "migration-catalog.json"))
+            except (OSError, ValueError):
+                expected = None
+            outcome = migration_outcome(settings, plan, candidate, migration_image(release, candidate, name),
+                                        expected) if isinstance(expected, dict) else "uncertain"
+            progress.update(name, status=outcome)
+            if outcome != "migrated":
+                raise progress.refused(name, outcome, outcome_text(candidate, outcome, name=name))
+            if name == CALENDAR:
+                # Recovery runs before admission: db-roles is a production write, so it waits for calls like any
+                # (Astra r1 F1). A wait records nothing; the next run decides the same evidence again.
+                wait_for_calls(settings, time.monotonic() + CALL_POLL)
+                progress.roles(settings, plan, candidate, migration_image(release, candidate, name))
+        elif phase.get("status") != "migrated":
+            progress.update(name, status="not-applied", code="interrupted")
+            raise progress.refused(name, "not-applied", outcome_text(candidate, "not-applied", "interrupted", name),
+                                   code="interrupted")
+        elif name == CALENDAR and phase.get("roles") != "ok":
+            progress.record("uncertain")
+            raise MigrationRefused(f"calendar migrated to {plan['target']}; roles: interrupted")
+    progress.record("migrated")
     return True
-
-
-def outcome_text(candidate, outcome, code=None):
-    if outcome == "not-applied":
-        return f"migration of {candidate} did not apply" + (f": {code}" if code else "")
-    if outcome == "diverged":
-        return (f"the migration of {candidate} changed {AUTO_DATABASE} differently from its rehearsal; inspect it "
-                "before any recovery")
-    return f"the migration of {candidate} is uncertain; inspect the ledger before any recovery"
 
 
 def unsettled_migrations(state):
@@ -3031,57 +3364,90 @@ def unsettled_migrations(state):
     return found
 
 
-def migrate(settings, http, plan, mirror, base, serving, candidate, release):
-    """M2 after preparation, M3 and M4: the producer check, the copy, the rehearsal, the final gate and the one
-    production `migrate-expand`. Returns when the database is at the target with the rehearsal's effect; raises
-    MigrationWait or CallActive/CallsUnknown (nothing changed), or MigrationRefused (a pause)."""
-    unattended = unattended_settings(settings)
-    producer_reads(settings, mirror, plan["target"])
-    image = migration_image(release, candidate)
-    def refused(reason, phase):
-        migration_receipt(release, plan, "refused", phase=phase, reason=reason)
-        return MigrationRefused(reason)
-    try:
-        with database_copy(settings, AUTO_DATABASE, candidate, keep=True, catalog=CATALOG) as copied:
-            rehearsal = rehearse(copied, plan, image, unattended["rehearsal_limit_ms"])
-    except MigrationRefused as exc:
-        raise refused(str(exc), "rehearsal") from exc
-    except CopyFailed as exc:
-        raise refused(f"the pre-migration copy of {AUTO_DATABASE} failed: {exc.code}", "copy") from exc
-    except Exception as exc:
-        raise refused(f"the pre-migration copy or rehearsal of {AUTO_DATABASE} stopped: "
-                      + (str(exc) if isinstance(exc, Refused) else type(exc).__name__), "copy") from exc
-    # The final gate: everything admission read, again, and the live catalog still the copy's.
-    migration_gate(settings, http, plan, mirror, base, serving)
-    producer_reads(settings, mirror, plan["target"])
-    source = copy_source(settings, AUTO_DATABASE)[0]
-    if hashlib.sha256("\n".join(live_lines(source, "shape", CATALOG)).encode()).hexdigest() != copied["catalog_sha256"]:
-        raise refused("the database changed shape since its copy", "final gate")
-    # The DSN the migration uses must reach the database that was copied and gated, not another one (Astra r1 F3); its
-    # one connection checks the same identity again before anything runs (Astra r2 F3).
-    identity = json.loads(live_lines(source, "identity", IDENTITY_SQL + ";")[0])
-    if database_identity("deedkit-identity-" + candidate[:12], image, unattended["network"],
-                         unattended["dsn_file"]) != identity:
-        raise refused("the owner DSN file does not reach the copied database", "final gate")
-    plan_file = release / "migrate-plan.json"
-    plan_file.write_text(json.dumps(expand_plan(plan, identity)) + "\n")
-    plan_file.chmod(0o644)
-    # The recovery evidence first: digests of the live catalog the gate read and the change the rehearsal made.
-    expected = {"before": sorted(([list(key), value] for key, value in digested(catalog_map(copied["catalog"])).items()),
-                                 key=json.dumps), "difference": rehearsal["difference"]}
-    write_record(release / "migration-catalog.json", expected)
-    migration_receipt(release, plan, "planned", copy=copied["id"], rehearsal_ms=rehearsal["took_ms"])
-    try:
-        answer = expand_run("deedkit-migrate-" + candidate[:12], image, unattended["network"], unattended["dsn_file"],
-                            plan_file)
-        outcome = migration_outcome(settings, plan, candidate, image, expected)
-    except Exception:  # whatever happened, migration.json stays `planned`: the next run reads --status
-        raise MigrationRefused(outcome_text(candidate, "uncertain"))
-    code = (answer or {}).get("error")
-    migration_receipt(release, plan, outcome, copy=copied["id"], rehearsal_ms=rehearsal["took_ms"],
-                      **({"code": code} if code else {}))
-    if outcome != "migrated":
-        raise MigrationRefused(outcome_text(candidate, outcome, code))
+def migrate(settings, http, plans, mirror, base, serving, candidate, release):
+    """M2 after preparation, M3 and M4 for each database of the range (K3): the producer check, every copy and its
+    rehearsal before any production write, the final gates, then one production `migrate-expand` per database,
+    calendar first and then its db-roles and db-roles --check. Returns when every database is at its target with its
+    rehearsal's effect; raises MigrationWait or CallActive/CallsUnknown (nothing changed), or MigrationRefused."""
+    messaging = [plan for plan in plans if plan["database"] == AUTO_DATABASE]
+    limit = rehearsal_limit(settings)
+    if messaging:
+        producer_reads(settings, mirror, messaging[0]["target"])
+    images = {plan["database"]: migration_image(release, candidate, plan["database"]) for plan in plans}
+    progress = Progress(release, plans)
+    def refused(name, reason, phase):
+        progress.update(name, status="refused", phase=phase)
+        return progress.refused(name, "refused", reason, phase=phase, reason=reason)
+    copies, rehearsals = {}, {}
+    for plan in plans:
+        name = plan["database"]
+        try:
+            with database_copy(settings, name, candidate, keep=True, catalog=CATALOG) as copied:
+                rehearsals[name] = rehearse(copied, plan, images[name], limit)
+        except MigrationRefused as exc:
+            raise refused(name, str(exc), "rehearsal") from exc
+        except CopyFailed as exc:
+            raise refused(name, f"the pre-migration copy of {name} failed: {exc.code}", "copy") from exc
+        except Exception as exc:
+            raise refused(name, f"the pre-migration copy or rehearsal of {name} stopped: "
+                          + (str(exc) if isinstance(exc, Refused) else type(exc).__name__), "copy") from exc
+        copies[name] = copied
+        progress.update(name, status="rehearsed", copy=copied["id"], rehearsal_ms=rehearsals[name]["took_ms"])
+    # The final gate: everything admission read, again, and each live catalog still its copy's.
+    for plan in plans:
+        migration_gate(settings, http, plan, mirror, base, serving)
+    if messaging:
+        producer_reads(settings, mirror, messaging[0]["target"])
+    evidence = {}
+    for plan in plans:
+        name, copied = plan["database"], copies[plan["database"]]
+        source = copy_source(settings, name)[0]
+        if hashlib.sha256("\n".join(live_lines(source, step_name(name, "shape"), CATALOG)).encode()).hexdigest() \
+                != copied["catalog_sha256"]:
+            raise refused(name, "the database changed shape since its copy" if name == AUTO_DATABASE
+                          else f"the {name} database changed shape since its copy", "final gate")
+        # The DSN the migration uses must reach the database that was copied and gated, not another one (Astra r1 F3);
+        # its one connection checks the same identity again before anything runs (Astra r2 F3).
+        identity = json.loads(live_lines(source, step_name(name, "identity"), IDENTITY_SQL + ";")[0])
+        if name == CALENDAR:
+            found = calendar_settings(settings)
+            reached = calendar_identity(container_name(name, "identity", candidate), images[name], found["network"],
+                                        found["runtime_file"])
+        else:
+            found = unattended_settings(settings)
+            reached = database_identity(container_name(name, "identity", candidate), images[name], found["network"],
+                                        found["dsn_file"])
+        if reached != identity:
+            raise refused(name, "the owner DSN file does not reach the copied database" if name == AUTO_DATABASE
+                          else f"the {name} runtime.json does not reach the copied {name} database", "final gate")
+        plan_file = evidence_file(release, name, "migrate-plan.json")
+        plan_file.write_text(json.dumps(expand_plan(plan, identity)) + "\n")
+        plan_file.chmod(0o644)
+        # The recovery evidence first: digests of the live catalog the gate read and the change the rehearsal made.
+        expected = {"before": sorted(([list(key), value] for key, value in digested(catalog_map(copied["catalog"])).items()),
+                                     key=json.dumps), "difference": rehearsals[name]["difference"]}
+        write_record(evidence_file(release, name, "migration-catalog.json"), expected)
+        evidence[name] = plan_file, expected
+    last = plans[-1]["database"]
+    summary = {"copy": copies[last]["id"], "rehearsal_ms": rehearsals[last]["took_ms"]}
+    for plan in plans:
+        name = plan["database"]
+        plan_file, expected = evidence[name]
+        progress.update(name, status="planned")
+        progress.record("planned", **summary)
+        try:
+            answer = expand_answer(settings, plan, candidate, images[name], plan_file)
+            outcome = migration_outcome(settings, plan, candidate, images[name], expected)
+        except Exception:  # whatever happened, migration.json stays `planned`: the next run reads --status
+            raise MigrationRefused(progress.committed(name) + outcome_text(candidate, "uncertain", name=name))
+        code = (answer or {}).get("error")
+        progress.update(name, status=outcome, **({"code": code} if code else {}))
+        if outcome != "migrated":
+            raise progress.refused(name, outcome, outcome_text(candidate, outcome, code, name), **summary,
+                                   **({"code": code} if code else {}))
+        if name == CALENDAR:
+            progress.roles(settings, plan, candidate, images[name])
+    progress.record("migrated", **summary)
 
 
 # Deploy tool updates (ANYM-443, production.md "Deploy tool updates"). Each installed tool pair has its own directory
@@ -3674,9 +4040,10 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
             return {"status": "waiting", "reason": "no newer main commit has attested images yet", "sha": base}
         since = base
     sql, pending = range_changes(mirror, since, candidate, installed)
-    # M1 (ANYM-449): a messaging range migrate-expand may run without a person migrates instead of pausing.
-    plan = unattended_plan(settings, mirror, since, candidate, sql) if sql and not pending and candidate != base else None
-    if (reasons := [] if plan else pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
+    # M1 (ANYM-449, ANYM-586 K3): a messaging or calendar range migrate-expand may run without a person migrates
+    # instead of pausing.
+    plans = migration_plans(settings, mirror, since, candidate, sql) if sql and not pending and candidate != base else None
+    if (reasons := [] if plans else pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
         # Only the tool pair waits for an install: the self-updating layout installs it, when this run is its tool.
         try:
             tool = installed_tool()
@@ -3689,8 +4056,9 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     if reasons:
         return halt("; ".join(reasons), sha=candidate)
     if dry_run:
-        migration = [f"migrate {AUTO_DATABASE} schema {plan['base']} to {plan['target']} after a verified copy and its "
-                     "rehearsal"] if plan else []
+        migration = [f"migrate {plan['database']} schema {plan['base']} to {plan['target']} after a verified copy and "
+                     "its rehearsal" + (", then db-roles and db-roles --check" if plan["database"] == CALENDAR else "")
+                     for plan in plans or ()]
         return {"status": "plan", "sha": candidate, "base": base,
                 "steps": migration + (["plan A"] if candidate != base else []) + ["plan B"]}
     record.update(sha=candidate, base=base, started_at=now(), status="deploying")
@@ -3711,14 +4079,15 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         migrated = False
         try:
             # M2 admission (read-only) before preparation; a run that finds migration.json resumes from it (M4).
-            if plan and not (migrated := resumed_migration(settings, plan, candidate, release)):
-                migration_gate(settings, http, plan, mirror, base, serving["sha"])
+            if plans and not (migrated := resumed_migration(settings, plans, candidate, release)):
+                for plan in plans:
+                    migration_gate(settings, http, plan, mirror, base, serving["sha"])
             if not (release / "prepared.json").exists():
                 if release.exists():
                     return finish(**halt(f"an earlier preparation of {candidate} did not finish; inspect {release}"))
                 prepare(settings, candidate)
-            if plan and not migrated:
-                migrate(settings, http, plan, mirror, base, serving["sha"], candidate, release)
+            if plans and not migrated:
+                migrate(settings, http, plans, mirror, base, serving["sha"], candidate, release)
                 migrated = True
             apply(settings, candidate)
         except Exception as exc:
@@ -3731,8 +4100,9 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
                 return finish("waiting", reason=message + "; nothing changed, the next run retries",
                               migration_waits={"count": gated + 1, "at": now(), "reason": message})
             if migrated:
-                assert plan
-                message += f" ({AUTO_DATABASE} is already at schema {plan['target']})"
+                assert plans
+                message += " (" + " and ".join(f"{plan['database']} is already at schema {plan['target']}"
+                                               for plan in plans) + ")"
             if isinstance(exc, (CallActive, CallsUnknown)) and not (release / "attempted.json").exists():
                 # Nothing was stopped: the prepared release waits for a later run; the fourth wait in a row pauses.
                 if waits + 1 >= CALL_WAITS:
@@ -3757,10 +4127,13 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
                 return finish(**halt(f"plan A of {candidate} failed its health wait and its rollback failed: {detail}; "
                                      "production state is unknown, inspect it"))
             if migrated:
-                assert plan
-                return finish(**halt(f"plan A of {candidate} failed its health wait after migrating schema "
-                                     f"{plan['base']} to {plan['target']}; rolled back to {base} on schema "
-                                     f"{plan['target']}", status="rolled-back"))
+                assert plans
+                named = len(plans) > 1 or plans[0]["database"] != AUTO_DATABASE
+                def schemas(text):
+                    return " and ".join((f"{plan['database']} " if named else "") + text.format(**plan) for plan in plans)
+                return finish(**halt(f"plan A of {candidate} failed its health wait after migrating "
+                                     f"{schemas('schema {base} to {target}')}; rolled back to {base} on "
+                                     f"{schemas('schema {target}')}", status="rolled-back"))
             return finish(**halt(f"plan A of {candidate} failed its health wait; rolled back to {base}",
                                  status="rolled-back"))
     try:

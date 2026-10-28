@@ -182,6 +182,18 @@ def test_the_session_budgets_are_read_back(store, expand, monkeypatch):
 
 
 # spec: ANYM-586
+def test_the_session_takes_pgappname_over_the_dsns_application_name(store, expand, monkeypatch):
+    setup, _ = expand
+    plan, paths = setup()
+    monkeypatch.setattr(store, "dsn", psycopg.conninfo.make_conninfo(store.dsn, application_name="synthetic-other"))
+    monkeypatch.setenv("PGAPPNAME", "deedkit-calendar-migrate-synthetic")
+    seen = []
+    assert store.migrate_expand(plan, **paths, before_commit=lambda conn: seen.append(
+        conn.execute("SHOW application_name").fetchone()["application_name"])) == {"schema_version": 6}
+    assert seen == ["deedkit-calendar-migrate-synthetic"]
+
+
+# spec: ANYM-586
 def test_a_held_migration_lock_returns_busy_at_once_and_changes_nothing(store, expand):
     setup, _ = expand
     plan, paths = setup()
