@@ -33,7 +33,7 @@ PG_DATA_PATH = '/var/lib/postgresql'
 HELPER_TMPFS = {'/tmp':'rw,noexec,nosuid,size=64m',
                 PG_DATA_PATH:'ro,noexec,nosuid,nodev,size=1m,mode=0700'}
 # Backup schema versions this verifier accepts from its helper (`capabilities` reports them).
-SCHEMAS = range(2,54)
+SCHEMAS = range(2,55)
 # Host admission (ANYM-609): every instance on the receiver shares this root-private directory.
 # It holds the one heavy-restore lock, the holder's admission record and the pin step's journal.
 HOST_DIRECTORY = '/var/lib/deedkit-backup-verify'

@@ -261,7 +261,7 @@ def digest(value: str) -> str:
 
 
 KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
-RUNTIME_SCHEMA=53  # the newest schema this runtime knows; migrate() refuses a newer database
+RUNTIME_SCHEMA=54  # the newest schema this runtime knows; migrate() refuses a newer database
 
 
 def revocable_token(value):
@@ -470,18 +470,16 @@ class Store:
         rows=c.execute('''SELECT a.id,a.synthetic,coalesce(s.coverage,'synthetic_fixture_only') AS coverage,
             s.status,s.last_ingest_at,s.detail_code FROM accounts a LEFT JOIN source_status s ON s.account=a.id
             WHERE a.id=ANY(%s) ORDER BY a.id''',(p['accounts'],)).fetchall()
-        conflicts={r['account']:r for r in c.execute('''SELECT m.account,
-            count(*) FILTER(WHERE mc.resolved_at IS NULL) AS active_conflicts,
-            count(*) FILTER(WHERE mc.resolved_at IS NOT NULL) AS historical_conflicts
-            FROM message_conflicts mc JOIN messages m ON m.id=mc.message
-            WHERE m.account=ANY(%s) GROUP BY m.account''',(p['accounts'],))}
+        from .conflict_classes import grouped,report
+        conflicts=grouped(c,'account',p['accounts'])
         for row in rows:
-            row.update({k:v for k,v in conflicts.get(row['id'],{'active_conflicts':0,'historical_conflicts':0}).items() if k!='account'})
+            open_by_class,row['active_conflicts'],row['historical_conflicts']=conflicts.get(row['id'],({},0,0))
             row['detail_scope']='account_summary_not_this_result'
             if row['detail_code']=='version_conflict' and not row['active_conflicts']:
                 row['detail_code']='coverage_not_reconciled'
             from .status_details import describe
             row['detail']=describe(row['detail_code'])
+            if row['detail_code']=='version_conflict':row['detail']['next_action']=report(open_by_class)['next_step']
         return serial({'synthetic':all(r['synthetic'] for r in rows),'sources':rows,
                        'coverage':'partial_or_unknown' if any(r['status'] for r in rows) else 'synthetic_fixture_only'})
 
@@ -892,7 +890,7 @@ class Store:
                 lower,upper=date_bound(from_time),date_bound(to_time)
                 if lower and upper and lower>=upper:raise APIError('invalid_date_range')
                 if not isinstance(chat_id,str) or len(chat_id)>256:raise APIError('invalid_filter')
-                data=chat_statuses(c,p,[chat_id],lower,upper)
+                data=chat_statuses(c,p,[chat_id],lower,upper,conflict_items=True)
                 if not data:raise APIError('not_found',404)
                 targets(p,[chat_id]);return serial(data[chat_id])
             if from_time or to_time:raise APIError('chat_required')
@@ -1454,7 +1452,7 @@ class Store:
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version>RUNTIME_SCHEMA: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql')]:
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
@@ -1464,6 +1462,9 @@ class Store:
                     if target==17:
                         from .chat_evidence import backfill
                         backfill(c)
+                    if target==54:
+                        from .conflict_classes import backfill as classify_conflicts
+                        classify_conflicts(c)
                     c.execute('INSERT INTO archive_migrations(version,sha256) VALUES(%s,%s)',(target,sha))
                     c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'",(str(target),))
                 else:

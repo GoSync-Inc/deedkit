@@ -26,7 +26,8 @@ def test_exact_provider_reference_and_scoped_conflict_lifecycle(archive):
     resolved=s.resolve_reference(key,'archive-test','100','17')
     assert resolved['message']['id']==mid and resolved['message']['provider_id']=='17'
     assert resolved['message']['evidence']['active_conflicts']==1
-    assert resolved['sync']['conflicts']=={'active':1,'historical':0}
+    assert {k:resolved['sync']['conflicts'][k] for k in ('active','historical','attention','known')}=={
+        'active':1,'historical':0,'attention':0,'known':1}
     for args in [('archive-test','100','17'),('archive-test','missing','17')]:
         with pytest.raises(APIError,match='not_found'):s.resolve_reference(hidden,*args)
     # Even a successful re-observation of the retained version leaves equal-time ambiguity.

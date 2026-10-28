@@ -94,7 +94,7 @@ def message_summary(row):
     evidence=row.get('evidence') or {}
     # Never silently remove the reasons that make a result uncertain.
     result['integrity']={'provider_currentness_verified':False,
-        **{k:evidence[k] for k in ('active_conflicts','revision_changed_during_read') if evidence.get(k)}}
+        **{k:evidence[k] for k in ('active_conflicts','conflict','revision_changed_during_read') if evidence.get(k)}}
     if files:
         result['attachments']=[file_summary(f) for f in files[:2]]
         result['attachment_count']=len(files)
@@ -145,7 +145,7 @@ def lean_message(row, *, search=False, files=True):
             'recipient_delivery_confirmed':receipt.get('recipient_delivery_confirmed') is True}
     if row.get('order_status')=='ambiguous':result['order_status']='ambiguous'
     evidence=row.get('evidence') or {}
-    problems={k:evidence[k] for k in ('active_conflicts','revision_changed_during_read') if evidence.get(k)}
+    problems={k:evidence[k] for k in ('active_conflicts','conflict','revision_changed_during_read') if evidence.get(k)}
     if problems:result['integrity']=problems
     attachments=row.get('attachments') or []
     if files and attachments:
@@ -421,6 +421,8 @@ def render(method, result, detail):
                 'archive_detail_code','oldest_message_at','newest_message_at','last_ingest_at','alerts') if k in source}
             # The compact budget carries only the live verdict; full detail has the evidence.
             if 'liveness' in source:row['liveness_state']=source['liveness']['state']
+            conflicts=source.get('conflicts') or {}
+            if conflicts.get('attention') or conflicts.get('known'):row['conflicts']=conflicts
             row['freshness']={k:v for k,v in source.get('freshness',{}).items()
                 if k in ('state','scan_state','last_successful_scan_at','scan_age_seconds','basis',
                     'pending_capture_events','last_capture_commit_at','qualifications')

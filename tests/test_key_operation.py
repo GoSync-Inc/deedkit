@@ -201,7 +201,7 @@ def schema_43(store):
     finally:
         with store.pool.connection() as c:
             c.execute(MIGRATION_044.read_text())
-            c.execute("UPDATE probe_metadata SET value='53' WHERE name='schema_version'")
+            c.execute("UPDATE probe_metadata SET value='54' WHERE name='schema_version'")
 
 
 def rows_any(store):
@@ -223,7 +223,7 @@ CHECKS = {
 
 # spec: ANYM-495
 @pytest.mark.parametrize('command', list(CHECKS))
-@pytest.mark.parametrize('version,answer', [(53, 'ok'), (43, 'schema_not_ready')], ids=['current', 'n-1'])
+@pytest.mark.parametrize('version,answer', [(54, 'ok'), (43, 'schema_not_ready')], ids=['current', 'n-1'])
 def test_check_validates_and_reports_the_schema_and_writes_nothing(seeded, run, tmp_path, command, version, answer):
     store = seeded[0]
     with store.pool.connection() as c:

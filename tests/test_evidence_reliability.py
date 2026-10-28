@@ -178,7 +178,8 @@ def test_registered_filename_presentation_uses_current_occurrence_evidence(archi
 
 
 def test_version_conflict_recommends_an_available_read_operation():
-    assert describe('version_conflict')['next_action'] == 'get_context'
+    # get_sync_status with a chat_id lists the open conflicts; get_context needs an ID the summary lacks (ANYM-557).
+    assert describe('version_conflict')['next_action'] == 'inspect_chat'
 
 
 def test_compact_status_preserves_freshness_qualifications_and_independent_media_counts():
