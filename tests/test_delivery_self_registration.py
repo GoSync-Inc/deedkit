@@ -434,3 +434,23 @@ def test_allowlisted_endpoints_keep_their_recovery_whether_the_url_is_a_vendor_s
     assert proxy.admit('hooks.example.test:443') == 'hooks.example.test'
     with pytest.raises(egress_proxy.Refused, match='policy_refused'):
         proxy.admit('hooks.agent-chosen.test:443')
+
+
+# spec: ANYM-585
+def test_allowlisted_endpoint_tests_keep_their_recovery_whether_the_url_is_a_vendor_shape(gate, policy):
+    store = gate
+    # No switch: only the URL shape makes the routine a vendor endpoint on an operator-listed host.
+    policy(allow_hosts=['cursor.sh', 'example.test'])
+    register(store, identity(store, 'routine-agent'), url=ROUTINE, headers=BEARER)
+    register(store, identity(store, 'listed-agent'), url=LISTED)
+    with store.pool.connection() as c:
+        c.execute("""UPDATE delivery_endpoint_tests SET state='leased',lease_token=gen_random_uuid(),
+            lease_until=clock_timestamp()-interval '1 second' WHERE state='pending'""")
+    posts = []
+    dispatch_hints(store, transport=lambda url, *a, **k: posts.append(url) or 200, resolver=PUBLIC)
+    # The vendor URL's test settles unknown with no POST; the generic listed endpoint's test is sent again.
+    assert posts == [LISTED]
+    with store.pool.connection() as c:
+        assert {row['host']: (row['state'], row['error_code']) for row in c.execute('''SELECT e.host,t.state,
+            t.error_code FROM delivery_endpoint_tests t JOIN delivery_endpoints e ON e.id=t.endpoint''').fetchall()} == \
+            {'api2.cursor.sh': ('failed', 'outcome_unknown'), 'hooks.example.test': ('delivered', None)}
