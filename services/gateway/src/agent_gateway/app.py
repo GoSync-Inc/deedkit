@@ -32,6 +32,10 @@ HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Con
 NORMAL_BODY_LIMIT = 65536
 UPLOAD_BODY_LIMIT = 360448
 UPLOAD_CHUNK_TOOL = "messages_upload_file_chunk"
+# ANYM-547: inline files of messages_send; the inline cap itself (256 KiB decoded) is the backend's.
+SEND_BODY_LIMIT = 524288
+# The only tools whose call may carry more than NORMAL_BODY_LIMIT, each with its own cap, after authentication.
+LARGE_BODY_LIMITS = {UPLOAD_CHUNK_TOOL: UPLOAD_BODY_LIMIT, "messages_send": SEND_BODY_LIMIT}
 
 
 def expiry_notice(credential):
@@ -61,12 +65,12 @@ def mcp_route(path):
         return None
 
 
-def is_chunk_call(path, body):
-    """Only one reviewed tool can use the larger envelope; never batches/other RPCs."""
-    if path == "/v1/" + UPLOAD_CHUNK_TOOL:
-        return True
+def large_call(path, body):
+    """The reviewed tool of LARGE_BODY_LIMITS this call is, or None; never batches/other RPCs."""
+    if path.removeprefix("/v1/") in LARGE_BODY_LIMITS:
+        return path.removeprefix("/v1/")
     if mcp_route(path) is None:
-        return False
+        return None
 
     def unique(pairs):
         result = {}
@@ -78,14 +82,11 @@ def is_chunk_call(path, body):
 
     try:
         value = json.loads(body, object_pairs_hook=unique)
-        return (
-            isinstance(value, dict)
-            and value.get("method") == "tools/call"
-            and isinstance(value.get("params"), dict)
-            and value["params"].get("name") == UPLOAD_CHUNK_TOOL
-        )
+        name = (value["params"].get("name") if isinstance(value, dict) and value.get("method") == "tools/call"
+                and isinstance(value.get("params"), dict) else None)
+        return name if isinstance(name, str) and name in LARGE_BODY_LIMITS else None
     except (ValueError, UnicodeDecodeError, RecursionError):
-        return False
+        return None
 
 
 def create_app(policy_path, public_url, *, transports=None):
@@ -176,7 +177,7 @@ def create_app(policy_path, public_url, *, transports=None):
         json_response=True,
         # The outer boundary enforces 64 KiB for every request except the
         # explicitly authorized upload chunk tool, including other MCP RPCs.
-        max_request_body_size=UPLOAD_BODY_LIMIT,
+        max_request_body_size=max(LARGE_BODY_LIMITS.values()),
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=[origin.netloc],
@@ -283,16 +284,24 @@ def create_app(policy_path, public_url, *, transports=None):
                     )(scope, receive, protected_send)
                 if request.method == "POST":
                     limit = NORMAL_BODY_LIMIT
-                    chunk_route = request.url.path == "/v1/" + UPLOAD_CHUNK_TOOL
-                    if chunk_route or route:
+                    rest_tool = request.url.path.removeprefix("/v1/")
+                    large_route = rest_tool in LARGE_BODY_LIMITS
+                    if large_route or route:
                         try:
                             snapshot, agent = policy.authenticate(key)
                             credential = dispatch.credential(agent)
-                            policy.authorize_agent(snapshot, agent, UPLOAD_CHUNK_TOOL)
-                            limit = UPLOAD_BODY_LIMIT
                         except Denied:
-                            if chunk_route:
+                            if large_route:
                                 raise
+                        else:
+                            # A larger body only for a tool this key may call: its own REST path, or any on MCP.
+                            for tool in [rest_tool] if large_route else LARGE_BODY_LIMITS:
+                                try:
+                                    policy.authorize_agent(snapshot, agent, tool)
+                                    limit = max(limit, LARGE_BODY_LIMITS[tool])
+                                except Denied:
+                                    if large_route:
+                                        raise
                     try:
                         declared = int(request.headers.get("content-length", "0"))
                     except ValueError:
@@ -314,7 +323,7 @@ def create_app(policy_path, public_url, *, transports=None):
                                     break
                     except TimeoutError:
                         raise Denied("body_timeout", 408) from None
-                    if len(body) > NORMAL_BODY_LIMIT and not is_chunk_call(request.url.path, body):
+                    if len(body) > LARGE_BODY_LIMITS.get(large_call(request.url.path, body), NORMAL_BODY_LIMIT):
                         raise Denied("body_too_large", 413)
                     sent = False
                     original_receive = receive

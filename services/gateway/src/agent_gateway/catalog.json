@@ -2404,7 +2404,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Send text and files to anyone in one call. Confirm with the owner first: call with dry_run true, show the owner the preview (recipient, text, warnings, files) and get their exact confirmation, then call again with its confirm_token (not approval). A live send without a token needs a request_id; repeat it unchanged after a network failure. States: previewed, running, succeeded, failed (resumable: resume true), unknown (check history, never resend). Example: {\"to\":\"+15550100\",\"text\":\"Running 10 minutes late\",\"dry_run\":true}",
+    "description": "Send text and files to anyone in one call. Confirm with the owner first: call with dry_run true, show the owner the preview (recipient, text, warnings, files) and get their exact confirmation, then call again with its confirm_token (not approval). A live send without a token needs a request_id; repeat it unchanged after a network failure. States: previewed, running, succeeded, failed (resumable: resume true), unknown (check history, never resend). Files: {upload_id}, {attachment_id} or a small file inline as {name, mime, base64} (at most 262144 bytes decoded per call; over that, a next to messages_prepare_file_upload). Example: {\"to\":\"+15550100\",\"text\":\"Running 10 minutes late\",\"dry_run\":true}",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

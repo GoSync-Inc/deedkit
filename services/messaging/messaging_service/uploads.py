@@ -66,14 +66,23 @@ def cleanup(store,c):
     StorageAdmission.lock(c)
     candidates=c.execute("""SELECT id FROM file_uploads WHERE state<>'expired'
         AND expires_at<=clock_timestamp() ORDER BY expires_at,id LIMIT 64""").fetchall()
-    for candidate in candidates:
+    for candidate in candidates:_reap(store,c,candidate)
+
+
+def reap(store,c,upload_ids):
+    """These expired uploads now, in cleanup's lock order (a sent intent's staged inline files, ANYM-547)."""
+    StorageAdmission.lock(c)
+    for upload_id in sorted(upload_ids):_reap(store,c,{'id':upload_id})
+
+
+def _reap(store,c,candidate):
         # Match chunk's capacity -> lifecycle -> row order. A source holds only
         # this upload's lifecycle lock; it never waits for capacity admission.
         _lifecycle_lock(c,candidate['id'])
         row=c.execute("""SELECT * FROM file_uploads WHERE id=%s AND state<>'expired'
             AND expires_at<=clock_timestamp() FOR UPDATE""",(candidate['id'],)).fetchone()
-        if not row:continue
-        if _pinned(c,row['id']):continue
+        if not row:return
+        if _pinned(c,row['id']):return
         root=_root(store,row['id'])
         if root.exists():
             # No recursive deletion or user-controlled names. Never visit CAS.
@@ -91,7 +100,7 @@ def cleanup(store,c):
                         if not entry.is_file(follow_symlinks=False):raise APIError('attachment_unavailable',409)
                         os.unlink(entry.path)
             try:root.rmdir()
-            except OSError:continue  # Keep capacity reserved until bounded reaping finishes.
+            except OSError:return  # Keep capacity reserved until bounded reaping finishes.
         c.execute("UPDATE file_uploads SET state='expired' WHERE id=%s",(row['id'],))
 
 

@@ -6,6 +6,8 @@ import {setTimeout as delay} from 'node:timers/promises';
 
 const UPLOAD_CHUNK_BYTES = 262144;
 const UPLOAD_BODY_BYTES = 360448;
+// messages_send with inline files (ANYM-547): at most 262144 decoded bytes, checked by the server.
+const SEND_BODY_BYTES = 524288;
 const UPLOAD_MAX_BYTES = 32 * 1024 * 1024;
 const METHODS = Object.freeze([
   'capabilities', 'list_chats', 'search', 'search_people', 'search_files',
@@ -13,7 +15,7 @@ const METHODS = Object.freeze([
   'get_attachment', 'request_file_download', 'get_file_text', 'get_file_segments', 'get_file_occurrences',
   'get_updates', 'dismiss_reply', 'ack_updates', 'get_reviews', 'record_review',
   'snooze_reply', 'restore_reply', 'mute_reply_source', 'unmute_reply_source', 'list_reply_dismissals',
-  'preview_message','send_message','get_send_status',
+  'preview_message','send_message','messages_send','get_send_status',
   'list_messenger_operations','preview_messenger_operation','execute_messenger_operation','get_messenger_operation',
   'create_subscription','list_subscriptions','get_subscription','update_subscription','get_subscription_events',
   'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events',
@@ -49,6 +51,8 @@ const SAFE_ERRORS = new Set([
   // ANYM-519: self-service webhook endpoints.
   'delivery_disabled','delivery_policy_unset','unsafe_endpoint','invalid_signing_secret','invalid_header','reserved_header',
   'rotation_in_progress','endpoint_limit','endpoint_conflict','operator_disabled','invalid_endpoint_state','endpoint_paused','endpoint_auto_paused',
+  // ANYM-546/547: messages_send.
+  'invalid_arguments','preview_stale','preview_expired','invalid_confirm_token','in_progress','identity_changed',
 ]);
 
 const UPLOAD_FIELDS = Object.freeze({
@@ -419,7 +423,7 @@ export class AnyMsgClient {
         [...arguments_.attachment_id].length>256)) throw new TypeError('Invalid download request arguments');
     let body;
     try { body = JSON.stringify(arguments_); } catch { throw new TypeError('Arguments must be JSON serializable'); }
-    const requestMaximum=method==='upload_file_chunk'?UPLOAD_BODY_BYTES:16384;
+    const requestMaximum=method==='upload_file_chunk'?UPLOAD_BODY_BYTES:method==='messages_send'?SEND_BODY_BYTES:16384;
     if (!body || Buffer.byteLength(body)>requestMaximum) throw new TypeError(`Request exceeds ${requestMaximum} bytes`);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.#timeout);
@@ -529,6 +533,8 @@ export class AnyMsgClient {
   recordReview(args) { return this.call('record_review', args); }
   previewMessage(args) { return this.call('preview_message',args); }
   sendMessage(args) { return this.call('send_message',sendWaitArguments(args)); }
+  // files: {upload_id}, {attachment_id} or a small file inline as {name, mime, base64} (ANYM-547).
+  messagesSend(args) { return this.call('messages_send',args); }
   getSendStatus(args) { return this.call('get_send_status',args); }
   listMessengerOperations(args) {
     return this.call('list_messenger_operations',messengerArguments('list_messenger_operations',args));

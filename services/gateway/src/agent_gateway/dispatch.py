@@ -1,6 +1,9 @@
+import base64
+import binascii
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import asyncio
+import hashlib
 import logging
 import re
 from platform_contracts import Capability, safe_error
@@ -178,6 +181,32 @@ def candidate_query(name, values, candidate):
             rest["window"] = window
         return rest
     return values
+
+
+INLINE_UPLOAD_FIELDS = frozenset({"account", "chat_id", "filename", "mime", "bytes", "sha256", "request_id"})
+
+
+def inline_upload_next(name, values, detail):
+    """ANYM-547: messages_send over its inline cap names the upload call that takes that file instead. Its file
+    fields are the caller's payload, so the relay keeps that `next` only when they are one inline file of this very
+    call, recomputed here from its bytes; account and chat_id are references and request_id is the placeholder."""
+    step = detail.get("next") if isinstance(detail, dict) else None
+    args = step.get("arguments") if isinstance(step, dict) else None
+    if (name != "messages_send" or not isinstance(args, dict) or step.get("tool") != "messages_prepare_file_upload"
+            or set(args) != INLINE_UPLOAD_FIELDS or args["request_id"] != PLACEHOLDER_REQUEST_ID):
+        return None
+    files = values.get("files") if isinstance(values, dict) else None
+    for item in files if isinstance(files, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("base64"), str):
+            continue
+        try:
+            raw = base64.b64decode(item["base64"], validate=True)
+        except (ValueError, binascii.Error):
+            continue
+        if (args["filename"], args["mime"], args["bytes"], args["sha256"]) == (
+                item.get("name"), item.get("mime"), len(raw), hashlib.sha256(raw).hexdigest()):
+            return step
+    return None
 
 
 # ANYM-519: write-only arguments of the endpoint tools; no gateway response repeats them.
@@ -820,12 +849,18 @@ class Dispatch:
                     error.detail = self.next_call(error.detail, snapshot, agent, caps)
                 visible = [n for n in self.policy.visible(current, principal)
                            if selected is None or CATALOG[n]["module"] in selected | {"gateway"}]
+                upload = inline_upload_next(name, values, error.detail)
                 error.detail = relayed_error(
                     error.detail, lambda value: self.runnable(value, visible, module, current, principal, caps),
                     {n for n in visible if CATALOG[n].get("annotations", {}).get("readOnlyHint", False)},
                     caller_payload(resolver_query(name, values), tool.get("inputSchema")),
                     lambda candidate: caller_payload(candidate_query(name, resolver_query(name, values), candidate),
                                                      tool.get("inputSchema")))
+                # Runnable as soon as the caller picks its own request_id in place of the placeholder.
+                if upload is not None and self.runnable(
+                        {**upload, "arguments": {**upload["arguments"], "request_id": "inline-upload-check"}},
+                        visible, module, current, principal, caps):
+                    error.detail["next"] = upload
             raise
         if module == "messaging":
             result = self.next_call(result, snapshot, agent, caps)
