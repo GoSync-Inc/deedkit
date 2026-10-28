@@ -11,6 +11,7 @@ from starlette.testclient import TestClient
 from messaging_service.app import create_app
 from messaging_service.archive import Archive
 from messaging_service.error_details import payload
+from messaging_service.messenger_operations import phone_digits
 from messaging_service.resolve_target import classify
 from messaging_service.store import APIError
 from messaging_service.whatsapp_collector import WhatsAppState
@@ -287,9 +288,51 @@ def test_a_contact_cards_phone_keeps_the_requested_account(world):
 
 
 # spec: ANYM-545
-@pytest.mark.parametrize('text', ['+44 7700 900123', '+44 (7700) 900‑123', '0044 7700 900123'])
+@pytest.mark.parametrize('text', ['+44 7700 900123', '+44 (7700) 900‑123', '0044 7700 900123',
+                                  '(+44) 7700 900123', '+(44) 7700 900123', '+44 7700 900123',
+                                  '44' + ' ' * 41 + '7700900123'])
 def test_every_phone_format_the_send_normalizer_accepts_is_exact(text):
     assert classify(text) == ('phone', '447700900123')
+
+
+# spec: ANYM-545
+@settings(max_examples=200, deadline=None)
+@given(st.from_regex(r'[1-9][0-9]{6,14}', fullmatch=True), st.sampled_from(['', '+', '00']),
+       st.lists(st.sampled_from([' ', ' ', '-', '‑', '.', '(', ')']), max_size=4), st.data())
+def test_property_any_number_the_send_normalizer_accepts_is_an_exact_phone(digits, prefix, separators, data):
+    text = prefix
+    for digit in digits:
+        text += digit + (data.draw(st.sampled_from(separators)) if separators else '')
+    assert phone_digits(text)[0] == digits  # The fixture is a number the open_chat_by_phone normalizer accepts.
+    assert classify(text) == ('phone', digits)
+
+
+# spec: ANYM-545
+def test_a_hidden_conflicting_observation_does_not_change_a_visible_alias(world):
+    s, _, _, say, _ = world
+    key = s.issue_key('rt-alias', [NATIVE])
+    seen = say(NATIVE, '555000111@lid', 'A1', 'lid chat', chat='555000111@lid', name='Synthetic LID', metadata=PRIVATE)
+    observe(s, NATIVE, seen, PHONE + '@c.us', '555000111@lid')
+    before = target(s, key, '+' + PHONE)
+    hidden = say(NATIVE, '555000222@lid', 'A2', 'gone', chat='555000333@g.us', metadata={'chat_type': 'group'})
+    observe(s, NATIVE, hidden, PHONE + '@c.us', '555000222@lid')
+    with s.pool.connection() as c:
+        c.execute('UPDATE messages SET deleted=true WHERE id=%s', (hidden,))
+    assert before['chat_id'] == chat_of(s, NATIVE, '555000111@lid') and target(s, key, '+' + PHONE) == before
+
+
+# spec: ANYM-545
+def test_one_accounts_several_alias_chats_are_candidates_beside_another_accounts_phone_chat(world):
+    s, _, _, say, _ = world
+    key = s.issue_key('rt-two', [WA, NATIVE])
+    say(WA, PHONE + '@c.us', 'B1', 'pn chat', chat=PHONE + '@c.us', name='Synthetic B', metadata=PRIVATE)
+    seen = say(NATIVE, '555000111@lid', 'A1', 'lid chat', chat='555000111@lid', name='Synthetic LID', metadata=PRIVATE)
+    say(NATIVE, PHONE + ':1@c.us', 'A3', 'device chat', chat=PHONE + ':1@c.us', name='Synthetic PN', metadata=PRIVATE)
+    observe(s, NATIVE, seen, PHONE + '@c.us', '555000111@lid')
+    body = refused(s, key, '+' + PHONE)
+    assert body['error'] == 'selection_required'
+    assert sorted(c['id'] for c in body['candidates']) == sorted(
+        [chat_of(s, WA, PHONE + '@c.us'), chat_of(s, NATIVE, '555000111@lid'), chat_of(s, NATIVE, PHONE + ':1@c.us')])
 
 
 # spec: ANYM-545

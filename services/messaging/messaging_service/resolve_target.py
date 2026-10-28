@@ -19,7 +19,6 @@ MAX_CANDIDATES = 10
 SCAN_LIMIT = 200
 JID = re.compile(r'([0-9]{5,20})(?::[0-9]{1,5})?@(c\.us|s\.whatsapp\.net|lid|g\.us)')
 USERNAME = re.compile(r'@([A-Za-z0-9_]{3,64})')
-PHONE_TEXT = re.compile(r'\+?[0-9][^A-Za-z@_]{6,40}')
 E164_DIGITS = re.compile(r'[1-9][0-9]{7,14}')
 # Seven digits with any separators between them (repeated spaces, NBSP, dashes): never in a candidate label.
 PHONE_LIKE = re.compile(r'\d(?:[\W_]*\d){6,}')
@@ -137,27 +136,35 @@ def _opted_in(store, c, p, account, digits):
     return bool(row and row['discover_chats'])
 
 
+def _alias_chats(c, p, account, jid):
+    """The chats of the number's PN/LID pair, read from observations this key can see only.
+
+    A conflicting pair in a visible source blocks the link. Hidden or deleted sources never change the answer, so it
+    is no oracle (whatsapp_identity.resolve_alias also fences on them: it serves sends, this read serves the agent).
+    """
+    scope, scope_args = scope_filter(p, 'm')
+    pairs = c.execute('''WITH seen AS NOT MATERIALIZED (
+        SELECT DISTINCT wi.pn,wi.lid FROM whatsapp_identity_observations wi
+        JOIN messages m ON m.id=wi.source_message JOIN chats ic ON ic.id=m.chat
+        WHERE wi.account=%s AND m.account=wi.account AND NOT m.deleted
+          AND (wi.identity_id=m.sender OR wi.identity_id=ic.provider_chat) AND ''' + scope + ''')
+        SELECT pair.pn,pair.lid FROM seen pair WHERE pair.pn=%s AND NOT EXISTS(SELECT 1 FROM seen other
+          WHERE (other.pn=pair.pn AND other.lid<>pair.lid) OR (other.lid=pair.lid AND other.pn<>pair.pn))''',
+                      [account, *scope_args, jid]).fetchall()
+    ids = sorted({value for pair in pairs for value in (pair['pn'], pair['lid'])})
+    return _chats(c, p, "a.platform='whatsapp' AND messenger_whatsapp_personal_id(c.provider_chat)=ANY(%s)",
+                  [ids], account) if ids else []
+
+
 def _phone(store, c, p, digits, account, purpose, how):
-    from .whatsapp_identity import resolve_alias
     jid = digits + '@c.us'
-    from .store import APIError
     rows = _chats(c, p, "a.platform='whatsapp' AND c.provider_chat=%s", [jid], account)
-    exact, ambiguous = {r['account'] for r in rows}, False
-    # An account's own phone-number chat wins; the LID alias is looked up only where there is none.
+    exact = {r['account'] for r in rows}
+    # An account's own phone-number chat wins; elsewhere the visible pair names its chats (several: candidates).
     for name in [name for name in _whatsapp_accounts(c, p, account) if name not in exact]:
-        try:
-            alias = resolve_alias(c, p, name, jid)
-        except APIError as error:
-            if error.code != 'ambiguous_reference':
-                raise
-            ambiguous = True  # Two visible chats of one verified pair: no single chat and no new one.
-            continue
-        if alias:
-            rows += _chats(c, p, 'c.id=%s', [alias['id']])
+        rows += _alias_chats(c, p, name, jid)
     if rows:
         return _one_or_choose(c, p, rows, how, purpose)
-    if ambiguous:
-        raise _not_found('several_chats_use_chat_search')
     opted = [name for name in _whatsapp_accounts(c, p, account) if _opted_in(store, c, p, name, digits)]
     if len(opted) == 1:
         return {'account': opted[0], 'chat_id': None, 'phone': '+' + digits, 'network': 'whatsapp',
@@ -291,11 +298,9 @@ def classify(to):
     match = JID.fullmatch(to)
     if match:
         return ('phone_jid', match[1]) if match[2] in ('c.us', 's.whatsapp.net') else ('jid', to)
-    if PHONE_TEXT.fullmatch(to):
-        from .messenger_operations import phone_digits
-        digits, _ = phone_digits(to)  # The open_chat_by_phone normalizer (ANYM-532): one phone grammar.
-        return ('phone', digits) if digits and E164_DIGITS.fullmatch(digits) else ('name', to)
-    return 'name', to
+    from .messenger_operations import phone_digits
+    digits, _ = phone_digits(to)  # The open_chat_by_phone normalizer (ANYM-532): every number it accepts is exact.
+    return ('phone', digits) if digits else ('name', to)
 
 
 def resolve_target(store, c, p, to, purpose='message', account='', sender=False):
