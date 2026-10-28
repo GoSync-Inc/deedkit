@@ -666,14 +666,23 @@ def follower(operator,tmp_path,monkeypatch):
     # What the registry serves for main's head; a pull stores it under the attested config digest.
     served={'Id':NEW_IMAGE,'Config':{'Labels':image_labels(HEAD)}}
     class Docker(f.Docker):
-        def __init__(self):super().__init__(900);self.pulled=[];self.removed=[]
+        def __init__(self):
+            super().__init__(900);self.pulled=[];self.removed=[];self.in_use=set();self.daemon_down=False
+            self.resources={}
         def command(self,*args):
+            if self.daemon_down:raise RuntimeError('restore_docker_failed')
             if args[:2]==('image','inspect'):
                 if args[2] not in images:raise RuntimeError('restore_docker_failed')
                 return r2.encoded([images[args[2]]])
-            if args[:2]==('image','rm'):self.removed.append(args[2]);images.pop(args[2],None);return b''
+            if args[:2]==('image','ls'):return '\n'.join(images).encode()
+            if args[:2]==('image','rm'):
+                self.removed.append(args[2])
+                if args[2] in self.in_use:raise RuntimeError('restore_docker_failed')
+                images.pop(args[2],None);return b''
             if args[0]=='info':return str(tmp_path).encode()
             raise AssertionError(args)
+        def inspect_owned(self,kind,name,run):return self.resources.get((kind,name))
+        def remove(self,kind,name):self.resources.pop((kind,name))
         def pull(self,reference):self.pulled.append(reference);images[NEW_IMAGE]=served
     class Main:
         def __init__(self):self.head_value=HEAD;self.forward_value=True
@@ -873,6 +882,7 @@ def test_follow_revert_switches_back_to_the_kept_pair_and_republishes_it(followe
 @pytest.mark.parametrize('case,code',[('foreign_file','publication_directory_foreign'),
                                       ('foreign_publication','publication_foreign'),
                                       ('malformed_publication','publication_foreign'),
+                                      ('reversed_schemas','publication_foreign'),
                                       ('mount_point','publication_mount_point'),
                                       ('private_mount_point','publication_mount_point'),
                                       ('private_directory','publication_directory_private'),
@@ -883,6 +893,10 @@ def test_follow_publishes_only_its_own_file_in_a_root_directory_that_is_no_mount
     if case=='foreign_file':(published/'notes.txt').write_text('operator')
     elif case=='foreign_publication':r2.CAPABILITIES_FILE.write_text('{"v":1}');r2.CAPABILITIES_FILE.chmod(0o644)
     elif case=='malformed_publication':r2.CAPABILITIES_FILE.write_text(malformed);r2.CAPABILITIES_FILE.chmod(0o644)
+    elif case=='reversed_schemas':
+        malformed=json.dumps({'v':1,'verifier_config':{'path':'/x','dev':1,'ino':1,'size':1,'mtime_ns':1,'ctime_ns':1},
+                              'helper_revision':'a'*40,'helper_schemas':[50,2]})
+        r2.CAPABILITIES_FILE.write_text(malformed);r2.CAPABILITIES_FILE.chmod(0o644)
     elif case=='mount_point':monkeypatch.setattr(s.f,'mount_points',lambda:{str(published)})
     elif case=='private_mount_point':published.chmod(0o700);monkeypatch.setattr(s.f,'mount_points',lambda:{str(published)})
     elif case=='private_directory':published.chmod(0o700)
@@ -892,7 +906,7 @@ def test_follow_publishes_only_its_own_file_in_a_root_directory_that_is_no_mount
     assert follow_status(s)['error']==code and published.stat().st_mode&0o777==mode
     if case=='foreign_file':assert (published/'notes.txt').read_text()=='operator'
     if case=='foreign_publication':assert r2.CAPABILITIES_FILE.read_text()=='{"v":1}'
-    if case=='malformed_publication':assert r2.CAPABILITIES_FILE.read_text()==malformed
+    if case in ('malformed_publication','reversed_schemas'):assert r2.CAPABILITIES_FILE.read_text()==malformed
 
 
 # spec: ANYM-597
@@ -1045,3 +1059,41 @@ def test_follow_service_stop_during_git_is_never_read_as_main_unreachable(tmp_pa
         with pytest.raises(InterruptedError):f.Main(tmp_path).head()
         assert f.failure_code(InterruptedError('restore_stopped'))=='restore_stopped'
     finally:r2.CANCELLED.clear()
+
+
+# spec: ANYM-597
+def test_follow_keeps_an_unremovable_candidate_record_and_starts_no_new_candidate(follower):
+    s=follower;s.results[HEAD]=KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):s.run()
+    s.docker.in_use.add(NEW_IMAGE)  # a container outside the follow still uses it
+    other='e'*40;s.main.head_value=other
+    s.proofs[other]={'reference':s.f.IMAGE+'@sha256:'+'f'*64,'digest':'sha256:'+'f'*64,'config_digest':'sha256:'+'b'*64}
+    with pytest.raises(ValueError,match='follow_candidate_unresolved'):s.run()
+    assert s.record('follow-candidate.json')['helper_image']==NEW_IMAGE and len(s.docker.pulled)==1
+    assert s.published()['helper_revision']==s.config['helper_revision']
+    s.docker.in_use.clear();s.main.head_value=s.config['helper_revision']
+    assert s.run()['status']=='current'
+    assert NEW_IMAGE not in s.images and not (s.directory/'follow-candidate.json').exists()
+
+
+# spec: ANYM-597
+def test_follow_never_reads_a_docker_daemon_failure_as_an_absent_image(follower):
+    s=follower;s.run();s.main.head_value='e'*40
+    s.proofs['e'*40]={'reference':s.f.IMAGE+'@sha256:'+'f'*64,'digest':'sha256:'+'f'*64,'config_digest':'sha256:'+'b'*64}
+    s.docker.daemon_down=True
+    with pytest.raises(RuntimeError,match='restore_docker_failed'):s.run()
+    assert not (s.directory/'follow-candidate.json').exists() and len(s.docker.pulled)==1
+    assert NEW_IMAGE in s.images
+
+
+# spec: ANYM-597
+def test_follow_sweeps_an_interrupted_self_test_before_anything_else(follower):
+    s=follower;s.run()  # the installed pair is proven: no self-test runs below
+    run='a'*32;(s.directory/(s.f.SELF_TEST+run)).mkdir(mode=0o700)
+    probe=s.f.self_test_containers(run)[0][0];s.docker.resources[('helper',probe)]={}
+    s.proofs.clear();s.main.head_value='e'*40
+    with pytest.raises(RuntimeError,match='helper_unattested'):s.run()
+    assert not s.docker.resources and not (s.directory/(s.f.SELF_TEST+run)).exists() and s.tested==[s.config['helper_revision'],HEAD]
+    (s.directory/(s.f.SELF_TEST+run)).mkdir(mode=0o700);s.docker.resources[('helper',probe)]={}
+    s.revert()
+    assert not s.docker.resources and not (s.directory/(s.f.SELF_TEST+run)).exists()

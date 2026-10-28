@@ -402,14 +402,18 @@ as root, an hour after the previous run ends. Each run:
    A pull needs the verifier's `reserve_bytes` plus 4 GiB free on the Docker
    data root (`follow_disk_capacity`); an image the follow pulled is recorded in
    `follow-candidate.json` first and removed by exact ID when it is refused or
-   its run was interrupted, unless it is the installed or the kept pair's;
+   its run was interrupted, unless it is the installed or the kept pair's.
+   While such an image cannot be removed (a container outside the follow uses
+   it, or the Docker daemon does not answer), its record stays and no new
+   candidate starts (`follow_candidate_unresolved`);
 4. reads the image's `backup.SCHEMAS` in a networkless, read-only container and
    self-tests it: the image makes a synthetic PG18 bundle, encrypts it with
    `age` to a throwaway ed25519 identity, and the verifier's isolated restore
    runs it with that image as the helper. The proven schema must equal the
    image's last one. The receiver's identity is never mounted. Every self-test
    container is named and labelled before it exists, so a hung or interrupted
-   one is stopped and removed by exact name;
+   one is stopped and removed by exact name, first thing in every run and in
+   `revert`;
 5. journals the switch (`follow-switch.json`: from, to, the image it drops),
    replaces `verifier.json` atomically with only the two pins changed, then
    writes the kept pair (`follow-previous.json`) and the proven installed pair

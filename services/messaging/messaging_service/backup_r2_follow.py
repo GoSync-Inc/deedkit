@@ -61,7 +61,7 @@ SAFE = WAITING | {'follow_config_mismatch', 'follow_not_forward', 'helper_attest
                   'helper_self_test_mismatch', 'helper_self_test_failed', 'publication_directory_foreign',
                   'publication_foreign', 'publication_mount_point', 'untrusted_operator_ancestor',
                   'no_previous_pair', 'invalid_follow_record', 'follow_switch_unresolved', 'follow_disk_capacity',
-                  'publication_directory_private', 'invalid_verifier_config'}
+                  'publication_directory_private', 'invalid_verifier_config', 'follow_candidate_unresolved'}
 SCHEMA_PROBE = ('import json;from messaging_service.backup import SCHEMAS as s;'
                 'print(json.dumps([s.start,s.stop-1] if s.step==1 else None))')
 # The native drill's synthetic fixture (tests/test_backup_r2_verifier_native.py), run by the image under test.
@@ -180,16 +180,14 @@ class Docker(verifier.Docker):
         return root
 
     def has_image(self, image):
-        try:self.inspect_image(image)
-        except RuntimeError:return False
-        return True
+        """Whether the daemon holds this exact image ID. A daemon failure raises: never read as absence."""
+        return image in self.command('image', 'ls', '--all', '--quiet', '--no-trunc').decode().split()
 
     def remove_image(self, image):
-        """Remove one exact image ID; never a prune. True once it is gone."""
+        """Remove one exact image ID; never a prune. True only once it is confirmed gone."""
         try:self.command('image', 'rm', image)
-        except (RuntimeError, subprocess.TimeoutExpired):pass
-        try:return not self.has_image(image)
-        except (RuntimeError, ValueError, subprocess.TimeoutExpired):return False
+        except RuntimeError:pass  # in use: still listed below
+        return not self.has_image(image)
 
 
 def fixture_run(run):
@@ -215,6 +213,13 @@ def clear_self_test(engine, directory, run):
     shutil.rmtree(path)
 
 
+def sweep_self_tests(engine, directory):
+    """Remove every interrupted self-test's exact containers and workspace (under the verifier lock)."""
+    for name in os.listdir(directory):
+        if name.startswith(SELF_TEST) and re.fullmatch('[0-9a-f]{32}', name[len(SELF_TEST):]):
+            clear_self_test(engine, directory, name[len(SELF_TEST):])
+
+
 def self_test(engine, config):
     """Read the image's `backup.SCHEMAS` in a networkless container, then restore a synthetic
     PG18 bundle, made and age-encrypted by the image under test, with that image as the helper,
@@ -222,9 +227,7 @@ def self_test(engine, config):
     A throwaway identity; the receiver's key is never mounted. Every container is named and
     labelled before it exists, so a crash or a hung one is removed by exact name later."""
     directory = Path(config['directory'])
-    for name in os.listdir(directory):
-        if name.startswith(SELF_TEST) and re.fullmatch('[0-9a-f]{32}', name[len(SELF_TEST):]):
-            clear_self_test(engine, directory, name[len(SELF_TEST):])
+    sweep_self_tests(engine, directory)
     run = secrets.token_hex(16); source = fixture_run(run); root = directory / (SELF_TEST + run)
     root.mkdir(mode=0o700); local.fsync_dir(directory)
     fixture = root / 'fixture'; fixture.mkdir(mode=0o700)
@@ -354,7 +357,7 @@ def switch(path, fd, engine, journal):
     return config
 
 
-def recover(path, fd, engine, config):
+def recover(fd, engine, config):
     """Finish or drop an interrupted switch, then remove an interrupted candidate's image."""
     _, journal = r2.read_root(fd, SWITCH, missing=True)
     if journal is not None:
@@ -398,7 +401,8 @@ def publication(value):
             set(bound) == {'path', 'dev', 'ino', 'size', 'mtime_ns', 'ctime_ns'} and isinstance(bound['path'], str) and
             all(type(bound[key]) is int for key in bound if key != 'path') and
             isinstance(value['helper_revision'], str) and re.fullmatch('[0-9a-f]{40}', value['helper_revision']) is not None and
-            isinstance(schemas, list) and len(schemas) == 2 and all(type(item) is int for item in schemas))
+            isinstance(schemas, list) and len(schemas) == 2 and all(type(item) is int for item in schemas) and
+            2 <= schemas[0] <= schemas[1])
 
 
 def publish(path, record):
@@ -475,6 +479,8 @@ def no_retry_pending(fd):
 
 def candidate(fd, engine, config, head, attest, test):
     """Pull, check and self-test main's head image: its record. A refused pull is removed."""
+    # An unresolved earlier candidate keeps its record: never overwritten by a new one.
+    if r2.read_root(fd, CANDIDATE, missing=True)[1] is not None:raise ValueError('follow_candidate_unresolved')
     proof = attest(head); image = proof['config_digest']
     owned = not engine.has_image(image)
     if owned:
@@ -500,7 +506,7 @@ def follow(path, *, engine=None, main=None, attest=None, test=None):
         try:
             config = reload(path, config); status['revision'] = config['helper_revision']
             no_retry_pending(fd)
-            recover(path, fd, engine, config); config = reload(path, config)
+            sweep_self_tests(engine, config['directory']); recover(fd, engine, config); config = reload(path, config)
             current = read_record(fd, CURRENT)
             if not pinned(current, config):current = None
             head = main.head(); refusal = untested = None
@@ -548,7 +554,7 @@ def revert(path, *, engine=None):
     with verifier.verifier_lock(config['directory']) as fd:
         config = reload(path, config)
         no_retry_pending(fd)
-        recover(path, fd, engine, config); config = reload(path, config)
+        sweep_self_tests(engine, config['directory']); recover(fd, engine, config); config = reload(path, config)
         previous = read_record(fd, PREVIOUS)
         if previous is None:raise ValueError('no_previous_pair')
         engine.preflight({**config, 'helper_image': previous['helper_image'], 'helper_revision': previous['helper_revision']})
