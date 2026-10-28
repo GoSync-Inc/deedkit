@@ -115,12 +115,16 @@ def server(tmp_path, monkeypatch):
     return Server()
 
 
+UPDATED = datetime(2026, 10, 28, 10, tzinfo=timezone.utc)
+
+
 def sync(sha, conclusion="success", number=1, attempt=1, status="completed", title=None):
     """One `Tiden sync` run as the GitHub run listing returns it."""
     return {"id": number, "run_attempt": attempt, "display_title": title or f"Tiden sync {sha}",
             "html_url": f"https://github.invalid/runs/{number}", "status": status,
             "conclusion": conclusion if status == "completed" else None,
-            "updated_at": f"2026-10-28T10:{number:02d}:{attempt:02d}Z", "run_started_at": "2026-10-28T10:00:00Z"}
+            "updated_at": f"{UPDATED + timedelta(minutes=number, seconds=attempt):%Y-%m-%dT%H:%M:%SZ}",
+            "run_started_at": "2026-10-28T10:00:00Z"}
 
 
 def listing(*runs):
@@ -712,38 +716,36 @@ def test_the_checker_reads_no_upstream_run_data():
     assert "github.event" not in json.dumps(checker) and ">> \"$GITHUB_PATH\"" not in WORKFLOW.read_text()
 
 
-class Runs:
-    """A stand-in for Tiden health's run listing: `read` answers one `created=A..B` window from ROWS, as GitHub does
-    for a filtered listing, and records every window."""
+class Pages(drift.Actions):
+    """Tiden health's run listing with GitHub's pages faked: a `created` qualifier (`A..B` or `>=A`) and `status`
+    select ROWS by `created_at` and conclusion; like GitHub, a listing exposes at most 1,000 matches in 100-row pages
+    and reports at most 1,000 as `total_count`."""
 
-    def __init__(self, rows, cap=None):
-        self.rows, self.windows, self.cap = rows, [], cap
+    def __init__(self, rows):
+        super().__init__("GoSync-Inc/deedkit", clock=lambda: 0.0)
+        self.rows, self.queries = rows, []
 
-    def clock(self):
-        return 0.0
-
-    def read(self, created, end, workflow, filters):
-        assert workflow == "tiden-sync.yml"
-        self.windows.append((created, filters))
-        low, high = (datetime.fromisoformat(part) for part in created.split(".."))
-        rows = [row for row in self.rows if low <= datetime.fromisoformat(row["created_at"]) <= high
-                and ("status=success" not in filters or row["conclusion"] == "success")]
-        return rows[:self.cap] if self.cap else rows
+    def page(self, number, created, end, workflow="tiden-sync.yml", filters=()):
+        assert workflow == "tiden-sync.yml" and end > 0
+        self.queries.append((created, filters, number))
+        low, _, high = created.removeprefix(">=").partition("..")
+        matches = [row for row in self.rows if datetime.fromisoformat(low) <= datetime.fromisoformat(row["created_at"])
+                   and (not high or datetime.fromisoformat(row["created_at"]) <= datetime.fromisoformat(high))
+                   and ("status=success" not in filters or row["conclusion"] == "success")][:1000]
+        return {"total_count": len(matches), "workflow_runs": matches[(number - 1) * 100:number * 100]}
 
 
 NOW = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
 
 
-def spread(shas, start, count, hours):
-    """COUNT runs over HOURS from START, cycling the titles of SHAS; the last of each SHA succeeds."""
+def spread(shas, start, count, hours, conclusion="success"):
+    """COUNT runs over HOURS from START, newest first as GitHub lists them, cycling the titles of SHAS."""
     rows = []
     for number in range(count):
-        sha = shas[number % len(shas)]
-        last = number >= count - len(shas)
         created = start + timedelta(hours=hours) * number / count
-        rows.append(sync(sha, conclusion="success" if last else "skipped", number=number + 1)
-                    | {"created_at": created.strftime("%Y-%m-%dT%H:%M:%SZ")})
-    return rows
+        rows.append(sync(shas[number % len(shas)], conclusion=conclusion, number=number + 1)
+                    | {"created_at": f"{created:%Y-%m-%dT%H:%M:%SZ}"})
+    return rows[::-1]
 
 
 # spec: ANYM-593
@@ -751,16 +753,27 @@ def test_a_watermark_stalled_past_the_listing_cap_still_reads_every_run_by_day(r
     w, a, b = history(repo)
     server.set(watermark=w, anchors=ANCHORED)
     since = NOW - timedelta(days=4)
-    runs = Runs(spread([a, b, "0" * 40], since, 2400, 4 * 24))  # 2,400 runs, about 600 a day
-    syncs = drift.SyncRuns(runs, now=lambda: NOW)
-    # The synthetic commits are dated now; the listing starts four days back as for a stalled watermark.
+    # 2,400 successful runs over four days, about 600 a day, plus one on a window boundary: no single listing could
+    # return them all.
+    rows = spread([a, b, "0" * 40], since, 2400, 4 * 24)
+    rows.append(sync(a, number=9999) | {"created_at": f"{since + timedelta(days=2):%Y-%m-%dT%H:%M:%SZ}"})
+    pages = Pages(rows)
+    syncs = drift.SyncRuns(pages, now=lambda: NOW)
+    listed = syncs(since, True)
+    assert len(listed) == len(rows) and {row["id"] for row in listed} == {row["id"] for row in rows}
+    windows = [f"{since + timedelta(days=day):%Y-%m-%dT%H:%M:%SZ}..{since + timedelta(days=day + 1):%Y-%m-%dT%H:%M:%SZ}"
+               for day in range(5)]
+    assert [created for created, _, number in pages.queries if number == 1] == windows
+    assert {filters for _, filters, _ in pages.queries} == {("status=success",)}
+    # The oldest window is read too: with the syncs of A and B only on the first day, the run still advances.
     assert run(repo, server, lambda start, success: syncs(since, success))[0] == 0
     assert server.state()["watermark"] == b
-    # Contiguous one-day windows from SINCE to now, only successful runs: nothing else was needed to decide.
-    assert [window for window, _ in runs.windows] == [
-        f"{since + timedelta(days=day):%Y-%m-%dT%H:%M:%SZ}..{since + timedelta(days=day + 1):%Y-%m-%dT%H:%M:%SZ}"
-        for day in range(5)]
-    assert {filters for _, filters in runs.windows} == {("status=success",)}
+    old = {row["id"] for row in rows if row["display_title"] != f"Tiden sync {'0' * 40}"
+           and datetime.fromisoformat(row["created_at"]) < since + timedelta(days=1)}
+    server.set(watermark=w)
+    pages.rows = [row for row in rows if row["id"] in old]
+    assert run(repo, server, lambda start, success: syncs(since, success))[0] == 0
+    assert server.state()["watermark"] == b
 
 
 # spec: ANYM-593
@@ -768,10 +781,7 @@ def test_a_day_that_reaches_the_listing_cap_is_unknown_never_synced(repo, server
     w, a, b = history(repo)
     server.set(watermark=w, anchors=ANCHORED)
     since = NOW - timedelta(hours=12)
-    runs = Runs(spread([a, b], since, 1200, 1), cap=1000)
-    for row in runs.rows:
-        row["conclusion"] = "success"
-    syncs = drift.SyncRuns(runs, now=lambda: NOW)
+    syncs = drift.SyncRuns(Pages(spread([a, b], since, 1200, 1)), now=lambda: NOW)
     with pytest.raises(Refused, match="listing cap"):
         run(repo, server, lambda start, success: syncs(since, success))
     assert server.state()["advances"] == []
