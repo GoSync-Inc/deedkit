@@ -223,6 +223,27 @@ def test_reconcile_loop_survives_database_errors(monkeypatch):
     assert len(attempts)==3 and sleeps==[2,4]
 
 
+# spec: ANYM-401
+def test_reconcile_database_backoff_doubles_to_60_seconds_and_resets_after_success(monkeypatch):
+    from psycopg_pool import PoolTimeout
+    errors=[psycopg.errors.QueryCanceled('statement timeout'),psycopg.OperationalError('connection lost'),
+        PoolTimeout('pool saturated')]*2+[psycopg.OperationalError('connection lost'),None,PoolTimeout('pool saturated')]
+    sleeps=[]
+    class Stop(BaseException):pass
+    async def sync_once():
+        if not errors:raise Stop()
+        error=errors.pop(0)
+        if error is not None:raise error
+    async def sleep(delay):sleeps.append(delay)
+    import messaging_service.telegram_collector as collector
+    monkeypatch.setattr(collector.asyncio,'sleep',sleep)
+    import messaging_service.telegram_identity as identity
+    monkeypatch.setattr(identity,'repair_sent_senders',lambda *args:None)
+    w=bare_collector(sync_once=sync_once,provider=NS(),interval=600,archive=None)
+    with pytest.raises(Stop):asyncio.run(w.reconcile_loop())
+    assert sleeps==[2,4,8,16,32,60,60,600,2]
+
+
 def test_large_original_gets_a_deadline_that_matches_paced_transfer():
     assert media_deadline(None)==3600 and media_deadline(10*1024**2)==3600
     two_gib=media_deadline(2*1024**3)
@@ -362,6 +383,16 @@ def test_sweep_removes_only_old_abandoned_temporary_files(tmp_path):
     assert writer.sweep_abandoned()==1
     assert not old.exists() and fresh.exists() and other.exists() and nested.exists()
     assert link.is_symlink() and target.exists()
+
+
+# spec: ANYM-401
+def test_one_sweep_removes_at_most_1000_abandoned_files(tmp_path):
+    writer=BlobWriter(tmp_path/'files',reserve_bytes=0);stale=time.time()-2*86400
+    for index in range(1001):
+        path=writer.root/('.pending-'+f'{index:032x}');path.write_bytes(b'x');os.utime(path,(stale,stale))
+    assert writer.sweep_abandoned()==1000
+    assert len(list(writer.root.glob('.pending-*')))==1
+    assert writer.sweep_abandoned()==1 and not list(writer.root.glob('.pending-*'))
 
 
 # Live callbacks: one deterministically unstorable item is skipped and counted;

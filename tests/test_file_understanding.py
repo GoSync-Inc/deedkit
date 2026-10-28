@@ -351,6 +351,24 @@ def test_waiting_for_asr_does_not_hide_ready_source_behind_candidate_limit(seede
     assert w.finish(claim[0],error='synthetic_stop')
 
 
+# spec: ANYM-396
+def test_document_candidate_requires_ready_current_nonblank_extracted_text_before_window(seeded):
+    s,_,_=seeded;add_source(s,'document','z-ready');w=make_worker(s,kind='document')
+    copies=[f'a-blank-{index:03}' for index in range(65)]+['b-queued','b-stale','b-indexed']
+    with s.pool.connection() as c:
+        c.cursor().executemany('''INSERT INTO attachments(id,message,digest,filename,mime,bytes)
+            SELECT %s,message,digest,%s,mime,bytes FROM attachments WHERE id='z-ready' ''',[(name,name) for name in copies])
+        c.execute("UPDATE attachment_text SET state='ready',text_content=%s WHERE attachment LIKE 'a-blank-%%'",('   ',))
+        c.execute("UPDATE attachment_text SET text_content='Synthetic queued text.' WHERE attachment='b-queued'")
+        c.execute("UPDATE attachment_text SET state='ready',text_content='Synthetic old text.',source_revision=source_revision+1 WHERE attachment='b-stale'")
+        c.execute("UPDATE attachment_text SET text_content='Synthetic indexed text.',indexed_at=clock_timestamp() WHERE attachment='b-indexed'")
+        assert c.execute("SELECT state FROM attachment_text WHERE attachment='b-indexed'").fetchone()['state']!='ready'
+    assert [w.once() for _ in range(3)]==[True,True,False]
+    with s.pool.connection() as c:
+        rows=c.execute("SELECT attachment FROM attachment_understanding WHERE state='ready' ORDER BY attachment").fetchall()
+    assert [r['attachment'] for r in rows]==['b-indexed','z-ready']
+
+
 def test_partial_asr_metadata_prevents_claiming_complete_description():
     u=module();row={'kind':'audio','source_text':'Partial recording text.',
         'source_truncated':False,'source_metadata':{'audio_truncated':True}}

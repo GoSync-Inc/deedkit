@@ -54,3 +54,27 @@ def test_step_claim_is_atomic_across_two_executors(tmp_path):
     assert other.claim(s) is False
     other.close()
     j.close()
+
+
+# spec: ANYM-365
+def test_run_scope_rejects_another_calendar_on_resume(tmp_path):
+    j = Journal(tmp_path / "run", "a", "cal1")
+    j.close()
+    with pytest.raises(CalendarError, match="run_scope_mismatch"):
+        Journal(tmp_path / "run", "a", "cal2")
+
+
+# spec: ANYM-365
+def test_rejected_intent_is_never_stored(tmp_path):
+    j = Journal(tmp_path / "run", "a", "cal1")
+    href = "https://caldav.icloud.com/a/c/a.ics"
+    with pytest.raises(CalendarError, match="conditional_write_unavailable"):
+        j.prepare("command", {"kind": "update", "href": href, "desired": b"new", "etag": None})
+    with pytest.raises(CalendarError, match="invalid_operation_kind"):
+        j.prepare("command", {"kind": "invite", "href": href, "desired": b"new", "etag": '"v1"'})
+    assert j.find("command") is None
+    assert j.steps() == []
+    # Nothing was stored, so the request ID is still free for a valid intent.
+    step = j.prepare("command", {"kind": "update", "href": href, "desired": b"new", "etag": '"v1"'})
+    assert [s["id"] for s in j.steps()] == [step]
+    j.close()

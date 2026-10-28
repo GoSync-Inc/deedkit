@@ -115,6 +115,30 @@ def test_decorations_same_chat_and_live_profile_source_only(seeded):
     assert s.search(b,'visible text')['items'][0]['sender_name'] is None
 
 
+# spec: ANYM-398
+def test_search_row_ignores_other_chat_profile_and_stale_revision_metadata(seeded):
+    s,a,b=seeded
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO chats(id,account,title) VALUES('telegram-demo-other','telegram-demo','Synthetic other chat')")
+    add(s,'other-source','elsewhere',chat='telegram-demo-other',sender='known')
+    add(s,'here','stale meta',sender='known')
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO sender_profiles(id,account,chat,sender,display_name,username,source_message,source_sent_at)
+            VALUES('other-profile','telegram-demo','telegram-demo-other','known','Other Chat Name','other_chat','other-source',now())''')
+        c.execute("UPDATE messages SET revision=2 WHERE id='here'")
+        c.execute('INSERT INTO message_metadata(message,revision,metadata) VALUES(%s,1,%s)',
+            ('here',Jsonb({'reply_to_provider_id':'11','forwarded':True,'media_kind':'photo'})))
+    assert s.search(b,'elsewhere')['items'][0]['sender_name']=='Other Chat Name'
+    row=s.search(b,'stale meta')['items'][0]
+    assert (row['sender_name'],row['username'])==(None,None)
+    assert (row['reply_to_provider_id'],row['forwarded'],row['media_kind'])==(None,None,None)
+    with s.pool.connection() as c:
+        c.execute("UPDATE message_metadata SET revision=2,metadata=%s WHERE message='here'",
+            (Jsonb({'reply_to_provider_id':'12','forwarded':False,'media_kind':'document'}),))
+    row=s.search(b,'stale meta')['items'][0]
+    assert (row['reply_to_provider_id'],row['forwarded'],row['media_kind'])==('12',False,'document')
+
+
 def test_centered_context_separate_counts_and_equal_timestamp_neighbors(seeded):
     s,a,b=seeded
     for n in range(12):add(s,f'around-{n:02}','nearby')
