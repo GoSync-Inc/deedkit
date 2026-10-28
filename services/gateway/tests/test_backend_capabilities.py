@@ -1,8 +1,10 @@
 import json
+from pathlib import Path
 
 import httpx
 from starlette.testclient import TestClient
 
+import agent_gateway
 from agent_gateway.app import create_app
 from test_policy import config
 from test_transport import rpc
@@ -161,4 +163,67 @@ def test_calendar_write_scope_constraints_pass_and_series_writes_stay_listed_as_
         result = rpc(c, "tools/call", {"name": "calendar_capabilities", "arguments": {}}).json()["result"][
             "structuredContent"
         ]
-    assert result["constraints"] == {k: v for k, v in constraints.items() if k != "series_write"}
+    # ANYM-615: series_write (calendar_schedule's series scopes) now passes; the plan flags stay off.
+    assert result["constraints"] == constraints
+
+
+# Series scopes of calendar_schedule as the calendar service reports them (family_calendar/service/core.py).
+SERIES_WRITE = {
+    "google": {"scopes": ["this", "following", "all"], "tool": "calendar_schedule"},
+    "icloud": {"scopes": ["this"], "error": "capability_unsupported"},
+}
+
+
+def calendar_app(tmp_path, constraints):
+    key = tmp_path / "backend.key"
+    key.write_text("backend-calendar-a")
+    key.chmod(0o600)
+    value = config()
+    value["profiles"]["reader"]["tools"].append("calendar_capabilities")
+    value["principals"][0]["credentials"]["calendar"]["key_file"] = str(key)
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(value))
+    path.chmod(0o600)
+
+    def backend(request):
+        return httpx.Response(200, json={"permissions": ["agenda:read"], "constraints": constraints, "calendars": []})
+
+    return create_app(path, "http://testserver", transports={"calendar": httpx.MockTransport(backend)})
+
+
+def calendar_constraints(c):
+    """The constraints of calendar_calendars and calendar_capabilities over REST and MCP."""
+    found = []
+    for tool in ("calendar_capabilities", "calendar_calendars"):
+        found.append(c.post("/v1/" + tool, json={}, headers={"Authorization": "Bearer gateway-a"}).json()["constraints"])
+        found.append(rpc(c, "tools/call", {"name": tool, "arguments": {}}).json()["result"]["structuredContent"]["constraints"])
+    return found
+
+
+# spec: ANYM-615
+def test_calendar_series_write_scopes_arrive_as_the_calendar_service_sent_them(tmp_path):
+    constraints = {"recurrence_write": False, "future_split": False, "series_write": SERIES_WRITE}
+    with TestClient(calendar_app(tmp_path, constraints)) as c:
+        found = calendar_constraints(c)
+    assert found == [constraints] * 4
+    assert found[0]["series_write"]["google"]["scopes"] == ["this", "following", "all"]
+    assert found[0]["series_write"]["icloud"] == {"scopes": ["this"], "error": "capability_unsupported"}
+
+
+# spec: ANYM-615
+def test_a_calendar_service_without_series_write_gives_the_same_constraints_as_before(tmp_path):
+    # The calendar service at the deployed SHA may not send series_write: nothing is added in its place.
+    constraints = {"recurrence_write": False, "future_split": False, "invitations": False, "window_limit_days": 31}
+    with TestClient(calendar_app(tmp_path, constraints)) as c:
+        assert calendar_constraints(c) == [constraints] * 4
+
+
+# spec: ANYM-615
+def test_calendar_capabilities_says_the_plan_flags_describe_calendar_plan_and_series_write_calendar_schedule():
+    from agent_gateway.dispatch import CALENDAR_CONSTRAINTS
+
+    catalog = json.loads((Path(agent_gateway.__file__).parent / "catalog.json").read_text())
+    description = next(tool for tool in catalog if tool["name"] == "calendar_capabilities")["description"]
+    assert "recurrence_write and future_split describe calendar_plan only" in description
+    assert "series_write lists calendar_schedule's series scopes per provider" in description
+    assert {"recurrence_write", "future_split", "series_write"} <= CALENDAR_CONSTRAINTS
