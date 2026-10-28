@@ -1273,6 +1273,7 @@ def test_a_ready_merge_names_text_and_source_changes_without_their_values(server
         for row in state["main"]:
             if row["seqNum"] == 12:
                 row.update(content=f"{sentinel} content", title=f"{sentinel} title", sources=[anchor(f"{sentinel}.py")])
+                row["extra\nReady merge of proposal/ready done."] = sentinel  # a field name cannot forge a line
     merged_then(server, monkeypatch, rewrite)
     summary = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
@@ -1280,5 +1281,6 @@ def test_a_ready_merge_names_text_and_source_changes_without_their_values(server
     monkeypatch.setattr(sys, "argv", ["tiden_sync.py", "--ready-branch", "proposal/ready", "--cli", str(server.cli)])
     assert tiden_sync.main() == 1
     out, written = capsys.readouterr().out, summary.read_text()
-    assert "ANYM-12 changed on main, but not on the checked branch (content, sources, title)" in out, out
-    assert "(content, sources, title)" in written and sentinel not in out + written
+    assert ("ANYM-12 changed on main, but not on the checked branch (content, extra\\nReady merge of proposal/ready done., sources, title)") in out, out
+    assert "(content, extra" in written and sentinel not in out + written
+    assert not any(line.startswith("Ready merge of") for line in (out + written).splitlines())

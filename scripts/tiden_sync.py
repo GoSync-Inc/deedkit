@@ -626,7 +626,7 @@ def changes(before: dict, after: dict, skip: frozenset = frozenset()) -> list[st
     """The fields that differ, each structural one with its values (`status: Active -> Done`, absent as none)."""
     def value(item) -> str:
         return "none" if item is None else shown(str(item))
-    return [f"{key}: {value(before.get(key))} -> {value(after.get(key))}" if key in SHOWN_VALUES else key
+    return [f"{key}: {value(before.get(key))} -> {value(after.get(key))}" if key in SHOWN_VALUES else shown(key)
             for key in differing(before, after, skip)]
 
 
