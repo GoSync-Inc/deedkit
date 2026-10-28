@@ -912,6 +912,108 @@ Rollout: migration 55, then reapply `subscription_role.sql` (EXECUTE on
 `journal_source_health(integer)`), then restart the matcher. Before the migration the matcher
 skips health journaling. Undo: stop selecting the kinds; the rows stay in the journal.
 
+## Module events (schema 57)
+
+Calendar and calls events (ANYM-562; design: docs/plans/cross-module-subscriptions.md, option a2)
+have a journal of their own, `module_events`, with its own gapless counter
+(`module_event_counter`). It is never part of the message journal: a module publish never takes
+the `feed_counter` row every message writer locks, and the message matcher, `get_updates`,
+message fetch and ACK, message retention and older runtimes never read module rows.
+
+Contract (`messaging_service/module_events.py`, `validate_event`). Each event uses the CloudEvents
+attribute names, not the CloudEvents HTTP binding:
+
+| Attribute | Value |
+| --- | --- |
+| `specversion` | `1.0` |
+| `id` | `<module>:<seq>`, `calendar:` or `calls:` plus the module's own journal number; also the idempotency key (`event_key`, one identifier) |
+| `source` | `deedkit:calendar` or `deedkit:calls` |
+| `type` | one of the types below |
+| `subject` | the primary reference (`event_ref` or `call_id`), equal to that data key |
+| `time` | when it happened (RFC 3339) |
+| `data` | references only: the type's listed keys, each within its type, enumeration or length bound |
+| `urgency` | `now` (passes quiet hours; never batched) or `batch` |
+| `expires_at` | RFC 3339 or null; an event already expired when matched is never matched |
+
+| Type | `data` keys |
+| --- | --- |
+| `calendar.event.created` | `calendar_ref`, `event_ref`, `start_at`, `version` |
+| `calendar.event.changed` | as created, plus `changed` (subset of `start`, `end`, `details`) |
+| `calendar.event.cancelled` | `calendar_ref`, `event_ref`, `start_at` |
+| `calendar.event.starting` | `calendar_ref`, `event_ref`, `start_at`, `lead_minutes` (1–1440); `expires_at` must equal `start_at` |
+| `call.finished` | `call_id`, `status` (`finished`), `end_reason`, `transcript` (`final`); optional `duration_s` (0–86400), `outcome` |
+| `call.failed` | `call_id`, `status`, `end_reason` |
+| `call.not_answered` | `call_id`, `end_reason` (`no_answer`, `busy`, `canceled`) |
+| `call.interrupted` | `call_id`, `end_reason` (`service_restart`) |
+| `call.owner_request` | `call_id`, `decision_id`, `state` (`pending`); `urgency=now` and `expires_at` = the decision's stored deadline |
+
+References are `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`; `end_reason` and `outcome` are lowercase
+tokens of at most 48 characters. No titles, places, descriptions, guest names, destinations,
+transcripts or owner answers. An event is at most 2 KiB.
+
+Producers' read endpoint (`GET /v1/events?after=<seq>&limit=<n>`, ANYM-563 and ANYM-565; the router,
+ANYM-575, applies `read_page`). A page is `{events, next_after, has_more, retention_floor,
+journal_id}`. `after` is exclusive; events are ordered by the module's gapless `seq`; at most
+`limit` events and the router's byte bound per page; `next_after` is at least the last event's seq
+and always moves past rows the producer filtered (a page with `has_more` never repeats its cursor).
+`retention_floor` is the highest pruned seq: a cursor below it gets an explicit `retention_gap`
+from `after` to the floor (the ANYM-446 shape), never an empty complete page. A `journal_id`
+other than the cursor's, or a `next_after` below the cursor, is a source reset: it is reported and
+never read as new events.
+
+Publishing: only `publish_module_event(...)`, a definer function with a fixed search path and no
+PUBLIC execute; it checks the type's data keys and the urgency and expiry rules again and inserts
+one row. A retry with the same `id` and fields returns the stored seq; the same `id` with other
+fields fails with `module_event_conflict`. The router's role (`module_router_role.sql`,
+`messaging_module_router`) can execute it and `report_module_reachability` and nothing else: no
+table privilege, so it can write no message event, change no subscription source or link and read
+no message content.
+
+The module stream. A subscription gets module sources `(source, scope_ref, types)` and a module
+stream (`subscription_module_streams`) through `module_events.attach_sources`; the link check
+that lets a key name a scope is ANYM-564, so no public API creates module sources yet. Each
+matcher pass, after the message pass and in a savepoint of its own (a failure is logged as
+`subscription_module_match_failed` and never undoes or stops the message matches), matches
+module events by `(source, scope_ref)` and type into `subscription_module_matches` with its own
+`matched_through`, match budget (`SUBSCRIPTION_MAX_MATCHES`) and gap (`stream: "modules"`), and
+stages one outbox hint of kind `module_events` whose `through_position` is a module position
+(endpoint bodies list `module_event_id`, `type`, `source`, `subject`, `urgency`, `expires_at`).
+
+Reads: `get_subscription` adds `module_stream` (state, positions, sources, health) only for a
+subscription that has one; message-only responses are unchanged. `get_subscription_events`,
+`fetch_subscription_events` and `wait_for_subscription_events` add `module: {items, has_more,
+next_after, gap}`; each item is the envelope above plus `module_event_id`. One fetch receipt
+carries both streams' positions (`module_after_position`, `module_through_position`); the ACK
+moves each position by compare-and-swap and returns `module_acked_through`. Retention prunes
+ACKed module references after the same window and with the same switch as message references,
+with its own floor; a cursor below it gets a `retention_gap` of the module stream only.
+
+Health: `report_module_reachability(source, reachable)` keeps the time of the first failure and
+clears on the next success. A subscription shows each unreachable module once in
+`module_stream.health` as `{source, state: "module_unreachable", since}`; `blocked_reason` stays
+the matcher's, and message sources keep matching.
+
+Rollback fence: module-aware code sets `messaging.module_aware` for the transaction that makes a
+subscription active. Any other change to `active` (an older runtime's resume of a paused
+subscription) sets `rollback_hold` through the trigger `subscription_module_fence`: the module
+stream stays held (`module_stream.state: "held_after_rollback"`, `next_action: "resume"`) while
+the message stream runs, until the key calls `update_subscription(action="resume")` again.
+
+Backup: the manifest covers `module_event_counter`, `module_events`, `subscription_module_sources`,
+`subscription_module_streams` and `subscription_module_matches` from schema 57;
+`module_source_health` is derived router state. A restore closes every subscription and cancels
+pending hints, module ones included.
+
+Rollout: a verified backup by the deployed image's backup (schema 55/56), migration 57 (manual),
+then reapply `subscription_role.sql`, `gateway_role.sql` and `delivery_role.sql` and install
+`module_router_role.sql` before the router (ANYM-575) exists; the new image's backup reads schema 57.
+Rollback to a runtime before schema 57: first cancel pending module hints
+(`UPDATE subscription_outbox SET state='cancelled',error_code='module_rollback',finished_at=clock_timestamp()
+WHERE kind='module_events' AND state IN ('pending','leased')`), because an older dispatcher would
+send them as message hints; the module tables stay and the fence holds every module stream an
+older runtime resumes. Backups taken after the migration need the schema-57 backup executable to
+verify or restore.
+
 ## Remaining extensions and verification boundaries
 
 Coalescing across subscriptions of different keys, stream resource notifications,

@@ -776,6 +776,22 @@ def hint_body(c, hint, row, p):
         return _compact(body)
     if hint['kind'] == 'test':
         return _compact({**base, 'type': 'test', 'test_id': str(hint['id']), 'endpoint_id': str(hint['endpoint'])})
+    if hint['kind'] == 'module_events':
+        # ANYM-562: the type, the subject reference and the module only; data is read through the fetch.
+        from .module_events import hint_references
+        from .store import serial
+        rows = hint_references(c, row, hint['through_position'])
+        listed = [{'module_event_id': item['seq'], 'type': item['type'], 'source': item['source'],
+            'subject': item['subject'], 'urgency': item['urgency'], 'expires_at': serial(item['expires_at'])}
+            for item in rows][:MAX_REFERENCES]
+        total = rows[0]['total'] if rows else 0
+        while True:
+            body = _compact({**base, 'type': 'module_events', 'references': listed,
+                'references_omitted': total - len(listed),
+                'next_call': {'tool': 'messages_fetch_subscription_events', 'subscription_id': str(row['id'])}})
+            if len(body) <= BODY_LIMIT or not listed:
+                return body
+            listed = listed[:-1]
     consumption = c.execute('SELECT acked_through FROM subscription_consumption WHERE subscription=%s',
         (row['id'],)).fetchone()
     after = consumption['acked_through'] if consumption else row['start_position']

@@ -106,3 +106,9 @@ DO $$ BEGIN
 END $$;
 -- Schema 53 (ANYM-548): the owner's preferred channel per person and purpose, read only; the owner CLI writes it.
 GRANT SELECT ON person_preferences TO messaging_gateway;
+-- Schema 57 (ANYM-562): read module streams and pages, ACK the module position, re-arm a held stream.
+GRANT SELECT ON module_events,module_event_counter,subscription_module_sources,subscription_module_matches,
+    module_source_health TO messaging_gateway;
+GRANT SELECT,INSERT ON subscription_module_streams TO messaging_gateway;
+GRANT UPDATE(matched_through,acked_through,gap,blocked_reason,rollback_hold) ON subscription_module_streams
+    TO messaging_gateway;
