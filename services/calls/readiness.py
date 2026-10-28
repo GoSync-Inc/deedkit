@@ -63,9 +63,6 @@ def per_engine(blockers, credentials, provider):
     reasons = {name:voice_engines.unfit(name, None, credentials) for name in voice_engines.ENGINES}
     engines = {name:{'ready':not common and reason is None, 'blockers':[*common, *([reason] if reason else [])]}
                for name,reason in reasons.items()}
-    # auto's order from voice_engines.choose: the owner's engine first, then the first fitting one.
-    owner = voice_engines.BY_DIALOG_ENGINE.get(provider)
-    order = [owner, *(n for n in voice_engines.ENGINES if n != owner)] if owner else list(voice_engines.ENGINES)
-    selects = next((name for name in order if reasons[name] is None), None)
+    selects = next((name for name in voice_engines.auto_order(provider) if reasons[name] is None), None)
     return {'voice_engines':engines, 'ready_engines':[name for name,e in engines.items() if e['ready']],
             'auto':{'ready':bool(selects) and engines[selects]['ready'], 'selects':selects}}

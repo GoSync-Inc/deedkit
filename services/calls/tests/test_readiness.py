@@ -165,14 +165,18 @@ def test_unreadable_call_voice_still_judges_explicit_engines_by_their_keys():
 
 
 # spec: ANYM-595
-@pytest.mark.parametrize('provider',['gemini_live','grok_realtime'])
-@pytest.mark.parametrize('keys',[{'gemini':True,'xai':True},{'gemini':True,'xai':False},{'gemini':False,'xai':True}])
+@pytest.mark.parametrize('provider',['gemini_live','grok_realtime',None])
+@pytest.mark.parametrize('keys',[{'gemini':True,'xai':True},{'gemini':True,'xai':False},{'gemini':False,'xai':True},{'gemini':False,'xai':False}])
 def test_auto_selects_what_choose_picks(provider,keys):
     from types import SimpleNamespace
+    from core import ServiceError
     from readiness import calling_readiness
     principal=SimpleNamespace(channels=['browser'],scopes={'calls:start'},destinations={})
     ready=calling_readiness(principal,None,keys,True,provider)
-    assert ready['channels']['browser']['auto']=={'ready':True,'selects':voice_engines.choose('auto','ru',provider,keys)['selected']}
+    try:selected=voice_engines.choose('auto','ru',provider,keys)['selected']
+    except ServiceError as error:
+        assert error.code=='no_voice_engine_available';selected=None
+    assert ready['channels']['browser']['auto']=={'ready':selected is not None,'selects':selected}
 
 
 # spec: ANYM-595
