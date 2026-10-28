@@ -8,6 +8,7 @@ import psycopg
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from psycopg.rows import dict_row, tuple_row
+from hypothesis import given, settings, strategies as st
 import pytest
 
 from messaging_service import migration_rollout as rollout
@@ -586,3 +587,164 @@ def test_the_pause_class_is_no_header_a_declared_manual_or_classify_of_a_declare
     assert rollout.rollout_class('-- rollout: manual\n' + body) == 'manual'
     assert rollout.rollout_class(EXPAND + body) == 'expand'
     assert rollout.rollout_class(EXPAND + COUNTEREXAMPLES['insert'][0]) == 'manual'
+
+
+# spec: ANYM-596
+# 038 holds the widening pair too, but its partial unique index already makes it manual for `classify`.
+@pytest.mark.parametrize(('body', 'pause_class'), [(ALLOWED['widen-in'], 'expand'), (source(MIGRATIONS[36]), 'expand'),
+                                                   (source(MIGRATIONS[38]), 'manual')], ids=['widening-pair', '036', '038'])
+def test_the_unattended_class_calls_any_drop_manual_while_the_rollout_class_stays_expand(body, pause_class):
+    text = EXPAND + body
+    assert rollout.rollout_class(text) == pause_class
+    assert rollout.unattended_class(text) == 'manual'
+    assert rollout.unattended_class(text, EXISTING) == 'manual'
+
+
+# spec: ANYM-596
+@pytest.mark.parametrize('form', [f for f in ALLOWED if not f.startswith('widen')])
+def test_the_unattended_class_keeps_every_drop_free_expand_form(form):
+    assert rollout.unattended_class(EXPAND + ALLOWED[form], EXISTING) == 'expand'
+    assert rollout.unattended_class(ALLOWED[form], EXISTING) == 'manual'  # no header
+    assert rollout.unattended_class('-- rollout: manual\n' + ALLOWED[form], EXISTING) == 'manual'
+
+
+# The appended text of each role file in #323 (schema 49) and #326 (schema 50), as merged.
+ROLE_049 = {
+    'gateway_role.sql': """-- Schema 49 (ANYM-519): self-service endpoints. Header values and signing secrets are write-only here:
+-- INSERT and UPDATE, never SELECT (no RETURNING or SET reads them either); only the dispatcher reads them.
+-- signing_secret UPDATE exists only to clear it on delete. Privilege separation, not encryption.
+GRANT SELECT(id,principal,key_id,request_id,request_hash,url,host,label,header_names,headers_fingerprint,
+    secret_fingerprint,pending_fingerprint,rotation_started_at,state,version,created_at,updated_at)
+    ON delivery_endpoints TO messaging_gateway;
+GRANT INSERT(principal,key_id,request_id,request_hash,url,host,label,header_names,headers_fingerprint,
+    secret_fingerprint,header_values,signing_secret) ON delivery_endpoints TO messaging_gateway;
+GRANT UPDATE(header_names,headers_fingerprint,header_values,pending_secret,pending_fingerprint,rotation_started_at,
+    signing_secret,state,version,updated_at) ON delivery_endpoints TO messaging_gateway;
+GRANT SELECT,INSERT ON delivery_endpoint_tests TO messaging_gateway;
+GRANT UPDATE(state,finished_at,error_code) ON delivery_endpoint_tests TO messaging_gateway;
+""",
+    'subscription_role.sql': """-- Schema 49 (ANYM-519): an endpoint binding stages a hint only while its endpoint is enabled; no
+-- secret, header value or URL column.
+GRANT SELECT(id,state) ON delivery_endpoints TO messaging_subscriptions;
+""",
+    'delivery_role.sql': """-- Schema 49 (ANYM-519): the only reader of endpoint secrets and header values; it promotes a rotation
+-- after 24 h, records test results and reads the operator's activation (delivery_features).
+GRANT SELECT ON probe_metadata TO messaging_event_delivery;
+GRANT SELECT ON delivery_endpoints TO messaging_event_delivery;
+GRANT UPDATE(signing_secret,pending_secret,secret_fingerprint,pending_fingerprint,rotation_started_at,updated_at)
+    ON delivery_endpoints TO messaging_event_delivery;
+GRANT SELECT ON delivery_endpoint_tests TO messaging_event_delivery;
+GRANT SELECT(subscription,acked_through) ON subscription_consumption TO messaging_event_delivery;
+-- References without message text: IDs, timing and native wake evidence only (049).
+GRANT EXECUTE ON FUNCTION public.subscription_hint_references(uuid,bigint,bigint,text[],text[]) TO messaging_event_delivery;
+GRANT UPDATE(state,lease_token,lease_until,http_status,latency_ms,error_code,finished_at)
+    ON delivery_endpoint_tests TO messaging_event_delivery;
+""",
+}
+BEAT = """-- Schema 50 (ANYM-534): only this component's heartbeat row (row-level security).
+GRANT SELECT,INSERT,UPDATE ON component_heartbeats TO {role};
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_policies WHERE tablename='component_heartbeats' AND policyname='{role}_beat') THEN
+        CREATE POLICY {role}_beat ON component_heartbeats TO {role} USING (component='{component}') WITH CHECK (component='{component}');
+    END IF;
+END $$;
+"""
+ROLE_050 = {'gateway_role.sql': BEAT.format(role='messaging_gateway', component='api'),
+            'subscription_role.sql': BEAT.format(role='messaging_subscriptions', component='matcher'),
+            'delivery_role.sql': BEAT.format(role='messaging_event_delivery', component='dispatcher')}
+HEARTBEATS = {'component_heartbeats'}
+
+
+def role_base(name, block):
+    """The role file as it stood before `block` was appended: the current file up to the block."""
+    text = SOURCE.joinpath(name).read_text()
+    assert block in text
+    return text[:text.index(block)]
+
+
+# spec: ANYM-596
+@pytest.mark.parametrize(('name', 'block', 'new_tables', 'expected'), [
+    ('gateway_role.sql', ROLE_049['gateway_role.sql'], set(), 'additive'),
+    ('subscription_role.sql', ROLE_049['subscription_role.sql'], set(), 'additive'),
+    ('delivery_role.sql', ROLE_049['delivery_role.sql'], set(), 'manual'),  # GRANT EXECUTE ON FUNCTION
+    ('gateway_role.sql', ROLE_050['gateway_role.sql'], HEARTBEATS, 'additive'),
+    ('subscription_role.sql', ROLE_050['subscription_role.sql'], HEARTBEATS, 'additive'),
+    ('delivery_role.sql', ROLE_050['delivery_role.sql'], HEARTBEATS, 'additive'),
+], ids=['049-gateway', '049-subscription', '049-delivery', '050-gateway', '050-subscription', '050-delivery'])
+def test_the_appended_role_text_of_049_and_050_classifies_as_merged(name, block, new_tables, expected):
+    base = role_base(name, block)
+    assert rollout.role_class(base, base + block, new_tables) == expected
+    # The policy template is additive only on a table the same release creates.
+    if new_tables: assert rollout.role_class(base, base + block, set()) == 'manual'
+
+
+GATEWAY = 'gateway_role.sql'
+GATEWAY_BASE = role_base(GATEWAY, ROLE_050[GATEWAY])
+GATEWAY_POLICY = ROLE_050[GATEWAY].split('\n', 2)[2]
+# Appended text the role language calls manual; each is valid SQL a careless edit could add.
+ROLE_MANUAL = {
+    'revoke': 'REVOKE SELECT ON messages FROM messaging_gateway;',
+    'new-role': 'GRANT SELECT ON messages TO messaging_synthetic;',
+    'membership': 'GRANT messaging_subscriptions TO messaging_gateway;',
+    'alter-role': 'ALTER ROLE messaging_gateway BYPASSRLS;',
+    'restrictive': GATEWAY_POLICY.replace('ON component_heartbeats TO', 'ON component_heartbeats AS RESTRICTIVE TO'),
+    'permissive-spelled': GATEWAY_POLICY.replace('ON component_heartbeats TO', 'ON component_heartbeats AS PERMISSIVE TO'),
+    'policy-other-table': GATEWAY_POLICY.replace('component_heartbeats', 'messages'),
+    'policy-for-all': GATEWAY_POLICY.replace(' TO messaging_gateway USING', ' FOR ALL TO messaging_gateway USING'),
+    'policy-other-role': GATEWAY_POLICY.replace('TO messaging_gateway', 'TO messaging_synthetic'),
+    'policy-expression': GATEWAY_POLICY.replace("USING (component='api')", 'USING (true)'),
+    'other-do': "DO $$ BEGIN EXECUTE 'GRANT ALL ON messages TO messaging_gateway'; END $$;",
+    'truncate': 'GRANT TRUNCATE ON messages TO messaging_gateway;',
+    'truncate-statement': 'TRUNCATE messages;',
+    'all': 'GRANT ALL ON messages TO messaging_gateway;',
+    'all-privileges': 'GRANT ALL PRIVILEGES ON messages TO messaging_gateway;',
+    'trigger': 'GRANT TRIGGER ON messages TO messaging_gateway;',
+    'grant-option': 'GRANT SELECT ON messages TO messaging_gateway WITH GRANT OPTION;',
+    'schema': 'GRANT CREATE ON SCHEMA public TO messaging_gateway;',
+    'database': 'GRANT CONNECT ON DATABASE messaging TO messaging_gateway;',
+    'function': 'GRANT EXECUTE ON FUNCTION public.synthetic() TO messaging_gateway;',
+    'sequence': 'GRANT USAGE ON SEQUENCE synthetic_seq TO messaging_gateway;',
+    'all-tables': 'GRANT SELECT ON ALL TABLES IN SCHEMA public TO messaging_gateway;',
+    'public': 'GRANT SELECT ON messages TO PUBLIC;',
+    'two-roles': 'GRANT SELECT ON messages TO messaging_gateway, messaging_subscriptions;',
+    'granted-by': 'GRANT SELECT ON messages TO messaging_gateway GRANTED BY CURRENT_USER;',
+    'other-schema': 'GRANT SELECT ON pg_catalog.pg_authid TO messaging_gateway;',
+    'set-role': 'SET ROLE messaging_gateway;',
+    'untokenizable': "GRANT SELECT ON messages TO messaging_gateway; -- ok\nSELECT U&'x';",
+}
+
+
+# spec: ANYM-596
+@pytest.mark.parametrize('example', ROLE_MANUAL)
+def test_role_text_outside_the_role_language_is_manual(example):
+    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE + ROLE_MANUAL[example] + '\n', HEARTBEATS) == 'manual'
+
+
+# spec: ANYM-596
+def test_a_role_file_whose_base_text_changed_is_manual():
+    candidate = GATEWAY_BASE + ROLE_050[GATEWAY]
+    assert rollout.role_class(GATEWAY_BASE, candidate, HEARTBEATS) == 'additive'
+    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE, set()) == 'additive'  # nothing appended
+    edited = candidate.replace('GRANT USAGE ON SCHEMA public', 'GRANT CREATE ON SCHEMA public', 1)
+    assert edited != candidate and rollout.role_class(GATEWAY_BASE, edited, HEARTBEATS) == 'manual'
+    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE[:-1], set()) == 'manual'  # shortened
+    # The appended text starts a statement: a base ending inside a statement cannot be continued.
+    open_base = GATEWAY_BASE + 'GRANT SELECT ON messages'
+    assert rollout.role_class(open_base, open_base + ' TO messaging_gateway;\n', set()) == 'manual'
+
+
+ADDITIVE_STATEMENTS = [ROLE_049['gateway_role.sql'], ROLE_050['gateway_role.sql'], GATEWAY_POLICY,
+                       '-- a comment only\n', 'GRANT REFERENCES ON messages TO messaging_gateway;\n',
+                       'GRANT DELETE ON TABLE public.messages, chats TO messaging_gateway;\n']
+MANUAL_STATEMENTS = [ROLE_MANUAL[k] + '\n' for k in ROLE_MANUAL]
+
+
+# spec: ANYM-596
+@given(st.lists(st.sampled_from(ADDITIVE_STATEMENTS), max_size=6),
+       st.lists(st.sampled_from(ADDITIVE_STATEMENTS), max_size=6), st.sampled_from(MANUAL_STATEMENTS))
+@settings(max_examples=200, deadline=None)
+def test_appended_additive_role_statements_stay_additive_until_one_manual_statement_joins(before, after, manual):
+    additive = ''.join(before + after)
+    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE + additive, HEARTBEATS) == 'additive'
+    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE + ''.join(before) + manual + ''.join(after),
+                              HEARTBEATS) == 'manual'

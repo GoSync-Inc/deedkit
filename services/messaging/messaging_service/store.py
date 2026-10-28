@@ -18,7 +18,8 @@ import threading
 from collections import OrderedDict
 from uuid import UUID
 
-from psycopg.errors import LockNotAvailable, TransactionTimeout
+import psycopg
+from psycopg.errors import LockNotAvailable, QueryCanceled, TransactionTimeout
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from . import __version__
@@ -36,6 +37,25 @@ class APIError(Exception):
 
 # Under the 5 s request budget, so a writer queued behind a migrate lock request still finishes.
 MIGRATE_LOCK_TIMEOUT="SET LOCAL lock_timeout='2s'"
+
+
+# migrate-expand (ANYM-596): the session budgets as SHOW prints them; all three below a request's 5 s.
+EXPAND_SETTINGS={'lock_timeout':'2s','statement_timeout':'4s','transaction_timeout':'4s'}
+
+
+class ExpandError(Exception):
+    """A fixed migrate-expand code; never PostgreSQL's message."""
+    def __init__(self, code):
+        self.code=code
+        super().__init__(code)
+
+
+def ledger_version(c):
+    if not c.execute("SELECT to_regclass('public.probe_metadata') IS NOT NULL AS present").fetchone()['present']:
+        raise ExpandError('ledger_mismatch')
+    row=c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()
+    if not row: raise ExpandError('ledger_mismatch')
+    return int(row['value'])
 
 
 REPLAY_LOCK_TABLES=('messages','deliveries','download_grants')
@@ -1288,6 +1308,85 @@ class Store:
                  REVOKE ALL ON FUNCTION public.subscription_hint_references(uuid,bigint,bigint,text[],text[]) FROM PUBLIC;
                 END IF;
             END $$''')
+
+    def expand_connection(self):
+        """One connection under the unattended budgets (ANYM-596), read back before use."""
+        c=psycopg.connect(self.pool.conninfo,row_factory=dict_row,prepare_threshold=None,connect_timeout=5,
+            options='-c lock_timeout=2000 -c statement_timeout=4000 -c transaction_timeout=4000 -c timezone=UTC')
+        try:
+            if [c.execute(f'SHOW {name}').fetchone()[name] for name in EXPAND_SETTINGS]!=list(EXPAND_SETTINGS.values()):
+                raise ExpandError('settings_refused')
+        except BaseException:
+            c.close(); raise
+        return c
+
+    def expand_status(self):
+        with self.expand_connection() as c:
+            return {'schema_version':ledger_version(c)}
+
+    def migrate_expand(self, plan, *, root=None, before_commit=None):
+        try:
+            return self._migrate_expand(plan,root=root,before_commit=before_commit)
+        except ExpandError:
+            raise
+        except LockNotAvailable:
+            raise ExpandError('lock_timeout') from None
+        except TransactionTimeout:
+            raise ExpandError('transaction_timeout') from None
+        except QueryCanceled:
+            raise ExpandError('statement_timeout') from None
+        except Exception:
+            raise ExpandError('failed') from None
+
+    def _migrate_expand(self, plan, *, root=None, before_commit=None):
+        """Applies only DROP-free expand migrations and appended role grants in one bounded transaction, or
+        nothing (ANYM-596). Never schema.sql, lock_replay_tables or the ACL repair of migrate(). Raises ExpandError
+        with a fixed code; `before_commit(c)` is a test hook."""
+        from . import migration_rollout as rollout
+        root=Path(root) if root else Path(__file__).parent
+        files={int(p.name[:3]):p for p in root.joinpath('migrations').glob('[0-9][0-9][0-9]_*.sql')}
+        roles={p.name:p.read_bytes() for p in root.glob('*_role.sql')}
+        try:
+            base,target,prefixes=plan['base'],plan['target'],plan['roles']
+            valid=(all(type(v) is int for v in (base,target)) and base<=target==max(files) and type(prefixes) is dict
+                and set(prefixes)==set(roles) and all(type(p) is dict and type(p.get('bytes')) is int
+                and 0<=p['bytes']<=len(roles[n]) and type(p.get('sha256')) is str for n,p in prefixes.items()))
+        except (KeyError,TypeError,ValueError):
+            valid=False
+        if not valid: raise ExpandError('plan_invalid')
+        try:
+            appended={}
+            for name,prefix in sorted(prefixes.items()):
+                data=roles[name]
+                if hashlib.sha256(data[:prefix['bytes']]).hexdigest()!=prefix['sha256']: raise ExpandError('prefix_mismatch')
+                appended[name]=(data[:prefix['bytes']].decode(),data.decode())
+        except UnicodeDecodeError:
+            raise ExpandError('prefix_mismatch') from None
+        pending=[(v,files[v].read_bytes()) for v in sorted(files) if base<v<=target]
+        with self.expand_connection() as c:
+            if not c.execute('SELECT pg_try_advisory_xact_lock(74509137) AS locked').fetchone()['locked']:
+                raise ExpandError('busy')
+            if ledger_version(c)!=base: raise ExpandError('ledger_mismatch')
+            applied={r['version']:r['sha256'] for r in c.execute('SELECT version,sha256 FROM archive_migrations')}
+            if applied!={v:hashlib.sha256(p.read_bytes()).hexdigest() for v,p in files.items() if 1<v<=base}:
+                raise ExpandError('ledger_mismatch')
+            inventory={r['tablename'] for r in c.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'")}
+            created=set()
+            for _,data in pending:
+                text=data.decode()
+                if rollout.unattended_class(text,inventory|created)!='expand': raise ExpandError('not_unattended')
+                created.update(rollout.new_tables(text))
+            for old,new in appended.values():
+                if rollout.role_class(old,new,created)!='additive': raise ExpandError('role_not_additive')
+            for version,data in pending:
+                c.execute(data.decode())
+                c.execute('INSERT INTO archive_migrations(version,sha256) VALUES(%s,%s)',(version,hashlib.sha256(data).hexdigest()))
+                c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'",(str(version),))
+            for old,new in appended.values():
+                if rollout.statements(new[len(old):]): c.execute(new[len(old):])
+            if before_commit: before_commit(c)
+            c.commit()
+        return {'schema_version':target}
 
     def issue_key(self, principal, accounts, days=7, *, chats=UNSET, permissions=UNSET,
                   key_permissions=UNSET, token=None, operation_id=None, check=False, new_principal=False,
