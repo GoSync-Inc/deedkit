@@ -31,8 +31,14 @@ def test_agents_md_section_2_carries_the_card_intake_override_bounded_by_the_loo
 # spec: ANYM-568
 def test_the_loop_document_has_envelope_owner_items_stop_caps_live_switch_and_undo_sections():
     doc = (ROOT / "docs/operations/feedback-autoloop.md").read_text(encoding="utf-8")
-    headings = set(re.findall(r"^## (.+)$", doc, re.M))
+    parts = {match.group(1): match.group(2) for match in re.finditer(r"^## ([^\n]+)\n(.*?)(?=^## |\Z)", doc, re.M | re.S)}
     assert {"Boundary", "Envelope", "Owner items", "Stop, withdraw, hold", "Caps", "The live switch",
-            "Undo per stage"} <= headings
+            "Undo per stage"} <= set(parts)
     # The protected paths are the one list in the review protocol, not a second copy here.
-    assert "the autoloop protected paths (both in docs/operations/review-protocol.md" in doc
+    assert "the autoloop protected paths (both in docs/operations/review-protocol.md" in parts["Envelope"]
+    assert "The next tick fences" in parts["Stop, withdraw, hold"]
+    switch = " ".join(parts["The live switch"].split())
+    assert "written by the owner" in switch and "`live: false` (the default)" in switch
+    assert "`live` stays false until this document's PR (ANYM-568)" in switch
+    assert "Undo: set `live` back to false, or `PAUSE`." in switch
+    assert "| Whole loop | `touch ~/.deedkit/autoloop/PAUSE`" in parts["Undo per stage"]
