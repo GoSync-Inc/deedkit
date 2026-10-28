@@ -775,3 +775,18 @@ def test_appended_additive_role_statements_stay_additive_until_one_manual_statem
     assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE + additive, HEARTBEATS) == 'additive'
     assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE + ''.join(before) + manual + ''.join(after),
                               HEARTBEATS) == 'manual'
+
+
+# spec: ANYM-596
+def test_a_policy_may_use_a_column_a_later_add_column_gives_a_new_table():
+    # Sol r2 F3: the column map follows ADD COLUMN on a new table, in the same file and in a later one.
+    first = 'CREATE TABLE synthetic_beats (id text PRIMARY KEY);\nALTER TABLE synthetic_beats ADD COLUMN component text;\n'
+    created = rollout.new_tables(first)
+    assert created == {'synthetic_beats': {'id', 'component'}}
+    later = rollout.new_tables('ALTER TABLE synthetic_beats ADD COLUMN state text;\n', created)
+    assert later == {'synthetic_beats': {'id', 'component', 'state'}} and created['synthetic_beats'] == {'id', 'component'}
+    policy = GATEWAY_POLICY.replace('component_heartbeats', 'synthetic_beats')
+    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE + policy, created) == 'additive'
+    stated = policy.replace("(component='api')", "(state='api')")
+    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE + stated, created) == 'manual'
+    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE + stated, later) == 'additive'

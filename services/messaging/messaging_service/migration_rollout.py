@@ -549,9 +549,10 @@ def role_class(base, candidate, new_tables, *, tables=None):
     return 'additive'
 
 
-def new_tables(text):
-    """{table: its column names} for each CREATE TABLE of a migration; {} when it does not parse."""
-    found = {}
+def new_tables(text, created=None):
+    """{table: its column names} for each CREATE TABLE of a migration, with the columns later ADD COLUMNs give
+    those tables, added to a copy of `created` (the earlier files' result); `created` alone when it does not parse."""
+    found = {table: set(columns) for table, columns in (created or {}).items()}
     try:
         for statement in statements(text):
             c = Cursor(statement)
@@ -564,6 +565,10 @@ def new_tables(text):
                             'constraint', 'primary', 'unique', 'check', 'foreign', 'exclude', 'like'):
                         columns.add(value)
                 found[table] = columns
+            elif c.word('alter') and c.word('table') and (table := c.name()) in found:
+                for part in split(statement[c.at:]):
+                    p = Cursor(part)
+                    if p.word('add') and p.word('column'): found[table].add(p.name())
     except (Manual, Untokenizable):
-        return {}
+        return {table: set(columns) for table, columns in (created or {}).items()}
     return found

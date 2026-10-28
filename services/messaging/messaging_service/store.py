@@ -124,13 +124,22 @@ def migrate_expand(dsn, plan, *, root=None, before_commit=None):
             applied={r['version']:r['sha256'] for r in c.execute('SELECT version,sha256 FROM archive_migrations')}
             if applied!={v:hashlib.sha256(p.read_bytes()).hexdigest() for v,p in files.items() if 1<v<=base}:
                 raise ExpandError('ledger_mismatch')
-            # Ordinary and partitioned tables of `public` only: a GRANT on a sequence or view is not additive.
-            inventory={r['tablename'] for r in c.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'")}
+            # An unqualified name resolves in pg_catalog before public (search_path=public), so a catalog name is
+            # never a table here. A GRANT target is an ordinary or partitioned table of `public`; a new table may
+            # not reuse the name of any relation (a sequence or view included), or IF NOT EXISTS would skip it.
+            relations={(r['nspname'],r['relname'],r['relkind']) for r in c.execute(
+                "SELECT n.nspname,c.relname,c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname IN ('public','pg_catalog')")}
+            taken={name for _,name,_ in relations}
+            inventory={name for space,name,kind in relations if space=='public' and kind in ('r','p')}-{
+                name for space,name,_ in relations if space=='pg_catalog'}
             created={}
             for _,data in pending:
                 text=data.decode()
                 if rollout.unattended_class(text,inventory|set(created))!='expand': raise ExpandError('not_unattended')
-                created.update(rollout.new_tables(text))
+                following=rollout.new_tables(text,created)
+                if (set(following)-set(created))&taken: raise ExpandError('not_unattended')
+                created=following
             for old,new in appended.values():
                 if rollout.role_class(old,new,created,tables=inventory)!='additive': raise ExpandError('role_not_additive')
             for version,data in pending:

@@ -108,6 +108,14 @@ def cli(dsn, tmp_path, *args, root=None):
     return done.returncode, json.loads(lines[0]), time.monotonic() - started
 
 
+def acls(dsn):
+    """Every relation's ACL in public and pg_catalog, and the public relations."""
+    with psycopg.connect(dsn) as c:
+        return c.execute("SELECT n.nspname, c.relname, c.relkind, c.relacl::text FROM pg_class c "
+                         "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('public','pg_catalog') "
+                         "ORDER BY 1, 2").fetchall()
+
+
 def write_plan(tmp_path, plan):
     path = tmp_path / 'plan.json'
     path.write_text(json.dumps(plan))
@@ -208,13 +216,22 @@ def test_an_expand_migration_and_its_role_grant_apply_together(db, tmp_path):
     ('-- rollout: manual\n' + NOTE.split('\n', 1)[1], {}, 'not_unattended'),
     (NOTE, {'gateway_role.sql': 'REVOKE SELECT ON messages FROM messaging_gateway;\n'}, 'role_not_additive'),
     (NOTE, {'gateway_role.sql': 'GRANT UPDATE ON synthetic_seq TO messaging_gateway;\n'}, 'role_not_additive'),
-], ids=['drop', 'declared-manual', 'revoke', 'not-a-table'])
+    # Sol r2 F1, F2: a "new" table named like an existing sequence, or like a catalog the GRANT would resolve to.
+    ('-- rollout: expand\nCREATE TABLE IF NOT EXISTS synthetic_seq (id text);\n',
+     {'gateway_role.sql': 'GRANT UPDATE ON synthetic_seq TO messaging_gateway;\n'}, 'not_unattended'),
+    ('-- rollout: expand\nCREATE TABLE pg_authid (id text);\n',
+     {'gateway_role.sql': 'GRANT SELECT ON pg_authid TO messaging_gateway;\n'}, 'not_unattended'),
+    (NOTE, {'gateway_role.sql': 'GRANT SELECT ON pg_authid TO messaging_gateway;\n'}, 'role_not_additive'),
+], ids=['drop', 'declared-manual', 'revoke', 'not-a-table', 'sequence-collision', 'catalog-collision', 'catalog'])
 def test_anything_outside_the_unattended_language_applies_nothing(db, tmp_path, migration, roles, code):
     _, dsn = db
+    with psycopg.connect(dsn) as c: c.execute('CREATE SEQUENCE synthetic_seq')
     root = package(tmp_path, migration, roles)
     plan = write_plan(tmp_path, plan_for(root, RUNTIME_SCHEMA, NEXT, roles))
+    before = acls(dsn)
     assert cli(dsn, tmp_path, '--plan', plan, root=root)[:2] == (1, {'error': code})
     assert ledger(dsn) == (RUNTIME_SCHEMA, 0, 0)
+    assert acls(dsn) == before
 
 
 # spec: ANYM-596
