@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from messaging_service import backup_crypto as crypto
+from test_backup_calendar import calendar_db  # noqa: F401  (a fixture)
 
 
 def bundle():
@@ -198,3 +199,157 @@ def test_worker_mismatched_dump_schema_never_enters_inventory_quarantine_or_resu
             'database_password':'a'*64,'snapshot_sha256':hashlib.sha256(raw).hexdigest(),'max_plaintext_bytes':len(data)}
     with pytest.raises(worker.RestoreStageError,match='restore_snapshot_failed'):worker.run(config,io.BytesIO(data))
     assert later==[] and not (restored/'result.json').exists()
+
+
+def fernet_encrypt(key,plaintext,iv=bytes(range(16))):
+    """A real Fernet token with a fixed IV and time, so a damaged-key outcome is deterministic."""
+    import base64,hmac
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher,algorithms,modes
+    secret=base64.urlsafe_b64decode(key);padder=padding.PKCS7(128).padder()
+    encryptor=Cipher(algorithms.AES(secret[16:]),modes.CBC(iv)).encryptor()
+    body=encryptor.update(padder.update(plaintext)+padder.finalize())+encryptor.finalize()
+    data=b'\x80'+(1_800_000_000).to_bytes(8,'big')+iv+body
+    return base64.urlsafe_b64encode(data+hmac.new(secret[:16],data,'sha256').digest())
+
+
+CALENDAR_KEY=__import__('base64').urlsafe_b64encode(hashlib.sha256(b'synthetic-calendar-key').digest())
+HOME_PLAINTEXT=b'{"refresh_token":"SYNTHETIC_TOKEN_NEVER_WRITTEN"}'
+
+
+def calendar_worker_config(raw,data=b''):
+    return {'v':1,'profile':'calendar','identity_file':'/run/restore/identity','work_directory':'/work',
+            'database_host':'restore-postgres','database_password':'a'*64,'snapshot_sha256':hashlib.sha256(raw).hexdigest(),
+            'max_plaintext_bytes':max(1,len(data))}
+
+
+@pytest.fixture
+def calendar_capture(calendar_db,tmp_path):  # noqa: F811  (the imported fixture)
+    """A captured synthetic calendar bundle (schema 4, real Fernet tokens) and a restore target factory."""
+    from test_backup_calendar import PROFILE,docker_tool,pg_tools
+    from messaging_service.backup_calendar import create_calendar_snapshot
+    container=pg_tools();source=calendar_db()
+    vault=tmp_path/'src/vault';profile=tmp_path/'src/profile';vault.mkdir(mode=0o700,parents=True);profile.mkdir(mode=0o700)
+    (vault/'key').write_bytes(CALENDAR_KEY)
+    (vault/'home.enc').write_bytes(fernet_encrypt(CALENDAR_KEY,HOME_PLAINTEXT))
+    (vault/'odd.enc').write_bytes(fernet_encrypt(CALENDAR_KEY,b'["not","an","object"]'))
+    for name,value in PROFILE.items():(profile/name).write_bytes(value)
+    import psycopg
+    with psycopg.connect(source,autocommit=True) as c:
+        c.execute("INSERT INTO fcs.connections VALUES ('home','google',true),('odd','google',false),('old','icloud',false)")
+    snapshot=tmp_path/'snapshot'
+    create_calendar_snapshot(source,snapshot,docker_tool(container,source,'pg_dump'),vault_directory=vault,profile_directory=profile)
+    def restore(snapshot=snapshot):
+        from messaging_service import backup_restore_worker as worker
+        from psycopg.conninfo import conninfo_to_dict
+        target=calendar_db(schema=None)
+        raw=(snapshot/'manifest.json').read_bytes()
+        return worker.restore_calendar(snapshot,hashlib.sha256(raw).hexdigest(),tool=lambda name:docker_tool(container,target,name),
+                                       env=None,dsn=target,database=conninfo_to_dict(target)['dbname'])
+    return SimpleNamespace(snapshot=snapshot,source=source,restore=restore,dump=lambda:docker_tool(container,source,'pg_dump'))
+
+
+def rewrite_manifest(snapshot,change):
+    manifest=json.loads((snapshot/'manifest.json').read_text());change(manifest)
+    (snapshot/'manifest.json').write_text(json.dumps(manifest))
+
+
+def restate(snapshot,name,data):
+    """Replace a state file and recompute its manifest hash, so the bundle still verifies."""
+    path=snapshot/'state'/name
+    if data is None:path.unlink()
+    else:path.write_bytes(data)
+    def change(manifest):
+        if data is None:del manifest['state_files'][name]
+        else:manifest['state_files'][name]={'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()}
+    rewrite_manifest(snapshot,change)
+
+
+# spec: ANYM-606
+def test_calendar_restore_passes_all_seven_checks_and_copies_the_vault_warnings(calendar_capture):
+    result=calendar_capture.restore()
+    assert result['profile']=='calendar' and result['schema_version']==4
+    assert result['checks']=={name:True for name in ('decryption','bundle_integrity','database_restore','schema_version',
+                                                      'table_inventory','vault_complete','vault_decrypts')}
+    assert result['vault_warnings']==[{'kind':'disabled_connection_without_token','name':'old'},
+                                      {'kind':'token_not_json_object','name':'odd'}]
+    assert b'SYNTHETIC_TOKEN_NEVER_WRITTEN' not in json.dumps(result).encode()
+
+
+def damaged_key():
+    import base64
+    secret=base64.urlsafe_b64decode(CALENDAR_KEY)
+    return base64.urlsafe_b64encode(secret[:16]+bytes(16))
+
+
+def damaged_token():
+    import base64,hmac
+    raw=bytearray(base64.urlsafe_b64decode(fernet_encrypt(CALENDAR_KEY,HOME_PLAINTEXT)))
+    raw[-33]^=0x01  # last ciphertext byte: its block's padding no longer decrypts
+    secret=base64.urlsafe_b64decode(CALENDAR_KEY);data=bytes(raw[:-32])
+    return base64.urlsafe_b64encode(data+hmac.new(secret[:16],data,'sha256').digest())
+
+
+# spec: ANYM-606
+@pytest.mark.parametrize('check,code',[('bundle_integrity','restore_bundle_failed'),('database_restore','restore_database_failed'),
+    ('schema_version','restore_schema_failed'),('table_inventory','restore_inventory_failed'),
+    ('vault_complete','restore_vault_incomplete'),('vault_decrypts_key','restore_vault_decrypt_failed'),
+    ('vault_decrypts_token','restore_vault_decrypt_failed')])
+def test_each_calendar_check_fails_its_own_bundle_after_every_earlier_check_passes(calendar_capture,check,code):
+    import subprocess
+    from messaging_service import backup_restore_worker as worker
+    from messaging_service.backup_calendar import fernet_hmac_valid,verify_calendar_bundle
+    snapshot=calendar_capture.snapshot
+    if check=='bundle_integrity':(snapshot/'state/profile/worker.json').write_bytes(b'{"dsn":"changed"}\n')
+    elif check=='database_restore':
+        dump=b'PGDMP-NOT-A-DUMP';(snapshot/'database.dump').write_bytes(dump)
+        rewrite_manifest(snapshot,lambda m:m.update(dump_sha256=hashlib.sha256(dump).hexdigest()))
+    elif check=='schema_version':rewrite_manifest(snapshot,lambda m:m.update(schema_version=5))
+    elif check=='table_inventory':
+        import psycopg
+        with psycopg.connect(calendar_capture.source,autocommit=True) as c:c.execute("INSERT INTO public.extra VALUES (7,'after')")
+        dump=subprocess.run([*calendar_capture.dump(),'--format=custom','--no-owner','--no-acl'],check=True,capture_output=True).stdout
+        (snapshot/'database.dump').write_bytes(dump)
+        rewrite_manifest(snapshot,lambda m:m.update(dump_sha256=hashlib.sha256(dump).hexdigest()))
+    elif check=='vault_complete':restate(snapshot,'vault/home.enc',None)
+    elif check=='vault_decrypts_key':
+        assert fernet_hmac_valid(damaged_key(),(snapshot/'state/vault/home.enc').read_bytes())
+        restate(snapshot,'vault/key',damaged_key())
+    else:
+        assert fernet_hmac_valid(CALENDAR_KEY,damaged_token())
+        restate(snapshot,'vault/home.enc',damaged_token())
+    if check!='bundle_integrity':verify_calendar_bundle(snapshot)
+    with pytest.raises(worker.RestoreStageError,match=code):calendar_capture.restore()
+
+
+# spec: ANYM-606
+def test_calendar_worker_refuses_a_failed_decryption_and_an_unknown_profile(tmp_path,monkeypatch):
+    from messaging_service import backup_restore_worker as worker
+    data,manifest=bundle();raw=json.dumps(manifest).encode()
+    decoder=tmp_path/'age-fails'
+    decoder.write_text('#!'+sys.executable+'\nimport sys\nsys.stdin.buffer.read()\nsys.exit(1)\n');decoder.chmod(0o700)
+    real=crypto.decrypt_snapshot_stream
+    monkeypatch.setattr(worker,'decrypt_snapshot_stream',lambda source,identity,destination,max_bytes:
+                        real(source,identity,tmp_path/'bundle',age=str(decoder),max_bytes=max_bytes))
+    with pytest.raises(worker.RestoreStageError,match='restore_decryption_failed'):
+        worker.run(calendar_worker_config(raw,data),io.BytesIO(data))
+    for profile in ('messaging','notes',None):
+        with pytest.raises(ValueError,match='invalid_restore_worker_config'):
+            worker.run({**calendar_worker_config(raw,data),'profile':profile},io.BytesIO(data))
+
+
+# spec: ANYM-606
+@pytest.mark.parametrize('configured',['messaging','calendar'])
+def test_worker_refuses_a_bundle_of_the_other_profile_before_any_restore(tmp_path,monkeypatch,configured):
+    from messaging_service import backup_restore_worker as worker
+    data,manifest=bundle()
+    if configured=='messaging':manifest={**manifest,'profile':'calendar'}
+    restored=tmp_path/'verified-bundle';restored.mkdir(mode=0o700)
+    (restored/'database.dump').write_bytes(b'UNIT_DUMP_NOT_A_DATABASE')
+    raw=json.dumps(manifest).encode();(restored/'manifest.json').write_bytes(raw)
+    monkeypatch.setattr(worker,'decrypt_snapshot_stream',lambda *a,**kw:restored)
+    calls=[];monkeypatch.setattr(worker.subprocess,'run',lambda *a,**kw:calls.append(a))
+    config=calendar_worker_config(raw,data)
+    if configured=='messaging':del config['profile']
+    with pytest.raises(worker.RestoreStageError,match='verifier_profile_mismatch'):worker.run(config,io.BytesIO(data))
+    assert calls==[] and not (restored/'result.json').exists()

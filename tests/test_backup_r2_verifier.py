@@ -1110,3 +1110,179 @@ def test_follow_sweeps_an_interrupted_self_test_while_a_verification_retry_waits
         with pytest.raises(RuntimeError,match='verification_pending'):entry()
         assert not s.docker.resources and not (s.directory/(s.f.SELF_TEST+run)).exists()
         assert active.read_bytes()==journal and s.path.read_bytes()==pins
+
+
+def calendar_facts(receipt,**changes):
+    return {'v':1,'status':'verified','profile':'calendar','schema_version':5,'manifest_sha256':receipt['wire']['snapshot_sha256'],
+            'checks':{k:True for k in r2.CALENDAR_CHECKS},
+            'vault_warnings':[{'kind':'disabled_connection_without_token','name':'old'}],**changes}
+
+
+@pytest.fixture
+def calendar_operator(operator):
+    # The calendar instance: its own receiver config with `profile: calendar` and a helper giving calendar facts.
+    v,config,receiver,cloud,engine,write_json=operator
+    receiver={**receiver,'profile':'calendar'};write_json(Path(config['receiver_config_file']),receiver)
+    config={**config,'profile':'calendar'};restore=engine.restore;engine.workers=[]
+    def calendar_restore(config,receiver,client,receipt,run,payload,secret_dir):
+        engine.workers.append(json.loads((secret_dir/'worker.json').read_text()))
+        facts=restore(config,receiver,client,receipt,run,payload,secret_dir)
+        return calendar_facts(receipt) if engine.calendar else facts
+    engine.restore=calendar_restore;engine.calendar=True
+    return v,config,receiver,cloud,engine,write_json
+
+
+# spec: ANYM-606
+def test_calendar_verifier_config_needs_a_calendar_receiver_and_a_messaging_config_loads_unchanged(operator):
+    v,config,receiver,cloud,engine,write_json=operator
+    path=Path(config['receiver_config_file']).parent/'verifier.json';write_json(path,config)
+    assert v.load_config(path)==config
+    write_json(path,{**config,'profile':'calendar'})
+    with pytest.raises(ValueError,match='verifier_profile_mismatch'):v.load_config(path)
+    write_json(Path(config['receiver_config_file']),{**receiver,'profile':'calendar'})
+    assert v.load_config(path)=={**config,'profile':'calendar'}
+    for profile in ('notes',None,['calendar']):
+        write_json(path,{**config,'profile':profile})
+        with pytest.raises(ValueError,match='invalid_verifier_config'):v.load_config(path)
+    write_json(Path(config['receiver_config_file']),{**receiver,'profile':'notes'})
+    with pytest.raises(ValueError,match='invalid_config'):r2.load_config(config['receiver_config_file'])
+
+
+# spec: ANYM-606
+def test_calendar_run_protects_its_own_proof_and_rotates_two_points(calendar_operator):
+    from test_backup_r2 import receive,THIRD
+    v,config,receiver,cloud,engine,_=calendar_operator
+    assert v.run(config,client=cloud,engine=engine)['status']=='verified'
+    assert engine.workers[0]['profile']=='calendar'
+    proof=json.loads(next(Path(config['directory']).glob('proof-*.json')).read_text())
+    assert proof['verification']['profile']=='calendar' and set(proof['verification']['checks'])==r2.CALENDAR_CHECKS
+    assert proof['verification']['vault_warnings']==[{'kind':'disabled_connection_without_token','name':'old'}]
+    old=Path(config['protected_file']).read_bytes()
+    receive(receiver,cloud,bid=THIRD)
+    assert v.run(config,client=cloud,engine=engine)['backup_id']==THIRD
+    assert Path(config['protected_file']).read_bytes()!=old
+    objects=[key for key in cloud.objects if '/objects/' in key]
+    assert len(objects)==1 and objects[0].startswith(receiver['prefix']+'/objects/'+THIRD+'-')
+
+
+# spec: ANYM-606
+def test_a_calendar_bundle_missing_an_enabled_token_keeps_the_old_point_protected_and_present(calendar_operator):
+    from test_backup_r2 import receive,THIRD
+    v,config,receiver,cloud,engine,_=calendar_operator
+    v.run(config,client=cloud,engine=engine)
+    marker=Path(config['protected_file']).read_bytes();objects=dict(cloud.objects)
+    receive(receiver,cloud,bid=THIRD)
+    engine.failure=v.HelperFailure('restore_vault_incomplete')
+    with pytest.raises(RuntimeError,match='restore_vault_incomplete'):v.run(config,client=cloud,engine=engine)
+    assert json.loads((Path(config['directory'])/'status.json').read_text())['error']=='restore_vault_incomplete'
+    assert Path(config['protected_file']).read_bytes()==marker
+    assert all(cloud.objects.get(key)==value for key,value in objects.items())
+
+
+# spec: ANYM-606
+@pytest.mark.parametrize('case',['messaging_facts_on_calendar','calendar_facts_on_messaging','retry_changed_profile',
+                                 'receiver_changed_profile'])
+def test_every_profile_mismatch_fails_and_protects_nothing(calendar_operator,case):
+    v,config,receiver,cloud,engine,write_json=calendar_operator
+    if case=='messaging_facts_on_calendar':engine.calendar=False
+    elif case=='calendar_facts_on_messaging':
+        write_json(Path(config['receiver_config_file']),{**receiver,'profile':'messaging'});config={**config,'profile':'messaging'}
+    elif case=='receiver_changed_profile':write_json(Path(config['receiver_config_file']),{**receiver,'profile':'messaging'})
+    else:
+        # A messaging run left its journal; the same directory then runs as the calendar instance.
+        write_json(Path(config['receiver_config_file']),{**receiver,'profile':'messaging'})
+        engine.failure=RuntimeError('restore_quarantine_failed')
+        with pytest.raises(RuntimeError):v.run({**config,'profile':'messaging'},client=cloud,engine=engine)
+        assert 'profile' not in json.loads((Path(config['directory'])/'active.json').read_text())
+        write_json(Path(config['receiver_config_file']),receiver);engine.failure=None
+    runs=len(engine.runs)
+    with pytest.raises(ValueError,match='verifier_profile_mismatch'):v.run(config,client=cloud,engine=engine)
+    assert json.loads((Path(config['directory'])/'status.json').read_text())['error']=='verifier_profile_mismatch'
+    assert not Path(config['protected_file']).exists()
+    assert len(engine.runs)==runs+(case in ('messaging_facts_on_calendar','calendar_facts_on_messaging'))
+
+
+# spec: ANYM-606
+def test_proof_check_sets_are_bound_to_their_profile_and_never_mix():
+    from test_backup_r2 import BID
+    v=module();receipt={'wire':{'id':BID,'bytes':100,'sha256':'a'*64,'snapshot_sha256':'b'*64,
+                                'received_at':'2026-10-16T09:17:03+00:00'}}
+    messaging_facts={'v':1,'status':'verified','schema_version':34,'manifest_sha256':'b'*64,'checks':{k:True for k in r2.CHECKS}}
+    messaging=v.make_proof(receipt,messaging_facts,'c'*32);calendar=v.make_proof(receipt,calendar_facts(receipt),'c'*32,'calendar')
+    assert 'profile' not in messaging['verification'] and r2.validate_proof(messaging,receipt)
+    assert calendar['verification']['profile']=='calendar' and r2.validate_proof(calendar,receipt,'calendar')
+    for proof,profile in ((messaging,'calendar'),(calendar,'messaging')):
+        with pytest.raises(ValueError,match='verifier_profile_mismatch'):r2.validate_proof(proof,receipt,profile)
+    for checks in (r2.CHECKS,r2.CHECKS|r2.CALENDAR_CHECKS,r2.CALENDAR_CHECKS-{'vault_decrypts'}):
+        mixed={**calendar,'verification':{**calendar['verification'],'checks':{k:True for k in checks}}}
+        with pytest.raises(ValueError,match='independent_restore_proof_required'):r2.validate_proof(mixed,receipt,'calendar')
+        with pytest.raises(ValueError,match='invalid_helper_result'):
+            v.make_proof(receipt,calendar_facts(receipt,checks={k:True for k in checks}),'c'*32,'calendar')
+    union={**messaging,'verification':{**messaging['verification'],'checks':{k:True for k in r2.CHECKS|r2.CALENDAR_CHECKS}}}
+    with pytest.raises(ValueError,match='independent_restore_proof_required'):r2.validate_proof(union,receipt)
+    for warnings in ([{'kind':'x','name':'y','extra':1}],[{'kind':'Bad Kind','name':'y'}],[{'kind':'x','name':'n'*65}],
+                     [{'kind':'x','name':'y'}]*33,{'kind':'x'}):
+        with pytest.raises(ValueError,match='invalid_helper_result'):
+            v.make_proof(receipt,calendar_facts(receipt,vault_warnings=warnings),'c'*32,'calendar')
+    with pytest.raises(ValueError,match='verifier_profile_mismatch'):v.make_proof(receipt,messaging_facts,'c'*32,'calendar')
+    with pytest.raises(ValueError,match='verifier_profile_mismatch'):v.make_proof(receipt,calendar_facts(receipt),'c'*32)
+
+
+# spec: ANYM-606
+def test_protect_refuses_a_proof_of_the_other_profile(calendar_operator):
+    v,config,receiver,cloud,engine,write_json=calendar_operator
+    engine.failure=RuntimeError('stop before promotion')
+    with pytest.raises(RuntimeError):v.run(config,client=cloud,engine=engine)
+    active=json.loads((Path(config['directory'])/'active.json').read_text())
+    messaging={'v':1,'status':'verified','schema_version':34,'manifest_sha256':active['receipt']['wire']['snapshot_sha256'],
+               'checks':{k:True for k in r2.CHECKS}}
+    proof=Path(config['directory'])/'proof-messaging.json'
+    write_json(proof,v.make_proof(active['receipt'],messaging,active['run']))
+    with pytest.raises(ValueError,match='verifier_profile_mismatch'):
+        r2.protect(r2.load_config(config['receiver_config_file']),config['protected_file'],proof,client=cloud)
+    assert not Path(config['protected_file']).exists()
+
+
+# spec: ANYM-606
+@pytest.mark.parametrize('code',['restore_bundle_failed','restore_schema_failed','restore_inventory_failed',
+                                 'restore_vault_incomplete','restore_vault_decrypt_failed','verifier_profile_mismatch'])
+def test_calendar_helper_failure_fact_reaches_the_status(operator,monkeypatch,code):
+    v,config,receiver,cloud,engine,_=operator
+    docker=v.Docker(60);helpers=[]
+    monkeypatch.setattr(docker,'setup',lambda *a:None)
+    monkeypatch.setattr(docker,'inspect_owned',lambda *a:{})
+    monkeypatch.setattr(v,'validate_helper_layout',lambda *a:None)
+    monkeypatch.setattr(r2,'verify_object',lambda receiver,client,receipt,out:out.write(b'synthetic-ciphertext'))
+    fact=r2.encoded({'v':1,'status':'failed','error':code})
+    def popen(*args,**kwargs):
+        helpers.append(ExitedHelper(next(Path(config['directory']).glob('payload-*')),fact,False));return helpers[-1]
+    monkeypatch.setattr(v.subprocess,'Popen',popen)
+    engine.restore=docker.restore
+    with pytest.raises(RuntimeError):v.run(config,client=cloud,engine=engine)
+    assert json.loads((Path(config['directory'])/'status.json').read_text())['error']==code
+
+
+# spec: ANYM-606
+def test_calendar_units_run_the_same_module_with_their_own_config_and_messaging_limits():
+    root=Path(__file__).resolve().parents[1]/'deploy'
+    def unit(name):
+        values={}
+        for line in (root/name).read_text().splitlines():
+            if '=' in line and not line.startswith('#'):key,value=line.split('=',1);values.setdefault(key,[]).append(value)
+        return values
+    service=unit('deedkit-calendar-backup-r2-verifier.service');messaging=unit('deedkit-backup-r2-verifier.service')
+    assert service['ExecStart']==['/opt/deedkit-backup-r2/venv/bin/python -m messaging_service.backup_r2_verifier '
+                                  '--config /etc/deedkit-calendar-backup-r2/verifier.json']
+    assert {k:v for k,v in service.items() if k not in ('ExecStart','Description')}=={
+        k:v for k,v in messaging.items() if k not in ('ExecStart','Description')}
+    timer=unit('deedkit-calendar-backup-r2-verifier.timer');messaging_timer=unit('deedkit-backup-r2-verifier.timer')
+    assert timer['OnUnitInactiveSec']==['15min'] and timer['Unit']==['deedkit-calendar-backup-r2-verifier.service']
+    assert {k:v for k,v in timer.items() if k not in ('Unit','Description')}=={
+        k:v for k,v in messaging_timer.items() if k not in ('Unit','Description')}
+    example=r2.unique_json((root/'calendar-backup-r2-verifier.example.json').read_bytes())
+    messaging_example=r2.unique_json((root/'backup-r2-verifier.example.json').read_bytes())
+    assert example['profile']=='calendar' and set(example)==set(messaging_example)|{'profile'}
+    paths=('receiver_config_file','directory','identity_file','protected_file')
+    assert all(example[k].startswith(('/etc/deedkit-calendar-backup-r2/','/var/lib/deedkit-calendar-backup-r2/')) for k in paths)
+    assert not any(Path(example[a]).is_relative_to(Path(messaging_example[b]).parent) or example[a]==messaging_example[b]
+                   for a in paths for b in paths)

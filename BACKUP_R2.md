@@ -378,6 +378,59 @@ status need operational monitoring; these unit examples do not send alerts or
 establish a live RPO/RTO. Disable only this timer if enrollment fails; retain its
 private evidence and reconcile its exact owned resources.
 
+## Calendar verifier instance
+
+The family calendar's encrypted bundle (ANYM-605) goes through the same verifier
+code as a second instance with `profile: calendar` (ANYM-606). Like every project
+on a shared receiver it has its own upload user, receiver config, state directory,
+recovery key, R2 bucket and protected marker (BACKUP.md, "Automatic run without a Mac"):
+add `"profile": "calendar"` to its receiver config and copy
+[the calendar verifier configuration](deploy/calendar-backup-r2-verifier.example.json)
+to `/etc/deedkit-calendar-backup-r2/verifier.json` (root-owned `0600`). A config
+without `profile` is messaging's and behaves as before. The profile comes only from
+these root configs; the verifier config, its receiver config, the retry journal,
+the helper result, the bundle manifest and the proof must all name the same one,
+and any mismatch fails `verifier_profile_mismatch` and protects nothing.
+
+The isolated helper (same pinned image, internal network, scratch database
+`deedkit_verify_restore_test`) passes a calendar bundle only when all seven
+checks hold; each failure has its own code in `status.json`:
+
+| Check | Fails with |
+|---|---|
+| `decryption`: authenticated age EOF | `restore_decryption_failed` |
+| `bundle_integrity`: `dump_sha256` and every `state_files` hash | `restore_bundle_failed` |
+| `database_restore`: `pg_restore --exit-on-error` (the fixed `fcs_*` roles first, NOLOGIN) | `restore_database_failed` |
+| `schema_version`: restored `max(fcs.migrations.version)` equals the manifest's | `restore_schema_failed` |
+| `table_inventory`: the capture's catalog manifest of the restored database equals `tables` | `restore_inventory_failed` |
+| `vault_complete`: every enabled connection has its `<id>.enc` | `restore_vault_incomplete` |
+| `vault_decrypts`: every token decrypts with the bundled key (Fernet) | `restore_vault_decrypt_failed` |
+
+Decrypted tokens stay in the helper's memory and are never written or logged; a
+token whose plaintext is not a JSON object is a warning, not a failure. The proof
+names `profile: calendar` and copies the manifest's `vault_warnings` (labels only,
+at most 32). `protect` and `rotate` accept on a calendar receiver config only a
+calendar proof with exactly these checks, and on a messaging one only messaging's
+seven; a union or the other set is refused. A failed check keeps the previous
+protected point and its object.
+
+Units: the [calendar service](deploy/deedkit-calendar-backup-r2-verifier.service) and
+[timer](deploy/deedkit-calendar-backup-r2-verifier.timer) run the same module with
+the calendar config and the messaging units' limits; no path is shared with the
+messaging instance. Installing them on the receiver is ANYM-607; running both
+verifiers side by side and following helper pins for the calendar config is
+ANYM-609, so do not enable the calendar timer before it.
+
+Age of the last proof (root on the receiver):
+
+```sh
+jq -r .verified_at /var/lib/deedkit-calendar-backup-r2/verification/last-success.json
+jq -r '.status, .error // empty' /var/lib/deedkit-calendar-backup-r2/verification/status.json
+```
+
+Undo: `systemctl disable --now deedkit-calendar-backup-r2-verifier.timer`. Its
+evidence, the protected calendar point and the messaging instance stay as they are.
+
 ## Receiver update follow
 
 The verifier's pinned helper (`helper_image`, `helper_revision` in

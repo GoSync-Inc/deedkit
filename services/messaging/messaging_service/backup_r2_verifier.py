@@ -56,8 +56,12 @@ def load_config(path):
     value=r2.unique_json(private_file(path,16384))
     required={'v','receiver_config_file','directory','identity_file','protected_file','helper_image','helper_revision','postgres_image'}
     defaults={'max_plaintext_bytes':40*GIB,'postgres_headroom_bytes':8*GIB,'reserve_bytes':2*GIB,'timeout_seconds':21600}
-    if (not isinstance(value,dict) or not required<=set(value) or set(value)-required-set(defaults) or
-            type(value['v']) is not int or value['v']!=1):raise ValueError('invalid_verifier_config')
+    # Optional `profile` (ANYM-606): absent is messaging, exactly as before; `calendar` selects the calendar
+    # helper checks and proof. It comes only from this root config and must equal its receiver config's.
+    if (not isinstance(value,dict) or not required<=set(value) or set(value)-required-set(defaults)-{'profile'} or
+            type(value['v']) is not int or value['v']!=1 or
+            ('profile' in value and (not isinstance(value['profile'],str) or value['profile'] not in r2.PROFILES))):
+        raise ValueError('invalid_verifier_config')
     value={**defaults,**value}
     if (not isinstance(value['helper_image'],str) or not re.fullmatch(r'sha256:[a-f0-9]{64}',value['helper_image']) or
             not isinstance(value['helper_revision'],str) or not re.fullmatch('[a-f0-9]{40}',value['helper_revision']) or
@@ -73,6 +77,7 @@ def load_config(path):
     with local.trusted_directory(value['directory']) as directory:
         if os.fstat(directory).st_mode&0o077:raise ValueError('private_verifier_directory_required')
     receiver=r2.load_config(value['receiver_config_file'])
+    if r2.profile(receiver)!=r2.profile(value):raise ValueError('verifier_profile_mismatch')
     state=Path(receiver['state_directory']);directory=Path(value['directory'])
     # Config, key and marker can never be selected/replaced by the upload UID or
     # by the helper's RW payload mount. Root evidence must not share their leaf.
@@ -261,7 +266,8 @@ class Docker:
                 failure='isolated_restore_failed';detail=None
                 try:
                     fact=r2.unique_json(private_file(payload/'failure.json',4096))
-                    safe={'restore_decryption_failed','restore_database_failed','restore_snapshot_failed','restore_quarantine_failed'}
+                    safe={'restore_decryption_failed','restore_database_failed','restore_snapshot_failed','restore_quarantine_failed',
+                      *CALENDAR_FAILURES}
                     if (isinstance(fact,dict) and set(fact)=={'v','status','error'} and
                             type(fact['v']) is int and fact['v']==1 and fact['status']=='failed' and type(fact['error']) is str and fact['error'] in safe):failure=fact['error']
                 except (OSError,ValueError):pass
@@ -278,6 +284,11 @@ class Docker:
         # Only facts from the helper payload are read here. Root proof is written
         # to a different path after full ciphertext hashing and successful exit.
         return r2.unique_json(private_file(payload/'result.json',16384))
+
+
+# The calendar helper's failure per V2 check (ANYM-606), and a bundle of the other profile.
+CALENDAR_FAILURES={'restore_bundle_failed','restore_schema_failed','restore_inventory_failed','restore_vault_incomplete',
+                   'restore_vault_decrypt_failed','verifier_profile_mismatch'}
 
 
 class HelperFailure(RuntimeError):
@@ -316,17 +327,23 @@ def preflight_disk(config,receipt,docker_root):
         raise ValueError('restore_disk_capacity')
 
 
-def make_proof(receipt,facts,run):
-    if (not isinstance(facts,dict) or set(facts)!={'v','status','schema_version','manifest_sha256','checks'} or
+def make_proof(receipt,facts,run,profile='messaging'):
+    if isinstance(facts,dict) and facts.get('profile','messaging')!=profile:raise ValueError('verifier_profile_mismatch')
+    keys,checks,schemas={'v','status','schema_version','manifest_sha256','checks'},r2.CHECKS,SCHEMAS
+    # The calendar schema is fcs.migrations' version, which the helper binds to the manifest; no messaging range.
+    if profile=='calendar':keys,checks,schemas=keys|{'profile','vault_warnings'},r2.CALENDAR_CHECKS,range(1,100001)
+    if (not isinstance(facts,dict) or set(facts)!=keys or
             type(facts['v']) is not int or facts['v']!=1 or facts['status']!='verified' or
-            type(facts['schema_version']) is not int or facts['schema_version'] not in SCHEMAS or
+            type(facts['schema_version']) is not int or facts['schema_version'] not in schemas or
             facts['manifest_sha256']!=receipt['wire']['snapshot_sha256'] or not isinstance(facts['checks'],dict) or
-            set(facts['checks'])!=r2.CHECKS or any(v is not True for v in facts['checks'].values())):
+            set(facts['checks'])!=checks or any(v is not True for v in facts['checks'].values()) or
+            (profile=='calendar' and not r2.valid_warnings(facts['vault_warnings']))):
         raise ValueError('invalid_helper_result')
+    verification={'id':run,'verified_at':now(),'schema_version':facts['schema_version'],
+                  'manifest_sha256':facts['manifest_sha256'],'checks':facts['checks']}
+    if profile=='calendar':verification={**verification,'profile':profile,'vault_warnings':facts['vault_warnings']}
     return {'v':1,'type':'independent_restore_verification','status':'verified',
-            'backup':{k:receipt['wire'][k] for k in ('id','bytes','sha256','snapshot_sha256')},
-            'verification':{'id':run,'verified_at':now(),'schema_version':facts['schema_version'],
-                            'manifest_sha256':facts['manifest_sha256'],'checks':facts['checks']}}
+            'backup':{k:receipt['wire'][k] for k in ('id','bytes','sha256','snapshot_sha256')},'verification':verification}
 
 
 def read_marker(receiver,path):
@@ -370,8 +387,10 @@ def select_candidate(receiver,client,state_fd,marker):
 
 
 def validate_journal(receiver,journal):
-    if (not isinstance(journal,dict) or set(journal)!={'v','run','destination','receipt','prior_sha256','phase','helper_image','helper_revision','protected_file'} or
-            journal['v']!=1 or type(journal['v']) is not int or journal['destination']!=r2.destination(receiver) or
+    # A calendar journal names its profile; a messaging journal has none, as before ANYM-606.
+    if (not isinstance(journal,dict) or
+            set(journal)-{'profile'}!={'v','run','destination','receipt','prior_sha256','phase','helper_image','helper_revision','protected_file'} or
+            journal.get('profile','messaging') not in r2.PROFILES or journal['v']!=1 or type(journal['v']) is not int or journal['destination']!=r2.destination(receiver) or
             journal['phase'] not in ('restoring','proof_ready','promoted') or
             (journal['prior_sha256'] is not None and not re.fullmatch('[a-f0-9]{64}',str(journal['prior_sha256'])))):
         raise ValueError('invalid_verifier_journal')
@@ -410,9 +429,10 @@ def verify_run(config,receiver,client,engine,journal,fd):
     worker={'v':1,'identity_file':'/run/restore/identity','work_directory':'/work','database_host':'restore-postgres',
             'database_password':password,'snapshot_sha256':journal['receipt']['wire']['snapshot_sha256'],
             'max_plaintext_bytes':min(config['max_plaintext_bytes'],journal['receipt']['wire']['bytes'])}
+    if r2.profile(config)=='calendar':worker['profile']='calendar'
     write_secret(secret_dir/'worker.json',r2.encoded(worker));local.fsync_dir(secret_dir);local.fsync_dir(directory)
     facts=engine.restore(config,receiver,client,journal['receipt'],run,payload,secret_dir)
-    proof=make_proof(journal['receipt'],facts,run);r2.validate_proof(proof,journal['receipt'])
+    proof=make_proof(journal['receipt'],facts,run,r2.profile(config));r2.validate_proof(proof,journal['receipt'],r2.profile(config))
     proof_name='proof-'+run+'.json'
     local.write_maintenance_json(proof_name,proof,dir_fd=fd)
     journal={**journal,'phase':'proof_ready'};local.write_maintenance_json('active.json',journal,dir_fd=fd)
@@ -432,11 +452,14 @@ def run(config,*,client=None,engine=None,path=None):
             fresh=load_config(path)
             if fresh['directory']!=config['directory']:raise ValueError('invalid_verifier_config')
             config=fresh
+        profile=r2.profile(config)
         try:
             with deadline(config['timeout_seconds']):
+                if r2.profile(receiver)!=profile:raise ValueError('verifier_profile_mismatch')
                 _,journal=r2.read_root(fd,'active.json',missing=True)
                 if journal is not None:
                     validate_journal(receiver,journal)
+                    if r2.profile(journal)!=profile:raise ValueError('verifier_profile_mismatch')
                     if any(journal[k]!=config[k] for k in ('helper_image','helper_revision')):
                         raise ValueError('restore_image_changed_during_retry')
                     if journal['protected_file']!=config['protected_file']:raise ValueError('verifier_control_changed_during_retry')
@@ -448,6 +471,7 @@ def run(config,*,client=None,engine=None,path=None):
                             status={'v':1,'status':'idle','checked_at':now()};local.write_maintenance_json('status.json',status,dir_fd=fd);return status
                         journal={'v':1,'run':secrets.token_hex(16),'destination':r2.destination(receiver),'receipt':candidate,
                                  'prior_sha256':prior,'protected_file':config['protected_file'],'phase':'restoring','helper_image':config['helper_image'],'helper_revision':config['helper_revision']}
+                        if profile=='calendar':journal['profile']=profile
                         local.write_maintenance_json('active.json',journal,dir_fd=fd)
                     # Even after a marker switch, exact committed candidate remains
                     # available by ID. Never silently adopt another new capture.
@@ -456,7 +480,7 @@ def run(config,*,client=None,engine=None,path=None):
                     if journal['phase']=='restoring':journal=verify_run(config,receiver,client,engine,journal,fd)
                     else:
                         _,proof=r2.read_root(fd,'proof-'+journal['run']+'.json')
-                        r2.validate_proof(proof,journal['receipt'])
+                        r2.validate_proof(proof,journal['receipt'],profile)
                     cleanup_resources(engine,journal['run']);remove_payload(config['directory'],journal['run'])
                 # Existing maintenance takes the same upload lock and independently
                 # rechecks full ciphertext, immutable receipts and root marker CAS.
@@ -500,7 +524,8 @@ def failure_code(error):
           'unreviewed_restore_image','unreviewed_postgres_image','unowned_restore_resource','invalid_helper_result',
           'uploader_lock_initialization_required','uncommitted_cloud_object','receiver_quota','protected_backup_missing',
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
-          'isolated_restore_failed','stored_backup_corrupt','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout'}
+          'isolated_restore_failed','stored_backup_corrupt','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
+          *CALENDAR_FAILURES}
     return str(error) if str(error) in safe else 'independent_restore_failed'
 
 
