@@ -628,18 +628,20 @@ A vendor host's endpoints deliver at most once after the request is written:
 |---|---|---|
 | 2xx | `delivered` | `delivered` |
 | 3xx | dead letter `redirect_rejected` | `failed` `redirect_rejected` |
-| 401, 403 | dead letter `vendor_refused`; the endpoint view turns `health: failing` with `last_hint` | `failed` `vendor_refused` |
+| 401, 403 | dead letter `vendor_refused`, no run started | `failed` `vendor_refused` |
 | other status (no run started) | bounded retry, `receiver_status` | `failed` `receiver_status` |
 | not sent (`egress.EgressNotSent`: refusal, connect, TLS, deadline before the first byte) | bounded retry, `receiver_unavailable` | `failed` `receiver_unavailable` |
 | timeout, reset, a 1xx or a malformed response after the write | dead letter `outcome_unknown`, never re-sent | `failed` `outcome_unknown` |
 | lease ran out during an attempt (dispatcher crash) | dead letter `outcome_unknown`, no POST, settled before DNS, quiet hours or the budget | `failed` `outcome_unknown`, no POST |
 
 Before the dispatcher's transport raises `EgressNotSent`, no failure counts as
-unsent, so a vendor hint is still never sent twice. A rotated or revoked routine
-key shows as `health: failing` with `last_hint.error_code: vendor_refused` (the
-endpoint stays `enabled`; later hints are refused too and start no run): replace
-the headers with `set_headers`, then `test_delivery_endpoint`; a delivered test
-makes it `ok` again.
+unsent, so a vendor hint is still never sent twice. After a rotated or revoked routine
+key every hint dead-letters `vendor_refused` and starts no run; the endpoint stays
+`enabled` with the health of its last test. Today the refusal shows only as a
+growing `hint_counts.dead_letter` in `get_subscription`, without the error code;
+the endpoint view does not show it yet (follow-up card ANYM-583). To rotate,
+replace the headers with `set_headers`, then call `test_delivery_endpoint`: a
+delivered test confirms the new key.
 A 429 is an "other status": the bounded retry spends its attempts in minutes. A lost
 wake loses no event: the
 routine also keeps a schedule trigger that fetches and ACKs. Other endpoints and

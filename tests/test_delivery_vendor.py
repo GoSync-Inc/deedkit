@@ -290,7 +290,7 @@ def test_vendor_informational_status_is_unknown_and_never_retried(gate, policy):
 
 
 # spec: ANYM-582
-def test_vendor_refused_key_shows_failing_until_new_headers_pass_a_test(gate, policy):
+def test_vendor_refused_key_dead_letters_under_the_delivery_role_until_new_headers_pass_a_test(gate, policy):
     from contextlib import contextmanager
     from copy import copy
     from pathlib import Path
@@ -316,9 +316,9 @@ def test_vendor_refused_key_shows_failing_until_new_headers_pass_a_test(gate, po
             c.execute(ddl)
         dispatch_hints(worker, transport=lambda *a, **k: 401, resolver=PUBLIC)
         assert hint(store) == {'state': 'dead_letter', 'error_code': 'vendor_refused', 'attempts': 1}
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'dead_letter': 1}
         view = store.list_delivery_endpoints(token)['items'][0]
-        assert (view['state'], view['health'], view['vendor']) == ('enabled', 'failing', 'grok-bot-routine')
-        assert (view['last_hint']['state'], view['last_hint']['error_code']) == ('dead_letter', 'vendor_refused')
+        assert (view['state'], view['vendor']) == ('enabled', 'grok-bot-routine')
         view = store.update_delivery_endpoint(token, endpoint['endpoint_id'], view['version'], 'set_headers',
             headers={'Authorization': 'Bearer synthetic-routine-key-0002'})
         age(store)

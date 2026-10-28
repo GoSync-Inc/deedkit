@@ -355,24 +355,16 @@ def _tests(c, endpoint_id):
 def _view(c, row):
     from .store import serial
     last = _tests(c, row['id'])
-    finished = c.execute('''SELECT state,finished_at FROM delivery_endpoint_tests WHERE endpoint=%s
-        AND state IN ('delivered','failed') ORDER BY finished_at DESC,id DESC LIMIT 1''', (row['id'],)).fetchone()
-    # ANYM-582: the latest finished hint, through the bindings (the outbox is indexed by subscription).
-    hint = c.execute('''SELECT o.state,o.error_code,o.finished_at FROM subscription_delivery d
-        JOIN subscription_outbox o ON o.subscription=d.subscription AND o.endpoint=d.endpoint
-        WHERE d.endpoint=%s AND o.finished_at IS NOT NULL ORDER BY o.created_at DESC,o.id DESC LIMIT 1''',
-        (row['id'],)).fetchone()
-    health = {'delivered': 'ok', 'failed': 'failing'}[finished['state']] if finished else 'unknown'
-    if hint and hint['error_code'] == 'vendor_refused' and (finished is None or hint['finished_at'] > finished['finished_at']):
-        # A vendor refused the key after the last test (rotated or revoked): failing until a new test is delivered.
-        health = 'failing'
+    finished = c.execute('''SELECT state FROM delivery_endpoint_tests WHERE endpoint=%s AND state IN ('delivered','failed')
+        ORDER BY finished_at DESC,id DESC LIMIT 1''', (row['id'],)).fetchone()
     rotation = None if row['rotation_started_at'] is None else {'pending_fingerprint': row['pending_fingerprint'],
         'started_at': row['rotation_started_at'], 'promotes_at': row['rotation_started_at'] + _day()}
     return serial({'endpoint_id': row['id'], 'version': row['version'], 'state': row['state'], 'url': row['url'],
         'host': row['host'], 'label': row['label'], 'header_names': list(row['header_names']),
         'headers_fingerprint': row['headers_fingerprint'], 'secret_fingerprint': row['secret_fingerprint'],
         'rotation': rotation, 'created_at': row['created_at'], 'updated_at': row['updated_at'],
-        'health': health, 'last_test': _test_view(last), 'last_hint': dict(hint) if hint else None, 'signature_scheme': SCHEME, 'vendor': vendor_of(load_policy(), row['host'])})
+        'health': {'delivered': 'ok', 'failed': 'failing'}[finished['state']] if finished else 'unknown',
+        'last_test': _test_view(last), 'signature_scheme': SCHEME, 'vendor': vendor_of(load_policy(), row['host'])})
 
 
 def _day():
