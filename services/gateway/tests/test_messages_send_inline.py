@@ -1,4 +1,5 @@
 """messages_send inline files through the gateway (ANYM-547): the raised body cap and the upload `next`."""
+import asyncio
 import base64
 import hashlib
 import json
@@ -121,4 +122,46 @@ def test_only_messages_send_gets_the_raised_cap(tmp_path):
         large = {"to": SEND["to"], "text": text, "dry_run": True}
         assert client.post("/v1/messages_send", json=large,
                            headers={"Authorization": "Bearer unknown-key"}).status_code in (401, 403)
+    assert seen == []
+
+
+def received(app, body, step=4096):
+    """The status and how many bytes of an MCP `body` the gateway read, sent in `step`-byte pieces."""
+    count = 0
+
+    async def pieces():
+        nonlocal count
+        for start in range(0, len(body), step):
+            count += len(body[start:start + step])
+            yield body[start:start + step]
+
+    async def post():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            response = await client.post("/mcp", content=pieces(), headers={**MCP_HEADERS,
+                                                                            "Content-Type": "application/json"})
+            return response.status_code
+    return asyncio.run(post()), count
+
+
+# spec: ANYM-547
+def test_more_than_64_kib_is_read_only_for_the_large_tool_the_call_claims_and_the_key_may_call(tmp_path):
+    app, seen = gateway(tmp_path, lambda body: httpx.Response(200, json={"state": "previewed"}))
+    item, _ = inline(200000)
+    send = json.dumps(mcp("messages_send", {"to": SEND["to"], "files": [item], "dry_run": True})).encode()
+    listing = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                          "params": {"_meta": {"pad": "x" * 200000}}}).encode()
+    batch = json.dumps([json.loads(send)]).encode()
+    for body in (listing, batch):
+        status, count = received(app, body)
+        assert status == 413 and count <= NORMAL_BODY_LIMIT + 4096
+    # A key that may upload chunks but not call messages_send reads no more of a messages_send call.
+    policy = tmp_path / "policy.json"
+    value = json.loads(policy.read_text())
+    value["profiles"]["reader"]["tools"].remove("messages_send")
+    policy.write_text(json.dumps(value))
+    chunk_only = create_app(policy, "http://testserver", transports={"messaging": httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"permissions": ["read", "send", "upload"],
+                                                  "tool_manifest": {"names": ["upload_file_chunk"]}}))})
+    status, count = received(chunk_only, send)
+    assert status == 413 and count <= NORMAL_BODY_LIMIT + 4096
     assert seen == []

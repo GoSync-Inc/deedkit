@@ -6,6 +6,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
 import json
 import logging
+import re
 import time
 from urllib.parse import urlsplit
 from datetime import datetime
@@ -32,7 +33,17 @@ from .telemetry import capture as capture_error
 from .uploads import UPLOAD_BODY_BYTES
 from .send_intent import SEND_BODY_BYTES
 # The only calls whose body may pass 16 KiB (ANYM-547: inline files of messages_send); REST path or MCP tool name.
+# Both stage bytes as uploads, so only a key that may upload (upload_file_chunk) reads more than 16 KiB.
 LARGE_BODIES = {'upload_file_chunk': UPLOAD_BODY_BYTES, 'messages_send': SEND_BODY_BYTES}
+NORMAL_BODY_BYTES = 16384
+
+
+def claimed_tool(prefix):
+    """The tool an MCP body names in its first 16 KiB, read before any more of it: a JSON object (never a batch)
+    with method tools/call and a name. Only a hint for how much to read; the parsed envelope decides the cap."""
+    if prefix.lstrip()[:1]!=b'{' or not re.search(rb'"method"\s*:\s*"tools/call"',prefix): return None
+    found=re.search(rb'"name"\s*:\s*"([A-Za-z0-9_]{1,64})"',prefix)
+    return found and found.group(1).decode()
 
 WaitSeconds = Annotated[float, Field(strict=True,ge=0,le=25,allow_inf_nan=False)]
 LiveWaitSeconds = Annotated[float, Field(strict=True,ge=0,le=20,allow_inf_nan=False)]
@@ -314,18 +325,29 @@ class Boundary:
                     'transport':'streamable_http','next_action':'use_post_requests'},
                     status_code=405,headers={'Allow':'POST'})(scope,receive,protected_send)
             if request.method=='POST':
-                rest_large=LARGE_BODIES.get(request.url.path.removeprefix('/v1/'))
+                rest_tool=request.url.path.removeprefix('/v1/')
                 mcp_route=request.url.path.rstrip('/')=='/mcp'
-                body_limit=rest_large or (max(LARGE_BODIES.values()) if mcp_route else 16384)
+                async def may_upload():
+                    return principal is not None and await run_in_threadpool(self.store.permits,
+                        bearer(request.headers),'upload_file_chunk')
+                # Past 16 KiB only for a large tool of a key that may upload: its REST path at once; on MCP the
+                # tool its first 16 KiB claim (claimed_tool), and the parsed envelope must then be that tool.
+                large=rest_tool if rest_tool in LARGE_BODIES and await may_upload() else None
+                body_limit=LARGE_BODIES[large] if large else NORMAL_BODY_BYTES
                 try: size=int(request.headers.get('content-length','0'))
                 except ValueError: raise APIError('invalid_body') from None
-                if size<0 or size>body_limit: raise APIError('body_too_large',413)
+                if size<0 or size>(max(LARGE_BODIES.values()) if mcp_route else body_limit):
+                    raise APIError('body_too_large',413)
                 async def read_body():
+                    nonlocal large,body_limit
                     data=bytearray()
                     while True:
                         event=await receive()
                         if event['type']=='http.disconnect': raise APIError('disconnected',400)
                         data.extend(event.get('body',b''))
+                        if len(data)>body_limit and mcp_route and large is None:
+                            claim=claimed_tool(bytes(data[:NORMAL_BODY_BYTES]))
+                            if claim in LARGE_BODIES and await may_upload(): large,body_limit=claim,LARGE_BODIES[claim]
                         if len(data)>body_limit: raise APIError('body_too_large',413)
                         if not event.get('more_body'): return bytes(data)
                 try: body=await asyncio.wait_for(read_body(),10)
@@ -338,8 +360,7 @@ class Boundary:
                 if mcp_route:
                     tool=(envelope['params'].get('name') if isinstance(envelope,dict) and
                         envelope.get('method')=='tools/call' and isinstance(envelope.get('params'),dict) else None)
-                    if len(body)>(LARGE_BODIES.get(tool,16384) if isinstance(tool,str) else 16384):
-                        raise APIError('body_too_large',413)
+                    if len(body)>NORMAL_BODY_BYTES and tool!=large: raise APIError('body_too_large',413)
                     if isinstance(envelope,dict) and envelope.get('method')=='tools/call':
                         params=envelope.get('params')
                         if isinstance(params,dict) and isinstance(params.get('name'),str):

@@ -89,6 +89,15 @@ def large_call(path, body):
         return None
 
 
+def claimed_tool(prefix):
+    """The tool an MCP body names in its first NORMAL_BODY_LIMIT bytes, read before any more of it: a JSON object
+    (never a batch) with method tools/call and a name. Only a hint for how much to read; `large_call` decides."""
+    if prefix.lstrip()[:1] != b"{" or not re.search(rb'"method"\s*:\s*"tools/call"', prefix):
+        return None
+    found = re.search(rb'"name"\s*:\s*"([A-Za-z0-9_]{1,64})"', prefix)
+    return found and found.group(1).decode()
+
+
 def create_app(policy_path, public_url, *, transports=None):
     from .files import Tickets
 
@@ -286,6 +295,9 @@ def create_app(policy_path, public_url, *, transports=None):
                     limit = NORMAL_BODY_LIMIT
                     rest_tool = request.url.path.removeprefix("/v1/")
                     large_route = rest_tool in LARGE_BODY_LIMITS
+                    # The large tools this key may call: its own REST path's, or on MCP the one its first
+                    # NORMAL_BODY_LIMIT bytes claim (claimed_tool); the parsed call must then be that tool.
+                    allowed = set()
                     if large_route or route:
                         try:
                             snapshot, agent = policy.authenticate(key)
@@ -294,19 +306,21 @@ def create_app(policy_path, public_url, *, transports=None):
                             if large_route:
                                 raise
                         else:
-                            # A larger body only for a tool this key may call: its own REST path, or any on MCP.
                             for tool in [rest_tool] if large_route else LARGE_BODY_LIMITS:
                                 try:
                                     policy.authorize_agent(snapshot, agent, tool)
-                                    limit = max(limit, LARGE_BODY_LIMITS[tool])
+                                    allowed.add(tool)
                                 except Denied:
                                     if large_route:
                                         raise
+                    large = rest_tool if large_route else None
+                    if large:
+                        limit = LARGE_BODY_LIMITS[large]
                     try:
                         declared = int(request.headers.get("content-length", "0"))
                     except ValueError:
                         raise Denied("invalid_body", 422) from None
-                    if not 0 <= declared <= limit:
+                    if not 0 <= declared <= max([limit, *(LARGE_BODY_LIMITS[tool] for tool in allowed)]):
                         raise Denied("body_too_large", 413)
                     body = bytearray()
                     try:
@@ -316,6 +330,10 @@ def create_app(policy_path, public_url, *, transports=None):
                                 if event["type"] == "http.disconnect":
                                     return
                                 chunk = event.get("body", b"")
+                                if len(body) + len(chunk) > limit and large is None:
+                                    claim = claimed_tool(bytes((body + chunk)[:NORMAL_BODY_LIMIT]))
+                                    if claim in allowed:
+                                        large, limit = claim, LARGE_BODY_LIMITS[claim]
                                 if len(body) + len(chunk) > limit:
                                     raise Denied("body_too_large", 413)
                                 body.extend(chunk)
@@ -323,7 +341,7 @@ def create_app(policy_path, public_url, *, transports=None):
                                     break
                     except TimeoutError:
                         raise Denied("body_timeout", 408) from None
-                    if len(body) > LARGE_BODY_LIMITS.get(large_call(request.url.path, body), NORMAL_BODY_LIMIT):
+                    if len(body) > NORMAL_BODY_LIMIT and large_call(request.url.path, body) != large:
                         raise Denied("body_too_large", 413)
                     sent = False
                     original_receive = receive

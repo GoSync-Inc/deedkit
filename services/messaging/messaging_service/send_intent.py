@@ -45,6 +45,8 @@ UPLOAD_TOOL = 'messages_prepare_file_upload'
 INLINE_PLACEHOLDER = 'REPLACE_WITH_THE_SAME_BASE64'
 MIME = re.compile(r'[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+')
 MAX_FILES = 10
+# Fresh child keys `stage` tries for one inline file once earlier ones were released or expired.
+STAGE_ATTEMPTS = 16
 CAPTION_LIMIT = 1024
 COMPARED = ('target', 'reply_to', 'text', 'files', 'scope')
 PENDING = frozenset(('queued', 'dispatching'))
@@ -491,8 +493,9 @@ def _finish(c, row, steps, state, reason=None):
         plan = {**plan, 'resolution': resolution}
     c.execute('''UPDATE send_intents SET state=%s,result=%s,steps=%s,plan=%s,updated_at=clock_timestamp()
         WHERE id=%s''', (state, Jsonb(result), Jsonb(steps), Jsonb(plan), row['id']))
-    staged = [item['upload_id'] for item in plan['value']['files'] if 'inline' in item]
-    # Every file is sent: the staged inline bytes go now (`release`), after this commits.
+    # Every file is sent: staged inline bytes go now (`release`), after this commits. Any upload_id may be one (a
+    # followed `next` names it plainly); release keeps only `stage`'s, by their child key.
+    staged = [item['upload_id'] for item in plan['value']['files'] if 'upload_id' in item]
     return {'result': serial(result), **({'release': staged} if state == 'succeeded' and staged else {})}
 
 
@@ -584,6 +587,12 @@ def stage(store, token, arguments):
     request_id = arguments.get('request_id')
     if not indexes or arguments.get('confirm_token') is not None: return arguments
     if not arguments.get('dry_run') and not is_request_id(request_id): return arguments  # admit names the key
+    if not arguments.get('dry_run'):
+        # A bound request_id replays its intent (admit compares the payload by its facts): nothing is resolved or
+        # staged again, so a recipient that changed since cannot fail the replay.
+        with store.authorized(token, 'send_message') as (c, p):
+            if c.execute('SELECT 1 FROM send_intents WHERE principal=%s AND request_id=%s',
+                         (p['id'], request_id)).fetchone(): return arguments
     with store.authorized(token, 'prepare_file_upload') as (c, p):
         target = resolve_target(store, c, p, value['to'] or value['reply_to'], 'message', value['account'])['target']
         principal = p['id']
@@ -598,10 +607,15 @@ def stage(store, token, arguments):
     files = list(value['files'])
     for index in indexes:
         item, facts = files[index], _facts(files[index])
-        key = CHILD_KEY_PREFIX + child_key(principal, TOOL, parent, f'inline{index + 1}', 1)
-        with store.authorized(token, 'prepare_file_upload') as (c, p):
-            row = prepare(store, c, p, target['account'], target['chat_id'], facts['name'], facts['mime'],
-                          facts['bytes'], facts['sha256'], key)
+        for attempt in range(1, STAGE_ATTEMPTS + 1):
+            # A released or expired upload is never reused: the next attempt stages the bytes afresh.
+            key = CHILD_KEY_PREFIX + child_key(principal, TOOL, parent, f'inline{index + 1}', attempt)
+            with store.authorized(token, 'prepare_file_upload') as (c, p):
+                row = prepare(store, c, p, target['account'], target['chat_id'], facts['name'], facts['mime'],
+                              facts['bytes'], facts['sha256'], key, child=True)
+            if row['status'] != 'expired': break
+        else:
+            raise APIError('upload_limit', 409)
         if row['status'] == 'uploading' and row['offset'] == 0:
             with store.authorized(token, 'upload_file_chunk') as (c, p):
                 chunk(store, c, p, row['upload_id'], 0, item['base64'])
@@ -610,11 +624,22 @@ def stage(store, token, arguments):
 
 
 def release(store, token, upload_ids):
-    """A sent intent's staged inline bytes are deleted, not left to expire (ANYM-547)."""
-    from .uploads import reap
-    with store.authorized(token, 'prepare_file_upload') as (c, p):
-        c.execute('''UPDATE file_uploads SET expires_at=least(expires_at,clock_timestamp())
-            WHERE id=ANY(%s) AND principal=%s AND key_id=%s AND state<>'expired' ''', (upload_ids, p['id'], p['key_id']))
+    """A sent intent's staged inline uploads (a child key: only `stage` makes one) are deleted, not left to expire,
+    unless a live preview or an unfinished intent of this principal still names one: that one expires (ANYM-547)."""
+    from .uploads import _lifecycle_lock, reap
+    for upload_id in sorted(set(upload_ids)):
+        # One upload per transaction, under its lifecycle lock: a preview or intent resolving it holds that lock
+        # until it commits, so this sees its row or it finds the upload expired.
+        with store.authorized(token, 'prepare_file_upload') as (c, p):
+            _lifecycle_lock(c, upload_id)
+            named = Jsonb([{'upload_id': upload_id}])
+            c.execute('''UPDATE file_uploads u SET expires_at=least(u.expires_at,clock_timestamp())
+                WHERE u.id=%s AND u.principal=%s AND u.key_id=%s AND u.state<>'expired' AND starts_with(u.request_id,%s)
+                AND NOT EXISTS(SELECT 1 FROM send_previews v WHERE v.principal=u.principal AND v.intent IS NULL
+                    AND v.expires_at>clock_timestamp() AND v.arguments->'files' @> %s)
+                AND NOT EXISTS(SELECT 1 FROM send_intents i WHERE i.principal=u.principal AND i.state<>'succeeded'
+                    AND i.plan->'value'->'files' @> %s)''',
+                      (upload_id, p['id'], p['key_id'], CHILD_KEY_PREFIX, named, named))
     with store.authorized(token, 'prepare_file_upload') as (c, p):
         reap(store, c, upload_ids)
 
@@ -630,11 +655,17 @@ async def send(store, token, arguments):
             # The staged form is the server's own: a caller never names an inline file by it.
             if isinstance(item, dict) and 'inline' in item: raise _invalid(f'files.{index}.inline', 'unknown_field')
     run = asyncio.to_thread
+    given = arguments
     if isinstance(files, list) and any(isinstance(item, dict) and 'base64' in item for item in files):
         arguments = await run(stage, store, token, arguments)
     if arguments.get('dry_run') or arguments.get('confirm_token') is None and not _bare(arguments): payload(arguments)
     if arguments.get('dry_run'):
-        staged = await run(store.messages_send_preview, token, arguments)
+        try: staged = await run(store.messages_send_preview, token, arguments)
+        except APIError as error:
+            # Another preview's send released the shared staged upload in between (`release`): stage afresh, once.
+            if error.code != 'attachment_unavailable' or arguments is given: raise
+            arguments = await run(stage, store, token, given)
+            staged = await run(store.messages_send_preview, token, arguments)
         if 'phone' not in staged: return staged
         from . import phone_send
         draft = await phone_send.preview(store, token, staged['phone'])

@@ -1,10 +1,12 @@
 """messages_send inline files (ANYM-547): small files go in the same call, staged through the upload store."""
+import asyncio
 import base64
 import hashlib
 import json
 import logging
 from pathlib import Path
 
+import httpx
 import jsonschema
 import pytest
 from starlette.testclient import TestClient
@@ -167,3 +169,101 @@ def test_only_messages_send_gets_the_raised_cap_and_errors_carry_no_bytes(world,
     assert error.value.field_errors == [{'field': 'files.0.inline', 'reason': 'unknown_field'}]
     for text in (missing.text, rich.text, caplog.text):
         assert item['base64'][:64] not in text
+
+
+# spec: ANYM-547
+def test_a_send_keeps_a_shared_staged_upload_that_another_live_preview_still_names(world):
+    item, _ = inline(4096)
+    first = world.call(to=CHAT, text='Synthetic caption one', files=[item], dry_run=True)
+    second = world.call(to=CHAT, text='Synthetic caption two', files=[item], dry_run=True)
+    [shared] = uploads(world)
+    assert world.drive(confirm_token=first['confirm_token'])['state'] == 'succeeded'
+    [row] = uploads(world)
+    assert row['state'] == 'ready' and row['live'] and (world.s.files / '.uploads' / row['id']).exists()
+    # The other preview still sends; then nothing names the upload and it is deleted.
+    assert world.drive(confirm_token=second['confirm_token'])['state'] == 'succeeded'
+    assert [caption for _, caption in world.files] == ['Synthetic caption one', 'Synthetic caption two']
+    [row] = uploads(world)
+    assert row['id'] == shared['id'] and row['state'] == 'expired'
+    assert not (world.s.files / '.uploads' / row['id']).exists()
+
+
+# spec: ANYM-547
+def test_a_fresh_dry_run_after_a_send_stages_the_released_file_again(world):
+    item, _ = inline(4096)
+    first = world.call(to=CHAT, files=[item], dry_run=True)
+    assert world.drive(confirm_token=first['confirm_token'])['state'] == 'succeeded'
+    fresh = world.call(to=CHAT, files=[item], dry_run=True)
+    released, staged = uploads(world)
+    assert released['state'] == 'expired' and staged['state'] == 'ready' and staged['live']
+    assert world.drive(confirm_token=fresh['confirm_token'])['state'] == 'succeeded'
+    assert [upload for upload, _ in world.files] == [released['id'], staged['id']]
+
+
+# spec: ANYM-547
+def test_following_a_preview_required_next_still_deletes_the_staged_bytes_after_the_send(world):
+    item, _ = inline(2048)
+    with pytest.raises(APIError) as error:
+        world.call(to=CHAT, files=[item], text='*Synthetic*', format='markdown', request_id='inline-next-0001')
+    assert error.value.code == 'preview_required'
+    [row] = uploads(world)
+    follow = error.value.next['arguments']
+    assert follow['files'] == [{'upload_id': row['id']}]
+    preview = world.call(**follow)
+    assert world.drive(confirm_token=preview['confirm_token'])['state'] == 'succeeded'
+    [row] = uploads(world)
+    assert row['state'] == 'expired' and not (world.s.files / '.uploads' / row['id']).exists()
+    # Only staging makes a child-key upload: a caller's prepare cannot claim one.
+    with pytest.raises(APIError) as error:
+        world.s.prepare_file_upload(world.key, 'send-fixture', CHAT, 'a.txt', 'text/plain', 1, '0' * 64,
+                                    CHILD_KEY_PREFIX + 'a' * 64)
+    assert error.value.code == 'invalid_upload'
+
+
+# spec: ANYM-547
+def test_a_full_payload_retry_of_a_completed_inline_send_replays_without_resolving_again(world, monkeypatch):
+    import messaging_service.resolve_target as targets
+    item, _ = inline(2048)
+    call = {'to': CHAT, 'text': 'Synthetic caption', 'files': [item], 'request_id': 'inline-replay-0001'}
+    assert world.drive(**call)['state'] == 'succeeded'
+
+    def ambiguous(*args, **kwargs): raise APIError('ambiguous_target', 409)
+    # The recipient no longer resolves (say, a second chat took its name): the bound intent still replays.
+    monkeypatch.setattr(targets, 'resolve_target', ambiguous)
+    assert world.call(**call)['state'] == 'succeeded'
+    assert len(world.files) == 1 and len(uploads(world)) == 1
+
+
+def received(app, path, body, token, step=4096):
+    """The status and how many bytes of `body` the app read, sent in `step`-byte pieces with no Content-Length."""
+    count = 0
+
+    async def pieces():
+        nonlocal count
+        for start in range(0, len(body), step):
+            count += len(body[start:start + step])
+            yield body[start:start + step]
+
+    async def post():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://testserver') as client:
+            return (await client.post(path, content=pieces(), headers={
+                'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json',
+                'Accept': 'application/json, text/event-stream'})).status_code
+    return asyncio.run(post()), count
+
+
+# spec: ANYM-547
+def test_more_than_16_kib_is_read_only_for_a_large_tool_of_a_key_that_may_upload(world):
+    app = create_app(world.s, ['testserver'])
+    item, _ = inline(40000)
+    send_only = world.s.issue_key('send-only-agent', ['send-fixture'], permissions=['read', 'send'])
+    call = json.dumps(mcp_call('messages_send', {'to': CHAT, 'files': [item], 'dry_run': True})).encode()
+    listing = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list',
+                          'params': {'_meta': {'pad': 'x' * 40000}}}).encode()
+    rest = json.dumps({'to': CHAT, 'files': [item], 'dry_run': True}).encode()
+    late = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
+        'arguments': {'to': CHAT, 'files': [item], 'dry_run': True}, 'name': 'messages_send'}}).encode()
+    for path, body, token in (('/mcp', call, send_only), ('/v1/messages_send', rest, send_only),
+                              ('/mcp', listing, world.key), ('/mcp', late, world.key)):
+        status, count = received(app, path, body, token)
+        assert status == 413 and count <= 16384 + 4096, (path, token == world.key, count)

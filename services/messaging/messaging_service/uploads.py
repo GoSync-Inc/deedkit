@@ -124,7 +124,8 @@ def _public(row,c):
         'changes_provider_state':False,'owner_approval_verified_by_server':False})
 
 
-def prepare(store,c,p,account,chat_id,filename,mime,bytes,sha256,request_id):
+def prepare(store,c,p,account,chat_id,filename,mime,bytes,sha256,request_id,*,child=False):
+    from .outgoing import CHILD_KEY_PREFIX
     _target(c,p,account,chat_id)
     if isinstance(mime,str):mime=mime.lower()
     if (not isinstance(filename,str) or not 1<=len(filename)<=255 or filename in ('.','..') or
@@ -132,7 +133,9 @@ def prepare(store,c,p,account,chat_id,filename,mime,bytes,sha256,request_id):
         not isinstance(mime,str) or not re.fullmatch(r'[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+',mime) or len(mime)>128 or
         type(bytes) is not int or not 1<=bytes<=MAX_BYTES or
         not isinstance(sha256,str) or not re.fullmatch(r'[a-f0-9]{64}',sha256) or
-        not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id)):
+        not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id) or
+        # A child key is messages_send's staged inline file (ANYM-547), whose release finds it by that key.
+        request_id.startswith(CHILD_KEY_PREFIX)!=child):
         raise APIError('invalid_upload')
     cleanup(store,c)
     existing=c.execute('SELECT * FROM file_uploads WHERE key_id=%s AND request_id=%s FOR UPDATE',
