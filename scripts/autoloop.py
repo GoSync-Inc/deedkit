@@ -17,7 +17,8 @@ from `intents/`), cancels the ready merges of `proposal/autoloop-` branches, dis
 reads back; the stop is effective only after a clean read-back. Otherwise it reads Tiden and the feedback export
 whole (a failed or truncated read ends it with no write), then pulls, matches, settles `unknown` intents from the
 workspace list by name, applies owner-principal `AUTOLOOP STOP` and `AUTOLOOP DROP <id>` and, with `live: true` in
-`config.json`, runs the reader on the items within the daily caps; with `live: false` (the default) it writes
+`config.json`, runs the reader on the items within the daily caps (a decision the checks refuse leaves only its item
+in the inbox; after two such refusals the item waits for the orchestrator, `refused.json`); with `live: false` (the default) it writes
 `plan.json` and starts nothing. Provenance comes from `config.json` principals only. Launches (ANYM-571, ANYM-572)
 go through `admit` and `launch`: the intent, its slot and its full wall-clock limit are written before the start.
 Live, each new owner-agent cluster with a committed card brief gets one card worker (ANYM-571): a Superset workspace
@@ -324,11 +325,14 @@ def checked_answer(decisions, inbox, specs):
         if i not in inbox or i in seen:
             raise Refused('answer: an ID outside the input or twice')
         seen.add(i)
+        if any(d.get(k) is not None and not isinstance(d[k], str) for k in FIELDS - {'id', 'specs'}):
+            raise Refused(f'{i}: a field that is not a string')
         c, code = d.get('classification'), d.get('reason_code')
         if c not in CLASSES or code not in REASONS:
             raise Refused(f'{i}: classification or reason_code outside the enum')
         matched = d.get('specs') or []
         if not isinstance(matched, list) or any(not isinstance(s, dict) or set(s) != {'ref', 'verdict'}
+                                                or not isinstance(s['ref'], str) or not isinstance(s['verdict'], str)
                                                 or s['ref'] not in specs or s['verdict'] not in triage.VERDICTS
                                                 for s in matched):
             raise Refused(f'{i}: a spec outside the snapshot')
@@ -2027,7 +2031,7 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
                 triage.save(state / 'report.json', dict(marker(state), ok=False, error=type(error).__name__))
         return 1 if withheld or failed else 0, (
             f"tick {'live' if cfg['live'] else 'plan only'}: pulled {fresh}, read {count}, over cap {len(over)}, "
-            f"dropped {len(drops)}, refused {len(refused)}, withhold not done {len(withheld)}, build steps failed {len(failed)}, "
+            f"dropped {len(drops)}, refused {len(refused)}, parked {len(plan['parked'])}, withhold not done {len(withheld)}, build steps failed {len(failed)}, "
             f"card workers {sum(v in intents(state) for v in cards.values())}; "
             f"reader {reader}; plan {state / 'plan.json'}")
 

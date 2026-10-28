@@ -601,10 +601,38 @@ def test_an_item_whose_reader_decision_is_refused_twice_waits_for_the_orchestrat
     code, line = run_tick(loop, fakes, NOW + timedelta(hours=2))
     plan = triage.load(a / 'plan.json', {})
     assert code == 0 and fakes.runner_calls == [[D1, D2, D3], [D1, D3], [D3]]  # an unanswered item is asked again
-    assert plan['refused'] == [] and plan['parked'] == [D1] and 'refused 0,' in line
+    assert plan['refused'] == [] and plan['parked'] == [D1] and 'refused 0, parked 1,' in line
     report = next((a / 'report').glob('*.md')).read_text()
     assert f'{D1}: решение читателя отклонено 2 раз(а), отзыв ждёт оркестратора' in report
     assert triage.load(a / 'last-tick.json', {})['outcome'] == 'live'
+
+
+# spec: ANYM-569
+@pytest.mark.parametrize('wrong', [{'reason_code': []}, {'classification': {}}, {'duplicate_of': {}},
+                                   {'primary': ['ANYM-10']}, {'new_card': 7},
+                                   {'specs': [{'ref': [], 'verdict': 'accepted'}]},
+                                   {'specs': [{'ref': 'ANYM-10', 'verdict': {}}]}],
+                         ids=['reason_code', 'classification', 'duplicate_of', 'primary', 'new_card', 'spec ref',
+                              'spec verdict'])
+def test_a_decision_field_of_the_wrong_type_is_refused_for_its_item_and_the_tick_stays_good(loop, wrong):
+    t, a, s = loop
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'groups lose names'), submission(D2, 'x', minute=1)])
+
+    def runner(projected):
+        ids = [row['id'] for row in projected['items']]
+        fakes.runner_calls.append(ids)
+        return stream(answer(*[dict(decision(i, 'not-actionable', reason_code='not-actionable'),
+                                    **(wrong if i == D1 else {})) for i in ids]))
+    fakes.runner = runner
+    for hour in (0, 1):
+        code, line = run_tick(loop, fakes, NOW + timedelta(hours=hour))
+        plan = triage.load(a / 'plan.json', {})
+        assert code == 0 and plan['refused'] == [D1] and plan['build_failed'] == []
+        assert triage.load(a / 'last-tick.json', {}) == {'at': triage.stamp(NOW + timedelta(hours=hour)),
+                                                         'outcome': 'live'}
+    assert set(triage.load(t / 'ledger.json', {})) == {D2} and plan['parked'] == [D1] and 'parked 1,' in line
+    assert triage.load(a / 'refused.json', {})[D1]['count'] == 2 and fakes.runner_calls == [[D1, D2], [D1]]
 
 
 # spec: ANYM-569
