@@ -194,8 +194,11 @@ def literal(c, *, cast=True):
     return (kind, value)
 
 
-def references(c):
-    c.name()
+def references(c, state):
+    # ANYM-619 (calendar's Astra r1, ANYM-586): an unqualified name resolves through search_path, so the referenced
+    # table must be one of the inventory or one this file created.
+    table = c.name()
+    if not (table in state['created'] or existing(state, table)): raise Manual('a reference outside the schema')
     if c.peek() == ('punct', '('): c.group()
     while True:
         if c.word('match'): c.expect('full', 'simple')
@@ -209,7 +212,7 @@ def references(c):
         else: return
 
 
-def new_column(c):
+def new_column(c, state):
     """A column of a table this file creates: literal, now() or gen_random_uuid() defaults and any constraint."""
     c.name()
     column_type(c)
@@ -227,7 +230,7 @@ def new_column(c):
             c.group()
             if c.word('no'): c.expect('inherit')
         elif option == 'primary': c.expect('key')
-        elif option == 'references': references(c)
+        elif option == 'references': references(c, state)
         elif option == 'initially': c.expect('deferred', 'immediate')
 
 
@@ -240,18 +243,19 @@ def create_table(c, state):
         raise Manual('not a new table')
     elements = c.group()
     c.end()
+    state['created'].add(table)  # a foreign key may reference its own table
     for element in split(elements):
         e = Cursor(element)
         if e.peek()[0] == 'word' and e.peek()[1] in ('constraint', 'primary', 'unique', 'check', 'foreign', 'exclude'):
-            table_constraint(e)
+            table_constraint(e, state)
         elif e.peek() == ('word', 'like'): raise Manual('LIKE')
-        else: new_column(e)
-    state['created'].add(table)
+        else: new_column(e, state)
 
 
-def table_constraint(e):
+def table_constraint(e, state):
     """`[CONSTRAINT c] CHECK (…) [NO INHERIT] | PRIMARY KEY (…) | UNIQUE (…) | FOREIGN KEY (…) REFERENCES …` of a new
-    table, which may reference any table, then only deferral words; EXCLUDE, INCLUDE, WITH and the rest are manual."""
+    table, which references an inventory table or one this file created, then only deferral words; EXCLUDE, INCLUDE,
+    WITH and the rest are manual."""
     if e.word('constraint'): e.name()
     kind = e.expect('check', 'primary', 'unique', 'foreign')
     if kind in ('primary', 'foreign'): e.expect('key')
@@ -259,7 +263,7 @@ def table_constraint(e):
     if kind == 'check' and e.word('no'): e.expect('inherit')
     if kind == 'foreign':
         e.expect('references')
-        references(e)
+        references(e, state)
     while not e.done():
         if e.word('not'): e.expect('deferrable')
         elif e.word('initially'): e.expect('deferred', 'immediate')
@@ -378,9 +382,16 @@ def set_local(c):
     c.end()
 
 
-def comment(c):
+def comment(c, state):
+    """`COMMENT ON TABLE <t> | COLUMN <t>.<c> IS '<literal>'` on an inventory table or one this file created
+    (ANYM-619, as calendar's copy: any other object, a schema, role or function too, is manual)."""
     c.expect('comment'), c.expect('on')
-    while c.peek()[0] in ('word', 'ident', 'punct') and c.peek() != ('word', 'is'): c.next()
+    kind = c.expect('table', 'column')
+    table = c.name()
+    if not (table in state['created'] or existing(state, table)): raise Manual("a comment outside the schema's tables")
+    if kind == 'column':
+        if not c.take('punct', '.'): raise Manual('not a column')
+        c.name()
     c.expect('is')
     if c.next()[0] not in ('string', 'estring'): raise Manual('not a literal comment')
     c.end()
@@ -407,7 +418,7 @@ def classify(text, inventory=None):
             elif first == 'create' and second in (('word', 'unique'), ('word', 'index')): create_index(c, state)
             elif first == 'alter': taken = alter_table(c, state, following)
             elif first == 'do': precondition(c)
-            elif first == 'comment': comment(c)
+            elif first == 'comment': comment(c, state)
             else: return 'manual'
             at += taken
     except (Manual, Untokenizable):
