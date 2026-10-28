@@ -207,6 +207,31 @@ lineage sends once. Before each step the server re-checks that the chat and repl
 still map to the previewed ones; otherwise the step fails with `identity_changed` and
 nothing goes to the new chat.
 
+**Small files inline (ANYM-547).** A `files` entry may also be `{name, mime, base64}`
+(canonical base64, optional `mode`), at most 262144 bytes decoded for all inline files of
+one call. Only `messages_send` takes the larger body this needs (512 KiB, at the gateway
+and on the messaging route, after authentication); every other route keeps its cap. More
+than the normal cap is read only for a key that may call that tool (on messaging: the
+`upload` permission), and on MCP only when the first 64 KiB (messaging: 16 KiB) name it: a
+top-level `tools/call` object, `method` before `params` and `params.name` before its
+`arguments`, as MCP clients send it (nested metadata never counts). One
+byte over gives `invalid_arguments` with `field_errors` (`files.<n>.base64`, `max_bytes`)
+and a `next` to `messages_prepare_file_upload` with that file's account, chat, name, MIME,
+size and SHA-256 and the placeholder `request_id`. The gateway relays that `next` only
+when its fields match a file of the same call. A dry run or a `request_id` call stages each
+inline file as the key's own upload under a child key of the call (`agent-child:…`),
+written like `messages_prepare_file_upload` plus one chunk. Previews and intents keep only
+its `upload_id`, name, size and hash, and repeated dry runs of one payload reuse the upload.
+Staged files count toward the key's 4 active uploads and need the `upload` permission. After
+a successful send the server deletes the staged bytes, also when the call followed a `next`
+that names them by `upload_id`, unless another live preview or unfinished send of the key's
+principal still names them; a later dry run stages the file afresh. A retry of a completed
+`request_id` replays its result without resolving or staging again. Other staged bytes expire
+after one hour like any upload, so a resume must come within that hour. Neither errors nor logs carry
+the bytes: a `next` repeats an inline file as `REPLACE_WITH_THE_SAME_BASE64` or, once
+staged, by its `upload_id`. The Python client's `messages_send` and the npm client's
+`messagesSend` take the same arguments.
+
 ## Sender identity and provenance (0.9.12)
 
 Telegram private short-send receipts may omit the sender. The collector uses its

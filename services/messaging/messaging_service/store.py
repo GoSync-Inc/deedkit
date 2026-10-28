@@ -451,6 +451,11 @@ class Store:
         with self.authorized(token) as (_, p):
             return p['id']
 
+    def permits(self, token, operation):
+        """Whether this key holds `operation`'s permission: the body boundary's question, not a denial to audit."""
+        with self.authorized(token) as (_, p):
+            return OPERATION_PERMISSIONS[operation] in p['permissions']
+
     @staticmethod
     def dataset(c,p):
         if p['chat_ids'] is not None:

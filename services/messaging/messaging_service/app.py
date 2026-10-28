@@ -6,6 +6,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
 import json
 import logging
+import re
 import time
 from urllib.parse import urlsplit
 from datetime import datetime
@@ -30,6 +31,44 @@ from .field_errors import field_error,pydantic_field_errors
 from .presentation import options, render
 from .telemetry import capture as capture_error
 from .uploads import UPLOAD_BODY_BYTES
+from .send_intent import SEND_BODY_BYTES
+# The only calls whose body may pass 16 KiB (ANYM-547: inline files of messages_send); REST path or MCP tool name.
+# Both stage bytes as uploads, so only a key that may upload (upload_file_chunk) reads more than 16 KiB.
+LARGE_BODIES = {'upload_file_chunk': UPLOAD_BODY_BYTES, 'messages_send': SEND_BODY_BYTES}
+NORMAL_BODY_BYTES = 16384
+SPACE = re.compile(r'[ \t\n\r]*')
+
+
+def claimed_tool(prefix):
+    """The tool a JSON-RPC body names in its first 16 KiB, read before any more of it: parsed structurally, the
+    top-level object's own `method` is tools/call, then its `params` object's own `name` (never nested metadata, a
+    batch, a repeated key or a member that ends past the prefix). Only how much to read; the parsed call decides."""
+    text,decoder=prefix.decode('utf-8','ignore'),json.JSONDecoder()
+    def space(i):return SPACE.match(text,i).end()
+    def members(i):
+        if text[i:i+1]!='{':return
+        i,seen=space(i+1),set()
+        while text[i:i+1]=='"':
+            key,i=decoder.raw_decode(text,i);i=space(i)
+            if key in seen or text[i:i+1]!=':':raise ValueError
+            seen.add(key);start=space(i+1)
+            yield key,start
+            i=space(decoder.raw_decode(text,start)[1])
+            if text[i:i+1]!=',':return
+            i=space(i+1)
+    method=None
+    try:
+        for key,start in members(space(0)):
+            if key=='method':method=decoder.raw_decode(text,start)[0]
+            elif key=='params':
+                if method!='tools/call':return None
+                for inner,at in members(start):
+                    if inner=='name':
+                        name=decoder.raw_decode(text,at)[0]
+                        return name if isinstance(name,str) else None
+                return None
+    except (ValueError,RecursionError):pass
+    return None
 
 WaitSeconds = Annotated[float, Field(strict=True,ge=0,le=25,allow_inf_nan=False)]
 LiveWaitSeconds = Annotated[float, Field(strict=True,ge=0,le=20,allow_inf_nan=False)]
@@ -311,18 +350,29 @@ class Boundary:
                     'transport':'streamable_http','next_action':'use_post_requests'},
                     status_code=405,headers={'Allow':'POST'})(scope,receive,protected_send)
             if request.method=='POST':
-                upload_route=request.url.path=='/v1/upload_file_chunk'
+                rest_tool=request.url.path.removeprefix('/v1/')
                 mcp_route=request.url.path.rstrip('/')=='/mcp'
-                body_limit=UPLOAD_BODY_BYTES if upload_route or mcp_route else 16384
+                async def may_upload():
+                    return principal is not None and await run_in_threadpool(self.store.permits,
+                        bearer(request.headers),'upload_file_chunk')
+                # Past 16 KiB only for a large tool of a key that may upload, asked once a body passes 16 KiB: its
+                # REST path's tool, or on MCP the one its first 16 KiB claim (claimed_tool); the parsed envelope
+                # must then be that tool.
+                large,body_limit=None,NORMAL_BODY_BYTES
                 try: size=int(request.headers.get('content-length','0'))
                 except ValueError: raise APIError('invalid_body') from None
-                if size<0 or size>body_limit: raise APIError('body_too_large',413)
+                if size<0 or size>(max(LARGE_BODIES.values()) if mcp_route else LARGE_BODIES.get(rest_tool,body_limit)):
+                    raise APIError('body_too_large',413)
                 async def read_body():
+                    nonlocal large,body_limit
                     data=bytearray()
                     while True:
                         event=await receive()
                         if event['type']=='http.disconnect': raise APIError('disconnected',400)
                         data.extend(event.get('body',b''))
+                        if len(data)>body_limit and large is None:
+                            claim=claimed_tool(bytes(data[:NORMAL_BODY_BYTES])) if mcp_route else rest_tool
+                            if claim in LARGE_BODIES and await may_upload(): large,body_limit=claim,LARGE_BODIES[claim]
                         if len(data)>body_limit: raise APIError('body_too_large',413)
                         if not event.get('more_body'): return bytes(data)
                 try: body=await asyncio.wait_for(read_body(),10)
@@ -333,10 +383,9 @@ class Boundary:
                     except (ValueError,UnicodeError):pass
                 if principal is not None:self.charge(principal,budget(request.url.path,envelope))
                 if mcp_route:
-                    if len(body)>16384 and not (isinstance(envelope,dict) and
-                        envelope.get('method')=='tools/call' and isinstance(envelope.get('params'),dict)
-                        and envelope['params'].get('name')=='upload_file_chunk'):
-                        raise APIError('body_too_large',413)
+                    tool=(envelope['params'].get('name') if isinstance(envelope,dict) and
+                        envelope.get('method')=='tools/call' and isinstance(envelope.get('params'),dict) else None)
+                    if len(body)>NORMAL_BODY_BYTES and tool!=large: raise APIError('body_too_large',413)
                     if isinstance(envelope,dict) and envelope.get('method')=='tools/call':
                         params=envelope.get('params')
                         if isinstance(params,dict) and isinstance(params.get('name'),str):
@@ -595,8 +644,10 @@ def create_app(store: Store, allowed_hosts: list[str]):
         SAME payload). Rich format always needs a preview (preview_required).
         to: anything platform_resolve_target resolves exactly (person, chat_ or msg_ ID,
         phone, @username, JID); reply_to (a msg_ ID) alone sends into its chat. files: up to
-        10 of {upload_id} (messages_prepare_file_upload) or {attachment_id} (forward an
-        archived file), each with optional mode; they go in order. A plain caption up to
+        10 of {upload_id} (messages_prepare_file_upload), {attachment_id} (forward an
+        archived file) or a small file inline as {name, mime, base64} (at most 262144 bytes
+        decoded per call, counted against the key's 4 active uploads; over that, field_errors
+        and a next to messages_prepare_file_upload), each with optional mode; they go in order. A plain caption up to
         1024 characters rides on the first file, other text is sent after the files.
         States: previewed, running (repeat with next), succeeded, failed with resumable
         true (repeat with resume true: only failed and unsent steps go; account_offline
@@ -1335,7 +1386,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
     for tool in mcp._tool_manager._tools.values():tool.parameters['additionalProperties']=False
     # Published only: the dict model still validates and keeps every key (ANYM-427).
     mcp._tool_manager._tools['list_chats'].fn_metadata.output_schema['properties']=LIST_CHATS_OUTPUT_PROPERTIES
-    app=mcp.streamable_http_app(stateless_http=True,json_response=True,max_request_body_size=UPLOAD_BODY_BYTES,
+    app=mcp.streamable_http_app(stateless_http=True,json_response=True,max_request_body_size=max(LARGE_BODIES.values()),
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
             allowed_hosts=allowed_hosts,allowed_origins=[urlsplit(store.public_url)._replace(path='',query='',fragment='').geturl()]))
     async def api_error(request,error):

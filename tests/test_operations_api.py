@@ -21,6 +21,7 @@ class RecordingStore:
     public_url = 'http://testserver'
     def __init__(self): self.calls = []
     def authenticate(self, token): return 'synthetic-principal'
+    def permits(self, token, operation): return True
     def audit_boundary(self, code): pass
     def _record(self, method, token, params):
         self.calls.append((method, params))

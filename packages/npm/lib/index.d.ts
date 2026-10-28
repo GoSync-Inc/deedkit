@@ -1,3 +1,10 @@
+/** messages_send files: an upload, an archived file or a small file inline (at most 262144 decoded bytes per call). */
+export type MessagesSendFile = ({upload_id:string} | {attachment_id:string} | {name:string; mime:string; base64:string}) & {mode?:string};
+export interface MessagesSendArguments {
+  to?: string; account?: string; reply_to?: string; text?: string; files?: MessagesSendFile[];
+  format?: 'plain'|'markdown'|'html'; dry_run?: boolean; confirm_token?: string; request_id?: string;
+  resume?: boolean; wait_s?: number;
+}
 export type ReplyReason = 'no_reply_needed' | 'spam_or_mailing' | 'handled_elsewhere' | 'other';
 export type Json = null | boolean | number | string | Json[] | {[key: string]: Json};
 export type Arguments = {[key: string]: Json};
@@ -254,6 +261,7 @@ export declare class AnyMsgClient {
   previewMessage(args: MessageDraft): Promise<Record<string,unknown>>;
   /** Rich content requires the reviewed preview digest and exact owner confirmation. */
   sendMessage(args: MessageAction): Promise<Record<string,unknown>>;
+  messagesSend(args: MessagesSendArguments): Promise<Record<string,unknown>>;
   getSendStatus(args: {send_id:string}): Promise<Record<string,unknown>>;
   /** Passive catalog and scoped permission read, with no provider request. */
   listMessengerOperations(args: {account:string}): Promise<Record<string,unknown>>;

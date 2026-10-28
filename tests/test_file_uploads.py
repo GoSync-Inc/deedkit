@@ -334,6 +334,7 @@ class UploadRecordingStore:
     public_url='http://testserver'
     def __init__(self):self.calls=[]
     def authenticate(self,token):return 'synthetic-upload-principal'
+    def permits(self,token,operation):return operation=='upload_file_chunk'
     def audit_boundary(self,code):pass
     def upload_file_chunk(self,token,**params):self.calls.append(params);return {'status':'uploading'}
 
