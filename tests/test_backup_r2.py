@@ -364,6 +364,52 @@ def test_pending_rotation_cannot_switch_proof_or_digest_and_revalidates_new_anch
     assert cloud.calls.count('delete_object')==calls
 
 
+def ciphertext_gets(cloud):
+    original=cloud.get_object;keys=[]
+    def get(**kw):
+        if '/objects/' in kw['Key']:keys.append(kw['Key'])
+        return original(**kw)
+    cloud.get_object=get
+    return keys
+
+def old_object(cloud):return next(k for k in cloud.objects if '/objects/' in k and OLD in k)
+
+# spec: ANYM-629
+def test_rotate_downloads_only_the_candidate_ciphertext_never_the_previous_object(operator):
+    config,cloud,marker,proof=operator
+    _,expected=enroll(operator);candidate=receive(config,cloud);write_json(proof,proof_for(candidate))
+    keys=ciphertext_gets(cloud);old=old_object(cloud)
+    result=r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)
+    assert result['status']=='rotated' and result['removed']==1
+    assert len(keys)==1 and BID in keys[0] and old not in keys
+
+# spec: ANYM-629
+def test_rotate_refuses_a_previous_object_of_the_wrong_size_before_any_deletion(operator):
+    config,cloud,marker,proof=operator
+    _,expected=enroll(operator);candidate=receive(config,cloud);write_json(proof,proof_for(candidate))
+    old=old_object(cloud);cloud.objects[old]+=b'x'
+    with pytest.raises(ValueError,match='protected_backup_corrupt'):
+        r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)
+    assert sha(marker.read_bytes())==expected and 'delete_object' not in cloud.calls and old in cloud.objects
+
+# spec: ANYM-629
+@pytest.mark.parametrize('interrupted',[False,True])
+def test_corrupt_previous_object_of_the_right_size_no_longer_blocks_rotation(operator,monkeypatch,interrupted):
+    config,cloud,marker,proof=operator
+    _,expected=enroll(operator);candidate=receive(config,cloud);write_json(proof,proof_for(candidate))
+    old=old_object(cloud);data=cloud.objects[old];cloud.objects[old]=data[:-1]+bytes([data[-1]^1])
+    keys=ciphertext_gets(cloud)
+    if interrupted:
+        # The marker switch lands, then the run dies before any deletion.
+        cloud.fail['delete_object']=TimeoutError('lost delete')
+        with pytest.raises(RuntimeError,match='storage_unavailable'):
+            r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)
+        assert json.loads(marker.read_bytes())['backups'][0]['id']==BID and old in cloud.objects
+    result=r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)
+    assert result['status']=='rotated' and result['duplicate'] is interrupted
+    assert old not in cloud.objects and len(cloud.objects)==2 and old not in keys
+
+
 def test_rotation_reuses_upload_lock_and_refuses_stale_marker(operator):
     config,cloud,marker,proof=operator
     _,expected=enroll(operator);candidate=receive(config,cloud);write_json(proof,proof_for(candidate))

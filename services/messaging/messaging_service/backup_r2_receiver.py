@@ -997,6 +997,24 @@ def validate_rotation_journal(config, journal):
     return journal
 
 
+def previous_present(config, client, old, *, resumed=False):
+    """Receipt-bound size check of a point being superseded; its bytes are never re-read.
+
+    The replacement is proven by its own restore and full re-hash; hashing data
+    about to be deleted protects nothing and would let a corrupt old point block
+    rotation. Absence is accepted only on a root-journal-bound resume.
+    """
+    try:
+        head = client.head_object(Bucket=config['bucket'], Key=old['object_key'])
+    except Exception as exc:
+        if not (resumed and absent(exc)):
+            raise RuntimeError('storage_unavailable') from None
+        return False
+    if head.get('ContentLength') != old['wire']['bytes']:
+        raise ValueError('protected_backup_corrupt')
+    return True
+
+
 def rotate(config, protected_file, proof_file, *, expected_protected_sha256, client=None):
     """Fsync root evidence/marker before exact, independently authorized deletion."""
     state, marker, proof_file = operator_paths(config, protected_file, proof_file)
@@ -1032,7 +1050,7 @@ def rotate(config, protected_file, proof_file, *, expected_protected_sha256, cli
                 receipt = get_receipt(config, client, item['id'])
                 if receipt is None or any(receipt['wire'][key] != value for key, value in item.items()):
                     raise ValueError('protected_receipt_mismatch')
-                verify_object(config, client, receipt)
+                previous_present(config, client, receipt)
                 previous_receipts.append(receipt)
             journal = {'v': 1, 'state': 'pending', 'destination': destination(config), 'proof_sha256': proof_sha,
                        'expected_protected_sha256': expected_protected_sha256, 'previous': current,
@@ -1055,15 +1073,7 @@ def rotate(config, protected_file, proof_file, *, expected_protected_sha256, cli
                     raise ValueError('protected_receipt_mismatch')
             elif saved != old:
                 raise ValueError('protected_receipt_mismatch')
-            try:
-                head = client.head_object(Bucket=config['bucket'], Key=old['object_key'])
-            except Exception as exc:
-                if not (resumed and absent(exc)):
-                    raise RuntimeError('storage_unavailable') from None
-            else:
-                if head.get('ContentLength') != old['wire']['bytes']:
-                    raise ValueError('protected_backup_corrupt')
-                verify_object(config, client, old)
+            if previous_present(config, client, old, resumed=resumed):
                 observed_present.add(old['object_key'])
         removed = 0
         for old in journal['previous_receipts']:
