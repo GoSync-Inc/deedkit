@@ -85,6 +85,16 @@ not detect a message's language. `query_mode: exact` means case-insensitive
 literal substring, including punctuation and identifiers. Existing `all`,
 `phrase`, `web` modes and chronological `asc`/`desc` remain available.
 
+Messages in another language (ANYM-539): DeedKit stores and returns each
+message in the language it was written in and translates nothing. When the
+owner wants a translation, the agent translates the text that `get_messages`,
+`get_context` or `search` returns with its own model. The translation is the
+agent's, never an archived text. A search for a message in another language uses
+terms in that language, for example `договор` for a Russian message even when the
+owner asked in English. `search_language` only picks the stemming dictionary for
+those terms. It does not detect a language or translate the query, so an English
+word does not match its Russian translation.
+
 `order: relevance` returns an opaque query/scope-bound `next_cursor`; pass it
 unchanged as `after`. Editing the anchor can invalidate it. `fuzzy: true` is
 an explicit fallback for a single word of 3–64 characters, used only when the
