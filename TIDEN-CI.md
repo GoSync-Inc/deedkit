@@ -557,8 +557,12 @@ and runs `scripts/tiden_drift.py`:
    queued, in progress, failed, cancelled, or dropped and not dispatched again),
    the run checks nothing, advances nothing, passes, and its summary names every
    commit in the range with its sync state; the sync that finishes later starts
-   a new run. A run listing that fails or is incomplete fails the run with
-   nothing sent.
+   a new run. The successful sync runs decide, and all runs are listed only to
+   name the state of a waiting commit; both listings read one day of runs at a
+   time, because GitHub returns at most 1,000 runs per listing, so a watermark
+   stalled for days still reads its whole range. A run listing that fails, is
+   incomplete or reaches that cap within one day fails the run with nothing
+   sent.
 2. It lists the files changed from W to that checkout, leaving out deletions and the categories in the
    checker's `EXCLUDED` list (Markdown and `docs/`, `.claude/`, tests and their
    fixtures, lockfiles and dependency pins, licence texts: `LICENSE`,
@@ -582,7 +586,11 @@ and runs `scripts/tiden_drift.py`:
 Runs never overlap (one concurrency group, no cancelling). GitHub may replace a
 waiting run with a newer one; the run that executes covers the newest merge, and
 the run after the last sync to finish sees every sync of the range done, so a
-dropped run loses no merge. A failed sync stays named in every run, and the
+dropped run loses no merge. One exception: a run the guard rejects (for example
+a fork's pull request that changed `Tiden sync` to run on its own event) still
+enters the concurrency group and may replace that waiting run; the watermark
+then waits for the next sync to finish or a dispatch, and Tiden health reports
+the lag meanwhile. A failed sync stays named in every run, and the
 watermark stays, until a sync of the same SHA succeeds (dispatch it by SHA, Main
 sync), which starts a run again; Tiden health's sync backlog (ANYM-503) reports
 the failure. A run whose checkout the watermark already reached passes without an advance.

@@ -1,4 +1,5 @@
 """The drift watermark job against temporary Git repositories and a fake Tiden CLI; it never calls Tiden."""
+from datetime import datetime, timedelta, timezone
 import inspect
 import json
 import os
@@ -123,7 +124,7 @@ def sync(sha, conclusion="success", number=1, attempt=1, status="completed", tit
 
 
 def listing(*runs):
-    return lambda since: list(runs)
+    return lambda since, success: [run for run in runs if not success or run["conclusion"] == "success"]
 
 
 FAKE_GH = textwrap.dedent(f"""\
@@ -637,7 +638,7 @@ def test_a_failed_run_listing_checks_and_advances_nothing_and_fails(repo, server
     w, a, b = history(repo)
     server.set(watermark=w, anchors=ANCHORED)
 
-    def broken(since):
+    def broken(since, success):
         raise drift.Unknown("gh api exited 1")
 
     with pytest.raises(Refused, match="Tiden sync runs could not be read"):
@@ -709,3 +710,86 @@ def test_the_checker_reads_no_upstream_run_data():
     assert checker["run"] == ('python3 scripts/tiden_drift.py --cli "$RUNNER_TEMP/tiden-bin/tiden" '
                               '--sync-repository "$GITHUB_REPOSITORY"')
     assert "github.event" not in json.dumps(checker) and ">> \"$GITHUB_PATH\"" not in WORKFLOW.read_text()
+
+
+class Runs:
+    """A stand-in for Tiden health's run listing: `read` answers one `created=A..B` window from ROWS, as GitHub does
+    for a filtered listing, and records every window."""
+
+    def __init__(self, rows, cap=None):
+        self.rows, self.windows, self.cap = rows, [], cap
+
+    def clock(self):
+        return 0.0
+
+    def read(self, created, end, workflow, filters):
+        assert workflow == "tiden-sync.yml"
+        self.windows.append((created, filters))
+        low, high = (datetime.fromisoformat(part) for part in created.split(".."))
+        rows = [row for row in self.rows if low <= datetime.fromisoformat(row["created_at"]) <= high
+                and ("status=success" not in filters or row["conclusion"] == "success")]
+        return rows[:self.cap] if self.cap else rows
+
+
+NOW = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
+
+
+def spread(shas, start, count, hours):
+    """COUNT runs over HOURS from START, cycling the titles of SHAS; the last of each SHA succeeds."""
+    rows = []
+    for number in range(count):
+        sha = shas[number % len(shas)]
+        last = number >= count - len(shas)
+        created = start + timedelta(hours=hours) * number / count
+        rows.append(sync(sha, conclusion="success" if last else "skipped", number=number + 1)
+                    | {"created_at": created.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    return rows
+
+
+# spec: ANYM-593
+def test_a_watermark_stalled_past_the_listing_cap_still_reads_every_run_by_day(repo, server):
+    w, a, b = history(repo)
+    server.set(watermark=w, anchors=ANCHORED)
+    since = NOW - timedelta(days=4)
+    runs = Runs(spread([a, b, "0" * 40], since, 2400, 4 * 24))  # 2,400 runs, about 600 a day
+    syncs = drift.SyncRuns(runs, now=lambda: NOW)
+    # The synthetic commits are dated now; the listing starts four days back as for a stalled watermark.
+    assert run(repo, server, lambda start, success: syncs(since, success))[0] == 0
+    assert server.state()["watermark"] == b
+    # Contiguous one-day windows from SINCE to now, only successful runs: nothing else was needed to decide.
+    assert [window for window, _ in runs.windows] == [
+        f"{since + timedelta(days=day):%Y-%m-%dT%H:%M:%SZ}..{since + timedelta(days=day + 1):%Y-%m-%dT%H:%M:%SZ}"
+        for day in range(5)]
+    assert {filters for _, filters in runs.windows} == {("status=success",)}
+
+
+# spec: ANYM-593
+def test_a_day_that_reaches_the_listing_cap_is_unknown_never_synced(repo, server):
+    w, a, b = history(repo)
+    server.set(watermark=w, anchors=ANCHORED)
+    since = NOW - timedelta(hours=12)
+    runs = Runs(spread([a, b], since, 1200, 1), cap=1000)
+    for row in runs.rows:
+        row["conclusion"] = "success"
+    syncs = drift.SyncRuns(runs, now=lambda: NOW)
+    with pytest.raises(Refused, match="listing cap"):
+        run(repo, server, lambda start, success: syncs(since, success))
+    assert server.state()["advances"] == []
+
+
+# spec: ANYM-593
+def test_the_state_listing_reads_all_runs_only_when_a_commit_waits(repo, server):
+    w, a, b = history(repo)
+    server.set(watermark=w, anchors=ANCHORED)
+    calls = []
+    runs = [sync(a, number=1), sync(b, number=2, status="in_progress")]
+
+    def syncs(since, success):
+        calls.append(success)
+        return listing(*runs)(since, success)
+
+    code, output = run(repo, server, syncs)
+    assert code == 0 and calls == [True, False] and f"- {b}: in_progress" in output
+    runs[1] = sync(b, number=2)
+    calls.clear()
+    assert run(repo, server, syncs)[0] == 0 and calls == [True] and server.state()["watermark"] == b

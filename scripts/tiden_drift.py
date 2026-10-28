@@ -13,7 +13,7 @@ retried: a fresh run reads the server watermark again.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatchcase
 import json
 import os
@@ -26,7 +26,8 @@ from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # The sync lookup of Tiden health (ANYM-438, ANYM-503): the same run titles, listing and checks.
-from tiden_health import SYNC_SLACK, Actions, Unknown, decisive, moment, sync_runs  # noqa: E402
+from tiden_health import (SYNC_READS, SYNC_SLACK, SYNC_WORKFLOW, Actions, Unknown, decisive, moment,  # noqa: E402
+                          sync_runs)
 
 REPOSITORY = "github.com/GoSync-Inc/deedkit"
 # Anchors recorded before the rename carry the former repository name, or none.
@@ -62,6 +63,9 @@ SHA = re.compile(r"[0-9a-f]{40}")
 TIMEOUT = 120
 RETRY_DELAY = 2  # seconds before the one retry of a read-only listing
 RETRY_MIN = 10  # a retry needs at least this many seconds left of the call's one TIMEOUT budget
+# A run listing returns at most 1,000 runs, so the sync runs are listed one day at a time (about 270 a day, 2026-10-28)
+# and a day that reaches the cap is unknown: a watermark stalled for days still reads every run of its range.
+SYNC_WINDOW, LISTING_CAP = timedelta(days=1), 1000
 
 
 class Refused(Exception):
@@ -194,10 +198,48 @@ def present(root: Path, sha: str) -> bool:
                               capture_output=True, timeout=TIMEOUT).returncode
 
 
-def synced(root: Path, base: str, target: str, syncs: Callable[[datetime], list[dict]], report) -> bool:
+class SyncRuns:
+    """The `Tiden sync` runs of main created at or after a moment, all of them or only the successful ones, read one
+    SYNC_WINDOW at a time through Tiden health's run listing (`gh api`, token GH_TOKEN), every window within one
+    TIMEOUT budget. A window that reaches LISTING_CAP, a changing or incomplete listing, or the budget is unknown."""
+
+    def __init__(self, actions: Actions, now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+        self.actions, self.now = actions, now
+
+    def __call__(self, since: datetime, success: bool) -> list[dict]:
+        end, filters = self.actions.clock() + TIMEOUT, ("status=success",) if success else ()
+        rows: dict[int, dict] = {}
+        start, now = since.astimezone(timezone.utc), self.now()
+        while start <= now:
+            stop = start + SYNC_WINDOW
+            # Both ends are inclusive, so a run created on a boundary is read twice and kept once.
+            created = f"{start:%Y-%m-%dT%H:%M:%SZ}..{stop:%Y-%m-%dT%H:%M:%SZ}"
+            for _ in range(SYNC_READS):
+                window = self.actions.read(created, end, SYNC_WORKFLOW, filters)
+                if window is not None:
+                    break
+            else:
+                raise Unknown("the run list changed on every read")
+            if len(window) >= LISTING_CAP:
+                raise Unknown(f"the runs created {created} reach the listing cap of {LISTING_CAP}")
+            rows |= {row["id"]: row for row in window}
+            start = stop
+        if self.actions.clock() >= end:
+            raise Unknown("gh api timed out")
+        return list(rows.values())
+
+
+def listed(syncs: Callable[[datetime, bool], list[dict]], since: datetime, success: bool) -> list[dict]:
+    try:
+        return syncs(since, success)
+    except Unknown as error:
+        raise Refused(f"the Tiden sync runs could not be read ({error})") from None
+
+
+def synced(root: Path, base: str, target: str, syncs: Callable[[datetime, bool], list[dict]], report) -> bool:
     """Whether every first-parent commit after BASE up to TARGET has a successful `Tiden sync <sha>` run; otherwise
-    each commit is named with its sync state. SYNCS lists the sync runs of main created at or after a moment; a failed
-    or incomplete listing is never read as synced."""
+    each commit is named with its sync state. SYNCS(since, success) lists the sync runs of main created at or after
+    SINCE, only the successful ones when SUCCESS; a failed or incomplete listing is never read as synced."""
     commits = []
     for line in git(root, "log", "--first-parent", "--format=%H %cI", f"{base}..{target}").splitlines():
         sha, _, stamp = line.partition(" ")
@@ -206,31 +248,31 @@ def synced(root: Path, base: str, target: str, syncs: Callable[[datetime], list[
         commits.append((sha, moment(stamp)))
     if not commits:
         raise Refused("no main commit lies between the watermark and the target")
-    try:
-        runs = syncs(min(stamp for _, stamp in commits) - SYNC_SLACK)
-    except Unknown as error:
-        raise Refused(f"the Tiden sync runs could not be read ({error})") from None
+    # A sync run is created after its commit; the successful runs decide, so the common listing stays small.
+    runs = listed(syncs, min(stamp for _, stamp in commits) - SYNC_SLACK, True)
+    done = {sha for sha, _ in commits if any(run["conclusion"] == "success" for run in sync_runs(runs, sha))}
+    if len(done) == len(commits):
+        report(f"All {len(commits)} main commit(s) after the watermark have a successful Tiden sync.")
+        return True
+    # Only to name the state of each waiting commit: every run since the oldest of them.
+    runs = listed(syncs, min(stamp for sha, stamp in commits if sha not in done) - SYNC_SLACK, False)
     states = []
     for sha, _ in reversed(commits):  # oldest first
         kept = sync_runs(runs, sha)
-        if any(run["conclusion"] == "success" for run in kept):
+        if sha in done:
             states.append((sha, "synced", None))
         elif kept:
             last = decisive(kept)
             states.append((sha, last["conclusion"] or last["status"], last["html_url"]))
         else:
             states.append((sha, "no sync run", None))
-    waiting = [state for state in states if state[1] != "synced"]
-    if not waiting:
-        report(f"All {len(states)} main commit(s) after the watermark have a successful Tiden sync.")
-        return True
-    report(f"{len(waiting)} of {len(states)} main commit(s) after the watermark have no successful Tiden sync yet; "
-           "nothing is checked or advanced. The run after their sync checks them:")
+    report(f"{len(commits) - len(done)} of {len(states)} main commit(s) after the watermark have no successful Tiden "
+           "sync yet; nothing is checked or advanced. The run after their sync checks them:")
     report("\n".join(f"- {sha}: {state}" + (f" ({shown(url)})" if url else "") for sha, state, url in states))
     return False
 
 
-def check(root: Path, cli: str, product: str, report, syncs: Callable[[datetime], list[dict]]) -> int:
+def check(root: Path, cli: str, product: str, report, syncs: Callable[[datetime, bool], list[dict]]) -> int:
     target = commit(root, "HEAD")  # the workflow checks out main as it is when the run starts
     base = watermark(cli, product)
     report(f"Target: main at {target}; watermark {base}.")
@@ -293,7 +335,7 @@ def main() -> int:
 
     try:
         return check(args.root.resolve(), args.cli, os.environ["TIDEN_PRODUCT_ID"], report,
-                     Actions(args.sync_repository).runs)
+                     SyncRuns(Actions(args.sync_repository)))
     except Refused as error:
         report(f"Refused: {error}")
         return 1
