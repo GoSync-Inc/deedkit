@@ -221,15 +221,28 @@ ANYM-301); only `http-router` and `check-image` still build on the host.
   `org.opencontainers.image.source` or `io.deedkit.production.build` label does not
   match the commit, or whose pushed manifest does not carry the tested config
   digest (`scripts/publish_images.py`). There is no `latest` or other moving tag.
-- **Write-once tags.** A tag that already exists is never pushed again. A full
-  rerun reuses an existing attested image of the same commit; an image pushed by
-  an attempt that failed before attesting it is attested only when this attempt
-  still holds the same tested archive. Anything else fails the job without moving
-  the tag. If a tag is left pushed but unattested and its archive expired, the
-  commit has no published images until the owner deletes that package version.
+- **Staging tags (ANYM-602).** A new image is pushed under the staging tag
+  `<sha>-attempt-<run_id>-<run_attempt>` in the same package, attested there, and
+  gets its final tag `<sha>` only after `promote` verifies that attestation in
+  GitHub and in the registry. `promote` reads the manifest by the verified digest,
+  checks its SHA-256 and PUTs exactly those bytes under the final tag, so the
+  final digest is the attested one; `confirm` then requires each final tag of a
+  target this attempt staged to hold that digest. A push, attestation or
+  verification that fails leaves only the staging tag, and a full rerun (which
+  rebuilds the archives) publishes under its own staging tag. Staging tags are
+  never promoted later or read by `production.py`, which resolves only `<sha>`;
+  they stay in the package (the publish job never deletes package versions;
+  a cleanup is separate work).
+- **Write-once tags.** A final tag that already exists is never pushed again. A full
+  rerun reuses an existing attested image of the same commit, without an archive.
+  A final tag left with no GitHub provenance by a run before ANYM-602 is attested
+  only when this attempt still holds the same tested archive; anything else fails
+  the job without moving the tag, and with its archive expired the commit has no
+  published images until the owner deletes that package version.
 - **Provenance.** Each newly pushed digest gets a SLSA build-provenance
   attestation from `actions/attest` with `push-to-registry`, without the
-  organization's artifact storage record. It is signed through public-good
+  organization's artifact storage record. A final tag whose provenance exists in
+  GitHub but whose registry bundle is missing is still repaired in place (`attest`). It is signed through public-good
   Sigstore (the repository is public) and verifiable with
   `gh attestation verify oci://ghcr.io/gosync-inc/deedkit-<target>@<digest>
   --repo GoSync-Inc/deedkit --signer-workflow
@@ -763,7 +776,11 @@ first).
    no DNS, no other bridge, no internet, whatever the host firewall holds. Its one way out is the
    `delivery-egress` proxy, which alone joins the egress bridge and resolves and connects only to
    public addresses of hosts allowed by `private/delivery-policy.json`; operator receiver hosts must
-   be in `allow_hosts` too (SUBSCRIPTIONS.md, Host policy). Set `DELIVERY_RESOLVER=<ip>` in the
+   be in `allow_hosts` too, never left to `self_registration`, whose kill switch would then
+   cut them off at the proxy (SUBSCRIPTIONS.md, Host policy). Self-registered endpoints (ANYM-585): `deedkit admin
+   delivery-endpoints list` shows each one's `admission` (`self_registration` = admitted only by the
+   switch); `deedkit admin delivery-endpoints disable ID` stops one; `"self_registration": false` in the
+   policy file and `reload-delivery-policy` stop all of them (SUBSCRIPTIONS.md, Self-registration). Set `DELIVERY_RESOLVER=<ip>` in the
    project's env file, `<ip>` being the host's current upstream resolver (`/etc/resolv.conf`, or
    `/run/systemd/resolve/resolv.conf` behind systemd-resolved; not a new third party); the overlay
    passes it as the proxy's `dns`. The host rules are the second layer (a host step):
@@ -933,6 +950,14 @@ or writes it, so it has no grant. A schema-43 runtime refuses schema 44, so it s
 release; update the pinned backup and restore runtimes first. Calendar migration 3 adds the same
 table for agents (`principal_operations`, no lock on `principals`). Rollback: existing keys are
 untouched; only keys issued with `--operation-id` have an operation row.
+Calendar migrations by hand (ANYM-601): after the calendar `migrate`, run `db-roles` and then
+`db-roles --check` in the same step, before the calendar services restart
+(`services/calendar/docs/SERVICE.md`, Grants). A non-zero check (`db_roles_drift`, one line per
+missing or extra grant, membership or role) stops the release; fix the cause, rerun both. A crash
+between `migrate` and `db-roles` leaves the new schema with the old grants; rerunning `db-roles`
+and `--check` repairs it. `db-roles` revokes any privilege the service roles hold on
+`principal_operations` (granted by the former `ALL TABLES` line on 2026-10-28); undo of that
+narrowing: `GRANT SELECT ON fcs.principal_operations TO fcs_gateway, fcs_worker`.
 Messaging migration 043 (`manual`, ANYM-283) is additive: the new `person_links` table
 with a SELECT grant to the gateway role. A schema-42 runtime refuses schema 43, so it ships
 with its release; update the pinned backup and restore runtimes first, since earlier ones

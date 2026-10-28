@@ -13,6 +13,7 @@ import tempfile
 import stat
 import time
 import re
+import shutil
 
 from psycopg.conninfo import conninfo_to_dict
 
@@ -113,7 +114,48 @@ def abandon_unpublished_fence(store,work,backup_id):
     return result
 
 
+def run_calendar(config):
+    """Family calendar profile (ANYM-605): staged capture of database, vault and profile files, then age."""
+    from .backup_calendar import CalendarCaptureRefused,create_calendar_snapshot
+    from .backup_receiver import BACKUP_ID
+    from .recovery_state import read_manifest
+    required={'profile','id','dsn_file','vault_directory','profile_directory','recipient_file','work_directory'}
+    if set(config)!=required or config['profile']!='calendar':raise ValueError('invalid_backup_worker_config')
+    if not isinstance(config['id'],str) or not BACKUP_ID.fullmatch(config['id']):raise ValueError('invalid_backup_id')
+    work=Path(config['work_directory'])
+    if work.is_symlink() or not work.is_dir() or work.stat().st_mode&0o077:raise ValueError('private_work_directory_required')
+    dsn=Path(config['dsn_file']).read_text().strip()
+    with tempfile.TemporaryDirectory(prefix='pg-') as secrets_dir:
+        command,password_file=dump_credentials(dsn,secrets_dir)
+        previous=os.environ.get('PGPASSFILE');os.environ['PGPASSFILE']=str(password_file)
+        try:
+            snapshot=create_calendar_snapshot(dsn,work/'snapshot',command,vault_directory=Path(config['vault_directory']),
+                                              profile_directory=Path(config['profile_directory']))
+        except CalendarCaptureRefused as exc:
+            # The subject (a connection id or file name) stays in the private work directory.
+            write_json(work/'refused.json',{'id':config['id'],'status':'refused','code':exc.code,'subject':exc.subject})
+            raise
+        finally:
+            if previous is None:os.environ.pop('PGPASSFILE',None)
+            else:os.environ['PGPASSFILE']=previous
+    write_json(work/'captured.json',{'id':config['id'],'status':'capture_complete'})
+    manifest=read_manifest(work/'snapshot')
+    output=work/'bundle.tar.age'
+    try:encrypt_snapshot(work/'snapshot',output,Path(config['recipient_file']).read_text().strip())
+    finally:
+        # The plaintext staging holds the vault key and database passwords; a retry captures anew.
+        shutil.rmtree(work/'snapshot')
+    with output.open('rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()
+    result={'v':1,'id':config['id'],'profile':'calendar','status':'encrypted','bytes':output.stat().st_size,
+            'sha256':digest,'snapshot':snapshot,'created_at':datetime.now(timezone.utc).isoformat(),
+            'captured_at':manifest['captured_at']}
+    write_json(work/'result.json',result)
+    print(json.dumps({'status':'encrypted','id':config['id'],'profile':'calendar','bytes':result['bytes']}),flush=True)
+    return result
+
+
 def run(config):
+    if 'profile' in config:return run_calendar(config)
     if config.get('action') in ('release_fence','abandon_fence'):
         if set(config)!={'action','id','dsn_file','work_directory'}:raise ValueError('invalid_backup_worker_config')
         work=Path(config['work_directory'])
@@ -196,7 +238,11 @@ def run(config):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--config',type=Path,required=True)
     args=parser.parse_args();os.umask(0o077)
+    from .backup_calendar import CalendarCaptureRefused
     try:run(private_json(args.config))
+    except CalendarCaptureRefused as exc:
+        print(json.dumps({'status':'refused','code':exc.code}),flush=True)
+        raise SystemExit(1) from None
     except Exception:
         print('{"status":"error","code":"backup_worker_failed"}',flush=True)
         raise SystemExit(1) from None

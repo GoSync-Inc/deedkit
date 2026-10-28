@@ -1222,3 +1222,101 @@ def test_each_role_writes_only_its_own_component_heartbeat(seeded):
             for role in roles:
                 c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
                 c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
+def answering(head):
+    """A transport whose receiver answers `head`, read by the real HTTP reader (egress.post)."""
+    from messaging_service.egress import deadline_after, post
+    class Connection:
+        def __init__(self): self.replies = [head]
+        def settimeout(self, value): pass
+        def sendall(self, data): pass
+        def recv(self, size): return self.replies.pop(0) if self.replies else b''
+    def transport(url, body, headers, *, resolved, timeout=5):
+        return post(Connection(), 'hooks.example.test', '/hook', body, headers, deadline_after(timeout), retry_after=True)
+    return transport
+
+
+def retry_delay(store):
+    with store.pool.connection() as c:
+        row = c.execute("""SELECT state, error_code,
+            extract(epoch FROM next_attempt_at-clock_timestamp())::float AS seconds FROM subscription_outbox""").fetchone()
+    return row['state'], row['seconds']
+
+
+def http_date(hours):
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+    return format_datetime(datetime.now(timezone.utc) + timedelta(hours=hours), usegmt=True)
+
+
+# spec: ANYM-604
+@pytest.mark.parametrize('status,header,delay', [
+    (429, 'Retry-After: 600', 600), (503, 'Retry-After: ' + http_date(2), 3600), (429, 'Retry-After: abc', 2),
+    (429, 'Retry-After: -5', 2), (503, 'Retry-After: ' + http_date(-1), 2), (429, 'Retry-After: 1', 2),
+    (500, 'Retry-After: 600', 2), (429, None, 2)],
+    ids=['delta', 'date-capped', 'unparsable', 'negative', 'past-date', 'below-own', 'other-status', 'bare-int'])
+def test_endpoint_retry_waits_for_the_receivers_retry_after_up_to_an_hour(seeded, tmp_path, monkeypatch, status, header, delay):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    try:
+        endpoint_setup(store, tmp_path, monkeypatch)
+        transport = (lambda *a, **k: status) if header is None else answering(
+            b'HTTP/1.1 %d Busy\r\n%s\r\nContent-Length: 0\r\n\r\n' % (status, header.encode()))
+        assert dispatch_hints(store, lane='endpoint', transport=transport, resolver=PUBLIC)['retried'] == 1
+        state, seconds = retry_delay(store)
+        assert state == 'pending' and delay - 30 < seconds <= delay
+    finally:
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-604
+def test_operator_receiver_retry_keeps_its_own_backoff_despite_retry_after(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, _ = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    emit(store)
+    match_subscriptions(store)
+    transport = answering(b'HTTP/1.1 429 Busy\r\nRetry-After: 600\r\n\r\n')
+    assert dispatch_hints(store, transport=transport, resolver=PUBLIC)['retried'] == 1
+    state, seconds = retry_delay(store)
+    assert state == 'pending' and 0 < seconds <= 2
+
+
+# spec: ANYM-604
+def test_post_reads_retry_after_only_from_a_complete_429_or_503_head():
+    from messaging_service.egress import deadline_after, post, retry_after_seconds
+    from datetime import datetime, timezone
+    class Connection:
+        def __init__(self, *replies): self.replies = list(replies)
+        def settimeout(self, value): pass
+        def sendall(self, data): pass
+        def recv(self, size): return self.replies.pop(0) if self.replies else b''
+    def answer(*replies, **kwargs):
+        return post(Connection(*replies), 'hooks.example.test', '/', b'{}', {}, deadline_after(5), **kwargs)
+    # A final status other than 429/503 returns at its status line, as before: the rest of the head is never read.
+    assert answer(b'HTTP/1.1 200 OK\r\n', retry_after=True) == (200, None)
+    assert answer(b'HTTP/1.1 429 Busy\r\nRetry-After: 600\r\n\r\n') == 429
+    assert answer(b'HTTP/1.1 429 Busy\r\nRetry-', b'After: 600\r\n\r\n', retry_after=True) == (429, 600)
+    # A head cut short, over the limit or with two values keeps the dispatcher's own backoff.
+    assert answer(b'HTTP/1.1 503 Busy\r\nRetry-After: 600\r\n', retry_after=True) == (503, None)
+    assert answer(b'HTTP/1.1 429 Busy\r\n', b'X: ' + b'y' * 5000 + b'\r\n\r\n', retry_after=True) == (429, None)
+    assert answer(b'HTTP/1.1 429 Busy\r\nRetry-After: 60\r\nretry-after: 600\r\n\r\n', retry_after=True) == (429, None)
+    now = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nretry-after:  120 ', now) == 120
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: Wed, 28 Oct 2026 12:10:00 GMT', now) == 600
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: ' + b'9' * 4000, now) > 3600
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: 0000000120', now) == 120
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: 0000000000', now) == 0
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: Wednesday, 28-Oct-26 12:10:00 GMT', now) == 600
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: Wed Oct 28 12:10:00 2026', now) == 600
+    # RFC 9110 section 5.6.7: a two-digit year is at most 50 years ahead, so 69 is 2069 and 99 is 1999.
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: Monday, 28-Oct-69 12:10:00 GMT', now) > 3600
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: Thursday, 28-Oct-99 12:10:00 GMT', now) is None
+    for value in (b'', b'1.5', b'-1', b'abc', b'Wed, 28 Oct 2026 11:00:00 GMT', b'Wed, 99 Oct 2026 12:00:00 GMT',
+                  b'Wed, 28 Oct 2026 12:10:00 GMT, Wed, 28 Oct 2026 12:20:00 GMT', b'Wed, 28 Oct 2026 12:10:00 GMT \xc3\xa9',
+                  b'Wed, 28 Xyz 2026 12:10:00 GMT', b'Wed, 28 Oct 2026 12:10:00 +0000', b'600 seconds'):
+        assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: ' + value, now) is None

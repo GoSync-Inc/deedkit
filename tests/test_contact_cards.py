@@ -290,7 +290,7 @@ def test_migration_047_indexes_only_contact_metadata_and_repeats_over_schema46_r
             assert c.execute("SELECT to_regclass('message_metadata_contact') AS i").fetchone()['i'] is None
         store.migrate();store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='51'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='52'
             assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=47').fetchone()['n']==1
             index=c.execute('''SELECT i.indisvalid,i.indisready,pg_get_expr(i.indpred,i.indrelid) AS predicate
                 FROM pg_index i WHERE i.indexrelid='message_metadata_contact'::regclass''').fetchone()
@@ -316,7 +316,7 @@ def test_migration_047_keeps_an_index_built_before_it(database,tmp_path):
             before=c.execute("SELECT 'message_metadata_contact'::regclass::oid AS i").fetchone()['i']
         store.migrate();store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='51'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='52'
             assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=47').fetchone()['n']==1
             assert c.execute("SELECT 'message_metadata_contact'::regclass::oid AS i").fetchone()['i']==before
 
@@ -334,6 +334,6 @@ def test_migration_047_refuses_an_unusable_prebuilt_index(database,tmp_path,shap
             c.execute('DROP INDEX message_metadata_contact')
         store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='51'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='52'
             assert c.execute('''SELECT indisvalid FROM pg_index
                 WHERE indexrelid='message_metadata_contact'::regclass''').fetchone()['indisvalid']

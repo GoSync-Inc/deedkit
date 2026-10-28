@@ -46,7 +46,11 @@ capture details of `live_capture.last_capture_stop` reports
 `durable_capture_failed.<detail>` (the Telegram-only codes below); without a
 detail, or with any other value, it reports `durable_capture_failed`. These
 qualified codes are built only from that detail: an exception whose text is a
-qualified code reports `collector_failed`, and WhatsApp never reports one. A
+qualified code reports `collector_failed`. A WhatsApp `provider_disconnected`
+stop whose adapter child recorded no failure code names how the child ended:
+`provider_disconnected.<detail>` (the WhatsApp-only codes below) from its exit
+status alone (0, 1, 2 for a Go panic, another status, SIGKILL, another signal);
+the supervisor line carries the same detail. A
 Telegram `capture_overload` stop names the bound that tripped (`waiters_limit` or
 `slot_wait_timeout`) in `last_capture_stop` and the supervisor line only; its
 event still reports `capture_overload`. The
@@ -76,6 +80,11 @@ Collector stop codes: `capture_overload`, `collection_disabled`,
 Telegram only: `durable_capture_failed.capture_error`,
 `durable_capture_failed.disk_reserve`, `durable_capture_failed.spool_full`,
 `durable_capture_failed.spool_io_error`.
+
+WhatsApp only: `provider_disconnected.exit_clean`,
+`provider_disconnected.exit_error`, `provider_disconnected.exit_killed`,
+`provider_disconnected.exit_other`, `provider_disconnected.exit_panic`,
+`provider_disconnected.exit_signal`.
 
 The payload contains the release, environment, fixed component/error code,
 allowlisted exception type, public Python filenames/line numbers and, for Telegram

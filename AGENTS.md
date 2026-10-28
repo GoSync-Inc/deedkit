@@ -1,6 +1,6 @@
 # DeedKit agent rules
 
-Process: harness egerev/agent-harness @ 0.59.0, ~/agent-harness; this file adds project rules.
+Process: harness egerev/agent-harness @ 0.59.3, ~/agent-harness; this file adds project rules.
 Claude Code loads harness process.md through the SessionStart hook (`.claude/hooks/harness.sh`:
 merged `origin/main`, else the pinned copy). Codex and cloud agents read the pinned copy
 docs/harness/process.md first. If no harness text is in context, stop and report BLOCKED. Each
@@ -17,7 +17,9 @@ monthly-cancellable spend only (owner D25 via harness)`; Tiden
 product and workspace: docs/operations/tiden-product-workflow.md; spec prefix `ANYM`;
 unlinked-tests list `config/tiden-unlinked-tests.json`; Tiden CI document TIDEN-CI.md; critical
 paths and deployed consumers: section 5; live actions: send, call, ACK, pairing,
-provider-session start/stop, allowlist changes; live activity: an active call; review notes
+provider-session start/stop, allowlist changes (agents' own: an agent's webhook endpoint under
+SUBSCRIPTIONS.md Self-registration and a vendor's documented webhook host in the delivery policy,
+owner 10-28); live activity: an active call; review notes
 (Codex points, change-path grep): docs/operations/review-protocol.md; lanes:
 docs/operations/parallel-development.md.
 

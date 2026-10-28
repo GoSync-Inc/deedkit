@@ -56,7 +56,8 @@ REFERENCE_KEY = re.compile(r"(?:^|_)(?:ids?|digest|ref|token)$|^(?:account|chat|
                            r"purpose|calendar)$")
 # platform_resolve_target's `to` (ANYM-545) is a reference only when it holds an exact archive ID or person UUID.
 EXACT_TO = re.compile(r"(?:chat|msg)_[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-PHONE = re.compile(r"\+?\d(?:[\s().-]?\d){6,}")
+# At least 7 digits, at most 3 separators between two digits, so "555 - 123 - 4567" and "(555)  123  4567" count.
+PHONE = re.compile(r"\+?\d(?:[\s().-]{0,3}\d){6,}")
 # A name, a dot and an extension of 1-10 letters or digits with at least one letter (.c, .7z, .sqlite3).
 FILE_NAME = re.compile(r"[\w-]+\.(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{1,10}\b")
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?")

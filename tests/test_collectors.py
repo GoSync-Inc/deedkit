@@ -618,17 +618,23 @@ def test_disabled_and_unconfirmed_configuration_never_constructs_provider(tmp_pa
         with pytest.raises(ValueError): validate_capture(bad)
 
 
+# Upper bound of an event wait in the runner tests below: generous for a loaded host, never a timing.
+BOUND=30
+
+
 def test_runner_graceful_stop_disconnects_and_releases_lease(worker):
     w,s,_=worker
     w.archive.release(w.account,w.owner,w.state.lease[1])
     async def scenario():
+        # Wait on the connect itself, not a wall-clock poll: a loaded host runs the DB steps before it slowly.
+        connected=asyncio.Event(); connect=w.provider.connect
+        async def connecting(): await connect(); connected.set()
+        w.provider.connect=connecting
         running=asyncio.create_task(w.run())
-        for _ in range(100):
-            if w.provider.connected: break
-            await asyncio.sleep(.01)
+        await asyncio.wait_for(connected.wait(),BOUND)
         assert w.provider.connected
         w.stopping.set()
-        await asyncio.wait_for(running,5)
+        await asyncio.wait_for(running,BOUND)
     asyncio.run(scenario())
     assert w.provider.closed
     assert w.archive.acquire(w.account,'replacement')>w.state.lease[1]
@@ -654,20 +660,20 @@ def test_runner_tears_down_hung_connect_and_releases_lease(worker,reason):
         w.provider.connect=connect; w.provider.disconnect=disconnect
         w.drain_loop=w.reconcile_loop=w.media_loop=unexpected_loop
         w.provider.wait_disconnected=unexpected_loop
-        if reason=='connect_timeout': w.connect_timeout=.05
+        # A stop or a lost lease ends the hung connect by itself: the connect timeout is far past the bound.
+        w.connect_timeout=.05 if reason=='connect_timeout' else 100*BOUND
         if reason=='lease_lost': w.heartbeat=lost_lease
         running=asyncio.create_task(w.run())
         try:
-            await asyncio.wait_for(entered.wait(),3)
+            await asyncio.wait_for(entered.wait(),BOUND)
             if reason=='stop':
                 w.stopping.set()
-                # Far shorter than the normal 60s/WhatsApp 300s connect timeout.
-                await asyncio.wait_for(asyncio.shield(running),3)
+                await asyncio.wait_for(asyncio.shield(running),BOUND)
             else:
                 error=TimeoutError if reason=='connect_timeout' else RuntimeError
                 code='provider_connect_timeout' if reason=='connect_timeout' else 'collector_lease_lost'
                 with pytest.raises(error,match=code):
-                    await asyncio.wait_for(asyncio.shield(running),3)
+                    await asyncio.wait_for(asyncio.shield(running),BOUND)
         finally:
             if not running.done(): running.cancel()
             await asyncio.gather(running,return_exceptions=True)
@@ -768,7 +774,7 @@ def test_backup_covers_collector_positions_and_pending_deletions(worker,tmp_path
     directory=tmp_path/'snapshot'
     create_snapshot(s,directory,[sys.executable,'-c','print("unit-dump-stub")'])
     manifest=json.loads((directory/'manifest.json').read_text())
-    assert manifest['schema_version']==51
+    assert manifest['schema_version']==52
     assert manifest['tables']['collector_chats']['rows']==1
     assert manifest['tables']['provider_tombstones']['rows']==1
     assert verify_snapshot(s,directory)['status']=='verified'

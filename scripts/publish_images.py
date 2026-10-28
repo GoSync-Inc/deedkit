@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Publish the exact images CI built and smoke-tested to GHCR, write-once per source SHA."""
+"""Publish the exact images CI built and smoke-tested to GHCR, write-once per source SHA.
+
+A new image is pushed under a staging tag `<sha>-attempt-<run_id>-<run_attempt>` and gets its final tag `<sha>`
+only after its attestation verifies, as the same manifest bytes (ANYM-602)."""
 from __future__ import annotations
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -13,6 +17,8 @@ import subprocess
 import sys
 import tarfile
 import time
+import urllib.parse
+import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import production  # noqa: E402
@@ -113,15 +119,24 @@ class Registry:
     def name(self, target):
         return f"{self.prefix}/deedkit-{target}"
 
-    def manifest(self, reference):
-        """The raw manifest and its digest, or None when the tag does not exist."""
+    def fetch(self, reference):
+        """The raw manifest bytes of a tag or digest reference, or None when it does not exist."""
+        return self.inspect(reference)
+
+    def inspect(self, reference):
         result = read(["skopeo", "inspect", *self.tls, "--raw", "docker://" + reference])
         if result.returncode:
             # A failure that is still transient after the retries never proves absence, whatever its body says.
             if not transient(result) and any(marker in result.stderr.lower() for marker in ABSENT):
                 return None
             raise Refused(f"cannot read {reference}: {result.stderr.strip()[-400:]}")
-        raw = result.stdout.encode()
+        return result.stdout.encode()
+
+    def manifest(self, reference):
+        """The raw manifest and its digest, or None when the tag does not exist."""
+        raw = self.inspect(reference)
+        if raw is None:
+            return None
         manifest = json.loads(raw)
         if manifest.get("mediaType") not in MANIFESTS:
             raise Refused(f"{reference} is not a single-image manifest")
@@ -139,6 +154,37 @@ class Registry:
     def push(self, archive, reference):
         run(["skopeo", "copy", "--quiet", *[f"--dest-{flag[2:]}" for flag in self.tls],
              "docker-archive:" + str(archive), "docker://" + reference])
+
+    def put(self, reference, raw, media_type):
+        """PUT exactly these manifest bytes under a tag (OCI distribution spec, "Pushing manifests"). Never retried."""
+        host, _, path = reference.partition("/")
+        repository, _, tag = path.rpartition(":")
+        request = urllib.request.Request(f"{'http' if self.tls else 'https'}://{host}/v2/{repository}/manifests/{tag}",
+                                         data=raw, method="PUT", headers={"Content-Type": media_type})
+        if not self.tls:  # the dry run's localhost registry has no authentication
+            request.add_unredirected_header("Authorization", "Bearer " + self.token(host, repository))
+        try:
+            with urllib.request.urlopen(request, timeout=120):
+                pass
+        except (OSError, ValueError) as exc:  # urllib.error.URLError and HTTPError are OSErrors
+            raise Refused(f"cannot write {reference}: {exc}") from exc
+
+    def token(self, host, repository):
+        """A push token for one repository from the registry's token endpoint, for the job's GITHUB_TOKEN."""
+        user, secret = os.environ.get("ACTOR", ""), os.environ.get("GH_TOKEN", "")
+        if not user or not secret:
+            raise Refused("writing a tag needs ACTOR and GH_TOKEN")
+        query = urllib.parse.urlencode({"scope": f"repository:{repository}:pull,push", "service": host})
+        request = urllib.request.Request(f"https://{host}/token?{query}")
+        request.add_unredirected_header("Authorization", "Basic " + base64.b64encode(f"{user}:{secret}".encode()).decode())
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                token = json.loads(response.read(65536)).get("token")
+        except (OSError, ValueError) as exc:
+            raise Refused(f"no push token for {repository}: {exc}") from exc
+        if not isinstance(token, str) or not token:
+            raise Refused(f"no push token for {repository}")
+        return token
 
 
 def attested(name, digest, sha):
@@ -189,7 +235,19 @@ def tested_artifact(directory, target, sha):
     return artifact
 
 
-def publish_one(registry, target, sha, images, verify=attested):
+def staging_tag(sha, attempt):
+    return f"{sha}-attempt-{attempt}"
+
+
+def dry_run_verifier(registry, attempt):
+    """The pull request dry run has no Sigstore: only the image this dry run staged counts as attested."""
+    def verify(name, digest, sha):
+        staged = registry.manifest(f"{name}:{staging_tag(sha, attempt)}")
+        return "complete" if staged and staged[0] == digest else "none"
+    return verify
+
+
+def publish_one(registry, target, sha, images, verify=attested, attempt=None):
     name = registry.name(target)
     reference = f"{name}:{sha}"
     directory = images / f"image-{target}"
@@ -203,8 +261,12 @@ def publish_one(registry, target, sha, images, verify=attested):
     artifact = None if attestation in {"complete", "github"} else tested_artifact(directory, target, sha)
     action = decide(found, existing_config, attestation, artifact)
     if action == "push" and artifact is not None:  # decide() pushes only with an artifact
-        registry.push(directory / "image.tar", reference)
-        found = registry.manifest(reference)
+        if not attempt:
+            raise Refused("a new image needs this run's attempt for its staging tag")
+        # The final tag is written only by promote(), after the attestation of this digest verifies.
+        staging = f"{name}:{staging_tag(sha, attempt)}"
+        registry.push(directory / "image.tar", staging)
+        found = registry.manifest(staging)
         if not found or found[1]["config"]["digest"] != artifact["config_digest"]:
             raise Refused(f"pushed {target} manifest does not carry the tested image config")
     if found is None:
@@ -224,8 +286,8 @@ def each(function, targets):
     return [future.result() for future in futures]
 
 
-def publish(registry, sha, images, outputs, verify=attested, targets=TARGETS):
-    results = each(lambda target: publish_one(registry, target, sha, images, verify), targets)
+def publish(registry, sha, images, outputs, verify=attested, targets=TARGETS, attempt=None):
+    results = each(lambda target: publish_one(registry, target, sha, images, verify, attempt), targets)
     lines = []
     for result in results:
         key = output_key(result["target"])
@@ -236,10 +298,45 @@ def publish(registry, sha, images, outputs, verify=attested, targets=TARGETS):
     return results
 
 
-def confirm(registry, sha, verify=attested):
-    """After attestation: every tag names an image of this commit attested in GitHub and in the registry."""
+def promote_one(registry, target, sha, attempt, verify=attested):
+    """The final tag for this attempt's staged image, written only after its attestation verifies, as the same bytes."""
+    name = registry.name(target)
+    staged = registry.manifest(f"{name}:{staging_tag(sha, attempt)}")
+    if staged is None:
+        return None  # not pushed by this attempt: its existing final tag was reused or attested in place
+    digest, final = staged[0], registry.manifest(f"{name}:{sha}")
+    if final is not None:
+        if final[0] != digest:
+            raise Refused(f"{target} final tag holds another image than this attempt staged")
+        return digest
+    if verify(name, digest, sha) != "complete":
+        raise Refused(f"{target} staged image {digest} has no complete attestation; its final tag is not written")
+    raw = registry.fetch(f"{name}@{digest}")
+    # Any client-side conversion of the manifest would give the final tag another digest: refused before the PUT.
+    if raw is None or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
+        raise Refused(f"{target} manifest read by digest is not the verified bytes; its final tag is not written")
+    media_type = json.loads(raw).get("mediaType")
+    if media_type not in MANIFESTS:
+        raise Refused(f"{target} staged image is not a single-image manifest")
+    registry.put(f"{name}:{sha}", raw, media_type)
+    final = registry.manifest(f"{name}:{sha}")
+    if final is None or final[0] != digest:
+        raise Refused(f"{target} final tag does not hold the verified digest after promotion")
+    return digest
+
+
+def promote(registry, sha, attempt, verify=attested, targets=TARGETS):
+    return dict(zip(targets, each(lambda target: promote_one(registry, target, sha, attempt, verify), targets)))
+
+
+def confirm(registry, sha, verify=attested, attempt=None):
+    """After promotion: every final tag names an image of this commit attested in GitHub and in the registry, and a
+    target this attempt staged holds exactly the staged, verified digest."""
     def confirm_one(target):
         found = registry.manifest(f"{registry.name(target)}:{sha}")
+        staged = registry.manifest(f"{registry.name(target)}:{staging_tag(sha, attempt)}") if attempt else None
+        if found and staged and found[0] != staged[0]:
+            raise Refused(f"{target} final tag does not hold the image this attempt staged and verified")
         if not found or verify(registry.name(target), found[0], sha) != "complete":
             raise Refused(f"{target} is not published with a valid attestation")
         return f"{registry.name(target)}@{found[0]}"
@@ -248,30 +345,37 @@ def confirm(registry, sha, verify=attested):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["export", "publish", "confirm"])
+    parser.add_argument("action", choices=["export", "publish", "promote", "confirm"])
     parser.add_argument("--target", choices=TARGETS)
     parser.add_argument("--sha", required=True)
     parser.add_argument("--directory", type=Path)
+    parser.add_argument("--attempt", help="<run_id>-<run_attempt>, naming this attempt's staging tags")
     parser.add_argument("--registry", default=REGISTRY)
     parser.add_argument("--local-dry-run", action="store_true",
-                        help="plain-HTTP localhost registry, no attestation lookup (pull request dry run only)")
+                        help="plain-HTTP localhost registry, no Sigstore: publish also promotes (pull request dry run only)")
     args = parser.parse_args(argv)
     try:
         if not re.fullmatch(r"[0-9a-f]{40}", args.sha):
             raise Refused("an exact lowercase 40-character commit SHA is required")
         if args.local_dry_run and not args.registry.startswith("localhost:"):
             raise Refused("the dry run publishes only to a localhost registry")
+        if args.action != "export" and not re.fullmatch(r"[0-9]+-[0-9]+", args.attempt or ""):
+            raise Refused("--attempt <run_id>-<run_attempt> is required")
         registry = Registry(args.registry, insecure=args.local_dry_run)
-        verify = (lambda *_: "none") if args.local_dry_run else attested
+        verify = dry_run_verifier(registry, args.attempt) if args.local_dry_run else attested
         if args.action == "export":
             result = export(args.target, args.sha, args.directory)
         elif args.action == "publish":
             targets = (args.target,) if args.target else TARGETS
             # A dry run leaves no step outputs that a later step could mistake for a publication.
             outputs = None if args.local_dry_run else os.environ.get("GITHUB_OUTPUT")
-            result = publish(registry, args.sha, args.directory, outputs, verify, targets)
+            result = publish(registry, args.sha, args.directory, outputs, verify, targets, args.attempt)
+            if args.local_dry_run:  # no attest step runs between them in the dry run
+                promote(registry, args.sha, args.attempt, verify, targets)
+        elif args.action == "promote":
+            result = promote(registry, args.sha, args.attempt, verify, (args.target,) if args.target else TARGETS)
         else:
-            result = confirm(registry, args.sha, verify)
+            result = confirm(registry, args.sha, verify, args.attempt)
         print(json.dumps(result, indent=2))
     except Refused as exc:
         parser.exit(1, "publication refused: " + str(exc) + "\n")

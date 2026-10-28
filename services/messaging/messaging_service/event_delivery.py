@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
-from .egress import EgressNotSent, deadline_after, post
+from .egress import EgressNotSent, answer, deadline_after, post
 from .subscriptions import _owned, _state, _view, _worker_identity
 
 
@@ -320,7 +320,7 @@ def _transport(endpoint, body, headers, *, resolved, timeout=5):
         except OSError as error:
             raise EgressNotSent('receiver_tls_failed') from error
         with connection:
-            return post(connection, host, path, body, headers, remaining)
+            return post(connection, host, path, body, headers, remaining, retry_after=True)
 
 
 # ANYM-518: webhook delivery counts as working while the dispatcher's last pass is this recent.
@@ -519,10 +519,10 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 stats['dead_letter'] += 1
                 continue
             if hint['state'] == 'leased' and hint.get('endpoint') is not None:
-                # ANYM-582: a lease that ran out mid-attempt may have reached a vendor. Settle it before DNS, quiet
-                # hours or the budget can turn it back into a pending hint that is sent again.
-                from .delivery_endpoints import vendor_endpoint
-                if vendor_endpoint(c, hint['endpoint']):
+                # ANYM-582/585: a lease that ran out mid-attempt may have reached an at-most-once receiver. Settle it
+                # before DNS, quiet hours or the budget can turn it back into a pending hint that is sent again.
+                from .delivery_endpoints import at_most_once_endpoint
+                if at_most_once_endpoint(c, hint['endpoint']):
                     c.execute("""UPDATE subscription_outbox SET state='dead_letter',finished_at=clock_timestamp(),
                         error_code='outcome_unknown',lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
                     stats['dead_letter'] += 1
@@ -548,6 +548,9 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 owner = c.execute('SELECT principal,key_id FROM subscriptions WHERE id=%s',
                     (hint['subscription'],)).fetchone()
                 slot = admission_slot(c, owner, now)
+                if slot is None and hint.get('endpoint') is not None:
+                    from .delivery_policy import host_admission_slot
+                    slot = host_admission_slot(c, hint['endpoint'], now)
                 if slot is not None:
                     c.execute("""UPDATE subscription_outbox SET state='pending',next_attempt_at=%s,
                         lease_token=NULL,lease_until=NULL WHERE id=%s""", (slot, hint['id']))
@@ -623,6 +626,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
             live = c.execute("""SELECT 1 FROM subscription_outbox WHERE id=%s AND state='leased'
                 AND lease_token=%s AND lease_until>clock_timestamp() FOR UPDATE""", (hint['id'], lease)).fetchone()
             if live:
+                delay = min(3600, 2**(hint['attempts'] + 1))
                 if not eligible:
                     state, error = 'cancelled', refused or 'access_or_configuration_changed'
                 # The retry age starts at admission: waiting for a budget slot or quiet hours never expires a hint.
@@ -631,17 +635,17 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     state, error = 'dead_letter', 'delivery_budget_exhausted'
                 elif unsafe:
                     state, error = 'dead_letter', 'unsafe_endpoint' if endpoint else 'unsafe_receiver_configuration'
-                elif endpoint is not None and endpoint['vendor'] and hint['state'] == 'leased':
-                    # ANYM-582: a lease that ran out mid-attempt may have reached the vendor; never send it again.
+                elif endpoint is not None and endpoint['at_most_once'] and hint['state'] == 'leased':
+                    # ANYM-582/585: a lease that ran out mid-attempt may have reached the receiver; never send it again.
                     state, error = 'dead_letter', 'outcome_unknown'
                 elif endpoint is not None and target is not None:
-                    from .delivery_endpoints import caller_headers, hint_body, signed_headers, vendor_result
+                    from .delivery_endpoints import caller_headers, hint_body, outcome, signed_headers
                     body = hint_body(c, hint, row, p)
                     headers = signed_headers((endpoint['signing_secret'], endpoint['pending_secret']), hint['id'], body,
                         caller_headers(endpoint))
-                    status = failure = None
+                    status = failure = retry_after = None
                     try:
-                        status = transport(endpoint['url'], body, headers, resolved=target[1], timeout=5)
+                        status, retry_after = answer(transport(endpoint['url'], body, headers, resolved=target[1], timeout=5))
                         if type(status) is int and 200 <= status < 300:
                             state, error = 'delivered', None
                         elif type(status) is int and 300 <= status < 400:
@@ -650,10 +654,14 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                         failure = caught
                     except ValueError as caught:
                         failure, state, error = caught, 'dead_letter', 'unsafe_endpoint'
-                    if endpoint['vendor']:
-                        # A vendor host: only a documented "no run started" or an unsent request is retried.
-                        result, error = vendor_result(status, failure)
+                    if endpoint['at_most_once']:
+                        # A vendor endpoint retries only its documented "no run started" statuses and an unsent
+                        # request; a generic self-registered one only an unsent request.
+                        result, error = outcome(endpoint, status, failure)
                         state = {'delivered': 'delivered', 'retry': 'pending', 'final': 'dead_letter'}[result]
+                    if status in (429, 503) and type(retry_after) is int and retry_after > 0:
+                        # ANYM-604: the receiver's Retry-After, never sooner than the own backoff, capped at an hour.
+                        delay = min(3600, max(delay, retry_after))
                 elif prepared is not None:
                     resolved, secret, body = prepared
                     try:
@@ -661,7 +669,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                         headers = {'Content-Type': 'application/json', 'X-DeedKit-Hint-ID': str(hint['id']),
                             'X-DeedKit-Timestamp': timestamp, 'X-DeedKit-Signature': 'sha256=' +
                             hmac.new(secret, timestamp.encode() + b'.' + body, hashlib.sha256).hexdigest()}
-                        status = transport(receiver['endpoint'], body, headers, resolved=resolved, timeout=5)
+                        status = answer(transport(receiver['endpoint'], body, headers, resolved=resolved, timeout=5))[0]
                         if type(status) is int and 200 <= status < 300:
                             state, error = 'delivered', None
                         elif type(status) is int and 300 <= status < 400:
@@ -677,7 +685,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     next_attempt_at=clock_timestamp()+(%s*interval '1 second'),
                     finished_at=CASE WHEN %s='pending' THEN NULL ELSE clock_timestamp() END
                     WHERE id=%s AND state='leased' AND lease_token=%s''',
-                    (state, error, min(3600, 2**(hint['attempts'] + 1)), state, hint['id'], lease))
+                    (state, error, delay, state, hint['id'], lease))
         # Each attempt's fence hold, so a latency regression shows up in a measurement.
         holds.append(round((time.monotonic() - fenced) * 1000))
         if live:

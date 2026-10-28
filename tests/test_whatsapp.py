@@ -134,6 +134,14 @@ def test_node_raw_spool_is_compatible_with_python_validator(tmp_path):
     assert seen==[validate_capture(item)]
 
 
+# spec: ANYM-92
+def test_whatsapp_event_capture_bounds_sender_name_and_rejects_unlisted_fields():
+    for name,expected in [('N'*512,'N'*512),('N'*600,'N'*512),('Ann\x00a','Ann�a')]:
+        converted=validate_capture(capture({**event(1),'senderName':name,'senderUsername':'synthetic_user'}))
+        assert converted['kind']=='message' and converted['envelope']['sender_profile']['display_name']==expected
+    for bad in [{**event(1),'senderPhone':'15550000000'},{**event(1),'rawMessage':{}},['not','a','dict']]:
+        with pytest.raises(ValueError,match='^invalid_whatsapp_event$'):validate_capture(capture(bad))
+
 def test_wa_media_uses_same_integrity_and_fencing_path(wa):
     w,s,key=wa;w.state.apply(capture(event(1,media=True)))
     assert asyncio.run(w.media_once())

@@ -224,6 +224,13 @@ def test_orphan_multipart_or_unknown_create_blocks_another_full_candidate(config
     with pytest.raises(RuntimeError):receive(config,cloud,bid=THIRD)
     assert cloud.calls.count('create_multipart_upload')==1
 
+# spec: ANYM-287
+def test_open_cold_multipart_upload_does_not_block_backup_admission(config):
+    cloud=Cloud();cloud.uploads['cold-open']={'key':config['prefix']+'/cold/'+'c'*64+'.age','parts':{}}
+    assert receive(config,cloud)['status']=='stored' and 'cold-open' in cloud.uploads
+    cloud.uploads['backup-open']={'key':config['prefix']+'/objects/orphan','parts':{}}
+    with pytest.raises(RuntimeError,match='unresolved_upload_required'):receive(config,cloud,bid=THIRD)
+
 def test_duplicate_detects_corrupted_ciphertext_despite_matching_etag(config):
     cloud=Cloud();receive(config,cloud)
     key=next(k for k in cloud.objects if '/objects/' in k);cloud.objects[key]=b'corrupted'

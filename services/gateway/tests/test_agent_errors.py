@@ -319,3 +319,17 @@ def test_a_backend_file_name_with_any_extension_never_reaches_hint_next_or_candi
         body = relayed(client, "messages_search", {"query": "lookup"})
     assert "hint" not in body and "next" not in body
     assert body["candidates"] == [{"id": "chat-2", "label": "Synthetic 2", "kind": "chat"}]
+
+
+# spec: ANYM-544
+@pytest.mark.parametrize("phone", ["555 - 123 - 4567", "+1 (202) 555-0147", "202 . 555 . 0147", "(555)  123  4567"])
+def test_a_backend_phone_number_with_spaced_separators_never_reaches_hint_next_or_candidates(gateway, phone):
+    app, _, failures = gateway
+    failures["search"] = (409, {"error": "conflict", "hint": f"Call {phone}",
+                                "next": {"tool": "messages_search", "arguments": {"query": phone}},
+                                "candidates": [{"id": "chat-1", "label": phone, "kind": "chat"},
+                                               {"id": "chat-2", "label": "Synthetic 2", "kind": "chat"}]})
+    with TestClient(app) as client:
+        body = relayed(client, "messages_search", {"query": "lookup"})
+    assert "hint" not in body and "next" not in body
+    assert body["candidates"] == [{"id": "chat-2", "label": "Synthetic 2", "kind": "chat"}]

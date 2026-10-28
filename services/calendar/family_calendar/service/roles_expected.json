@@ -1,0 +1,49 @@
+{
+  "about": "ANYM-601: what roles.sql grants, per migration version that adds it; `db-roles --check` expects the union of versions up to the schema's. Entry: PRIVILEGE object[(column)], object `fcs` is the schema. No grant option, no PUBLIC entry, no role membership.",
+  "1": {
+    "fcs_gateway": [
+      "USAGE fcs",
+      "SELECT fcs.migrations", "SELECT fcs.people", "SELECT fcs.groups", "SELECT fcs.memberships",
+      "SELECT fcs.guardians", "SELECT fcs.connections", "SELECT fcs.calendars", "SELECT fcs.calendar_grants",
+      "SELECT fcs.bindings", "SELECT fcs.principals", "SELECT fcs.agent_calendars", "SELECT fcs.resources",
+      "SELECT fcs.occurrences", "SELECT fcs.coverage", "SELECT fcs.sync_jobs", "SELECT fcs.plans",
+      "SELECT fcs.operations", "SELECT fcs.operation_steps", "SELECT fcs.assignments", "SELECT fcs.audit",
+      "INSERT fcs.plans", "INSERT fcs.operations", "INSERT fcs.operation_steps", "INSERT fcs.sync_jobs",
+      "INSERT fcs.assignments", "INSERT fcs.audit", "UPDATE fcs.assignments",
+      "USAGE fcs.audit_id_seq"
+    ],
+    "fcs_worker": [
+      "USAGE fcs",
+      "SELECT fcs.migrations", "SELECT fcs.people", "SELECT fcs.groups", "SELECT fcs.memberships",
+      "SELECT fcs.guardians", "SELECT fcs.connections", "SELECT fcs.calendars", "SELECT fcs.calendar_grants",
+      "SELECT fcs.bindings", "SELECT fcs.principals", "SELECT fcs.agent_calendars", "SELECT fcs.resources",
+      "SELECT fcs.occurrences", "SELECT fcs.coverage", "SELECT fcs.sync_jobs", "SELECT fcs.plans",
+      "SELECT fcs.operations", "SELECT fcs.operation_steps", "SELECT fcs.assignments", "SELECT fcs.audit",
+      "INSERT fcs.resources", "UPDATE fcs.resources", "DELETE fcs.resources",
+      "INSERT fcs.occurrences", "UPDATE fcs.occurrences", "DELETE fcs.occurrences",
+      "INSERT fcs.coverage", "UPDATE fcs.coverage", "DELETE fcs.coverage",
+      "INSERT fcs.audit", "UPDATE fcs.operations", "UPDATE fcs.operation_steps", "UPDATE fcs.sync_jobs",
+      "USAGE fcs.audit_id_seq"
+    ]
+  },
+  "2": {
+    "fcs_gateway": ["SELECT fcs.guardian_rules", "SELECT fcs.projection_links"],
+    "fcs_worker": [
+      "SELECT fcs.guardian_rules", "SELECT fcs.projection_links",
+      "INSERT fcs.projection_links", "UPDATE fcs.projection_links"
+    ]
+  },
+  "3": {},
+  "4": {
+    "fcs_gateway": [
+      "SELECT fcs.schedule_selections", "INSERT fcs.schedule_selections",
+      "UPDATE fcs.plans(token_hash)", "UPDATE fcs.plans(tool)", "UPDATE fcs.plans(request)",
+      "UPDATE fcs.plans(operation_id)"
+    ],
+    "fcs_worker": ["SELECT fcs.schedule_selections"]
+  },
+  "5": {
+    "fcs_gateway": ["SELECT fcs.invitation_opt_ins"],
+    "fcs_worker": ["SELECT fcs.invitation_opt_ins"]
+  }
+}
