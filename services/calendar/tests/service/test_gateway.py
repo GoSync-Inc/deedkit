@@ -12,7 +12,8 @@ from tests.service.test_policy import SCOPES
 def test_gateway_preserves_busy_only_missing_coverage_and_calendar_grants(household, tmp_path):
     household.grant('family', 'adult-a', 'cal-a', SCOPES, 'details')
     key = household.agent('agent', 'family', 'adult-a', SCOPES, ['cal-a'], 'busy_only')
-    selected_port = port(); base = f'http://127.0.0.1:{selected_port}'
+    selected_port = port()
+    base = f'http://127.0.0.1:{selected_port}'
     direct = FamilyService(household)
     tools = ['calendar_' + n for n in ['calendars', 'members', 'agenda', 'slots']]
     with server(create_app(household, port=selected_port), selected_port), gateway(tmp_path, {'calendar': (base, key)}, {'calendar': SCOPES}, tools) as (c, _, _):
