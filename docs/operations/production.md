@@ -833,10 +833,16 @@ before any stop while that file exists and its git blob is not the release's
 `services/messaging/messaging_service/backup_runner.py`; the refusal names both
 blob ids, and under `deploy --auto` it pauses the deployer like any refusal
 before a change. A host without the file runs no backup and is not checked.
-With the timer and the backup service idle, from the prepared release:
+With the timer and the backup service idle (`systemctl is-active personal-os-backup.service
+deedkit-autodeploy.service` both not `active`/`activating`, and no active call), from the
+prepared release. The new runner's read-only `--check` must exit 0 against messaging's
+`runner.json` first: exit 3 means an unfinished journal, whose recovery stays under the
+existing rules (`--recover-stop` restarts the collectors it stopped), and the install waits:
 
 ```sh
 sha=<same-sha>; src=/var/lib/deedkit-production/$sha/source
+sudo python3 -I "$src/services/messaging/messaging_service/backup_runner.py" \
+  --config /opt/personal-os-probe/backup-config/runner.json --check   # exit 0 {"status":"idle"} or stop here
 sudo cp -p /opt/personal-os-probe/ops/backup_runner.py /opt/personal-os-probe/ops/backup_runner.py.before-$sha
 sudo install -o root -g root -m 0600 "$src/services/messaging/messaging_service/backup_runner.py" \
   /opt/personal-os-probe/ops/backup_runner.py
@@ -1429,7 +1435,10 @@ whole run, so a backup started by hand during a deploy refuses before it stops
 anything (`backup_job_already_running`) and systemd retries it every 30 minutes,
 at most three starts in 8 hours: pause the timer and let a running deploy finish
 before starting a backup by hand. While a backup holds the lock, the deploy
-exits 75 and the run counts as a skip. A skipped run (condition or lock) prints
+exits 75 and the run counts as a skip. The calendar's backup runner holds the
+same lock as its `host_lock` (BACKUP.md, Family calendar), and a manual
+`production.py deploy` (without `--auto`) takes it too, without waiting: while a
+backup holds it the deploy returns `busy` (`backup_running`) before any change. A skipped run (condition or lock) prints
 no JSON line.
 
 The unit adds no destination: `deploy` reads `main` from GitHub over HTTPS

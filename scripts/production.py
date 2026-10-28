@@ -962,6 +962,31 @@ def now():
 # stays off the host unnoticed. A host without the file runs no backup and is not checked.
 BACKUP_RUNNER = Path("/opt/personal-os-probe/ops/backup_runner.py")
 BACKUP_RUNNER_SOURCE = "services/messaging/messaging_service/backup_runner.py"
+# Messaging's runner lock: messaging's run and the calendar's (its `host_lock`, ANYM-608) hold it. A manual `deploy` takes
+# it without waiting; `deploy --auto` runs under the unit's `flock` wrapper on the same file (DEEDKIT_BACKUP_LOCK).
+BACKUP_LOCK = Path("/opt/personal-os-probe/backups/.runner.lock")
+
+
+@contextmanager
+def backup_lock():
+    """Hold the backup runner's lock, or refuse `Busy` while a backup holds it. A host without its directory runs no
+    backup."""
+    path = Path(os.environ.get("DEEDKIT_BACKUP_LOCK") or BACKUP_LOCK)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except FileNotFoundError:
+        if path.parent.exists():
+            raise
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Busy(f"backup_running: a backup holds {path}") from exc
+        yield
+    finally:
+        os.close(fd)
 
 
 def check_backup_runner(source, sha):
@@ -3842,6 +3867,8 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=
     with ExitStack() as held:
         try:
             held.enter_context(host_locks(settings, http, s))
+            if not auto:  # --auto: the unit's flock wrapper holds it for this whole run.
+                held.enter_context(backup_lock())
         except Busy as exc:
             return {"status": "busy", "reason": str(exc)}
         except Exception as exc:

@@ -1,6 +1,7 @@
 """Promotion guards use synthetic GitHub/Compose responses; no live runtime access."""
 import contextlib
 import copy
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -30,7 +31,8 @@ CHECK_SPACE, RETAIN_IMAGES, PROMOTABLE = p.check_space, p.retain_images, p.promo
 @pytest.fixture(autouse=True)
 def no_host_state(tmp_path, monkeypatch):
     """No test reads this machine's production state, /etc/deedkit, containerd, tool or systemd directory."""
-    for name in ("HOST_STATE", "CONFIG_DIRECTORY", "CONTAINERD_ROOT", "TOOL_ROOT", "SYSTEMD_DIRECTORY", "BACKUP_RUNNER"):
+    for name in ("HOST_STATE", "CONFIG_DIRECTORY", "CONTAINERD_ROOT", "TOOL_ROOT", "SYSTEMD_DIRECTORY", "BACKUP_RUNNER",
+                 "BACKUP_LOCK"):
         monkeypatch.setattr(p, name, tmp_path / "absent" / name.lower())
 
 
@@ -4954,3 +4956,51 @@ def test_deploy_pauses_before_any_step_when_a_database_copy_cannot_be_confirmed_
     outcome = host.deploy()
     assert outcome["status"] == "halted" and outcome["reason"] == "a database copy could not be stopped: " + copy_id
     assert host.paused() == outcome["reason"] and host.steps == [] and host.git == []
+
+
+def held_backup_lock(tmp_path, monkeypatch):
+    """The backup runner's lock, held by a synthetic backup run (another open file description)."""
+    path = tmp_path / "backups" / ".runner.lock"
+    path.parent.mkdir(mode=0o700)
+    monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(path))
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return path, fd
+
+
+# spec: ANYM-608
+def test_a_manual_deploy_returns_busy_before_any_change_while_a_backup_holds_its_lock(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    path, fd = held_backup_lock(tmp_path, monkeypatch)
+    try:
+        outcome = host.deploy()
+    finally:
+        os.close(fd)
+    assert outcome["status"] == "busy" and outcome["reason"].startswith("backup_running") and str(path) in outcome["reason"]
+    assert host.steps == [] and host.git == [] and host.requests == [] and host.paused() is None
+    assert not (host.state / "deploy.json").exists()
+    # Once the backup ends, the same deploy runs and releases the lock when it ends.
+    assert host.deploy()["status"] == "deployed"
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+
+
+# spec: ANYM-608
+def test_an_auto_deploy_under_the_units_held_wrapper_lock_is_not_blocked_by_it(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    _, fd = held_backup_lock(tmp_path, monkeypatch)  # the unit's `flock --nonblock` wrapper holds it
+    try:
+        outcome = host.deploy(auto=True)
+    finally:
+        os.close(fd)
+    assert outcome["status"] == "deployed" and host.steps
+
+
+# spec: ANYM-608
+def test_a_host_without_the_backup_directory_deploys_without_the_backup_lock(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(tmp_path / "absent" / ".runner.lock"))
+    assert host.deploy()["status"] == "deployed" and not (tmp_path / "absent").exists()

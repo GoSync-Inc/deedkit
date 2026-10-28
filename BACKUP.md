@@ -317,8 +317,40 @@ messaging_service.backup_worker` with `"profile": "calendar"` and the keys `id`,
 `vault_directory`, `profile_directory`, `recipient_file`, `work_directory` (read-only
 mounts of `${CALENDAR_STATE_DIR}/service/vault` and `${CALENDAR_STATE_DIR}/service`). It
 writes `bundle.tar.age`, `result.json` and `captured.json` like a staged messaging run;
-without `profile` the worker behaves as before. The host runner, receiver verification,
-scheduling, the data-policy line and the restore procedure are ANYM-608, -606, -607 and -610.
+without `profile` the worker behaves as before. Receiver verification, scheduling, the
+data-policy line and the restore procedure are ANYM-606, -607 and -610.
+
+The host runner takes it with its own `runner.json` (ANYM-608; example:
+`deploy/backup-runner-calendar.example.json`, placeholder paths only) and its own `directory`,
+journal and lock. Keys: `profile: "calendar"`, `directory`, `project`, `network`, `image`,
+`dsn_file`, `recipient_file`, `state_mounts` (`vault` and `profile`: the host paths of
+`${CALENDAR_STATE_DIR}/service/vault` and `${CALENDAR_STATE_DIR}/service`, mounted read-only at
+`/sources/vault` and `/sources/profile`), `transfer`, `timeout_seconds`, `keep_local` and
+`host_lock` (messaging's runner lock, `/opt/personal-os-probe/backups/.runner.lock`); optional
+`delivery_mode` (`staged_v1` only: the calendar worker stages) and `busy_wait_seconds`.
+`files_volume`, `mounts`, `recovery` and `dump_timeout_seconds` are refused, and so is a
+`host_lock` that is the profile's own lock. Without `profile` (or with `"messaging"`) a
+`runner.json` is read as before.
+
+A calendar run never lists, stops or starts an application container: its journal records
+`stopped: []` and names only its own worker, `deedkit-calendar-backup-<id>`, labelled with its
+project; a journal naming anything else is refused before any Docker call. Recovery
+(`--recover-stop`) stops and removes only that worker. A capture that failed before its
+`result.json` is abandoned (the job directory goes, no fence action: the calendar capture
+opens none) and the next run takes a new snapshot; an encrypted bundle and a lost receipt are
+delivered again under the same ID, with messaging's journal, `receiver_busy` wait and resume.
+The worker deletes the plaintext staging right after encryption.
+
+Exclusion: a calendar run, a `--recover-stop` and a `Persistent=` catch-up first take the
+profile's own `<directory>/.runner.lock` (held: `backup_job_already_running`), then wait up to
+5400 s for `host_lock`, polling every 5 s; at the bound the run ends `host_lock_busy` (the
+status file says so) with no journal and nothing started. It holds both until it ends. While
+it holds `host_lock`, autodeploy skips (exit 75), messaging's runner refuses
+`backup_job_already_running` and systemd retries it, and a manual `production.py deploy`
+returns `busy` (`backup_running`) before any change. `backup_runner.py --config <file>
+--check` is read-only (no Docker call, no lock, nothing created): it prints
+`{"status":"idle"}` and exits 0, or prints the unfinished journal's `id`, `phase` and the
+number of stopped collectors and exits 3.
 
 The bundle holds:
 - `database.dump`: `pg_dump --format=custom --no-owner --no-acl` of `family_calendar`,

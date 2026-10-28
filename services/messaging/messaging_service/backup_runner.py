@@ -5,6 +5,7 @@ An upload failure retains the same encrypted object for an idempotent retry.
 """
 import argparse
 import asyncio
+from contextlib import contextmanager
 from datetime import datetime,timezone
 import fcntl
 import hashlib
@@ -29,12 +30,17 @@ SAFE_ERRORS={'backup_capture_failed','backup_capture_timeout','backup_container_
     'backup_delivery_failed','invalid_backup_receipt','local_backup_corrupt','receiver_quota','receiver_disk_reserve',
     'receiver_busy','backup_id_conflict','docker_inspection_failed','docker_operation_failed',
     'backup_fence_release_failed','backup_capture_unfenced','backup_fence_retained',
-    'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop'}
+    'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop','host_lock_busy'}
 # The receiver's own verifier holds its upload lock for a whole restore (about an hour). A delivery it refuses as busy
 # before it stores anything (stream_v2: before the stream started) is offered again, same backup ID, every
 # BUSY_RETRY_SECONDS while the bound since the first offer allows; each offer keeps its upload timeout.
 BUSY_RETRY_SECONDS=60
 BUSY_WAIT_SECONDS=7200
+# The calendar profile (ANYM-608) waits this long for messaging's runner lock, which a deploy and messaging's own run
+# hold, so a 16:00 run gives up before messaging's 18:00 one. Its worker owns no application container.
+HOST_LOCK_WAIT_SECONDS=5400
+HOST_LOCK_POLL_SECONDS=5
+CALENDAR_WORKER='deedkit-calendar-backup-'
 
 
 def read_json(path,limit=65536):
@@ -57,17 +63,53 @@ def write_json(path,data):
     finally:Path(name).unlink(missing_ok=True)
 
 
+def path_valid(value):
+    p=Path(value)
+    return p.is_absolute() and '..' not in p.parts and not any(c in value for c in ',\n\r\x00') and not any(x.is_symlink() for x in [p,*p.parents])
+
+
+def transfer_valid(t):
+    return (isinstance(t,dict) and set(t)=={'host','user','identity_file','known_hosts_file'} and
+        all(isinstance(v,str) for v in t.values()) and re.fullmatch(r'[a-zA-Z0-9.:-]{1,253}',t['host']) and
+        re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}',t['user']) and all(path_valid(t[k]) for k in ('identity_file','known_hosts_file')))
+
+
+def calendar_config(cfg):
+    """`profile: calendar`: database and calendar state only, staged (ANYM-605's worker stages), messaging's lock."""
+    if set(cfg)-{'delivery_mode','busy_wait_seconds'}!={'profile','directory','project','network','image','dsn_file',
+                  'recipient_file','state_mounts','transfer','timeout_seconds','keep_local','host_lock'}:
+        raise ValueError('invalid_backup_config')
+    if cfg.get('delivery_mode','staged_v1')!='staged_v1':raise ValueError('invalid_backup_config')
+    for key in ('project','network'):
+        if not isinstance(cfg[key],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,128}',cfg[key]):raise ValueError('invalid_backup_config')
+    if not isinstance(cfg['image'],str) or not re.fullmatch(r'[a-zA-Z0-9_./:@-]{1,256}',cfg['image']):
+        raise ValueError('invalid_backup_config')
+    for key in ('directory','dsn_file','recipient_file','host_lock'):
+        if not isinstance(cfg[key],str) or not path_valid(cfg[key]):raise ValueError('invalid_backup_path')
+    # Its own lock as host_lock would block the run on itself.
+    if Path(cfg['host_lock'])==Path(cfg['directory'])/'.runner.lock':raise ValueError('invalid_backup_path')
+    mounts=cfg['state_mounts']
+    if (not isinstance(mounts,dict) or set(mounts)!={'vault','profile'} or
+        not all(isinstance(v,str) and path_valid(v) for v in mounts.values())):raise ValueError('invalid_backup_mount')
+    if not transfer_valid(cfg['transfer']):raise ValueError('invalid_backup_transfer')
+    if type(cfg['timeout_seconds']) is not int or not 60<=cfg['timeout_seconds']<=7200:raise ValueError('invalid_backup_timeout')
+    if type(cfg.get('busy_wait_seconds',0)) is not int or not 0<=cfg.get('busy_wait_seconds',0)<=7200:
+        raise ValueError('invalid_backup_timeout')
+    if type(cfg['keep_local']) is not int or not 1<=cfg['keep_local']<=24:raise ValueError('invalid_backup_retention')
+    return cfg
+
+
 def config(path):
     cfg=read_json(path)
-    if set(cfg)-{'delivery_mode','busy_wait_seconds','dump_timeout_seconds'}!={'directory','project','network','image','files_volume','dsn_file','recipient_file',
+    if not isinstance(cfg,dict) or cfg.get('profile','messaging') not in ('messaging','calendar'):
+        raise ValueError('invalid_backup_config')
+    if cfg.get('profile')=='calendar':return calendar_config(cfg)
+    if set(cfg)-{'profile','delivery_mode','busy_wait_seconds','dump_timeout_seconds'}!={'directory','project','network','image','files_volume','dsn_file','recipient_file',
                   'mounts','recovery','transfer','timeout_seconds','keep_local'}:raise ValueError('invalid_backup_config')
     if cfg.get('delivery_mode','staged_v1') not in ('staged_v1','stream_v2'):raise ValueError('invalid_backup_config')
     for key in ('project','network','files_volume'):
         if not isinstance(cfg[key],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,128}',cfg[key]):raise ValueError('invalid_backup_config')
     if not re.fullmatch(r'[a-zA-Z0-9_./:@-]{1,256}',cfg['image']):raise ValueError('invalid_backup_config')
-    def path_valid(value):
-        p=Path(value)
-        return p.is_absolute() and '..' not in p.parts and not any(c in value for c in ',\n\r\x00') and not any(x.is_symlink() for x in [p,*p.parents])
     for key in ('directory','dsn_file','recipient_file'):
         if not isinstance(cfg[key],str) or not path_valid(cfg[key]):raise ValueError('invalid_backup_path')
     aliases=set()
@@ -243,7 +285,14 @@ class Runner:
         if self.root.is_symlink() or self.root.stat().st_mode&0o077:raise ValueError('private_backup_directory_required')
         self.journal_path=self.root/'journal.json';self.status_path=self.root/'status.json'
         self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
+        self.calendar=cfg.get('profile')=='calendar'
     def save(self):write_json(self.journal_path,self.journal)
+    def load(self):
+        self.journal=read_json(self.journal_path)
+        if not ID.fullmatch(self.journal['id']):raise ValueError('invalid_backup_journal')
+        # A calendar job names only its own worker: never an application container to stop, start or remove.
+        if self.calendar and (self.journal['stopped'] or self.journal['container']!=CALENDAR_WORKER+self.journal['id'].lower()):
+            raise ValueError('invalid_backup_journal')
     def deliver(self,send,sent=lambda:False):
         """`send()`, offered again while the receiver answers busy and `sent()` says the stream has not started; a new
         offer starts only within the bound since the first. Returns the receipt and the seconds before the offer that
@@ -288,16 +337,31 @@ class Runner:
             if not info['State']['Running']:self.docker.call('start',saved['id'])
             self.journal['stopped'].remove(saved);self.save()
     def prepare(self):
-        if self.journal_path.exists():
-            self.journal=read_json(self.journal_path)
-            if not ID.fullmatch(self.journal['id']):raise ValueError('invalid_backup_journal')
-            return
+        if self.journal_path.exists():return self.load()
         backup_id=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(8)
         work=self.root/backup_id;work.mkdir(mode=0o700)
-        self.journal={'id':backup_id,'phase':'stopping','stopped':self.docker.running_collectors(self.cfg['project']),
-                      'created':self.clock(),'container':'pos-backup-'+backup_id.lower()}
+        stopped=[] if self.calendar else self.docker.running_collectors(self.cfg['project'])
+        self.journal={'id':backup_id,'phase':'stopping','stopped':stopped,'created':self.clock(),
+                      'container':(CALENDAR_WORKER if self.calendar else 'pos-backup-')+backup_id.lower()}
         self.save();self.status('capturing')
+    def create_calendar_worker(self,work):
+        """The calendar profile's worker: its database, vault and profile files read-only, no files volume."""
+        write_json(work/'worker.json',{'profile':'calendar','id':self.journal['id'],'dsn_file':'/run/secrets/database_url',
+            'vault_directory':'/sources/vault','profile_directory':'/sources/profile',
+            'recipient_file':'/run/secrets/recipient','work_directory':'/work'})
+        mounts=self.cfg['state_mounts']
+        self.docker.call('create','--name',self.journal['container'],'--label','personal-os.backup.id='+self.journal['id'],
+            '--label','personal-os.backup.project='+self.cfg['project'],'--network',self.cfg['network'],
+            '--read-only','--user','0','--cap-drop','ALL','--cap-add','DAC_OVERRIDE','--security-opt','no-new-privileges',
+            '--memory','384m','--cpus','0.75','--pids-limit','64','--tmpfs','/tmp:size=32m,noexec,nosuid',
+            '--mount','type=bind,src='+str(work)+',dst=/work',
+            '--mount','type=bind,src='+str(work/'worker.json')+',dst=/run/secrets/backup_config,readonly',
+            '--mount','type=bind,src='+self.cfg['dsn_file']+',dst=/run/secrets/database_url,readonly',
+            '--mount','type=bind,src='+self.cfg['recipient_file']+',dst=/run/secrets/recipient,readonly',
+            '--mount','type=bind,src='+mounts['vault']+',dst=/sources/vault,readonly',
+            '--mount','type=bind,src='+mounts['profile']+',dst=/sources/profile,readonly',self.cfg['image'])
     def create_worker(self,work):
+        if self.calendar:return self.create_calendar_worker(work)
         streaming=self.cfg.get('delivery_mode')=='stream_v2'
         if streaming:
             if not (work/'snapshot').exists():
@@ -462,6 +526,7 @@ class Runner:
         write_json(work/'delivery.json',receipt)
         self.cleanup_plaintext(work);self.finish(work,result,receipt)
     def release_fence(self,work):
+        if self.calendar:return  # The calendar capture opens no attachment fence.
         metadata=read_json(work/('stream.json' if (work/'stream.json').exists() else 'result.json'))
         if 'backup_fence' not in metadata:return  # Pre-lifecycle deliveries remain compatible.
         if metadata['backup_fence']!=self.journal['id']:raise RuntimeError('backup_capture_unfenced')
@@ -541,6 +606,12 @@ class Runner:
             # Durable decision first: a lost acknowledgement is read back, never guessed.
             self.journal['phase']='abandoning';self.save()
         jid=self.journal['id']
+        if self.calendar:
+            # No fence to end: removing the undelivered job is the whole abandonment.
+            self.remove_abandoned(work)
+            status=read_json(self.status_path) if self.status_path.exists() else {}
+            status.update(abandoned_id=jid);write_json(self.status_path,status)
+            return self.journal_path.unlink()
         results=[{'id':jid,'backup_fence':jid,'status':s} for s in ('fence_released','fence_absent')]
         try:
             # Nothing here is reusable. Every attempt reads the outcome back from
@@ -596,9 +667,9 @@ class Runner:
     def recover_stop(self):
         """systemd ExecStopPost: settle the owned container, then resume its collectors."""
         if not self.journal_path.exists():return
-        self.journal=read_json(self.journal_path)
-        if not ID.fullmatch(self.journal['id']):raise ValueError('invalid_backup_journal')
-        for kind in ('release','abandon'):self.settle_fence_action(kind)
+        self.load()
+        if not self.calendar:
+            for kind in ('release','abandon'):self.settle_fence_action(kind)
         info=self.check_worker(self.docker.inspect(self.journal['container']))
         if info and info['State']['Running']:
             self.docker.call('stop','--time','25',self.journal['container'])
@@ -619,28 +690,69 @@ class Runner:
             self.status('error','backup_job_failed')
 
 
+@contextmanager
+def hold_locks(cfg):
+    """The runner's own lock; a calendar run then also messaging's lock (`host_lock`), the one a deploy holds.
+
+    The host lock is waited for at most HOST_LOCK_WAIT_SECONDS (`host_lock_busy`); both are held until the run ends.
+    """
+    fds=[]
+    try:
+        fds.append(os.open(Path(cfg['directory'])/'.runner.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600))
+        try:fcntl.flock(fds[0],fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise RuntimeError('backup_job_already_running') from None
+        if cfg.get('profile')=='calendar':
+            fds.append(os.open(cfg['host_lock'],os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600))
+            deadline=time.monotonic()+HOST_LOCK_WAIT_SECONDS
+            while True:
+                try:fcntl.flock(fds[1],fcntl.LOCK_EX|fcntl.LOCK_NB);break
+                except BlockingIOError:
+                    left=deadline-time.monotonic()
+                    if left<=0:raise RuntimeError('host_lock_busy') from None
+                    time.sleep(min(HOST_LOCK_POLL_SECONDS,left))
+        yield
+    finally:
+        for fd in reversed(fds):os.close(fd)
+
+
+def check(cfg):
+    """Read-only: does an unfinished journal exist? No Docker call, no lock, nothing created."""
+    profile=cfg.get('profile','messaging');journal=Path(cfg['directory'])/'journal.json'
+    if not os.path.lexists(journal):
+        print(json.dumps({'status':'idle','profile':profile}),flush=True);return 0
+    data=read_json(journal)
+    print(json.dumps({'status':'unfinished','profile':profile,'id':data.get('id'),'phase':data.get('phase'),
+                      'stopped':len(data.get('stopped') or [])}),flush=True)
+    return 3
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',type=Path,required=True);parser.add_argument('--recover-stop',action='store_true')
+    parser.add_argument('--check',action='store_true',help='report an unfinished journal (exit 3); read-only')
     args=parser.parse_args();os.umask(0o077)
+    if args.check:raise SystemExit(check(config(args.config)))
     def interrupted(*_):raise InterruptedError('backup_interrupted')
     signal.signal(signal.SIGTERM,interrupted);signal.signal(signal.SIGINT,interrupted)
     runner=Runner(config(args.config))
-    lock=os.open(runner.root/'.runner.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
-    owns_lock=False
+    owns_lock=False;code='backup_job_failed'
     try:
-        try:
-            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);owns_lock=True
-        except BlockingIOError:raise RuntimeError('backup_job_already_running') from None
-        if args.recover_stop:runner.recover_stop()
-        else:runner.run()
-    except Exception:
-        if owns_lock:
-            try:runner.recover_stop()
-            except Exception:pass  # Journal remains for ExecStopPost / next operator run.
-        print('{"status":"error","code":"backup_job_failed"}',flush=True)
+        with hold_locks(runner.cfg):
+            owns_lock=True
+            try:
+                if args.recover_stop:runner.recover_stop()
+                else:runner.run()
+            except Exception:
+                try:runner.recover_stop()
+                except Exception:pass  # Journal remains for ExecStopPost / next operator run.
+                raise
+    except Exception as exc:
+        if not owns_lock and str(exc)=='host_lock_busy':
+            code='host_lock_busy'
+            try:runner.status('error',code)
+            except Exception:pass
+        print(json.dumps({'status':'error','code':code},separators=(',',':')),flush=True)
         raise SystemExit(1) from None
-    finally:os.close(lock)
 
 
 if __name__=='__main__':main()
