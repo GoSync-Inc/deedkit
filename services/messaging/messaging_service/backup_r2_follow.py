@@ -505,8 +505,10 @@ def follow(path, *, engine=None, main=None, attest=None, test=None):
         status = {'v': 1, 'status': 'current', 'revision': config['helper_revision'], 'checked_at': verifier.now()}
         try:
             config = reload(path, config); status['revision'] = config['helper_revision']
+            # Leftover self-test containers go first, also while a verification retry waits for its resources.
+            sweep_self_tests(engine, config['directory'])
             no_retry_pending(fd)
-            sweep_self_tests(engine, config['directory']); recover(fd, engine, config); config = reload(path, config)
+            recover(fd, engine, config); config = reload(path, config)
             current = read_record(fd, CURRENT)
             if not pinned(current, config):current = None
             head = main.head(); refusal = untested = None
@@ -553,8 +555,9 @@ def revert(path, *, engine=None):
     engine = engine if engine is not None else Docker(600)
     with verifier.verifier_lock(config['directory']) as fd:
         config = reload(path, config)
+        sweep_self_tests(engine, config['directory'])
         no_retry_pending(fd)
-        sweep_self_tests(engine, config['directory']); recover(fd, engine, config); config = reload(path, config)
+        recover(fd, engine, config); config = reload(path, config)
         previous = read_record(fd, PREVIOUS)
         if previous is None:raise ValueError('no_previous_pair')
         engine.preflight({**config, 'helper_image': previous['helper_image'], 'helper_revision': previous['helper_revision']})

@@ -1097,3 +1097,16 @@ def test_follow_sweeps_an_interrupted_self_test_before_anything_else(follower):
     (s.directory/(s.f.SELF_TEST+run)).mkdir(mode=0o700);s.docker.resources[('helper',probe)]={}
     s.revert()
     assert not s.docker.resources and not (s.directory/(s.f.SELF_TEST+run)).exists()
+
+
+# spec: ANYM-597
+def test_follow_sweeps_an_interrupted_self_test_while_a_verification_retry_waits(follower):
+    s=follower;s.run()
+    run='a'*32;probe=s.f.self_test_containers(run)[0][0]
+    active=s.directory/'active.json';s.write_json(active,{'v':1,'phase':'restoring'})
+    journal=active.read_bytes();pins=s.path.read_bytes()
+    for entry in (s.run,s.revert):
+        (s.directory/(s.f.SELF_TEST+run)).mkdir(mode=0o700);s.docker.resources[('helper',probe)]={}
+        with pytest.raises(RuntimeError,match='verification_pending'):entry()
+        assert not s.docker.resources and not (s.directory/(s.f.SELF_TEST+run)).exists()
+        assert active.read_bytes()==journal and s.path.read_bytes()==pins
