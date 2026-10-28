@@ -946,6 +946,14 @@ or writes it, so it has no grant. A schema-43 runtime refuses schema 44, so it s
 release; update the pinned backup and restore runtimes first. Calendar migration 3 adds the same
 table for agents (`principal_operations`, no lock on `principals`). Rollback: existing keys are
 untouched; only keys issued with `--operation-id` have an operation row.
+Calendar migrations by hand (ANYM-601): after the calendar `migrate`, run `db-roles` and then
+`db-roles --check` in the same step, before the calendar services restart
+(`services/calendar/docs/SERVICE.md`, Grants). A non-zero check (`db_roles_drift`, one line per
+missing or extra grant, membership or role) stops the release; fix the cause, rerun both. A crash
+between `migrate` and `db-roles` leaves the new schema with the old grants; rerunning `db-roles`
+and `--check` repairs it. `db-roles` revokes any privilege the service roles hold on
+`principal_operations` (granted by the former `ALL TABLES` line on 2026-10-28); undo of that
+narrowing: `GRANT SELECT ON fcs.principal_operations TO fcs_gateway, fcs_worker`.
 Messaging migration 043 (`manual`, ANYM-283) is additive: the new `person_links` table
 with a SELECT grant to the gateway role. A schema-42 runtime refuses schema 43, so it ships
 with its release; update the pinned backup and restore runtimes first, since earlier ones
