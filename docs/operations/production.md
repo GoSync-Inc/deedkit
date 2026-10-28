@@ -657,7 +657,12 @@ first).
    They drop host-bound packets from both bridges, `dk-delivery0` (egress) and `dk-deliverydb0` (the
    internal database network, which still has a host gateway address), and, from `dk-delivery0`, the
    tailnet (100.64.0.0/10), RFC 1918, link-local and metadata (169.254.0.0/16), loopback and every
-   IPv6 packet; they allow DNS to `<ip>` and TCP 443 to public addresses. Undo: `rules --undo`.
+   IPv6 packet; they allow DNS to `<ip>` and TCP 443 to public addresses. Fail closed: the overlay
+   turns Docker's masquerade off for `dk-delivery0`, and the only NAT is the printed `-t nat` rule,
+   which matches a mark the first rule of `DEEDKIT-DELIVERY` sets on packets that then reach a
+   `RETURN`. A lost `DOCKER-USER` jump, a flushed chain or a boot without the filter rules leaves
+   every packet unmarked and unNATed, so no reply and no connection, whichever path started the
+   container. Without the NAT rule the dispatcher has no internet. Undo: `rules --undo`.
 5. First enrollment (owner-authorized, once; `production.py` cannot do it: a selected service must
    already run, `snapshot`, and databases are never restarted). The host is on a release with this
    code, applied by `production.py`; `I=deedkit-production-runtime:<that sha>` is its verified image

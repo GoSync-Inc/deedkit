@@ -1,7 +1,10 @@
 """Dispatcher egress isolation (ANYM-534): the host rules and the connectivity check for the receipt.
 
 `rules --resolver IP` prints the host firewall commands for the dispatcher bridge dk-delivery0 (a host step the
-owner approves; nothing here changes a firewall). `check` runs inside the dispatcher container, stdlib only:
+owner approves; nothing here changes a firewall). Fail closed by construction: Docker does not masquerade that bridge
+(compose.delivery.yaml), and the only NAT is a host rule for packets the filter chain marked on their way to RETURN.
+A lost jump, a flushed chain or a missing filter load leaves packets unmarked and unNATed: no reply, no connection.
+`check` runs inside the dispatcher container, stdlib only:
 
     docker compose ... exec -T delivery python -I - check --open db:5432 --open example.com:443 \\
         --blocked 172.18.0.5:8080 ... < scripts/delivery_egress_check.py
@@ -30,14 +33,18 @@ CHAIN = 'DEEDKIT-DELIVERY'
 # Host-local, private, tailnet (CGNAT), link-local (with metadata 169.254.169.254), multicast and reserved.
 DROPPED = ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12',
            '192.0.0.0/24', '192.168.0.0/16', '198.18.0.0/15', '224.0.0.0/4', '240.0.0.0/4')
+# Bit 25 of the packet mark: clear of Docker, tailscale (0xff0000) and kube-proxy (0xc000).
+MARK = '0x2000000/0x2000000'
+NAT = f'-t nat -I POSTROUTING -m mark --mark {MARK} -j MASQUERADE'
 
 
 def rules(resolver):
     allow = [f'iptables -A {CHAIN} -d {resolver} -p {proto} --dport 53 -j RETURN' for proto in ('udp', 'tcp')]
-    return ([f'iptables -N {CHAIN}', f'iptables -F {CHAIN}', *allow] +
+    # The first rule marks every packet; only those that reach a RETURN leave the chain, so only they get NAT.
+    return ([f'iptables -N {CHAIN}', f'iptables -F {CHAIN}', f'iptables -A {CHAIN} -j MARK --set-xmark {MARK}', *allow] +
             [f'iptables -A {CHAIN} -d {network} -j DROP' for network in DROPPED] +
             [f'iptables -A {CHAIN} -p tcp --dport 443 -j RETURN', f'iptables -A {CHAIN} -j DROP',
-             f'iptables -I DOCKER-USER -i {BRIDGE} -j {CHAIN}',
+             f'iptables -I DOCKER-USER -i {BRIDGE} -j {CHAIN}', f'iptables {NAT}',
              # Packets to the host itself are not forwarded, so DOCKER-USER never sees them; both bridges.
              *[f'iptables -I INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, DB_BRIDGE)],
              # The bridges have no IPv6 (enable_ipv6: false); these drop ULA, NAT64 and everything else anyway.
@@ -46,7 +53,7 @@ def rules(resolver):
 
 
 def undo():
-    return [f'iptables -D DOCKER-USER -i {BRIDGE} -j {CHAIN}',
+    return [f'iptables -D DOCKER-USER -i {BRIDGE} -j {CHAIN}', f'iptables {NAT.replace(" -I ", " -D ")}',
             *[f'iptables -D INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, DB_BRIDGE)],
             f'ip6tables -D DOCKER-USER -i {BRIDGE} -j DROP',
             *[f'ip6tables -D INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, DB_BRIDGE)],

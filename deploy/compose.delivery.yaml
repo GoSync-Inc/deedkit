@@ -3,8 +3,10 @@
 # The dispatcher reaches PostgreSQL only over delivery_db (internal bridge dk-deliverydb0, no API, matcher,
 # gateway or collector) and the internet only over its own bridge dk-delivery0. The host rules from
 # `scripts/delivery_egress_check.py rules` drop host-bound packets on both bridges and restrict dk-delivery0 to
-# DNS on DELIVERY_RESOLVER and public 443 (docs/operations/production.md). An explicit `dns` makes Docker's
-# embedded resolver query DELIVERY_RESOLVER from the container namespace, so those rules apply to DNS too.
+# DNS on DELIVERY_RESOLVER and public 443 (docs/operations/production.md). Docker does not masquerade dk-delivery0:
+# its only NAT is the host rule for packets those filter rules passed, so without them nothing gets a reply (fail
+# closed on every start path). An explicit `dns` makes Docker's embedded resolver query DELIVERY_RESOLVER from the
+# container namespace, so those rules apply to DNS too.
 services:
   delivery:
     image: anymsg-delivery:${MESSAGING_VERSION:-0.9.19}
@@ -74,3 +76,4 @@ networks:
     enable_ipv6: false
     driver_opts:
       com.docker.network.bridge.name: dk-delivery0
+      com.docker.network.bridge.enable_ip_masquerade: "false"
