@@ -24,6 +24,13 @@ from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy
 
 # open_chat_by_phone: both adapter calls and the archive check (the native lookup's 10 s).
 PHONE_RESOLUTION_SECONDS=10
+
+
+def exit_detail(returncode):
+    """The fixed CHILD_EXIT_DETAILS value of an adapter child's exit status; None while it runs."""
+    if type(returncode) is not int:return None
+    if returncode<0:return 'exit_killed' if returncode==-signal.SIGKILL else 'exit_signal'
+    return {0:'exit_clean',1:'exit_error',2:'exit_panic'}.get(returncode,'exit_other')
 # How long history waits for whatsmeow's own auto-reconnect: the connect_timeout a fresh start gets.
 NOT_READY_WAIT_SECONDS=300
 HISTORY_READS=('dialogs','page')
@@ -242,7 +249,10 @@ class NodeProvider:
         return bool(directory) and (Path(directory)/'.transport-failure').exists()
     async def wait_disconnected(self):
         await self.process.wait()
-        raise RuntimeError(self.failure_code())
+        stop=RuntimeError(self.failure_code())
+        # A child that recorded no failure still says how it ended (Tiden 1d532d67 had only the bare code).
+        if str(stop)=='provider_disconnected' and not self.failure_recorded():stop.detail=exit_detail(self.process.returncode)
+        raise stop
     async def request(self,method,params,*,sending=False):
         if not self.process or self.process.returncode is not None: raise RuntimeError(self.failure_code())
         self.counter+=1
@@ -650,9 +660,9 @@ def main():
     args=parser.parse_args();os.umask(0o077)
     try:asyncio.run(run_config(args.config))
     except Exception as exc:
-        code,_,event=collector_stop(exc,'whatsapp')
+        code,detail,event=collector_stop(exc,'whatsapp')
         capture(exc, event)
-        print(json.dumps({'status':'stopped','code':code}),flush=True)
+        print(json.dumps({'status':'stopped','code':code,**({'detail':detail} if detail else {})}),flush=True)
         raise SystemExit(1) from None
 
 

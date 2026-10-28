@@ -320,7 +320,7 @@ def stopped(component, monkeypatch, text, detail=None, stop=None):
     ('whatsapp', 'provider_disconnected', None, 'provider_disconnected', {'code': 'provider_disconnected'}),
     ('whatsapp', 'whatsapp_logged_out', None, 'whatsapp_logged_out', {'code': 'collector_failed'}),
     ('whatsapp', 'durable_capture_failed', None, 'durable_capture_failed', {'code': 'collector_failed'}),
-    # Only Telegram records a fixed capture detail; WhatsApp never qualifies its code.
+    # Only Telegram records a fixed capture detail; WhatsApp never qualifies a capture code.
     ('whatsapp', 'durable_capture_failed', 'spool_full', 'durable_capture_failed', {'code': 'collector_failed'}),
     ('whatsapp', SECRET, None, 'collector_failed', {'code': 'collector_failed'}),
 ])
@@ -440,7 +440,9 @@ def test_stop_codes_are_allowlisted_for_collectors_only():
     from messaging_service.operational import CONNECTION_ERRORS, SUPERVISOR_STOP_CODES
     durable = {'durable_capture_failed.' + detail for detail in CAPTURE_STOP_DETAILS}
     assert telemetry.STOP_CODES['telegram'] == SUPERVISOR_STOP_CODES['telegram'] | CONNECTION_ERRORS | durable
-    assert telemetry.STOP_CODES['whatsapp'] == SUPERVISOR_STOP_CODES['whatsapp'] | CONNECTION_ERRORS
+    from messaging_service.operational import CHILD_EXIT_DETAILS
+    exits = {'provider_disconnected.' + detail for detail in CHILD_EXIT_DETAILS}
+    assert telemetry.STOP_CODES['whatsapp'] == SUPERVISOR_STOP_CODES['whatsapp'] | CONNECTION_ERRORS | exits
     assert telemetry.safe_event(error(), 'telegram', 'durable_capture_failed.spool_io_error')
     assert telemetry.safe_event(error(), 'whatsapp', 'durable_capture_failed.spool_io_error') is None
     for component in ('telegram', 'whatsapp'):
@@ -470,7 +472,7 @@ def test_telemetry_document_lists_the_stop_vocabulary():
         section = re.search(rf'^{title}: (.+?)\.$', text, re.M | re.S)
         return set(re.findall(r'`([a-z_.]+)`', section.group(1)))
     # Both collectors share the stop codes; a split must be documented.
-    assert listed('Collector stop codes') == telemetry.STOP_CODES['whatsapp']
+    assert listed('Collector stop codes') | listed('WhatsApp only') == telemetry.STOP_CODES['whatsapp']
     assert listed('Collector stop codes') | listed('Telegram only') == telemetry.STOP_CODES['telegram']
 
 
@@ -566,3 +568,59 @@ def test_telemetry_document_states_the_fingerprint_and_grouping_rule():
     from pathlib import Path
     text = (Path(__file__).resolve().parents[1]/'TELEMETRY.md').read_text()
     assert '`fingerprint`' in text and '["collector-stop", <component>, <code>]' in text
+
+
+# spec: ANYM-292
+@pytest.mark.parametrize('component,text,detail,code,line', [
+    ('whatsapp', 'provider_disconnected', 'exit_panic', 'provider_disconnected.exit_panic',
+     {'code': 'provider_disconnected', 'detail': 'exit_panic'}),
+    ('whatsapp', 'provider_disconnected', 'exit_killed', 'provider_disconnected.exit_killed',
+     {'code': 'provider_disconnected', 'detail': 'exit_killed'}),
+    ('whatsapp', 'provider_disconnected', SECRET, 'provider_disconnected', {'code': 'provider_disconnected'}),
+    ('whatsapp', 'provider_disconnected', LooksSafe(SECRET, 'exit_panic'), 'provider_disconnected',
+     {'code': 'provider_disconnected'}),
+    ('whatsapp', 'provider_disconnected.exit_panic', None, 'collector_failed', {'code': 'collector_failed'}),
+    ('whatsapp', 'whatsapp_logged_out', 'exit_error', 'whatsapp_logged_out', {'code': 'collector_failed'}),
+    ('telegram', 'provider_disconnected', 'exit_panic', 'provider_disconnected', {'code': 'provider_disconnected'}),
+])
+def test_whatsapp_child_exit_detail_names_how_the_adapter_ended(component, text, detail, code, line, monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr(telemetry, 'capture', lambda error, code: seen.append(code))
+    stopped(component, monkeypatch, text, detail)
+    assert seen == [code]
+    assert json.loads(capsys.readouterr().out) == {'status': 'stopped', **line}
+
+
+# spec: ANYM-292
+def test_whatsapp_child_exit_code_is_its_own_issue_on_the_wire(monkeypatch):
+    event = stop_event('whatsapp', 'provider_disconnected', 'exit_panic', monkeypatch)
+    assert event['fingerprint'] == ['collector-stop', 'whatsapp', 'provider_disconnected.exit_panic']
+    assert event['tags']['error_code'] == 'provider_disconnected.exit_panic'
+    assert SECRET not in json.dumps(event)
+    assert telemetry.safe_event(error(), 'telegram', 'provider_disconnected.exit_panic') is None
+
+
+# spec: ANYM-292
+@pytest.mark.parametrize('returncode,recorded,detail', [
+    (0, None, 'exit_clean'), (1, None, 'exit_error'), (2, None, 'exit_panic'), (3, None, 'exit_other'),
+    (-9, None, 'exit_killed'), (-15, None, 'exit_signal'),
+    # A recorded failure is its own code, or a deliberate exit: no exit detail is added.
+    (1, {'code': 'whatsapp_logged_out'}, None), (1, {'code': SECRET}, None),
+])
+def test_adapter_child_exit_status_becomes_the_stop_detail(tmp_path, returncode, recorded, detail):
+    import asyncio
+    from types import SimpleNamespace
+    from messaging_service import whatsapp_collector
+    events = tmp_path/'events'
+    events.mkdir(mode=0o700)
+    if recorded is not None:
+        (events/'.transport-failure').write_text(json.dumps(recorded))
+        (events/'.transport-failure').chmod(0o600)
+    provider = object.__new__(whatsapp_collector.WhatsmeowProvider)
+    async def wait(): return returncode
+    provider.cfg = {'events_directory': str(events)}
+    provider.process = SimpleNamespace(wait=wait, returncode=returncode)
+    with pytest.raises(RuntimeError) as stop:
+        asyncio.run(provider.wait_disconnected())
+    assert str(stop.value) == ('whatsapp_logged_out' if recorded == {'code': 'whatsapp_logged_out'} else 'provider_disconnected')
+    assert getattr(stop.value, 'detail', None) == detail
