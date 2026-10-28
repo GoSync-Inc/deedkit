@@ -218,6 +218,8 @@ def retire(mine, docker, marks, clock):
             continue
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # refused while a launcher holds the mark
+            if not os.path.samestat(os.fstat(fd), os.stat(mark)):
+                continue  # another retire() removed this mark meanwhile; a newer one may be leased
             if made:
                 os.utime(fd, (0, 0))  # made here: no launcher has named it
             if clock() - os.fstat(fd).st_mtime < IDLE or docker(
@@ -449,7 +451,9 @@ def running(name, docker=call):
     try:
         return docker(['docker', 'inspect', '--format', '{{.State.Running}}', name]).strip() == 'true'
     except Refused as error:
-        if 'no such' in str(error).lower():  # `docker inspect` says `no such object`, the daemon `No such container`
+        # Docker's own answer for this container only (the CLI says `no such object: NAME`, the daemon `No such
+        # container: NAME`); a socket's `no such file or directory` is no answer
+        if re.search(rf'no such (?:object|container): {re.escape(name)}(?:\s|$)', str(error), re.I):
             return None
         raise
 

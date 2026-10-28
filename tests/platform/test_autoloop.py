@@ -13,6 +13,7 @@ import sys
 import tarfile
 import threading
 import time
+import types
 
 import pytest
 
@@ -2390,7 +2391,7 @@ def test_a_stop_counts_only_when_docker_confirms_the_container_stopped_or_gone()
 
     def gone(argv, timeout=None):
         if argv[1] == 'inspect':
-            raise launcher.Refused('docker inspect: exit 1: Error: No such object: x')
+            raise launcher.Refused('docker inspect: exit 1: Error: No such object: ' + BUILD)
         return ''
     assert launcher.stop(BUILD, gone) is True
     with pytest.raises(launcher.Refused):
@@ -2563,7 +2564,6 @@ def test_a_build_that_ends_without_finish_is_interrupted_on_the_host_and_frees_i
     assert launcher.requests(json.dumps({'action': 'end', 'intent': BUILD}), BUILD) == []
 
 
-# spec: ANYM-574
 def proxy_docker(proxies, users, calls, arrive=None):
     """A fake docker CLI for the proxies: `proxies` maps each proxy to its image, `users` holds the proxies a
     labelled container uses; `arrive` runs at the in-use check."""
@@ -2589,6 +2589,7 @@ def proxy_docker(proxies, users, calls, arrive=None):
     return docker
 
 
+# spec: ANYM-574
 def test_a_new_runner_image_gets_its_own_proxy_and_an_older_one_is_stopped_only_when_idle(tmp_path, monkeypatch):
     old, new = 'deedkit_autoloop_proxy_old', 'deedkit_autoloop_proxy_new'  # the images img:old and img:new
     proxies, users, calls = {}, {old}, []
@@ -2631,8 +2632,8 @@ def test_the_proxy_refuses_ipv6_addresses_that_carry_an_ipv4_address():
 
 # spec: ANYM-574
 def test_a_container_docker_reports_missing_in_its_own_words_counts_as_gone():
-    for message in ('docker inspect: exit 1: Error: no such object: x',  # the docker CLI 29 on the owner Mac
-                    'docker inspect: exit 1: Error response from daemon: No such container: x'):
+    for message in (f'docker inspect: exit 1: Error: no such object: {BUILD}',  # the docker CLI 29 on the owner Mac
+                    f'docker inspect: exit 1: Error response from daemon: No such container: {BUILD}'):
         def gone(argv, timeout=None):
             if argv[1] == 'inspect':
                 raise launcher.Refused(message)
@@ -2707,5 +2708,47 @@ def test_a_proxy_another_launcher_takes_while_it_is_being_retired_is_running_for
     launcher.retire(new, docker, marks, time.time)
     arrivals[0].join(10)
     assert not arrivals[0].is_alive() and proxies.get(old) == 'img:old'  # that launcher's build has its proxy
+    for fd in launcher.LEASES:
+        os.close(fd)
+
+
+# spec: ANYM-574
+def test_a_docker_socket_that_is_missing_is_no_answer_about_the_container():
+    def unreachable(argv, timeout=None):
+        raise launcher.Refused(f'{" ".join(argv[:2])}: exit 1: failed to connect to the docker API at '
+                               'unix:///tmp/docker.sock; dial unix /tmp/docker.sock: connect: no such file or directory')
+    with pytest.raises(launcher.Refused):
+        launcher.running(BUILD, unreachable)
+    assert launcher.stop(BUILD, unreachable) is False  # never confirmed: the intent is not ended as stopped
+
+    def other(argv, timeout=None):
+        raise launcher.Refused('docker inspect: exit 1: Error: No such object: ' + BUILD + '-old')
+    with pytest.raises(launcher.Refused):
+        launcher.running(BUILD, other)
+
+
+# spec: ANYM-574
+def test_a_retire_that_locks_a_mark_another_retire_removed_keeps_the_proxy_a_launcher_took_since(
+        tmp_path, monkeypatch):
+    old, new = 'deedkit_autoloop_proxy_old', 'deedkit_autoloop_proxy_new'
+    proxies, calls, runs = {old: 'img:old'}, [], tmp_path / 'runs'
+    marks = runs / 'proxies'
+    marks.mkdir(parents=True)
+    (marks / old).touch()
+    os.utime(marks / old, (0, 0))  # no launcher has named the old proxy for long
+    monkeypatch.setattr(launcher, 'LEASES', [], raising=False)
+    docker, real, paused = proxy_docker(proxies, set(), calls), fcntl.flock, []
+
+    def flock(fd, op):  # the first retire() pauses between opening the old mark and locking it
+        if op & fcntl.LOCK_EX and not paused:
+            paused.append(fd)
+            launcher.retire(new, docker, marks, time.time)  # a second retire() stops the proxy, removes the mark
+            launcher.network('img:old', docker, runs)  # a launcher of the old image leases a new mark, restarts it
+        return real(fd, op)
+    monkeypatch.setattr(launcher, 'fcntl', types.SimpleNamespace(
+        flock=flock, LOCK_SH=fcntl.LOCK_SH, LOCK_EX=fcntl.LOCK_EX, LOCK_NB=fcntl.LOCK_NB))
+    launcher.retire(new, docker, marks, time.time)
+    assert paused and ['docker', 'stop', old] in calls  # the interleaving ran
+    assert proxies.get(old) == 'img:old' and (marks / old).exists()  # that launcher keeps its proxy and mark
     for fd in launcher.LEASES:
         os.close(fd)
