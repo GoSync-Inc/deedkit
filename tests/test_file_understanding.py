@@ -632,3 +632,17 @@ def test_cancelled_extraction_obeys_its_configured_attempt_limit(archive,limit,a
     else:
         assert fresh is not None and fresh['source_revision']==2 and fresh['attempts']==attempt+1
         assert indexer.finish(fresh,Extraction('ready','Completed within configured parser limit.','synthetic-v1'))=='ready'
+
+
+# spec: ANYM-230
+def test_blank_extracted_text_of_any_whitespace_never_starves_a_ready_document(seeded):
+    s,_,_=seeded;space=''.join(c for c in map(chr,range(0x110000)) if c.isspace())  # what str.strip() removes
+    # 64 blank documents sort ahead of the ready one and would fill the whole claim window (LIMIT 64).
+    blanks=['a-blank-%02d'%n for n in range(64)]
+    for n,name in enumerate(blanks):
+        add_source(s,'document',name)
+        with s.pool.connection() as c:
+            c.execute('UPDATE attachment_text SET text_content=%s WHERE attachment=%s',(space[n%len(space)]*3+'\n\t',name))
+    add_source(s,'document','z-ready-document');w=make_worker(s,kind='document')
+    claimed=w.claim()
+    assert claimed is not None and claimed[0]['attachment']=='z-ready-document'
