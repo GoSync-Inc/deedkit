@@ -653,9 +653,12 @@ using `PREVIOUS_MARKER_SHA256` supplied by the operator:
 ```
 
 Rotation holds the shared receiver lock, checks destination, exact marker digest,
-receipt/proof identities and object hashes, then fsyncs its root-owned pending
-journal. It switches and fsyncs the marker **before** deleting only the exact
-superseded ciphertext and logical receipt. It does not remove unrelated
+receipt/proof identities and the candidate's full ciphertext hash, then fsyncs its
+root-owned pending journal. It re-verifies the previous point's receipt and size
+(one HEAD, before the journal and again before deletion) and never downloads it:
+the point being replaced was proven when it was protected, and a corrupt old
+object no longer blocks its proven replacement. It switches and fsyncs the marker
+**before** deleting only the exact superseded ciphertext and logical receipt. It does not remove unrelated
 candidates. Preserve the successful journal, proof and marker for audit/retry.
 Serialize this procedure with new deliveries. Two occupied slots require
 candidate reconciliation/rotation before another full upload, not higher limits

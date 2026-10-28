@@ -752,7 +752,7 @@ def failure_code(error):
           'unreviewed_restore_image','unreviewed_postgres_image','unowned_restore_resource','invalid_helper_result',
           'uploader_lock_initialization_required','uncommitted_cloud_object','receiver_quota','protected_backup_missing',
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
-          'isolated_restore_failed','stored_backup_corrupt','verifier_host_busy','verifier_cleanup_unconfirmed',
+          'isolated_restore_failed','stored_backup_corrupt','protected_backup_corrupt','verifier_host_busy','verifier_cleanup_unconfirmed',
           'verifier_pins_unfinished','invalid_verifier_lock','verification_pending','instances_invalid','pins_switch_unresolved','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
           *CALENDAR_FAILURES}
     return str(error) if str(error) in safe else 'independent_restore_failed'
