@@ -23,8 +23,10 @@ def capabilities(credentials,provider):
                         'voices':list(e['voices']),'languages':list(e['languages']),'tool_calls':e['tool_calls'],
                         'success_fields':e['success_fields']} for name,e in ENGINES.items()],
             'omitted_uses':BY_DIALOG_ENGINE.get(provider),'voice':'owner_call_voice',
-            # Whatever engine speaks, the supervisor and the after-call analysis read transcript text with Gemini.
-            'transcript_analysis_vendor':'google'}
+            # Whatever engine speaks, the in-call supervisor and the after-call analysis send the call record to Gemini
+            # when its key is set: the brief with its prompt, facts, transcript, answers, decisions and tool calls.
+            'transcript_analysis_vendor':'google',
+            'transcript_analysis_input':['brief','facts','transcript','answers','decisions','tool_calls']}
 
 
 def unfit(name,language,credentials):

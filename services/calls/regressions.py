@@ -62,6 +62,15 @@ class CaseVerdict(BaseModel):
     evidence_event_ids:list[str]=Field(min_length=1,max_length=12)
 
 
+def replay_input(source):
+    """A stored brief as owner input. Its voice_engine choice record (ANYM-584) is not an input field: it is carried over."""
+    selected={k:source[k] for k in BriefInput.model_fields if k in source and k!='voice_engine'}
+    selected['source_message_ids']=[]
+    brief=BriefInput.model_validate(selected)
+    if isinstance(source.get('voice_engine'),dict):brief._voice_engine=source['voice_engine']
+    return brief
+
+
 class NativeReplay:
     def __init__(self,client_factory=None):
         self.client_factory=client_factory
@@ -77,9 +86,7 @@ class NativeReplay:
             store=VoiceService(directory)
             try:
                 source=case['brief']
-                selected={k:source[k] for k in BriefInput.model_fields if k in source}
-                selected['source_message_ids']=[]
-                brief=store.prepare(BriefInput.model_validate(selected),[])
+                brief=store.prepare(replay_input(source),[])
                 # Exact archived task facts, with no new archive/network reads.
                 brief['facts']=copy.deepcopy(source['facts'])
                 brief['prompt']=case.get('replay_prompt') or build_prompt(brief,instruction)

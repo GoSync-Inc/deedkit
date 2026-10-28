@@ -513,7 +513,7 @@ class VoiceService:
         """Freeze the owner's current call_voice into an agent brief (ANYM-359), in the engine the agent named (ANYM-584)."""
         from voice_engines import brief_fields,choose
         voice=self.call_voice()
-        choice=choose(selected.voice_engine,selected.language,voice.provider,self.engine_credentials())
+        choice=choose(selected.voice_engine,selected.language,voice.provider,{} if selected.voice_engine is None else self.engine_key_status(selected.voice_engine))
         fields={**selected.model_dump(),**brief_fields(voice,choice),'voice_engine':None}
         if hasattr(selected,'channel'):
             from outbound import ExternalBrief
@@ -522,6 +522,13 @@ class VoiceService:
             brief=BriefInput(**fields)
         brief._voice_engine=choice
         return brief
+
+    def engine_key_status(self,requested):
+        """Key presence for an explicit engine request; omitted requests never read it. Unreadable = a bounded refusal."""
+        try:
+            return dict(self.engine_credentials())
+        except Exception:
+            raise ServiceError('voice_engine_unavailable',503,{'voice_engine':requested,'reason':'key_status_unreadable'}) from None
 
     def get_brief(self,identity):
         with self.lock:

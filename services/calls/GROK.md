@@ -74,9 +74,13 @@ No fitting engine refuses before saving (503 `voice_engine_unavailable` or
 `no_voice_engine_available`). After prepare the frozen engine alone picks the
 key: a missing key is `model_key_required` at preflight, never another vendor.
 A followup keeps its parent's engine and choice. Grok gets the owner's
-`grok_voice`; a replicated Gemini voice is not used with it. Whatever engine
-speaks, the supervisor and the after-call analysis read transcript text with
-Gemini (`transcript_analysis_vendor: google`). `dialog_engine` stays refused for
+`grok_voice`; a replicated Gemini voice is not used with it. Only the live
+model session (call audio, its prompt and its tool calls) follows the engine.
+Whatever engine speaks, the in-call supervisor and the after-call analysis send
+the call record to Google Gemini when a Gemini key is set: the brief with its
+prompt, facts, transcript, answers, decisions and tool arguments and results
+(`transcript_analysis_vendor: google`, `transcript_analysis_input`). The phone,
+SIP or messenger transport carries the audio as before. `dialog_engine` stays refused for
 agents: it also names the owner-only `gemini_live_flows` rehearsal.
 
 ## Input audio format

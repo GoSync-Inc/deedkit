@@ -206,7 +206,8 @@ def test_capabilities_list_voice_engines_and_status_reports_choice(tmp_path):
              'voices':VOICES,'languages':['ru','en','id'],'tool_calls':True,'success_fields':True},
             {'name':'grok_live','dialog_engine':'grok_realtime','vendor':'xai','available':True,'model':GROK_MODEL,
              'voices':GROK_VOICES,'languages':['ru','en','id'],'tool_calls':True,'success_fields':True}],
-            'omitted_uses':'gemini_live','voice':'owner_call_voice','transcript_analysis_vendor':'google'}
+            'omitted_uses':'gemini_live','voice':'owner_call_voice','transcript_analysis_vendor':'google',
+            'transcript_analysis_input':['brief','facts','transcript','answers','decisions','tool_calls']}
         assert KEYS['xai'] not in json.dumps(listing)
         b=prepare(client,'browser',voice_engine='auto').json()
         assert b['voice_engine']=={'requested':'auto','selected':'grok_live','reason':'auto_first_fitting',
@@ -255,3 +256,48 @@ async def test_control_mcp_accepts_voice_engine(tmp_path,monkeypatch):
     with pytest.raises(ServiceError,match='voice_engine_unavailable'):
         from core import AgentBrief
         app.state.service.with_call_voice(AgentBrief(**{**BRIEF,'voice_engine':'gemini_live'}))
+
+
+# spec: ANYM-584
+def test_omitted_voice_engine_never_reads_key_status(tmp_path):
+    from core import AgentBrief, VoiceService
+    service=VoiceService(tmp_path)
+    def unreadable():raise OSError('synthetic unreadable key store')
+    service.engine_credentials=unreadable
+    assert service.with_call_voice(AgentBrief(**BRIEF))._voice_engine['reason']=='owner_call_voice'
+    with pytest.raises(ServiceError) as error:
+        service.with_call_voice(AgentBrief(**{**BRIEF,'voice_engine':'auto'}))
+    assert (error.value.code,error.value.status,error.value.detail)==(
+        'voice_engine_unavailable',503,{'voice_engine':'auto','reason':'key_status_unreadable'})
+
+
+# spec: ANYM-584
+def test_regression_replay_rebuilds_an_agent_brief_with_its_engine_choice(tmp_path):
+    from core import AgentBrief, VoiceService
+    from regressions import replay_input
+    service=VoiceService(tmp_path/'agent')
+    service.engine_credentials=lambda:{'gemini':True,'xai':True}
+    for engine in (None,'grok_live'):
+        stored=service.prepare(service.with_call_voice(AgentBrief(**{**BRIEF,'voice_engine':engine})),[])
+        replay=VoiceService(tmp_path/f'replay-{engine}').prepare(replay_input(stored),[])
+        assert replay['voice_engine']==stored['voice_engine']
+        assert replay['dialog_engine']==stored['dialog_engine']
+
+
+# spec: ANYM-584
+async def test_control_mcp_refusal_names_engine_and_reason(tmp_path,monkeypatch):
+    monkeypatch.setenv('VOICE_EXTERNAL_MCP','1')
+    app=create_app(tmp_path,Archive(),control_token='control-fixture-token')
+    app.state.service.engine_credentials=lambda:{'gemini':False,'xai':False}
+    async with app.router.lifespan_context(app):
+        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app),headers={'Authorization':'Bearer control-fixture-token'}) as http:
+            async with streamable_http_client('http://testserver/control/mcp',http_client=http) as (read,write):
+                async with ClientSession(read,write) as client:
+                    await client.initialize()
+                    browser=await client.call_tool('prepare_call',{'brief':{**BRIEF,'voice_engine':'grok_live'}})
+                    external=await client.call_tool('prepare_external_call',{'brief':{**BRIEF,**ROUTES['whatsapp'],'voice_engine':'auto'}})
+        assert app.state.service.db.execute('SELECT count(*) FROM briefs').fetchone()[0]==0
+    assert browser.is_error and json.loads(browser.content[0].text.split(': ',1)[1])=={
+        'error':'voice_engine_unavailable','voice_engine':'grok_live','reason':'key_not_configured'}
+    assert external.is_error and json.loads(external.content[0].text.split(': ',1)[1])=={'error':'no_voice_engine_available',
+        'skipped':{'gemini_live':'key_not_configured','grok_live':'key_not_configured'}}
