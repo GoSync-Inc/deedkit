@@ -18,7 +18,7 @@ from platform_contracts.release import ReleaseRuntime
 
 from .catalog import CATALOG, public
 from .diagnostics import with_catalog
-from .dispatch import Dispatch, Route, admitted
+from .dispatch import Dispatch, PLAIN_PATH, Route, admitted
 from .http_clients import Clients
 from .policy import Denied, Policy
 from .release import messaging_dial_url
@@ -327,7 +327,7 @@ def create_app(policy_path, public_url, *, transports=None):
                         return await original_receive()
 
                     receive = replay
-                if route and route.modules is not None:
+                if route and route.path != PLAIN_PATH:
                     # The SDK transport serves `/mcp`; plain `/mcp` requests pass through untouched.
                     scope = dict(scope, path="/mcp", raw_path=b"/mcp")
                 token, held = current_key.set(key), current_credential.set(credential)
