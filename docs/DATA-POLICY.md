@@ -52,9 +52,11 @@ the owner has decided parts (below), not this inventory as a whole.
   - Backups, encrypted, to the shared backup server over the tailnet and its object storage; originals,
     encrypted, to the private R2 bucket (owner 10-17 cold archive «yes»; owner 10-22 «надо на всех проектах
     так сделать»).
-  - Webhook receivers named by an agent: subscription, event, account, chat, message and sender IDs,
-    event kinds and times, the delivery timing and the agent's own headers; never message text, names or
-    file content (SECURITY.md, SUBSCRIPTIONS.md:558-561; owner 10-27 webhooks «... возможность прописывать
+  - Webhook receivers named by an agent: hint, test, endpoint, subscription, event, account, chat,
+    message, sender and send IDs, the subscription version, event kinds and times, wake reasons, the
+    count of omitted references, the next tool to call, the signature headers, the delivery timing, and
+    what the agent itself set (the subscription's `label`, its own headers); never archive message text,
+    contact names or file content (SECURITY.md, SUBSCRIPTIONS.md:558-561; owner 10-27 webhooks «... возможность прописывать
     самостоятельно агенты ...»). Under self-registration the receiver is any public host the agent names,
     with no operator host entry (ANYM-585; owner 10-28 «... дать агентам себе создавать вот этот, прописывать
     эту штуку ...»).

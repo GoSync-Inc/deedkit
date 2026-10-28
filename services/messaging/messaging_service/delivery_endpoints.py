@@ -198,8 +198,21 @@ def vendor_result(status=None, failure=None):
     return ('final', 'vendor_refused') if status in (401, 403) else ('retry', 'receiver_status')
 
 
+def self_registered_result(status=None, failure=None):
+    """An endpoint admitted only by self-registration and no vendor (ANYM-585): its receiver documents nothing, so
+    any answer may follow an action. Only a request that never left is retried; everything else is final."""
+    if failure is not None or type(status) is not int or not 200 <= status <= 599 or 200 <= status < 300:
+        return vendor_result(status, failure)
+    return 'final', 'redirect_rejected' if 300 <= status < 400 else 'receiver_status'
+
+
+def outcome(row, status=None, failure=None):
+    """The at-most-once table of an endpoint row from fenced(): the vendor's documented one, else the strict one."""
+    return (vendor_result if row['vendor'] else self_registered_result)(status, failure)
+
+
 def at_most_once(policy, host, url):
-    """Whether an endpoint's attempts use the at-most-once table (vendor_result): a vendor endpoint (ANYM-582) or one
+    """Whether an endpoint's attempts use an at-most-once table (outcome): a vendor endpoint (ANYM-582) or one
     admitted only by self-registration (ANYM-585), whose receiver no operator vouched for, so a request that may have
     arrived is never sent again whatever its URL turns out to be."""
     return bool(vendor_of(policy, host, url)) or admission(policy, host) == 'self_registration'
@@ -815,6 +828,13 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
                 JOIN delivery_endpoints e ON e.id=t.endpoint WHERE t.id=%s FOR UPDATE OF t SKIP LOCKED''', strict)
             if test is None:
                 break
+            if test['state'] == 'leased' and at_most_once_endpoint(c, test['endpoint']):
+                # ANYM-582/585: a lease that ran out mid-attempt may have reached the receiver. Settle it before the
+                # age check and DNS, so neither turns "may have arrived" into test_expired or receiver_unavailable.
+                c.execute("""UPDATE delivery_endpoint_tests SET state='failed',error_code='outcome_unknown',
+                    finished_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=%s""", (test['id'],))
+                stats['failed'] += 1
+                continue
             if c.execute("SELECT %s<clock_timestamp()-interval '5 minutes' AS old", (test['created_at'],)).fetchone()['old']:
                 c.execute("""UPDATE delivery_endpoint_tests SET state='failed',error_code='test_expired',
                     finished_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=%s""", (test['id'],))
@@ -845,12 +865,12 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
                     state, error = ('delivered', None) if type(status) is int and 200 <= status < 300 else (
                         'failed', 'redirect_rejected' if type(status) is int and 300 <= status < 400 else 'receiver_status')
                     if row['at_most_once']:
-                        result, error = vendor_result(status)
+                        result, error = outcome(row, status)
                         state = 'delivered' if result == 'delivered' else 'failed'
                 except (OSError, TimeoutError) as failure:
-                    state, error = 'failed', vendor_result(failure=failure)[1] if row['at_most_once'] else 'receiver_unavailable'
+                    state, error = 'failed', outcome(row, failure=failure)[1] if row['at_most_once'] else 'receiver_unavailable'
                 except ValueError as failure:
-                    state, error = 'failed', vendor_result(failure=failure)[1] if row['at_most_once'] else 'receiver_status'
+                    state, error = 'failed', outcome(row, failure=failure)[1] if row['at_most_once'] else 'receiver_status'
                 latency = round((time.monotonic() - started) * 1000)
                 status = status if type(status) is int and 100 <= status <= 599 else None
             c.execute('''UPDATE delivery_endpoint_tests SET state=%s,error_code=%s,http_status=%s,latency_ms=%s,

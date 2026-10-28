@@ -638,7 +638,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     # ANYM-582/585: a lease that ran out mid-attempt may have reached the receiver; never send it again.
                     state, error = 'dead_letter', 'outcome_unknown'
                 elif endpoint is not None and target is not None:
-                    from .delivery_endpoints import caller_headers, hint_body, signed_headers, vendor_result
+                    from .delivery_endpoints import caller_headers, hint_body, outcome, signed_headers
                     body = hint_body(c, hint, row, p)
                     headers = signed_headers((endpoint['signing_secret'], endpoint['pending_secret']), hint['id'], body,
                         caller_headers(endpoint))
@@ -654,9 +654,9 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     except ValueError as caught:
                         failure, state, error = caught, 'dead_letter', 'unsafe_endpoint'
                     if endpoint['at_most_once']:
-                        # A vendor or self-registered endpoint: only a "no run started" status or an unsent request is
-                        # retried.
-                        result, error = vendor_result(status, failure)
+                        # A vendor endpoint retries only its documented "no run started" statuses and an unsent
+                        # request; a generic self-registered one only an unsent request.
+                        result, error = outcome(endpoint, status, failure)
                         state = {'delivered': 'delivered', 'retry': 'pending', 'final': 'dead_letter'}[result]
                 elif prepared is not None:
                     resolved, secret, body = prepared

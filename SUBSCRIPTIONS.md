@@ -523,13 +523,15 @@ feature's switch, off when absent. `allow_any_public` stays the operator's own
 mode for hosts it vouches for (agents' and operator receivers' alike); set one,
 not both: with `allow_any_public` on, every host counts as operator-allowed, so
 the at-most-once rule and the kill switch below do not apply to it.
-An endpoint admitted only by the switch uses the at-most-once outcome table
-(Vendor hosts) whatever its URL: an attempt that may have reached the receiver
-(a timeout after the request was written, a lease that ran out mid-attempt, a
-1xx answer) is final with `outcome_unknown`, 401 and 403 are final
-(`vendor_refused`), and only an unsent request or another status is retried. A
-vendor routine whose URL nothing recognises therefore never runs twice for one
-hint; the receiver no operator vouched for gets no retry it cannot tell apart.
+An endpoint admitted only by the switch is at most once whatever its URL: an
+attempt that may have reached the receiver (a timeout after the request was
+written, a lease that ran out mid-attempt, a 1xx answer) is final with
+`outcome_unknown`, and so is every HTTP answer other than 2xx (`receiver_status`,
+`redirect_rejected`), since an unknown receiver may act before it answers 500.
+Only a request that never left (`receiver_unavailable`) is retried. A recognised
+vendor endpoint (Vendor hosts) keeps its documented table, which also retries
+the vendor's "no run started" statuses. A vendor routine whose URL nothing
+recognises therefore never runs twice for one hint.
 Every endpoint view (register, list, update) shows `at_most_once`, true for a
 vendor endpoint or one admitted only by the switch.
 `deedkit admin delivery-endpoints list` shows each endpoint's `admission`:
@@ -552,7 +554,8 @@ CGNAT answers are refused. Resolution runs at registration and before each
 attempt, the connection is pinned to the checked address, TLS verifies the
 hostname, redirects fail and proxy variables are ignored. A refusal is
 `unsafe_endpoint` with the field error "https on port 443, a public address, a
-host the operator allows"; a tailnet or private host also gets the next step to
+host the operator allows" (under self-registration every public host not in
+`deny_hosts` is allowed); a tailnet or private host also gets the next step to
 ask the operator for the wake relay (ANYM-228).
 
 **Secret and headers.** The caller supplies `signing_secret` as
@@ -613,15 +616,16 @@ same fence as receivers: no POST starts after the change commits.
 1–32) that are not deleted (`endpoint_limit`); registration and test each at most
 once per minute per key (`rate_limited` with `retry_after_s`). Endpoint hints
 count toward `SUBSCRIPTION_MAX_HINTS_PER_HOUR`. Across all keys, at most
-`DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR` endpoint hints (default 100, 1–10000) make
-their first POST to one host in a rolling hour (ANYM-585); past it a hint waits
+`DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR` endpoint hints (default 100, 1–10000) are
+admitted (their first attempt reserved) for one host in a rolling hour
+(ANYM-585); past it a hint waits
 for the next slot, spends no attempt and never dead-letters for the budget. Like
 the per-key admission wait, the hint shows only as pending in `hint_counts`
 (endpoint-level reasons: ANYM-583). Operator receivers are not counted; vendor
-hosts share the same budget. The budget counts admissions: each admitted hint
-makes at most 8 attempts, and a self-registered endpoint retries only an unsent
-request or a status that started nothing (Self-registration), so a crash between
-admission and the POST never sends that hint later. Endpoint tests are bounded
+hosts share the same budget. The budget counts admissions, not POSTs: each
+admitted hint makes at most 8 attempts over at most 7 days, and a self-registered
+endpoint retries only a request that never left (Self-registration), so a lease
+that ran out between admission and the POST settles with no POST at all. Endpoint tests are bounded
 per key (one per minute), and keys are issued by the operator.
 
 **Decided edge cases.** Deleting a bound endpoint leaves the subscription

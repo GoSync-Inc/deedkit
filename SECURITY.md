@@ -23,10 +23,11 @@ Self-service webhook endpoints (ANYM-519) send data to a host the agent names, i
 the operator's host policy file. With its `self_registration` switch on (ANYM-585) that is any
 public host `deny_hosts` does not match; a per-host hourly budget across keys bounds what one
 third-party host receives, such an endpoint never receives a request twice when the first may have
-arrived, and `self_registration: false` stops those endpoints. A receiver host learns subscription, event, account,
-chat, message, sender and send IDs, event kinds and times, wake reasons, the count of omitted
-references, the next tool to call, the delivery timing, and what the agent itself set: the
-subscription's `label` and its own headers; never archive message text, names or file content. SSRF controls: https
+arrived, and `self_registration: false` stops those endpoints. A receiver host learns hint, test,
+endpoint, subscription, event, account, chat, message, sender and send IDs, the subscription
+version, event kinds and times, wake reasons, the count of omitted references, the next tool to
+call, the Standard Webhooks signature headers, the delivery timing, and what the agent itself set:
+the subscription's `label` and its own headers; never archive message text, names or file content. SSRF controls: https
 on port 443, every resolved address public (no private, loopback, CGNAT, multicast,
 NAT64, 6to4, Teredo or IPv4-mapped answers), resolution again before each attempt with
 the address pinned, TLS hostname verification, no redirects, no proxies, and the

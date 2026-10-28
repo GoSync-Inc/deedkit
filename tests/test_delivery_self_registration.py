@@ -229,9 +229,11 @@ def test_self_registered_endpoints_are_at_most_once_whatever_the_url(gate, polic
     due_now(store)
     dispatch_hints(store, transport=timeout, resolver=PUBLIC)
     # A request that may have arrived is never sent again to a host no operator listed; a listed host retries.
-    assert sorted(posts) == sorted([LISTED, LISTED, SELF])
-    assert outbox(store) == {'hooks.agent-chosen.test': ('dead_letter', 'outcome_unknown', 1),
-        'hooks.example.test': ('pending', 'receiver_unavailable', 2)}
+    # Counts, not an exact list: on a slow host the listed hint's 2-second backoff can elapse within one pass.
+    assert posts.count(SELF) == 1 and posts.count(LISTED) >= 2
+    rows = outbox(store)
+    assert rows['hooks.agent-chosen.test'] == ('dead_letter', 'outcome_unknown', 1)
+    assert rows['hooks.example.test'][:2] == ('pending', 'receiver_unavailable')
 
 
 # spec: ANYM-585
@@ -305,3 +307,130 @@ def test_kill_switch_reload_waits_for_a_post_in_flight_and_no_post_follows(gate,
     emit(store)
     dispatch_hints(store, transport=lambda *a, **k: pytest.fail('POST after the kill switch'), resolver=PUBLIC)
     assert posts == [SELF]
+
+
+def endpoint_test_rows(store):
+    with store.pool.connection() as c:
+        return [(row['state'], row['error_code']) for row in c.execute(
+            'SELECT state,error_code FROM delivery_endpoint_tests ORDER BY created_at').fetchall()]
+
+
+def held(store, block):
+    """Runs block in a thread; returns (started event, release event, thread, results)."""
+    entered, release, results = threading.Event(), threading.Event(), []
+    def wait(*a, **k):
+        entered.set()
+        release.wait(10)
+    thread = threading.Thread(target=lambda: results.append(block(wait)))
+    thread.start()
+    return entered, release, thread, results
+
+
+def reload_while_held(store, policy, entered, release, thread):
+    """The kill switch flipped while another transaction holds the fence: the reload waits for it."""
+    assert entered.wait(10)
+    policy(self_registration=False, allow_hosts=['example.test'])
+    reloaded = []
+    switch = threading.Thread(target=lambda: reloaded.append(store.reload_delivery_policy()))
+    switch.start()
+    switch.join(1)
+    assert not reloaded
+    release.set()
+    thread.join(10)
+    switch.join(10)
+    return reloaded[0]
+
+
+# spec: ANYM-585
+def test_kill_switch_reload_waits_for_a_test_post_and_for_a_registration_in_flight(gate, policy):
+    store = gate
+    token = identity(store)
+    register(store, token)
+    def test_post(wait):
+        return dispatch_hints(store, transport=lambda *a, **k: wait() or 200, resolver=PUBLIC)
+    entered, release, thread, _ = held(store, test_post)
+    assert reload_while_held(store, policy, entered, release, thread)['refused_endpoints'] == 1
+    assert endpoint_test_rows(store) == [('delivered', None)]
+    # A registration that read the switch on commits first; the reload then cancels its staged test.
+    policy(self_registration=True)
+    store.reload_delivery_policy()
+    age(store)
+    def registration(wait):
+        return register(store, token, url=SELF + '-2', request_id='self-request-2',
+            resolver=lambda *a, **k: wait() or ['93.184.216.34'])
+    entered, release, thread, registered = held(store, registration)
+    reloaded = reload_while_held(store, policy, entered, release, thread)
+    assert registered[0]['state'] == 'enabled' and reloaded['cancelled'] == 1
+    assert endpoint_test_rows(store)[-1] == ('cancelled', 'endpoint_policy_refused')
+    dispatch_hints(store, transport=lambda *a, **k: pytest.fail('POST after the kill switch'), resolver=PUBLIC)
+
+
+# spec: ANYM-585
+def test_generic_self_registered_endpoint_never_resends_after_any_answer(gate, policy):
+    store = gate
+    policy(allow_hosts=['example.test'], self_registration=True)
+    subscribed(store, identity(store, 'listed-agent'), url=LISTED)
+    subscribed(store, identity(store, 'chosen-agent'))
+    routine_agent = identity(store, 'routine-agent')
+    routine = register(store, routine_agent, url=ROUTINE, headers=BEARER)
+    assert dispatch_hints(store, transport=lambda *a, **k: 200, resolver=PUBLIC)['endpoint_tests']['delivered'] == 1
+    store.create_subscription(routine_agent, ['telegram-demo-chat'], delivery={'endpoint_id': routine['endpoint_id']})
+    emit(store)
+    posts = []
+    # A receiver that acted and then failed: the unknown one never gets it again; the vendor's documented
+    # "no run started" status and the operator-listed host still retry.
+    dispatch_hints(store, transport=lambda url, *a, **k: posts.append(url) or 500, resolver=PUBLIC)
+    due_now(store)
+    dispatch_hints(store, transport=lambda url, *a, **k: posts.append(url) or 500, resolver=PUBLIC)
+    assert posts.count(SELF) == 1 and posts.count(LISTED) >= 2 and posts.count(ROUTINE) >= 2
+    rows = outbox(store)
+    assert rows['hooks.agent-chosen.test'] == ('dead_letter', 'receiver_status', 1)
+    assert rows['hooks.example.test'][:2] == ('pending', 'receiver_unavailable')
+    assert rows['api2.cursor.sh'][:2] == ('pending', 'receiver_status')
+    # A request that never left is retried.
+    from messaging_service.delivery_endpoints import EgressNotSent, self_registered_result
+    assert self_registered_result(failure=EgressNotSent()) == ('retry', 'receiver_unavailable')
+    assert self_registered_result(status=503) == ('final', 'receiver_status')
+
+
+# spec: ANYM-585
+@pytest.mark.parametrize('recovery', ['dns-outage', 'over-five-minutes'])
+def test_self_registered_test_lease_settles_unknown_before_dns_and_age(gate, policy, recovery):
+    store = gate
+    register(store, identity(store))
+    with store.pool.connection() as c:
+        c.execute("""UPDATE delivery_endpoint_tests SET state='leased',lease_token=gen_random_uuid(),
+            lease_until=clock_timestamp()-interval '1 second',created_at=created_at-%s*interval '1 minute'
+            WHERE state='pending'""", (10 if recovery == 'over-five-minutes' else 0,))
+    def no_dns(*a, **k):
+        raise OSError('synthetic resolver outage')
+    dispatch_hints(store, transport=lambda *a, **k: pytest.fail('re-sent a test after a lost lease'),
+        resolver=no_dns if recovery == 'dns-outage' else PUBLIC)
+    assert endpoint_test_rows(store) == [('failed', 'outcome_unknown')]
+
+
+# spec: ANYM-585
+def test_allowlisted_endpoints_keep_their_recovery_whether_the_url_is_a_vendor_shape(gate, policy):
+    store = gate
+    # No switch: the routine host is operator-listed and named by no `vendors` entry, only by its URL shape.
+    policy(allow_hosts=['cursor.sh', 'example.test'])
+    routine_agent, listed = identity(store, 'routine-agent'), identity(store, 'listed-agent')
+    routine = register(store, routine_agent, url=ROUTINE, headers=BEARER)
+    plain = register(store, listed, url=LISTED)
+    assert (routine['at_most_once'], plain['at_most_once']) == (True, False)
+    assert dispatch_hints(store, transport=lambda *a, **k: 200, resolver=PUBLIC)['endpoint_tests']['delivered'] == 2
+    for token, endpoint in ((routine_agent, routine), (listed, plain)):
+        store.create_subscription(token, ['telegram-demo-chat'], delivery={'endpoint_id': endpoint['endpoint_id']})
+    emit(store)
+    lost_lease(store)
+    posts = []
+    dispatch_hints(store, transport=lambda url, *a, **k: posts.append(url) or 200, resolver=PUBLIC)
+    # The vendor URL settles unknown with no POST; the generic allowlisted endpoint is delivered again.
+    assert posts == [LISTED]
+    assert outbox(store) == {'api2.cursor.sh': ('dead_letter', 'outcome_unknown', 1),
+        'hooks.example.test': ('delivered', None, 2)}
+    # The proxy keeps tunnelling operator-listed hosts with the switch off.
+    proxy = egress_proxy.Proxy(policy=load_policy)
+    assert proxy.admit('hooks.example.test:443') == 'hooks.example.test'
+    with pytest.raises(egress_proxy.Refused, match='policy_refused'):
+        proxy.admit('hooks.agent-chosen.test:443')
