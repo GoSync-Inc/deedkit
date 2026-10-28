@@ -231,7 +231,8 @@ ANYM-301); only `http-router` and `check-image` still build on the host.
   verification that fails leaves only the staging tag, and a full rerun (which
   rebuilds the archives) publishes under its own staging tag. Staging tags are
   never promoted later or read by `production.py`, which resolves only `<sha>`;
-  they stay in the package (deleting them needs `packages: delete`).
+  they stay in the package (the publish job never deletes package versions;
+  a cleanup is separate work).
 - **Write-once tags.** A final tag that already exists is never pushed again. A full
   rerun reuses an existing attested image of the same commit, without an archive.
   A final tag left with no GitHub provenance by a run before ANYM-602 is attested
