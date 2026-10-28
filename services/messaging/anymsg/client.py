@@ -44,10 +44,14 @@ SAFE_ERROR_CODES = frozenset({
     # ANYM-519: self-service webhook endpoints.
     'delivery_disabled','delivery_policy_unset','unsafe_endpoint','invalid_signing_secret','invalid_header','reserved_header',
     'rotation_in_progress','endpoint_limit','endpoint_conflict','operator_disabled','invalid_endpoint_state','endpoint_paused','endpoint_auto_paused',
+    # ANYM-546/547: messages_send.
+    'invalid_arguments','preview_stale','preview_expired','invalid_confirm_token','in_progress','identity_changed',
 })
 
 _UPLOAD_CHUNK_BYTES = 262144
 _UPLOAD_BODY_BYTES = 360448
+# messages_send with inline files (ANYM-547): at most 262144 decoded bytes, checked by the server.
+_SEND_BODY_BYTES = 524288
 _UPLOAD_MAX_BYTES = 32 * 1024**2
 _UPLOAD_FIELDS = {
     'prepare_file_upload': {'account','chat_id','filename','mime','bytes','sha256','request_id'},
@@ -374,7 +378,7 @@ class Client:
             body=json.dumps(parameters,ensure_ascii=False,allow_nan=False,separators=(",",":")).encode("utf-8")
         except (ValueError,TypeError,RecursionError):
             raise ValueError("invalid_parameters") from None
-        if len(body)>(_UPLOAD_BODY_BYTES if operation=='upload_file_chunk' else 16384):
+        if len(body)>{'upload_file_chunk':_UPLOAD_BODY_BYTES,'messages_send':_SEND_BODY_BYTES}.get(operation,16384):
             raise ValueError("request_too_large")
         try:
             with self._http.stream("POST",self.base_url+"/v1/"+operation,content=body,
@@ -541,6 +545,21 @@ class Client:
             parameters.update(format=format,preview_digest=preview_digest,
                 link_preview=link_preview,allow_lossy=allow_lossy)
         return self.call('send_message',parameters)
+
+    def messages_send(self,*,to=None,account=None,reply_to=None,text=None,files=None,format=None,
+                      dry_run=None,confirm_token=None,request_id=None,resume=None,wait_s=None):
+        """Send text and files in one call: preview (dry_run), confirm_token or request_id, wait, resume.
+
+        files: {upload_id}, {attachment_id} or a small file inline as {name, mime, base64}
+        (at most 262144 decoded bytes per call), each with optional mode. Confirm with the
+        owner before any send; the confirm_token binds a preview, it is not that confirmation.
+        Arguments left as None are not sent.
+        """
+        parameters={name:value for name,value in dict(to=to,account=account,reply_to=reply_to,text=text,
+            files=files,format=format,dry_run=dry_run,confirm_token=confirm_token,request_id=request_id,
+            resume=resume,wait_s=wait_s).items() if value is not None}
+        if 'wait_s' in parameters:_wait_seconds(parameters['wait_s'])
+        return self.call('messages_send',parameters)
 
     def get_send_status(self,send_id):
         return self.call('get_send_status',{'send_id':send_id})

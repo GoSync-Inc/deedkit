@@ -1,4 +1,6 @@
 """The drift watermark job against temporary Git repositories and a fake Tiden CLI; it never calls Tiden."""
+from datetime import datetime, timedelta, timezone
+import inspect
 import json
 import os
 from pathlib import Path
@@ -113,9 +115,62 @@ def server(tmp_path, monkeypatch):
     return Server()
 
 
-def run(repo, server):
+UPDATED = datetime(2026, 10, 28, 10, tzinfo=timezone.utc)
+
+
+def sync(sha, conclusion="success", number=1, attempt=1, status="completed", title=None):
+    """One `Tiden sync` run as the GitHub run listing returns it."""
+    return {"id": number, "run_attempt": attempt, "display_title": title or f"Tiden sync {sha}",
+            "html_url": f"https://github.invalid/runs/{number}", "status": status,
+            "conclusion": conclusion if status == "completed" else None,
+            "updated_at": f"{UPDATED + timedelta(minutes=number, seconds=attempt):%Y-%m-%dT%H:%M:%SZ}",
+            "run_started_at": "2026-10-28T10:00:00Z"}
+
+
+def listing(*runs):
+    return lambda since, success: [run for run in runs if not success or run["conclusion"] == "success"]
+
+
+FAKE_GH = textwrap.dedent(f"""\
+    #!{sys.executable}
+    import json, os, sys
+    with open(os.environ["FAKE_GH_CALLS"], "a") as calls:
+        calls.write(json.dumps(sys.argv[1:]) + "\\n")
+    runs = json.load(open(os.environ["FAKE_GH_RUNS"]))
+    if runs is None:
+        sys.stderr.write("HTTP 502 {SECRET}\\n"); sys.exit(1)
+    print(json.dumps({{"total_count": len(runs), "workflow_runs": runs}}))
+""")
+
+
+@pytest.fixture
+def gh(tmp_path, monkeypatch):
+    """A fake `gh api` on PATH that answers every run listing with the runs set here."""
+    directory = tmp_path / "gh-bin"
+    directory.mkdir()
+    (directory / "gh").write_text(FAKE_GH)
+    (directory / "gh").chmod(0o755)
+    runs, calls = tmp_path / "gh-runs.json", tmp_path / "gh-calls.jsonl"
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_RUNS", str(runs))
+    monkeypatch.setenv("FAKE_GH_CALLS", str(calls))
+
+    class Gh:
+        def set(self, value):
+            runs.write_text(json.dumps(value))
+
+        def calls(self):
+            return [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+
+    return Gh()
+
+
+def run(repo, server, syncs=None):
+    if syncs is None:  # every first-parent commit of main has a successful sync
+        shas = git(repo, "rev-list", "--first-parent", "HEAD").split()
+        syncs = listing(*(sync(sha, number=number) for number, sha in enumerate(shas, 1)))
     lines = []
-    code = check(repo, server.cli, "product", lines.append)
+    code = check(repo, server.cli, "product", lines.append, syncs)
     return code, "\n".join(lines)
 
 
@@ -401,13 +456,15 @@ def test_a_divergent_watermark_fails_without_an_advance(repo, server):
 
 
 @pytest.mark.parametrize(("stage", "mode"), [("status", "exit"), ("list", "garbage"), ("advance", "exit")])
-def test_the_token_and_cli_error_bodies_never_reach_the_output(repo, server, monkeypatch, capsys, stage, mode):
+def test_the_token_and_cli_error_bodies_never_reach_the_output(repo, server, monkeypatch, capsys, stage, mode, gh):
     a, b, c = history(repo)
+    gh.set([sync(b, number=1), sync(c, number=2)])
     summary = repo.parent / "summary.md"
     server.set(watermark=a, anchors=["services/messaging/app.py", "services/messaging/new.py"], fault={stage: mode})
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
     monkeypatch.setenv("TIDEN_PRODUCT_ID", "product")
-    monkeypatch.setattr(sys, "argv", ["tiden_drift.py", "--root", str(repo), "--cli", server.cli])
+    monkeypatch.setattr(sys, "argv", ["tiden_drift.py", "--root", str(repo), "--cli", server.cli,
+                                      "--sync-repository", "GoSync-Inc/deedkit"])
     assert drift.main() == 1
     captured = capsys.readouterr()
     assert SECRET not in captured.out + captured.err + summary.read_text()
@@ -470,12 +527,13 @@ def workflow():
 def test_the_workflow_runs_after_every_merge_serialized_and_read_only():
     value = workflow()
     triggers = value[True]  # yaml reads the `on` key as a boolean
-    assert triggers["push"] == {"branches": ["main"]} and "workflow_dispatch" in triggers
-    assert set(triggers) == {"push", "workflow_dispatch"}
-    assert value["permissions"] == {"contents": "read"}
+    assert triggers["workflow_run"] == {"workflows": ["Tiden sync"], "types": ["completed"]}
+    assert "workflow_dispatch" in triggers and set(triggers) == {"workflow_run", "workflow_dispatch"}
+    assert value["permissions"] == {"contents": "read", "actions": "read"}
     assert value["concurrency"] == {"group": "tiden-drift", "cancel-in-progress": False}
     (job,) = value["jobs"].values()
-    assert "permissions" not in job and job["if"] == "github.ref == 'refs/heads/main'"
+    assert "permissions" not in job and job["if"] == ("github.ref == 'refs/heads/main' && (github.event_name == "
+                                                      "'workflow_dispatch' || github.event_name == 'workflow_run')")
     steps = job["steps"]
     assert steps[0]["run"] == 'test "$REF" = refs/heads/main'
     checkout = next(step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@"))
@@ -507,3 +565,241 @@ def test_the_ref_guard_admits_main_exactly(ref, passes):
     guard = workflow()["jobs"]["anchors"]["steps"][0]["run"]
     completed = subprocess.run(["bash", "-e", "-c", guard], env={"REF": ref, "PATH": "/usr/bin:/bin"})
     assert (completed.returncode == 0) == passes
+
+
+ANCHORED = ["services/messaging/app.py", "services/messaging/new.py"]
+
+
+# spec: ANYM-593
+def test_a_merge_whose_sync_is_pending_blocks_the_check_until_its_sync_succeeds(repo, server):
+    # A < B after the watermark W; B's sync finished first and A's is still running.
+    w, a, b = history(repo)
+    server.set(watermark=w, anchors=[])  # no anchor yet: a check would fail
+    code, output = run(repo, server, listing(sync(b, number=2), sync(a, number=1, status="in_progress")))
+    assert code == 0 and server.state()["advances"] == []
+    assert f"- {a}: in_progress (https://github.invalid/runs/1)" in output and f"- {b}: synced" in output
+    assert "no Tiden source anchor" not in output
+    # A's sync succeeds and anchored the files: one run checks W..B and advances to B.
+    server.set(anchors=ANCHORED)
+    code, output = run(repo, server, listing(sync(b, number=2), sync(a, number=1)))
+    assert code == 0 and server.state()["watermark"] == b
+    assert [(call["--from"], call["--to"]) for call in server.state()["advances"]] == [(w, b)]
+
+
+# spec: ANYM-593
+@pytest.mark.parametrize("other", [
+    sync("", title="Tiden sync ready merge proposal/2026-10-28-card", number=3),
+    sync("", conclusion="skipped", number=3),
+    sync("0" * 40, number=3),
+], ids=["ready-merge", "skipped", "unrelated-commit"])
+def test_a_ready_merge_skipped_or_unrelated_sync_run_counts_for_no_commit(repo, server, other):
+    w, a, b = history(repo)
+    other = other | ({"display_title": f"Tiden sync {a}"} if other["conclusion"] == "skipped" else {})
+    server.set(watermark=w, anchors=ANCHORED)
+    code, output = run(repo, server, listing(other, sync(b, number=2)))
+    assert code == 0 and server.state()["advances"] == []
+    assert f"- {a}: no sync run" in output
+    # The checker takes no upstream run at all: whatever completion triggered it, it reads main and the run list.
+    assert list(inspect.signature(check).parameters) == ["root", "cli", "product", "report", "syncs"]
+
+
+# spec: ANYM-593
+def test_the_newest_run_covers_merges_whose_waiting_drift_run_was_dropped(repo, server):
+    w = commit(repo, {"base.py": "w"}, "W")
+    a = commit(repo, {"services/messaging/app.py": "a"}, "A")
+    b = commit(repo, {"services/messaging/new.py": "b"}, "B")
+    c = commit(repo, {"services/messaging/later.py": "c"}, "C")
+    git(repo, "push", "-q", "origin", "main")
+    server.set(watermark=w, anchors=[*ANCHORED, "services/messaging/later.py"])
+    # Drift for B's sync: A's sync still running, C's queued.
+    code, output = run(repo, server, listing(sync(a, number=1, status="in_progress"), sync(b, number=2),
+                                             sync(c, number=3, status="queued")))
+    assert code == 0 and server.state()["advances"] == []
+    assert f"- {c}: queued" in output and f"- {a}: in_progress" in output
+    # Drift for C's sync was replaced in the queue by drift for A's late sync: that run sees all three done.
+    code, output = run(repo, server, listing(sync(c, number=3), sync(a, number=1, attempt=1), sync(b, number=2)))
+    assert code == 0 and server.state()["watermark"] == c
+    assert [(call["--from"], call["--to"]) for call in server.state()["advances"]] == [(w, c)]
+
+
+# spec: ANYM-593
+@pytest.mark.parametrize("retry", ["rerun", "dispatch"])
+def test_a_failed_sync_blocks_the_advance_and_its_later_success_unblocks_it(repo, server, retry):
+    w, a, b = history(repo)
+    server.set(watermark=w, anchors=ANCHORED)
+    failed = sync(a, conclusion="failure", number=1)
+    code, output = run(repo, server, listing(failed, sync(b, number=2)))
+    assert code == 0 and server.state()["advances"] == []
+    assert f"- {a}: failure (https://github.invalid/runs/1)" in output
+    # A rerun keeps the run ID with a new attempt; a dispatch by SHA is a new run of the same title.
+    later = sync(a, number=1, attempt=2) if retry == "rerun" else sync(a, number=3)
+    runs = [later, sync(b, number=2)] + ([failed] if retry == "dispatch" else [])
+    assert run(repo, server, listing(*runs))[0] == 0 and server.state()["watermark"] == b
+
+
+# spec: ANYM-593
+def test_a_failed_run_listing_checks_and_advances_nothing_and_fails(repo, server):
+    w, a, b = history(repo)
+    server.set(watermark=w, anchors=ANCHORED)
+
+    def broken(since, success):
+        raise drift.Unknown("gh api exited 1")
+
+    with pytest.raises(Refused, match="Tiden sync runs could not be read"):
+        run(repo, server, broken)
+    assert server.state()["advances"] == []
+
+
+# spec: ANYM-593
+def test_the_runs_are_listed_from_main_through_gh_api_and_a_failed_read_is_named(repo, server, monkeypatch, capsys,
+                                                                                gh):
+    w, a, b = history(repo)
+    server.set(watermark=w, anchors=ANCHORED)
+    monkeypatch.setenv("TIDEN_PRODUCT_ID", "product")
+    monkeypatch.setattr(sys, "argv", ["tiden_drift.py", "--root", str(repo), "--cli", server.cli,
+                                      "--sync-repository", "GoSync-Inc/deedkit"])
+    gh.set(None)
+    assert drift.main() == 1 and server.state()["advances"] == []
+    out = capsys.readouterr().out
+    assert "Refused: the Tiden sync runs could not be read (gh api exited 1)" in out and SECRET not in out
+    gh.set([sync(a, number=1), sync(b, number=2)])
+    assert drift.main() == 0 and server.state()["watermark"] == b
+    endpoint, branch = gh.calls()[-1][3], gh.calls()[-1][5]
+    assert endpoint == "repos/GoSync-Inc/deedkit/actions/workflows/tiden-sync.yml/runs" and branch == "branch=main"
+
+
+def guard_step():
+    steps = workflow()["jobs"]["anchors"]["steps"]
+    names = [step.get("name") for step in steps]
+    index = names.index("Require a Tiden sync run of this repository or a dispatch")
+    checkout = next(i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith("actions/checkout@"))
+    holder = names.index("Require an anchor for every changed code file, then advance the watermark")
+    return steps[index], index < checkout < holder
+
+
+REPOSITORY = "GoSync-Inc/deedkit"
+SYNC_RUN = {"EVENT": "workflow_run", "UPSTREAM_EVENT": "workflow_run", "UPSTREAM_REPOSITORY": REPOSITORY,
+            "UPSTREAM_HEAD_REPOSITORY": REPOSITORY, "REPOSITORY": REPOSITORY}
+
+
+# spec: ANYM-593
+@pytest.mark.parametrize(("env", "passes"), [
+    ({"EVENT": "workflow_dispatch", "REPOSITORY": REPOSITORY}, True),
+    (SYNC_RUN, True),
+    (SYNC_RUN | {"UPSTREAM_EVENT": "workflow_dispatch"}, True),
+    (SYNC_RUN | {"UPSTREAM_REPOSITORY": "example/deedkit"}, False),
+    (SYNC_RUN | {"UPSTREAM_HEAD_REPOSITORY": "example/deedkit"}, False),
+    (SYNC_RUN | {"UPSTREAM_REPOSITORY": "gosync-inc/deedkit"}, False),
+    (SYNC_RUN | {"UPSTREAM_EVENT": "push"}, False),
+    (SYNC_RUN | {"UPSTREAM_EVENT": "pull_request"}, False),
+    (SYNC_RUN | {"UPSTREAM_EVENT": "Workflow_Run"}, False),
+    (SYNC_RUN | {"UPSTREAM_EVENT": ""}, False),
+    ({key: value for key, value in SYNC_RUN.items() if key != "UPSTREAM_REPOSITORY"}, False),
+    (SYNC_RUN | {"EVENT": "push"}, False),
+], ids=["dispatch", "sync-by-ci", "sync-dispatched", "foreign-repository", "foreign-head", "case-variant",
+        "push", "pull-request", "event-case", "event-empty", "repository-missing", "drift-push"])
+def test_a_malformed_or_foreign_upstream_run_stops_the_job_before_the_token(env, passes):
+    step, ordered = guard_step()
+    assert ordered and step["if"] == "steps.config.outputs.enabled == 'true'"
+    assert all("secrets." not in str(value) for value in step["env"].values())
+    completed = subprocess.run(["bash", "-e", "-c", step["run"]], env={**env, "PATH": "/usr/bin:/bin"})
+    assert (completed.returncode == 0) == passes
+
+
+# spec: ANYM-593
+def test_the_checker_reads_no_upstream_run_data():
+    steps = workflow()["jobs"]["anchors"]["steps"]
+    checker = next(step for step in steps if step.get("name", "").startswith("Require an anchor"))
+    assert checker["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert checker["run"] == ('python3 scripts/tiden_drift.py --cli "$RUNNER_TEMP/tiden-bin/tiden" '
+                              '--sync-repository "$GITHUB_REPOSITORY"')
+    assert "github.event" not in json.dumps(checker) and ">> \"$GITHUB_PATH\"" not in WORKFLOW.read_text()
+
+
+class Pages(drift.Actions):
+    """Tiden health's run listing with GitHub's pages faked: a `created` qualifier (`A..B` or `>=A`) and `status`
+    select ROWS by `created_at` and conclusion; like GitHub, a listing exposes at most 1,000 matches in 100-row pages
+    and reports at most 1,000 as `total_count`."""
+
+    def __init__(self, rows):
+        super().__init__("GoSync-Inc/deedkit", clock=lambda: 0.0)
+        self.rows, self.queries = rows, []
+
+    def page(self, number, created, end, workflow="tiden-sync.yml", filters=()):
+        assert workflow == "tiden-sync.yml" and end > 0
+        self.queries.append((created, filters, number))
+        low, _, high = created.removeprefix(">=").partition("..")
+        matches = [row for row in self.rows if datetime.fromisoformat(low) <= datetime.fromisoformat(row["created_at"])
+                   and (not high or datetime.fromisoformat(row["created_at"]) <= datetime.fromisoformat(high))
+                   and ("status=success" not in filters or row["conclusion"] == "success")][:1000]
+        return {"total_count": len(matches), "workflow_runs": matches[(number - 1) * 100:number * 100]}
+
+
+NOW = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
+
+
+def spread(shas, start, count, hours, conclusion="success"):
+    """COUNT runs over HOURS from START, newest first as GitHub lists them, cycling the titles of SHAS."""
+    rows = []
+    for number in range(count):
+        created = start + timedelta(hours=hours) * number / count
+        rows.append(sync(shas[number % len(shas)], conclusion=conclusion, number=number + 1)
+                    | {"created_at": f"{created:%Y-%m-%dT%H:%M:%SZ}"})
+    return rows[::-1]
+
+
+# spec: ANYM-593
+def test_a_watermark_stalled_past_the_listing_cap_still_reads_every_run_by_day(repo, server):
+    w, a, b = history(repo)
+    server.set(watermark=w, anchors=ANCHORED)
+    since = NOW - timedelta(days=4)
+    # 2,400 successful runs over four days, about 600 a day, plus one on a window boundary: no single listing could
+    # return them all.
+    rows = spread([a, b, "0" * 40], since, 2400, 4 * 24)
+    rows.append(sync(a, number=9999) | {"created_at": f"{since + timedelta(days=2):%Y-%m-%dT%H:%M:%SZ}"})
+    pages = Pages(rows)
+    syncs = drift.SyncRuns(pages, now=lambda: NOW)
+    listed = syncs(since, True)
+    assert len(listed) == len(rows) and {row["id"] for row in listed} == {row["id"] for row in rows}
+    windows = [f"{since + timedelta(days=day):%Y-%m-%dT%H:%M:%SZ}..{since + timedelta(days=day + 1):%Y-%m-%dT%H:%M:%SZ}"
+               for day in range(5)]
+    assert [created for created, _, number in pages.queries if number == 1] == windows
+    assert {filters for _, filters, _ in pages.queries} == {("status=success",)}
+    # The oldest window is read too: with the syncs of A and B only on the first day, the run still advances.
+    assert run(repo, server, lambda start, success: syncs(since, success))[0] == 0
+    assert server.state()["watermark"] == b
+    old = {row["id"] for row in rows if row["display_title"] != f"Tiden sync {'0' * 40}"
+           and datetime.fromisoformat(row["created_at"]) < since + timedelta(days=1)}
+    server.set(watermark=w)
+    pages.rows = [row for row in rows if row["id"] in old]
+    assert run(repo, server, lambda start, success: syncs(since, success))[0] == 0
+    assert server.state()["watermark"] == b
+
+
+# spec: ANYM-593
+def test_a_day_that_reaches_the_listing_cap_is_unknown_never_synced(repo, server):
+    w, a, b = history(repo)
+    server.set(watermark=w, anchors=ANCHORED)
+    since = NOW - timedelta(hours=12)
+    syncs = drift.SyncRuns(Pages(spread([a, b], since, 1200, 1)), now=lambda: NOW)
+    with pytest.raises(Refused, match="listing cap"):
+        run(repo, server, lambda start, success: syncs(since, success))
+    assert server.state()["advances"] == []
+
+
+# spec: ANYM-593
+def test_the_state_listing_reads_all_runs_only_when_a_commit_waits(repo, server):
+    w, a, b = history(repo)
+    server.set(watermark=w, anchors=ANCHORED)
+    calls = []
+    runs = [sync(a, number=1), sync(b, number=2, status="in_progress")]
+
+    def syncs(since, success):
+        calls.append(success)
+        return listing(*runs)(since, success)
+
+    code, output = run(repo, server, syncs)
+    assert code == 0 and calls == [True, False] and f"- {b}: in_progress" in output
+    runs[1] = sync(b, number=2)
+    calls.clear()
+    assert run(repo, server, syncs)[0] == 0 and calls == [True] and server.state()["watermark"] == b

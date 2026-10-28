@@ -26,6 +26,7 @@ from family_calendar.providers.caldav.codec import (
     semantic_hash,
 )
 from family_calendar.providers.google.adapter import GoogleAdapter
+from . import series as recurrence
 from .store import digest, instant
 
 # Occurrences published for one calendar window; the same limit as agenda/slots responses.
@@ -447,6 +448,8 @@ class Providers:
         if invite and (step["action"] != "create" or cal["provider"] != "google"):
             # Guests only on a Google create (ANYM-555); nothing was read or sent yet.
             raise CalendarError("capability_unsupported")
+        if step.get("series"):
+            return await self._prepare_series(cal, step)
         target = step["target_id"]
         event = step.get("event", {})
         occurrence = step.get("occurrence")
@@ -542,6 +545,87 @@ class Providers:
             intent["desired"] = base64.b64encode(original.to_ical()).decode()
             intent["semantic_hash"] = semantic_hash(original.to_ical())
         return intent
+
+    async def _prepare_series(self, cal, step):
+        """A series edit (ANYM-556): the instance the plan named is read and guarded as an occurrence edit, then its
+        master by the instance's own recurringEventId; the write goes to the master, or creates the replacement.
+        The undo of a partial following move deletes the replacement series it names by its own ID."""
+        series, occurrence = step["series"], step.get("occurrence")
+        if cal["provider"] != "google":
+            raise CalendarError("capability_unsupported")
+        if series.get("role") == "undo":
+            return await self._prepare_undo(cal, step)
+        if not occurrence or series.get("scope") not in ("all", "following"):
+            raise CalendarError("capability_unverified")
+        replacing = step["action"] == "create"
+        if replacing and await self.read(cal, step["target_id"]):
+            raise CalendarError("version_conflict")
+        instance = await self.read(cal, series["instance_id"] if replacing else step["target_id"])
+        if not instance or instance.get("etag") != (series["instance_etag"] if replacing else step["expected_etag"]):
+            raise CalendarError("version_conflict")
+        self._guard_google(cal, instance, occurrence)
+        master = self._series_master(await self.read(cal, instance["recurringEventId"]))
+        # The master as the plan saw it: changed since the preview, or since the replacement was made from it.
+        if series.get("master_etag") and master["etag"] != series["master_etag"]:
+            raise CalendarError("version_conflict")
+        if master.get("updated") and instant(master["updated"]) > instant(series["planned_at"]):
+            raise CalendarError("version_conflict")
+        zone = recurrence.zone_of(master)
+        boundary = recurrence.boundary_of(occurrence, zone)
+        cancel = step["action"] == "delete"
+        recurrence.check_exceptions(await self._exceptions(cal, master), zone, boundary, series["scope"], cancel)
+        moving = not cancel and series["scope"] == "following"
+        if moving and boundary <= recurrence.master_start(master, zone):
+            # From the first occurrence on, a following move is the whole series: ending the original would be a
+            # delete this plan never authorized. Nothing was written; series all is that change.
+            raise CalendarError("series_starts_here")
+        intent = {"action": "update", "target": master["id"], "expected_etag": master["etag"],
+                  "resource_ref": source_ref("res", cal["ref"], master["id"]), "scope": "series",
+                  "series_etag": master["etag"]}
+        if replacing:
+            intent.update(action="create", target=step["target_id"], expected_etag=None,
+                          resource_ref=source_ref("res", cal["ref"], step["target_id"]),
+                          desired=recurrence.replacement(master, occurrence, step["event"], zone, step["target_id"]))
+        elif series["scope"] == "all":
+            if cancel:
+                intent.update(action="delete", desired=None)
+            else:
+                intent["desired"] = recurrence.edit_all(master, occurrence, step["event"], zone)
+        else:
+            lines = recurrence.truncated(master, zone, boundary)
+            if lines is None:
+                # A following cancel from the first occurrence on: nothing of the series is left, the master goes.
+                intent.update(action="delete", desired=None)
+            else:
+                intent["desired"] = {"recurrence": lines}
+        return intent
+
+    async def _prepare_undo(self, cal, step):
+        """Delete the replacement series a partial following move created, only as it was created (its etag)."""
+        master = self._series_master(await self.read(cal, step["target_id"]))
+        if master["etag"] != step["expected_etag"]:
+            raise CalendarError("version_conflict")
+        # An instance changed or cancelled since has its own resource and etag, which the master's etag does not
+        # cover: any exception means someone changed the replacement, and it stays.
+        if await self._exceptions(cal, master):
+            raise CalendarError("version_conflict")
+        return {"action": "delete", "target": master["id"], "expected_etag": master["etag"], "desired": None,
+                "resource_ref": source_ref("res", cal["ref"], master["id"]), "scope": "series"}
+
+    @staticmethod
+    def _series_master(master):
+        if not master or master.get("status") == "cancelled" or not master.get("recurrence"):
+            raise CalendarError("version_conflict")
+        if master.get("attendees") or master.get("eventType", "default") != "default":
+            raise CalendarError("capability_unverified")
+        if not master.get("etag") or not master.get("iCalUID"):
+            raise CalendarError("conditional_write_unavailable")
+        return master
+
+    async def _exceptions(self, cal, master):
+        adapter = await self.adapter(cal)
+        return [e for e in await adapter.exceptions(cal["target"], master["iCalUID"])
+                if isinstance(e, dict) and e.get("recurringEventId") == master["id"]]
 
     @staticmethod
     def _caldav_times(event):

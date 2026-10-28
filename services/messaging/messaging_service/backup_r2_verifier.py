@@ -33,7 +33,7 @@ PG_DATA_PATH = '/var/lib/postgresql'
 HELPER_TMPFS = {'/tmp':'rw,noexec,nosuid,size=64m',
                 PG_DATA_PATH:'ro,noexec,nosuid,nodev,size=1m,mode=0700'}
 # Backup schema versions this verifier accepts from its helper (`capabilities` reports them).
-SCHEMAS = range(2,56)
+SCHEMAS = range(2,54)
 
 
 def now():return datetime.now(timezone.utc).isoformat()
@@ -419,13 +419,19 @@ def verify_run(config,receiver,client,engine,journal,fd):
     return journal
 
 
-def run(config,*,client=None,engine=None):
+def run(config,*,client=None,engine=None,path=None):
     if os.geteuid()!=0:raise ValueError('root_verifier_required')
     receiver=r2.load_config(config['receiver_config_file'])
     client=client if client is not None else r2.make_client(receiver)
     engine=engine if engine is not None else Docker(config['timeout_seconds'])
     with verifier_lock(config['directory']) as fd:
         journal=None
+        if path is not None:
+            # The receiver update follow (ANYM-597) rewrites the pins under this lock: a
+            # config loaded before the lock must never start a journal on the old pair.
+            fresh=load_config(path)
+            if fresh['directory']!=config['directory']:raise ValueError('invalid_verifier_config')
+            config=fresh
         try:
             with deadline(config['timeout_seconds']):
                 _,journal=r2.read_root(fd,'active.json',missing=True)
@@ -522,7 +528,7 @@ def describe(error):
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--config',required=True)
     args=parser.parse_args(argv)
-    try:run(load_config(args.config))
+    try:run(load_config(args.config),path=args.config)
     except Exception as error:
         print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
     return 0

@@ -66,14 +66,23 @@ def cleanup(store,c):
     StorageAdmission.lock(c)
     candidates=c.execute("""SELECT id FROM file_uploads WHERE state<>'expired'
         AND expires_at<=clock_timestamp() ORDER BY expires_at,id LIMIT 64""").fetchall()
-    for candidate in candidates:
+    for candidate in candidates:_reap(store,c,candidate)
+
+
+def reap(store,c,upload_ids):
+    """These expired uploads now, in cleanup's lock order (a sent intent's staged inline files, ANYM-547)."""
+    StorageAdmission.lock(c)
+    for upload_id in sorted(upload_ids):_reap(store,c,{'id':upload_id})
+
+
+def _reap(store,c,candidate):
         # Match chunk's capacity -> lifecycle -> row order. A source holds only
         # this upload's lifecycle lock; it never waits for capacity admission.
         _lifecycle_lock(c,candidate['id'])
         row=c.execute("""SELECT * FROM file_uploads WHERE id=%s AND state<>'expired'
             AND expires_at<=clock_timestamp() FOR UPDATE""",(candidate['id'],)).fetchone()
-        if not row:continue
-        if _pinned(c,row['id']):continue
+        if not row:return
+        if _pinned(c,row['id']):return
         root=_root(store,row['id'])
         if root.exists():
             # No recursive deletion or user-controlled names. Never visit CAS.
@@ -91,7 +100,7 @@ def cleanup(store,c):
                         if not entry.is_file(follow_symlinks=False):raise APIError('attachment_unavailable',409)
                         os.unlink(entry.path)
             try:root.rmdir()
-            except OSError:continue  # Keep capacity reserved until bounded reaping finishes.
+            except OSError:return  # Keep capacity reserved until bounded reaping finishes.
         c.execute("UPDATE file_uploads SET state='expired' WHERE id=%s",(row['id'],))
 
 
@@ -115,7 +124,8 @@ def _public(row,c):
         'changes_provider_state':False,'owner_approval_verified_by_server':False})
 
 
-def prepare(store,c,p,account,chat_id,filename,mime,bytes,sha256,request_id):
+def prepare(store,c,p,account,chat_id,filename,mime,bytes,sha256,request_id,*,child=False):
+    from .outgoing import CHILD_KEY_PREFIX
     _target(c,p,account,chat_id)
     if isinstance(mime,str):mime=mime.lower()
     if (not isinstance(filename,str) or not 1<=len(filename)<=255 or filename in ('.','..') or
@@ -123,7 +133,9 @@ def prepare(store,c,p,account,chat_id,filename,mime,bytes,sha256,request_id):
         not isinstance(mime,str) or not re.fullmatch(r'[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+',mime) or len(mime)>128 or
         type(bytes) is not int or not 1<=bytes<=MAX_BYTES or
         not isinstance(sha256,str) or not re.fullmatch(r'[a-f0-9]{64}',sha256) or
-        not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id)):
+        not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id) or
+        # A child key is messages_send's staged inline file (ANYM-547), whose release finds it by that key.
+        request_id.startswith(CHILD_KEY_PREFIX)!=child):
         raise APIError('invalid_upload')
     cleanup(store,c)
     existing=c.execute('SELECT * FROM file_uploads WHERE key_id=%s AND request_id=%s FOR UPDATE',

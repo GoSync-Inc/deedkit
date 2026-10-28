@@ -85,6 +85,13 @@ class GoogleAdapter:
             },
         )
 
+    async def exceptions(self, calendar, ical_uid):
+        """A recurring event unexpanded: its master and its exceptions (instances changed or cancelled on their own)."""
+        return await self.pages(
+            "calendars/" + quote(calendar, safe="") + "/events",
+            {"iCalUID": ical_uid, "singleEvents": "false", "showDeleted": "true", "maxResults": 2500},
+        )
+
     async def read(self, calendar, event):
         return await self.request(
             "GET", "calendars/" + quote(calendar, safe="") + "/events/" + quote(event, safe=""), missing=True

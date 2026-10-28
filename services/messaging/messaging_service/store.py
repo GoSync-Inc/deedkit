@@ -60,13 +60,22 @@ class ExpandError(Exception):
         super().__init__(code)
 
 
-def expand_connection(dsn):
-    """The only connection of migrate-expand (ANYM-596): its budgets, `public` only and no notices, read back."""
+# The database a connection reached: cluster system identifier, database name and OID (ANYM-449).
+EXPAND_IDENTITY=("SELECT ARRAY[(SELECT system_identifier::text FROM pg_control_system()),current_database()::text,"
+    "(SELECT oid::text FROM pg_database WHERE datname=current_database())] AS identity")
+
+
+def expand_connection(dsn, application_name=None):
+    """The only connection of migrate-expand (ANYM-596): its budgets, `public` only and no notices, read back.
+    `application_name` overrides one the DSN names, so deploy finds this session by it (ANYM-449)."""
     c=psycopg.connect(dsn,row_factory=dict_row,prepare_threshold=None,connect_timeout=5,
         options='-c lock_timeout=2000 -c statement_timeout=4000 -c transaction_timeout=4000 -c search_path=public '
-                '-c client_min_messages=error -c timezone=UTC')
+                '-c client_min_messages=error -c timezone=UTC',
+        **({'application_name':application_name} if application_name else {}))
     try:
         if [c.execute(f'SHOW {name}').fetchone()[name] for name in EXPAND_SETTINGS]!=list(EXPAND_SETTINGS.values()):
+            raise ExpandError('settings_refused')
+        if application_name and c.execute('SHOW application_name').fetchone()['application_name']!=application_name:
             raise ExpandError('settings_refused')
     except BaseException:
         c.close(); raise
@@ -91,25 +100,27 @@ def expand_code(run):
         raise ExpandError('failed') from None
 
 
-def expand_status(dsn):
+def expand_status(dsn, application_name=None):
     def run():
-        c=expand_connection(dsn)
+        c=expand_connection(dsn,application_name)
         try: return {'schema_version':ledger_version(c)}
         finally: c.close()
     return expand_code(run)
 
 
-def migrate_expand(dsn, plan, *, root=None, before_commit=None):
+def migrate_expand(dsn, plan, *, root=None, before_commit=None, application_name=None):
     """Applies only DROP-free expand migrations and appended role grants in one bounded transaction on one
     connection, or nothing (ANYM-596). Never schema.sql, lock_replay_tables or the ACL repair of migrate().
-    Raises ExpandError with a fixed code; `before_commit(c)` is a test hook."""
+    A plan `identity` (EXPAND_IDENTITY of the database deploy copied) must be what this connection reached before
+    anything else runs (ANYM-449). Raises ExpandError with a fixed code; `before_commit(c)` is a test hook."""
     from . import migration_rollout as rollout
     root=Path(root) if root else Path(__file__).parent
     files={int(p.name[:3]):p for p in root.joinpath('migrations').glob('[0-9][0-9][0-9]_*.sql')}
     roles={p.name:p.read_bytes() for p in root.glob('*_role.sql')}
     try:
-        base,target,prefixes=plan['base'],plan['target'],plan['roles']
-        valid=(all(type(v) is int for v in (base,target)) and base<=target==max(files) and type(prefixes) is dict
+        base,target,prefixes,identity=plan['base'],plan['target'],plan['roles'],plan.get('identity')
+        valid=((identity is None or type(identity) is list and len(identity)==3 and all(type(i) is str for i in identity))
+            and all(type(v) is int for v in (base,target)) and base<=target==max(files) and type(prefixes) is dict
             and set(prefixes)==set(roles) and all(type(p) is dict and type(p.get('bytes')) is int
             and 0<=p['bytes']<=len(roles[n]) and type(p.get('sha256')) is str for n,p in prefixes.items()))
     except (KeyError,TypeError,ValueError):
@@ -126,8 +137,10 @@ def migrate_expand(dsn, plan, *, root=None, before_commit=None):
     pending=[(v,files[v].read_bytes()) for v in sorted(files) if base<v<=target]
 
     def run():
-        c=expand_connection(dsn)
+        c=expand_connection(dsn,application_name)
         try:
+            if identity is not None and c.execute(EXPAND_IDENTITY).fetchone()['identity']!=identity:
+                raise ExpandError('identity_mismatch')
             if not c.execute('SELECT pg_try_advisory_xact_lock(74509137) AS locked').fetchone()['locked']:
                 raise ExpandError('busy')
             if ledger_version(c)!=base: raise ExpandError('ledger_mismatch')
@@ -248,7 +261,7 @@ def digest(value: str) -> str:
 
 
 KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
-RUNTIME_SCHEMA=55  # the newest schema this runtime knows; migrate() refuses a newer database
+RUNTIME_SCHEMA=53  # the newest schema this runtime knows; migrate() refuses a newer database
 
 
 def revocable_token(value):
@@ -437,6 +450,11 @@ class Store:
     def authenticate(self, token):
         with self.authorized(token) as (_, p):
             return p['id']
+
+    def permits(self, token, operation):
+        """Whether this key holds `operation`'s permission: the body boundary's question, not a denial to audit."""
+        with self.authorized(token) as (_, p):
+            return OPERATION_PERMISSIONS[operation] in p['permissions']
 
     @staticmethod
     def dataset(c,p):
@@ -1364,6 +1382,11 @@ class Store:
         with self.pool.connection() as c:
             return delete(c, person)
 
+    def set_person_channel(self, person, purpose, account=None):
+        from .person_links import prefer
+        with self.pool.connection() as c:
+            return prefer(c, person, purpose, account)
+
     def list_people(self, person=None):
         from .person_links import list_people
         with self.pool.connection() as c:
@@ -1431,7 +1454,7 @@ class Store:
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version>RUNTIME_SCHEMA: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(55,'055_failure_events.sql')]:
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:

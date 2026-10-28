@@ -38,11 +38,12 @@ def migrate_expand(args, parser):
     logging.getLogger('psycopg').disabled=True
     try:
         dsn=Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
-        if args.status: result=store.expand_status(dsn)
+        name=os.environ.get('PGAPPNAME') or None
+        if args.status: result=store.expand_status(dsn,name)
         else:
             try: plan=json.loads(args.plan.read_text())
             except (OSError,ValueError): raise store.ExpandError('plan_invalid') from None
-            result=store.migrate_expand(dsn,plan if isinstance(plan,dict) else {})
+            result=store.migrate_expand(dsn,plan if isinstance(plan,dict) else {},application_name=name)
     except store.ExpandError as error: result=error.code
     except Exception: result='failed'
     print(json.dumps(result if isinstance(result,dict) else {'error':result}))
@@ -55,7 +56,7 @@ def main():
         'replay','snapshot','verify-restore','quarantine-restore','register-account',
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
         'set-messenger-operations','extend-key','set-feedback-status','export-feedback','release-retention-hold',
-        'set-subscription-retention','link-person','unlink-person','delete-person','list-people','key-info',
+        'set-subscription-retention','link-person','unlink-person','delete-person','list-people','set-person-channel','key-info',
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
         'reload-delivery-policy','set-delivery-features','migrate-expand'])
     parser.add_argument('--principal')
@@ -115,6 +116,8 @@ def main():
     parser.add_argument('--all-subscriptions',action='store_true',help='release-retention-hold: every held subscription')
     parser.add_argument('--sender',help='link-person/unlink-person: exact provider sender ID (sender_id from search_people)')
     parser.add_argument('--person',help='link-person: add to this person UUID (default: a new person); delete-person, list-people')
+    parser.add_argument('--purpose',choices=['message','call'],help='set-person-channel: the purpose of the preference')
+    parser.add_argument('--clear',action='store_true',help='set-person-channel: clear the preference instead of --account')
     args=parser.parse_args()
     if args.command=='migrate-expand': return migrate_expand(args,parser)
     if args.command == 'serve':
@@ -233,6 +236,11 @@ def main():
         elif args.command=='delete-person':
             if not args.person: parser.error('delete-person requires --person')
             print(json.dumps(store.delete_person(args.person)))
+        elif args.command=='set-person-channel':
+            # ANYM-548: the owner's preferred channel per purpose; like the links, no agent path.
+            if not args.person or not args.purpose or bool(args.account)==args.clear:
+                parser.error('set-person-channel requires --person, --purpose and either --account or --clear')
+            print(json.dumps(store.set_person_channel(args.person,args.purpose,None if args.clear else args.account)))
         elif args.command=='list-people':
             print(json.dumps(store.list_people(args.person)))
         elif args.command=='set-feedback-status':

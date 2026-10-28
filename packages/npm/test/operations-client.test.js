@@ -24,7 +24,7 @@ test('all operation SDK methods preserve exact payload and expose the current ma
     assert.equal((await client[name](args)).status,'submitted');
     assert.ok(tools.includes(method));
   }
-  assert.equal(tools.length,51);
+  assert.equal(tools.length,52);
   assert.deepEqual(captured,Object.values(methods).map(([method,args])=>[
     `https://archive.example/base/v1/${method}`,args]));
 });

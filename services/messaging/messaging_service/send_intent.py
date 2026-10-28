@@ -8,12 +8,19 @@ send_file) or the phone send (phone_send). A step is enqueued and its handle rec
 repeat with the same key reads the record and continues; an uncertain step ends the parent in `unknown` and is
 never resumed. No server approval: the acting agent confirms with the owner before any send (SENDING.md); the
 token binds a preview, it is not that confirmation. Text leaves both tables once no unsent step needs it.
+A small file may come inline (ANYM-547): {name, mime, base64}, at most INLINE_BYTES decoded per call. Its bytes become
+this key's upload under a child key of the call (`stage`); previews and intents keep only its upload_id and facts,
+and a successful send deletes the staged bytes (`release`), else they expire like any upload.
 """
 import asyncio
+import base64
+import binascii
 import hashlib
+import re
 import secrets
 
-from platform_contracts.agent import PREVIEW_TTL_S, agent_result, child_key, is_request_id, missing_request_id, next_call
+from platform_contracts.agent import (PLACEHOLDER_REQUEST_ID, PREVIEW_TTL_S, agent_result, child_key, is_request_id,
+                                      missing_request_id, next_call)
 from psycopg.errors import LockNotAvailable
 from psycopg.types.json import Jsonb
 
@@ -27,7 +34,18 @@ TOOL = 'messages_send'
 CONTROL = ('dry_run', 'confirm_token', 'request_id', 'resume', 'wait_s', 'allow_open_chat', 'allow_files')
 FIELDS = frozenset(('to', 'account', 'reply_to', 'text', 'files', 'format', *CONTROL))
 FILE_FIELDS = frozenset(('upload_id', 'attachment_id', 'mode'))
+INLINE_FIELDS = frozenset(('name', 'mime', 'base64', 'mode'))
+# Inline files of one call, decoded; a larger file goes through UPLOAD_TOOL and chunks.
+INLINE_BYTES = 262144
+# The request body a messages_send call may need (gateway and messaging): the inline base64, text as \u escapes, room.
+SEND_BODY_BYTES = 524288
+UPLOAD_TOOL = 'messages_prepare_file_upload'
+# Stands in for an inline file's bytes in a `next`: never canonical base64, so such a `next` never runs verbatim.
+INLINE_PLACEHOLDER = 'REPLACE_WITH_THE_SAME_BASE64'
+MIME = re.compile(r'[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+')
 MAX_FILES = 10
+# A staged upload a later dry run or call reuses keeps this long (seconds), longer than a preview lives (PREVIEW_TTL_S).
+REUSE_LEFT_S = 1800
 CAPTION_LIMIT = 1024
 COMPARED = ('target', 'reply_to', 'text', 'files', 'scope')
 PENDING = frozenset(('queued', 'dispatching'))
@@ -47,6 +65,57 @@ def _invalid(field, reason, hint=None):
 
 def _hash(value):
     return hashlib.sha256(value.encode() if isinstance(value, str) else canonical(value)).hexdigest()
+
+
+def _inline(index, item):
+    """An inline file's canonical bytes; field_errors name the field, never its value."""
+    name, mime, data = item.get('name'), item.get('mime'), item.get('base64')
+    if (not isinstance(name, str) or not 1 <= len(name) <= 255 or name in ('.', '..') or
+            any(ord(ch) < 32 or ord(ch) == 127 or 0xD800 <= ord(ch) <= 0xDFFF or ch in '/\\' for ch in name)):
+        raise _invalid(f'files.{index}.name', 'pattern')
+    if not isinstance(mime, str) or len(mime) > 128 or not MIME.fullmatch(mime): raise _invalid(f'files.{index}.mime', 'pattern')
+    if 'mode' in item and (not isinstance(item['mode'], str) or not 1 <= len(item['mode']) <= 256):
+        raise _invalid(f'files.{index}.mode', 'type')
+    if not isinstance(data, str): raise _invalid(f'files.{index}.base64', 'type')
+    try: raw = base64.b64decode(data, validate=True)
+    except (ValueError, binascii.Error): raise _invalid(f'files.{index}.base64', 'format') from None
+    if not raw or base64.b64encode(raw).decode() != data: raise _invalid(f'files.{index}.base64', 'format')
+    return raw
+
+
+def _facts(item):
+    """The identity of an inline file: what its preview, payload hash and a `next` carry instead of its bytes."""
+    if 'inline' in item: return item['inline']
+    raw = base64.b64decode(item['base64'])
+    return {'name': item['name'], 'mime': item['mime'], 'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+
+
+def _staged_item(index, item):
+    """A staged inline file (`stage`): its upload of this key and its facts; never a caller's form."""
+    facts = item.get('inline')
+    if (set(item) - {'upload_id', 'inline', 'mode'} or not isinstance(item.get('upload_id'), str)
+            or not isinstance(facts, dict) or set(facts) != {'name', 'mime', 'bytes', 'sha256'}):
+        raise _invalid(f'files.{index}', 'type')
+    return item
+
+
+def public(value):
+    """The payload as its hash and comparisons see it: an inline file by its facts, whether staged or not."""
+    return {**value, 'files': [{'inline': _facts(item), **({'mode': item['mode']} if 'mode' in item else {})}
+                               if 'base64' in item or 'inline' in item else item for item in value['files']]}
+
+
+def callable_files(files):
+    """Files as a caller may send them again: a staged file by its upload_id, an inline one without its bytes."""
+    if not isinstance(files, list): return files
+    return [{'upload_id': item['upload_id'], **({'mode': item['mode']} if 'mode' in item else {})}
+            if isinstance(item, dict) and 'inline' in item else
+            {**item, 'base64': INLINE_PLACEHOLDER} if isinstance(item, dict) and 'base64' in item else item
+            for item in files]
+
+
+def _callable(value):
+    return {**value, 'files': callable_files(value['files'])} if 'files' in value else value
 
 
 def payload(arguments):
@@ -69,8 +138,18 @@ def payload(arguments):
     if not isinstance(files, list): raise _invalid('files', 'type')
     if len(files) > MAX_FILES: raise _invalid('files', 'max_items')
     clean = []
+    inline = []
     for index, item in enumerate(files):
         if not isinstance(item, dict): raise _invalid(f'files.{index}', 'type')
+        if 'inline' in item:
+            clean.append(_staged_item(index, item))
+            continue
+        if {'name', 'mime', 'base64'} & set(item):
+            extra = sorted(set(item) - INLINE_FIELDS)
+            if extra: raise _invalid(f'files.{index}.{extra[0]}', 'unknown_field')
+            inline.append((index, len(_inline(index, item))))
+            clean.append({name: item[name] for name in sorted(item)})
+            continue
         extra = sorted(set(item) - FILE_FIELDS)
         if extra: raise _invalid(f'files.{index}.{extra[0]}', 'unknown_field')
         if ('upload_id' in item) == ('attachment_id' in item): raise _invalid(f'files.{index}.upload_id', 'required')
@@ -78,6 +157,15 @@ def payload(arguments):
             if not isinstance(item[name], str) or not 1 <= len(item[name]) <= 256:
                 raise _invalid(f'files.{index}.{name}', 'type')
         clean.append({name: item[name] for name in sorted(item)})
+    total = 0
+    for index, size in inline:
+        total += size
+        if total > INLINE_BYTES:
+            # The upload call that takes this file instead is added once the recipient is known (`stage`).
+            raise _error('invalid_arguments', 400, field_errors=[{'field': f'files.{index}.base64', 'reason': 'max_bytes'}],
+                         hint=f'Inline files take at most {INLINE_BYTES} bytes per call: upload this one with '
+                              f'{UPLOAD_TOOL} and upload_file_chunk, then send it as {{upload_id}}.',
+                         inline_file=_facts(files[index]))
     if len({canonical(item) for item in clean}) != len(clean): raise _invalid('files', 'unique')
     if not value['text'].strip() and not clean: raise _invalid('text', 'required')
     return {**value, 'files': clean}
@@ -209,7 +297,7 @@ def _bind(c, p, request_id, token_hash, value, resolution):
     parent = request_id or 'token:' + token_hash
     return c.execute('''INSERT INTO send_intents(principal,key_id,tool,request_id,token_hash,parent_key,request_hash,
         plan,steps) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
-        (p['id'], p['key_id'], TOOL, request_id, token_hash, parent, _hash(value),
+        (p['id'], p['key_id'], TOOL, request_id, token_hash, parent, _hash(public(value)),
          Jsonb({'value': value, 'resolution': resolution}), Jsonb(_steps(resolution)))).fetchone()['id']
 
 
@@ -218,7 +306,7 @@ def _bare(arguments):
 
 
 def _preview_required(value):
-    return _error('preview_required', 409, next=next_call(TOOL, {**value, 'dry_run': True}),
+    return _error('preview_required', 409, next=next_call(TOOL, {**_callable(value), 'dry_run': True}),
                   hint='This send needs a preview: call with dry_run true, confirm with the owner, then send the token.')
 
 
@@ -230,7 +318,7 @@ def admit(store, c, p, arguments):
     value = None if _bare(arguments) and (token is not None or request_id is not None) else payload(arguments)
     if request_id is not None and not is_request_id(request_id): raise _invalid('request_id', 'pattern')
     if token is None and request_id is None:
-        failure = missing_request_id(TOOL, {k: v for k, v in arguments.items() if k != 'wait_s'})
+        failure = missing_request_id(TOOL, _callable({k: v for k, v in arguments.items() if k != 'wait_s'}))
         raise _error(failure['error'], 400, field_errors=failure['field_errors'], hint=failure['hint'], next=failure['next'])
     if request_id is not None: _locked(c, f'send-intent:{p["id"]}:{request_id}')
     bound = c.execute('SELECT * FROM send_intents WHERE principal=%s AND request_id=%s',
@@ -250,12 +338,12 @@ def admit(store, c, p, arguments):
             # another intent's is a conflict, and so is a payload that differs from the bound one.
             if bound is not None and bound['id'] != record['intent']: raise _error('idempotency_conflict', 409)
             if value is not None and c.execute('SELECT request_hash FROM send_intents WHERE id=%s',
-                                               (record['intent'],)).fetchone()['request_hash'] != _hash(value):
+                                               (record['intent'],)).fetchone()['request_hash'] != _hash(public(value)):
                 raise _error('idempotency_conflict', 409)
             return record['intent']
-        if value is not None and value != record['arguments']: raise _error('idempotency_conflict', 409)
+        if value is not None and public(value) != public(record['arguments']): raise _error('idempotency_conflict', 409)
         if record['expired']:
-            raise _error('preview_expired', 409, next=next_call(TOOL, {**record['arguments'], 'dry_run': True}))
+            raise _error('preview_expired', 409, next=next_call(TOOL, {**_callable(record['arguments']), 'dry_run': True}))
         value, old = record['arguments'], record['resolution']
         fresh = resolve(store, c, p, value, old['text'] if old['target'].get('opens_chat') else None, open_chat, files)
         before, after = _comparable(old), _comparable(fresh)
@@ -274,7 +362,7 @@ def admit(store, c, p, arguments):
         return intent
     if value is None and bound is None: payload(arguments)  # Nothing bound to this key: name the missing field.
     if bound is not None:
-        if value is not None and bound['request_hash'] != _hash(value) or bound['tool'] != TOOL: raise _error('idempotency_conflict', 409)
+        if value is not None and bound['request_hash'] != _hash(public(value)) or bound['tool'] != TOOL: raise _error('idempotency_conflict', 409)
         return bound['id']
     if value['format'] != 'plain': raise _preview_required(value)
     fresh = resolve(store, c, p, value, open_chat=open_chat, files=files)
@@ -404,7 +492,10 @@ def _finish(c, row, steps, state, reason=None):
         plan = {**plan, 'resolution': resolution}
     c.execute('''UPDATE send_intents SET state=%s,result=%s,steps=%s,plan=%s,updated_at=clock_timestamp()
         WHERE id=%s''', (state, Jsonb(result), Jsonb(steps), Jsonb(plan), row['id']))
-    return {'result': serial(result)}
+    # Every file is sent: staged inline bytes go now (`release`), after this commits. Any upload_id may be one (a
+    # followed `next` names it plainly); release keeps only `stage`'s, by their child key.
+    staged = [item['upload_id'] for item in plan['value']['files'] if 'upload_id' in item]
+    return {'result': serial(result), **({'release': staged} if state == 'succeeded' and staged else {})}
 
 
 def advance(store, c, p, intent_id, *, resume=False, first=False, open_chat=True, files=True):
@@ -464,15 +555,121 @@ def _decorate(result, arguments):
     return result
 
 
+def _inline_next(store, token, arguments, error):
+    """Over the inline cap: the prepare call that takes that file instead, for the recipient this call names."""
+    from .resolve_target import resolve_target
+    facts = error.inline_file
+    try:
+        with store.authorized(token, 'preview_message') as (c, p):
+            target = resolve_target(store, c, p, arguments.get('to') or arguments.get('reply_to') or '', 'message',
+                                    arguments.get('account') or '')['target']
+    except APIError:
+        return error  # No recipient this key may send to: the field error alone.
+    if target.get('opens_chat') or not target.get('chat_id'): return error
+    error.next = next_call(UPLOAD_TOOL, {'account': target['account'], 'chat_id': target['chat_id'],
+                                         'filename': facts['name'], 'mime': facts['mime'], 'bytes': facts['bytes'],
+                                         'sha256': facts['sha256'], 'request_id': PLACEHOLDER_REQUEST_ID})
+    return error
+
+
+def stage(store, token, arguments):
+    """Inline files of a dry run or a request_id call become this key's uploads (ANYM-547), each prepared and then
+    written in its own transaction, like messages_prepare_file_upload and one chunk, under a child key of the call:
+    a repeat with the same request_id reuses them. A confirm_token call only compares them with its preview."""
+    from .resolve_target import resolve_target
+    from .uploads import chunk, prepare
+    try: value = payload(arguments)
+    except APIError as error:
+        if getattr(error, 'inline_file', None) is None: raise
+        raise _inline_next(store, token, arguments, error) from None
+    indexes = [index for index, item in enumerate(value['files']) if 'base64' in item]
+    request_id = arguments.get('request_id')
+    if not indexes or arguments.get('confirm_token') is not None: return arguments
+    if not arguments.get('dry_run') and not is_request_id(request_id): return arguments  # admit names the key
+    if not arguments.get('dry_run'):
+        # A bound request_id replays its intent (admit compares the payload by its facts): nothing is resolved or
+        # staged again, so a recipient that changed since cannot fail the replay.
+        with store.authorized(token, 'send_message') as (c, p):
+            if c.execute('SELECT 1 FROM send_intents WHERE principal=%s AND request_id=%s',
+                         (p['id'], request_id)).fetchone(): return arguments
+    with store.authorized(token, 'prepare_file_upload') as (c, p):
+        target = resolve_target(store, c, p, value['to'] or value['reply_to'], 'message', value['account'])['target']
+        principal = p['id']
+    if target.get('opens_chat'):
+        raise _invalid('files', 'max_items', 'a phone without a chat takes text only: send it, then the files')
+    files = list(value['files'])
+    for index in indexes:
+        item, facts = files[index], _facts(files[index])
+
+        def staged(parent):
+            key = CHILD_KEY_PREFIX + child_key(principal, TOOL, parent, f'inline{index + 1}', 1)
+            with store.authorized(token, 'prepare_file_upload') as (c, p):
+                return prepare(store, c, p, target['account'], target['chat_id'], facts['name'], facts['mime'],
+                               facts['bytes'], facts['sha256'], key, child=True)
+        # A request_id call's own child key first: its repeat finds its upload.
+        row = staged(request_id) if is_request_id(request_id) else None
+        if row is None or row['status'] == 'expired':
+            # Else a live staged upload of the same file and chat (a key holds at most 4 active ones), else a fresh
+            # child key: a released or expired upload is never reused, however often the file is sent.
+            with store.authorized(token, 'prepare_file_upload') as (c, p):
+                live = c.execute('''SELECT id FROM file_uploads WHERE principal=%s AND key_id=%s AND account=%s
+                    AND chat=%s AND filename=%s AND mime=lower(%s) AND bytes=%s AND sha256=%s AND state='ready'
+                    AND starts_with(request_id,%s) AND expires_at>clock_timestamp()+%s*interval '1 second'
+                    ORDER BY expires_at DESC LIMIT 1''', (p['id'], p['key_id'], target['account'], target['chat_id'],
+                    facts['name'], facts['mime'], facts['bytes'], facts['sha256'], CHILD_KEY_PREFIX,
+                    REUSE_LEFT_S)).fetchone()
+            row = ({'upload_id': live['id'], 'status': 'ready'} if live else
+                   staged(f'{request_id or "dry-run"}:{secrets.token_hex(16)}'))
+        if row['status'] == 'uploading' and row['offset'] == 0:
+            with store.authorized(token, 'upload_file_chunk') as (c, p):
+                chunk(store, c, p, row['upload_id'], 0, item['base64'])
+        files[index] = {'upload_id': row['upload_id'], 'inline': facts, **({'mode': item['mode']} if 'mode' in item else {})}
+    return {**arguments, 'files': files}
+
+
+def release(store, token, upload_ids):
+    """A sent intent's staged inline uploads (a child key: only `stage` makes one) are deleted, not left to expire,
+    unless a live preview or an unfinished intent of this principal still names one: that one expires (ANYM-547)."""
+    from .uploads import _lifecycle_lock, reap
+    for upload_id in sorted(set(upload_ids)):
+        # One upload per transaction, under its lifecycle lock: a preview or intent resolving it holds that lock
+        # until it commits, so this sees its row or it finds the upload expired.
+        with store.authorized(token, 'prepare_file_upload') as (c, p):
+            _lifecycle_lock(c, upload_id)
+            named = Jsonb([{'upload_id': upload_id}])
+            c.execute('''UPDATE file_uploads u SET expires_at=least(u.expires_at,clock_timestamp())
+                WHERE u.id=%s AND u.principal=%s AND u.key_id=%s AND u.state<>'expired' AND starts_with(u.request_id,%s)
+                AND NOT EXISTS(SELECT 1 FROM send_previews v WHERE v.principal=u.principal AND v.intent IS NULL
+                    AND v.expires_at>clock_timestamp() AND v.arguments->'files' @> %s)
+                AND NOT EXISTS(SELECT 1 FROM send_intents i WHERE i.principal=u.principal AND i.state<>'succeeded'
+                    AND i.plan->'value'->'files' @> %s)''',
+                      (upload_id, p['id'], p['key_id'], CHILD_KEY_PREFIX, named, named))
+    with store.authorized(token, 'prepare_file_upload') as (c, p):
+        reap(store, c, upload_ids)
+
+
 async def send(store, token, arguments):
     """The tool: dry_run previews; otherwise admit, advance and wait through the shared wait admission."""
     from .send_wait import MAX_WAIT_S, validate_wait_s, wait_for_operation, wait_for_send
     arguments = {k: v for k, v in arguments.items() if v is not None}
     wait_s = validate_wait_s(arguments.get('wait_s', 0))
-    if arguments.get('dry_run') or arguments.get('confirm_token') is None and not _bare(arguments): payload(arguments)
+    files = arguments.get('files')
+    if isinstance(files, list):
+        for index, item in enumerate(files):
+            # The staged form is the server's own: a caller never names an inline file by it.
+            if isinstance(item, dict) and 'inline' in item: raise _invalid(f'files.{index}.inline', 'unknown_field')
     run = asyncio.to_thread
+    given = arguments
+    if isinstance(files, list) and any(isinstance(item, dict) and 'base64' in item for item in files):
+        arguments = await run(stage, store, token, arguments)
+    if arguments.get('dry_run') or arguments.get('confirm_token') is None and not _bare(arguments): payload(arguments)
     if arguments.get('dry_run'):
-        staged = await run(store.messages_send_preview, token, arguments)
+        try: staged = await run(store.messages_send_preview, token, arguments)
+        except APIError as error:
+            # Another preview's send released the shared staged upload in between (`release`): stage afresh, once.
+            if error.code != 'attachment_unavailable' or arguments is given: raise
+            arguments = await run(stage, store, token, given)
+            staged = await run(store.messages_send_preview, token, arguments)
         if 'phone' not in staged: return staged
         from . import phone_send
         draft = await phone_send.preview(store, token, staged['phone'])
@@ -491,4 +688,7 @@ async def send(store, token, arguments):
             if error.status in (401, 403, 404): raise
             break  # Busy or timed out: the record keeps the step; the answer says running.
         answer = await run(store.messages_send_advance, token, answer['intent'], arguments)
+    if answer.get('release'):
+        try: await run(release, store, token, answer['release'])
+        except Exception: pass  # The send succeeded; unreleased staged bytes expire like any upload.
     return _decorate(answer['result'], arguments)
