@@ -1,5 +1,5 @@
-"""claimed_tool (gateway dispatch and the messaging app) reads at most the first 16 KiB of an MCP body to decide how
-much more to read. It must never claim a tool other than the top-level params.name json.loads sees in the body."""
+"""claimed_tool (gateway dispatch, first 64 KiB, and the messaging app, first 16 KiB) reads a prefix of an MCP body to
+decide how much more to read. It must never claim a tool other than the top-level params.name json.loads sees in the body."""
 import ast
 import json
 from pathlib import Path
@@ -86,12 +86,21 @@ def test_claimed_tool_never_claims_a_tool_json_loads_does_not_see(text, junk, at
             assert claim is None or expected is MALFORMED or claim == expected, (copy, candidate)
 
 
+arguments = st.recursive(
+    st.one_of(st.none(), st.booleans(), st.integers(), st.floats(allow_nan=False, allow_infinity=False), st.text(max_size=8)),
+    lambda inner: st.one_of(st.lists(inner, max_size=3), st.dictionaries(st.text(max_size=4), inner, max_size=3)),
+    max_leaves=20)
+
+
 # spec: ANYM-547
-@settings(max_examples=500, deadline=None)
-@given(st.sampled_from(TOOLS[:3]), st.integers(min_value=1, max_value=400))
-def test_a_cut_prefix_claims_the_named_tool_or_nothing(name, cut):
+@settings(max_examples=800, deadline=None)
+@given(st.sampled_from(TOOLS[:3]), arguments, st.integers(min_value=1, max_value=2000))
+def test_a_cut_prefix_claims_the_named_tool_once_the_name_is_complete(name, args, cut):
     raw = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                      "params": {"name": name, "arguments": {"text": "x" * 300}}}).encode()
+                      "params": {"name": name, "arguments": {"value": args, "text": "x" * 300}}}).encode()
+    # The byte after the name's closing quote: from there on, any cut (inside nested arguments, a number, a
+    # literal or a key) must keep the claim, or a legitimate large call could not be read.
+    named = raw.index(json.dumps(name).encode(), raw.index(b'"name"')) + len(json.dumps(name).encode())
     for claimed_tool in CLAIMS:
         assert claimed_tool(raw) == name
-        assert claimed_tool(raw[:cut]) in (None, name)
+        assert claimed_tool(raw[:cut]) == name if cut >= named else claimed_tool(raw[:cut]) in (None, name)
