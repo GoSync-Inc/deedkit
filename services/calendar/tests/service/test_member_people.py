@@ -2,6 +2,7 @@
 import os
 import threading
 import time
+from pathlib import Path
 from uuid import uuid4
 
 import psycopg
@@ -174,6 +175,18 @@ def test_migration_6_leaves_every_existing_table_as_version_5_code_reads_it():
             s.drop_test_schema()
         finally:
             s.close()
+
+
+# spec: ANYM-554
+def test_migration_6_and_its_grant_are_an_unattended_expand_from_schema_5():
+    from family_calendar.service import migration_rollout as rollout
+    from family_calendar.service.store import MIGRATIONS, ROLES
+
+    files = {v: Path(p).read_text() for v, p in MIGRATIONS}
+    roles = ROLES.read_text()
+    base = roles[:roles.index("-- Migration 6")]
+    plan = rollout.plan({v: t for v, t in files.items() if v <= 5}, files, base, roles)
+    assert plan["base"] == 5 and plan["target"] == 6 and "pause" not in plan
 
 
 # spec: ANYM-554
