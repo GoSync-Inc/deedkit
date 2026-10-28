@@ -589,8 +589,8 @@ def test_the_pause_class_is_no_header_a_declared_manual_or_classify_of_a_declare
     assert rollout.rollout_class(EXPAND + COUNTEREXAMPLES['insert'][0]) == 'manual'
 
 
-# spec: ANYM-596
 # 038 holds the widening pair too, but its partial unique index already makes it manual for `classify`.
+# spec: ANYM-596
 @pytest.mark.parametrize(('body', 'pause_class'), [(ALLOWED['widen-in'], 'expand'), (source(MIGRATIONS[36]), 'expand'),
                                                    (source(MIGRATIONS[38]), 'manual')], ids=['widening-pair', '036', '038'])
 def test_the_unattended_class_calls_any_drop_manual_while_the_rollout_class_stays_expand(body, pause_class):
