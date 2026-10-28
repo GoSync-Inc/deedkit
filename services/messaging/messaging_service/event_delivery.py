@@ -518,6 +518,15 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
                 stats['dead_letter'] += 1
                 continue
+            if hint['state'] == 'leased' and hint.get('endpoint') is not None:
+                # ANYM-582: a lease that ran out mid-attempt may have reached a vendor. Settle it before DNS, quiet
+                # hours or the budget can turn it back into a pending hint that is sent again.
+                from .delivery_endpoints import vendor_endpoint
+                if vendor_endpoint(c, hint['endpoint']):
+                    c.execute("""UPDATE subscription_outbox SET state='dead_letter',finished_at=clock_timestamp(),
+                        error_code='outcome_unknown',lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
+                    stats['dead_letter'] += 1
+                    continue
             now = c.execute('SELECT clock_timestamp() AS t').fetchone()['t']
             if hint['kind'] != 'test' and not hint['quiet_bypass']:
                 # A hint deferred by the budget or retried after receiver downtime can reach a
@@ -622,21 +631,29 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     state, error = 'dead_letter', 'delivery_budget_exhausted'
                 elif unsafe:
                     state, error = 'dead_letter', 'unsafe_endpoint' if endpoint else 'unsafe_receiver_configuration'
+                elif endpoint is not None and endpoint['vendor'] and hint['state'] == 'leased':
+                    # ANYM-582: a lease that ran out mid-attempt may have reached the vendor; never send it again.
+                    state, error = 'dead_letter', 'outcome_unknown'
                 elif endpoint is not None and target is not None:
-                    from .delivery_endpoints import caller_headers, hint_body, signed_headers
+                    from .delivery_endpoints import caller_headers, hint_body, signed_headers, vendor_result
                     body = hint_body(c, hint, row, p)
                     headers = signed_headers((endpoint['signing_secret'], endpoint['pending_secret']), hint['id'], body,
                         caller_headers(endpoint))
+                    status = failure = None
                     try:
                         status = transport(endpoint['url'], body, headers, resolved=target[1], timeout=5)
                         if type(status) is int and 200 <= status < 300:
                             state, error = 'delivered', None
                         elif type(status) is int and 300 <= status < 400:
                             state, error = 'dead_letter', 'redirect_rejected'
-                    except (OSError, TimeoutError):
-                        pass
-                    except ValueError:
-                        state, error = 'dead_letter', 'unsafe_endpoint'
+                    except (OSError, TimeoutError) as caught:
+                        failure = caught
+                    except ValueError as caught:
+                        failure, state, error = caught, 'dead_letter', 'unsafe_endpoint'
+                    if endpoint['vendor']:
+                        # A vendor host: only a documented "no run started" or an unsent request is retried.
+                        result, error = vendor_result(status, failure)
+                        state = {'delivered': 'delivered', 'retry': 'pending', 'final': 'dead_letter'}[result]
                 elif prepared is not None:
                     resolved, secret, body = prepared
                     try:
