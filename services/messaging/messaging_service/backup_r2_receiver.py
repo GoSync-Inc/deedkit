@@ -579,14 +579,15 @@ class Parts:
     (upload_concurrency + 2) x part_bytes plus one frame; the reader blocks only at that bound.
     While workers may exist the reader holds SIGALRM (`held`): our deadline is raised only in a
     `window`, a stream read or a wait round, never inside thread or lock bookkeeping. `finish` and
-    `stop` join every worker, so none still calls R2 when the caller aborts, completes or releases
-    the receiver lock, and a worker's first error reaches the reader.
+    `stop` join every worker and then let the deadline through again, so none still calls R2 when
+    the caller aborts, completes or releases the receiver lock, the abort and the `completing`
+    journal write run as in serial mode, and a worker's first error reaches the reader.
     """
     def __init__(self, config, client, key, upload_id):
         self.config, self.client, self.key, self.upload_id = config, client, key, upload_id
         self.workers = config.get('upload_concurrency', 1); self.count = 0; self.etags = {}
         self.waiting = []; self.running = 0; self.error = None; self.halted = False; self.threads = []
-        self.cond = threading.Condition(); self.outer = None
+        self.cond = threading.Condition(); self.outer = None; self.released = False
 
     @contextmanager
     def masked(self):
@@ -608,7 +609,13 @@ class Parts:
             signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
 
     def window(self):
-        return self.opened() if self.workers > 1 else nullcontext()
+        return self.opened() if self.workers > 1 and not self.released else nullcontext()
+
+    def release(self):
+        # Every worker has ended: from here a deadline is raised where it lands, as in serial mode.
+        if self.outer is not None and not self.released:
+            self.released = True
+            signal.pthread_sigmask(signal.SIG_SETMASK, self.outer)
 
     def send(self, number, data):
         cancelled()
@@ -682,7 +689,8 @@ class Parts:
         """Drop waiting parts and join running ones; a deadline/stop meanwhile is raised after the join.
 
         After our deadline/stop the SDK hooks refuse another attempt, so a running part ends
-        within one request's connect/read timeouts; past STOP_SECONDS the process ends.
+        within one request's connect/read timeouts; past STOP_SECONDS the process ends. The
+        abort that follows runs with the deadline deliverable.
         """
         limit = time.monotonic() + STOP_SECONDS; interrupted = None
         with self.cond:
@@ -697,6 +705,7 @@ class Parts:
                     pass
             except BaseException as exc:
                 interrupted = interrupted or exc
+        self.release()
         if interrupted is not None:
             raise interrupted
 
@@ -790,10 +799,8 @@ def receive(config, source, *, client=None, respond=None):
                     del buffer[filled:]
                     full, buffer = buffer, None
                     uploads.add(full); full = None
+                # Joins every worker and lets a held deadline through before `completing`.
                 parts = uploads.finish()
-                # A deadline held until here fires before the journal says `completing`.
-                with uploads.window():
-                    pass
                 wire = {'v': 2, 'status': 'stored', 'id': bid, 'bytes': size, 'sha256': digest.hexdigest(),
                         'snapshot_sha256': header['snapshot_sha256'], 'duplicate': False,
                         'received_at': datetime.now(timezone.utc).isoformat()}

@@ -1126,3 +1126,34 @@ def test_a_part_request_outliving_the_stop_limit_ends_the_process_without_releas
         assert len(seen['alive'])==3 and 'abort_multipart_upload' not in cloud.calls and journal(config)
     finally:
         cloud.free();eventually(lambda:not workers_alive())
+
+# spec: ANYM-628
+def test_deadline_at_the_completing_write_aborts_like_serial_and_never_strands_the_journal(config,alarm,monkeypatch):
+    config=parallel(config);data=r2.AGE_HEADER+b'c'*(4*PART);cloud=Parallel(hold=False);written=r2.state_write
+    def state_write(directory,name,value):
+        if value.get('phase')=='completing':alarm()
+        return written(directory,name,value)
+    monkeypatch.setattr(r2,'state_write',state_write)
+    with pytest.raises(TimeoutError,match='receiver_timeout'):r2.receive(config,io.BytesIO(wire(data)),client=cloud)
+    assert 'complete_multipart_upload' not in cloud.calls and not workers_alive()
+    # The deadline refuses the abort's answer as in serial mode; the journal says `uploading`, so it reconciles.
+    assert [json.loads(p.read_text())['phase'] for p in journal(config)]==['uploading']
+    r2.CANCELLED.clear();monkeypatch.setattr(r2,'state_write',written)
+    with pytest.raises(RuntimeError,match='incomplete_upload_aborted_retry'):r2.receive(config,io.BytesIO(wire(data)),client=cloud)
+    assert r2.receive(config,io.BytesIO(wire(data)),client=cloud)['status']=='stored'
+
+# spec: ANYM-628
+def test_a_stalled_abort_after_the_join_still_gets_the_deadline(config,alarm,free_on_stop):
+    config=parallel(config);cloud=Parallel(fail_part=2);free_on_stop(cloud);entered=threading.Event();held=threading.Event()
+    def abort(**kw):
+        entered.set();assert held.wait(10),'abort never released'
+        return Cloud.abort_multipart_upload(cloud,**kw)
+    cloud.abort_multipart_upload=abort
+    def fire():entered.wait(10);alarm()
+    helper=threading.Thread(target=fire);helper.start();started=time.monotonic()
+    try:
+        with pytest.raises(TimeoutError,match='receiver_timeout'):
+            r2.receive(config,io.BytesIO(wire(r2.AGE_HEADER+b'a'*(5*PART-100))),client=cloud)
+        assert time.monotonic()-started<5 and not held.is_set() and not workers_alive() and journal(config)
+    finally:
+        held.set();helper.join(20)
