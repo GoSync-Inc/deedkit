@@ -81,8 +81,8 @@ def provider_flags_capture():
 
 
 def contact_card_capture():
-    # Off until the release a rollback would return to accepts metadata.contact (ANYM-529).
-    return os.environ.get('ANYMSG_CAPTURE_CONTACT_CARDS')=='1'
+    # On unless ANYMSG_CAPTURE_CONTACT_CARDS=0, the kill switch (ANYM-529).
+    return os.environ.get('ANYMSG_CAPTURE_CONTACT_CARDS')!='0'
 
 
 def contact_text(value):
@@ -102,12 +102,13 @@ def normalize_phone(raw):
 
 def telegram_contact(media):
     """MessageMediaContact as stated by Telegram; never a lookup of the shared user."""
-    name,cut=contact_text(' '.join(x for x in (media.first_name,media.last_name) if isinstance(x,str) and x))
+    first,last,phone,user=(getattr(media,k,None) for k in ('first_name','last_name','phone_number','user_id'))
+    name,cut=contact_text(' '.join(x for x in (first,last) if isinstance(x,str) and x))
     contact={'name':name,'phones':[]}
-    number,normalized=normalize_phone(media.phone_number if isinstance(media.phone_number,str) else '')
+    number,normalized=normalize_phone(phone if isinstance(phone,str) else '')
     number,number_cut=contact_text(number)
     if number:contact['phones'].append({'number':number,'normalized':normalized})
-    if type(media.user_id) is int and media.user_id>0:contact['telegram_user_id']=str(media.user_id)
+    if type(user) is int and user>0:contact['telegram_user_id']=str(user)
     if not name and not contact['phones']:return {'status':'unavailable','contacts':[]}
     return {'status':'truncated' if cut or number_cut else 'parsed','contacts':[contact]}
 

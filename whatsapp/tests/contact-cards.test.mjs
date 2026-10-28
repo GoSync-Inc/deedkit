@@ -64,10 +64,16 @@ test('bounds truncate contacts, phones and strings',()=>{
 });
 
 // spec: ANYM-529
+// The name predates the default flip (a Tiden case ID); it now checks the 0 kill switch.
 test('contact capture is off by default, so collection is unchanged',()=>{
-  const e=withCapture(undefined,()=>event(message()));
+  const e=withCapture('0',()=>event(message()));
   assert.equal('contactCard' in e,false);
   assert.equal('contactCard' in withCapture('1',()=>event(message({type:'chat',body:'hi',vCards:[]}))),false);
+});
+
+// spec: ANYM-529
+test('contact capture is on without the variable',()=>{
+  assert.equal(withCapture(undefined,()=>event(message())).contactCard.status,'parsed');
 });
 
 // spec: ANYM-529
