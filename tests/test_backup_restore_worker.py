@@ -11,6 +11,7 @@ import pytest
 
 from messaging_service import backup_crypto as crypto
 from test_backup_calendar import calendar_db  # noqa: F401  (a fixture)
+from test_backup_r2_verifier import calendar_operator,operator  # noqa: F401  (fixtures)
 
 
 def bundle():
@@ -239,12 +240,13 @@ def calendar_capture(calendar_db,tmp_path):  # noqa: F811  (the imported fixture
         c.execute("INSERT INTO fcs.connections VALUES ('home','google',true),('odd','google',false),('old','icloud',false)")
     snapshot=tmp_path/'snapshot'
     create_calendar_snapshot(source,snapshot,docker_tool(container,source,'pg_dump'),vault_directory=vault,profile_directory=profile)
-    def restore(snapshot=snapshot):
+    def restore(snapshot=snapshot,manifest_sha=None):
         from messaging_service import backup_restore_worker as worker
         from psycopg.conninfo import conninfo_to_dict
         target=calendar_db(schema=None)
         raw=(snapshot/'manifest.json').read_bytes()
-        return worker.restore_calendar(snapshot,hashlib.sha256(raw).hexdigest(),tool=lambda name:docker_tool(container,target,name),
+        manifest_sha=manifest_sha or hashlib.sha256(raw).hexdigest()
+        return worker.restore_calendar(snapshot,manifest_sha,tool=lambda name:docker_tool(container,target,name),
                                        env=None,dsn=target,database=conninfo_to_dict(target)['dbname'])
     return SimpleNamespace(snapshot=snapshot,source=source,restore=restore,dump=lambda:docker_tool(container,source,'pg_dump'))
 
@@ -353,3 +355,73 @@ def test_worker_refuses_a_bundle_of_the_other_profile_before_any_restore(tmp_pat
     if configured=='messaging':del config['profile']
     with pytest.raises(worker.RestoreStageError,match='verifier_profile_mismatch'):worker.run(config,io.BytesIO(data))
     assert calls==[] and not (restored/'result.json').exists()
+
+
+# spec: ANYM-606
+@pytest.mark.parametrize('profile',[None,'calendar ',['messaging']],ids=['null','other','list'])
+def test_a_manifest_naming_any_other_profile_value_is_a_mismatch_for_messaging(tmp_path,monkeypatch,profile):
+    from messaging_service import backup_restore_worker as worker
+    data,manifest=bundle();manifest={**manifest,'profile':profile}
+    restored=tmp_path/'verified-bundle';restored.mkdir(mode=0o700)
+    raw=json.dumps(manifest).encode();(restored/'manifest.json').write_bytes(raw)
+    monkeypatch.setattr(worker,'decrypt_snapshot_stream',lambda *a,**kw:restored)
+    config=calendar_worker_config(raw,data);del config['profile']
+    with pytest.raises(worker.RestoreStageError,match='verifier_profile_mismatch'):worker.run(config,io.BytesIO(data))
+
+
+# spec: ANYM-606
+@pytest.mark.parametrize('damage',['dump','state'])
+def test_an_age_authentic_calendar_bundle_with_a_wrong_hash_fails_bundle_integrity_not_decryption(tmp_path,monkeypatch,decoder,damage):
+    from messaging_service import backup_restore_worker as worker
+    from messaging_service.backup_calendar import MANIFEST_KEYS,RESTORE_MODE
+    dump=b'SYNTHETIC_CALENDAR_DUMP';state=b'POSTGRES_PASSWORD=synthetic\n'
+    manifest={key:None for key in MANIFEST_KEYS}
+    manifest.update(profile='calendar',format=1,created_at='2026-10-28T12:00:00+00:00',captured_at='2026-10-28T12:00:00+00:00',
+                    schema_version=4,tables={},type_warnings=[],vault_warnings=[],vault_staging_skipped=0,restore_mode=RESTORE_MODE,
+                    dump_sha256=hashlib.sha256(dump if damage=='state' else b'other').hexdigest(),
+                    state_files={'profile/postgres.env':{'bytes':len(state),'sha256':hashlib.sha256(state if damage=='dump' else b'x').hexdigest()}})
+    raw=json.dumps(manifest).encode();out=io.BytesIO()
+    with tarfile.open(fileobj=out,mode='w') as archive:
+        for name,value in [('manifest.json',raw),('database.dump',dump),('state/profile/postgres.env',state)]:
+            item=tarfile.TarInfo(name);item.size=len(value);archive.addfile(item,io.BytesIO(value))
+    data=out.getvalue();real=crypto.decrypt_snapshot_stream
+    monkeypatch.setattr(worker,'decrypt_snapshot_stream',lambda source,identity,destination,max_bytes:
+                        real(source,identity,tmp_path/'bundle',age=decoder,max_bytes=max_bytes))
+    with pytest.raises(worker.RestoreStageError,match='restore_bundle_failed'):
+        worker.run(calendar_worker_config(raw,data),io.BytesIO(data))
+
+
+# spec: ANYM-606
+def test_warnings_with_long_escaped_names_stay_inside_the_byte_bound_and_the_proof_read_limit():
+    from messaging_service import backup_restore_worker as worker
+    from messaging_service import backup_r2_receiver as r2
+    for count in (21,32,40):
+        warnings=[{'kind':'unknown_entry','name':'\U0001f600'*60+'%02d'%i} for i in range(count)]
+        bounded=worker.proof_warnings(warnings)
+        assert r2.valid_warnings(bounded) and len(r2.encoded(bounded))<=r2.WARNING_BYTES
+        assert bounded[-1]=={'kind':'warnings_truncated','name':str(count)}
+    assert not r2.valid_warnings([{'kind':'unknown_entry','name':'\U0001f600'*60}]*21)
+    small=[{'kind':'disabled_connection_without_token','name':'old'}]
+    assert worker.proof_warnings(small)==small
+
+
+# spec: ANYM-606
+def test_a_real_bundle_missing_an_enabled_token_fails_vault_complete_and_keeps_the_old_point(calendar_operator,calendar_capture):  # noqa: F811
+    from test_backup_r2 import receive,THIRD
+    from messaging_service import backup_restore_worker as worker
+    v,config,receiver,cloud,engine,_=calendar_operator
+    def restore(config,receiver,client,receipt,run,payload,secret_dir):
+        # The real calendar checks on the captured bundle, and the real failure fact the verifier reads.
+        engine.runs.append(run)
+        try:return calendar_capture.restore(manifest_sha=receipt['wire']['snapshot_sha256'])
+        except worker.RestoreStageError as error:
+            worker.write_failure(payload,error);raise v.helper_failure(payload) from None
+    engine.restore=restore
+    assert v.run(config,client=cloud,engine=engine)['status']=='verified'
+    marker=Path(config['protected_file']).read_bytes();objects=dict(cloud.objects)
+    receive(receiver,cloud,bid=THIRD)
+    restate(calendar_capture.snapshot,'vault/home.enc',None)
+    with pytest.raises(v.HelperFailure,match='restore_vault_incomplete'):v.run(config,client=cloud,engine=engine)
+    assert json.loads((Path(config['directory'])/'status.json').read_text())['error']=='restore_vault_incomplete'
+    assert Path(config['protected_file']).read_bytes()==marker
+    assert all(cloud.objects.get(key)==value for key,value in objects.items())

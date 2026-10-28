@@ -1229,6 +1229,21 @@ def test_proof_check_sets_are_bound_to_their_profile_and_never_mix():
 
 
 # spec: ANYM-606
+def test_a_calendar_proof_with_the_most_warnings_the_helper_keeps_is_protected(calendar_operator):
+    from messaging_service import backup_restore_worker as worker
+    v,config,receiver,cloud,engine,_=calendar_operator
+    warnings=worker.proof_warnings([{'kind':'unknown_entry','name':'\U0001f600'*60+'%02d'%i} for i in range(40)])
+    restore=engine.restore
+    def wide(*args):
+        facts=restore(*args);return {**facts,'vault_warnings':warnings}
+    engine.restore=wide
+    assert v.run(config,client=cloud,engine=engine)['status']=='verified'
+    proof=next(Path(config['directory']).glob('proof-*.json'))
+    assert proof.stat().st_size<16384 and json.loads(proof.read_text())['verification']['vault_warnings']==warnings
+    assert Path(config['protected_file']).exists()
+
+
+# spec: ANYM-606
 def test_protect_refuses_a_proof_of_the_other_profile(calendar_operator):
     v,config,receiver,cloud,engine,write_json=calendar_operator
     engine.failure=RuntimeError('stop before promotion')

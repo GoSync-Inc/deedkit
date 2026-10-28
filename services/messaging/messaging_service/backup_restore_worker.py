@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from . import backup
 from .backup_crypto import decrypt_snapshot_stream
-from .backup_r2_receiver import MAX_WARNINGS, private_json, encoded
+from .backup_r2_receiver import MAX_WARNINGS, WARNING_BYTES, private_json, encoded
 from .spool import fsync_dir
 
 DATABASE = 'deedkit_verify_restore_test'
@@ -120,12 +120,20 @@ def assert_quarantined(store, version):
                 raise RuntimeError('restore_quarantine_failed')
 
 
+UNREADABLE=object()
+# verify_calendar_bundle's errors. decrypt_snapshot_stream raises them only after age authenticated the whole
+# stream (backup_crypto._decrypt_snapshot), so they are integrity failures, not decryption ones.
+CALENDAR_BUNDLE_ERRORS={'invalid_calendar_bundle','dump_corrupt','state_corrupt'}
+
+
 def bundle_profile(path):
-    """The manifest's profile (absent: messaging); None for an unreadable manifest, which verification then refuses."""
+    """The manifest's profile: absent is messaging, any present value (null too) is itself; UNREADABLE for a
+    manifest that is no JSON object, which verification then refuses."""
     try:
         with path.open('rb') as manifest:value=json.load(manifest)
-    except (OSError,ValueError):return None
-    return value.get('profile','messaging') if isinstance(value,dict) else None
+    except (OSError,ValueError):return UNREADABLE
+    if not isinstance(value,dict):return UNREADABLE
+    return value['profile'] if 'profile' in value else 'messaging'
 
 
 def proof_warnings(warnings):
@@ -134,8 +142,12 @@ def proof_warnings(warnings):
                                                 isinstance(w['kind'],str) and isinstance(w['name'],str) for w in warnings):
         raise ValueError('invalid_calendar_bundle')
     items=[{'kind':w['kind'],'name':w['name'][:64]} for w in warnings]
-    if len(items)>MAX_WARNINGS:items=items[:MAX_WARNINGS-1]+[{'kind':'warnings_truncated','name':str(len(items))}]
-    return items
+    def kept(count):
+        return items[:count]+([{'kind':'warnings_truncated','name':str(len(items))}] if count<len(items) else [])
+    count=len(items) if len(items)<=MAX_WARNINGS else MAX_WARNINGS-1
+    # Count and characters do not bound bytes (an escaped emoji is 12): drop from the end until it fits.
+    while len(encoded(kept(count)))>WARNING_BYTES:count-=1
+    return kept(count)
 
 
 def calendar_vault_decrypts(restored,manifest):
@@ -212,12 +224,15 @@ def run(config, source=None):
         raise ValueError('invalid_restore_worker_config')
     source = sys.stdin.buffer if source is None else source
     work=Path(config['work_directory'])
-    restored=stage('restore_decryption_failed',lambda:decrypt_snapshot_stream(source,config['identity_file'],work/'bundle',max_bytes=config['max_plaintext_bytes']))
+    try:restored=decrypt_snapshot_stream(source,config['identity_file'],work/'bundle',max_bytes=config['max_plaintext_bytes'])
+    except Exception as error:
+        code='restore_bundle_failed' if profile=='calendar' and str(error) in CALENDAR_BUNDLE_ERRORS else 'restore_decryption_failed'
+        raise RestoreStageError(code) from None
     with (restored/'manifest.json').open('rb') as manifest_file:
         manifest_sha=hashlib.file_digest(manifest_file,'sha256').hexdigest()
     if manifest_sha != config['snapshot_sha256']:raise RuntimeError('restore_manifest_mismatch')
     found=bundle_profile(restored/'manifest.json')
-    if found is not None and found!=profile:raise RestoreStageError('verifier_profile_mismatch')
+    if found is not UNREADABLE and found!=profile:raise RestoreStageError('verifier_profile_mismatch')
     # Isolated DB name, host, user and arguments are fixed, never taken from the dump.
     env={**os.environ,'PGHOST':'restore-postgres','PGPORT':'5432','PGUSER':'restore_owner',
          'PGDATABASE':DATABASE,'PGPASSWORD':config['database_password'],'PGCONNECT_TIMEOUT':'10'}
@@ -269,22 +284,27 @@ def main():
     args=parser.parse_args()
     try:run(private_json(args.config))
     except Exception as error:
-        code=str(error) if isinstance(error,RestoreStageError) else 'isolated_restore_failed'
-        # A separate file keeps failure.json's exact shape for verifiers that predate the detail.
-        if isinstance(error,RestoreStageError) and error.detail:
-            try:
-                fd=os.open('/work/failure-detail.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
-                with os.fdopen(fd,'wb') as out:
-                    out.write(encoded({'v':1,'detail':error.detail}));out.flush();os.fsync(out.fileno())
-            except Exception:pass
-        try:
-            fd=os.open('/work/failure.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
-            with os.fdopen(fd,'wb') as out:
-                out.write(encoded({'v':1,'status':'failed','error':code}));out.flush();os.fsync(out.fileno())
-            fsync_dir('/work')
-        except Exception:pass
-        print(code,file=sys.stderr);return 1
+        print(write_failure(Path('/work'),error),file=sys.stderr);return 1
     return 0
+
+
+def write_failure(work,error):
+    """The failure fact the verifier reads (backup_r2_verifier.helper_failure): a fixed stage code only."""
+    code=str(error) if isinstance(error,RestoreStageError) else 'isolated_restore_failed'
+    # A separate file keeps failure.json's exact shape for verifiers that predate the detail.
+    if isinstance(error,RestoreStageError) and error.detail:
+        try:
+            fd=os.open(work/'failure-detail.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+            with os.fdopen(fd,'wb') as out:
+                out.write(encoded({'v':1,'detail':error.detail}));out.flush();os.fsync(out.fileno())
+        except Exception:pass
+    try:
+        fd=os.open(work/'failure.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'wb') as out:
+            out.write(encoded({'v':1,'status':'failed','error':code}));out.flush();os.fsync(out.fileno())
+        fsync_dir(work)
+    except Exception:pass
+    return code
 
 
 if __name__=='__main__':raise SystemExit(main())

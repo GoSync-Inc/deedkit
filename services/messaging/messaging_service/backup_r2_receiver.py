@@ -44,6 +44,9 @@ CALENDAR_CHECKS = {'decryption', 'bundle_integrity', 'database_restore', 'schema
                    'table_inventory', 'vault_complete', 'vault_decrypts'}
 PROFILES = ('messaging', 'calendar')
 MAX_WARNINGS = 32
+# Encoded bytes of the copied warnings: an escaped non-ASCII name grows (an emoji is 12 bytes), and
+# the proof must stay far inside the 16 KiB `protect`/`rotate` read limit.
+WARNING_BYTES = 4096
 WARNING_KIND = re.compile('[a-z_]{1,40}')
 
 
@@ -56,7 +59,7 @@ def valid_warnings(value):
     return (isinstance(value, list) and len(value) <= MAX_WARNINGS and
             all(isinstance(item, dict) and set(item) == {'kind', 'name'} and isinstance(item['kind'], str) and
                 WARNING_KIND.fullmatch(item['kind']) and isinstance(item['name'], str) and len(item['name']) <= 64
-                for item in value))
+                for item in value) and len(encoded(value)) <= WARNING_BYTES)
 
 
 def unique_json(raw):

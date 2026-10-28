@@ -262,19 +262,7 @@ class Docker:
                 try:process.wait(timeout=min(1,self.remaining()))
                 except subprocess.TimeoutExpired:continue
             self.check_reserve()
-            if process.wait(timeout=self.remaining()) or broken:
-                failure='isolated_restore_failed';detail=None
-                try:
-                    fact=r2.unique_json(private_file(payload/'failure.json',4096))
-                    safe={'restore_decryption_failed','restore_database_failed','restore_snapshot_failed','restore_quarantine_failed',
-                      *CALENDAR_FAILURES}
-                    if (isinstance(fact,dict) and set(fact)=={'v','status','error'} and
-                            type(fact['v']) is int and fact['v']==1 and fact['status']=='failed' and type(fact['error']) is str and fact['error'] in safe):failure=fact['error']
-                except (OSError,ValueError):pass
-                if failure=='restore_database_failed':
-                    try:detail=helper_detail(r2.unique_json(private_file(payload/'failure-detail.json',4096)))
-                    except (OSError,ValueError):pass
-                raise HelperFailure(failure,detail)
+            if process.wait(timeout=self.remaining()) or broken:raise helper_failure(payload)
         finally:
             if process.stdin and not process.stdin.closed:process.stdin.close()
             if process.poll() is None:
@@ -293,6 +281,22 @@ CALENDAR_FAILURES={'restore_bundle_failed','restore_schema_failed','restore_inve
 
 class HelperFailure(RuntimeError):
     def __init__(self,code,detail=None):super().__init__(code);self.detail=detail
+
+
+def helper_failure(payload):
+    """The failed helper's own fact (backup_restore_worker.write_failure) when it is a known safe code."""
+    failure='isolated_restore_failed';detail=None
+    try:
+        fact=r2.unique_json(private_file(payload/'failure.json',4096))
+        safe={'restore_decryption_failed','restore_database_failed','restore_snapshot_failed','restore_quarantine_failed',
+              *CALENDAR_FAILURES}
+        if (isinstance(fact,dict) and set(fact)=={'v','status','error'} and
+                type(fact['v']) is int and fact['v']==1 and fact['status']=='failed' and type(fact['error']) is str and fact['error'] in safe):failure=fact['error']
+    except (OSError,ValueError):pass
+    if failure=='restore_database_failed':
+        try:detail=helper_detail(r2.unique_json(private_file(payload/'failure-detail.json',4096)))
+        except (OSError,ValueError):pass
+    return HelperFailure(failure,detail)
 
 
 # The only phrases backup_restore_worker.restore_detail writes: fixed words, never a name or message text.
