@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
-from .core import DATE_VALUE, wall_time
+from .core import DATE_VALUE, GUEST_WRITE, wall_time
 from .providers import created_event_ref
 from .store import instant, ref
 
@@ -38,6 +38,11 @@ STATES = {
 }
 SETTLED = frozenset(("verified", "conflict", "failed", "unknown", "needs_attention", "partial"))
 KINDS = {"create": "create", "move": "update", "cancel": "delete"}
+# Guests of a create (ANYM-555): one plain address each, compared case-insensitively.
+MAX_GUESTS = 20
+EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+                   r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+")
+INVITE_FIELDS = ("guests", "notify")
 
 
 def token_hash(token):
@@ -89,6 +94,50 @@ class Choice(CalendarError):
     def __init__(self, calendars, request):
         super().__init__("selection_required")
         self.calendars, self.request = calendars, request
+
+
+class Unsupported(CalendarError):
+    """Guests asked of a calendar whose provider cannot invite. The tool turns it into `capability_unsupported`
+    outside every transaction, with a stored selection for the same event without guests."""
+
+    def __init__(self, calendar, request):
+        super().__init__("capability_unsupported")
+        self.calendar, self.request = calendar, request
+
+
+def invite(request):
+    """The create's guests and notify, checked before anything resolves; None without guests."""
+    guests, notify = request.get("guests"), request.get("notify")
+    if guests is None:
+        if notify is not None:
+            raise missing("guests")
+        return None
+    if notify not in ("none", "all"):
+        raise missing("notify", "required" if notify is None else "enum")
+    if not isinstance(guests, list) or not 1 <= len(guests) <= MAX_GUESTS:
+        raise missing("guests", "size")
+    seen = set()
+    for n, guest in enumerate(guests):
+        if not isinstance(guest, str) or len(guest) > 254 or not EMAIL.fullmatch(guest):
+            raise missing(f"guests/{n}", "format")
+        if guest.casefold() in seen:
+            raise missing(f"guests/{n}", "unique")
+        seen.add(guest.casefold())
+    return {"guests": list(guests), "notify": notify}
+
+
+def notifications(event, guests, notify):
+    """Who is told what (ANYM-555): with notify all, each guest's invitation email and its fields."""
+    if notify == "none":
+        return {"notify": "none", "recipients": [],
+                "summary": "Nobody is notified: no invitation email is sent. Google can still show the event, with "
+                           "these fields, in a guest's own Google Calendar."}
+    # Google's default guest list visibility: each guest sees the others.
+    receives = {**{k: event.get(k) for k in ("title", "start", "end", "timezone", "description", "location")},
+                "guests": guests}
+    return {"notify": "all", "recipients": [{"email": g, "receives": receives} for g in guests],
+            "summary": f"Google emails an invitation from this calendar's account to each of {len(guests)} "
+                       "guest(s), with the fields below and the guest list."}
 
 
 class Scheduler:
@@ -164,6 +213,22 @@ class Scheduler:
             for n, c in enumerate(choice.calendars, 1)
         ])
 
+    def unsupported(self, p, refusal):
+        """`capability_unsupported` for guests: `next` previews the same event without guests in that calendar."""
+        cal, token = refusal.calendar, secrets.token_urlsafe(24)
+        self.store.query(
+            "INSERT INTO schedule_selections(token_hash,principal_id,request,expires_at) "
+            "VALUES (%s,%s,%s,now()+make_interval(secs=>%s))",
+            (token_hash(token), p["id"], Jsonb({k: v for k, v in refusal.request.items()
+                                                 if k not in ("calendar", *INVITE_FIELDS)}), SELECTION_TTL_S),
+        )
+        return CalendarError("capability_unsupported", details={
+            "capability": "guests", "provider": cal["provider"],
+            "calendar": {"calendar_ref": cal["calendar_ref"], "label": cal["label"]},
+            "next": {"tool": TOOL_NAME, "arguments": {"selection_token": token, "calendar": cal["calendar_ref"],
+                                                      "dry_run": True}},
+        })
+
     def selected(self, p, token):
         """The request a selection stored; the caller's own arguments then add the chosen calendar."""
         if not isinstance(token, str) or not 8 <= len(token) <= 256:
@@ -190,7 +255,12 @@ class Scheduler:
         if kind not in KINDS:
             raise missing("action")
         zone = family["zone"]
+        if kind != "create":
+            for field in INVITE_FIELDS:
+                if field in request:
+                    raise missing(field, "unknown_field")
         if kind == "create":
+            guests = invite(request)
             if not request.get("title"):
                 raise missing("title")
             if "start" not in request:
@@ -212,7 +282,10 @@ class Scheduler:
                 b = a + timedelta(minutes=request.get("duration", DEFAULT_MINUTES))
                 event = {"title": request["title"], "start": a.astimezone(zone).isoformat(),
                          "end": b.astimezone(zone).isoformat(), "timezone": family["timezone"]}
-            return {"action": "create", "calendar_ref": cal["calendar_ref"], "event": event}, cal
+            if guests and not GUEST_WRITE[cal["provider"]]["supported"]:
+                raise Unsupported(cal, request)
+            return {"action": "create", "calendar_ref": cal["calendar_ref"], "event": event,
+                    **({"invite": guests} if guests else {})}, cal
         if "event" not in request:
             raise missing("event")
         if kind == "move" and "start" not in request:
@@ -288,7 +361,7 @@ class Scheduler:
     def preview(self, key, p, request, family):
         """Resolve `request` into a fresh plan with a token. Returns the plan row and the token."""
         action, cal = self.action(key, p, request, family)
-        plan = self.service.plan(key, [action])
+        plan = self.service.plan(key, [action], invitations=True)
         token = secrets.token_urlsafe(24)
         row = self.store.one(
             "UPDATE plans SET token_hash=%s,tool=%s,request=%s WHERE id=%s AND principal_id=%s RETURNING *",
@@ -311,6 +384,11 @@ class Scheduler:
         elif event:
             shown.update(start=instant(event["start"]).astimezone(zone).isoformat(),
                          end=instant(event["end"]).astimezone(zone).isoformat())
+        if step.get("invite"):
+            guests = step["invite"]["guests"]
+            shown["guests"] = guests
+            shown["notifications"] = notifications(
+                {**event, **{k: shown.get(k) for k in ("start", "end")}}, guests, step["invite"]["notify"])
         before = step.get("before")
         if before:
             shown["event_ref"] = plan["event_ref"]
@@ -411,6 +489,8 @@ class Scheduler:
                 result, operation_id = self.run(key, p, arguments, family, tool)
             except Choice as choice:
                 raise self.chosen(p, choice) from None
+            except Unsupported as refusal:
+                raise self.unsupported(p, refusal) from None
         except CalendarError as e:
             e.details = {**e.details, **self.context(family)}
             raise

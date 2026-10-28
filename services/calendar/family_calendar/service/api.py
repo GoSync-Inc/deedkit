@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 import json
 import time
-from typing import Literal
+from typing import Annotated, Literal
 
 from mcp.server import Server
 from mcp.server.transport_security import TransportSecuritySettings
@@ -144,6 +144,10 @@ class Schedule(Strict):
     duration: int | None = Field(default=None, ge=5, le=1440)
     calendar: str | None = Field(default=None, min_length=1, max_length=256)
     event: str | EventQuery | None = None
+    # create only (ANYM-555): guest email addresses and whether Google emails them the invitation.
+    guests: list[Annotated[str, Field(min_length=3, max_length=254)]] | None = Field(default=None, min_length=1,
+                                                                                    max_length=20)
+    notify: Literal["none", "all"] | None = None
     dry_run: bool = False
     confirm_token: str | None = Field(default=None, max_length=256)
     # A calendar candidate's preview: the stored request, so its `next` never repeats the caller's title.
@@ -206,8 +210,12 @@ DESCRIPTIONS = {
     "operation": "Read durable receipts. Unknown results require reconciliation; never submit a replacement create.",
     "assignment": "Assign a dropoff/pickup/stay interval. Does not claim acceptance or create provider projections.",
     "assignments": "List family responsibilities in a bounded window, with versions for conditional changes.",
-    "schedule": "Create, move or cancel one guest-free event in one call. create: title, start, duration in "
-    "minutes (default 30), calendar (full name or calendar_ref; default: the family's default calendar). move "
+    "schedule": "Create, move or cancel one event in one call. create: title, start, duration in "
+    "minutes (default 30), calendar (full name or calendar_ref; default: the family's default calendar), optional "
+    "guests (1-20 email addresses) with notify: none (no invitation email) or all (Google emails each guest); the "
+    "preview names every recipient and what each receives. Guests work only where calendar_capabilities shows "
+    "guests.supported; elsewhere capability_unsupported names the calendar and provider, with next: the same event "
+    "without guests. Events that already have guests are not moved or cancelled. move "
     "(start, optional duration) and cancel act only on event (an event_ref from agenda); event {title, date} "
     "lists the matching events as selection_required candidates, each previewing its change by event_ref. "
     "start: ISO 8601; without an offset it is read in the family timezone; YYYY-MM-DD makes an all-day event. "
@@ -245,7 +253,7 @@ HINTS = {
 
 # Errors whose fixed-shape details the agent needs to choose its next action.
 PUBLIC_DETAILS = {"nothing_to_project", "nothing_to_unproject", "selection_required", "preview_stale",
-                  "invalid_arguments", "event_not_found"}
+                  "invalid_arguments", "event_not_found", "capability_unsupported"}
 
 
 def failure(code, field_errors=None, details=None):
