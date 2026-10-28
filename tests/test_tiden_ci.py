@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from scripts.tiden_ci import (CHECKS, FRAGMENTS, MODULE_REPORTS, REQUIRED_EXECUTIONS, SHARD_JOBS, intent_links, linked_intent_branch, normalize_junit, prepare, publish,
+from scripts.tiden_ci import (CHECKS, FRAGMENTS, MODULE_REPORTS, PYTHON_SHARDS, REQUIRED_EXECUTIONS, SHARD_JOBS, intent_links, linked_intent_branch, normalize_junit, prepare, publish,
                               resolve_branch, route_branch)
 
 
@@ -539,7 +539,9 @@ def test_ci_reports_required_checks_for_merge_queue_runs_without_cancelling_them
     assert ci["jobs"]["gate"]["name"] == "CI gate" and ci["jobs"]["gate"]["if"] == "${{ always() }}"
     assert set(ci["jobs"]["gate"]["needs"]) == {"reuse", "pr_reuse", "checks", "native", "images"}
     assert ci["jobs"]["checks"]["uses"] == "./.github/workflows/checks.yml"
-    assert not any("if" in ci["jobs"][job] for job in ("native", "images"))
+    assert "if" not in ci["jobs"]["images"]
+    # native is skipped only with checks / verify on the queue's pull request reuse.
+    assert ci["jobs"]["native"]["if"] == "${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}"
     assert ci["jobs"]["reuse"]["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
     assert ci["jobs"]["checks"]["if"] == ("${{ !cancelled() && (needs.reuse.outputs.decision != 'reuse' "
                                           "|| needs.reuse.result == 'success') }}")
@@ -2027,7 +2029,7 @@ def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=
     (verify / "metadata.json").write_text(json.dumps({**metadata(), "tiden_branch": "", "module_checks": modules}))
     for name in ("python-1.xml", *verify_files):
         (verify / name).write_text('<testsuite><testcase name="x" file="tests/x.py"/></testsuite>')
-    for job in shards:  # the `checks / python` matrix jobs, shards 2-4 of the root suite
+    for job in shards:  # the `checks / python` matrix jobs, shards 2-6 of the root suite
         fragment = fragments / f"ci-evidence-{job}"
         fragment.mkdir()
         (fragment / "source-sha").write_text("a" * 40 + "\n")
@@ -2069,7 +2071,7 @@ def test_parallel_load_fragment_is_assembled_with_verify_evidence_of_the_same_co
     assert merged["module_checks"]["load"] == "success" and set(merged["module_checks"]) == set(MODULE_REPORTS)
     assert {path.name for path in out.iterdir()} == {"metadata.json", "source-sha", "python.xml", "load.xml", "load.json",
                                                      "whatsmeow.json", "release-router.json"}
-    # The four shard reports merge into the one python report, in shard order, so test identities do not change.
+    # The shard reports merge into the one python report, in shard order, so test identities do not change.
     assert [case.get("name") for case in ET.parse(out / "python.xml").getroot().iter("testcase")] == ["x", *SHARD_JOBS]
     rows = assembled_rows(tmp_path, merged)
     assert rows["deedkit-ci::load"] == rows["anymsg-ci::python"] == rows["deedkit-ci::whatsmeow"] == "passed"
@@ -2169,7 +2171,7 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     assert step["env"] == {"VERIFY": "verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}",
                            "LOAD": "load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}",
                            **{f"PYTHON_{index}": f"python-{index}:${{{{ needs.python-{index}.result }}}}:${{{{ needs.python-{index}.outputs.source_sha }}}}"
-                              for index in range(2, 5)},
+                              for index in range(2, PYTHON_SHARDS + 1)},
                            "GO": "go:${{ needs.go.result }}:${{ needs.go.outputs.source_sha }}"}
     work = tmp_path / "work"
     work.mkdir()
@@ -2179,7 +2181,7 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     evidence_fragments(temp, load=False)  # both jobs report success, the load artifact is gone, Tiden is unconfigured
     env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin", "RUNNER_TEMP": str(temp), "GITHUB_REPOSITORY": "example/repo",
            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "VERIFY": "verify:success:" + "a" * 40,
-           "LOAD": "load:success:" + "a" * 40, **{f"PYTHON_{index}": f"python-{index}:success:" + "a" * 40 for index in range(2, 5)},
+           "LOAD": "load:success:" + "a" * 40, **{f"PYTHON_{index}": f"python-{index}:success:" + "a" * 40 for index in range(2, PYTHON_SHARDS + 1)},
            "GO": "go:success:" + "a" * 40}
     result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, capture_output=True, text=True, env=env)
     assert result.returncode != 0, result.stderr
@@ -2219,7 +2221,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         assert upload["with"]["name"] == f"ci-evidence-{job}" and upload["if"] == "${{ always() }}"
         assert upload["with"]["overwrite"] is True
     evidence = jobs["evidence"]
-    assert evidence["needs"] == ["documentation", "verify", "load", "python-2", "python-3", "python-4", "go"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
+    assert evidence["needs"] == ["documentation", "verify", "load", *SHARD_JOBS, "go"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     assert jobs["tiden"]["needs"] == ["documentation", "evidence"]
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in evidence["steps"]}
     assert steps["actions/download-artifact"]["with"]["pattern"] == "ci-evidence-*"
@@ -2229,7 +2231,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     require = steps["Require every test job to have succeeded"]
     assert require["if"] == "${{ always() }}"
     assert require["env"] == {"VERIFY_RESULT": "${{ needs.verify.result }}", "LOAD_RESULT": "${{ needs.load.result }}",
-                              **{f"PYTHON_{index}_RESULT": f"${{{{ needs.python-{index}.result }}}}" for index in range(2, 5)},
+                              **{f"PYTHON_{index}_RESULT": f"${{{{ needs.python-{index}.result }}}}" for index in range(2, PYTHON_SHARDS + 1)},
                               "GO_RESULT": "${{ needs.go.result }}"}
     for verify, load_result, shards, go in [("success", "success", "success", "success"), ("success", "failure", "success", "success"),
                                             ("success", "cancelled", "success", "success"), ("success", "skipped", "success", "success"),
@@ -2237,8 +2239,9 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
                                             ("success", "success", "failure", "success"), ("success", "success", "skipped", "success"),
                                             ("success", "success", "success", "failure"), ("success", "success", "success", "skipped")]:
         result = subprocess.run(["bash", "-e", "-c", require["run"]], capture_output=True,
-                                env={"VERIFY_RESULT": verify, "LOAD_RESULT": load_result, "PYTHON_2_RESULT": "success",
-                                     "PYTHON_3_RESULT": shards, "PYTHON_4_RESULT": "success", "GO_RESULT": go})
+                                env={"VERIFY_RESULT": verify, "LOAD_RESULT": load_result, "GO_RESULT": go,
+                                     **{f"PYTHON_{index}_RESULT": "success" for index in range(2, PYTHON_SHARDS + 1)},
+                                     "PYTHON_3_RESULT": shards})
         assert (result.returncode == 0) == (verify == load_result == shards == go == "success"), (verify, load_result, shards, go)
 
 

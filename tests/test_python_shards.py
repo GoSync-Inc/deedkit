@@ -1,4 +1,4 @@
-"""The root Python suite runs in four file-level shards on parallel runners; synthetic workflows and reports only."""
+"""The root Python suite runs in file-level shards (six in CI) on parallel runners; synthetic workflows and reports only."""
 import fnmatch
 import json
 import os
@@ -51,9 +51,9 @@ def test_the_plan_is_deterministic_balanced_and_gives_shard_one_less_work():
     # One shard runs everything, without a head start.
     assert set(python_shards.plan(files, 1, weights).values()) == {1}
     # The committed plan balances the real suite: verify's shard plus its head start is within a minute of the others.
-    real = python_shards.plan(python_shards.modules(ROOT), 4, WEIGHTS)
+    real = python_shards.plan(python_shards.modules(ROOT), tiden_ci.PYTHON_SHARDS, WEIGHTS)
     seconds = [sum(WEIGHTS["seconds"].get(name, WEIGHTS["default"]) for name, owner in real.items() if owner == index)
-               for index in range(1, 5)]
+               for index in range(1, tiden_ci.PYTHON_SHARDS + 1)]
     seconds[0] += WEIGHTS["head_start"]
     assert max(seconds) - min(seconds) < 60, seconds
 
@@ -282,7 +282,7 @@ def test_the_python_check_passes_only_when_every_shard_passed_with_its_report(tm
 
 
 def test_a_missing_shard_or_a_failed_verify_shard_never_reads_as_passed(tmp_path):
-    missing = tiden_ci.assemble(tmp_path / "a" / "ci-evidence", evidence_fragments(tmp_path / "a", shards=("python-2", "python-4")),
+    missing = tiden_ci.assemble(tmp_path / "a" / "ci-evidence", evidence_fragments(tmp_path / "a", shards=tuple(job for job in tiden_ci.SHARD_JOBS if job != "python-3")),
                                 ATTEMPT_URL, PASSED)
     assert missing["missing"] == ["python-3"] and missing["checks"]["python"] == "skipped"
     assert assembled_rows(tmp_path / "a", missing)["anymsg-ci::python"] == "blocked"
@@ -401,6 +401,7 @@ def test_a_partial_rerun_keeps_the_untouched_shard_jobs_fragments(tmp_path):
     producers = {**PASSED, "python-3": ("failure", "a" * 40)}
     merged = tiden_ci.assemble(tmp_path / "ci-evidence", fragments, ATTEMPT_URL, producers)
     assert merged["missing"] == [] and merged["checks"]["python"] == "failure"
-    assert {job: merged["producers"][job]["attempt"] for job in tiden_ci.SHARD_JOBS} == {"python-2": "1", "python-3": "2", "python-4": "1"}
+    assert {job: merged["producers"][job]["attempt"] for job in tiden_ci.SHARD_JOBS} == {
+        job: "1" if job in ("python-2", "python-4") else "2" for job in tiden_ci.SHARD_JOBS}
     names = [case.get("name") for case in ET.parse(tmp_path / "ci-evidence" / "python.xml").getroot().iter("testcase")]
     assert names == ["x", *tiden_ci.SHARD_JOBS]

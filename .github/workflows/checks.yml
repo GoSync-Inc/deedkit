@@ -273,7 +273,7 @@ jobs:
           ANYMSG_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           ANYMSG_TEST_WHEEL: ${{ github.workspace }}/dist/anymsg-${{ steps.build.outputs.version }}-py3-none-any.whl
           ANYMSG_TEST_SDIST: ${{ github.workspace }}/dist/anymsg-${{ steps.build.outputs.version }}.tar.gz
-          DEEDKIT_TEST_SHARD: 1/4
+          DEEDKIT_TEST_SHARD: 1/6
         run: |
           DEEDKIT_TEST_ROUTER_IMAGE="$(docker image inspect --format '{{.Id}}' deedkit-release-router:ci)"
           export DEEDKIT_TEST_ROUTER_IMAGE
@@ -553,14 +553,14 @@ jobs:
           retention-days: 1
           overwrite: true
   python-2:
-    # Shards 2-4 of the root Python/PostgreSQL suite, in parallel with verify, which runs shard 1. Each shard has
+    # Shards 2-6 of the root Python/PostgreSQL suite, in parallel with verify, which runs shard 1. Each shard has
     # its own runner and PostgreSQL and the same tools, images and environments as verify's suite step; every
     # test module belongs to exactly one shard (scripts/python_shards.py), and evidence merges their reports.
     # Each shard is a job of its own, not one matrix, so evidence receives each shard job's completed result and
-    # captured SHA; python-3 and python-4 repeat this job's steps through the anchor. A shard job does not check
+    # captured SHA; python-3 to python-6 repeat this job's steps through the anchor. A shard job does not check
     # the commit receiving the checks: evidence requires its captured SHA to be verify's, and verify checks it,
     # so a shard job's result is its tests' and never a baseline's deliberate mismatch.
-    name: python (${{ matrix.shard }}/4)
+    name: python (${{ matrix.shard }}/6)
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
@@ -684,7 +684,7 @@ jobs:
           ANYMSG_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           ANYMSG_TEST_WHEEL: ${{ github.workspace }}/dist/anymsg-${{ steps.package.outputs.version }}-py3-none-any.whl
           ANYMSG_TEST_SDIST: ${{ github.workspace }}/dist/anymsg-${{ steps.package.outputs.version }}.tar.gz
-          DEEDKIT_TEST_SHARD: ${{ matrix.shard }}/4
+          DEEDKIT_TEST_SHARD: ${{ matrix.shard }}/6
         run: |
           DEEDKIT_TEST_ROUTER_IMAGE="$(docker image inspect --format '{{.Id}}' deedkit-release-router:ci)"
           export DEEDKIT_TEST_ROUTER_IMAGE
@@ -719,7 +719,7 @@ jobs:
           retention-days: 1
           overwrite: true
   python-3:
-    name: python (${{ matrix.shard }}/4)
+    name: python (${{ matrix.shard }}/6)
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
@@ -734,7 +734,7 @@ jobs:
     services: *python-shard-services
     steps: *python-shard-steps
   python-4:
-    name: python (${{ matrix.shard }}/4)
+    name: python (${{ matrix.shard }}/6)
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
@@ -748,11 +748,41 @@ jobs:
       source_sha: ${{ steps.source.outputs.sha }}
     services: *python-shard-services
     steps: *python-shard-steps
+  python-5:
+    name: python (${{ matrix.shard }}/6)
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        shard: [5]
+    env:
+      DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    services: *python-shard-services
+    steps: *python-shard-steps
+  python-6:
+    name: python (${{ matrix.shard }}/6)
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        shard: [6]
+    env:
+      DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    services: *python-shard-services
+    steps: *python-shard-steps
   evidence:
     # One `ci-evidence` artifact from every test job's fragment, attempted even after a failure so the
     # failure itself is recorded (TIDEN-CI.md). A missing, failed, cancelled or skipped test job fails
     # this job whether or not Tiden reporting is configured.
-    needs: [documentation, verify, load, python-2, python-3, python-4, go]
+    needs: [documentation, verify, load, python-2, python-3, python-4, python-5, python-6, go]
     if: ${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -779,12 +809,14 @@ jobs:
           PYTHON_2: python-2:${{ needs.python-2.result }}:${{ needs.python-2.outputs.source_sha }}
           PYTHON_3: python-3:${{ needs.python-3.result }}:${{ needs.python-3.outputs.source_sha }}
           PYTHON_4: python-4:${{ needs.python-4.result }}:${{ needs.python-4.outputs.source_sha }}
+          PYTHON_5: python-5:${{ needs.python-5.result }}:${{ needs.python-5.outputs.source_sha }}
+          PYTHON_6: python-6:${{ needs.python-6.result }}:${{ needs.python-6.outputs.source_sha }}
           GO: go:${{ needs.go.result }}:${{ needs.go.outputs.source_sha }}
         run: |
           assembled=0
           python ci-tools/scripts/tiden_ci.py assemble --directory "$RUNNER_TEMP/ci-evidence" --fragments "$RUNNER_TEMP/fragments" \
             --producer "$VERIFY" --producer "$LOAD" --producer "$PYTHON_2" --producer "$PYTHON_3" --producer "$PYTHON_4" \
-            --producer "$GO" || assembled=$?
+            --producer "$PYTHON_5" --producer "$PYTHON_6" --producer "$GO" || assembled=$?
           python ci-tools/scripts/tiden_ci.py prepare --directory "$RUNNER_TEMP/ci-evidence"
           exit "$assembled"
       - name: Retain test evidence even when a check fails
@@ -810,6 +842,8 @@ jobs:
           PYTHON_2_RESULT: ${{ needs.python-2.result }}
           PYTHON_3_RESULT: ${{ needs.python-3.result }}
           PYTHON_4_RESULT: ${{ needs.python-4.result }}
+          PYTHON_5_RESULT: ${{ needs.python-5.result }}
+          PYTHON_6_RESULT: ${{ needs.python-6.result }}
           GO_RESULT: ${{ needs.go.result }}
         run: |
           test "$VERIFY_RESULT" = success
@@ -817,6 +851,8 @@ jobs:
           test "$PYTHON_2_RESULT" = success
           test "$PYTHON_3_RESULT" = success
           test "$PYTHON_4_RESULT" = success
+          test "$PYTHON_5_RESULT" = success
+          test "$PYTHON_6_RESULT" = success
           test "$GO_RESULT" = success
   tiden_pr:
     # Check A (ANYM-405, TIDEN-CI.md): the pull request's `Spec:`/`Delivers:`/`Tiden branch:` lines, the markers
