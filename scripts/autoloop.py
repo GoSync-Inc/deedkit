@@ -17,7 +17,8 @@ from `intents/`), cancels the ready merges of `proposal/autoloop-` branches, dis
 reads back; the stop is effective only after a clean read-back. Otherwise it reads Tiden and the feedback export
 whole (a failed or truncated read ends it with no write), then pulls, matches, settles `unknown` intents from the
 workspace list by name, applies owner-principal `AUTOLOOP STOP` and `AUTOLOOP DROP <id>` and, with `live: true` in
-`config.json`, runs the reader on the items within the daily caps; with `live: false` (the default) it writes
+`config.json`, runs the reader on the items within the daily caps (a decision the checks refuse leaves only its item
+in the inbox; after two such refusals the item waits for the orchestrator, `refused.json`); with `live: false` (the default) it writes
 `plan.json` and starts nothing. Provenance comes from `config.json` principals only. Launches (ANYM-571, ANYM-572)
 go through `admit` and `launch`: the intent, its slot and its full wall-clock limit are written before the start.
 Live, each new owner-agent cluster with a committed card brief gets one card worker (ANYM-571): a Superset workspace
@@ -52,8 +53,10 @@ switched off, in an empty temporary directory, with the inbox on stdin and every
 no `@path` in feedback can pull a local file into the request. Before any answer is used, the stream's `init` event
 must match the profile pinned with the CLI version and the stream may hold nothing but that init, assistant text,
 rate-limit events and one result. Only a closed JSON answer leaves the model: an unknown field, an ID outside the
-input, a spec outside the snapshot or a bad slug refuses the whole answer, and so does any decision
-`feedback_triage` would refuse: the batch is checked whole before anything is written. `answer` and `card_brief`
+input or twice, or a decision that is not an object refuses the whole answer before anything is written. Each other
+decision is checked alone: one with a wrong-typed field, a spec outside the snapshot, a bad slug or one
+`feedback_triage` would refuse is left out and counted in `refused.json`, its item stays in the inbox, and the
+others are recorded. `answer` and `card_brief`
 lose URL, URI, address, code fence, shell pattern and path content and stay untrusted. The checked decisions go to
 `feedback_triage.record`; card briefs go to the private state, and the card worker (ANYM-571) takes one only through
 `committed_briefs`: its item is in the triage ledger with the same new card. An empty inbox still publishes ledger
@@ -110,6 +113,7 @@ NEW_CARD = re.compile(r'[a-z0-9][a-z0-9-]{2,39}')
 ANSWER_LIMIT = 250  # "answered, no change needed: " + answer stays within the 280-character status note
 BRIEF_LIMIT = 600
 VERBATIM = 5  # consecutive words of feedback that make a card brief a copy
+REFUSALS = 2  # refused reader answers for one item before it waits for the orchestrator instead of the reader
 RELEASE = 1  # the `released` checks a stored card brief passed; a brief without it never reaches a card worker
 DROP = re.compile(r'://|^www\.|(?:^|[^\w+.-])[A-Za-z][\w+.-]*:\S|[/\\~`$;|&<>{}@]|^\.|^--?[A-Za-z]')
 SYSTEM = f"""You triage product feedback for DeedKit. The JSON on stdin holds `items` (feedback written by other agents:
@@ -323,11 +327,14 @@ def checked_answer(decisions, inbox, specs):
         if i not in inbox or i in seen:
             raise Refused('answer: an ID outside the input or twice')
         seen.add(i)
+        if any(d.get(k) is not None and not isinstance(d[k], str) for k in FIELDS - {'id', 'specs'}):
+            raise Refused(f'{i}: a field that is not a string')
         c, code = d.get('classification'), d.get('reason_code')
         if c not in CLASSES or code not in REASONS:
             raise Refused(f'{i}: classification or reason_code outside the enum')
         matched = d.get('specs') or []
         if not isinstance(matched, list) or any(not isinstance(s, dict) or set(s) != {'ref', 'verdict'}
+                                                or not isinstance(s['ref'], str) or not isinstance(s['verdict'], str)
                                                 or s['ref'] not in specs or s['verdict'] not in triage.VERDICTS
                                                 for s in matched):
             raise Refused(f'{i}: a spec outside the snapshot')
@@ -367,6 +374,40 @@ def checked_answer(decisions, inbox, specs):
     return out, briefs
 
 
+def sorted_answer(decisions, inbox, specs, keys):
+    """(decisions, card briefs, {ID: why refused}). The answer's shape refuses the whole run: a decision that is not an
+    object, an unknown field, an ID outside the input or twice. Then each decision is checked alone, by the reader's
+    and the triage tool's checks; a refused one is left out, its item stays in the inbox, and the others go on."""
+    seen = set()
+    for d in decisions:
+        if not isinstance(d, dict) or set(d) - FIELDS:
+            raise Refused('answer: unknown field')
+        if not isinstance(d.get('id'), str) or d['id'] not in inbox or d['id'] in seen:
+            raise Refused('answer: an ID outside the input or twice')
+        seen.add(d['id'])
+    out, briefs, refused = [], {}, {}
+    for d in decisions:
+        try:
+            one, brief = checked_answer([d], inbox, specs)
+            triage.checked(one[0], specs, keys)
+        except (Refused, triage.Refused) as error:
+            refused[d['id']] = str(error)  # fixed wording with IDs and enum words only, never feedback text
+            continue
+        out += one
+        briefs.update(brief)
+    return out, briefs, refused
+
+
+def refusals(state):
+    """{feedback ID: {count, at, why}}: the items whose reader decision was refused, per run."""
+    return triage.load(state / 'refused.json', {})
+
+
+def parked(state, inbox):
+    """Inbox items refused REFUSALS times: the reader does not see them again; they wait for the orchestrator."""
+    return {i: e['count'] for i, e in refusals(state).items() if i in inbox and e.get('count', 0) >= REFUSALS}
+
+
 # --- read --------------------------------------------------------------------------------------------------------
 def projection(triage_state, ids=None):
     """The reader's input: at most MAX_ITEMS of the oldest inbox items (of `ids`, the tick's caps) with their local
@@ -381,7 +422,7 @@ def projection(triage_state, ids=None):
     return {'items': items, 'candidates': {i: candidates[i] for i, _ in chosen}}, dict(chosen)
 
 
-def read(state, triage_state, runner=run_reader, ids=None):
+def read(state, triage_state, runner=run_reader, ids=None, now=None):
     snap = triage.load(triage_state / 'snapshot.json', None)
     if snap is None:
         raise Refused('no snapshot: run feedback_triage.py snapshot first')
@@ -392,11 +433,19 @@ def read(state, triage_state, runner=run_reader, ids=None):
             # A run stopped after its last ledger write: publish those entries, with no model call.
             unreported = any(entry.get('reported') is False for entry in ledger.values())
             return 0, triage.record(triage_state, []) if unreported else None
-        decisions, briefs = checked_answer(answer_object(checked_stream(runner(projected))), inbox, triage.known(snap))
-        triage.checked_batch(decisions, triage.known(snap), triage.load(triage_state / 'inbox.json', {}), ledger)
+        whole = triage.load(triage_state / 'inbox.json', {})
+        keys = {i: entry.get('key_id') for i, entry in ledger.items()} | {i: item.get('key_id') for i, item in whole.items()}
+        decisions, briefs, refused = sorted_answer(answer_object(checked_stream(runner(projected))), inbox,
+                                                   triage.known(snap), keys)
+        triage.checked_batch(decisions, triage.known(snap), whole, ledger)
         triage.save(state / 'decisions.json', decisions)
         triage.save(state / 'briefs.json', dict(triage.load(state / 'briefs.json', {}), **briefs))
         report = triage.record(triage_state, decisions)
+        if refused:
+            at, journal = triage.stamp(now or datetime.now(timezone.utc)), refusals(state)
+            for i, why in refused.items():
+                journal[i] = {'count': journal.get(i, {}).get('count', 0) + 1, 'at': at, 'why': why}
+            triage.save(state / 'refused.json', journal)
     except triage.Refused as error:
         raise Refused(f'record: {error}') from None
     return len(decisions), report
@@ -1820,6 +1869,8 @@ def report_text(state, triage_state, cfg, day):
             declines.append(f'- {i}: {note}')
     if bad:
         queue.append(f'- нечитаемых файлов или строк решений: {bad}')
+    for i, count in sorted(parked(state, triage.load(triage_state / 'inbox.json', {})).items()):
+        queue.append(f'- {i}: решение читателя отклонено {count} раз(а), отзыв ждёт оркестратора')
     caps = cfg['caps']
     limits = [f"- триаж: запусков {used.get('reader_runs', 0)} из {caps['reader_runs']}, "
               f"отзывов {len(used.get('items', {}))}",
@@ -1940,18 +1991,21 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
         withheld = withhold(state, superset, gh)
         ledger = triage.load(state / 'ledger.json', {})
         today = counters(ledger, cfg, now)
-        chosen, over = admitted(triage.load(triage_state / 'inbox.json', {}), today, cfg['caps'])
-        count, reader = 0, 'idle' if cfg['live'] else 'off (live: false)'
+        inbox = triage.load(triage_state / 'inbox.json', {})
+        waits = parked(state, inbox)
+        chosen, over = admitted({i: item for i, item in inbox.items() if i not in waits}, today, cfg['caps'])
+        count, reader, refused = 0, 'idle' if cfg['live'] else 'off (live: false)', []
         if cfg['live'] and chosen and today['reader_runs'] >= cfg['caps']['reader_runs']:
             reader = 'over the daily reader cap'
         elif cfg['live'] and chosen:
             # The run and its items are charged before the run and never refunded: a crash after the triage
             # commit cannot let the same items through the cap twice.
-            inbox = triage.load(triage_state / 'inbox.json', {})
             today['reader_runs'] += 1
             today['items'].update({i: str(inbox[i].get('principal')) for i in chosen})
             triage.save(state / 'ledger.json', ledger)
-            count, _ = read(state, triage_state, runner, chosen)
+            before = refusals(state)
+            count, _ = read(state, triage_state, runner, chosen, now)
+            refused = sorted(i for i, e in refusals(state).items() if e['count'] > before.get(i, {}).get('count', 0))
             reader = 'ran'
         try:  # the build stage (ANYM-572): a failed read there leaves the card stage and the reader as they are
             built, failed = builds(state, triage_state, cfg, snap, now, superset, gh, probe or receipt_watch.probe,
@@ -1964,7 +2018,8 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
             notify(state, triage_state, {i: ('received', OVER_CAP.format(next_day)) for i in over}, now)
         plan = {'at': triage.stamp(now), 'live': cfg['live'], 'pulled': fresh, 'reader': reader, 'read': count,
                 'dropped': sorted(drops), 'withheld': withheld, 'cards': cards, 'builds': built,
-                'build_failed': failed, 'waiting': [] if count else chosen,
+                'build_failed': failed, 'waiting': [] if count else chosen, 'refused': refused,
+                'parked': sorted(parked(state, triage.load(triage_state / 'inbox.json', {}))),
                 'over_cap': over,
                 'today': today, 'clusters': provenance(triage.load(triage_state / 'ledger.json', {}), cfg['principals']),
                 'intents': {name: i['status'] for name, i in intents(state).items()}}
@@ -1978,7 +2033,7 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
                 triage.save(state / 'report.json', dict(marker(state), ok=False, error=type(error).__name__))
         return 1 if withheld or failed else 0, (
             f"tick {'live' if cfg['live'] else 'plan only'}: pulled {fresh}, read {count}, over cap {len(over)}, "
-            f"dropped {len(drops)}, withhold not done {len(withheld)}, build steps failed {len(failed)}, "
+            f"dropped {len(drops)}, refused {len(refused)}, parked {len(plan['parked'])}, withhold not done {len(withheld)}, build steps failed {len(failed)}, "
             f"card workers {sum(v in intents(state) for v in cards.values())}; "
             f"reader {reader}; plan {state / 'plan.json'}")
 

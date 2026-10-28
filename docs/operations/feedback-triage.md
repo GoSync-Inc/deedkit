@@ -208,9 +208,14 @@ inbox it makes no model call; it only publishes ledger entries a stopped run lef
 - The answer is closed: `{"decisions": [...]}` with `id`, `classification` (the classes above
   plus `already-live`), `specs`, `primary`, `duplicate_of`, `new_card`, `reason_code` (an enum;
   the ledger reason is the code's fixed text), `answer` and `card_brief`. An unknown field, an ID
-  outside the input or twice, a spec outside the snapshot, a bad slug or verdict, or `new_card` on
-  anything but an unmatched, non-duplicate bug or feature refuses the whole answer, and so does
-  a decision `record` would refuse: the batch is checked whole before anything is written.
+  outside the input or twice, or a decision that is not an object refuses the whole answer, and
+  nothing is written. Then each decision is checked alone: one with a field of the wrong type, a
+  spec outside the snapshot, a bad slug or verdict, `new_card` on anything but an unmatched,
+  non-duplicate bug or feature, or one `record` would refuse is left out; its item stays in the
+  inbox, the others are recorded, and `refused.json` in the autoloop state counts it (IDs and the
+  check's fixed wording only). After two refusals the tick no longer gives the item to the reader:
+  `plan.json` (`parked`), the tick line and the daily report's orchestrator queue list it until
+  the orchestrator settles it with `record`.
   `already-live` needs one accepted Done spec on main and is recorded as an accepted bug or
   feature, which the ANYM-536 follower moves to `verify_requested`.
 - `answer` and `card_brief` lose URLs, URIs, addresses, code fences, shell patterns and paths

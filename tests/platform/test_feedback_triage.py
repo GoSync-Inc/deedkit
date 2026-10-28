@@ -204,6 +204,48 @@ def test_snapshot_reads_main_and_open_branches_and_refuses_a_truncated_read(tmp_
 
 
 # spec: ANYM-264
+def test_a_branch_merged_or_closed_after_the_branch_list_is_left_out_and_main_is_read_again(tmp_path):
+    calls = []
+    listed = dict(BRANCHES, branches=[*BRANCHES['branches'], {'name': 'proposal/y', 'status': 'open'}])
+
+    def gone(name):
+        base = reader(calls, branches=listed)
+
+        def read(*argv):
+            if argv == ('spec', 'list', '--branch', 'proposal/y'):
+                calls.append(argv)
+                raise triage.Gone('tiden spec exited 1', name)
+            return base(*argv)
+        return read
+    assert triage.snapshot(tmp_path, gone('proposal/y')) == (3, 1)
+    assert calls == [('spec', 'list', '--branch', 'main', '--include-sources'), ('branch', 'list'),
+                     ('spec', 'list', '--branch', 'proposal/x'), ('spec', 'list', '--branch', 'proposal/y'),
+                     ('spec', 'list', '--branch', 'main', '--include-sources')]
+    assert set(read(tmp_path, 'snapshot.json')['branches']) == {'proposal/x'}
+    before = (tmp_path / 'snapshot.json').read_bytes()
+    with pytest.raises(triage.Gone):  # Tiden named another branch: not the one asked for
+        triage.snapshot(tmp_path, gone('proposal/x'))
+    assert (tmp_path / 'snapshot.json').read_bytes() == before
+
+
+# spec: ANYM-264
+@pytest.mark.parametrize('argv,stderr,branch', [
+    (['tiden', 'spec'], "error: HTTP 400: branch 'review/anym-1' is merged\n", 'review/anym-1'),
+    (['tiden', 'spec'], "Error: HTTP 400: branch 'intent/x' is closed\n", None),
+    (['tiden', 'spec'], "error: HTTP 400: branch 'intent/x' is closed\n", 'intent/x'),
+    (['tiden', 'spec'], 'error: HTTP 500: internal\n', None),
+    (['tiden', 'spec'], "error: HTTP 400: branch 'x' is merged\nhint: retry\n", None),
+    (['ssh', 'host'], "error: HTTP 400: branch 'x' is merged\n", None),
+], ids=['merged', 'other wording', 'closed', 'server error', 'more output', 'not tiden'])
+def test_only_tidens_merged_or_closed_branch_error_is_a_gone_branch(monkeypatch, argv, stderr, branch):
+    monkeypatch.setattr(triage.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(argv, 1, '', stderr))
+    with pytest.raises(triage.Refused, match='exited 1') as error:
+        triage.run(argv, 5)
+    assert isinstance(error.value, triage.Gone) == (branch is not None)
+    assert getattr(error.value, 'branch', None) == branch
+
+
+# spec: ANYM-264
 def test_local_match_and_classification_vocabulary(state):
     triage.pull(state, 'deedkit-prod', exporter([item(P1, 1), item(P2, 2, 'Reaction export would help',
                                                                  operation=None)], []))
