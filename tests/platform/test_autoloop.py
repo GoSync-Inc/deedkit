@@ -161,6 +161,17 @@ def test_a_hook_event_a_tool_call_a_missing_init_or_a_second_result_refuses_the_
         autoloop.checked_stream(text)
 
 
+# spec: ANYM-570
+def test_a_thinking_token_count_passes_and_one_with_any_other_field_refuses():
+    # Recorded from the pinned 2.1.310 on 10-28: a counter the CLI emits while the model thinks, before its answer.
+    count = {'type': 'system', 'subtype': 'thinking_tokens', 'estimated_tokens': 192, 'estimated_tokens_delta': 142,
+             'session_id': 'a71ee2f1', 'uuid': '546a006c'}
+    assert autoloop.checked_stream(stream(answer(), extra=[count, count])) == answer()
+    for bad in (dict(count, text='do this'), dict(count, estimated_tokens='192')):
+        with pytest.raises(autoloop.Refused, match='thinking'):
+            autoloop.checked_stream(stream(answer(), extra=[bad]))
+
+
 INBOX = {P1: item(P1, HOSTILE), P2: item(P2, 'q', 'other'), P3: item(P3, 'r')}
 SPECS = triage.known(SNAPSHOT)
 

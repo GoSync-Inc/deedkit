@@ -93,7 +93,10 @@ PROFILE = {'plugins': {'cc-plugin-agents-md', 'cc-plugin-telemetry', 'cc-plugin-
            'agents': {'claude', 'Explore', 'general-purpose', 'Plan', 'statusline-setup'}}
 # Each must be present and an empty list: a missing field is not evidence of an empty one.
 EMPTY = ('tools', 'mcp_servers', 'slash_commands', 'skills')
-EVENTS = {('system', 'init'), ('assistant', None), ('rate_limit_event', None), ('result', 'success')}
+EVENTS = {('system', 'init'), ('system', 'thinking_tokens'), ('assistant', None), ('rate_limit_event', None),
+          ('result', 'success')}
+# A thinking-token count (2.1.310 emits it while the model thinks, seen 10-28): these fields and nothing else.
+THINKING = {'type', 'subtype', 'estimated_tokens', 'estimated_tokens_delta', 'session_id', 'uuid'}
 TIMEOUT = 600
 MAX_ITEMS = 20
 MAX_STREAM = 1 << 20
@@ -258,6 +261,9 @@ def checked_stream(stream):
         kind = (event.get('type'), event.get('subtype'))
         if kind not in EVENTS or kind == ('system', 'init'):
             raise Refused(f'reader: unexpected event {kind[0]}/{kind[1]}')
+        if kind == ('system', 'thinking_tokens') and (set(event) != THINKING or any(
+                type(event[k]) is not int for k in ('estimated_tokens', 'estimated_tokens_delta'))):
+            raise Refused('reader: a thinking-token event holds more than its count')
         if kind == ('assistant', None):
             content = (event.get('message') or {}).get('content') or []
             if any(not isinstance(part, dict) or part.get('type') not in ('text', 'thinking') for part in content):
