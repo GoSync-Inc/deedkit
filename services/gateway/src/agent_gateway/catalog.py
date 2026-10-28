@@ -134,4 +134,17 @@ def public(tool, actions=None):
     }
     if tool.get("action_group") and "operation" in result["inputSchema"].get("properties", {}):
         result["inputSchema"]["properties"]["operation"]["enum"] = routed(tool, actions)
+        result["description"] = with_example(tool, result["inputSchema"]["properties"]["operation"]["enum"])
     return result
+
+
+def with_example(tool, operations):
+    """A risk-class tool's description with its example call for the first operation the key may use (ANYM-550)."""
+    description = tool["description"]
+    examples = tool.get("examples") or {}
+    chosen = next((op for op in operations if op in examples), None)
+    if chosen is None or "Example: " not in description:
+        return description
+    call = {"account": "telegram-synthetic", "operation": chosen, **examples[chosen]}
+    return description[:description.index("Example: ")] + "Example: " + json.dumps(
+        call, ensure_ascii=False, separators=(",", ":"))

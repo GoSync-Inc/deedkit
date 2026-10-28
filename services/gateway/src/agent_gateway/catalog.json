@@ -2897,7 +2897,71 @@
       "unpin_message",
       "unstar_message",
       "vote_poll"
-    ]
+    ],
+    "examples": {
+      "delete_message": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "message_id": "msg_0123456789abcdef0123456789abcdef",
+        "expected_revision": 3,
+        "dry_run": true
+      },
+      "edit_message": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "message_id": "msg_0123456789abcdef0123456789abcdef",
+        "expected_revision": 3,
+        "parameters": {
+          "text": "Corrected text"
+        },
+        "dry_run": true
+      },
+      "pin_message": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "message_id": "msg_0123456789abcdef0123456789abcdef",
+        "expected_revision": 3,
+        "parameters": {
+          "seconds": 86400
+        },
+        "dry_run": true
+      },
+      "send_reaction": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "message_id": "msg_0123456789abcdef0123456789abcdef",
+        "expected_revision": 3,
+        "parameters": {
+          "emoji": "👍"
+        },
+        "dry_run": true
+      },
+      "star_message": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "message_id": "msg_0123456789abcdef0123456789abcdef",
+        "expected_revision": 3,
+        "dry_run": true
+      },
+      "unpin_message": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "message_id": "msg_0123456789abcdef0123456789abcdef",
+        "expected_revision": 3,
+        "dry_run": true
+      },
+      "unstar_message": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "message_id": "msg_0123456789abcdef0123456789abcdef",
+        "expected_revision": 3,
+        "dry_run": true
+      },
+      "vote_poll": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "message_id": "msg_0123456789abcdef0123456789abcdef",
+        "expected_revision": 3,
+        "parameters": {
+          "option_indices": [
+            0
+          ]
+        },
+        "dry_run": true
+      }
+    }
   },
   {
     "annotations": {
@@ -3030,7 +3094,177 @@
       "unarchive_chat",
       "unmute_chat",
       "unpin_chat"
-    ]
+    ],
+    "examples": {
+      "add_participant": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "user_id": "contact-synthetic"
+        },
+        "dry_run": true
+      },
+      "approve_join_requests": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "user_ids": [
+            "contact-synthetic"
+          ]
+        },
+        "dry_run": true
+      },
+      "archive_chat": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "dry_run": true
+      },
+      "create_group": {
+        "parameters": {
+          "title": "Team",
+          "user_ids": [
+            "contact-synthetic"
+          ]
+        },
+        "dry_run": true
+      },
+      "demote_participant": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "user_id": "contact-synthetic"
+        },
+        "dry_run": true
+      },
+      "get_invite_link": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "dry_run": true
+      },
+      "join_chat": {
+        "parameters": {
+          "link": "https://t.me/+synthetic"
+        },
+        "dry_run": true
+      },
+      "leave_group": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "dry_run": true
+      },
+      "mark_read": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "message_id": "msg_0123456789abcdef0123456789abcdef",
+        "expected_revision": 3,
+        "dry_run": true
+      },
+      "mark_unread": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "dry_run": true
+      },
+      "mute_chat": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "seconds": 3600
+        },
+        "dry_run": true
+      },
+      "open_chat_by_phone": {
+        "parameters": {
+          "phone": "+12025550199",
+          "create": false
+        },
+        "dry_run": true
+      },
+      "pin_chat": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "dry_run": true
+      },
+      "promote_participant": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "user_id": "contact-synthetic"
+        },
+        "dry_run": true
+      },
+      "reject_join_requests": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "user_ids": [
+            "contact-synthetic"
+          ]
+        },
+        "dry_run": true
+      },
+      "remove_participant": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "user_id": "contact-synthetic"
+        },
+        "dry_run": true
+      },
+      "rename_group": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "title": "Team"
+        },
+        "dry_run": true
+      },
+      "revoke_invite_link": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "dry_run": true
+      },
+      "set_chat_labels": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "label_ids": [
+            "1"
+          ]
+        },
+        "dry_run": true
+      },
+      "set_group_description": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "description": "Weekly plans"
+        },
+        "dry_run": true
+      },
+      "set_group_info_admins_only": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "enabled": true
+        },
+        "dry_run": true
+      },
+      "set_group_messages_admins_only": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "enabled": true
+        },
+        "dry_run": true
+      },
+      "set_join_approval": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "enabled": true
+        },
+        "dry_run": true
+      },
+      "set_slow_mode": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "seconds": 60
+        },
+        "dry_run": true
+      },
+      "unarchive_chat": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "dry_run": true
+      },
+      "unmute_chat": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "dry_run": true
+      },
+      "unpin_chat": {
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "dry_run": true
+      }
+    }
   },
   {
     "annotations": {
@@ -3117,7 +3351,34 @@
       "block_contact",
       "delete_contact",
       "unblock_contact"
-    ]
+    ],
+    "examples": {
+      "add_contact": {
+        "parameters": {
+          "phone": "+12025550199",
+          "first_name": "Alex"
+        },
+        "dry_run": true
+      },
+      "block_contact": {
+        "parameters": {
+          "user_id": "contact-synthetic"
+        },
+        "dry_run": true
+      },
+      "delete_contact": {
+        "parameters": {
+          "user_id": "contact-synthetic"
+        },
+        "dry_run": true
+      },
+      "unblock_contact": {
+        "parameters": {
+          "user_id": "contact-synthetic"
+        },
+        "dry_run": true
+      }
+    }
   },
   {
     "annotations": {
@@ -3203,7 +3464,31 @@
       "get_labels",
       "list_blocked",
       "list_contacts"
-    ]
+    ],
+    "examples": {
+      "get_contact": {
+        "parameters": {
+          "user_id": "contact-synthetic"
+        },
+        "request_id": "contacts-read-0001"
+      },
+      "get_labels": {
+        "request_id": "contacts-read-0001"
+      },
+      "list_blocked": {
+        "parameters": {
+          "limit": 50
+        },
+        "request_id": "contacts-read-0001"
+      },
+      "list_contacts": {
+        "parameters": {
+          "limit": 50,
+          "offset": 0
+        },
+        "request_id": "contacts-read-0001"
+      }
+    }
   },
   {
     "annotations": {

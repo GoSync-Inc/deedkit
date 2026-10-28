@@ -93,20 +93,40 @@ def test_the_everyday_fixture_default_list_has_at_most_15_tools_and_advanced_kee
           size(default, FIXTURE_ACTIONS))
 
 
+def published_example(tool):
+    description = tool["description"]
+    assert len(description.split()) <= 80, tool["name"]
+    assert description.count("Example: ") == 1, tool["name"]
+    example, _ = json.JSONDecoder().raw_decode(description, description.index("Example: ") + len("Example: "))
+    assert isinstance(example, dict), tool["name"]
+    return example
+
+
 # spec: ANYM-550
 def test_every_everyday_description_is_short_and_its_one_example_passes_the_schema():
-    decoder = json.JSONDecoder()
     for name in EVERYDAY:
-        tool = with_catalog(public(CATALOG[name]), {"catalog": "0" * 12})
-        description = tool["description"]
-        assert len(description.split()) <= 80, name
-        assert description.count("Example: ") == 1, name
-        example, _ = decoder.raw_decode(description, description.index("Example: ") + len("Example: "))
-        assert isinstance(example, dict), name
-        # The published schema of a key that holds the example's operation, then the gateway's own admission.
-        published = public(CATALOG[name], [example["operation"]] if "operation" in example else None)
-        StrictValidator(published["inputSchema"]).validate(example)
-        assert arguments(CATALOG[name], example) is not None, name
+        # A risk-class tool publishes its example per key: check every single-operation grant it routes.
+        grants = [[op] for op in CATALOG[name].get("routes_actions") or []] or [None]
+        for actions in grants:
+            published = with_catalog(public(CATALOG[name], actions), {"catalog": "0" * 12})
+            example = published_example(published)
+            # The published schema this key receives, then the gateway's own admission.
+            StrictValidator(published["inputSchema"]).validate(example)
+            assert arguments(CATALOG[name], example) is not None, (name, actions)
+            if actions:
+                assert example["operation"] == actions[0]
+
+
+# spec: ANYM-550
+def test_a_delete_only_key_gets_a_delete_example_in_its_tool_list(tmp_path):
+    app, _ = gateway(tmp_path, FIXTURE_TOOLS, ["delete_message"])
+    with TestClient(app) as client:
+        tools = {t["name"]: t for t in rpc(client, "/mcp", "tools/list")["tools"]}
+    tool = tools["messages_change_message"]
+    assert tool["inputSchema"]["properties"]["operation"]["enum"] == ["delete_message"]
+    example = published_example(tool)
+    assert example["operation"] == "delete_message"
+    StrictValidator(tool["inputSchema"]).validate(example)
 
 
 # spec: ANYM-550
