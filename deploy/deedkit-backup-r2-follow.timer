@@ -1,0 +1,11 @@
+[Unit]
+Description=Check main for a newer attested DeedKit backup helper
+
+[Timer]
+OnBootSec=20min
+OnUnitInactiveSec=1h
+RandomizedDelaySec=5min
+Unit=deedkit-backup-r2-follow.service
+
+[Install]
+WantedBy=timers.target

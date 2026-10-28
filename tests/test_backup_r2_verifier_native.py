@@ -159,3 +159,22 @@ def test_exact_owned_container_cleanup_removes_legacy_anonymous_volume_preserves
         if engine.inspect_owned('volume',sentinel,run) is not None:engine.remove('volume',sentinel)
         if anonymous and engine.command('volume','ls','--filter','name=^'+anonymous+'$','--format','{{.Name}}').strip():
             engine.command('volume','rm',anonymous)
+
+
+# spec: ANYM-597
+def test_follow_self_test_restores_a_synthetic_bundle_made_by_the_image_under_test():
+    # The receiver update follow's proof of a new helper, against the image CI built.
+    from messaging_service import backup_r2_follow as follow
+    parent=Path('/root/deedkit-backup-native-tests');parent.mkdir(mode=0o700,exist_ok=True)
+    root=parent/secrets.token_hex(16);root.mkdir(mode=0o700)
+    engine=follow.Docker(900)
+    config={'directory':str(root),'helper_image':IMAGE,'helper_revision':REVISION,'postgres_image':verifier.POSTGRES_IMAGE,
+            'identity_file':'/never/mounted/by/the/self-test'}
+    try:
+        engine.preflight(config)
+        schemas,version=follow.self_test(engine,config)
+        assert schemas==[verifier.SCHEMAS[0],verifier.SCHEMAS[-1]] and version==schemas[1]
+        assert list(root.iterdir())==[]
+        leftover=engine.command('container','ls','-a','--filter','label='+verifier.LABEL+'.owned=1','--format','{{.Names}}')
+        assert not [n for n in leftover.decode().split() if n.endswith(('-probe','-fixture'))]
+    finally:shutil.rmtree(root)
