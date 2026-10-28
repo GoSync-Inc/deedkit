@@ -8,6 +8,7 @@
   {"name": "calendar_members", "read_only": true},
   {"name": "calendar_operation", "read_only": true},
   {"name": "calendar_plan", "read_only": false},
+  {"name": "calendar_schedule", "read_only": false},
   {"name": "calendar_slots", "read_only": true},
   {"name": "calls_capabilities", "read_only": true},
   {"name": "calls_dial_call", "read_only": false},

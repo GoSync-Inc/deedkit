@@ -14,5 +14,13 @@ DO $$ BEGIN
   GRANT INSERT,UPDATE ON fcs.projection_links TO fcs_worker;
  END IF;
 END $$;
+-- Migration 4 (calendar_schedule, ANYM-552): the gateway marks its previews and binds a plan to the operation that
+-- consumed it; a plan's payload, scope and expiry stay insert-only. Skipped before migration 4.
+DO $$ BEGIN
+ IF to_regclass('fcs.schedule_selections') IS NOT NULL THEN
+  GRANT UPDATE (token_hash, tool, request, operation_id) ON fcs.plans TO fcs_gateway;
+  GRANT INSERT ON fcs.schedule_selections TO fcs_gateway;
+ END IF;
+END $$;
 -- Neither process can issue/revoke keys, change grants, memberships, providers or write opt-in.
 -- Provider secrets and raw encrypted source payload keys are outside PostgreSQL, worker-only.

@@ -4192,6 +4192,194 @@
     }
   },
   {
+    "name": "calendar_schedule",
+    "description": "Create, move or cancel one guest-free event in one call. create: title, start, duration in minutes (default 30), calendar (full name or calendar_ref; default: the family's default calendar). move (start, optional duration) and cancel act only on event (an event_ref from agenda); event {title, date} lists the matching events as selection_required candidates, each previewing its change by event_ref. start: ISO 8601; without an offset it is read in the family timezone; YYYY-MM-DD makes an all-day event. dry_run=true returns state previewed, the exact plan and a confirm_token valid 600 s; apply it with {confirm_token} alone: the token runs exactly that plan, once; a repeat returns the same operation. A plan that expired or whose calendar or scope changed returns preview_stale with a fresh preview and token. A live call without a token needs a request_id (one per intent; keep it on retries). Waits up to wait_s (default 10, max 25) for the result: succeeded with event_ref, else the operation and next calendar_operation; unknown means reconcile, never create again. Every result states timezone and now.",
+    "inputSchema": {
+      "$defs": {
+        "EventQuery": {
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "maxLength": 256,
+              "minLength": 1,
+              "title": "Title",
+              "type": "string"
+            },
+            "date": {
+              "title": "Date",
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "date"
+          ],
+          "title": "EventQuery",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "enum": [
+                "create",
+                "move",
+                "cancel"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        },
+        "duration": {
+          "anyOf": [
+            {
+              "maximum": 1440,
+              "minimum": 5,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration"
+        },
+        "calendar": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Calendar"
+        },
+        "event": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/EventQuery"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Event"
+        },
+        "dry_run": {
+          "default": false,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "confirm_token": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confirm Token"
+        },
+        "selection_token": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Selection Token"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        },
+        "wait_s": {
+          "anyOf": [
+            {
+              "maximum": 25,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Wait S"
+        }
+      },
+      "title": "Schedule",
+      "type": "object"
+    },
+    "module": "calendar",
+    "operation": "schedule",
+    "scopes": [
+      "plan:create",
+      "plan:execute"
+    ],
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
     "name": "calls_capabilities",
     "module": "calls",
     "operation": "capabilities",

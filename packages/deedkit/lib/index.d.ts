@@ -8,6 +8,7 @@ export type ToolName =
   | 'calendar_members'
   | 'calendar_operation'
   | 'calendar_plan'
+  | 'calendar_schedule'
   | 'calendar_slots'
   | 'calls_capabilities'
   | 'calls_dial_call'

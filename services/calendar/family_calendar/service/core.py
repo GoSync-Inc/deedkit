@@ -374,6 +374,8 @@ class FamilyService:
                 "carry_projections": True,
                 # Agenda marks linked drives with their drift only for a caller that sends projection_status (ANYM-436).
                 "projection_status": True,
+                # calendar_schedule: create, move or cancel one event in one call, with a dry-run token (ANYM-552).
+                "schedule": True,
             },
             # Top level: the common gateway drops backend `features` but passes this through.
             guardian_projections=self.guardian_projections(),

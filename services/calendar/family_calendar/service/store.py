@@ -5,7 +5,9 @@ import json
 from pathlib import Path
 import re
 import secrets
+import threading
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 from psycopg import sql
@@ -16,7 +18,8 @@ from family_calendar.errors import CalendarError
 
 
 HERE = Path(__file__).parent
-MIGRATIONS = ((1, HERE / "schema.sql"), (2, HERE / "schema_v2.sql"), (3, HERE / "schema_v3.sql"))
+MIGRATIONS = ((1, HERE / "schema.sql"), (2, HERE / "schema_v2.sql"), (3, HERE / "schema_v3.sql"),
+              (4, HERE / "schema_v4.sql"))
 
 
 def caller_key(value):
@@ -97,6 +100,7 @@ class Store:
             open=True,
             kwargs={"row_factory": dict_row, "connect_timeout": 10},
         )
+        self._local = threading.local()
 
     def close(self):
         self.pool.close()
@@ -112,6 +116,10 @@ class Store:
 
     @contextmanager
     def transaction(self):
+        bound = getattr(self._local, "conn", None)
+        if bound is not None:
+            yield bound
+            return
         try:
             with self.pool.connection() as conn:
                 conn.execute(
@@ -120,6 +128,18 @@ class Store:
                 yield conn
         except (PoolTimeout, psycopg.OperationalError):
             raise CalendarError("database_unavailable") from None
+
+    @contextmanager
+    def bound(self):
+        """One transaction that every store call of this thread joins until it ends (ANYM-552): a caller that holds
+        a pooled connection never waits for a second one, so concurrent callers cannot drain the pool of 8."""
+        outer = getattr(self._local, "conn", None)
+        with self.transaction() as conn:
+            self._local.conn = conn
+            try:
+                yield conn
+            finally:
+                self._local.conn = outer
 
     def migrate(self, through=None):
         # One transaction for all pending versions; an applied file is never edited, only a new one added.
@@ -178,6 +198,25 @@ class Store:
         self.query(
             "INSERT INTO groups(id,label) VALUES (%s,%s) ON CONFLICT(id) DO NOTHING", (group_id, label)
         )
+
+    def family_settings(self, group_id, zone=None, default_calendar_ref=None):
+        """A family's timezone and default calendar (ANYM-552): an omitted value stays, "" clears it."""
+        if zone:
+            try:
+                ZoneInfo(zone)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise CalendarError("invalid_timezone") from None
+        if default_calendar_ref and not self.one("SELECT 1 FROM calendars WHERE ref=%s", (default_calendar_ref,)):
+            raise CalendarError("not_found_or_forbidden")
+        row = self.one(
+            "UPDATE groups SET timezone=CASE WHEN %(z)s::text IS NULL THEN timezone ELSE nullif(%(z)s,'') END,"
+            "default_calendar_ref=CASE WHEN %(d)s::text IS NULL THEN default_calendar_ref "
+            "ELSE nullif(%(d)s,'') END,version=version+1 WHERE id=%(g)s RETURNING timezone,default_calendar_ref",
+            {"z": zone, "d": default_calendar_ref, "g": group_id},
+        )
+        if not row:
+            raise CalendarError("not_found_or_forbidden")
+        return {"group_id": group_id, **row}
 
     def member(self, group_id, person_id, role):
         self.query(

@@ -109,7 +109,7 @@ def test_initialize_and_stateless_reconnect_preserve_catalog(household):
             assert result.json()["result"]["serverInfo"]["name"] == "family-calendar-service"
             assert "mcp-session-id" not in result.headers
             listed = c.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-            assert len(listed.json()["result"]["tools"]) == 10
+            assert len(listed.json()["result"]["tools"]) == 11
 
 
 def test_explicit_internal_host_does_not_trust_forwarded_identity(household):
