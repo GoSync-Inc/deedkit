@@ -897,11 +897,11 @@ the later of the connect and the last event for longer than `SOURCE_HEALTH_STALE
 default 30, 1–1440, set on the matcher) or `connected` (a recovery). An account quiet for longer
 than the threshold is therefore stale; raise the threshold for quiet accounts. The matcher derives
 the status from `collector_health` and the lease every 30 seconds through the definer function
-`journal_source_health`, which remembers the last status, the collector's connect count, connect
-time and lease epoch per account in `source_health_journal`. Changes between two calls are not lost:
-the connects since the last call replay the alternating history (a reconnect journals
-`disconnected`, `connected`; a connect that dropped again journals `connected`, `disconnected`; at
-most three connects are replayed per call). The first observation of an account
+`journal_source_health`, which remembers the last status, connect time and lease epoch per account
+in `source_health_journal`. The status is sampled every 30 seconds: a disconnect and reconnect, or a
+collector restart, between two samples is journaled as `disconnected` followed by the current
+status, but other changes reverted within one interval (for example a connect that drops again
+before the next sample) may collapse into no event. The first observation of an account
 is a baseline and journals nothing. The function locks no collector row; its transaction is
 bounded to 2 seconds. A failure is logged and counted and never stops matching.
 
