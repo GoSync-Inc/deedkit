@@ -126,6 +126,37 @@ Native WhatsApp operations and sends write each provider frame once (no resend
 after a reconnect) and answer within 20 s, `send_file` within 75 s; a late
 change or send ends `unknown` (docs/whatsapp-native.md).
 
+## Risk-class gateway tools
+
+The gateway also offers four tools, one per risk class (ANYM-549). Each routes a
+fixed set of operations (`OPERATION_TOOLS` in `messenger_operations.py`) to the
+same preview and execute, with the same permissions, account opt-ins and receipts:
+
+| Tool | Operations | MCP annotations |
+| --- | --- | --- |
+| `messages_change_message` | edit, delete, react, vote, pin/unpin, star/unstar one message | external effect |
+| `messages_manage_chat` | archive, mute, pin, read state, labels, groups, members, invite links, join, `open_chat_by_phone` | external effect |
+| `messages_change_contacts` | add, delete, block, unblock a contact | external effect |
+| `messages_read_contacts` | contacts, blocked list, labels | read only |
+
+A tool lists in its `operation` enum only the operations this key may use; a key
+with none of them does not see the tool, and an operation outside the key's
+action ceiling is refused before any backend call, also on the low-level tools.
+`dry_run=true` is the preview and needs no `request_id`; a live call needs one and
+the preview's `preview_digest`. Sends, live chat reads, live search, history
+requests and the owner's own profile stay on `execute_messenger_operation` only
+(`ADVANCED_ONLY`, each with its reason).
+
+`preview_messenger_operation` accepts `request_id` so preview and execute take the
+same arguments; it is ignored and reserves nothing. `execute_messenger_operation`
+takes `wait_s` (0-25 s) and returns the receipt once it leaves `queued` or
+`dispatching`, or with `wait_timed_out: true`; the action is queued once either
+way. The gateway forwards `wait_s` only to a backend whose capabilities name
+`messenger_operations.execute_wait_s_max`, else it answers `unsupported_by_backend`
+(repeat without `wait_s`, then poll). Checked-in profiles grant none of these
+tools; an operator adds them to principals that already hold the matching
+operation actions.
+
 ## Parameter formats and field errors
 
 Each `parameters_schema` field keeps its `type`, `required`, `default` and limits.

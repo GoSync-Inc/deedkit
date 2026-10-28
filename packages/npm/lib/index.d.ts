@@ -55,11 +55,15 @@ export interface MessengerOperationPreview {
   expected_revision?: number;
   /** Strict allowlisted parameters from listMessengerOperations, never a raw RPC payload. */
   parameters?: Arguments;
+  /** Accepted so preview and execute share arguments; ignored and never reserved. */
+  request_id?: string;
 }
 export interface MessengerOperationAction extends MessengerOperationPreview {
   request_id: string;
   /** Required for mutations; binds payload but never proves owner approval. */
   preview_digest?: string;
+  /** Bounded receipt wait, 0–25 seconds. Zero is omitted for older servers. */
+  wait_s?: number;
 }
 export interface FileUploadPreparation {
   account: string;

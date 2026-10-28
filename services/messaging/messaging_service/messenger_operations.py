@@ -177,6 +177,36 @@ OPERATIONS = {
         'create': _field('boolean', default=False)},
         limitation=PHONE_LIMITATION),
 }
+# ANYM-549: the gateway's risk-class tools (catalog.json `messages_<tool>`, `routes_actions`). One MCP annotation
+# set holds per tool, so a tool never mixes a read with an external effect; open_chat_by_phone is a local write
+# (a lookup and an archived chat), the only non-mutation of an effect tool.
+OPERATION_TOOLS = {
+    'change_message': ('edit_message', 'delete_message', 'send_reaction', 'vote_poll', 'pin_message',
+                       'unpin_message', 'star_message', 'unstar_message'),
+    'manage_chat': ('open_chat_by_phone', 'archive_chat', 'unarchive_chat', 'mute_chat', 'unmute_chat',
+                    'pin_chat', 'unpin_chat', 'mark_read', 'mark_unread', 'set_chat_labels', 'create_group',
+                    'rename_group', 'set_group_description', 'add_participant', 'remove_participant',
+                    'promote_participant', 'demote_participant', 'leave_group', 'get_invite_link',
+                    'revoke_invite_link', 'set_group_messages_admins_only', 'set_group_info_admins_only',
+                    'set_slow_mode', 'set_join_approval', 'approve_join_requests', 'reject_join_requests', 'join_chat'),
+    'change_contacts': ('add_contact', 'delete_contact', 'block_contact', 'unblock_contact'),
+    'read_contacts': ('list_contacts', 'get_contact', 'list_blocked', 'get_labels'),
+}
+LOCAL_WRITE_OPERATIONS = frozenset(('open_chat_by_phone',))
+_SEND = 'a send: the send layer (send_message, ANYM-546) owns sends'
+_LIVE_READ = 'a live chat read; no risk-class tool of this story reads chats (ANYM-550 picks the default layer)'
+# Reached only through execute_messenger_operation, each with its reason.
+ADVANCED_ONLY = {
+    'send_file': _SEND, 'forward_message': _SEND, 'send_poll': _SEND, 'send_contact': _SEND,
+    'send_location': _SEND,
+    'chat_info': _LIVE_READ, 'list_participants': _LIVE_READ, 'get_reactions': _LIVE_READ,
+    'get_message_info': _LIVE_READ, 'get_pinned_messages': _LIVE_READ, 'list_topics': _LIVE_READ,
+    'list_join_requests': _LIVE_READ, 'check_chat_link': _LIVE_READ,
+    LIVE_SEARCH: 'messages_search with live (ANYM-478) is its everyday route',
+    HISTORY: 'an archive backfill request, not a chat or contact change',
+    'get_profile': 'the owner\'s own account profile, not a contact',
+    'update_profile': 'changes the owner\'s own profile seen by every contact; kept advanced',
+}
 
 
 def operation_spec(name, platform=None):

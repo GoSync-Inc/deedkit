@@ -99,6 +99,9 @@ def arguments(tool, value):
         raise InvalidArguments(field_errors(schema, errors))
     if tool.get("name") == "messages_submit_feedback" and (errors := feedback_operation_errors(value)):
         raise InvalidArguments(errors)
+    if tool.get("routes_actions") and not value.get("dry_run") and "request_id" not in value:
+        # ANYM-549: a live call of a risk-class tool needs the caller's own key; dry_run neither needs nor uses it.
+        raise InvalidArguments([{"field": "request_id", "reason": "required"}])
     if tool["operation"] == "upload_file_chunk":
         try:
             raw = base64.b64decode(value["data_base64"], validate=True)
@@ -115,6 +118,12 @@ def arguments(tool, value):
     return result
 
 
+def routed(tool, actions):
+    """The actions a tool may carry: a risk-class tool (ANYM-549) only those it routes."""
+    routes = tool.get("routes_actions")
+    return sorted(set(actions or []) & set(routes)) if routes else sorted(actions or [])
+
+
 def public(tool, actions=None):
     result = {
         k: deepcopy(v)
@@ -122,5 +131,5 @@ def public(tool, actions=None):
         if k in {"name", "title", "description", "inputSchema", "outputSchema", "annotations", "_meta"}
     }
     if tool.get("action_group") and "operation" in result["inputSchema"].get("properties", {}):
-        result["inputSchema"]["properties"]["operation"]["enum"] = sorted(actions or [])
+        result["inputSchema"]["properties"]["operation"]["enum"] = routed(tool, actions)
     return result
