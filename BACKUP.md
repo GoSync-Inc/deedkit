@@ -285,3 +285,57 @@ Schema 43 adds `person_links` (owner-made person links, ANYM-283) to the manifes
 backups of schemas 2-42 still restore.
 Schema 44 adds `api_key_operations` (repeatable key issue, ANYM-495) to the manifest;
 backups of schemas 2-43 still restore.
+
+## Family calendar
+
+The backup image also captures the family calendar (ANYM-605): `python -m
+messaging_service.backup_worker` with `"profile": "calendar"` and the keys `id`, `dsn_file`,
+`vault_directory`, `profile_directory`, `recipient_file`, `work_directory` (read-only
+mounts of `${CALENDAR_STATE_DIR}/service/vault` and `${CALENDAR_STATE_DIR}/service`). It
+writes `bundle.tar.age`, `result.json` and `captured.json` like a staged messaging run;
+without `profile` the worker behaves as before. The host runner, receiver verification,
+scheduling, the data-policy line and the restore procedure are ANYM-608, -606, -607 and -610.
+
+The bundle holds:
+- `database.dump`: `pg_dump --format=custom --no-owner --no-acl` of `family_calendar`,
+  taken from the snapshot exported by one REPEATABLE READ READ ONLY transaction;
+- `manifest.json`: `profile: calendar`, `schema_version` (`max(version)` of
+  `fcs.migrations`), `tables` and `type_warnings`, `dump_sha256`, `state_files` (bytes and
+  sha256 each), `vault_warnings`, `vault_staging_skipped` and
+  `restore_mode: verify_only_no_provider_calls`;
+- `state/vault/`: the Fernet `key` and every `<connection>.enc` token;
+- `state/profile/`: `postgres.env`, `gateway.json`, `worker.json` and `runtime.json` when
+  present. `gateway.json` and `worker.json` hold the two service roles' passwords and are kept
+  because the restore reuses their `bind`, `allowed_hosts` and `allowed_origins`.
+
+The table manifest needs no table list: in the snapshot, with `TimeZone=UTC`, `DateStyle=ISO`,
+`IntervalStyle=postgres`, `extra_float_digits=3`, `search_path=pg_catalog`, `lc_monetary=C` and
+`bytea_output=hex` set locally, every ordinary table outside `pg_catalog` and
+`information_schema` gets its row count and the sha256 of its sorted per-row sha256 digests of
+the row's text form. A table a later migration adds is picked up from the catalog. A column
+type outside the tested set (built-in base types, arrays, enums, domains over those) is still
+hashed and listed in `type_warnings`; the backup is never refused for it.
+`backup_calendar.calendar_manifest` rebuilds the same manifest from a restored database.
+
+State files are read after the snapshot export, each opened with `O_NOFOLLOW` and read
+through the held descriptor; a symlink or non-regular file refuses the capture
+(`calendar_state_unsafe`). The writer's `.tmp-*` staging files are skipped and counted. Each
+token's Fernet HMAC is checked under the copied key. Refusals, which build no bundle and leave
+the previous protected point as it is: an enabled connection without its token
+(`calendar_vault_incomplete`), a token under another key (`calendar_vault_key_mismatch`),
+tokens without a key (`calendar_vault_key_missing`), a missing `postgres.env`, `gateway.json`
+or `worker.json` (`calendar_profile_incomplete`). The worker prints only the code; the
+connection or file it names is in `refused.json` in the private work directory. A disabled
+connection without a token, a token without a connection row, a missing `runtime.json` and an
+unknown vault entry are `vault_warnings`; the bundle is still built. An empty calendar (no
+connections, a vault with only `key`, or no vault directory yet) builds a valid bundle.
+
+Not in the bundle: agent key files (the database keeps their hashes; recovery is ANYM-610),
+calendar logs, the container image and the raw provider data outside the database.
+`backup_crypto` accepts `state/` members only in a bundle whose first member is a manifest with
+`profile: calendar`, and such a bundle accepts no `files/` or `recovery/` member; messaging's
+member rules are unchanged.
+
+Retention: the calendar keeps one protected point plus room for one candidate
+(`max_objects` = 2, and rotation keeps `protected: 1`, backup_r2_receiver.py:870), so
+calendar data edited later is recoverable only as of the last protected point.
