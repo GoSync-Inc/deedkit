@@ -624,3 +624,33 @@ def test_adapter_child_exit_status_becomes_the_stop_detail(tmp_path, returncode,
         asyncio.run(provider.wait_disconnected())
     assert str(stop.value) == ('whatsapp_logged_out' if recorded == {'code': 'whatsapp_logged_out'} else 'provider_disconnected')
     assert getattr(stop.value, 'detail', None) == detail
+
+
+# spec: ANYM-292
+@pytest.mark.parametrize('script,detail', [
+    pytest.param('import sys; sys.stdin.readline(); sys.exit(2)', 'exit_panic', id='exit_panic'),
+    pytest.param('import os, signal, sys; sys.stdin.readline(); os.kill(os.getpid(), signal.SIGKILL)', 'exit_killed',
+                 id='exit_killed'),
+])
+def test_child_exit_during_an_outstanding_request_keeps_its_exit_detail(tmp_path, script, detail):
+    import asyncio
+    import sys
+    from messaging_service import whatsapp_collector
+    events = tmp_path/'events'
+    events.mkdir(mode=0o700)
+    provider = object.__new__(whatsapp_collector.WhatsmeowProvider)
+    provider.cfg = {'events_directory': str(events)}
+    provider.counter = 0
+    async def scenario():
+        # A synthetic child that reads the request and dies before it answers.
+        provider.process = await asyncio.create_subprocess_exec(sys.executable, '-I', '-c', script,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        request = await provider.request('page', {'chat': 'synthetic', 'limit': 1, 'before': None})
+        try:
+            await provider.reply(request, timeout=30)
+        finally:
+            await provider.process.wait()
+    with pytest.raises(RuntimeError) as stop:
+        asyncio.run(scenario())
+    assert str(stop.value) == 'provider_disconnected'
+    assert stop.value.detail == detail

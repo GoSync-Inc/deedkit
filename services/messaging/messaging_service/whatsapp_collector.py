@@ -24,6 +24,8 @@ from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy
 
 # open_chat_by_phone: both adapter calls and the archive check (the native lookup's 10 s).
 PHONE_RESOLUTION_SECONDS=10
+# How long a stop waits for a child whose pipe closed to be reaped, so its exit status is known.
+CHILD_EXIT_WAIT_SECONDS=2
 
 
 def exit_detail(returncode):
@@ -247,27 +249,35 @@ class NodeProvider:
     def failure_recorded(self):
         directory=self.cfg.get('events_directory')
         return bool(directory) and (Path(directory)/'.transport-failure').exists()
-    async def wait_disconnected(self):
-        await self.process.wait()
+    async def child_stop(self):
+        """The stop of an ended child: its recorded code, else provider_disconnected with how it exited."""
         stop=RuntimeError(self.failure_code())
         # A child that recorded no failure still says how it ended (Tiden 1d532d67 had only the bare code).
-        if str(stop)=='provider_disconnected' and not self.failure_recorded():stop.detail=exit_detail(self.process.returncode)
-        raise stop
+        if str(stop)=='provider_disconnected' and self.process and not self.failure_recorded():
+            # A closed pipe can precede the reaped exit; read the status before any cleanup kills the child.
+            with suppress(TimeoutError):await asyncio.wait_for(self.process.wait(),CHILD_EXIT_WAIT_SECONDS)
+            stop.detail=exit_detail(self.process.returncode)
+        return stop
+    async def wait_disconnected(self):
+        await self.process.wait()
+        raise await self.child_stop()
     async def request(self,method,params,*,sending=False):
-        if not self.process or self.process.returncode is not None: raise RuntimeError(self.failure_code())
+        if not self.process or self.process.returncode is not None: raise await self.child_stop()
         self.counter+=1
         request_id=self.counter
         payload=json.dumps({'id':request_id,'method':method,'params':params},separators=(',',':')).encode()+b'\n'
         if len(payload)>1024*1024: raise ValueError('provider_request_too_large')
         writer=self.send_writer if sending else self.process.stdin
         if writer is None:raise RuntimeError('provider_disconnected')
-        writer.write(payload); await writer.drain()
+        try:writer.write(payload); await writer.drain()
+        except (BrokenPipeError,ConnectionResetError):raise await self.child_stop() from None
         return request_id
     async def reply(self,request,timeout=90,*,sending=False):
         reader=self.send_reader if sending else self.process.stdout
         if reader is None:raise RuntimeError('provider_disconnected')
         line=await asyncio.wait_for(reader.readline(),timeout)
-        if not line or len(line)>1024*1024: raise RuntimeError(self.failure_code())
+        if not line: raise await self.child_stop()
+        if len(line)>1024*1024: raise RuntimeError(self.failure_code())
         result=json.loads(line)
         if not isinstance(result,dict) or result.get('id')!=request: raise RuntimeError('provider_protocol_error')
         if 'error' in result:

@@ -26,7 +26,8 @@ CAPTURE_STOP_DETAILS = {'spool_full','disk_reserve','spool_io_error','capture_er
 # Which bound a capture_overload stop tripped (ANYM-291); status and supervisor line only, not telemetry.
 OVERLOAD_STOP_DETAILS = {'waiters_limit','slot_wait_timeout'}
 # How the WhatsApp adapter child ended when it recorded no failure code (a bare provider_disconnected):
-# exit status 0, 1, 2 (Go's unrecovered panic), another status, SIGKILL (OOM or forced) or another signal.
+# exit status 0, 1, 2 (whatsmeow: Go's unrecovered panic or fatal error; webjs: status 2 only), another
+# status, SIGKILL (OOM or forced) or another signal.
 CHILD_EXIT_DETAILS = {'exit_clean','exit_error','exit_panic','exit_other','exit_killed','exit_signal'}
 # Fixed codes each collector prints to its supervisor when it stops.
 SUPERVISOR_STOP_CODES = {
