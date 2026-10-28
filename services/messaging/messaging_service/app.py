@@ -582,7 +582,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                    files: list[dict[str,StrictStr]] | None=None,format: MessageFormat | None=None,
                    dry_run: StrictBool | None=None,confirm_token: StrictStr | None=None,
                    request_id: StrictStr | None=None,resume: StrictBool | None=None,
-                   wait_s: WaitSeconds | None=None,allow_open_chat: StrictBool | None=None) -> dict[str,Any]:
+                   wait_s: WaitSeconds | None=None,allow_open_chat: StrictBool | None=None,
+                   allow_files: StrictBool | None=None) -> dict[str,Any]:
         """Send text and files to anyone in one call: preview, confirm, send, wait, resume.
 
         Confirm with the owner before any send: call with dry_run true, show the owner the
@@ -603,10 +604,11 @@ def create_app(store: Store, allowed_hosts: list[str]):
         check history, never resend). preview_stale returns changed, a fresh preview and
         a new confirm_token. wait_s (0-25) waits for the receipts here. allow_open_chat is
         set by the gateway from its open_chat_by_phone grant; false refuses a phone with no chat.
+        allow_files is set by the gateway from its send_file grant; false refuses any file step.
         """
         return await async_call(ctx,'messages_send',to=to,account=account,reply_to=reply_to,text=text,files=files,
             format=format,dry_run=dry_run,confirm_token=confirm_token,request_id=request_id,resume=resume,
-            wait_s=wait_s,allow_open_chat=allow_open_chat)
+            wait_s=wait_s,allow_open_chat=allow_open_chat,allow_files=allow_files)
 
     @mcp.tool(structured_output=True,annotations=read)
     def get_send_status(ctx: Context,send_id: StrictStr) -> dict[str,Any]:

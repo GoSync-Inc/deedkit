@@ -212,7 +212,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Send text and files to anyone in one call: preview, confirm, send, wait, resume.\n\nConfirm with the owner before any send: call with dry_run true, show the owner the\npreview (recipient, visible text, warnings, links, reply target, files, caption\nhandling) and get their exact confirmation; then call again with its confirm_token.\nThe token binds that preview; it is not the owner's confirmation, and the server\ndoes not verify approval. A live send needs confirm_token or request_id (8-128\ncharacters, one key per approved action; repeat it after a network failure with the\nSAME payload). Rich format always needs a preview (preview_required).\nto: anything platform_resolve_target resolves exactly (person, chat_ or msg_ ID,\nphone, @username, JID); reply_to (a msg_ ID) alone sends into its chat. files: up to\n10 of {upload_id} (messages_prepare_file_upload) or {attachment_id} (forward an\narchived file), each with optional mode; they go in order. A plain caption up to\n1024 characters rides on the first file, other text is sent after the files.\nStates: previewed, running (repeat with next), succeeded, failed with resumable\ntrue (repeat with resume true: only failed and unsent steps go; account_offline\nwhen the account was not connected), unknown (a step may have been delivered:\ncheck history, never resend). preview_stale returns changed, a fresh preview and\na new confirm_token. wait_s (0-25) waits for the receipts here. allow_open_chat is\nset by the gateway from its open_chat_by_phone grant; false refuses a phone with no chat.\n",
+      "description": "Send text and files to anyone in one call: preview, confirm, send, wait, resume.\n\nConfirm with the owner before any send: call with dry_run true, show the owner the\npreview (recipient, visible text, warnings, links, reply target, files, caption\nhandling) and get their exact confirmation; then call again with its confirm_token.\nThe token binds that preview; it is not the owner's confirmation, and the server\ndoes not verify approval. A live send needs confirm_token or request_id (8-128\ncharacters, one key per approved action; repeat it after a network failure with the\nSAME payload). Rich format always needs a preview (preview_required).\nto: anything platform_resolve_target resolves exactly (person, chat_ or msg_ ID,\nphone, @username, JID); reply_to (a msg_ ID) alone sends into its chat. files: up to\n10 of {upload_id} (messages_prepare_file_upload) or {attachment_id} (forward an\narchived file), each with optional mode; they go in order. A plain caption up to\n1024 characters rides on the first file, other text is sent after the files.\nStates: previewed, running (repeat with next), succeeded, failed with resumable\ntrue (repeat with resume true: only failed and unsent steps go; account_offline\nwhen the account was not connected), unknown (a step may have been delivered:\ncheck history, never resend). preview_stale returns changed, a fresh preview and\na new confirm_token. wait_s (0-25) waits for the receipts here. allow_open_chat is\nset by the gateway from its open_chat_by_phone grant; false refuses a phone with no chat.\nallow_files is set by the gateway from its send_file grant; false refuses any file step.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -227,6 +227,18 @@
             ],
             "default": null,
             "title": "Account"
+          },
+          "allow_files": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Allow Files"
           },
           "allow_open_chat": {
             "anyOf": [

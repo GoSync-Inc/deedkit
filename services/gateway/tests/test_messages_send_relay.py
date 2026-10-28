@@ -120,3 +120,17 @@ def test_allow_open_chat_is_the_gateways_grant_and_never_the_agents_word(tmp_pat
             assert result.status_code == 200
     # Whatever the agent sends, the backend sees this gateway's grant.
     assert [args["allow_open_chat"] for _, args in seen] == [expected] * 3
+
+
+# spec: ANYM-546
+@pytest.mark.parametrize("actions,expected", [(["send_file"], True), ([], False)])
+def test_allow_files_is_the_gateways_grant_on_a_token_only_call(tmp_path, actions, expected):
+    # A confirm_token or resume carries no files: the backend still learns whether this gateway grants send_file.
+    app, seen = setup(tmp_path, actions)
+    with TestClient(app) as client:
+        for forged in (None, True, False):
+            extra = {} if forged is None else {"allow_files": forged}
+            for call in ({"confirm_token": "t" * 43}, {"request_id": SEND["request_id"], "resume": True}):
+                result = client.post("/v1/messages_send", json={**call, **extra}, headers=HEADERS)
+                assert result.status_code == 200
+    assert [args["allow_files"] for _, args in seen] == [expected] * 6

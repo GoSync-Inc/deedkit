@@ -22,8 +22,9 @@ from .outgoing import CHILD_KEY_PREFIX
 from .store import APIError, serial
 
 TOOL = 'messages_send'
-# allow_open_chat is set by the gateway from its open_chat_by_phone grant (ANYM-532); omitted means a direct caller.
-CONTROL = ('dry_run', 'confirm_token', 'request_id', 'resume', 'wait_s', 'allow_open_chat')
+# allow_open_chat and allow_files are set by the gateway from its open_chat_by_phone (ANYM-532) and send_file grants
+# on every call, token-only ones included; omitted means a direct caller.
+CONTROL = ('dry_run', 'confirm_token', 'request_id', 'resume', 'wait_s', 'allow_open_chat', 'allow_files')
 FIELDS = frozenset(('to', 'account', 'reply_to', 'text', 'files', 'format', *CONTROL))
 FILE_FIELDS = frozenset(('upload_id', 'attachment_id', 'mode'))
 MAX_FILES = 10
@@ -62,7 +63,7 @@ def payload(arguments):
     if value['reply_to'] and not value['reply_to'].startswith('msg_'): raise _invalid('reply_to', 'pattern')
     if value['format'] not in ('plain', 'markdown', 'html'): raise _invalid('format', 'enum')
     if not value['to'] and not value['reply_to']: raise _invalid('to', 'required')
-    for name in ('dry_run', 'resume', 'allow_open_chat'):
+    for name in ('dry_run', 'resume', 'allow_open_chat', 'allow_files'):
         if name in arguments and type(arguments[name]) is not bool: raise _invalid(name, 'type')
     files = value['files']
     if not isinstance(files, list): raise _invalid('files', 'type')
@@ -112,11 +113,12 @@ def _text(draft):
             'links': list(draft.get('links') or []), 'digest': draft['preview_digest']}
 
 
-def resolve(store, c, p, value, phone_text=None, open_chat=True):
+def resolve(store, c, p, value, phone_text=None, open_chat=True, files=True):
     """Everything the owner should see, from the caller's current scope. Refusals are the low-level codes.
     A phone target that opens a chat needs its lookup draft (`phone_text`); without one it returns None."""
     from .outgoing import reviewed, target, valid_text
     from .resolve_target import resolve_target
+    if value['files'] and not files: raise APIError('forbidden', 403)
     reply = resolve_target(store, c, p, value['reply_to'], 'message', value['account'])['target'] \
         if value['reply_to'] else None
     to = resolve_target(store, c, p, value['to'], 'message', value['account'])['target'] if value['to'] else reply
@@ -175,14 +177,24 @@ def _visible(resolution):
         'owner_confirmation': 'required_before_send', 'owner_approval_verified_by_server': False})
 
 
-def save_preview(c, p, value, resolution):
+def _scrubbed(resolution, sent=None):
+    """The resolution without text: all of it, or (`sent`: file indexes) only the captions already delivered."""
+    if sent is not None:
+        return {**resolution, 'files': [{**item, 'caption': ''} if index in sent else item
+                                        for index, item in enumerate(resolution['files'])]}
+    return {**resolution, 'text': None, 'files': [{**item, 'caption': ''} for item in resolution['files']]}
+
+
+def save_preview(c, p, value, resolution, lineage=None):
     # Unbound previews age out 7 days past expiry (PR Deletes: line); bound ones keep their intent's replay.
     c.execute('''DELETE FROM send_previews WHERE ctid IN (SELECT ctid FROM send_previews WHERE intent IS NULL
         AND expires_at<clock_timestamp()-interval '7 days' LIMIT 100)''')
     token = secrets.token_urlsafe(32)
-    c.execute('''INSERT INTO send_previews(token_hash,principal,key_id,tool,arguments,resolution,expires_at)
-        VALUES(%s,%s,%s,%s,%s,%s,clock_timestamp()+%s*interval '1 second')''',
-              (_hash(token), p['id'], p['key_id'], TOOL, Jsonb(value), Jsonb(resolution), PREVIEW_TTL_S))
+    # A preview_stale replacement keeps the lineage of the preview it replaces: one lineage binds one intent.
+    c.execute('''INSERT INTO send_previews(token_hash,principal,key_id,tool,lineage,arguments,resolution,expires_at)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,clock_timestamp()+%s*interval '1 second')''',
+              (_hash(token), p['id'], p['key_id'], TOOL, lineage or _hash(token), Jsonb(value), Jsonb(resolution),
+               PREVIEW_TTL_S))
     return agent_result('previewed', preview=_visible(resolution), confirm_token=token, expires_in_s=PREVIEW_TTL_S,
                         hint='Show this preview to the owner and get their exact confirmation; then call messages_send '
                              'with this confirm_token. The token is not the owner\'s confirmation.')
@@ -213,9 +225,9 @@ def _preview_required(value):
 def admit(store, c, p, arguments):
     """The intent this call acts on, bound before any effect; or an error to commit first (`preview_stale`)."""
     request_id, token = arguments.get('request_id'), arguments.get('confirm_token')
-    open_chat = arguments.get('allow_open_chat') is not False
-    # A token carries its payload; control fields alone replay (or resume) the intent of that key.
-    value = None if token is not None or _bare(arguments) and request_id is not None else payload(arguments)
+    open_chat, files = arguments.get('allow_open_chat') is not False, arguments.get('allow_files') is not False
+    # Control fields alone replay (or resume) the intent of that key; a payload sent with them must equal it.
+    value = None if _bare(arguments) and (token is not None or request_id is not None) else payload(arguments)
     if request_id is not None and not is_request_id(request_id): raise _invalid('request_id', 'pattern')
     if token is None and request_id is None:
         failure = missing_request_id(TOOL, {k: v for k, v in arguments.items() if k != 'wait_s'})
@@ -226,36 +238,46 @@ def admit(store, c, p, arguments):
     if token is not None:
         if not isinstance(token, str) or not 1 <= len(token) <= 256: raise _error('invalid_confirm_token', 409)
         token_hash = _hash(token)
-        _locked(c, 'send-preview:' + token_hash)
-        record = c.execute('''SELECT *,expires_at<=clock_timestamp() AS expired FROM send_previews
+        found = c.execute('SELECT lineage FROM send_previews WHERE token_hash=%s', (token_hash,)).fetchone()
+        if found: _locked(c, 'send-preview:' + found['lineage'])
+        record = found and c.execute('''SELECT *,expires_at<=clock_timestamp() AS expired FROM send_previews
             WHERE token_hash=%s''', (token_hash,)).fetchone()
-        if not record or record['principal'] != p['id'] or record['tool'] != TOOL:
+        # A token is its issuing key's: another key of the same principal cannot consume it.
+        if not record or record['principal'] != p['id'] or record['key_id'] != p['key_id'] or record['tool'] != TOOL:
             raise _error('invalid_confirm_token', 409)
         if record['intent'] is not None:
-            # A consumed token is its intent's key: a new request_id with it is ignored, another intent's is a conflict.
+            # A consumed token (or one of its lineage) is its intent's key: a new request_id with it is ignored,
+            # another intent's is a conflict, and so is a payload that differs from the bound one.
             if bound is not None and bound['id'] != record['intent']: raise _error('idempotency_conflict', 409)
+            if value is not None and c.execute('SELECT request_hash FROM send_intents WHERE id=%s',
+                                               (record['intent'],)).fetchone()['request_hash'] != _hash(value):
+                raise _error('idempotency_conflict', 409)
             return record['intent']
+        if value is not None and value != record['arguments']: raise _error('idempotency_conflict', 409)
         if record['expired']:
             raise _error('preview_expired', 409, next=next_call(TOOL, {**record['arguments'], 'dry_run': True}))
         value, old = record['arguments'], record['resolution']
-        fresh = resolve(store, c, p, value, old['text'] if old['target'].get('opens_chat') else None, open_chat)
+        fresh = resolve(store, c, p, value, old['text'] if old['target'].get('opens_chat') else None, open_chat, files)
         before, after = _comparable(old), _comparable(fresh)
         changed = [name for name in COMPARED if before[name] != after[name]]
         if changed:
-            stale = save_preview(c, p, value, fresh)
+            stale = save_preview(c, p, value, fresh, record['lineage'])
             return _error('preview_stale', 409, changed=changed, preview=stale['preview'],
                           confirm_token=stale['confirm_token'])
         if bound is not None: raise _error('idempotency_conflict', 409)
         intent = _bind(c, p, request_id, token_hash, value, fresh)
-        c.execute("UPDATE send_previews SET intent=%s,arguments=arguments-'text',resolution=resolution-'text' "
-                  "WHERE token_hash=%s", (intent, token_hash))
+        # Every preview of the lineage now names this intent, and none keeps text or captions.
+        for row in c.execute('SELECT token_hash,resolution FROM send_previews WHERE lineage=%s AND intent IS NULL',
+                             (record['lineage'],)).fetchall():
+            c.execute("UPDATE send_previews SET intent=%s,arguments=arguments-'text',resolution=%s "
+                      "WHERE token_hash=%s", (intent, Jsonb(_scrubbed(row['resolution'])), row['token_hash']))
         return intent
     if value is None and bound is None: payload(arguments)  # Nothing bound to this key: name the missing field.
     if bound is not None:
         if value is not None and bound['request_hash'] != _hash(value) or bound['tool'] != TOOL: raise _error('idempotency_conflict', 409)
         return bound['id']
     if value['format'] != 'plain': raise _preview_required(value)
-    fresh = resolve(store, c, p, value, open_chat=open_chat)
+    fresh = resolve(store, c, p, value, open_chat=open_chat, files=files)
     if fresh is None: raise _preview_required(value)
     return _bind(c, p, request_id, None, value, fresh)
 
@@ -277,6 +299,12 @@ def _start(store, c, p, row, step):
     from .outgoing import enqueue as send
     resolution, value = row['plan']['resolution'], row['plan']['value']
     target, key = resolution['target'], _key(p, row, step)
+    if step['kind'] != 'phone':
+        # The previewed recipient binds every step: a chat or reply that maps elsewhere now sends nothing.
+        from .outgoing import target as chat_target
+        chat, reply_id = chat_target(c, p, target['account'], target['chat_id'], value['reply_to'])
+        if chat['provider_chat'] != target['provider_chat'] or reply_id != (resolution['reply_to'] or {}).get('provider_id'):
+            raise _error('identity_changed', 409)
     if step['kind'] == 'text':
         rich = value['format'] != 'plain'
         return {'send_id': send(c, p, target['account'], target['chat_id'], value['text'], key, value['reply_to'],
@@ -347,15 +375,20 @@ def _finish(c, row, steps, state, reason=None):
                               steps=_steps_public(steps),
                               hint='A step may have been delivered: check the chat history before any new send.')
     plan = row['plan']
-    if state != 'failed':  # Text stays only while a resume may still send it.
-        plan = {'value': {**plan['value'], 'text': ''}, 'resolution': {**plan['resolution'], 'text': None,
-                'files': [{**item, 'caption': ''} for item in plan['resolution']['files']]}}
+    # Text stays only while a resume may still send it: an unsent text or phone step, or an unsent file's caption.
+    sent = None if state != 'failed' else \
+        {int(s['name'][4:]) - 1 for s in steps if s['kind'] == 'file' and s['state'] == 'succeeded'}
+    resolution = _scrubbed(plan['resolution'], sent)
+    if state != 'failed' or not any(s['kind'] != 'file' and s['state'] != 'succeeded' for s in steps):
+        plan = {'value': {**plan['value'], 'text': ''}, 'resolution': {**resolution, 'text': None}}
+    else:
+        plan = {**plan, 'resolution': resolution}
     c.execute('''UPDATE send_intents SET state=%s,result=%s,steps=%s,plan=%s,updated_at=clock_timestamp()
         WHERE id=%s''', (state, Jsonb(result), Jsonb(steps), Jsonb(plan), row['id']))
     return {'result': serial(result)}
 
 
-def advance(store, c, p, intent_id, *, resume=False, first=False, open_chat=True):
+def advance(store, c, p, intent_id, *, resume=False, first=False, open_chat=True, files=True):
     """Move one intent as far as it goes without waiting: {'result'} when final, else {'wait', 'result'}."""
     try:
         row = c.execute('SELECT * FROM send_intents WHERE id=%s AND principal=%s FOR UPDATE NOWAIT',
@@ -370,7 +403,9 @@ def advance(store, c, p, intent_id, *, resume=False, first=False, open_chat=True
     for step in steps:
         if step['state'] == 'succeeded': continue
         if step['handle'] is None:
-            if step['kind'] == 'phone' and not open_chat: raise APIError('forbidden', 403)
+            # The gateway's grants of this call bound every unsent step, also of an intent bound earlier.
+            if step['kind'] == 'phone' and not open_chat or step['kind'] == 'file' and not files:
+                raise APIError('forbidden', 403)
             try:
                 step['handle'] = _start(store, c, p, row, step)
             except APIError as error:
@@ -436,5 +471,5 @@ async def send(store, token, arguments):
         except APIError as error:
             if error.status in (401, 403, 404): raise
             break  # Busy or timed out: the record keeps the step; the answer says running.
-        answer = await run(store.messages_send_advance, token, answer['intent'])
+        answer = await run(store.messages_send_advance, token, answer['intent'], arguments)
     return _decorate(answer['result'], arguments)

@@ -1,13 +1,15 @@
 -- rollout: manual
 -- messages_send (ANYM-546): the durable preview record behind a confirm_token and the parent record of a composite
 -- send. Additive: older runtimes never read these tables. Manual only because of the grants below.
--- A preview keeps only the hash of its token. Text leaves both tables once no unsent step needs it (send_intent.py).
+-- A preview keeps only the hash of its token; a preview_stale replacement shares its lineage, which binds once.
+-- Text leaves both tables once no unsent step needs it (send_intent.py).
 SET LOCAL lock_timeout='2s';
 CREATE TABLE send_previews (
  token_hash text PRIMARY KEY CHECK(token_hash ~ '^[a-f0-9]{64}$'),
  principal text NOT NULL REFERENCES principals(id),
  key_id uuid NOT NULL REFERENCES api_keys(id),
  tool text NOT NULL CHECK(tool ~ '^[a-z][a-z0-9_]{0,63}$'),
+ lineage text NOT NULL CHECK(lineage ~ '^[a-f0-9]{64}$'),
  arguments jsonb NOT NULL,
  resolution jsonb NOT NULL,
  intent text,
@@ -15,6 +17,7 @@ CREATE TABLE send_previews (
  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX send_previews_unbound ON send_previews(expires_at) WHERE intent IS NULL;
+CREATE INDEX send_previews_lineage ON send_previews(lineage);
 CREATE TABLE send_intents (
  id text PRIMARY KEY DEFAULT ('si_' || replace(gen_random_uuid()::text,'-','')) CHECK(id ~ '^si_[a-f0-9]{32}$'),
  principal text NOT NULL REFERENCES principals(id),

@@ -411,3 +411,215 @@ def test_phone_target_opens_the_chat_and_sends_under_the_gateway_grant(phone_wor
     result = asyncio.run(with_workers({'confirm_token': token, 'wait_s': 10, 'allow_open_chat': True}))
     assert result['state'] == 'succeeded' and result['steps'][0]['receipt']['provider_message_id'] == 'wa-1'
     assert len(texts) == 1 and texts[0]['provider_chat'] == LID and texts[0]['body'] == 'Synthetic'
+
+
+def stored_text(w):
+    with w.s.pool.connection() as c:
+        previews = c.execute('SELECT arguments,resolution FROM send_previews').fetchall()
+        plans = c.execute('SELECT plan FROM send_intents').fetchall()
+    return str(previews) + str(plans)
+
+
+# spec: ANYM-546
+def test_the_file_grant_bounds_token_only_and_resume_calls(world):
+    a, b = (world.upload(f'Synthetic file {n}'.encode(), f'synthetic-upload-000{n}') for n in (1, 2))
+    files = [{'upload_id': a}, {'upload_id': b}]
+    world.reject.add(b)
+    assert refused(world.call, to=CHAT, files=files, dry_run=True, allow_files=False).code == 'forbidden'
+    token = world.call(to=CHAT, files=files, dry_run=True)['confirm_token']
+    # A token-only call carries no files: the gateway's allow_files still refuses the stored file steps.
+    assert refused(world.call, confirm_token=token, allow_files=False).code == 'forbidden'
+    world.work()
+    assert not world.files and intents(world) == 0
+    failed = world.drive(confirm_token=token, request_id='synthetic-grant-0001')
+    assert failed['state'] == 'failed' and [f[0] for f in world.files] == [a]
+    world.reject.clear()
+    # The grant withdrawn after binding: neither resume form sends the unsent file.
+    assert refused(world.call, request_id='synthetic-grant-0001', resume=True, allow_files=False).code == 'forbidden'
+    assert refused(world.call, confirm_token=token, resume=True, allow_files=False).code == 'forbidden'
+    world.work()
+    assert [f[0] for f in world.files] == [a]
+    assert world.drive(confirm_token=token, resume=True)['state'] == 'succeeded'
+    assert [f[0] for f in world.files] == [a, b]
+
+
+# spec: ANYM-546
+def test_a_confirm_token_is_only_its_issuing_keys(world):
+    token = world.call(to=CHAT, text='Synthetic one key', dry_run=True)['confirm_token']
+    second = world.s.issue_key('send-agent', [ACCOUNT], permissions=['read', 'send', 'upload'])
+    assert refused(world.call, second, confirm_token=token).code == 'invalid_confirm_token'
+    assert refused(world.call, second, confirm_token=token, request_id='synthetic-second-01').code == 'invalid_confirm_token'
+    world.work()
+    assert not world.texts and intents(world) == 0
+    assert world.drive(confirm_token=token)['state'] == 'succeeded' and len(world.texts) == 1
+
+
+# spec: ANYM-546
+def test_stale_retries_of_one_token_send_once(world):
+    token = world.call(to=CHAT, text='Synthetic lineage', dry_run=True)['confirm_token']
+    with world.s.pool.connection() as c:
+        c.execute("UPDATE chats SET provider_chat='999' WHERE id=%s", (CHAT,))
+    second, third = (refused(world.call, confirm_token=token).confirm_token for _ in range(2))
+    assert len({token, second, third}) == 3
+    first = world.drive(confirm_token=second)
+    assert first['state'] == 'succeeded'
+    # The other replacement and the original token read the same intent: one action, one send.
+    for other in (third, token):
+        assert world.drive(confirm_token=other)['operation'] == first['operation']
+    world.work()
+    assert len(world.texts) == 1 and intents(world) == 1
+
+
+# spec: ANYM-546
+def test_a_recipient_remapped_between_steps_sends_nothing_to_the_new_chat(world):
+    a, b = (world.upload(f'Synthetic file {n}'.encode(), f'synthetic-upload-000{n}') for n in (1, 2))
+    world.reject.add(b)
+    text = 'Synthetic separate text ' * 50  # over the caption limit: file1, file2, then a text step
+    arguments = {'to': CHAT, 'text': text, 'files': [{'upload_id': a}, {'upload_id': b}],
+                 'request_id': 'synthetic-remap-0001'}
+    assert world.drive(**arguments)['state'] == 'failed'
+    world.reject.clear()
+    # The bound chat now maps to another provider chat: the resumed steps send nothing there.
+    with world.s.pool.connection() as c:
+        c.execute("UPDATE chats SET provider_chat='999' WHERE id=%s", (CHAT,))
+    result = world.drive(**arguments, resume=True)
+    assert result['state'] == 'failed' and result['steps'][1]['error'] == 'identity_changed'
+    world.work()
+    assert not world.texts and [f[0] for f in world.files] == [a]
+
+
+# spec: ANYM-546
+def test_a_payload_sent_with_a_token_must_equal_the_preview(world):
+    token = world.call(to=CHAT, text='Synthetic approved', dry_run=True)['confirm_token']
+    for changed in ({'to': CHAT, 'text': 'Synthetic other'}, {'to': OTHER_CHAT, 'text': 'Synthetic approved'}):
+        assert refused(world.call, confirm_token=token, **changed).code == 'idempotency_conflict'
+    world.work()
+    assert not world.texts and intents(world) == 0
+    assert world.drive(confirm_token=token, to=CHAT, text='Synthetic approved')['state'] == 'succeeded'
+    assert refused(world.call, confirm_token=token, to=CHAT, text='Synthetic other').code == 'idempotency_conflict'
+    world.work()
+    assert [t['body'] for t in world.texts] == ['Synthetic approved']
+
+
+# spec: ANYM-546
+def test_no_caption_or_text_stays_once_no_unsent_step_needs_it(world):
+    a, b = (world.upload(f'Synthetic file {n}'.encode(), f'synthetic-upload-000{n}') for n in (1, 2))
+    world.reject.add(b)
+    token = world.call(to=CHAT, text='Synthetic secret caption', files=[{'upload_id': a}, {'upload_id': b}],
+                       dry_run=True)['confirm_token']
+    failed = world.drive(confirm_token=token)
+    # The caption rode on file1, which went: the failed parent and the bound preview keep it nowhere.
+    assert failed['state'] == 'failed' and world.files[0][1] == 'Synthetic secret caption'
+    assert 'Synthetic secret caption' not in stored_text(world)
+    world.reject.clear()
+    assert world.drive(confirm_token=token, resume=True)['state'] == 'succeeded'
+    assert [f[1] for f in world.files] == ['Synthetic secret caption', '']
+    long = 'Synthetic later text ' * 60
+    token = world.call(to=CHAT, text=long, files=[{'upload_id': a}], dry_run=True)['confirm_token']
+    assert world.drive(confirm_token=token)['state'] == 'succeeded'
+    assert 'Synthetic later text' not in stored_text(world) and 'Synthetic secret caption' not in stored_text(world)
+
+
+# spec: ANYM-546
+def test_a_crash_after_a_step_starts_rolls_back_with_it_and_the_repeat_sends_once(world, monkeypatch):
+    import messaging_service.send_intent as intent
+    real, crashed = intent._observe, []
+
+    def observe(*args):
+        if not crashed:
+            crashed.append(True)
+            raise RuntimeError('synthetic crash between enqueue and handle record')
+        return real(*args)
+    monkeypatch.setattr(intent, '_observe', observe)
+    with pytest.raises(Exception): world.call(to=CHAT, text='Synthetic crash', request_id='synthetic-crash-0002')
+    world.work()
+    assert not world.texts and intents(world) == 0
+    assert world.drive(to=CHAT, text='Synthetic crash', request_id='synthetic-crash-0002')['state'] == 'succeeded'
+    assert len(world.texts) == 1
+
+
+# spec: ANYM-546
+def test_a_crash_before_the_parent_receipt_after_resume_sends_nothing_twice(world, monkeypatch):
+    import messaging_service.send_intent as intent
+    a, b = (world.upload(f'Synthetic file {n}'.encode(), f'synthetic-upload-000{n}') for n in (1, 2))
+    world.reject.add(b)
+    token = world.call(to=CHAT, files=[{'upload_id': a}, {'upload_id': b}], dry_run=True)['confirm_token']
+    assert world.drive(confirm_token=token)['state'] == 'failed'
+    world.reject.clear()
+    real, crashed = intent._finish, []
+
+    def finish(c, row, steps, state, reason=None):
+        if state == 'succeeded' and not crashed:
+            crashed.append(True)
+            raise RuntimeError('synthetic crash before the parent receipt')
+        return real(c, row, steps, state, reason)
+    monkeypatch.setattr(intent, '_finish', finish)
+    assert world.call(confirm_token=token, resume=True)['state'] == 'running'
+    world.work()  # file2 delivered; recording the parent receipt crashes
+    with pytest.raises(Exception): world.call(confirm_token=token)
+    done = world.drive(confirm_token=token)
+    assert done['state'] == 'succeeded' and crashed
+    world.work()
+    assert [f[0] for f in world.files] == [a, b]
+
+
+# spec: ANYM-546
+def test_hidden_attachments_and_a_missing_download_permission_are_refused(world):
+    content = b'Synthetic archived file'
+    digest = hashlib.sha256(content).hexdigest()
+    visible = stable_id('att', ACCOUNT, '100', '1', 'synthetic-visible')
+    hidden = stable_id('att', ACCOUNT, '200', '2', 'synthetic-hidden')
+    with world.s.pool.connection() as c:
+        for aid, message in ((visible, MESSAGE), (hidden, stable_id('msg', ACCOUNT, '200', '2'))):
+            c.execute('INSERT INTO attachments(id,message,digest,filename,mime,bytes,active) '
+                      'VALUES(%s,%s,%s,%s,%s,%s,true)', (aid, message, digest, 'synthetic.txt', 'text/plain', len(content)))
+    parameters = {'attachment_id': visible, 'sha256': digest, 'mode': 'document', 'caption': ''}
+    # Without download: the low-level send_file refusal.
+    low = refused(world.s.preview_messenger_operation, world.key, ACCOUNT, 'send_file', CHAT, parameters=parameters)
+    assert refused(world.call, to=CHAT, files=[{'attachment_id': visible}], dry_run=True).code == low.code
+    assert refused(world.call, to=CHAT, files=[{'attachment_id': visible}],
+                   request_id='synthetic-attach-0001').code == low.code
+    # A source outside the caller's scope is not_found, like the low-level route.
+    reader = world.s.issue_key('send-downloader', [ACCOUNT], permissions=['read', 'send', 'download'])
+    world.s.set_access('send-downloader', chats=[CHAT])
+    hidden_low = refused(world.s.preview_messenger_operation, reader, ACCOUNT, 'send_file', CHAT,
+                         parameters={**parameters, 'attachment_id': hidden})
+    assert refused(world.call, reader, to=CHAT, files=[{'attachment_id': hidden}], dry_run=True).code == hidden_low.code
+    assert hidden_low.code == 'not_found'
+    world.work()
+    assert not world.files and intents(world) == 0
+
+
+# spec: ANYM-546
+def test_a_phone_send_finish_crash_repeats_into_one_send(phone_world, monkeypatch):
+    import messaging_service.phone_send as phone_send
+    from test_phone_send import answer, local
+    s, state, key = phone_world
+    texts, real, crashed = [], phone_send.send_finish, []
+
+    async def adapter(job):
+        return answer(name='Synthetic Bakery') if job['parameters'].get('create') is not True else local(job)
+
+    async def text_provider(job):
+        texts.append(job)
+        return {'provider_message_id': 'wa-1'}
+
+    async def with_workers(arguments):
+        task = asyncio.create_task(send(s, key, arguments))
+        while not task.done():
+            await CommandWorker(state, adapter).once()
+            await OutgoingWorker(state, text_provider).once()
+            await asyncio.sleep(0.05)
+        return await task
+
+    def finish(*args, **kwargs):
+        if not crashed:
+            crashed.append(True)
+            raise RuntimeError('synthetic crash in phone send_finish')
+        return real(*args, **kwargs)
+    monkeypatch.setattr(phone_send, 'send_finish', finish)
+    from test_phone_send import PHONE
+    token = asyncio.run(with_workers({'to': '+' + PHONE, 'text': 'Synthetic', 'dry_run': True}))['confirm_token']
+    with pytest.raises(Exception): asyncio.run(with_workers({'confirm_token': token, 'wait_s': 10}))
+    result = asyncio.run(with_workers({'confirm_token': token, 'wait_s': 10}))
+    assert result['state'] == 'succeeded' and crashed and len(texts) == 1

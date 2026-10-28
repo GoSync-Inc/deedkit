@@ -694,9 +694,11 @@ class Dispatch:
             # An empty recipient field is not sent, so a backend from before ANYM-532 keeps taking chat_id calls.
             args = {k: v for k, v in args.items() if k not in ("chat_id", "phone") or v != ""}
         if module == "messaging" and tool["operation"] == "messages_send":
-            # ANYM-546: whether a phone with no chat may be opened is this gateway's grant, never the agent's word.
-            args = {**args, "allow_open_chat": "send" in caps["permissions"] and OPEN_CHAT_BY_PHONE in self.actions(
-                snapshot, agent, caps, args.get("account") or None)}
+            # ANYM-546: whether a phone with no chat may be opened, and whether files may go, is this gateway's
+            # grant on every call (a token-only or resume call carries no files), never the agent's word.
+            actions = self.actions(snapshot, agent, caps, args.get("account") or None)
+            args = {**args, "allow_open_chat": "send" in caps["permissions"] and OPEN_CHAT_BY_PHONE in actions,
+                    "allow_files": "send" in caps["permissions"] and SEND_FILE in actions}
         if module == "calendar" and tool["operation"] == "plan":
             # Carried drives (and create with activity) are asked for only under this gateway's own rule-read
             # ceiling, and only from a backend that declares the field; an agent never sets it itself.

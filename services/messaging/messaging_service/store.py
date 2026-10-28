@@ -553,7 +553,8 @@ class Store:
         with self.authorized(token,'preview_message') as (c,p):
             value=payload(arguments)
             resolution=resolve(self,c,p,value,phone_text=_text(draft) if draft else None,
-                               open_chat=arguments.get('allow_open_chat') is not False)
+                               open_chat=arguments.get('allow_open_chat') is not False,
+                               files=arguments.get('allow_files') is not False)
             if resolution is not None:return save_preview(c,p,value,resolution)
             target=resolve_target(self,c,p,value['to'],'message',value['account'])['target']
             return {'phone':{'account':target['account'],'phone':target['phone'][1:],'text':value['text'],
@@ -566,12 +567,14 @@ class Store:
             # preview_stale: its fresh preview commits with this transaction, then the caller raises.
             if isinstance(intent,APIError):return {'raise':intent}
             return advance(self,c,p,intent,resume=arguments.get('resume',False),first=True,
-                           open_chat=arguments.get('allow_open_chat') is not False)
+                           open_chat=arguments.get('allow_open_chat') is not False,
+                           files=arguments.get('allow_files') is not False)
 
-    def messages_send_advance(self,token,intent_id):
+    def messages_send_advance(self,token,intent_id,arguments):
         from .send_intent import advance
         with self.authorized(token,'send_message') as (c,p):
-            return advance(self,c,p,intent_id)
+            return advance(self,c,p,intent_id,open_chat=arguments.get('allow_open_chat') is not False,
+                           files=arguments.get('allow_files') is not False)
 
     def get_send_status(self,token,send_id):
         from .outgoing import status

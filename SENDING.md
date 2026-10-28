@@ -179,7 +179,13 @@ payload with that key gets `idempotency_conflict`. Text leaves both tables once
 no unsent step needs it; unbound previews are deleted 7 days after they expire.
 A phone with no chat is opened only when the gateway sets `allow_open_chat` from
 the caller's `open_chat_by_phone` grant; an agent's own value is replaced, and
-`false` refuses such a phone with `forbidden`.
+`false` refuses such a phone with `forbidden`. Likewise `allow_files` comes from the
+`send_file` grant on every call, also one with only `confirm_token`, `request_id` or
+`resume`: `false` refuses any unsent file step with `forbidden`. A confirm_token belongs
+to the key that previewed it; a `preview_stale` replacement shares its lineage, and one
+lineage sends once. Before each step the server re-checks that the chat and reply target
+still map to the previewed ones; otherwise the step fails with `identity_changed` and
+nothing goes to the new chat.
 
 ## Sender identity and provenance (0.9.12)
 
