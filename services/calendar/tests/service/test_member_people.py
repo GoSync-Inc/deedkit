@@ -104,6 +104,20 @@ def test_a_person_whose_calendar_the_caller_cannot_read_is_not_found_like_an_unl
 
 
 # spec: ANYM-554
+def test_a_person_id_never_matches_a_name_and_an_unbound_linked_member_resolves(store, tmp_path):
+    key = setup(store)
+    # A member labelled with the UUID itself is still not that person without the owner's link.
+    store.person("helper", MASHA)
+    assert find(store, key, people=[MASHA], window=DAY)["error"] == "not_found"
+    partial = find(store, key, people=[MASHA[:8]], window=DAY)
+    assert partial["error"] == "selection_required" and [c["id"] for c in partial["candidates"]] == ["helper"]
+    # The helper has no binding: linked, it resolves and is reported unbound, as by name.
+    link(store, tmp_path, "--member", "helper", "--person", ZOE)
+    found = find(store, key, people=[ZOE], window=DAY, exclude_me=True)
+    assert [m["member_id"] for m in found["people"]] == ["helper"] and found["unbound_members"] == ["helper"]
+
+
+# spec: ANYM-554
 def test_two_concurrent_links_of_one_person_end_with_one_link_and_person_already_linked(store, tmp_path):
     setup(store)
     dsn = os.environ["FCS_TEST_DSN"]
