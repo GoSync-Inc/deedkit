@@ -689,9 +689,6 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     finished_at=CASE WHEN %s='pending' THEN NULL ELSE clock_timestamp() END
                     WHERE id=%s AND state='leased' AND lease_token=%s''',
                     (state, error, min(3600, 2**(hint['attempts'] + 1)), state, hint['id'], lease))
-                if endpoint is not None and endpoint['vendor'] and error == 'vendor_refused':
-                    from .delivery_endpoints import auto_pause
-                    auto_pause(c, endpoint['id'])
         # Each attempt's fence hold, so a latency regression shows up in a measurement.
         holds.append(round((time.monotonic() - fenced) * 1000))
         if live:

@@ -186,14 +186,6 @@ def vendor_endpoint(c, endpoint_id):
     return vendor_of(load_policy(), row['host']) if row else None
 
 
-def auto_pause(c, endpoint_id):
-    """A vendor refused the caller's key (401/403): the endpoint stops until the agent replaces its headers and
-    resumes, so nothing else dead-letters unseen. The caller holds the endpoint lock shared (fenced)."""
-    paused = c.execute("""UPDATE delivery_endpoints SET state='auto_paused',version=version+1,
-        updated_at=clock_timestamp() WHERE id=%s AND state='enabled'""", (endpoint_id,)).rowcount
-    return cancel_queued(c, endpoint_id, 'endpoint_auto_paused') if paused else 0
-
-
 def _private_answer(address):
     ip = ipaddress.ip_address(address)
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
@@ -363,16 +355,24 @@ def _tests(c, endpoint_id):
 def _view(c, row):
     from .store import serial
     last = _tests(c, row['id'])
-    finished = c.execute('''SELECT state FROM delivery_endpoint_tests WHERE endpoint=%s AND state IN ('delivered','failed')
-        ORDER BY finished_at DESC,id DESC LIMIT 1''', (row['id'],)).fetchone()
+    finished = c.execute('''SELECT state,finished_at FROM delivery_endpoint_tests WHERE endpoint=%s
+        AND state IN ('delivered','failed') ORDER BY finished_at DESC,id DESC LIMIT 1''', (row['id'],)).fetchone()
+    # ANYM-582: the latest finished hint, through the bindings (the outbox is indexed by subscription).
+    hint = c.execute('''SELECT o.state,o.error_code,o.finished_at FROM subscription_delivery d
+        JOIN subscription_outbox o ON o.subscription=d.subscription AND o.endpoint=d.endpoint
+        WHERE d.endpoint=%s AND o.finished_at IS NOT NULL ORDER BY o.created_at DESC,o.id DESC LIMIT 1''',
+        (row['id'],)).fetchone()
+    health = {'delivered': 'ok', 'failed': 'failing'}[finished['state']] if finished else 'unknown'
+    if hint and hint['error_code'] == 'vendor_refused' and (finished is None or hint['finished_at'] > finished['finished_at']):
+        # A vendor refused the key after the last test (rotated or revoked): failing until a new test is delivered.
+        health = 'failing'
     rotation = None if row['rotation_started_at'] is None else {'pending_fingerprint': row['pending_fingerprint'],
         'started_at': row['rotation_started_at'], 'promotes_at': row['rotation_started_at'] + _day()}
     return serial({'endpoint_id': row['id'], 'version': row['version'], 'state': row['state'], 'url': row['url'],
         'host': row['host'], 'label': row['label'], 'header_names': list(row['header_names']),
         'headers_fingerprint': row['headers_fingerprint'], 'secret_fingerprint': row['secret_fingerprint'],
         'rotation': rotation, 'created_at': row['created_at'], 'updated_at': row['updated_at'],
-        'health': {'delivered': 'ok', 'failed': 'failing'}[finished['state']] if finished else 'unknown',
-        'last_test': _test_view(last), 'signature_scheme': SCHEME, 'vendor': vendor_of(load_policy(), row['host'])})
+        'health': health, 'last_test': _test_view(last), 'last_hint': dict(hint) if hint else None, 'signature_scheme': SCHEME, 'vendor': vendor_of(load_policy(), row['host'])})
 
 
 def _day():

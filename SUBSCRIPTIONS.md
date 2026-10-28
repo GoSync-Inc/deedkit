@@ -566,8 +566,7 @@ and records `http_status` and `latency_ms`. Past 10 s the result says
 same `request_id`. A failed test still creates the endpoint (state `enabled`,
 health `failing`), so a retry needs no new request ID.
 
-**States.** `enabled`, `agent_paused`, `auto_paused` (set by S3, and by a vendor's
-401 or 403, ANYM-582) and
+**States.** `enabled`, `agent_paused`, `auto_paused` (set by S3) and
 `operator_disabled`. The agent may pause, and resume from `agent_paused` or
 `auto_paused`; resume and test on `operator_disabled` answer `operator_disabled`.
 Only the operator disables or enables (`deedkit admin delivery-endpoints list |
@@ -629,7 +628,7 @@ A vendor host's endpoints deliver at most once after the request is written:
 |---|---|---|
 | 2xx | `delivered` | `delivered` |
 | 3xx | dead letter `redirect_rejected` | `failed` `redirect_rejected` |
-| 401, 403 | dead letter `vendor_refused`; the endpoint turns `auto_paused` and its queued hints and tests are cancelled `endpoint_auto_paused` | `failed` `vendor_refused` |
+| 401, 403 | dead letter `vendor_refused`; the endpoint view turns `health: failing` with `last_hint` | `failed` `vendor_refused` |
 | other status (no run started) | bounded retry, `receiver_status` | `failed` `receiver_status` |
 | not sent (`egress.EgressNotSent`: refusal, connect, TLS, deadline before the first byte) | bounded retry, `receiver_unavailable` | `failed` `receiver_unavailable` |
 | timeout, reset, a 1xx or a malformed response after the write | dead letter `outcome_unknown`, never re-sent | `failed` `outcome_unknown` |
@@ -637,7 +636,10 @@ A vendor host's endpoints deliver at most once after the request is written:
 
 Before the dispatcher's transport raises `EgressNotSent`, no failure counts as
 unsent, so a vendor hint is still never sent twice. A rotated or revoked routine
-key shows as `auto_paused`: replace the headers with `set_headers`, then `resume`.
+key shows as `health: failing` with `last_hint.error_code: vendor_refused` (the
+endpoint stays `enabled`; later hints are refused too and start no run): replace
+the headers with `set_headers`, then `test_delivery_endpoint`; a delivered test
+makes it `ok` again.
 A 429 is an "other status": the bounded retry spends its attempts in minutes. A lost
 wake loses no event: the
 routine also keeps a schedule trigger that fetches and ACKs. Other endpoints and

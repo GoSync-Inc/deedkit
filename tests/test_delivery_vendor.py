@@ -290,18 +290,45 @@ def test_vendor_informational_status_is_unknown_and_never_retried(gate, policy):
 
 
 # spec: ANYM-582
-def test_vendor_refused_key_auto_pauses_the_endpoint_until_new_headers_and_resume(gate, policy):
+def test_vendor_refused_key_shows_failing_until_new_headers_pass_a_test(gate, policy):
+    from contextlib import contextmanager
+    from copy import copy
+    from pathlib import Path
+    from uuid import uuid4
+
+    from psycopg import sql
     store = gate
     token = identity(store)
     endpoint, sid = bound(store, token)
-    dispatch_hints(store, transport=lambda *a, **k: 401, resolver=PUBLIC)
-    assert hint(store)['error_code'] == 'vendor_refused'
-    view = store.list_delivery_endpoints(token)['items'][0]
-    assert view['state'] == 'auto_paused' and view['vendor'] == 'grok-bot-routine'
-    view = store.update_delivery_endpoint(token, endpoint['endpoint_id'], view['version'], 'set_headers',
-        headers={'Authorization': 'Bearer synthetic-routine-key-0002'})
-    view = store.update_delivery_endpoint(token, endpoint['endpoint_id'], view['version'], 'resume')
-    assert view['state'] == 'enabled'
+    # The dispatcher runs as the deployed delivery role: the refusal needs no grant it lacks.
+    role = 'synthetic_dispatcher_' + uuid4().hex
+    ddl = Path('services/messaging/messaging_service/delivery_role.sql').read_text().replace('messaging_event_delivery', role)
+    class RestrictedPool:
+        @contextmanager
+        def connection(self):
+            with store.pool.connection() as c:
+                c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+                yield c
+    worker = copy(store)
+    worker.pool = RestrictedPool()
+    try:
+        with store.pool.connection() as c:
+            c.execute(ddl)
+        dispatch_hints(worker, transport=lambda *a, **k: 401, resolver=PUBLIC)
+        assert hint(store) == {'state': 'dead_letter', 'error_code': 'vendor_refused', 'attempts': 1}
+        view = store.list_delivery_endpoints(token)['items'][0]
+        assert (view['state'], view['health'], view['vendor']) == ('enabled', 'failing', 'grok-bot-routine')
+        assert (view['last_hint']['state'], view['last_hint']['error_code']) == ('dead_letter', 'vendor_refused')
+        view = store.update_delivery_endpoint(token, endpoint['endpoint_id'], view['version'], 'set_headers',
+            headers={'Authorization': 'Bearer synthetic-routine-key-0002'})
+        age(store)
+        store.test_delivery_endpoint(token, endpoint['endpoint_id'], 'vendor-retest-0001')
+        assert dispatch_hints(worker, transport=lambda *a, **k: 200, resolver=PUBLIC)['endpoint_tests']['delivered'] == 1
+        assert store.list_delivery_endpoints(token)['items'][0]['health'] == 'ok'
+    finally:
+        with store.pool.connection() as c:
+            c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
+            c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
 
 
 # spec: ANYM-582
