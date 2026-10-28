@@ -1,6 +1,6 @@
 # DeedKit agent rules
 
-Process: harness egerev/agent-harness @ 0.52.0, ~/agent-harness; this file adds project rules.
+Process: harness egerev/agent-harness @ 0.52.1, ~/agent-harness; this file adds project rules.
 Claude Code loads harness process.md through the SessionStart hook (`.claude/hooks/harness.sh`:
 merged `origin/main`, else the pinned copy). Codex and cloud agents read the pinned copy
 docs/harness/process.md first. If no harness text is in context, stop and report BLOCKED. Each
@@ -11,7 +11,9 @@ DeedKit is the product; the repo keeps its AnyMsg identities (`anymsg`, `messagi
 
 Harness values: ruleset `deploy/main-ruleset.json`; required checks `CI gate` and
 `checks / verify`; CI check IDs: the seven `anymsg-ci::*` checks; deploy command
-`production.py deploy` (docs/operations/production.md); security document SECURITY.md; Tiden
+`production.py deploy` (docs/operations/production.md); security document SECURITY.md;
+data-policy document docs/DATA-POLICY.md; money cap `Budget: EUR 50/month without asking,
+monthly-cancellable spend only (owner D25 via harness)`; Tiden
 product and workspace: docs/operations/tiden-product-workflow.md; spec prefix `ANYM`;
 unlinked-tests list `config/tiden-unlinked-tests.json`; Tiden CI document TIDEN-CI.md; critical
 paths and deployed consumers: section 5; live actions: send, call, ACK, pairing,
@@ -26,13 +28,20 @@ docs/operations/parallel-development.md.
   on one provider session. Tests and health checks never touch a live provider.
 - Never change applied migrations, provider IDs, existing test paths, names or parameters (Tiden
   IDs) or the seven `anymsg-ci::*` checks.
-- Production changes only via `scripts/production.py` from a green `main` SHA
-  (docs/operations/production.md); never prune shared Docker data; SSH is read-only except `production.py`, `deedkit admin` and approved steps. Merged source is not live verification.
+- Deploys only via `scripts/production.py` from a green `main` SHA (docs/operations/production.md);
+  other production changes: section 2 gates. Never prune shared Docker data; SSH is read-only
+  except `production.py`, `deedkit admin` and section 2-gated steps. Merged source is not live
+  verification.
 - Backups: over the tailnet to the shared backup server only; no public backup port.
 
 ## 2. What the owner keeps
 
-The harness list holds. In a task (a ready card) the agent applies its migration under
+Authority: owner decision D25 (harness, 2026-10-27, «1) да 2)да 3)да»): the owner keeps only the
+five harness items; production changes, rollbacks, restores, destructive SQL, keys and access are
+agents' under the harness section 2 gates. Item 2 asks only what docs/DATA-POLICY.md does not
+cover; item 3 is the Budget line above. The live actions act on the owner's messenger accounts
+under the owner's name (item 4) and the owner's devices and provider auth (item 5): they keep
+section 1's exact confirmation. In a task (a ready card) the agent applies its migration under
 production.md's backup gate; enabling a feature never includes send, call, pairing, session or
 allowlist changes, and none of it runs during an active call.
 
