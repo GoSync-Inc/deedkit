@@ -92,3 +92,13 @@ def test_verify_runs_the_deedkit_package_tests():
     assert step["run"] == "npm test --prefix packages/deedkit"
     assert step["if"] == "${{ !cancelled() }}"
     assert "continue-on-error" not in step and "working-directory" not in step
+
+
+# spec: ANYM-324
+def test_every_workflow_lives_where_github_runs_it_and_calendar_runs_in_verify():
+    # GitHub runs only the repository root's .github/workflows; a nested copy is dead and misleads readers.
+    listed = subprocess.run(["git", "ls-files", "--", "*.github/workflows/*"], cwd=ROOT, capture_output=True,
+                            text=True, check=True).stdout.split()
+    assert listed and all(path.startswith(".github/workflows/") for path in listed), listed
+    calendar = next(step for step in _verify_steps() if step.get("id") == "calendar")
+    assert calendar["working-directory"] == "services/calendar" and "uv run pytest" in calendar["run"]
