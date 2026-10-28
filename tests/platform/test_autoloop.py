@@ -275,13 +275,47 @@ def test_a_decision_the_triage_tool_refuses_writes_no_decision_brief_or_triage_s
     inbox = triage.load(t / 'inbox.json', {})
     inbox[P3]['key_id'] = 'k2'  # another key: triage refuses a duplicate across keys; the reader's own check cannot see it
     triage.save(t / 'inbox.json', inbox)
+    count, _ = run_read(states, decision(P2, 'reported-bug', reason_code='new-idea', new_card='group-receipts',
+                                         card_brief='Receipts stop in groups.'),
+                        decision(P1, reason_code='duplicate', duplicate_of=P3))
+    # The refused decision is left out alone: its item stays in the inbox; the other one is recorded.
+    assert count == 1 and set(triage.load(t / 'ledger.json', {})) == {P2}
+    assert set(triage.load(t / 'inbox.json', {})) == {P1, P3}
+    assert [d['id'] for d in triage.load(a / 'decisions.json', [])] == [P2] and set(triage.load(a / 'briefs.json', {})) == {P2}
+    assert 'duplicate_of' in triage.load(a / 'refused.json', {})[P1]['why']
+
+
+# spec: ANYM-570
+def test_one_refused_decision_leaves_its_item_for_the_next_run_and_the_others_are_recorded(states):
+    t, a = states
+    decisions = (decision(P1, specs=[{'ref': 'ANYM-10', 'verdict': 'accepted'}], primary='ANYM-10', new_card='abc'),
+                 decision(P2, 'question', reason_code='question-answered'),
+                 decision(P3, 'reported-bug', specs=[{'ref': 'ANYM-10', 'verdict': 'accepted'}]))  # triage: no primary
+    count, report = run_read(states, *decisions)
+    assert count == 1 and report and set(triage.load(t / 'ledger.json', {})) == {P2}
+    assert set(triage.load(t / 'inbox.json', {})) == {P1, P3}
+    refused = triage.load(a / 'refused.json', {})
+    assert set(refused) == {P1, P3} and {refused[i]['count'] for i in refused} == {1}
+    assert 'new_card only' in refused[P1]['why'] and 'primary' in refused[P3]['why']
+    assert stat.S_IMODE((a / 'refused.json').stat().st_mode) == 0o600
+    run_read(states, *decisions[::2])
+    assert {i: e['count'] for i, e in triage.load(a / 'refused.json', {}).items()} == {P1: 2, P3: 2}
+    for path in a.rglob('*'):  # the inbox keeps the text; no autoloop file carries it
+        if path.is_file():
+            assert CANARY not in path.read_text(), path
+
+
+# spec: ANYM-570
+@pytest.mark.parametrize('bad', [[decision(P1, note='x')], [decision('22222222-2222-4222-8222-000000000009')],
+                                 [decision(P2, 'question', reason_code='question-answered')], ['not an object'],
+                                 [decision([P1])]], ids=['unknown field', 'unknown ID', 'ID twice', 'not an object',
+                                                         'ID not a string'])
+def test_a_malformed_decision_or_an_unknown_or_repeated_id_still_refuses_the_whole_run(states, bad):
+    t, a = states
     before = {p.name: p.read_text() for p in t.iterdir()}
-    with pytest.raises(autoloop.Refused, match='duplicate_of'):
-        run_read(states, decision(P2, 'reported-bug', reason_code='new-idea', new_card='group-receipts',
-                                  card_brief='Receipts stop in groups.'),
-                 decision(P1, reason_code='duplicate', duplicate_of=P3))
-    assert {p.name: p.read_text() for p in t.iterdir()} == before
-    assert not (a / 'decisions.json').exists() and not (a / 'briefs.json').exists()
+    with pytest.raises(autoloop.Refused, match='^answer: '):
+        run_read(states, decision(P2, 'question', reason_code='question-answered'), *bad)
+    assert {p.name: p.read_text() for p in t.iterdir()} == before and not a.exists()
 
 
 # spec: ANYM-570
@@ -544,6 +578,33 @@ def test_a_failed_or_truncated_read_ends_the_tick_with_no_write(loop, broken):
     assert not any((t / name).exists() for name in ('snapshot.json', 'inbox.json', 'candidates.json', 'ledger.json'))
     assert not any((a / name).exists() for name in ('plan.json', 'last-tick.json', 'ledger.json'))
     assert triage.load(a / 'intents' / 'autoloop-card-anym-10.json', {})['status'] == 'unknown'
+
+
+# spec: ANYM-569
+def test_an_item_whose_reader_decision_is_refused_twice_waits_for_the_orchestrator_and_the_tick_goes_on(loop):
+    t, a, s = loop
+    configure(a, live=True)
+    fakes = Fakes([submission(D1, 'groups lose names'), submission(D2, 'x', minute=1), submission(D3, 'y', minute=2)])
+
+    def runner(projected):
+        ids = [row['id'] for row in projected['items']]
+        fakes.runner_calls.append(ids)
+        return stream(answer(*[decision(i, 'not-actionable', reason_code='not-actionable',
+                                        **({'new_card': 'abc'} if i == D1 else {})) for i in ids if i != D3]))
+    fakes.runner = runner
+    code, line = run_tick(loop, fakes)
+    plan = triage.load(a / 'plan.json', {})
+    assert code == 0 and 'refused 1,' in line and plan['refused'] == [D1] and plan['parked'] == []
+    assert set(triage.load(t / 'ledger.json', {})) == {D2} and set(triage.load(t / 'inbox.json', {})) == {D1, D3}
+    code, line = run_tick(loop, fakes, NOW + timedelta(hours=1))
+    assert code == 0 and triage.load(a / 'plan.json', {})['parked'] == [D1]
+    code, line = run_tick(loop, fakes, NOW + timedelta(hours=2))
+    plan = triage.load(a / 'plan.json', {})
+    assert code == 0 and fakes.runner_calls == [[D1, D2, D3], [D1, D3], [D3]]  # an unanswered item is asked again
+    assert plan['refused'] == [] and plan['parked'] == [D1] and 'refused 0,' in line
+    report = next((a / 'report').glob('*.md')).read_text()
+    assert f'{D1}: решение читателя отклонено 2 раз(а), отзыв ждёт оркестратора' in report
+    assert triage.load(a / 'last-tick.json', {})['outcome'] == 'live'
 
 
 # spec: ANYM-569

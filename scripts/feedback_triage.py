@@ -43,6 +43,8 @@ HOLD = 'waits for the owner: opt-in'  # an enable-only item's note: the sync too
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 SPEC = re.compile(r'ANYM-[1-9][0-9]*')
 SLUG = re.compile(r'[a-z0-9][a-z0-9-]{2,60}')
+# Tiden's whole stderr when a branch was merged or closed after `branch list` listed it as open.
+GONE = re.compile(r"error: HTTP 400: branch '(.+)' is (?:merged|closed)")
 IMAGE = re.compile(r'sha256:[0-9a-f]{64}')
 PAGE = re.compile(r'[A-Za-z0-9_=.:+/-]{1,512}')
 NOTE_LIMIT = 280
@@ -60,6 +62,14 @@ class Refused(Exception):
     pass
 
 
+class Gone(Refused):
+    """The named branch is merged or closed (Tiden said so); every other failure stays a plain refusal."""
+
+    def __init__(self, message, branch):
+        super().__init__(message)
+        self.branch = branch
+
+
 def run(argv, timeout, stdin=None):
     try:
         # stdin is never the terminal, so an unattended run cannot wait on a prompt (ANYM-536).
@@ -68,7 +78,11 @@ def run(argv, timeout, stdin=None):
     except (OSError, subprocess.TimeoutExpired) as error:
         raise Refused(f'{argv[0]} failed: {type(error).__name__}') from None
     if done.returncode:
-        raise Refused(f'{argv[0]} {argv[1] if len(argv) > 1 else ""} exited {done.returncode}')
+        message = f'{argv[0]} {argv[1] if len(argv) > 1 else ""} exited {done.returncode}'
+        gone = GONE.fullmatch((done.stderr or '').strip()) if argv[0] == 'tiden' else None
+        if gone:
+            raise Gone(message, gone.group(1))
+        raise Refused(message)
     return done.stdout
 
 
@@ -235,7 +249,18 @@ def collect(read=None):
         complete(branches, len(branches['branches']), 'branch list')
     open_names = sorted(b['name'] for b in branches['branches'] if b.get('status') == 'open' and b.get('name') != 'main')
     # Every open branch is kept whole, branch versions of main specs too; the file is replaced only after all reads.
-    branch_specs = {name: flatten(read('spec', 'list', '--branch', name), name) for name in open_names}
+    # A branch merged or closed since `branch list` is left out, and main is read again so a merged branch's specs
+    # are in it; any other failed read refuses the whole snapshot.
+    branch_specs, gone = {}, False
+    for name in open_names:
+        try:
+            branch_specs[name] = flatten(read('spec', 'list', '--branch', name), name)
+        except Gone as error:
+            if error.branch != name:
+                raise
+            gone = True
+    if gone:
+        main = flatten(read('spec', 'list', '--branch', 'main', '--include-sources'), 'main')
     return {'main': main, 'branches': branch_specs}
 
 
