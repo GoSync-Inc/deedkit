@@ -19,7 +19,7 @@ def _verify_steps():
     return _workflow("checks.yml")["jobs"]["verify"]["steps"]
 
 
-# spec: ANYM-141
+# spec: ANYM-137
 def test_osv_scanner_fails_the_security_run_except_for_listed_advisories():
     steps = _workflow("security.yml")["jobs"]["report"]["steps"]
     osv = next(step for step in steps if step.get("id") == "osv")
@@ -40,7 +40,7 @@ def test_osv_scanner_fails_the_security_run_except_for_listed_advisories():
         assert "; card: " in entry["reason"], entry
 
 
-# spec: ANYM-141
+# spec: ANYM-500
 def test_security_runs_cancel_only_an_older_run_of_the_same_pull_request():
     concurrency = _workflow("security.yml")["concurrency"]
     assert concurrency["group"] == "security-${{ github.event.pull_request.number || github.sha }}"
@@ -67,7 +67,7 @@ def _run_uv_locks(tmp_path, listed, git_status=0, stale=()):
     return result.returncode, checked.read_text().split()
 
 
-# spec: ANYM-141
+# spec: ANYM-137
 def test_verify_fails_on_a_stale_uv_lock_and_keeps_the_seven_check_steps(tmp_path):
     steps = _verify_steps()
     ids = [step.get("id") for step in steps]
