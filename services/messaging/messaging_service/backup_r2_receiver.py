@@ -110,9 +110,11 @@ def load_config(path):
     defaults = {'max_bytes': 64 * 1024 ** 3, 'quota_bytes': 128 * 1024 ** 3,
                 'max_objects': 2, 'part_bytes': 64 * MIB, 'timeout_seconds': 7200,
                 'cold_max_bytes': 5 * 1024 ** 3}
-    # `capabilities_file` (optional): the root verifier's helper publication.
+    # Optional pair: the root verifier's helper publication and the one verifier
+    # config (the installed service's) whose publication `capabilities` accepts.
+    published = {'capabilities_file', 'verifier_config_file'}
     if (not isinstance(value, dict) or not required <= set(value) or
-            set(value) - required - set(defaults) - {'capabilities_file'} or
+            set(value) - required - set(defaults) - published or len(published & set(value)) == 1 or
             type(value['v']) is not int or value['v'] != 1):
         raise ValueError('invalid_config')
     value = {**defaults, **value}
@@ -129,13 +131,13 @@ def load_config(path):
             not 60 <= value['timeout_seconds'] <= 21600 or
             not 64 <= value['cold_max_bytes'] <= min(5 * 1024 ** 4, value['part_bytes'] * 10000)):
         raise ValueError('invalid_limits')
-    for key in ('state_directory', 'credentials_file', 'capabilities_file'):
+    for key in ('state_directory', 'credentials_file', *published):
         if key in value and (not isinstance(value[key], str) or not Path(value[key]).is_absolute() or
                              '..' in Path(value[key]).parts):
             raise ValueError('invalid_config_path')
     state = Path(value['state_directory'])
     # The upload UID owns its state; a publication it could write is no root answer.
-    if 'capabilities_file' in value and Path(value['capabilities_file']).is_relative_to(state):
+    if any(key in value and Path(value[key]).is_relative_to(state) for key in published):
         raise ValueError('invalid_config_path')
     if any(p.is_symlink() for p in (state, *state.parents)) or not state.is_dir() or state.stat().st_mode & 0o077:
         raise ValueError('private_receiver_directory_required')
@@ -1140,8 +1142,8 @@ def published_helper(config):
                     raise ValueError('capabilities_unavailable')
                 value = unique_json(source.read(4097))
         bound = value.get('verifier_config') if isinstance(value, dict) else None
-        if (not isinstance(bound, dict) or not isinstance(bound.get('path'), str) or
-                not Path(bound['path']).is_absolute() or '..' in Path(bound['path']).parts or
+        # Only the installed service's config counts: a staged copy's publication is refused.
+        if (not isinstance(bound, dict) or bound.get('path') != str(Path(config['verifier_config_file'])) or
                 config_identity(bound['path']) != bound):
             raise ValueError('capabilities_unavailable')
     except (OSError, ValueError):

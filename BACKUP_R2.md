@@ -478,15 +478,21 @@ line:
 (`backup_r2_verifier.SCHEMAS`). `helper_schemas` and `helper_revision` come from
 the pinned helper image, which only root may inspect, so the root verifier
 publishes them in a file the upload account can read: `capabilities_file` in the
-receiver configuration (an absolute path outside `state_directory`; set the same
-value in the root operator copy). The file must be root-owned, single-link,
+receiver configuration, set together with `verifier_config_file`, the path of the
+installed service's verifier configuration (both absolute and outside
+`state_directory`; set the same values in the root operator copy). The
+publication path must not be, or share a directory with, the verifier
+configuration, the operator configuration, its credentials, the recovery key or
+the protected marker, nor lie in the verifier `directory`
+(`separate_capabilities_file_required`, checked before anything changes). The file must be root-owned, single-link,
 world-readable and not group/other-writable, under root-owned ancestors that are
 not group/other writable, for example
 `/var/lib/deedkit-backup-r2/published/capabilities.json` in a root-owned `0755`
 directory. Anything else, a missing file or a malformed one answers
 `capabilities_unavailable`: the deployer then waits.
 
-The file also names the verifier configuration it was made from: its path,
+The file also names the verifier configuration it was made from, which must be
+`verifier_config_file` (a staged copy's publication is refused): its path,
 device, inode, size, modification and change times. `capabilities` compares
 them with the current file (a `stat`, which needs only search permission on its
 directories, never read access to the private file). Any edit, replacement,
@@ -503,13 +509,19 @@ Publish it as root:
   --config /etc/deedkit-backup-r2/verifier.json --publish-capabilities
 ```
 
-It removes the previous file, checks the helper image ID, labels and volumes as
+It refuses any `--config` other than `verifier_config_file`
+(`verifier_config_not_canonical`) and takes the verifier lock, so two publishers
+never overlap and none runs during a verification (`verifier_busy`, the file is
+left as it is). It removes the previous file, checks the helper image ID, labels and volumes as
 a restore does, runs that exact image once with no input, network, mount,
 capability or log to print its own `messaging_service.backup.SCHEMAS`, and
 writes `{"v":1,"verifier_config":{…},"helper_revision":…,"helper_schemas":[first,last]}`
 atomically with mode `0644`. A failed check leaves no file, never the previous
 helper's range; a configuration changed during the probe also leaves none
-(`verifier_config_changed`). The
+(`verifier_config_changed`). The probe container has a unique name and the
+`org.deedkit.backup-verifier.capabilities=1` label: a timed-out or interrupted
+probe is stopped and removed by that name, and each publication first removes
+any probe a killed publisher left behind. The
 [verifier service](deploy/deedkit-backup-r2-verifier.service) runs it before
 each verification with its failure ignored (`ExecStartPre=-`), so a failed
 publication never stops a restore. Run it again by hand after changing

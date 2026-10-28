@@ -191,13 +191,25 @@ class Docker:
         root=self.command('info','--format','{{.DockerRootDir}}').decode().strip()
         if not Path(root).is_absolute():raise ValueError('invalid_docker_data_root')
         return root
+    def discard(self,name):
+        for args in (('container','stop','--time=1',name),('container','rm',name)):
+            try:self.command(*args)
+            except Exception:pass
     def helper_schemas(self,config):
+        # A probe left running by a killed publisher (its CLI timed out or was stopped).
+        owner=LABEL+'.capabilities'
+        for name in self.command('container','ls','-a','--filter','label='+owner+'=1','--format','{{.Names}}').decode().split():
+            self.discard(name)
         # Run only after preflight checked the image ID, labels and volumes. No input,
         # network, mount, capability or log; inherited volumes are bounded tmpfs.
-        raw=self.command('run','--rm','--network=none','--read-only','--cap-drop=ALL','--security-opt=no-new-privileges',
+        name='deedkit-verify-capabilities-'+secrets.token_hex(8)
+        try:raw=self.command('run','--rm','--name',name,'--label',owner+'=1','--network=none','--read-only','--cap-drop=ALL','--security-opt=no-new-privileges',
                          '--log-driver=none','--restart=no','--cpus=1','--memory=256m','--memory-swap=256m','--pids-limit=64',
                          '--tmpfs','/tmp:'+HELPER_TMPFS['/tmp'],'--tmpfs',PG_DATA_PATH+':'+HELPER_TMPFS[PG_DATA_PATH],
                          '--entrypoint','python',config['helper_image'],'-c',SCHEMA_PROBE)
+        except BaseException:
+            # A timed-out CLI leaves the daemon's container running: stop exactly this one.
+            Docker(60).discard(name);raise
         try:value=r2.unique_json(raw)
         except ValueError:raise ValueError('invalid_helper_schemas') from None
         if (not isinstance(value,dict) or set(value)!={'start','stop','step'} or any(type(item) is not int for item in value.values()) or
@@ -485,8 +497,17 @@ def publish_capabilities(config_path,*,engine=None):
     config=load_config(config_path)
     receiver=r2.load_config(config['receiver_config_file'])
     if 'capabilities_file' not in receiver:raise ValueError('capabilities_file_required')
+    if Path(receiver['verifier_config_file'])!=config_path:raise ValueError('verifier_config_not_canonical')
     path=Path(receiver['capabilities_file'])
-    with local.trusted_directory(path.parent) as fd:
+    # It unlinks and writes this one path: never a private input, nor in their directories
+    # or the verifier's workspace. Checked before any change.
+    private=[config_path,*(Path(p) for p in (config['receiver_config_file'],receiver['credentials_file'],
+                                              config['identity_file'],config['protected_file']))]
+    if (any(path==item or path.parent==item.parent for item in private) or
+            path.is_relative_to(config['directory'])):
+        raise ValueError('separate_capabilities_file_required')
+    # The verifier lock serializes publishers and keeps a publication out of a running verification.
+    with verifier_lock(config['directory']),local.trusted_directory(path.parent) as fd:
         try:os.unlink(path.name,dir_fd=fd);local.fsync_dir(fd)
         except FileNotFoundError:pass
         engine=engine if engine is not None else Docker(min(600,config['timeout_seconds']))
@@ -520,7 +541,8 @@ def failure_code(error):
           'uploader_lock_initialization_required','uncommitted_cloud_object','receiver_quota','protected_backup_missing',
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
           'isolated_restore_failed','stored_backup_corrupt','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
-          'capabilities_file_required','invalid_helper_schemas','verifier_config_changed'}
+          'capabilities_file_required','invalid_helper_schemas','verifier_config_changed',
+          'verifier_config_not_canonical','separate_capabilities_file_required'}
     return str(error) if str(error) in safe else 'independent_restore_failed'
 
 

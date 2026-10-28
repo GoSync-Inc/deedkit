@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -583,94 +584,170 @@ def test_receiver_timeout_never_leaks_into_a_later_healthy_stream(monkeypatch,ca
     assert out.getvalue()==data
 
 
-def published_operator(operator,tmp_path):
-    v,config,receiver,cloud,engine,write_json=operator
+def published_operator(operator,tmp_path,monkeypatch):
+    """A real Docker adapter whose CLI is faked: argv recorded, answers scripted."""
+    v,config,receiver,cloud,_,write_json=operator
     published=tmp_path/'published';published.mkdir();published.chmod(0o755)
-    path=Path(config['receiver_config_file']);write_json(path,{**receiver,'capabilities_file':str(published/'capabilities.json')})
     config_path=Path(config['receiver_config_file']).with_name('verifier.json');write_json(config_path,config)
-    engine.config_path=config_path
-    calls=[]
-    def command(*args):
-        calls.append(args)
-        return engine.answer
-    engine.answer=b'{"start":2,"stop":52,"step":1}\n';engine.command=command
-    engine.preflight=lambda config:calls.append('preflight') or '/var/lib/docker'
-    engine.helper_schemas=lambda config:v.Docker.helper_schemas(engine,config)
-    return v,config,engine,published/'capabilities.json',calls
+    write_json(Path(config['receiver_config_file']),{**receiver,'capabilities_file':str(published/'capabilities.json'),
+                                                    'verifier_config_file':str(config_path)})
+    state=SimpleNamespace(calls=[],answer=b'{"start":2,"stop":52,"step":1}\n',leftover=b'',run=None,
+                          config_path=config_path,path=published/'capabilities.json',write_json=write_json)
+    def command(self,*args):
+        state.calls.append(args)
+        if args[:2]==('container','ls'):return state.leftover
+        if args[0]=='run':
+            if state.run:return state.run(*args)
+            return state.answer
+        return b''
+    monkeypatch.setattr(v.Docker,'command',command)
+    monkeypatch.setattr(v.Docker,'preflight',lambda self,config:state.calls.append('preflight') or '/var/lib/docker')
+    return v,config,v.Docker(600),state
+
+
+def probe_of(state):return next(call for call in state.calls if call[0]=='run')
 
 
 # spec: ANYM-589
-def test_server_verifier_publishes_the_pinned_helper_schema_range(operator,tmp_path):
-    v,config,engine,path,calls=published_operator(operator,tmp_path)
-    expected={'v':1,'verifier_config':r2.config_identity(engine.config_path),'helper_revision':config['helper_revision'],
+def test_server_verifier_publishes_the_pinned_helper_schema_range(operator,tmp_path,monkeypatch):
+    v,config,engine,state=published_operator(operator,tmp_path,monkeypatch)
+    expected={'v':1,'verifier_config':r2.config_identity(state.config_path),'helper_revision':config['helper_revision'],
               'helper_schemas':[2,51]}
-    assert v.publish_capabilities(engine.config_path,engine=engine)==expected
-    assert r2.unique_json(path.read_bytes())==expected
+    assert v.publish_capabilities(state.config_path,engine=engine)==expected
+    assert r2.unique_json(state.path.read_bytes())==expected
     # The receiver's own reader accepts exactly this publication.
     assert r2.published_helper(r2.load_config(config['receiver_config_file']))==expected
-    info=os.stat(path)
-    assert info.st_mode&0o777==0o644 and info.st_nlink==1 and not list(path.parent.glob('.*'))
+    info=os.stat(state.path)
+    assert info.st_mode&0o777==0o644 and info.st_nlink==1 and not list(state.path.parent.glob('.*'))
     # The probe runs the exact pinned image ID only after its labels and volumes were checked,
-    # with no input, network, mount, capability or log.
-    assert calls[0]=='preflight'
-    probe=calls[1];assert probe[0]=='run' and config['helper_image'] in probe
+    # with no input, network, mount, capability or log, under an owned label and unique name.
+    assert state.calls[0]=='preflight'
+    probe=probe_of(state);assert config['helper_image'] in probe
     for flag in ('--rm','--network=none','--read-only','--cap-drop=ALL','--security-opt=no-new-privileges','--log-driver=none'):
         assert flag in probe
     assert '--mount' not in probe and '-v' not in probe and '--volume' not in probe and '-i' not in probe
+    assert probe[probe.index('--label')+1]==v.LABEL+'.capabilities=1' and probe[probe.index('--name')+1].startswith('deedkit-verify-capabilities-')
     assert probe[probe.index('--entrypoint')+1]=='python' and probe[-2:]==('-c',v.SCHEMA_PROBE)
 
 
 # spec: ANYM-589
 @pytest.mark.parametrize('failure',['docker','labels','malformed','step','below_two','boolean','extra'])
-def test_server_verifier_unproven_helper_range_removes_the_old_publication(operator,tmp_path,failure):
-    v,config,engine,path,calls=published_operator(operator,tmp_path)
-    v.publish_capabilities(engine.config_path,engine=engine);assert path.exists()
+def test_server_verifier_unproven_helper_range_removes_the_old_publication(operator,tmp_path,monkeypatch,failure):
+    v,config,engine,state=published_operator(operator,tmp_path,monkeypatch)
+    v.publish_capabilities(state.config_path,engine=engine);assert state.path.exists()
     answers={'malformed':b'[2,51]','step':b'{"start":2,"stop":52,"step":2}','below_two':b'{"start":1,"stop":52,"step":1}',
              'boolean':b'{"start":true,"stop":52,"step":1}','extra':b'{"start":2,"stop":52,"step":1,"x":1}'}
     if failure=='docker':
-        def command(*args):raise RuntimeError('restore_docker_failed')
-        engine.command=command
+        def broken(*args):raise RuntimeError('restore_docker_failed')
+        state.run=broken
     elif failure=='labels':
-        def preflight(config):raise ValueError('unreviewed_restore_image')
-        engine.preflight=preflight
-    else:engine.answer=answers[failure]
-    with pytest.raises((RuntimeError,ValueError)):v.publish_capabilities(engine.config_path,engine=engine)
+        def preflight(self,config):raise ValueError('unreviewed_restore_image')
+        monkeypatch.setattr(v.Docker,'preflight',preflight)
+    else:state.answer=answers[failure]
+    with pytest.raises((RuntimeError,ValueError)):v.publish_capabilities(state.config_path,engine=engine)
     # Absent means unknown to the deployer (`waiting`), never the previous helper's range.
-    assert not path.exists()
+    assert not state.path.exists()
 
 
 # spec: ANYM-589
-def test_server_verifier_config_changed_during_publication_leaves_no_publication(operator,tmp_path):
-    v,config,engine,path,calls=published_operator(operator,tmp_path)
+def test_server_verifier_config_changed_during_publication_leaves_no_publication(operator,tmp_path,monkeypatch):
+    v,config,engine,state=published_operator(operator,tmp_path,monkeypatch)
     def probe(*args):
         # The operator moves the helper pin while the old image is being probed.
-        Path(engine.config_path).write_text(json.dumps({**config,'helper_revision':'d'*40}))
-        return b'{"start":2,"stop":52,"step":1}'
-    engine.command=probe
-    with pytest.raises(ValueError,match='verifier_config_changed'):v.publish_capabilities(engine.config_path,engine=engine)
-    assert not path.exists()
+        state.config_path.write_text(json.dumps({**config,'helper_revision':'d'*40}))
+        return state.answer
+    state.run=probe
+    with pytest.raises(ValueError,match='verifier_config_changed'):v.publish_capabilities(state.config_path,engine=engine)
+    assert not state.path.exists()
 
 
 # spec: ANYM-589
-def test_publication_from_an_older_verifier_config_is_stale_to_the_receiver(operator,tmp_path):
-    v,config,engine,path,calls=published_operator(operator,tmp_path)
-    v.publish_capabilities(engine.config_path,engine=engine)
+@pytest.mark.parametrize('edit',['replaced','ctime_only'])
+def test_publication_from_an_older_verifier_config_is_stale_to_the_receiver(operator,tmp_path,monkeypatch,edit):
+    v,config,engine,state=published_operator(operator,tmp_path,monkeypatch)
+    v.publish_capabilities(state.config_path,engine=engine)
     receiver=r2.load_config(config['receiver_config_file'])
     assert r2.published_helper(receiver)['helper_revision']==config['helper_revision']
-    # A new pin written without a new publication (ExecStartPre failed, or no rerun yet).
-    new=Path(engine.config_path).with_name('verifier.json.new');write_json=operator[5]
-    write_json(new,{**config,'helper_revision':'d'*40});new.replace(engine.config_path)
+    before=os.stat(state.config_path)
+    if edit=='replaced':
+        # A new pin written without a new publication (ExecStartPre failed, or no rerun yet).
+        new=state.config_path.with_name('verifier.json.new');state.write_json(new,{**config,'helper_revision':'d'*40})
+        new.replace(state.config_path)
+    else:
+        # Same inode, same size, mtime put back (`cp -p`, `touch -r`): only ctime moved.
+        raw=state.config_path.read_bytes().replace(config['helper_revision'].encode(),b'd'*40)
+        time.sleep(0.01);state.config_path.write_bytes(raw)
+        os.utime(state.config_path,ns=(before.st_atime_ns,before.st_mtime_ns))
+        after=os.stat(state.config_path)
+        assert (after.st_ino,after.st_size,after.st_mtime_ns)==(before.st_ino,before.st_size,before.st_mtime_ns)
+        assert after.st_ctime_ns!=before.st_ctime_ns
     with pytest.raises(ValueError,match='capabilities_unavailable'):r2.published_helper(receiver)
 
 
 # spec: ANYM-589
-def test_server_verifier_proof_range_is_the_published_verifier_schemas():
-    v=module();receipt={'wire':{'id':'20261016T091703Z-fedcba9876543210','bytes':100,'sha256':'a'*64,'snapshot_sha256':'b'*64}}
-    for version,accepted in ((v.SCHEMAS[0],True),(v.SCHEMAS[-1],True),(v.SCHEMAS[0]-1,False),(v.SCHEMAS[-1]+1,False)):
-        facts={'v':1,'status':'verified','schema_version':version,'manifest_sha256':'b'*64,'checks':{k:True for k in r2.CHECKS}}
-        if accepted:assert v.make_proof(receipt,facts,'c'*32)['verification']['schema_version']==version
-        else:
-            with pytest.raises(ValueError,match='invalid_helper_result'):v.make_proof(receipt,facts,'c'*32)
+def test_publication_from_a_staged_verifier_config_is_refused(operator,tmp_path,monkeypatch):
+    v,config,engine,state=published_operator(operator,tmp_path,monkeypatch)
+    v.publish_capabilities(state.config_path,engine=engine);kept=state.path.read_bytes()
+    staged=state.config_path.with_name('verifier.next.json');state.write_json(staged,{**config,'helper_revision':'d'*40})
+    with pytest.raises(ValueError,match='verifier_config_not_canonical'):v.publish_capabilities(staged,engine=engine)
+    assert state.path.read_bytes()==kept
+    # A root publication bound to the staged copy (written by any means) is refused by the reader too.
+    receiver=r2.load_config(config['receiver_config_file'])
+    forged={**r2.unique_json(kept),'verifier_config':r2.config_identity(staged),'helper_revision':'d'*40}
+    state.path.write_bytes(r2.encoded(forged));state.path.chmod(0o644)
+    with pytest.raises(ValueError,match='capabilities_unavailable'):r2.published_helper(receiver)
+
+
+# spec: ANYM-589
+@pytest.mark.parametrize('alias',['identity','protected','receiver_config','credentials','verifier_config','workspace',
+                                  'beside_identity'])
+def test_publication_never_touches_a_private_verifier_input(operator,tmp_path,monkeypatch,alias):
+    v,config,engine,state=published_operator(operator,tmp_path,monkeypatch)
+    receiver=json.loads(Path(config['receiver_config_file']).read_text())
+    Path(config['protected_file']).write_bytes(b'{"synthetic":"protected marker"}\n')
+    targets={'identity':config['identity_file'],'protected':config['protected_file'],
+             'receiver_config':config['receiver_config_file'],'credentials':receiver['credentials_file'],
+             'verifier_config':str(state.config_path),'workspace':str(Path(config['directory'])/'status.json'),
+             'beside_identity':str(Path(config['identity_file']).with_name('capabilities.json'))}
+    target=Path(targets[alias]);target.parent.mkdir(exist_ok=True)
+    if not target.exists():target.write_bytes(b'synthetic sentinel\n')
+    files=[Path(p) for p in (config['identity_file'],config['protected_file'],config['receiver_config_file'],
+                             receiver['credentials_file'],state.config_path,target)]
+    state.write_json(Path(config['receiver_config_file']),{**receiver,'capabilities_file':str(target)})
+    files=[p for p in files if p.exists()];kept={p:p.read_bytes() for p in files}
+    with pytest.raises(ValueError,match='separate_capabilities_file_required'):v.publish_capabilities(state.config_path,engine=engine)
+    assert {p:p.read_bytes() for p in files}==kept and 'preflight' not in state.calls
+
+
+# spec: ANYM-589
+def test_publishers_are_serialized_with_verification_by_the_verifier_lock(operator,tmp_path,monkeypatch):
+    v,config,engine,state=published_operator(operator,tmp_path,monkeypatch)
+    v.publish_capabilities(state.config_path,engine=engine);kept=state.path.read_bytes();calls=len(state.calls)
+    with v.verifier_lock(config['directory']):
+        # A second publisher, or one started during a verification, changes nothing.
+        with pytest.raises(RuntimeError,match='verifier_busy'):v.publish_capabilities(state.config_path,engine=engine)
+    assert state.path.read_bytes()==kept and state.calls[calls:]==[]
+
+
+# spec: ANYM-589
+@pytest.mark.parametrize('interruption',['cli_timeout','stopped'])
+def test_a_probe_interrupted_mid_run_is_stopped_and_a_leftover_one_is_reconciled(operator,tmp_path,monkeypatch,interruption):
+    v,config,engine,state=published_operator(operator,tmp_path,monkeypatch)
+    def hang(*args):
+        if interruption=='cli_timeout':raise v.subprocess.TimeoutExpired(['docker','run'],120)
+        raise InterruptedError('restore_stopped')
+    state.run=hang
+    with pytest.raises((v.subprocess.TimeoutExpired,InterruptedError)):v.publish_capabilities(state.config_path,engine=engine)
+    name=probe_of(state)[probe_of(state).index('--name')+1]
+    assert ('container','stop','--time=1',name) in state.calls and ('container','rm',name) in state.calls
+    assert not state.path.exists()
+    # A publisher killed outright leaves its labelled probe; the next one removes exactly those first.
+    state.calls.clear();state.run=None;state.leftover=b'deedkit-verify-capabilities-0123456789abcdef\n'
+    v.publish_capabilities(state.config_path,engine=engine)
+    ls=state.calls.index(('container','ls','-a','--filter','label='+v.LABEL+'.capabilities=1','--format','{{.Names}}'))
+    assert state.calls[ls+1:ls+3]==[('container','stop','--time=1','deedkit-verify-capabilities-0123456789abcdef'),
+                                     ('container','rm','deedkit-verify-capabilities-0123456789abcdef')]
+    assert state.calls.index(probe_of(state))>ls+2 and state.path.exists()
 
 
 # spec: ANYM-589
