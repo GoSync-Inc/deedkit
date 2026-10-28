@@ -1976,9 +1976,10 @@ def claim(copy, kind, name):
     write_record(Path(copy["directory"]) / "owner.json", copy)
 
 
-def snapshot_copy(copy, timeout, keep):
+def snapshot_copy(copy, timeout, keep, catalog=None):
     """C1-C3: the snapshot, its dumps and their verified restore; writes `copy.json`. With `keep` the scratch container
-    stays up for the caller."""
+    stays up for the caller; with `catalog` the snapshot's catalog lines are returned (`catalog`) and their digest is
+    recorded."""
     source, directory = copy["source"], Path(copy["directory"])
     container, owner, database = source["container"], source["owner"], source["database"]
     # Only the image, the mounts and PGDATA: the container's other variables hold its password.
@@ -2006,6 +2007,7 @@ def snapshot_copy(copy, timeout, keep):
             if free < 2 * found["bytes"] + copy_reserve(size):
                 raise CopyFailed(copy["id"], "disk_reserve")
         reference = counts(copy, keeper.query(COUNTS), "dump_failed")
+        shape = keeper.query(catalog) if catalog else None
         snapshot = "--snapshot=" + found["snapshot"]
         dumped(copy, copy_exec(copy, "schema", container, "pg_dump", "--schema-only", snapshot, "-U", owner,
                                "-d", database), directory / "reference.schema", failure="dump_failed", **watch)
@@ -2059,10 +2061,12 @@ def snapshot_copy(copy, timeout, keep):
     record = {"id": copy["id"], "verified": True, "database": database, "counts": reference, "files": files,
               "snapshot_at": found["at"], "server_version": found["version"], "database_bytes": found["bytes"],
               "image": image, "scratch_container": scratch_container if keep else None, "verified_at": now()}
+    if shape is not None:
+        record["catalog_sha256"] = hashlib.sha256("\n".join(shape).encode()).hexdigest()
     write_record(directory / "copy.json", record)
     if not keep:
         stop_copy_containers(copy)
-    return record
+    return record if shape is None else {**record, "catalog": shape}
 
 
 def copy_sql(source, step, prefix, text):
@@ -2216,9 +2220,11 @@ def expire_copies(state, *, at=None):
 
 
 @contextmanager
-def database_copy(settings, name, sha, *, keep=False):
+def database_copy(settings, name, sha, *, keep=False, catalog=None):
     """ANYM-588: a verified copy of `migration.databases.<name>` taken for release `sha`; its `copy.json` record. With
-    `keep` the scratch container serves the block. Every call ends with its resources released, pass or fail."""
+    `keep` the scratch container serves the block and the record carries the copy's owner record (`copy`, for
+    `claim`); with `catalog` (ANYM-449) also the lines that query printed in the copy's snapshot. Every call ends with
+    its resources released, pass or fail."""
     source, timeout = copy_source(settings, name)
     if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
         raise Refused("an exact lowercase 40-character commit SHA is required")
@@ -2233,7 +2239,8 @@ def database_copy(settings, name, sha, *, keep=False):
             "application_name": "deedkit-copy-" + copy_id, "source": source, "resources": [], "created_at": now()}
     write_record(directory / "owner.json", copy)
     try:
-        yield snapshot_copy(copy, timeout, keep)
+        found = snapshot_copy(copy, timeout, keep, catalog)
+        yield {**found, "copy": copy} if keep else found
     finally:
         release_copy(copy)
 
@@ -2336,7 +2343,7 @@ CLASSIFY_MEMORY = 512 << 20
 # attested main commit (or the current release), the same trust the tool self-update gives its production.py; the
 # audit hook is no sandbox, it only stops a faulty classifier from opening files, importing, starting processes or
 # reaching the network.
-CLASSIFY = """import json, re, sys
+CLASSIFY_PRELUDE = """import json, re, sys
 data = json.loads(sys.stdin.read())
 def refuse(event, args):
     if event.split(".")[0] in ("open", "import", "socket", "subprocess", "os", "shutil", "ctypes", "fcntl", "urllib",
@@ -2345,8 +2352,8 @@ def refuse(event, args):
 sys.addaudithook(refuse)
 module = {"__name__": "migration_rollout"}
 exec(compile(data["source"], "migration_rollout.py", "exec"), module)
-print(json.dumps([module["rollout_class"](text) for text in data["texts"]]))
 """
+CLASSIFY = CLASSIFY_PRELUDE + 'print(json.dumps([module["rollout_class"](text) for text in data["texts"]]))\n'
 
 
 def classifier_limits():
@@ -2355,6 +2362,20 @@ def classifier_limits():
     for limit, value in ((resource.RLIMIT_AS, CLASSIFY_MEMORY), (resource.RLIMIT_FSIZE, CLASSIFY_OUTPUT_LIMIT + 1)):
         with suppress(ValueError, OSError):
             resource.setrlimit(limit, (value, value))
+
+
+def classifier_child(script, payload):
+    """The JSON a classifier child running `script` prints for `payload`, within the CLASSIFY_* bounds; ValueError,
+    OSError or a timeout otherwise."""
+    with tempfile.TemporaryFile() as out:
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", script], stdout=out, stderr=subprocess.DEVNULL,
+                                input=json.dumps(payload).encode(), timeout=CLASSIFY_TIMEOUT,
+                                preexec_fn=classifier_limits)
+        out.seek(0)
+        output = out.read(CLASSIFY_OUTPUT_LIMIT + 1)
+    if result.returncode or len(output) > CLASSIFY_OUTPUT_LIMIT:
+        raise ValueError("the classifier failed or printed too much")
+    return json.loads(output)
 
 
 def migration_classes(mirror, base, candidate, sql):
@@ -2376,15 +2397,7 @@ def migration_classes(mirror, base, candidate, sql):
         if sum(map(len, blobs)) > CLASSIFY_INPUT_LIMIT:
             raise ValueError("over the classifier input limit")
         *texts, source = [data.decode() for data in blobs]
-        with tempfile.TemporaryFile() as out:
-            result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", CLASSIFY], stdout=out,
-                                    stderr=subprocess.DEVNULL, input=json.dumps({"source": source, "texts": texts}).encode(),
-                                    timeout=CLASSIFY_TIMEOUT, preexec_fn=classifier_limits)
-            out.seek(0)
-            output = out.read(CLASSIFY_OUTPUT_LIMIT + 1)
-        if result.returncode or len(output) > CLASSIFY_OUTPUT_LIMIT:
-            raise ValueError("the classifier failed or printed too much")
-        classes = json.loads(output)
+        classes = classifier_child(CLASSIFY, {"source": source, "texts": texts})
     except Exception:  # Refused, OSError, a timeout, a limit, RecursionError of deep JSON: all name `manual`
         classes = None
     if not (isinstance(classes, list) and len(classes) == len(added) and all(c in CLASSES for c in classes)):
@@ -2407,6 +2420,569 @@ def pause_reasons(mirror, base, candidate, installed):
     that are not installed yet."""
     sql, pending = range_changes(mirror, base, candidate, installed)
     return pause_text(sql, pending, migration_classes(mirror, base, candidate, sql))
+
+
+# Unattended migrations (ANYM-449, production.md "Migration releases"). A messaging range whose every added migration
+# the candidate's classifier names `expand` and whose every changed role file only appends grants (ANYM-596) runs in
+# fixed phases: admission, preparation, the producer check, a verified copy (ANYM-588), a rehearsal on it, the final
+# gate, one bounded `migrate-expand` on production, then plan A and plan B. Anything else pauses as before. A
+# migration is never reversed, retried or followed by a restore; `<sha>/migration.json` records each step.
+AUTO_DATABASE = "messaging"
+PACKAGE = "services/messaging/messaging_service/"
+ROLE_FILE = re.compile(re.escape(PACKAGE) + r"[A-Za-z0-9_]+_role\.sql")
+MIGRATION_NAME = re.compile(r"([0-9]{3})_[A-Za-z0-9_]+\.sql")
+BACKUP_SOURCE, STORE_SOURCE = PACKAGE + "backup.py", PACKAGE + "store.py"
+BACKUP_SCHEMAS = re.compile(r"^SCHEMAS=range\(([0-9]+),([0-9]+)\)$", re.M)
+# #352: the running Store prepares no statement server-side, so its cached `SELECT *` survives an ADD COLUMN.
+UNPREPARED = re.compile(r"ConnectionPool\([^)]*'prepare_threshold': None")
+HOST_PATH = re.compile(r"/[A-Za-z0-9_.@/-]{1,255}")
+MIGRATION_WAITS = 3
+MIGRATE_TIMEOUT = 30
+REHEARSAL_LIMIT_MS = 1000
+EXPAND_CODES = ("busy", "settings_refused", "plan_invalid", "ledger_mismatch", "not_unattended", "role_not_additive",
+                "prefix_mismatch", "lock_timeout", "statement_timeout", "transaction_timeout", "failed")
+MIGRATE_FLAGS = ("--log-driver", "none", "--read-only", "--user", "10001:10001", "--cap-drop", "ALL", "--security-opt",
+                 "no-new-privileges", "--pids-limit", "64", "--memory", "512m")
+# The candidate's classifiers in the same isolated child as CLASSIFY: each added file's `unattended_class` and each
+# changed role file's `role_class` with the tables the range creates, as migrate-expand runs them.
+UNATTENDED = CLASSIFY_PRELUDE + '''created, classes = {}, []
+for text in data["texts"]:
+    classes.append(module["unattended_class"](text))
+    created = module["new_tables"](text, created)
+print(json.dumps({"files": classes, "roles": [module["role_class"](old, new, created) for old, new in data["roles"]],
+                  "tables": sorted(created)}))
+'''
+# M3's canonical catalog: one JSON line {"k": key, "v": value} per object, by name, never by OID; values hold
+# definitions, owners and grants, never a row. Dependency catalogs (pg_depend, pg_shdepend) follow these objects.
+CATALOG = r"""WITH ns AS (
+  SELECT oid, nspname, nspowner, nspacl FROM pg_namespace
+   WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND nspname !~ '^pg_(toast|temp_|toast_temp_)'),
+rel AS (
+  SELECT c.oid, c.relkind, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.reloptions,
+         c.relpersistence, c.relispartition, format('%I.%I', ns.nspname, c.relname) AS name
+    FROM pg_class c JOIN ns ON ns.oid = c.relnamespace),
+typ AS (
+  SELECT t.oid, t.typtype, t.typowner, t.typacl, t.typbasetype, t.typtypmod, t.typdefault, t.typnotnull,
+         format('%I.%I', ns.nspname, t.typname) AS name
+    FROM pg_type t JOIN ns ON ns.oid = t.typnamespace
+   WHERE t.typsubscript <> 'array_subscript_handler'::regproc
+     AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind <> 'c')),
+fn AS (
+  SELECT p.oid, p.prokind, p.proowner, p.proacl,
+         format('%I.%I(%s)', ns.nspname, p.proname, pg_get_function_identity_arguments(p.oid)) AS name
+    FROM pg_proc p JOIN ns ON ns.oid = p.pronamespace),
+acl(object, item) AS (
+  SELECT json_build_array('schema', nspname)::text, aclexplode(coalesce(nspacl, acldefault('n', nspowner))) FROM ns
+  UNION ALL SELECT json_build_array('relation', name)::text,
+         aclexplode(coalesce(relacl, acldefault(CASE relkind WHEN 'S' THEN 's' ELSE 'r' END::"char", relowner))) FROM rel
+  UNION ALL SELECT json_build_array('column', rel.name, a.attname)::text, aclexplode(a.attacl)
+    FROM pg_attribute a JOIN rel ON rel.oid = a.attrelid WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attacl IS NOT NULL
+  UNION ALL SELECT json_build_array('function', name)::text, aclexplode(coalesce(proacl, acldefault('f', proowner))) FROM fn
+  UNION ALL SELECT json_build_array('type', name)::text, aclexplode(coalesce(typacl, acldefault('T', typowner))) FROM typ
+  UNION ALL SELECT json_build_array('database')::text, aclexplode(coalesce(datacl, acldefault('d', datdba)))
+    FROM pg_database WHERE datname = current_database())
+SELECT line FROM (
+  SELECT json_build_object('k', json_build_array('schema', nspname), 'v', json_build_array(pg_get_userbyid(nspowner)))::text AS line
+    FROM ns
+  UNION ALL SELECT json_build_object('k', json_build_array('relation', name), 'v', json_build_array(relkind, relrowsecurity,
+         relforcerowsecurity, reloptions, pg_get_userbyid(relowner), relpersistence, relispartition))::text FROM rel
+  UNION ALL SELECT json_build_object('k', json_build_array('column', rel.name, a.attname), 'v', json_build_array(
+         format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid), a.attidentity, a.attgenerated,
+         (SELECT collname FROM pg_collation WHERE oid = a.attcollation), d.adbin::text LIKE '{CONST %'))::text
+    FROM pg_attribute a JOIN rel ON rel.oid = a.attrelid LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+   WHERE a.attnum > 0 AND NOT a.attisdropped AND rel.relkind IN ('r', 'p', 'v', 'm', 'f', 'c')
+  UNION ALL SELECT json_build_object('k', json_build_array('constraint', coalesce(rel.name, typ.name), co.conname), 'v',
+         json_build_array(co.contype, pg_get_constraintdef(co.oid), co.convalidated, ARRAY(SELECT attname FROM pg_attribute
+         WHERE attrelid = co.conrelid AND attnum = ANY (co.conkey) ORDER BY attnum)))::text
+    FROM pg_constraint co JOIN ns ON ns.oid = co.connamespace LEFT JOIN rel ON rel.oid = co.conrelid
+    LEFT JOIN typ ON typ.oid = co.contypid
+  UNION ALL SELECT json_build_object('k', json_build_array('index', i.name), 'v', json_build_array(pg_get_indexdef(x.indexrelid),
+         t.name, x.indisvalid))::text FROM pg_index x JOIN rel i ON i.oid = x.indexrelid JOIN rel t ON t.oid = x.indrelid
+  UNION ALL SELECT json_build_object('k', json_build_array('trigger', rel.name, tg.tgname), 'v', json_build_array(
+         pg_get_triggerdef(tg.oid), tg.tgenabled))::text FROM pg_trigger tg JOIN rel ON rel.oid = tg.tgrelid WHERE NOT tg.tgisinternal
+  UNION ALL SELECT json_build_object('k', json_build_array('function', name), 'v', json_build_array(prokind, pg_get_userbyid(proowner),
+         md5(CASE WHEN prokind IN ('f', 'p') THEN pg_get_functiondef(oid) ELSE '' END)))::text FROM fn
+  UNION ALL SELECT json_build_object('k', json_build_array('type', name), 'v', json_build_array(typtype, pg_get_userbyid(typowner),
+         format_type(typbasetype, typtypmod), typdefault, typnotnull,
+         ARRAY(SELECT enumlabel FROM pg_enum WHERE enumtypid = typ.oid ORDER BY enumsortorder)))::text FROM typ
+  UNION ALL SELECT json_build_object('k', json_build_array('rule', rel.name, r.rulename), 'v', json_build_array(
+         md5(pg_get_ruledef(r.oid)), r.ev_enabled))::text FROM pg_rewrite r JOIN rel ON rel.oid = r.ev_class
+  UNION ALL SELECT json_build_object('k', json_build_array('policy', rel.name, po.polname), 'v', json_build_array(po.polpermissive,
+         po.polcmd, ARRAY(SELECT CASE WHEN g = 0 THEN 'public' ELSE pg_get_userbyid(g)::text END FROM unnest(po.polroles) g
+         ORDER BY 1), pg_get_expr(po.polqual, po.polrelid), pg_get_expr(po.polwithcheck, po.polrelid)))::text
+    FROM pg_policy po JOIN rel ON rel.oid = po.polrelid
+  UNION ALL SELECT json_build_object('k', json_build_array('sequence', rel.name), 'v', json_build_array(format_type(s.seqtypid, NULL),
+         s.seqstart, s.seqincrement, s.seqmax, s.seqmin, s.seqcache, s.seqcycle))::text
+    FROM pg_sequence s JOIN rel ON rel.oid = s.seqrelid
+  UNION ALL SELECT json_build_object('k', json_build_array('acl', object, pg_get_userbyid((item).grantor),
+         CASE WHEN (item).grantee = 0 THEN 'public' ELSE pg_get_userbyid((item).grantee)::text END, (item).privilege_type),
+         'v', (item).is_grantable)::text FROM acl
+  UNION ALL SELECT json_build_object('k', json_build_array('default_acl', pg_get_userbyid(defaclrole),
+         CASE WHEN defaclnamespace = 0 THEN '' ELSE defaclnamespace::regnamespace::text END, defaclobjtype, defaclacl::text),
+         'v', true)::text FROM pg_default_acl
+  UNION ALL SELECT json_build_object('k', json_build_array('role', rolname), 'v', json_build_array(rolsuper, rolinherit, rolcreaterole,
+         rolcreatedb, rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, rolvaliduntil))::text
+    FROM pg_roles WHERE rolname !~ '^pg_'
+  UNION ALL SELECT json_build_object('k', json_build_array('membership', pg_get_userbyid(roleid), pg_get_userbyid(member),
+         pg_get_userbyid(grantor)), 'v', json_build_array(admin_option, inherit_option, set_option))::text FROM pg_auth_members
+  UNION ALL SELECT json_build_object('k', json_build_array('role_setting', coalesce(d.datname::text, ''),
+         pg_get_userbyid(s.setrole)), 'v', s.setconfig)::text
+    FROM pg_db_role_setting s LEFT JOIN pg_database d ON d.oid = s.setdatabase
+  UNION ALL SELECT json_build_object('k', json_build_array('count', name), 'v', rows)::text FROM (VALUES
+         ('pg_extension', (SELECT count(*) FROM pg_extension)), ('pg_publication', (SELECT count(*) FROM pg_publication)),
+         ('pg_publication_rel', (SELECT count(*) FROM pg_publication_rel)),
+         ('pg_publication_namespace', (SELECT count(*) FROM pg_publication_namespace)),
+         ('pg_subscription', (SELECT count(*) FROM pg_subscription)),
+         ('pg_event_trigger', (SELECT count(*) FROM pg_event_trigger)), ('pg_cast', (SELECT count(*) FROM pg_cast)),
+         ('pg_operator', (SELECT count(*) FROM pg_operator)), ('pg_opclass', (SELECT count(*) FROM pg_opclass)),
+         ('pg_opfamily', (SELECT count(*) FROM pg_opfamily)), ('pg_am', (SELECT count(*) FROM pg_am)),
+         ('pg_language', (SELECT count(*) FROM pg_language)),
+         ('pg_foreign_data_wrapper', (SELECT count(*) FROM pg_foreign_data_wrapper)),
+         ('pg_foreign_server', (SELECT count(*) FROM pg_foreign_server)),
+         ('pg_user_mappings', (SELECT count(*) FROM pg_user_mappings)),
+         ('pg_statistic_ext', (SELECT count(*) FROM pg_statistic_ext)), ('pg_transform', (SELECT count(*) FROM pg_transform)),
+         ('pg_conversion', (SELECT count(*) FROM pg_conversion)), ('pg_collation', (SELECT count(*) FROM pg_collation)),
+         ('pg_ts_config', (SELECT count(*) FROM pg_ts_config)), ('pg_ts_dict', (SELECT count(*) FROM pg_ts_dict)),
+         ('pg_ts_parser', (SELECT count(*) FROM pg_ts_parser)), ('pg_ts_template', (SELECT count(*) FROM pg_ts_template))
+         ) AS counted(name, rows)) AS lines ORDER BY line;"""
+# M3's data ledger on the copy: probe_metadata (values other than schema_version only as digests), archive_migrations
+# and each table's write counters.
+MIGRATION_DATA = r"""SELECT line FROM (
+  SELECT json_build_object('k', json_build_array('metadata', name), 'v',
+         CASE WHEN name = 'schema_version' THEN value ELSE md5(value) END)::text AS line FROM probe_metadata
+  UNION ALL SELECT json_build_object('k', json_build_array('ledger', version::text), 'v', sha256)::text FROM archive_migrations
+  UNION ALL SELECT json_build_object('k', json_build_array('writes', format('%I.%I', schemaname, relname)), 'v',
+         json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables) AS lines ORDER BY line;"""
+LEDGER = r"""SELECT json_build_object('schema_version', (SELECT value FROM probe_metadata WHERE name = 'schema_version'),
+  'applied', (SELECT coalesce(json_object_agg(version::text, sha256 ORDER BY version), '{}'::json) FROM archive_migrations))::text;"""
+OTHER_SESSIONS = "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid();"
+
+
+class MigrationWait(Refused):
+    """A migration gate that waits: nothing changed, the next run retries, the third wait in a row pauses."""
+
+
+class MigrationRefused(Refused):
+    """A migration gate or phase that pauses with this reason; the reason holds names, versions and codes only."""
+
+
+def unattended_settings(settings):
+    """`migration.unattended` {network, dsn_file, runner_config}: the database's Docker network, the owner DSN file
+    the migration container mounts and the backup runner's runner.json; with `migration.rehearsal_limit_ms`."""
+    section = settings.get("migration")
+    found = section.get("unattended") if isinstance(section, dict) else None
+    if (not isinstance(found, dict) or set(found) != {"network", "dsn_file", "runner_config"}
+            or not all(isinstance(value, str) for value in found.values()) or not DOCKER_NAME.fullmatch(found["network"])
+            or not all(HOST_PATH.fullmatch(found[key]) and ".." not in found[key].split("/")
+                       for key in ("dsn_file", "runner_config"))):
+        raise Refused("migration.unattended must name the database network, the owner DSN file and runner.json")
+    assert isinstance(section, dict)
+    limit = section.get("rehearsal_limit_ms", REHEARSAL_LIMIT_MS)
+    if type(limit) is not int or not 1 <= limit <= 4000:
+        raise Refused("migration.rehearsal_limit_ms must be 1 to 4000")
+    return {**found, "rehearsal_limit_ms": limit}
+
+
+def unattended_plan(settings, mirror, base, candidate, sql):
+    """M1: the plan of `base..candidate` when `migrate-expand` may run it without a person, else None (the pause
+    names the range as before). The plan A configuration has `migration.databases.messaging` and
+    `migration.unattended`; every SQL inventory path is an added messaging migration or a modified messaging role
+    file; the candidate's classifier names each added file `expand` and each role file `additive`; the added
+    versions follow the base's highest without a gap. Whatever fails here is None."""
+    try:
+        copy_source(settings, AUTO_DATABASE)
+        unattended_settings(settings)
+    except Refused:
+        return None
+    git = ["git", "-C", str(mirror)]
+    try:
+        def changed(kind):
+            return set(run([*git, "diff", "--name-only", "--no-renames", "--diff-filter=" + kind, "-z", base,
+                            candidate]).split("\0")) - {""}
+        def tree(sha, path):
+            return set(run([*git, "ls-tree", "--name-only", "-z", f"{sha}:{path}"]).split("\0")) - {""}
+        def content(sha, path):
+            return run([*git, "cat-file", "blob", f"{sha}:{path}"], binary=True)
+        def versions(sha):
+            names = [name for name in tree(sha, PACKAGE + "migrations") if MIGRATION_NAME.fullmatch(name)]
+            found = {int(name[:3]): name for name in names}
+            if len(found) != len(names):
+                raise ValueError("two migrations share a version")
+            return found
+        added, modified = changed("A"), changed("M")
+        files = [path for path in sql if path in added and MIGRATION.fullmatch(path)]
+        roles = sorted(path for path in sql if path in modified and ROLE_FILE.fullmatch(path))
+        if len(files) + len(roles) != len(sql):
+            return None
+        before, after = versions(base), versions(candidate)
+        start, target = max(before), max(after)
+        pending = sorted(set(after) - set(before))
+        if (any(after.get(version) != name for version, name in before.items())
+                or pending != list(range(start + 1, target + 1))
+                or {PACKAGE + "migrations/" + after[version] for version in pending} != set(files)):
+            return None
+        role_names = {name for name in tree(candidate, PACKAGE) if name.endswith("_role.sql")}
+        if role_names != {name for name in tree(base, PACKAGE) if name.endswith("_role.sql")}:
+            return None
+        texts = {version: content(candidate, PACKAGE + "migrations/" + after[version]) for version in pending}
+        prefixes = {name: content(base, PACKAGE + name) for name in sorted(role_names)}
+        appended = [(prefixes[path[len(PACKAGE):]], content(candidate, path)) for path in roles]
+        source = content(candidate, CLASSIFIER)
+        if sum(map(len, [source, *texts.values(), *(new for _, new in appended)])) > CLASSIFY_INPUT_LIMIT:
+            return None
+        found = classifier_child(UNATTENDED, {"source": source.decode(),
+                                              "texts": [texts[version].decode() for version in pending],
+                                              "roles": [[old.decode(), new.decode()] for old, new in appended]})
+        if (not isinstance(found, dict) or found.get("files") != ["expand"] * len(pending)
+                or found.get("roles") != ["additive"] * len(roles) or not isinstance(found.get("tables"), list)
+                or not all(isinstance(table, str) and SQL_NAME.fullmatch(table) for table in found["tables"])):
+            return None
+        ledger = {str(version): hashlib.sha256(content(base, PACKAGE + "migrations/" + name)).hexdigest()
+                  for version, name in sorted(before.items()) if version > 1}
+    except Exception:  # Refused, a decode error, the child's bounds: the range pauses as before
+        return None
+    return {"database": AUTO_DATABASE, "base": start, "target": target,
+            "files": [after[version] for version in pending], "roles_changed": [path[len(PACKAGE):] for path in roles],
+            "pending": {str(version): hashlib.sha256(texts[version]).hexdigest() for version in pending},
+            "ledger": ledger, "tables": found["tables"],
+            "roles": {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                      for name, data in prefixes.items()}}
+
+
+def expand_plan(plan):
+    """The plan file migrate-expand reads (ANYM-596)."""
+    return {"base": plan["base"], "target": plan["target"], "roles": plan["roles"]}
+
+
+def live_lines(source, step, text):
+    """The lines `text` prints on the live database, through `docker exec` as its owner (no DSN leaves the
+    container); stderr is discarded."""
+    status, output = bounded(["docker", "exec", "-i", "-e", f"PGAPPNAME=deedkit-migration-{step}", source["container"],
+                              "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-U", source["owner"], "-d",
+                              source["database"]], timeout=60, text=text)
+    if status != 0:
+        raise MigrationRefused(f"the {AUTO_DATABASE} database could not be read ({step})")
+    return [line for line in output.splitlines() if line]
+
+
+def live_ledger(source):
+    """(schema_version, {version: sha256}) of the live database."""
+    try:
+        found = json.loads(live_lines(source, "ledger", LEDGER)[0])
+        return int(found["schema_version"]), dict(found["applied"])
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        raise MigrationRefused(f"the live {AUTO_DATABASE} ledger could not be read") from exc
+
+
+def catalog_map(lines):
+    """{key: value} of CATALOG or MIGRATION_DATA lines; keys are tuples of names."""
+    rows = {}
+    for line in lines:
+        row = json.loads(line)
+        rows[tuple(row["k"])] = row["v"]
+    return rows
+
+
+def catalog_difference(before, after):
+    """What changed between two catalog maps, canonically ordered: what the rehearsal and production compare."""
+    order = json.dumps
+    return {"removed": sorted((list(key) for key in before.keys() - after.keys()), key=order),
+            "changed": sorted(([list(key), after[key]] for key in before.keys() & after.keys()
+                               if before[key] != after[key]), key=order),
+            "added": sorted(([list(key), after[key]] for key in after.keys() - before.keys()), key=order)}
+
+
+def described(key):
+    return " ".join(str(part) for part in key)
+
+
+def not_additive(before, after):
+    """M3: the first catalog difference that is not additive, or None. Additive: only new tables with their
+    columns, indexes, constraints, sequences, policies and ACL items; new columns on existing tables that are
+    nullable without a default or have a constant default (PostgreSQL 18 records the NOT NULL of such a column as a
+    constraint); added ACL items; new permissive policies on new tables."""
+    change = catalog_difference(before, after)
+    if change["removed"]:
+        return "removed " + described(change["removed"][0])
+    if change["changed"]:
+        return "changed " + described(change["changed"][0][0])
+    added = [(tuple(key), value) for key, value in change["added"]]
+    tables = {key[1] for key, value in added if key[0] == "relation" and value[0] in ("r", "p")}
+    columns = {(key[1], key[2]) for key, _ in added if key[0] == "column"}
+    for key, value in added:
+        kind = key[0]
+        if kind == "relation":
+            allowed = value[0] in ("r", "p", "S", "i")
+        elif kind == "column":
+            allowed = key[1] in tables or (not value[3] and not value[4]
+                                           and (value[6] is True if value[2] is not None else not value[1]))
+        elif kind == "constraint":
+            allowed = key[1] in tables or (value[0] == "n" and bool(value[3])
+                                           and all((key[1], column) in columns for column in value[3]))
+        elif kind == "index":
+            allowed = value[1] in tables
+        elif kind == "policy":
+            allowed = key[1] in tables and value[0] is True
+        else:
+            allowed = kind in ("sequence", "acl")
+        if not allowed:
+            return "added " + described(key)
+    return None
+
+
+def data_unchanged(before, after, plan):
+    """M3's data: the first reason the copy's data changed beyond the migration's own ledger rows, or None."""
+    def metadata(rows):
+        return {key: value for key, value in rows.items() if key[0] == "metadata" and key[1] != "schema_version"}
+    def ledger(rows):
+        return {key[1]: value for key, value in rows.items() if key[0] == "ledger"}
+    if (metadata(before) != metadata(after) or before.get(("metadata", "schema_version")) != str(plan["base"])
+            or after.get(("metadata", "schema_version")) != str(plan["target"])):
+        return "probe_metadata changed beyond schema_version"
+    if set(plan["pending"]) & set(ledger(before)) or ledger(after) != {**ledger(before), **plan["pending"]}:
+        return "archive_migrations changed beyond the pending versions"
+    for key, value in sorted(before.items(), key=json.dumps):
+        if key[0] == "writes" and key[1] not in ("public.probe_metadata", "public.archive_migrations") \
+                and after.get(key) != value:
+            return f"rows of {key[1]} were written"
+    return None
+
+
+def scratch_lines(copy, copied, step, text):
+    """The lines `text` prints on the copy's scratch database (names, digests and counts, never a row)."""
+    try:
+        return [line for line in helper_output(copy, copy_exec(
+            copy, step, copied["scratch_container"], "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-h",
+            "127.0.0.1", "-U", COPY_USER, "-d", copied["database"]), timeout=60, failure="restore_failed",
+            text=text).splitlines() if line]
+    except CopyFailed as exc:
+        raise MigrationRefused(f"the rehearsal could not read the copy ({step})") from exc
+
+
+def expand_run(name, image, network, dsn_file, plan_file, *, label=None, status=False):
+    """One `migrate-expand` (or `--status`) container: the candidate's API image with MIGRATE_FLAGS, the DSN file
+    and the plan mounted read-only, at most MIGRATE_TIMEOUT seconds; its one JSON line, or None when the answer is
+    lost (a deadline kills the container). Its output holds a version or a fixed code, never PostgreSQL's message."""
+    argv = ["docker", "run", "--rm", "--name", name, *(["--label", label] if label else []), "--network", network,
+            *MIGRATE_FLAGS, "-e", "DATABASE_URL_FILE=/run/secrets/database_url",
+            "--mount", f"type=bind,src={dsn_file},dst=/run/secrets/database_url,readonly"]
+    if not status:
+        argv += ["--mount", f"type=bind,src={plan_file},dst=/run/deedkit/plan.json,readonly"]
+    argv += [image, "python", "-m", "messaging_service", "migrate-expand",
+             *(["--status"] if status else ["--plan", "/run/deedkit/plan.json"])]
+    code, output = bounded(argv, timeout=MIGRATE_TIMEOUT)
+    if code is None:
+        with suppress(Exception):
+            run(["docker", "kill", name], timeout=30)
+        return None
+    try:
+        found = json.loads((output.strip().splitlines() or ["null"])[-1])
+    except ValueError:
+        return None
+    if isinstance(found, dict) and set(found) == {"schema_version"} and type(found["schema_version"]) is int:
+        return found
+    if isinstance(found, dict) and set(found) == {"error"}:
+        return {"error": found["error"] if found["error"] in EXPAND_CODES else "failed"}
+    return None
+
+
+def stable_data(copy, copied):
+    """MIGRATION_DATA once no other session is left on the copy and two reads half a second apart agree: an
+    ended session's write counters are flushed as it exits."""
+    deadline = copy_clock() + 10
+    while scratch_lines(copy, copied, "sessions", OTHER_SESSIONS) != ["0"]:
+        if copy_clock() >= deadline:
+            raise MigrationRefused("the rehearsal's session did not end")
+        time.sleep(0.2)
+    found = scratch_lines(copy, copied, "data", MIGRATION_DATA)
+    for _ in range(10):
+        time.sleep(0.5)
+        again = scratch_lines(copy, copied, "data", MIGRATION_DATA)
+        if again == found:
+            return catalog_map(found)
+        found = again
+    raise MigrationRefused("the copy's write counters did not settle")
+
+
+def rehearse(copied, plan, image, limit):
+    """M3: `migrate-expand` on the copy, its effect compared before and after; the rehearsal record, or
+    MigrationRefused. The copy's scratch server and the migration container share a fresh internal network, each
+    claimed in the copy's owner.json before it is created, so a killed run leaves nothing the next run's
+    reconciliation (ANYM-588 C4) cannot remove; `release_copy` removes and confirms them all."""
+    copy, scratch = copied["copy"], copied["scratch_container"]
+    network = "deedkit-copy-" + copy["id"]
+    claim(copy, "network", network)
+    run(["docker", "network", "create", "--internal", "--label", "deedkit-copy=" + copy["id"], network], timeout=60)
+    run(["docker", "network", "disconnect", "none", scratch], timeout=60)
+    run(["docker", "network", "connect", network, scratch], timeout=60)
+    before = catalog_map(scratch_lines(copy, copied, "before", CATALOG))
+    data = stable_data(copy, copied)
+    directory = Path(copy["directory"])
+    dsn, plan_file = directory / "rehearsal.dsn", directory / "rehearsal-plan.json"
+    # Trust on the internal network: the DSN names no password. Image user 10001 reads both files.
+    for path, text in ((dsn, f"postgresql://{copy['source']['owner']}@{scratch}:5432/{copied['database']}\n"),
+                       (plan_file, json.dumps(expand_plan(plan)) + "\n")):
+        path.write_text(text)
+        path.chmod(0o644)
+    container = network + "-migrate"
+    claim(copy, "container", container)
+    answer = expand_run(container, image, network, dsn, plan_file, label="deedkit-copy=" + copy["id"])
+    if answer != {"schema_version": plan["target"]}:
+        raise MigrationRefused("the rehearsal of migrate-expand failed: "
+                               + (answer or {}).get("error", "no answer" if answer is None else "wrong version"))
+    took = None
+    if plan["pending"]:
+        took = int(scratch_lines(copy, copied, "took", "SELECT coalesce(round(extract(epoch FROM clock_timestamp()"
+                                 f" - max(applied_at)) * 1000), -1) FROM archive_migrations WHERE version > {int(plan['base'])};")[0])
+        if not 0 <= took <= limit:
+            raise MigrationRefused(f"too slow for an unattended lock: the rehearsal took {took} ms, over {limit} ms")
+    after_data = stable_data(copy, copied)
+    after = catalog_map(scratch_lines(copy, copied, "after", CATALOG))
+    if reason := not_additive(before, after) or data_unchanged(data, after_data, plan):
+        raise MigrationRefused("not additive: " + reason)
+    return {"took_ms": took, "difference": catalog_difference(before, after)}
+
+
+def producer_reads(settings, mirror, target):
+    """The backup producer's pinned image (runner.json `image`) is a revision whose backup.py SCHEMAS holds
+    `target`, else MigrationWait."""
+    waiting = MigrationWait(f"the backup producer does not read schema {target} yet")
+    try:
+        image = read(unattended_settings(settings)["runner_config"])["image"]
+        revision = run(["docker", "image", "inspect", "--format",
+                        '{{index .Config.Labels "org.opencontainers.image.revision"}}', image], timeout=60).strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise waiting
+        found = BACKUP_SCHEMAS.search(run(["git", "-C", str(mirror), "cat-file", "blob", f"{revision}:{BACKUP_SOURCE}"]))
+    except MigrationWait:
+        raise
+    except Exception as exc:
+        raise waiting from exc
+    if not found or not int(found[1]) <= target < int(found[2]):
+        raise waiting
+
+
+def migration_gate(settings, http, plan, mirror, base, serving):
+    """M2's read-only gates, at admission and again as the final gate: no active or unknown call, nothing
+    unfinished, the base release's Store without server-side prepared statements (#352), a receiver that reads the
+    target, and the live ledger exactly the base's."""
+    wait_for_calls(settings, time.monotonic() + CALL_POLL)
+    if reason := unresolved(Path(settings["state_directory"]), Path(http["state_directory"]), lambda: mirror, serving):
+        raise MigrationRefused(reason)
+    try:
+        store = run(["git", "-C", str(mirror), "cat-file", "blob", f"{base}:{STORE_SOURCE}"])
+    except Refused:
+        store = ""
+    if not UNPREPARED.search(store):
+        raise MigrationRefused("the running release would fail on the new columns: deploy #352 first")
+    limit = settings["migration"].get("receiver_schema_max")
+    if type(limit) is not int or limit < plan["target"]:
+        raise MigrationWait(f"the backup receiver does not read schema {plan['target']} yet")
+    version, applied = live_ledger(copy_source(settings, AUTO_DATABASE)[0])
+    if version != plan["base"] or applied != plan["ledger"]:
+        raise MigrationRefused(f"the live {AUTO_DATABASE} ledger is not the base's schema {plan['base']}; "
+                               "migrate by hand (production.md)")
+
+
+def migration_receipt(release, plan, status, **fields):
+    record = {"database": AUTO_DATABASE, "base": plan["base"], "target": plan["target"], "files": plan["files"],
+              "roles": plan["roles_changed"], "tables": plan["tables"], "status": status, "at": now(), **fields}
+    write_record(release / "migration.json", record)
+    return record
+
+
+def migration_image(release, candidate):
+    """The candidate's verified API image (plan B's target), pulled or reused under its production tag."""
+    return build_image(release / "source", candidate, PROOF_TARGET)
+
+
+def migration_outcome(settings, plan, candidate, image):
+    """`migrated` when --status shows the target and the live ledger the candidate's checksums, `not-applied` when
+    both are still the base's, else `uncertain`."""
+    unattended, source = unattended_settings(settings), copy_source(settings, AUTO_DATABASE)[0]
+    answer = expand_run("deedkit-status-" + candidate[:12], image, unattended["network"], unattended["dsn_file"], None,
+                        status=True)
+    try:
+        version, applied = live_ledger(source)
+    except MigrationRefused:
+        return "uncertain"
+    if answer == {"schema_version": plan["target"]} == {"schema_version": version} \
+            and applied == {**plan["ledger"], **plan["pending"]}:
+        return "migrated"
+    if answer == {"schema_version": plan["base"]} == {"schema_version": version} and applied == plan["ledger"]:
+        return "not-applied"
+    return "uncertain"
+
+
+def resumed_migration(settings, plan, candidate, release):
+    """A run that finds `migration.json`: True when it records `migrated` (or --status shows it), else
+    MigrationRefused; nothing is retried. False when there is none."""
+    if not (release / "migration.json").exists():
+        return False
+    status = read(release / "migration.json").get("status")
+    if status == "migrated":
+        return True
+    if status != "planned" or plan is None:
+        raise MigrationRefused(f"the unattended migration of {candidate} ended {status}; inspect "
+                               f"{release / 'migration.json'} and migrate by hand (production.md)")
+    outcome = migration_outcome(settings, plan, candidate, migration_image(release, candidate))
+    migration_receipt(release, plan, outcome, resumed=True)
+    if outcome != "migrated":
+        raise MigrationRefused(f"migration of {candidate} did not apply" if outcome == "not-applied" else
+                               f"the migration of {candidate} is uncertain; inspect the ledger before any recovery")
+    return True
+
+
+def migrate(settings, http, plan, mirror, base, serving, candidate, release):
+    """M2 after preparation, M3 and M4: the producer check, the copy, the rehearsal, the final gate and the one
+    production `migrate-expand`. Returns when the database is at the target with the rehearsal's effect; raises
+    MigrationWait or CallActive/CallsUnknown (nothing changed), or MigrationRefused (a pause)."""
+    unattended = unattended_settings(settings)
+    producer_reads(settings, mirror, plan["target"])
+    image = migration_image(release, candidate)
+    def refused(reason, phase):
+        migration_receipt(release, plan, "refused", phase=phase, reason=reason)
+        return MigrationRefused(reason)
+    try:
+        with database_copy(settings, AUTO_DATABASE, candidate, keep=True, catalog=CATALOG) as copied:
+            rehearsal = rehearse(copied, plan, image, unattended["rehearsal_limit_ms"])
+    except MigrationRefused as exc:
+        raise refused(str(exc), "rehearsal") from exc
+    except CopyFailed as exc:
+        raise refused(f"the pre-migration copy of {AUTO_DATABASE} failed: {exc.code}", "copy") from exc
+    except Exception as exc:
+        raise refused(f"the pre-migration copy or rehearsal of {AUTO_DATABASE} stopped: "
+                      + (str(exc) if isinstance(exc, Refused) else type(exc).__name__), "copy") from exc
+    live = catalog_map(copied["catalog"])
+    # The final gate: everything admission read, again, and the live catalog still the copy's.
+    migration_gate(settings, http, plan, mirror, base, serving)
+    producer_reads(settings, mirror, plan["target"])
+    source = copy_source(settings, AUTO_DATABASE)[0]
+    if hashlib.sha256("\n".join(live_lines(source, "shape", CATALOG)).encode()).hexdigest() != copied["catalog_sha256"]:
+        raise refused("the database changed shape since its copy", "final gate")
+    plan_file = release / "migrate-plan.json"
+    plan_file.write_text(json.dumps(expand_plan(plan)) + "\n")
+    plan_file.chmod(0o644)
+    migration_receipt(release, plan, "planned", copy=copied["id"], rehearsal_ms=rehearsal["took_ms"])
+    try:
+        answer = expand_run("deedkit-migrate-" + candidate[:12], image, unattended["network"], unattended["dsn_file"],
+                            plan_file)
+        outcome = migration_outcome(settings, plan, candidate, image)
+        if outcome == "migrated":
+            effect = catalog_difference(live, catalog_map(live_lines(source, "effect", CATALOG)))
+            outcome = "migrated" if effect == rehearsal["difference"] else "diverged"
+    except Exception:  # whatever happened, migration.json stays `planned`: the next run reads --status
+        raise MigrationRefused(f"the migration of {candidate} is uncertain; inspect the ledger before any recovery")
+    code = (answer or {}).get("error")
+    migration_receipt(release, plan, outcome, copy=copied["id"], rehearsal_ms=rehearsal["took_ms"],
+                      **({"code": code} if code else {}))
+    if outcome == "not-applied":
+        raise MigrationRefused(f"migration of {candidate} did not apply" + (f": {code}" if code else ""))
+    if outcome == "diverged":
+        raise MigrationRefused(f"the migration of {candidate} changed {AUTO_DATABASE} differently from its rehearsal; "
+                               "inspect it before any recovery")
+    if outcome != "migrated":
+        raise MigrationRefused(f"the migration of {candidate} is uncertain; inspect the ledger before any recovery")
 
 
 # Deploy tool updates (ANYM-443, production.md "Deploy tool updates"). Each installed tool pair has its own directory
@@ -2898,13 +3474,17 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     try:
         last = read(state / "deploy.json") if (state / "deploy.json").exists() else {}
         started, failures, misses, waits = deploy_counts(last)
+        gated = last.get("migration_waits", {"count": 0})["count"]
+        if type(gated) is not int or gated < 0:
+            raise ValueError("migration wait count")
     except (ValueError, TypeError, AttributeError, KeyError):
         return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it")
     if auto and started and (datetime.now(timezone.utc) - started).total_seconds() < DEPLOY_INTERVAL:
         return {"status": "waiting", "reason": "less than 20 minutes since the last deploy started"}
-    if "call_waits" in last:
-        # Waits for calls count only in a row: this run carries the count on only when it waits again.
-        last = {key: value for key, value in last.items() if key != "call_waits"}
+    if "call_waits" in last or "migration_waits" in last:
+        # Waits for calls or a migration gate count only in a row: this run carries the count on only when it waits
+        # again.
+        last = {key: value for key, value in last.items() if key not in ("call_waits", "migration_waits")}
         if not dry_run:
             write(state / "deploy.json", last)
     if reason := unresolved(state, http_state):
@@ -2989,7 +3569,9 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
             return {"status": "waiting", "reason": "no newer main commit has attested images yet", "sha": base}
         since = base
     sql, pending = range_changes(mirror, since, candidate, installed)
-    if (reasons := pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
+    # M1 (ANYM-449): a messaging range migrate-expand may run without a person migrates instead of pausing.
+    plan = unattended_plan(settings, mirror, since, candidate, sql) if sql and not pending and candidate != base else None
+    if (reasons := [] if plan else pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
         # Only the tool pair waits for an install: the self-updating layout installs it, when this run is its tool.
         try:
             tool = installed_tool()
@@ -3002,8 +3584,10 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     if reasons:
         return halt("; ".join(reasons), sha=candidate)
     if dry_run:
+        migration = [f"migrate {AUTO_DATABASE} schema {plan['base']} to {plan['target']} after a verified copy and its "
+                     "rehearsal"] if plan else []
         return {"status": "plan", "sha": candidate, "base": base,
-                "steps": (["plan A"] if candidate != base else []) + ["plan B"]}
+                "steps": migration + (["plan A"] if candidate != base else []) + ["plan B"]}
     record.update(sha=candidate, base=base, started_at=now(), status="deploying")
     write(state / "deploy.json", record)
     def finish(status, **fields):
@@ -3019,14 +3603,31 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         return finish("error", reason=message + "; nothing changed, the next run retries")
     release = state / candidate
     if candidate != base:
+        migrated = False
         try:
+            # M2 admission (read-only) before preparation; a run that finds migration.json resumes from it (M4).
+            if plan and not (migrated := resumed_migration(settings, plan, candidate, release)):
+                migration_gate(settings, http, plan, mirror, base, serving["sha"])
             if not (release / "prepared.json").exists():
                 if release.exists():
                     return finish(**halt(f"an earlier preparation of {candidate} did not finish; inspect {release}"))
                 prepare(settings, candidate)
+            if plan and not migrated:
+                migrate(settings, http, plan, mirror, base, serving["sha"], candidate, release)
+                migrated = True
             apply(settings, candidate)
         except Exception as exc:
             message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+            if isinstance(exc, MigrationRefused):
+                return finish(**halt(message))
+            if isinstance(exc, MigrationWait) and not (release / "attempted.json").exists():
+                if gated + 1 >= MIGRATION_WAITS:
+                    return finish(**halt(f"the migration of {candidate} waited {gated + 1} runs in a row: {message}"))
+                return finish("waiting", reason=message + "; nothing changed, the next run retries",
+                              migration_waits={"count": gated + 1, "at": now(), "reason": message})
+            if migrated:
+                assert plan
+                message += f" ({AUTO_DATABASE} is already at schema {plan['target']})"
             if isinstance(exc, (CallActive, CallsUnknown)) and not (release / "attempted.json").exists():
                 # Nothing was stopped: the prepared release waits for a later run; the fourth wait in a row pauses.
                 if waits + 1 >= CALL_WAITS:
@@ -3042,13 +3643,19 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
             result = read(release / "result.json") if (release / "result.json").exists() else {}
             if result.get("status") != "unhealthy":
                 return finish(**halt(f"plan A of {candidate} stopped in an unknown state: {message}; inspect it"))
-            # Automatic deploys never change the SQL inventory (pause_reasons), so the previous release still fits.
+            # The previous release still fits: a range either leaves the SQL inventory alone (pause_reasons) or only
+            # expands the schema (ANYM-449 M5), and the base runs on the target schema; a migration is never reversed.
             try:
                 rollback(settings, candidate)
             except Exception as again:
                 detail = str(again) if isinstance(again, Refused) else type(again).__name__
                 return finish(**halt(f"plan A of {candidate} failed its health wait and its rollback failed: {detail}; "
                                      "production state is unknown, inspect it"))
+            if migrated:
+                assert plan
+                return finish(**halt(f"plan A of {candidate} failed its health wait after migrating schema "
+                                     f"{plan['base']} to {plan['target']}; rolled back to {base} on schema "
+                                     f"{plan['target']}", status="rolled-back"))
             return finish(**halt(f"plan A of {candidate} failed its health wait; rolled back to {base}",
                                  status="rolled-back"))
     try:

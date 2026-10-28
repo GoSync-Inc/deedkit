@@ -3,6 +3,10 @@
   "state_directory": "/var/lib/deedkit-production",
   "migration": {
     "copy_timeout_s": 1800,
+    "receiver_schema_max": 51,
+    "rehearsal_limit_ms": 1000,
+    "unattended": {"network": "anymsg_default", "dsn_file": "/opt/deedkit/deploy/private/messaging-owner.dsn",
+                   "runner_config": "/opt/personal-os-probe/ops/runner.json"},
     "databases": {
       "messaging": {"container": "anymsg-db-1", "owner": "probe_owner", "database": "messaging_probe"},
       "calendar": {"container": "deedkit-calendar-calendar-db-1", "owner": "fcs_owner", "database": "family_calendar"}

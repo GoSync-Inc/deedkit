@@ -471,7 +471,8 @@ runner, no image lock is taken. `check-image` builds the working tree under
 production tag.
 
 Before applying, follow [backup/migration and rollback](platform-cutover.md).
-This tool does not run migrations, prove data compatibility, authorize external
+This tool runs no migration by hand (`deploy` runs the qualifying messaging ones itself, "Unattended
+migrations" below), does not prove data compatibility, authorize external
 actions, or perform provider readback. A schema change needs the module's explicit
 migration procedure and the backup gate below first. Confirm that the pinned
 backup/restore runtimes support both the current database schema and the planned
@@ -603,6 +604,76 @@ never leave it.
 
 Undo: none needed; a copy changes no database. To remove a copy at once: `rm -r
 /var/lib/deedkit-production/migration-copies/<id>` after its `released.json` exists.
+
+### Unattended migrations
+
+ANYM-449, owner 2026-10-28: «Да, добавление миграции автоматически с копией.» `deploy` applies a messaging
+range itself only when every step below passes; anything else pauses with today's text and you migrate by
+hand (above). Nothing is retried, a migration is never reversed and nothing is restored automatically (a
+restore is the gated restore procedure, from the copy or the backup).
+
+Configuration, in the plan A file's `migration` section (`deploy/production.example.json`), besides
+`databases.messaging` (Database copies): `unattended` = `{network, dsn_file, runner_config}` (the
+database's Docker network, the owner DSN file the migration container mounts read-only, readable by the
+image user 10001, and the backup runner's `runner.json`), `receiver_schema_max` (the newest schema the
+backup receiver reads; the operator raises it after updating the receiver, until ANYM-589 asks the
+receiver) and `rehearsal_limit_ms` (default 1000, at most 4000). Undo: remove `unattended` (or
+`databases.messaging`) and every SQL change pauses again.
+
+What qualifies (M1): every SQL inventory path of the range is an added
+`services/messaging/messaging_service/migrations/NNN_*.sql` or a modified messaging `*_role.sql`
+(`schema.sql`, `deploy/*.sql`, calendar SQL, a new, deleted or renamed role file and an edited applied
+migration pause); the candidate's `migration_rollout.py`, in the classifier's isolated process, names each
+added file `expand` by `unattended_class` (no DROP of any kind, so the CHECK widening pair pauses) and each
+role file `additive` by `role_class`; the added versions follow the base's highest without a gap.
+
+Phases, each a pause or a wait before any production write:
+
+1. Admission (read-only): no active or unknown call (one poll; else `waiting` with `call_waits`); nothing
+   unfinished (`unresolved`); the base release's `store.py` opens its pool with
+   `prepare_threshold: None` (#352; else "deploy #352 first"); `receiver_schema_max` is at least the
+   target (else `waiting`); the live ledger is exactly the base's (`schema_version` and every
+   `archive_migrations` checksum; else a pause).
+2. Preparation: plan A `prepare` as always, then the producer check: the image `runner.json` pins has an
+   `org.opencontainers.image.revision` whose `backup.py` `SCHEMAS` holds the target (else `waiting`;
+   move the pin by hand until ANYM-589). Waits on the receiver or the producer count in `deploy.json`
+   (`migration_waits`); the third in a row pauses.
+3. Copy: ANYM-588 for `messaging`, keeping the scratch server; the copy's keeper also records the live
+   catalog in its snapshot (`catalog_sha256`). A failed copy pauses "the pre-migration copy of messaging
+   failed: <code>".
+4. Rehearsal: a fresh `docker network create --internal deedkit-copy-<id>` and the container
+   `deedkit-copy-<id>-migrate`, each named in the copy's `owner.json` before it is created; the scratch
+   server leaves `none` for that network and the candidate's API image runs `migrate-expand` against it
+   (trust, the owner's name, the production flags). The canonical catalog (`CATALOG` in production.py:
+   schemas, relations, columns, constraints, indexes, triggers, functions, types and enum labels, rules
+   and views, policies, sequences, every ACL item, default ACLs, roles, memberships, role settings and the
+   row counts of extensions, publications, subscriptions, casts, operators, access methods, languages,
+   foreign servers, extended statistics and text search) before and after must differ only by new tables
+   with their columns, indexes, constraints, sequences, policies and ACL items, nullable or constant-default
+   columns on existing tables and added ACL items; `probe_metadata` only by `schema_version`;
+   `archive_migrations` only by the pending versions; and no other existing table may show a write in
+   `pg_stat_user_tables`. Its transaction (from `applied_at` to the first read after the container ended)
+   takes at most `rehearsal_limit_ms`. Else the run pauses "not additive: <first difference>" or "too slow
+   for an unattended lock". The copy's release removes and confirms every resource; a killed run leaves
+   them to the next run's reconciliation.
+5. Final gate: admission and the producer check again, and the live catalog still the copy's (else "the
+   database changed shape since its copy").
+6. Apply: `<sha>/migration.json` (fsynced) records `planned`; `docker run --rm --name
+   deedkit-migrate-<sha12> --log-driver none --read-only --user 10001:10001 --cap-drop ALL --security-opt
+   no-new-privileges --pids-limit 64 --memory 512m` on the database network runs `migrate-expand` once
+   (30 s); then `--status` must show the target, the live ledger the candidate's checksums and the live
+   catalog change equal the rehearsal's: `migrated`, and plan A and plan B follow at once. Otherwise
+   `not-applied` ("did not apply"), `diverged` or `uncertain`, each a pause. A run that finds
+   `migration.json` reads it: `migrated` continues with plan A; `planned` reads `--status` and the ledger
+   and records `migrated` (continue), `not-applied` or `uncertain` (pause); any other status pauses.
+
+Rollback (M5): a plan A health failure after the migration runs the usual rollback: the base images on the
+target schema (expand migrations keep the base working; delivery heartbeats are read only while delivery
+features are enabled). The pause reads "plan A of <sha> failed its health wait after migrating schema
+<base> to <target>; rolled back to <base> on schema <target>". Receipts and the pause hold file names,
+versions, fixed codes and object names, never a DSN, a row value or PostgreSQL's message (the containers
+log nothing and their stderr is discarded). The copy's dumps stay for its retention (48 hours, Database
+copies).
 
 ## Apply and verify
 
@@ -1104,7 +1175,8 @@ Otherwise it:
    space, 4 MiB of input, 64 KiB of output, stderr discarded; the candidate is
    attested main, trusted like a tool self-update, so the hook is no sandbox);
    any failure there names the file `manual`. The
-   class changes nothing else: the run pauses and you migrate by hand.
+   class changes nothing else: the run pauses and you migrate by hand, unless the range qualifies
+   for an unattended migration ("Unattended migrations"): then the run migrates in phases instead;
    When the only such change is the `production.py`/`seamless_release.py`
    pair, the self-updating layout installs it instead ("Deploy tool updates");
    apply also refuses before any change while the host backup runner is not
@@ -1146,7 +1218,8 @@ candidate, or takes a newer attested one. `deploy.json` counts such runs in a
 row (`call_waits`); the fourth (about an hour and a half of waiting) pauses
 with the last reason, and a run that writes any other outcome there clears it. A
 `--dry-run` never waits and keeps the count. An error after a release step started pauses as an unknown state; a call refusal before a later project is one. When plan A failed its health wait (`unhealthy`, above), it runs
-`rollback` once (automatic deploys never change the SQL inventory) and pauses
+`rollback` once (the base release also runs on a schema an unattended migration expanded; the
+migration is not reversed) and pauses
 with status `rolled-back`; a failed rollback (a call refusal there included), or an apply that stopped in any
 other state, pauses with no further action. A failed plan B pauses and leaves
 plan A applied (the serving HTTP pair is unchanged or awaits recovery
