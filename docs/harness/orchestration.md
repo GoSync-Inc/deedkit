@@ -70,13 +70,13 @@ affect every pull request make parallel edits collide.
   to peer orchestrators: they read the registry.
 - Restart. A worker near its brief's token limit (process.md section 6; the orchestrator near 250k), at the next natural boundary,
   writes a handoff of at most 40 lines (templates/handoff.md, kept as `handoffs/TEMPLATE.md` in the orchestrator's directory)
-  that lists the files and ranges already read and the decisions taken, waits for its own
+  whose Read map lists the file:line facts already established (decisions under State), waits for its own
   background jobs (closing the terminal kills them), then restarts itself with the orchestrator's
   `worker-restart.sh` (handoff, your current model and effort, brief), sends the orchestrator `RESTARTED <path>` and
   stops. Not with about 30 calls left (only merge, `main` push run, read-back, DONE): finish.
-  Restart early, from 150k, before an expected idle of over an hour (owner gate, usage limit,
+  Restart early, from 300k, before an expected idle of over an hour (owner gate, usage limit,
   overnight). The orchestrator's `Hold` to a worker names an ETA (a clock time or event) or says `no ETA`
-  (templates/messages.md); a worker above 150k treats `no ETA` or an ETA over an hour away as that idle
+  (templates/messages.md); a worker above 300k treats `no ETA` or an ETA over an hour away as that idle
   and restarts before it waits, also with about 30 calls left (nothing finishes during a hold; a warm idle
   re-bills its whole context on resume). The script lists each brief once (COMMON_BRIEF included) and,
   when the handoff names `review-codex.sh` or `wait-merge.sh` anywhere (its `Commands:` line is the place),
@@ -144,10 +144,13 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
   handoff; AGENTS.md, CLAUDE.md and process.md are already in context. Read only the section of a
   process document a step needs. Plan, follow-ups and the decision log live in the orchestrator's
   log, read on demand and for the weekly review, never on start; never read an archive on start.
-- Briefs: the common worker brief (templates/worker-brief-common.md, filled in) plus a 3–6 line task
+- Briefs: the common worker brief (templates/worker-brief-common.md, filled in) plus a 3–7 line task
   brief with only what Tiden does not hold: card ID (or goal for a skip), files busy in other
   workers' open PRs or briefs (`gh pr diff N --name-only`; Tiden does not show concurrent work),
-  level if not in the card, limits beyond the card (production read-only, etc.), SP when Estimates is on.
+  level if not in the card, limits beyond the card (production read-only, etc.), SP when Estimates is on,
+  plus one line of read targets (owner 10-28): the card's expected paths, prior PRs on them and any file:line the
+  card or an earlier worker's DONE names; the worker reads those first instead of surveying the repository
+  (worker brief, Read targets).
 - Workspaces: no tags on any workspace; the type lives in the workspace name (`code-…`,
   `research-…`, `ops-…`, `process-…`).
 - Worker states (CLI 1.39+): `bin/watch.sh` prints `AGENT <name> (terminal <id8>): <state>`

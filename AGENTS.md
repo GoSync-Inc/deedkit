@@ -1,6 +1,6 @@
 # DeedKit agent rules
 
-Process: harness egerev/agent-harness @ 0.57.0, ~/agent-harness; this file adds project rules.
+Process: harness egerev/agent-harness @ 0.58.1, ~/agent-harness; this file adds project rules.
 Claude Code loads harness process.md through the SessionStart hook (`.claude/hooks/harness.sh`:
 merged `origin/main`, else the pinned copy). Codex and cloud agents read the pinned copy
 docs/harness/process.md first. If no harness text is in context, stop and report BLOCKED. Each
