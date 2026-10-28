@@ -76,4 +76,4 @@ Every Astra task starts with DeedKit's copy of the four questions (harness `proc
 
 ## 6. Working with the orchestrator
 
-- Budget: 1,000 words (`wc -w`).
+- Word cap: 1,000 words (`wc -w`).

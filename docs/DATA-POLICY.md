@@ -30,8 +30,11 @@ the owner has decided parts (below), not this inventory as a whole.
   in the cold archive, with a 30-day cold lock (owner 10-25, stories 511-516 «Ну пусть 30 дней ... То, что
   удаляется, не должно храниться даже в холодном архиве»). Today BACKUP_R2.md:444-454 says rotation never
   deletes cold copies and prescribes an indefinite bucket lock; the cold receiver can only put and get.
-  Closing that gap is open implementation and configuration work (story 516). Gates: an Astra-reviewed
-  plan, a fresh verified backup, an undo (process.md section 2).
+  Closing that gap is open implementation and configuration work (story 516). Gates: a DELETE statement
+  the running service executes on rows this line or a ready card names is ordinary, PR-listed code
+  (harness reviews.md, `Deletes:`); any other deletion (TRUNCATE, DROP, a script, data fix, deploy hook or
+  other automation, a migration, a restore) needs an Astra-reviewed plan, a fresh verified backup and an
+  undo (process.md section 2).
 - Visibility: the owner; agents through scoped API keys and gateway profiles, and production read-only
   over SSH (AGENTS.md section 1); explicit attachment download below `history_since` only on an explicit
   request (owner 10-23 «да, разреши явное скачивание вложений»). Never in a PR, issue, log excerpt,

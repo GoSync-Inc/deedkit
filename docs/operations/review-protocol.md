@@ -41,6 +41,9 @@ list: release, deploy and `production.py`, sends and live provider-session code.
   git diff -U5 origin/main... | grep -E -i '^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|RENAME)\b|ALTER )'
   ```
 
+  A `DELETE FROM` hit in service code (not a migration, not a script or hook that deletes production data) is a
+  `Deletes:` PR line item (harness reviews.md), not an OWNER signal.
+
   A host-tool change still waits for the owner to install it before autodeploy resumes
   (docs/operations/production.md).
 
