@@ -726,15 +726,17 @@ first).
      --open-proxied <allowed host> --refused-proxied example.com --blocked 1.1.1.1:443 \
      --blocked-dns $DELIVERY_RESOLVER --blocked <api ip>:8080 --blocked <gateway ip>:13240 \
      --blocked <matcher ip>:18080 --blocked <host public ip>:22 --blocked <tailnet ip>:22 \
-     --blocked <dk-deliverydb0 subnet .1>:22 --blocked <dk-deliverypx0 subnet .1>:22 \
+     --unreached <dk-deliverydb0 subnet .1>:22 --unreached <dk-deliverypx0 subnet .1>:22 \
      --blocked <docker0 gateway ip>:22 --blocked 169.254.169.254:80 --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
    ```
    The subnet `.1` and `docker0` targets pass with or without the host rules: both internal networks
-   use gateway mode `isolated`, so their bridges hold no host address. Then the second layer from the proxy, which has the egress bridge:
+   use gateway mode `isolated`, so their bridges hold no host address. `--unreached` accepts the local
+   refusal an isolated subnet `.1` gives, never a connection; port 22 is the positive control, so first
+   check that sshd listens on every host address (`ss -Hltn "sport = :22"` shows `0.0.0.0:22`). Then the second layer from the proxy, which has the egress bridge:
    ```sh
    docker compose $F exec -T delivery-egress python -I - check --open <allowed host>:443 \
      --open-dns $DELIVERY_RESOLVER --blocked <host public ip>:22 --blocked <tailnet ip>:22 \
-     --blocked <dk-delivery0 gateway ip>:22 --blocked <dk-deliverypx0 subnet .1>:22 \
+     --blocked <dk-delivery0 gateway ip>:22 --unreached <dk-deliverypx0 subnet .1>:22 \
      --blocked <matcher ip>:18080 --blocked 169.254.169.254:80 --blocked <alt>:53 \
      --blocked-dns <alt> --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
    ```

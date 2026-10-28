@@ -173,8 +173,10 @@ def check(targets, timeout, proxy=None):
             passed = outcome == 'answered' if expect == 'open-dns' else outcome in ('timeout', 'unreachable')
             results.append({'target': target, 'expect': expect, 'outcome': outcome, 'passed': passed})
             continue
-        outcome = probe(target, timeout, literal=expect == 'blocked')
-        passed = outcome == 'connected' if expect == 'open' else outcome in ('timeout', 'unreachable')
+        outcome = probe(target, timeout, literal=expect != 'open')
+        # unreached: no listener behind the address answered; an isolated bridge refuses its subnet .1 locally.
+        allowed = ('refused', 'timeout', 'unreachable') if expect == 'unreached' else ('timeout', 'unreachable')
+        passed = outcome == 'connected' if expect == 'open' else outcome in allowed
         results.append({'target': target, 'expect': expect, 'outcome': outcome, 'passed': passed})
     return {'passed': bool(results) and all(item['passed'] for item in results), 'results': results}
 
@@ -208,6 +210,8 @@ def main(argv=None):
     probe_parser.set_defaults(targets=[])
     probe_parser.add_argument('--open', action=Target, const='open', metavar='HOST:PORT')
     probe_parser.add_argument('--blocked', action=Target, const='blocked', metavar='IP:PORT')
+    probe_parser.add_argument('--unreached', action=Target, const='unreached', metavar='IP:PORT',
+                              help='anything but a connection (a port the host listens on at every address)')
     probe_parser.add_argument('--open-dns', action=Target, const='open-dns', metavar='IP[:PORT]',
                               help='a UDP DNS query to this resolver must be answered')
     probe_parser.add_argument('--blocked-dns', action=Target, const='blocked-dns', metavar='IP[:PORT]',

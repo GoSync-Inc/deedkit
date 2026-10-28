@@ -191,3 +191,24 @@ def test_proxied_probe_reads_a_fragmented_body_whole_and_stops_at_its_deadline()
         assert time.monotonic() - started < 4
     finally:
         server.close()
+
+
+# spec: ANYM-581
+def test_unreached_targets_accept_a_local_refusal_but_never_a_connection():
+    listener = socket.create_server(('127.0.0.1', 0))
+    closed = socket.create_server(('127.0.0.1', 0))
+    refused = '127.0.0.1:%d' % closed.getsockname()[1]
+    closed.close()
+    try:
+        # An isolated bridge's subnet .1 refuses locally: --unreached passes where --blocked (a firewall DROP) fails.
+        code, out = run('check', '--unreached', refused)
+        assert code == 0 and json.loads(out)['results'][0]['outcome'] == 'refused', out
+        code, out = run('check', '--blocked', refused)
+        assert code == 1, out
+        # A listener behind the address is reached: --unreached fails.
+        code, out = run('check', '--unreached', '127.0.0.1:%d' % listener.getsockname()[1])
+        assert code == 1 and json.loads(out)['results'][0]['outcome'] == 'connected', out
+        code, out = run('check', '--unreached', 'localhost:22')
+        assert code == 1 and json.loads(out)['results'][0]['outcome'] == 'malformed', out
+    finally:
+        listener.close()
