@@ -164,7 +164,7 @@ def test_operation_manifest_has_30_actual_tools_and_truthful_annotations():
             'method': 'initialize', 'params': {'protocolVersion': '2025-11-25',
             'capabilities': {}, 'clientInfo': {'name': 'synthetic', 'version': '1'}}})
     tools = {row['name']: row for row in response.json()['result']['tools']}
-    assert len(tools) == 51 and set(METHODS) <= set(tools)
+    assert len(tools) == 52 and set(METHODS) <= set(tools)
     for method in METHODS:
         assert tools[method]['inputSchema']['additionalProperties'] is False
         annotations = tools[method]['annotations']

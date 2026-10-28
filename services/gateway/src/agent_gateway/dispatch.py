@@ -51,7 +51,9 @@ CALENDAR_CONSTRAINTS = {
 # A request key that names something the caller already chose (an ID, an account, a mode); any other string the
 # caller sent is payload: message text, file names, phone numbers, queries.
 REFERENCE_KEY = re.compile(r"(?:^|_)(?:ids?|digest|ref|token)$|^(?:account|chat|person|sender|receipt|operation|"
-                           r"consumer|reply_to|network|kind|view|detail|direction|order|format|status|live|modules|tool)$")
+                           r"consumer|reply_to|network|kind|view|detail|direction|order|format|status|live|modules|tool|purpose)$")
+# platform_resolve_target's `to` (ANYM-545) is a reference only when it holds an exact archive ID or person UUID.
+EXACT_TO = re.compile(r"(?:chat|msg)_[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 PHONE = re.compile(r"\+?\d(?:[\s().-]?\d){6,}")
 # A name, a dot and an extension of 1-10 letters or digits with at least one letter (.c, .7z, .sqlite3).
 FILE_NAME = re.compile(r"[\w-]+\.(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{1,10}\b")
@@ -82,7 +84,18 @@ def exposed(value, key=None):
         return [s for k, v in value.items() for s in exposed(v, k)]
     if isinstance(value, list):
         return [s for v in value for s in exposed(v, key)]
+    if key == "to" and isinstance(value, str) and EXACT_TO.fullmatch(value):
+        return []
     return [value] if isinstance(value, str) and not (key and REFERENCE_KEY.search(key)) else []
+
+
+def resolver_query(name, values):
+    """platform_resolve_target's `to` (ANYM-545) is the name to look up: its candidates' labels and their read-only
+    listing repeat it by design. Only that request's `to` stops being payload; phones and file names in the relayed
+    error are still dropped (`sensitive`), and a `to` in any relayed `next` is still checked."""
+    if name == "platform_resolve_target" and isinstance(values, dict):
+        return {key: value for key, value in values.items() if key != "to"}
+    return values
 
 
 # ANYM-519: write-only arguments of the endpoint tools; no gateway response repeats them.
@@ -679,7 +692,7 @@ class Dispatch:
                 error.detail = relayed_error(
                     error.detail, lambda value: self.runnable(value, visible, module, current, principal, caps),
                     {n for n in visible if CATALOG[n].get("annotations", {}).get("readOnlyHint", False)},
-                    payload_strings(values))
+                    payload_strings(resolver_query(name, values)))
             raise
         if module == "messaging":
             result = self.next_call(result, snapshot, agent, caps)

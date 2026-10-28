@@ -80,6 +80,7 @@ export type ToolName =
   | 'messages_upload_file_chunk'
   | 'messages_wait_for_subscription_events'
   | 'platform_capabilities'
+  | 'platform_resolve_target'
   | 'platform_select_modules';
 
 export interface ToolCatalogEntry {

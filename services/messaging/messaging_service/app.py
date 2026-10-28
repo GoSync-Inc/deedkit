@@ -997,6 +997,21 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     provider_message_id=provider_message_id)
 
     @mcp.tool(structured_output=True, annotations=read)
+    def resolve_target(ctx: Context,to: Annotated[StrictStr,Field(min_length=1,max_length=256)],
+                       purpose: Literal['message','call']='message',account: StrictStr='',
+                       sender: StrictBool=False) -> dict[str, Any]:
+        """Any identifier to one exact target, or candidates to choose from (read-only, archive only).
+        to: person UUID, chat_ or msg_ ID (its chat; its sender with sender=true; a contact card's
+        contact), a phone in any format, @username, WhatsApp JID, or a name. Exact IDs return
+        target {person?, account, chat_id, phone?, network, label, how_resolved}; a phone with no chat
+        on one opted-in account returns chat_id null and opens_chat=true (send_message with phone).
+        A name or fragment never resolves alone: error selection_required with up to 10 candidates
+        by last activity, each with its own next; more=true names messages_search_people. Hidden and
+        missing are the same not_found, whose next is a read-only listing. account narrows the search.
+        """
+        return call(ctx,'resolve_target',to=to,purpose=purpose,account=account,sender=sender)
+
+    @mcp.tool(structured_output=True, annotations=read)
     def get_file_occurrences(ctx: Context, attachment_id: str, after: str='', limit: int=20) -> dict[str, Any]:
         """Find permitted occurrences of the same original, anchored by a visible attachment ID."""
         return call(ctx,'get_file_occurrences',attachment_id=attachment_id,after=after,limit=limit)
@@ -1236,7 +1251,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
         operations={'capabilities','list_chats','search','get_messages','get_context',
                     'get_attachment','request_file_download','get_updates','ack_updates','dismiss_reply','record_review','get_reviews',
                     'snooze_reply','restore_reply','mute_reply_source','unmute_reply_source','list_reply_dismissals',
-                    'search_people','search_files','get_file_text','get_sync_status','get_file_occurrences','get_file_segments','resolve_reference','preview_message','send_message','get_send_status',
+                    'search_people','search_files','get_file_text','get_sync_status','get_file_occurrences','get_file_segments','resolve_reference','resolve_target','preview_message','send_message','get_send_status',
                     'list_messenger_operations','preview_messenger_operation','execute_messenger_operation','get_messenger_operation',
                     'prepare_file_upload','upload_file_chunk','get_file_upload',
                     'create_subscription','list_subscriptions','get_subscription','update_subscription','get_subscription_events',

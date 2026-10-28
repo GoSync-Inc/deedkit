@@ -80,5 +80,6 @@
   {"name": "messages_upload_file_chunk", "read_only": false},
   {"name": "messages_wait_for_subscription_events", "read_only": true},
   {"name": "platform_capabilities", "read_only": true},
+  {"name": "platform_resolve_target", "read_only": true},
   {"name": "platform_select_modules", "read_only": false}
 ]
