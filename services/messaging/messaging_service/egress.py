@@ -7,7 +7,6 @@ sent and retries. After the request starts, OSError, TimeoutError and ValueError
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 import ipaddress
 import json
 import math
@@ -84,24 +83,52 @@ def post(connection, host, path, body, headers, remaining, *, retry_after=False)
         data = data.split(b'\r\n\r\n', 1)[1]
 
 
+_MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+_CLOCK = '([0-9]{2}):([0-9]{2}):([0-9]{2})'
+# RFC 9110 section 5.6.7: IMF-fixdate, then the obsolete rfc850-date and asctime-date forms.
+_IMF_DATE = re.compile('(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), ([0-9]{2}) ([A-Za-z]{3}) ([0-9]{4}) ' + _CLOCK + ' GMT')
+_RFC850_DATE = re.compile('(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day, ([0-9]{2})-([A-Za-z]{3})-([0-9]{2}) ' + _CLOCK + ' GMT')
+_ASCTIME_DATE = re.compile('(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([A-Za-z]{3}) ([ 0-9][0-9]) ' + _CLOCK + ' ([0-9]{4})')
+
+
+def _http_date(value, now):
+    """An HTTP-date as an aware UTC datetime, or None; the whole value must be exactly one date."""
+    if match := _IMF_DATE.fullmatch(value):
+        day, month, year, clock = match[1], match[2], int(match[3]), match.groups()[3:6]
+    elif match := _RFC850_DATE.fullmatch(value):
+        day, month, clock = match[1], match[2], match.groups()[3:6]
+        # A two-digit year more than 50 years ahead is the most recent past year with those digits.
+        year = now.year // 100 * 100 + int(match[3])
+        if year > now.year + 50:
+            year -= 100
+    elif match := _ASCTIME_DATE.fullmatch(value):
+        month, day, clock, year = match[1], match[2], match.groups()[2:5], int(match[6])
+    else:
+        return None
+    if month not in _MONTHS:
+        return None
+    try:
+        return datetime(year, _MONTHS.index(month) + 1, int(day), *map(int, clock), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def retry_after_seconds(head, now=None):
     """The delay of a response head's one Retry-After in whole seconds (RFC 9110 section 10.2.3: delta-seconds or an
     HTTP-date), or None when it is missing, repeated, unparsable or not in the future."""
     values = [line.split(b':', 1)[1].strip() for line in head.split(b'\r\n')[1:]
         if b':' in line and line.split(b':', 1)[0].strip().lower() == b'retry-after']
-    if len(values) != 1:
+    if len(values) != 1 or not values[0].isascii():
         return None
-    value = values[0].decode('ascii', 'replace')
+    value, now = values[0].decode('ascii'), now or datetime.now(timezone.utc)
     if re.fullmatch('[0-9]+', value):
         # Any delay past the dispatcher's cap is the cap; a long digit run never reaches int().
-        return int(value) if len(value) <= 9 else 10**9
-    try:
-        when = parsedate_to_datetime(value)
-    except (TypeError, ValueError, OverflowError):
+        digits = value.lstrip('0') or '0'
+        return int(digits) if len(digits) <= 9 else 10**9
+    when = _http_date(value, now)
+    if when is None:
         return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    seconds = math.ceil((when - (now or datetime.now(timezone.utc))).total_seconds())
+    seconds = math.ceil((when - now).total_seconds())
     return seconds if seconds > 0 else None
 
 

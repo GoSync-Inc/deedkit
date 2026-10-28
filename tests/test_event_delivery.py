@@ -1309,5 +1309,14 @@ def test_post_reads_retry_after_only_from_a_complete_429_or_503_head():
     assert retry_after_seconds(b'HTTP/1.1 503 x\r\nretry-after:  120 ', now) == 120
     assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: Wed, 28 Oct 2026 12:10:00 GMT', now) == 600
     assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: ' + b'9' * 4000, now) > 3600
-    for value in (b'', b'1.5', b'-1', b'abc', b'Wed, 28 Oct 2026 11:00:00 GMT', b'Wed, 99 Oct 2026 12:00:00 GMT'):
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: 0000000120', now) == 120
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: 0000000000', now) == 0
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: Wednesday, 28-Oct-26 12:10:00 GMT', now) == 600
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: Wed Oct 28 12:10:00 2026', now) == 600
+    # RFC 9110 section 5.6.7: a two-digit year is at most 50 years ahead, so 69 is 2069 and 99 is 1999.
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: Monday, 28-Oct-69 12:10:00 GMT', now) > 3600
+    assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: Thursday, 28-Oct-99 12:10:00 GMT', now) is None
+    for value in (b'', b'1.5', b'-1', b'abc', b'Wed, 28 Oct 2026 11:00:00 GMT', b'Wed, 99 Oct 2026 12:00:00 GMT',
+                  b'Wed, 28 Oct 2026 12:10:00 GMT, Wed, 28 Oct 2026 12:20:00 GMT', b'Wed, 28 Oct 2026 12:10:00 GMT \xc3\xa9',
+                  b'Wed, 28 Xyz 2026 12:10:00 GMT', b'Wed, 28 Oct 2026 12:10:00 +0000', b'600 seconds'):
         assert retry_after_seconds(b'HTTP/1.1 503 x\r\nRetry-After: ' + value, now) is None
