@@ -454,6 +454,55 @@ Objects must be age ciphertext; the optional `cold_max_bytes` (default 5 GiB)
 bounds each one and must exceed the archiver's `max_object_bytes` plus age
 overhead. Larger objects use the configured multipart part size.
 
+## Schema capabilities key
+
+An automatic migration (ANYM-587) needs to know whether this receiver can verify
+a backup at the new schema before production moves to it. A **third** key on
+the restricted upload account answers that and nothing else:
+
+```text
+restrict,from="SOURCE_ADDRESS",command="/opt/deedkit-backup-r2/venv/bin/python -m messaging_service.backup_r2_receiver --config /etc/deedkit-backup-r2/receive.json capabilities" ssh-ed25519 REPLACE_WITH_CAPABILITIES_PUBLIC_KEY
+```
+
+The `capabilities` mode takes no argument (argparse refuses one; the forced
+command fixes the argv anyway) and no input: a byte already waiting on stdin is
+refused with `capabilities_takes_no_input`, and an open, silent stdin is never
+read. It reads no archive or receipt and never contacts the object store. It prints one
+line:
+
+```json
+{"v":1,"verifier_schemas":[2,50],"helper_schemas":[2,50],"helper_revision":"<40-hex>"}
+```
+
+`verifier_schemas` is the range the installed verifier accepts from its helper
+(`backup_r2_verifier.SCHEMAS`). `helper_schemas` and `helper_revision` describe
+the pinned helper image, which only root may inspect. They are read from a
+root-published file at a path fixed in code, never configured:
+`/var/lib/deedkit-backup-r2/published/capabilities.json`. The mode is enabled by
+`verifier_config_file` in the receiver configuration: the absolute path of the
+installed service's verifier configuration, outside `state_directory` (set the
+same value in the root operator copy).
+
+The publisher of that file is not part of this release; it comes with the
+receiver's update follow (ANYM-597). Until it exists, `capabilities` answers
+`capabilities_unavailable` and the deployer waits, as it does for every answer
+it cannot prove. The reader accepts a file only when it is root-owned,
+single-link, world-readable and not group/other-writable, under root-owned
+ancestors that are not group/other writable, and exactly
+`{"v":1,"verifier_config":{…},"helper_revision":"<40-hex>","helper_schemas":[first,last]}`.
+`verifier_config` must name `verifier_config_file` and its current path, device,
+inode, size, modification and change times. `capabilities` compares them with a
+`stat` of that file, which needs only search permission on its directories,
+never read access to the private file. Any edit, replacement, removal or symlink
+of the verifier configuration after the publication makes it stale. A missing,
+unreadable, malformed or stale file answers `capabilities_unavailable`. Keep the
+verifier configuration's directories searchable by the upload account (as for
+`receive.json`), or the answer is always `capabilities_unavailable`.
+
+Undo: remove the capabilities key line from `authorized_keys` and
+`verifier_config_file` from the receiver configuration; the upload and cold keys
+and `receive` are unchanged by this key.
+
 Backup quota inventory, verified-point rotation and the verifier only address
 `<prefix>/objects/` and `<prefix>/receipts/`: cold copies never occupy a backup
 slot and rotation never deletes them. Cleanup of incomplete multipart uploads

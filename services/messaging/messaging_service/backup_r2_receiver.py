@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import signal
 import stat
 import struct
@@ -29,6 +30,9 @@ MIB = 1024 ** 2
 STREAM_RESUMES = 5
 # Codes our own SIGALRM/SIGTERM handlers raise; an SDK may wrap them.
 SIGNAL_CODES = {'receiver_timeout', 'restore_deadline', 'restore_stopped'}
+# The root-published helper facts `capabilities` reads (written by the receiver's
+# update follow, ANYM-597). A fixed path, never configured.
+CAPABILITIES_FILE = Path('/var/lib/deedkit-backup-r2/published/capabilities.json')
 # The deadline/stop our signal handlers raised. botocore's retry loop can swallow it and
 # return a later attempt's success, so its retry hook and every cloud call re-raise it.
 CANCELLED = []
@@ -109,7 +113,10 @@ def load_config(path):
     defaults = {'max_bytes': 64 * 1024 ** 3, 'quota_bytes': 128 * 1024 ** 3,
                 'max_objects': 2, 'part_bytes': 64 * MIB, 'timeout_seconds': 7200,
                 'cold_max_bytes': 5 * 1024 ** 3}
-    if (not isinstance(value, dict) or not required <= set(value) or set(value) - required - set(defaults) or
+    # Optional `verifier_config_file`: the installed service's verifier config, the one
+    # whose publication (CAPABILITIES_FILE) `capabilities` accepts; it enables the mode.
+    if (not isinstance(value, dict) or not required <= set(value) or
+            set(value) - required - set(defaults) - {'verifier_config_file'} or
             type(value['v']) is not int or value['v'] != 1):
         raise ValueError('invalid_config')
     value = {**defaults, **value}
@@ -126,10 +133,17 @@ def load_config(path):
             not 60 <= value['timeout_seconds'] <= 21600 or
             not 64 <= value['cold_max_bytes'] <= min(5 * 1024 ** 4, value['part_bytes'] * 10000)):
         raise ValueError('invalid_limits')
-    for key in ('state_directory', 'credentials_file'):
-        if not isinstance(value[key], str) or not Path(value[key]).is_absolute() or '..' in Path(value[key]).parts:
+    for key in ('state_directory', 'credentials_file', 'verifier_config_file'):
+        if key in value and (not isinstance(value[key], str) or not Path(value[key]).is_absolute() or
+                             '..' in Path(value[key]).parts):
             raise ValueError('invalid_config_path')
     state = Path(value['state_directory'])
+    # The upload UID owns its state; a publication it could write is no root answer.
+    # `//x` is another spelling of `/x` that path comparisons would miss.
+    if 'verifier_config_file' in value and (value['verifier_config_file'].startswith('//') or
+                                            Path(value['verifier_config_file']).is_relative_to(state) or
+                                            CAPABILITIES_FILE.is_relative_to(state)):
+        raise ValueError('invalid_config_path')
     if any(p.is_symlink() for p in (state, *state.parents)) or not state.is_dir() or state.stat().st_mode & 0o077:
         raise ValueError('private_receiver_directory_required')
     credentials(value)
@@ -1103,12 +1117,74 @@ def cold_serve(config, source, sink, *, client=None):
         cold_put(config, client, key, source, respond, state_fd)
 
 
+def config_identity(path):
+    """What any rewrite, replacement or removal of the root verifier config changes.
+
+    Visible to the upload UID without reading the private file (search permission only).
+    """
+    info = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError('capabilities_unavailable')
+    return {'path': str(path), 'dev': info.st_dev, 'ino': info.st_ino, 'size': info.st_size,
+            'mtime_ns': info.st_mtime_ns, 'ctime_ns': info.st_ctime_ns}
+
+
+def published_helper(config):
+    """Read the root verifier's publication: root-owned, world-readable, not writable by others, one link.
+
+    It names the verifier config it was made from; once that config changed, it is stale.
+    """
+    if 'verifier_config_file' not in config:
+        raise ValueError('capabilities_unavailable')
+    path = CAPABILITIES_FILE
+    try:
+        with local.trusted_directory(path.parent) as parent_fd:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+            with os.fdopen(fd, 'rb') as source:
+                info = os.fstat(source.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or
+                        info.st_mode & 0o022 or not info.st_mode & 0o004 or info.st_size > 4096):
+                    raise ValueError('capabilities_unavailable')
+                value = unique_json(source.read(4097))
+        bound = value.get('verifier_config') if isinstance(value, dict) else None
+        # Only the installed service's config counts: a staged copy's publication is refused.
+        if (not isinstance(bound, dict) or bound.get('path') != str(Path(config['verifier_config_file'])) or
+                config_identity(bound['path']) != bound):
+            raise ValueError('capabilities_unavailable')
+    except (OSError, ValueError):
+        raise ValueError('capabilities_unavailable') from None
+    schemas = value.get('helper_schemas')
+    if (set(value) != {'v', 'verifier_config', 'helper_revision', 'helper_schemas'} or
+            type(value['v']) is not int or value['v'] != 1 or
+            not isinstance(value['helper_revision'], str) or not re.fullmatch('[a-f0-9]{40}', value['helper_revision']) or
+            not isinstance(schemas, list) or len(schemas) != 2 or any(type(item) is not int for item in schemas) or
+            not 2 <= schemas[0] <= schemas[1]):
+        raise ValueError('capabilities_unavailable')
+    return value
+
+
+def capabilities(config, source):
+    """Report the schema ranges this receiver's verifier and pinned helper read.
+
+    Reached only through its own forced-command key. It takes no input and reads
+    no archive, receipt or object store: only installed code and one root file.
+    """
+    # A pending byte is refused; an open, silent stdin is left unread.
+    if select.select([source], [], [], 0)[0] and os.read(source.fileno(), 1):
+        raise ValueError('capabilities_takes_no_input')
+    from . import backup_r2_verifier as verifier
+    helper = published_helper(config)
+    return {'v': 1, 'verifier_schemas': [verifier.SCHEMAS[0], verifier.SCHEMAS[-1]],
+            'helper_schemas': helper['helper_schemas'], 'helper_revision': helper['helper_revision']}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
     commands = parser.add_subparsers(dest='command')
     commands.add_parser('receive')
     commands.add_parser('cold')
+    commands.add_parser('capabilities')
     fetch = commands.add_parser('download')
     fetch.add_argument('--id', required=True)
     fetch.add_argument('--output', type=Path, required=True)
@@ -1133,7 +1209,10 @@ def main(argv=None):
             # A separate forced-command key fixes this argv; it writes its own frames.
             cold_serve(config, sys.stdin.buffer, sys.stdout.buffer)
             return 0
-        if args.command == 'download':
+        if args.command == 'capabilities':
+            # Its own forced-command key fixes this argv; argparse refuses any argument.
+            result = capabilities(config, sys.stdin.buffer)
+        elif args.command == 'download':
             result = download(config, args.id, args.output)
         elif args.command == 'protect':
             result = protect(config, args.protected_file, args.restore_proof)
@@ -1151,7 +1230,7 @@ def main(argv=None):
                 'storage_unavailable', 'receiver_timeout', 'completion_outcome_unknown', 'receipt_outcome_unknown',
                 'creation_outcome_unknown', 'unresolved_upload_required', 'incomplete_upload_aborted_retry',
                 'uploader_lock_initialization_required', 'invalid_cold_request', 'cold_size_limit',
-                'cold_object_missing'}
+                'cold_object_missing', 'capabilities_unavailable', 'capabilities_takes_no_input'}
         error = str(exc) if str(exc) in safe else 'receiver_failed'
         print(json.dumps({'v': 1, 'status': 'error', 'code': error}), flush=True)
         return 1

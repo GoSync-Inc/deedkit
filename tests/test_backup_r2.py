@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import struct
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -716,3 +717,134 @@ def test_sent_cold_completion_blocks_replacement_until_it_is_settled(config,age_
     cloud.objects[key]=r2.AGE_HEADER+b'the earlier completion landed'*4
     responses,_=cold(config,cloud,'put',data=data)
     assert responses==[{'v':1,'status':'exists','key':key,'bytes':len(cloud.objects[key])}] and not journal.exists()
+
+
+def silent_stdin(monkeypatch,data=b'',*,close=True):
+    read,write=os.pipe();os.write(write,data)
+    if close:os.close(write);write=None
+    monkeypatch.setattr(r2.sys,'stdin',SimpleNamespace(buffer=os.fdopen(read,'rb')))
+    return write
+
+@pytest.fixture
+def published(config,tmp_path,monkeypatch):
+    """The root verifier's helper publication: ownership virtualized; modes, links and FDs real."""
+    original=os.fstat;upload_owned=set()
+    ancestors={(p.stat().st_dev,p.stat().st_ino) for p in (tmp_path,*tmp_path.parents)}
+    def root_view(fd):
+        info=original(fd);values=list(info)
+        values[4]=1000 if (info.st_dev,info.st_ino) in upload_owned else 0
+        if (info.st_dev,info.st_ino) in ancestors:values[0]&=~0o022
+        return os.stat_result(values)
+    monkeypatch.setattr(os,'fstat',root_view)
+    control=tmp_path/'published';control.mkdir();control.chmod(0o755)
+    path=control/'capabilities.json'
+    # The root verifier config: private, but its identity is visible to the upload UID.
+    verifier_config=tmp_path/'verifier.json';write_json(verifier_config,{'synthetic':'verifier config'})
+    def good():return {'v':1,'verifier_config':r2.config_identity(verifier_config),'helper_revision':'c'*40,'helper_schemas':[2,51]}
+    def publish(raw=None,*,mode=0o644,root=True):
+        path.write_bytes(r2.encoded(good()) if raw is None else raw)
+        path.chmod(mode)
+        if not root:upload_owned.add((path.stat().st_dev,path.stat().st_ino))
+    config_path=tmp_path/'config.json'
+    monkeypatch.setattr(r2,'CAPABILITIES_FILE',path)
+    write_json(config_path,{**json.loads(config_path.read_text()),'verifier_config_file':str(verifier_config)})
+    return SimpleNamespace(publish=publish,config=str(config_path),path=path,verifier_config=verifier_config,good=good)
+
+
+# spec: ANYM-589
+def test_capabilities_prints_only_the_installed_verifier_and_helper_ranges(published,monkeypatch,capsys):
+    from messaging_service import backup_r2_verifier as verifier
+    published.publish();silent_stdin(monkeypatch)
+    monkeypatch.setattr(r2,'make_client',lambda conf:pytest.fail('capabilities reached the object store'))
+    monkeypatch.setattr(r2,'receive',lambda *a,**kw:pytest.fail('capabilities read an archive'))
+    assert r2.main(['--config',published.config,'capabilities'])==0
+    first,last=verifier.SCHEMAS[0],verifier.SCHEMAS[-1]
+    assert capsys.readouterr().out==('{"v":1,"verifier_schemas":[%d,%d],"helper_schemas":[2,51],"helper_revision":"%s"}\n'
+                                     %(first,last,'c'*40))
+
+
+# spec: ANYM-589
+def test_capabilities_refuses_an_argument_or_input(published,monkeypatch,capsys):
+    published.publish()
+    for extra in (['extra'],['--id',BID],['--output','/tmp/x']):
+        with pytest.raises(SystemExit) as refused:r2.main(['--config',published.config,'capabilities',*extra])
+        assert refused.value.code==2
+    capsys.readouterr()
+    silent_stdin(monkeypatch,b'{"v":2,"id":"forged"}\n')
+    assert r2.main(['--config',published.config,'capabilities'])==1
+    assert json.loads(capsys.readouterr().out)=={'v':1,'status':'error','code':'capabilities_takes_no_input'}
+    # An open, silent stdin (ssh without -n) is no input: it answers without reading it.
+    write=silent_stdin(monkeypatch,close=False)
+    try:assert r2.main(['--config',published.config,'capabilities'])==0
+    finally:os.close(write)
+    assert set(json.loads(capsys.readouterr().out))=={'v','verifier_schemas','helper_schemas','helper_revision'}
+
+
+# spec: ANYM-589
+@pytest.mark.parametrize('case',['unconfigured','missing','unreadable','upload_owned','group_writable','symlink','hardlink',
+                                 'malformed','duplicate_field','extra_field','reversed_range','boolean_bound','short_revision',
+                                 'oversized','unbound','config_edited','config_replaced','config_removed','config_symlink',
+                                 'config_relative','other_config','config_ctime_only'])
+def test_capabilities_without_a_trusted_helper_publication_is_unavailable(published,monkeypatch,capsys,case):
+    good=published.good();bound=good['verifier_config']
+    raws={'malformed':b'{"v":1,','duplicate_field':r2.encoded(good).replace(b'{"helper',b'{"v":1,"helper',1),
+          'extra_field':r2.encoded({**good,'verifier_schemas':[2,99]}),'reversed_range':r2.encoded({**good,'helper_schemas':[51,2]}),
+          'boolean_bound':r2.encoded({**good,'helper_schemas':[True,51]}),'short_revision':r2.encoded({**good,'helper_revision':'c'*7}),
+          'oversized':r2.encoded({**good,'pad':'x'*8192}),'unbound':r2.encoded({k:v for k,v in good.items() if k!='verifier_config'}),
+          'config_relative':r2.encoded({**good,'verifier_config':{**bound,'path':'verifier.json'}})}
+    if case=='other_config':
+        # Bound to a staged copy, not the installed service's config: refused although it matches its own file.
+        staged=published.verifier_config.with_name('verifier.next.json');write_json(staged,{'synthetic':'staged'})
+        raws[case]=r2.encoded({**good,'verifier_config':r2.config_identity(staged)})
+    modes={'group_writable':0o664,'unreadable':0o640}
+    published.publish(raws.get(case),mode=modes.get(case,0o644),root=case!='upload_owned')
+    # A publication made from an older verifier config (a pin changed since) is stale.
+    if case=='config_edited':write_json(published.verifier_config,{'synthetic':'verifier config','helper_revision':'d'*40})
+    elif case=='config_ctime_only':
+        # Same inode and size, mtime put back (`cp -p`, `touch -r`): only ctime moved.
+        before=os.stat(published.verifier_config);raw=published.verifier_config.read_bytes()
+        time.sleep(0.01);published.verifier_config.write_bytes(raw.replace(b'verifier config',b'verifier CONFIG'))
+        os.utime(published.verifier_config,ns=(before.st_atime_ns,before.st_mtime_ns))
+        after=os.stat(published.verifier_config)
+        assert (after.st_ino,after.st_size,after.st_mtime_ns)==(before.st_ino,before.st_size,before.st_mtime_ns)
+        assert after.st_ctime_ns!=before.st_ctime_ns
+    elif case=='config_replaced':
+        new=published.verifier_config.with_name('verifier.json.new');new.write_bytes(published.verifier_config.read_bytes())
+        new.chmod(0o600);new.replace(published.verifier_config)
+    elif case=='config_removed':published.verifier_config.unlink()
+    elif case=='config_symlink':
+        real=published.verifier_config.with_name('verifier-real.json');published.verifier_config.rename(real)
+        published.verifier_config.symlink_to(real)
+    elif case=='unconfigured':
+        write_json(Path(published.config),{k:v for k,v in json.loads(Path(published.config).read_text()).items()
+                                           if k!='verifier_config_file'})
+    elif case=='missing':published.path.unlink()
+    elif case=='symlink':
+        target=published.path.with_name('real.json');published.path.rename(target);published.path.symlink_to(target)
+    elif case=='hardlink':os.link(published.path,published.path.with_name('second.json'))
+    silent_stdin(monkeypatch)
+    assert r2.main(['--config',published.config,'capabilities'])==1
+    assert json.loads(capsys.readouterr().out)=={'v':1,'status':'error','code':'capabilities_unavailable'}
+
+
+# spec: ANYM-589
+def test_capabilities_file_stays_outside_upload_state_and_leaves_receive_unchanged(config,tmp_path,monkeypatch):
+    path=tmp_path/'config.json';value=json.loads(path.read_text());good={'verifier_config_file':str(tmp_path/'verifier.json')}
+    # The publication path is fixed: the configuration cannot name one.
+    assert r2.CAPABILITIES_FILE==Path('/var/lib/deedkit-backup-r2/published/capabilities.json')
+    write_json(path,{**value,**good,'capabilities_file':str(tmp_path/'elsewhere.json')})
+    with pytest.raises(ValueError,match='invalid_config'):r2.load_config(path)
+    for bad in ('relative/verifier.json',str(Path(config['state_directory'])/'verifier.json'),'/etc/../tmp/v.json',7,
+                '/'+str(tmp_path/'verifier.json')):
+        write_json(path,{**value,'verifier_config_file':bad})
+        with pytest.raises(ValueError,match='invalid_config_path'):r2.load_config(path)
+    # A state directory holding the fixed publication path cannot enable the mode.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(r2,'CAPABILITIES_FILE',Path(config['state_directory'])/'published/capabilities.json')
+        write_json(path,{**value,**good})
+        with pytest.raises(ValueError,match='invalid_config_path'):r2.load_config(path)
+    write_json(path,{**value,**good})
+    loaded=r2.load_config(path);cloud=Cloud()
+    assert receive(loaded,cloud)['status']=='stored'
+    responses,_=cold(loaded,cloud,'put',data=r2.AGE_HEADER+b'synthetic cold ciphertext'*8)
+    assert responses[-1]['status']=='stored'

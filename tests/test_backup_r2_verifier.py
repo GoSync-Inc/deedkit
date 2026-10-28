@@ -583,6 +583,16 @@ def test_receiver_timeout_never_leaks_into_a_later_healthy_stream(monkeypatch,ca
     assert out.getvalue()==data
 
 
+# spec: ANYM-589
+def test_server_verifier_proof_range_is_the_published_verifier_schemas():
+    v=module();receipt={'wire':{'id':'20261016T091703Z-fedcba9876543210','bytes':100,'sha256':'a'*64,'snapshot_sha256':'b'*64}}
+    for version,accepted in ((v.SCHEMAS[0],True),(v.SCHEMAS[-1],True),(v.SCHEMAS[0]-1,False),(v.SCHEMAS[-1]+1,False)):
+        facts={'v':1,'status':'verified','schema_version':version,'manifest_sha256':'b'*64,'checks':{k:True for k in r2.CHECKS}}
+        if accepted:assert v.make_proof(receipt,facts,'c'*32)['verification']['schema_version']==version
+        else:
+            with pytest.raises(ValueError,match='invalid_helper_result'):v.make_proof(receipt,facts,'c'*32)
+
+
 class PipeStdin:
     """The helper's stdin after the helper exited: every write breaks the pipe."""
     def __init__(self):self.closed=False;self.writes=0
