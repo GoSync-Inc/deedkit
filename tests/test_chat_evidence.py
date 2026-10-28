@@ -199,8 +199,11 @@ def test_a_filter_that_names_no_visible_chat_points_to_list_chats(seeded):
     # An absent and a hidden account read alike, and the next step is a real operation that needs no reference
     # the agent lacks: list_chats shows the accounts and chats the key may search.
     catalog=json.loads((Path(__file__).resolve().parents[1]/'services/gateway/src/agent_gateway/catalog.json').read_text())
-    evidence=[s.search(b,accounts=[account],query='missing')['result_evidence'] for account in ('absent-account','whatsapp-demo-1')]
-    assert evidence[0]==evidence[1]
-    assert evidence[0]['empty_reason']=='not_found_or_not_permitted'
-    assert evidence[0]['next_action']=='list_chats'
+    for read in (lambda account:s.search(b,accounts=[account],query='missing'),
+                 lambda account:s.search_files(b,accounts=[account],query='missing'),
+                 lambda account:s.search_files(b,accounts=[account],query='missing',include_coverage=False)):
+        evidence=[read(account)['result_evidence'] for account in ('absent-account','whatsapp-demo-1')]
+        assert evidence[0]==evidence[1]
+        assert evidence[0]['empty_reason']=='not_found_or_not_permitted'
+        assert evidence[0]['next_action']=='list_chats'
     assert any(tool.get('operation')=='list_chats' for tool in catalog)
