@@ -46,7 +46,13 @@ MIRROR = 'follow-main.git'
 CURRENT = 'follow-current.json'
 PREVIOUS = 'follow-previous.json'
 STATUS = 'follow-status.json'
+# A switch in progress (from, to, the image it drops): recovered before anything else.
+SWITCH = 'follow-switch.json'
+# An image this follow pulled and has not installed: removed when refused or after a crash.
+CANDIDATE = 'follow-candidate.json'
 SELF_TEST = 'selftest-'
+# Free space a candidate pull and its self-test may take, on top of the verifier's reserve.
+PULL_BYTES = 4 * verifier.GIB
 TEMPORARY = re.compile(r'\.capabilities\.json-[0-9a-f]{32}')
 # Answers that only mean "not now": the service exits cleanly and the next tick retries.
 WAITING = {'verifier_busy', 'verification_pending', 'helper_unattested', 'attestation_unreachable', 'main_unreachable'}
@@ -54,7 +60,8 @@ SAFE = WAITING | {'follow_config_mismatch', 'follow_not_forward', 'helper_attest
                   'attest_verifier_unavailable', 'helper_pull_failed', 'helper_schemas_unavailable',
                   'helper_self_test_mismatch', 'helper_self_test_failed', 'publication_directory_foreign',
                   'publication_foreign', 'publication_mount_point', 'untrusted_operator_ancestor',
-                  'no_previous_pair', 'invalid_follow_record'}
+                  'no_previous_pair', 'invalid_follow_record', 'follow_switch_unresolved', 'follow_disk_capacity',
+                  'publication_directory_private', 'invalid_verifier_config'}
 SCHEMA_PROBE = ('import json;from messaging_service.backup import SCHEMAS as s;'
                 'print(json.dumps([s.start,s.stop-1] if s.step==1 else None))')
 # The native drill's synthetic fixture (tests/test_backup_r2_verifier_native.py), run by the image under test.
@@ -167,35 +174,39 @@ class Docker(verifier.Docker):
                            stderr=subprocess.DEVNULL, timeout=min(1800, self.remaining()), check=True)
         except subprocess.CalledProcessError:raise RuntimeError('helper_pull_failed') from None
 
-    def helper_schemas(self, image):
-        """The backup schemas the image's own code reads (`backup.SCHEMAS`), from a networkless run."""
-        raw = self.command('run', '--rm', '--network', 'none', '--read-only', '--cap-drop=ALL',
-                           '--security-opt=no-new-privileges', '--memory=256m', '--pids-limit=64',
-                           '--label', verifier.LABEL + '.owned=1',
-                           '--tmpfs', verifier.PG_DATA_PATH + ':' + verifier.HELPER_TMPFS[verifier.PG_DATA_PATH],
-                           '--entrypoint', 'python', image, '-c', SCHEMA_PROBE)
-        try:value = r2.unique_json(raw)
-        except ValueError:value = None
-        if (not isinstance(value, list) or len(value) != 2 or any(type(item) is not int for item in value) or
-                not 2 <= value[0] <= value[1]):
-            raise ValueError('helper_schemas_unavailable')
-        return value
+    def docker_root(self):
+        root = self.command('info', '--format', '{{.DockerRootDir}}').decode().strip()
+        if not Path(root).is_absolute():raise ValueError('invalid_docker_data_root')
+        return root
+
+    def has_image(self, image):
+        try:self.inspect_image(image)
+        except RuntimeError:return False
+        return True
 
     def remove_image(self, image):
-        # Best effort: an image a container still uses stays; never a prune.
+        """Remove one exact image ID; never a prune. True once it is gone."""
         try:self.command('image', 'rm', image)
         except (RuntimeError, subprocess.TimeoutExpired):pass
+        try:return not self.has_image(image)
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired):return False
 
 
 def fixture_run(run):
     return hashlib.sha256(run.encode()).hexdigest()[:32]
 
 
+def self_test_containers(run):
+    """The exact names and owner run of a self-test's own containers."""
+    source = fixture_run(run)
+    return [(verifier.names(run)['helper'] + '-probe', run), (verifier.names(source)['helper'] + '-fixture', source)]
+
+
 def clear_self_test(engine, directory, run):
     """Remove one self-test's exact labelled resources and its workspace (also after a crash)."""
-    source = fixture_run(run); name = verifier.names(source)['helper'] + '-fixture'
-    if engine.inspect_owned('helper', name, source) is not None:engine.remove('helper', name)
-    verifier.cleanup_resources(engine, source); verifier.cleanup_resources(engine, run)
+    for name, owner in self_test_containers(run):
+        if engine.inspect_owned('helper', name, owner) is not None:engine.remove('helper', name)
+    verifier.cleanup_resources(engine, fixture_run(run)); verifier.cleanup_resources(engine, run)
     path = Path(directory) / (SELF_TEST + run)
     try:info = path.lstat()
     except FileNotFoundError:return
@@ -205,18 +216,32 @@ def clear_self_test(engine, directory, run):
 
 
 def self_test(engine, config):
-    """Restore a synthetic PG18 bundle, made and age-encrypted by the image under test, with
-    that image as the helper, through the verifier's own isolated restore. Returns the
-    proven schema version. A throwaway identity; the receiver's key is never mounted."""
+    """Read the image's `backup.SCHEMAS` in a networkless container, then restore a synthetic
+    PG18 bundle, made and age-encrypted by the image under test, with that image as the helper,
+    through the verifier's own isolated restore. Returns (schemas, proven schema version).
+    A throwaway identity; the receiver's key is never mounted. Every container is named and
+    labelled before it exists, so a crash or a hung one is removed by exact name later."""
     directory = Path(config['directory'])
     for name in os.listdir(directory):
         if name.startswith(SELF_TEST) and re.fullmatch('[0-9a-f]{32}', name[len(SELF_TEST):]):
             clear_self_test(engine, directory, name[len(SELF_TEST):])
     run = secrets.token_hex(16); source = fixture_run(run); root = directory / (SELF_TEST + run)
-    root.mkdir(mode=0o700)
+    root.mkdir(mode=0o700); local.fsync_dir(directory)
     fixture = root / 'fixture'; fixture.mkdir(mode=0o700)
     tested = {**config, 'identity_file': str(fixture / 'identity')}
+    (probe, _), (name, _) = self_test_containers(run)
+    pg_tmpfs = verifier.PG_DATA_PATH + ':' + verifier.HELPER_TMPFS[verifier.PG_DATA_PATH]
     try:
+        engine.command('container', 'create', '--name', probe, '--label', verifier.LABEL + '=' + run,
+                       '--label', verifier.LABEL + '.owned=1', '--network', 'none', '--read-only', '--cap-drop=ALL',
+                       '--security-opt=no-new-privileges', '--memory=256m', '--memory-swap=256m', '--pids-limit=64',
+                       '--tmpfs', pg_tmpfs, '--entrypoint', 'python', config['helper_image'], '-c', SCHEMA_PROBE)
+        raw = engine.command('container', 'start', '-a', probe); engine.remove('helper', probe)
+        try:schemas = r2.unique_json(raw)
+        except ValueError:schemas = None
+        if (not isinstance(schemas, list) or len(schemas) != 2 or any(type(item) is not int for item in schemas) or
+                not 2 <= schemas[0] <= schemas[1]):
+            raise ValueError('helper_schemas_unavailable')
         try:
             # age reads an OpenSSH ed25519 identity; the receiver has no age-keygen.
             subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', '', '-f', str(fixture / 'identity')],
@@ -234,11 +259,10 @@ def self_test(engine, config):
         verifier.write_secret(source_secrets / 'postgres.env', env)
         verifier.write_secret(source_secrets / 'worker.json', b'{}\n')
         engine.setup(tested, source, source_payload, source_secrets)
-        name = verifier.names(source)['helper'] + '-fixture'
         engine.command('container', 'create', '--name', name, '--label', verifier.LABEL + '=' + source,
                        '--label', verifier.LABEL + '.owned=1', '--network', verifier.names(source)['network'],
                        '--memory=512m', '--memory-swap=512m', '--cpus=1', '--pids-limit=256', '--log-driver=none',
-                       '--tmpfs', verifier.PG_DATA_PATH + ':' + verifier.HELPER_TMPFS[verifier.PG_DATA_PATH],
+                       '--tmpfs', pg_tmpfs,
                        '--env-file', str(source_secrets / 'postgres.env'), '--env', 'DEEDKIT_SYNTHETIC_RECIPIENT=' + recipient,
                        '--mount', 'type=bind,src=' + str(fixture) + ',dst=/fixture',
                        '--entrypoint', 'python', config['helper_image'], '-c', FIXTURE_SCRIPT)
@@ -251,13 +275,13 @@ def self_test(engine, config):
         receipt = {'wire': {'id': '20261028T000000Z-0000000000000597', 'bytes': cipher.stat().st_size,
                             'sha256': digest, 'snapshot_sha256': snapshot}, 'object_key': 'synthetic-self-test'}
         class Fixture:
-            def get_object(self, **kwargs):return {'ContentLength': cipher.stat().st_size, 'Body': cipher.open('rb')}
+            def get_object(self, **_):return {'ContentLength': cipher.stat().st_size, 'Body': cipher.open('rb')}
         verifier.write_secret(target_secrets / 'postgres.env', env)
         verifier.write_secret(target_secrets / 'worker.json', r2.encoded({
             'v': 1, 'identity_file': '/run/restore/identity', 'work_directory': '/work', 'database_host': 'restore-postgres',
             'database_password': password, 'snapshot_sha256': snapshot, 'max_plaintext_bytes': receipt['wire']['bytes']}))
         facts = engine.restore(tested, {'bucket': 'synthetic'}, Fixture(), receipt, run, target_payload, target_secrets)
-        return verifier.make_proof(receipt, facts, run)['verification']['schema_version']
+        return schemas, verifier.make_proof(receipt, facts, run)['verification']['schema_version']
     finally:
         clear_self_test(Docker(120) if isinstance(engine, verifier.Docker) else engine, directory, run)
 
@@ -265,15 +289,13 @@ def self_test(engine, config):
 def prove(engine, config, test):
     """Preflight, schema probe and self-test of one pinned pair: its follow record."""
     engine.preflight(config)
-    schemas = engine.helper_schemas(config['helper_image'])
-    if test(engine, config) != schemas[1]:raise ValueError('helper_self_test_mismatch')
+    schemas, version = test(engine, config)
+    if version != schemas[1]:raise ValueError('helper_self_test_mismatch')
     return {'v': 1, 'helper_image': config['helper_image'], 'helper_revision': config['helper_revision'],
             'helper_schemas': schemas, 'tested_at': verifier.now()}
 
 
-def read_record(fd, name):
-    _, value = r2.read_root(fd, name, missing=True)
-    if value is None:return None
+def valid_record(value):
     if (not isinstance(value, dict) or set(value) != {'v', 'helper_image', 'helper_revision', 'helper_schemas', 'tested_at'} or
             value['v'] != 1 or not isinstance(value['helper_image'], str) or not DIGEST.fullmatch(value['helper_image']) or
             not isinstance(value['helper_revision'], str) or not re.fullmatch('[0-9a-f]{40}', value['helper_revision']) or
@@ -281,6 +303,16 @@ def read_record(fd, name):
                  all(type(item) is int for item in value['helper_schemas'])))):
         raise ValueError('invalid_follow_record')
     return value
+
+
+def read_record(fd, name):
+    _, value = r2.read_root(fd, name, missing=True)
+    return None if value is None else valid_record(value)
+
+
+def unproven(config):
+    return {'v': 1, 'helper_image': config['helper_image'], 'helper_revision': config['helper_revision'],
+            'helper_schemas': None, 'tested_at': verifier.now()}
 
 
 def pinned(record, config):
@@ -298,6 +330,55 @@ def write_pins(path, image, revision):
     return installed
 
 
+def unlink(fd, name):
+    try:os.unlink(name, dir_fd=fd)
+    except FileNotFoundError:return
+    local.fsync_dir(fd)
+
+
+def finish_switch(fd, engine, journal):
+    """After the config holds `to`: the kept pair, the installed record, the dropped image."""
+    local.write_maintenance_json(PREVIOUS, journal['from'], dir_fd=fd)
+    if journal['to']['helper_schemas'] is None:unlink(fd, CURRENT)
+    else:local.write_maintenance_json(CURRENT, journal['to'], dir_fd=fd)
+    # The pair before the kept one is no undo any more.
+    if journal['drop'] is not None:engine.remove_image(journal['drop'])
+    unlink(fd, SWITCH)
+
+
+def switch(path, fd, engine, journal):
+    """Journal, then one atomic config replace, then the records: `from` survives every crash."""
+    local.write_maintenance_json(SWITCH, journal, dir_fd=fd)
+    config = write_pins(path, journal['to']['helper_image'], journal['to']['helper_revision'])
+    finish_switch(fd, engine, journal)
+    return config
+
+
+def recover(path, fd, engine, config):
+    """Finish or drop an interrupted switch, then remove an interrupted candidate's image."""
+    _, journal = r2.read_root(fd, SWITCH, missing=True)
+    if journal is not None:
+        if (not isinstance(journal, dict) or set(journal) != {'v', 'from', 'to', 'drop'} or journal['v'] != 1 or
+                not (journal['drop'] is None or (isinstance(journal['drop'], str) and DIGEST.fullmatch(journal['drop'])))):
+            raise ValueError('invalid_follow_record')
+        valid_record(journal['from']); valid_record(journal['to'])
+        if pinned(journal['to'], config):finish_switch(fd, engine, journal)
+        elif pinned(journal['from'], config):unlink(fd, SWITCH)
+        else:raise ValueError('follow_switch_unresolved')
+    _, candidate = r2.read_root(fd, CANDIDATE, missing=True)
+    if candidate is not None:
+        if not isinstance(candidate, dict) or set(candidate) != {'v', 'helper_image'} or not DIGEST.fullmatch(str(candidate['helper_image'])):
+            raise ValueError('invalid_follow_record')
+        drop_candidate(fd, engine, config, candidate['helper_image'])
+
+
+def drop_candidate(fd, engine, config, image):
+    """Remove a pulled, not installed image unless it is the installed or the kept pair's."""
+    previous = read_record(fd, PREVIOUS)
+    if image in (config['helper_image'], previous and previous['helper_image']) or engine.remove_image(image):
+        unlink(fd, CANDIDATE)
+
+
 def mount_points():
     points = set()
     with open('/proc/self/mountinfo', 'rb') as source:
@@ -308,32 +389,46 @@ def mount_points():
     return points
 
 
+def publication(value):
+    """Whether `value` has exactly the shape the receiver's reader accepts."""
+    bound = value.get('verifier_config') if isinstance(value, dict) else None
+    schemas = value.get('helper_schemas') if isinstance(value, dict) else None
+    return (isinstance(value, dict) and set(value) == {'v', 'verifier_config', 'helper_revision', 'helper_schemas'} and
+            type(value['v']) is int and value['v'] == 1 and isinstance(bound, dict) and
+            set(bound) == {'path', 'dev', 'ino', 'size', 'mtime_ns', 'ctime_ns'} and isinstance(bound['path'], str) and
+            all(type(bound[key]) is int for key in bound if key != 'path') and
+            isinstance(value['helper_revision'], str) and re.fullmatch('[0-9a-f]{40}', value['helper_revision']) is not None and
+            isinstance(schemas, list) and len(schemas) == 2 and all(type(item) is int for item in schemas))
+
+
 def publish(path, record):
     """Write CAPABILITIES_FILE, bound to the verifier config's current identity.
 
-    Only its own files live in that root directory, the file it replaces must be a
-    publication, and the directory must not be a mount point: fail closed otherwise.
+    Every check runs before any change: the directory is no mount point, holds only
+    this file (and its own temporaries), and the file it replaces is a publication.
+    Only a directory this call created gets its mode set; fail closed otherwise.
     """
     value = {'v': 1, 'verifier_config': r2.config_identity(path), 'helper_revision': record['helper_revision'],
              'helper_schemas': record['helper_schemas']}
     target = r2.CAPABILITIES_FILE; directory = target.parent
     with local.trusted_directory(directory.parent) as parent:
-        try:os.mkdir(directory.name, 0o755, dir_fd=parent)
-        except FileExistsError:pass
+        try:
+            os.mkdir(directory.name, 0o700, dir_fd=parent); created = True
+        except FileExistsError:created = False
         fd = os.open(directory.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
         try:
             info = os.fstat(fd)
-            # Created under the service's 0077 umask: the upload account needs to search it.
-            if info.st_uid == 0 and info.st_mode & 0o777 == 0o700:os.fchmod(fd, 0o755)
+            if str(directory) in mount_points() or info.st_dev != os.fstat(parent).st_dev:
+                raise ValueError('publication_mount_point')
+            # The upload account reads it: searchable, never writable by others.
+            if created:os.fchmod(fd, 0o755); local.fsync_dir(parent)
+            elif info.st_mode & 0o005 != 0o005:raise ValueError('publication_directory_private')
         finally:os.close(fd)
-    if str(directory) in mount_points():raise ValueError('publication_mount_point')
     data = (json.dumps(value, separators=(',', ':')) + '\n').encode()
     with local.trusted_directory(directory) as fd:
         names = os.listdir(fd)
         if any(name != target.name and not TEMPORARY.fullmatch(name) for name in names):
             raise ValueError('publication_directory_foreign')
-        for name in names:
-            if TEMPORARY.fullmatch(name):os.unlink(name, dir_fd=fd)
         if target.name in names:
             existing = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
             with os.fdopen(existing, 'rb') as source:
@@ -341,9 +436,11 @@ def publish(path, record):
             try:old = r2.unique_json(raw)
             except ValueError:old = None
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or len(raw) > 4096 or
-                    not isinstance(old, dict) or set(old) != set(value) or old.get('v') != 1):
+                    not publication(old)):
                 raise ValueError('publication_foreign')
             if raw == data:return value
+        for name in names:
+            if TEMPORARY.fullmatch(name):os.unlink(name, dir_fd=fd)
         name = '.' + target.name + '-' + secrets.token_hex(16)
         out = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644, dir_fd=fd)
         try:
@@ -364,9 +461,33 @@ def load(path):
     return path, config
 
 
+def reload(path, config):
+    """The config as it is under the verifier lock: a run that loaded it earlier never acts on old pins."""
+    _, fresh = load(path)
+    if fresh['directory'] != config['directory']:raise ValueError('invalid_verifier_config')
+    return fresh
+
+
 def no_retry_pending(fd):
     # A retry journal pins its helper pair (backup_r2_verifier.run): never switch under it.
     if r2.read_root(fd, 'active.json', missing=True)[1] is not None:raise RuntimeError('verification_pending')
+
+
+def candidate(fd, engine, config, head, attest, test):
+    """Pull, check and self-test main's head image: its record. A refused pull is removed."""
+    proof = attest(head); image = proof['config_digest']
+    owned = not engine.has_image(image)
+    if owned:
+        if shutil.disk_usage(engine.docker_root()).free < config['reserve_bytes'] + PULL_BYTES:
+            raise ValueError('follow_disk_capacity')
+        # Recorded before the pull: a crash leaves an image the next run removes.
+        local.write_maintenance_json(CANDIDATE, {'v': 1, 'helper_image': image}, dir_fd=fd)
+    try:
+        engine.pull(proof['reference'])
+        return prove(engine, {**config, 'helper_image': image, 'helper_revision': head}, test)
+    except Exception:
+        if owned and not r2.CANCELLED:drop_candidate(fd, engine, config, image)
+        raise
 
 
 def follow(path, *, engine=None, main=None, attest=None, test=None):
@@ -377,7 +498,9 @@ def follow(path, *, engine=None, main=None, attest=None, test=None):
     with verifier.verifier_lock(config['directory']) as fd, verifier.deadline(3600):
         status = {'v': 1, 'status': 'current', 'revision': config['helper_revision'], 'checked_at': verifier.now()}
         try:
+            config = reload(path, config); status['revision'] = config['helper_revision']
             no_retry_pending(fd)
+            recover(path, fd, engine, config); config = reload(path, config)
             current = read_record(fd, CURRENT)
             if not pinned(current, config):current = None
             head = main.head(); refusal = untested = None
@@ -393,25 +516,17 @@ def follow(path, *, engine=None, main=None, attest=None, test=None):
                 status['candidate'] = head
                 try:
                     if not main.forward(config['helper_revision'], head):raise ValueError('follow_not_forward')
-                    proof = attest(head)
-                    engine.pull(proof['reference'])
-                    record = prove(engine, {**config, 'helper_image': proof['config_digest'], 'helper_revision': head}, test)
+                    record = candidate(fd, engine, config, head, attest, test)
                 except Exception as error:
                     if r2.CANCELLED:raise
                     refusal = error
                 else:
-                    kept = read_record(fd, PREVIOUS); replaced = config['helper_image']
-                    # The kept pair is written first: a crash before the switch leaves the old config.
-                    local.write_maintenance_json(PREVIOUS, {
-                        'v': 1, 'helper_image': config['helper_image'], 'helper_revision': config['helper_revision'],
-                        'helper_schemas': current['helper_schemas'] if current else None,
-                        'tested_at': current['tested_at'] if current else verifier.now()}, dir_fd=fd)
-                    config = write_pins(path, record['helper_image'], record['helper_revision'])
-                    local.write_maintenance_json(CURRENT, record, dir_fd=fd); current = record
+                    kept = read_record(fd, PREVIOUS)
+                    drop = kept['helper_image'] if kept and kept['helper_image'] not in (
+                        config['helper_image'], record['helper_image']) else None
+                    config = switch(path, fd, engine, {'v': 1, 'from': current or unproven(config), 'to': record, 'drop': drop})
+                    unlink(fd, CANDIDATE); current = record
                     status.update(status='switched', revision=head)
-                    # The pair before the kept one is no undo any more: drop its image.
-                    if kept and kept['helper_image'] not in (record['helper_image'], replaced):
-                        engine.remove_image(kept['helper_image'])
             if current is None:raise refusal or untested or RuntimeError('follow_failed')
             publish(path, current)
             if refusal is not None:raise refusal
@@ -431,22 +546,17 @@ def revert(path, *, engine=None):
     path, config = load(path)
     engine = engine if engine is not None else Docker(600)
     with verifier.verifier_lock(config['directory']) as fd:
+        config = reload(path, config)
         no_retry_pending(fd)
+        recover(path, fd, engine, config); config = reload(path, config)
         previous = read_record(fd, PREVIOUS)
         if previous is None:raise ValueError('no_previous_pair')
         engine.preflight({**config, 'helper_image': previous['helper_image'], 'helper_revision': previous['helper_revision']})
-        current = read_record(fd, CURRENT); proven = current if pinned(current, config) else None
-        replaced = {'v': 1, 'helper_image': config['helper_image'], 'helper_revision': config['helper_revision'],
-                    'helper_schemas': proven['helper_schemas'] if proven else None,
-                    'tested_at': proven['tested_at'] if proven else verifier.now()}
-        local.write_maintenance_json(PREVIOUS, replaced, dir_fd=fd)
-        write_pins(path, previous['helper_image'], previous['helper_revision'])
-        if previous['helper_schemas'] is None:
-            # Never self-tested here: no publication until a follow run proves it.
-            try:os.unlink(CURRENT, dir_fd=fd)
-            except FileNotFoundError:pass
-        else:
-            local.write_maintenance_json(CURRENT, previous, dir_fd=fd); publish(path, previous)
+        current = read_record(fd, CURRENT)
+        switch(path, fd, engine, {'v': 1, 'from': current if pinned(current, config) else unproven(config),
+                                  'to': previous, 'drop': None})
+        # A pair never proven here is not published until a follow run proves it.
+        if previous['helper_schemas'] is not None:publish(path, previous)
         status = {'v': 1, 'status': 'reverted', 'revision': previous['helper_revision'], 'checked_at': verifier.now()}
         local.write_maintenance_json(STATUS, status, dir_fd=fd)
         return status

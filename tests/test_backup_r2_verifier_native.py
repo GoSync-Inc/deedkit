@@ -172,8 +172,9 @@ def test_follow_self_test_restores_a_synthetic_bundle_made_by_the_image_under_te
             'identity_file':'/never/mounted/by/the/self-test'}
     try:
         engine.preflight(config)
-        schemas=engine.helper_schemas(IMAGE)
-        assert schemas==[verifier.SCHEMAS[0],verifier.SCHEMAS[-1]]
-        assert follow.self_test(engine,config)==schemas[1]
+        schemas,version=follow.self_test(engine,config)
+        assert schemas==[verifier.SCHEMAS[0],verifier.SCHEMAS[-1]] and version==schemas[1]
         assert list(root.iterdir())==[]
+        leftover=engine.command('container','ls','-a','--filter','label='+verifier.LABEL+'.owned=1','--format','{{.Names}}')
+        assert not [n for n in leftover.decode().split() if n.endswith(('-probe','-fixture'))]
     finally:shutil.rmtree(root)

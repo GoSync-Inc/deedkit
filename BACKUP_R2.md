@@ -399,15 +399,26 @@ as root, an hour after the previous run ends. Each run:
    `production.py` runs, empty environment), pulls that image by digest and runs
    the verifier's own preflight: image ID equal to the attested config digest,
    the source and revision labels, no unexpected volume;
+   A pull needs the verifier's `reserve_bytes` plus 4 GiB free on the Docker
+   data root (`follow_disk_capacity`); an image the follow pulled is recorded in
+   `follow-candidate.json` first and removed by exact ID when it is refused or
+   its run was interrupted, unless it is the installed or the kept pair's;
 4. reads the image's `backup.SCHEMAS` in a networkless, read-only container and
    self-tests it: the image makes a synthetic PG18 bundle, encrypts it with
    `age` to a throwaway ed25519 identity, and the verifier's isolated restore
    runs it with that image as the helper. The proven schema must equal the
-   image's last one. The receiver's identity is never mounted;
-5. writes the kept pair to `follow-previous.json`, then replaces
-   `verifier.json` atomically with only the two pins changed, records the
-   proven pair in `follow-current.json` and drops the image of the pair before
-   the kept one (best effort, never a prune);
+   image's last one. The receiver's identity is never mounted. Every self-test
+   container is named and labelled before it exists, so a hung or interrupted
+   one is stopped and removed by exact name;
+5. journals the switch (`follow-switch.json`: from, to, the image it drops),
+   replaces `verifier.json` atomically with only the two pins changed, then
+   writes the kept pair (`follow-previous.json`) and the proven installed pair
+   (`follow-current.json`), drops the image of the pair before the kept one
+   (by exact ID, never a prune) and removes the journal. The next run or
+   `revert` first finishes or drops an interrupted switch, so the kept pair
+   survives a crash at any step. The verifier reloads `verifier.json` under the
+   same lock, so a verification started before a switch never journals the old
+   pair;
 6. publishes `capabilities.json` for the proven installed pair. It writes only
    its own file in `/var/lib/deedkit-backup-r2/published/` (root, mode 0755,
    created if missing), refuses to replace a file that is not a publication or
