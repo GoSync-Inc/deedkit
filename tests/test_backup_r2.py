@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import struct
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -776,7 +777,7 @@ def test_capabilities_refuses_an_argument_or_input(published,monkeypatch,capsys)
 @pytest.mark.parametrize('case',['unconfigured','missing','unreadable','upload_owned','group_writable','symlink','hardlink',
                                  'malformed','duplicate_field','extra_field','reversed_range','boolean_bound','short_revision',
                                  'oversized','unbound','config_edited','config_replaced','config_removed','config_symlink',
-                                 'config_relative','other_config'])
+                                 'config_relative','other_config','config_ctime_only'])
 def test_capabilities_without_a_trusted_helper_publication_is_unavailable(published,monkeypatch,capsys,case):
     good=published.good();bound=good['verifier_config']
     raws={'malformed':b'{"v":1,','duplicate_field':r2.encoded(good).replace(b'{"helper',b'{"v":1,"helper',1),
@@ -792,6 +793,14 @@ def test_capabilities_without_a_trusted_helper_publication_is_unavailable(publis
     published.publish(raws.get(case),mode=modes.get(case,0o644),root=case!='upload_owned')
     # A publication made from an older verifier config (a pin changed since) is stale.
     if case=='config_edited':write_json(published.verifier_config,{'synthetic':'verifier config','helper_revision':'d'*40})
+    elif case=='config_ctime_only':
+        # Same inode and size, mtime put back (`cp -p`, `touch -r`): only ctime moved.
+        before=os.stat(published.verifier_config);raw=published.verifier_config.read_bytes()
+        time.sleep(0.01);published.verifier_config.write_bytes(raw.replace(b'verifier config',b'verifier CONFIG'))
+        os.utime(published.verifier_config,ns=(before.st_atime_ns,before.st_mtime_ns))
+        after=os.stat(published.verifier_config)
+        assert (after.st_ino,after.st_size,after.st_mtime_ns)==(before.st_ino,before.st_size,before.st_mtime_ns)
+        assert after.st_ctime_ns!=before.st_ctime_ns
     elif case=='config_replaced':
         new=published.verifier_config.with_name('verifier.json.new');new.write_bytes(published.verifier_config.read_bytes())
         new.chmod(0o600);new.replace(published.verifier_config)
