@@ -2077,7 +2077,7 @@
   },
   {
     "name": "calendar_capabilities",
-    "description": "Read-only. Granted calendars with allowed event actions, plus constraints: accepted time format, window/calendar/event limits, plan action limit and TTL, and unsupported writes (series, this-and-following, invitations). Read this before planning.",
+    "description": "Read-only. Granted calendars with allowed event actions, plus constraints: accepted time format, window/calendar/event limits, plan action limit and TTL. recurrence_write and future_split describe calendar_plan only (false: a plan never edits a whole series or this-and-following; invitations false: a plan never invites); series_write lists calendar_schedule's series scopes per provider (this, following, all). Read this before planning.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
