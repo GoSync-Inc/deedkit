@@ -7,6 +7,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from agent_gateway.app import create_app
+from agent_gateway.catalog import CATALOG, public
 from test_policy import config
 from test_transport import rpc
 
@@ -240,3 +241,25 @@ def test_calls_listings_need_read_scope_and_pass_owned_pages_through(tmp_path):
         ("/v1/list_briefs", {"limit": 5, "offset": 0}),
         ("/v1/list_calls", {"limit": 100, "offset": 0}),
     ]
+
+
+# spec: ANYM-392
+def test_tools_list_publishes_catalog_annotations_name_description_and_schemas_unchanged(tmp_path):
+    def backend(request):
+        return httpx.Response(200, json={"permissions": ["read", "cursor-write", "send"]})
+
+    tools = ["platform_capabilities", "messages_list_chats", "messages_preview_message", "messages_ack_updates",
+             "messages_send_message"]
+    app, _, _ = configured(tmp_path, backend, module="messaging", tools=tools, grants=["read", "cursor-write", "send"])
+    with TestClient(app) as client:
+        listed = {t["name"]: t for t in rpc(client, "tools/list").json()["result"]["tools"]}
+    assert set(listed) == set(tools)
+    for name in tools:
+        expected, tool = public(CATALOG[name]), listed[name]
+        assert tool["annotations"] == CATALOG[name]["annotations"], name
+        if name == "platform_capabilities":
+            # Only its description gains the catalog note; the reviewed text stays its prefix.
+            assert tool.pop("description").startswith(expected.pop("description"))
+        assert tool == expected, name
+    assert listed["messages_send_message"]["annotations"] == {"readOnlyHint": False, "destructiveHint": True,
+                                                              "idempotentHint": True, "openWorldHint": True}
