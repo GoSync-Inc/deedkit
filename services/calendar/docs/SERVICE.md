@@ -231,10 +231,12 @@ as the calendar knows them. `people` are member names (`people.label`, case and 
 caller's own member is added unless `exclude_me`. The window is checked first, then every name: an unknown name is
 `not_found` with `next` `calendar_members`; else the first name several members share, or only part of a label
 matches, is `selection_required` with one candidate per member (`kind: member`) whose `next` is the same request with
-that member's ID, every resolved name by ID and an ISO window as the checked instants, without `title`. For these
-candidates the gateway stops counting a `people` entry as payload only as a member ID or part of a relayed candidate's
+that member's ID, every resolved name by ID and an ISO window as the checked instants, without `title`. For each
+candidate the gateway stops counting a `people` entry as payload only as a member ID or part of that candidate's own
 label, and the `window` only as a named window or two timestamps; other entries, `title`, and the error's `hint` and
-top-level `next` keep the whole payload. A refreshing search (`refresh` omitted or true) waits in the calendar wait
+top-level `next` keep the whole payload. One partial match is still a selection. With two unresolved names the
+first one's candidates retry with the second name as asked, so the gateway relays them without `next`: name that
+member by ID. A refreshing search (`refresh` omitted or true) waits in the calendar wait
 pool, never the metadata pool.
 
 `window` is `today`, `tomorrow`, `this_week` or `next_week` (Monday to Monday) in the family timezone, `today` and

@@ -134,3 +134,21 @@ def test_a_refreshing_find_time_waits_in_the_calendar_wait_pool_and_leaves_contr
             assert budget.pending == 0
 
     asyncio.run(run())
+
+
+# spec: ANYM-553
+def test_only_a_candidates_own_label_exempts_a_name_in_its_retry(tmp_path):
+    marker = "confidential salary marker"
+    good = member("adult-b", "Anna", "tomorrow")
+    trailing = {**good, "next": {**good["next"], "arguments": {**good["next"]["arguments"],
+                                                                "people": ["adult-b", marker]}}}
+    # An invalid candidate whose label is the marker is discarded and exempts nothing for the others.
+    invalid = {"id": "", "kind": "member", "label": marker}
+    second = {**good, "next": {**good["next"], "arguments": {**good["next"]["arguments"], "people": ["adult-b", "Mash"]}}}
+    answer = {"error": "selection_required", "candidates": [trailing, invalid, second]}
+    with pytest.raises(Denied) as caught:
+        asyncio.run(gateway(tmp_path, answer).call("gateway-a", "calendar_find_time",
+                                                   {"people": ["Ann", marker, "Mash"], "window": "tomorrow"}))
+    # A second unresolved name ("Mash") is not in Anna's label: that retry is dropped too, id and label stay.
+    bare = {k: v for k, v in good.items() if k != "next"}
+    assert caught.value.detail["candidates"] == [bare, bare]

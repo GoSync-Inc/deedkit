@@ -219,3 +219,13 @@ def test_a_slot_preview_without_title_runs_and_a_reader_gets_slots_without_next(
     reader = store.agent("reader", "family", "adult-a", ["availability:read"], ["cal-a", "cal-child"])
     read = find(store, reader, people=["Masha"], window=DAY, duration=60)
     assert read["slots"] and all("next" not in slot for slot in read["slots"])
+
+
+# spec: ANYM-553
+def test_one_partial_match_is_a_selection_and_a_second_unresolved_name_stays_as_asked(store):
+    key = setup(store)
+    one = find(store, key, people=["Mash"], window="tomorrow")
+    assert one["error"] == "selection_required" and [c["id"] for c in one["candidates"]] == ["child"]
+    assert one["candidates"][0]["next"]["arguments"]["people"] == ["child"]
+    two = find(store, key, people=["Ann", "Mash"], window="tomorrow")
+    assert [c["next"]["arguments"]["people"] for c in two["candidates"]] == [["adult-b", "Mash"], ["helper", "Mash"]]

@@ -147,22 +147,21 @@ def resolver_query(name, values):
     return values
 
 
-def candidate_query(name, values, detail):
-    """The payload a relayed candidate is checked against. calendar_find_time's `people` (ANYM-553) are names too,
-    and a candidate's label and read-only retry repeat them and the `window`: there an entry stops being payload
-    only as a member ID or as part of a relayed candidate's label, and the `window` only as a named window or two
-    timestamps. Any other entry (an unknown trailing name, free text in `from`) and the `title` stay payload, and
-    the hint and top-level next keep the whole payload."""
+def candidate_query(name, values, candidate):
+    """The payload one relayed candidate is checked against. calendar_find_time's `people` (ANYM-553) are names too,
+    and a candidate's label and read-only retry repeat them and the `window`: for that candidate an entry stops being
+    payload only as a member ID or as part of its own label, and the `window` only as a named window or two
+    timestamps. Any other entry (an unknown trailing name, free text in `from`) and the `title` stay payload; another
+    candidate's label exempts nothing here, and the hint and top-level next keep the whole payload."""
     if name == "calendar_find_time" and isinstance(values, dict):
-        candidates = detail.get("candidates") if isinstance(detail, dict) else None
-        labels = [" ".join(c["label"].split()).casefold() for c in candidates or []
-                  if isinstance(c, dict) and isinstance(c.get("label"), str)] if isinstance(candidates, list) else []
+        label = candidate.get("label") if isinstance(candidate, dict) else None
+        label = " ".join(label.split()).casefold() if isinstance(label, str) else ""
 
         def member(entry):
             if not isinstance(entry, str):
                 return False
             wanted = " ".join(entry.split()).casefold()
-            return bool(EXACT_TO.fullmatch(entry)) or bool(wanted) and any(wanted in label for label in labels)
+            return bool(EXACT_TO.fullmatch(entry)) or bool(wanted and label) and wanted in label
 
         window = values.get("window")
         checked = (isinstance(window, str) and window in NAMED_WINDOWS) or (
@@ -198,6 +197,7 @@ def carries(value, payload):
 
 
 def relayed_error(detail, runnable, read_only, payload, candidate_payload=None):
+    # candidate_payload(candidate): the payload that candidate is checked against (default: the whole payload).
     """A backend error as the gateway relays it (ANYM-544). Every `next` (top level and per candidate) must run as
     given for this caller and route; a `hint`, `next` or candidate with the caller's payload, a phone number or a
     file name outside an ID or reference field is dropped. `selection_required` keeps a mutating continuation on
@@ -209,7 +209,7 @@ def relayed_error(detail, runnable, read_only, payload, candidate_payload=None):
     def safe(value, payload=payload):
         return runnable(value) and not carries(value, payload)
 
-    candidate_payload = payload if candidate_payload is None else candidate_payload
+    candidate_payload = candidate_payload or (lambda candidate: payload)
 
     if "next" in detail and not (safe(detail["next"]) and (detail.get("error") != "selection_required"
                                                            or detail["next"]["tool"] in read_only)):
@@ -217,7 +217,8 @@ def relayed_error(detail, runnable, read_only, payload, candidate_payload=None):
     if "candidates" in detail:
         kept = []
         for candidate in detail["candidates"] if isinstance(detail["candidates"], list) else []:
-            if isinstance(candidate, dict) and "next" in candidate and not safe(candidate["next"], candidate_payload):
+            own = candidate_payload(candidate)
+            if isinstance(candidate, dict) and "next" in candidate and not safe(candidate["next"], own):
                 candidate = {k: v for k, v in candidate.items() if k != "next"}
             if (isinstance(candidate, dict) and "last_activity" in candidate
                     and not (isinstance(candidate["last_activity"], str)
@@ -227,8 +228,7 @@ def relayed_error(detail, runnable, read_only, payload, candidate_payload=None):
                 validate_candidate(candidate)
             except ValueError:
                 continue
-            if not carries({k: v for k, v in candidate.items() if k not in ("next", "last_activity")},
-                           candidate_payload):
+            if not carries({k: v for k, v in candidate.items() if k not in ("next", "last_activity")}, own):
                 kept.append(candidate)
         more = len(kept) > MAX_CANDIDATES or detail.get("more") is True
         detail["candidates"] = kept[:MAX_CANDIDATES]
@@ -789,8 +789,8 @@ class Dispatch:
                     error.detail, lambda value: self.runnable(value, visible, module, current, principal, caps),
                     {n for n in visible if CATALOG[n].get("annotations", {}).get("readOnlyHint", False)},
                     caller_payload(resolver_query(name, values), tool.get("inputSchema")),
-                    caller_payload(candidate_query(name, resolver_query(name, values), error.detail),
-                                   tool.get("inputSchema")))
+                    lambda candidate: caller_payload(candidate_query(name, resolver_query(name, values), candidate),
+                                                     tool.get("inputSchema")))
             raise
         if module == "messaging":
             result = self.next_call(result, snapshot, agent, caps)

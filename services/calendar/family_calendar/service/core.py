@@ -637,13 +637,14 @@ class FamilyService:
             matches = exact or [m for m in members if wanted and wanted in norm(m["label"])]
             if not matches:
                 raise CalendarError("not_found", details={"next": {"tool": "calendar_members", "arguments": {}}})
-            asked.append(matches)
-        for i, matches in enumerate(asked):
-            if len(matches) == 1:
+            # Only one exact name or ID resolves; one partial match is still a selection.
+            asked.append((matches, len(exact) == 1))
+        people = [m[0]["member_id"] if one else name for (m, one), name in zip(asked, request["people"])]
+        for i, (matches, one) in enumerate(asked):
+            if one:
                 continue
             # The title stays out, since a relayed next must not repeat it.
             retry = {k: v for k, v in request.items() if k not in ("title", "refresh")}
-            people = [m[0]["member_id"] if len(m) == 1 else name for m, name in zip(asked, request["people"])]
             raise CalendarError("selection_required", details={"candidates": [
                 {"id": m["member_id"], "kind": "member", "label": m["label"][:200],
                  "next": {"tool": "calendar_find_time",
@@ -651,7 +652,7 @@ class FamilyService:
                 for m in matches[:10]
             ]})
         me = [] if request.get("exclude_me") else [m for m in members if m["member_id"] == p["person_id"]]
-        found = list({m["member_id"]: m for m in me + [m[0] for m in asked]}.values())
+        found = list({m["member_id"]: m for m in me + [m[0] for m, _ in asked]}.values())
         if not found:
             raise CalendarError("invalid_arguments", [{"field": "people", "reason": "required"}])
         return found
