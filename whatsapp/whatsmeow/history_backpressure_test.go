@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -193,5 +195,98 @@ func TestHistoryWorkerDefersLocalCapacityWithoutFailingProvider(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(p.Config.EventsDirectory, ".transport-failure")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("deferred download reported a transport failure", err)
+	}
+}
+
+// spec: ANYM-387
+func TestHistoryLaterAttemptsWaitFiveMinutes(t *testing.T) {
+	s := openTestStore(t)
+	enqueueHistoryFixture(t, s, "later-attempts")
+	now := time.Unix(1700000100, 0)
+	first, err := s.claimHistory(now)
+	if err != nil || first.Attempt != 1 || first.Next != now.Add(time.Minute).UnixMilli() {
+		t.Fatal("first retry is not one minute later", first, err)
+	}
+	if err = s.historyFailure(first, "history_download_failed"); err != nil {
+		t.Fatal(err)
+	}
+	now = time.UnixMilli(first.Next)
+	for attempt := 2; attempt <= maxHistoryAttempts; attempt++ {
+		job, err := s.claimHistory(now)
+		if err != nil || job.Attempt != attempt || job.Next != now.Add(5*time.Minute).UnixMilli() {
+			t.Fatal("later attempt does not wait 5 minutes", attempt, job, err)
+		}
+		if err = s.historyFailure(job, "history_download_failed"); err != nil {
+			t.Fatal(err)
+		}
+		if attempt < maxHistoryAttempts {
+			requirePythonHistoryStatus(t, s, "retrying", "history_download_failed", attempt)
+			if _, err = s.claimHistory(now.Add(5*time.Minute - time.Second)); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatal("claimed before the 5 minute backoff", attempt, err)
+			}
+		}
+		now = time.UnixMilli(job.Next)
+	}
+}
+
+// spec: ANYM-387
+func TestHistoryWorkerKeepsProviderReadyUnderFullSpool(t *testing.T) {
+	p := skipProvider(t)
+	owner := p.Capture.Owner
+	p.Client = nativeClient(&store.Device{ID: &owner})
+	// A @lid conversation needs no session-store lookup in the native history
+	// storage step, so the real worker path runs offline.
+	chat := "111111@lid"
+	var messages []*waHistorySync.HistorySyncMsg
+	for _, id := range []string{"w1", "w2", "w3"} {
+		messages = append(messages, &waHistorySync.HistorySyncMsg{Message: &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(chat), ID: proto.String(id)}, MessageTimestamp: proto.Uint64(1700000000), Message: &waE2E.Message{Conversation: proto.String("synthetic " + id)}}})
+	}
+	wire, err := proto.Marshal(&waHistorySync.HistorySync{SyncType: waHistorySync.HistorySync_RECENT.Enum(), Conversations: []*waHistorySync.Conversation{{ID: proto.String(chat), Messages: messages}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	writer := zlib.NewWriter(&compressed)
+	writer.Write(wire)
+	writer.Close()
+	n := fixtureMessage("full-spool-control", 1700000000)
+	n.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{HistorySyncNotification: &waE2E.HistorySyncNotification{InitialHistBootstrapInlinePayload: compressed.Bytes()}}}
+	if err = p.Capture.EnqueueHistory(n); err != nil {
+		t.Fatal(err)
+	}
+	// One export slot for three history messages.
+	p.Capture.MaxSpoolEntries = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.historyWorker(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	for deadline := time.Now().Add(15 * time.Second); ; {
+		raw, _ := readPrivate(filepath.Join(p.Config.EventsDirectory, ".history-status"), 4096)
+		var status map[string]any
+		if json.Unmarshal(raw, &status) == nil && status["state"] != "downloading" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("history worker did not run")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	requirePythonHistoryStatus(t, p.Capture, "captured", "", 1)
+	var rows, published int
+	p.Capture.db.QueryRow("SELECT COUNT(*),COALESCE(SUM(published),0) FROM capture").Scan(&rows, &published)
+	if rows != 3 || published != 1 || spoolFiles(t, p.Config.EventsDirectory) != 1 {
+		t.Fatal("history batch not journaled behind the full spool", rows, published)
+	}
+	if !p.ready.Load() {
+		t.Fatal("full spool in the history worker cleared readiness")
+	}
+	if _, err = os.Stat(filepath.Join(p.Config.EventsDirectory, ".transport-failure")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("full spool in the history worker recorded a transport failure", err)
 	}
 }

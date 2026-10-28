@@ -210,3 +210,28 @@ func TestSkipCounterIsContentFree(t *testing.T) {
 		t.Fatal("skip recorded a transport failure", err)
 	}
 }
+
+// spec: ANYM-387
+func TestHistoryBatchCountsMissingOrOutOfRangeTimestampAsInvalidMessage(t *testing.T) {
+	p := skipProvider(t)
+	owner := p.Capture.Owner
+	p.Client = nativeClient(&store.Device{ID: &owner})
+	chat := "111111@s.whatsapp.net"
+	item := func(id string, stamp *uint64) *waHistorySync.HistorySyncMsg {
+		return &waHistorySync.HistorySyncMsg{Message: &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(chat), ID: proto.String(id)}, MessageTimestamp: stamp, Message: &waE2E.Message{Conversation: proto.String("synthetic")}}}
+	}
+	data := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{
+		item("before", proto.Uint64(1700000000)), item("missing", nil), item("future", proto.Uint64(maxEnvelopeUnix+1)), item("after", proto.Uint64(1700000001)),
+	}}}}
+	if err := p.captureHistory(data); err != nil {
+		t.Fatal("an invalid timestamp stopped the batch", err)
+	}
+	if got := skipCounts(t, p.Capture); got["invalid_history_message"] != 2 || len(got) != 1 {
+		t.Fatal(got)
+	}
+	var n int
+	p.Capture.db.QueryRow("SELECT COUNT(*) FROM capture WHERE message_id IN('false_111111@c.us_before','false_111111@c.us_after')").Scan(&n)
+	if n != 2 {
+		t.Fatal("valid history around invalid timestamps not captured", n)
+	}
+}

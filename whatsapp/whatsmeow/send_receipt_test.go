@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -144,4 +145,29 @@ func TestNativeSendReceiptJournalIsPrivateExactBoundedAndContentFree(t *testing.
 		t.Fatal(err)
 	}
 	requireError(t, p.journalSendReceipt(receiptSendID, operationsChat, receipt), "spool_full")
+}
+
+// spec: ANYM-391
+func TestNativeSendReceiptJournalIsBoundedTo1000Entries(t *testing.T) {
+	capture := openTestStore(t)
+	p := &Provider{Config: capture.Config, Capture: capture}
+	receipt := map[string]any{"provider_message_id": "true_" + operationsChat + "_TESTSTANZA",
+		"archive_reference": map[string]any{"provider_chat_id": operationsChat, "provider_message_id": "true_" + operationsChat + "_TESTSTANZA"}}
+	if err := p.journalSendReceipt(receiptSendID, operationsChat, receipt); err != nil {
+		t.Fatal(err)
+	}
+	// 998 tiny pending entries: far below the 4 MiB byte bound.
+	dir := filepath.Join(p.Config.EventsDirectory, "send-receipts")
+	for i := 0; i < 998; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%020d-pending.json", i)), []byte("{}"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.journalSendReceipt(receiptSendID, operationsChat, receipt); err != nil {
+		t.Fatal("entry 1000 refused", err)
+	}
+	requireError(t, p.journalSendReceipt(receiptSendID, operationsChat, receipt), "spool_full")
+	if entries, _ := os.ReadDir(dir); len(entries) != 1000 {
+		t.Fatal("journal not bounded at 1000 entries", len(entries))
+	}
 }

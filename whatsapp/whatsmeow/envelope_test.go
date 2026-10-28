@@ -428,3 +428,39 @@ func TestNativeBusinessSenderFlagIsGatedAndStatedOnly(t *testing.T) {
 		}
 	}
 }
+
+// spec: ANYM-389
+func TestNativePNLIDObservationOnlyForOnePersonalPhoneAndOneLID(t *testing.T) {
+	pn20, lid := types.NewJID(strings.Repeat("9", 20), types.DefaultUserServer), types.NewJID("700", types.HiddenUserServer)
+	observations := func(sender, alt types.JID) []any {
+		t.Helper()
+		m := fixtureMessage("pair", 1700000000)
+		m.Info.Sender, m.Info.SenderAlt = sender, alt
+		v, err := NormalizeMessage(m, types.EmptyJID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v["identityObservations"].([]any)
+	}
+	for _, tc := range []struct{ sender, alt types.JID }{{lid, pn20}, {pn20, lid}} {
+		got := observations(tc.sender, tc.alt)
+		if len(got) != 1 {
+			t.Fatal("valid PN/LID pair not observed", tc.sender, tc.alt, got)
+		}
+		pair := got[0].(map[string]any)
+		if pair["pn"] != pn20.User+"@c.us" || pair["lid"] != "700@lid" || pair["identity_id"] != LegacyChatID(tc.sender) || pair["provenance"] != "whatsmeow_message_alt_v1" {
+			t.Fatal("wrong PN/LID observation", pair)
+		}
+	}
+	for name, tc := range map[string]struct{ sender, alt types.JID }{
+		"non_numeric_phone": {lid, types.NewJID("abc", types.DefaultUserServer)},
+		"21_digit_phone":    {lid, types.NewJID(strings.Repeat("1", 21), types.DefaultUserServer)},
+		"21_digit_lid":      {types.NewJID(strings.Repeat("7", 21), types.HiddenUserServer), pn20},
+		"two_phones":        {types.NewJID("111111", types.DefaultUserServer), pn20},
+		"two_lids":          {lid, types.NewJID("800", types.HiddenUserServer)},
+	} {
+		if got := observations(tc.sender, tc.alt); len(got) != 0 {
+			t.Fatal("unarchivable PN/LID pair observed", name, got)
+		}
+	}
+}

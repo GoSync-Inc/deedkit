@@ -1398,3 +1398,50 @@ func TestJoinFrameFromPythonKeepsConfirmedChat(t *testing.T) {
 		t.Fatalf("%#v", job.ExpectedChat)
 	}
 }
+
+// spec: ANYM-388
+func TestNativeOperationRequestUsesStrictDecoder(t *testing.T) {
+	// No client: a request that got past decoding would dereference it.
+	p := skipProvider(t)
+	for _, raw := range []string{
+		`{"operation":"send_location","provider_chat":"15551234567@c.us","expires_at":1,"raw_api":"danger"}`,
+		`{"operation":"send_location"} {}`,
+		`{"operation":42}`,
+	} {
+		_, err := p.handle(context.Background(), request{ID: 1, Method: "messenger_operation", Params: json.RawMessage(raw)}, func(any) error { return nil })
+		if err == nil || err.Error() != "operation_invalid_parameters" {
+			t.Fatalf("non-strict operation request %s: %v", raw, err)
+		}
+	}
+}
+
+// spec: ANYM-388
+func TestNativeGroupOperationOnNonGroupTargetIsOperationTargetInvalid(t *testing.T) {
+	params := map[string]map[string]any{"list_participants": {}, "rename_group": {"title": "Title"}, "set_group_description": {"description": "Description"},
+		"add_participant": {"user_id": "15559876543@c.us"}, "remove_participant": {"user_id": "15559876543@c.us"}, "promote_participant": {"user_id": "15559876543@c.us"},
+		"demote_participant": {"user_id": "15559876543@c.us"}, "leave_group": {}, "get_invite_link": {}, "revoke_invite_link": {}}
+	for op, values := range params {
+		for _, target := range []string{operationsChat, "15551234567@lid"} {
+			t.Run(op+"/"+target, func(t *testing.T) {
+				d := operationsFake(t)
+				provider := func() { t.Fatal("provider called for a non-group target") }
+				d.send = func(context.Context, types.JID, *waE2E.Message, whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+					provider()
+					return whatsmeow.SendResponse{}, nil
+				}
+				d.group = func(context.Context, types.JID) (*types.GroupInfo, error) { provider(); return nil, nil }
+				d.groupSettle = func(context.Context) error { provider(); return nil }
+				d.participants = func(context.Context, types.JID, []types.JID, whatsmeow.ParticipantChange) ([]types.GroupParticipant, error) {
+					provider()
+					return nil, nil
+				}
+				d.groupName = func(context.Context, types.JID, string) error { provider(); return nil }
+				d.groupDescription = func(context.Context, types.JID, string, string) error { provider(); return nil }
+				d.leave = func(context.Context, types.JID) error { provider(); return nil }
+				d.invite = func(context.Context, types.JID, bool) (string, error) { provider(); return "", nil }
+				_, err := executeOperation(context.Background(), operationJob(op, target, values), d)
+				requireError(t, err, "operation_target_invalid")
+			})
+		}
+	}
+}

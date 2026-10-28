@@ -486,3 +486,94 @@ func TestNativeRoundVideoDownloadsAndVerifiesWithVideoKeys(t *testing.T) {
 	}
 	requireNoNativeTemp(t, cfg.PagesDirectory)
 }
+
+// spec: ANYM-386
+func TestNativeMediaChangedReferenceIsRefusedWithReferenceChangedCode(t *testing.T) {
+	for _, mode := range []string{"filename", "mime", "bytes", "provider_id", "wrong_chat"} {
+		t.Run(mode, func(t *testing.T) {
+			req, cfg, m := mediaFixture(t, []byte("safe"))
+			switch mode {
+			case "filename":
+				req.Descriptor.Filename = "different.pdf"
+			case "mime":
+				req.Descriptor.Mime = "image/png"
+			case "bytes":
+				req.Descriptor.Bytes++
+			case "provider_id":
+				req.Descriptor.ProviderID = "different"
+			case "wrong_chat":
+				m.Info.Chat, _ = ParseChatID("15559999999@c.us")
+			}
+			downloads, emitted := 0, 0
+			err := downloadMedia(context.Background(), req, cfg, mediaPolicy, mediaGet(m), func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads++; return nil }, func([]byte) error { emitted++; return nil })
+			requireError(t, err, "media_reference_changed")
+			if downloads != 0 || emitted != 0 {
+				t.Fatal("changed reference fetched or emitted", downloads, emitted)
+			}
+		})
+	}
+}
+
+// spec: ANYM-386
+func TestNativeMediaViewOnceAndOversizeAreRefusedWithTheirCodes(t *testing.T) {
+	for mode, want := range map[string]string{"viewonce_flag": "unsupported_media_type", "viewonce_wrapper": "unsupported_media_type", "over_max_media_bytes": "media_size_limit"} {
+		t.Run(mode, func(t *testing.T) {
+			data := []byte("synthetic media bytes")
+			req, cfg, m := mediaFixture(t, data)
+			switch mode {
+			case "viewonce_flag":
+				m.IsViewOnce = true
+			case "viewonce_wrapper":
+				m.Message = &waE2E.Message{ViewOnceMessageV2: &waE2E.FutureProofMessage{Message: m.Message}}
+				m.RawMessage = m.Message
+			case "over_max_media_bytes":
+				cfg.MaxMediaBytes = int64(len(data)) - 1
+			}
+			downloads, emitted := 0, 0
+			err := downloadMedia(context.Background(), req, cfg, mediaPolicy, mediaGet(m), func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads++; return nil }, func([]byte) error { emitted++; return nil })
+			requireError(t, err, want)
+			if downloads != 0 || emitted != 0 {
+				t.Fatal("refused media fetched or emitted", downloads, emitted)
+			}
+		})
+	}
+}
+
+// spec: ANYM-386
+func TestNativeMediaChecksPolicyBeforeCacheReadAndAfterTemporaryCreation(t *testing.T) {
+	for _, revokeAt := range []string{"before_cache_read", "after_temporary_created"} {
+		t.Run(revokeAt, func(t *testing.T) {
+			req, cfg, m := mediaFixture(t, []byte("safe"))
+			policyCalls, gets, temps, downloads := 0, 0, 0, 0
+			// The first policy read allows the chat only in the second mode; every
+			// later read excludes it.
+			policy := func() (Policy, error) {
+				policyCalls++
+				p := allowedOperationPolicy()
+				if revokeAt == "before_cache_read" || policyCalls > 1 {
+					p.ExcludeChats = []string{operationsChat}
+				}
+				return p, nil
+			}
+			get := func(string, string) (*events.Message, error) { gets++; return m, nil }
+			createMediaTemp = func(dir, pattern string) (*os.File, error) { temps++; return os.CreateTemp(dir, pattern) }
+			t.Cleanup(func() { createMediaTemp = os.CreateTemp })
+			err := downloadMedia(context.Background(), req, cfg, policy, get, func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads++; return nil }, func([]byte) error { t.Fatal("excluded media emitted"); return nil })
+			requireError(t, err, "chat_excluded")
+			want := map[string][3]int{"before_cache_read": {1, 0, 0}, "after_temporary_created": {2, 1, 1}}[revokeAt]
+			if got := [3]int{policyCalls, gets, temps}; got != want || downloads != 0 {
+				t.Fatalf("policy/cache/temp calls %v want %v, downloads %d", got, want, downloads)
+			}
+			requireNoNativeTemp(t, cfg.PagesDirectory)
+		})
+	}
+}
+
+// spec: ANYM-386
+func TestNativeMediaProductionKeepaliveIntervalAndIdleTimeout(t *testing.T) {
+	// The watchdog itself is exercised with shortened values above; this pins the
+	// production defaults those tests replace.
+	if mediaKeepaliveInterval != 30*time.Second || mediaIdleTimeout != 2*time.Minute {
+		t.Fatal("production media watchdog values changed", mediaKeepaliveInterval, mediaIdleTimeout)
+	}
+}
