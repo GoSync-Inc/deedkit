@@ -41,9 +41,10 @@ def snapshot_stream_bound(directory,blob_root):
 
     Admission is still enforced against actual bytes on the receiver; this bound
     never authorizes unlimited output. It does not stage plaintext/ciphertext.
+    Sizes only: it reads no dump or original contents (ANYM-631).
     """
     from .backup import verify_bundle
-    manifest=verify_bundle(directory,blob_root=blob_root)
+    manifest=verify_bundle(directory,blob_root=blob_root,hash_dump=False,hash_originals=False)
     size=1024
     for name,path,digest in stream_members(directory,blob_root,manifest):
         if not valid_member(name):raise ValueError('invalid_backup_file')
@@ -55,12 +56,14 @@ def snapshot_stream_bound(directory,blob_root):
 def encrypt_snapshot_stream(directory,output,recipient,*,blob_root,age='age',expected_manifest_sha256=None):
     """Encrypt directly to a caller-owned bounded sink; originals are never copied.
 
-    The source CAS is immutable and read-only. Hash each original again while tar
-    reads it; report completion ONLY after source integrity and age exit succeed.
-    The receiver must await this result before committing its terminal frame.
+    The source CAS is immutable and read-only. Capture (or the retry's verify_bundle)
+    hashed each original; here only its size is checked before the first byte and
+    tar's reads hash it (ANYM-631). Report completion ONLY after source integrity
+    and age exit succeed. The receiver must await this result before committing
+    its terminal frame.
     """
     from .backup import verify_bundle
-    manifest=verify_bundle(directory,blob_root=blob_root)
+    manifest=verify_bundle(directory,blob_root=blob_root,hash_originals=False)
     with regular_source(Path(directory)/'manifest.json') as f:manifest_sha=hashlib.file_digest(f,'sha256').hexdigest()
     if expected_manifest_sha256 is not None and expected_manifest_sha256!=manifest_sha:
         raise RuntimeError('backup_source_changed')
