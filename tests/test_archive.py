@@ -391,3 +391,124 @@ def test_migration_checksum_and_restart_preserve_revisions(archive):
         with pytest.raises(RuntimeError,match='checksum'): s.migrate()
     finally:
         with s.pool.connection() as c: c.execute('UPDATE archive_migrations SET sha256=%s WHERE version=2',(saved,))
+
+
+UNREADABLE_FORMAT={'version':1,'state':'unknown','basis':None,'wire_sha256':None,'entities':None,
+    'unsupported_entities':[],'warnings':['native_entities_not_captured']}
+
+
+def wa_event(**changes):
+    body=changes.get('body','Первый текст lighthouse')
+    return event(**{'account':'archive-wa','platform':'whatsapp','chat':'900@lid','provider_id':'false_900@lid_3EB0SYNTH',
+        'sender':'900@lid','formatting':{'version':1,'state':'wire_observed','basis':'whatsapp_native_wire',
+            'wire_sha256':hashlib.sha256(body.encode()).hexdigest(),'entities':None,
+            'unsupported_entities':[],'warnings':['syntax_interpretation_unknown']},
+        'metadata':{'message_kind':'text','chat_type':'private'},**changes})
+
+
+def unreadable(**changes):
+    return wa_event(**{'body':'','media':[],'formatting':UNREADABLE_FORMAT,'origin':'reconcile',
+        'metadata':{'message_kind':'unknown','chat_type':'private'},
+        'sender_profile':{'display_name':'Synthetic Sender'},**changes})
+
+
+def archive_state(s,mid):
+    with s.pool.connection() as c:
+        return (c.execute('SELECT sender,body,revision,deleted,content_hash FROM messages WHERE id=%s',(mid,)).fetchone(),
+            [r['snapshot'] for r in c.execute('SELECT snapshot FROM message_revisions WHERE message=%s ORDER BY revision',(mid,))],
+            c.execute('SELECT revision,metadata FROM message_metadata WHERE message=%s',(mid,)).fetchone(),
+            [dict(r) for r in c.execute("SELECT id,state FROM media_jobs WHERE message=%s ORDER BY id",(mid,))],
+            c.execute('SELECT count(*) AS n FROM events WHERE message=%s',(mid,)).fetchone()['n'],
+            c.execute("SELECT count(*) AS n FROM sender_profiles WHERE account='archive-wa'").fetchone()['n'],
+            c.execute('SELECT count(*) AS n FROM message_conflicts WHERE message=%s',(mid,)).fetchone()['n'])
+
+
+# spec: ANYM-613
+@pytest.mark.parametrize('media',[[],[{'provider_id':'f1','mime':'image/jpeg','bytes':10,'filename':'p.jpg'}]])
+def test_unreadable_whatsapp_observation_is_not_a_conflict(archive,media):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    key=s.issue_key('wa-reader',['archive-wa'])
+    mid=ar.ingest(wa_event(media=media))['message']
+    before=archive_state(s,mid); shown=conversation_state(s,key,mid)
+    assert ar.ingest(unreadable())['outcome']=='unchanged'
+    # The retained revision, text, formatting, attachments and metadata stay; no revision,
+    # no event, no conflict and no sender profile from the empty observation.
+    assert archive_state(s,mid)==before
+    assert before[2]['metadata']['message_kind']=='text' and before[5]==0 and before[6]==0
+    assert conversation_state(s,key,mid)==shown
+    assert shown[0]['body']=='Первый текст lighthouse' and len(before[3])==len(media)
+
+
+def conversation_state(s,key,mid):
+    shown=s.get_context(key,mid,view='conversation')
+    with s.pool.connection() as c:
+        chat=c.execute('SELECT title,chat_type FROM chats c JOIN messages m ON m.chat=c.id WHERE m.id=%s',(mid,)).fetchone()
+    return shown['message'],shown['conversation_view'],chat
+
+
+# spec: ANYM-613
+def test_unreadable_whatsapp_observation_keeps_chat_and_presentation(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    key=s.issue_key('wa-reader',['archive-wa'])
+    mid=ar.ingest(wa_event(chat_title='Synthetic Contact'))['message']
+    before=archive_state(s,mid); shown=conversation_state(s,key,mid)
+    candidate=unreadable(chat_title='Other synthetic title',metadata={'message_kind':'unknown','chat_type':'group'})
+    assert ar.ingest(candidate)['outcome']=='unchanged'
+    assert archive_state(s,mid)==before and conversation_state(s,key,mid)==shown
+    assert shown[2]=={'title':'Synthetic Contact','chat_type':'private'}
+
+
+# spec: ANYM-613
+def test_unreadable_whatsapp_observation_of_a_textless_message_stays_conflict(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    ar.ingest(wa_event(body='',formatting=UNREADABLE_FORMAT,metadata={'message_kind':'photo','chat_type':'private'},
+        media=[{'provider_id':'f1','mime':'image/jpeg','bytes':10,'filename':'p.jpg'}]))
+    assert ar.ingest(unreadable())['outcome']=='conflict'
+
+
+# spec: ANYM-613
+@pytest.mark.parametrize('change,outcome',[
+    ({'metadata':{'message_kind':'text','chat_type':'private'}},'conflict'),
+    ({'metadata':{'message_kind':'document','chat_type':'private'}},'conflict'),
+    ({'metadata':{'chat_type':'private'}},'conflict'),
+    ({'metadata':{}},'conflict'),
+    ({'media':[{'provider_id':'f2','mime':'image/jpeg','bytes':10,'filename':'q.jpg'}]},'conflict'),
+    ({'body':'Другой текст','formatting':UNREADABLE_FORMAT},'conflict'),
+    ({'deleted':True},'deleted'),
+    ({'sent_at':'2026-10-01T11:59:59+00:00'},'conflict'),
+    ({'direction':'outgoing'},'conflict'),
+    ({'sender':'901@lid'},'conflict'),
+    ({'updated_at':'2026-10-01T12:01:00+00:00'},'edited')])
+def test_unreadable_whatsapp_rule_keeps_other_shapes(archive,change,outcome):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    ar.ingest(wa_event())
+    candidate=unreadable(**change)
+    if not candidate['metadata']:del candidate['metadata']
+    assert ar.ingest(candidate)['outcome']==outcome
+
+
+# spec: ANYM-613
+def test_unreadable_whatsapp_observation_keeps_deletion_precedence(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    deleted=ar.ingest(wa_event(provider_id='false_900@lid_3EB0GONE'))['message']
+    assert ar.ingest(wa_event(provider_id='false_900@lid_3EB0GONE',deleted=True,body='',formatting=UNREADABLE_FORMAT,
+        updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='deleted'
+    assert ar.ingest(unreadable(provider_id='false_900@lid_3EB0GONE',updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='tombstoned'
+    mid=ar.ingest(wa_event())['message']
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO provider_tombstones(account,provider_chat,provider_id,observed_at)
+            VALUES('archive-wa','900@lid','false_900@lid_3EB0SYNTH','2026-10-01T12:00:00+00:00')''')
+    assert ar.ingest(unreadable())['outcome']=='deleted'
+    assert archive_state(s,mid)[0]['deleted'] and archive_state(s,deleted)[0]['deleted']
+
+
+# spec: ANYM-613
+def test_unreadable_observation_rule_is_whatsapp_only(archive):
+    ar,s,key,_=archive
+    ar.ingest(event(metadata={'message_kind':'text'}))
+    assert ar.ingest(event(body='',metadata={'message_kind':'unknown'}))['outcome']=='conflict'
