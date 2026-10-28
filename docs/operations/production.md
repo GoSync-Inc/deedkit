@@ -221,15 +221,28 @@ ANYM-301); only `http-router` and `check-image` still build on the host.
   `org.opencontainers.image.source` or `io.deedkit.production.build` label does not
   match the commit, or whose pushed manifest does not carry the tested config
   digest (`scripts/publish_images.py`). There is no `latest` or other moving tag.
-- **Write-once tags.** A tag that already exists is never pushed again. A full
-  rerun reuses an existing attested image of the same commit; an image pushed by
-  an attempt that failed before attesting it is attested only when this attempt
-  still holds the same tested archive. Anything else fails the job without moving
-  the tag. If a tag is left pushed but unattested and its archive expired, the
-  commit has no published images until the owner deletes that package version.
+- **Staging tags (ANYM-602).** A new image is pushed under the staging tag
+  `<sha>-attempt-<run_id>-<run_attempt>` in the same package, attested there, and
+  gets its final tag `<sha>` only after `promote` verifies that attestation in
+  GitHub and in the registry. `promote` reads the manifest by the verified digest,
+  checks its SHA-256 and PUTs exactly those bytes under the final tag, so the
+  final digest is the attested one; `confirm` then requires each final tag of a
+  target this attempt staged to hold that digest. A push, attestation or
+  verification that fails leaves only the staging tag, and a full rerun (which
+  rebuilds the archives) publishes under its own staging tag. Staging tags are
+  never promoted later or read by `production.py`, which resolves only `<sha>`;
+  they stay in the package (the publish job never deletes package versions;
+  a cleanup is separate work).
+- **Write-once tags.** A final tag that already exists is never pushed again. A full
+  rerun reuses an existing attested image of the same commit, without an archive.
+  A final tag left with no GitHub provenance by a run before ANYM-602 is attested
+  only when this attempt still holds the same tested archive; anything else fails
+  the job without moving the tag, and with its archive expired the commit has no
+  published images until the owner deletes that package version.
 - **Provenance.** Each newly pushed digest gets a SLSA build-provenance
   attestation from `actions/attest` with `push-to-registry`, without the
-  organization's artifact storage record. It is signed through public-good
+  organization's artifact storage record. A final tag whose provenance exists in
+  GitHub but whose registry bundle is missing is still repaired in place (`attest`). It is signed through public-good
   Sigstore (the repository is public) and verifiable with
   `gh attestation verify oci://ghcr.io/gosync-inc/deedkit-<target>@<digest>
   --repo GoSync-Inc/deedkit --signer-workflow

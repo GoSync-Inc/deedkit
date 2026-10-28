@@ -241,7 +241,9 @@ jobs:
   publish:
     # The only job with write permissions, and only on a main push after every verification
     # passed. It ships the images `images / build (<target>)` tested, never a rebuild, and a
-    # tag that already exists is never moved (scripts/publish_images.py, production.md).
+    # tag that already exists is never moved (scripts/publish_images.py, production.md). A new
+    # image is pushed under a staging tag and gets its final `<sha>` tag only after its
+    # attestation verifies, so a failed attestation leaves nothing a full rerun refuses (ANYM-602).
     name: publish
     needs: [gate]
     # Explicit result checks: a push run has skipped ancestors (pr_reuse, reused test jobs), and
@@ -275,12 +277,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
-      - name: Push each tested image unless its tag already exists
+      - name: Push each tested image to a staging tag unless its final tag already exists
         id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.sha }}
-        run: python3 scripts/publish_images.py publish --sha "$SHA" --directory "$RUNNER_TEMP/images"
+        run: python3 scripts/publish_images.py publish --sha "$SHA" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --directory "$RUNNER_TEMP/images"
       - name: Attest runtime
         if: steps.publish.outputs.attest_runtime == 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -345,11 +347,17 @@ jobs:
           subject-digest: ${{ steps.publish.outputs.digest_backup }}
           push-to-registry: true
           create-storage-record: false
+      - name: Tag each staged image as final once its attestation verifies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+        run: python3 scripts/publish_images.py promote --sha "$SHA" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
       - name: Require every image to be published with a valid attestation
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.sha }}
-        run: python3 scripts/publish_images.py confirm --sha "$SHA"
+        run: python3 scripts/publish_images.py confirm --sha "$SHA" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
       - name: Log out of GHCR
         if: ${{ always() }}
         run: docker logout ghcr.io
