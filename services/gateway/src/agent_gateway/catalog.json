@@ -4019,11 +4019,13 @@
                   "file.text.ready",
                   "file.transcript.ready",
                   "file.description.ready",
-                  "file.processing.failed"
+                  "file.processing.failed",
+                  "send.failed",
+                  "source.health"
                 ],
                 "type": "string"
               },
-              "maxItems": 9,
+              "maxItems": 11,
               "minItems": 1,
               "type": "array"
             },

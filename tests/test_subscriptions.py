@@ -8,6 +8,7 @@ import pytest
 
 from messaging_service.store import APIError
 from messaging_service.subscriptions import match_subscriptions
+from test_sending import sender  # noqa: F401
 
 
 def key(store, principal='subscriber', accounts=None, **kwargs):
@@ -416,3 +417,136 @@ def test_debounce_flushes_at_max_wait(seeded, tmp_path):
     # the previous hint). Real test runtime adds to the simulated clock, so it may come early.
     assert len(emitted_at) == 2 and 270 <= emitted_at[0] <= 300
     assert all(later - first <= 300 for first, later in zip([0] + [t + 5 for t in emitted_at], emitted_at))
+
+
+def failure_keys(store):
+    permissions = ['read', 'send', 'subscription-write']
+    return [store.issue_key('failure-agent', ['send-fixture'], permissions=permissions,
+        key_permissions=permissions) for _ in range(2)]
+
+
+def failing_provider(outcome):
+    async def provider(job):
+        if outcome == 'rejected':
+            job['_provider_phase']('refused')
+        raise RuntimeError('synthetic provider failure')
+    return provider
+
+
+# spec: ANYM-535
+@pytest.mark.parametrize('outcome,status,code', [('rejected', 'failed', 'send_not_started'),
+    ('uncertain', 'unknown', 'send_result_unknown')], ids=['failed', 'uncertain'])
+def test_send_failed_reaches_only_the_sending_key(sender, outcome, status, code):  # noqa: F811
+    import asyncio
+    import json
+    from messaging_service import outgoing
+    from messaging_service.envelope import stable_id
+    s, _, _, _, state = sender
+    mine, sibling = failure_keys(s)
+    chat = stable_id('chat', 'send-fixture', '100')
+    selected = {name: s.create_subscription(token, [chat], kinds=['send.failed'])['subscription_id']
+        for name, token in (('mine', mine), ('sibling', sibling))}
+    default = s.create_subscription(mine, [chat], direction='')['subscription_id']
+    queued = s.send_message(mine, account='send-fixture', chat_id=chat, text='Synthetic failing text',
+        request_id='synthetic-failure-0001')
+    asyncio.run(outgoing.OutgoingWorker(state, failing_provider(outcome)).once())
+    assert s.get_send_status(mine, queued['send_id'])['status'] == status
+    match_subscriptions(s)
+    items = s.get_subscription_events(mine, selected['mine'])['items']
+    assert len(items) == 1
+    item = items[0]
+    assert (item['kind'], item['send_id'], item['status'], item['error_code']) == ('send.failed', queued['send_id'], status, code)
+    assert item['account'] == 'send-fixture' and item['chat'] == chat and item['origin'] == 'live'
+    assert not {'principal', 'key_id', 'message', 'body', 'sender'} & set(item)
+    assert 'Synthetic failing text' not in json.dumps(item, default=str)
+    # Another key of the same principal, and the default kinds of the sending key, see nothing.
+    assert s.get_subscription_events(sibling, selected['sibling'])['items'] == []
+    assert s.get_subscription_events(mine, default)['items'] == []
+
+
+# spec: ANYM-535
+def test_send_failed_journal_error_never_blocks_the_send_status(sender):  # noqa: F811
+    import asyncio
+    from messaging_service import outgoing, subscriptions
+    from messaging_service.envelope import stable_id
+    s, _, _, _, state = sender
+    mine, _ = failure_keys(s)
+    chat = stable_id('chat', 'send-fixture', '100')
+    sid = s.create_subscription(mine, [chat], kinds=['send.failed'])['subscription_id']
+    queued = s.send_message(mine, account='send-fixture', chat_id=chat, text='Synthetic failing text',
+        request_id='synthetic-failure-0002')
+    with s.pool.connection() as c:
+        head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
+        c.execute('''CREATE FUNCTION pg_temp.refuse_send_failed() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'synthetic journal failure'; END $$''')
+        c.execute('''CREATE TRIGGER refuse_send_failed BEFORE INSERT ON events FOR EACH ROW
+            WHEN (NEW.kind='send.failed') EXECUTE FUNCTION pg_temp.refuse_send_failed()''')
+    before = subscriptions.JOURNAL_FAILURES['send.failed']
+    try:
+        asyncio.run(outgoing.OutgoingWorker(state, failing_provider('uncertain')).once())
+    finally:
+        with s.pool.connection() as c:
+            c.execute('DROP TRIGGER refuse_send_failed ON events')
+    assert subscriptions.JOURNAL_FAILURES['send.failed'] == before + 1
+    status = s.get_send_status(mine, queued['send_id'])
+    assert status['status'] == 'unknown' and status['error_code'] == 'send_result_unknown'
+    with s.pool.connection() as c:
+        # The counter step rolled back with the row: no journal gap for the matcher.
+        assert c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value'] == head
+    match_subscriptions(s)
+    page = s.get_subscription_events(mine, sid)
+    assert page['items'] == [] and page['subscription']['gap'] is None
+    assert page['subscription']['blocked_reason'] is None
+
+
+# spec: ANYM-535
+def test_source_health_journals_status_changes_for_account_readers(seeded):
+    import json
+    from messaging_service.archive import Archive
+    from messaging_service.collector_state import CollectorState
+    from messaging_service.subscriptions import journal_source_health
+    store, _, _ = seeded
+    permissions = ['read', 'subscription-write']
+    reader = store.issue_key('health-reader', ['telegram-demo'], permissions=permissions, key_permissions=permissions)
+    restricted = store.issue_key('health-chat-reader', ['telegram-demo'], chats=['telegram-demo-chat'],
+        permissions=permissions, key_permissions=permissions)
+    elsewhere = store.issue_key('health-elsewhere', ['whatsapp-demo-1'], permissions=permissions,
+        key_permissions=permissions)
+    selected = store.create_subscription(reader, ['telegram-demo-chat'], kinds=['source.health'])['subscription_id']
+    default = store.create_subscription(reader, ['telegram-demo-chat'], direction='')['subscription_id']
+    narrow = store.create_subscription(restricted, ['telegram-demo-chat'], kinds=['source.health'])['subscription_id']
+    other = store.create_subscription(elsewhere, ['whatsapp-demo-1-chat'], kinds=['source.health'])['subscription_id']
+    archive = Archive(store)
+    epoch = archive.acquire('telegram-demo', 'synthetic-health')
+    state = CollectorState(archive, 'telegram-demo', ('synthetic-health', epoch))
+
+    def age(*phases):
+        with store.pool.connection() as c:
+            for phase in phases:
+                c.execute('''UPDATE collector_health SET operations=jsonb_set(operations,%s,
+                    to_jsonb((clock_timestamp()-interval '31 minutes')::text)) WHERE account='telegram-demo' ''',
+                    ('{%s,observed_at}' % phase,))
+    state.phase('connection', 'connected', 'provider_ready')
+    state.capture_progress(None, 0, 0)
+    assert journal_source_health(store) == 0  # The first observation is a baseline.
+    state.connection_failed('provider_disconnected')
+    assert journal_source_health(store) == 1 and journal_source_health(store) == 0
+    # A reconnect after a long outage is connected, not stale, before its first capture refresh.
+    age('live_capture')
+    state.phase('connection', 'connected', 'provider_ready')
+    assert journal_source_health(store) == 1
+    # No confirmation of the provider session for longer than the default 30 minutes.
+    age('connection', 'live_capture')
+    assert journal_source_health(store) == 1
+    state.connection_failed('telegram_pairing_required')
+    assert journal_source_health(store) == 1
+    archive.release('telegram-demo', 'synthetic-health', epoch)
+    assert journal_source_health(store) == 0  # Still auth_required: not a change.
+    match_subscriptions(store)
+    items = store.get_subscription_events(reader, selected)['items']
+    assert [(item['kind'], item['account'], item['status']) for item in items] == [
+        ('source.health', 'telegram-demo', status) for status in ('disconnected', 'connected', 'stale', 'auth_required')]
+    assert all(not {'chat', 'message', 'sender', 'send_id', 'error_code'} & set(item) for item in items)
+    assert 'provider_disconnected' not in json.dumps(items, default=str)
+    for token, sid in ((reader, default), (restricted, narrow), (elsewhere, other)):
+        assert store.get_subscription_events(token, sid)['items'] == []

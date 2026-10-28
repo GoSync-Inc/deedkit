@@ -158,7 +158,7 @@ const FEEDBACK_FIELDS = Object.freeze({
 });
 const SUBSCRIPTION_KINDS = new Set(['message.created','message.edited','message.deleted',
   'message.status','attachment.ready','file.text.ready','file.transcript.ready',
-  'file.description.ready','file.processing.failed']);
+  'file.description.ready','file.processing.failed','send.failed','source.health']);
 const SUBSCRIPTION_ORIGINS = new Set(['live','backfill','reconcile','fixture']);
 const WAKE_RULES = new Set(['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send']);
 function plainObject(value) {
@@ -261,7 +261,7 @@ function subscriptionArguments(method,args) {
     let valid=true;
     if (['chat_ids','sender_ids','kinds','origins','wake_rules'].includes(key)) {
       if (value===null && key!=='chat_ids') continue;
-      const maximum=key==='kinds'?9:['origins','wake_rules'].includes(key)?4:64;
+      const maximum=key==='kinds'?11:['origins','wake_rules'].includes(key)?4:64;
       valid=Array.isArray(value) && value.length>=1 && value.length<=maximum &&
         value.every(item=>['chat_ids','sender_ids'].includes(key)?subscriptionReference(item):
           typeof item==='string' && (key==='kinds'?SUBSCRIPTION_KINDS:

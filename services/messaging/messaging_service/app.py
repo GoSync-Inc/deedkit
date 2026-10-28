@@ -54,13 +54,13 @@ SearchLanguage = Literal['auto','simple','russian','english','indonesian']
 EventKind = Literal['message.created','message.edited','message.deleted','message.status','attachment.ready']
 SubscriptionEventKind = Literal['message.created','message.edited','message.deleted',
     'message.status','attachment.ready','file.text.ready','file.transcript.ready',
-    'file.description.ready','file.processing.failed']
+    'file.description.ready','file.processing.failed','send.failed','source.health']
 EventOrigin = Literal['live','backfill','reconcile','fixture']
 MessageFormat = Literal['plain','markdown','html']
 SubscriptionReference = Annotated[StrictStr, Field(min_length=1,max_length=256,
     pattern=r'^[^\x00-\x20\x7f]+$')]
 SubscriptionReferences = Annotated[list[SubscriptionReference], Field(min_length=1,max_length=64)]
-SubscriptionKinds = Annotated[list[SubscriptionEventKind], Field(min_length=1,max_length=9)]
+SubscriptionKinds = Annotated[list[SubscriptionEventKind], Field(min_length=1,max_length=11)]
 SubscriptionOrigins = Annotated[list[EventOrigin], Field(min_length=1,max_length=4)]
 SubscriptionLimit = Annotated[StrictInt, Field(ge=1,le=100)]
 SubscriptionVersion = Annotated[StrictInt, Field(ge=1,le=9007199254740991)]

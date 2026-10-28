@@ -6,6 +6,7 @@ advances each checkpoint in the same transaction as its matching references.
 """
 from __future__ import annotations
 
+from collections import Counter
 from datetime import timedelta
 import json
 import os
@@ -17,7 +18,11 @@ from .policy import effective_permissions, lock_principal, targets
 
 EVENT_KINDS = frozenset(('message.created', 'message.edited', 'message.deleted',
     'message.status', 'attachment.ready', 'file.text.ready', 'file.transcript.ready',
-    'file.description.ready', 'file.processing.failed'))
+    'file.description.ready', 'file.processing.failed', 'send.failed', 'source.health'))
+# ANYM-535: journal rows that name no archived message, matched by their own rule and never by default.
+FAILURE_KINDS = frozenset(('send.failed', 'source.health'))
+# A journal write the send or collector path survived, per kind, since process start.
+JOURNAL_FAILURES = Counter()
 ORIGINS = frozenset(('live', 'fixture', 'backfill', 'reconcile'))
 
 
@@ -305,12 +310,16 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50):
             'sent_at',e.snapshot->'sent_at','direction',e.snapshot->'direction',
             'deleted',e.snapshot->'deleted','processing',e.snapshot->'processing',
             -- ANYM-529: a shared contact card is message content: the journal keeps it, references do not.
-            'metadata',(e.snapshot->'metadata')-'contact','reply_evidence',e.snapshot->'reply_evidence')) AS snapshot
+            'metadata',(e.snapshot->'metadata')-'contact','reply_evidence',e.snapshot->'reply_evidence',
+            -- ANYM-535: IDs and codes only; the sending key stays in the journal.
+            'send_id',CASE WHEN e.kind='send.failed' THEN e.snapshot->'send_id' END,
+            'error_code',CASE WHEN e.kind='send.failed' THEN e.snapshot->'error_code' END,
+            'status',CASE WHEN e.kind IN ('send.failed','source.health') THEN e.snapshot->'status' END)) AS snapshot
         FROM subscription_matches sm JOIN events e ON e.id=sm.event
         WHERE sm.subscription=%s AND sm.event>%s ORDER BY sm.event LIMIT %s''',
         (row['id'], after, limit + 1)).fetchall()
     fields = ('message', 'account', 'chat', 'sender', 'provider_id', 'revision', 'sent_at',
-        'direction', 'deleted', 'processing', 'metadata', 'reply_evidence')
+        'direction', 'deleted', 'processing', 'metadata', 'reply_evidence', 'send_id', 'error_code', 'status')
     items = [{**{key: event['snapshot'][key] for key in fields if key in event['snapshot']},
         'event_id': event['id'], 'kind': event['kind'], 'origin': event['origin'],
         'revision': event['revision'], 'observed_at': event['created_at'],
@@ -379,7 +388,8 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
             events = c.execute('''SELECT id,account,kind,origin,
                 jsonb_strip_nulls(jsonb_build_object('chat',snapshot->'chat',
                     'sender',snapshot->'sender','direction',snapshot->'direction',
-                    'metadata',snapshot->'metadata','reply_evidence',snapshot->'reply_evidence')) AS snapshot
+                    'metadata',snapshot->'metadata','reply_evidence',snapshot->'reply_evidence',
+                    'principal',snapshot->'principal','key_id',snapshot->'key_id')) AS snapshot
                 FROM events WHERE id>%s AND id<=%s ORDER BY id LIMIT %s''',
                 (row['matched_through'], head, batch_size)).fetchall()
             count = c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
@@ -399,20 +409,25 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     break
                 snapshot = event['snapshot']
                 source = (event['account'], snapshot.get('chat'))
-                matches = (source in lookup and event['kind'] in selector['kinds'] and
-                    event['origin'] in selector['origins'])
-                if matches and selector['direction']:
-                    if 'direction' not in snapshot:
-                        missing += 1
-                        matches = False
-                    else:
-                        matches = snapshot['direction'] == selector['direction']
-                if matches and lookup[source] is not None:
-                    if 'sender' not in snapshot:
-                        missing += 1
-                        matches = False
-                    else:
-                        matches = snapshot['sender'] in lookup[source]
+                if event['kind'] in FAILURE_KINDS:
+                    # Direction and senders describe messages; these kinds have their own audience.
+                    matches = (event['kind'] in selector['kinds'] and event['origin'] in selector['origins'] and
+                        _failure_audience(event, source in lookup, row, p))
+                else:
+                    matches = (source in lookup and event['kind'] in selector['kinds'] and
+                        event['origin'] in selector['origins'])
+                    if matches and selector['direction']:
+                        if 'direction' not in snapshot:
+                            missing += 1
+                            matches = False
+                        else:
+                            matches = snapshot['direction'] == selector['direction']
+                    if matches and lookup[source] is not None:
+                        if 'sender' not in snapshot:
+                            missing += 1
+                            matches = False
+                        else:
+                            matches = snapshot['sender'] in lookup[source]
                 if matches and selector.get('wake_rules'):
                     from .subscription_consumption import wake_reason
                     evidence = {**snapshot, 'account': event['account'], 'kind': event['kind'],
@@ -456,6 +471,63 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     capture(error, 'subscription_hint_failed')
                     print(json.dumps({'error': 'subscription_hint_failed'}), flush=True)
     return stats
+
+
+def _failure_audience(event, selected_chat, row, p):
+    """send.failed: only the key that made the send, in a selected chat. source.health: a key that
+    sees the whole account; a chat-restricted key reads no collector health (sync_status)."""
+    if event['kind'] == 'send.failed':
+        snapshot = event['snapshot']
+        return (selected_chat and snapshot.get('principal') == row['principal'] and
+            snapshot.get('key_id') == str(row['key_id']))
+    return event['account'] in p['accounts'] and p['chat_ids'] is None
+
+
+def _journal_failed(kind, error):
+    JOURNAL_FAILURES[kind] += 1
+    from .telemetry import capture
+    capture(error, 'subscription_journal_failed')
+    print(json.dumps({'error': 'subscription_journal_failed', 'kind': kind, 'class': type(error).__name__}), flush=True)
+
+
+def journal_send_failures(c, rows):
+    """ANYM-535: one send.failed row per failed or uncertain send, in the caller's transaction.
+
+    Each row has its own savepoint: an error rolls back that row and its counter step only, is logged
+    and counted, and the send status commits anyway. IDs and codes only, never text.
+    """
+    for row in rows:
+        if row['status'] not in ('failed', 'unknown'):
+            continue
+        try:
+            with c.transaction():
+                value = c.execute('UPDATE feed_counter SET value=value+1 WHERE id=1 RETURNING value').fetchone()['value']
+                c.execute('''INSERT INTO events(id,account,message,kind,revision,origin,snapshot,event_key)
+                    VALUES(%s,%s,NULL,'send.failed',1,'live',%s,%s)''', (value, row['account'], Jsonb({
+                        'account': row['account'], 'chat': row['chat'], 'send_id': str(row['id']),
+                        'status': row['status'], 'error_code': row['error_code'],
+                        'principal': row['principal'], 'key_id': str(row['key_id'])}), 'send.failed:' + str(row['id'])))
+        except Exception as error:
+            _journal_failed('send.failed', error)
+
+
+def source_health_stale_seconds():
+    """The operator's source.health stale threshold; checked at worker startup."""
+    return 60 * _bound_setting('SOURCE_HEALTH_STALE_MINUTES', 30, 1, 1440)
+
+
+def journal_source_health(store):
+    """One call of schema 55's definer function; returns the rows journaled and never raises."""
+    from psycopg import errors
+    try:
+        with store.pool.connection() as c:
+            return c.execute('SELECT public.journal_source_health(%s) AS n',
+                (source_health_stale_seconds(),)).fetchone()['n']
+    except errors.UndefinedFunction:
+        return 0  # Schema before 55: the migration precedes this worker.
+    except Exception as error:
+        _journal_failed('source.health', error)
+        return 0
 
 
 RETENTION_BATCH = 500

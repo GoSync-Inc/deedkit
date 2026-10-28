@@ -154,7 +154,8 @@ _FEEDBACK_FIELDS = {
     'list_feedback': (set(), {'limit','status'}),
 }
 _SUBSCRIPTION_KINDS = frozenset({'message.created','message.edited','message.deleted','message.status',
-    'attachment.ready','file.text.ready','file.transcript.ready','file.description.ready','file.processing.failed'})
+    'attachment.ready','file.text.ready','file.transcript.ready','file.description.ready','file.processing.failed',
+    'send.failed','source.health'})
 _SUBSCRIPTION_ORIGINS = frozenset({'live','backfill','reconcile','fixture'})
 _WAKE_RULES = frozenset({'incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send'})
 
@@ -191,7 +192,7 @@ def _subscription_parameters(operation, parameters):
         valid=True
         if name in ('chat_ids','sender_ids','kinds','origins','wake_rules'):
             if value is None and name!='chat_ids':continue
-            maximum=9 if name=='kinds' else 4 if name in ('origins','wake_rules') else 64
+            maximum=11 if name=='kinds' else 4 if name in ('origins','wake_rules') else 64
             valid=isinstance(value,list) and 1<=len(value)<=maximum
             if valid:
                 valid=all(_subscription_reference(item) if name in ('chat_ids','sender_ids')

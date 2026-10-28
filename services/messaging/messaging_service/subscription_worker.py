@@ -12,8 +12,11 @@ import time
 from . import heartbeats
 from .store import Store
 from .delivery_policy import flush_hints
-from .subscriptions import acked_retention_days, match_subscriptions, prune_subscriptions
+from .subscriptions import (acked_retention_days, journal_source_health, match_subscriptions,
+    prune_subscriptions, source_health_stale_seconds)
 from .telemetry import configure, capture
+
+HEALTH_INTERVAL_S = 30
 
 
 def main():
@@ -32,13 +35,14 @@ def main():
         parser.error('max-subscriptions must be between 1 and 100')
     # An out-of-bounds retention window fails startup instead of pruning with a wrong one.
     acked_retention_days()
+    source_health_stale_seconds()
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
     dsn = Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
     store = Store(dsn, Path(os.environ.get('PROBE_FILES', '/tmp/unused-files')),
                   'http://localhost')
-    last_beat = None
+    last_beat = last_health = None
     try:
         while not stop.is_set():
             if not args.once:
@@ -48,6 +52,10 @@ def main():
                 except Exception as error:
                     capture(error, 'subscription_retention_failed')
                     print(json.dumps({'error': 'subscription_retention_failed'}), flush=True)
+            # ANYM-535: account health changes join the journal before matching; never raises.
+            if last_health is None or time.monotonic() - last_health >= HEALTH_INTERVAL_S:
+                journal_source_health(store)
+                last_health = time.monotonic()
             try:
                 result = match_subscriptions(store, batch_size=args.batch_size,
                                              max_subscriptions=args.max_subscriptions)

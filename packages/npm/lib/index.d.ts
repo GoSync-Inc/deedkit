@@ -112,7 +112,7 @@ export interface LocalFileUploadOptions {
 }
 export type SubscriptionEventKind = 'message.created' | 'message.edited' | 'message.deleted' |
   'message.status' | 'attachment.ready' | 'file.text.ready' | 'file.transcript.ready' |
-  'file.description.ready' | 'file.processing.failed';
+  'file.description.ready' | 'file.processing.failed' | 'send.failed' | 'source.health';
 export type SubscriptionOrigin = 'live' | 'backfill' | 'reconcile' | 'fixture';
 export type SubscriptionWakeRule = 'incoming_message' | 'owner_mention' | 'reply_to_owner' | 'reply_to_confirmed_send';
 export interface SubscriptionSelection {

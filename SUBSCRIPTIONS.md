@@ -867,6 +867,42 @@ kinds) gets the same snapshot and keeps its content-free state: `delivery_receip
 and other metadata go. ACK positions and versions are unchanged, and hints stay
 content-free references.
 
+## Failed sends and account health (schema 55)
+
+Two opt-in kinds (ANYM-535) wake an agent without polling send status or sync status. They are
+matched only when listed in `kinds`, never by the default kinds; `wake_rules` select incoming
+messages only, so a subscription with wake rules never matches them. `direction` and
+`sender_ids` do not filter them.
+
+| Kind | Journaled when | Fetched fields | Hint reference |
+| --- | --- | --- | --- |
+| `send.failed` | A send reaches `failed` or `unknown` (uncertain; also a send interrupted by a collector restart) | `send_id`, `account`, `chat`, `status`, `error_code` | `send_id`, `status`, `account_id`, `chat_id` |
+| `source.health` | An account's health changes to or from `disconnected`, `auth_required` or `stale` | `account`, `status` | `status`, `account_id` |
+
+`send.failed` matches only subscriptions of the key that made the send, in one of their chats;
+another key of the same principal sees nothing. No text leaves: neither the body nor the
+provider's error text, only the fixed `error_code`. The collector writes the row in the same
+transaction as the send status, in its own savepoint: a journal error is logged
+(`subscription_journal_failed`) and counted, and the status commits anyway.
+
+`source.health` matches subscriptions whose key sees the whole account; a chat-restricted key
+reads no collector health (as in `get_sync_status`). Its `status` is `auth_required` (the
+connection is blocked until the owner relinks), `disconnected` (no live collector lease, a
+stopped collector or a connection that is not connected), `stale` (connected, but neither the
+connect nor the live capture, which refreshes about every 15 seconds while the provider session is
+open, has confirmed the session for longer than `SOURCE_HEALTH_STALE_MINUTES`, default 30,
+1–1440, set on the matcher) or `connected` (a recovery). A quiet chat is not stale: the capture
+refresh does not depend on new messages. The matcher derives it from `collector_health` and the lease every 30 seconds through
+the definer function `journal_source_health`; the first observation of an account is a baseline
+and journals nothing. Its failure is logged and counted and never stops matching.
+
+Voice transcripts need no new kind: `file.transcript.ready` already wakes a subscriber when an
+audio or voice message's transcript is ready.
+
+Rollout: migration 55, then reapply `subscription_role.sql` (EXECUTE on
+`journal_source_health(integer)`), then restart the matcher. Before the migration the matcher
+skips health journaling. Undo: stop selecting the kinds; the rows stay in the journal.
+
 ## Remaining extensions and verification boundaries
 
 Coalescing across subscriptions of different keys, stream resource notifications,

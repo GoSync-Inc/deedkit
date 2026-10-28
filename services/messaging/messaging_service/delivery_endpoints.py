@@ -792,6 +792,11 @@ def hint_body(c, hint, row, p):
         reference = {'event_id': item['event'], 'kind': item['kind'], 'occurred_at': serial(item['created_at']),
             'wake_reason': reasons, 'account_id': item['account'], 'chat_id': evidence.get('chat'),
             'message_id': evidence.get('message'), 'sender_id': evidence.get('sender')}
+        if item['kind'] == 'send.failed':
+            reference['send_id'] = evidence.get('send_id')
+        if item['kind'] in ('send.failed', 'source.health'):
+            # ANYM-535: the status code only; the error code is read through the subscription fetch.
+            reference['status'] = evidence.get('status')
         if 'reply_to_confirmed_send' in reasons:
             reference['reply_to_send_id'] = (row['selector'].get('reply_anchor') or {}).get('send_id')
         references.append(reference)
