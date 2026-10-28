@@ -126,6 +126,27 @@ def admission_slot(c, owner, now):
     return _slot(c, owner, 'admitted_at', now)
 
 
+def host_admission_slot(c, endpoint, now):
+    """ANYM-585: None if an endpoint hint may make its first POST to its host now, else when the host's next slot opens.
+
+    Counts endpoint hints admitted to one canonical host in the rolling hour across every key, so agents choosing
+    their own hosts cannot pile on one third party. Taken after the per-key lock; nothing takes them the other way.
+    """
+    limit = _bound_setting('DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR', 100, 1, 10000)
+    host = c.execute('SELECT host FROM delivery_endpoints WHERE id=%s', (endpoint,)).fetchone()
+    if host is None:
+        return None
+    c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('delivery-host:' + host['host'],))
+    # The per-key count's shape (_slot) over the subscriptions of keys with an endpoint on the host, so the planner can
+    # read subscription_hint_admission (subscription, admitted_at) per subscription instead of the outbox history.
+    charged = c.execute('''SELECT o.admitted_at AS t FROM subscriptions s
+        JOIN subscription_outbox o ON o.subscription=s.id JOIN delivery_endpoints e ON e.id=o.endpoint
+        WHERE (s.principal,s.key_id) IN (SELECT principal,key_id FROM delivery_endpoints WHERE host=%s)
+        AND e.host=%s AND o.admitted_at>%s-interval '1 hour' ORDER BY o.admitted_at DESC OFFSET %s LIMIT 1''',
+        (host['host'], host['host'], now, limit - 1)).fetchone()
+    return None if charged is None else charged['t'] + timedelta(hours=1)
+
+
 def _now(c):
     return c.execute('SELECT clock_timestamp() AS t').fetchone()['t']
 

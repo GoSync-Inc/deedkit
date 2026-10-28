@@ -55,7 +55,9 @@ the owner has decided parts (below), not this inventory as a whole.
   - Webhook receivers named by an agent: subscription, event, account, chat, message and sender IDs,
     event kinds and times, the delivery timing and the agent's own headers; never message text, names or
     file content (SECURITY.md, SUBSCRIPTIONS.md:558-561; owner 10-27 webhooks «... возможность прописывать
-    самостоятельно агенты ...»).
+    самостоятельно агенты ...»). Under self-registration the receiver is any public host the agent names,
+    with no operator host entry (ANYM-585; owner 10-28 «... дать агентам себе создавать вот этот, прописывать
+    эту штуку ...»).
   - Feedback: raw feedback text reaches the model provider of the owner-run triage session and the
     autoloop's tool-less reader on the owner's workstation (owner decision D1, ANYM-264); for a principal in
     the autoloop config, a card in the card worker's own words, with no quote, name, phone number or message

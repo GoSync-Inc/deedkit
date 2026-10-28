@@ -465,7 +465,8 @@ server-side gate before a relay fires an agent run.
 
 A key with `read` and the explicit `delivery-write` permission (ANYM-519,
 [ACCESS.md](ACCESS.md)) registers where its own hints go. The operator only sets
-the switch, the host policy and the limits.
+the switch, the host policy and the limits; under self-registration (below) the
+agent picks any public host, with no operator step per agent or per vendor.
 
 | Tool | Arguments | Behavior |
 | --- | --- | --- |
@@ -499,7 +500,7 @@ regular file, no symlink, mode 0600 or tighter, at most 64 KiB):
 Hosts are IDNA-canonicalized (UTS 46, lowercase, one trailing dot removed). A
 suffix matches on a DNS label boundary (`example.com` matches `a.example.com`, not
 `badexample.com`) and deny wins. A missing or invalid file, unknown keys or an
-empty allowlist without `allow_any_public: true` leave the policy unset:
+empty allowlist without `allow_any_public: true` or `self_registration: true` leave the policy unset:
 registration answers `delivery_policy_unset` and the webhook transport shows
 reason `delivery_policy_unset`. Set `allow_any_public: true` only after the
 dispatcher's egress check passes (production.md, migration 050). The policy is read again before every attempt; a host that
@@ -513,6 +514,36 @@ In Compose the dispatcher reaches receivers only through the `delivery-egress` p
 as unreachable. A host outside the file or with a non-public DNS answer gets no tunnel.
 The stored URL and the TLS name and Host header use the same A-label host as the
 policy check (`https://faß.example/` is kept as `https://xn--fa-hia.example/`).
+
+**Self-registration (ANYM-585).** With `"self_registration": true` in the policy
+file, an agent registers an endpoint on any public host that `deny_hosts` does
+not match, with no `allow_hosts` entry; every other check here (address, port,
+pinning, the proxy, write-only secrets, limits) is unchanged. It is the
+feature's switch, off when absent. `allow_any_public` stays the operator's own
+mode for hosts it vouches for (agents' and operator receivers' alike); set one,
+not both: with `allow_any_public` on, every host counts as operator-allowed, so
+the at-most-once rule and the kill switch below do not apply to it.
+An endpoint admitted only by the switch uses the at-most-once outcome table
+(Vendor hosts) whatever its URL: an attempt that may have reached the receiver
+(a timeout after the request was written, a lease that ran out mid-attempt, a
+1xx answer) is final with `outcome_unknown`, 401 and 403 are final
+(`vendor_refused`), and only an unsent request or another status is retried. A
+vendor routine whose URL nothing recognises therefore never runs twice for one
+hint; the receiver no operator vouched for gets no retry it cannot tell apart.
+Every endpoint view (register, list, update) shows `at_most_once`, true for a
+vendor endpoint or one admitted only by the switch.
+`deedkit admin delivery-endpoints list` shows each endpoint's `admission`:
+`allow_hosts` (listed or `allow_any_public`), `self_registration` (admitted only
+by the switch) or null (refused now), and the top-level `self_registration`;
+`reload-delivery-policy` prints it too. The kill switch is `"self_registration":
+false` (or removing the key) and `reload-delivery-policy`: it revokes only the
+switch's own admissions, so queued hints and tests of every endpoint whose
+`admission` was `self_registration` are cancelled (`endpoint_policy_refused`),
+no POST to such a host starts after the command returns, and endpoints on
+`allow_hosts` hosts keep delivering. The endpoints stay listed and deliver again
+when the switch is back on; wakes cancelled in between are not replayed, and the
+agent fetches those events by pull. To stop one endpoint, use
+`disable-delivery-endpoint` (States below).
 
 **Address check.** The URL is https on port 443 without credentials, query or
 fragment. Every resolved address must be public: multicast, NAT64 (`64:ff9b::/96`,
@@ -581,7 +612,17 @@ same fence as receivers: no POST starts after the change commits.
 **Limits.** At most `DELIVERY_MAX_ENDPOINTS_PER_KEY` endpoints per key (default 4,
 1–32) that are not deleted (`endpoint_limit`); registration and test each at most
 once per minute per key (`rate_limited` with `retry_after_s`). Endpoint hints
-count toward `SUBSCRIPTION_MAX_HINTS_PER_HOUR`.
+count toward `SUBSCRIPTION_MAX_HINTS_PER_HOUR`. Across all keys, at most
+`DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR` endpoint hints (default 100, 1–10000) make
+their first POST to one host in a rolling hour (ANYM-585); past it a hint waits
+for the next slot, spends no attempt and never dead-letters for the budget. Like
+the per-key admission wait, the hint shows only as pending in `hint_counts`
+(endpoint-level reasons: ANYM-583). Operator receivers are not counted; vendor
+hosts share the same budget. The budget counts admissions: each admitted hint
+makes at most 8 attempts, and a self-registered endpoint retries only an unsent
+request or a status that started nothing (Self-registration), so a crash between
+admission and the POST never sends that hint later. Endpoint tests are bounded
+per key (one per minute), and keys are issued by the operator.
 
 **Decided edge cases.** Deleting a bound endpoint leaves the subscription
 pull-only; `get_subscription` shows `delivery.target: "none"` with reason
@@ -599,7 +640,13 @@ itself, with no host relay. A Grok Bot routine's Webhook section gives a "POST t
 URL and a key; the vendor documents `Authorization: Bearer <key>`, a `200` when a
 run started and every other status as "no run started", and no deduplication
 (docs.x.ai/grok-bot/skills-routines-and-automations, cursor.com/help/grok-bot/routines,
-2026-10-28). The operator names the vendor's host in the policy file once:
+2026-10-28). Under self-registration a routine URL of the form
+`https://api2.cursor.sh/automations/webhook/<routine-id>` is recognised as
+`grok-bot-routine` by its shape, with no policy entry (ANYM-585; the vendor pages
+publish no URL, the shape is Hookdeck's Grok Bot guide, 2026-10-28). The shape
+only adds the Bearer check: a self-registered endpoint is at most once anyway. On
+an `allow_hosts` host the operator names the vendor's documented host once (an
+agent with operator access may; AGENTS.md: agents' decision, no owner step):
 
 ```json
 {"allow_hosts": ["<vendor host>"], "vendors": {"grok-bot-routine": ["<vendor host>"]}}
@@ -619,8 +666,12 @@ vendor never checks the `webhook-*` headers. Without that header, registration a
 `set_headers` on a vendor host answer `invalid_header` with `header:
 "Authorization"`: send the routine key as `Bearer <key>`. Endpoint views show
 `vendor` (`grok-bot-routine` or null) under the current policy. If the register
-answer shows `vendor: null` for the routine's URL, the host is not in `vendors`:
-stop and ask the operator, since that endpoint would deliver at least once. Every
+answer shows `vendor: null` for the routine's URL, neither the shape nor `vendors`
+matched it. With `at_most_once: true` in the same answer (a self-registered
+endpoint) keep it: make sure you sent the key as `Authorization: Bearer <key>`
+yourself (the check did not run) and go on. With `at_most_once: false` that
+endpoint would deliver at least once: do not bind it; delete it and report the URL's host (never the
+key) to the operator, who adds it to `vendors`, then register again. Every
 test (the registration's and `test_delivery_endpoint`) starts one run with body
 `type: "test"`; the routine should end quietly on it. Bind with a
 `delivery_policy` of `{"debounce_s": 60}` so a burst of events wakes one run, not

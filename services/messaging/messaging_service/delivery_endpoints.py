@@ -51,6 +51,9 @@ _CGNAT = ipaddress.ip_network('100.64.0.0/10')
 # ANYM-582: vendor hosts the operator names in the policy. Grok Bot routine webhooks take a Bearer key, start a run
 # on 200 and document every other status as "no run started"; they do not deduplicate a repeated request.
 VENDORS = frozenset(('grok-bot-routine',))
+# ANYM-585: a vendor recognised by its webhook URL, with no `vendors` entry. Grok Bot routines publish no host; the
+# shape is Hookdeck's Grok Bot guide (fetched 2026-10-28). It only selects the at-most-once table and the Bearer check.
+VENDOR_URLS = (('grok-bot-routine', 'api2.cursor.sh', re.compile(r'/automations/webhook/[^/]+')),)
 _BEARER = re.compile(r'Bearer [\x21-\x7e]+')
 try:
     from .egress import EgressNotSent
@@ -122,11 +125,12 @@ def load_policy():
         return None
     finally:
         os.close(fd)
-    if not isinstance(data, dict) or set(data) - {'allow_hosts', 'deny_hosts', 'allow_any_public', 'vendors'}:
+    if not isinstance(data, dict) or set(data) - {'allow_hosts', 'deny_hosts', 'allow_any_public', 'vendors',
+            'self_registration'}:
         return None
     allow, deny, public = data.get('allow_hosts', []), data.get('deny_hosts', []), data.get('allow_any_public', False)
-    vendors = data.get('vendors', {})
-    if type(public) is not bool or any(not isinstance(v, list) or len(v) > 1000 for v in (allow, deny)):
+    vendors, self_registration = data.get('vendors', {}), data.get('self_registration', False)
+    if type(public) is not bool or type(self_registration) is not bool or any(not isinstance(v, list) or len(v) > 1000 for v in (allow, deny)):
         return None
     if not isinstance(vendors, dict) or set(vendors) - VENDORS or any(
             not isinstance(v, list) or len(v) > 1000 for v in vendors.values()):
@@ -136,28 +140,42 @@ def load_policy():
         vendors = {name: [canonical_host(h) for h in hosts] for name, hosts in vendors.items()}
     except ValueError:
         return None
-    if not allow and not public:
+    if not allow and not public and not self_registration:
         return None
-    return {'allow': allow, 'deny': deny, 'allow_any_public': public, 'vendors': vendors}
+    return {'allow': allow, 'deny': deny, 'allow_any_public': public, 'vendors': vendors,
+        'self_registration': self_registration}
+
+
+def admission(policy, host):
+    """Why the policy admits a host: 'allow_hosts' (listed, or allow_any_public), 'self_registration' (ANYM-585: only
+    the switch admits it, so switching it off stops the host's endpoints) or None (refused)."""
+    if policy is None or any(_matches(host, suffix) for suffix in policy['deny']):
+        return None
+    if policy['allow_any_public'] or any(_matches(host, suffix) for suffix in policy['allow']):
+        return 'allow_hosts'
+    return 'self_registration' if policy.get('self_registration') else None
 
 
 def host_allowed(policy, host):
-    if policy is None or any(_matches(host, suffix) for suffix in policy['deny']):
-        return False
-    return policy['allow_any_public'] or any(_matches(host, suffix) for suffix in policy['allow'])
+    return admission(policy, host) is not None
 
 
-def vendor_of(policy, host):
-    """The vendor whose outcome table a host's endpoints use (ANYM-582), or None. Never widens host_allowed."""
+def vendor_of(policy, host, url=None):
+    """The vendor whose outcome table an endpoint uses (ANYM-582), by the policy's `vendors` or the URL's shape
+    (ANYM-585), or None. Never widens host_allowed."""
     if not host_allowed(policy, host):
         return None
-    return next((name for name, hosts in sorted(policy.get('vendors', {}).items())
+    named = next((name for name, hosts in sorted(policy.get('vendors', {}).items())
         if any(_matches(host, suffix) for suffix in hosts)), None)
+    if named or not isinstance(url, str):
+        return named
+    path = urlsplit(url).path
+    return next((name for name, shape_host, shape in VENDOR_URLS if host == shape_host and shape.fullmatch(path)), None)
 
 
-def _vendor_headers(policy, host, names, values):
-    """A vendor host needs its key as `Authorization: Bearer <key>`; the value never appears in the error."""
-    if vendor_of(policy, host) and not any(name.lower() == 'authorization' and _BEARER.fullmatch(value)
+def _vendor_headers(policy, host, url, names, values):
+    """A vendor endpoint needs its key as `Authorization: Bearer <key>`; the value never appears in the error."""
+    if vendor_of(policy, host, url) and not any(name.lower() == 'authorization' and _BEARER.fullmatch(value)
             for name, value in zip(names, values)):
         raise _error('invalid_header', 400, header='Authorization')
 
@@ -180,10 +198,17 @@ def vendor_result(status=None, failure=None):
     return ('final', 'vendor_refused') if status in (401, 403) else ('retry', 'receiver_status')
 
 
-def vendor_endpoint(c, endpoint_id):
-    """The vendor of an endpoint's host under the current policy (ANYM-582), or None."""
-    row = c.execute('SELECT host FROM delivery_endpoints WHERE id=%s', (endpoint_id,)).fetchone()
-    return vendor_of(load_policy(), row['host']) if row else None
+def at_most_once(policy, host, url):
+    """Whether an endpoint's attempts use the at-most-once table (vendor_result): a vendor endpoint (ANYM-582) or one
+    admitted only by self-registration (ANYM-585), whose receiver no operator vouched for, so a request that may have
+    arrived is never sent again whatever its URL turns out to be."""
+    return bool(vendor_of(policy, host, url)) or admission(policy, host) == 'self_registration'
+
+
+def at_most_once_endpoint(c, endpoint_id):
+    """at_most_once for an endpoint ID under the current policy."""
+    row = c.execute('SELECT host,url FROM delivery_endpoints WHERE id=%s', (endpoint_id,)).fetchone()
+    return at_most_once(load_policy(), row['host'], row['url']) if row else False
 
 
 def _private_answer(address):
@@ -354,7 +379,7 @@ def _tests(c, endpoint_id):
 
 def _view(c, row):
     from .store import serial
-    last = _tests(c, row['id'])
+    last, policy = _tests(c, row['id']), load_policy()
     finished = c.execute('''SELECT state FROM delivery_endpoint_tests WHERE endpoint=%s AND state IN ('delivered','failed')
         ORDER BY finished_at DESC,id DESC LIMIT 1''', (row['id'],)).fetchone()
     rotation = None if row['rotation_started_at'] is None else {'pending_fingerprint': row['pending_fingerprint'],
@@ -364,7 +389,8 @@ def _view(c, row):
         'headers_fingerprint': row['headers_fingerprint'], 'secret_fingerprint': row['secret_fingerprint'],
         'rotation': rotation, 'created_at': row['created_at'], 'updated_at': row['updated_at'],
         'health': {'delivered': 'ok', 'failed': 'failing'}[finished['state']] if finished else 'unknown',
-        'last_test': _test_view(last), 'signature_scheme': SCHEME, 'vendor': vendor_of(load_policy(), row['host'])})
+        'last_test': _test_view(last), 'signature_scheme': SCHEME,
+        'vendor': vendor_of(policy, row['host'], row['url']), 'at_most_once': at_most_once(policy, row['host'], row['url'])})
 
 
 def _day():
@@ -450,7 +476,7 @@ def register_delivery_endpoint(store, c, p, request_id, url, signing_secret, lab
     except OSError:
         # DNS that does not answer is not proof of a public host.
         raise _unsafe('unsafe_endpoint') from None
-    _vendor_headers(policy, resolved[0], names, values)
+    _vendor_headers(policy, resolved[0], canonical_url(urlsplit(url), resolved[0]), names, values)
     count = c.execute('''SELECT count(*) AS n FROM delivery_endpoints WHERE principal=%s AND key_id=%s
         AND state<>'deleted' ''', (p['id'], p['key_id'])).fetchone()['n']
     if count >= max_endpoints():
@@ -511,7 +537,7 @@ def update_delivery_endpoint(store, c, p, endpoint_id, version, action, new_secr
         values = [new_secret, _fingerprint(key)]
     elif action == 'set_headers':
         names, header_values = normalize_headers(headers)
-        _vendor_headers(load_policy(), row['host'], names, header_values)
+        _vendor_headers(load_policy(), row['host'], row['url'], names, header_values)
         changes += ',header_names=%s,header_values=%s,headers_fingerprint=%s'
         values = [names, header_values or None, headers_fingerprint(names, header_values)]
     elif action == 'pause':
@@ -639,15 +665,19 @@ def reload_delivery_policy(store):
             cancelled += cancel_queued(c, row['id'], 'endpoint_policy_refused')
     # The vendor map as loaded, so an operator sees a host left out of `vendors` at the moment of the edit.
     return {'policy_set': policy is not None, 'refused_endpoints': refused, 'cancelled': cancelled,
-        'vendors': policy['vendors'] if policy else {}}
+        'vendors': policy['vendors'] if policy else {}, 'self_registration': bool(policy and policy['self_registration'])}
 
 
 def list_endpoints_admin(store, principal=None):
     with store.pool.connection() as c:
         rows = c.execute('SELECT ' + COLUMNS + ''' FROM delivery_endpoints WHERE state<>'deleted'
             AND (%s::text IS NULL OR principal=%s) ORDER BY principal,created_at,id''', (principal, principal)).fetchall()
-        return {'items': [{**_view(c, row), 'principal': row['principal'], 'key_id': str(row['key_id'])} for row in rows],
-            'delivery_features': 'enabled' if gate_on(c, fence=False) else 'disabled', 'policy_set': load_policy() is not None}
+        policy = load_policy()
+        # ANYM-585: `admission` shows which endpoints exist only through self-registration (the kill switch stops them).
+        return {'items': [{**_view(c, row), 'principal': row['principal'], 'key_id': str(row['key_id']),
+            'admission': admission(policy, row['host'])} for row in rows],
+            'delivery_features': 'enabled' if gate_on(c, fence=False) else 'disabled', 'policy_set': policy is not None,
+            'self_registration': bool(policy and policy['self_registration'])}
 
 
 def set_operator_state(store, endpoint_id, enabled):
@@ -712,7 +742,8 @@ def fenced(c, p, endpoint_id, url):
     policy = load_policy()
     if not host_allowed(policy, row['host']):
         return None, 'endpoint_policy_refused'
-    return {**row, 'vendor': vendor_of(policy, row['host'])}, None
+    return {**row, 'vendor': vendor_of(policy, row['host'], row['url']),
+        'at_most_once': at_most_once(policy, row['host'], row['url'])}, None
 
 
 def caller_headers(row):
@@ -802,8 +833,8 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
                 AND lease_until>clock_timestamp() FOR UPDATE""", (test['id'], lease)).fetchone()
             if not live:
                 continue
-            if row is not None and target is not None and row['vendor'] and test['state'] == 'leased':
-                # ANYM-582: a lease that ran out mid-attempt may have reached the vendor; never send it again.
+            if row is not None and target is not None and row['at_most_once'] and test['state'] == 'leased':
+                # ANYM-582/585: a lease that ran out mid-attempt may have reached the receiver; never send it again.
                 state, error = 'failed', 'outcome_unknown'
             elif row is not None and target is not None:
                 body = test_body(test)
@@ -813,13 +844,13 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
                     status = transport(row['url'], body, headers, resolved=target[1], timeout=5)
                     state, error = ('delivered', None) if type(status) is int and 200 <= status < 300 else (
                         'failed', 'redirect_rejected' if type(status) is int and 300 <= status < 400 else 'receiver_status')
-                    if row['vendor']:
+                    if row['at_most_once']:
                         result, error = vendor_result(status)
                         state = 'delivered' if result == 'delivered' else 'failed'
                 except (OSError, TimeoutError) as failure:
-                    state, error = 'failed', vendor_result(failure=failure)[1] if row['vendor'] else 'receiver_unavailable'
+                    state, error = 'failed', vendor_result(failure=failure)[1] if row['at_most_once'] else 'receiver_unavailable'
                 except ValueError as failure:
-                    state, error = 'failed', vendor_result(failure=failure)[1] if row['vendor'] else 'receiver_status'
+                    state, error = 'failed', vendor_result(failure=failure)[1] if row['at_most_once'] else 'receiver_status'
                 latency = round((time.monotonic() - started) * 1000)
                 status = status if type(status) is int and 100 <= status <= 599 else None
             c.execute('''UPDATE delivery_endpoint_tests SET state=%s,error_code=%s,http_status=%s,latency_ms=%s,
