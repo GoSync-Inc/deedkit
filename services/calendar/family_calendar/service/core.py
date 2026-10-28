@@ -1581,7 +1581,8 @@ class FamilyService:
 
             scheduler = Scheduler(self)
             steps_ = plan["payload"]["steps"]
-            result.update(scheduler.partial(scheduler.primary(steps_), steps_, scheduler.family(key, p)))
+            result.update(scheduler.partial(scheduler.primary(steps_), steps_, scheduler.family(key, p)),
+                          state="failed", detail_state="partial")
         return result
 
     def assignments(self, key, start, end):

@@ -605,7 +605,10 @@ class Providers:
         master = self._series_master(await self.read(cal, step["target_id"]))
         if master["etag"] != step["expected_etag"]:
             raise CalendarError("version_conflict")
-        recurrence.check_exceptions(await self._exceptions(cal, master), recurrence.zone_of(master), None, "all", True)
+        # An instance changed or cancelled since has its own resource and etag, which the master's etag does not
+        # cover: any exception means someone changed the replacement, and it stays.
+        if await self._exceptions(cal, master):
+            raise CalendarError("version_conflict")
         return {"action": "delete", "target": master["id"], "expected_etag": master["etag"], "desired": None,
                 "resource_ref": source_ref("res", cal["ref"], master["id"]), "scope": "series"}
 

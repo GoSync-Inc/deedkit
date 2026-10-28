@@ -318,7 +318,8 @@ def test_a_refused_truncation_is_a_partial_failure_with_both_handles(store, fail
     assert writes(server) == sent and again["state"] == "failed" and again["partial"] is True
     # Polling the operation gives the same definite failure and recovery, not a reconcile.
     polled = FamilyService(store).operation(key, result["operation"]["id"])
-    assert polled["partial"] is True and polled["undo"] == result["undo"]
+    assert (polled["state"], polled["detail_state"], polled["partial"]) == ("failed", "partial", True)
+    assert polled["undo"] == result["undo"]
     assert polled["handles"] == handles and "reconcile" not in polled["next_action"]
     # The undo resolves the replacement from the durable record, before any read published it.
     undo = rulebook.validate_result(start(store, key, result["undo"]["arguments"])[0])
@@ -501,3 +502,23 @@ def test_the_replacement_keeps_a_tentative_status(store):
     result = run(store, providers, key, {**MOVE, "event": refs["20261102"], "request_id": "req-tentative"})
     assert result["state"] == "succeeded"
     assert server.events[plan_steps(store, result)[0]["target_id"]]["status"] == "tentative"
+
+
+# spec: ANYM-556
+def test_undo_keeps_a_replacement_whose_occurrence_was_changed_since(store):
+    """The master's etag does not cover an instance changed on its own: such a replacement is not deleted."""
+    key = setup(store)
+    providers, server = world(series_events(), rejected)
+    refs = publish(store, server)
+    result = run(store, providers, key, {**MOVE, "event": refs["20261102"], "request_id": "req-undo-edited"})
+    made = plan_steps(store, result)[0]["target_id"]
+    etag = server.events[made]["etag"]
+    server.events[made + "_20261109T093000Z"] = {
+        "id": made + "_20261109T093000Z", "iCalUID": server.events[made]["iCalUID"], "recurringEventId": made,
+        "etag": '"edited"', "summary": "Lesson", "originalStartTime": {"dateTime": "2026-11-09T10:30:00+01:00"},
+        "start": {"dateTime": "2026-11-09T12:00:00+01:00"}, "end": {"dateTime": "2026-11-09T13:00:00+01:00"}}
+    sent = writes(server)
+    undo = start(store, key, result["undo"]["arguments"])[0]
+    done = run(store, providers, key, {"confirm_token": undo["confirm_token"]})
+    assert (done["state"], done["error"]) == ("failed", "version_conflict")
+    assert writes(server) == sent and server.events[made]["etag"] == etag
