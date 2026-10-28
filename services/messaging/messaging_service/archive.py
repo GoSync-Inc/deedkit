@@ -28,6 +28,13 @@ BACKFILL_CANDIDATES = 16
 MEDIA_TIER = '''CASE WHEN j.descriptor->>'mime'=ANY(%(voice_mimes)s)
         AND (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(voice_max)s THEN 0
     WHEN (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(small_max)s THEN 1 ELSE 2 END'''
+# A WhatsApp user identity with and without its device number (`<user>:<device>@lid`) is one
+# sender, as whatsmeow's JID.ToNonAD() reads it. Used for comparison only; senders stay raw.
+WHATSAPP_USER=re.compile(r'([0-9]+)(?::[0-9]+)?@(lid|c\.us)')
+
+
+def whatsapp_user(sender):
+    match=WHATSAPP_USER.fullmatch(sender); return match.groups() if match else None
 
 
 class Archive:
@@ -150,9 +157,17 @@ class Archive:
                 and old['provider_updated_at']==updated
                 and fingerprint({**e,'sender':''})==old['content_hash']
                 and not formatting_changed)
+            # The same WhatsApp sender with and without a device number, everything else equal,
+            # contradicts nothing: the retained sender, revision and sender profiles stay.
+            sender_device_only=bool(old and e['platform']=='whatsapp' and old['sender']!=e['sender']
+                and not old['deleted'] and not e['deleted'] and whatsapp_user(old['sender']) is not None
+                and whatsapp_user(old['sender'])==whatsapp_user(e['sender'])
+                and fingerprint({**e,'sender':old['sender']})==old['content_hash']
+                and (candidate_format==old_format or not (known_candidate or known_retained)))
             if old:
                 if old['deleted'] and not e['deleted']: outcome='tombstoned'
                 elif sender_completed:outcome='edited'
+                elif sender_device_only:outcome='unchanged'
                 elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
                       or old['sender']!=e['sender']): outcome='conflict'
                 elif old['content_hash']==content and not (formatting_changed or formatting_completed): outcome='unchanged'
@@ -192,7 +207,7 @@ class Archive:
                     AND active IS DISTINCT FROM (id=ANY(%s))''',(media_ids,mid,media_ids))
             elif outcome=='unchanged':
                 c.execute('UPDATE messages SET provider_updated_at=greatest(provider_updated_at,%s) WHERE id=%s',(updated,mid))
-            if outcome in ('created','edited','unchanged') and not e['deleted'] and e['sender']:
+            if outcome in ('created','edited','unchanged') and not e['deleted'] and e['sender'] and not sender_device_only:
                 # Identity hints come only from this message's provider payload,
                 # never a cross-chat contact book. Unknown metadata stays unknown.
                 profile=e.get('sender_profile',{})
