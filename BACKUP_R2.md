@@ -338,9 +338,11 @@ and timer accuracy, so a delayed daily upload or transient verification failure
 can be picked up without an operator Mac.
 Systemd does not start a second copy of the same oneshot service while it runs;
 the coordinator's durable state/locking remains necessary for manual invocations
-and crash recovery. The 21900-second service start limit gives the configured
-21600-second job deadline a cleanup margin. Match these values if changing the
-deadline; do not shorten the service timeout below the actual restore budget.
+and crash recovery. The 25500-second service start limit covers the configured
+21600-second job deadline, the host lock's 3600-second wait
+([Two verifiers on one receiver](#two-verifiers-on-one-receiver)) and a cleanup
+margin. Match these values if changing the deadline or the wait; do not shorten
+the service timeout below the actual restore budget plus the wait.
 See the [systemd timer contract](https://github.com/systemd/systemd/blob/main/man/systemd.timer.xml)
 for monotonic timing and active-unit behavior.
 
@@ -417,9 +419,10 @@ protected point and its object.
 Units: the [calendar service](deploy/deedkit-calendar-backup-r2-verifier.service) and
 [timer](deploy/deedkit-calendar-backup-r2-verifier.timer) run the same module with
 the calendar config and the messaging units' limits; no path is shared with the
-messaging instance. Installing them on the receiver is ANYM-607; running both
-verifiers side by side and following helper pins for the calendar config is
-ANYM-609, so do not enable the calendar timer before it.
+messaging instance. Installing them on the receiver is ANYM-607. Before the
+calendar timer runs, list both configs in the instances file
+([Two verifiers on one receiver](#two-verifiers-on-one-receiver)), so their
+restores take turns and their helper pins move together.
 
 Age of the last proof (root on the receiver):
 
@@ -430,6 +433,88 @@ jq -r '.status, .error // empty' /var/lib/deedkit-calendar-backup-r2/verificatio
 
 Undo: `systemctl disable --now deedkit-calendar-backup-r2-verifier.timer`. Its
 evidence, the protected calendar point and the messaging instance stay as they are.
+
+## Two verifiers on one receiver
+
+Both instances (ANYM-609) run on one host. Each restore can start a 1 GiB
+scratch PostgreSQL and a 512 MiB helper and checks free disk on its own, so
+they take turns, and their helper pins move only together.
+
+**Host directory.** Every verifier config shares `host_directory` (optional,
+default `/var/lib/deedkit-backup-verify`; root `0700`, created on first use
+under a trusted parent). It holds the host lock `host.lock`, the holder's
+`admission.json` and the pin step's `pins-switch.json`/`pins-previous.json`.
+The lock is not in the world-writable `/run/lock`: every operator path is
+walked from `/` through root-owned, non-writable ancestors.
+
+**One heavy restore at a time.** Before a run creates any scratch container,
+network or volume (and before it journals a new run), it takes the host lock.
+It waits at most `verify_wait_seconds` (optional, default 3600, at most 21600),
+then fails `verifier_host_busy` with nothing created and its journal unchanged;
+the timer tries again. The run's deadline pauses while it waits, so the restore
+keeps its whole budget; a service stop still ends the wait. Free disk is checked
+after the wait. Under the lock the holder:
+
+1. reads a previous `admission.json`, removes each resource it names by exact
+   name and owner label, and confirms it gone. A holder killed by SIGKILL
+   released the lock, but its containers may still run. When it cannot confirm
+   them gone, the new holder fails `verifier_cleanup_unconfirmed`, creates
+   nothing and keeps the record;
+2. writes its own record (profile, run, the exact name of every resource it
+   will create, for a messaging retry also its names from before ANYM-609)
+   before creating any;
+3. removes its resources after success or failure and then its record.
+
+Scratch names carry the profile: `deedkit-verify-<profile>-<run>-helper`,
+`-postgres`, `-data` and `-net`. A messaging retry journaled before ANYM-609
+also removes its old `deedkit-verify-<run>-*` names. The scratch database keeps
+its name `deedkit_verify_restore_test` inside the profile's own container: the
+pinned helper checks that name.
+
+**Instances file.** `/etc/deedkit-backup-r2/instances.json` (root `0600`,
+[example](deploy/backup-r2-instances.example.json)) lists every verifier config
+on the receiver, messaging's first. The configs must have separate directories
+and one `host_directory`.
+
+**Pin step.** One run moves every listed config to one helper pair, or none:
+
+```sh
+/opt/deedkit-backup-r2/venv/bin/python -m messaging_service.backup_r2_verifier \
+  --update-pins --helper-image sha256:<image ID> --helper-revision <40-hex commit>
+```
+
+It takes every instance's verifier lock (`verifier_busy` while one runs),
+refuses while any instance has a retry journal (`verification_pending`),
+preflights the pair for each config, then self-tests it under the host lock on
+each profile's synthetic bundle (messaging's and a calendar bundle with an
+enabled connection, its token and a disabled one), made and encrypted by the
+image under test. Then it journals every config's old pair in
+`pins-switch.json`, replaces each config atomically with only its two pins
+changed, writes the old pairs to `pins-previous.json` and removes the journal.
+Removing the journal is the commit point: a failure before it puts every config
+back, nothing after it rolls back. After a stop or crash between two writes the
+journal stays, and the first follow, pin step or verifier of a listed instance
+that runs puts every config back on its old pair before any listed instance uses
+a pin (a verifier that cannot fails `verifier_pins_unfinished`). A verifier the
+journal does not list leaves it alone: its writer may still be running. It prints
+`{"v":1,"status":"pinned","helper_revision":...}`, or the safe code on stderr
+and exit 1.
+
+Undo: run the pin step again with the previous pair (it self-tests it again):
+
+```sh
+jq -c .pins /var/lib/deedkit-backup-verify/pins-previous.json
+```
+
+With the instances file, the [update follow](#receiver-update-follow) is this
+step: it holds every listed instance's lock, self-tests the candidate on
+messaging's and every other profile's bundle, and moves all configs together.
+A listed instance on another pair (newly listed, or pinned by hand) joins
+messaging's pair once that pair passes its profile's self-test. `revert` moves
+them all back to the kept pair, after the kept pair passes every other
+profile's self-test (a helper older than 115a55d3 refuses a calendar bundle, so
+such a revert changes nothing). Without the file the follow moves messaging's
+config alone, as before.
 
 ## Receiver update follow
 
@@ -468,7 +553,8 @@ as root, an hour after the previous run ends. Each run:
    one is stopped and removed by exact name, first thing in every run and in
    `revert`;
 5. journals the switch (`follow-switch.json`: from, to, the image it drops),
-   replaces `verifier.json` atomically with only the two pins changed, then
+   replaces `verifier.json` (and every config the instances file lists, through
+   the pin step's journal) atomically with only the two pins changed, then
    writes the kept pair (`follow-previous.json`) and the proven installed pair
    (`follow-current.json`), drops the image of the pair before the kept one
    (by exact ID, never a prune) and removes the journal. The next run or
