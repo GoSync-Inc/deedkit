@@ -538,6 +538,65 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    destroys or corrupts data, a restore returns the database to that snapshot, and everything
    written after it (messages, receipts, keys, operator changes) is lost.
 
+### Database copies
+
+ANYM-588. `production.py copy-database --config <plan A config> --database <name> --sha <sha>` makes an
+exactly checked copy of one live database on this host without stopping its writers, proves it restores
+and leaves nothing running. Automatic migrations (ANYM-449) call the same function; a hand release kit can
+call the command. It runs under the plan A lock, like `prepare`.
+
+Configuration: the plan A file's `migration` section (`deploy/production.example.json`):
+`databases.<name>` = `{container, owner, database}` (the name: up to 12 lowercase letters and digits) and
+`copy_timeout_s` (default 1800, the deadline of each dump and of the restore). Without the section
+`copy-database` refuses and `deploy` behaves as before. The section is not part of the configuration
+digest, so adding it changes no prepared release (`settings_digest`).
+
+Steps, all through `docker exec -i -e PGAPPNAME=deedkit-copy-<id>-<step> <container>`, where `<id>` is
+`<sha12>-<name>-<UTC stamp>`:
+
+1. `<state>/migration-copies/<id>/owner.json` (0600, fsynced, directory 0700) names the scratch container
+   and the session prefix before anything starts.
+2. A keeper `psql` session (`idle_in_transaction_session_timeout` and `statement_timeout` = the deadline)
+   opens `REPEATABLE READ READ ONLY`, exports its snapshot, reads the database size and an exact
+   `count(*)` of every table outside the system schemas.
+3. Free space: the copy filesystem and the live database's data filesystem (the Source of the mount that
+   holds the container's `PGDATA`) each need 2 × the database size + the reserve, max(10 GiB, 10 % of that
+   filesystem). While a dump or the restore runs both are read every 2 s; below the reserve the step is
+   cancelled.
+4. At the snapshot: `pg_dump --schema-only` (the reference schema), `pg_dump -Fc` to `<database>.dump`,
+   `pg_dumpall --roles-only --no-role-passwords` to `roles.sql` (files 0600, created with `O_NOFOLLOW`);
+   the keeper commits.
+5. A scratch PostgreSQL from the database container's own image ID: `--rm --network none --log-driver
+   none --memory 1g --cpus 1 --pids-limit 256 --shm-size 256m`, label `deedkit-copy=<id>`, trust
+   authentication (no network: only `docker exec` reaches it), data in `<id>/scratch`. Roles, then the
+   database with the live owner, encoding and locale, then `pg_restore --exit-on-error
+   --single-transaction`.
+6. Every count and the schema-only dump (its random `\restrict` lines excepted) must equal the reference;
+   then `copy.json` (`verified`, counts, file hashes and sizes, snapshot time, server version).
+
+A failure is one fixed code: `dump_failed`, `restore_failed`, `count_mismatch`, `schema_mismatch`,
+`disk_reserve` or `deadline`; no `copy.json` is written. No helper's output is kept or printed: stderr is
+discarded, receipts hold table names, counts, sizes, hashes, times and codes only.
+
+Cleanup, at the end of every call, pass or fail: `pg_terminate_backend` of every live session whose
+application name starts with `deedkit-copy-<id>-`, `docker stop -t 10` of the scratch container and of
+every container a caller claimed, `docker network rm` of its claimed networks, then a read back (no such
+session in `pg_stat_activity`, no container with the label or name, no network) for up to 30 s; only then
+the scratch directory is removed and `released.json` written. `copy.json` says nothing about resources.
+
+Crashes: every `deploy` (not `--dry-run`) and every `copy-database` starts by releasing each copy with an
+`owner.json` and no `released.json` the same way; the dump files stay. A session or container it cannot
+confirm gone pauses `deploy`: "a database copy could not be stopped: <id>". Inspect it with `docker ps -a
+--filter label=deedkit-copy=<id>` and `pg_stat_activity`, stop what remains, then remove the pause.
+
+Retention (C6, docs/DATA-POLICY.md): every `deploy` run, paused or not (a paused run takes the plan A
+lock only when it is free), and every `copy-database` deletes copies older than 48 hours, whatever their
+state. Of a copy whose resources are not confirmed released only `owner.json` stays, so a later run can
+still stop them. The copies are plaintext on this host's disk and never leave it.
+
+Undo: none needed; a copy changes no database. To remove a copy at once: `rm -r
+/var/lib/deedkit-production/migration-copies/<id>` after its `released.json` exists.
+
 ## Apply and verify
 
 ```sh

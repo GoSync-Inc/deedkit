@@ -1,6 +1,13 @@
 {
   "version": 1,
   "state_directory": "/var/lib/deedkit-production",
+  "migration": {
+    "copy_timeout_s": 1800,
+    "databases": {
+      "messaging": {"container": "anymsg-db-1", "owner": "probe_owner", "database": "messaging_probe"},
+      "calendar": {"container": "deedkit-calendar-calendar-db-1", "owner": "fcs_owner", "database": "family_calendar"}
+    }
+  },
   "projects": [
     {
       "name": "deedkit-gateway",
