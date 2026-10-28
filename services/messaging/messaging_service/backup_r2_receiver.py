@@ -5,6 +5,7 @@ The producer still speaks stream_v2 and never receives object-store credentials.
 No boto3 import, ambient AWS credential lookup or network call occurs on import.
 """
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 import hashlib
@@ -134,7 +135,7 @@ def load_config(path):
     required = {'v', 'endpoint', 'bucket', 'prefix', 'state_directory', 'credentials_file'}
     defaults = {'max_bytes': 64 * 1024 ** 3, 'quota_bytes': 128 * 1024 ** 3,
                 'max_objects': 2, 'part_bytes': 64 * MIB, 'timeout_seconds': 7200,
-                'cold_max_bytes': 5 * 1024 ** 3}
+                'cold_max_bytes': 5 * 1024 ** 3, 'upload_concurrency': 1}
     # Optional `verifier_config_file`: the installed service's verifier config, the one
     # whose publication (CAPABILITIES_FILE) `capabilities` accepts; it enables the mode.
     if (not isinstance(value, dict) or not required <= set(value) or
@@ -153,7 +154,7 @@ def load_config(path):
             not 5 * MIB <= value['part_bytes'] <= 64 * MIB or
             not 64 <= value['max_bytes'] <= min(5 * 1024 ** 4, value['part_bytes'] * 10000) or
             not value['max_bytes'] <= value['quota_bytes'] <= 10 * 1024 ** 4 or
-            not 60 <= value['timeout_seconds'] <= 21600 or
+            not 60 <= value['timeout_seconds'] <= 21600 or not 1 <= value['upload_concurrency'] <= 4 or
             not 64 <= value['cold_max_bytes'] <= min(5 * 1024 ** 4, value['part_bytes'] * 10000)):
         raise ValueError('invalid_limits')
     for key in ('state_directory', 'credentials_file', 'verifier_config_file'):
@@ -559,6 +560,82 @@ def reconcile(config, client, attempt, state_fd):
     return saved
 
 
+class Parts:
+    """The parts of one multipart receive (ANYM-628).
+
+    With `upload_concurrency` 1 each part uploads inline, as before. With more, at most that many
+    upload at once and one more waits, so with the reader's own part memory stays within
+    (upload_concurrency + 2) x part_bytes; the reader blocks only at that bound. `finish` and
+    `stop` join every worker, so no thread still calls R2 when the caller aborts, completes or
+    releases the receiver lock, and a worker's error reaches the reader.
+    """
+    def __init__(self, config, client, key, upload_id):
+        self.config, self.client, self.key, self.upload_id = config, client, key, upload_id
+        self.workers = config.get('upload_concurrency', 1); self.count = 0; self.etags = {}; self.pending = set()
+        self.halted = False
+        self.pool = ThreadPoolExecutor(self.workers, thread_name_prefix='r2-part') if self.workers > 1 else None
+
+    def send(self, number, data):
+        if self.halted:
+            raise RuntimeError('upload_stopped')
+        cancelled()
+        result = cloud_call(self.client.upload_part, Bucket=self.config['bucket'], Key=self.key,
+                            UploadId=self.upload_id, PartNumber=number, Body=data)
+        etag = result.get('ETag')
+        if not isinstance(etag, str) or not 1 <= len(etag) <= 1024:
+            raise ValueError('invalid_part_receipt')
+        return number, etag
+
+    def collect(self, block):
+        done, self.pending = wait(self.pending, timeout=None if block else 0, return_when=FIRST_COMPLETED)
+        for future in done:
+            number, etag = future.result()
+            self.etags[number] = etag
+
+    def add(self, data):
+        self.count += 1
+        if self.count > 10000:
+            raise ValueError('backup_size_mismatch')
+        if self.pool is None:
+            number, etag = self.send(self.count, data)
+            self.etags[number] = etag
+            return
+        self.collect(False)
+        while len(self.pending) > self.workers:
+            self.collect(True)
+        self.pending.add(self.pool.submit(self.send, self.count, data))
+
+    def finish(self):
+        while self.pending:
+            self.collect(True)
+        self.stop()
+        if sorted(self.etags) != list(range(1, self.count + 1)):
+            raise ValueError('invalid_part_receipt')
+        # Parts remain bounded in memory. The durable completion journal
+        # needs the final object identity, not 10,000 part ETags: an
+        # unknown completion is reconciled, never blindly repeated.
+        return [{'PartNumber': number, 'ETag': self.etags[number]} for number in sorted(self.etags)]
+
+    def stop(self):
+        """Cancel waiting parts and join running ones; a deadline/stop meanwhile is raised after the join.
+
+        After our deadline/stop the SDK's retry hook refuses another attempt, so a running
+        part ends within one request's connect/read timeouts.
+        """
+        if self.pool is None:
+            return
+        self.halted = True; interrupted = None
+        while True:
+            try:
+                self.pool.shutdown(wait=True, cancel_futures=True)
+                break
+            except (TimeoutError, InterruptedError, KeyboardInterrupt) as exc:
+                # Our SIGALRM handler raises in this thread; a worker may still be calling R2.
+                interrupted = interrupted or exc
+        if interrupted is not None:
+            raise interrupted
+
+
 def receive(config, source, *, client=None, respond=None):
     header = read_header(config, source); bid = header['id']
     client = client if client is not None else make_client(config)
@@ -596,23 +673,11 @@ def receive(config, source, *, client=None, respond=None):
             raise ValueError('invalid_upload_id')
         attempt['upload_id'] = upload_id; attempt['phase'] = 'uploading'
         state_write(state_fd, attempt_name(bid), attempt)
+        uploads = Parts(config, client, key, upload_id)
         try:
             if respond:
                 respond({'v': 2, 'status': 'ready', 'id': bid, 'snapshot_sha256': header['snapshot_sha256']})
-            digest = hashlib.sha256(); size = 0; prefix = b''; buffer = bytearray(); parts = []
-            def part(data):
-                number = len(parts) + 1
-                if number > 10000:
-                    raise ValueError('backup_size_mismatch')
-                result = cloud_call(client.upload_part, Bucket=config['bucket'], Key=key, UploadId=upload_id,
-                                    PartNumber=number, Body=data)
-                etag = result.get('ETag')
-                if not isinstance(etag, str) or not 1 <= len(etag) <= 1024:
-                    raise ValueError('invalid_part_receipt')
-                parts.append({'PartNumber': number, 'ETag': etag})
-                # Parts remain bounded in memory. The durable completion journal
-                # needs the final object identity, not 10,000 part ETags: an
-                # unknown completion is reconciled, never blindly repeated.
+            digest = hashlib.sha256(); size = 0; prefix = b''; buffer = bytearray()
             while True:
                 length = struct.unpack('!I', local.exact_read(source, 4))[0]
                 if length == 0:
@@ -626,7 +691,9 @@ def receive(config, source, *, client=None, respond=None):
                     prefix += data[:len(AGE_HEADER) - len(prefix)]
                 buffer.extend(data)
                 if len(buffer) >= config['part_bytes']:
-                    part(bytes(buffer[:config['part_bytes']])); del buffer[:config['part_bytes']]
+                    # Cut before handing over: a waiting reader holds one part, not two copies.
+                    data = bytes(buffer[:config['part_bytes']]); del buffer[:config['part_bytes']]
+                    uploads.add(data); data = None
             raw = source.readline(4097)
             if len(raw) > 4096 or not raw.endswith(b'\n'):
                 raise ValueError('truncated_backup')
@@ -641,7 +708,8 @@ def receive(config, source, *, client=None, respond=None):
             if prefix != AGE_HEADER:
                 raise ValueError('encrypted_backup_required')
             if buffer:
-                part(bytes(buffer))
+                uploads.add(bytes(buffer))
+            parts = uploads.finish()
             wire = {'v': 2, 'status': 'stored', 'id': bid, 'bytes': size, 'sha256': digest.hexdigest(),
                     'snapshot_sha256': header['snapshot_sha256'], 'duplicate': False,
                     'received_at': datetime.now(timezone.utc).isoformat()}
@@ -650,7 +718,9 @@ def receive(config, source, *, client=None, respond=None):
             state_write(state_fd, attempt_name(bid), attempt)
         except BaseException:
             # This path is reachable only before CompleteMultipartUpload. Never
-            # abort a completion whose response may have been lost.
+            # abort a completion whose response may have been lost. No part
+            # upload may still run when the abort or the lock release happens.
+            uploads.stop()
             cloud_call(client.abort_multipart_upload, Bucket=config['bucket'], Key=key, UploadId=upload_id)
             os.unlink(attempt_name(bid), dir_fd=state_fd); local.fsync_dir(state_fd)
             raise
