@@ -103,6 +103,7 @@
       "mcp__claude_ai_Deedkit__messages_register_delivery_endpoint",
       "mcp__claude_ai_Deedkit__messages_request_file_download",
       "mcp__claude_ai_Deedkit__messages_restore_reply",
+      "mcp__claude_ai_Deedkit__messages_send",
       "mcp__claude_ai_Deedkit__messages_send_message",
       "mcp__claude_ai_Deedkit__messages_snooze_reply",
       "mcp__claude_ai_Deedkit__messages_submit_feedback",

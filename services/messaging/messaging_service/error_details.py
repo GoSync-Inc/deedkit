@@ -36,6 +36,9 @@ def payload(error,operation='',request_id=None):
     # ANYM-545: rulebook v1 (AGENT_API.md) next, candidates and more; archive IDs and labels the key may read.
     for name in ('next','candidates','more'):
         if hasattr(error,name):info[name]=getattr(error,name)
+    # ANYM-546: preview_stale's changed fields, fresh preview and its new confirm_token (the caller's own send).
+    for name in ('changed','preview','confirm_token'):
+        if hasattr(error,name):info[name]=getattr(error,name)
     if retry:info['retry_after_seconds']=2
     if code in EXPECTED:info['expected']=EXPECTED[code]
     if operation in ('search','search_files'):info['results_state']='not_returned_due_to_error'
