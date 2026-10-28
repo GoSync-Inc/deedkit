@@ -18,7 +18,6 @@ import binascii
 import hashlib
 import re
 import secrets
-import time
 
 from platform_contracts.agent import (PLACEHOLDER_REQUEST_ID, PREVIEW_TTL_S, agent_result, child_key, is_request_id,
                                       missing_request_id, next_call)
@@ -45,8 +44,8 @@ UPLOAD_TOOL = 'messages_prepare_file_upload'
 INLINE_PLACEHOLDER = 'REPLACE_WITH_THE_SAME_BASE64'
 MIME = re.compile(r'[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+')
 MAX_FILES = 10
-# Fresh child keys `stage` tries for one inline file once earlier ones were released or expired.
-STAGE_ATTEMPTS = 16
+# A staged upload a later dry run or call reuses keeps this long (seconds), longer than a preview lives (PREVIEW_TTL_S).
+REUSE_LEFT_S = 1800
 CAPTION_LIMIT = 1024
 COMPARED = ('target', 'reply_to', 'text', 'files', 'scope')
 PENDING = frozenset(('queued', 'dispatching'))
@@ -598,24 +597,29 @@ def stage(store, token, arguments):
         principal = p['id']
     if target.get('opens_chat'):
         raise _invalid('files', 'max_items', 'a phone without a chat takes text only: send it, then the files')
-    parent = request_id
-    if arguments.get('dry_run') and not is_request_id(request_id):
-        # Repeated dry runs of one payload reuse their uploads (a key holds at most 4 active ones). A half-hour window
-        # keeps a reused upload over 30 minutes from its 1 hour expiry, longer than a preview lives (PREVIEW_TTL_S).
-        parent = 'dry-run:' + _hash({'account': target['account'], 'chat_id': target['chat_id'],
-                                     'files': public(value)['files'], 'window': int(time.time() // 1800)})
     files = list(value['files'])
     for index in indexes:
         item, facts = files[index], _facts(files[index])
-        for attempt in range(1, STAGE_ATTEMPTS + 1):
-            # A released or expired upload is never reused: the next attempt stages the bytes afresh.
-            key = CHILD_KEY_PREFIX + child_key(principal, TOOL, parent, f'inline{index + 1}', attempt)
+
+        def staged(parent):
+            key = CHILD_KEY_PREFIX + child_key(principal, TOOL, parent, f'inline{index + 1}', 1)
             with store.authorized(token, 'prepare_file_upload') as (c, p):
-                row = prepare(store, c, p, target['account'], target['chat_id'], facts['name'], facts['mime'],
-                              facts['bytes'], facts['sha256'], key, child=True)
-            if row['status'] != 'expired': break
-        else:
-            raise APIError('upload_limit', 409)
+                return prepare(store, c, p, target['account'], target['chat_id'], facts['name'], facts['mime'],
+                               facts['bytes'], facts['sha256'], key, child=True)
+        # A request_id call's own child key first: its repeat finds its upload.
+        row = staged(request_id) if is_request_id(request_id) else None
+        if row is None or row['status'] == 'expired':
+            # Else a live staged upload of the same file and chat (a key holds at most 4 active ones), else a fresh
+            # child key: a released or expired upload is never reused, however often the file is sent.
+            with store.authorized(token, 'prepare_file_upload') as (c, p):
+                live = c.execute('''SELECT id FROM file_uploads WHERE principal=%s AND key_id=%s AND account=%s
+                    AND chat=%s AND filename=%s AND mime=lower(%s) AND bytes=%s AND sha256=%s AND state='ready'
+                    AND starts_with(request_id,%s) AND expires_at>clock_timestamp()+%s*interval '1 second'
+                    ORDER BY expires_at DESC LIMIT 1''', (p['id'], p['key_id'], target['account'], target['chat_id'],
+                    facts['name'], facts['mime'], facts['bytes'], facts['sha256'], CHILD_KEY_PREFIX,
+                    REUSE_LEFT_S)).fetchone()
+            row = ({'upload_id': live['id'], 'status': 'ready'} if live else
+                   staged(f'{request_id or "dry-run"}:{secrets.token_hex(16)}'))
         if row['status'] == 'uploading' and row['offset'] == 0:
             with store.authorized(token, 'upload_file_chunk') as (c, p):
                 chunk(store, c, p, row['upload_id'], 0, item['base64'])

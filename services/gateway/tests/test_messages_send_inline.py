@@ -151,7 +151,10 @@ def test_more_than_64_kib_is_read_only_for_the_large_tool_the_call_claims_and_th
     listing = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
                           "params": {"_meta": {"pad": "x" * 200000}}}).encode()
     batch = json.dumps([json.loads(send)]).encode()
-    for body in (listing, batch):
+    # Nested metadata that looks like a large call claims nothing: only the top-level method and params.name count.
+    nested = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": {
+        "method": "tools/call", "name": "messages_send", "pad": "x" * 200000}}}).encode()
+    for body in (listing, batch, nested):
         status, count = received(app, body)
         assert status == 413 and count <= NORMAL_BODY_LIMIT + 4096
     # A key that may upload chunks but not call messages_send reads no more of a messages_send call.
@@ -162,6 +165,10 @@ def test_more_than_64_kib_is_read_only_for_the_large_tool_the_call_claims_and_th
     chunk_only = create_app(policy, "http://testserver", transports={"messaging": httpx.MockTransport(
         lambda request: httpx.Response(200, json={"permissions": ["read", "send", "upload"],
                                                   "tool_manifest": {"names": ["upload_file_chunk"]}}))})
-    status, count = received(chunk_only, send)
-    assert status == 413 and count <= NORMAL_BODY_LIMIT + 4096
+    disguised = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+        "_meta": {"name": "messages_upload_file_chunk"}, "name": "messages_send",
+        "arguments": {"to": SEND["to"], "files": [item], "dry_run": True}}}).encode()
+    for body in (send, disguised):
+        status, count = received(chunk_only, body)
+        assert status == 413 and count <= NORMAL_BODY_LIMIT + 4096
     assert seen == []

@@ -201,6 +201,16 @@ def test_a_fresh_dry_run_after_a_send_stages_the_released_file_again(world):
 
 
 # spec: ANYM-547
+def test_any_number_of_preview_and_send_cycles_of_one_file_stage_it_afresh(world):
+    item, _ = inline(1024)
+    for cycle in range(18):
+        preview = world.call(to=CHAT, text=f'Synthetic caption {cycle}', files=[item], dry_run=True)
+        assert world.drive(confirm_token=preview['confirm_token'])['state'] == 'succeeded'
+    rows = uploads(world)
+    assert len(world.files) == 18 and len(rows) == 18 and all(row['state'] == 'expired' for row in rows)
+
+
+# spec: ANYM-547
 def test_following_a_preview_required_next_still_deletes_the_staged_bytes_after_the_send(world):
     item, _ = inline(2048)
     with pytest.raises(APIError) as error:
@@ -263,7 +273,10 @@ def test_more_than_16_kib_is_read_only_for_a_large_tool_of_a_key_that_may_upload
     rest = json.dumps({'to': CHAT, 'files': [item], 'dry_run': True}).encode()
     late = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
         'arguments': {'to': CHAT, 'files': [item], 'dry_run': True}, 'name': 'messages_send'}}).encode()
+    # Nested metadata that looks like a large call claims nothing: only the top-level method and params.name count.
+    nested = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {'_meta': {
+        'method': 'tools/call', 'name': 'messages_send', 'pad': 'x' * 40000}}}).encode()
     for path, body, token in (('/mcp', call, send_only), ('/v1/messages_send', rest, send_only),
-                              ('/mcp', listing, world.key), ('/mcp', late, world.key)):
+                              ('/mcp', listing, world.key), ('/mcp', late, world.key), ('/mcp', nested, world.key)):
         status, count = received(app, path, body, token)
         assert status == 413 and count <= 16384 + 4096, (path, token == world.key, count)

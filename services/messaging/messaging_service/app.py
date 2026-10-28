@@ -36,14 +36,39 @@ from .send_intent import SEND_BODY_BYTES
 # Both stage bytes as uploads, so only a key that may upload (upload_file_chunk) reads more than 16 KiB.
 LARGE_BODIES = {'upload_file_chunk': UPLOAD_BODY_BYTES, 'messages_send': SEND_BODY_BYTES}
 NORMAL_BODY_BYTES = 16384
+SPACE = re.compile(r'[ \t\n\r]*')
 
 
 def claimed_tool(prefix):
-    """The tool an MCP body names in its first 16 KiB, read before any more of it: a JSON object (never a batch)
-    with method tools/call and a name. Only a hint for how much to read; the parsed envelope decides the cap."""
-    if prefix.lstrip()[:1]!=b'{' or not re.search(rb'"method"\s*:\s*"tools/call"',prefix): return None
-    found=re.search(rb'"name"\s*:\s*"([A-Za-z0-9_]{1,64})"',prefix)
-    return found and found.group(1).decode()
+    """The tool a JSON-RPC body names in its first 16 KiB, read before any more of it: parsed structurally, the
+    top-level object's own `method` is tools/call, then its `params` object's own `name` (never nested metadata, a
+    batch, a repeated key or a member that ends past the prefix). Only how much to read; the parsed call decides."""
+    text,decoder=prefix.decode('utf-8','ignore'),json.JSONDecoder()
+    def space(i):return SPACE.match(text,i).end()
+    def members(i):
+        if text[i:i+1]!='{':return
+        i,seen=space(i+1),set()
+        while text[i:i+1]=='"':
+            key,i=decoder.raw_decode(text,i);i=space(i)
+            if key in seen or text[i:i+1]!=':':raise ValueError
+            seen.add(key);start=space(i+1)
+            yield key,start
+            i=space(decoder.raw_decode(text,start)[1])
+            if text[i:i+1]!=',':return
+            i=space(i+1)
+    method=None
+    try:
+        for key,start in members(space(0)):
+            if key=='method':method=decoder.raw_decode(text,start)[0]
+            elif key=='params':
+                if method!='tools/call':return None
+                for inner,at in members(start):
+                    if inner=='name':
+                        name=decoder.raw_decode(text,at)[0]
+                        return name if isinstance(name,str) else None
+                return None
+    except (ValueError,RecursionError):pass
+    return None
 
 WaitSeconds = Annotated[float, Field(strict=True,ge=0,le=25,allow_inf_nan=False)]
 LiveWaitSeconds = Annotated[float, Field(strict=True,ge=0,le=20,allow_inf_nan=False)]

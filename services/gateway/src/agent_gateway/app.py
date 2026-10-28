@@ -36,6 +36,7 @@ UPLOAD_CHUNK_TOOL = "messages_upload_file_chunk"
 SEND_BODY_LIMIT = 524288
 # The only tools whose call may carry more than NORMAL_BODY_LIMIT, each with its own cap, after authentication.
 LARGE_BODY_LIMITS = {UPLOAD_CHUNK_TOOL: UPLOAD_BODY_LIMIT, "messages_send": SEND_BODY_LIMIT}
+SPACE = re.compile(r"[ \t\n\r]*")
 
 
 def expiry_notice(credential):
@@ -90,12 +91,48 @@ def large_call(path, body):
 
 
 def claimed_tool(prefix):
-    """The tool an MCP body names in its first NORMAL_BODY_LIMIT bytes, read before any more of it: a JSON object
-    (never a batch) with method tools/call and a name. Only a hint for how much to read; `large_call` decides."""
-    if prefix.lstrip()[:1] != b"{" or not re.search(rb'"method"\s*:\s*"tools/call"', prefix):
-        return None
-    found = re.search(rb'"name"\s*:\s*"([A-Za-z0-9_]{1,64})"', prefix)
-    return found and found.group(1).decode()
+    """The tool an MCP body names in its first NORMAL_BODY_LIMIT bytes, read before any more of it: parsed
+    structurally, the top-level object's own `method` is tools/call, then its `params` object's own `name` (never
+    nested metadata, a batch, a repeated key or a member that ends past the prefix). Only how much to read;
+    `large_call` decides on the whole body."""
+    text, decoder = prefix.decode("utf-8", "ignore"), json.JSONDecoder()
+
+    def space(i):
+        return SPACE.match(text, i).end()
+
+    def members(i):
+        if text[i:i + 1] != "{":
+            return
+        i, seen = space(i + 1), set()
+        while text[i:i + 1] == '"':
+            key, i = decoder.raw_decode(text, i)
+            i = space(i)
+            if key in seen or text[i:i + 1] != ":":
+                raise ValueError
+            seen.add(key)
+            start = space(i + 1)
+            yield key, start
+            i = space(decoder.raw_decode(text, start)[1])
+            if text[i:i + 1] != ",":
+                return
+            i = space(i + 1)
+
+    method = None
+    try:
+        for key, start in members(space(0)):
+            if key == "method":
+                method = decoder.raw_decode(text, start)[0]
+            elif key == "params":
+                if method != "tools/call":
+                    return None
+                for inner, at in members(start):
+                    if inner == "name":
+                        name = decoder.raw_decode(text, at)[0]
+                        return name if isinstance(name, str) else None
+                return None
+    except (ValueError, RecursionError):
+        pass
+    return None
 
 
 def create_app(policy_path, public_url, *, transports=None):

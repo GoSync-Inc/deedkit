@@ -193,7 +193,8 @@ one call. Only `messages_send` takes the larger body this needs (512 KiB, at the
 and on the messaging route, after authentication); every other route keeps its cap. More
 than the normal cap is read only for a key that may call that tool (on messaging: the
 `upload` permission), and on MCP only when the first 64 KiB (messaging: 16 KiB) name it: a
-`tools/call` object with `params.name` before its `arguments`, as MCP clients send it. One
+top-level `tools/call` object, `method` before `params` and `params.name` before its
+`arguments`, as MCP clients send it (nested metadata never counts). One
 byte over gives `invalid_arguments` with `field_errors` (`files.<n>.base64`, `max_bytes`)
 and a `next` to `messages_prepare_file_upload` with that file's account, chat, name, MIME,
 size and SHA-256 and the placeholder `request_id`. The gateway relays that `next` only
