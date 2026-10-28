@@ -185,7 +185,7 @@ def test_vendor_hint_from_an_expired_lease_is_unknown_without_a_post(gate, polic
             lease_until=clock_timestamp()-interval '1 second',admitted_at=clock_timestamp() WHERE kind='events'""")
     dispatch_hints(store, transport=lambda *a, **k: pytest.fail('re-sent to a vendor after a lost lease'),
         resolver=PUBLIC)
-    assert hint(store) == {'state': 'dead_letter', 'error_code': 'outcome_unknown', 'attempts': 2}
+    assert hint(store) == {'state': 'dead_letter', 'error_code': 'outcome_unknown', 'attempts': 1}
 
 
 # spec: ANYM-582
@@ -238,3 +238,75 @@ def test_vendor_test_from_an_expired_lease_fails_unknown_without_a_post(gate, po
     with store.pool.connection() as c:
         assert c.execute('SELECT state,error_code FROM delivery_endpoint_tests').fetchone() == \
             {'state': 'failed', 'error_code': 'outcome_unknown'}
+
+
+def lost_lease(store):
+    with store.pool.connection() as c:
+        # A dispatcher that crashed during its attempt: the lease ran out with the attempt reserved.
+        c.execute("""UPDATE subscription_outbox SET state='leased',attempts=1,lease_token=gen_random_uuid(),
+            lease_until=clock_timestamp()-interval '1 second',admitted_at=clock_timestamp() WHERE kind='events'""")
+
+
+def _no_dns(*args, **kwargs):
+    raise OSError('synthetic resolver outage')
+
+
+# spec: ANYM-582
+@pytest.mark.parametrize('recovery', ['dns-outage', 'quiet-hours'])
+def test_vendor_lost_lease_stays_unknown_when_dns_fails_or_quiet_hours_hold_it(gate, policy, monkeypatch, recovery):
+    import datetime
+
+    from messaging_service import delivery_policy
+    store = gate
+    token = identity(store)
+    bound(store, token)
+    lost_lease(store)
+    if recovery == 'quiet-hours':
+        later = lambda *a, **k: datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)  # noqa: E731
+        monkeypatch.setattr(delivery_policy, 'quiet_until', later)
+    dispatch_hints(store, transport=lambda *a, **k: pytest.fail('re-sent to a vendor after a lost lease'),
+        resolver=_no_dns if recovery == 'dns-outage' else PUBLIC)
+    assert hint(store) == {'state': 'dead_letter', 'error_code': 'outcome_unknown', 'attempts': 1}
+    due_now(store)
+    dispatch_hints(store, transport=lambda *a, **k: pytest.fail('re-sent to a vendor after recovery'), resolver=PUBLIC)
+    assert hint(store)['state'] == 'dead_letter'
+
+
+# spec: ANYM-582
+def test_vendor_informational_status_is_unknown_and_never_retried(gate, policy):
+    store = gate
+    token = identity(store)
+    endpoint = register(store, token)
+    dispatch_hints(store, transport=lambda *a, **k: 100, resolver=PUBLIC)
+    result = asyncio.run(finish_inline_test(store, token, endpoint, wait_s=0.5))
+    assert (result['test']['test_status'], result['test']['error_code']) == ('failed', 'outcome_unknown')
+    bound(store, identity(store, 'vendor-agent-2'))
+    posts = []
+    dispatch_hints(store, transport=lambda *a, **k: posts.append(1) or 100, resolver=PUBLIC)
+    assert hint(store) == {'state': 'dead_letter', 'error_code': 'outcome_unknown', 'attempts': 1}
+    due_now(store)
+    dispatch_hints(store, transport=lambda *a, **k: posts.append(1) or 100, resolver=PUBLIC)
+    assert posts == [1]
+
+
+# spec: ANYM-582
+def test_vendor_refused_key_auto_pauses_the_endpoint_until_new_headers_and_resume(gate, policy):
+    store = gate
+    token = identity(store)
+    endpoint, sid = bound(store, token)
+    dispatch_hints(store, transport=lambda *a, **k: 401, resolver=PUBLIC)
+    assert hint(store)['error_code'] == 'vendor_refused'
+    view = store.list_delivery_endpoints(token)['items'][0]
+    assert view['state'] == 'auto_paused' and view['vendor'] == 'grok-bot-routine'
+    view = store.update_delivery_endpoint(token, endpoint['endpoint_id'], view['version'], 'set_headers',
+        headers={'Authorization': 'Bearer synthetic-routine-key-0002'})
+    view = store.update_delivery_endpoint(token, endpoint['endpoint_id'], view['version'], 'resume')
+    assert view['state'] == 'enabled'
+
+
+# spec: ANYM-582
+def test_policy_reload_reports_the_vendor_map_it_loaded(gate, policy):
+    store = gate
+    assert store.reload_delivery_policy()['vendors'] == {'grok-bot-routine': ['routine.vendor.test']}
+    policy(allow_hosts=['vendor.test'])
+    assert store.reload_delivery_policy()['vendors'] == {}

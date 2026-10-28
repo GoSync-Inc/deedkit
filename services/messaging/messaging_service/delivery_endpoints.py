@@ -170,13 +170,28 @@ def vendor_result(status=None, failure=None):
     """
     if failure is not None:
         return ('retry', 'receiver_unavailable') if isinstance(failure, EgressNotSent) else ('final', 'outcome_unknown')
-    if type(status) is not int or not 100 <= status <= 599:
+    if type(status) is not int or not 200 <= status <= 599:
+        # A 1xx (100 Continue) is not a final answer: the vendor may still start the run.
         return 'final', 'outcome_unknown'
     if 200 <= status < 300:
         return 'delivered', None
     if 300 <= status < 400:
         return 'final', 'redirect_rejected'
     return ('final', 'vendor_refused') if status in (401, 403) else ('retry', 'receiver_status')
+
+
+def vendor_endpoint(c, endpoint_id):
+    """The vendor of an endpoint's host under the current policy (ANYM-582), or None."""
+    row = c.execute('SELECT host FROM delivery_endpoints WHERE id=%s', (endpoint_id,)).fetchone()
+    return vendor_of(load_policy(), row['host']) if row else None
+
+
+def auto_pause(c, endpoint_id):
+    """A vendor refused the caller's key (401/403): the endpoint stops until the agent replaces its headers and
+    resumes, so nothing else dead-letters unseen. The caller holds the endpoint lock shared (fenced)."""
+    paused = c.execute("""UPDATE delivery_endpoints SET state='auto_paused',version=version+1,
+        updated_at=clock_timestamp() WHERE id=%s AND state='enabled'""", (endpoint_id,)).rowcount
+    return cancel_queued(c, endpoint_id, 'endpoint_auto_paused') if paused else 0
 
 
 def _private_answer(address):
@@ -630,7 +645,9 @@ def reload_delivery_policy(store):
             refused += 1
             lock_endpoint(c, row['id'])
             cancelled += cancel_queued(c, row['id'], 'endpoint_policy_refused')
-    return {'policy_set': policy is not None, 'refused_endpoints': refused, 'cancelled': cancelled}
+    # The vendor map as loaded, so an operator sees a host left out of `vendors` at the moment of the edit.
+    return {'policy_set': policy is not None, 'refused_endpoints': refused, 'cancelled': cancelled,
+        'vendors': policy['vendors'] if policy else {}}
 
 
 def list_endpoints_admin(store, principal=None):
