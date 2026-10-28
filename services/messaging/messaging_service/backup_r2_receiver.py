@@ -5,7 +5,7 @@ The producer still speaks stream_v2 and never receives object-store credentials.
 No boto3 import, ambient AWS credential lookup or network call occurs on import.
 """
 import argparse
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 import hashlib
 import fcntl
@@ -272,8 +272,11 @@ def verify_object(config, client, receipt, output=None):
                     raise stop
                 if size == wire['bytes']:
                     break
-                with suppress(Exception):
+                try:
                     body.close()
+                except Exception as closing:
+                    if (stop := signalled(closing)) is not None:
+                        raise stop
                 while True:
                     resumes += 1
                     if resumes > STREAM_RESUMES:

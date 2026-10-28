@@ -437,6 +437,19 @@ def test_stream_deadline_or_stop_inside_an_sdk_read_is_never_retried(monkeypatch
 
 
 # spec: ANYM-285
+def test_stream_deadline_while_closing_the_broken_body_is_never_swallowed(monkeypatch):
+    data=r2.AGE_HEADER+os.urandom(r2.MIB);pauses=[]
+    monkeypatch.setattr(r2,'stream_pause',pauses.append)
+    class Closing(FlakyBody):
+        def close(self):raise TimeoutError('restore_deadline')
+    cloud=FlakyCloud(data,[])
+    cloud.get_object=lambda **kw:(cloud.calls.append(kw),{'ContentLength':len(data),'ETag':'"e"','Body':Closing(data,100)})[1]
+    with pytest.raises(TimeoutError,match='restore_deadline'):
+        r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),io.BytesIO())
+    assert not pauses and len(cloud.calls)==1
+
+
+# spec: ANYM-285
 def test_stream_never_retries_a_failed_write_to_the_restore_helper(monkeypatch):
     data=r2.AGE_HEADER+os.urandom(r2.MIB);pauses=[]
     monkeypatch.setattr(r2,'stream_pause',pauses.append)
