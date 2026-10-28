@@ -225,31 +225,47 @@ merged build live. A paused autodeploy is recorded for the report and never touc
 ## Container runner (ANYM-574)
 
 `deploy/autoloop-runner/launch.py build <intent> <card>` runs on the owner's Mac in the build
-workspace's terminal. It builds the pinned image (`Dockerfile`: the agent CLI, git, gh, uv with
-Python 3.13, node and the Tiden CLI, each pinned by version and digest or checksum; tagged by the
-hash of the directory) and starts one container with a fresh clone of `main` on the intent's
-branch. Nothing of the owner's is mounted (no `~/.ssh`, SSH agent socket, `~/.deedkit`, the
-orchestrator directory, Docker socket or login directory); the two mounts are a read-only control
-directory (the two brief copies and the gate file) and an outbox.
+workspace's terminal. It builds the image (`Dockerfile`: the agent CLI, gh, uv with Python
+3.13.11, node and the Tiden CLI pinned by version and digest or checksum; git, python3 and
+certificates come unpinned from the base image's Debian release; tagged by the hash of the
+directory) and starts one container with a fresh clone of `main` on the intent's branch. Nothing
+of the owner's is mounted (no `~/.ssh`, SSH agent socket, `~/.deedkit`, the orchestrator
+directory, Docker socket or login directory); the one mount is a read-only control directory
+(the two brief copies and the gate file).
 
 - **Logins.** Existing ones only, as environment values that never appear on a command line: the
   gh token, the Claude subscription's current access token (the refresh token stays in the
   Keychain; the launcher refuses a token that expires within the 4-hour build limit) and the Tiden
-  token. No new key.
+  token. No new key. They sit in the container's Docker metadata (`docker inspect`, readable by
+  the owner's user only) until the launcher removes the container at the end.
 - **Egress.** The container sits on the internal Docker network `deedkit_autoloop` with no route
   out. Its only way out is `proxy.py` (`deedkit_autoloop_proxy`, the one container on both that
   network and the default bridge): `CONNECT` on port 443 to GitHub, the Anthropic API, Tiden, PyPI,
-  npm and the Go module proxy, and nothing else. No IP literal, and no name that resolves to a
-  private, loopback, link-local or tailnet address.
+  npm and the Go module proxy, and nothing else. No IP literal, no name that resolves to a
+  private, loopback, link-local or tailnet address, and the tunnel's TLS ClientHello must name
+  the same host. The proxy cannot see the HTTP host inside TLS; that a worker holding the gh
+  token can send data out through GitHub is the residual below, not something the proxy stops.
 - **Check.** `selfcheck.py` runs before the clone; any SSH key, socket, variable outside its list,
   forbidden mount, or route to the production host (directly or through the proxy) stops the
   container. `launch.py check` runs the check and one model call: the subscription login works in
   a container.
+- **Agent.** The agent CLI runs non-interactively (`claude -p`) and ends after its last answer;
+  the launcher stops the container at the 4-hour build limit. There is no Codex in the image: the
+  worker's own review rounds run as an Opus subagent (its prompt says so), and the controller's
+  Astra review of the head on the host (above) stays the review of record.
 - **Gate and ends.** Inside the container `autoloop.py gate|finish|decline|large` work through the
-  mounts: `gate` reads the gate file, which the launcher rewrites from the host state every 30 s;
-  a stop there (`PAUSE`, a held card, a dropped item) stops the container, and so does a closed
-  terminal (fence, hold). `finish`, `decline` and `large` for this intent go to the outbox, and the
-  launcher applies them on the host after the container ends. Other commands are refused inside.
+  control directory and an outbox file inside the container: `gate` reads the gate file, which
+  the launcher rewrites from the host state every 30 s; a stop there (`PAUSE`, a held card, a
+  dropped item), a failed gate check or a closed terminal (fence, hold) stops the container
+  (`docker kill` if `stop` does not; a container still running then is said in the terminal).
+  `finish`, `decline` and `large` for this intent go to the outbox. After the container ends the
+  launcher copies out the outbox with `docker cp` (one regular file of at most 5 KiB, else
+  nothing), keeps the valid requests in `~/.cache/deedkit-autoloop-runner/<intent>/pending.json`,
+  removes the container and applies them on the host, retrying for 20 minutes while a tick holds
+  the lock. What it could not apply stays in that file, the terminal says so, and
+  `launch.py apply <intent>` applies it later; a new build of the intent waits until then.
+  Other commands are refused inside. The worker's output stays in the build terminal's
+  scrollback.
 - **Undo.** `docker stop <intent>`; `docker stop deedkit_autoloop_proxy`; to start builds with the
   worker preset again, revert ANYM-574's `build_start`.
 

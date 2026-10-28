@@ -1,4 +1,6 @@
 """Feedback autoloop: the tool-less reader, its init check, the closed answer and its outcomes (ANYM-570)."""
+import asyncio
+import io
 import json
 import os
 from pathlib import Path
@@ -6,6 +8,8 @@ import re
 import shutil
 import stat
 import sys
+import tarfile
+import threading
 
 import pytest
 
@@ -1972,7 +1976,7 @@ def test_the_in_container_check_finds_no_ssh_key_socket_or_extra_variable_and_no
 # spec: ANYM-574
 def test_the_entrypoint_runs_the_check_before_the_clone_and_the_agent_cli():
     text = (ROOT / 'deploy/autoloop-runner/entrypoint.sh').read_text()
-    assert text.index('selfcheck.py') < text.index('git clone') < text.index('exec claude --dangerously')
+    assert text.index('selfcheck.py') < text.index('git clone') < text.index('exec claude -p "$AUTOLOOP_PROMPT" --dangerously')
     assert text.startswith('#!/bin/sh\n') and 'set -eu' in text
 
 
@@ -1994,14 +1998,14 @@ def test_the_runner_container_gets_no_owner_directory_no_secret_on_its_command_l
         tmp_path):
     values = {**{name: 'secret-value-' + name for name in launcher.SECRETS},
               **launcher.settings(BUILD, 'ANYM-30', PROD)}
-    control, outbox = tmp_path / 'control', tmp_path / 'outbox'
-    argv = launcher.run_argv(BUILD, 'img', sorted(values), control, outbox, tty=True)
+    control = tmp_path / 'control'
+    argv = launcher.run_argv(BUILD, 'img', sorted(values), control, tty=True, remove=False)
+    assert '--rm' not in argv and '--rm' in launcher.run_argv('c', 'img', [])
     assert not any('secret-value' in part for part in argv)
     assert argv[argv.index('--network') + 1] == launcher.NETWORK and '--privileged' not in argv
     assert argv[argv.index('--cap-drop') + 1] == 'ALL' and 'no-new-privileges' in argv
     mounts = [argv[i + 1] for i, part in enumerate(argv) if part in ('--mount', '--volume', '-v')]
-    assert mounts == [f'type=bind,source={control},target=/run/autoloop/control,readonly',
-                      f'type=bind,source={outbox},target=/run/autoloop/outbox']
+    assert mounts == [f'type=bind,source={control},target=/run/autoloop/control,readonly']  # no writable host path
     assert all(word not in m for m in mounts for word in selfcheck.FORBIDDEN_MOUNTS)
     names = [argv[i + 1] for i, part in enumerate(argv) if part == '--env']
     assert all('=' not in n for n in names) and set(names) <= selfcheck.ENV and set(launcher.ENV) <= selfcheck.ENV
@@ -2009,7 +2013,9 @@ def test_the_runner_container_gets_no_owner_directory_no_secret_on_its_command_l
     env = launcher.client_env(values)
     assert env['GH_TOKEN'] == 'secret-value-GH_TOKEN' and 'SSH_AUTH_SOCK' not in env
     assert values['AUTOLOOP_PROMPT'] == ('Read and follow /run/autoloop/control/common.md and '
-                                         f'/run/autoloop/control/autoloop-build.md. Intent: {BUILD}. Card: ANYM-30.')
+                                         f'/run/autoloop/control/autoloop-build.md. Intent: {BUILD}. Card: ANYM-30. In this '
+                                         'container there is no Codex: run each review round as an Opus subagent; '
+                                         "the controller's Astra review on the host is the review of record.")
     # The proxy is the one container on both networks, and the runner's network has no route out.
     calls = []
 
@@ -2066,10 +2072,11 @@ def test_a_worker_in_the_runner_reaches_the_host_state_only_through_the_gate_fil
                      {'action': 'decline', 'intent': BUILD, 'reason': 'bogus'}, {'action': 'finish', 'intent': BUILD}):
             outbox.write(json.dumps(item) + '\n')
         outbox.write('not json\n')
+    pending = tmp_path / 'pending.json'
+    pending.write_text(json.dumps(launcher.requests((runner / 'outbox' / 'requests.jsonl').read_text(), BUILD)))
     applied = []
-    assert launcher.apply(runner / 'outbox', BUILD, lambda step: applied.append(step) or 0) == [
-        ('large', 0), ('finish', 0)]
-    assert applied == [['large', BUILD], ['finish', BUILD]]
+    assert launcher.apply(pending, lambda step: applied.append(step) or 0) == [('large', 0), ('finish', 0)]
+    assert applied == [['large', BUILD], ['finish', BUILD]] and not pending.exists()
 
 
 # spec: ANYM-574
@@ -2083,3 +2090,126 @@ def test_the_egress_proxy_passes_only_allowlisted_names_on_443_with_public_addre
     for private in (['100.109.74.46'], ['10.0.0.1'], ['127.0.0.1'], ['169.254.169.254'], ['::1'],
                     ['140.82.121.4', '192.168.1.2'], []):
         assert egress.public(private) == [], private
+
+
+def tar_of(name, data=b'', kind=tarfile.REGTYPE, count=1):
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode='w') as tar:
+        for _ in range(count):
+            info = tarfile.TarInfo(name)
+            info.type = kind
+            if kind == tarfile.SYMTYPE:
+                info.linkname = '/etc/passwd'
+            info.size = len(data) if kind == tarfile.REGTYPE else 0
+            tar.addfile(info, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+    return out.getvalue()
+
+
+# spec: ANYM-574
+def test_the_host_reads_the_outbox_as_one_small_regular_file_and_only_well_typed_requests():
+    line = json.dumps({'action': 'finish', 'intent': BUILD}).encode()
+    assert launcher.outbox_text(tar_of('requests.jsonl', line)) == line.decode()
+    for archive in (tar_of('requests.jsonl', b'x' * (launcher.MAX_OUTBOX + 1)),  # oversized
+                    tar_of('requests.jsonl', kind=tarfile.SYMTYPE), tar_of('requests.jsonl', kind=tarfile.FIFOTYPE),
+                    tar_of('requests.jsonl', kind=tarfile.DIRTYPE), tar_of('requests.jsonl', line, count=2),
+                    b'not a tar', b''):
+        assert launcher.outbox_text(archive) == ''
+    for reason in ([], {'a': 1}, 7):
+        text = json.dumps({'action': 'decline', 'intent': BUILD, 'reason': reason})
+        assert launcher.requests(text, BUILD) == []
+    assert launcher.requests('\n'.join([line.decode()] * 50), BUILD) == [['finish', BUILD]]
+
+
+# spec: ANYM-574
+def test_a_busy_host_lock_is_retried_and_a_step_never_applied_stays_pending(tmp_path, monkeypatch):
+    monkeypatch.setattr(launcher, 'ATTEMPTS', 3)
+    pending = tmp_path / 'pending.json'
+    steps = [['large', BUILD], ['finish', BUILD]]
+    pending.write_text(json.dumps(steps))
+    answers = iter([1, 0, 1, 1, 1])  # large: busy once then applied; finish: busy every time
+    slept = []
+    assert launcher.apply(pending, lambda step: next(answers), slept.append) == [('large', 0), ('finish', 1)]
+    assert json.loads(pending.read_text()) == [['finish', BUILD]] and len(slept) == 3
+    assert launcher.report([], pending) == 1  # still pending: said, and the launcher exits non-zero
+    assert launcher.apply(pending, lambda step: 0) == [('finish', 0)] and not pending.exists()
+    assert launcher.report([], pending) == 0
+
+
+# spec: ANYM-574
+def test_a_failed_gate_check_or_the_time_limit_stops_the_container(tmp_path, monkeypatch):
+    calls = []
+
+    def docker(argv, timeout=None):
+        calls.append(argv[:2])
+        if argv[:2] == ['docker', 'inspect']:
+            return 'false\n'
+        return ''
+    monkeypatch.setattr(launcher, 'POLL', 0)
+    done = threading.Event()
+
+    def broken(state, intent):
+        raise OSError('state unreadable')
+    monkeypatch.setattr(launcher.autoloop, 'gate', broken)
+    launcher.watch(tmp_path, BUILD, tmp_path, BUILD, done, float('inf'), docker)
+    assert ['docker', 'stop'] in calls
+    calls.clear()
+    monkeypatch.setattr(launcher.autoloop, 'gate', lambda state, intent: None)
+    launcher.watch(tmp_path, BUILD, tmp_path, BUILD, done, 0, docker, clock=lambda: 1)
+    assert (tmp_path / 'gate').read_text() == 'time limit\n' and ['docker', 'stop'] in calls
+
+    def stuck(argv, timeout=None):
+        return 'true\n' if argv[:2] == ['docker', 'inspect'] else ''
+    assert launcher.stop(BUILD, stuck) is False  # stop and kill both tried; still running is reported
+
+
+def client_hello(name):
+    sni = name.encode()
+    ext = (0).to_bytes(2, 'big') + (len(sni) + 5).to_bytes(2, 'big') + (len(sni) + 3).to_bytes(2, 'big') + b'\0' \
+        + len(sni).to_bytes(2, 'big') + sni
+    body = b'\x03\x03' + b'r' * 32 + b'\0' + b'\0\x02\x13\x01' + b'\x01\0' + len(ext).to_bytes(2, 'big') + ext
+    hs = b'\x01' + len(body).to_bytes(3, 'big') + body
+    return b'\x16\x03\x01' + len(hs).to_bytes(2, 'big') + hs
+
+
+# spec: ANYM-574
+def test_the_proxy_tunnels_only_a_tls_session_whose_server_name_is_the_connect_name():
+    assert egress.server_name(client_hello('pypi.org')) == 'pypi.org'
+    assert egress.server_name(client_hello('Outside.Example')) == 'outside.example'
+    whole = client_hello('pypi.org')
+    for record in (b'GET / HTTP/1.1\r\n\r\n', whole[:20], whole[:-3], b'\x17' + whole[1:], b''):
+        assert egress.server_name(record) is None
+
+    async def tunnel(name):
+        upstream = []
+
+        class Up:
+            def write(self, data):
+                upstream.append(data)
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+        async def resolver(host):
+            return ['140.82.121.4']
+
+        async def opener(host, port):
+            return asyncio.StreamReader(), Up()
+        reader, out = asyncio.StreamReader(), []
+        reader.feed_data(b'CONNECT pypi.org:443 HTTP/1.1\r\n\r\n' + client_hello(name))
+        reader.feed_eof()
+
+        class Down(Up):
+            def write(self, data):
+                out.append(data)
+        original = asyncio.open_connection
+        asyncio.open_connection = opener
+        try:
+            await egress.handle(reader, Down(), resolver)
+        finally:
+            asyncio.open_connection = original
+        return upstream
+    assert asyncio.run(tunnel('outside.example')) == []
+    assert asyncio.run(tunnel('pypi.org')) == [client_hello('pypi.org')]

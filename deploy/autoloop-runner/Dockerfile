@@ -1,6 +1,8 @@
 # The autoloop runner image (ANYM-574, docs/operations/feedback-autoloop.md, Container runner): the agent CLI, git,
-# gh, uv with Python 3.13, node and the Tiden CLI, every one pinned. launch.py builds it, tagged by the hash of this
-# directory, and runs it on an internal network whose only way out is proxy.py.
+# gh, uv with Python 3.13.11, node and the Tiden CLI pinned by version and digest or checksum; the Debian packages
+# (git, python3, certificates) come unpinned from the base image's release, as in services/messaging/Dockerfile.
+# launch.py builds it, tagged by the hash of this directory, and runs it on an internal network whose only way out is
+# proxy.py.
 FROM ghcr.io/astral-sh/uv:0.9.26@sha256:9a23023be68b2ed09750ae636228e903a54a05ea56ed03a934d00fe9fbeded4b AS uv
 
 FROM node:24-bookworm-slim@sha256:8579e5fce559544b50072d05cc5d3b84b6a14d0989ae56c331d9e983a36a21f1 AS tools
@@ -34,8 +36,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=uv /uv /uvx /usr/local/bin/
 COPY --from=tools /out/gh /out/tiden /usr/local/bin/
 RUN npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-    && uv python install 3.13 && chmod -R a+rX /opt/uv-python \
-    && useradd --create-home --uid 10001 --shell /bin/bash runner
+    && uv python install 3.13.11 && chmod -R a+rX /opt/uv-python \
+    && useradd --create-home --uid 10001 --shell /bin/bash runner \
+    && install -d -o runner -m 0700 /run/autoloop/outbox
 COPY --chmod=0555 proxy.py selfcheck.py entrypoint.sh /opt/runner/
 USER runner
 WORKDIR /home/runner
