@@ -71,7 +71,10 @@ execution tool conservatively advertises destructive/open-world behavior because
 its allowlist includes mutations; catalog rows distinguish live reads from writes.
 
 Account-wide operations such as profile/contact lists and group creation require
-full-account scope as well as their named permission. A chat-scoped key is not a
+full-account scope as well as their named permission. A Telegram `create_group` receipt
+names the new group's `provider_chat_id` and, when the collection policy collects it, its
+archive `chat_id`: the group is in the archive at once (a send or `resolve_reference` works
+before its first message). Without `chat_id` the group arrives with the next dialog discovery. A chat-scoped key is not a
 back door to the whole contact book. Source and destination evidence are separately
 authorized for forwarding and files. Authorization, revision, key expiry/revocation,
 operation policy and collector ownership are rechecked before dispatch.
@@ -364,7 +367,8 @@ the browser WhatsApp fallback supports neither:
   `invite_invalid`, `invite_expired`, `chat_full` and `join_not_allowed` fail it. Any
   other error or a timeout is `unknown` and never retried. A joined chat reports
   `archive: collected` with its provider chat when the collection policy collects it,
-  else `archive: not_collected` and the operator's next step.
+  else `archive: not_collected` and the operator's next step. A collected chat on Telegram
+  is in the archive catalog at once and the receipt names its archive `chat_id`.
 - While an earlier join of the same link on the account, from any key, is queued,
   dispatching or `unknown`, a new one is refused with `operation_result_unknown` until
   a later `check_chat_link` shows `member` or `not_member`.

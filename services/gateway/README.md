@@ -82,6 +82,8 @@ When a rejection has a top-level `required` or `unknown_field` entry, the body a
 the packaged catalog schema (at most 64 names; `values` only for enums of at most 8 values), so a caller with an
 old tool list can retry at once. An `unknown_field` entry also adds `tool_list_stale: "likely"` and an
 `owner_hint` line to relay once (reconnect the DeedKit MCP client); a missing required field alone does not.
+When every unknown field is the singular or plural of a field the tool has, the body names it instead
+(`use_instead: {"account": "accounts"}`) and the tool list is not called stale.
 Nested failures keep the shape above. Calling a tool this key cannot call (nonexistent, outside the profile or
 of an undeployed module) returns one identical `not_found_or_forbidden` body with
 `next_action: "refresh_tool_list_once"` and a `hint`: if the tool is still absent after a refresh, the key does

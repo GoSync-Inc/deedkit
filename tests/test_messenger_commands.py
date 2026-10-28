@@ -872,3 +872,143 @@ def test_native_join_carries_confirmed_chat_and_definite_refusal(operator,tmp_pa
     # A definite refusal leaves no unknown-join guard behind.
     link_check(s,key,state,request_id='synthetic-check-0002')
     assert join_queue(s,key,'synthetic-join-0002')['status']=='queued'
+
+
+CREATED_CHAT='-5000000023'
+
+
+def collector_worker(state,client):
+    """The Telegram collector's operation path (catalog of a new chat included) over a synthetic client."""
+    from types import SimpleNamespace
+    from messaging_service.commands import CommandWorker
+    from messaging_service.telegram_collector import TelegramCollector
+    from messaging_service.telegram_operations import execute
+    collector=TelegramCollector.__new__(TelegramCollector)
+    async def provider(job):return await execute(client,job)
+    collector.state,collector.account,collector.history_since=state,'command-fixture',None
+    collector.provider=SimpleNamespace(execute_operation=provider)
+    return CommandWorker(state,collector.execute_operation)
+
+
+def created_by_worker(s,key,state,run=asyncio.run):
+    from datetime import datetime,timezone
+    from telethon.tl import functions,types
+    from test_telegram_operations import Client
+    s.set_messenger_operations('command-fixture',['create_group'])
+    args={'account':'command-fixture','operation':'create_group',
+          'parameters':{'title':'Synthetic new group','user_ids':['200']}}
+    draft=s.preview_messenger_operation(key,**args)
+    queued=s.execute_messenger_operation(key,**args,request_id='synthetic-create-0001',
+                                         preview_digest=draft['preview_digest'])
+    client=Client()
+    created=types.Chat(int(CREATED_CHAT[1:]),'Synthetic new group',types.ChatPhotoEmpty(),2,datetime.now(timezone.utc),1)
+    client.responses[functions.messages.CreateChatRequest]=types.messages.InvitedUsers(
+        types.Updates([],[],[created],datetime.now(timezone.utc),0),[])
+    assert run(collector_worker(state,client).once())
+    return s.get_messenger_operation(key,queued['operation_id'])
+
+
+# spec: ANYM-171
+def test_created_group_is_in_the_archive_at_once_and_its_receipt_names_the_chat(operator):
+    # A new basic group's only message is a service message, which live capture skips; the group used to
+    # wait for the next dialog discovery, so resolve_reference found nothing and nothing could be sent to it.
+    s,_,key,state=operator
+    receipt=created_by_worker(s,key,state)
+    data=receipt['result']['data']
+    chat=stable_id('chat','command-fixture',CREATED_CHAT)
+    assert receipt['status']=='succeeded' and data['provider_chat_id']==CREATED_CHAT and data['chat_id']==chat
+    resolved=s.resolve_reference(key,'command-fixture',CREATED_CHAT)['chat']
+    assert resolved['id']==chat and resolved['title']=='Synthetic new group'
+    assert chat in {c['id'] for c in s.list_chats(key,accounts=['command-fixture'],order='id',limit=100)['items']}
+
+
+# spec: ANYM-171
+def test_a_failed_catalog_write_keeps_the_created_group_confirmed(operator,monkeypatch):
+    s,_,key,state=operator
+    def broken(*args):raise RuntimeError('synthetic catalog failure')
+    monkeypatch.setattr(CollectorState,'catalog',broken)
+    receipt=created_by_worker(s,key,state)
+    data=receipt['result']['data']
+    assert receipt['status']=='succeeded' and data['provider_chat_id']==CREATED_CHAT and 'chat_id' not in data
+
+
+# spec: ANYM-171
+def test_a_created_group_the_collection_policy_leaves_out_gets_no_archive_chat(operator):
+    s,_,key,state=operator
+    with s.pool.connection() as c:
+        c.execute('UPDATE account_policies SET exclude_chats=%s WHERE account=%s',([CREATED_CHAT],'command-fixture'))
+    receipt=created_by_worker(s,key,state)
+    assert receipt['status']=='succeeded' and 'chat_id' not in receipt['result']['data']
+    with pytest.raises(APIError,match='not_found'):s.resolve_reference(key,'command-fixture',CREATED_CHAT)
+
+
+# spec: ANYM-243
+def test_a_joined_chat_is_in_the_archive_at_once_and_its_receipt_names_the_chat(operator):
+    from test_telegram_operations import LinkClient
+    s,_,key,state=operator
+    s.set_messenger_operations('command-fixture',['check_chat_link','join_chat'])
+    link_check(s,key,state)
+    queued=join_queue(s,key)
+    assert asyncio.run(collector_worker(state,LinkClient()).once())
+    data=s.get_messenger_operation(key,queued['operation_id'])['result']['data']
+    chat=stable_id('chat','command-fixture',JOINED_CHAT)
+    assert data['archive']=='collected' and data['chat_id']==chat
+    assert s.resolve_reference(key,'command-fixture',JOINED_CHAT)['chat']['id']==chat
+
+
+# spec: ANYM-171
+def test_a_slow_catalog_write_is_cut_off_and_keeps_the_created_group_confirmed(operator,monkeypatch):
+    import time
+    from messaging_service import telegram_collector
+    s,_,key,state=operator
+    monkeypatch.setattr(telegram_collector,'CATALOG_SECONDS',0.2)
+    def slow(*args):time.sleep(4);return True
+    monkeypatch.setattr(CollectorState,'catalog',slow)
+    receipt=created_by_worker(s,key,state)
+    assert receipt['status']=='succeeded' and 'chat_id' not in receipt['result']['data']
+    with s.pool.connection() as c:
+        took=c.execute("SELECT extract(epoch FROM finished_at-started_at) AS s FROM messenger_commands WHERE id=%s",
+                       (receipt['operation_id'],)).fetchone()['s']
+    # The receipt is written once the budget and the thread grace are spent, not after the slow write.
+    assert took<telegram_collector.STORE_GRACE+1.5
+
+
+# spec: ANYM-171
+def test_a_shutdown_during_the_catalog_write_settles_the_created_group_before_it_stops(operator,monkeypatch):
+    # The provider already created the group; a collector shutdown at that point used to leave the receipt
+    # dispatching, and recovery then read the confirmed change as unknown.
+    import threading
+    import time
+    s,_,key,state=operator
+    started=threading.Event()
+    def slow(*args):started.set();time.sleep(.5);return True
+    monkeypatch.setattr(CollectorState,'catalog',slow)
+    async def cancel_during_catalog(once):
+        task=asyncio.ensure_future(once)
+        await asyncio.to_thread(started.wait,10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):await task
+        return True
+    receipt=created_by_worker(s,key,state,lambda once:asyncio.run(cancel_during_catalog(once)))
+    assert receipt['status']=='succeeded' and receipt['result']['data']['provider_chat_id']==CREATED_CHAT
+
+
+# spec: ANYM-171
+def test_a_collector_checkpoint_without_an_archive_chat_gives_no_chat_id(operator):
+    # Live capture writes the checkpoint before the chats row; the receipt names only a chat the archive holds.
+    s,_,key,state=operator
+    with s.pool.connection() as c:
+        c.execute('INSERT INTO collector_chats(account,provider_chat,peer_kind) VALUES(%s,%s,%s)',
+                  ('command-fixture',CREATED_CHAT,'chat'))
+    receipt=created_by_worker(s,key,state)
+    assert receipt['status']=='succeeded' and 'chat_id' not in receipt['result']['data']
+
+
+# spec: ANYM-171
+def test_a_tracked_chat_the_policy_now_leaves_out_gives_no_chat_id(operator):
+    s,_,key,state=operator
+    state.inventory([(CREATED_CHAT,'chat','Synthetic old title','group')],None)
+    with s.pool.connection() as c:
+        c.execute('UPDATE account_policies SET exclude_chats=%s WHERE account=%s',([CREATED_CHAT],'command-fixture'))
+    receipt=created_by_worker(s,key,state)
+    assert receipt['status']=='succeeded' and 'chat_id' not in receipt['result']['data']

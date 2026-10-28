@@ -844,6 +844,7 @@ class CommandWorker:
             timeout=180 if job['operation']=='send_file' else 30
             # The collector stops starting archive writes for a live read before this deadline.
             if live:timeout=left();job['_deadline']=deadline
+            job['_ends_at']=loop.time()+timeout  # Work after the provider change stays inside this timeout.
             try:answer=safe_result(await asyncio.wait_for(self.execute(job),timeout))
             except (TimeoutError,psycopg.OperationalError,psycopg.errors.TransactionTimeout,
                     psycopg.errors.IdleInTransactionSessionTimeout):
@@ -886,4 +887,6 @@ class CommandWorker:
             confirmed=answer['outcome']=='confirmed'
             await settle(job,'succeeded' if confirmed else
                 'unknown' if job['mutation'] else 'failed',answer,None if confirmed else 'operation_result_unknown')
+        # A cancellation that came while optional work followed a provider change resumes once the receipt is settled.
+        if job.get('_cancel_after_settle') and asyncio.current_task().cancelling():raise asyncio.CancelledError
         return True
