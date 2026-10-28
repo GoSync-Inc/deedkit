@@ -24,6 +24,26 @@ approval. The API intentionally does not accept `approved: true` as proof.
    Changing the payload with that ID fails with `idempotency_conflict`.
    Never create another action ID automatically to bypass an uncertain result.
 
+### Translated sends
+
+DeedKit translates nothing and stores no separate original-language text or
+instruction beside a send (ANYM-539). When the owner asks
+for a message in another language, the agent translates it with its own model,
+and the translation is the text that is sent. When the sent text is in a language
+other than the owner's instruction, the confirmation shows the exact
+`rendered_text` that `preview_message` returns (or the visible text of the
+`messages_send` dry-run preview). Beside it, for the owner's check, it shows the
+instruction the text came from. The owner confirms the sent text, not the
+instruction. A change to the translation after the preview needs a new preview and
+a new confirmation. The agent keeps the owner's instruction in its own conversation
+log. The send record keeps what it keeps for any send (source, rendered and wire
+text, FORMATTING.md), nothing more.
+
+The same rule holds for an upload caption (`send_file`) and an edit of a sent
+message (`edit_message`), which have no `preview_message` step. There the owner
+sees the exact text passed to the tool (the caption or the new text in
+`preview_messenger_operation`, MESSENGER_OPERATIONS.md), next to the instruction.
+
 ### Optional bounded status wait
 
 `wait_s` accepts a number from 0 to 25 seconds. Its default, `0`, returns the
