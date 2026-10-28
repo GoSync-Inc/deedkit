@@ -139,10 +139,11 @@ def test_sdk_is_lazy_and_uses_only_explicit_credentials(config,monkeypatch):
     calls=[]
     class Session:
         def __init__(self,**kw):calls.append(('session',kw))
-        def client(self,*a,**kw):calls.append(('client',a,kw));return 'client'
+        def client(self,*a,**kw):calls.append(('client',a,kw));return made
+    made=SimpleNamespace(meta=SimpleNamespace(events=SimpleNamespace(register_first=lambda *a:calls.append(('hook',a)))))
     monkeypatch.setitem(sys.modules,'boto3',SimpleNamespace(session=SimpleNamespace(Session=Session)))
     monkeypatch.setitem(sys.modules,'botocore.config',SimpleNamespace(Config=lambda **kw:kw))
-    assert r2.make_client(config)=='client'
+    assert r2.make_client(config) is made and calls[2]==('hook',('needs-retry.s3',r2.cancelled))
     assert calls[0][1]=={'aws_access_key_id':'a'*32,'aws_secret_access_key':'b'*64,'region_name':'auto'}
     client=calls[1][2]
     assert client['endpoint_url']==config['endpoint']

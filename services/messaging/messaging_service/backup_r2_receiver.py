@@ -18,11 +18,20 @@ import signal
 import stat
 import struct
 import sys
+import time
 
 from . import backup_receiver as local
 
 AGE_HEADER = local.AGE_HEADER
 MIB = 1024 ** 2
+# A ranged GET resumes a body read that broke mid-stream (R2 resets, read
+# timeouts) at most this many times per object, with bounded backoff.
+STREAM_RESUMES = 5
+# Codes our own SIGALRM/SIGTERM handlers raise; an SDK may wrap them.
+SIGNAL_CODES = {'receiver_timeout', 'restore_deadline', 'restore_stopped'}
+# The deadline/stop our signal handlers raised. botocore's retry loop can swallow it and
+# return a later attempt's success, so its retry hook and every cloud call re-raise it.
+CANCELLED = []
 CHECKS = {'decryption', 'bundle_integrity', 'database_restore', 'table_inventory',
           'original_hashes', 'recovery_objects', 'collectors_quarantined'}
 
@@ -135,11 +144,25 @@ def make_client(config):
     secret = credentials(config)
     session = boto3.session.Session(aws_access_key_id=secret['access_key_id'],
                                    aws_secret_access_key=secret['secret_access_key'], region_name='auto')
-    return session.client('s3', endpoint_url=config['endpoint'], config=Config(
+    client = session.client('s3', endpoint_url=config['endpoint'], config=Config(
         signature_version='s3v4', connect_timeout=10, read_timeout=120,
         retries={'mode': 'standard', 'total_max_attempts': 3},
         request_checksum_calculation='when_required', response_checksum_validation='when_required',
         s3={'addressing_style': 'path'}))
+    client.meta.events.register_first('needs-retry.s3', cancelled)
+    return client
+
+
+def cancel(error):
+    """Signal handlers raise through here, so a deadline/stop the SDK swallowed is still seen."""
+    CANCELLED[:] = [error]
+    raise error
+
+
+def cancelled(**_):
+    """botocore `needs-retry` hook (first) and post-call check: never retry past a deadline/stop."""
+    if CANCELLED:
+        raise CANCELLED[0]
 
 
 def destination(config):
@@ -159,10 +182,13 @@ def absent(exc):
 
 def cloud_call(method, **kwargs):
     try:
-        return method(**kwargs)
+        response = method(**kwargs)
     except Exception:
+        cancelled()
         # SDK exceptions can contain signed URLs, request headers and diagnostics.
         raise RuntimeError('storage_unavailable') from None
+    cancelled()
+    return response
 
 
 def receipt_key(config, bid):
@@ -216,17 +242,76 @@ def get_receipt(config, client, bid):
     return validate_receipt(config, value, bid)
 
 
+def signalled(exc):
+    """Our deadline/stop error, even when urllib3/botocore wrapped it in a read error."""
+    if CANCELLED:
+        return CANCELLED[0]
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (TimeoutError, InterruptedError)) and exc.args[:1] and exc.args[0] in SIGNAL_CODES:
+            return exc
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def stream_pause(attempt):
+    time.sleep(min(30, 2 ** attempt))
+
+
+def resume_body(config, client, receipt, offset, etag):
+    total = receipt['wire']['bytes']
+    request = {'Bucket': config['bucket'], 'Key': receipt['object_key'], 'Range': 'bytes=%d-%d' % (offset, total - 1)}
+    if etag:
+        request['IfMatch'] = etag
+    response = cloud_call(client.get_object, **request)
+    if (response.get('ContentLength') != total - offset or
+            response.get('ContentRange', 'bytes %d-%d/%d' % (offset, total - 1, total)) != 'bytes %d-%d/%d' % (offset, total - 1, total)):
+        response['Body'].close()
+        raise ValueError('stored_backup_corrupt')
+    return response['Body']
+
+
 def verify_object(config, client, receipt, output=None):
-    """Hash actual downloaded bytes; multipart ETags are never integrity proof."""
+    """Hash actual downloaded bytes; multipart ETags are never integrity proof.
+
+    A body read that fails mid-stream resumes at the next byte with a ranged GET
+    of the same ETag (STREAM_RESUMES, bounded backoff); the full SHA256 still
+    covers every delivered byte. A failed write to `output` is never retried.
+    """
     wire = receipt['wire']
     response = cloud_call(client.get_object, Bucket=config['bucket'], Key=receipt['object_key'])
-    body = response['Body']
-    digest = hashlib.sha256(); size = 0; prefix = b''
+    body = response['Body']; etag = response.get('ETag')
+    digest = hashlib.sha256(); size = 0; prefix = b''; resumes = 0
     try:
         if response.get('ContentLength') != wire['bytes']:
             raise ValueError('stored_backup_corrupt')
         while True:
-            data = body.read(MIB)
+            try:
+                data = body.read(MIB)
+            except Exception as exc:
+                if (stop := signalled(exc)) is not None:
+                    raise stop
+                if size == wire['bytes']:
+                    break
+                try:
+                    body.close()
+                except Exception as closing:
+                    if (stop := signalled(closing)) is not None:
+                        raise stop
+                while True:
+                    resumes += 1
+                    if resumes > STREAM_RESUMES:
+                        # SDK errors can hold signed URLs; only their class reaches diagnostics.
+                        raise RuntimeError('storage_unavailable') from None
+                    stream_pause(resumes)
+                    try:
+                        body = resume_body(config, client, receipt, size, etag)
+                        break
+                    except RuntimeError as again:
+                        if (stop := signalled(again)) is not None:
+                            raise stop
+                continue
             if not data:
                 break
             size += len(data)
@@ -1036,7 +1121,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     os.umask(0o077)
     def timed_out(*_):
-        raise TimeoutError('receiver_timeout')
+        cancel(TimeoutError('receiver_timeout'))
+    CANCELLED.clear()
     signal.signal(signal.SIGALRM, timed_out)
     try:
         config = load_config(args.config)
@@ -1071,6 +1157,7 @@ def main(argv=None):
         return 1
     finally:
         signal.alarm(0)
+        CANCELLED.clear()
 
 
 if __name__ == '__main__':

@@ -364,3 +364,220 @@ def test_cold_archive_state_and_objects_do_not_block_backup_verification(operato
         with pytest.raises(ValueError,match='unresolved_upload_required'):
             v.select_candidate(r2.load_config(config['receiver_config_file']),cloud,fd,None)
     finally:os.close(fd)
+
+
+class StreamingError(Exception):
+    """Stands in for botocore's ResponseStreamingError around a urllib3 reset."""
+
+
+class FlakyBody:
+    def __init__(self,data,fail_at,cause=None):self.data=io.BytesIO(data);self.left=fail_at;self.cause=cause
+    def read(self,size):
+        if self.left is not None and self.left<=0:
+            try:raise self.cause or ConnectionResetError('https://signed.example/?X-Amz-Signature=SECRET')
+            except BaseException as error:raise StreamingError('Connection broken: SECRET') from error
+        if self.left is not None:size=min(size,self.left);self.left-=size
+        return self.data.read(size)
+    def close(self):pass
+
+
+class FlakyCloud:
+    """One object; every GET's body fails after the next offset in `failures`."""
+    def __init__(self,data,failures):self.data=data;self.failures=list(failures);self.calls=[]
+    def get_object(self,**kw):
+        self.calls.append({k:kw[k] for k in ('Range','IfMatch') if k in kw})
+        start=0
+        if 'Range' in kw:
+            start,end=(int(x) for x in kw['Range'].removeprefix('bytes=').split('-'));assert end==len(self.data)-1
+        fail=self.failures.pop(0)-start if self.failures else None
+        return {'ContentLength':len(self.data)-start,'ETag':'"etag-1"','Body':FlakyBody(self.data[start:],fail)}
+
+
+def stream_receipt(data):
+    return {'object_key':'test/objects/x','wire':{'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()}}
+
+
+# spec: ANYM-285
+@pytest.mark.parametrize('failures',[[1],[r2.MIB],[r2.MIB+7,2*r2.MIB+1],[5,6,7,8,9]],
+                         ids=['header','chunk-boundary','two-resets','max-resumes'])
+def test_stream_resumes_a_transient_read_failure_from_the_next_byte(monkeypatch,failures):
+    data=r2.AGE_HEADER+os.urandom(3*r2.MIB);pauses=[]
+    monkeypatch.setattr(r2,'stream_pause',pauses.append)
+    cloud=FlakyCloud(data,failures);out=io.BytesIO()
+    r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),out)
+    assert out.getvalue()==data and len(pauses)==len(failures)
+    assert cloud.calls==[{}]+[{'Range':'bytes=%d-%d'%(offset,len(data)-1),'IfMatch':'"etag-1"'} for offset in failures]
+
+
+# spec: ANYM-285
+def test_stream_gives_up_after_bounded_resumes_with_a_safe_code(monkeypatch):
+    data=r2.AGE_HEADER+os.urandom(r2.MIB);pauses=[]
+    monkeypatch.setattr(r2,'stream_pause',pauses.append)
+    cloud=FlakyCloud(data,range(10,10+r2.STREAM_RESUMES+1))
+    with pytest.raises(RuntimeError,match='^storage_unavailable$'):
+        r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),io.BytesIO())
+    assert len(pauses)==r2.STREAM_RESUMES and len(cloud.calls)==r2.STREAM_RESUMES+1
+    delays=[];monkeypatch.undo()
+    monkeypatch.setattr(r2.time,'sleep',delays.append)
+    for attempt in range(1,r2.STREAM_RESUMES+1):r2.stream_pause(attempt)
+    assert delays==sorted(delays) and 0<delays[0] and delays[-1]<=30
+
+
+# spec: ANYM-285
+@pytest.mark.parametrize('stop',[TimeoutError('restore_deadline'),InterruptedError('restore_stopped'),
+                                 TimeoutError('receiver_timeout')],ids=['deadline','service-stop','receiver-alarm'])
+def test_stream_deadline_or_stop_inside_an_sdk_read_is_never_retried(monkeypatch,stop):
+    data=r2.AGE_HEADER+os.urandom(r2.MIB);pauses=[]
+    monkeypatch.setattr(r2,'stream_pause',pauses.append)
+    cloud=FlakyCloud(data,[100])
+    cloud.get_object=lambda **kw:(cloud.calls.append(kw),{'ContentLength':len(data),'ETag':'"e"','Body':FlakyBody(data,100,stop)})[1]
+    with pytest.raises(type(stop)) as raised:
+        r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),io.BytesIO())
+    assert raised.value is stop and not pauses and len(cloud.calls)==1
+
+
+# spec: ANYM-285
+def test_stream_deadline_while_closing_the_broken_body_is_never_swallowed(monkeypatch):
+    data=r2.AGE_HEADER+os.urandom(r2.MIB);pauses=[]
+    monkeypatch.setattr(r2,'stream_pause',pauses.append)
+    class Closing(FlakyBody):
+        def close(self):raise TimeoutError('restore_deadline')
+    cloud=FlakyCloud(data,[])
+    cloud.get_object=lambda **kw:(cloud.calls.append(kw),{'ContentLength':len(data),'ETag':'"e"','Body':Closing(data,100)})[1]
+    with pytest.raises(TimeoutError,match='restore_deadline'):
+        r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),io.BytesIO())
+    assert not pauses and len(cloud.calls)==1
+
+
+# spec: ANYM-285
+def test_stream_never_retries_a_failed_write_to_the_restore_helper(monkeypatch):
+    data=r2.AGE_HEADER+os.urandom(r2.MIB);pauses=[]
+    monkeypatch.setattr(r2,'stream_pause',pauses.append)
+    class Closed:
+        def write(self,data):raise BrokenPipeError('helper exited')
+    cloud=FlakyCloud(data,[])
+    with pytest.raises(BrokenPipeError):r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),Closed())
+    assert not pauses and len(cloud.calls)==1
+
+
+# spec: ANYM-285
+def test_stream_resume_refuses_a_range_of_the_wrong_length(monkeypatch):
+    data=r2.AGE_HEADER+os.urandom(r2.MIB)
+    monkeypatch.setattr(r2,'stream_pause',lambda attempt:None)
+    cloud=FlakyCloud(data,[50]);original=cloud.get_object
+    def short(**kw):
+        response=original(**kw)
+        if 'Range' in kw:response['ContentLength']-=1
+        return response
+    cloud.get_object=short
+    with pytest.raises(ValueError,match='stored_backup_corrupt'):
+        r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),io.BytesIO())
+
+
+# spec: ANYM-285
+def test_first_run_survives_a_transient_cloud_reset_mid_stream(operator,monkeypatch):
+    v,config,receiver,cloud,engine,_=operator
+    monkeypatch.setattr(r2,'stream_pause',lambda attempt:None)
+    original=cloud.get_object;broken=[]
+    def get_object(**kw):
+        response=original(**kw)
+        if '/objects/' in kw['Key'] and not broken:
+            broken.append(kw);response['Body']=FlakyBody(response['Body'].read(),64)
+        elif 'Range' in kw:
+            start=int(kw['Range'].removeprefix('bytes=').split('-')[0]);rest=response['Body'].read()[start:]
+            response={'ContentLength':len(rest),'Body':io.BytesIO(rest)}
+        return response
+    cloud.get_object=get_object
+    result=v.run(config,client=cloud,engine=engine)
+    assert broken and result['status']=='verified' and Path(config['protected_file']).exists()
+
+
+# spec: ANYM-285
+def test_failure_status_records_exception_types_and_frames_but_no_message(operator):
+    v,config,receiver,cloud,engine,_=operator
+    try:raise StreamingError('https://signed.example/?X-Amz-Signature=SECRET')
+    except StreamingError:
+        try:raise RuntimeError('storage_unavailable') from None
+        except RuntimeError as error:engine.failure=error
+    with pytest.raises(RuntimeError):v.run(config,client=cloud,engine=engine)
+    directory=Path(config['directory']);raw=(directory/'status.json').read_text()
+    status=json.loads(raw)
+    assert status['error']=='storage_unavailable' and 'SECRET' not in raw and 'signed.example' not in raw
+    chain=status['diagnostic']
+    assert [item['type'] for item in chain]==['builtins.RuntimeError','test_backup_r2_verifier.StreamingError']
+    assert all(len(frame)==3 and isinstance(frame[1],int) for item in chain for frame in item['frames'])
+    assert ['messaging_service/backup_r2_verifier.py','run'] in [[f[0],f[2]] for f in chain[0]['frames']]
+    assert json.loads((directory/'last-failure.json').read_text())==status
+    engine.failure=None
+    assert v.run(config,client=cloud,engine=engine)['status']=='verified'
+    assert json.loads((directory/'last-failure.json').read_text())==status
+
+
+# spec: ANYM-285
+def test_service_stderr_names_the_safe_code_and_exception_types_only(monkeypatch,capsys):
+    v=module()
+    def fail(path):
+        try:raise StreamingError('SECRET diagnostic')
+        except StreamingError:raise RuntimeError('storage_unavailable') from None
+    monkeypatch.setattr(v,'load_config',fail)
+    assert v.main(['--config','/synthetic'])==1
+    err=capsys.readouterr().err;line=json.loads(err)
+    assert line['error']=='storage_unavailable' and 'SECRET' not in err
+    assert [item['type'] for item in line['diagnostic']]==['builtins.RuntimeError','test_backup_r2_verifier.StreamingError']
+
+
+class SwallowingCloud(FlakyCloud):
+    """A ranged GET whose transport catches our deadline/stop and retries to success, as botocore's retry loop does."""
+    def __init__(self,data,failures,signum):super().__init__(data,failures);self.signum=signum
+    def get_object(self,**kw):
+        if 'Range' in kw:
+            import signal
+            try:signal.raise_signal(self.signum)
+            except Exception:pass
+        return super().get_object(**kw)
+
+
+# spec: ANYM-285
+@pytest.mark.parametrize('signum,code',[('SIGALRM','restore_deadline'),('SIGTERM','restore_stopped')],ids=['deadline','service-stop'])
+def test_stream_deadline_or_stop_swallowed_by_an_sdk_retry_still_stops_the_run(monkeypatch,signum,code):
+    import signal
+    v=module();data=r2.AGE_HEADER+os.urandom(r2.MIB);pauses=[]
+    monkeypatch.setattr(r2,'stream_pause',pauses.append)
+    cloud=SwallowingCloud(data,[100],getattr(signal,signum));out=io.BytesIO()
+    with pytest.raises((TimeoutError,InterruptedError),match=code):
+        with v.deadline(60):r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),out)
+    assert len(cloud.calls)==2 and len(pauses)==1 and len(out.getvalue())==100 and not r2.CANCELLED
+
+
+# spec: ANYM-285
+def test_sdk_retry_hook_reraises_a_recorded_deadline_before_the_next_attempt(monkeypatch):
+    import sys
+    registered=[]
+    class Events:
+        def register_first(self,event,handler):registered.append((event,handler))
+    client=SimpleNamespace(meta=SimpleNamespace(events=Events()))
+    session=SimpleNamespace(client=lambda *a,**kw:client)
+    monkeypatch.setitem(sys.modules,'boto3',SimpleNamespace(session=SimpleNamespace(Session=lambda **kw:session)))
+    monkeypatch.setitem(sys.modules,'botocore',SimpleNamespace())
+    monkeypatch.setitem(sys.modules,'botocore.config',SimpleNamespace(Config=lambda **kw:kw))
+    monkeypatch.setattr(r2,'credentials',lambda config:{'access_key_id':'a','secret_access_key':'s'})
+    monkeypatch.setattr(r2,'CANCELLED',[])
+    assert r2.make_client({'endpoint':'https://synthetic.invalid'}) is client
+    assert registered==[('needs-retry.s3',r2.cancelled)]
+    assert r2.cancelled(caught_exception=OSError()) is None
+    with pytest.raises(TimeoutError,match='restore_deadline'):r2.cancel(TimeoutError('restore_deadline'))
+    with pytest.raises(TimeoutError,match='restore_deadline'):r2.cancelled(caught_exception=OSError())
+
+
+# spec: ANYM-285
+def test_receiver_timeout_never_leaks_into_a_later_healthy_stream(monkeypatch,capsys):
+    import signal
+    previous=signal.getsignal(signal.SIGALRM)
+    monkeypatch.setattr(r2,'load_config',lambda path:{'timeout_seconds':60})
+    monkeypatch.setattr(r2,'receive',lambda *a,**kw:signal.raise_signal(signal.SIGALRM))
+    try:assert r2.main(['--config','/synthetic/private.json','receive'])==1
+    finally:signal.signal(signal.SIGALRM,previous)
+    assert json.loads(capsys.readouterr().out)['code']=='receiver_timeout' and not r2.CANCELLED
+    data=r2.AGE_HEADER+os.urandom(r2.MIB);out=io.BytesIO()
+    r2.verify_object({'bucket':'synthetic'},FlakyCloud(data,[]),stream_receipt(data),out)
+    assert out.getvalue()==data

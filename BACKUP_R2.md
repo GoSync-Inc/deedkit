@@ -267,6 +267,14 @@ selected. Orphan objects, multipart uploads, unresolved attempts or ambiguous
 candidates block new work. It streams the full cloud GET directly into an
 isolated `backup_restore_worker` helper and hashes/counts the exact consumed
 ciphertext, without staging a complete encrypted file on receiver disk.
+A body read that breaks mid-stream (a connection reset or read timeout on a
+multi-gigabyte object) resumes at the next byte with a ranged GET of the same
+ETag, at most five times per object with 2-30 s backoff; the full SHA256 still
+covers every byte. After that the run fails with `storage_unavailable`. A
+deadline, a service stop or a failed write to the helper is never retried:
+the signal handlers record the deadline or stop, and a first-priority botocore
+`needs-retry` hook and a check after every cloud call re-raise it, so an SDK
+request retry cannot swallow it and continue the run.
 
 The helper receives the recovery key read-only and plaintext workspace access,
 with no R2 credentials, producer DSN, delivery key, shared application volumes or
@@ -296,7 +304,12 @@ receiver, leave memory for the host and existing applications; do not increase
 helper/PostgreSQL limits or delete shared data to make admission pass.
 
 The coordinator keeps root-owned `active.json`, `status.json`, `last-success.json`
-and proof evidence outside the helper's writable payload. A failed download,
+and proof evidence outside the helper's writable payload. A failed run's
+`status.json` (and `last-failure.json`, which later busy, idle or verified runs
+keep) adds `diagnostic`: the exception class chain (cause/context, at most four)
+with code frames as `[file, line, function]`, never messages, arguments or
+locals. The service prints the same code and diagnostic as one JSON line to
+stderr (the journal). A failed download,
 decryption, restore, quarantine, promotion or cleanup remains a failed job.
 Verification failure never authorizes discarding the previous point. If a
 failure follows marker promotion, the newly verified point may already be
