@@ -15,6 +15,9 @@ permissions; see [SENDING.md](SENDING.md).
    and immutable SQL/Node assets.
 2. Review staged paths and diff, plus private-data scans. Commit and tag the
    reviewed source. Keep deployment upgrades separate from registry releases.
+   Production gets a messaging migration by `deploy` itself when the range qualifies (an added
+   `expand` migration and appended role grants, a verified copy, a rehearsal on it, ANYM-449), else by
+   hand ([production.md](docs/operations/production.md), "Unattended migrations" and "Migration releases").
 3. Configure PyPI Trusted Publishing, then dispatch `publish-pypi.yml` on the tag.
 4. For the first npm release, an authorized maintainer publishes the inspected
    tarball through `npm publish --access public`, completing the registry's
