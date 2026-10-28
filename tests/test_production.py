@@ -4957,11 +4957,13 @@ def test_deploy_pauses_before_any_step_when_a_database_copy_cannot_be_confirmed_
 
 
 # spec: ANYM-627
-def test_backup_runner_undo_installs_the_older_runner_before_the_older_image_pin():
-    # A newer runner writes dump_timeout_seconds into worker.json, which an older worker refuses, so the undo
-    # never pairs the newer runner with the older image: the older runner goes back first, its image pin last.
+def test_backup_runner_steps_never_pair_a_newer_runner_with_an_older_image():
+    # A newer runner writes dump_timeout_seconds into worker.json, which an older worker refuses: the install sets
+    # the newer image pin before the newer runner, and the undo puts the older runner back before its image pin.
     docs = (ROOT / "docs/operations/production.md").read_text()
-    section = docs.split("### Backup runner\n", 1)[1].split("\n## ", 1)[0]
-    undo = " ".join(section.split("Undo,", 1)[1].split())
+    section = " ".join(docs.split("### Backup runner\n", 1)[1].split("\n## ", 1)[0].split())
+    install, undo = section.split("Undo,", 1)
+    assert install.index("first set the backup image pin") < install.index("then install the runner") \
+        < install.index("sudo install") < install.index("before you add any new `runner.json` key")
     assert undo.index("remove from `runner.json` every key") < undo.index("install the `.before-<sha>` copy") \
         < undo.index("put back the image pin")

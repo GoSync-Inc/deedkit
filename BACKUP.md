@@ -190,8 +190,7 @@ with the timer and the backup service idle and no capture started until it ends:
 `image` pin to the release's backup image and read it back, then install the runner, then add
 `dump_timeout_seconds` if wanted. Undo, in the same kind of idle step: remove `dump_timeout_seconds` from
 `runner.json` (an older runner refuses unknown keys), install the `.before-<sha>` runner, then put back the
-image pin it ran with (production.md's undo puts the pin back first; with this release, keep the runner first,
-since the new runner with the old image is the pair that fails).
+image pin it ran with (the new runner with the old image is the pair that fails).
 
 Delivery uses a separate SSH key created on the source VM. The key does not give
 shell/SFTP/forwarding/read/delete: the target VM runs only
