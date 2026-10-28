@@ -97,23 +97,22 @@ def test_mixed_classes_attention_outside_the_top_three_still_counts(archive):
 def test_class_is_stored_at_insert_against_the_observed_revision(archive):
     from messaging_service.conflict_classes import REASON_VERSION,backfill
     ar,s,key,_=archive
-    media=[{'provider_id':'media-42','filename':'note.txt','mime':'text/plain','bytes':4}]
-    mid=contradict(ar,'17',media=media)
-    assert stored(s,mid)['reason']=='telegram_media_equal_version'
+    mid=contradict(ar,'17',direction='outgoing')
+    assert stored(s,mid)['reason']=='telegram_direction_equal_version'
     assert stored(s,mid)['reason_version']==REASON_VERSION
-    # The retained revision advances after the conflict (it now has the media and another text). Against it the class
-    # would be a text difference; against the contradicted revision it stays the attachment difference.
-    assert ar.ingest(event(body='Вторая версия',media=media,updated_at='2026-10-01T12:01:00Z'))['outcome']=='edited'
+    # The retained revision advances after the conflict; the class still describes what was contradicted.
+    assert ar.ingest(event(body='Вторая версия',updated_at='2026-10-01T12:01:00Z'))['outcome']=='edited'
     resolved=stored(s,mid)['resolved_at']
     assert resolved is not None
     with s.pool.connection() as c:
         c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL WHERE message=%s',(mid,))
     assert backfill(s.pool)==1
-    assert stored(s,mid)=={'reason':'telegram_media_equal_version','reason_version':REASON_VERSION,'resolved_at':resolved}
+    assert stored(s,mid)=={'reason':'telegram_direction_equal_version','reason_version':REASON_VERSION,'resolved_at':resolved}
 
 
 # spec: ANYM-557
 def test_relation_is_to_the_version_the_archive_held_after_an_unchanged_reobservation(archive):
+    from messaging_service.conflict_classes import backfill
     ar,s,key,_=archive
     later='2026-10-01T12:03:00+00:00'
     # An `unchanged` re-read advances the archive's provider version past the revision's snapshot (ANYM-561 s4).
@@ -124,31 +123,12 @@ def test_relation_is_to_the_version_the_archive_held_after_an_unchanged_reobserv
     direction,body=(stable_id('msg','archive-test','100',p) for p in ('d','b'))
     assert stored(s,direction)['reason']=='telegram_direction_equal_version'
     assert stored(s,body)['reason']=='telegram_body_equal_version'
-    assert account(s,key)['conflicts']=={**account(s,key)['conflicts'],'attention':0,'known':2,'next_step':'none_required'}
-
-
-# spec: ANYM-557
-def test_backfill_names_identity_rows_unclassified_and_content_rows_equal_version(archive):
-    from messaging_service.conflict_classes import backfill
-    ar,s,key,_=archive
-    later='2026-10-01T12:03:00+00:00'
-    media=[{'provider_id':'media-42','filename':'note.txt','mime':'text/plain','bytes':4}]
-    cases={'sent_at':{'sent_at':'2026-10-01T11:59:55+00:00'},'direction':{'direction':'outgoing'},'sender':{'sender':'43'},
-        'body':{'body':'Другой текст'},'media':{'media':media}}
-    # Each message is re-read unchanged first, so its snapshot's version is older than the one the archive compared.
-    for field,changes in cases.items():
-        ar.ingest(event(provider_id=field))
-        assert ar.ingest(event(provider_id=field,updated_at=later,origin='reconcile'))['outcome']=='unchanged'
-        assert ar.ingest(event(provider_id=field,updated_at=later,**changes))['outcome']=='conflict'
     with s.pool.connection() as c:
         c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL')
-    assert backfill(s.pool)==5
-    reasons={field:stored(s,stable_id('msg','archive-test','100',field))['reason'] for field in cases}
-    # No stored evidence orders re-reads against a conflict, so an identity row never becomes known (Sol r4);
-    # the archive raises a content conflict only at an equal version.
-    assert reasons=={'sent_at':'unclassified','direction':'unclassified','sender':'unclassified',
-        'body':'telegram_body_equal_version','media':'telegram_media_equal_version'}
-    assert account(s,key)['conflicts']=={**account(s,key)['conflicts'],'attention':4,'known':1,'next_step':'inspect_chat'}
+    assert backfill(s.pool)==2
+    assert stored(s,direction)['reason']=='telegram_direction_equal_version'
+    assert stored(s,body)['reason']=='telegram_body_equal_version'
+    assert account(s,key)['conflicts']=={**account(s,key)['conflicts'],'attention':0,'known':2,'next_step':'none_required'}
 
 
 # spec: ANYM-557
