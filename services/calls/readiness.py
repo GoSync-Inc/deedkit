@@ -58,8 +58,10 @@ def calling_readiness(principal, outbound, credentials, browser_enabled, provide
 
 def per_engine(blockers, credentials, provider):
     """Readiness for an explicit voice_engine and for auto (ANYM-595): the channel's engine-independent blockers plus
-    each engine's own reason; the owner's-engine blockers above judge only an omitted voice_engine."""
-    common = [b for b in blockers if b not in ('model_key_required', 'call_voice_invalid')]
+    each engine's own reason; the owner's-engine key blocker above judges only an omitted voice_engine. An unreadable
+    call_voice blocks every engine: a fresh agent brief freezes the owner's voice (with_call_voice, core.py:515), so
+    prepare refuses each engine; a follow-up keeps its parent's frozen voice and is not judged here."""
+    common = [b for b in blockers if b != 'model_key_required']
     reasons = {name:voice_engines.unfit(name, None, credentials) for name in voice_engines.ENGINES}
     engines = {name:{'ready':not common and reason is None, 'blockers':[*common, *([reason] if reason else [])]}
                for name,reason in reasons.items()}
