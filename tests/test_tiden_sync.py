@@ -1175,8 +1175,10 @@ def test_a_ready_merge_fails_its_read_back_when_a_spec_moved_parent_after_its_ch
         server.set(main=state["main"])
     monkeypatch.setattr(tiden_sync, "write", write)
     code, out = ready_run(server)
-    assert code == 1 and "ANYM-60 on main differs from the checked branch copy (parentId)" in out, out
-    assert "ANYM-12 changed on main, but not on the checked branch" in out and "Ready merge of" not in out
+    assert code == 1 and ("ANYM-60 on main differs from the checked branch copy "
+                          "(parentId: none -> m-0012-0000-0000-0000-000000000000)") in out, out
+    # ANYM-12 gained a child the checked branch did not add, but a derived child count is no evidence (ANYM-598).
+    assert "ANYM-12 changed on main" not in out and "Ready merge of" not in out
 
 
 # spec: ANYM-405
@@ -1195,5 +1197,88 @@ def test_a_ready_merge_fails_its_read_back_when_unchanged_specs_swap_parents_aft
         original(cli, arguments, product)
     monkeypatch.setattr(tiden_sync, "write", write)
     code, out = ready_run(server)
-    assert code == 1 and "ANYM-80 changed on main, but not on the checked branch; ANYM-81 changed on main" in out, out
+    assert code == 1, out
+    assert f"ANYM-80 changed on main, but not on the checked branch (parentId: {first} -> {second})" in out, out
+    assert f"ANYM-81 changed on main, but not on the checked branch (parentId: {second} -> {first})" in out, out
     assert "Ready merge of" not in out
+
+
+def merged_then(server, monkeypatch, change):
+    """Run `change` on the fake's state right after the merge call, then save it."""
+    original = tiden_sync.write
+
+    def write(cli, arguments, product):
+        original(cli, arguments, product)
+        state = server.state()
+        change(state)
+        server.set(main=state["main"])
+    monkeypatch.setattr(tiden_sync, "write", write)
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("raised", [0, 2], ids=["not-yet", "by-two"])
+def test_a_ready_merge_reads_back_green_whatever_its_parents_child_count_reads_after_it(server, monkeypatch, raised):
+    parent = "m-0012-0000-0000-0000-000000000000"
+    ready_server(server, preview={"additions": [{"seqNum": 70, "parentId": parent}],
+                                  "stats": {"additions": 1, "conflicts": 0}},
+                 branch=[dict(spec(70, status="Backlog", content=READY_LINE, branch=True), parentId=parent)])
+
+    def count(state):
+        for row in state["main"]:
+            row["childrenCount"] += raised * (row["seqNum"] == 12)
+    merged_then(server, monkeypatch, count)
+    code, out = ready_run(server)
+    assert code == 0 and "ready merge: ANYM-70 b-0070-0000-0000-0000-000000000000 Backlog on main (new)." in out, out
+    assert server.main(70)["parentId"] == parent
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("landed", ["m-0013-0000-0000-0000-000000000000", None], ids=["other-parent", "no-parent"])
+def test_a_ready_merge_names_both_parents_of_a_new_card_that_landed_under_another(server, monkeypatch, landed):
+    parent = "m-0012-0000-0000-0000-000000000000"
+    ready_server(server, main=[spec(12), spec(13)], preview={"additions": [{"seqNum": 70, "parentId": parent}],
+                                                              "stats": {"additions": 1, "conflicts": 0}},
+                 branch=[dict(spec(70, status="Backlog", content=READY_LINE, branch=True), parentId=parent)])
+
+    def move(state):
+        for row in state["main"]:
+            if row["seqNum"] == 70:
+                row.pop("parentId", None)
+                row.update({"parentId": landed} if landed else {})
+    merged_then(server, monkeypatch, move)
+    code, out = ready_run(server)
+    assert code == 1 and ("ANYM-70 on main differs from the checked branch copy "
+                          f"(parentId: {parent} -> {landed or 'none'})") in out, out
+    assert "Ready merge of" not in out
+
+
+# spec: ANYM-405
+def test_a_ready_merge_names_the_status_values_of_an_unchanged_spec_that_moved(server, monkeypatch):
+    ready_server(server)
+
+    def move(state):
+        for row in state["main"]:
+            row["status"] = "Done" if row["seqNum"] == 12 else row["status"]
+    merged_then(server, monkeypatch, move)
+    code, out = ready_run(server)
+    assert code == 1 and "ANYM-12 changed on main, but not on the checked branch (status: Active -> Done)" in out, out
+
+
+# spec: ANYM-405
+def test_a_ready_merge_names_text_and_source_changes_without_their_values(server, monkeypatch, tmp_path, capsys):
+    ready_server(server)
+    sentinel = "sentinel-7f3a-private"
+
+    def rewrite(state):
+        for row in state["main"]:
+            if row["seqNum"] == 12:
+                row.update(content=f"{sentinel} content", title=f"{sentinel} title", sources=[anchor(f"{sentinel}.py")])
+    merged_then(server, monkeypatch, rewrite)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setenv("TIDEN_PRODUCT_ID", "product")
+    monkeypatch.setattr(sys, "argv", ["tiden_sync.py", "--ready-branch", "proposal/ready", "--cli", str(server.cli)])
+    assert tiden_sync.main() == 1
+    out, written = capsys.readouterr().out, summary.read_text()
+    assert "ANYM-12 changed on main, but not on the checked branch (content, sources, title)" in out, out
+    assert "(content, sources, title)" in written and sentinel not in out + written

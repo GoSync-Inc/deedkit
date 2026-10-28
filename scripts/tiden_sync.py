@@ -618,6 +618,18 @@ def differing(before: dict, after: dict, skip: frozenset = frozenset()) -> list[
     return sorted(key for key in set(before) | set(after) if key not in skip and before.get(key) != after.get(key))
 
 
+# A read-back failure shows the before and after values of these fields only; text and sources are named without them.
+SHOWN_VALUES = frozenset({"status", "priority", "position", "type", "parentId", "componentId"})
+
+
+def changes(before: dict, after: dict, skip: frozenset = frozenset()) -> list[str]:
+    """The fields that differ, each structural one with its values (`status: Active -> Done`, absent as none)."""
+    def value(item) -> str:
+        return "none" if item is None else shown(str(item))
+    return [f"{key}: {value(before.get(key))} -> {value(after.get(key))}" if key in SHOWN_VALUES else key
+            for key in differing(before, after, skip)]
+
+
 def ready_check(cli: str, product: str, name: str) -> tuple[set[int], dict[int, dict], dict[int, dict]]:
     """Read and check a branch for a ready merge: the numbers it changes and both listings, or a refusal naming its
     cause."""
@@ -729,18 +741,17 @@ def ready_merge(cli: str, product: str, name: str, report, dry: bool = False) ->
         expected = (main.get(number) or branch[number])["id"]
         if spec["id"] != expected:
             problems.append(f"ANYM-{number} is record {spec['id']} on main, not {expected}")
-        fields = differing(card(branch[number]), card(spec))
+        fields = changes(card(branch[number]), card(spec))
         if fields:
             problems.append(f"ANYM-{number} on main differs from the checked branch copy ({', '.join(fields)})")
-    # The listing names a spec's parent (absent when it has none): a parent counts each new spec under it, and
-    # anything else of a spec the branch did not change stays, its parent included.
-    gained = Counter(branch[number].get("parentId") for number in numbers if number not in main)
+    # Everything of a spec the branch did not change stays, its parent included. A parent's child count is derived by
+    # the server and may settle later, so it is no evidence either way (ANYM-598); a new spec's own parentId above is.
     for number in sorted(set(main) - numbers):
         before, after = main[number], now.get(number)
-        expected = card(before) | {"childrenCount": before.get("childrenCount", 0) + gained[before["id"]]}
-        if after is None or after["id"] != before["id"] or differing(
-                expected, card(after) | {"childrenCount": after.get("childrenCount", 0)}):
-            problems.append(f"ANYM-{number} changed on main, but not on the checked branch")
+        fields = ["no longer listed"] if after is None else (["id"] if after["id"] != before["id"] else []) + changes(
+            card(before), card(after), frozenset({"childrenCount"}))
+        if fields:
+            problems.append(f"ANYM-{number} changed on main, but not on the checked branch ({', '.join(fields)})")
     if problems:
         raise StepFailed("read-back", "; ".join(problems))
     for number in sorted(numbers):

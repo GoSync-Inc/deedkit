@@ -507,9 +507,11 @@ Tiden merges a branch by name, with no revision a merge can be held to, so the
 job reads the preview and both listings again just before the merge and
 refuses when anything differs from what it checked. The window between that
 read and the merge stays; the read-back closes it by detection, not
-prevention: main must then hold the specs it had (same record, same fields, a
-parent's child count raised by each new spec under it), plus exactly the
-checked branch copies (parent included), a text change in main's record and
+prevention: main must then hold the specs it had (same record, same fields,
+except a parent's child count: the server derives it and may settle it later,
+so it is no evidence either way, ANYM-598), plus exactly the
+checked branch copies (parent included, so a new spec's placement is checked
+on the spec itself), a text change in main's record and
 a new spec in its branch record (no record is created on
 a merge: 2026-10-26, the main specs that merged branches changed kept their
 `createdAt`, and none was created at a merge). Its output, each number with
@@ -518,7 +520,10 @@ its record ID, new or text changed, is the receipt. A refusal names its step
 but the branch reads merged, the same run reads it back; when it reads open,
 dispatch again. A merged branch can no longer be listed, so a dispatch of one
 fails at `branch` and names the receipt of the run that merged it; a failed
-`read-back` is checked on main by hand (needs a maintenance window to fix).
+`read-back` names each spec's differing fields, with before and after values
+for status, priority, position, type, parentId and componentId only (content,
+title and sources are named without values), and is checked on main by hand
+(needs a maintenance window to fix).
 Nobody writes to a branch after its dispatch.
 
 It runs in the `tiden-sync` concurrency group, so it is no change by hand and
