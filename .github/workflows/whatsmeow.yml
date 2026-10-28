@@ -5,6 +5,10 @@ on:
       source_ref:
         type: string
         default: ''
+      added_tests:
+        # ci.yml `added_list`: the files autoloop pull requests add, deleted before any test builds (ANYM-578).
+        type: string
+        default: ''
   workflow_dispatch:
 permissions:
   contents: read
@@ -17,6 +21,19 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.source_ref || '' }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ci-tools
+      - name: Delete the files autoloop pull requests add to tests before anything compiles a test
+        env:
+          ADDED_TESTS: ${{ inputs.added_tests }}
+          # Called by ci.yml, the run's inventory must be present; dispatched by itself, nothing is added.
+          DISPATCHED: ${{ github.event_name == 'workflow_dispatch' && github.workflow == 'Native WhatsApp adapter' }}
+        run: |
+          if [ -z "$ADDED_TESTS" ] && [ "$DISPATCHED" = true ]; then export ADDED_TESTS='{"files": [], "provenance": []}'; fi
+          python3 ci-tools/scripts/added_tests.py strip --root . --root ci-tools --evidence "$RUNNER_TEMP"
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: '1.26.9'
@@ -39,4 +56,5 @@ jobs:
           path: |
             ${{ runner.temp }}/whatsmeow-tests.json
             ${{ runner.temp }}/whatsmeow-build.txt
+            ${{ runner.temp }}/exclusions.json
           retention-days: 14

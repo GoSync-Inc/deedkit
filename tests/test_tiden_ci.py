@@ -537,7 +537,7 @@ def test_ci_reports_required_checks_for_merge_queue_runs_without_cancelling_them
     # on a main push whose reuse job validated the merge queue's verification of that commit (ANYM-322) and on a
     # merge queue run that reused a full pull request run of its identical tree (ANYM-358).
     assert ci["jobs"]["gate"]["name"] == "CI gate" and ci["jobs"]["gate"]["if"] == "${{ always() }}"
-    assert set(ci["jobs"]["gate"]["needs"]) == {"reuse", "pr_reuse", "checks", "native", "images"}
+    assert set(ci["jobs"]["gate"]["needs"]) == {"added_list", "reuse", "pr_reuse", "checks", "native", "images"}
     assert ci["jobs"]["checks"]["uses"] == "./.github/workflows/checks.yml"
     assert "if" not in ci["jobs"]["images"]
     # native is skipped only with checks / verify on the queue's pull request reuse.
@@ -1988,7 +1988,7 @@ def test_the_overall_deadline_ends_a_hang_outside_tiden_calls_and_fails_the_ci_r
 ATTEMPT_URL ="https://github.com/example/repo/actions/runs/1/attempts/2"
 LOAD_REPORT = '<testsuite><testcase name="budgets" file="tests/platform/benchmarks/gateway_read_load.py"/></testsuite>'
 PASSED = {"verify": ("success", "a" * 40), "load": ("success", "a" * 40), **dict.fromkeys(SHARD_JOBS, ("success", "a" * 40)),
-          "go": ("success", "a" * 40)}
+          "go": ("success", "a" * 40), "added": ("success", "a" * 40)}
 # Synthetic Go modules at the module directories of the two Go checks; `go_results` reads only go.mod and *_test.go.
 GO_MODULE_PATHS = {"whatsmeow": "example.com/whatsmeow", "release_router": "example.com/release/router"}
 
@@ -2053,6 +2053,14 @@ def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=
         for check, name in (("whatsmeow", "whatsmeow.json"), ("release_router", "release-router.json")):
             (fragment / name).write_text((go_streams or {}).get(check) or passing_go_stream(go_module(tmp_path, check)))
         (fragment / "outcomes.json").write_text(json.dumps({"module_checks": {"whatsmeow": "success", "release_router": "success"}}))
+    added = fragments / "ci-evidence-added"  # the job that runs only the added tests (ANYM-578)
+    added.mkdir()
+    (added / "source-sha").write_text("a" * 40 + "\n")
+    (added / "attempt").write_text("2\n")
+    (added / "added.json").write_text('{"result": "none", "runs": []}')
+    (added / "outcomes.json").write_text('{"module_checks": {}}')
+    for fragment in fragments.iterdir():  # every job keeps the same exclusion inventory
+        (fragment / "exclusions.json").write_text('{"files": [], "provenance": []}')
     return fragments
 
 
@@ -2067,20 +2075,20 @@ def test_parallel_load_fragment_is_assembled_with_verify_evidence_of_the_same_co
     out = tmp_path / "ci-evidence"
     merged = assemble(out, evidence_fragments(tmp_path), ATTEMPT_URL, PASSED)
     # The assembling attempt names the evidence, so a rerun of one test job publishes under new row identities.
-    assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load", *SHARD_JOBS, "go"] and merged["missing"] == []
+    assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load", *SHARD_JOBS, "go", "added"] and merged["missing"] == []
     assert merged["module_checks"]["load"] == "success" and set(merged["module_checks"]) == set(MODULE_REPORTS)
     assert {path.name for path in out.iterdir()} == {"metadata.json", "source-sha", "python.xml", "load.xml", "load.json",
-                                                     "whatsmeow.json", "release-router.json"}
+                                                     "whatsmeow.json", "release-router.json", "exclusions.json", "added.json"}
     # The shard reports merge into the one python report, in shard order, so test identities do not change.
     assert [case.get("name") for case in ET.parse(out / "python.xml").getroot().iter("testcase")] == ["x", *SHARD_JOBS]
     rows = assembled_rows(tmp_path, merged)
     assert rows["deedkit-ci::load"] == rows["anymsg-ci::python"] == rows["deedkit-ci::whatsmeow"] == "passed"
     # A job that succeeded and was not rerun keeps its earlier attempt's fragment, and the evidence says so.
     earlier = assemble(tmp_path / "earlier", evidence_fragments(tmp_path / "e", load_attempt="1"), ATTEMPT_URL, PASSED)
-    assert earlier["fragments"] == ["verify", "load", *SHARD_JOBS, "go"]
+    assert earlier["fragments"] == ["verify", "load", *SHARD_JOBS, "go", "added"]
     assert earlier["producers"] == {"verify": {"result": "success", "sha": "a" * 40, "attempt": "2"},
                                     "load": {"result": "success", "sha": "a" * 40, "attempt": "1"},
-                                    **{job: {"result": "success", "sha": "a" * 40, "attempt": "2"} for job in (*SHARD_JOBS, "go")}}
+                                    **{job: {"result": "success", "sha": "a" * 40, "attempt": "2"} for job in (*SHARD_JOBS, "go", "added")}}
     # Assembling again into a used directory could keep a report the new fragments no longer supply.
     with pytest.raises(ValueError, match="new or empty"):
         assemble(out, evidence_fragments(tmp_path / "again", load=False), ATTEMPT_URL, PASSED)
@@ -2131,7 +2139,7 @@ def test_assembly_refuses_a_fragment_of_another_commit_or_of_foreign_checks(tmp_
 def test_missing_load_fragment_is_recorded_as_an_unrun_check(tmp_path):
     from scripts.tiden_ci import assemble
     merged = assemble(tmp_path / "ci-evidence", evidence_fragments(tmp_path, load=False), ATTEMPT_URL, PASSED)
-    assert merged["fragments"] == ["verify", *SHARD_JOBS, "go"] and merged["missing"] == ["load"] and merged["module_checks"]["load"] == "skipped"
+    assert merged["fragments"] == ["verify", *SHARD_JOBS, "go", "added"] and merged["missing"] == ["load"] and merged["module_checks"]["load"] == "skipped"
     assert assembled_rows(tmp_path, merged)["deedkit-ci::load"] == "blocked"
 
 
@@ -2172,7 +2180,8 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
                            "LOAD": "load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}",
                            **{f"PYTHON_{index}": f"python-{index}:${{{{ needs.python-{index}.result }}}}:${{{{ needs.python-{index}.outputs.source_sha }}}}"
                               for index in range(2, PYTHON_SHARDS + 1)},
-                           "GO": "go:${{ needs.go.result }}:${{ needs.go.outputs.source_sha }}"}
+                           "GO": "go:${{ needs.go.result }}:${{ needs.go.outputs.source_sha }}",
+                           "ADDED": "added:${{ needs.added.result }}:${{ needs.added.outputs.source_sha }}"}
     work = tmp_path / "work"
     work.mkdir()
     (work / "ci-tools").symlink_to(root, target_is_directory=True)
@@ -2182,7 +2191,7 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin", "RUNNER_TEMP": str(temp), "GITHUB_REPOSITORY": "example/repo",
            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "VERIFY": "verify:success:" + "a" * 40,
            "LOAD": "load:success:" + "a" * 40, **{f"PYTHON_{index}": f"python-{index}:success:" + "a" * 40 for index in range(2, PYTHON_SHARDS + 1)},
-           "GO": "go:success:" + "a" * 40}
+           "GO": "go:success:" + "a" * 40, "ADDED": "added:success:" + "a" * 40}
     result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, capture_output=True, text=True, env=env)
     assert result.returncode != 0, result.stderr
     rows = json.loads((temp / "ci-evidence" / "ci-checks.json").read_text())  # the evidence still exists for upload
@@ -2190,7 +2199,8 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     load = temp / "fragments" / "ci-evidence-load"
     load.mkdir()
     for name, value in {"source-sha": "a" * 40, "attempt": "2", "load.xml": LOAD_REPORT, "load.json": "{}",
-                        "outcomes.json": json.dumps({"module_checks": {"load": "success"}})}.items():
+                        "outcomes.json": json.dumps({"module_checks": {"load": "success"}}),
+                        "exclusions.json": json.dumps({"files": [], "provenance": []}, sort_keys=True)}.items():
         (load / name).write_text(value)
     for path in (temp / "ci-evidence").iterdir():
         path.unlink()
@@ -2221,7 +2231,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         assert upload["with"]["name"] == f"ci-evidence-{job}" and upload["if"] == "${{ always() }}"
         assert upload["with"]["overwrite"] is True
     evidence = jobs["evidence"]
-    assert evidence["needs"] == ["documentation", "verify", "load", *SHARD_JOBS, "go"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
+    assert evidence["needs"] == ["documentation", "verify", "load", *SHARD_JOBS, "go", "added"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     assert jobs["tiden"]["needs"] == ["documentation", "evidence"]
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in evidence["steps"]}
     assert steps["actions/download-artifact"]["with"]["pattern"] == "ci-evidence-*"
@@ -2232,7 +2242,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     assert require["if"] == "${{ always() }}"
     assert require["env"] == {"VERIFY_RESULT": "${{ needs.verify.result }}", "LOAD_RESULT": "${{ needs.load.result }}",
                               **{f"PYTHON_{index}_RESULT": f"${{{{ needs.python-{index}.result }}}}" for index in range(2, PYTHON_SHARDS + 1)},
-                              "GO_RESULT": "${{ needs.go.result }}"}
+                              "GO_RESULT": "${{ needs.go.result }}", "ADDED_RESULT": "${{ needs.added.result }}"}
     for verify, load_result, shards, go in [("success", "success", "success", "success"), ("success", "failure", "success", "success"),
                                             ("success", "cancelled", "success", "success"), ("success", "skipped", "success", "success"),
                                             ("failure", "success", "success", "success"), ("skipped", "success", "success", "success"),
@@ -2241,7 +2251,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         result = subprocess.run(["bash", "-e", "-c", require["run"]], capture_output=True,
                                 env={"VERIFY_RESULT": verify, "LOAD_RESULT": load_result, "GO_RESULT": go,
                                      **{f"PYTHON_{index}_RESULT": "success" for index in range(2, PYTHON_SHARDS + 1)},
-                                     "PYTHON_3_RESULT": shards})
+                                     "PYTHON_3_RESULT": shards, "ADDED_RESULT": "success"})
         assert (result.returncode == 0) == (verify == load_result == shards == go == "success"), (verify, load_result, shards, go)
 
 
@@ -2373,7 +2383,7 @@ def test_a_failed_tiden_publication_warns_and_never_fails_the_reporting_job(tmp_
     assert retain["if"].startswith("${{ always() && ((steps.config.outputs.enabled == 'true'")
     assert retain["with"]["path"] == "${{ runner.temp }}/ci-evidence/tiden-*.json"
     # The gate sees the reporting job only through the checks result, which a step allowed to fail leaves successful.
-    assert ci["jobs"]["gate"]["needs"] == ["reuse", "pr_reuse", "checks", "native", "images"]
+    assert ci["jobs"]["gate"]["needs"] == ["added_list", "reuse", "pr_reuse", "checks", "native", "images"]
     assert 'test "$CHECKS_RESULT" = success' in ci["jobs"]["gate"]["steps"][0]["run"]
 
     def warned(install_outcome, publish_outcome):
@@ -2459,7 +2469,8 @@ def test_the_go_job_uploads_both_native_go_suites_as_a_fragment_the_evidence_job
     assert recorded.returncode == 0, recorded.stderr
     assert json.loads((tmp_path / "ci-evidence" / "outcomes.json").read_text()) == {
         "module_checks": {"whatsmeow": "failure", "release_router": "success"}}
-    assert FRAGMENTS["go"] == (("whatsmeow", "release_router"), ("outcomes.json", "whatsmeow.json", "release-router.json"))
+    assert FRAGMENTS["go"] == (("whatsmeow", "release_router"), ("outcomes.json", "whatsmeow.json", "release-router.json",
+                                                                 "exclusions.json"))
     upload = next(step for step in go["steps"] if step.get("uses", "").startswith("actions/upload-artifact"))
     assert upload["if"] == "${{ always() }}" and upload["with"]["name"] == "ci-evidence-go"
     assert upload["with"]["path"] == "${{ runner.temp }}/ci-evidence" and upload["with"]["overwrite"] is True

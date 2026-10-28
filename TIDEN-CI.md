@@ -68,6 +68,31 @@ row's ID is a UUIDv5 of the publishing run attempt, the check and the signature,
 so a main push that publishes reused queue or pull request evidence gives the Go
 rows its own IDs.
 
+The tests an autoloop pull request (head branch `autoloop-*` of this
+repository) adds run apart from the required suites (ANYM-578,
+`scripts/added_tests.py`). ci.yml's `added_list` job computes the event's
+exclusion inventory once: every file such a pull request adds (renames and
+copies included) under a `test/` or `tests/` directory and every added
+`test_*.py`, `*.test.*` or `*_test.go` anywhere, each pull request compared
+against its own merge base (a merge queue group reads its pull requests from the
+queue; other events exclude nothing). An unreadable pull request, base or queue
+fails `added_list` and so `CI gate`. Every job that collects, compiles or builds
+tests (`checks / verify`, the shards, `checks / load`, `checks / go` and
+whatsmeow.yml's `synthetic`) deletes the listed files from its checkouts before
+its first test step, prints them and keeps the inventory as `exclusions.json` in
+its fragment; `checks / evidence` refuses fragments whose inventories differ.
+The `checks / added` job, on its own runner and with no cache it saves, runs only
+the added tests, one pytest per Python project, one `go test` per Go module and
+one `node --test` per package, and uploads `ci-evidence-added` (`added.json`
+with result `passed`, `failed` or `none`, and empty module checks); with no added
+test it passes and says so. `checks / evidence` needs it, so it is part of
+`CI gate`. Evidence is reused only with equal isolation: a merge queue group
+reuses a pull request run only when that run's `exclusions.json` equals the
+inventory the group requires, computed for the group, and its added tests
+passed or were none; a main push, which excludes nothing, reuses queue evidence
+only with an empty inventory, so a push after an autoloop pull request with
+added tests verifies in full in its one run.
+
 Three root-suite cases run in `checks / verify` steps of their own instead of
 the shards (ANYM-429). Both shard command lines `--deselect` them:
 `tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root`

@@ -28,6 +28,29 @@ concurrency:
   group: ci-${{ github.event_name == 'merge_group' && format('merge-queue-{0}', github.run_id) || github.event_name == 'push' && format('main-push-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'merge_group' && github.event_name != 'push' }}
 jobs:
+  added_list:
+    # ANYM-578: the exclusion inventory of this event, computed once: the files that autoloop pull requests (head
+    # branch `autoloop-*` here) add to test directories, and every added test file, each against its merge base; a
+    # merge queue group reads its pull requests from the queue. Other events exclude nothing. An unreadable pull
+    # request, base or queue fails this job, and so every job that needs the inventory and CI gate.
+    name: Added tests of autoloop pull requests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read  # checkout of this commit's script and the comparisons of each pull request head
+      pull-requests: read  # the merge queue entries and their pull requests
+    outputs:
+      inventory: ${{ steps.list.outputs.inventory }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: List the added tests this event excludes from the required suites
+        id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/added_tests.py list
   reuse:
     # A main push of a commit the merge queue verified reuses that run's verification instead of testing the
     # commit again; production.py verify accepts it by the same queue rules (ANYM-321, ANYM-322, TIDEN-CI.md).
@@ -84,6 +107,7 @@ jobs:
     # and validates that run's evidence as data; any doubt runs the full suite and never fails the run. The main
     # push of such a group reuses the same pull request run's evidence by the chain rules of the `reuse` job.
     name: Reuse the pull request verification
+    needs: added_list
     if: github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -107,6 +131,8 @@ jobs:
         timeout-minutes: 6
         env:
           GH_TOKEN: ${{ github.token }}
+          # The group's own inventory: a pull request run is reused only when it excluded exactly these files.
+          ADDED_TESTS: ${{ needs.added_list.outputs.inventory }}
         run: python3 scripts/ci_reuse.py group
       - name: Reused pull request run ${{ steps.decide.outputs.run_id }} attempt ${{ steps.decide.outputs.run_attempt }}
         # This step's name in the run's jobs names the decision's producer: promotion and the main push follow the
@@ -116,7 +142,7 @@ jobs:
   checks:
     # After the decisions: a validated reuse skips the test jobs (on a main push it publishes the queue's evidence);
     # every other run verifies in full. A reuse that failed validation leaves checks skipped, so the gate fails.
-    needs: [reuse, pr_reuse]
+    needs: [added_list, reuse, pr_reuse]
     if: ${{ !cancelled() && (needs.reuse.outputs.decision != 'reuse' || needs.reuse.result == 'success') }}
     uses: ./.github/workflows/checks.yml
     with:
@@ -126,30 +152,34 @@ jobs:
       reuse_pr_verification: ${{ needs.pr_reuse.outputs.decision == 'reuse' }}
       reused_pr_run: ${{ needs.pr_reuse.outputs.producer_url }}
       reused_pr_tested_sha: ${{ needs.pr_reuse.outputs.tested_sha }}
+      added_tests: ${{ needs.added_list.outputs.inventory }}
     secrets:
       # A queued group can hold a fork's unmerged code, so it never gets the credential.
       TIDEN_API_TOKEN: ${{ github.event_name != 'merge_group' && secrets.TIDEN_API_TOKEN || '' }}
   native:
     # A merge queue group that reuses a pull request run skips this job too: that run's CI gate required it on exactly
     # this tree. Every other run, and any doubt, runs it; the main push always does (production.py REQUIRED_JOBS).
-    needs: [pr_reuse]
+    # It also needs the event's exclusion inventory (ANYM-578); without one its strip step fails closed.
+    needs: [added_list, pr_reuse]
     if: ${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}
     uses: ./.github/workflows/whatsmeow.yml
     with:
       source_ref: ${{ inputs.source_ref || '' }}
+      added_tests: ${{ needs.added_list.outputs.inventory }}
   images:
     uses: ./.github/workflows/images.yml
     with:
       source_ref: ${{ inputs.source_ref || '' }}
   gate:
     name: CI gate
-    needs: [reuse, pr_reuse, checks, native, images]
+    needs: [added_list, reuse, pr_reuse, checks, native, images]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
       - name: Require every verification job
         env:
+          ADDED_LIST_RESULT: ${{ needs.added_list.result }}
           CHECKS_RESULT: ${{ needs.checks.result }}
           NATIVE_RESULT: ${{ needs.native.result }}
           IMAGES_RESULT: ${{ needs.images.result }}
@@ -157,6 +187,7 @@ jobs:
           SOURCE_REF: ${{ inputs.source_ref || '' }}
           EXPECTED_SHA: ${{ github.sha }}
         run: |
+          test "$ADDED_LIST_RESULT" = success
           test "$CHECKS_RESULT" = success
           # native / synthetic is skipped only with the pull request reuse, which the next step validates. An if, not
           # an `&&` list: `bash -e` ignores a failure on the left of `&&`.

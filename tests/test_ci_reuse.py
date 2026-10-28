@@ -10,7 +10,7 @@ import zipfile
 import pytest
 import yaml
 
-from scripts import ci_reuse, production, tiden_ci
+from scripts import added_tests, ci_reuse, production, tiden_ci
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = production.REPOSITORY
@@ -40,8 +40,9 @@ def go_stream(check, action="pass"):
 
 
 def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, event="merge_group", tiden_branch="",
-                   producer_url=PRODUCER_URL, shard_outcomes=None, shard_reports=None):
-    """The `ci-evidence` directory a passing merge queue run uploads, built by the real assemble and prepare."""
+                   producer_url=PRODUCER_URL, shard_outcomes=None, shard_reports=None, exclusions=None):
+    """The `ci-evidence` directory a passing merge queue run uploads, built by the real assemble and prepare.
+    Every fragment keeps the run's exclusion inventory (ANYM-578), none by default."""
     fragments = tmp_path / "fragments"
     verify, load = fragments / "ci-evidence-verify", fragments / "ci-evidence-load"
     for fragment in (verify, load):
@@ -76,6 +77,14 @@ def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, even
     for check in tiden_ci.GO_MODULES:
         (go / tiden_ci.MODULE_REPORTS[check][0]).write_text(go_stream(check))
     (go / "outcomes.json").write_text(json.dumps({"module_checks": dict.fromkeys(tiden_ci.GO_MODULES, "success")}))
+    added = fragments / "ci-evidence-added"  # the job that runs only the added tests
+    added.mkdir()
+    (added / "source-sha").write_text(sha + "\n")
+    (added / "attempt").write_text(attempt + "\n")
+    (added / "added.json").write_text(json.dumps({"result": "none", "runs": []}))
+    (added / "outcomes.json").write_text(json.dumps({"module_checks": {}}))
+    for fragment in fragments.iterdir():
+        (fragment / "exclusions.json").write_text(json.dumps(exclusions or {"files": [], "provenance": []}, sort_keys=True))
     evidence = tmp_path / "queue-evidence"
     producers = {job: ("success", sha) for job in tiden_ci.FRAGMENTS}
     metadata = tiden_ci.assemble(evidence, fragments, producer_url, producers)
@@ -634,7 +643,7 @@ def test_a_reusing_push_skips_only_the_test_jobs_and_still_builds_publishes_and_
     assert "reuse_queue_evidence" not in json.dumps(tiden)
     assert "if" not in ci["jobs"]["images"] and "needs" not in ci["jobs"]["images"]
     # native skips only on the queue's pull request reuse, never on a main push (pr_reuse is skipped there).
-    assert ci["jobs"]["native"]["needs"] == ["pr_reuse"]
+    assert ci["jobs"]["native"]["needs"] == ["added_list", "pr_reuse"]
     assert ci["jobs"]["native"]["if"] == "${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}"
     assert ci["jobs"]["publish"]["needs"] == ["gate"] and ci["jobs"]["release"]["needs"] == ["gate", "publish", "checks"]
     # The queue still gets no Tiden credential.
@@ -681,7 +690,7 @@ REUSED = {"DECISION": "reuse", "REUSE_RESULT": "success", "REUSED_SHA": SHA, "VE
 def test_ci_gate_passes_a_skipped_verify_only_for_a_validated_reuse_of_this_commit(environment, passes):
     ci, _ = workflows()
     gate = ci["jobs"]["gate"]
-    assert gate["needs"] == ["reuse", "pr_reuse", "checks", "native", "images"]
+    assert gate["needs"] == ["added_list", "reuse", "pr_reuse", "checks", "native", "images"]
     step = gate["steps"][1]
     assert set(step["env"]) == set(GREEN)
     completed = subprocess.run(["bash", "-e", "-c", step["run"]], env={"PATH": "/usr/bin:/bin", **environment},
@@ -793,8 +802,10 @@ def pr_evidence(tmp_path, **change):
                                        "tiden_branch": "intent/2026-10-18-feature", "producer_url": PR_URL, **change})
 
 
-def decide_group(github, event=GROUP_EVENT, event_name="merge_group", sha=GROUP_SHA, repository=REPOSITORY):
-    return ci_reuse.decide_group(sha, repository, event_name, event, get=github, fetch=lambda path: github.data)
+def decide_group(github, event=GROUP_EVENT, event_name="merge_group", sha=GROUP_SHA, repository=REPOSITORY,
+                 exclusions=added_tests.EMPTY):
+    return ci_reuse.decide_group(sha, repository, event_name, event, get=github, fetch=lambda path: github.data,
+                                 exclusions=exclusions)
 
 
 def test_a_queue_group_reuses_a_passed_full_pull_request_run_of_exactly_its_tree(tmp_path):
@@ -879,7 +890,8 @@ def test_a_group_decision_error_at_any_point_means_full_verification_and_a_green
     output, event = tmp_path / "output", tmp_path / "event.json"
     event.write_text(json.dumps(GROUP_EVENT))
     for name, value in {"GITHUB_OUTPUT": str(output), "GITHUB_SHA": GROUP_SHA, "GITHUB_REPOSITORY": REPOSITORY,
-                        "GITHUB_EVENT_NAME": "merge_group", "GITHUB_EVENT_PATH": str(event)}.items():
+                        "GITHUB_EVENT_NAME": "merge_group", "GITHUB_EVENT_PATH": str(event),
+                        "ADDED_TESTS": json.dumps(added_tests.EMPTY)}.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(sys, "argv", ["ci_reuse.py", "group"])
     data = archive(pr_evidence(tmp_path))
@@ -889,20 +901,20 @@ def test_a_group_decision_error_at_any_point_means_full_verification_and_a_green
         def unavailable(state, failing=failing):
             raise OSError(f"GitHub API unavailable at {failing}")
         github.after[failing] = unavailable
-        monkeypatch.setattr(ci_reuse.decide_group, "__defaults__", (github, lambda path: data))
+        monkeypatch.setattr(ci_reuse.decide_group, "__defaults__", (github, lambda path: data, None))
         output.write_text("")
         assert ci_reuse.main() == 0
         assert output.read_text() == "decision=full\n"
         assert "Full verification" in capsys.readouterr().out
     # A download that fails, or an unreadable event, ends the same way.
-    monkeypatch.setattr(ci_reuse.decide_group, "__defaults__", (PullGitHub(data), lambda path: (_ for _ in ()).throw(OSError("down"))))
+    monkeypatch.setattr(ci_reuse.decide_group, "__defaults__", (PullGitHub(data), lambda path: (_ for _ in ()).throw(OSError("down")), None))
     output.write_text("")
     assert ci_reuse.main() == 0 and output.read_text() == "decision=full\n"
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(tmp_path / "missing.json"))
     output.write_text("")
     assert ci_reuse.main() == 0 and output.read_text() == "decision=full\n"
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
-    monkeypatch.setattr(ci_reuse.decide_group, "__defaults__", (PullGitHub(data), lambda path: data))
+    monkeypatch.setattr(ci_reuse.decide_group, "__defaults__", (PullGitHub(data), lambda path: data, None))
     output.write_text("")
     assert ci_reuse.main() == 0
     assert output.read_text().splitlines() == ["decision=reuse", f"pull_request={PR_NUMBER}", f"run_id={PR_RUN_ID}",
@@ -924,7 +936,7 @@ def test_only_a_merge_queue_run_decides_on_a_pull_request_run_and_its_reuse_publ
     assert job["outputs"] == {name: f"${{{{ steps.decide.outcome == 'success' && steps.decide.outputs.{name} || '{default}' }}}}"
                               for name, default in (("decision", "full"), ("validated_sha", ""), ("producer_url", ""),
                                                     ("tested_sha", ""))}
-    assert ci["jobs"]["checks"]["needs"] == ["reuse", "pr_reuse"]
+    assert ci["jobs"]["checks"]["needs"] == ["added_list", "reuse", "pr_reuse"]
     assert ci["jobs"]["checks"]["with"]["reuse_pr_verification"] == "${{ needs.pr_reuse.outputs.decision == 'reuse' }}"
     assert ci["jobs"]["checks"]["with"]["reused_pr_run"] == "${{ needs.pr_reuse.outputs.producer_url }}"
     assert ci["jobs"]["checks"]["with"]["reused_pr_tested_sha"] == "${{ needs.pr_reuse.outputs.tested_sha }}"
@@ -1009,13 +1021,13 @@ def test_ci_gate_passes_a_queue_run_with_skipped_verify_only_for_its_validated_p
 def test_ci_gate_accepts_a_skipped_native_job_only_with_the_queue_pull_request_reuse(native, decision, passes):
     ci, _ = workflows()
     job = ci["jobs"]["native"]
-    assert job["needs"] == ["pr_reuse"] and job["uses"] == "./.github/workflows/whatsmeow.yml"
+    assert job["needs"] == ["added_list", "pr_reuse"] and job["uses"] == "./.github/workflows/whatsmeow.yml"
     # Any doubt about the decision (a failed or skipped pr_reuse leaves no `reuse`) runs the native suite.
     assert job["if"] == "${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}"
     first, second = ci["jobs"]["gate"]["steps"][:2]
     assert first["env"]["PR_DECISION"] == second["env"]["PR_DECISION"] == "${{ needs.pr_reuse.outputs.decision }}"
-    environment = {"CHECKS_RESULT": "success", "NATIVE_RESULT": native, "IMAGES_RESULT": "success", "PR_DECISION": decision,
-                   "SOURCE_REF": "", "EXPECTED_SHA": SHA}
+    environment = {"ADDED_LIST_RESULT": "success", "CHECKS_RESULT": "success", "NATIVE_RESULT": native, "IMAGES_RESULT": "success",
+                   "PR_DECISION": decision, "SOURCE_REF": "", "EXPECTED_SHA": SHA}
     completed = subprocess.run(["bash", "-e", "-c", first["run"]], env={"PATH": "/usr/bin:/bin", **environment},
                                capture_output=True)
     assert (completed.returncode == 0) == passes
@@ -1610,3 +1622,39 @@ def test_chained_pull_request_go_rows_are_published_under_the_push_runs_ids(tmp_
     assert pull_request_ids == {tiden_ci.row_id(PR_URL, check, row["signature"]) for check in tiden_ci.GO_MODULES
                                 for row in json.loads((published / tiden_ci.normalized_report(check)).read_text())}
     assert not pull_request_ids & {value for ids in found.values() for value in ids}
+
+
+EXCLUDED = {"files": ["tests/test_added.py"], "provenance": [{"pull_request": PR_NUMBER, "head": HEAD_SHA, "merge_base": BASE_SHA}]}
+OTHER_BASE = {**EXCLUDED, "provenance": [{**EXCLUDED["provenance"][0], "merge_base": "9" * 40}]}
+
+
+# spec: ANYM-578
+@pytest.mark.parametrize("produced, required", [(None, EXCLUDED), (EXCLUDED, added_tests.EMPTY), (EXCLUDED, OTHER_BASE),
+                                                (EXCLUDED, {**EXCLUDED, "files": ["tests/test_added.py", "tests/test_more.py"]})],
+                         ids=["unfiltered-run-filtered-group", "filtered-run-unfiltered-group", "other-merge-base", "other-files"])
+def test_a_queue_group_of_the_same_tree_with_other_exclusions_than_its_pull_request_run_verifies_in_full(tmp_path, produced, required):
+    github = PullGitHub(archive(pr_evidence(tmp_path, exclusions=produced)))
+    with pytest.raises(ci_reuse.Refused, match="excluded other added tests"):
+        decide_group(github, exclusions=required)
+
+
+# spec: ANYM-578
+def test_a_queue_group_reuses_a_pull_request_run_that_excluded_exactly_the_added_tests_it_requires(tmp_path):
+    github = PullGitHub(archive(pr_evidence(tmp_path, exclusions=EXCLUDED)))
+    assert decide_group(github, exclusions=EXCLUDED)["run_id"] == str(PR_RUN_ID)
+
+
+# spec: ANYM-578
+def test_a_main_push_never_reuses_queue_evidence_that_excluded_added_tests(tmp_path):
+    data = archive(queue_evidence(tmp_path, exclusions=EXCLUDED))
+    with pytest.raises(ci_reuse.Refused, match="excluded other added tests"):
+        adopt(tmp_path, GitHub(artifacts=[artifact(data=data)]), data)
+
+
+# spec: ANYM-578
+@pytest.mark.parametrize("report", [{"result": "failed", "runs": []}, {"runs": []}, None], ids=["failed", "no-result", "absent"])
+def test_evidence_whose_added_tests_did_not_pass_is_never_reused(tmp_path, report):
+    evidence = pr_evidence(tmp_path)
+    data = archive(evidence, drop=("added.json",)) if report is None else archive(evidence, change={"added.json": json.dumps(report).encode()})
+    with pytest.raises(ci_reuse.Refused):
+        decide_group(PullGitHub(data))

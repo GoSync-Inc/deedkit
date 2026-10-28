@@ -226,9 +226,9 @@ merged build live. A paused autodeploy is recorded for the report and never touc
 `~/.deedkit/autoloop/config.json` (directory 0700, files 0600, refused inside a Git checkout) is
 written by the owner or by the orchestrator on the owner's words. `live: false` (the default)
 makes the tick write its plan and start nothing. `live` stays false until this document's PR
-(ANYM-568), the driver cards and the CI card "PR-added tests run in a separate pytest process"
-(see the residual below) are merged; before that card, `live: true` is not allowed, also not on
-the owner's words. Undo: set `live` back to false, or `PAUSE`.
+(ANYM-568), the driver cards and ANYM-578 (the tests a PR adds run apart; see the residual
+below) are merged; before ANYM-578's merge, `live: true` is not allowed, also not on the owner's
+words. Undo: set `live` back to false, or `PAUSE`.
 
 ## Undo per stage
 
@@ -277,10 +277,11 @@ a steered worker can do what those logins allow. Brief rules, the gate and the p
 (a merged loop PR whose head the controller did not approve pauses the loop) detect this; they do
 not prevent it.
 
-A test module the PR adds runs in the same pytest process as the existing tests, so it can
-change process-wide state (pytest internals, `sys.modules`, builtins, monkeypatching at import)
-and turn failing verifiers green. The protected paths cannot see this (Astra recheck at b774469).
-The owner decided (10-26) to merge this document anyway and keep the loop off: `live` stays false
-until the CI card above is merged. That card adds a required job that runs main's existing tests
-against the PR code without the PR's added test files, and runs the new tests in their own job.
-Until then, every review packet of a loop PR asks: does an added test change process-wide state?
+Closed by ANYM-578: a test module the PR adds ran in the same pytest process as the existing
+tests, so it could change process-wide state and turn failing verifiers green (Astra recheck at
+b774469). Now every job of a required check deletes the files loop PRs add to test directories,
+and every added test file, from its checkout before its first test step, and the `checks / added`
+job runs only those tests on its own runner, inside `CI gate` (TIDEN-CI.md). Added `*.pyc`,
+`__pycache__/`, `*.so`, `*.pyd` and `*.dylib` files are protected-path hits. A rename of an
+existing test is a hit (deletion) for a loop PR, and the renamed file would run in the added-test
+job only. Other PRs exclude nothing: their added and renamed tests run in the required suites.

@@ -53,15 +53,20 @@ _VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and na
 PYTHON_SHARDS = 6
 SHARD_REPORTS = tuple(f"python-{index}.xml" for index in range(1, PYTHON_SHARDS + 1))
 SHARD_JOBS = tuple(f"python-{index}" for index in range(2, PYTHON_SHARDS + 1))
+# Each test job deletes the files autoloop pull requests add to test directories from its checkout and keeps that
+# exclusion inventory as `exclusions.json` (scripts/added_tests.py, ANYM-578); every fragment's must be the same.
+EXCLUSIONS, ADDED_REPORT = "exclusions.json", "added.json"
 # Each parallel test job uploads one `ci-evidence-<job>` fragment: the module checks it runs and the files it
 # produces (verify's seven checks travel in its metadata.json, a shard's `python` outcome in its outcomes.json),
-# besides the `source-sha` and `attempt` it ran.
+# besides the `source-sha` and `attempt` it ran. `added`, the job that runs only the added tests on its own runner,
+# reports no module check: its result is its producer result and `added.json`.
 FRAGMENTS = {
     "verify": (_VERIFY_MODULES, ("metadata.json", SHARD_REPORTS[0], *(name for check, name in REPORTS.items() if check != "python"),
-                                 *(MODULE_REPORTS[name][0] for name in _VERIFY_MODULES))),
-    "load": (("load",), ("outcomes.json", MODULE_REPORTS["load"][0], "load.json")),
-    **{job: ((), ("outcomes.json", report)) for job, report in zip(SHARD_JOBS, SHARD_REPORTS[1:])},
-    "go": (GO_MODULES, ("outcomes.json", *(MODULE_REPORTS[name][0] for name in GO_MODULES))),
+                                 *(MODULE_REPORTS[name][0] for name in _VERIFY_MODULES), EXCLUSIONS)),
+    "load": (("load",), ("outcomes.json", MODULE_REPORTS["load"][0], "load.json", EXCLUSIONS)),
+    **{job: ((), ("outcomes.json", report, EXCLUSIONS)) for job, report in zip(SHARD_JOBS, SHARD_REPORTS[1:])},
+    "go": (GO_MODULES, ("outcomes.json", *(MODULE_REPORTS[name][0] for name in GO_MODULES), EXCLUSIONS)),
+    "added": ((), ("outcomes.json", ADDED_REPORT, EXCLUSIONS)),
 }
 CONTROL_FILES = {"source-sha", "attempt", "metadata.json", "outcomes.json"}
 # Every file assembly writes besides `source-sha` and `metadata.json`.
@@ -496,7 +501,8 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, 
     each shard job succeeded: a shard job that failed or was cancelled after its tests never reads as passed. A
     shard job's result is the one it recorded before its receiving-commit check, which a baseline of another
     source fails by design (checks.yml). The valid shard reports merge into one python.xml, so test identities
-    do not change.
+    do not change. Every fresh fragment holds the same exclusion inventory (`EXCLUSIONS`), which the merged
+    evidence keeps, so no job tested another set of files than the others (ANYM-578).
     `ci_url` names this assembly's run attempt, which reruns with every producer; `producers` in the metadata
     keeps each job's own result, captured SHA and the attempt its merged fragment came from. `directory` must
     be new or empty, so no earlier assembly's report survives.
@@ -519,7 +525,7 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, 
         raise ValueError("the evidence directory must be new or empty")
     checks, module_checks, provenance = dict(metadata["checks"]), {}, {}
     directory.mkdir(parents=True, exist_ok=True)
-    present, missing, shards, suites = [], [], [], []
+    present, missing, shards, suites, inventories = [], [], [], [], {}
     source_root = source_root or Path.cwd()
     for job, (names, files) in FRAGMENTS.items():
         result, captured = producers[job]
@@ -540,6 +546,9 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, 
         if control_file(fragment, "source-sha") != sha or captured != sha:
             raise ValueError(f"the {job} fragment tested another source than verify")
         provenance[job]["attempt"] = control_file(fragment, "attempt")
+        inventories[job] = control_file(fragment, EXCLUSIONS)
+        if len(set(inventories.values())) > 1:
+            raise ValueError(f"the {job} fragment excluded other added tests than another job")
         if not provenance[job]["attempt"].isdigit():
             raise ValueError(f"the {job} fragment does not name its run attempt")
         try:
