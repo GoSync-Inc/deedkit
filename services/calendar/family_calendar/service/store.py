@@ -20,7 +20,7 @@ from family_calendar.errors import CalendarError
 
 HERE = Path(__file__).parent
 MIGRATIONS = ((1, HERE / "schema.sql"), (2, HERE / "schema_v2.sql"), (3, HERE / "schema_v3.sql"),
-              (4, HERE / "schema_v4.sql"), (5, HERE / "schema_v5.sql"))
+              (4, HERE / "schema_v4.sql"), (5, HERE / "schema_v5.sql"), (6, HERE / "schema_v6.sql"))
 ROLES = HERE / "roles.sql"
 # migrate-expand's session budgets (ANYM-586 K2, as messaging's ANYM-596), read back after connecting.
 EXPAND_SETTINGS = {"lock_timeout": "2s", "statement_timeout": "4s", "transaction_timeout": "4s"}
@@ -56,6 +56,15 @@ def expand_code(run):
         raise CalendarError("statement_timeout") from None
     except Exception:
         raise CalendarError("failed") from None
+
+
+# A messaging person ID (ANYM-554): a UUID in its canonical 8-4-4-4-12 form, any case.
+PERSON_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def person_uuid(value):
+    """The lower-case person UUID of value, or None when value is not one."""
+    return value.lower() if isinstance(value, str) and PERSON_ID.fullmatch(value) else None
 
 
 def caller_key(value):
@@ -409,6 +418,31 @@ class Store:
                 "DO UPDATE SET enabled=excluded.enabled,changed_at=now()", (calendar_ref, enabled),
             )
             c.execute("UPDATE calendars SET version=version+1 WHERE ref=%s", (calendar_ref,))
+
+    def member_person(self, group_id, member_id, person_id):
+        """The owner's link of a calendar member to a messaging person UUID (ANYM-554); person_id None unlinks. Only
+        the UUID is kept. Returns the link with the person it replaced, so a relink or unlink can be undone."""
+        if person_id is not None:
+            person_id = person_uuid(person_id)
+            if person_id is None:
+                raise CalendarError("invalid_person_id")
+        with self.transaction() as c:
+            if not c.execute("SELECT 1 FROM memberships WHERE group_id=%s AND person_id=%s FOR UPDATE",
+                             (group_id, member_id)).fetchone():
+                raise CalendarError("not_found")
+            old = c.execute("SELECT person_uuid::text AS p FROM member_people WHERE group_id=%s AND member_id=%s",
+                            (group_id, member_id)).fetchone()
+            if person_id is None:
+                c.execute("DELETE FROM member_people WHERE group_id=%s AND member_id=%s", (group_id, member_id))
+            else:
+                if c.execute("SELECT 1 FROM member_people WHERE group_id=%s AND person_uuid=%s AND member_id<>%s",
+                             (group_id, person_id, member_id)).fetchone():
+                    raise CalendarError("person_already_linked")
+                c.execute("INSERT INTO member_people(group_id,member_id,person_uuid) VALUES (%s,%s,%s) "
+                          "ON CONFLICT(group_id,member_id) DO UPDATE SET person_uuid=excluded.person_uuid,"
+                          "linked_at=now()", (group_id, member_id, person_id))
+        return {"group_id": group_id, "member_id": member_id, "person_id": person_id,
+                "linked": person_id is not None, "previous": old["p"] if old else None}
 
     def grant(self, group_id, person_id, calendar_ref, scopes, visibility="details"):
         self.query(
