@@ -515,10 +515,24 @@ def test_join_request_batch_worker_interrupted_receipt_is_unknown_without_rows(o
     from test_telegram_operations import SUPERGROUP,GroupClient
     s,_,key,state=operator
     s.set_messenger_operations('command-fixture',['approve_join_requests'])
-    client=GroupClient()
+    reached=asyncio.Event()
+    class Client(GroupClient):
+        async def __call__(self,request):
+            if getattr(getattr(request,'user_id',None),'user_id',None)==202:
+                reached.set()
+            return await super().__call__(request)
+    client=Client()
     client.hide[202]='hang' if failure=='timeout' else RuntimeError('synthetic crash')
     original=asyncio.wait_for
-    monkeypatch.setattr(asyncio,'wait_for',lambda awaitable,timeout:original(awaitable,0.5))
+    async def after_201(awaitable,timeout):
+        # The worker's short deadline starts only once 201 is approved and 202's request has begun, so 201 never
+        # races it (ANYM-591); 202's hang lasts 30 s, far past it.
+        task=asyncio.ensure_future(awaitable)
+        started=asyncio.ensure_future(reached.wait())
+        await asyncio.wait({task,started},return_when=asyncio.FIRST_COMPLETED)
+        started.cancel()
+        return await original(task,0.5)
+    monkeypatch.setattr(asyncio,'wait_for',after_201)
     async def provider(job):
         result=await execute(client,{**job,'provider_chat':SUPERGROUP})
         if failure=='crash':raise RuntimeError('synthetic worker crash after the provider answered')
