@@ -253,7 +253,8 @@ DESCRIPTIONS = {
     "today and this_week from now; or {from, to} ISO 8601, without an offset read in the family timezone, at most "
     "31 days. duration in minutes (default 30). slots (at most 20) are free intervals in the members' configured "
     "bindings, each with next: calendar_schedule create at its start with dry_run=true (a preview with a "
-    "confirm_token, never an apply), carrying title and calendar when given. availability verified with no slots: "
+    "confirm_token, never an apply), with title (default \"Meeting with\" the others' names) and calendar when "
+    "given; a key without plan:create and plan:execute gets slots without next. availability verified with no slots: "
     "next is this tool one step wider (a day, or a week for a week window). availability unknown (refresh pending, "
     "incomplete coverage or unbound_members): no slot is claimed. Every result states timezone and now.",
 }
@@ -378,13 +379,20 @@ class Gateway:
         """calendar_find_time (ANYM-553): people by name, a named window, slots that each preview a booking."""
         scheduler = Scheduler(self.service)
         await asyncio.to_thread(scheduler.ready)
-        p, members = await asyncio.to_thread(self.service.find_members, key, request)
+        p = await asyncio.to_thread(self.service.principal, key)
+        if "availability:read" not in p["scopes"]:
+            raise CalendarError("not_found_or_forbidden")
         family = await asyncio.to_thread(scheduler.family, key, p)
         zone, now = family["zone"], core.clock()
+        # The window is checked before any name, so an error never carries an unchecked window back.
         a, b, step = core.find_window(request["window"], zone, now)
         shown = {"from": a.isoformat(), "to": b.isoformat()}
-        # A `next` repeats the request with every member by ID; the caller comes back unless exclude_me.
+        named = request["window"] if isinstance(request["window"], str) else shown
+        members = await asyncio.to_thread(self.service.find_members, p, {**request, "window": named})
+        # A `next` repeats the request with every member by ID; the caller comes back unless exclude_me, so only a
+        # caller asking for themself is named.
         ids = [m["member_id"] for m in members if m["member_id"] != p["person_id"] or request["exclude_me"]]
+        ids = ids or [p["person_id"]]
         same = {**{k: v for k, v in request.items() if k != "refresh"}, "people": ids, "window": shown}
         result = {"people": members, "window": shown, "duration": request["duration"], "slots": []}
         if a < b:
@@ -400,12 +408,15 @@ class Gateway:
             found, a = {"candidate_slots": []}, b
             result["availability"] = "verified"
         book = {"plan:create", "plan:execute"} <= set(p["scopes"])
+        # calendar_schedule create needs a title: without one the preview names the others.
+        others = ", ".join(m["label"] for m in members if m["member_id"] != p["person_id"])
+        title = request.get("title") or (f"Meeting with {others}" if others else "Meeting")[:256]
         for free in found["candidate_slots"][:MAX_SLOTS]:
             start = core.instant(free["start"]).astimezone(zone).isoformat()
             slot = {"start": start, "end": core.instant(free["end"]).astimezone(zone).isoformat()}
             if book:
                 slot["next"] = {"tool": TOOL_NAME, "arguments": {
-                    "action": "create", **{k: request[k] for k in ("title", "calendar") if k in request},
+                    "action": "create", "title": title, **{k: request[k] for k in ("calendar",) if k in request},
                     "start": start, "duration": request["duration"], "dry_run": True}}
             result["slots"].append(slot)
         if not result["slots"] and result["availability"] == "verified":

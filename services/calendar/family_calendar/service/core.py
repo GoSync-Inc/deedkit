@@ -49,9 +49,15 @@ def find_window(value, zone, now):
 
 
 def widened(a, b, step):
-    """One step wider: `to` later by step days, inside the 31-day limit; a window at the limit moves on instead."""
-    end = min(b + timedelta(days=step), a + timedelta(days=31))
-    return (a, end) if end > b else (b, min(b + timedelta(days=step), b + timedelta(days=31)))
+    """One step wider: `to` later by step days, inside the 31-day limit; a window at the limit moves on instead.
+    The limit counts elapsed time, as window() does: a DST change makes a wall-clock day 23 or 25 hours."""
+    def limit(start):
+        return (start.astimezone(timezone.utc) + timedelta(days=31)).astimezone(start.tzinfo)
+
+    end = min(b + timedelta(days=step), limit(a))
+    c, d = (a, end) if end > b else (b, min(b + timedelta(days=step), limit(b)))
+    window(c, d)
+    return c, d
 
 
 TIME_FORMAT = (
@@ -607,14 +613,14 @@ class FamilyService:
         result["configured_bindings_availability"] = "verified"
         return result
 
-    def find_members(self, key, request):
-        """calendar_find_time's people (ANYM-553) as enabled members: a member ID, or a member name the calendar
-        knows (case and spacing ignored). One exact name resolves; several exact ones, or only names containing it,
-        are a selection whose candidates retry the request with that member; none is not_found. The caller comes
-        first unless exclude_me. Returns (principal, [{member_id, label, role}])."""
-        p = self.principal(key)
-        if "availability:read" not in p["scopes"]:
-            raise CalendarError("not_found_or_forbidden")
+    def find_members(self, p, request):
+        """calendar_find_time's people (ANYM-553) as enabled members of principal p (availability:read checked by
+        the caller): a member ID, or a member name the calendar knows (case and spacing ignored). One exact name
+        resolves; several exact ones, or only names containing it, match several. Every name is looked up first: an
+        unknown one is not_found, else the first that matches several is a selection whose candidates retry the
+        request with that member and every resolved name by ID; `request["window"]` is already validated, so a
+        retry repeats no caller text but names that matched member labels. The caller comes first unless
+        exclude_me. Returns [{member_id, label, role}]."""
         members = self.store.query(
             "SELECT m.person_id AS member_id,p.label,m.role FROM memberships m JOIN people p ON p.id=m.person_id "
             "WHERE m.group_id=%s AND m.enabled ORDER BY p.label,m.person_id",
@@ -624,30 +630,31 @@ class FamilyService:
         def norm(text):
             return " ".join(text.split()).casefold()
 
-        found = [] if request.get("exclude_me") else [m for m in members if m["member_id"] == p["person_id"]]
-        people = request["people"]
-        for i, name in enumerate(people):
+        asked = []
+        for name in request["people"]:
             wanted = norm(name)
             exact = [m for m in members if m["member_id"] == name] or [m for m in members if norm(m["label"]) == wanted]
-            if len(exact) == 1:
-                found.extend(exact)
-                continue
             matches = exact or [m for m in members if wanted and wanted in norm(m["label"])]
             if not matches:
                 raise CalendarError("not_found", details={"next": {"tool": "calendar_members", "arguments": {}}})
-            # The retry names every member by ID; the title stays out, since a relayed next must not repeat it.
-            done = [m["member_id"] for m in found if m["member_id"] != p["person_id"] or request.get("exclude_me")]
+            asked.append(matches)
+        for i, matches in enumerate(asked):
+            if len(matches) == 1:
+                continue
+            # The title stays out, since a relayed next must not repeat it.
             retry = {k: v for k, v in request.items() if k not in ("title", "refresh")}
+            people = [m[0]["member_id"] if len(m) == 1 else name for m, name in zip(asked, request["people"])]
             raise CalendarError("selection_required", details={"candidates": [
                 {"id": m["member_id"], "kind": "member", "label": m["label"][:200],
                  "next": {"tool": "calendar_find_time",
-                          "arguments": {**retry, "people": [*done, m["member_id"], *people[i + 1:]]}}}
+                          "arguments": {**retry, "people": [*people[:i], m["member_id"], *people[i + 1:]]}}}
                 for m in matches[:10]
             ]})
-        found = list({m["member_id"]: m for m in found}.values())
+        me = [] if request.get("exclude_me") else [m for m in members if m["member_id"] == p["person_id"]]
+        found = list({m["member_id"]: m for m in me + [m[0] for m in asked]}.values())
         if not found:
             raise CalendarError("invalid_arguments", [{"field": "people", "reason": "required"}])
-        return p, found
+        return found
 
     def plan(self, key, actions, carry_projections=False, invitations=False):
         p = self.principal(key)

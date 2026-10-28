@@ -61,7 +61,8 @@ def test_an_exact_unique_name_resolves_and_the_owner_is_included(store):
         ("2026-10-20T11:00:00+08:00", "2026-10-20T12:00:00+08:00"),
     ]
     # Anna is an exact name although "Anna Petrova" contains it.
-    anna = FamilyService(store).find_members(key, {"people": ["Anna"], "exclude_me": True})[1]
+    service = FamilyService(store)
+    anna = service.find_members(service.principal(key), {"people": ["Anna"], "exclude_me": True})
     assert [m["member_id"] for m in anna] == ["adult-b"]
     # exclude_me leaves Egor out; the helper has no binding, so no slot is claimed and none is suggested.
     alone = find(store, key, people=["anna  PETROVA", "child"], window=DAY, duration=60, exclude_me=True)
@@ -71,7 +72,8 @@ def test_an_exact_unique_name_resolves_and_the_owner_is_included(store):
     assert find(store, key, people=["Masha"], window=DAY, duration=60, exclude_me=True)["slots"] == [
         {"start": "2026-10-20T08:00:00+08:00", "end": "2026-10-20T12:00:00+08:00", "next": {
             "tool": "calendar_schedule",
-            "arguments": {"action": "create", "start": "2026-10-20T08:00:00+08:00", "duration": 60, "dry_run": True}}},
+            "arguments": {"action": "create", "title": "Meeting with Masha", "start": "2026-10-20T08:00:00+08:00",
+                          "duration": 60, "dry_run": True}}},
     ]
 
 
@@ -153,3 +155,67 @@ def test_widening_stays_inside_the_31_day_limit_and_moves_on_at_it():
     # A 31-day window cannot widen: the next one starts where it ends.
     full = datetime(2026, 12, 2, tzinfo=zone)
     assert core.widened(a, full, 31) == (full, datetime(2027, 1, 2, tzinfo=zone))
+
+
+# spec: ANYM-553
+def test_every_name_and_the_window_are_checked_before_a_selection_repeats_them(store):
+    key = setup(store)
+    marker = "confidential salary marker"
+    # An unknown trailing name is not_found, never a candidate retry that repeats it.
+    unknown = find(store, key, people=["Ann", marker], window="tomorrow")
+    assert unknown["error"] == "not_found" and "candidates" not in unknown and marker not in str(unknown)
+    # A window that is no time is refused before any name is resolved.
+    bad = find(store, key, people=["Ann"], window={"from": "private medical marker", "to": "another secret marker"})
+    assert bad["error"] != "selection_required" and "marker" not in str(bad)
+    # Every resolved name is retried by member ID, an ISO window as the checked instants.
+    partial = find(store, key, people=["Ann", "Masha"], window=DAY)
+    assert [c["next"]["arguments"]["people"] for c in partial["candidates"]] == [["adult-b", "child"],
+                                                                                 ["helper", "child"]]
+    assert partial["candidates"][0]["next"]["arguments"]["window"] == {
+        "from": "2026-10-20T08:00:00+08:00", "to": "2026-10-20T18:00:00+08:00"}
+
+
+# spec: ANYM-553
+def test_a_caller_asking_for_themself_gets_continuations_that_run(store, monkeypatch):
+    key = setup(store)
+    # Egor is busy 10:00-11:00 local: a self-only search there is empty and widens with Egor named.
+    busy = {"from": "2026-10-20T10:00", "to": "2026-10-20T11:00"}
+    empty = find(store, key, people=["adult-a"], window=busy, duration=30)
+    assert empty["slots"] == [] and empty["next"]["arguments"]["people"] == ["adult-a"]
+    MODELS["find_time"].model_validate(empty["next"]["arguments"])
+    wider = find(store, key, **empty["next"]["arguments"])
+    assert "error" not in wider and [m["member_id"] for m in wider["people"]] == ["adult-a"]
+
+    async def pending(self, *args, **kwargs):
+        return {"status": "pending", "jobs": [{"calendar_ref": "x", "state": "queued"}]}
+
+    monkeypatch.setattr(Gateway, "refresh", pending)
+    waiting = find(store, key, people=["adult-a"], window=busy, duration=30, refresh=True)
+    assert waiting["next"]["arguments"]["people"] == ["adult-a"] and waiting["next"]["arguments"]["refresh"] is False
+    MODELS["find_time"].model_validate(waiting["next"]["arguments"])
+
+
+# spec: ANYM-553
+def test_widening_across_a_dst_change_stays_a_window_the_tool_accepts():
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("Europe/Berlin")
+    # 2026-10-25 is the fall-back day: a wall-clock month there is 745 hours.
+    a, b, step = core.find_window({"from": "2026-10-01T00:00", "to": "2026-10-20T00:00"}, zone, core.clock())
+    c, d = core.widened(a, b, step)
+    utc = core.timezone.utc
+    assert c == a and d.astimezone(utc) - c.astimezone(utc) == core.timedelta(days=31) and core.window(c, d)
+    assert core.find_window({"from": c.isoformat(), "to": d.isoformat()}, zone, core.clock())[:2] == (c, d)
+
+
+# spec: ANYM-553
+def test_a_slot_preview_without_title_runs_and_a_reader_gets_slots_without_next(store):
+    key = setup(store)
+    found = find(store, key, people=["Masha"], window=DAY, duration=60)
+    first = found["slots"][0]["next"]["arguments"]
+    assert first["title"] == "Meeting with Masha" and first["dry_run"] is True
+    preview = schedule_call(store, key, first)
+    assert preview["state"] == "previewed" and preview["confirm_token"]
+    reader = store.agent("reader", "family", "adult-a", ["availability:read"], ["cal-a", "cal-child"])
+    read = find(store, reader, people=["Masha"], window=DAY, duration=60)
+    assert read["slots"] and all("next" not in slot for slot in read["slots"])

@@ -228,19 +228,23 @@ Owner setup: `service family-settings --group family --timezone Asia/Makassar --
 
 `family_find_time` (gateway `calendar_find_time`, scope `availability:read`, read-only) runs `slots` for people named
 as the calendar knows them. `people` are member names (`people.label`, case and spacing ignored) or member IDs; the
-caller's own member is added unless `exclude_me`. One exact name resolves; a name several members share, or one only
-part of a label matches, is `selection_required` with one candidate per member (`kind: member`) whose `next` is the
-same request with that member's ID and without `title`; an unknown name is `not_found` with `next` `calendar_members`.
-The gateway does not count `people` and `window` as payload for this tool (as `platform_resolve_target`'s `to`), so
-those candidates are relayed; `title` stays payload.
+caller's own member is added unless `exclude_me`. The window is checked first, then every name: an unknown name is
+`not_found` with `next` `calendar_members`; else the first name several members share, or only part of a label
+matches, is `selection_required` with one candidate per member (`kind: member`) whose `next` is the same request with
+that member's ID, every resolved name by ID and an ISO window as the checked instants, without `title`. For these
+candidates the gateway stops counting a `people` entry as payload only as a member ID or part of a relayed candidate's
+label, and the `window` only as a named window or two timestamps; other entries, `title`, and the error's `hint` and
+top-level `next` keep the whole payload. A refreshing search (`refresh` omitted or true) waits in the calendar wait
+pool, never the metadata pool.
 
 `window` is `today`, `tomorrow`, `this_week` or `next_week` (Monday to Monday) in the family timezone, `today` and
 `this_week` from the next quarter hour, or `{from, to}` ISO 8601 (offset-free: family wall time; at most 31 days).
 `duration` defaults to 30 minutes. The answer names the resolved `people`, the `window`, `availability`, `coverage`,
 `unbound_members`, `timezone` and `now`, and at most 20 `slots` (free intervals of the configured bindings). With
 `plan:create` and `plan:execute` each slot has `next`: `calendar_schedule` `create` at the slot start with
-`dry_run: true` (and the request's `title` and `calendar`), so it previews and never applies. `availability:
-verified` with no slot gives `next` this tool one step wider (the window's length in whole days, inside 31 days);
+`dry_run: true`, the request's `title` (default `Meeting with` the other members' names) and `calendar`, so it
+previews and never applies; a key without them gets slots without `next`. `availability:
+verified` with no slot gives `next` this tool one step wider (the window's length in whole days, inside 31 days of elapsed time across DST);
 a pending refresh gives `next` the same request with `refresh: false`; other unknown availability gives no `next`.
 
 ## Coverage and read errors

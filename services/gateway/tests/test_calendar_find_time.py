@@ -2,10 +2,12 @@
 import asyncio
 import json
 
+import httpx
 import pytest
 
 from agent_gateway.catalog import CATALOG
 from agent_gateway.dispatch import Dispatch
+from agent_gateway.http_clients import Clients, admission, wait_tools
 from agent_gateway.policy import Denied, Policy
 from test_policy import config
 
@@ -40,7 +42,7 @@ def gateway(tmp_path, answer):
 
 def member(member_id, label, window):
     return {"id": member_id, "kind": "member", "label": label, "next": {"tool": "calendar_find_time", "arguments": {
-        "people": [member_id, "Masha"], "window": window, "duration": 45, "exclude_me": False}}}
+        "people": [member_id, "child"], "window": window, "duration": 45, "exclude_me": False}}}
 
 
 # spec: ANYM-553
@@ -72,3 +74,63 @@ def test_an_unknown_name_relays_its_calendar_members_next(tmp_path):
         asyncio.run(gateway(tmp_path, answer).call("gateway-a", "calendar_find_time",
                                                    {"people": ["Zoe"], "window": "today"}))
     assert caught.value.detail["next"] == answer["next"]
+
+
+# spec: ANYM-553
+def test_caller_text_outside_member_names_and_checked_windows_stays_payload(tmp_path):
+    marker = "confidential salary marker"
+    good = member("adult-b", "Anna", "tomorrow")
+    trailing = {**good, "next": {**good["next"], "arguments": {**good["next"]["arguments"],
+                                                                "people": ["adult-b", marker]}}}
+    hinted = {"error": "selection_required", "hint": f"Ann or {marker}", "candidates": [
+        trailing, member("helper", "Anna Petrova", "tomorrow")]}
+    with pytest.raises(Denied) as caught:
+        asyncio.run(gateway(tmp_path, hinted).call("gateway-a", "calendar_find_time",
+                                                   {"people": ["Ann", marker], "window": "tomorrow"}))
+    # An unknown trailing name is still payload: the retry repeating it and the hint are dropped; a retry by
+    # member IDs is kept.
+    assert caught.value.detail.get("hint") is None
+    assert caught.value.detail["candidates"] == [{k: v for k, v in good.items() if k != "next"},
+                                                 member("helper", "Anna Petrova", "tomorrow")]
+    window = {"from": "private medical marker", "to": "another secret marker"}
+    leaked = {"error": "selection_required", "candidates": [member("adult-b", "Anna", window)]}
+    with pytest.raises(Denied) as caught:
+        asyncio.run(gateway(tmp_path, leaked).call("gateway-a", "calendar_find_time",
+                                                   {"people": ["Ann"], "window": window}))
+    # A window that is no named window or timestamps stays payload: the retry repeating it is dropped.
+    assert caught.value.detail["candidates"] == [{"id": "adult-b", "kind": "member", "label": "Anna"}]
+
+
+# spec: ANYM-553
+def test_a_refreshing_find_time_waits_in_the_calendar_wait_pool_and_leaves_control_reads_admitted():
+    tools = wait_tools(CATALOG)
+    assert admission(tools, "calendar", "find_time", {"people": ["Ann"], "window": "today"}) == "waits"
+    assert admission(tools, "calendar", "find_time", {"people": ["Ann"], "window": "today", "refresh": False}) \
+        == "metadata"
+    deployment = {"modules": ["calendar"], "backends": {"calendar": {"url": "http://calendar"}}}
+
+    async def run():
+        release = asyncio.Event()
+
+        async def handler(request):
+            if request.url.path.endswith("/find_time"):
+                await release.wait()
+            return httpx.Response(200, json={"ok": True})
+
+        async with Clients(deployment, {"calendar": httpx.MockTransport(handler)}) as clients:
+            budget = clients.wait_budgets["calendar"]
+            held = [asyncio.create_task(clients.call("calendar", "find_time", "synthetic",
+                                                     {"people": ["Ann"], "window": "today"})) for _ in range(8)]
+            try:
+                await asyncio.sleep(0.05)
+                assert budget.pending == budget.capacity
+                async with asyncio.timeout(1):
+                    for operation in ("capabilities", "operation"):
+                        assert (await clients.call("calendar", operation, "synthetic", {}))["ok"] is True
+                assert clients.budgets["calendar"].pending == 0
+            finally:
+                release.set()
+                await asyncio.gather(*held, return_exceptions=True)
+            assert budget.pending == 0
+
+    asyncio.run(run())
