@@ -151,7 +151,7 @@ def test_backfill_commits_each_batch_so_ingest_and_resolution_never_wait_for_it(
         # A collector on its own connection, with a lock wait far below the batch bounds: a new conflict and a
         # resolving edit of an already classified row both go through while the backfill is between batches.
         with s.pool.connection() as c:
-            c.execute("SET lock_timeout='200ms'")
+            c.execute("SET LOCAL lock_timeout='200ms'")
             seen.append(c.execute('SELECT count(*) AS n FROM message_conflicts WHERE reason IS NOT NULL').fetchone()['n'])
         if len(seen)==1:
             contradict(ar,'during',body='Другой')
