@@ -337,6 +337,10 @@ class RecordingStore:
         self.calls.append(('unlink_person', account, sender))
         return {'person': '00000000-0000-4000-8000-000000000001', 'account': account, 'sender': sender}
 
+    def set_person_channel(self, person, purpose, account=None):
+        self.calls.append(('set_person_channel', person, purpose, account))
+        return {'person': person, 'purpose': purpose, 'account': account, 'changed': True}
+
     def delete_person(self, person):
         self.calls.append(('delete_person', person))
         return {'person': person, 'unlinked': 1}
@@ -489,3 +493,32 @@ def test_unlink_follows_a_moved_identity_and_waits_for_its_new_person(people):
 def s_unlink(c, sender):
     from messaging_service.person_links import unlink as remove
     return remove(c, 'person-tg', sender)['person']
+
+
+# spec: ANYM-548
+def test_cli_sets_and_clears_a_person_channel_and_agents_have_no_path(monkeypatch, tmp_path, capsys):
+    RecordingStore.calls = []
+    monkeypatch.setattr(operator, 'Store', RecordingStore)
+    dsn = tmp_path / 'synthetic.dsn'
+    dsn.write_text('postgresql://synthetic.invalid/messaging_probe_test')
+    monkeypatch.setenv('DATABASE_URL_FILE', str(dsn))
+    person = '00000000-0000-4000-8000-000000000002'
+    for arguments in (['set-person-channel', '--person', person, '--purpose', 'call', '--account', 'tg'],
+                      ['set-person-channel', '--person', person, '--purpose', 'message', '--clear']):
+        monkeypatch.setattr(sys, 'argv', ['anymsg', *arguments])
+        operator.main()
+        json.loads(capsys.readouterr().out)
+    assert [call for call in RecordingStore.calls if call != ('close',)] == [
+        ('set_person_channel', person, 'call', 'tg'), ('set_person_channel', person, 'message', None)]
+    for arguments in (['--person', person, '--purpose', 'call'],
+                      ['--person', person, '--purpose', 'call', '--account', 'tg', '--clear'],
+                      ['--person', person, '--account', 'tg'], ['--purpose', 'call', '--account', 'tg'],
+                      ['--person', person, '--purpose', 'sms', '--account', 'tg']):
+        monkeypatch.setattr(sys, 'argv', ['anymsg', 'set-person-channel', *arguments])
+        with pytest.raises(SystemExit):
+            operator.main()
+    catalog = json.loads((ROOT / 'services/gateway/src/agent_gateway/catalog.json').read_text())
+    contracts = json.loads((ROOT / 'tests/platform/fixtures/messaging-contracts.json').read_text())
+    assert 'set_person_channel' not in OPERATION_PERMISSIONS
+    assert not any(tool.get('operation') == 'set_person_channel' for tool in catalog)
+    assert not any(tool['name'] == 'set_person_channel' for tool in contracts['tools'])

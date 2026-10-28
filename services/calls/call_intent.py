@@ -38,6 +38,7 @@ CHANNELS = ["phone", "whatsapp", "telegram", "sip"]
 ACCOUNT_CHANNEL = re.compile(r"(whatsapp|telegram)[-_][A-Za-z0-9_.-]{1,60}")
 CONTROL = frozenset(("dry_run", "confirm_token", "request_id", "wait_s"))
 INSTRUCTION = ("owner_instruction", "authorization_reference")
+PERSON_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 # A resolver answer that only echoes a number the agent passed: no archive source holds it.
 UNSOURCED = ("phone", "jid")
 REASONS = {"missing": "required", "extra_forbidden": "unknown_field", "string_too_short": "min_length",
@@ -206,11 +207,14 @@ class CallIntents:
         """ANYM-545 with purpose call. A name never resolves alone: its candidates come back without a continuation."""
         if not principal.archive_config:
             raise ServiceError("scoped_archive_not_configured", 403)
+        # A person is looked up by its UUID alone (ANYM-548): an asked account is checked here, never sent.
+        person = PERSON_ID.fullmatch(to.strip()) is not None
         archive = self.archive_factory(principal)
         try:
-            status, body = await archive.resolve_target(to.strip(), "call", account)
+            status, body = await archive.resolve_target(to.strip(), "call", "" if person else account)
         except Exception:
-            raise ServiceError("scoped_archive_unavailable", 503) from None
+            # Messaging down, slow (3 s, ANYM-548) or answering 5xx: only this call fails, and it may be retried.
+            raise ServiceError("dependency_unavailable", 503, {"retryable": True}) from None
         finally:
             await archive.close()
         if status == 200 and isinstance(body.get("target"), dict):
@@ -221,6 +225,10 @@ class CallIntents:
                                             "owner wrote it, or pass the person, chat or message ID it came from."})
             if not isinstance(target.get("label"), str) or not isinstance(target.get("how_resolved"), str):
                 raise ServiceError("scoped_archive_unavailable", 503)
+            if person and account and target.get("account") != account:
+                raise invalid([{"field": "channel", "reason": "enum", "allowed": [target.get("account")]}],
+                              hint="This person's channel for calls is another account: pass that account, or the "
+                                   "chat_ ID of the channel you want as to.")
             return target
         code = body.get("error") if isinstance(body.get("error"), str) else ""
         if code == "selection_required":
@@ -244,13 +252,8 @@ class CallIntents:
             if not isinstance(phone, str) or not re.fullmatch(r"\+[1-9][0-9]{7,14}", phone):
                 raise ServiceError("destination_unavailable", 422, {"retryable": False})
             return channel, phone
-        archive = self.archive_factory(principal)
-        try:
-            user = await archive.provider_chat(target["chat_id"])
-        except Exception:
-            raise ServiceError("scoped_archive_unavailable", 503) from None
-        finally:
-            await archive.close()
+        # The resolver names a private Telegram chat's user ID (ANYM-548): no message of the chat is read.
+        user = target.get("telegram_user_id")
         if not isinstance(user, str) or not re.fullmatch(r"[1-9][0-9]{0,17}", user):
             raise ServiceError("destination_unavailable", 422, {"retryable": False})
         return "telegram", user

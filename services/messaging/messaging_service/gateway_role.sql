@@ -104,3 +104,5 @@ DO $$ BEGIN
         CREATE POLICY messaging_gateway_beat ON component_heartbeats TO messaging_gateway USING (component='api') WITH CHECK (component='api');
     END IF;
 END $$;
+-- Schema 53 (ANYM-548): the owner's preferred channel per person and purpose, read only; the owner CLI writes it.
+GRANT SELECT ON person_preferences TO messaging_gateway;

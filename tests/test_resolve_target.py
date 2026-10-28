@@ -407,3 +407,66 @@ def test_property_non_exact_input_never_returns_a_single_target_and_errors_follo
                    for c in body['candidates'])
     if to.strip().lower() in chosen.lower():
         assert body['error'] == 'selection_required'
+
+
+# spec: ANYM-548
+def test_a_preferred_channel_resolves_the_person_per_purpose_and_names_it(world):
+    s, _, key, _, _ = world
+    person = s.link_person(TG, '42')['person']
+    s.link_person(WA, WA_STEPAN, person=person)
+    tg, wa = chat_of(s, TG, '42'), chat_of(s, WA, WA_STEPAN)
+    assert s.set_person_channel(person, 'message', WA) == {'person': person, 'purpose': 'message', 'account': WA,
+                                                           'changed': True}
+    sent = target(s, key, person)
+    assert (sent['chat_id'], sent['how_resolved'], sent['person']) == (wa, 'person_preferred', person)
+    # Another purpose keeps its own preference: none yet, so the call still asks which channel.
+    assert refused(s, key, person, purpose='call')['error'] == 'selection_required'
+    s.set_person_channel(person, 'call', TG)
+    # Egress messaging -> calls, exactly: label, network, account, the dial ID and how_resolved; no archive
+    # reference, message text or other identity.
+    called = target(s, key, person, purpose='call')
+    assert called == {'account': TG, 'network': 'telegram', 'label': target(s, key, tg)['label'],
+                      'how_resolved': 'person_preferred', 'telegram_user_id': '42'}
+    s.set_person_channel(person, 'call', WA)
+    assert target(s, key, person, purpose='call') == {
+        'account': WA, 'network': 'whatsapp', 'label': target(s, key, wa)['label'], 'how_resolved': 'person_preferred',
+        'phone': '+' + WA_STEPAN.split('@')[0]}
+    s.set_person_channel(person, 'call', TG)
+    assert 'telegram_user_id' not in target(s, key, tg)
+    assert s.set_person_channel(person, 'message')['changed'] is True
+    assert refused(s, key, person)['error'] == 'selection_required'
+    assert s.list_people(person)['people'][0]['preferences'] == {'call': TG}
+
+
+# spec: ANYM-548
+def test_a_preference_on_a_hidden_identity_changes_nothing_for_that_caller(world):
+    s, _, _, _, _ = world
+    person = s.link_person(TG, '42')['person']
+    s.link_person(WA, WA_STEPAN, person=person)
+    s.set_person_channel(person, 'message', WA)
+    narrow = s.issue_key('rt-tg-only', [TG])
+    seen = target(s, narrow, person)
+    assert (seen['chat_id'], seen['how_resolved'], seen['account']) == (chat_of(s, TG, '42'), 'person', TG)
+    hidden = s.issue_key('rt-none', [NATIVE])
+    assert refused(s, hidden, person)['error'] == 'not_found'
+
+
+# spec: ANYM-548
+def test_the_owner_prefers_only_a_linked_account_and_unlinking_it_clears_the_preference(world):
+    s, _, key, _, _ = world
+    person = s.link_person(TG, '42')['person']
+    s.link_person(WA, WA_STEPAN, person=person)
+    for arguments, code in (((person, 'call', NATIVE), 'account_not_linked'), ((str(uuid4()), 'call', TG), 'unknown_person'),
+                            ((person, 'sms', TG), 'invalid_purpose'), (('not-a-uuid', 'call', TG), 'invalid_person')):
+        with pytest.raises(ValueError, match=code):
+            s.set_person_channel(*arguments)
+    s.set_person_channel(person, 'call', WA)
+    assert s.set_person_channel(person, 'call', WA)['changed'] is False
+    s.set_person_channel(person, 'message', TG)
+    s.unlink_person(WA, WA_STEPAN)
+    assert s.list_people(person)['people'][0]['preferences'] == {'message': TG}
+    s.link_person(WA, WA_STEPAN, person=person)
+    assert refused(s, key, person, purpose='call')['error'] == 'selection_required'
+    s.delete_person(person)
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM person_preferences').fetchone()['n'] == 0

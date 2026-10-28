@@ -7,7 +7,7 @@ own exact `next`, and never a mutating top-level `next`; `not_found` names a rea
 """
 import re
 
-from .person_links import UUID_TEXT, annotate, visible_members
+from .person_links import UUID_TEXT, annotate, preferred_account, visible_members
 from .policy import scope_filter, targets
 from .search_query import valid_text
 from .whatsapp_identity import personal_id
@@ -105,6 +105,9 @@ def _chat_target(c, p, row, how, purpose):
             target['person'] = linked[0]['person']
         if row['platform'] == 'whatsapp' and peer.endswith('@c.us'):
             target['phone'] = '+' + peer.split('@')[0]
+        # A private Telegram chat's provider ID is the user ID a call dials (ANYM-548): calls needs no message read.
+        if purpose == 'call' and row['platform'] == 'telegram' and re.fullmatch(r'[1-9][0-9]{0,17}', peer):
+            target['telegram_user_id'] = peer
     targets(p, [row['id']])
     return target
 
@@ -200,6 +203,16 @@ def _private_chats(c, p, identities):
                   '(SELECT * FROM unnest(%s::text[],%s::text[]))', [[a for a, _ in pairs], [s for _, s in pairs]])
 
 
+# What a person lookup for a call returns (ANYM-548): the dial target only, no archive reference or other identity.
+CALL_PERSON_FIELDS = ('account', 'network', 'label', 'how_resolved', 'phone', 'telegram_user_id')
+
+
+def _person_target(target, person, purpose):
+    if purpose == 'call':
+        return {k: target[k] for k in CALL_PERSON_FIELDS if k in target}
+    return {**target, 'person': person}
+
+
 def _person(c, p, person, account, purpose):
     from .store import APIError
     try:
@@ -211,8 +224,15 @@ def _person(c, p, person, account, purpose):
     if not rows:
         raise _not_found('no_usable_channel', person=person)
     if len(rows) == 1:
-        return {**_chat_target(c, p, rows[0], 'person', purpose), 'person': person}
-    # Several channels and no preference (ANYM-548 adds one): the agent picks the channel.
+        return _person_target(_chat_target(c, p, rows[0], 'person', purpose), person, purpose)
+    # The owner's preferred channel for this purpose (ANYM-548), when the caller sees a chat on it; a preference
+    # on an account the caller cannot read leaves the same candidates as no preference.
+    preferred = preferred_account(c, person, purpose)
+    chosen = [r for r in rows if r['account'] == preferred]
+    if len(chosen) == 1:
+        return _person_target(_chat_target(c, p, chosen[0], 'person_preferred', purpose), person, purpose)
+    rows = chosen or rows
+    # Several channels and no usable preference: the agent picks the channel.
     raise _choose([_candidate(r['id'], _title(c, p, r), 'chat', r['platform'], r['account'], r['last_at'], purpose)
                    for r in rows])
 

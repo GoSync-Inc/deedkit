@@ -42,6 +42,7 @@ python -m messaging_service link-person --account <account> --sender <sender_id>
 python -m messaging_service unlink-person --account <account> --sender <sender_id>
 python -m messaging_service delete-person --person <id>
 python -m messaging_service list-people [--person <id>]
+python -m messaging_service set-person-channel --person <id> --purpose message|call (--account <account> | --clear)
 ```
 
 Take `--account` and `--sender` from a `search_people` row (`account`, `sender_id`) read
@@ -54,6 +55,12 @@ LID sender: these are two identities. `link-person` and `list-people` print
 `search(person)` returns half the WhatsApp side. `delete-person` removes only the links.
 Link and removal commands of one person are serialized, so a delete never leaves a
 member that was linked at the same moment.
+
+Preferred channel (ANYM-548, schema 53): `set-person-channel` stores one account per
+person and purpose (`message`, `call`); the account must be one the person has a link on
+(`account_not_linked` otherwise). `--clear` removes it. `list-people` prints
+`preferences`. Unlinking the person's last identity on that account, or `delete-person`,
+removes the preference with it. Like the links, no agent key can set it.
 
 Reading: a `search_people` row of a linked identity carries `person`, the person's id.
 `search_people(person=<id>)` lists the name observations of that person's identities;
@@ -81,9 +88,12 @@ to choose from. It is read-only: no provider call, no write. The audit log recor
   private chat; a shared contact card resolves to the card's phone or Telegram user); a
   person UUID; a WhatsApp JID; a phone in any format (`+7 911 …`, `00…`); `@username`.
   The answer is `{state: succeeded, target: {account, chat_id, network, label,
-  how_resolved, person?, phone?}}`; `how_resolved` names the rule (`chat_id`,
-  `message_chat`, `message_sender`, `person`, `jid`, `phone`, `username`,
-  `contact_card_phone`, `contact_card_telegram_user`).
+  how_resolved, person?, phone?, telegram_user_id?}}`; `how_resolved` names the rule (`chat_id`,
+  `message_chat`, `message_sender`, `person`, `person_preferred`, `jid`, `phone`, `username`,
+  `contact_card_phone`, `contact_card_telegram_user`). With `purpose: call` a private
+  Telegram chat also carries `telegram_user_id`, the user ID a call dials, and a person
+  UUID returns only `{account, network, label, how_resolved, phone | telegram_user_id}`:
+  no `chat_id` or `person` (ANYM-548; `calls_call` asks this with the caller's own key).
 - A phone with no chat on exactly one native WhatsApp account that has the
   `open_chat_by_phone` opt-in and a key with `send` (SENDING.md) gives `chat_id: null,
   opens_chat: true`; send with `phone`. Two such accounts give `selection_required` with
@@ -93,8 +103,11 @@ to choose from. It is read-only: no provider call, no write. The audit log recor
   phone-number chat wins over its LID alias chat.
 - A name or fragment never resolves by itself, even with one match: `selection_required`
   with candidates (chats), each with its own `next` (this tool with the exact ID). The
-  same holds for a person with several private chats and a username shared by several
-  identities. At most 10 candidates, newest `last_activity` first; with more, `more: true`
+  same holds for a person with several private chats and no usable preference, and a
+  username shared by several identities. A person whose owner-set preferred account for
+  the purpose has exactly one private chat the key can read resolves to it
+  (`how_resolved: person_preferred`); a preference on an account the key cannot read
+  changes nothing. At most 10 candidates, newest `last_activity` first; with more, `more: true`
   and `next` is `messages_search_people`. A candidate label with seven or more digits
   (any separators) becomes `<network> <kind>`. `account` narrows every form, a contact
   card's phone included.

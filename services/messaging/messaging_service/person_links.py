@@ -10,6 +10,7 @@ from .policy import scope_filter
 from .search_query import fingerprint
 from .whatsapp_identity import personal_id
 
+PURPOSES = ('message', 'call')
 UUID_TEXT = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 
@@ -85,6 +86,9 @@ def unlink(c, account, sender):
         _lock(c, person)
         if c.execute('DELETE FROM person_links WHERE account=%s AND sender=%s AND person=%s RETURNING person',
                      (account, sender, person)).fetchone():
+            # A preference for an account the person no longer has a link on goes with its last link (ANYM-548).
+            c.execute('''DELETE FROM person_preferences pp WHERE pp.person=%s AND pp.account=%s AND NOT EXISTS(
+                SELECT 1 FROM person_links pl WHERE pl.person=pp.person AND pl.account=pp.account)''', (person, account))
             return {'person': person, 'account': account, 'sender': sender}
     raise ValueError('link_changed')
 
@@ -96,6 +100,7 @@ def delete(c, person):
     rows = c.execute('DELETE FROM person_links WHERE person=%s RETURNING account', (person,)).fetchall()
     if not rows:
         raise ValueError('unknown_person')
+    c.execute('DELETE FROM person_preferences WHERE person=%s', (person,))
     return {'person': person, 'unlinked': len(rows)}
 
 
@@ -106,12 +111,48 @@ def list_people(c, person=None):
         WHERE %s::uuid IS NULL OR person=%s::uuid ORDER BY person,account,sender''', (person, person)).fetchall()
     if person is not None and not rows:
         raise ValueError('unknown_person')
-    people = {}
+    people, preferences = {}, {}
     for row in rows:
         people.setdefault(str(row['person']), []).append({'account': row['account'], 'sender': row['sender'],
             'linked_at': row['linked_at'].isoformat(),
             'whatsapp_siblings': whatsapp_siblings(c, row['account'], row['sender'])})
-    return {'people': [{'person': key, 'members': members} for key, members in people.items()]}
+    for row in c.execute('''SELECT person,purpose,account FROM person_preferences
+            WHERE %s::uuid IS NULL OR person=%s::uuid ORDER BY person,purpose''', (person, person)).fetchall():
+        preferences.setdefault(str(row['person']), {})[row['purpose']] = row['account']
+    return {'people': [{'person': key, 'members': members, 'preferences': preferences.get(key, {})}
+                       for key, members in people.items()]}
+
+
+def prefer(c, person, purpose, account=None):
+    """Set (account) or clear (None) the person's preferred channel for one purpose (ANYM-548, owner only)."""
+    person = _person(person)
+    if purpose not in PURPOSES:
+        raise ValueError('invalid_purpose')
+    if account is not None:
+        _identity(account, 'account')
+    c.execute("SET LOCAL transaction_timeout='5s'")
+    _lock(c, person)
+    accounts = {r['account'] for r in c.execute('SELECT account FROM person_links WHERE person=%s', (person,))}
+    if not accounts:
+        raise ValueError('unknown_person')
+    if account is None:
+        cleared = c.execute('DELETE FROM person_preferences WHERE person=%s AND purpose=%s RETURNING account',
+                            (person, purpose)).fetchone()
+        return {'person': person, 'purpose': purpose, 'account': None, 'changed': bool(cleared)}
+    # The channel must be one the owner linked to this person; a typo never points the person elsewhere.
+    if account not in accounts:
+        raise ValueError('account_not_linked')
+    changed = c.execute('''INSERT INTO person_preferences(person,purpose,account) VALUES(%s,%s,%s)
+        ON CONFLICT(person,purpose) DO UPDATE SET account=excluded.account,set_at=now()
+        WHERE person_preferences.account<>excluded.account RETURNING account''', (person, purpose, account)).fetchone()
+    return {'person': person, 'purpose': purpose, 'account': account, 'changed': bool(changed)}
+
+
+def preferred_account(c, person, purpose):
+    """The owner's preferred account of a person for a purpose, or None. Callers check visibility first."""
+    row = c.execute('SELECT account FROM person_preferences WHERE person=%s AND purpose=%s',
+                    (person, purpose)).fetchone()
+    return row['account'] if row else None
 
 
 def visible_members(c, p, person):
