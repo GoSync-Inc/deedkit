@@ -34,7 +34,7 @@ def test_server_verifier_proof_requires_exact_helper_facts_and_cloud_identity():
 
 
 # spec: ANYM-511
-@pytest.mark.parametrize('version,accepted',[(52,True),(53,True),(54,False)],ids=['n-1','current','next'])
+@pytest.mark.parametrize('version,accepted',[(53,True),(54,True),(55,False)],ids=['n-1','current','next'])
 def test_server_verifier_proof_accepts_current_schema_and_rejects_the_next(version,accepted):
     v=module();receipt={'wire':{'id':'20261016T091703Z-fedcba9876543210','bytes':100,'sha256':'a'*64,'snapshot_sha256':'b'*64}}
     facts={'v':1,'status':'verified','schema_version':version,'manifest_sha256':'b'*64,'checks':{k:True for k in r2.CHECKS}}

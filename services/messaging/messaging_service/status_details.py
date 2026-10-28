@@ -2,7 +2,7 @@
 from datetime import datetime,timezone
 
 DETAILS={
-    'version_conflict':('Conflicting provider observations; current archive revision is retained. Read the message context and scoped sync evidence.','get_context'),
+    'version_conflict':('Conflicting provider observations; current archive revision is retained. The account conflict line counts what needs attention; get_sync_status with a chat_id lists that chat\'s open conflicts.','inspect_chat'),
     'coverage_not_reconciled':('Archived observations do not establish complete provider history.','get_sync_status_for_chat'),
     'whatsapp_catchup_gap':('Provider traversal did not reach a previous checkpoint. Live collection may still work.','inspect_chat_gaps'),
     'whatsapp_history_partial':('WhatsApp history remains a partial provider traversal.','get_sync_status_for_chat'),
