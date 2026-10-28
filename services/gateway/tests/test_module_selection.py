@@ -399,3 +399,53 @@ def test_modules_available_summary(gateway):
     assert {row["id"]: row["selected"] for row in on_path["modules_available"]} == {
         "calendar": False, "messaging": True}
     assert on_path["tools"] == PLATFORM + MODULE_TOOLS["messaging"]
+
+
+TWINS = ["calls_get_call_analysis", "calls_call_result"]
+
+
+def advanced_paths():
+    yield "/mcp/modules/advanced", set(MODULES)
+    for path, chosen in module_paths():
+        if path != "/mcp":
+            yield path + ",advanced", chosen
+
+
+# spec: ANYM-550
+def test_advanced_lists_only_the_profiles_tools_and_scopes_never_widen_it(gateway):
+    """`advanced` adds back the low-level twins the default list hides, never a tool the profile excludes."""
+    app, value, write, _ = gateway
+    profile = PLATFORM + [t for m in MODULES for t in MODULE_TOOLS[m]] + TWINS
+
+    def change(v):
+        v["profiles"]["reader"]["tools"] = profile
+        # Every calls scope: the profile alone still decides the set.
+        v["principals"][0]["grants"]["calls"] = sorted({s for t in CATALOG.values() if t["module"] == "calls"
+                                                        for s in t["scopes"]})
+    write(change)
+    with TestClient(app) as client:
+        plain, _ = listed(client)
+        assert "calls_get_call_analysis" not in plain and "calls_call_result" in plain
+        for path, chosen in advanced_paths():
+            names, found = listed(client, path)
+            assert names == [n for n in profile if CATALOG[n]["module"] in chosen | {"gateway"}], path
+            assert found["tool_count"] == len(names)
+            for name in ("calls_get_call_status", "calls_dial_call", "messages_send"):
+                assert name not in names, (path, name)
+                assert call(client, name, path=path)["isError"], (path, name)
+
+
+# spec: ANYM-550
+def test_advanced_paths_narrow_like_module_paths_and_selection_still_only_narrows(gateway):
+    app, _, _, requests = gateway
+    with TestClient(app) as client:
+        names, _ = listed(client, "/mcp/modules/advanced,messaging")
+        assert names == PLATFORM + MODULE_TOOLS["messaging"]
+        assert calls_to(requests, "calendar") == calls_to(requests, "calls") == []
+        selected = call(client, "platform_select_modules", {"modules": ["calendar"]}, path="/mcp/modules/advanced")
+        assert selected["structuredContent"]["selection_path"] == "/mcp/modules/advanced"
+        narrowed, _ = listed(client, "/mcp/modules/advanced")
+        assert narrowed == PLATFORM + MODULE_TOOLS["calendar"]
+        # The plain path keeps its own selection, and `advanced` is no module to select.
+        assert listed(client)[0] == PLATFORM + [t for m in MODULES for t in MODULE_TOOLS[m]]
+        assert call(client, "platform_select_modules", {"modules": ["advanced"]})["isError"]

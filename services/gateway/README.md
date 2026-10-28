@@ -158,6 +158,38 @@ change only the URL path from `/mcp` to the module path (`<gateway>` is the publ
 Hosts with deferred tool loading (Claude Code tool search) need this less; hosts that load every tool
 (Grok, Cursor, some Desktop setups) gain the most.
 
+### Everyday tools and the `advanced` tier (ANYM-550)
+
+An MCP `tools/list` without `advanced` is the default list. It lists the everyday layer and hides a
+low-level tool only while the key also has its everyday twin. The twins are in `tiers.py` (`REPLACED_BY`):
+
+| Low-level tools | Everyday twin |
+| --- | --- |
+| `messages_preview_message`, `messages_send_message`, `messages_get_send_status` | `messages_send` |
+| `calls_prepare_external_call`, `calls_preflight_call`, `calls_dial_call` | `calls_call` |
+| `calls_get_call_status`, `calls_get_call_result`, `calls_get_call_analysis` | `calls_call_result` |
+
+Every other tool keeps its place on the default list until its twin lands. The calendar tools wait for
+find-time (ANYM-553). The everyday layer (`EVERYDAY`) is `platform_capabilities`, `messages_search`,
+`messages_search_people`, `platform_resolve_target`, `messages_get_messages`, `messages_get_context`,
+`messages_get_file_text`, `messages_send`, the four risk-class tools, `messages_get_messenger_operation`,
+`calls_call` and `calls_call_result`. Each has a description of at most 80 words that ends with one example
+call. The detail moved to the property descriptions of the input schema.
+
+- **Selecting `advanced`.** Add `advanced` to a module path: `/mcp/modules/advanced` (every module),
+  `/mcp/modules/messaging,advanced` (in any order; reported sorted as `advanced,messaging`). That path lists
+  what `/mcp` listed before this change. `advanced` is no module: `platform_select_modules` does not take it.
+  It narrows nothing and widens nothing. The profile, grants, actions, backend scopes and module selection
+  limit it exactly as on `/mcp`, so a tool the profile excludes stays excluded on every path.
+- **Old tools stay callable.** The tier filters listings only. A key may still call a hidden tool by name on
+  any path whose modules include it, and REST (`/v1/<tool>`) has no tier. A `next` may name a hidden tool.
+- **Finding a tool.** `platform_capabilities` adds `tool_paths`. Each tool the key may use gets one row,
+  `{tool, tier, path}`, where `tier` is `everyday` or `advanced` and `path` is a connection path that lists
+  the tool. A hidden tool's row adds `replaced_by`.
+- **Transition.** A host that uses `messages_send_message`, `messages_preview_message`,
+  `messages_get_send_status` or the low-level call tools has two choices. It can move to the twin, or it can
+  change its connector URL to a path with `advanced`. A key without the twin sees no change.
+
 Module capabilities preserve the backend `principal` and add `backend_principal`
 and `gateway_principal`; platform `principal` remains the gateway identity.
 Subscription ownership and receipts continue to use the existing backend credential.

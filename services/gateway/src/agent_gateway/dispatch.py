@@ -12,6 +12,7 @@ from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, stale_argu
 from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
 from .sections import capabilities_view, subscription_blocks
+from .tiers import ADVANCED, default_list, REPLACED_BY
 
 PLAIN_PATH = "/mcp"
 MODULE_PATH = "/mcp/modules/"
@@ -240,10 +241,11 @@ def relayed_error(detail, runnable, read_only, payload, candidate_payload=None):
 
 
 class Route:
-    """An MCP connection path: plain `/mcp` (all modules) or `/mcp/modules/<m>[,<m>...]` (only those)."""
+    """An MCP connection path: plain `/mcp` (all modules) or `/mcp/modules/<m>[,<m>...]` (only those), where the
+    `advanced` name lists the low-level tools as well (ANYM-550); `/mcp/modules/advanced` keeps every module."""
 
-    def __init__(self, path, modules=None):
-        self.path, self.modules = path, modules
+    def __init__(self, path, modules=None, advanced=False):
+        self.path, self.modules, self.advanced = path, modules, advanced
 
     @classmethod
     def parse(cls, path):
@@ -254,9 +256,35 @@ class Route:
             return None
         names = path[len(MODULE_PATH):]
         names = (names[:-1] if names.endswith("/") else names).split(",")
-        if not names or len(set(names)) != len(names) or not set(names) <= MODULE_PURPOSES.keys():
+        if not names or len(set(names)) != len(names) or not set(names) <= MODULE_PURPOSES.keys() | {ADVANCED}:
             raise Denied("unknown_module", 404)
-        return cls(MODULE_PATH + ",".join(sorted(names)), frozenset(names))
+        modules = frozenset(names) - {ADVANCED}
+        return cls(MODULE_PATH + ",".join(sorted(names)), modules or None, ADVANCED in names)
+
+    def listed(self, names):
+        """This route's tools/list out of the caller's effective tools: without `advanced`, the default list."""
+        return names if self.advanced else default_list(names)
+
+
+def tool_paths(usable, selections=None):
+    """Every tool the key may use, the advanced ones included, with the connection path that lists it (ANYM-550).
+
+    `selections` are the principal's in-session selections by path; a row whose path a selection narrows past the
+    tool's module carries the `next` selection that lists it there again."""
+    everyday = set(default_list(usable))
+    rows = []
+    for name in usable:
+        module = CATALOG[name]["module"]
+        names = ([] if module == "gateway" else [module]) + ([] if name in everyday else [ADVANCED])
+        row = {"tool": name, "tier": "everyday" if name in everyday else ADVANCED,
+               "path": MODULE_PATH + ",".join(sorted(names)) if names else PLAIN_PATH}
+        if name not in everyday:
+            row["replaced_by"] = REPLACED_BY[name]
+        chosen = (selections or {}).get(row["path"])
+        if chosen and module != "gateway" and module not in chosen:
+            row["next"] = {"tool": "platform_select_modules", "arguments": {"modules": sorted(chosen | {module})}}
+        rows.append(row)
+    return rows
 
 
 WARNING_WINDOW_DAYS = 7
@@ -484,6 +512,8 @@ class Dispatch:
                 )
             )
         ]
+        if narrow and route is not None:
+            visible = route.listed(visible)
         manifests = {module: summary for module, caps, _ in results
                      if (summary := manifest_summary(caps)) is not None}
         return current, principal, visible, {
@@ -512,8 +542,10 @@ class Dispatch:
         snapshot, agent, usable, states = await self.discover(key, route or Route(PLAIN_PATH), narrow=False)
         selected = states["selected"]
         visible = usable
-        if route is not None and selected is not None:
-            visible = [n for n in usable if CATALOG[n]["module"] in selected | {"gateway"}]
+        if route is not None:
+            if selected is not None:
+                visible = [n for n in usable if CATALOG[n]["module"] in selected | {"gateway"}]
+            visible = route.listed(visible)
             states["discovery"] = discovery(visible, states["actions"], snapshot["revision"])
         counts = {}
         for name in usable:
@@ -528,6 +560,8 @@ class Dispatch:
                  "path": MODULE_PATH + m}
                 for m in sorted(counts)
             ],
+            "tool_paths": tool_paths(usable, {path: modules for (principal, path), modules in self.selections.items()
+                                              if principal == agent["id"]}),
         }
 
     def authenticate(self, key):
