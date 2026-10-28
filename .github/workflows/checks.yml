@@ -29,6 +29,11 @@ on:
       reused_pr_tested_sha:
         type: string
         default: ''
+      added_tests:
+        # ci.yml `added_list`: the exclusion inventory of this event (scripts/added_tests.py, ANYM-578). Every
+        # job that collects, compiles or builds tests deletes these files first; an empty or malformed one fails it.
+        type: string
+        default: ''
     outputs:
       source_sha:
         description: Exact commit these checks tested
@@ -101,6 +106,11 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
           path: ci-tools
+      - name: Delete the files autoloop pull requests add to tests before anything collects or builds a test
+        # ANYM-578: an added file never runs inside this job's suites; the added-test job runs them on its own.
+        env:
+          ADDED_TESTS: ${{ inputs.added_tests }}
+        run: python3 ci-tools/scripts/added_tests.py strip --root . --root ci-tools --evidence "$RUNNER_TEMP/ci-evidence"
       - name: Start evidence record
         id: source
         run: |
@@ -458,6 +468,16 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.source_ref }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ci-tools
+      - name: Delete the files autoloop pull requests add to tests before anything collects or builds a test
+        # ANYM-578: an added file never runs inside this job's suites; the added-test job runs them on its own.
+        env:
+          ADDED_TESTS: ${{ inputs.added_tests }}
+        run: python3 ci-tools/scripts/added_tests.py strip --root . --root ci-tools --evidence "$RUNNER_TEMP/ci-evidence"
       - name: Start evidence record
         id: source
         run: |
@@ -507,6 +527,16 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.source_ref }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ci-tools
+      - name: Delete the files autoloop pull requests add to tests before anything collects or builds a test
+        # ANYM-578: an added file never runs inside this job's suites; the added-test job runs them on its own.
+        env:
+          ADDED_TESTS: ${{ inputs.added_tests }}
+        run: python3 ci-tools/scripts/added_tests.py strip --root . --root ci-tools --evidence "$RUNNER_TEMP/ci-evidence"
       - name: Start evidence record
         id: source
         run: |
@@ -591,6 +621,11 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
           path: ci-tools
+      - name: Delete the files autoloop pull requests add to tests before anything collects or builds a test
+        # ANYM-578: an added file never runs inside this job's suites; the added-test job runs them on its own.
+        env:
+          ADDED_TESTS: ${{ inputs.added_tests }}
+        run: python3 ci-tools/scripts/added_tests.py strip --root . --root ci-tools --evidence "$RUNNER_TEMP/ci-evidence"
       - name: Start evidence record
         id: source
         run: |
@@ -778,11 +813,87 @@ jobs:
       source_sha: ${{ steps.source.outputs.sha }}
     services: *python-shard-services
     steps: *python-shard-steps
+  added:
+    # ANYM-578: only the tests autoloop pull requests add (scripts/added_tests.py run), on a runner of their own: one
+    # pytest per Python project, one `go test` per Go package and one `node --test` per package. The suites above
+    # never see these files, and nothing here reaches them: this job saves no cache (setup-go `cache: false`) and
+    # only `evidence` reads its fragment. With no added test it passes and says so.
+    name: added tests
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    services: *python-shard-services
+    env:
+      ADDED_TESTS: ${{ inputs.added_tests }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_ref }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ci-tools
+      - name: Start evidence record
+        id: source
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/ci-evidence/source-sha"
+          echo "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/ci-evidence/attempt"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Record the exclusion inventory and the languages of the added tests
+        id: plan
+        # The tested checkout keeps the added files; only the tools checkout loses them.
+        run: |
+          python3 ci-tools/scripts/added_tests.py strip --root ci-tools --evidence "$RUNNER_TEMP/ci-evidence"
+          python3 ci-tools/scripts/added_tests.py languages --root .
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        if: contains(steps.plan.outputs.languages, 'python')
+        with: {python-version: '3.13'}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        if: contains(steps.plan.outputs.languages, 'python')
+        with: {version: '0.9.26', enable-cache: false}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: contains(steps.plan.outputs.languages, 'node')
+        with: {node-version: '24'}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        if: contains(steps.plan.outputs.languages, 'go')
+        with:
+          go-version: '1.26.9'
+          cache: false
+      - name: Run only the added tests
+        env:
+          PROBE_TEST_DSN_FILE: ${{ runner.temp }}/anymsg-test.dsn
+          ANYMSG_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          # The same disposable database the calendar suite of `verify` uses.
+          FCS_TEST_DSN: postgresql://probe_owner:synthetic-ci-password@127.0.0.1:5432/messaging_probe_test
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p=Path(os.environ['PROBE_TEST_DSN_FILE'])
+          p.write_text('postgresql://probe_owner:synthetic-ci-password@127.0.0.1:5432/messaging_probe_test')
+          p.chmod(0o600)
+          PY
+          python3 ci-tools/scripts/added_tests.py run --root . --evidence "$RUNNER_TEMP/ci-evidence"
+      - name: Retain the added-test evidence even when a test fails
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-evidence-added
+          path: ${{ runner.temp }}/ci-evidence
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
   evidence:
     # One `ci-evidence` artifact from every test job's fragment, attempted even after a failure so the
     # failure itself is recorded (TIDEN-CI.md). A missing, failed, cancelled or skipped test job fails
     # this job whether or not Tiden reporting is configured.
-    needs: [documentation, verify, load, python-2, python-3, python-4, python-5, python-6, go]
+    needs: [documentation, verify, load, python-2, python-3, python-4, python-5, python-6, go, added]
     if: ${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -812,11 +923,12 @@ jobs:
           PYTHON_5: python-5:${{ needs.python-5.result }}:${{ needs.python-5.outputs.source_sha }}
           PYTHON_6: python-6:${{ needs.python-6.result }}:${{ needs.python-6.outputs.source_sha }}
           GO: go:${{ needs.go.result }}:${{ needs.go.outputs.source_sha }}
+          ADDED: added:${{ needs.added.result }}:${{ needs.added.outputs.source_sha }}
         run: |
           assembled=0
           python ci-tools/scripts/tiden_ci.py assemble --directory "$RUNNER_TEMP/ci-evidence" --fragments "$RUNNER_TEMP/fragments" \
             --producer "$VERIFY" --producer "$LOAD" --producer "$PYTHON_2" --producer "$PYTHON_3" --producer "$PYTHON_4" \
-            --producer "$PYTHON_5" --producer "$PYTHON_6" --producer "$GO" || assembled=$?
+            --producer "$PYTHON_5" --producer "$PYTHON_6" --producer "$GO" --producer "$ADDED" || assembled=$?
           python ci-tools/scripts/tiden_ci.py prepare --directory "$RUNNER_TEMP/ci-evidence"
           exit "$assembled"
       - name: Retain test evidence even when a check fails
@@ -845,6 +957,7 @@ jobs:
           PYTHON_5_RESULT: ${{ needs.python-5.result }}
           PYTHON_6_RESULT: ${{ needs.python-6.result }}
           GO_RESULT: ${{ needs.go.result }}
+          ADDED_RESULT: ${{ needs.added.result }}
         run: |
           test "$VERIFY_RESULT" = success
           test "$LOAD_RESULT" = success
@@ -854,6 +967,7 @@ jobs:
           test "$PYTHON_5_RESULT" = success
           test "$PYTHON_6_RESULT" = success
           test "$GO_RESULT" = success
+          test "$ADDED_RESULT" = success
   tiden_pr:
     # Check A (ANYM-405, TIDEN-CI.md): the pull request's `Spec:`/`Delivers:`/`Tiden branch:` lines, the markers
     # of its new tests and the anchors of its changed code files, read-only against Tiden. Only a verdict fails the

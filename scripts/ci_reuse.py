@@ -36,6 +36,7 @@ import uuid
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import added_tests  # noqa: E402  the exclusion inventory a reused run must equal (ANYM-578)
 import production  # noqa: E402  the queue rules promotion applies (ANYM-321)
 import tiden_ci  # noqa: E402
 
@@ -123,6 +124,20 @@ def decide(sha: str, repository: str, get=production.api, sleep=time.sleep, cloc
             "artifact_digest": artifact["digest"]}
 
 
+def required_inventory(pin: dict, fetch=None, exclusions: dict = added_tests.EMPTY) -> None:
+    """Before the choice: the pinned evidence must have excluded exactly what a main push requires, nothing (ANYM-578).
+    Evidence of a run that excluded added tests is not this push's verification, so the push verifies in full
+    instead of failing at adoption; adoption validates the same artifact again."""
+    data = (fetch or download)(f"actions/artifacts/{pin['artifact_id']}/zip")
+    if "sha256:" + hashlib.sha256(data).hexdigest() != pin["artifact_digest"]:
+        raise Refused("the downloaded evidence differs from the pinned artifact")
+    with tempfile.TemporaryDirectory() as scratch:
+        directory = Path(scratch) / "evidence"
+        extract(data, directory)
+        if read_json(directory, added_tests.EVIDENCE) != exclusions:
+            raise Refused("the evidence excluded other added tests than this event requires")
+
+
 def evidence_artifact(run: dict, head_sha: str, get, kind: str) -> dict:
     """The one current `ci-evidence` artifact of the run's latest attempt, created by that run for `head_sha`."""
     attempt = run["run_attempt"]
@@ -206,11 +221,14 @@ def read_json(directory: Path, name: str):
         raise Refused(f"the evidence file {name} is not valid JSON") from None
 
 
-def validate(directory: Path, sha: str, producer_url: str, attempt: int, pull_request_branch: str = "") -> dict:
+def validate(directory: Path, sha: str, producer_url: str, attempt: int, pull_request_branch: str = "",
+             exclusions: dict = added_tests.EMPTY) -> dict:
     """Refuse evidence that is not the queue run's complete, passing verification of exactly `sha`.
 
     With `pull_request_branch`, the producer is instead a pull request run of that head branch, whose `sha` is the
-    merge commit it tested; every other rule is the same.
+    merge commit it tested; every other rule is the same. The producer's exclusion inventory (ANYM-578), its
+    excluded files and their comparisons, must equal `exclusions`, the one the receiving event requires: none for a
+    main push, the group's for a merge queue group. Equal trees with other lists are not equal verification.
     """
     metadata, manifest, load = (read_json(directory, name) for name in ("metadata.json", "manifest.json", "load.json"))
     if not all(isinstance(value, dict) for value in (metadata, manifest, load)):
@@ -238,6 +256,11 @@ def validate(directory: Path, sha: str, producer_url: str, attempt: int, pull_re
                 not isinstance(job, dict) or job.get("result") != "success" or job.get("sha") != sha
                 or not str(job.get("attempt")).isdigit() or int(job["attempt"]) > attempt for job in producers.values()):
         raise Refused("a test job of the queue run did not produce passing evidence of this commit")
+    if read_json(directory, added_tests.EVIDENCE) != exclusions:
+        raise Refused("the evidence excluded other added tests than this event requires")
+    added = read_json(directory, added_tests.REPORT)
+    if not isinstance(added, dict) or added.get("result") not in {"passed", "none"}:
+        raise Refused("the added tests of the evidence did not pass")
     reports = [tiden_ci.normalized_report(check) for check in REPORT_CHECKS]
     if sorted(manifest.get("reports") or []) != sorted([*reports, "ci-checks.json"]):
         raise Refused("the evidence manifest does not list every required report")
@@ -382,7 +405,8 @@ def adopt(pin: dict, sha: str, repository: str, run_id: str, run_attempt: str, d
     return record
 
 
-def decide_group(sha: str, repository: str, event_name: str, event: dict, get=production.api, fetch=download) -> dict:
+def decide_group(sha: str, repository: str, event_name: str, event: dict, get=production.api, fetch=download,
+                 exclusions: dict | None = None) -> dict:
     """Pin the passing full pull request run that tested exactly this group commit's tree; Refused means verify in full.
 
     Tree identity is the whole claim: the queue builds the group commit from main and the pull request, so its tree
@@ -390,6 +414,8 @@ def decide_group(sha: str, repository: str, event_name: str, event: dict, get=pr
     that pull request alone; whenever the trees are equal, the same code was tested. The pull request's workflow
     files are part of that tree, as they are of the group commit.
     """
+    if exclusions is None:
+        raise Refused("the group's exclusion inventory is required")
     if event_name != "merge_group" or repository != production.REPOSITORY or not SHA.fullmatch(sha):
         raise Refused("only a merge queue run of an exact commit of this repository reuses a pull request run")
     group = event.get("merge_group") or {}
@@ -425,7 +451,8 @@ def decide_group(sha: str, repository: str, event_name: str, event: dict, get=pr
         tested = (directory / "source-sha").read_text().strip()
         if not SHA.fullmatch(tested):
             raise Refused("the pull request run's evidence names no exact tested commit")
-        validate(directory, tested, run_url(repository, run["id"], attempt), int(attempt), pull_request_branch=head_ref)
+        validate(directory, tested, run_url(repository, run["id"], attempt), int(attempt), pull_request_branch=head_ref,
+                 exclusions=exclusions)
     commit, group_commit = get(f"git/commits/{tested}"), get(f"git/commits/{sha}")
     if commit.get("sha") != tested or [parent.get("sha") for parent in commit.get("parents") or []][1:] != [head_sha]:
         raise Refused("the tested commit is not GitHub's merge of this pull request head")
@@ -453,7 +480,9 @@ def main() -> int:
     if args.command == "group":
         try:
             event = json.loads(Path(os.environ.get("GITHUB_EVENT_PATH", "")).read_text())
-            pin = decide_group(sha, repository, os.environ.get("GITHUB_EVENT_NAME", ""), event)
+            # The group requires the inventory ci.yml `added_list` computed for this event (ANYM-578).
+            exclusions = added_tests.inventory(os.environ.get("ADDED_TESTS", ""))
+            pin = decide_group(sha, repository, os.environ.get("GITHUB_EVENT_NAME", ""), event, exclusions=exclusions)
         except Exception as exc:  # any doubt means the queue run verifies in full, never a failed run
             print(f"::notice title=Full verification::{type(exc).__name__}: {exc}")
             outputs({"decision": "full"})
@@ -465,6 +494,7 @@ def main() -> int:
     if args.command == "decide":
         try:
             pin = decide(sha, repository)
+            required_inventory(pin)
         except Exception as exc:  # any doubt before the choice means full verification, never a failed run
             print(f"::notice title=Full verification::{type(exc).__name__}: {exc}")
             outputs({"decision": "full"})

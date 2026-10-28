@@ -291,8 +291,8 @@ def test_native_and_image_rules_are_untouched_by_the_docs_only_decision():
     ci, _ = workflows()
     assert "if" not in ci["jobs"]["images"] and "needs" not in ci["jobs"]["images"]
     # native skips only on the queue's pull request reuse (tests/test_ci_reuse.py), never on the docs-only decision.
-    assert ci["jobs"]["native"]["needs"] == ["pr_reuse"] and "docs_only" not in json.dumps(ci["jobs"]["native"])
-    assert ci["jobs"]["gate"]["needs"] == ["reuse", "pr_reuse", "checks", "native", "images"]
+    assert ci["jobs"]["native"]["needs"] == ["added_list", "pr_reuse"] and "docs_only" not in json.dumps(ci["jobs"]["native"])
+    assert ci["jobs"]["gate"]["needs"] == ["added_list", "reuse", "pr_reuse", "checks", "native", "images"]
     images = yaml.safe_load((ROOT / ".github/workflows/images.yml").read_text())
     assert "docs_only" not in json.dumps(images) and "docs_only" not in json.dumps(ci["jobs"]["publish"])
 

@@ -33,6 +33,8 @@ jobs:
     with:
       version: ${{ inputs.version }}
       source_ref: refs/tags/v${{ inputs.version }}
+      # A release tag tests everything: no autoloop pull request's added tests are excluded (ANYM-578).
+      added_tests: '{"files": [], "provenance": []}'
   publish:
     needs: checks
     runs-on: ubuntu-latest

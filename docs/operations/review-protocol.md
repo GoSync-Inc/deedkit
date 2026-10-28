@@ -49,10 +49,13 @@ list: release, deploy and `production.py`, sends and live provider-session code.
   checks' own verifiers (load budgets, test config, release contracts, import shadowing). In a
   test directory (`test/` or `tests/` anywhere) an autoloop PR may only add test files
   (`test_*.py`, `*.test.*`, `*_test.go`) and fixtures: a modified or deleted file there, or an
-  added code file that is not a test (a helper), is a hit.
+  added code file that is not a test (a helper), is a hit. Added bytecode and native libraries
+  (`*.pyc`, `__pycache__/`, `*.so`, `*.pyd`, `*.dylib`) are hits anywhere. The tests a loop PR
+  adds never run in the required suites: every test job deletes them first, and `checks / added`
+  runs them alone inside `CI gate` (ANYM-578, TIDEN-CI.md).
 
   ```sh
-  git diff --no-renames --name-only origin/main... | grep -E '^(\.github/|scripts/|deploy/|tools/|config/|docs/(operations|harness)/|services/release-router/|packages/platform-contracts/|tests/platform/benchmarks/)|^[^/]+\.py$|^[^/]+/__init__\.py$|(^|/)(sitecustomize|usercustomize)\.py$|\.pth$|(^|/)(pytest\.ini|setup\.cfg|tox\.ini)$|(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|conftest\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|requirements[^/]*\.(lock|in|txt))$'
+  git diff --no-renames --name-only origin/main... | grep -E '^(\.github/|scripts/|deploy/|tools/|config/|docs/(operations|harness)/|services/release-router/|packages/platform-contracts/|tests/platform/benchmarks/)|^[^/]+\.py$|^[^/]+/__init__\.py$|(^|/)(sitecustomize|usercustomize)\.py$|\.pth$|(^|/)(pytest\.ini|setup\.cfg|tox\.ini)$|(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|conftest\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|requirements[^/]*\.(lock|in|txt))$|\.(pyc|so|pyd|dylib)$|(^|/)__pycache__/'
   git diff --no-renames --diff-filter=D --name-only origin/main...   # any deleted file
   git diff --no-renames --diff-filter=M --name-only origin/main... | grep -E '(^|/)tests?/'   # a changed test-directory file
   git diff --no-renames --diff-filter=A --name-only origin/main... | grep -E '(^|/)tests?/' \

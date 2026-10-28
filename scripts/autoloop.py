@@ -1040,7 +1040,7 @@ PROTECTED = re.compile(
     r'(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|'
     r'\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|'
     r'conftest\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|'
-    r'requirements[^/]*\.(lock|in|txt))$')
+    r'requirements[^/]*\.(lock|in|txt))$|\.(pyc|so|pyd|dylib)$|(^|/)__pycache__/')
 TEST_DIR = re.compile(r'(^|/)tests?/')
 CODE_FILE = re.compile(r'\.(py|pyi|js|mjs|cjs|ts|tsx|go|sh)$')
 TEST_FILE = re.compile(r'(^|/)test_[^/]*\.py$|\.test\.[^/]+$|_test\.go$')

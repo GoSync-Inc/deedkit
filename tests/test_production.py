@@ -577,14 +577,21 @@ def test_ci_gate_fails_for_failed_cancelled_or_skipped_dependencies():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     gate = workflow["jobs"]["gate"]
     # The reuse decisions gate only the second step (ANYM-322, the queue's pull request reuse); this first step is unchanged.
-    assert gate["needs"] == ["reuse", "pr_reuse", "checks", "native", "images"] and gate["if"] == "${{ always() }}"
+    # ANYM-578: the exclusion inventory (`added_list`) is a verification job too.
+    assert gate["needs"] == ["added_list", "reuse", "pr_reuse", "checks", "native", "images"] and gate["if"] == "${{ always() }}"
     assert workflow["jobs"]["native"]["uses"] == "./.github/workflows/whatsmeow.yml"
     script = gate["steps"][0]["run"]
-    for checks, native, images in [("success", "success", "success"), ("failure", "success", "success"),
-                                  ("success", "skipped", "success"), ("cancelled", "success", "success"),
-                                  ("success", "success", "failure")]:
-        result = subprocess.run(["bash", "-e", "-c", script], env={"CHECKS_RESULT": checks, "NATIVE_RESULT": native, "IMAGES_RESULT": images}, capture_output=True)
-        assert (result.returncode == 0) == (checks == native == images == "success")
+    for added, checks, native, images in [("success", "success", "success", "success"),
+                                         ("success", "failure", "success", "success"),
+                                         ("success", "success", "skipped", "success"),
+                                         ("success", "cancelled", "success", "success"),
+                                         ("success", "success", "success", "failure"),
+                                         ("failure", "success", "success", "success"),
+                                         ("skipped", "success", "success", "success")]:
+        result = subprocess.run(["bash", "-e", "-c", script], env={"ADDED_LIST_RESULT": added, "CHECKS_RESULT": checks,
+                                                                   "NATIVE_RESULT": native, "IMAGES_RESULT": images},
+                                capture_output=True)
+        assert (result.returncode == 0) == (added == checks == native == images == "success")
 
 
 def test_ci_gate_refuses_a_manual_baseline_of_another_revision():
@@ -592,8 +599,8 @@ def test_ci_gate_refuses_a_manual_baseline_of_another_revision():
     step = workflow["jobs"]["gate"]["steps"][0]
     assert step["env"]["SOURCE_REF"] == "${{ inputs.source_ref || '' }}"
     assert step["env"]["EXPECTED_SHA"] == "${{ github.sha }}"
-    green = {"CHECKS_RESULT": "success", "NATIVE_RESULT": "success", "IMAGES_RESULT": "success",
-             "EXPECTED_SHA": SHA}
+    green = {"ADDED_LIST_RESULT": "success", "CHECKS_RESULT": "success", "NATIVE_RESULT": "success",
+             "IMAGES_RESULT": "success", "EXPECTED_SHA": SHA}
     for source_ref, passes in [("", True), (SHA, True), ("b" * 40, False), ("main", False),
                                ("refs/tags/v1.2.3", False)]:
         result = subprocess.run(["bash", "-e", "-c", step["run"]], env={**green, "SOURCE_REF": source_ref},
