@@ -211,14 +211,87 @@ def release_admission(fd):
 
 
 def run_resources(run,profile='messaging'):
-    return [(kind,name,run) for kind,name in names(run,profile).items()]
+    """A run's resources by exact name and owner; a messaging retry may still own its names from before ANYM-609."""
+    resources=[names(run,profile),*([legacy_names(run)] if profile=='messaging' else [])]
+    return [(kind,name,run) for resource in resources for kind,name in resource.items()]
 
 
-def no_pin_switch(config):
-    # A pin step that died between two config writes leaves its journal: no instance runs on a
-    # mixed pair until the next pin step or follow run puts every config back on one pair.
-    with host_directory(config) as fd:
-        if r2.read_root(fd,PINS_SWITCH,missing=True)[1] is not None:raise RuntimeError('verifier_pins_unfinished')
+def pair(config):return [config['helper_image'],config['helper_revision']]
+
+
+def valid_pair(value):
+    return (isinstance(value,list) and len(value)==2 and isinstance(value[0],str) and re.fullmatch('sha256:[a-f0-9]{64}',value[0]) is not None and
+            isinstance(value[1],str) and re.fullmatch('[a-f0-9]{40}',value[1]) is not None)
+
+
+def unlink_entry(fd,name):
+    try:os.unlink(name,dir_fd=fd)
+    except FileNotFoundError:return
+    local.fsync_dir(fd)
+
+
+def write_pins(path,image,revision):
+    """One atomic replace of a verifier config with only its two pins changed."""
+    value=r2.unique_json(private_file(path,16384))
+    local.write_maintenance_json(path,{**value,'helper_image':image,'helper_revision':revision})
+    installed=load_config(path)
+    if pair(installed)!=[image,revision]:raise ValueError('invalid_verifier_config')
+    return installed
+
+
+def move_pins(host,paths,image,revision):
+    """Every instance's config to one pair, or none (ANYM-609, C2). The journal holds each config's old
+    pair before the first write; each config is one atomic replace. A failure up to the journal's removal
+    puts every config back; after a stop or crash the first verifier, follow or pin step to run does
+    (recover_pins) before any instance uses a pin. The caller holds every instance's lock."""
+    journal={'v':1,'to':[image,revision],'from':{str(p):pair(load_config(p)) for p in paths}}
+    local.write_maintenance_json(PINS_SWITCH,journal,dir_fd=host)
+    try:
+        for p in paths:write_pins(p,image,revision)
+        # The pairs before this step, for the documented undo (a pin step back to them).
+        local.write_maintenance_json(PINS_PREVIOUS,{'v':1,'pins':journal['from']},dir_fd=host)
+        unlink_entry(host,PINS_SWITCH)
+    except BaseException:
+        if not r2.CANCELLED:
+            try:undo_pins(host,journal)
+            except Exception:pass  # the journal stays: recover_pins finishes it
+        raise
+
+
+def undo_pins(host,journal):
+    for p,old in journal['from'].items():
+        if pair(load_config(p))!=old:write_pins(Path(p),*old)
+    unlink_entry(host,PINS_SWITCH)
+
+
+def recover_pins(host,paths=None):
+    """A pin step that stopped between two config writes: every config back on its old pair.
+    `paths` (the instances file's) must be the journal's; without it, the journal's own. Returns them."""
+    _,journal=r2.read_root(host,PINS_SWITCH,missing=True)
+    if journal is None:return None
+    olds=journal.get('from') if isinstance(journal,dict) else None
+    if (not isinstance(journal,dict) or set(journal)!={'v','to','from'} or type(journal['v']) is not int or
+            journal['v']!=1 or not valid_pair(journal['to']) or not isinstance(olds,dict) or not olds or
+            any(not Path(p).is_absolute() or '..' in Path(p).parts for p in olds) or
+            (paths is not None and set(olds)!={str(p) for p in paths}) or not all(valid_pair(v) for v in olds.values())):
+        raise ValueError('pins_switch_unresolved')
+    if any(pair(load_config(p)) not in (old,journal['to']) for p,old in olds.items()):
+        raise ValueError('pins_switch_unresolved')
+    undo_pins(host,journal)
+    return [Path(p) for p in olds]
+
+
+def finish_pin_switch(config):
+    """Before this instance uses a pin: a stopped pin step's configs back on their old pairs. No pin step
+    or follow runs meanwhile (each holds every instance's lock, this one's too) and no other instance
+    passed this point since the journal was written. Returns this instance's config path when it did."""
+    with host_directory(config) as host:
+        try:paths=recover_pins(host)
+        except Exception:
+            if r2.CANCELLED:raise
+            raise RuntimeError('verifier_pins_unfinished') from None
+    if paths is None:return None
+    return next((p for p in paths if load_config(p)['directory']==config['directory']),None)
 
 
 @contextmanager
@@ -567,6 +640,10 @@ def run(config,*,client=None,engine=None,path=None):
     engine=engine if engine is not None else Docker(config['timeout_seconds'])
     with verifier_lock(config['directory']) as fd,ExitStack() as host:
         journal=None;admitted=None
+        # A pin step stopped between two config writes (ANYM-609): every config back on its old pair first.
+        try:recovered=finish_pin_switch(config);pins_error=None
+        except Exception as error:recovered=None;pins_error=error
+        path=path if path is not None else recovered
         if path is not None:
             # The receiver update follow (ANYM-597) rewrites the pins under this lock: a
             # config loaded before the lock must never start a journal on the old pair.
@@ -577,7 +654,7 @@ def run(config,*,client=None,engine=None,path=None):
         try:
             with deadline(config['timeout_seconds']):
                 if r2.profile(receiver)!=profile:raise ValueError('verifier_profile_mismatch')
-                no_pin_switch(config)
+                if pins_error is not None:raise pins_error
                 _,journal=r2.read_root(fd,'active.json',missing=True)
                 if journal is not None:
                     validate_journal(receiver,journal)
@@ -598,12 +675,14 @@ def run(config,*,client=None,engine=None,path=None):
                     if pending['phase']=='restoring':
                         # One heavy restore per host (ANYM-609): wait, clear a dead holder's resources and
                         # record ours, all before a new run's journal or any scratch resource exists.
-                        started=time.monotonic();lock=host.enter_context(host_lock(config))
-                        # The wait has its own bound: the deadline moves by exactly the time waited, so the
-                        # restore keeps its whole budget and a run ends within timeout plus the wait.
-                        waited=time.monotonic()-started
-                        signal.setitimer(signal.ITIMER_REAL,signal.getitimer(signal.ITIMER_REAL)[0]+waited)
-                        if isinstance(engine,Docker):engine.ends+=waited
+                        # The wait has its own bound (verify_wait_seconds): the restore deadline pauses while
+                        # it waits, so the restore keeps its whole budget; SIGTERM still stops the wait.
+                        started=time.monotonic();left=signal.getitimer(signal.ITIMER_REAL)[0]
+                        signal.setitimer(signal.ITIMER_REAL,0)
+                        try:lock=host.enter_context(host_lock(config))
+                        finally:
+                            if left>0:signal.setitimer(signal.ITIMER_REAL,left)
+                        if isinstance(engine,Docker):engine.ends+=time.monotonic()-started
                         # A refused admission keeps the record it could not clear for the next holder.
                         admit(engine,lock,profile,pending['run'],run_resources(pending['run'],profile));admitted=lock
                     if journal is None:
@@ -704,7 +783,8 @@ def main(argv=None):
         try:result=follow.update_pins(args.instances,args.helper_image,args.helper_revision)
         except Exception as error:
             print(json.dumps({'error':follow.failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
-        print(json.dumps(result,separators=(',',':')));return 0
+        # Only the outcome: config paths and the image ID stay in the root-private records.
+        print(json.dumps({k:result[k] for k in ('v','status','helper_revision')},separators=(',',':')));return 0
     if not args.config:parser.error('--config is required')
     try:run(load_config(args.config),path=args.config)
     except Exception as error:

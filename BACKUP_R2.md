@@ -451,8 +451,9 @@ walked from `/` through root-owned, non-writable ancestors.
 network or volume (and before it journals a new run), it takes the host lock.
 It waits at most `verify_wait_seconds` (optional, default 3600, at most 21600),
 then fails `verifier_host_busy` with nothing created and its journal unchanged;
-the timer tries again. The run's deadline moves by exactly the time it waited.
-Free disk is checked after the wait. Under the lock the holder:
+the timer tries again. The run's deadline pauses while it waits, so the restore
+keeps its whole budget; a service stop still ends the wait. Free disk is checked
+after the wait. Under the lock the holder:
 
 1. reads a previous `admission.json`, removes each resource it names by exact
    name and owner label, and confirms it gone. A holder killed by SIGKILL
@@ -460,7 +461,8 @@ Free disk is checked after the wait. Under the lock the holder:
    them gone, the new holder fails `verifier_cleanup_unconfirmed`, creates
    nothing and keeps the record;
 2. writes its own record (profile, run, the exact name of every resource it
-   will create) before creating any;
+   will create, for a messaging retry also its names from before ANYM-609)
+   before creating any;
 3. removes its resources after success or failure and then its record.
 
 Scratch names carry the profile: `deedkit-verify-<profile>-<run>-helper`,
@@ -489,10 +491,12 @@ enabled connection, its token and a disabled one), made and encrypted by the
 image under test. Then it journals every config's old pair in
 `pins-switch.json`, replaces each config atomically with only its two pins
 changed, writes the old pairs to `pins-previous.json` and removes the journal.
-A failure puts the written configs back. A stop or crash between two writes
-leaves the journal: until the next pin step or follow run puts every config
-back on its old pair, each verifier refuses to start (`verifier_pins_unfinished`).
-It prints `{"status":"pinned",...}`, or the safe code on stderr and exit 1.
+A failure before the journal is removed puts every config back. After a stop or
+crash between two writes the journal stays, and the first verifier, follow or
+pin step that runs puts every config back on its old pair before any instance
+uses a pin (a verifier that cannot fails `verifier_pins_unfinished`). It prints
+`{"v":1,"status":"pinned","helper_revision":...}`, or the safe code on stderr
+and exit 1.
 
 Undo: run the pin step again with the previous pair (it self-tests it again):
 
@@ -502,9 +506,13 @@ jq -c .pins /var/lib/deedkit-backup-verify/pins-previous.json
 
 With the instances file, the [update follow](#receiver-update-follow) is this
 step: it holds every listed instance's lock, self-tests the candidate on
-messaging's and every other profile's bundle, and moves all configs together;
-its `revert` moves them all back to the kept pair. Without the file the follow
-moves messaging's config alone, as before.
+messaging's and every other profile's bundle, and moves all configs together.
+A listed instance on another pair (newly listed, or pinned by hand) joins
+messaging's pair once that pair passes its profile's self-test. `revert` moves
+them all back to the kept pair, after the kept pair passes every other
+profile's self-test (a helper older than 115a55d3 refuses a calendar bundle, so
+such a revert changes nothing). Without the file the follow moves messaging's
+config alone, as before.
 
 ## Receiver update follow
 

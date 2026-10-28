@@ -33,6 +33,7 @@ import sys
 from . import backup_r2_receiver as r2
 from . import backup_r2_verifier as verifier
 from . import backup_receiver as local
+from .backup_r2_verifier import move_pins, pair, recover_pins
 
 SOURCE = 'https://github.com/GoSync-Inc/deedkit.git'
 IMAGE = 'ghcr.io/gosync-inc/deedkit-backup'
@@ -392,16 +393,6 @@ def pinned(record, config):
         config['helper_image'], config['helper_revision'])
 
 
-def write_pins(path, image, revision):
-    """One atomic replace of the verifier config with only its two pins changed."""
-    value = r2.unique_json(verifier.private_file(path, 16384))
-    local.write_maintenance_json(path, {**value, 'helper_image': image, 'helper_revision': revision})
-    installed = verifier.load_config(path)
-    if (installed['helper_image'], installed['helper_revision']) != (image, revision):
-        raise ValueError('invalid_verifier_config')
-    return installed
-
-
 def unlink(fd, name):
     try:os.unlink(name, dir_fd=fd)
     except FileNotFoundError:return
@@ -425,52 +416,6 @@ def switch(path, fd, engine, journal, paths):
         move_pins(host, paths, journal['to']['helper_image'], journal['to']['helper_revision'])
     finish_switch(fd, engine, journal)
     return verifier.load_config(path)
-
-
-def pair(config):
-    return [config['helper_image'], config['helper_revision']]
-
-
-def valid_pair(value):
-    return (isinstance(value, list) and len(value) == 2 and isinstance(value[0], str) and DIGEST.fullmatch(value[0]) is not None and
-            isinstance(value[1], str) and re.fullmatch('[0-9a-f]{40}', value[1]) is not None)
-
-
-def move_pins(host, paths, image, revision):
-    """Every instance's config to one pair, or none (ANYM-609, C2). The journal holds each config's
-    old pair first; each config is one atomic replace; a failure puts the written ones back, and a
-    crash is put back by the next run's recover_pins. Each verifier refuses to start meanwhile."""
-    journal = {'v': 1, 'to': [image, revision], 'from': {str(p): pair(verifier.load_config(p)) for p in paths}}
-    local.write_maintenance_json(verifier.PINS_SWITCH, journal, dir_fd=host)
-    try:
-        for p in paths:write_pins(p, image, revision)
-    except BaseException:
-        if not r2.CANCELLED:
-            try:undo_pins(host, journal)
-            except Exception:pass  # the journal stays: recover_pins finishes it
-        raise
-    # The previous pairs, for the documented undo (an update_pins run back to them).
-    local.write_maintenance_json(verifier.PINS_PREVIOUS, {'v': 1, 'pins': journal['from']}, dir_fd=host)
-    unlink(host, verifier.PINS_SWITCH)
-
-
-def undo_pins(host, journal):
-    for p, old in journal['from'].items():
-        if pair(verifier.load_config(p)) != old:write_pins(Path(p), *old)
-    unlink(host, verifier.PINS_SWITCH)
-
-
-def recover_pins(host, paths):
-    """A pin step that died between two config writes: every config back on its old pair."""
-    _, journal = r2.read_root(host, verifier.PINS_SWITCH, missing=True)
-    if journal is None:return
-    if (not isinstance(journal, dict) or set(journal) != {'v', 'to', 'from'} or type(journal['v']) is not int or
-            journal['v'] != 1 or not valid_pair(journal['to']) or not isinstance(journal['from'], dict) or
-            set(journal['from']) != {str(p) for p in paths} or not all(valid_pair(v) for v in journal['from'].values())):
-        raise ValueError('pins_switch_unresolved')
-    if any(pair(verifier.load_config(p)) not in (old, journal['to']) for p, old in journal['from'].items()):
-        raise ValueError('pins_switch_unresolved')
-    undo_pins(host, journal)
 
 
 def read_instances(file, default=None):
@@ -677,12 +622,24 @@ def follow(path, *, engine=None, main=None, attest=None, test=None):
             # Leftover self-test containers go first, also while a verification retry waits for its resources.
             sweep_self_tests(engine, config['directory'])
             for held in fds:no_retry_pending(held)
+            # A stopped pin step first, then the follow's own switch against the configs as they are now.
             with verifier.host_directory(config) as host:recover_pins(host, paths)
-            recover(fd, engine, config); config = reload(path, config)
+            config = reload(path, config); recover(fd, engine, config)
+            config = reload(path, config); configs = reload_instances(paths, configs)
             profiles = list(dict.fromkeys(r2.profile(c) for c in configs if r2.profile(c) != r2.profile(config)))
             current = read_record(fd, CURRENT)
             if not pinned(current, config):current = None
-            head = main.head(); refusal = untested = None
+            head = main.head(); refusal = untested = unaligned = None
+            if any(pair(c) != pair(config) for c in configs):
+                # A newly listed instance (or one pinned by hand) joins this pair once the pair passes
+                # that profile's self-test; a candidate switch below moves every instance anyway.
+                try:
+                    for profile in profiles:admitted_test(engine, {**config, 'profile': profile}, test)
+                    with verifier.host_directory(config) as host:move_pins(host, paths, *pair(config))
+                except Exception as error:
+                    if r2.CANCELLED:raise
+                    unaligned = error
+                else:status['aligned'] = True
             if current is None:
                 # The installed pair is published only once proven here. A pair from before
                 # `backup.SCHEMAS` cannot be: a proven newer pair may still replace it.
@@ -707,9 +664,10 @@ def follow(path, *, engine=None, main=None, attest=None, test=None):
                                     paths)
                     unlink(fd, CANDIDATE); current = record
                     status.update(status='switched', revision=head)
-            if current is None:raise refusal or untested or RuntimeError('follow_failed')
+            if current is None:raise refusal or untested or unaligned or RuntimeError('follow_failed')
             publish(path, current)
             if refusal is not None:raise refusal
+            if unaligned is not None and status['status'] != 'switched':raise unaligned
             local.write_maintenance_json(STATUS, status, dir_fd=fd)
             return status
         except BaseException as error:
@@ -721,20 +679,25 @@ def follow(path, *, engine=None, main=None, attest=None, test=None):
             raise
 
 
-def revert(path, *, engine=None):
-    """Switch back to the kept pair; the replaced pair becomes the kept one."""
+def revert(path, *, engine=None, test=None):
+    """Switch back to the kept pair; the replaced pair becomes the kept one. Every listed instance
+    moves with it, once the kept pair passes each other profile's self-test."""
     path, config = load(path); paths, configs = instances(path, config)
-    engine = engine if engine is not None else Docker(600)
-    with locked(configs) as fds:
+    engine = engine if engine is not None else Docker(3600); test = test or self_test
+    with locked(configs) as fds, verifier.deadline(3600):
         fd = fds[0]
         config = reload(path, config); configs = reload_instances(paths, configs)
         sweep_self_tests(engine, config['directory'])
         for held in fds:no_retry_pending(held)
         with verifier.host_directory(config) as host:recover_pins(host, paths)
-        recover(fd, engine, config); config = reload(path, config)
+        config = reload(path, config); recover(fd, engine, config); config = reload(path, config)
         previous = read_record(fd, PREVIOUS)
         if previous is None:raise ValueError('no_previous_pair')
-        engine.preflight({**config, 'helper_image': previous['helper_image'], 'helper_revision': previous['helper_revision']})
+        kept = {**config, 'helper_image': previous['helper_image'], 'helper_revision': previous['helper_revision']}
+        engine.preflight(kept)
+        # A kept helper from before a profile existed (calendar: 115a55d3) refuses its bundle: no change then.
+        for profile in dict.fromkeys(r2.profile(c) for c in configs if r2.profile(c) != r2.profile(config)):
+            admitted_test(engine, {**kept, 'profile': profile}, test)
         current = read_record(fd, CURRENT)
         # Every instance moves back with it: the pins move only together.
         switch(path, fd, engine, {'v': 1, 'from': current if pinned(current, config) else unproven(config),
