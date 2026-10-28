@@ -93,10 +93,14 @@ card or a review branch changes it.
 Main's Quality Gate counts a `Backlog` spec without tests as `no_test` (no status filter: open
 Tiden limitation, feedback 10-21; still none in CLI 0.43.0), so ready cards keep it `BLOCKED`. Read
 it per spec with `bin/tiden-gate.sh`: a red row on a `Backlog` spec without code (no pull request,
-no non-.md repo file) is planned work (one `not built` line); any other failing row, a `Backlog`
-spec with code included, is a finding (exit 1); a failed read is exit 2, never a pass. Never link
-tests or move a card to turn it green; a job that fails on main's verdict fails on this read's exit
-code (1 or 2) instead of the raw verdict.
+no non-.md repo file) is planned work (one `not built` line); a `Done` spec red only on coverage
+whose content has an evidence line (one that starts `Evidence`, not `Evidence to close`, or
+`Done:`, carries a YYYY-MM-DD date and sits outside a fenced block) is counted on one
+`evidence-closed` line: the read checks the line's form, not its proof, which the Done rule above
+still requires. Any other failing row, a `Backlog` spec with code included, is a finding (exit 1);
+a failed read is exit 2, never a pass. Never link tests, move a card or add an evidence line to
+turn it green; a job that fails on main's verdict fails on this read's exit code (1 or 2) instead
+of the raw verdict.
 
 ## Card intake
 

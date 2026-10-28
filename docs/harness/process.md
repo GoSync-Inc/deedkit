@@ -102,7 +102,7 @@ Done: the squash's `main` push run is green.
   files, section 2, the card's criteria, a fork without an obvious answer).
 - Test only touched and new code.
 - Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_*` block.
-- At the brief's token limit (default 170k), restart via handoff (orchestration.md, Sessions).
+- At the brief's token limit (default 400k), restart via handoff (orchestration.md, Sessions).
 - Word cap: this file 1,000 words, a project AGENTS.md its own (`wc -w`).
   A rule change replaces or deletes words and names its incident and enforcer; an incident gets a
   test or hook first.
