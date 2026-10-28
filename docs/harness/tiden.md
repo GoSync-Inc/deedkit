@@ -91,9 +91,12 @@ stays: no relocation preserves identity (none through CLI 0.41.0, checked 10-24)
 card or a review branch changes it.
 
 Main's Quality Gate counts a `Backlog` spec without tests as `no_test` (no status filter: open
-Tiden limitation, feedback 10-21), so ready cards keep it `BLOCKED`. Read it per spec: `no_test` on
-`Backlog` is planned work, any other failing row a finding. Never link tests or move a card to turn
-it green; a job that fails on main's verdict filters those rows first.
+Tiden limitation, feedback 10-21; still none in CLI 0.43.0), so ready cards keep it `BLOCKED`. Read
+it per spec with `bin/tiden-gate.sh`: a red row on a `Backlog` spec without code (no pull request,
+no non-.md repo file) is planned work (one `not built` line); any other failing row, a `Backlog`
+spec with code included, is a finding (exit 1); a failed read is exit 2, never a pass. Never link
+tests or move a card to turn it green; a job that fails on main's verdict fails on this read's exit
+code (1 or 2) instead of the raw verdict.
 
 ## Card intake
 
@@ -355,7 +358,7 @@ trial's start and result in the digest, and the loop returns with that report.
 Criteria change only through a card's branch reviewed with its PR or by the ready-merge job;
 no daily delta audit runs.
 
-## Commands (CLI 0.42.0)
+## Commands (CLI 0.43.0)
 
 ```sh
 tiden intent skip --reason "<why>"                                   # first Tiden call
@@ -425,9 +428,9 @@ the local machine); `bin/tiden-version.sh` reads these lines, a project's CI rea
 pinned copy. A CI on another platform gets its line here first.
 
 ```sh
-TIDEN_CLI_VERSION=0.42.0
-TIDEN_CLI_SHA256_linux_amd64=691850035886a903f67e3650e578786db1cd7418ab7d7296e9666ef7f3724380
-TIDEN_CLI_SHA256_darwin_arm64=9ef396aadb7a8d2e695b64682f2a5c381080b7cb1e35eac5aa8feb391bf01909
+TIDEN_CLI_VERSION=0.43.0
+TIDEN_CLI_SHA256_linux_amd64=3332d6d1f5a0bdb37134109efba6266db3e9435d9de7b7753b4965cfbc9a04ea
+TIDEN_CLI_SHA256_darwin_arm64=63c2569806e1382721d7de752a853f8aa3590892cd0994a85188ade2234522b5
 ```
 
 - A project's CI installs Tiden with this step (after `actions/checkout`), never a version or
@@ -457,7 +460,7 @@ TIDEN_CLI_SHA256_darwin_arm64=9ef396aadb7a8d2e695b64682f2a5c381080b7cb1e35eac5aa
 - New release, the same day `check` shows it: the harness orchestrator downloads
   `tiden_darwin_arm64.tar.gz` of the new tag into `mktemp -d`, checks it against that release's
   `checksums.txt`, extracts it and runs `tiden-version.sh smoke <that binary>` (the reads
-  consumers parse: `product list`, `spec list` with pagination, `spec get`; a consumer that starts
+  consumers parse: `product list`, `spec list` with pagination, `spec get`, `gate check`; a consumer that starts
   parsing another command adds it to the smoke), then checks for twin test cases (two cases for one
   signature) among the first 200 cases, oldest first (the CLI's default order), of the smoke's product
   (the argument, else the first of `product list`). A twin is a smoke FAIL: the pin stays until the

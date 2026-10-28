@@ -184,14 +184,16 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
   check needs no yes. The
   owner does by hand only what no agent can. A GUI step (open a service, read a setting, add or register
   something) is an agent's through computer use (worker brief, GUI steps) before it is the owner's; the
-  orchestrator answers `GUI CLAIM` (messages.md) against the shared `~/.config/agent-harness/gui-claims.tsv` (all
-  projects; one row: app or window as `list_windows` names it, project, agent, cua session, since; a missing file
-  holds no claims). It edits the file only while holding the lock directory `gui-claims.lock` beside it (`mkdir`
-  succeeds; `rmdir` after), and grants an app or window that no row holds (a whole-app row holds all its windows)
-  and `foreground` to one agent at a time. It adds the row, removes it at `GUI FREE`, and at a holder's
-  `exited`/`gone`, and on its own start or restart for its project's rows whose agent is not live, ends the row's
-  cua session (`timeout 20 cua-driver call end_session '{"session":"<name>"}'`) and removes the row. A row of a
-  project with no live orchestrator (`bin/boss-of.sh <project>`, ListAgents) may be removed by any orchestrator.
+  orchestrator answers `GUI CLAIM` and `GUI FREE` (messages.md) with `bin/gui-claims.sh claim|free|list` on the
+  shared `~/.config/agent-harness/gui-claims.tsv` (all projects; one row: app or window as `list_windows` names it,
+  project, agent, cua session, since), not a hand edit (the script holds the lock; a hand repair takes the same
+  `gui-claims.lock`; a `STOP:` for the lock held is retried, not a refusal). It grants an app or window that no row
+  holds (a whole-app row holds all its windows, a window row blocks its whole app) and `foreground` to one agent at
+  a time, and runs `free` at `GUI FREE` only when `list` shows the sender as the holder. At a holder's
+  `exited`/`gone`, and on its own start or restart for its project's rows whose agent is not live, it ends the
+  row's cua session (`timeout 20 cua-driver call end_session
+  '{"session":"<name>"}'`) and frees the row (`free --agent <project> <agent>` frees all of one agent's rows). A row
+  of a project with no live orchestrator (`bin/boss-of.sh <project>`, ListAgents) may be freed by any orchestrator.
 - Finished work is closed (owner 10-28: an idle worker in the sidebar reads as waiting on the owner). In the turn
   that reads any worker's DONE (with or without a PR: research, ops and triage too), and when a worker's last PR merges
   (whoever merged it) and its agent is not working: check its worktree is clean, nothing is unpushed (`git -C <worktree> status -sb`) and its test
