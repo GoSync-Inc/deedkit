@@ -198,7 +198,8 @@ the owner (orchestration.md, Owner asks): the orchestrator decides it within thi
   DELETE statements: each statement and the rows a ready card or the data policy names that it
   removes; the reviewer checks the diff against that list. Only these statements leave the
   process.md section 2 deletion gate (no owner question; the files' own change path, section 3).
-  Still gated: TRUNCATE, DROP and other destructive SQL in any code; a script, command, data fix,
+  Still gated: TRUNCATE, DROP and other destructive SQL in any code (a grep hit, in service code as
+  in a migration, is never a `Deletes:` item); a script, command, data fix,
   deploy or release hook or other automation that deletes production data, whoever starts it,
   the promotion command included. Rows neither names: user data is section 2 item 2, other rows
   need a card first.
