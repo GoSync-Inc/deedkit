@@ -565,7 +565,7 @@ def test_sdk_retry_hook_reraises_a_recorded_deadline_before_the_next_attempt(mon
     monkeypatch.setattr(r2,'credentials',lambda config:{'access_key_id':'a','secret_access_key':'s'})
     monkeypatch.setattr(r2,'CANCELLED',[])
     assert r2.make_client({'endpoint':'https://synthetic.invalid'}) is client
-    assert registered==[('needs-retry.s3',r2.cancelled)]
+    assert registered==[('needs-retry.s3',r2.cancelled),('request-created.s3',r2.cancelled)]
     assert r2.cancelled(caught_exception=OSError()) is None
     with pytest.raises(TimeoutError,match='restore_deadline'):r2.cancel(TimeoutError('restore_deadline'))
     with pytest.raises(TimeoutError,match='restore_deadline'):r2.cancelled(caught_exception=OSError())
