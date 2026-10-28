@@ -1588,8 +1588,9 @@ def test_a_ready_card_from_an_owner_agent_card_worker_gets_one_build_worker_whos
     assert len(created()) == 1
     argv = created()[0]
     assert argv[argv.index('--name') + 1] == BUILD and argv[argv.index('--branch') + 1] == BUILD
-    assert argv[argv.index('--prompt') + 1] == (
-        f"Read and follow {autoloop.BRIEFS / 'common.md'} and {build_template}. Intent: {BUILD}. Card: ANYM-30.")
+    # ANYM-574: the build runs in the container runner; the launcher gets the intent and the card only.
+    assert '--agent' not in argv and '--prompt' not in argv
+    assert argv[argv.index('--command') + 1] == f'{sys.executable} {autoloop.LAUNCHER} build {BUILD} ANYM-30'
     built = autoloop.intents(a)[BUILD]
     assert (built['status'], built['lane'], built['paths']) == (
         'started', 'messaging', ['services/messaging/groups.py', 'tests/test_groups.py'])
@@ -1993,3 +1994,192 @@ def test_open_pr_reservations_are_keyed_by_pr_and_hold_both_names_of_a_rename(tm
                              'previous_filename': 'services/messaging/old_name.py'}]}
     assert autoloop.open_files(fakes.gh) == {5: ['services/messaging/new_name.py'],
                                              6: ['services/messaging/new_name.py', 'services/messaging/old_name.py']}
+
+
+# --- the container runner (ANYM-574) -----------------------------------------------------------------------------
+def runner_module(name):
+    import importlib.util
+    spec_ = importlib.util.spec_from_file_location(f'autoloop_runner_{name}', ROOT / 'deploy/autoloop-runner' / f'{name}.py')
+    module = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(module)
+    return module
+
+
+selfcheck, launcher, egress = (runner_module(n) for n in ('selfcheck', 'launch', 'proxy'))
+PROD = '100.64.0.9'
+MOUNTINFO = ('1 0 0:1 / / rw - overlay overlay rw\n'
+             '2 1 0:2 /Users/someone/.cache/deedkit-autoloop-runner/x/control /run/autoloop/control ro - virtiofs m ro\n')
+
+
+def clean_env():
+    return {'HOME': '/home/runner', 'PATH': '/usr/bin', 'GH_TOKEN': 'x', 'HTTPS_PROXY': launcher.PROXY_URL,
+            'AUTOLOOP_PROD_HOST': PROD, 'AUTOLOOP_INTENT': BUILD}
+
+
+def no_route(host, port):
+    return False
+
+
+def only_github(proxy, host, port):
+    return (host, port) == ('github.com', 443)
+
+
+# spec: ANYM-574
+def test_the_in_container_check_finds_no_ssh_key_socket_or_extra_variable_and_no_route_to_production(tmp_path):
+    home = tmp_path / 'home'
+    home.mkdir()
+    import tempfile
+    run = Path(tempfile.mkdtemp(prefix='al', dir='/tmp'))  # a socket path is at most 104 bytes on macOS
+    roots = [str(run)]
+
+    def found(env=None, mountinfo=MOUNTINFO, connect=no_route, tunnel=only_github):
+        return selfcheck.check(env or clean_env(), home, mountinfo, roots, connect, tunnel)
+    assert found() == []
+    # An SSH key, an SSH agent socket, an extra variable or a forbidden mount is each a finding.
+    (home / '.ssh').mkdir()
+    (home / '.ssh' / 'id_ed25519').write_text('k')
+    assert any('SSH directory' in f for f in found()) and any('private key' in f for f in found())
+    shutil.rmtree(home / '.ssh')
+    (home / 'key.pem').write_text('-----BEGIN OPENSSH PRIVATE KEY-----\n')
+    assert any('private key' in f for f in found())
+    (home / 'key.pem').unlink()
+    import socket as socket_
+    agent = socket_.socket(socket_.AF_UNIX)
+    path = run / 'a.sock'
+    try:
+        agent.bind(str(path))
+        assert found() == [f'socket: {path}']
+    finally:
+        agent.close()
+        shutil.rmtree(run)
+    assert found({**clean_env(), 'SSH_AUTH_SOCK': '/tmp/x'}) == [
+        'variable outside the runner list: SSH_AUTH_SOCK', 'SSH agent variable set']
+    assert found({**clean_env(), 'AWS_SECRET_ACCESS_KEY': 'x'}) == [
+        'variable outside the runner list: AWS_SECRET_ACCESS_KEY']
+    for source in ('/Users/someone/.ssh', '/Users/someone/.deedkit/autoloop', '/Users/someone/deedkit-orchestrator',
+                   '/run/host-services/ssh-auth.sock', '/var/run/docker.sock'):
+        assert found(mountinfo=MOUNTINFO + f'3 1 0:3 {source} /mnt rw - virtiofs m rw\n'), source
+    # The production host answers directly or through the proxy: a finding; a proxy that cannot reach GitHub too.
+    assert found(connect=lambda host, port: (host, port) == (PROD, 22)) == [f'production host reachable: {PROD}:22']
+    assert found(tunnel=lambda proxy, host, port: True) == [
+        f'production host reachable through the proxy: {PROD}:22',
+        f'production host reachable through the proxy: {PROD}:443']
+    assert found(tunnel=lambda proxy, host, port: False) == ['the proxy does not reach github.com']
+    assert found({k: v for k, v in clean_env().items() if k != 'AUTOLOOP_PROD_HOST'}) == [
+        'AUTOLOOP_PROD_HOST is not set: the production check cannot run']
+
+
+# spec: ANYM-574
+def test_the_entrypoint_runs_the_check_before_the_clone_and_the_agent_cli():
+    text = (ROOT / 'deploy/autoloop-runner/entrypoint.sh').read_text()
+    assert text.index('selfcheck.py') < text.index('git clone') < text.index('exec claude --dangerously')
+    assert text.startswith('#!/bin/sh\n') and 'set -eu' in text
+
+
+# spec: ANYM-574
+def test_the_image_pins_every_tool_and_runs_as_a_non_root_user():
+    text = (ROOT / 'deploy/autoloop-runner/Dockerfile').read_text()
+    assert all('@sha256:' in line for line in text.splitlines() if line.startswith('FROM '))
+    assert 'sha256sum --check --strict' in text and '@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}' in text
+    assert f'CLAUDE_CODE_VERSION={autoloop.CLI_VERSION}' in text
+    assert re.search(r'^USER runner$', text, re.M) and 'ENTRYPOINT ["/opt/runner/entrypoint.sh"]' in text
+    pin = (ROOT / 'docs/harness/tiden.md').read_text()
+    version = re.search(r'^TIDEN_CLI_VERSION=(\S+)$', pin, re.M)[1]
+    amd64 = re.search(r'^TIDEN_CLI_SHA256_linux_amd64=(\S+)$', pin, re.M)[1]
+    assert f'TIDEN_VERSION={version}' in text and f'TIDEN_SHA256_amd64={amd64}' in text
+
+
+# spec: ANYM-574
+def test_the_runner_container_gets_no_owner_directory_no_secret_on_its_command_line_and_only_the_internal_network(
+        tmp_path):
+    values = {**{name: 'secret-value-' + name for name in launcher.SECRETS},
+              **launcher.settings(BUILD, 'ANYM-30', PROD)}
+    control, outbox = tmp_path / 'control', tmp_path / 'outbox'
+    argv = launcher.run_argv(BUILD, 'img', sorted(values), control, outbox, tty=True)
+    assert not any('secret-value' in part for part in argv)
+    assert argv[argv.index('--network') + 1] == launcher.NETWORK and '--privileged' not in argv
+    assert argv[argv.index('--cap-drop') + 1] == 'ALL' and 'no-new-privileges' in argv
+    mounts = [argv[i + 1] for i, part in enumerate(argv) if part in ('--mount', '--volume', '-v')]
+    assert mounts == [f'type=bind,source={control},target=/run/autoloop/control,readonly',
+                      f'type=bind,source={outbox},target=/run/autoloop/outbox']
+    assert all(word not in m for m in mounts for word in selfcheck.FORBIDDEN_MOUNTS)
+    names = [argv[i + 1] for i, part in enumerate(argv) if part == '--env']
+    assert all('=' not in n for n in names) and set(names) <= selfcheck.ENV and set(launcher.ENV) <= selfcheck.ENV
+    assert set(values) <= set(launcher.ENV)
+    env = launcher.client_env(values)
+    assert env['GH_TOKEN'] == 'secret-value-GH_TOKEN' and 'SSH_AUTH_SOCK' not in env
+    assert values['AUTOLOOP_PROMPT'] == ('Read and follow /run/autoloop/control/common.md and '
+                                         f'/run/autoloop/control/autoloop-build.md. Intent: {BUILD}. Card: ANYM-30.')
+    # The proxy is the one container on both networks, and the runner's network has no route out.
+    calls = []
+
+    def docker(argv_, timeout=None):
+        calls.append(argv_)
+        if argv_[:3] == ['docker', 'network', 'inspect'] and not any(c[:3] == ['docker', 'network', 'create']
+                                                                      for c in calls):
+            raise launcher.Refused('missing')
+        if argv_[:3] == ['docker', 'network', 'inspect']:
+            return json.dumps([{'Internal': True}])
+        if argv_[:2] == ['docker', 'inspect']:
+            raise launcher.Refused('no proxy')
+        return ''
+    launcher.network('img', docker)
+    assert ['docker', 'network', 'create', '--internal', launcher.NETWORK] in calls
+    assert launcher.proxy_argv('img') in calls and ['docker', 'network', 'connect', launcher.NETWORK,
+                                                    launcher.PROXY] in calls
+
+
+# spec: ANYM-574
+def test_the_launcher_passes_only_the_current_claude_access_token_and_refuses_one_about_to_expire():
+    now = datetime(2026, 10, 28, tzinfo=timezone.utc)
+    later = int((now + timedelta(hours=5)).timestamp() * 1000)
+    raw = json.dumps({'claudeAiOauth': {'accessToken': 'at', 'refreshToken': 'rt', 'expiresAt': later}})
+    assert launcher.access_token(raw, now, 4 * 3600) == 'at'
+    with pytest.raises(launcher.Refused, match='expires'):
+        launcher.access_token(raw, now, 6 * 3600)
+    with pytest.raises(launcher.Refused, match='not readable'):
+        launcher.access_token('{}', now, 60)
+
+
+# spec: ANYM-574
+def test_a_worker_in_the_runner_reaches_the_host_state_only_through_the_gate_file_and_the_outbox(
+        tmp_path, monkeypatch, capsys):
+    runner = tmp_path / 'runner'
+    (runner / 'control').mkdir(parents=True)
+    (runner / 'outbox').mkdir()
+    monkeypatch.setenv('AUTOLOOP_RUNNER', str(runner))
+    monkeypatch.setenv('AUTOLOOP_INTENT', BUILD)
+    state = tmp_path / 'state'
+    assert autoloop.main(['gate', BUILD, '--state', str(state)]) == 1  # no gate file yet: stop
+    launcher.write_gate(runner / 'control', None)
+    assert autoloop.main(['gate', BUILD]) == 0
+    launcher.write_gate(runner / 'control', 'paused')
+    assert autoloop.main(['gate', BUILD]) == 1 and 'STOP paused' in capsys.readouterr().err
+    assert autoloop.main(['large', BUILD]) == 0 and autoloop.main(['finish', BUILD]) == 0
+    assert autoloop.main(['finish', 'autoloop-build-other']) == 1
+    for action in (['tick'], ['hold', 'ANYM-30'], ['bind', BUILD, '--card', 'ANYM-30'], ['resume']):
+        assert autoloop.main(action) == 1
+    assert not state.exists()
+    # The host applies this intent's known requests only, an end before `finish`, each once.
+    with open(runner / 'outbox' / 'requests.jsonl', 'a') as outbox:
+        for item in ({'action': 'hold', 'intent': BUILD}, {'action': 'finish', 'intent': 'autoloop-build-other'},
+                     {'action': 'decline', 'intent': BUILD, 'reason': 'bogus'}, {'action': 'finish', 'intent': BUILD}):
+            outbox.write(json.dumps(item) + '\n')
+        outbox.write('not json\n')
+    applied = []
+    assert launcher.apply(runner / 'outbox', BUILD, lambda step: applied.append(step) or 0) == [
+        ('large', 0), ('finish', 0)]
+    assert applied == [['large', BUILD], ['finish', BUILD]]
+
+
+# spec: ANYM-574
+def test_the_egress_proxy_passes_only_allowlisted_names_on_443_with_public_addresses():
+    assert egress.allowed('github.com', 443) and egress.allowed('api.anthropic.com', 443)
+    assert egress.allowed('app.tiden.ai', 443) and egress.allowed('pypi.org', 443)
+    for host, port in (('github.com', 22), ('github.com', 80), (PROD, 443), ('deedkit-prod', 443),
+                       ('evil.example', 443), ('github.com.evil.example', 443), ('[::1]', 443), (None, 443)):
+        assert not egress.allowed(host, port), (host, port)
+    assert egress.public(['140.82.121.4']) == ['140.82.121.4']
+    for private in (['100.109.74.46'], ['10.0.0.1'], ['127.0.0.1'], ['169.254.169.254'], ['::1'],
+                    ['140.82.121.4', '192.168.1.2'], []):
+        assert egress.public(private) == [], private
