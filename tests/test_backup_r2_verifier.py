@@ -1857,3 +1857,4 @@ def test_both_verifier_timers_start_two_minutes_after_the_last_run():
     for name in ('deedkit-backup-r2-verifier.timer','deedkit-calendar-backup-r2-verifier.timer'):
         lines=(root/name).read_text().splitlines()
         assert 'OnUnitInactiveSec=2min' in lines and 'RandomizedDelaySec=30s' in lines and 'OnBootSec=10min' in lines
+        assert 'AccuracySec=1s' in lines

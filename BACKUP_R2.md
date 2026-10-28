@@ -347,8 +347,9 @@ The generic [oneshot service](deploy/deedkit-backup-r2-verifier.service) and
 root. They do not schedule source captures or deploy services. Install them only
 after adapting paths and reviewing configuration and image provenance. The
 timer waits 2 minutes after an invocation ends, plus up to 30 seconds of random
-delay and timer accuracy, so a committed upload is picked up within about 2.5
-minutes and a transient verification failure is retried without an operator Mac.
+delay and 1 second of timer accuracy (`AccuracySec=1s`; the default would add up
+to a minute), so a committed upload is picked up within about 2.5 minutes and a
+transient verification failure is retried without an operator Mac.
 An idle run (no candidate) creates nothing and holds the receiver lock only for
 its inventory; an upload arriving in that moment is answered `receiver_busy`
 before storage and retried by the producer after 60 seconds (ANYM-489).
@@ -366,12 +367,20 @@ status file (the holder owns it) and exits 0. A run that already journaled (a
 retry in progress) or a promotion that meets the receiver lock still fails
 with `receiver_busy`.
 
-Undo of the 2-minute timers: install the previous timer and service files
-(`OnUnitInactiveSec=15min`, `RandomizedDelaySec=1min`, `TimeoutStartSec=25500s`)
-and run `systemctl daemon-reload`. Remove `busy_wait_seconds` from the verifier
-configs before installing an older verifier, whose parser refuses it. Install
-the 2-minute timers only after the production host backup runner carries
-ANYM-489's busy retry.
+Install order: the verifier wheel that waits for the receiver lock goes in
+together with both service files (`TimeoutStartSec=26400s`) and keeps them while
+it is installed, whatever the timers say: its waits pause the deadline, so
+21600 + 3600 + 900 seconds no longer fit the old 25500-second limit. Install the
+2-minute timers only after the production host backup runner carries ANYM-489's
+busy retry; until then the timers stay at 15 minutes.
+
+Undo of the 2-minute timers alone: install the previous timer files
+(`OnUnitInactiveSec=15min`, `RandomizedDelaySec=1min`, no `AccuracySec`) and run
+`systemctl daemon-reload`; the service files stay. Undo of the wheel: complete
+or let fail any running verification, remove `busy_wait_seconds` from the
+verifier configs (an older verifier's parser refuses it), install the older
+wheel, then the previous service files (`TimeoutStartSec=25500s`) and timers,
+and run `systemctl daemon-reload`.
 Systemd does not start a second copy of the same oneshot service while it runs;
 the coordinator's durable state/locking remains necessary for manual invocations
 and crash recovery. The 26400-second service start limit covers the configured
