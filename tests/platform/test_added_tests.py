@@ -200,7 +200,7 @@ def test_list_writes_the_inventory_of_an_event_that_excludes_nothing_to_the_step
 
 
 # spec: ANYM-578
-def test_the_run_plan_is_one_process_per_language_and_project(tmp_path):
+def test_the_run_plan_is_one_process_per_language_project_and_go_package(tmp_path):
     files = {"tests/test_root.py": "", "services/gateway/tests/test_gate.py": "", "tests/fixtures/data.json": "",
              "whatsapp/whatsmeow/go.mod": "", "whatsapp/whatsmeow/x_test.go": "func TestAdded(t *testing.T) {}\n",
              "whatsapp/whatsmeow/sub/y_test.go": "func TestDeeper(t *testing.T) {}\n",
@@ -210,13 +210,17 @@ def test_the_run_plan_is_one_process_per_language_and_project(tmp_path):
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_text(text)
     names = sorted(set(files) - {"whatsapp/whatsmeow/go.mod", "packages/npm/package.json", "packages/npm/package-lock.json"})
-    plan = {(item["language"], item["project"]): item for item in added_tests.plan({"files": names, "provenance": []}, tmp_path)}
-    assert set(plan) == {("python", "."), ("python", "services/gateway"), ("go", "whatsapp/whatsmeow"), ("node", "packages/npm")}
-    assert plan[("python", ".")]["argv"][-1] == "tests/test_root.py"
-    assert plan[("python", "services/gateway")]["argv"][-1] == "tests/test_gate.py"
-    assert plan[("go", "whatsapp/whatsmeow")]["argv"] == ["go", "test", "-count=1", "-run", "^(TestAdded|TestDeeper)$", "./.", "./sub"]
-    assert plan[("node", "packages/npm")]["prepare"] == [["npm", "ci", "--ignore-scripts"]]
-    assert plan[("node", "packages/npm")]["argv"] == ["node", "--test", "test/new.test.mjs"]
+    runs = added_tests.plan({"files": names, "provenance": []}, tmp_path)
+    plan = {(item["language"], item["project"], item["argv"][-1]): item for item in runs}
+    assert set(plan) == {("python", ".", "tests/test_root.py"), ("python", "services/gateway", "tests/test_gate.py"),
+                         ("go", "whatsapp/whatsmeow", "./."), ("go", "whatsapp/whatsmeow", "./sub"),
+                         ("node", "packages/npm", "test/new.test.mjs")}
+    # One `go test` per package, so a name never selects a same-named test of another package, and each must run.
+    assert plan[("go", "whatsapp/whatsmeow", "./.")]["argv"] == ["go", "test", "-count=1", "-v", "-run", "^(TestAdded)$", "./."]
+    assert plan[("go", "whatsapp/whatsmeow", "./sub")]["argv"] == ["go", "test", "-count=1", "-v", "-run", "^(TestDeeper)$", "./sub"]
+    assert plan[("go", "whatsapp/whatsmeow", "./sub")]["expected"] == ["TestDeeper"]
+    assert plan[("node", "packages/npm", "test/new.test.mjs")]["prepare"] == [["npm", "ci", "--ignore-scripts", "--no-audit"]]
+    assert plan[("node", "packages/npm", "test/new.test.mjs")]["argv"] == ["node", "--test", "test/new.test.mjs"]
 
 
 # spec: ANYM-578
@@ -281,3 +285,80 @@ def test_the_added_test_job_runs_only_the_added_tests_and_is_part_of_evidence_an
     assert 'test "$ADDED_LIST_RESULT" = success' in gate
     assert ci["checks"]["with"]["added_tests"] == ci["native"]["with"]["added_tests"] == "${{ needs.added_list.outputs.inventory }}"
     assert ci["added_list"]["permissions"] == {"contents": "read", "pull-requests": "read"}
+
+
+# spec: ANYM-578
+@pytest.mark.parametrize("event", [
+    {"pull_request": {**pull_event()["pull_request"], "head": {"ref": "autoloop-fix-17", "sha": HEAD, "repo": None}}},
+    {"pull_request": {**pull_event()["pull_request"], "head": {"sha": HEAD, "repo": {"full_name": REPOSITORY}}}},
+    {"pull_request": {**pull_event()["pull_request"], "head": {"ref": None, "sha": HEAD, "repo": {"full_name": REPOSITORY}}}},
+], ids=["no-head-repository", "no-head-branch", "null-head-branch"])
+def test_a_pull_request_without_its_head_branch_or_repository_fails_closed_instead_of_reading_as_not_autoloop(event):
+    with pytest.raises(added_tests.Refused, match="head branch or head repository"):
+        added_tests.required("pull_request", event, get=Compare({}))
+
+
+# spec: ANYM-578
+def test_a_queue_answer_with_errors_or_a_pull_request_without_its_head_repository_fails_closed():
+    errors = lambda body: {**MIXED(body), "errors": [{"message": "partial"}]}  # noqa: E731
+    with pytest.raises(added_tests.Refused, match="returned errors"):
+        added_tests.required("merge_group", GROUP, get=Compare({}), graphql=errors)
+    no_repository = entry(20, "autoloop-fix-20", MIDDLE, GROUP_BASE, HEAD)
+    no_repository["pullRequest"]["headRepository"] = None
+    with pytest.raises(added_tests.Refused, match="head branch or head repository"):
+        added_tests.required("merge_group", GROUP, get=Compare({}),
+                             graphql=queue(entry(21, "feature-21", GROUP_HEAD, MIDDLE, OTHER_HEAD), no_repository))
+
+
+# spec: ANYM-578
+def test_an_unbuilt_queue_entry_outside_the_group_does_not_block_it():
+    unbuilt = {"headCommit": None, "baseCommit": {"oid": GROUP_HEAD},
+               "pullRequest": {"number": 30, "headRefName": "feature-30", "headRefOid": OTHER_HEAD, "headRepository": None}}
+    graphql = queue(unbuilt, entry(21, "feature-21", GROUP_HEAD, MIDDLE, OTHER_HEAD), entry(20, "autoloop-fix-20", MIDDLE, GROUP_BASE, HEAD))
+    get = Compare({f"compare/{GROUP_BASE}...{HEAD}": comparison(("tests/test_twenty.py", "added"))})
+    assert added_tests.required("merge_group", GROUP, get=get, graphql=graphql)["files"] == ["tests/test_twenty.py"]
+
+
+# spec: ANYM-578
+def test_every_runnable_go_test_form_of_an_added_file_is_selected():
+    source = """package x
+
+func TestMain(m *testing.M) { os.Exit(m.Run()) }
+func TestAdded(t *testing.T) {}
+func Test(t *testing.T) {}
+func Testify(t *testing.T) {}
+func FuzzParse(f *testing.F) {}
+func ExampleShown() {
+\tfmt.Println("x")
+\t// Output: x
+}
+func ExampleSilent() {
+\tfmt.Println("x")
+}
+"""
+    assert added_tests.go_tests(source) == ["TestAdded", "Test", "FuzzParse", "ExampleShown"]
+
+
+# spec: ANYM-578
+@pytest.mark.parametrize("stdout, expected", [("=== RUN   TestAdded\n--- PASS: TestAdded\nok\n", "passed"),
+                                              ("ok  \texample.com/x\t0.01s [no tests to run]\n", "failed")],
+                         ids=["ran", "never-ran"])
+def test_an_added_go_test_that_never_runs_fails_the_added_job(tmp_path, monkeypatch, stdout, expected):
+    import subprocess
+    (tmp_path / "go.mod").write_text("module example.com/x\n")
+    (tmp_path / "x_test.go").write_text("func TestAdded(t *testing.T) {}\n")
+    monkeypatch.setattr(added_tests.subprocess, "run",
+                        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=""))
+    returncode = added_tests.run({"files": ["x_test.go"], "provenance": []}, tmp_path, tmp_path / "evidence")
+    assert json.loads((tmp_path / "evidence" / "added.json").read_text())["result"] == expected
+    assert returncode == (0 if expected == "passed" else 1)
+
+
+# spec: ANYM-578
+def test_release_publication_tests_everything_and_the_added_job_reaches_the_calendar_database():
+    for name in ("publish-npm.yml", "publish-pypi.yml"):
+        assert workflow(name)["jobs"]["checks"]["with"]["added_tests"] == '{"files": [], "provenance": []}', name
+        assert added_tests.inventory(workflow(name)["jobs"]["checks"]["with"]["added_tests"]) == added_tests.EMPTY
+    step = next(step for step in workflow("checks.yml")["jobs"]["added"]["steps"] if step.get("name") == "Run only the added tests")
+    verify = next(step for step in workflow("checks.yml")["jobs"]["verify"]["steps"] if step.get("id") == "calendar")
+    assert step["env"]["FCS_TEST_DSN"] == verify["env"]["FCS_TEST_DSN"]

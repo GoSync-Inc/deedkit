@@ -260,11 +260,13 @@ def test_a_lookup_error_before_the_choice_means_full_verification_and_a_green_de
     assert output.read_text() == "decision=full\n"
     assert "Full verification" in capsys.readouterr().out
     output.write_text("")
-    github = GitHub(artifacts=[artifact(data=b"zip")])
+    data = archive(queue_evidence(tmp_path))
+    github = GitHub(artifacts=[artifact(data=data)])
     monkeypatch.setattr(ci_reuse.decide, "__defaults__", (github, lambda seconds: None, Clock()))
+    monkeypatch.setattr(ci_reuse.required_inventory, "__defaults__", (lambda path: data, added_tests.EMPTY))
     assert ci_reuse.main() == 0
     assert output.read_text().splitlines() == ["decision=reuse", f"run_id={QUEUE_ID}", "run_attempt=2", "artifact_id=77",
-                                               "artifact_digest=" + digest(b"zip")]
+                                               "artifact_digest=" + digest(data)]
 
 
 def test_validated_queue_evidence_is_published_unchanged_with_this_push_runs_record(tmp_path):
@@ -1306,6 +1308,7 @@ def test_the_reuse_job_passes_the_chained_pull_request_from_its_decision_to_its_
                         "GITHUB_RUN_ID": str(PUSH_ID), "GITHUB_RUN_ATTEMPT": "1"}.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(ci_reuse.decide, "__defaults__", (ChainGitHub(data), lambda seconds: None, ci_reuse.time.monotonic))
+    monkeypatch.setattr(ci_reuse.required_inventory, "__defaults__", (lambda path: data, added_tests.EMPTY))
     monkeypatch.setattr(sys, "argv", ["ci_reuse.py", "decide"])
     output.write_text("")
     assert ci_reuse.main() == 0
@@ -1649,6 +1652,23 @@ def test_a_main_push_never_reuses_queue_evidence_that_excluded_added_tests(tmp_p
     data = archive(queue_evidence(tmp_path, exclusions=EXCLUDED))
     with pytest.raises(ci_reuse.Refused, match="excluded other added tests"):
         adopt(tmp_path, GitHub(artifacts=[artifact(data=data)]), data)
+
+
+# spec: ANYM-578
+@pytest.mark.parametrize("produced", [EXCLUDED, None], ids=["filtered-queue-run", "evidence-before-the-inventory"])
+def test_a_main_push_chooses_full_verification_before_adopting_evidence_that_excluded_added_tests(tmp_path, monkeypatch, capsys, produced):
+    output = tmp_path / "output"
+    output.write_text("")
+    for name, value in (("GITHUB_OUTPUT", str(output)), ("GITHUB_SHA", SHA), ("GITHUB_REPOSITORY", REPOSITORY)):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(sys, "argv", ["ci_reuse.py", "decide"])
+    evidence = queue_evidence(tmp_path, exclusions=EXCLUDED) if produced else queue_evidence(tmp_path)
+    data = archive(evidence, drop=() if produced else (added_tests.EVIDENCE,))
+    monkeypatch.setattr(ci_reuse.decide, "__defaults__", (GitHub(artifacts=[artifact(data=data)]), lambda seconds: None, Clock()))
+    monkeypatch.setattr(ci_reuse.required_inventory, "__defaults__", (lambda path: data, added_tests.EMPTY))
+    assert ci_reuse.main() == 0
+    assert output.read_text() == "decision=full\n"
+    assert "excluded other added tests" in capsys.readouterr().out or produced is None
 
 
 # spec: ANYM-578

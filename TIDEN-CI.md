@@ -82,16 +82,20 @@ whatsmeow.yml's `synthetic`) deletes the listed files from its checkouts before
 its first test step, prints them and keeps the inventory as `exclusions.json` in
 its fragment; `checks / evidence` refuses fragments whose inventories differ.
 The `checks / added` job, on its own runner and with no cache it saves, runs only
-the added tests, one pytest per Python project, one `go test` per Go module and
+the added tests, one pytest per Python project, one `go test` per Go package
+(each added test, fuzz seed and example with output must report that it ran) and
 one `node --test` per package, and uploads `ci-evidence-added` (`added.json`
 with result `passed`, `failed` or `none`, and empty module checks); with no added
-test it passes and says so. `checks / evidence` needs it, so it is part of
-`CI gate`. Evidence is reused only with equal isolation: a merge queue group
+test it passes and says so. Assembly refuses an `added` fragment without a valid
+`added.json`, and `verdict` fails on failed added tests. `checks / evidence`
+needs it, so it is part of `CI gate`. Evidence is reused only with equal isolation: a merge queue group
 reuses a pull request run only when that run's `exclusions.json` equals the
 inventory the group requires, computed for the group, and its added tests
 passed or were none; a main push, which excludes nothing, reuses queue evidence
-only with an empty inventory, so a push after an autoloop pull request with
-added tests verifies in full in its one run.
+only with an empty inventory, checked before it chooses reuse, so a push after
+an autoloop pull request with added tests verifies in full in its one run.
+Release publication (publish-npm.yml, publish-pypi.yml) passes an empty
+inventory: a tag tests everything.
 
 Three root-suite cases run in `checks / verify` steps of their own instead of
 the shards (ANYM-429). Both shard command lines `--deselect` them:

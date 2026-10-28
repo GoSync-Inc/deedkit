@@ -30,7 +30,10 @@ jobs:
   checks:
     needs: tag
     uses: ./.github/workflows/checks.yml
-    with: {version: '${{ inputs.version }}'}
+    with:
+      version: ${{ inputs.version }}
+      # A release tag tests everything: no autoloop pull request's added tests are excluded (ANYM-578).
+      added_tests: '{"files": [], "provenance": []}'
   publish:
     needs: checks
     runs-on: ubuntu-latest

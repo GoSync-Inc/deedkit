@@ -3060,3 +3060,33 @@ def test_every_tiden_cli_install_accepts_only_a_well_formed_shared_pin(tmp_path,
     for expression in ("s/^TIDEN_CLI_VERSION=\\([0-9][0-9]*\\.[0-9][0-9]*\\.[0-9][0-9]*\\)$/\\1/p",
                        "s/^TIDEN_CLI_SHA256_linux_amd64=\\([0-9a-f]\\{64\\}\\)$/\\1/p"):
         assert all(expression in script for script in scripts) and expression in setup
+
+
+# spec: ANYM-578
+@pytest.mark.parametrize("report, reason", [(None, "missing"), ("{", "not JSON"), ('{"result": "none", "runs": [{}]}', "malformed"),
+                                            ('{"result": "passed"}', "malformed"),
+                                            ('{"result": "failed", "runs": [{}]}', "succeeded although")],
+                         ids=["absent", "not-json", "none-with-runs", "no-runs", "failed-under-a-green-job"])
+def test_assembly_refuses_an_added_fragment_without_a_valid_added_test_report(tmp_path, report, reason):
+    from scripts.tiden_ci import assemble
+    fragments = evidence_fragments(tmp_path)
+    if report is None:
+        (fragments / "ci-evidence-added" / "added.json").unlink()
+    else:
+        (fragments / "ci-evidence-added" / "added.json").write_text(report)
+    with pytest.raises(ValueError, match=reason):
+        assemble(tmp_path / "ci-evidence", fragments, ATTEMPT_URL, PASSED)
+
+
+# spec: ANYM-578
+def test_the_evidence_verdict_fails_on_failed_added_tests(tmp_path):
+    import subprocess
+    from scripts.tiden_ci import assemble
+    root = Path(__file__).resolve().parents[1]
+    fragments = evidence_fragments(tmp_path)
+    (fragments / "ci-evidence-added" / "added.json").write_text('{"result": "failed", "runs": [{}]}')
+    out = tmp_path / "ci-evidence"
+    assembled_rows(tmp_path, assemble(out, fragments, ATTEMPT_URL, {**PASSED, "added": ("failure", "a" * 40)}))
+    done = subprocess.run([sys.executable, str(root / "scripts/tiden_ci.py"), "verdict", "--directory", str(out)],
+                          capture_output=True, text=True)
+    assert done.returncode == 1 and "failed added tests" in done.stdout

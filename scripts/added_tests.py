@@ -13,7 +13,8 @@ repository) the required suites never see a file it adds to a test directory, no
 - `strip` (every job that collects, compiles or builds tests for a required check) deletes the listed files from its
   checkouts before it starts, prints them and keeps the inventory in the job's evidence as `exclusions.json`.
 - `run` (checks.yml `added`, on its own runner) runs only the added tests: pytest per Python project, `go test` per Go
-  module and `node --test` per package, one process each, and records them in `added.json`. No added test passes.
+  package (each added test, fuzz seed and example must report that it ran) and `node --test` per package, one process
+  each, and records them in `added.json`. No added test passes.
 
 Evidence is reused only with an equal inventory (scripts/ci_reuse.py), and a main push requires none (TIDEN-CI.md).
 """
@@ -42,7 +43,10 @@ REPORT = "added.json"
 # Python projects with their own environment; any other Python test runs in the root project.
 PYTHON_PROJECTS = ("services/gateway", "services/calendar", "services/calls")
 NODE_TESTS = re.compile(r"\.test\.(js|mjs|cjs|ts)$")
-GO_TEST = re.compile(r"^func (Test\w+)\(", re.M)
+# Go runs a `Test`, `Fuzz` (its seed corpus) or `Example` function whose name goes on with no lower-case letter;
+# an example runs only with an output comment. `TestMain` is the package's harness, not a test.
+GO_TEST = re.compile(r"^func ((?:Test|Fuzz|Example)(?![a-z])\w*)\(", re.M)
+GO_OUTPUT = re.compile(r"^\s*// (?:Unordered output|Output):", re.M | re.I)
 QUEUE = """query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { mergeQueue(branch: "main") {
   entries(first: 100) { nodes { headCommit { oid } baseCommit { oid } pullRequest {
     number headRefName headRefOid headRepository { nameWithOwner } } } } } } }"""
@@ -103,14 +107,18 @@ def queued(group: dict, graphql) -> list[dict]:
         raise Refused("the merge group event has no head, base or queue branch")
     owner, name = REPOSITORY.split("/")
     try:
-        nodes = graphql({"query": QUEUE, "variables": {"owner": owner, "name": name}})["data"]["repository"]["mergeQueue"]["entries"]["nodes"]
-        entries = {node["headCommit"]["oid"]: node for node in nodes}
+        response = graphql({"query": QUEUE, "variables": {"owner": owner, "name": name}})
+        if response.get("errors"):  # a partial answer is no answer
+            raise Refused(f"the queue query returned errors: {response['errors']}")
+        nodes = response["data"]["repository"]["mergeQueue"]["entries"]["nodes"]
+        # An entry the queue has not built yet has no head commit; it cannot be part of this group's chain.
+        entries = {node["headCommit"]["oid"]: node for node in nodes if isinstance((node.get("headCommit") or {}).get("oid"), str)}
     except Exception as exc:
         raise Refused(f"cannot read the merge queue: {exc}") from None
     chain, commit = [], head
     while commit != base:
         entry = entries.get(commit)
-        if entry is None or len(chain) >= len(entries):
+        if entry is None or len(chain) >= len(entries) or not isinstance(entry.get("pullRequest"), dict):
             raise Refused(f"the merge queue holds no entry for group commit {commit}")
         chain.append(entry["pullRequest"])
         commit = (entry.get("baseCommit") or {}).get("oid")
@@ -134,8 +142,10 @@ def required(event_name: str, event: dict, get=api, graphql=None) -> dict:
                           pull.get("headRefOid"), group["base_sha"]))
     files, provenance = set(), []
     for number, branch, repository, head, base in pulls:
-        if not isinstance(number, int) or not isinstance(branch, str):
-            raise Refused("a pull request has no number or head branch")
+        # Scope is decided from the head branch and repository: a missing one never reads as "not autoloop".
+        if not isinstance(number, int) or not isinstance(branch, str) or not branch \
+                or not isinstance(repository, str) or not repository:
+            raise Refused("a pull request has no number, head branch or head repository")
         if not autoloop(branch, repository):
             continue
         merge_base, names = compared(str(base or ""), str(head or ""), get)
@@ -199,26 +209,40 @@ def plan(document: dict, root: Path) -> list[dict]:
             continue
         if name.endswith(".py") and TEST_FILE.search(name):
             project = next((p for p in PYTHON_PROJECTS if name.startswith(p + "/")), ".")
-            groups.setdefault(("python", project), []).append(name)
-        elif name.endswith("_test.go"):
-            groups.setdefault(("go", owner(name, ("go.mod",), root)), []).append(name)
+            groups.setdefault(("python", project, ""), []).append(name)
+        elif name.endswith("_test.go"):  # per package, so a name never selects a test of another package
+            groups.setdefault(("go", owner(name, ("go.mod",), root), str(PurePosixPath(name).parent)), []).append(name)
         elif NODE_TESTS.search(name):
-            groups.setdefault(("node", owner(name, ("package.json",), root)), []).append(name)
+            groups.setdefault(("node", owner(name, ("package.json",), root), ""), []).append(name)
     runs = []
-    for (language, project), names in sorted(groups.items()):
+    for (language, project, package), names in sorted(groups.items()):
         relative = [str(PurePosixPath(name).relative_to(project)) if project != "." else name for name in names]
+        expected: list[str] = []
         if language == "python":
             argv = ["uv", "run", "--frozen", "--group", "dev", "pytest", "-p", "no:cacheprovider", *relative]
         elif language == "go":
-            tests = sorted({test for name in names for test in GO_TEST.findall((root / name).read_text(errors="replace"))})
-            packages = sorted({"./" + str(PurePosixPath(name).parent) for name in relative})
-            argv = ["go", "test", "-count=1", "-run", f"^({'|'.join(tests)})$" if tests else "^$", *packages]
+            tests = sorted({test for name in names for test in go_tests((root / name).read_text(errors="replace"))})
+            directory = PurePosixPath(package).relative_to(project) if project != "." else PurePosixPath(package)
+            argv = ["go", "test", "-count=1", "-v", "-run", f"^({'|'.join(tests)})$" if tests else "^$", f"./{directory}"]
+            expected = tests  # each must report `=== RUN`, so a selection that misses one fails
         else:
             argv = ["node", "--test", *relative]
         # `uv run --frozen` installs a Python project's locked environment itself; a Node package installs its own.
-        prepare = [["npm", "ci", "--ignore-scripts"]] if language == "node" and (root / project / "package-lock.json").is_file() else []
-        runs.append({"language": language, "project": project, "files": names, "prepare": prepare, "argv": argv})
+        prepare = [["npm", "ci", "--ignore-scripts", "--no-audit"]] \
+            if language == "node" and (root / project / "package-lock.json").is_file() else []
+        runs.append({"language": language, "project": project, "files": names, "prepare": prepare, "argv": argv,
+                     "expected": expected})
     return runs
+
+
+def go_tests(source: str) -> list[str]:
+    """The functions `go test` runs from one test file: tests, fuzz seeds and examples with an output comment."""
+    # A function's text runs to the next top-level declaration.
+    starts = [match.start() for match in re.finditer(r"^(?:func|type|var|const) ", source, re.M)] + [len(source)]
+    bodies = {match.group(1): source[match.start():next(end for end in starts if end > match.start())]
+              for match in GO_TEST.finditer(source)}
+    return [name for name in GO_TEST.findall(source)
+            if name != "TestMain" and (not name.startswith("Example") or GO_OUTPUT.search(bodies.get(name, "")))]
 
 
 def run(document: dict, root: Path, evidence: Path) -> int:
@@ -228,9 +252,16 @@ def run(document: dict, root: Path, evidence: Path) -> int:
     for item in runs:
         print(f"::group::{item['language']} in {item['project']}: {' '.join(item['argv'])}", flush=True)
         item["returncode"] = 0
-        for argv in (*item["prepare"], item["argv"]):
+        for argv in item["prepare"]:
             if item["returncode"] == 0:
                 item["returncode"] = subprocess.run(argv, cwd=root / item["project"], check=False).returncode
+        if item["returncode"] == 0:
+            done = subprocess.run(item["argv"], cwd=root / item["project"], check=False, capture_output=True, text=True)
+            print(done.stdout + done.stderr, end="", flush=True)
+            missed = [name for name in item["expected"] if not re.search(rf"^=== RUN\s+{re.escape(name)}$", done.stdout, re.M)]
+            if missed:
+                print(f"::error::added tests that never ran: {', '.join(missed)}")
+            item["returncode"] = done.returncode or (1 if missed else 0)
         print("::endgroup::", flush=True)
     result = "none" if not runs else "passed" if all(item["returncode"] == 0 for item in runs) else "failed"
     evidence.mkdir(parents=True, exist_ok=True)

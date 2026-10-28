@@ -124,6 +124,20 @@ def decide(sha: str, repository: str, get=production.api, sleep=time.sleep, cloc
             "artifact_digest": artifact["digest"]}
 
 
+def required_inventory(pin: dict, fetch=None, exclusions: dict = added_tests.EMPTY) -> None:
+    """Before the choice: the pinned evidence must have excluded exactly what a main push requires, nothing (ANYM-578).
+    Evidence of a run that excluded added tests is not this push's verification, so the push verifies in full
+    instead of failing at adoption; adoption validates the same artifact again."""
+    data = (fetch or download)(f"actions/artifacts/{pin['artifact_id']}/zip")
+    if "sha256:" + hashlib.sha256(data).hexdigest() != pin["artifact_digest"]:
+        raise Refused("the downloaded evidence differs from the pinned artifact")
+    with tempfile.TemporaryDirectory() as scratch:
+        directory = Path(scratch) / "evidence"
+        extract(data, directory)
+        if read_json(directory, added_tests.EVIDENCE) != exclusions:
+            raise Refused("the evidence excluded other added tests than this event requires")
+
+
 def evidence_artifact(run: dict, head_sha: str, get, kind: str) -> dict:
     """The one current `ci-evidence` artifact of the run's latest attempt, created by that run for `head_sha`."""
     attempt = run["run_attempt"]
@@ -480,6 +494,7 @@ def main() -> int:
     if args.command == "decide":
         try:
             pin = decide(sha, repository)
+            required_inventory(pin)
         except Exception as exc:  # any doubt before the choice means full verification, never a failed run
             print(f"::notice title=Full verification::{type(exc).__name__}: {exc}")
             outputs({"decision": "full"})
