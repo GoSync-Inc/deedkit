@@ -243,8 +243,11 @@ directory, Docker socket or login directory); the one mount is a read-only contr
   network and the default bridge): `CONNECT` on port 443 to GitHub, the Anthropic API, Tiden, PyPI,
   npm and the Go module proxy, and nothing else. No IP literal, no name that resolves to a
   private, loopback, link-local or tailnet address, and the tunnel's TLS ClientHello must name
-  the same host. The proxy cannot see the HTTP host inside TLS; that a worker holding the gh
-  token can send data out through GitHub is the residual below, not something the proxy stops.
+  the same host. The check is on the CONNECT name and the TLS server name only: the proxy cannot
+  see the HTTP host inside TLS, so an upstream that serves several sites on one address and
+  routes by that host (a CDN front) could carry a request to a site not on the list. What the
+  proxy does stop is any route to the production host, the tailnet and private addresses; a
+  worker holding the gh token can send data out through GitHub anyway (the residual below).
 - **Check.** `selfcheck.py` runs before the clone; any SSH key, socket, variable outside its list,
   forbidden mount, or route to the production host (directly or through the proxy) stops the
   container. `launch.py check` runs the check and one model call: the subscription login works in
@@ -264,8 +267,12 @@ directory, Docker socket or login directory); the one mount is a read-only contr
   removes the container and applies them on the host, retrying for 20 minutes while a tick holds
   the lock. What it could not apply stays in that file, the terminal says so, and
   `launch.py apply <intent>` applies it later; a new build of the intent waits until then.
-  Other commands are refused inside. The worker's output stays in the build terminal's
-  scrollback.
+  Other commands are refused inside. A copy that fails or does not answer keeps the container
+  and applies nothing; `launch.py apply <intent>` tries again.
+- **Logs.** The runner container has no Docker log (`--log-driver none`); the worker's output
+  stays in the build terminal's scrollback only. The proxy keeps one Docker log of at most 1 MB
+  (refused names, cut to 64 characters) until it is stopped (`docker stop
+  deedkit_autoloop_proxy`, which also removes it).
 - **Undo.** `docker stop <intent>`; `docker stop deedkit_autoloop_proxy`; to start builds with the
   worker preset again, revert ANYM-574's `build_start`.
 

@@ -124,8 +124,8 @@ async def handle(reader, writer, resolver=resolve):
     await writer.drain()
     record = await hello(reader)
     if record is None or server_name(record) != host:
-        print(f'refused {host!r}: TLS server name {server_name(record) if record else None!r}', file=sys.stderr,
-              flush=True)
+        print(f'refused {host!r}: TLS server name {str(server_name(record) if record else None)[:64]!r}',
+              file=sys.stderr, flush=True)
         upstream_writer.close()
         writer.close()
         return
