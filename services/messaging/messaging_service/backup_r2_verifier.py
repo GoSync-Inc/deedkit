@@ -244,20 +244,24 @@ class Docker:
             class Sink:
                 def write(self,data):
                     engine.check_reserve();return process.stdin.write(data)
-            r2.verify_object(receiver,client,receipt,Sink())
-            process.stdin.close()
+            # A helper that exits mid-stream breaks the pipe: stop streaming (never
+            # retried), wait for it within the deadline and report its own failure.
+            try:r2.verify_object(receiver,client,receipt,Sink());broken=False
+            except BrokenPipeError:broken=True
+            try:process.stdin.close()
+            except BrokenPipeError:broken=True
             while process.poll() is None:
                 self.check_reserve()
                 try:process.wait(timeout=min(1,self.remaining()))
                 except subprocess.TimeoutExpired:continue
             self.check_reserve()
-            if process.wait(timeout=self.remaining()):
+            if process.wait(timeout=self.remaining()) or broken:
                 failure='isolated_restore_failed'
                 try:
                     fact=r2.unique_json(private_file(payload/'failure.json',4096))
                     safe={'restore_decryption_failed','restore_database_failed','restore_snapshot_failed','restore_quarantine_failed'}
                     if (isinstance(fact,dict) and set(fact)=={'v','status','error'} and
-                            type(fact['v']) is int and fact['v']==1 and fact['status']=='failed' and fact['error'] in safe):failure=fact['error']
+                            type(fact['v']) is int and fact['v']==1 and fact['status']=='failed' and type(fact['error']) is str and fact['error'] in safe):failure=fact['error']
                 except (OSError,ValueError):pass
                 raise RuntimeError(failure)
         finally:
