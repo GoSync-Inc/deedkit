@@ -61,13 +61,16 @@ class InboundAudioProbe(FrameProcessor):
 
 
 FILES_REFUSED='Files are not accepted in calls.'
+TOOL_RESULTS_REFUSED='Tool results come only from the server.'
+CLIENT_REFUSALS={'send-file':FILES_REFUSED,'llm-function-call-result':TOOL_RESULTS_REFUSED}
 
 
 class CallRTVI(RTVIProcessor):
-    """Calls take no client files (ANYM-617): RTVI send-file (Pipecat 1.13+) is refused before it becomes a frame."""
+    """Calls take no client files or tool results (ANYM-617): RTVI send-file (Pipecat 1.13+) and
+    llm-function-call-result are refused before they become frames; the server runs every tool itself."""
     async def _handle_message(self,message,user_id=None):
-        if message.type=='send-file':
-            return await self._send_error_response(message.id,FILES_REFUSED)
+        if message.type in CLIENT_REFUSALS:
+            return await self._send_error_response(message.id,CLIENT_REFUSALS[message.type])
         await super()._handle_message(message,user_id)
 
 
