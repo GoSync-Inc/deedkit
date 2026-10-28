@@ -438,9 +438,15 @@ class Store:
                 if c.execute("SELECT 1 FROM member_people WHERE group_id=%s AND person_uuid=%s AND member_id<>%s",
                              (group_id, person_id, member_id)).fetchone():
                     raise CalendarError("person_already_linked")
-                c.execute("INSERT INTO member_people(group_id,member_id,person_uuid) VALUES (%s,%s,%s) "
-                          "ON CONFLICT(group_id,member_id) DO UPDATE SET person_uuid=excluded.person_uuid,"
-                          "linked_at=now()", (group_id, member_id, person_id))
+                try:
+                    c.execute("INSERT INTO member_people(group_id,member_id,person_uuid) VALUES (%s,%s,%s) "
+                              "ON CONFLICT(group_id,member_id) DO UPDATE SET person_uuid=excluded.person_uuid,"
+                              "linked_at=now()", (group_id, member_id, person_id))
+                except psycopg.errors.UniqueViolation as e:
+                    # A concurrent link of the person to another member committed after the check above.
+                    if e.diag.constraint_name == "member_people_group_id_person_uuid_key":
+                        raise CalendarError("person_already_linked") from None
+                    raise
         return {"group_id": group_id, "member_id": member_id, "person_id": person_id,
                 "linked": person_id is not None, "previous": old["p"] if old else None}
 
