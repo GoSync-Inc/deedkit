@@ -51,8 +51,10 @@ def read_key(path):
 def parser():
     p = argparse.ArgumentParser(description="Family Calendar owner CLI / isolated gateway / worker")
     sub = p.add_subparsers(dest="action", required=True)
-    for name in ("migrate", "schema-status", "db-roles", "serve", "worker"):
+    for name in ("migrate", "schema-status", "serve", "worker"):
         sub.add_parser(name)
+    roles = sub.add_parser("db-roles")
+    roles.add_argument("--check", action="store_true", help="read-only: compare the grants with roles_expected.json")
     init = sub.add_parser("init-family")
     init.add_argument("--group", default="family")
     init.add_argument("--owner", default="egor")
@@ -232,6 +234,95 @@ def db_roles(store, root, config):
     return {"db_roles": ["gateway", "worker"], "provider_secrets_in_gateway": False}
 
 
+ROLES = ("fcs_gateway", "fcs_worker")
+# ANYM-601: one statement, so one snapshot: the schema version, every ACL entry in the schema held by a service role
+# or PUBLIC (schema, tables and sequences, columns), every membership of a service role, and which roles exist.
+GRANTS = """
+WITH n AS (SELECT oid, nspname, nspacl FROM pg_namespace WHERE nspname=%(schema)s),
+r AS (SELECT oid, rolname FROM pg_roles WHERE rolname=ANY(%(roles)s)),
+acl AS (
+ SELECT n.nspname AS object, NULL::text AS col, a.grantee, a.privilege_type, a.is_grantable
+  FROM n, aclexplode(n.nspacl) a
+ UNION ALL
+ SELECT n.nspname || '.' || c.relname, NULL, a.grantee, a.privilege_type, a.is_grantable
+  FROM n JOIN pg_class c ON c.relnamespace=n.oid, aclexplode(c.relacl) a
+ UNION ALL
+ SELECT n.nspname || '.' || c.relname, t.attname::text, a.grantee, a.privilege_type, a.is_grantable
+  FROM n JOIN pg_class c ON c.relnamespace=n.oid JOIN pg_attribute t ON t.attrelid=c.oid AND NOT t.attisdropped,
+  aclexplode(t.attacl) a)
+SELECT 'acl' AS kind, CASE WHEN acl.grantee=0 THEN 'PUBLIC' ELSE r.rolname END AS role, acl.object, acl.col,
+ acl.privilege_type AS privilege, acl.is_grantable AS option
+ FROM acl LEFT JOIN r ON r.oid=acl.grantee WHERE acl.grantee=0 OR r.oid IS NOT NULL
+UNION ALL
+SELECT 'member', r.rolname, g.rolname, NULL,
+ concat_ws(', ', CASE WHEN m.admin_option THEN 'admin' END, CASE WHEN m.inherit_option THEN 'inherit' END,
+  CASE WHEN m.set_option THEN 'set' END), false
+ FROM pg_auth_members m JOIN r ON r.oid=m.member JOIN pg_roles g ON g.oid=m.roleid
+UNION ALL
+SELECT 'role', rolname, NULL, NULL, NULL, false FROM r
+UNION ALL
+SELECT 'version', NULL, max(version)::text, NULL, NULL, false FROM migrations
+"""
+
+
+def expected_grants(version, schema="fcs", names=None):
+    """The (role, object, column, privilege) set roles.sql grants at a schema version, or None for an unknown one."""
+    data = json.loads(Path(__file__).with_name("roles_expected.json").read_text())
+    if str(version) not in data:
+        return None
+    names = names or {}
+    out = set()
+    for v in range(1, version + 1):
+        for role, entries in data.get(str(v), {}).items():
+            for entry in entries:
+                privilege, obj, col = re.fullmatch(r"([A-Z]+) fcs((?:\.[a-z0-9_]+)?)(?:\(([a-z0-9_]+)\))?", entry).groups()
+                out.add((names.get(role, role), schema + obj, col, privilege))
+    return out
+
+
+def check_roles(conn, schema="fcs", names=None):
+    """`db-roles --check`: one line per missing or extra privilege, membership or role; empty when they match."""
+    names = names or {}
+    roles = [names.get(r, r) for r in ROLES]
+    rows = conn.execute(GRANTS, {"schema": schema, "roles": roles}).fetchall()
+    version = int(next(r["object"] for r in rows if r["kind"] == "version") or 0)
+    expected = expected_grants(version, schema, names)
+    if expected is None:
+        return version, ["unknown schema version %d" % version]
+    present = {r["role"] for r in rows if r["kind"] == "role"}
+    missing_roles = [r for r in roles if r not in present]
+    lines = ["missing role " + r for r in missing_roles]
+
+    def name(role, obj, col, privilege):
+        return " ".join((role, privilege, obj + ("(%s)" % col if col else "")))
+
+    acl = [r for r in rows if r["kind"] == "acl"]
+    actual = {(r["role"], r["object"], r["col"], r["privilege"]) for r in acl}
+    granting = {(r["role"], r["object"], r["col"], r["privilege"]) for r in acl if r["option"]}
+
+    def order(entry):
+        return tuple(x or "" for x in entry)
+
+    for entry in sorted(expected - actual, key=order):
+        if entry[0] not in missing_roles:
+            lines.append("missing " + name(*entry))
+    for entry in sorted(actual - expected | granting, key=order):
+        lines.append("extra " + name(*entry) + (" WITH GRANT OPTION" if entry in granting else ""))
+    for r in sorted((r for r in rows if r["kind"] == "member"), key=lambda r: (r["role"], r["object"])):
+        lines.append("extra %s MEMBER OF %s (%s)" % (r["role"], r["object"], r["privilege"] or "no options"))
+    return version, lines
+
+
+def db_roles_check(store):
+    with store._connect() as conn:
+        conn.read_only = True
+        conn.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(store.schema)))
+        version, lines = check_roles(conn, store.schema)
+    if lines:
+        raise CalendarError("db_roles_drift", details={"schema_version": version, "drift": lines})
+    return {"db_roles_check": "ok", "schema_version": version}
+
+
 def run(argv, home):
     for name in ("httpx", "httpcore", "google.auth", "google_auth_oauthlib", "urllib3", "oauthlib", "mcp"):
         logging.getLogger(name).disabled = True
@@ -275,7 +366,7 @@ def dispatch(args, home, root, config, store):
     if args.action == "schema-status":
         return {"migrations": store.query("SELECT version,checksum FROM migrations ORDER BY version")}
     if args.action == "db-roles":
-        return db_roles(store, root, config)
+        return db_roles_check(store) if args.check else db_roles(store, root, config)
     if args.action == "init-family":
         store.person(args.owner, args.label)
         store.group(args.group, "Семья")
