@@ -15,8 +15,11 @@ TOOLS = ["platform_capabilities", "platform_resolve_target", "messages_search_pe
 
 
 def candidate(i):
-    return {"id": f"chat_{i:032x}", "label": f"Synthetic Steven {i}", "kind": "chat", "network": "telegram",
-            "account": "synthetic", "next": {"tool": "platform_resolve_target", "arguments": {"to": f"chat_{i:032x}"}}}
+    # Hex IDs with long digit runs: a phone-shaped string inside an exact `to` ID is still a reference.
+    chat = f"chat_{1234567890123 + i:032d}"
+    return {"id": chat, "label": f"Synthetic Steven {i}", "kind": "chat", "network": "telegram",
+            "account": "synthetic", "next": {"tool": "platform_resolve_target",
+                                             "arguments": {"to": chat, "purpose": "message"}}}
 
 
 def gateway(tmp_path, body):
@@ -44,7 +47,7 @@ def test_name_candidates_and_their_read_only_listing_survive_the_relay(tmp_path)
     body = {"error": "selection_required", "candidates": many, "more": True,
             "next": {"tool": "messages_search_people", "arguments": {"query": "Steven"}}}
     with TestClient(gateway(tmp_path, body)) as client:
-        result = call(client, "platform_resolve_target", {"to": "Steven"})
+        result = call(client, "platform_resolve_target", {"to": "Steven", "purpose": "message"})
     relayed = result["structuredContent"]
     assert result["isError"] and relayed["candidates"] == many and relayed["more"] is True
     assert relayed["next"] == body["next"]
@@ -59,3 +62,13 @@ def test_a_phone_in_to_still_never_reaches_a_relayed_candidate_or_next(tmp_path)
     with TestClient(gateway(tmp_path, body)) as client:
         relayed = call(client, "platform_resolve_target", {"to": "+12025550177"})["structuredContent"]
     assert "next" not in relayed and "+1" not in json.dumps(relayed)
+
+
+# spec: ANYM-545
+def test_free_text_in_a_relayed_to_is_still_payload_for_every_other_tool(tmp_path):
+    text = "canary message text 7f3a"
+    body = {"error": "conflict", "next": {"tool": "platform_resolve_target", "arguments": {"to": text}}}
+    with TestClient(gateway(tmp_path, body)) as client:
+        relayed = call(client, "messages_send_message", {"account": "synthetic", "chat_id": "chat-synthetic",
+                                                         "text": text, "request_id": "req-synthetic-1"})
+    assert "next" not in relayed["structuredContent"] and text not in json.dumps(relayed)

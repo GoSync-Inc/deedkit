@@ -19,10 +19,10 @@ MAX_CANDIDATES = 10
 SCAN_LIMIT = 200
 JID = re.compile(r'([0-9]{5,20})(?::[0-9]{1,5})?@(c\.us|s\.whatsapp\.net|lid|g\.us)')
 USERNAME = re.compile(r'@([A-Za-z0-9_]{3,64})')
-PHONE_TEXT = re.compile(r'\+?[0-9][0-9 ().-]{6,30}')
+PHONE_TEXT = re.compile(r'\+?[0-9][^A-Za-z@_]{6,40}')
 E164_DIGITS = re.compile(r'[1-9][0-9]{7,14}')
-# The gateway drops a candidate whose label looks like a phone number (agent_gateway.dispatch.PHONE).
-PHONE_LIKE = re.compile(r'\+?\d(?:[\s().-]?\d){6,}')
+# Seven digits with any separators between them (repeated spaces, NBSP, dashes): never in a candidate label.
+PHONE_LIKE = re.compile(r'\d(?:[\W_]*\d){6,}')
 CHAT_COLUMNS = '''c.id,c.account,c.title,c.chat_type,c.provider_chat,a.platform,
     (SELECT m.sent_at FROM messages m WHERE m.account=c.account AND m.chat=c.id AND NOT m.deleted
      ORDER BY m.sent_at DESC LIMIT 1) AS last_at'''
@@ -64,7 +64,7 @@ def _choose(candidates, query=''):
     return _error('selection_required', 409, **fields)
 
 
-def _chats(c, p, where, args, account=''):
+def _chats(c, p, where, args, account='', limit=SCAN_LIMIT):
     scope, scope_args = scope_filter(p, 'c', chat_column='id')
     sql = ('SELECT ' + CHAT_COLUMNS + ' FROM chats c JOIN accounts a ON a.id=c.account WHERE ' + scope
            + ' AND c.purged_at IS NULL AND ' + where)
@@ -72,7 +72,7 @@ def _chats(c, p, where, args, account=''):
     if account:
         sql += ' AND c.account=%s'
         values.append(account)
-    return c.execute(sql + ' ORDER BY last_at DESC NULLS LAST,c.id LIMIT ' + str(SCAN_LIMIT), values).fetchall()
+    return c.execute(sql + ' ORDER BY last_at DESC NULLS LAST,c.id LIMIT ' + str(int(limit)), values).fetchall()
 
 
 def _peer(row):
@@ -127,22 +127,37 @@ def _opted_in(store, c, p, account, digits):
             _native(c, p, account)
             _admit(store, c, p, account, digits, True)
         return True
-    except APIError:
-        return False
+    except APIError as error:
+        if error.code != 'chat_not_collected':
+            return False
+    # The last admission guard (commands._phone_policy) also reads exclusions of the number's known LIDs, which this
+    # key may not see: answer from the account's own discovery setting only, so a hidden exclusion and an unknown
+    # number look the same. The send still runs every guard and refuses an excluded number (chat_not_collected).
+    row = c.execute('SELECT discover_chats FROM account_policies WHERE account=%s', (account,)).fetchone()
+    return bool(row and row['discover_chats'])
 
 
 def _phone(store, c, p, digits, account, purpose, how):
     from .whatsapp_identity import resolve_alias
     jid = digits + '@c.us'
+    from .store import APIError
     rows = _chats(c, p, "a.platform='whatsapp' AND c.provider_chat=%s", [jid], account)
-    seen = {r['id'] for r in rows}
-    for name in _whatsapp_accounts(c, p, account):
-        alias = resolve_alias(c, p, name, jid)
-        if alias and alias['id'] not in seen:
+    exact, ambiguous = {r['account'] for r in rows}, False
+    # An account's own phone-number chat wins; the LID alias is looked up only where there is none.
+    for name in [name for name in _whatsapp_accounts(c, p, account) if name not in exact]:
+        try:
+            alias = resolve_alias(c, p, name, jid)
+        except APIError as error:
+            if error.code != 'ambiguous_reference':
+                raise
+            ambiguous = True  # Two visible chats of one verified pair: no single chat and no new one.
+            continue
+        if alias:
             rows += _chats(c, p, 'c.id=%s', [alias['id']])
-            seen.add(alias['id'])
     if rows:
         return _one_or_choose(c, p, rows, how, purpose)
+    if ambiguous:
+        raise _not_found('several_chats_use_chat_search')
     opted = [name for name in _whatsapp_accounts(c, p, account) if _opted_in(store, c, p, name, digits)]
     if len(opted) == 1:
         return {'account': opted[0], 'chat_id': None, 'phone': '+' + digits, 'network': 'whatsapp',
@@ -211,14 +226,14 @@ def _message(store, c, p, message_id, account, purpose, sender):
             return _phone(store, c, p, own.split('@')[0], row['account'], purpose, 'message_sender_phone')
         raise _not_found('no_private_chat')
     if metadata.get('message_kind') == 'contact':
-        return _card(store, c, p, row, metadata.get('contact'), purpose)
+        return _card(store, c, p, row, metadata.get('contact'), account, purpose)
     rows = _chats(c, p, 'c.id=%s', [row['chat']])
     if not rows:
         raise _not_found()
     return _chat_target(c, p, rows[0], 'message_chat', purpose)
 
 
-def _card(store, c, p, row, card, purpose):
+def _card(store, c, p, row, card, account, purpose):
     """A shared contact card (ANYM-529) resolves to its WhatsApp ID or phone, or its Telegram user's chat."""
     options = []
     contacts = card.get('contacts') if isinstance(card, dict) and card.get('status') in ('parsed', 'truncated') else []
@@ -238,7 +253,7 @@ def _card(store, c, p, row, card, purpose):
                                   row['account'], None, purpose, follow=kind == 'phone') for kind, value, name in options])
     kind, value, _ = options[0]
     if kind == 'phone':
-        return _phone(store, c, p, value, '', purpose, 'contact_card_phone')
+        return _phone(store, c, p, value, account, purpose, 'contact_card_phone')
     chats = _chats(c, p, 'c.provider_chat=%s', [value], row['account'])
     if not chats:
         raise _not_found('no_private_chat')
@@ -249,14 +264,18 @@ def _name(c, p, text, account, purpose):
     """A name or fragment never resolves by itself, even with one match (ANYM-545 criterion 2)."""
     query = text.lower()
     pattern = '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
-    identities = _identities(c, p, 'sp.search_text LIKE %s', [pattern], account)
-    rows = {r['id']: r for r in _private_chats(c, p, identities)}
-    for row in _chats(c, p, 'lower(c.title) LIKE %s', [pattern], account):
-        rows.setdefault(row['id'], row)
+    scope, scope_args = scope_filter(p, 'm')
+    # One query ranks every matching chat (a title, or a private chat of a matching visible identity) by activity
+    # before the limit; one more row than shown tells `more`.
+    rows = _chats(c, p, "(lower(c.title) LIKE %s OR (coalesce(c.chat_type,'private')='private' AND "
+                  '(c.account,c.provider_chat) IN (SELECT sp.account,coalesce(messenger_whatsapp_personal_id(sp.sender),'
+                  'sp.sender) FROM sender_profiles sp JOIN messages m ON m.id=sp.source_message WHERE ' + scope
+                  + ' AND NOT m.deleted AND sp.search_text LIKE %s)))', [pattern, *scope_args, pattern], account,
+                  limit=MAX_CANDIDATES + 1)
     if not rows:
         raise _not_found(query=text)
     raise _choose([_candidate(r['id'], _title(c, p, r), 'chat', r['platform'], r['account'], r['last_at'], purpose)
-                   for r in rows.values()], text)
+                   for r in rows], text)
 
 
 def classify(to):
@@ -273,9 +292,9 @@ def classify(to):
     if match:
         return ('phone_jid', match[1]) if match[2] in ('c.us', 's.whatsapp.net') else ('jid', to)
     if PHONE_TEXT.fullmatch(to):
-        digits = re.sub(r'[^0-9]', '', to)
-        digits = digits[2:] if to.startswith('00') else digits
-        return ('phone', digits) if E164_DIGITS.fullmatch(digits) else ('name', to)
+        from .messenger_operations import phone_digits
+        digits, _ = phone_digits(to)  # The open_chat_by_phone normalizer (ANYM-532): one phone grammar.
+        return ('phone', digits) if digits and E164_DIGITS.fullmatch(digits) else ('name', to)
     return 'name', to
 
 

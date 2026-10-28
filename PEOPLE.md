@@ -87,13 +87,17 @@ to choose from. It is read-only: no provider call, no write. The audit log recor
 - A phone with no chat on exactly one native WhatsApp account that has the
   `open_chat_by_phone` opt-in and a key with `send` (SENDING.md) gives `chat_id: null,
   opens_chat: true`; send with `phone`. Two such accounts give `selection_required` with
-  one candidate per account and no `next`: repeat the call with `account`.
+  one candidate per account and no `next`: repeat the call with `account`. This answer reads
+  the account's discovery setting, not exclusions of the number's other IDs the key may not
+  see, so the send can still refuse it (`chat_not_collected`). An account's own
+  phone-number chat wins over its LID alias chat.
 - A name or fragment never resolves by itself, even with one match: `selection_required`
   with candidates (chats), each with its own `next` (this tool with the exact ID). The
   same holds for a person with several private chats and a username shared by several
   identities. At most 10 candidates, newest `last_activity` first; with more, `more: true`
-  and `next` is `messages_search_people`. A candidate label that looks like a phone number
-  becomes `<network> <kind>`.
+  and `next` is `messages_search_people`. A candidate label with seven or more digits
+  (any separators) becomes `<network> <kind>`. `account` narrows every form, a contact
+  card's phone included.
 - `purpose='call'` refuses group and channel chats (`unsupported_target`).
 - Scope: every read is the key's own projection (accounts, chats, visible members), as in
   the section above. A hidden chat, identity or person is the same `not_found` as a

@@ -1,5 +1,7 @@
 """One target for any identifier, candidates for anything else (ANYM-545); synthetic accounts only."""
+import string
 from uuid import uuid4
+import zlib
 
 from hypothesis import HealthCheck, given, settings, strategies as st
 from platform_contracts.agent import validate_error
@@ -239,16 +241,106 @@ def test_calls_refuse_group_chats_and_rest_mcp_agree(world):
     assert rpc['result']['isError'] and 'selection_required' in str(rpc['result'])
 
 
-NAMES = st.sampled_from(['Steven', 'teve', 'Boat', 'Степан', 'степ', 'Synthetic', 'rt', 'Crowd 1', 'Twin'])
+
+
+def observe(s, account, source, pn, lid):
+    """A verified PN/LID observation, as whatsapp_identity.record() stores it."""
+    with s.pool.connection() as c:
+        sender = c.execute('SELECT sender FROM messages WHERE id=%s', (source,)).fetchone()['sender']
+        c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,
+            pn,lid,provenance,first_observed_at,observed_at) VALUES(%s,%s,%s,%s,%s,'whatsmeow_message_alt_v1',now(),now())''',
+            (account, source, sender, pn, lid))
 
 
 # spec: ANYM-545
-@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
-@given(to=st.one_of(NAMES, st.text(min_size=1, max_size=40), st.builds(lambda a, b: a + ' ' + b, NAMES, NAMES)))
-def test_property_non_exact_input_never_returns_a_single_target_and_errors_follow_the_rulebook(world, to):
-    s, _, key, _, _ = world
-    if not to.strip() or classify(to.strip())[0] != 'name':
-        return
+def test_an_accounts_own_phone_chat_wins_over_its_lid_alias_chat(world):
+    s, _, key, say, mid = world
+    say(WA, '555000111@lid', 'L1', 'lid chat', chat='555000111@lid', name='Степан LID', metadata=PRIVATE)
+    observe(s, WA, mid['stepan'], WA_STEPAN, '555000111@lid')
+    found = target(s, key, '+79110000002')
+    assert (found['chat_id'], found['how_resolved']) == (chat_of(s, WA, WA_STEPAN), 'phone')
+
+
+# spec: ANYM-545
+def test_a_hidden_exclusion_of_the_numbers_lid_answers_like_an_unknown_number(world):
+    s, _, _, say, _ = world
+    key = s.issue_key('rt-excl', [NATIVE], permissions=['read', 'send'])
+    s.set_messenger_operations(NATIVE, ['open_chat_by_phone'])
+    hidden = say(NATIVE, '555000222@lid', 'H1', 'gone', chat='555000222@lid', metadata=PRIVATE)
+    observe(s, NATIVE, hidden, PHONE + '@c.us', '555000222@lid')
+    with s.pool.connection() as c:
+        c.execute('UPDATE messages SET deleted=true WHERE id=%s', (hidden,))
+        c.execute('UPDATE account_policies SET exclude_chats=%s WHERE account=%s', (['555000222@lid'], NATIVE))
+    excluded, unknown = target(s, key, '+' + PHONE), target(s, key, '+12025550178')
+    assert excluded['opens_chat'] and unknown['opens_chat']
+    assert {**excluded, 'phone': None, 'label': None} == {**unknown, 'phone': None, 'label': None}
+
+
+# spec: ANYM-545
+def test_a_contact_cards_phone_keeps_the_requested_account(world):
+    s, _, key, say, _ = world
+    card = say(TG, '42', 'k9', 'card', chat='42', metadata={**PRIVATE, 'message_kind': 'contact', 'contact': {
+        'status': 'parsed', 'contacts': [{'name': 'Synthetic Stepan',
+                                          'phones': [{'number': '+79110000002', 'normalized': True}]}]}})
+    assert target(s, key, card)['account'] == WA
+    assert refused(s, key, card, account=TG)['error'] == 'not_found'
+
+
+# spec: ANYM-545
+@pytest.mark.parametrize('text', ['+44 7700 900123', '+44 (7700) 900‑123', '0044 7700 900123'])
+def test_every_phone_format_the_send_normalizer_accepts_is_exact(text):
+    assert classify(text) == ('phone', '447700900123')
+
+
+# spec: ANYM-545
+def test_phone_shaped_titles_never_reach_a_candidate_label(world):
+    s, _, key, say, _ = world
+    say(TG, '61', 'p1', 'phone title', chat='61', name='Synthetic +1  202  555  0177', metadata=PRIVATE)
+    body = refused(s, key, 'Synthetic +1')
+    assert [c['label'] for c in body['candidates']] == ['telegram chat'] and '555' not in str(body)
+
+
+# spec: ANYM-545
+def test_a_matching_private_chat_is_found_behind_many_matching_identities_without_one(world):
+    s, _, key, say, _ = world
+    for i in range(205):
+        say(TG, str(1000 + i), f'g{i}', 'group', chat='300', name=f'Synthetic Many {i}', title='Group room',
+            metadata={'chat_type': 'group'})
+    # The private chat's sender sorts after every group sender (the old scan stopped at 200 identities).
+    say(TG, '9999', 'last', 'private', chat='9999', name='Synthetic Many Last', title='Private room', metadata=PRIVATE,
+        at='2026-09-01T12:00:00+00:00')
+    assert [c['id'] for c in refused(s, key, 'Synthetic Many')['candidates']] == [chat_of(s, TG, '9999')]
+
+
+# ASCII and basic Cyrillic letters: Python and PostgreSQL lower-case them alike.
+LETTERS = st.sampled_from(string.ascii_letters + ''.join(map(chr, range(0x410, 0x450))))
+NON_EXACT = st.text(alphabet=st.one_of(LETTERS, st.sampled_from(" .,'")), max_size=30)
+
+
+# spec: ANYM-545
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(names=st.lists(st.builds(lambda a, b: a + b, st.text(LETTERS, min_size=1, max_size=1), NON_EXACT),
+                      min_size=1, max_size=3), data=st.data())
+def test_property_non_exact_input_never_returns_a_single_target_and_errors_follow_the_rulebook(world, names, data):
+    """Fixtures vary per example; inputs are drawn without the resolver's classifier (no digit, @, _ or -)."""
+    s, _, key, say, _ = world
+    for name in names:
+        sender = str(10_000 + zlib.crc32(name.encode()))
+        say(TG, sender, 'h' + sender, 'synthetic', chat=sender, name=name, metadata=PRIVATE)
+    chosen = data.draw(st.sampled_from(names))
+    start = data.draw(st.integers(0, len(chosen) - 1))
+    fragment = chosen[start:data.draw(st.integers(start + 1, len(chosen)))]
+    to = data.draw(st.one_of(st.just(fragment), st.builds(lambda a, b: a + b, st.text(LETTERS, min_size=1,
+                                                                                    max_size=1), NON_EXACT)))
+    if not to.strip():
+        to = chosen
     with pytest.raises(APIError) as caught:
         s.resolve_target(key, to)
-    validate_error(payload(caught.value, 'resolve_target'), read_only=READ_ONLY)
+    body = payload(caught.value, 'resolve_target')
+    validate_error(body, read_only=READ_ONLY)
+    assert body['error'] in ('selection_required', 'not_found') and 'target' not in body
+    if body['error'] == 'selection_required':
+        assert all(c['next'] == {'tool': 'platform_resolve_target', 'arguments': {'to': c['id'], 'purpose': 'message'}}
+                   for c in body['candidates'])
+    if to.strip().lower() in chosen.lower():
+        assert body['error'] == 'selection_required'
