@@ -60,6 +60,18 @@ continued after a newline, an unclosed quote or comment), is `manual`.
 `tests/test_migration_rollout.py` never executes a declared `expand` that `classify` rejects; it
 applies the others to PostgreSQL and fails unless the catalog only gained those kinds of change
 (row security included; a widened list must be a superset of numbers or strings). Nothing runs a migration because of its class: `deploy` only names it in its pause.
+The unattended entry point `python -m messaging_service migrate-expand --plan <file>` (ANYM-596; `migrate`
+is unchanged) runs only files whose `unattended_class` is `expand`: a `rollout_class` `expand` with no
+DROP of any kind, so the widening pair stays manual. Role files may only grow: `role_class` calls the
+appended text `additive` when the file still starts with its old text byte for byte and every appended
+statement is a comment, a `GRANT <SELECT|INSERT|UPDATE|DELETE|REFERENCES>[(<columns>)], ... ON [TABLE]
+<table>, ... TO <role>` to a role the old text already grants to, or 050's permissive `DO ... CREATE POLICY`
+template on a table the same release creates; REVOKE, ALL, TRUNCATE, TRIGGER, `WITH GRANT OPTION`,
+schema/function/sequence grants, role membership, `ALTER ROLE` and other `DO` blocks are manual. It runs
+under `lock_timeout` 2 s, `statement_timeout` 4 s and `transaction_timeout` 4 s (read back first), takes
+the migration advisory lock without waiting (`busy`), checks the ledger against the image, and applies the
+files, their ledger rows and the appended role text in one transaction; it never runs `schema.sql`. Its
+output is one JSON line with `schema_version` or a fixed `error` code.
 Keep source revisions, original provider IDs and acknowledgement semantics stable.
 Do not rename or move existing tests.
 

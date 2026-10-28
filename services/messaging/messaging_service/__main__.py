@@ -29,6 +29,25 @@ def read_token(path):
     return caller_token(lines[0].strip())
 
 
+def migrate_expand(args, parser):
+    # ANYM-596: one bounded connection and no application pool; one JSON line, a fixed error code and exit 1 on
+    # refusal. PostgreSQL's message is never printed: psycopg's own logger is off in this process.
+    import logging
+    from . import store
+    if args.status not in (None,'ledger') or not (args.status or args.plan): parser.error('migrate-expand requires --plan or --status')
+    logging.getLogger('psycopg').disabled=True
+    try:
+        dsn=Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
+        if args.status: result=store.expand_status(dsn)
+        else:
+            try: plan=json.loads(args.plan.read_text())
+            except (OSError,ValueError): raise store.ExpandError('plan_invalid') from None
+            result=store.migrate_expand(dsn,plan if isinstance(plan,dict) else {})
+    except store.ExpandError as error: result=error.code
+    except Exception: result='failed'
+    print(json.dumps(result if isinstance(result,dict) else {'error':result}))
+    return 0 if isinstance(result,dict) else 1
+
 def main():
     from .telemetry import configure
     parser=argparse.ArgumentParser()
@@ -38,7 +57,7 @@ def main():
         'set-messenger-operations','extend-key','set-feedback-status','export-feedback','release-retention-hold',
         'set-subscription-retention','link-person','unlink-person','delete-person','list-people','key-info',
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
-        'reload-delivery-policy','set-delivery-features'])
+        'reload-delivery-policy','set-delivery-features','migrate-expand'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -79,7 +98,9 @@ def main():
     parser.add_argument('--synthetic',action='store_true')
     parser.add_argument('--id',nargs='+',dest='feedback_ids',
         help='set-feedback-status: 1-100 feedback UUIDs; disable-/enable-delivery-endpoint: one endpoint UUID')
-    parser.add_argument('--status',help='set-feedback-status: received, accepted, declined, duplicate, fixed or verify_requested')
+    parser.add_argument('--status',nargs='?',const='ledger',
+        help='set-feedback-status: received, accepted, declined, duplicate, fixed or verify_requested; migrate-expand: alone, read the ledger only')
+    parser.add_argument('--plan',type=Path,help='migrate-expand: JSON {base, target, roles: {file: {bytes, sha256}}}')
     parser.add_argument('--fixed-in',help='set-feedback-status: deedkit@<40-hex SHA> or anymsg@<semver>')
     parser.add_argument('--spec',help='set-feedback-status: ANYM-<n>')
     parser.add_argument('--duplicate-of',help='set-feedback-status: a feedback UUID of the same key')
@@ -95,6 +116,7 @@ def main():
     parser.add_argument('--sender',help='link-person/unlink-person: exact provider sender ID (sender_id from search_people)')
     parser.add_argument('--person',help='link-person: add to this person UUID (default: a new person); delete-person, list-people')
     args=parser.parse_args()
+    if args.command=='migrate-expand': return migrate_expand(args,parser)
     if args.command == 'serve':
         configure('gateway')
     dsn=Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
@@ -294,4 +316,4 @@ def main():
     finally: store.close()
 
 
-if __name__=='__main__': main()
+if __name__=='__main__': sys.exit(main())

@@ -18,7 +18,8 @@ import threading
 from collections import OrderedDict
 from uuid import UUID
 
-from psycopg.errors import LockNotAvailable, TransactionTimeout
+import psycopg
+from psycopg.errors import LockNotAvailable, QueryCanceled, TransactionTimeout
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from . import __version__
@@ -36,6 +37,136 @@ class APIError(Exception):
 
 # Under the 5 s request budget, so a writer queued behind a migrate lock request still finishes.
 MIGRATE_LOCK_TIMEOUT="SET LOCAL lock_timeout='2s'"
+
+
+# migrate-expand (ANYM-596): the session budgets as SHOW prints them; all three below a request's 5 s.
+EXPAND_SETTINGS={'lock_timeout':'2s','statement_timeout':'4s','transaction_timeout':'4s','search_path':'public'}
+
+
+class ExpandError(Exception):
+    """A fixed migrate-expand code; never PostgreSQL's message."""
+    def __init__(self, code):
+        self.code=code
+        super().__init__(code)
+
+
+def expand_connection(dsn):
+    """The only connection of migrate-expand (ANYM-596): its budgets, `public` only and no notices, read back."""
+    c=psycopg.connect(dsn,row_factory=dict_row,prepare_threshold=None,connect_timeout=5,
+        options='-c lock_timeout=2000 -c statement_timeout=4000 -c transaction_timeout=4000 -c search_path=public '
+                '-c client_min_messages=error -c timezone=UTC')
+    try:
+        if [c.execute(f'SHOW {name}').fetchone()[name] for name in EXPAND_SETTINGS]!=list(EXPAND_SETTINGS.values()):
+            raise ExpandError('settings_refused')
+    except BaseException:
+        c.close(); raise
+    return c
+
+
+def expand_code(run):
+    """`run()` with every failure as a fixed code. The connection is closed, never rolled back by psycopg's
+    context manager, whose rollback failure logs PostgreSQL's message (Astra r1 F4); the server discards the
+    open transaction when the session ends."""
+    try:
+        return run()
+    except ExpandError:
+        raise
+    except LockNotAvailable:
+        raise ExpandError('lock_timeout') from None
+    except TransactionTimeout:
+        raise ExpandError('transaction_timeout') from None
+    except QueryCanceled:
+        raise ExpandError('statement_timeout') from None
+    except Exception:
+        raise ExpandError('failed') from None
+
+
+def expand_status(dsn):
+    def run():
+        c=expand_connection(dsn)
+        try: return {'schema_version':ledger_version(c)}
+        finally: c.close()
+    return expand_code(run)
+
+
+def migrate_expand(dsn, plan, *, root=None, before_commit=None):
+    """Applies only DROP-free expand migrations and appended role grants in one bounded transaction on one
+    connection, or nothing (ANYM-596). Never schema.sql, lock_replay_tables or the ACL repair of migrate().
+    Raises ExpandError with a fixed code; `before_commit(c)` is a test hook."""
+    from . import migration_rollout as rollout
+    root=Path(root) if root else Path(__file__).parent
+    files={int(p.name[:3]):p for p in root.joinpath('migrations').glob('[0-9][0-9][0-9]_*.sql')}
+    roles={p.name:p.read_bytes() for p in root.glob('*_role.sql')}
+    try:
+        base,target,prefixes=plan['base'],plan['target'],plan['roles']
+        valid=(all(type(v) is int for v in (base,target)) and base<=target==max(files) and type(prefixes) is dict
+            and set(prefixes)==set(roles) and all(type(p) is dict and type(p.get('bytes')) is int
+            and 0<=p['bytes']<=len(roles[n]) and type(p.get('sha256')) is str for n,p in prefixes.items()))
+    except (KeyError,TypeError,ValueError):
+        valid=False
+    if not valid: raise ExpandError('plan_invalid')
+    try:
+        appended={}
+        for name,prefix in sorted(prefixes.items()):
+            data=roles[name]
+            if hashlib.sha256(data[:prefix['bytes']]).hexdigest()!=prefix['sha256']: raise ExpandError('prefix_mismatch')
+            appended[name]=(data[:prefix['bytes']].decode(),data.decode())
+    except UnicodeDecodeError:
+        raise ExpandError('prefix_mismatch') from None
+    pending=[(v,files[v].read_bytes()) for v in sorted(files) if base<v<=target]
+
+    def run():
+        c=expand_connection(dsn)
+        try:
+            if not c.execute('SELECT pg_try_advisory_xact_lock(74509137) AS locked').fetchone()['locked']:
+                raise ExpandError('busy')
+            if ledger_version(c)!=base: raise ExpandError('ledger_mismatch')
+            applied={r['version']:r['sha256'] for r in c.execute('SELECT version,sha256 FROM archive_migrations')}
+            if applied!={v:hashlib.sha256(p.read_bytes()).hexdigest() for v,p in files.items() if 1<v<=base}:
+                raise ExpandError('ledger_mismatch')
+            # An unqualified name resolves in pg_catalog before public (search_path=public), so a catalog name is
+            # never a table here. A GRANT target is an ordinary or partitioned table of `public`; a new table may
+            # not reuse the name of any relation (a sequence or view included), or IF NOT EXISTS would skip it.
+            relations={(r['nspname'],r['relname'],r['relkind']) for r in c.execute(
+                "SELECT n.nspname,c.relname,c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname IN ('public','pg_catalog')")}
+            taken={name for _,name,_ in relations}
+            inventory={name for space,name,kind in relations if space=='public' and kind in ('r','p')}-{
+                name for space,name,_ in relations if space=='pg_catalog'}
+            created={}
+            for _,data in pending:
+                text=data.decode()
+                if rollout.unattended_class(text,inventory|set(created))!='expand': raise ExpandError('not_unattended')
+                following=rollout.new_tables(text,created)
+                if (set(following)-set(created))&taken: raise ExpandError('not_unattended')
+                created=following
+            for old,new in appended.values():
+                if rollout.role_class(old,new,created,tables=inventory)!='additive': raise ExpandError('role_not_additive')
+            for version,data in pending:
+                c.execute(data.decode())
+                c.execute('INSERT INTO archive_migrations(version,sha256) VALUES(%s,%s)',(version,hashlib.sha256(data).hexdigest()))
+                c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'",(str(version),))
+            # Each claimed new table must now be an ordinary or partitioned table of `public`: a relation the batch
+            # made under that name some other way (a sequence, an index) made IF NOT EXISTS skip it (Sol r3).
+            if created and c.execute("SELECT count(*) AS n FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname=ANY(%s)",(sorted(created),)
+                    ).fetchone()['n']!=len(created):
+                raise ExpandError('not_unattended')
+            for old,new in appended.values():
+                if rollout.statements(new[len(old):]): c.execute(new[len(old):])
+            if before_commit: before_commit(c)
+            c.commit()
+        finally: c.close()
+        return {'schema_version':target}
+    return expand_code(run)
+
+
+def ledger_version(c):
+    if not c.execute("SELECT to_regclass('public.probe_metadata') IS NOT NULL AS present").fetchone()['present']:
+        raise ExpandError('ledger_mismatch')
+    row=c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()
+    if not row: raise ExpandError('ledger_mismatch')
+    return int(row['value'])
 
 
 REPLAY_LOCK_TABLES=('messages','deliveries','download_grants')
@@ -1288,6 +1419,12 @@ class Store:
                  REVOKE ALL ON FUNCTION public.subscription_hint_references(uuid,bigint,bigint,text[],text[]) FROM PUBLIC;
                 END IF;
             END $$''')
+
+    def expand_status(self):
+        return expand_status(self.pool.conninfo)
+
+    def migrate_expand(self, plan, *, root=None, before_commit=None):
+        return migrate_expand(self.pool.conninfo,plan,root=root,before_commit=before_commit)
 
     def issue_key(self, principal, accounts, days=7, *, chats=UNSET, permissions=UNSET,
                   key_permissions=UNSET, token=None, operation_id=None, check=False, new_principal=False,
