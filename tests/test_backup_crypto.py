@@ -155,3 +155,22 @@ def test_state_members_only_in_a_calendar_bundle_and_messaging_members_never_in_
     with pytest.raises(ValueError, match='invalid_calendar_bundle'):
         encrypt_snapshot(calendar, tmp_path / 'never', recipient)
     assert not any(tmp_path.glob('out-*')) and not (tmp_path / 'never').exists()
+
+
+# spec: ANYM-605
+@pytest.mark.parametrize('extra', ['files', 'recovery'])
+def test_a_late_calendar_manifest_never_admits_messaging_members(seeded, tmp_path, extra):
+    import json
+    store, *_ = seeded
+    recipient = real_age(tmp_path)
+    messaging = tmp_path / 'messaging'
+    create_snapshot(store, messaging, DUMP)
+    manifest = json.loads((messaging / 'manifest.json').read_text())
+    manifest['profile'] = 'calendar'
+    if extra == 'recovery': manifest['format'] = 2
+    member = extra + '/' + (manifest['blobs'][0]['digest'] if extra == 'files' else 'b' * 64)
+    blob = (messaging / 'files' / manifest['blobs'][0]['digest']).read_bytes() if extra == 'files' else b'r'
+    with pytest.raises(ValueError, match='invalid_backup_member'):
+        decrypt_snapshot(age_tar(tmp_path, recipient, [('database.dump', (messaging / 'database.dump').read_bytes()),
+            ('manifest.json', json.dumps(manifest).encode()), (member, blob)]), tmp_path / 'identity', tmp_path / 'out')
+    assert not (tmp_path / 'out').exists()

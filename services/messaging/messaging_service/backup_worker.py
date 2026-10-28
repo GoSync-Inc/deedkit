@@ -13,6 +13,7 @@ import tempfile
 import stat
 import time
 import re
+import shutil
 
 from psycopg.conninfo import conninfo_to_dict
 
@@ -140,7 +141,10 @@ def run_calendar(config):
     write_json(work/'captured.json',{'id':config['id'],'status':'capture_complete'})
     manifest=read_manifest(work/'snapshot')
     output=work/'bundle.tar.age'
-    encrypt_snapshot(work/'snapshot',output,Path(config['recipient_file']).read_text().strip())
+    try:encrypt_snapshot(work/'snapshot',output,Path(config['recipient_file']).read_text().strip())
+    finally:
+        # The plaintext staging holds the vault key and database passwords; a retry captures anew.
+        shutil.rmtree(work/'snapshot')
     with output.open('rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()
     result={'v':1,'id':config['id'],'profile':'calendar','status':'encrypted','bytes':output.stat().st_size,
             'sha256':digest,'snapshot':snapshot,'created_at':datetime.now(timezone.utc).isoformat(),

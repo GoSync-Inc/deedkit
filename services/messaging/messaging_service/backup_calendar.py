@@ -26,7 +26,8 @@ from .spool import fsync_dir
 
 # Every client setting that changes a value's text form; set locally in the manifest transaction.
 SESSION={'TimeZone':'UTC','DateStyle':'ISO','IntervalStyle':'postgres','extra_float_digits':'3',
-         'search_path':'pg_catalog','lc_monetary':'C','bytea_output':'hex'}
+         'search_path':'pg_catalog','lc_monetary':'C','bytea_output':'hex',
+         'quote_all_identifiers':'off'}
 PROFILE_FILES=('postgres.env','runtime.json','gateway.json','worker.json')
 # runtime.json is written by the local bootstrap only; the compose profile needs the other three.
 OPTIONAL_PROFILE_FILES={'runtime.json'}
@@ -47,8 +48,9 @@ class CalendarCaptureRefused(RuntimeError):
 
 
 def rows_digest(texts):
-    """Order-free multiset hash: sha256 of the sorted per-row sha256 digests."""
-    return hashlib.sha256(b''.join(sorted(hashlib.sha256(t.encode()).digest() for t in texts))).hexdigest()
+    """Order-free multiset hash: sha256 of the sorted per-row sha256 digests; returns (rows, hex)."""
+    digests=sorted(hashlib.sha256(t.encode()).digest() for t in texts)
+    return len(digests),hashlib.sha256(b''.join(digests)).hexdigest()
 
 
 def fernet_hmac_valid(key,token):
@@ -94,12 +96,11 @@ def calendar_manifest(c):
                     key=lambda w:(w['table'],w['column']))
     result={}
     for index,table in enumerate(tables):
-        digests=[];count=0
         with c.cursor(name='calendar_manifest_%d'%index,row_factory=tuple_row) as rows:
             rows.itersize=2000
             rows.execute(sql.SQL('SELECT t::text FROM {} t').format(sql.Identifier(table['nspname'],table['relname'])))
-            for (text,) in rows:digests.append(hashlib.sha256(text.encode()).digest());count+=1
-        result[table['name']]={'rows':count,'sha256':hashlib.sha256(b''.join(sorted(digests))).hexdigest()}
+            count,digest=rows_digest(text for (text,) in rows)
+        result[table['name']]={'rows':count,'sha256':digest}
     return result,warnings
 
 

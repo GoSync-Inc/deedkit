@@ -66,10 +66,10 @@ def write_state(root, tokens, *, key=b'calendar-key'):
 @given(st.lists(st.text(st.characters(blacklist_categories=['Cs']), max_size=20), max_size=12), st.randoms(use_true_random=False))
 def test_row_digest_is_an_order_free_multiset_hash(rows, random):
     shuffled = list(rows); random.shuffle(shuffled)
-    assert rows_digest(shuffled) == rows_digest(rows)
+    assert rows_digest(shuffled) == rows_digest(rows) and rows_digest(rows)[0] == len(rows)
     for row in set(rows) | {'x'}:
         # A duplicated row is a different multiset.
-        assert rows_digest([*rows, row]) != rows_digest(rows)
+        assert rows_digest([*rows, row])[1] != rows_digest(rows)[1]
 
 
 # spec: ANYM-605
@@ -268,6 +268,7 @@ def test_worker_calendar_profile_builds_an_encrypted_bundle_and_records_a_refusa
     result = backup_worker.run(config)
     assert result['status'] == 'encrypted' and result['profile'] == 'calendar'
     assert json.loads((work / 'result.json').read_text())['sha256'] == result['sha256']
+    assert not (work / 'snapshot').exists()  # no plaintext vault or profile left behind
     from messaging_service.backup_crypto import decrypt_snapshot
     decrypt_snapshot(work / 'bundle.tar.age', tmp_path / 'identity', tmp_path / 'restored')
     assert verify_calendar_bundle(tmp_path / 'restored')['schema_version'] == 4
@@ -279,3 +280,18 @@ def test_worker_calendar_profile_builds_an_encrypted_bundle_and_records_a_refusa
     assert json.loads((second / 'refused.json').read_text()) == {
         'id': config['id'], 'status': 'refused', 'code': 'calendar_vault_incomplete', 'subject': 'home'}
     assert not (second / 'bundle.tar.age').exists() and not (second / 'snapshot').exists()
+
+
+# spec: ANYM-605
+def test_manifest_ignores_row_order_and_identifier_quoting_but_counts_duplicates(calendar_db):
+    table = ('CREATE TABLE public."Mixed"(r regclass, f regproc, note text); ')
+    rows = ["('fcs.notes','now','a')", "('fcs.notes','now','a')", "('fcs.connections','pg_backend_pid','b')"]
+    forward = calendar_db(SCHEMA + table + 'INSERT INTO public."Mixed" VALUES ' + ','.join(rows) + ';')
+    backward = calendar_db(SCHEMA + table + 'INSERT INTO public."Mixed" VALUES ' + ','.join(rows[::-1]) + ';')
+    tables, warnings = manifest_of(forward)
+    assert '"Mixed"' not in tables and 'public."Mixed"' in tables and tables['public."Mixed"']['rows'] == 3
+    assert manifest_of(backward) == (tables, warnings)
+    assert manifest_of(forward, quote_all_identifiers='on', search_path='fcs, public') == (tables, warnings)
+    with psycopg.connect(backward, autocommit=True) as c:
+        c.execute("DELETE FROM public.\"Mixed\" WHERE ctid=(SELECT min(ctid) FROM public.\"Mixed\" WHERE note='a')")
+    assert manifest_of(backward)[0]['public."Mixed"']['sha256'] != tables['public."Mixed"']['sha256']

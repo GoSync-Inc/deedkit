@@ -241,6 +241,8 @@ def _decrypt_snapshot(command,destination,max_bytes,*,source=None):
                 if thread.is_alive():raise RuntimeError('backup_decryption_failed')
                 if failures:raise failures[0]
             if not {'manifest.json','database.dump'}<=seen: raise ValueError('incomplete_backup')
+            # A calendar manifest anywhere but first never admitted calendar rules: refuse it.
+            if snapshot_profile(temporary)!=profile: raise ValueError('invalid_backup_member')
         from .recovery_state import read_manifest
         from .backup import verify_bundle
         if profile=='calendar':
