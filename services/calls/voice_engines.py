@@ -30,28 +30,35 @@ def capabilities(credentials,provider):
 
 
 def unfit(name,language,credentials):
-    """Why an engine cannot speak this brief, or None. Every agent brief needs the task tools and success_fields."""
+    """Why an engine cannot speak this brief, or None. Every agent brief needs the task tools and success_fields.
+    language None: no brief yet (calls readiness, ANYM-595); the language is checked when the brief is prepared."""
     e=ENGINES[name]
     if not credentials.get(e['key']):return 'key_not_configured'
-    if language not in e['languages']:return 'language_unsupported'
+    if language is not None and language not in e['languages']:return 'language_unsupported'
     if not e['tool_calls']:return 'tool_calls_unsupported'
     if not e['success_fields']:return 'success_fields_unsupported'
     return None
 
 
+def auto_order(provider):
+    """auto's order: the owner's call_voice engine first, then ENGINES order; unknown owner (unreadable setting): ENGINES order."""
+    owner=BY_DIALOG_ENGINE.get(provider)
+    return [*([owner] if owner else []),*(n for n in ENGINES if n!=owner)]
+
+
 def choose(requested,language,provider,credentials):
     """The engine of one agent call: {requested, selected, reason, skipped}, or a refusal before anything is saved.
     None keeps today's behaviour: the owner's call_voice engine, unchecked here (preflight reports a missing key)."""
-    owner=BY_DIALOG_ENGINE[provider]
+    owner=BY_DIALOG_ENGINE.get(provider)
     if requested is None:
-        return {'requested':None,'selected':owner,'reason':'owner_call_voice','skipped':{}}
+        return {'requested':None,'selected':BY_DIALOG_ENGINE[provider],'reason':'owner_call_voice','skipped':{}}
     if requested!='auto':
         reason=unfit(requested,language,credentials)
         if reason:
             raise ServiceError('voice_engine_unavailable',503,{'voice_engine':requested,'reason':reason})
         return {'requested':requested,'selected':requested,'reason':'requested','skipped':{}}
     skipped={}
-    for name in [owner,*(n for n in ENGINES if n!=owner)]:
+    for name in auto_order(provider):
         reason=unfit(name,language,credentials)
         if reason is None:
             return {'requested':'auto','selected':name,'reason':'auto_owner_engine' if name==owner else 'auto_first_fitting',

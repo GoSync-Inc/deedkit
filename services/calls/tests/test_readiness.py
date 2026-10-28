@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from app import create_app
 from test_agent_api import registry
 from test_tasks import Archive, HEADERS, owner_headers
+import voice_engines
 
 
 def test_capabilities_report_scoped_blockers_without_provider_io(tmp_path):
@@ -88,3 +89,97 @@ def test_twilio_preflight_requires_the_briefs_own_model_credential(tmp_path,cred
             else:
                 assert response.status_code==200 and response.json()['configured']
         assert app.state.service.list_calls()==[]
+
+
+def engines_app(tmp_path,keys,scopes_without=(),enabled=True):
+    tmp_path.mkdir(exist_ok=True)
+    path,doc,save=registry(tmp_path)
+    for principal in doc['principals']:
+        principal['channels'].append('sip');principal['destinations']={'sip':['sip:alice@pbx.example.test']}
+        for scope in scopes_without:principal['scopes'].remove(scope)
+    save()
+    app=create_app(tmp_path/'data',Archive(),agent_registry=path)
+    client=TestClient(app);client.__enter__()
+    client.headers.update(owner_headers(tmp_path/'data'))
+    if keys:client.post('/api/credentials',json=keys,headers=HEADERS)
+    assert client.post('/api/call-voice',json={'provider':'gemini_live'},headers=HEADERS).status_code==200
+    setup={'enabled':enabled,'allowed':{'sip':['sip:alice@pbx.example.test']},'twilio':{
+        'account_sid':'AC'+'1'*32,'auth_token':'synthetic-token','phone_from':'+12025550125',
+        'public_url':'https://voice.example.test'}}
+    assert client.post('/api/calling',json=setup,headers=HEADERS).status_code==200
+    ready=client.post('/v1/capabilities',json={},headers={'Authorization':'Bearer alice'}).json()['calling_readiness']
+    assert app.state.service.list_calls()==[]
+    client.__exit__(None,None,None)
+    return ready
+
+
+# spec: ANYM-595
+def test_readiness_judges_each_voice_engine_by_its_own_key(tmp_path):
+    ready=engines_app(tmp_path/'xai',{'xai':'synthetic-xai-secret'})
+    assert set(ready['channels'])=={'browser','phone','sip'}
+    for name,channel in ready['channels'].items():
+        assert list(channel['voice_engines'])==list(voice_engines.ENGINES), name
+        assert channel['voice_engines']['grok_live']=={'ready':True,'blockers':[]}, name
+        assert channel['voice_engines']['gemini_live']=={'ready':False,'blockers':['key_not_configured']}, name
+        assert channel['ready_engines']==['grok_live'], name
+        assert channel['auto']=={'ready':True,'selects':'grok_live'}, name
+        # An omitted voice_engine still uses the owner's Gemini: today's aggregate is unchanged.
+        assert channel['configuration_ready'] is False and channel['blockers']==['model_key_required'], name
+    both=engines_app(tmp_path/'both',{'xai':'synthetic-xai-secret','gemini':'synthetic-gemini-secret'})
+    for name,channel in both['channels'].items():
+        assert channel['ready_engines']==['gemini_live','grok_live'], name
+        assert channel['auto']=={'ready':True,'selects':'gemini_live'}, name
+        assert channel['configuration_ready'] is True, name
+    none=engines_app(tmp_path/'none',{})
+    for name,channel in none['channels'].items():
+        assert channel['ready_engines']==[] and channel['auto']=={'ready':False,'selects':None}, name
+    serialized=json.dumps([ready,both,none])
+    assert 'synthetic' not in serialized and 'secret' not in serialized
+
+
+# spec: ANYM-595
+@pytest.mark.parametrize('scopes_without,enabled,code',[(('calls:dial',),True,'calls:dial_required'),((),False,'calling_disabled')])
+def test_dial_scope_or_disabled_calling_blocks_every_engine(tmp_path,scopes_without,enabled,code):
+    ready=engines_app(tmp_path,{'xai':'synthetic-xai-secret','gemini':'synthetic-gemini-secret'},scopes_without,enabled)
+    for name in ('phone','sip'):
+        channel=ready['channels'][name]
+        for engine in voice_engines.ENGINES:
+            assert channel['voice_engines'][engine]['ready'] is False and code in channel['voice_engines'][engine]['blockers']
+        assert channel['ready_engines']==[] and channel['auto']=={'ready':False,'selects':'gemini_live'}
+    assert ready['channels']['browser']['ready_engines']==['gemini_live','grok_live']
+
+
+# spec: ANYM-595
+def test_unreadable_call_voice_still_judges_explicit_engines_by_their_keys():
+    from types import SimpleNamespace
+    from readiness import calling_readiness
+    principal=SimpleNamespace(channels=['browser','telegram'],scopes={'calls:start','calls:dial'},destinations={})
+    outbound=SimpleNamespace(settings=SimpleNamespace(enabled=True,allowed={}),providers={'telegram':object()},
+                             daily_calls_remaining=lambda:3)
+    ready=calling_readiness(principal,outbound,{'gemini':False,'xai':True},True,None)
+    for name,channel in ready['channels'].items():
+        assert channel['blockers']==['call_voice_invalid'], name
+        assert channel['voice_engines']=={'gemini_live':{'ready':False,'blockers':['key_not_configured']},
+                                          'grok_live':{'ready':True,'blockers':[]}}, name
+        assert channel['ready_engines']==['grok_live'] and channel['auto']=={'ready':True,'selects':'grok_live'}, name
+
+
+# spec: ANYM-595
+@pytest.mark.parametrize('provider',['gemini_live','grok_realtime',None])
+@pytest.mark.parametrize('keys',[{'gemini':True,'xai':True},{'gemini':True,'xai':False},{'gemini':False,'xai':True},{'gemini':False,'xai':False}])
+def test_auto_selects_what_choose_picks(provider,keys):
+    from types import SimpleNamespace
+    from core import ServiceError
+    from readiness import calling_readiness
+    principal=SimpleNamespace(channels=['browser'],scopes={'calls:start'},destinations={})
+    ready=calling_readiness(principal,None,keys,True,provider)
+    try:selected=voice_engines.choose('auto','ru',provider,keys)['selected']
+    except ServiceError as error:
+        assert error.code=='no_voice_engine_available';selected=None
+    assert ready['channels']['browser']['auto']=={'ready':selected is not None,'selects':selected}
+
+
+# spec: ANYM-595
+def test_capabilities_description_names_ready_engines():
+    from agent_api import DESCRIPTIONS
+    assert 'ready_engines' in DESCRIPTIONS['capabilities']

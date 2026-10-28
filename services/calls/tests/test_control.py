@@ -66,3 +66,28 @@ async def test_mcp_separate_auth_browser_job_and_durable_result(tmp_path):
                     child=await client.call_tool('start_call',{'brief_id':followup.structured_content['id']})
                     assert child.structured_content['requires_browser_join'] is True
                     assert child.structured_content['status']=='waiting_for_browser'
+
+
+# spec: ANYM-595
+async def test_control_call_status_names_the_engine_the_call_used(tmp_path):
+    from core import BriefInput
+    app=create_app(tmp_path,Archive(),control_token='control-fixture-token')
+    async with app.router.lifespan_context(app):
+        owner={'Authorization':'Bearer '+(tmp_path/'owner.token').read_text().strip(),'Origin':'http://testserver','X-Voice-Service':'1'}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app),base_url='http://testserver') as c:
+            assert (await c.post('/api/credentials',json={'xai':'synthetic-xai-key'},headers=owner)).status_code==200
+        service=app.state.service
+        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app),headers={'Authorization':'Bearer control-fixture-token'}) as http:
+            async with streamable_http_client('http://testserver/control/mcp',http_client=http) as (read,write):
+                async with ClientSession(read,write) as client:
+                    await client.initialize()
+                    prepared=await client.call_tool('prepare_call',{'brief':{**BRIEF,'voice_engine':'grok_live'}})
+                    assert not prepared.is_error, prepared
+                    started=await client.call_tool('start_call',{'brief_id':prepared.structured_content['id']})
+                    status=(await client.call_tool('get_call_status',{'call_id':started.structured_content['id']})).structured_content
+                    assert status['voice_engine']=={'requested':'grok_live','selected':'grok_live','reason':'requested','skipped':{}}
+                    assert status['voice_engine']==service.get_call(status['id'])['brief']['voice_engine']
+                    await client.call_tool('stop_call',{'call_id':status['id']})
+                    older=service.start(service.prepare(BriefInput(**BRIEF),[])['id'])['id']
+                    legacy=(await client.call_tool('get_call_status',{'call_id':older})).structured_content
+                    assert legacy['id']==older and 'voice_engine' not in legacy

@@ -4384,7 +4384,7 @@
     "module": "calls",
     "operation": "capabilities",
     "scopes": [],
-    "description": "Read-only; places no call. Shows this principal's calls scopes, each granted channel's configured state and recipient policy (any valid destination; SIP: exact allowlist), the daily call cap with the owner's active raises, daily_calls_remaining, brief/call limits, and voice_engines: each engine (gemini_live, grok_live) with available (key configured), model, voices, languages, tool_calls, success_fields and which engine an omitted voice_engine uses. Contacts no provider; preflight_call checks one external brief.",
+    "description": "Read-only; places no call. Shows this principal's calls scopes, each granted channel's configured state and recipient policy (any valid destination; SIP: exact allowlist), the daily call cap with the owner's active raises, daily_calls_remaining, brief/call limits, and voice_engines: each engine (gemini_live, grok_live) with available (key configured), model, voices, languages, tool_calls, success_fields and which engine an omitted voice_engine uses. calling_readiness per channel: configuration_ready and blockers judge an omitted voice_engine; voice_engines, ready_engines and auto say which explicit choice works now. Contacts no provider; preflight_call checks one external brief.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},

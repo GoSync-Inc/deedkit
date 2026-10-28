@@ -13,7 +13,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field, ValidationError
 
-from agent_api import OWNER_NOTICE, Dial, RaiseCap, call_origin
+from agent_api import OWNER_NOTICE, Dial, RaiseCap, call_origin, voice_engine
 import destination_policy as policy
 from core import AgentBrief, ServiceError
 from outbound import AgentExternalBrief
@@ -103,11 +103,11 @@ def create_control(service,prepare,start,stop,capabilities,outbound=None,browser
 
     @tool(structured_output=True,annotations=read)
     async def get_call_status(call_id:str)->dict[str,Any]:
-        """Read lifecycle, collected answers, and pending owner decisions."""
+        """Read lifecycle, collected answers, pending owner decisions and the call's voice_engine choice."""
         try:
             v=service.get_call(call_id)
             return {**{k:v[k] for k in ('id','status','outcome','answers','decisions','started_at','channel','end_reason','dial_state','provider_call_id','provider_status') if k in v},
-                    **call_origin(v)}
+                    **call_origin(v),**voice_engine(v)}
         except ServiceError as error:
             raise ToolError(error.code) from None
 
