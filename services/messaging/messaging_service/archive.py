@@ -244,7 +244,8 @@ class Archive:
                     c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
                         candidate_updated_at,observed_at,reason,reason_version) VALUES(%s,%s,%s,%s,clock_timestamp(),%s,%s)''',
                         (receipt,mid,old['revision'],updated,
-                         classify(retained['snapshot'] if retained else None,captured),REASON_VERSION))
+                         classify(retained['snapshot'] if retained else None,captured,old['provider_updated_at']),
+                         REASON_VERSION))
                 else:c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
                     (receipt,mid,old['revision'],updated))

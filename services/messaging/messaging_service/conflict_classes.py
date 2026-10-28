@@ -60,7 +60,24 @@ def _time(value):
 SNAPSHOT_FIELDS = ('message', 'provider_chat', 'chat', 'revision')
 
 
-def _classify(retained, candidate):
+def version_at_conflict(retained, unchanged):
+    """The provider version the archive held when it raised the conflict: the observed revision's own, advanced by
+    each earlier `unchanged` observation (archive.ingest bumps provider_updated_at without a revision). An
+    unreadable or missing receipt can only leave it lower, which reads as newer: attention, never known."""
+    times = []
+    for value in unchanged or []:
+        try: times.append(_time(value))
+        except (TypeError, ValueError): pass
+    at = _time(retained['updated_at'])
+    return max([at, *times])
+
+
+def _at_conflict(retained, unchanged):
+    try: return version_at_conflict(retained, unchanged)
+    except Exception: return None  # classify then reads the snapshot or names the row unclassified
+
+
+def _classify(retained, candidate, retained_at=None):
     # Both sides pass the ingest validation, so every field is in its domain (direction is incoming or outgoing,
     # times carry a zone); anything else raises and is unclassified, never a known class (Astra r1 F2).
     candidate = validate(candidate)
@@ -75,18 +92,22 @@ def _classify(retained, candidate):
     elif candidate['body'] != retained['body']: field = 'body'
     elif candidate['media'] != retained['media']: field = 'media'
     else: field = 'other'
-    candidate_at, retained_at = _time(candidate['updated_at']), _time(retained['updated_at'])
+    # The relation is to the version the archive compared at the conflict, not the snapshot's own (ANYM-561 s4).
+    candidate_at = _time(candidate['updated_at'])
+    if retained_at is None: retained_at = _time(retained['updated_at'])
+    if not isinstance(retained_at, datetime) or retained_at.tzinfo is None: return UNCLASSIFIED
     relation = ('equal_version' if candidate_at == retained_at else
                 'older_version' if candidate_at < retained_at else 'newer_version')
     return f'{platform}_{field}_{relation}'
 
 
-def classify(retained, candidate):
-    """The class of one conflict: `retained` is the observed revision's snapshot, `candidate` the receipt envelope.
+def classify(retained, candidate, retained_at=None):
+    """The class of one conflict: `retained` is the observed revision's snapshot, `candidate` the receipt envelope and
+    `retained_at` the provider version the archive held then (ingest: exact; backfill: version_at_conflict).
     Never raises: ingest calls it inside its transaction, and bad evidence is a class of its own."""
     try:
         if not isinstance(retained, dict) or not isinstance(candidate, dict): return UNCLASSIFIED
-        return _classify(retained, candidate)
+        return _classify(retained, candidate, retained_at)
     except Exception:
         return UNCLASSIFIED
 
@@ -156,15 +177,22 @@ def backfill(pool, batch=BACKFILL_BATCH, *, after_batch=None):
         with pool.connection() as c:
             if not stored(c): return classified
             c.execute(BATCH_LOCK_TIMEOUT);c.execute(BATCH_STATEMENT_TIMEOUT)
-            rows = c.execute('''SELECT mc.receipt_digest,r.envelope,mr.snapshot FROM message_conflicts mc
+            # The message's earlier `unchanged` receipts, found through the indexed receipt links (045).
+            rows = c.execute('''SELECT mc.receipt_digest,r.envelope,mr.snapshot,b.unchanged FROM message_conflicts mc
                 LEFT JOIN ingest_receipts r ON r.digest=mc.receipt_digest
                 LEFT JOIN message_revisions mr ON mr.message=mc.message AND mr.revision=mc.observed_revision
+                LEFT JOIN LATERAL (SELECT array_agg(u.envelope->>'updated_at') AS unchanged
+                    FROM ingest_receipt_links l JOIN ingest_receipts u ON u.digest=l.digest
+                    WHERE l.account=r.account AND l.provider_chat=r.envelope->>'chat'
+                    AND l.provider_id=r.envelope->>'provider_id' AND u.outcome='unchanged'
+                    AND u.received_at<=mc.observed_at) b ON true
                 WHERE mc.reason IS NULL AND mc.receipt_digest>%s ORDER BY mc.receipt_digest LIMIT %s''',
                 (after, batch)).fetchall()
             if not rows: return classified
             with c.cursor() as cur:
                 cur.executemany('''UPDATE message_conflicts SET reason=%s,reason_version=%s
                     WHERE receipt_digest=%s AND reason IS NULL''',
-                    [(classify(r['snapshot'], r['envelope']), REASON_VERSION, r['receipt_digest']) for r in rows])
+                    [(classify(r['snapshot'], r['envelope'], _at_conflict(r['snapshot'], r['unchanged'])),
+                      REASON_VERSION, r['receipt_digest']) for r in rows])
         classified += len(rows); after = rows[-1]['receipt_digest']
         if after_batch: after_batch()

@@ -111,6 +111,27 @@ def test_class_is_stored_at_insert_against_the_observed_revision(archive):
 
 
 # spec: ANYM-557
+def test_relation_is_to_the_version_the_archive_held_after_an_unchanged_reobservation(archive):
+    from messaging_service.conflict_classes import backfill
+    ar,s,key,_=archive
+    later='2026-10-01T12:03:00+00:00'
+    # An `unchanged` re-read advances the archive's provider version past the revision's snapshot (ANYM-561 s4).
+    for provider_id,changes in (('d',{'direction':'outgoing'}),('b',{'body':'Другой текст'})):
+        ar.ingest(event(provider_id=provider_id))
+        assert ar.ingest(event(provider_id=provider_id,updated_at=later,origin='reconcile'))['outcome']=='unchanged'
+        assert ar.ingest(event(provider_id=provider_id,updated_at=later,**changes))['outcome']=='conflict'
+    direction,body=(stable_id('msg','archive-test','100',p) for p in ('d','b'))
+    assert stored(s,direction)['reason']=='telegram_direction_equal_version'
+    assert stored(s,body)['reason']=='telegram_body_equal_version'
+    with s.pool.connection() as c:
+        c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL')
+    assert backfill(s.pool)==2
+    assert stored(s,direction)['reason']=='telegram_direction_equal_version'
+    assert stored(s,body)['reason']=='telegram_body_equal_version'
+    assert account(s,key)['conflicts']=={**account(s,key)['conflicts'],'attention':0,'known':2,'next_step':'none_required'}
+
+
+# spec: ANYM-557
 def test_backfill_is_bounded_idempotent_and_reads_malformed_or_n1_rows_as_unclassified(archive):
     from messaging_service.conflict_classes import backfill
     ar,s,key,_=archive
