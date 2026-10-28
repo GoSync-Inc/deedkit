@@ -7,8 +7,8 @@ import time
 
 import pytest
 
-from messaging_service import delivery_worker, egress_proxy
-from messaging_service.egress import EgressNotSent, proxy_lookup, proxy_transport
+from messaging_service import delivery_worker, egress, egress_proxy
+from messaging_service.egress import EgressNotSent, deadline_after, post, proxy_lookup, proxy_transport
 from messaging_service.event_delivery import OPERATOR_DNS_SLOTS, _transport
 
 PUBLIC = {'hooks.example': ['1.1.1.1', '8.8.8.8'], 'other.example': ['9.9.9.9'], 'inside.example': ['10.0.0.5']}
@@ -203,3 +203,73 @@ def test_the_dispatcher_with_a_proxy_sends_every_lane_through_it(monkeypatch):
         assert transport.__qualname__ == 'proxy_transport.<locals>.transport', lane
         assert resolver.__qualname__ == 'proxy_lookup.<locals>.lookup', lane
         assert transport is not _transport
+
+
+class FakeConnection:
+    """A TLS connection stand-in: records what was sent and replies with the given chunks."""
+
+    def __init__(self, replies=(), fail_send=False):
+        self.replies, self.fail_send, self.sent = list(replies), fail_send, b''
+
+    def settimeout(self, value):
+        pass
+
+    def sendall(self, data):
+        if self.fail_send:
+            raise ConnectionResetError('reset during the request')
+        self.sent += data
+
+    def recv(self, size):
+        return self.replies.pop(0) if self.replies else b''
+
+
+# spec: ANYM-581
+def test_a_stalled_proxy_name_lookup_is_not_sent_within_the_deadline_and_bounded_per_lane(monkeypatch):
+    release = threading.Event()
+    def stalled(*args, **kwargs):
+        release.wait(10)
+        raise socket.gaierror('stalled')
+    monkeypatch.setattr(egress.socket, 'getaddrinfo', stalled)
+    resolved = ('hooks.example', ['1.1.1.1'], '/')
+    try:
+        started = time.monotonic()
+        with pytest.raises(EgressNotSent) as error:
+            proxy_transport('delivery-egress.invalid:3128')('https://hooks.example/', b'{}', {}, resolved=resolved, timeout=1)
+        assert time.monotonic() - started < 1.5 and str(error.value.__cause__) == 'egress_proxy_dns_unavailable'
+        for _ in range(3):
+            with pytest.raises(EgressNotSent):
+                proxy_transport('delivery-egress.invalid:3128')('https://hooks.example/', b'{}', {}, resolved=resolved,
+                                                                timeout=0.1)
+        # Four lookups still stall: the fifth endpoint one is refused at once, the operator lane has its own slots.
+        with pytest.raises(EgressNotSent) as error:
+            proxy_transport('delivery-egress.invalid:3128')('https://hooks.example/', b'{}', {}, resolved=resolved)
+        assert str(error.value.__cause__) == 'egress_proxy_dns_busy'
+        with pytest.raises(EgressNotSent) as error:
+            proxy_transport('delivery-egress.invalid:3128', lane='operator')('https://hooks.example/', b'{}', {},
+                                                                             resolved=resolved, timeout=0.1)
+        assert str(error.value.__cause__) == 'egress_proxy_dns_unavailable'
+    finally:
+        release.set()
+    assert wait_for(lambda: all(slot._value == slot._initial_value for slot in egress._PROXY_DNS_SLOTS.values()))
+
+
+# spec: ANYM-581
+def test_post_sends_nothing_past_the_deadline_and_a_failure_after_the_start_is_maybe_sent():
+    expired = FakeConnection([b'HTTP/1.1 200 OK\r\n\r\n'])
+    with pytest.raises(EgressNotSent, match='receiver_deadline'):
+        post(expired, 'hooks.example', '/', b'{}', {}, deadline_after(-1))
+    assert expired.sent == b''
+    with pytest.raises(OSError) as error:
+        post(FakeConnection(fail_send=True), 'hooks.example', '/', b'{}', {}, deadline_after(5))
+    assert not isinstance(error.value, EgressNotSent)
+
+
+# spec: ANYM-581
+def test_post_skips_interim_responses_to_the_final_status_within_a_bounded_head():
+    connection = FakeConnection([b'HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early', b' Hints\r\nLink: </a>\r\n\r\n',
+                                 b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'])
+    assert post(connection, 'hooks.example', '/', b'{}', {}, deadline_after(5)) == 200
+    assert connection.sent.endswith(b'\r\n\r\n{}')
+    endless = FakeConnection([b'HTTP/1.1 100 Continue\r\n\r\n'] * 400)
+    with pytest.raises(ValueError, match='invalid_receiver_response'):
+        post(endless, 'hooks.example', '/', b'{}', {}, deadline_after(5))

@@ -658,8 +658,8 @@ first).
    `python3 scripts/delivery_egress_check.py rules --resolver <ip>` (the same IP) prints them; as
    root, apply them before the first start (they match bridge names, which may not exist yet) and
    save them with the host's firewall persistence. They drop host-bound packets from all three
-   bridges, `dk-delivery0` (egress), `dk-deliverydb0` and `dk-deliverypx0` (internal networks still
-   reach the host gateway), and, from `dk-delivery0`, the tailnet (100.64.0.0/10), RFC 1918,
+   bridges, `dk-delivery0` (egress), `dk-deliverydb0` and `dk-deliverypx0` (internal networks in gateway
+   mode `isolated` have no host address; the rules are the second layer), and, from `dk-delivery0`, the tailnet (100.64.0.0/10), RFC 1918,
    link-local and metadata (169.254.0.0/16), loopback and every IPv6 packet; they allow DNS to `<ip>`
    and TCP 443 to public addresses. Undo: `rules --undo`.
 5. First enrollment (owner-authorized, once; `production.py` cannot do it: a selected service must
@@ -726,15 +726,15 @@ first).
      --open-proxied <allowed host> --refused-proxied example.com --blocked 1.1.1.1:443 \
      --blocked-dns $DELIVERY_RESOLVER --blocked <api ip>:8080 --blocked <gateway ip>:13240 \
      --blocked <matcher ip>:18080 --blocked <host public ip>:22 --blocked <tailnet ip>:22 \
-     --blocked <dk-deliverydb0 gateway ip>:22 --blocked <dk-deliverypx0 gateway ip>:22 \
-     --blocked 169.254.169.254:80 --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
+     --blocked <dk-deliverydb0 subnet .1>:22 --blocked <dk-deliverypx0 subnet .1>:22 \
+     --blocked <docker0 gateway ip>:22 --blocked 169.254.169.254:80 --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
    ```
-   The two gateway targets pass only with the host rules in place (an internal bridge reaches the
-   host gateway). Then the second layer from the proxy, which has the egress bridge:
+   The subnet `.1` and `docker0` targets pass with or without the host rules: both internal networks
+   use gateway mode `isolated`, so their bridges hold no host address. Then the second layer from the proxy, which has the egress bridge:
    ```sh
    docker compose $F exec -T delivery-egress python -I - check --open <allowed host>:443 \
      --open-dns $DELIVERY_RESOLVER --blocked <host public ip>:22 --blocked <tailnet ip>:22 \
-     --blocked <dk-delivery0 gateway ip>:22 --blocked <dk-deliverypx0 gateway ip>:22 \
+     --blocked <dk-delivery0 gateway ip>:22 --blocked <dk-deliverypx0 subnet .1>:22 \
      --blocked <matcher ip>:18080 --blocked 169.254.169.254:80 --blocked <alt>:53 \
      --blocked-dns <alt> --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
    ```

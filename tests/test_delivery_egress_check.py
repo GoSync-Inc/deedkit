@@ -149,3 +149,45 @@ def test_proxied_probes_need_a_tunnel_or_the_proxys_refusal():
         proxy.stop.set()
         server.close()
         upstream.close()
+
+
+# spec: ANYM-581
+def test_proxied_probe_reads_a_fragmented_body_whole_and_stops_at_its_deadline():
+    import threading
+    import time
+    server = socket.create_server(('127.0.0.1', 0))
+    stall = threading.Event()
+
+    def serve():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                request = conn.recv(4096)
+                if request.startswith(b'RESOLVE'):
+                    body = b'["1.1.1.1"]'
+                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n' % len(body) + body[:3])
+                    if stall.is_set():
+                        time.sleep(5)
+                    else:
+                        time.sleep(0.3)
+                    conn.sendall(body[3:])
+                else:
+                    conn.sendall(b'HTTP/1.1 200 OK\r\n\r\n')
+
+    threading.Thread(target=serve, daemon=True).start()
+    address = '127.0.0.1:%d' % server.getsockname()[1]
+    try:
+        # The body arrives in two segments: the probe waits for all of it, then tunnels.
+        code, out = run('check', '--proxy', address, '--open-proxied', 'hooks.example')
+        assert code == 0 and json.loads(out)['results'][0]['outcome'] == 'tunnel', out
+        # A body that stalls past the deadline fails the probe within the timeout, not after the stall.
+        stall.set()
+        started = time.monotonic()
+        code, out = run('check', '--proxy', address, '--timeout', '1', '--open-proxied', 'hooks.example')
+        assert code == 1 and json.loads(out)['results'][0]['outcome'] == 'unreachable', out
+        assert time.monotonic() - started < 4
+    finally:
+        server.close()

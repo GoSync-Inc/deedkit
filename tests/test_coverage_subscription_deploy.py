@@ -113,11 +113,13 @@ def test_delivery_overlay_isolates_the_dispatcher_database_path_and_egress(tmp_p
     assert {name for name, item in services.items() if 'delivery_proxy' in item['networks']} == {'delivery', 'delivery-egress'}
     assert {name for name, item in services.items() if 'delivery_egress' in item['networks']} == {'delivery-egress'}
     assert networks['delivery_proxy']['internal'] is True and networks['delivery_proxy'].get('enable_ipv6') is False
-    assert networks['delivery_proxy']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-deliverypx0'}
+    assert networks['delivery_proxy']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-deliverypx0',
+                                                     'com.docker.network.bridge.gateway_mode_ipv4': 'isolated'}
     assert set(services['db']['networks']) == {'backend', 'delivery_db'}
     assert set(services['subscriptions']['networks']) == {'backend'}
     assert networks['delivery_db']['internal'] is True and networks['delivery_db'].get('enable_ipv6') is False
-    assert networks['delivery_db']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-deliverydb0'}
+    assert networks['delivery_db']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-deliverydb0',
+                                                     'com.docker.network.bridge.gateway_mode_ipv4': 'isolated'}
     # No resolver of its own: names outside its networks never resolve; the proxy resolves.
     assert 'dns' not in service
     assert not networks['delivery_egress'].get('internal') and networks['delivery_egress'].get('enable_ipv6') is False

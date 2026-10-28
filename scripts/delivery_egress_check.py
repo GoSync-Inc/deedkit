@@ -29,8 +29,8 @@ import sys
 import time
 
 BRIDGE = 'dk-delivery0'
-# Internal bridges still have a host gateway address: host listeners answer on it unless dropped (measured on
-# Docker 29: an internal network has no DNS, other bridges or internet, but reaches the host gateway).
+# Internal bridges in gateway mode `isolated` hold no host address (a plain internal network reaches the host
+# gateway, measured on Docker 29); their INPUT drops below are the second layer.
 DB_BRIDGE = 'dk-deliverydb0'
 PROXY_BRIDGE = 'dk-deliverypx0'
 INTERNAL = (DB_BRIDGE, PROXY_BRIDGE)
@@ -111,12 +111,27 @@ def probe_dns(target, timeout):
 
 
 def _proxy_head(proxy, head, timeout):
-    """(status, reason, body) of one proxy request; the connection closes after the head (a tunnel is not used)."""
+    """(status, reason, body) of one proxy request; the connection closes after the head (a tunnel is not used).
+
+    The head and its Content-Length body are read under one absolute deadline, so a body split across segments is
+    read whole and a slow proxy cannot stretch the probe past `timeout`.
+    """
     host, _, port = proxy.rpartition(':')
+    deadline = time.monotonic() + timeout
     with socket.create_connection((host, int(port)), timeout=timeout) as sock:
         sock.sendall(head.encode('ascii'))
-        data = b''
-        while b'\r\n\r\n' not in data and len(data) < 8192:
+        data, length = b'', None
+        while len(data) < 16384:
+            if length is None and b'\r\n\r\n' in data:
+                fields = data.partition(b'\r\n\r\n')[0].split(b'\r\n')[1:]
+                length = next((int(value) for name, _, value in (field.partition(b':') for field in fields)
+                               if name.strip().lower() == b'content-length'), 0)
+            if length is not None and len(data.partition(b'\r\n\r\n')[2]) >= length:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('proxy reply past the deadline')
+            sock.settimeout(remaining)
             part = sock.recv(4096)
             if not part:
                 break
@@ -125,7 +140,8 @@ def _proxy_head(proxy, head, timeout):
     parts = line.decode('ascii', 'replace').split(' ')
     if len(parts) != 3 or not parts[1].isdigit():
         return 0, 'malformed', b''
-    return int(parts[1]), parts[2], rest.partition(b'\r\n\r\n')[2]
+    body = rest.partition(b'\r\n\r\n')[2]
+    return int(parts[1]), parts[2], body if length is None else body[:length]
 
 
 def probe_proxied(proxy, host, timeout):

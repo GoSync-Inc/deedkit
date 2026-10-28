@@ -46,18 +46,26 @@ def post(connection, host, path, body, headers, remaining):
         # The deadline passed before the first request byte.
         raise EgressNotSent('receiver_deadline') from error
     connection.sendall(request + body)
-    status = b''
-    while b'\r\n' not in status:
-        connection.settimeout(remaining())
-        part = connection.recv(256)
-        if not part or len(status) + len(part) > 1024:
+    data, total = b'', 0
+    def receive(marker):
+        nonlocal data, total
+        while marker not in data:
+            connection.settimeout(remaining())
+            part = connection.recv(256)
+            total += len(part)
+            if not part or total > HEAD_LIMIT:
+                raise ValueError('invalid_receiver_response')
+            data += part
+    while True:
+        receive(b'\r\n')
+        match = re.fullmatch(rb'HTTP/1\.[01] ([0-9]{3})(?: [\x20-\x7e]*)?', data.split(b'\r\n', 1)[0])
+        if match is None:
             raise ValueError('invalid_receiver_response')
-        status += part
-    line = status.split(b'\r\n', 1)[0]
-    match = re.fullmatch(rb'HTTP/1\.[01] ([0-9]{3})(?: [\x20-\x7e]*)?', line)
-    if match is None:
-        raise ValueError('invalid_receiver_response')
-    return int(match[1])
+        if not 100 <= int(match[1]) < 200 or int(match[1]) == 101:
+            return int(match[1])
+        # An interim response (100 Continue, 103 Early Hints): skip its head; the final status follows it.
+        receive(b'\r\n\r\n')
+        data = data.split(b'\r\n\r\n', 1)[1]
 
 
 def _proxy_address(proxy, lane, remaining):
