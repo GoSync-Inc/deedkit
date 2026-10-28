@@ -42,21 +42,24 @@ SPACE = re.compile(r'[ \t\n\r]*')
 def claimed_tool(prefix):
     """The tool a JSON-RPC body names in its first 16 KiB, read before any more of it: parsed structurally, the
     top-level object's own `method` is tools/call, then its `params` object's own `name` (never nested metadata, a
-    batch, a repeated key or a member that ends past the prefix). Only how much to read; the parsed call decides."""
+    batch, a repeated key or a member that ends past the prefix). Members after the name are read to the prefix's end:
+    a repeated key there claims nothing, as json.loads keeps the last. Only how much to read; the parsed call decides."""
     text,decoder=prefix.decode('utf-8','ignore'),json.JSONDecoder()
+    class Repeated(Exception):pass
     def space(i):return SPACE.match(text,i).end()
     def members(i):
         if text[i:i+1]!='{':return
         i,seen=space(i+1),set()
         while text[i:i+1]=='"':
             key,i=decoder.raw_decode(text,i);i=space(i)
-            if key in seen or text[i:i+1]!=':':raise ValueError
+            if key in seen:raise Repeated
+            if text[i:i+1]!=':':raise ValueError
             seen.add(key);start=space(i+1)
             yield key,start
             i=space(decoder.raw_decode(text,start)[1])
             if text[i:i+1]!=',':return
             i=space(i+1)
-    method=None
+    method=name=None
     try:
         for key,start in members(space(0)):
             if key=='method':method=decoder.raw_decode(text,start)[0]
@@ -65,10 +68,10 @@ def claimed_tool(prefix):
                 for inner,at in members(start):
                     if inner=='name':
                         name=decoder.raw_decode(text,at)[0]
-                        return name if isinstance(name,str) else None
-                return None
+                        if not isinstance(name,str):return None
+    except Repeated:return None
     except (ValueError,RecursionError):pass
-    return None
+    return name
 
 WaitSeconds = Annotated[float, Field(strict=True,ge=0,le=25,allow_inf_nan=False)]
 LiveWaitSeconds = Annotated[float, Field(strict=True,ge=0,le=20,allow_inf_nan=False)]

@@ -61,7 +61,7 @@ QUEUE_GROUP_BRANCH = re.compile(re.escape(QUEUE_BRANCH_PREFIX) + r"pr-([1-9][0-9
 MAX_PAGES = 10
 MIN_FREE_BYTES = 15 * 1024**3
 BUILDS = {
-    "runtime": (".", "services/messaging/Dockerfile", "runtime", "import messaging_service, telegram_broker, telegram_session_owner, platform_contracts.release"),
+    "runtime": (".", "services/messaging/Dockerfile", "runtime", "import messaging_service.app, telegram_broker, telegram_session_owner, platform_contracts.release"),
     "indexer": (".", "services/messaging/Dockerfile", "indexer", "import messaging_service.file_index"),
     "enricher-local": (".", "services/messaging/Dockerfile", "enricher-local", "import messaging_service.enrichment"),
     "whatsapp-native": (".", "services/messaging/Dockerfile", "whatsapp-native", "import messaging_service.whatsapp_collector"),

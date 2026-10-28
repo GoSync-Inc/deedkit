@@ -12,6 +12,6 @@ UMask=0077
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/deedkit-backup-r2/venv/bin/python -m messaging_service.backup_r2_verifier --config /etc/deedkit-backup-r2/verifier.json
-TimeoutStartSec=21900s
+TimeoutStartSec=25500s
 TimeoutStopSec=180s
 KillMode=control-group

@@ -655,6 +655,15 @@ def test_production_messaging_stages_end_with_the_source_revision():
     assert {target for target, build in p.BUILDS.items() if build[1] == "services/messaging/Dockerfile"} == set(MESSAGING_STAGES)
 
 
+# spec: ANYM-300
+def test_the_runtime_image_smoke_imports_the_app_its_serve_command_loads():
+    # `python -m messaging_service serve` imports messaging_service.app; importing only the package passed an image
+    # whose API could not start (release N, 2026-10-28: platform_contracts.agent missing from the build context).
+    assert p.BUILDS["runtime"][2:] == ("runtime", "import messaging_service.app, telegram_broker, telegram_session_owner, "
+                                       "platform_contracts.release")
+    assert "from .app import create_app" in (Path(p.__file__).parents[1] / "services/messaging/messaging_service/__main__.py").read_text()
+
+
 def image_builder(monkeypatch, *, labels=None, env=None):
     calls, tagged = [], set()
     def command(argv, **kwargs):

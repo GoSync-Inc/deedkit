@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "verifier_configs": [
+    "/etc/deedkit-backup-r2/verifier.json",
+    "/etc/deedkit-calendar-backup-r2/verifier.json"
+  ]
+}
