@@ -36,6 +36,12 @@
       "externalId": "s:tests.test_telegram_receipts::test_fake_state_without_receipt_publisher_remains_compatible",
       "category": "helper",
       "reason": "only checks a test-double state without publish_receipts does not crash the drain"
+    },
+    {
+      "caseId": "896b8c20-a395-485c-ab4c-f5e9663353ef",
+      "externalId": "s:tests.test_audio_native::test_preinstalled_tiny_cpu_model_on_synthetic_speech",
+      "category": "duplicate",
+      "reason": "Optional real-model variant of test_local_whisper_inference_is_cpu_only_no_download_and_normalizes_complete_segments (ANYM-70, passes in CI); it skips unless ENRICHMENT_TEST_MODEL_DIR and a speech WAV are supplied, which CI never does, so it never gives evidence"
     }
   ]
 }
