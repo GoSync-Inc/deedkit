@@ -98,7 +98,9 @@ class Store:
             max_size=8,
             timeout=15,
             open=True,
-            kwargs={"row_factory": dict_row, "connect_timeout": 10},
+            # No server-side prepared statements: `service migrate` runs beside live services, and a cached
+            # SELECT * plan fails with "cached plan must not change result type" once a migration adds a column.
+            kwargs={"row_factory": dict_row, "prepare_threshold": None, "connect_timeout": 10},
         )
         self._local = threading.local()
 
