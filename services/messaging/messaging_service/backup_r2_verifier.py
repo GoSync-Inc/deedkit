@@ -244,14 +244,18 @@ class Docker:
             class Sink:
                 def write(self,data):
                     engine.check_reserve();return process.stdin.write(data)
-            r2.verify_object(receiver,client,receipt,Sink())
-            process.stdin.close()
+            # A helper that exits mid-stream breaks the pipe: stop streaming (never
+            # retried), wait for it within the deadline and report its own failure.
+            try:r2.verify_object(receiver,client,receipt,Sink());broken=False
+            except BrokenPipeError:broken=True
+            try:process.stdin.close()
+            except BrokenPipeError:broken=True
             while process.poll() is None:
                 self.check_reserve()
                 try:process.wait(timeout=min(1,self.remaining()))
                 except subprocess.TimeoutExpired:continue
             self.check_reserve()
-            if process.wait(timeout=self.remaining()):
+            if process.wait(timeout=self.remaining()) or broken:
                 failure='isolated_restore_failed'
                 try:
                     fact=r2.unique_json(private_file(payload/'failure.json',4096))

@@ -581,3 +581,50 @@ def test_receiver_timeout_never_leaks_into_a_later_healthy_stream(monkeypatch,ca
     data=r2.AGE_HEADER+os.urandom(r2.MIB);out=io.BytesIO()
     r2.verify_object({'bucket':'synthetic'},FlakyCloud(data,[]),stream_receipt(data),out)
     assert out.getvalue()==data
+
+
+class PipeStdin:
+    """The helper's stdin after the helper exited: every write breaks the pipe."""
+    def __init__(self):self.closed=False;self.writes=0
+    def write(self,data):self.writes+=1;raise BrokenPipeError('helper exited')
+    def close(self):self.closed=True
+
+
+class ExitedHelper:
+    """Synthetic helper that stops reading mid-stream, optionally leaving failure.json or hanging."""
+    def __init__(self,payload,fact,hangs):
+        self.stdin=PipeStdin();self.hangs=hangs;self.terminated=False
+        if fact is not None:
+            path=payload/'failure.json';path.write_bytes(fact);path.chmod(0o600)
+    def poll(self):return None if self.hangs and not self.terminated else 1
+    def wait(self,timeout):
+        import subprocess,time
+        if self.hangs and not self.terminated:
+            time.sleep(min(timeout,0.05));raise subprocess.TimeoutExpired('helper',timeout)
+        return 1
+    def terminate(self):self.terminated=True
+    def kill(self):self.terminated=True
+
+
+# spec: ANYM-603
+@pytest.mark.parametrize('fact,hangs,code',[
+    (r2.encoded({'v':1,'status':'failed','error':'restore_database_failed'}),False,'restore_database_failed'),
+    (None,False,'isolated_restore_failed'),
+    (r2.encoded({'v':1,'status':'failed','error':'storage_unavailable'}),False,'isolated_restore_failed'),
+    (None,True,'restore_deadline')],ids=['named','missing','invalid','hang'])
+def test_helper_exit_mid_stream_reports_its_failure_fact_not_a_generic_code(operator,monkeypatch,fact,hangs,code):
+    v,config,receiver,cloud,engine,_=operator
+    docker=v.Docker(0.3 if hangs else 60);helpers=[]
+    monkeypatch.setattr(docker,'setup',lambda *a:None)
+    monkeypatch.setattr(docker,'inspect_owned',lambda *a:{})
+    monkeypatch.setattr(v,'validate_helper_layout',lambda *a:None)
+    monkeypatch.setattr(r2,'verify_object',lambda receiver,client,receipt,out:out.write(b'synthetic-ciphertext'))
+    def popen(*args,**kwargs):
+        helpers.append(ExitedHelper(next(Path(config['directory']).glob('payload-*')),fact,hangs));return helpers[-1]
+    monkeypatch.setattr(v.subprocess,'Popen',popen)
+    engine.restore=docker.restore
+    with pytest.raises((RuntimeError,TimeoutError)):v.run(config,client=cloud,engine=engine)
+    directory=Path(config['directory'])
+    for name in ('status.json','last-failure.json'):assert json.loads((directory/name).read_text())['error']==code
+    assert len(helpers)==1 and helpers[0].stdin.writes==1 and helpers[0].stdin.closed
+    assert helpers[0].terminated==hangs and not Path(config['protected_file']).exists()
