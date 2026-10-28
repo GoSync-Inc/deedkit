@@ -776,7 +776,11 @@ first).
    no DNS, no other bridge, no internet, whatever the host firewall holds. Its one way out is the
    `delivery-egress` proxy, which alone joins the egress bridge and resolves and connects only to
    public addresses of hosts allowed by `private/delivery-policy.json`; operator receiver hosts must
-   be in `allow_hosts` too (SUBSCRIPTIONS.md, Host policy). Set `DELIVERY_RESOLVER=<ip>` in the
+   be in `allow_hosts` too, never left to `self_registration`, whose kill switch would then
+   cut them off at the proxy (SUBSCRIPTIONS.md, Host policy). Self-registered endpoints (ANYM-585): `deedkit admin
+   delivery-endpoints list` shows each one's `admission` (`self_registration` = admitted only by the
+   switch); `deedkit admin delivery-endpoints disable ID` stops one; `"self_registration": false` in the
+   policy file and `reload-delivery-policy` stop all of them (SUBSCRIPTIONS.md, Self-registration). Set `DELIVERY_RESOLVER=<ip>` in the
    project's env file, `<ip>` being the host's current upstream resolver (`/etc/resolv.conf`, or
    `/run/systemd/resolve/resolv.conf` behind systemd-resolved; not a new third party); the overlay
    passes it as the proxy's `dns`. The host rules are the second layer (a host step):
