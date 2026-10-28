@@ -7,6 +7,8 @@ any other class, unclassifiable evidence and a NULL class (rows written by N-1 c
 """
 from datetime import datetime
 
+from .envelope import validate
+
 REASON_VERSION = 1
 UNCLASSIFIED = 'unclassified'
 PLATFORMS = {'telegram': 'Telegram', 'whatsapp': 'WhatsApp'}
@@ -54,12 +56,18 @@ def _time(value):
     return parsed
 
 
+# A revision snapshot is the validated envelope plus these archive fields; its `chat` is the archive chat ID.
+SNAPSHOT_FIELDS = ('message', 'provider_chat', 'chat', 'revision')
+
+
 def _classify(retained, candidate):
+    # Both sides pass the ingest validation, so every field is in its domain (direction is incoming or outgoing,
+    # times carry a zone); anything else raises and is unclassified, never a known class (Astra r1 F2).
+    candidate = validate(candidate)
+    retained = validate({**{k: v for k, v in retained.items() if k not in SNAPSHOT_FIELDS},
+                         'chat': retained['provider_chat']})
     platform = candidate['platform']
-    if platform not in PLATFORMS or retained.get('platform') != platform: return UNCLASSIFIED
-    for key in ('direction', 'sender', 'body'):
-        if not isinstance(candidate[key], str) or not isinstance(retained[key], str): return UNCLASSIFIED
-    if not isinstance(candidate['media'], list) or not isinstance(retained['media'], list): return UNCLASSIFIED
+    if platform not in PLATFORMS or retained['platform'] != platform: return UNCLASSIFIED
     # archive.ingest: identity (sent_at, direction, sender) first, then content at one provider version.
     if _time(candidate['sent_at']) != _time(retained['sent_at']): field = 'sent_at'
     elif candidate['direction'] != retained['direction']: field = 'direction'
@@ -133,19 +141,30 @@ def listing(c, chat):
              'observed_at': r['observed_at']} for r in rows]
 
 
-def backfill(c, batch=BACKFILL_BATCH):
-    """Classifies rows without a stored class with the insert rule. Bounded (one keyset pass in batches),
-    idempotent (only NULL classes) and non-resolving (resolved_at and resolved_revision are never written)."""
-    after = ''
+# One backfill batch is its own short transaction: a lock wait or a slow batch fails it instead of holding
+# collectors behind it (Astra r1 F1). A failed batch leaves its rows NULL (read as unclassified); rerun to resume.
+BATCH_LOCK_TIMEOUT = "SET LOCAL lock_timeout='2s'"
+BATCH_STATEMENT_TIMEOUT = "SET LOCAL statement_timeout='10s'"
+
+
+def backfill(pool, batch=BACKFILL_BATCH, *, after_batch=None):
+    """Classifies rows without a stored class with the insert rule, after migrate() has committed. Bounded (one
+    keyset pass, each batch committed on its own), idempotent (only NULL classes) and non-resolving (resolved_at and
+    resolved_revision are never written). Returns the number of rows classified; `after_batch()` is a test hook."""
+    after, classified = '', 0
     while True:
-        rows = c.execute('''SELECT mc.receipt_digest,r.envelope,mr.snapshot FROM message_conflicts mc
-            LEFT JOIN ingest_receipts r ON r.digest=mc.receipt_digest
-            LEFT JOIN message_revisions mr ON mr.message=mc.message AND mr.revision=mc.observed_revision
-            WHERE mc.reason IS NULL AND mc.receipt_digest>%s ORDER BY mc.receipt_digest LIMIT %s''',
-            (after, batch)).fetchall()
-        if not rows: return
-        with c.cursor() as cur:
-            cur.executemany('''UPDATE message_conflicts SET reason=%s,reason_version=%s
-                WHERE receipt_digest=%s AND reason IS NULL''',
-                [(classify(r['snapshot'], r['envelope']), REASON_VERSION, r['receipt_digest']) for r in rows])
-        after = rows[-1]['receipt_digest']
+        with pool.connection() as c:
+            if not stored(c): return classified
+            c.execute(BATCH_LOCK_TIMEOUT);c.execute(BATCH_STATEMENT_TIMEOUT)
+            rows = c.execute('''SELECT mc.receipt_digest,r.envelope,mr.snapshot FROM message_conflicts mc
+                LEFT JOIN ingest_receipts r ON r.digest=mc.receipt_digest
+                LEFT JOIN message_revisions mr ON mr.message=mc.message AND mr.revision=mc.observed_revision
+                WHERE mc.reason IS NULL AND mc.receipt_digest>%s ORDER BY mc.receipt_digest LIMIT %s''',
+                (after, batch)).fetchall()
+            if not rows: return classified
+            with c.cursor() as cur:
+                cur.executemany('''UPDATE message_conflicts SET reason=%s,reason_version=%s
+                    WHERE receipt_digest=%s AND reason IS NULL''',
+                    [(classify(r['snapshot'], r['envelope']), REASON_VERSION, r['receipt_digest']) for r in rows])
+        classified += len(rows); after = rows[-1]['receipt_digest']
+        if after_batch: after_batch()

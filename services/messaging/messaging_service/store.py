@@ -1462,9 +1462,6 @@ class Store:
                     if target==17:
                         from .chat_evidence import backfill
                         backfill(c)
-                    if target==54:
-                        from .conflict_classes import backfill as classify_conflicts
-                        classify_conflicts(c)
                     c.execute('INSERT INTO archive_migrations(version,sha256) VALUES(%s,%s)',(target,sha))
                     c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'",(str(target),))
                 else:
@@ -1483,6 +1480,10 @@ class Store:
                  REVOKE ALL ON FUNCTION public.subscription_hint_references(uuid,bigint,bigint,text[],text[]) FROM PUBLIC;
                 END IF;
             END $$''')
+        # After the commit, in short batches of their own: conflicts without a class (054, or rows N-1 code wrote
+        # since) get one; a rerun of migrate resumes it (ANYM-557, Astra r1 F1).
+        from .conflict_classes import backfill as classify_conflicts
+        classify_conflicts(self.pool)
 
     def expand_status(self):
         return expand_status(self.pool.conninfo)

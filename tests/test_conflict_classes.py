@@ -106,7 +106,7 @@ def test_class_is_stored_at_insert_against_the_observed_revision(archive):
     assert resolved is not None
     with s.pool.connection() as c:
         c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL WHERE message=%s',(mid,))
-        backfill(c)
+    assert backfill(s.pool)==1
     assert stored(s,mid)=={'reason':'telegram_direction_equal_version','reason_version':REASON_VERSION,'resolved_at':resolved}
 
 
@@ -122,9 +122,11 @@ def test_backfill_is_bounded_idempotent_and_reads_malformed_or_n1_rows_as_unclas
         # Malformed legacy evidence: a receipt without the fields the class needs.
         c.execute('''UPDATE ingest_receipts SET envelope='{"platform":"telegram"}'::jsonb
             WHERE digest=(SELECT receipt_digest FROM message_conflicts WHERE message=%s)''',(bad,))
-        backfill(c,batch=2)
+    assert backfill(s.pool,batch=2)==5
+    with s.pool.connection() as c:
         first=c.execute('SELECT receipt_digest,reason,reason_version,resolved_at FROM message_conflicts ORDER BY 1').fetchall()
-        backfill(c,batch=2)
+    assert backfill(s.pool,batch=2)==0
+    with s.pool.connection() as c:
         assert c.execute('SELECT receipt_digest,reason,reason_version,resolved_at FROM message_conflicts ORDER BY 1').fetchall()==first
         # N-1 code inserts without a class after the backfill.
         row=c.execute('DELETE FROM message_conflicts WHERE message=%s RETURNING *',(legacy,)).fetchone()
@@ -135,6 +137,57 @@ def test_backfill_is_bounded_idempotent_and_reads_malformed_or_n1_rows_as_unclas
     conflicts=account(s,key)['conflicts']
     assert conflicts['attention']==2 and conflicts['known']==3 and conflicts['next_step']=='inspect_chat'
     assert {'class':'unclassified','count':2} in [{k:c[k] for k in ('class','count')} for c in conflicts['top_classes']]
+
+
+# spec: ANYM-557
+def test_backfill_commits_each_batch_so_ingest_and_resolution_never_wait_for_it(archive):
+    from messaging_service.conflict_classes import backfill
+    ar,s,key,_=archive
+    mids=[contradict(ar,f'c{n}',body=f'Другой {n}') for n in range(3)]
+    with s.pool.connection() as c:
+        c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL')
+    seen=[]
+    def between():
+        # A collector on its own connection, with a lock wait far below the batch bounds: a new conflict and a
+        # resolving edit of an already classified row both go through while the backfill is between batches.
+        with s.pool.connection() as c:
+            c.execute("SET lock_timeout='200ms'")
+            seen.append(c.execute('SELECT count(*) AS n FROM message_conflicts WHERE reason IS NOT NULL').fetchone()['n'])
+        if len(seen)==1:
+            contradict(ar,'during',body='Другой')
+            assert ar.ingest(event(provider_id='c0',body='Новая версия',updated_at='2026-10-01T12:05:00Z'))['outcome']=='edited'
+    assert backfill(s.pool,batch=1,after_batch=between)==3
+    # Each batch was committed when the next began; the conflict ingested in between was classified at insert.
+    assert seen==[1,3,4]
+    assert stored(s,mids[0])['resolved_at'] is not None and stored(s,mids[0])['reason']=='telegram_body_equal_version'
+    assert stored(s,stable_id('msg','archive-test','100','during'))['reason']=='telegram_body_equal_version'
+
+
+# spec: ANYM-557
+@pytest.mark.parametrize('candidate,retained',[
+    ({'direction':'sideways','sender':'43'},{}),
+    ({'sent_at':'2026-10-01T12:00:00'},{}),
+    ({'media':'not-a-list'},{}),
+    ({},{'direction':'sideways'}),
+    ({},{'provider_chat':None}),
+    ({'platform':'whatsapp'},{}),
+],ids=['candidate-direction','naive-time','media-type','retained-direction','retained-chat','platform-mix'])
+def test_malformed_evidence_with_present_fields_is_never_a_known_class(candidate,retained):
+    from messaging_service.conflict_classes import classify
+    base=event(body='Другой текст')
+    snapshot={**event(),'message':'m','provider_chat':'100','chat':'chat-id','revision':1}
+    assert classify(snapshot,base)=='telegram_body_equal_version'
+    assert classify({**snapshot,**retained},{**base,**candidate})=='unclassified'
+
+
+# spec: ANYM-557
+def test_migration_numbers_have_no_gap_so_a_later_lower_number_cannot_follow_an_applied_one():
+    from messaging_service.store import RUNTIME_SCHEMA
+    source=(ROOT/'services/messaging/messaging_service/store.py').read_text()
+    listed=[int(n) for n in re.findall(r"\((\d+),'\d{3}_[a-z0-9_]+\.sql'\)",source)]
+    files=sorted(int(p.name[:3]) for p in (ROOT/'services/messaging/messaging_service/migrations').glob('[0-9][0-9][0-9]_*.sql'))
+    # migrate() treats every number at or below the ledger as applied (Astra r1 F3): 054 ships after 053 exists.
+    assert listed==files==list(range(2,RUNTIME_SCHEMA+1))
 
 
 # spec: ANYM-557
