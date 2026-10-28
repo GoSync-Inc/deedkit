@@ -189,6 +189,18 @@ def test_whatsapp_sender_device_rule_needs_known_formatting_on_both_sides(archiv
 
 
 # spec: ANYM-612
+def test_whatsapp_sender_device_reread_resolves_no_open_conflict(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(whatsapp_event('900:7@lid'))['message']
+    assert ar.ingest(whatsapp_event('900@lid',formatting=wire()))['outcome']=='conflict'
+    assert ar.ingest(whatsapp_event('900:7@lid',body='contradiction'))['outcome']=='conflict'
+    # A later reread in the other device form states nothing about either open conflict.
+    assert ar.ingest(whatsapp_event('900@lid',updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='unchanged'
+    assert sender_rows(s,mid)==('900:7@lid',1,[],2)
+
+
+# spec: ANYM-612
 def test_telegram_sender_with_a_colon_is_not_a_whatsapp_device(archive):
     ar,s,key,_=archive
     ar.ingest(event(sender='900:7@lid'))

@@ -158,7 +158,8 @@ class Archive:
                 and fingerprint({**e,'sender':''})==old['content_hash']
                 and not formatting_changed)
             # The same WhatsApp sender with and without a device number, everything else equal,
-            # contradicts nothing: the retained sender, revision and sender profiles stay.
+            # contradicts nothing: the retained sender, revision and sender profiles stay, and it
+            # is no later evidence for an open conflict.
             sender_device_only=bool(old and e['platform']=='whatsapp' and old['sender']!=e['sender']
                 and not old['deleted'] and not e['deleted'] and whatsapp_user(old['sender']) is not None
                 and whatsapp_user(old['sender'])==whatsapp_user(e['sender'])
@@ -264,7 +265,7 @@ class Archive:
                 else:c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
                     (receipt,mid,old['revision'],updated))
-            elif outcome in ('edited','deleted','unchanged'):
+            elif outcome in ('edited','deleted','unchanged') and not sender_device_only:
                 # A repeated copy of the retained revision does not resolve an
                 # equal/newer conflicting observation. Only later evidence does.
                 c.execute('''UPDATE message_conflicts mc SET resolved_at=clock_timestamp(),
