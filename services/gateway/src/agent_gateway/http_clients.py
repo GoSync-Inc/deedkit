@@ -37,6 +37,8 @@ WAIT_ADMISSION = {
     ("messaging", "execute_messenger_operation"): ("waits", lambda a: (a.get("wait_s") or 0) > 0),
     **{("messaging", tool): ("waits", lambda a: (a.get("wait_s") or 0) > 0 and not a.get("dry_run"))
        for tool in ("change_message", "manage_chat", "change_contacts", "read_contacts")},
+    # ANYM-552: a live schedule waits 10 s by default (wait_s omitted), up to 25; a dry run never waits.
+    ("calendar", "schedule"): ("waits", lambda a: not a.get("dry_run") and (a.get("wait_s") is None or a["wait_s"] > 0)),
 }
 
 

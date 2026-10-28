@@ -73,6 +73,23 @@ def payload_strings(value, key=None):
     return set()
 
 
+def schema_words(schema):
+    """The enum and const strings of a tool's input schema: its own fixed words, never the caller's payload."""
+    if isinstance(schema, dict):
+        enum = schema.get("enum")
+        own = [schema.get("const"), *(enum if isinstance(enum, list) else [])]
+        return {w for w in own if isinstance(w, str)} | {w for v in schema.values() for w in schema_words(v)}
+    if isinstance(schema, list):
+        return {w for v in schema for w in schema_words(v)}
+    return set()
+
+
+def caller_payload(values, schema):
+    """payload_strings without the schema's fixed words and timestamps (ANYM-552): a continuation that echoes an
+    action such as "cancel" or the caller's start time carries no payload."""
+    return {s for s in payload_strings(values) - schema_words(schema) if not TIMESTAMP.fullmatch(s)}
+
+
 def sensitive(text):
     """A phone-shaped number or a file name, whoever wrote it: never relayed in backend guidance."""
     return bool(PHONE.search(text) or FILE_NAME.search(text))
@@ -111,7 +128,9 @@ def found(piece, text):
 
 def carries(value, payload):
     """The caller's payload, a phone number or a file name in any string of `value` outside a reference key."""
-    return any(sensitive(s) or any(found(p, s) for p in payload) for s in exposed(value))
+    # A whole timestamp (a schedule's start) is no phone number, though its digits match PHONE (ANYM-552).
+    return any((sensitive(s) and not TIMESTAMP.fullmatch(s)) or any(found(p, s) for p in payload)
+               for s in exposed(value))
 
 
 def relayed_error(detail, runnable, read_only, payload):
@@ -692,7 +711,7 @@ class Dispatch:
                 error.detail = relayed_error(
                     error.detail, lambda value: self.runnable(value, visible, module, current, principal, caps),
                     {n for n in visible if CATALOG[n].get("annotations", {}).get("readOnlyHint", False)},
-                    payload_strings(resolver_query(name, values)))
+                    caller_payload(resolver_query(name, values), tool.get("inputSchema")))
             raise
         if module == "messaging":
             result = self.next_call(result, snapshot, agent, caps)

@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from datetime import datetime, timezone
 import json
 import time
 from typing import Literal
@@ -16,6 +17,7 @@ from starlette.routing import Route
 
 from family_calendar.errors import CalendarError
 from .core import TIME_FORMAT, FamilyService, window
+from .schedule import DEFAULT_WAIT_S, Scheduler
 from .store import ref
 
 agent_key = ContextVar("family_calendar_agent_key", default="")
@@ -130,6 +132,25 @@ class Assignments(Strict):
     end: str
 
 
+class EventQuery(Strict):
+    title: str = Field(min_length=1, max_length=256)
+    date: str
+
+
+class Schedule(Strict):
+    # Optional only for a confirm_token apply: the token carries the request it previewed.
+    action: Literal["create", "move", "cancel"] | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=256)
+    start: str | None = None
+    duration: int | None = Field(default=None, ge=5, le=1440)
+    calendar: str | None = Field(default=None, min_length=1, max_length=256)
+    event: str | EventQuery | None = None
+    dry_run: bool = False
+    confirm_token: str | None = Field(default=None, max_length=256)
+    request_id: str | None = None
+    wait_s: int | None = Field(default=None, ge=0, le=25)
+
+
 MODELS = {
     "capabilities": Empty,
     "calendars": Empty,
@@ -141,6 +162,7 @@ MODELS = {
     "operation": Operation,
     "assignment": Assignment,
     "assignments": Assignments,
+    "schedule": Schedule,
 }
 DESCRIPTIONS = {
     "capabilities": "Read-only. Granted calendars with allowed event actions, plus constraints: accepted "
@@ -183,6 +205,17 @@ DESCRIPTIONS = {
     "operation": "Read durable receipts. Unknown results require reconciliation; never submit a replacement create.",
     "assignment": "Assign a dropoff/pickup/stay interval. Does not claim acceptance or create provider projections.",
     "assignments": "List family responsibilities in a bounded window, with versions for conditional changes.",
+    "schedule": "Create, move or cancel one guest-free event in one call. create: title, start, duration in "
+    "minutes (default 30), calendar (full name or calendar_ref; default: the family's default calendar). move "
+    "(start, optional duration) and cancel act only on event (an event_ref from agenda); event {title, date} "
+    "lists the matching events as selection_required candidates, each previewing its change by event_ref. "
+    "start: ISO 8601; without an offset it is read in the family timezone; YYYY-MM-DD makes an all-day event. "
+    "dry_run=true returns state previewed, the exact plan and a confirm_token valid 600 s; apply it with "
+    "{confirm_token} alone: the token runs exactly that plan, once; a repeat returns the same operation. A plan "
+    "that expired or whose calendar or scope changed returns preview_stale with a fresh preview and token. "
+    "A live call without a token needs a request_id (one per intent; keep it on retries). Waits up to wait_s "
+    "(default 10, max 25) for the result: succeeded with event_ref, else the operation and next "
+    "calendar_operation; unknown means reconcile, never create again. Every result states timezone and now.",
 }
 
 READ = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
@@ -198,6 +231,7 @@ ANNOTATIONS = {
     },
     "apply": WRITE,
     "assignment": WRITE,
+    "schedule": WRITE,
 }
 HINTS = {
     "invalid_time": TIME_FORMAT,
@@ -209,7 +243,8 @@ HINTS = {
 
 
 # Errors whose fixed-shape details the agent needs to choose its next action.
-PUBLIC_DETAILS = {"nothing_to_project", "nothing_to_unproject"}
+PUBLIC_DETAILS = {"nothing_to_project", "nothing_to_unproject", "selection_required", "preview_stale",
+                  "invalid_arguments", "event_not_found"}
 
 
 def failure(code, field_errors=None, details=None):
@@ -284,6 +319,19 @@ class Gateway:
             "poll_with_refresh": False,
         }
 
+    async def schedule(self, key, arguments):
+        """calendar_schedule: one call, then a bounded wait for a live operation to settle (ANYM-544 admission)."""
+        wait_s = arguments.pop("wait_s", DEFAULT_WAIT_S)
+        scheduler = Scheduler(self.service)
+        result, operation_id, family = await asyncio.to_thread(scheduler.schedule, key, arguments)
+        if operation_id and result["state"] in ("pending", "running"):
+            deadline = time.monotonic() + wait_s
+            while time.monotonic() < deadline and not await asyncio.to_thread(scheduler.settled, operation_id):
+                await asyncio.sleep(min(0.25, max(0, deadline - time.monotonic())))
+            result = await asyncio.to_thread(scheduler.replay, operation_id, family)
+        return {**result, "timezone": family["timezone"],
+                "now": datetime.now(timezone.utc).astimezone(family["zone"]).isoformat(timespec="seconds")}
+
     async def call(self, key, name, arguments):
         if name not in MODELS:
             raise CalendarError("not_found_or_forbidden")
@@ -291,6 +339,8 @@ class Gateway:
             value = MODELS[name].model_validate(arguments).model_dump(exclude_none=True)
         except ValidationError:
             raise CalendarError("invalid_request") from None
+        if name == "schedule":
+            return await self.schedule(key, value)
         method = getattr(self.service, "family" if name == "members" else name)
         if name not in {"agenda", "slots"}:
             return await asyncio.to_thread(method, key, **value)

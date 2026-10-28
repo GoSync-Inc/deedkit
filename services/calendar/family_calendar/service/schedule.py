@@ -89,16 +89,21 @@ class Scheduler:
 
     def calendar(self, name, calendars, request):
         """The one calendar `name` names in full (label, case-insensitive, or calendar_ref); otherwise the choice."""
-        exact = [c for c in calendars if name in (c["calendar_ref"],) or c["label"].casefold() == name.casefold()]
+        exact = [c for c in calendars if name == c["calendar_ref"] or c["label"].casefold() == name.casefold()]
         if len(exact) == 1:
             return exact[0]
+        raise self.choice(exact or [c for c in calendars if name.casefold() in c["label"].casefold()] or calendars,
+                          request)
+
+    @staticmethod
+    def choice(calendars, request):
+        """The calendars to choose from, each previewing the request in it; none visible: not_found_or_forbidden."""
         if not calendars:
-            raise CalendarError("not_found_or_forbidden")
-        close = exact or [c for c in calendars if name.casefold() in c["label"].casefold()] or calendars
-        raise selection([
+            return CalendarError("not_found_or_forbidden")
+        return selection([
             {"id": c["calendar_ref"], "label": c["label"][:200], "kind": "calendar",
              "next": {"tool": TOOL_NAME, "arguments": {**request, "calendar": c["calendar_ref"], "dry_run": True}}}
-            for c in close
+            for c in calendars
         ])
 
     # --- resolution: one request to one plan action --------------------------------------------------------
@@ -125,7 +130,7 @@ class Scheduler:
             elif family["default"]:
                 cal = family["default"]
             else:
-                self.calendar("", family["creatable"], request)
+                raise self.choice(family["creatable"], request)
             start = request["start"]
             if isinstance(start, str) and DATE_VALUE.fullmatch(start):
                 if "duration" in request:
@@ -302,7 +307,10 @@ class Scheduler:
         return operation_id
 
     def lock(self, c, *parts):
-        c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("".join(parts),))
+        """Never waits: a waiting caller would hold a pooled connection the holder may need (pool of 8)."""
+        if not c.execute("SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS ok", ("".join(parts),)
+                         ).fetchone()["ok"]:
+            raise CalendarError("in_progress")
 
     # --- the tool ----------------------------------------------------------------------------------------
 
@@ -329,7 +337,7 @@ class Scheduler:
                 "next": {"tool": TOOL_NAME, "arguments": {**arguments, "request_id": PLACEHOLDER_REQUEST_ID}},
             })
         with self.store.transaction() as c:
-            # The same lock as calendar_apply: one request_id, one operation, whichever tool used it.
+            # The same lock key as calendar_apply: one request_id, one operation, whichever tool used it.
             self.lock(c, p["id"], request_id)
             old = c.execute(
                 "SELECT o.id,p.tool,p.request FROM operations o JOIN plans p ON p.id=o.plan_id "

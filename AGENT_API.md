@@ -126,6 +126,8 @@ A backend error is relayed through these filters; each drops a field and never r
 - A `hint`, `next` or candidate is dropped when a string of it outside an ID or reference field carries the caller's
   payload (a string the caller sent outside an ID or reference field, or a word of it of 6 or more characters; a
   payload shorter than 4 characters counts as a whole word), a phone-shaped number or a file name, whoever wrote it.
-  A candidate's `last_activity` that is not a timestamp is dropped.
+  A candidate's `last_activity` that is not a timestamp is dropped. An enum or const value of the failing tool's input
+  schema (an `action` such as `cancel`) and a string that is a whole timestamp (a `start`) are not payload, and a whole
+  timestamp is not phone-shaped, so a candidate that previews the same change by its ID keeps its `next` (ANYM-552).
 - `selection_required` keeps a top-level `next` only when it is read-only; a mutating one stays on candidates only.
 - Candidates must pass the shared shape and are cut at 10; `more: true` stays only with a read-only top-level `next`.
