@@ -1,6 +1,8 @@
+-- rollout: manual
 -- ANYM-535: send.failed and source.health journal rows. Neither names an archived message: every
 -- reader outside the subscription path joins messages (update_queries.py), so these rows stay
--- visible only to subscriptions that select them.
+-- visible only to subscriptions that select them. Additive: older runtimes write and read neither
+-- kind. Manual because of the definer functions and the matcher grant (subscription_role.sql).
 ALTER TABLE events ALTER COLUMN message DROP NOT NULL;
 -- The last source.health status journaled for the account; NULL until the first observation, which
 -- is a baseline and journals nothing.
