@@ -26,7 +26,8 @@ approval. The API intentionally does not accept `approved: true` as proof.
 
 ### Translated sends
 
-DeedKit translates nothing and stores no original (ANYM-539). When the owner asks
+DeedKit translates nothing and stores no separate original-language text or
+instruction beside a send (ANYM-539). When the owner asks
 for a message in another language, the agent translates it with its own model,
 and the translation is the text that is sent. When the sent text is in a language
 other than the owner's instruction, the confirmation shows the exact
@@ -35,7 +36,8 @@ other than the owner's instruction, the confirmation shows the exact
 instruction the text came from. The owner confirms the sent text, not the
 instruction. A change to the translation after the preview needs a new preview and
 a new confirmation. The agent keeps the owner's instruction in its own conversation
-log: the send record holds only the sent text.
+log. The send record keeps what it keeps for any send (source, rendered and wire
+text, FORMATTING.md), nothing more.
 
 The same rule holds for an upload caption (`send_file`) and an edit of a sent
 message (`edit_message`), which have no `preview_message` step. There the owner
