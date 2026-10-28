@@ -210,3 +210,70 @@ def test_core_future_native_visual_acceptance_are_independent(tmp_path):
             await t.close()
 
     asyncio.run(exercise())
+
+
+# spec: ANYM-365
+def test_mock_matrix_stale_etag_update_gets_412(tmp_path):
+    server = MemoryDAV()
+    answers = []
+
+    def handler(req):
+        response = server(req)
+        answers.append((req.method, str(req.url), req.headers.get("if-match"), response.status_code))
+        return response
+
+    async def exercise():
+        t = DAVTransport("a", "secret", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        j = Journal(tmp_path / "run", "a", "cal1")
+        try:
+            pilot = Pilot(CalDAVAdapter("a", t), j, "https://caldav.icloud.com/a/c/", environment="mock")
+            report = await pilot.run()
+            assert report["checks"]["conditional_write"]["status"] == "server_verified"
+            stale = j.find("conditional:stale-version")
+            assert (stale["state"], stale["error_code"]) == ("conflict", "version_conflict")
+            href, etag = stale["intent"]["href"], stale["intent"]["etag"]
+            # The new-version update and the stale update carry the same If-Match: the first wins, the second gets 412.
+            assert [a[3] for a in answers if a[:3] == ("PUT", href, etag)] == [201, 412]
+            assert server.resources[href][0] == j.find("conditional:new-version")["intent"]["desired"]
+        finally:
+            j.close()
+            await t.close()
+
+    asyncio.run(exercise())
+
+
+# spec: ANYM-365
+@pytest.mark.parametrize("change", ["etag", "data"])
+def test_failed_old_series_trim_keeps_changed_new_part(tmp_path, change):
+    server = MemoryDAV()
+    original = server.__call__
+    pilot = None
+
+    def handler(req):
+        if req.method == "PUT" and req.headers.get("if-match"):
+            # Someone edits the new future part before the trim of the old series is refused.
+            href = pilot._href("future-fault-next")
+            data, etag = server.resources[href]
+            server.resources[href] = (
+                (data, '"edited"') if change == "etag" else (data.replace(b"[Family Pilot]", b"[Edited]"), etag)
+            )
+            return httpx.Response(412)
+        return original(req)
+
+    async def exercise():
+        nonlocal pilot
+        t = DAVTransport("a", "secret", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        j = Journal(tmp_path / "run", "a", "cal1")
+        try:
+            pilot = Pilot(CalDAVAdapter("a", t), j, "https://caldav.icloud.com/a/c/", environment="mock")
+            with pytest.raises(CalendarError, match="version_conflict"):
+                await pilot._future("future-fault")
+            assert j.find("future-fault:trim-past")["state"] == "conflict"
+            assert pilot._href("future-fault") in server.resources
+            assert pilot._href("future-fault-next") in server.resources
+            assert j.find("future-fault:compensate-new") is None
+        finally:
+            j.close()
+            await t.close()
+
+    asyncio.run(exercise())

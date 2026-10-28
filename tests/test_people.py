@@ -81,6 +81,22 @@ def test_people_invalid_parameters(seeded,kwargs):
     with pytest.raises(APIError):seeded[0].search_people(seeded[1],**kwargs)
 
 
+class LookupReached(Exception):pass
+class NoLookup:
+    def __getitem__(self,key):raise LookupReached(key)
+    def execute(self,*args):raise LookupReached('execute')
+
+# spec: ANYM-44
+@pytest.mark.parametrize('kwargs,code',[({'query':'q'*201},'invalid_filter'),({'after':'a'*4097},'invalid_filter'),
+    ({'query':None},'invalid_filter'),({'after':'x\x00'},'invalid_filter'),({'accounts':'oops'},'invalid_filter'),
+    ({'chats':[True]},'invalid_filter'),({'limit':True},'invalid_limit')])
+def test_people_parameter_codes_and_length_bounds_before_any_lookup(kwargs,code):
+    from messaging_service.people_candidates import search_people
+    with pytest.raises(APIError) as error:search_people(None,NoLookup(),NoLookup(),**kwargs)
+    assert error.value.code==code
+    # The bound itself is accepted: validation passes and the first lookup is reached.
+    with pytest.raises(LookupReached):search_people(None,NoLookup(),NoLookup(),query='q'*200,after='a'*4096)
+
 def test_telegram_cached_sender_has_no_network_lookup():
     m=message(1);m.sender=NS(first_name='Anna',last_name='Example',username='anna_example')
     value=telegram_message('fixture',m)

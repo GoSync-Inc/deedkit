@@ -133,6 +133,24 @@ def test_invalid_native_audio_does_not_reach_provider(tmp_path):
         infer(profile(tmp_path), 'audio', path, 'audio/wav', transport=httpx.MockTransport(forbidden))
 
 
+# spec: ANYM-395
+@pytest.mark.parametrize('kind', ['no_audio_stream', 'no_duration'])
+def test_readable_file_without_audio_stream_or_duration_does_not_reach_provider(tmp_path, kind):
+    if kind == 'no_audio_stream':
+        path, mime = tmp_path/'synthetic.mp4', 'video/mp4'
+        subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-f', 'lavfi', '-i', 'color=c=black:s=16x16:d=1',
+                        '-c:v', 'mpeg4', '-threads', '1', str(path)], check=True, timeout=10,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        path, mime = tmp_path/'synthetic.wav', 'audio/wav'
+        with wave.open(str(path), 'wb') as out:
+            out.setnchannels(1); out.setsampwidth(2); out.setframerate(16000); out.writeframes(b'')
+    def forbidden(_):
+        pytest.fail('Audio without a known duration must never be submitted')
+    with pytest.raises(ModelError, match='^audio_duration_unknown$'):
+        infer(profile(tmp_path), 'audio', path, mime, transport=httpx.MockTransport(forbidden))
+
+
 def test_optional_cpu_package_loads_without_gpu_or_model_download():
     if os.environ.get('REQUIRE_NATIVE_AUDIO') != '1':
         pytest.importorskip('faster_whisper')

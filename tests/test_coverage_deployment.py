@@ -313,8 +313,9 @@ def probe(code, *arguments, **environment):
 
 class HostBoundServer:
     """Synthetic loopback server with the service's Host rule and health path."""
-    def __init__(self, path, allowed):
+    def __init__(self, path, allowed, address='127.0.0.1'):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import socket
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 ok = self.path == path and self.headers.get('Host') in allowed and 'Origin' not in self.headers
@@ -322,7 +323,8 @@ class HostBoundServer:
                 self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'{}')
             def log_message(self, *args):
                 pass
-        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        family = socket.AF_INET6 if ':' in address else socket.AF_INET
+        self.server = type('Server', (ThreadingHTTPServer,), {'address_family': family})((address, 0), Handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
     def __enter__(self):
@@ -383,6 +385,37 @@ def test_calendar_healthcheck_uses_the_service_port_bind_and_allowed_hosts(tmp_p
         allowed.clear()
         assert probe(code, FCS_DATA_DIR=str(tmp_path)) == 1
     assert probe(code, FCS_DATA_DIR=str(tmp_path / 'missing')) == 1
+
+
+def specific_bind_server(path, allowed, address):
+    # Listens only on the bind address: a probe that dials 127.0.0.1 instead finds no listener.
+    try:
+        return HostBoundServer(path, allowed, address)
+    except OSError:
+        pytest.skip(f'{address} is not a local address on this host')
+
+
+# spec: ANYM-402
+@pytest.mark.parametrize('bind', ['127.0.0.2', '::1'])
+def test_api_healthcheck_requests_a_specific_bind_address(bind):
+    code, _ = healthcheck('api')
+    with specific_bind_server('/healthz', {'anymsg.example.invalid'}, bind) as server:
+        settings = {'PROBE_BIND': bind, 'PROBE_PORT': str(server.port)}
+        assert probe(code, PROBE_ALLOWED_HOSTS='anymsg.example.invalid', **settings) == 0
+        assert probe(code, PROBE_ALLOWED_HOSTS='anymsg.example.invalid', **{**settings, 'PROBE_BIND': '0.0.0.0'}) == 1
+
+
+# spec: ANYM-402
+@pytest.mark.parametrize('bind', ['127.0.0.2', '::1'])
+def test_calendar_healthcheck_requests_a_specific_bind_address(tmp_path, bind):
+    code, _ = healthcheck('calendar-api')
+    with specific_bind_server('/health', {'calendar-api:13232'}, bind) as server:
+        settings = {'port': server.port, 'bind': bind, 'allowed_hosts': ['calendar-api:13232']}
+        (tmp_path / 'service').mkdir(mode=0o700)
+        (tmp_path / 'service/gateway.json').write_text(json.dumps(settings))
+        assert probe(code, FCS_DATA_DIR=str(tmp_path)) == 0
+        (tmp_path / 'service/gateway.json').write_text(json.dumps({**settings, 'bind': '0.0.0.0'}))
+        assert probe(code, FCS_DATA_DIR=str(tmp_path)) == 1
 
 
 def synthetic_release_clone(tmp_path):

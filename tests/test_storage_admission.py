@@ -80,6 +80,37 @@ def test_media_config_default_preserves_larger_capture_floor(tmp_path,platform,
         assert parsed['disk_reserve_bytes']==capture_gib*1024**3
 
 
+def collector_configuration(tmp_path,platform,**extra):
+    cfg={'enabled':True,'account':'synthetic','permit_file':str(tmp_path/'permit'),'disk_reserve_bytes':1024**3,**extra}
+    permit={'account':'synthetic','prior_clients_stopped':True}
+    if platform=='telegram':
+        from messaging_service.telegram_collector import configuration
+        cfg.update(credentials_file=str(tmp_path/'credentials'),session_file=str(tmp_path/'session.session'),
+            spool_directory=str(tmp_path/'spool'))
+        credentials=tmp_path/'credentials'
+        credentials.write_text(json.dumps({'api_id':1,'api_hash':'a'*32,'expected_user_id':1}))
+        credentials.chmod(0o600);permit['expected_user_id']=1
+    else:
+        from messaging_service.whatsapp_collector import configuration
+        cfg.update(expected_wid='123456789@c.us',session_directory=str(tmp_path/'session'),
+            events_directory=str(tmp_path/'events'),pages_directory=str(tmp_path/'pages'),
+            chromium_executable='/usr/bin/chromium',node_executable='/usr/bin/node')
+        permit['expected_wid']=cfg['expected_wid']
+    path=tmp_path/'configuration';path.write_text(json.dumps(cfg));path.chmod(0o600)
+    (tmp_path/'permit').write_text(json.dumps(permit));(tmp_path/'permit').chmod(0o600)
+    result=configuration(path)
+    return result[0] if platform=='telegram' else result
+
+
+# spec: ANYM-65
+@pytest.mark.parametrize('platform',['telegram','whatsapp'])
+def test_media_disk_reserve_is_capped_at_100_gib(tmp_path,platform):
+    parsed=collector_configuration(tmp_path,platform,media_disk_reserve_bytes=100*1024**3)
+    assert parsed['media_disk_reserve_bytes']==100*1024**3
+    with pytest.raises(ValueError,match='invalid_media_disk_reserve_bytes'):
+        collector_configuration(tmp_path,platform,media_disk_reserve_bytes=100*1024**3+1)
+
+
 def test_expired_streaming_reservation_prevents_any_write(tmp_path):
     writer=BlobWriter(tmp_path/'blobs',reserve_bytes=0)
     guard=MediaReservation(8,datetime.now(timezone.utc)-timedelta(seconds=1))
