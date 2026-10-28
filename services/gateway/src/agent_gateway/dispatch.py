@@ -51,13 +51,16 @@ CALENDAR_CONSTRAINTS = {
 # A request key that names something the caller already chose (an ID, an account, a mode); any other string the
 # caller sent is payload: message text, file names, phone numbers, queries.
 REFERENCE_KEY = re.compile(r"(?:^|_)(?:ids?|digest|ref|token)$|^(?:account|chat|person|sender|receipt|operation|"
-                           r"consumer|reply_to|network|kind|view|detail|direction|order|format|status|live|modules|tool|purpose)$")
+                           r"consumer|reply_to|network|kind|view|detail|direction|order|format|status|live|modules|tool|"
+                           r"purpose|calendar)$")
 # platform_resolve_target's `to` (ANYM-545) is a reference only when it holds an exact archive ID or person UUID.
 EXACT_TO = re.compile(r"(?:chat|msg)_[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 PHONE = re.compile(r"\+?\d(?:[\s().-]?\d){6,}")
 # A name, a dot and an extension of 1-10 letters or digits with at least one letter (.c, .7z, .sqlite3).
 FILE_NAME = re.compile(r"[\w-]+\.(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{1,10}\b")
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
+# The fields a whole timestamp of the caller may stand in without counting as payload (caller_payload).
+TIME_KEY = re.compile(r"start|end|date")
 MIN_PAYLOAD, MIN_TOKEN = 4, 6
 
 
@@ -73,21 +76,46 @@ def payload_strings(value, key=None):
     return set()
 
 
-def schema_words(schema):
-    """The enum and const strings of a tool's input schema: its own fixed words, never the caller's payload."""
-    if isinstance(schema, dict):
-        enum = schema.get("enum")
-        own = [schema.get("const"), *(enum if isinstance(enum, list) else [])]
-        return {w for w in own if isinstance(w, str)} | {w for v in schema.values() for w in schema_words(v)}
-    if isinstance(schema, list):
-        return {w for v in schema for w in schema_words(v)}
-    return set()
+def branches(schema, defs):
+    """The object schemas `schema` stands for: itself, its anyOf/oneOf/allOf members and local $defs references."""
+    if not isinstance(schema, dict):
+        return []
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        return branches(defs.get(ref.removeprefix("#/$defs/")), defs)
+    nested = [b for k in ("anyOf", "oneOf", "allOf") if isinstance(schema.get(k), list) for s in schema[k]
+              for b in branches(s, defs)]
+    return [schema, *nested]
 
 
-def caller_payload(values, schema):
-    """payload_strings without the schema's fixed words and timestamps (ANYM-552): a continuation that echoes an
-    action such as "cancel" or the caller's start time carries no payload."""
-    return {s for s in payload_strings(values) - schema_words(schema) if not TIMESTAMP.fullmatch(s)}
+def fixed(value, schema, key, defs):
+    """A caller string its own field fixes (ANYM-552): one of that field's enum or const words, or a whole
+    timestamp in a declared time field (TIME_KEY). The same words in any other field stay payload."""
+    if schema is None:
+        return False
+    for branch in branches(schema, defs):
+        enum = branch.get("enum")
+        if value == branch.get("const") or (isinstance(enum, list) and value in enum):
+            return True
+    return bool(key and TIME_KEY.fullmatch(key) and TIMESTAMP.fullmatch(value))
+
+
+def caller_payload(value, schema, key=None, defs=None):
+    """payload_strings, walking the tool's input schema beside the values: a continuation that echoes the
+    caller's action ("cancel") or start time carries no payload; free text, titles and queries still do."""
+    if defs is None:
+        defs = schema.get("$defs", {}) if isinstance(schema, dict) else {}
+    if isinstance(value, dict):
+        fields = {}
+        for branch in branches(schema, defs):
+            fields.update(branch.get("properties") if isinstance(branch.get("properties"), dict) else {})
+        return {s for k, v in value.items() for s in caller_payload(v, fields.get(k), k, defs)}
+    if isinstance(value, list):
+        items = [b["items"] for b in branches(schema, defs) if isinstance(b.get("items"), dict)]
+        return {s for v in value for s in caller_payload(v, items[0] if items else None, key, defs)}
+    if isinstance(value, str) and fixed(value, schema, key, defs):
+        return set()
+    return payload_strings(value, key)
 
 
 def sensitive(text):

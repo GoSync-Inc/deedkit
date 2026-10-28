@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import secrets
+import threading
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -99,6 +100,7 @@ class Store:
             open=True,
             kwargs={"row_factory": dict_row, "connect_timeout": 10},
         )
+        self._local = threading.local()
 
     def close(self):
         self.pool.close()
@@ -114,6 +116,10 @@ class Store:
 
     @contextmanager
     def transaction(self):
+        bound = getattr(self._local, "conn", None)
+        if bound is not None:
+            yield bound
+            return
         try:
             with self.pool.connection() as conn:
                 conn.execute(
@@ -122,6 +128,18 @@ class Store:
                 yield conn
         except (PoolTimeout, psycopg.OperationalError):
             raise CalendarError("database_unavailable") from None
+
+    @contextmanager
+    def bound(self):
+        """One transaction that every store call of this thread joins until it ends (ANYM-552): a caller that holds
+        a pooled connection never waits for a second one, so concurrent callers cannot drain the pool of 8."""
+        outer = getattr(self._local, "conn", None)
+        with self.transaction() as conn:
+            self._local.conn = conn
+            try:
+                yield conn
+            finally:
+                self._local.conn = outer
 
     def migrate(self, through=None):
         # One transaction for all pending versions; an applied file is never edited, only a new one added.

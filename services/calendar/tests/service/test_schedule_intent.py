@@ -1,6 +1,7 @@
 """calendar_schedule: create, move or cancel one event in one call (ANYM-552)."""
 import asyncio
 from datetime import datetime
+import json
 from pathlib import Path
 import random
 import sys
@@ -8,6 +9,7 @@ import threading
 import time
 from uuid import uuid4
 
+import psycopg
 import pytest
 
 from family_calendar.errors import CalendarError
@@ -17,7 +19,7 @@ from family_calendar.service.core import READ, WRITE, FamilyService
 from family_calendar.service.schedule import Scheduler
 from family_calendar.service.store import Store
 from family_calendar.service.worker import Worker
-from tests.service.test_guardian_rules import family
+from tests.service.test_guardian_rules import family, roles, schema_one  # noqa: F401 (fixtures)
 from tests.service.test_projection import Fake
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -214,6 +216,10 @@ def test_expired_plan_is_stale_with_a_fresh_plan(store):
     assert call(store, key, {"confirm_token": stale["confirm_token"]}, fake)["state"] == "succeeded"
     # A token-only apply has no caller request_id to show.
     assert "request_id" not in call(store, key, {"confirm_token": stale["confirm_token"]}, fake)
+    # A consumed plan replays its operation after expiry too.
+    store.query("UPDATE plans SET expires_at=now()-interval '1 second' WHERE operation_id IS NOT NULL")
+    assert call(store, key, {"confirm_token": stale["confirm_token"]}, fake)["state"] == "succeeded"
+    assert len(fake.sent) == 1
 
 
 # spec: ANYM-552
@@ -357,3 +363,140 @@ def test_random_sequences_keep_one_plan_one_operation(store, seed):
         elif move == "expire":
             store.query("UPDATE plans SET expires_at=now()-interval '1 second' WHERE operation_id IS NULL")
     assert len(fake.sent) == len(operations) == store.one("SELECT count(*) AS n FROM operations")["n"]
+
+
+# spec: ANYM-552
+def test_runtime_gateway_role_schedules_after_db_roles(schema_one, roles):
+    apply_roles, connect = roles
+    schema_one.migrate()
+    key = setup(schema_one, second=True)
+    apply_roles()
+    gateway_store, worker_store, fake = connect("gateway"), connect("worker"), Provider()
+    scheduler = Scheduler(FamilyService(gateway_store))
+    preview = scheduler.schedule(key, {**CREATE, "calendar": "A", "dry_run": True})[0]
+    result, operation_id, family_ = scheduler.schedule(key, {"confirm_token": preview["confirm_token"]})
+    asyncio.run(Worker(worker_store, fake).run_operation(operation_id))
+    assert scheduler.replay(operation_id, family_)["state"] == "succeeded"
+    assert scheduler.schedule(key, {**CREATE, "calendar": "A", "title": "Chess", "request_id": "req-role-1"})[1]
+    with pytest.raises(CalendarError) as caught:
+        scheduler.schedule(key, {**CREATE, "request_id": "req-role-2"})
+    assert caught.value.code == "selection_required"
+    chosen = caught.value.details["candidates"][0]["next"]["arguments"]
+    assert scheduler.schedule(key, chosen)[0]["state"] == "previewed"
+    # The runtime role marks and binds plans; what a plan does stays insert-only.
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with gateway_store.transaction() as c:
+            c.execute("UPDATE plans SET payload='{}'::jsonb WHERE id=%s", (result["operation"]["id"],))
+
+
+# spec: ANYM-552
+def test_distinct_concurrent_schedules_never_drain_the_pool(store, monkeypatch):
+    key, n = setup(store), 8  # the store's pool max_size
+    barrier, lock = threading.Barrier(n, timeout=10), Scheduler.lock
+
+    def held(self, c, *parts):
+        lock(self, c, *parts)
+        barrier.wait()  # every caller holds its transaction at once, then plans and validates inside it
+
+    monkeypatch.setattr(Scheduler, "lock", held)
+    results = [None] * n
+
+    def one(i):
+        results[i] = call(store, key, {**CREATE, "title": "Swim %d" % i, "request_id": "req-pool-%d" % i})
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    started = time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert all(r and r.get("state") == "pending" for r in results), results
+    assert time.monotonic() - started < 10
+    assert FamilyService(store).calendars(key)["calendars"]
+
+
+# spec: ANYM-552
+def test_calendar_candidates_preview_the_stored_request_without_the_title(store):
+    key, fake = setup(store, second=True), Provider()
+    choose = rulebook.validate_error(call(store, key, {**CREATE, "duration": 45, "request_id": "req-sel-1"}, fake))
+    assert choose["error"] == "selection_required" and "Swimming" not in json.dumps(choose)
+    nexts = {c["id"]: c["next"]["arguments"] for c in choose["candidates"]}
+    assert set(nexts["cal-child"]) == {"selection_token", "calendar", "dry_run"}
+    preview = call(store, key, nexts["cal-child"], fake)
+    assert preview["state"] == "previewed" and preview["preview"]["title"] == "Swimming"
+    assert preview["preview"]["calendar"]["calendar_ref"] == "cal-child"
+    assert preview["preview"]["end"] == "2026-11-02T10:45:00+08:00"
+    other = store.agent("agent-2", "family", "adult-a", READ + WRITE, ["cal-a", "cal-child"])
+    assert call(store, other, nexts["cal-a"])["error"] == "invalid_selection_token"
+    store.query("UPDATE schedule_selections SET expires_at=now()-interval '1 second' WHERE expires_at>now()")
+    assert call(store, key, nexts["cal-a"])["error"] == "invalid_selection_token"
+    assert not fake.sent
+
+
+# spec: ANYM-552
+def test_offset_free_start_adds_elapsed_minutes_across_dst(store):
+    key = setup(store)
+    store.family_settings("family", "Europe/Berlin")
+    spring = call(store, key, {**CREATE, "start": "2026-03-29T01:30", "duration": 120, "dry_run": True})
+    assert spring["preview"]["start"] == "2026-03-29T01:30:00+01:00"
+    assert spring["preview"]["end"] == "2026-03-29T04:30:00+02:00"
+    autumn = call(store, key, {"action": "move", "event": "event-dentist", "start": "2026-10-25T01:30",
+                               "duration": 120, "dry_run": True})
+    assert autumn["preview"]["start"] == "2026-10-25T01:30:00+02:00"
+    assert autumn["preview"]["end"] == "2026-10-25T02:30:00+01:00"
+
+
+# spec: ANYM-552
+def test_all_day_move_keeps_its_days_across_dst(store):
+    key = setup(store)
+    store.calendar("cal-a", "google-a", "private-a", "A", "Europe/Berlin", "write")
+    # Saturday 28 and Sunday 29 March in Berlin: 47 hours between the two local midnights.
+    store.publish_window("cal-a", "2026-03-27T00:00:00Z", "2026-03-31T00:00:00Z", [{
+        "resource_ref": "res-trip", "target": "provider-trip", "etag": '"v1"', "payload": {},
+        "occurrences": [{"ref": "event-trip", "start": "2026-03-27T23:00:00Z", "end": "2026-03-29T22:00:00Z",
+                         "busy": True, "details": {"title": "Trip", "all_day": True}}],
+    }], "complete")
+    moved = call(store, key, {"action": "move", "event": "event-trip", "start": "2026-04-10", "dry_run": True})
+    assert moved["preview"]["start"] == "2026-04-10" and moved["preview"]["end"] == "2026-04-12"
+
+
+# spec: ANYM-552
+def test_a_read_only_twin_name_needs_a_choice(store):
+    setup(store)
+    store.calendar("cal-twin", "google-b", "twin", "A", "Asia/Makassar", "read")
+    store.grant("family", "adult-a", "cal-twin", READ, "details")
+    key = store.agent("agent-twin", "family", "adult-a", READ + WRITE, ["cal-a", "cal-twin"])
+    twin = rulebook.validate_error(call(store, key, {**CREATE, "calendar": "A", "request_id": "req-twin-1"}))
+    assert twin["error"] == "selection_required" and [c["id"] for c in twin["candidates"]] == ["cal-a"]
+    assert call(store, key, {**CREATE, "calendar": "cal-twin", "dry_run": True})["error"] == "not_found_or_forbidden"
+
+
+# spec: ANYM-552
+def test_renamed_or_revoked_calendar_is_stale(store):
+    key, fake = setup(store, second=True), Provider()
+    token = call(store, key, {**CREATE, "calendar": "Lessons", "dry_run": True})["confirm_token"]
+    store.calendar("cal-child", "google-a", "child", "Lessons 2", "Asia/Makassar", "write")
+    renamed = rulebook.validate_error(call(store, key, {"confirm_token": token}, fake))
+    assert renamed["error"] == "preview_stale" and renamed["changed"] == ["calendar"]
+    assert renamed["preview"]["calendar"] == {"calendar_ref": "cal-child", "label": "Lessons 2"}
+    store.grant("family", "adult-a", "cal-child", READ, "details")
+    # A revoked calendar is no staleness: the token is refused (ANYM-544 matrix case_revocation).
+    revoked = rulebook.validate_error(call(store, key, {"confirm_token": renamed["confirm_token"]}, fake))
+    assert revoked["error"] == "not_found_or_forbidden" and not fake.sent
+
+
+# spec: ANYM-552
+def test_errors_state_timezone_and_now(store):
+    key = setup(store, second=True)
+    gateway = Gateway(store)
+    with pytest.raises(CalendarError) as caught:
+        asyncio.run(gateway.call(key, "schedule", {**CREATE, "request_id": "req-ctx-1"}))
+    relayed = failure(caught.value.code, caught.value.field_errors, caught.value.details)
+    assert relayed["error"] == "selection_required" and relayed["timezone"] == "Asia/Makassar"
+    assert relayed["now"].endswith("+08:00")
+    token = asyncio.run(gateway.call(key, "schedule", {**CREATE, "calendar": "A", "dry_run": True}))["confirm_token"]
+    store.query("UPDATE plans SET expires_at=now()-interval '1 second' WHERE operation_id IS NULL")
+    with pytest.raises(CalendarError) as caught:
+        asyncio.run(gateway.call(key, "schedule", {"confirm_token": token}))
+    stale = failure(caught.value.code, caught.value.field_errors, caught.value.details)
+    assert stale["error"] == "preview_stale" and stale["timezone"] == "Asia/Makassar" and "now" in stale

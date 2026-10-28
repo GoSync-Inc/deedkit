@@ -147,6 +147,8 @@ class Schedule(Strict):
     event: str | EventQuery | None = None
     dry_run: bool = False
     confirm_token: str | None = Field(default=None, max_length=256)
+    # A calendar candidate's preview: the stored request, so its `next` never repeats the caller's title.
+    selection_token: str | None = Field(default=None, max_length=256)
     request_id: str | None = None
     wait_s: int | None = Field(default=None, ge=0, le=25)
 
@@ -329,8 +331,7 @@ class Gateway:
             while time.monotonic() < deadline and not await asyncio.to_thread(scheduler.settled, operation_id):
                 await asyncio.sleep(min(0.25, max(0, deadline - time.monotonic())))
             result = await asyncio.to_thread(scheduler.replay, operation_id, family)
-        return {**result, "timezone": family["timezone"],
-                "now": datetime.now(timezone.utc).astimezone(family["zone"]).isoformat(timespec="seconds")}
+        return {**result, **scheduler.context(family)}
 
     async def call(self, key, name, arguments):
         if name not in MODELS:
