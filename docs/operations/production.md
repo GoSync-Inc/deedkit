@@ -1240,7 +1240,10 @@ Otherwise it:
    `services/release-router/**`, `deploy/deedkit-autodeploy.service` and
    `.timer`) that is not installed yet (the running tool file, or the unit in
    `/etc/systemd/system/`, equals the candidate's; a host without the unit
-   installs none; the verifier matches the installed pin), or
+   installs none; the verifier: the installed binary is the running tool's
+   pinned build and the candidate's `attest-verify.linux-amd64.sha256` records
+   that same build, so a later tool change with an unchanged verifier installs
+   itself; ANYM-618), or
    when the configuration changed since the current release (the plan A
    settings digest, each project's Compose document, the HTTP settings digest).
    An SQL pause also names the rollout class of each messaging migration the

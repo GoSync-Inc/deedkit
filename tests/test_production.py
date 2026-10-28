@@ -4460,6 +4460,25 @@ def test_a_tool_change_with_an_sql_router_verifier_or_unit_change_pauses_and_ins
     assert tree(host.tool) == before and host.receipt() is None and host.steps == []
 
 
+# spec: ANYM-618
+@pytest.mark.parametrize("recorded", ["the installed build", "another build"])
+def test_a_tool_change_after_a_hand_installed_verifier_updates_itself_only_when_the_candidate_records_that_build(
+        tmp_path, monkeypatch, recorded):
+    # BASE..NEWEST: NEWER rebuilt the verifier (installed by hand with its tool), NEWEST changes production.py only.
+    host = ToolHost(tmp_path, monkeypatch, changes={NEWER: ["tools/attest-verify/main.go", p.VERIFIER_RECORD],
+                                                    NEWEST: ["scripts/production.py"]})
+    pin = p.VERIFIER_SHA256 if recorded == "the installed build" else "c" * 64
+    host.blobs[f"{NEWEST}:{p.VERIFIER_RECORD}"] = git_blob(f"{pin}  attest-verify\n".encode())
+    before = tree(host.tool)
+    outcome = host.deploy()
+    if recorded == "the installed build":
+        assert outcome["status"] == "tool-updated" and host.current_tool() == f"releases/{NEWEST}"
+        assert host.receipt()["status"] == "active"
+    else:
+        assert outcome["status"] == "halted" and "tools/attest-verify/main.go" in outcome["reason"]
+        assert tree(host.tool) == before and host.receipt() is None and host.steps == []
+
+
 # spec: ANYM-443
 def test_a_changed_autodeploy_unit_pauses_until_the_installed_unit_is_the_candidates(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["deploy/deedkit-autodeploy.service"]})

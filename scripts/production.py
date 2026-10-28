@@ -81,6 +81,7 @@ REGISTRY = "ghcr.io/gosync-inc/deedkit-"
 # tests keep this hash equal to tools/attest-verify/attest-verify.linux-amd64.sha256.
 VERIFIER = Path("/usr/local/libexec/deedkit/attest-verify")
 VERIFIER_SHA256 = "de0544eda3668946aad1d4237557b3fbd747c702d1e511d0060daa5eaa62978f"
+VERIFIER_RECORD = "tools/attest-verify/attest-verify.linux-amd64.sha256"
 IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 # The pinned verifier's refusal lines (tools/attest-verify main.go, registry.go). Only a registry 404 for the image
 # tag proves it is not published yet. "No bundle attached" is also printed when the referrers API failed, and a bundle
@@ -2329,9 +2330,14 @@ def range_changes(mirror, base, candidate, installed):
             if path in UNITS and not os.path.lexists(installed[path]):
                 return True
             return run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{path}"]).strip() == blob(installed[path])
-        # The verifier is the candidate's when it matches the pin of the installed (the candidate's) production.py.
-        return (path.startswith("tools/attest-verify/") and current_tool("scripts/production.py") and VERIFIER.exists()
-                and hashlib.sha256(VERIFIER.read_bytes()).hexdigest() == VERIFIER_SHA256)
+        # The verifier is the candidate's when the installed binary is this tool's pinned build and the candidate
+        # records that same build (tests keep each commit's two pins equal to its recorded file): a later tool change
+        # with an unchanged verifier then installs itself instead of pausing (ANYM-618).
+        recorded = f"{VERIFIER_SHA256}  attest-verify\n".encode()
+        return (path.startswith("tools/attest-verify/") and VERIFIER.exists()
+                and hashlib.sha256(VERIFIER.read_bytes()).hexdigest() == VERIFIER_SHA256
+                and run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{VERIFIER_RECORD}"]).strip()
+                == hashlib.sha1(b"blob %d\0" % len(recorded) + recorded).hexdigest())
     return sql, [path for path in tools if not current_tool(path)]
 
 
