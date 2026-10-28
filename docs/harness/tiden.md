@@ -458,7 +458,11 @@ TIDEN_CLI_SHA256_darwin_arm64=9ef396aadb7a8d2e695b64682f2a5c381080b7cb1e35eac5aa
   `tiden_darwin_arm64.tar.gz` of the new tag into `mktemp -d`, checks it against that release's
   `checksums.txt`, extracts it and runs `tiden-version.sh smoke <that binary>` (the reads
   consumers parse: `product list`, `spec list` with pagination, `spec get`; a consumer that starts
-  parsing another command adds it to the smoke). No `tiden upgrade` before the pin PR merges. It
+  parsing another command adds it to the smoke), then checks for twin test cases (two cases for one
+  signature) among the first 200 cases, oldest first (the CLI's default order), of the smoke's product
+  (the argument, else the first of `product list`). A twin is a smoke FAIL: the pin stays until the
+  orchestrator of the project that owns that product folds them with `tiden test merge <from> --into
+  <to>` and the smoke is rerun. No `tiden upgrade` before the pin PR merges. The harness orchestrator
   reads the release notes for removed or changed flags, then bumps the pin by PR with the
   checksum of each platform the pin covers (`PLATFORMS` in bin/tiden-version.sh; not every line of
   `checksums.txt`); the PR body quotes the smoke's OK lines and the notes check, and

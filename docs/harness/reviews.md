@@ -135,7 +135,7 @@ VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <
    scripts are code and a test-only PR here is AUTO, Routing) is never AUTO (process.md section 3)
    and gets the author's checklist: each changed rule matches the documents that refer to it,
    no change lets agents decide a process.md section 2 item or weakens a section 2 gate without the owner's quoted words, process.md and
-   AGENTS.md stay within their word budgets and the PR names the words it replaced. Astra reviews
+   AGENTS.md stay within their word caps and the PR names the words it replaced. Astra reviews
    it only when it changes how a gate works. A pinned-copy refresh skips this checklist: its owner
    words are the harness PR's (Routing). VISION.md is never AUTO either; its review is the
    brainstorm ritual's Fable round, nothing more (Routing).
@@ -194,6 +194,14 @@ the owner (orchestration.md, Owner asks): the orchestrator decides it within thi
   signals (the project's grep). A hit is an item to read, not a verdict; no hit does not make a
   PR AUTO. Read the changed blocks of every listed file (a workflow's `permissions:` and jobs, SQL
   grants, secret mounts); in doubt the path is AUTO+review with Astra. A card's own level label adds no merge gate.
+- `Deletes:` when code the deployed service runs itself (a request path, a scheduled job) executes
+  DELETE statements: each statement and the rows a ready card or the data policy names that it
+  removes; the reviewer checks the diff against that list. Only these statements leave the
+  process.md section 2 deletion gate (no owner question; the files' own change path, section 3).
+  Still gated: TRUNCATE, DROP and other destructive SQL in any code; a script, command, data fix,
+  deploy or release hook or other automation that deletes production data, whoever starts it,
+  the promotion command included. Rows neither names: user data is section 2 item 2, other rows
+  need a card first.
 - `Review record:` one line per reviewer and round with its counts, naming one Codex reviewer per
   round, e.g. `Review record: Astra r1 1 blocking, 2 major; Sol r2 1 major; Sol r3 1 major; Sol r4
   over-cap (<reason>) 0/0`. No findings ledger or per-finding

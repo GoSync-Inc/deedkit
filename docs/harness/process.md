@@ -26,7 +26,7 @@ input box. A project adds an owner item only on the owner's words (differences.m
 
 1. Product direction outside VISION.md and ready cards.
 2. User-data policy the project's data-policy document does not cover.
-3. Money above the project's `Budget:` cap (unset: any spend), annual payments, hardware.
+3. Money above the project's monthly `Budget:` cap (unset: any spend), annual payments, hardware.
 4. Publication under the owner's name to outsiders (public repository, third-party pull
    request, package, announcement, letter, send); a new account or terms in the owner's name.
 5. The owner's hands: password, MFA, passkey, payment card, device.
@@ -38,8 +38,9 @@ Everything else: agents decide and report the undo, gated:
   accounts, `.claude/settings.json` allow entries): Astra r1.
 - Destructive SQL (DROP, TRUNCATE, DELETE, RENAME, narrowing ALTER), an edited migration, a
   restore, rollback or production change other than `<deploy command>`, deleting data, any step
-  without an undo: an Astra-reviewed plan, a fresh verified backup, any undo. User data no card
-  names: item 2.
+  without an undo: an Astra-reviewed plan, a fresh verified backup, any undo. User data neither a
+  card nor the data policy names: item 2. Exempt: service-run DELETEs of rows a ready card or data policy
+  names (PR-listed).
 - Card moves, deletions and evidence-based criterion weakening: a digest line (tiden.md); other
   weakening: item 1.
 - Releases: the project's promotion tool.
@@ -83,9 +84,9 @@ Done: the squash's `main` push run is green.
 ## 5. Reviews
 
 - Astra: `codex exec --disable hooks -m gpt-6-astra -c service_tier="default" "<task with packet
-  paths>" </dev/null`. For Codex-written code an Opus subagent; Codex line: reviews.md.
-  Fable: `fable` subagent, product manager, never on code. Who runs which round: reviews.md, Routing.
-- Packet, rounds and verdict line: reviews.md. Every Astra task starts with:
+  paths>" </dev/null`.
+  Fable: `fable` subagent, product manager, never on code.
+- Packet, rounds, routing, verdict line: reviews.md. Every Astra task starts with:
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
      existing path (`<critical paths>`)? Name the line.
   2. Data egress vs PR claims: what data leaves the process (model APIs, logs, telemetry, third
@@ -99,9 +100,9 @@ Done: the squash's `main` push run is green.
 
 - The card or brief is the plan. Decide in scope; ask only before leaving it (another task's
   files, section 2, the card's criteria, a fork without an obvious answer).
-- Run only touched code's tests and new ones.
+- Test only touched and new code.
 - Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_*` block.
-- At the brief's token limit (default 170k), hand off and restart yourself (orchestration.md, Sessions).
-- Budget: this file 1,000 words, a project AGENTS.md its own (`wc -w`).
+- At the brief's token limit (default 170k), restart via handoff (orchestration.md, Sessions).
+- Word cap: this file 1,000 words, a project AGENTS.md its own (`wc -w`).
   A rule change replaces or deletes words and names its incident and enforcer; an incident gets a
   test or hook first.
