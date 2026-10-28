@@ -567,3 +567,17 @@ def test_sdk_retry_hook_reraises_a_recorded_deadline_before_the_next_attempt(mon
     assert r2.cancelled(caught_exception=OSError()) is None
     with pytest.raises(TimeoutError,match='restore_deadline'):r2.cancel(TimeoutError('restore_deadline'))
     with pytest.raises(TimeoutError,match='restore_deadline'):r2.cancelled(caught_exception=OSError())
+
+
+# spec: ANYM-285
+def test_receiver_timeout_never_leaks_into_a_later_healthy_stream(monkeypatch,capsys):
+    import signal
+    previous=signal.getsignal(signal.SIGALRM)
+    monkeypatch.setattr(r2,'load_config',lambda path:{'timeout_seconds':60})
+    monkeypatch.setattr(r2,'receive',lambda *a,**kw:signal.raise_signal(signal.SIGALRM))
+    try:assert r2.main(['--config','/synthetic/private.json','receive'])==1
+    finally:signal.signal(signal.SIGALRM,previous)
+    assert json.loads(capsys.readouterr().out)['code']=='receiver_timeout' and not r2.CANCELLED
+    data=r2.AGE_HEADER+os.urandom(r2.MIB);out=io.BytesIO()
+    r2.verify_object({'bucket':'synthetic'},FlakyCloud(data,[]),stream_receipt(data),out)
+    assert out.getvalue()==data

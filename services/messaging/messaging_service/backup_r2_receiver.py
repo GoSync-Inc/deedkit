@@ -1157,6 +1157,7 @@ def main(argv=None):
         return 1
     finally:
         signal.alarm(0)
+        CANCELLED.clear()
 
 
 if __name__ == '__main__':
