@@ -93,8 +93,16 @@ DRIFT_SKIP = {
 EVENT_WRITE = (
     "guest-free single event, all-day event (date range, exclusive end), or one occurrence of a "
     "recurring series (update or cancel, chosen by its event_ref); series, this-and-following and "
-    "invitations are not written; calendar_schedule create invites guests where a calendar's guests.supported is true"
+    "invitations are not written by plan and apply; calendar_schedule move and cancel take series all or following "
+    "on Google calendars (series_write); calendar_schedule create invites guests where a calendar's guests.supported "
+    "is true"
 )
+# Series scopes of calendar_schedule move and cancel, per provider (ANYM-556); synthetic evidence until the owner's
+# live run. iCloud refuses following and all with capability_unsupported and a next for this occurrence only.
+SERIES_WRITE = {
+    "google": {"scopes": ["this", "following", "all"], "tool": "calendar_schedule"},
+    "icloud": {"scopes": ["this"], "error": "capability_unsupported"},
+}
 # Per provider, exactly what the write path implements; both rest on synthetic evidence until the owner's live run.
 PROVIDER_WRITE = {
     provider: {"occurrence_write": True, "all_day_write": True} for provider in ("google", "icloud")
@@ -108,6 +116,12 @@ GUEST_WRITE = {
 # Mixed into the scope hash of a plan with guests: a worker that predates guests computes another hash and refuses
 # the plan (scope_changed) instead of creating the event without them.
 INVITE_SCOPE = "invitations-v1"
+# Recurring-series scopes of calendar_schedule move and cancel (ANYM-556), Google only: `this` is the occurrence
+# edit above; `all` writes the master; `following` ends the master before the occurrence and, for a move, first
+# creates the replacement series. Mixed into the scope hash like INVITE_SCOPE, so a worker that predates series
+# refuses the plan (scope_changed) instead of writing only the one occurrence.
+SERIES_SCOPES = ("this", "following", "all")
+SERIES_SCOPE = "series-v1"
 LIMITS = [("title", 256), ("location", 512), ("description", 4000)]
 DATE_VALUE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
@@ -236,7 +250,7 @@ class FamilyService:
                 raise CalendarError("write_not_enabled")
         return p, c
 
-    def _scope_hash(self, p, calendars, invitations=False):
+    def _scope_hash(self, p, calendars, invitations=False, series=False):
         return digest(
             [
                 p["id"],
@@ -250,6 +264,7 @@ class FamilyService:
                 ],
             ]
             + ([INVITE_SCOPE] if invitations else [])
+            + ([SERIES_SCOPE] if series else [])
         )
 
     def invitations_enabled(self, calendar_ref):
@@ -410,6 +425,7 @@ class FamilyService:
                 "occurrence_write": True,
                 "all_day_write": True,
                 "provider_write": PROVIDER_WRITE,
+                "series_write": SERIES_WRITE,
                 "recurrence_write": False,
                 "future_split": False,
                 "invitations": False,
@@ -657,7 +673,7 @@ class FamilyService:
             raise CalendarError("invalid_arguments", [{"field": "people", "reason": "required"}])
         return found
 
-    def plan(self, key, actions, carry_projections=False, invitations=False):
+    def plan(self, key, actions, carry_projections=False, invitations=False, series=False):
         p = self.principal(key)
         if not isinstance(actions, list) or not 1 <= len(actions) <= 8:
             raise CalendarError("invalid_actions")
@@ -672,6 +688,10 @@ class FamilyService:
         if invitations:
             # calendar_schedule only (ANYM-555): calendar_plan never takes guests.
             allowed.add("invite")
+        if series:
+            # calendar_schedule only (ANYM-556): a series scope of a move or cancel, and the undo of a partial
+            # following move (`replacement`: the series_ref of the replacement series it created).
+            allowed.update(("series", "replacement"))
         for action in actions:
             if not isinstance(action, dict) or set(action) - allowed:
                 raise CalendarError("invalid_action")
@@ -753,6 +773,13 @@ class FamilyService:
                     raise CalendarError("invalid_event")
                 step["resource_ref"] = ref("res")
                 step["target_id"] = uuid_token()
+            elif "replacement" in action:
+                if kind != "delete":
+                    raise CalendarError("invalid_action")
+                step = self._undo_step(p, cal, action["replacement"], step)
+                if (cal["ref"], step["target_id"]) in targets:
+                    raise CalendarError("duplicate_resource_action")
+                targets.add((cal["ref"], step["target_id"]))
             else:
                 row = self.store.one(
                     "SELECT o.*,r.etag,r.target FROM occurrences o JOIN resources r ON r.ref=o.resource_ref "
@@ -799,6 +826,15 @@ class FamilyService:
                     expected_etag=row["etag"],
                     before=before,
                 )
+                scope = action.get("series", "this")
+                if scope not in SERIES_SCOPES or (scope != "this" and "occurrence" not in step):
+                    raise CalendarError("invalid_action")
+                if scope != "this":
+                    steps = self._series_steps(key, cal, step, scope, len(prepared))
+                    # One calendar entry per step, as validate_plan recomputes the scope hash.
+                    calendars.extend([cal] * (len(steps) - 1))
+                    prepared.extend(steps)
+                    continue
             prepared.append(step)
             if kind == "create" and label:
                 # A new lesson and its drives in one plan; the drives wait for the lesson's verified create.
@@ -849,7 +885,8 @@ class FamilyService:
         self.store.query(
             "INSERT INTO plans(id,principal_id,payload,scope_hash,expires_at) VALUES (%s,%s,%s,%s,%s)",
             (plan_id, p["id"], Jsonb(payload),
-             self._scope_hash(p, calendars + source_calendars, any("invite" in s for s in prepared)), expires),
+             self._scope_hash(p, calendars + source_calendars, any("invite" in s for s in prepared),
+                              any("series" in s for s in prepared)), expires),
         )
         return {
             "plan_id": plan_id,
@@ -1269,10 +1306,61 @@ class FamilyService:
         "WHERE r.group_id=%s AND l.state<>'removed' AND "
     )
 
+    def replacement_of(self, p, handle):
+        """The verified replacement series one of p's own following moves created, by its series_ref: the plan step
+        that created it and the create's receipt. Durable, so an undo never waits for a read to publish it."""
+        from .providers import series_ref
+
+        rows = self.store.query(
+            "SELECT p.payload,s.receipt FROM operations o JOIN plans p ON p.id=o.plan_id "
+            "JOIN operation_steps s ON s.operation_id=o.id AND s.ordinal=0 "
+            "WHERE o.principal_id=%s AND s.state='verified' "
+            "AND p.payload->'steps'->0->'series'->>'role'='replacement' ORDER BY o.created_at",
+            (p["id"],),
+        )
+        for row in rows:
+            made = row["payload"]["steps"][0]
+            if series_ref(made["calendar_ref"], made["target_id"]) == handle and (row["receipt"] or {}).get("etag"):
+                return dict(made, receipt=row["receipt"])
+        raise CalendarError("not_found_or_forbidden")
+
+    def _undo_step(self, p, cal, handle, step):
+        """Delete the replacement series of a partial following move, only as its create left it (its etag)."""
+        made = self.replacement_of(p, handle)
+        if made["calendar_ref"] != cal["ref"] or cal["provider"] != "google":
+            raise CalendarError("not_found_or_forbidden")
+        return dict(step, target_id=made["target_id"], resource_ref=made["resource_ref"],
+                    expected_etag=made["receipt"]["etag"], before=dict(made["span"]),
+                    series={"scope": "all", "role": "undo", "series_ref": handle,
+                            "planned_at": datetime.now(timezone.utc).isoformat()})
+
+    def _series_steps(self, key, cal, step, scope, ordinal):
+        """The steps of a series edit (ANYM-556): `all` is one write to the master; `following` ends the master just
+        before the occurrence, and a following move first creates the replacement series under a stable,
+        client-generated ID (step 0), then truncates (step 1), so a failed truncation never loses an occurrence."""
+        if cal["provider"] != "google":
+            raise CalendarError("capability_unsupported")
+        planned = datetime.now(timezone.utc).isoformat()
+        if scope == "all" or step["action"] == "delete":
+            return [dict(step, ordinal=ordinal, series={"scope": scope, "planned_at": planned})]
+        self.authorize(key, cal["ref"], "event:create")
+        replacement = {
+            "action": "create", "calendar_ref": step["calendar_ref"], "provider": step["provider"],
+            "ordinal": ordinal, "event": step["event"], "span": step["span"], "resource_ref": ref("res"),
+            "target_id": uuid_token(), "occurrence": step["occurrence"],
+            "series": {"scope": "following", "role": "replacement", "instance_id": step["target_id"],
+                       "instance_etag": step["expected_etag"], "planned_at": planned},
+        }
+        truncation = {k: v for k, v in step.items() if k not in ("event", "span")}
+        truncation.update(ordinal=ordinal + 1, series={"scope": "following", "role": "truncation",
+                                                       "replacement_step": ordinal, "planned_at": planned})
+        return [replacement, truncation]
+
     def _overlap_check(self, key, principal, prepared, selected):
         """Advisory cached evidence within current read grants, never permission
         to read a hidden calendar or a guarantee against a concurrent edit."""
-        proposed = [s for s in prepared if s["action"] != "delete"]
+        # The truncation of a following move writes no time of its own: its replacement carries the span.
+        proposed = [s for s in prepared if s["action"] != "delete" and "span" in s]
         result = {
             "status": "incomplete",
             "scope": "visible_calendars",
@@ -1390,12 +1478,14 @@ class FamilyService:
                 equal = instant(old) == instant(new)
             if not equal:
                 diff[field] = {"before": old, "after": new}
-        if update and was != will:
+        if update and "event" in step and was != will:
             diff["all_day"] = {"before": was, "after": will}
-        return {
-            **{k: v for k, v in step.items() if k not in ("target_id", "resource_ref", "expected_etag", "span", "projection")},
-            "diff": diff,
-        }
+        shown = {k: v for k, v in step.items()
+                 if k not in ("target_id", "resource_ref", "expected_etag", "span", "projection", "series")}
+        if "series" in step:
+            # The scope and role only: the instance's provider ID and etag stay internal.
+            shown["series"] = {k: step["series"][k] for k in ("scope", "role") if k in step["series"]}
+        return {**shown, "diff": diff}
 
     def validate_plan(self, plan, principal_id):
         p = self.principal(principal_id=principal_id)
@@ -1419,7 +1509,8 @@ class FamilyService:
                 raise CalendarError("scope_changed")
             calendars.append(cal)
         invites = [s for s in plan["payload"]["steps"] if "invite" in s]
-        if self._scope_hash(p, calendars, bool(invites)) != plan["scope_hash"]:
+        if self._scope_hash(p, calendars, bool(invites),
+                            any("series" in s for s in plan["payload"]["steps"])) != plan["scope_hash"]:
             raise CalendarError("scope_changed")
         if any(not self.invitations_enabled(s["calendar_ref"]) for s in invites):
             raise CalendarError("invitations_not_enabled")
@@ -1473,7 +1564,7 @@ class FamilyService:
             "SELECT ordinal,state,receipt,error FROM operation_steps WHERE operation_id=%s ORDER BY ordinal",
             (operation_id,),
         )
-        return {
+        result = {
             "operation_id": operation_id,
             "state": op["state"],
             "steps": steps,
@@ -1482,6 +1573,17 @@ class FamilyService:
             if op["state"] in ("unknown", "needs_attention", "partial")
             else None,
         }
+        first = plan["payload"]["steps"][0]
+        if op["state"] == "partial" and (first.get("series") or {}).get("role") == "replacement":
+            # A following move whose truncation was definitely refused (ANYM-556): the same definite failure, both
+            # series and the undo preview calendar_schedule gives, never a reconcile.
+            from .schedule import Scheduler
+
+            scheduler = Scheduler(self)
+            steps_ = plan["payload"]["steps"]
+            result.update(scheduler.partial(scheduler.primary(steps_), steps_, scheduler.family(key, p)),
+                          state="failed", detail_state="partial")
+        return result
 
     def assignments(self, key, start, end):
         p = self.principal(key)

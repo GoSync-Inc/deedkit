@@ -66,13 +66,20 @@ class FakeGoogle:
         self.requests.append(req)
         event_id = unquote(req.url.raw_path.decode().partition("/events")[2].lstrip("/").split("?")[0])
         current = self.events.get(event_id)
+        if req.method == "GET" and not event_id:
+            # events.list by iCalUID, unexpanded: the master and its stored exceptions, never the instances
+            # the series only generates (marked `_generated` in fixtures).
+            uid = req.url.params.get("iCalUID")
+            items = [e for e in self.events.values() if uid and e.get("iCalUID") == uid and not e.get("_generated")]
+            return httpx.Response(200, json={"items": items})
         if req.method == "GET":
             return httpx.Response(200, json=current) if current else httpx.Response(404)
         if req.method == "POST":
             body = json.loads(req.content)
             if body["id"] in self.events:
                 return httpx.Response(409)
-            self.events[body["id"]] = dict(body, etag=self._etag())
+            # Google gives every new event an iCalUID of its own.
+            self.events[body["id"]] = dict(body, etag=self._etag(), iCalUID=body.get("iCalUID", body["id"] + "@google.com"))
             return httpx.Response(200, json=self.events[body["id"]])
         if current is None:
             return httpx.Response(404)

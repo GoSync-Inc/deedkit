@@ -84,10 +84,14 @@ class Worker:
                             self._finish(operation_id, "needs_attention", "unknown_result")
                             return
                     elif row["state"] == "prepared":
-                        if plan["expires_at"] < datetime.now(timezone.utc):
+                        # A series plan that already wrote resumes past the preview TTL (ANYM-556): the TTL
+                        # bounds when an apply may start, not how a started plan finishes.
+                        if plan["expires_at"] < datetime.now(timezone.utc) and not (completed and step.get("series")):
                             raise CalendarError("plan_expired")
                         if claim and step["link"].get("source_step") is not None:
                             step = self._created_source(plan, step, operation_id)
+                        if (step.get("series") or {}).get("replacement_step") is not None:
+                            step = self._replaced_series(step, operation_id)
                         intent = await self.providers.prepare(cal, step)
                         if intent.get("absent"):
                             # The fresh read found our drive already gone: the link closes without a write.
@@ -297,6 +301,16 @@ class Worker:
             raise CalendarError("source_unverified")
         event_ref = created_event_ref(source["provider"], row["receipt"]["resource_ref"], source["target_id"])
         return dict(step, link=dict(step["link"], source_event_ref=event_ref))
+
+    def _replaced_series(self, step, operation_id):
+        """The truncation of a following edit ends the master the verified replacement was made from, by its etag."""
+        row = self.store.one(
+            "SELECT state,intent FROM operation_steps WHERE operation_id=%s AND ordinal=%s",
+            (operation_id, step["series"]["replacement_step"]),
+        )
+        if row["state"] != "verified" or not (row["intent"] or {}).get("series_etag"):
+            raise CalendarError("source_unverified")
+        return dict(step, series=dict(step["series"], master_etag=row["intent"]["series_etag"]))
 
     REPAIRED = "UPDATE projection_links SET "
 
