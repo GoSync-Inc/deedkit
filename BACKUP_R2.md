@@ -309,7 +309,14 @@ and proof evidence outside the helper's writable payload. A failed run's
 keep) adds `diagnostic`: the exception class chain (cause/context, at most four)
 with code frames as `[file, line, function]`, never messages, arguments or
 locals. The service prints the same code and diagnostic as one JSON line to
-stderr (the journal). A failed download,
+stderr (the journal). A failed `pg_restore` also adds `detail`: its first
+`pg_restore: error:` line as one fixed phrase (the kind of a missing or existing schema
+object, a COPY failure, a resource category) or `unclassified pg_restore error`,
+never a name, message text or row value. The helper writes
+it to `failure-detail.json` beside the unchanged `failure.json`. Before the restore
+the helper creates the fixed roles the schema names (`RESTORE_ROLES`) as NOLOGIN in
+the isolated cluster only;
+`--no-acl` skips grants but not row-level security policies. A failed download,
 decryption, restore, quarantine, promotion or cleanup remains a failed job.
 Verification failure never authorizes discarding the previous point. If a
 failure follows marker promotion, the newly verified point may already be
