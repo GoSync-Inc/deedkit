@@ -64,8 +64,10 @@ def test_capabilities_summary_within_1500_chars(seeded):
 
 
 # spec: ANYM-270
-def test_capabilities_full_matches_previous_payload(seeded):
+def test_capabilities_full_matches_previous_payload(seeded,monkeypatch):
     s,_,_=seeded
+    # The snapshot's build.source_sha is null; an image's test stage may carry a real commit (ANYM-592).
+    monkeypatch.delenv('DEEDKIT_SOURCE_SHA',raising=False)
     key=all_permissions_key(s)
     full=s.capabilities(key,detail='full')
     assert masked(full)==json.loads(SNAPSHOT.read_text())
