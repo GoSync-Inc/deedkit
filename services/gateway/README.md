@@ -174,6 +174,9 @@ do not deny a selected calls preparation method. Calls channel, destination, sco
 and owned-brief checks remain the backend's authority; these labels grant no access.
 `calls_list_briefs` and `calls_list_calls` (`calls:read`) page the backend credential's
 own briefs and calls newest first as short summaries; existing profiles do not gain them.
+`calls_call` (`calls:dial`; the backend also requires `calls:prepare`) places one call in one tool from a destination
+and a goal; `calls_call_result` (`calls:read`) returns that call in one object. Both take
+`wait_s` and wait in the calls wait pool.
 
 Backend HTTP failures retain only their numeric `backend_status`, a reviewed
 `backend_error` classification (including `query_timeout`), and a UUID-shaped

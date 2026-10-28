@@ -10,6 +10,8 @@ export type ToolName =
   | 'calendar_plan'
   | 'calendar_schedule'
   | 'calendar_slots'
+  | 'calls_call'
+  | 'calls_call_result'
   | 'calls_capabilities'
   | 'calls_dial_call'
   | 'calls_get_call_analysis'

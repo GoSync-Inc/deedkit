@@ -31,8 +31,8 @@ def test_gateway_catalog_mirrors_reviewed_calls_metadata():
         assert ANNOTATIONS[name]["readOnlyHint"] is reads
         assert DESCRIPTIONS[name].startswith("Read-only") is reads
     assert len(set(DESCRIPTIONS.values())) == len(METHODS)
-    assert [n for n, a in ANNOTATIONS.items() if a["openWorldHint"]] == ["dial_call"]
-    assert [n for n, a in ANNOTATIONS.items() if a["destructiveHint"]] == ["dial_call"]
+    assert [n for n, a in ANNOTATIONS.items() if a["openWorldHint"]] == ["dial_call", "call"]
+    assert [n for n, a in ANNOTATIONS.items() if a["destructiveHint"]] == ["dial_call", "call"]
 
 
 def test_gateway_scoped_phone_preparation_needs_no_messaging(tmp_path):
