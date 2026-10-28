@@ -1,11 +1,19 @@
 """Feedback autoloop: the tool-less reader, its init check, the closed answer and its outcomes (ANYM-570)."""
+import asyncio
+import io
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
+import subprocess
 import sys
+import tarfile
+import threading
+import time
+import types
 
 import pytest
 
@@ -1588,8 +1596,9 @@ def test_a_ready_card_from_an_owner_agent_card_worker_gets_one_build_worker_whos
     assert len(created()) == 1
     argv = created()[0]
     assert argv[argv.index('--name') + 1] == BUILD and argv[argv.index('--branch') + 1] == BUILD
-    assert argv[argv.index('--prompt') + 1] == (
-        f"Read and follow {autoloop.BRIEFS / 'common.md'} and {build_template}. Intent: {BUILD}. Card: ANYM-30.")
+    # ANYM-574: the build runs in the container runner; the launcher gets the intent and the card only.
+    assert '--agent' not in argv and '--prompt' not in argv
+    assert argv[argv.index('--command') + 1] == f'{sys.executable} {autoloop.LAUNCHER} build {BUILD} ANYM-30'
     built = autoloop.intents(a)[BUILD]
     assert (built['status'], built['lane'], built['paths']) == (
         'started', 'messaging', ['services/messaging/groups.py', 'tests/test_groups.py'])
@@ -1993,3 +2002,753 @@ def test_open_pr_reservations_are_keyed_by_pr_and_hold_both_names_of_a_rename(tm
                              'previous_filename': 'services/messaging/old_name.py'}]}
     assert autoloop.open_files(fakes.gh) == {5: ['services/messaging/new_name.py'],
                                              6: ['services/messaging/new_name.py', 'services/messaging/old_name.py']}
+
+
+# --- the container runner (ANYM-574) -----------------------------------------------------------------------------
+def runner_module(name):
+    import importlib.util
+    spec_ = importlib.util.spec_from_file_location(f'autoloop_runner_{name}', ROOT / 'deploy/autoloop-runner' / f'{name}.py')
+    module = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(module)
+    return module
+
+
+selfcheck, launcher, egress = (runner_module(n) for n in ('selfcheck', 'launch', 'proxy'))
+PROD = '100.64.0.9'
+MOUNTINFO = ('1 0 0:1 / / rw - overlay overlay rw\n'
+             '2 1 0:2 /Users/someone/.cache/deedkit-autoloop-runner/x/control /run/autoloop/control ro - virtiofs m ro\n')
+
+
+def clean_env():
+    return {'HOME': '/home/runner', 'PATH': '/usr/bin', 'GH_TOKEN': 'x', 'HTTPS_PROXY': launcher.PROXY_URL,
+            'AUTOLOOP_PROD_HOST': PROD, 'AUTOLOOP_INTENT': BUILD}
+
+
+def no_route(host, port):
+    return False
+
+
+def only_github(proxy, host, port):
+    return (host, port) == ('github.com', 443)
+
+
+# spec: ANYM-574
+def test_the_in_container_check_finds_no_ssh_key_socket_or_extra_variable_and_no_route_to_production(tmp_path):
+    home = tmp_path / 'home'
+    home.mkdir()
+    import tempfile
+    run = Path(tempfile.mkdtemp(prefix='al', dir='/tmp'))  # a socket path is at most 104 bytes on macOS
+    roots = [str(run)]
+
+    def found(env=None, mountinfo=MOUNTINFO, connect=no_route, tunnel=only_github):
+        return selfcheck.check(env or clean_env(), home, mountinfo, roots, connect, tunnel)
+    assert found() == []
+    # An SSH key, an SSH agent socket, an extra variable or a forbidden mount is each a finding.
+    (home / '.ssh').mkdir()
+    (home / '.ssh' / 'id_ed25519').write_text('k')
+    assert any('SSH directory' in f for f in found()) and any('private key' in f for f in found())
+    shutil.rmtree(home / '.ssh')
+    (home / 'key.pem').write_text('-----BEGIN OPENSSH PRIVATE KEY-----\n')
+    assert any('private key' in f for f in found())
+    (home / 'key.pem').unlink()
+    import socket as socket_
+    agent = socket_.socket(socket_.AF_UNIX)
+    path = run / 'a.sock'
+    try:
+        agent.bind(str(path))
+        assert found() == [f'socket: {path}']
+    finally:
+        agent.close()
+        shutil.rmtree(run)
+    assert found({**clean_env(), 'SSH_AUTH_SOCK': '/tmp/x'}) == [
+        'variable outside the runner list: SSH_AUTH_SOCK', 'SSH agent variable set']
+    assert found({**clean_env(), 'AWS_SECRET_ACCESS_KEY': 'x'}) == [
+        'variable outside the runner list: AWS_SECRET_ACCESS_KEY']
+    for source in ('/Users/someone/.ssh', '/Users/someone/.deedkit/autoloop', '/Users/someone/deedkit-orchestrator',
+                   '/run/host-services/ssh-auth.sock', '/var/run/docker.sock'):
+        assert found(mountinfo=MOUNTINFO + f'3 1 0:3 {source} /mnt rw - virtiofs m rw\n'), source
+    # The production host answers directly or through the proxy: a finding; a proxy that cannot reach GitHub too.
+    assert found(connect=lambda host, port: (host, port) == (PROD, 22)) == [f'production host reachable: {PROD}:22']
+    assert found(tunnel=lambda proxy, host, port: True) == [
+        f'production host reachable through the proxy: {PROD}:22',
+        f'production host reachable through the proxy: {PROD}:443']
+    assert found(tunnel=lambda proxy, host, port: False) == ['the proxy does not reach github.com']
+    assert found({k: v for k, v in clean_env().items() if k != 'AUTOLOOP_PROD_HOST'}) == [
+        'AUTOLOOP_PROD_HOST is not set: the production check cannot run']
+
+
+# spec: ANYM-574
+def test_the_entrypoint_runs_the_check_before_the_clone_and_the_agent_cli():
+    text = (ROOT / 'deploy/autoloop-runner/entrypoint.sh').read_text()
+    assert text.index('selfcheck.py') < text.index('git clone') < text.index('exec claude -p "$AUTOLOOP_PROMPT" --dangerously')
+    assert text.startswith('#!/bin/sh\n') and 'set -eu' in text
+
+
+# spec: ANYM-574
+def test_the_image_pins_every_tool_and_runs_as_a_non_root_user():
+    text = (ROOT / 'deploy/autoloop-runner/Dockerfile').read_text()
+    assert all('@sha256:' in line for line in text.splitlines() if line.startswith('FROM '))
+    assert 'sha256sum --check --strict' in text and '@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}' in text
+    assert f'CLAUDE_CODE_VERSION={autoloop.CLI_VERSION}' in text
+    assert re.search(r'^USER runner$', text, re.M) and 'ENTRYPOINT ["/opt/runner/entrypoint.sh"]' in text
+    pin = (ROOT / 'docs/harness/tiden.md').read_text()
+    version = re.search(r'^TIDEN_CLI_VERSION=(\S+)$', pin, re.M)[1]
+    amd64 = re.search(r'^TIDEN_CLI_SHA256_linux_amd64=(\S+)$', pin, re.M)[1]
+    assert f'TIDEN_VERSION={version}' in text and f'TIDEN_SHA256_amd64={amd64}' in text
+
+
+# spec: ANYM-574
+def test_the_runner_container_gets_no_owner_directory_no_secret_on_its_command_line_and_only_the_internal_network(
+        tmp_path):
+    values = {**{name: 'secret-value-' + name for name in launcher.SECRETS},
+              **launcher.settings(BUILD, 'ANYM-30', PROD)}
+    control = tmp_path / 'control'
+    argv = launcher.run_argv(BUILD, 'img', sorted(values), control, tty=True, remove=False)
+    assert '--rm' not in argv and '--rm' in launcher.run_argv('c', 'img', [])
+    assert not any('secret-value' in part for part in argv)
+    assert argv[argv.index('--network') + 1] == launcher.NETWORK and '--privileged' not in argv
+    assert argv[argv.index('--cap-drop') + 1] == 'ALL' and 'no-new-privileges' in argv
+    mounts = [argv[i + 1] for i, part in enumerate(argv) if part in ('--mount', '--volume', '-v')]
+    assert mounts == [f'type=bind,source={control},target=/run/autoloop/control,readonly']  # no writable host path
+    assert all(word not in m for m in mounts for word in selfcheck.FORBIDDEN_MOUNTS)
+    names = [argv[i + 1] for i, part in enumerate(argv) if part == '--env']
+    assert all('=' not in n for n in names) and set(names) <= selfcheck.ENV and set(launcher.ENV) <= selfcheck.ENV
+    assert set(values) <= set(launcher.ENV)
+    env = launcher.client_env(values)
+    assert env['GH_TOKEN'] == 'secret-value-GH_TOKEN' and 'SSH_AUTH_SOCK' not in env
+    assert values['AUTOLOOP_PROMPT'] == ('Read and follow /run/autoloop/control/common.md and '
+                                         f'/run/autoloop/control/autoloop-build.md. Intent: {BUILD}. Card: ANYM-30. In this '
+                                         'container there is no Codex: run each review round as an Opus subagent; '
+                                         "the controller's Astra review on the host is the review of record.")
+    # The proxy is the one container on both networks, and the runner's network has no route out.
+    calls = []
+
+    def docker(argv_, timeout=None):
+        calls.append(argv_)
+        if argv_[:3] == ['docker', 'network', 'inspect'] and not any(c[:3] == ['docker', 'network', 'create']
+                                                                      for c in calls):
+            raise launcher.Refused('missing')
+        if argv_[:3] == ['docker', 'network', 'inspect']:
+            return json.dumps([{'Internal': True}])
+        if argv_[:2] == ['docker', 'inspect']:
+            raise launcher.Refused('no proxy')
+        return ''
+    assert launcher.network('img', docker, tmp_path) == launcher.proxy_name('img')
+    assert ['docker', 'network', 'create', '--internal', launcher.NETWORK] in calls
+    assert launcher.proxy_argv('img') in calls and ['docker', 'network', 'connect', launcher.NETWORK,
+                                                    launcher.proxy_name('img')] in calls
+
+
+# spec: ANYM-574
+def test_the_launcher_passes_only_the_current_claude_access_token_and_refuses_one_about_to_expire():
+    now = datetime(2026, 10, 28, tzinfo=timezone.utc)
+    later = int((now + timedelta(hours=5)).timestamp() * 1000)
+    raw = json.dumps({'claudeAiOauth': {'accessToken': 'at', 'refreshToken': 'rt', 'expiresAt': later}})
+    assert launcher.access_token(raw, now, 4 * 3600) == 'at'
+    with pytest.raises(launcher.Refused, match='expires'):
+        launcher.access_token(raw, now, 6 * 3600)
+    with pytest.raises(launcher.Refused, match='not readable'):
+        launcher.access_token('{}', now, 60)
+
+
+# spec: ANYM-574
+def test_a_worker_in_the_runner_reaches_the_host_state_only_through_the_gate_file_and_the_outbox(
+        tmp_path, monkeypatch, capsys):
+    runner = tmp_path / 'runner'
+    (runner / 'control').mkdir(parents=True)
+    (runner / 'outbox').mkdir()
+    monkeypatch.setenv('AUTOLOOP_RUNNER', str(runner))
+    monkeypatch.setenv('AUTOLOOP_INTENT', BUILD)
+    state = tmp_path / 'state'
+    assert autoloop.main(['gate', BUILD, '--state', str(state)]) == 1  # no gate file yet: stop
+    launcher.write_gate(runner / 'control', None)
+    assert autoloop.main(['gate', BUILD]) == 0
+    launcher.write_gate(runner / 'control', 'paused')
+    assert autoloop.main(['gate', BUILD]) == 1 and 'STOP paused' in capsys.readouterr().err
+    assert autoloop.main(['large', BUILD]) == 0 and autoloop.main(['finish', BUILD]) == 0
+    assert autoloop.main(['finish', 'autoloop-build-other']) == 1
+    for action in (['tick'], ['hold', 'ANYM-30'], ['bind', BUILD, '--card', 'ANYM-30'], ['resume']):
+        assert autoloop.main(action) == 1
+    assert not state.exists()
+    # The host applies this intent's known requests only, an end before `finish`, each once.
+    with open(runner / 'outbox' / 'requests.jsonl', 'a') as outbox:
+        for item in ({'action': 'hold', 'intent': BUILD}, {'action': 'finish', 'intent': 'autoloop-build-other'},
+                     {'action': 'decline', 'intent': BUILD, 'reason': 'bogus'}, {'action': 'finish', 'intent': BUILD}):
+            outbox.write(json.dumps(item) + '\n')
+        outbox.write('not json\n')
+    pending = tmp_path / 'pending.json'
+    pending.write_text(json.dumps(launcher.requests((runner / 'outbox' / 'requests.jsonl').read_text(), BUILD)))
+    applied = []
+    assert launcher.apply(pending, lambda step: applied.append(step) or 0) == [('large', 0), ('finish', 0)]
+    assert applied == [['large', BUILD], ['finish', BUILD]] and not pending.exists()
+
+
+# spec: ANYM-574
+def test_the_egress_proxy_passes_only_allowlisted_names_on_443_with_public_addresses():
+    assert egress.allowed('github.com', 443) and egress.allowed('api.anthropic.com', 443)
+    assert egress.allowed('app.tiden.ai', 443) and egress.allowed('pypi.org', 443)
+    for host, port in (('github.com', 22), ('github.com', 80), (PROD, 443), ('deedkit-prod', 443),
+                       ('evil.example', 443), ('github.com.evil.example', 443), ('[::1]', 443), (None, 443)):
+        assert not egress.allowed(host, port), (host, port)
+    assert egress.public(['140.82.121.4']) == ['140.82.121.4']
+    for private in (['100.109.74.46'], ['10.0.0.1'], ['127.0.0.1'], ['169.254.169.254'], ['::1'],
+                    ['140.82.121.4', '192.168.1.2'], []):
+        assert egress.public(private) == [], private
+
+
+def tar_of(name, data=b'', kind=tarfile.REGTYPE, count=1):
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode='w') as tar:
+        for _ in range(count):
+            info = tarfile.TarInfo(name)
+            info.type = kind
+            if kind == tarfile.SYMTYPE:
+                info.linkname = '/etc/passwd'
+            info.size = len(data) if kind == tarfile.REGTYPE else 0
+            tar.addfile(info, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+    return out.getvalue()
+
+
+# spec: ANYM-574
+def test_the_host_reads_the_outbox_as_one_small_regular_file_and_only_well_typed_requests():
+    line = json.dumps({'action': 'finish', 'intent': BUILD}).encode()
+    assert launcher.outbox_text(tar_of('requests.jsonl', line)) == line.decode()
+    for archive in (tar_of('requests.jsonl', b'x' * (launcher.MAX_OUTBOX + 1)),  # oversized
+                    tar_of('requests.jsonl', kind=tarfile.SYMTYPE), tar_of('requests.jsonl', kind=tarfile.FIFOTYPE),
+                    tar_of('requests.jsonl', kind=tarfile.DIRTYPE), tar_of('requests.jsonl', line, count=2),
+                    b'not a tar', b''):
+        assert launcher.outbox_text(archive) == ''
+    for reason in ([], {'a': 1}, 7):
+        text = json.dumps({'action': 'decline', 'intent': BUILD, 'reason': reason})
+        assert launcher.requests(text, BUILD) == []
+    assert launcher.requests('\n'.join([line.decode()] * 50), BUILD) == [['finish', BUILD]]
+
+
+# spec: ANYM-574
+def test_a_busy_host_lock_is_retried_and_a_step_never_applied_stays_pending(tmp_path, monkeypatch):
+    monkeypatch.setattr(launcher, 'ATTEMPTS', 3)
+    pending = tmp_path / 'pending.json'
+    steps = [['large', BUILD], ['finish', BUILD]]
+    pending.write_text(json.dumps(steps))
+    answers = iter([1, 0, 1, 1, 1])  # large: busy once then applied; finish: busy every time
+    slept = []
+    assert launcher.apply(pending, lambda step: next(answers), slept.append) == [('large', 0), ('finish', 1)]
+    assert json.loads(pending.read_text()) == [['finish', BUILD]] and len(slept) == 3
+    assert launcher.report([], pending) == 1  # still pending: said, and the launcher exits non-zero
+    assert launcher.apply(pending, lambda step: 0) == [('finish', 0)] and not pending.exists()
+    assert launcher.report([], pending) == 0
+
+
+# spec: ANYM-574
+def test_a_failed_gate_check_or_the_time_limit_stops_the_container(tmp_path, monkeypatch):
+    calls = []
+
+    def docker(argv, timeout=None):
+        calls.append(argv[:2])
+        if argv[:2] == ['docker', 'stop']:
+            done.set()  # the stopped container's client returns
+        if argv[:2] == ['docker', 'inspect']:
+            return 'false\n'
+        return ''
+    monkeypatch.setattr(launcher, 'POLL', 0)
+    done = threading.Event()
+
+    def broken(state, intent):
+        raise OSError('state unreadable')
+    monkeypatch.setattr(launcher.autoloop, 'gate', broken)
+    launcher.watch(tmp_path, BUILD, tmp_path, BUILD, done, float('inf'), docker)
+    assert ['docker', 'stop'] in calls
+    calls.clear()
+    done.clear()
+    monkeypatch.setattr(launcher.autoloop, 'gate', lambda state, intent: None)
+    launcher.watch(tmp_path, BUILD, tmp_path, BUILD, done, 0, docker, clock=lambda: 1)
+    assert (tmp_path / 'gate').read_text() == 'time limit\n' and ['docker', 'stop'] in calls
+
+    def stuck(argv, timeout=None):
+        return 'true\n' if argv[:2] == ['docker', 'inspect'] else ''
+    assert launcher.stop(BUILD, stuck) is False  # stop and kill both tried; still running is reported
+
+
+def client_hello(name):
+    sni = name.encode()
+    ext = (0).to_bytes(2, 'big') + (len(sni) + 5).to_bytes(2, 'big') + (len(sni) + 3).to_bytes(2, 'big') + b'\0' \
+        + len(sni).to_bytes(2, 'big') + sni
+    body = b'\x03\x03' + b'r' * 32 + b'\0' + b'\0\x02\x13\x01' + b'\x01\0' + len(ext).to_bytes(2, 'big') + ext
+    hs = b'\x01' + len(body).to_bytes(3, 'big') + body
+    return b'\x16\x03\x01' + len(hs).to_bytes(2, 'big') + hs
+
+
+# spec: ANYM-574
+def test_the_proxy_tunnels_only_a_tls_session_whose_server_name_is_the_connect_name():
+    assert egress.server_name(client_hello('pypi.org')) == 'pypi.org'
+    assert egress.server_name(client_hello('Outside.Example')) == 'outside.example'
+    whole = client_hello('pypi.org')
+    for record in (b'GET / HTTP/1.1\r\n\r\n', whole[:20], whole[:-3], b'\x17' + whole[1:], b''):
+        assert egress.server_name(record) is None
+
+    async def tunnel(name):
+        upstream = []
+
+        class Up:
+            def write(self, data):
+                upstream.append(data)
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+        async def resolver(host):
+            return ['140.82.121.4']
+
+        async def opener(host, port):
+            ended = asyncio.StreamReader()
+            ended.feed_eof()  # the upstream closes at once, so both pipes end
+            return ended, Up()
+        reader, out = asyncio.StreamReader(), []
+        reader.feed_data(b'CONNECT pypi.org:443 HTTP/1.1\r\n\r\n' + client_hello(name))
+        reader.feed_eof()
+
+        class Down(Up):
+            def write(self, data):
+                out.append(data)
+        original = asyncio.open_connection
+        asyncio.open_connection = opener
+        try:
+            await asyncio.wait_for(egress.handle(reader, Down(), resolver), 10)
+        finally:
+            asyncio.open_connection = original
+        return upstream
+    assert asyncio.run(tunnel('outside.example')) == []
+    assert asyncio.run(tunnel('pypi.org')) == [client_hello('pypi.org')]
+
+
+class FakeCopy:
+    """A `docker cp` child on a real pipe: `hang` keeps the pipe's write end open and the child running until killed;
+    `held` keeps the pipe open even after the kill (a grandchild holding it)."""
+    def __init__(self, data, code=0, hang=False, held=False):
+        read, self.writer = os.pipe()
+        self.stdout, self.code, self.hang, self.killed = os.fdopen(read, 'rb'), code, hang or held, False
+        self.stderr = None
+        threading.Thread(target=self.feed, args=(data, hang or held), daemon=True).start()
+
+    def feed(self, data, hang):
+        try:
+            os.write(self.writer, data) if len(data) < 4096 else [os.write(self.writer, data[i:i + 4096])
+                                                                for i in range(0, len(data), 4096)]
+        except OSError:
+            return  # the reader closed its end
+        if not hang:
+            os.close(self.writer)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def kill(self):
+        self.killed = True
+
+    def poll(self):
+        return None if self.hang and not self.killed else self.code
+
+    def wait(self, timeout=None):
+        return self.code
+
+
+# spec: ANYM-574
+def test_a_failed_or_unanswered_outbox_copy_keeps_the_container_and_applies_nothing(tmp_path):
+    line = json.dumps({'action': 'finish', 'intent': BUILD}).encode()
+    good = tar_of('requests.jsonl', line)
+    assert launcher.collect(BUILD, lambda *a, **k: FakeCopy(good)) == line.decode()
+    assert launcher.collect(BUILD, lambda *a, **k: FakeCopy(b'', code=1)) is None  # docker cp failed
+    assert launcher.collect(BUILD, lambda *a, **k: FakeCopy(b'', hang=True), timeout=0.1) is None  # no answer
+    assert launcher.collect(BUILD, lambda *a, **k: FakeCopy(b'x' * (launcher.MAX_OUTBOX + 20000))) == ''  # too big
+    (tmp_path / BUILD).mkdir()
+    calls = []
+
+    def docker(argv, timeout=None):
+        calls.append(argv[:2])
+        return 'false\n'
+    with pytest.raises(launcher.Refused, match='container is kept'):
+        launcher.gather(BUILD, tmp_path, docker, lambda name: None)
+    assert ['docker', 'rm'] not in calls and not (tmp_path / BUILD / 'pending.json').exists()
+    launcher.gather(BUILD, tmp_path, docker, lambda name: line.decode())
+    assert ['docker', 'rm'] in calls
+    assert json.loads((tmp_path / BUILD / 'pending.json').read_text()) == [['finish', BUILD]]
+
+
+# spec: ANYM-574
+def test_a_stop_counts_only_when_docker_confirms_the_container_stopped_or_gone():
+    tried = []
+
+    def down(argv, timeout=None):  # the Docker daemon does not answer
+        tried.append(argv[1])
+        raise launcher.Refused('docker inspect: exit 1: Cannot connect to the Docker daemon')
+    assert launcher.stop(BUILD, down) is False and tried.count('kill') == 1
+
+    def gone(argv, timeout=None):
+        if argv[1] == 'inspect':
+            raise launcher.Refused('docker inspect: exit 1: Error: No such object: ' + BUILD)
+        return ''
+    assert launcher.stop(BUILD, gone) is True
+    with pytest.raises(launcher.Refused):
+        launcher.exists(BUILD, down)
+
+
+# spec: ANYM-574
+def test_a_copy_that_ends_its_output_but_never_exits_is_killed_and_read_as_failed():
+    started = []
+
+    def hung(*args, **kwargs):  # a real process: empty output at once, then it never exits by itself
+        started.append(subprocess.Popen([sys.executable, '-c', 'import os, time; os.close(1); time.sleep(60)'],
+                                        stdout=subprocess.PIPE, stdin=subprocess.DEVNULL))
+        return started[0]
+    begin = time.monotonic()
+    assert launcher.collect(BUILD, hung, timeout=0.5) is None
+    assert time.monotonic() - begin < 10 and started[0].poll() is not None  # killed, not waited on for a minute
+
+
+# spec: ANYM-574
+def test_a_killed_copy_is_reaped_only_with_a_bounded_wait():
+    waits = []
+
+    class Copy(subprocess.Popen):  # a real hung process whose every wait is recorded
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return super().wait(timeout)
+
+    def hung(*args, **kwargs):
+        return Copy([sys.executable, '-c', 'import os, time; os.close(1); time.sleep(60)'],
+                    stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    assert launcher.collect(BUILD, hung, timeout=0.5) is None
+    assert waits and None not in waits  # no unbounded wait, also not from a context manager's exit
+
+
+# spec: ANYM-574
+def test_every_launcher_child_wait_is_bounded_even_when_a_grandchild_holds_its_pipes(tmp_path, monkeypatch):
+    waits, pid = [], tmp_path / 'grandchild'
+
+    class Recorded(subprocess.Popen):
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return super().wait(timeout)
+    monkeypatch.setattr(subprocess, 'Popen', Recorded)
+    monkeypatch.setattr(launcher, 'REAP', 0.5, raising=False)
+    script = ('import pathlib, subprocess, sys, time; '
+              'g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"]); '
+              f'pathlib.Path({str(pid)!r}).write_text(str(g.pid)); time.sleep(30)')
+    begin = time.monotonic()
+    try:
+        with pytest.raises(launcher.Refused, match='TimeoutExpired'):
+            launcher.call([sys.executable, '-c', script], timeout=1)
+        assert time.monotonic() - begin < 6 and None not in waits  # killed and reaped, never waited on unbounded
+    finally:
+        if pid.exists():
+            os.kill(int(pid.read_text()), signal.SIGKILL)
+
+
+# spec: ANYM-574
+def test_an_outbox_copy_whose_pipe_stays_open_after_the_kill_is_read_as_failed_within_its_bound():
+    copy, got = FakeCopy(b'', held=True), []
+    reader = threading.Thread(target=lambda: got.append(launcher.collect(BUILD, lambda *a, **k: copy, timeout=0.3)),
+                              daemon=True)
+    reader.start()
+    reader.join(5)
+    try:
+        assert got == [None] and copy.killed and copy.stdout.closed  # no close waits on a reader thread's lock
+    finally:
+        os.close(copy.writer)
+
+
+def runner_build(monkeypatch, tmp_path, events, **fakes):
+    """launch.py build with every Docker, login and host call faked; `events` records what ran, in order."""
+    monkeypatch.setattr(launcher, 'RUNS', tmp_path / 'runs')
+    monkeypatch.setattr(launcher, 'exists', lambda name, docker=None: False)
+    monkeypatch.setattr(launcher.autoloop, 'gate', lambda state, intent: None)
+    monkeypatch.setattr(launcher, 'prepare', lambda intent: tmp_path)
+    monkeypatch.setattr(launcher, 'image', lambda: 'img:abc')
+    monkeypatch.setattr(launcher, 'network', lambda name: 'deedkit_autoloop_proxy_abc')
+    monkeypatch.setattr(launcher, 'logins', lambda now, minimum: {})
+    monkeypatch.setattr(launcher, 'production_host', lambda: PROD)
+    monkeypatch.setattr(launcher, 'stop', lambda name, docker=None: events.append(('stop', name)) or True)
+    monkeypatch.setattr(launcher, 'gather', lambda intent: tmp_path / 'runs' / intent / 'pending.json')
+    monkeypatch.setattr(launcher, 'apply', lambda pending: events.append(
+        ('apply', json.loads(pending.read_text()) if pending.exists() else [])) or [])
+
+    def client(argv, env=None, timeout=None, capture=True):
+        events.append(('run', timeout, capture))
+        return 0, '', ''
+    monkeypatch.setattr(launcher, 'supervise', client, raising=False)
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: events.append(('run', None, False)) or
+                        subprocess.CompletedProcess(a, 0, '', ''))  # the base commit's client: never a real docker
+    for name, value in fakes.items():
+        monkeypatch.setattr(launcher, name, value, raising=False)
+
+
+# spec: ANYM-574
+def test_a_cancel_before_the_container_starts_never_starts_it_and_every_exit_stops_it_first(tmp_path, monkeypatch):
+    events = []
+
+    def ignored(*_):
+        pass  # the test process's own handler: a launcher that installs none never dies of the signal
+
+    def cancelled_logins(now, minimum):  # the terminal closes while the logins are read
+        os.kill(os.getpid(), signal.SIGTERM)
+        return {}
+    runner_build(monkeypatch, tmp_path, events, logins=cancelled_logins)
+    before = signal.signal(signal.SIGTERM, ignored)
+    try:
+        with pytest.raises(launcher.Refused, match='cancelled before the container started'):
+            launcher.build(BUILD, 'ANYM-30', tmp_path)
+        assert signal.getsignal(signal.SIGTERM) is ignored  # the launcher's handlers are put back
+    finally:
+        signal.signal(signal.SIGTERM, before)
+    assert not any(e[0] == 'run' for e in events) and events[-2:] == [('stop', BUILD), ('apply', [['end', BUILD]])]
+    # A failed attached client: the container is confirmed stopped before supervision ends; the client is bounded.
+    events.clear()
+    (tmp_path / 'runs' / BUILD / 'pending.json').unlink()
+
+    def broken(argv, env=None, timeout=None, capture=True):
+        events.append(('run', timeout, capture))
+        raise OSError('docker gone')
+    runner_build(monkeypatch, tmp_path, events, supervise=broken)
+    with pytest.raises(launcher.Refused, match='the build client'):
+        launcher.build(BUILD, 'ANYM-30', tmp_path)
+    (_, timeout, capture), = [e for e in events if e[0] == 'run']
+    assert capture is False and launcher.autoloop.LIMITS['build'] < timeout <= launcher.autoloop.LIMITS['build'] + 600
+    assert events[1:] == [('stop', BUILD), ('apply', [['end', BUILD]])]
+    # The check's container is stopped (and so removed) after a time-out too.
+    events.clear()
+
+    def late(argv, env=None, timeout=None, capture=True):
+        raise subprocess.TimeoutExpired(argv, timeout)
+    monkeypatch.setattr(launcher, 'supervise', late, raising=False)
+    monkeypatch.setattr(subprocess, 'run', late)
+    assert launcher.check() == 1 and ('stop', launcher.CHECK) in events
+
+
+# spec: ANYM-574
+def test_a_build_that_ends_without_finish_is_interrupted_on_the_host_and_frees_its_slot_lane_and_paths(
+        tmp_path, monkeypatch):
+    a, c, real_apply = tmp_path / 'a', cfg(build_in_flight=1), launcher.apply
+    a.mkdir(mode=0o700)
+    reserved, _ = autoloop.admit(a, c, 'build', 'ANYM-30', [], NOW)
+    assert reserved['name'] == BUILD
+    autoloop.put(a, dict(reserved, status='started', started_at=triage.stamp(NOW), lane='messaging',
+                         paths=['services/messaging/x.py']))
+    assert list(autoloop.claims(a)) == [BUILD] and autoloop.admit(a, c, 'build', 'ANYM-31', [], NOW) == \
+        (None, 'workers in flight')
+    # The image build fails: no container ever runs, and the launcher still ends the intent on the host.
+    events = []
+    runner_build(monkeypatch, tmp_path, events, image=lambda: (_ for _ in ()).throw(launcher.Refused('docker build')))
+    monkeypatch.setattr(launcher, 'apply', real_apply)  # the real host step: `autoloop.py end` on this state
+    monkeypatch.setenv('AUTOLOOP_STATE', str(a))
+    monkeypatch.delenv('AUTOLOOP_RUNNER', raising=False)
+    with pytest.raises(launcher.Refused, match='docker build'):
+        launcher.build(BUILD, 'ANYM-30', a)
+    got = autoloop.intents(a)[BUILD]
+    assert got['status'] == 'interrupted' and got['ended_at'] and autoloop.claims(a) == {}
+    assert triage.load(a / 'ledger.json', {})['days']['2026-10-26']['seconds'] == 4 * 3600  # reservation kept
+    assert not (tmp_path / 'runs' / BUILD / 'pending.json').exists()
+    assert autoloop.admit(a, c, 'build', 'ANYM-31', [], NOW)[1] is None
+    # A finished build stays finished; the worker can neither ask for `end` nor put it in the outbox.
+    intent(a, 'autoloop-build-anym-32', 'ANYM-32', 'finished')
+    assert autoloop.main(['end', 'autoloop-build-anym-32', '--state', str(a)]) == 0
+    assert autoloop.intents(a)['autoloop-build-anym-32']['status'] == 'finished'
+    monkeypatch.setenv('AUTOLOOP_RUNNER', str(tmp_path))
+    monkeypatch.setenv('AUTOLOOP_INTENT', BUILD)
+    assert autoloop.main(['end', BUILD]) == 1
+    assert launcher.requests(json.dumps({'action': 'end', 'intent': BUILD}), BUILD) == []
+
+
+def proxy_docker(proxies, users, calls, arrive=None):
+    """A fake docker CLI for the proxies: `proxies` maps each proxy to its image, `users` holds the proxies a
+    labelled container uses; `arrive` runs at the in-use check."""
+    def docker(argv, timeout=None):
+        calls.append(argv)
+        if argv[:3] == ['docker', 'network', 'inspect']:
+            return json.dumps([{'Internal': True}])
+        if argv[:2] == ['docker', 'inspect']:
+            if argv[-1] not in proxies:
+                raise launcher.Refused('No such object')
+            return proxies[argv[-1]] + '\n'
+        if argv[:3] == ['docker', 'run', '--detach']:
+            proxies[argv[argv.index('--name') + 1]] = argv[-2]
+        if argv[:2] == ['docker', 'stop']:
+            proxies.pop(argv[-1])
+        if argv[:2] == ['docker', 'ps'] and '--quiet' in argv:
+            if arrive:
+                arrive()
+            return 'c1\n' if argv[-1].split('=', 2)[2] in users else ''
+        if argv[:2] == ['docker', 'ps']:
+            return '\n'.join(proxies)
+        return ''
+    return docker
+
+
+# spec: ANYM-574
+def test_a_new_runner_image_gets_its_own_proxy_and_an_older_one_is_stopped_only_when_idle(tmp_path, monkeypatch):
+    old, new = 'deedkit_autoloop_proxy_old', 'deedkit_autoloop_proxy_new'  # the images img:old and img:new
+    proxies, users, calls = {}, {old}, []
+    docker = proxy_docker(proxies, users, calls)
+    monkeypatch.setattr(launcher, 'RUNS', tmp_path / 'runs')
+    monkeypatch.setattr(launcher, 'LEASES', [], raising=False)
+    launcher.network('img:old', docker)
+    launcher.network('img:new', docker)  # the runner changed while a build of the old image runs
+    assert not any(c[:2] == ['docker', 'stop'] for c in calls) and proxies == {old: 'img:old', new: 'img:new'}
+    for fd in launcher.LEASES:
+        os.close(fd)  # both launchers have exited; the old image's build container is still there
+    launcher.LEASES.clear()
+    clock = time.time() + launcher.IDLE + 60  # an hour later: the old proxy is idle but a build still uses it
+    assert launcher.network('img:new', docker, clock=lambda: clock) == new and set(proxies) == {old, new}
+    users.clear()  # that build's container is gone
+    assert launcher.network('img:new', docker, clock=lambda: clock) == new and set(proxies) == {new}
+    assert ['docker', 'stop', old] in calls and ['docker', 'stop', new] not in calls
+    values = launcher.settings(BUILD, 'ANYM-30', PROD, proxy=new)
+    argv = launcher.run_argv(BUILD, 'img:new', sorted(values), proxy=new)
+    assert values['HTTPS_PROXY'] == f'http://{new}:3128' and f'deedkit.autoloop.proxy={new}' in argv
+    for fd in launcher.LEASES:
+        os.close(fd)
+
+
+# spec: ANYM-574
+def test_the_build_agent_saves_no_session_in_the_container():
+    text = (ROOT / 'deploy/autoloop-runner/entrypoint.sh').read_text()
+    build_line = text[text.rindex('exec claude'):]
+    assert '--no-session-persistence' in build_line and '--dangerously-skip-permissions' in build_line
+
+
+# spec: ANYM-574
+def test_the_proxy_refuses_ipv6_addresses_that_carry_an_ipv4_address():
+    for translated in ('64:ff9b::a00:1', '64:ff9b::6440:9', '64:ff9b:1::a00:1', '2002:a00:1::1', '2001:0:a00:1::1',
+                       '::ffff:10.0.0.1', '::ffff:140.82.121.4', '::a00:1', '::ffff:0:a00:1'):
+        assert egress.public([translated]) == [], translated
+        assert egress.public(['140.82.121.4', translated]) == [], translated
+    assert egress.public(['2606:4700:4700::1111']) == ['2606:4700:4700::1111']
+
+
+# spec: ANYM-574
+def test_a_container_docker_reports_missing_in_its_own_words_counts_as_gone():
+    for message in (f'docker inspect: exit 1: Error: no such object: {BUILD}',  # the docker CLI 29 on the owner Mac
+                    f'docker inspect: exit 1: Error response from daemon: No such container: {BUILD}'):
+        def gone(argv, timeout=None):
+            if argv[1] == 'inspect':
+                raise launcher.Refused(message)
+            raise launcher.Refused('docker stop: exit 1: Error response from daemon: No such container: x')
+        assert launcher.running(BUILD, gone) is None and launcher.stop(BUILD, gone) is True, message
+
+
+# spec: ANYM-574
+def test_a_cancel_while_docker_still_creates_the_container_stops_it_once_it_appears(tmp_path, monkeypatch):
+    box = {'exists': False, 'running': False, 'asked': 0}
+    done, cancelled = threading.Event(), threading.Event()
+
+    def docker(argv, timeout=None):
+        if argv[:2] == ['docker', 'inspect']:
+            if not box['exists']:
+                box['asked'] += 1
+                box['exists'] = box['running'] = True  # the pending `docker create` lands right after this answer
+                raise launcher.Refused('docker inspect: exit 1: Error: No such object: ' + BUILD)
+            return 'true\n' if box['running'] else 'false\n'
+        if argv[1] in ('stop', 'kill'):
+            if not box['exists']:
+                raise launcher.Refused('No such container')
+            box['running'] = False
+            done.set()  # the attached client returns once its container stopped
+        return ''
+    monkeypatch.setattr(launcher, 'POLL', 0.01)
+    monkeypatch.setattr(launcher.autoloop, 'gate', lambda state, intent: None)
+    cancelled.set()  # the terminal closed after the pre-start check
+    watcher = threading.Thread(target=launcher.watch, args=(tmp_path, BUILD, tmp_path, BUILD, done, float('inf'),
+                                                            docker), kwargs={'cancelled': cancelled}, daemon=True)
+    watcher.start()
+    watcher.join(5)
+    assert box['asked'] == 1 and box['running'] is False and not watcher.is_alive()
+
+
+# spec: ANYM-574
+def test_a_build_that_fails_with_an_unexpected_error_before_its_container_still_ends_the_intent(tmp_path, monkeypatch):
+    a, c, real_apply, real_prepare = tmp_path / 'a', cfg(build_in_flight=1), launcher.apply, launcher.prepare
+    a.mkdir(mode=0o700)
+    reserved, _ = autoloop.admit(a, c, 'build', 'ANYM-30', [], NOW)
+    autoloop.put(a, dict(reserved, status='started', started_at=triage.stamp(NOW), lane='messaging',
+                         paths=['services/messaging/x.py']))
+    events = []
+    runner_build(monkeypatch, tmp_path, events,
+                 prepare=lambda intent: real_prepare(intent, tmp_path / 'runs', tmp_path / 'no-briefs'))
+    monkeypatch.setattr(launcher, 'apply', real_apply)
+    monkeypatch.setenv('AUTOLOOP_STATE', str(a))
+    monkeypatch.delenv('AUTOLOOP_RUNNER', raising=False)
+    with pytest.raises(FileNotFoundError):  # a brief is missing: the original error still reaches the terminal
+        launcher.build(BUILD, 'ANYM-30', a)
+    assert ('stop', BUILD) in events and autoloop.intents(a)[BUILD]['status'] == 'interrupted'
+    assert autoloop.claims(a) == {} and autoloop.admit(a, c, 'build', 'ANYM-31', [], NOW)[1] is None
+
+
+# spec: ANYM-574
+def test_a_proxy_another_launcher_takes_while_it_is_being_retired_is_running_for_that_build(tmp_path, monkeypatch):
+    old, new = 'deedkit_autoloop_proxy_old', 'deedkit_autoloop_proxy_new'
+    proxies, calls, arrivals = {old: 'img:old'}, [], []
+    marks = tmp_path / 'runs' / 'proxies'
+    marks.mkdir(parents=True)
+    (marks / old).touch()
+    os.utime(marks / old, (0, 0))  # no launcher has named the old proxy for long
+    monkeypatch.setattr(launcher, 'LEASES', [], raising=False)
+
+    def arrive():  # a launcher of the old image starts right after retire()'s idle check
+        if not arrivals:
+            arrivals.append(threading.Thread(target=launcher.network, args=('img:old', docker, tmp_path / 'runs'),
+                                             daemon=True))
+            arrivals[0].start()
+            arrivals[0].join(1)
+    docker = proxy_docker(proxies, set(), calls, arrive)
+    launcher.retire(new, docker, marks, time.time)
+    arrivals[0].join(10)
+    assert not arrivals[0].is_alive() and proxies.get(old) == 'img:old'  # that launcher's build has its proxy
+    for fd in launcher.LEASES:
+        os.close(fd)
+
+
+# spec: ANYM-574
+def test_a_docker_socket_that_is_missing_is_no_answer_about_the_container():
+    def unreachable(argv, timeout=None):
+        raise launcher.Refused(f'{" ".join(argv[:2])}: exit 1: failed to connect to the docker API at '
+                               'unix:///tmp/docker.sock; dial unix /tmp/docker.sock: connect: no such file or directory')
+    with pytest.raises(launcher.Refused):
+        launcher.running(BUILD, unreachable)
+    assert launcher.stop(BUILD, unreachable) is False  # never confirmed: the intent is not ended as stopped
+
+    def other(argv, timeout=None):
+        raise launcher.Refused('docker inspect: exit 1: Error: No such object: ' + BUILD + '-old')
+    with pytest.raises(launcher.Refused):
+        launcher.running(BUILD, other)
+
+
+# spec: ANYM-574
+def test_a_retire_that_locks_a_mark_another_retire_removed_keeps_the_proxy_a_launcher_took_since(
+        tmp_path, monkeypatch):
+    old, new = 'deedkit_autoloop_proxy_old', 'deedkit_autoloop_proxy_new'
+    proxies, calls, runs = {old: 'img:old'}, [], tmp_path / 'runs'
+    marks = runs / 'proxies'
+    marks.mkdir(parents=True)
+    (marks / old).touch()
+    os.utime(marks / old, (0, 0))  # no launcher has named the old proxy for long
+    monkeypatch.setattr(launcher, 'LEASES', [], raising=False)
+    docker, real, paused = proxy_docker(proxies, set(), calls), fcntl.flock, []
+
+    def flock(fd, op):  # the first retire() pauses between opening the old mark and locking it
+        if op & fcntl.LOCK_EX and not paused:
+            paused.append(fd)
+            launcher.retire(new, docker, marks, time.time)  # a second retire() stops the proxy, removes the mark
+            launcher.network('img:old', docker, runs)  # a launcher of the old image leases a new mark, restarts it
+        return real(fd, op)
+    monkeypatch.setattr(launcher, 'fcntl', types.SimpleNamespace(
+        flock=flock, LOCK_SH=fcntl.LOCK_SH, LOCK_EX=fcntl.LOCK_EX, LOCK_NB=fcntl.LOCK_NB))
+    launcher.retire(new, docker, marks, time.time)
+    assert paused and ['docker', 'stop', old] in calls  # the interleaving ran
+    assert proxies.get(old) == 'img:old' and (marks / old).exists()  # that launcher keeps its proxy and mark
+    for fd in launcher.LEASES:
+        os.close(fd)
