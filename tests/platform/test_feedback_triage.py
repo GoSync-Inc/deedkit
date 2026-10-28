@@ -219,6 +219,22 @@ def test_local_match_and_classification_vocabulary(state):
 
 
 # spec: ANYM-264
+def test_match_tokenises_each_distinct_spec_version_once(state, monkeypatch):
+    # The live tick hung ~48 min here: 42 items x 33,718 versions (67 open branches, each a whole copy of main).
+    triage.pull(state, 'deedkit-prod', exporter([item(P, n) for n, P in enumerate((P1, P2, P3, P4))], []))
+    snap = triage.load(state / 'snapshot.json', None)
+    unique = len(triage.indexed(triage.variants(snap)))
+    snap['branches'].update({f'proposal/copy-{n}': [dict(s) for s in snap['main']] for n in range(200)})
+    triage.save(state / 'snapshot.json', snap)
+    calls, real = [], triage.words
+    monkeypatch.setattr(triage, 'words', lambda text: calls.append(text) or real(text))
+    rows = triage.match(state)
+    assert len(calls) <= unique + 4  # one per distinct version and one per item, not one per item and version
+    assert all(row['candidates'][0] == {'ref': 'ANYM-10', 'title': 'Participants of a group chat', 'status': 'Active',
+                                        'branch': 'main'} for row in rows)
+
+
+# spec: ANYM-264
 def test_clusters_count_reports_principals_and_keys(state):
     triage.pull(state, 'deedkit-prod', exporter([item(P1, 1), item(P2, 2, principal='agent-a', key='k2'),
                                                  item(P3, 3, principal='agent-b', key='k3'), item(P4, 4, key='k4')], []))

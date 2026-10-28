@@ -256,15 +256,26 @@ def words(text):
     return {w for w in re.findall(r'[a-z_]{4,}', text.lower())}
 
 
+def indexed(versions):
+    """(ref, body, words) once per distinct version: open branches repeat main's specs, so a snapshot holds a few
+    hundred distinct texts in tens of thousands of versions, and each is tokenised once per match, not per item."""
+    seen = {}
+    for spec in versions:
+        key = (spec['ref'], spec['title'], spec['text'], tuple(spec['sources']))
+        if key not in seen:
+            seen[key] = (spec['ref'], spec['title'] + ' ' + spec['text'] + ' ' + ' '.join(spec['sources']),
+                         words(spec['title'] + ' ' + spec['text']))
+    return list(seen.values())
+
+
 def candidates(item, versions, limit=5):
     operation = item.get('operation') or ''
     mine = words(item.get('description') or '')
     best = {}
-    for spec in versions:
-        body = spec['title'] + ' ' + spec['text'] + ' ' + ' '.join(spec['sources'])
-        score = (10 if operation and operation in body else 0) + len(mine & words(spec['title'] + ' ' + spec['text']))
-        if score > best.get(spec['ref'], 0):
-            best[spec['ref']] = score
+    for ref, body, vocabulary in versions:
+        score = (10 if operation and operation in body else 0) + len(mine & vocabulary)
+        if score > best.get(ref, 0):
+            best[ref] = score
     return [ref for _, ref in sorted((-score, ref) for ref, score in best.items())[:limit]]
 
 
@@ -274,9 +285,10 @@ def match(state):
         raise Refused('no snapshot: run `snapshot` first')
     specs = known(snap)
     inbox = load(state / 'inbox.json', {})
+    versions = indexed(variants(snap))
     out = [{'id': i, 'category': item.get('category'), 'operation': item.get('operation'),
             'candidates': [{'ref': ref, 'title': specs[ref]['title'], 'status': specs[ref]['status'],
-                            'branch': specs[ref]['branch']} for ref in candidates(item, variants(snap))]}
+                            'branch': specs[ref]['branch']} for ref in candidates(item, versions)]}
            for i, item in sorted(inbox.items(), key=lambda pair: (pair[1].get('created_at') or '', pair[0]))]
     save(state / 'candidates.json', out)
     return out
