@@ -340,7 +340,8 @@ class Gateway:
         try:
             value = MODELS[name].model_validate(arguments).model_dump(exclude_none=True)
         except ValidationError:
-            raise CalendarError("invalid_request") from None
+            stated = await asyncio.to_thread(Scheduler(self.service).stated, key) if name == "schedule" else {}
+            raise CalendarError("invalid_request", details=stated) from None
         if name == "schedule":
             return await self.schedule(key, value)
         method = getattr(self.service, "family" if name == "members" else name)

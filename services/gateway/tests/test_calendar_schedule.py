@@ -98,3 +98,17 @@ def test_a_calendar_candidate_keeps_its_next_when_the_caller_named_part_of_its_l
     with pytest.raises(Denied) as caught:
         asyncio.run(gateway(tmp_path, answer).call("gateway-a", "calendar_schedule", create))
     assert caught.value.detail["candidates"] == [lessons]
+
+
+# spec: ANYM-552
+def test_the_service_fallback_label_survives_where_the_label_repeating_the_title_is_dropped(tmp_path):
+    def option(ref, label):
+        return {"id": ref, "label": label, "kind": "calendar",
+                "next": {"tool": "calendar_schedule",
+                         "arguments": {"selection_token": "s" * 32, "calendar": ref, "dry_run": True}}}
+
+    answer = {"error": "selection_required", "candidates": [option("cal-child", "#1a"), option("cal-b", "Lessons #1")]}
+    create = {"action": "create", "title": "#1", "start": "2026-11-02T10:00", "calendar": "Less"}
+    with pytest.raises(Denied) as caught:
+        asyncio.run(gateway(tmp_path, answer).call("gateway-a", "calendar_schedule", create))
+    assert caught.value.detail["candidates"] == [option("cal-child", "#1a")]

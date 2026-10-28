@@ -51,21 +51,24 @@ def request_of(arguments):
 
 def texts(value, key=None):
     """The caller's own words in a request: every string outside the fields the gateway reads as references or
-    fixed values (action, start, date, IDs), with its words of 6 or more characters."""
+    fixed values (action, calendar, start, date, IDs), with its words of 6 or more characters."""
     if isinstance(value, dict):
         return {t for k, v in value.items() for t in texts(v, k)}
-    if isinstance(value, str) and value.strip() and key not in ("action", "start", "date", "request_id"):
+    if isinstance(value, str) and value.strip() and key not in ("action", "calendar", "start", "date", "request_id"):
         return {value} | {word for word in value.split() if len(word) >= 6}
     return set()
 
 
 def label_for(label, request, n):
     """A candidate label the gateway relays: one that repeats the caller's title or query would drop the candidate
-    (ANYM-544 payload filter), so that label falls back to the candidate's position."""
+    (ANYM-544 payload filter), so that label falls back to the first of `#n`, `#na` … `#nz` that repeats none."""
     def found(piece, text):
         return piece in text if len(piece) >= 4 else re.search(rf"(?<!\w){re.escape(piece)}(?!\w)", text) is not None
-    label = label[:200]
-    return f"#{n}" if any(found(t, label) for t in texts(request)) else label
+    pieces = texts(request)
+    for shown in (label[:200], f"#{n}", *(f"#{n}{c}" for c in "abcdefghijklmnopqrstuvwxyz")):
+        if not any(found(t, shown) for t in pieces):
+            return shown
+    return label[:200]
 
 
 def selection(candidates, more_next=None):
@@ -387,6 +390,15 @@ class Scheduler:
             raise CalendarError("in_progress")
 
     # --- the tool ----------------------------------------------------------------------------------------
+
+    def stated(self, key):
+        """The family timezone and now for an answer that fails before scheduling (bad arguments); empty when the
+        key or the schema cannot give them, so that answer keeps its own error."""
+        try:
+            self.ready()
+            return self.context(self.family(key, self.service.principal(key)))
+        except CalendarError:
+            return {}
 
     def schedule(self, key, arguments, tool=TOOL):
         """One call: a preview, a token apply or a keyed apply. Returns (result, operation_id or None, family);

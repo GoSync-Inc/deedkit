@@ -530,3 +530,37 @@ def test_token_errors_state_timezone_and_now(store):
         relayed = failure(caught.value.code, caught.value.field_errors, caught.value.details)
         assert relayed["error"] == code and relayed["timezone"] == "Asia/Makassar"
         assert relayed["now"].endswith("+08:00")
+
+
+# spec: ANYM-552
+def test_a_fallback_label_that_repeats_the_title_takes_the_next_letter(store):
+    key = setup(store, second=True)
+    store.family_settings("family", "Asia/Makassar")
+    store.calendar("cal-child", "google-a", "child", "Lessons #1", "Asia/Makassar", "write")
+    choose = rulebook.validate_error(call(store, key, {**CREATE, "title": "#1", "calendar": "Less",
+                                                       "request_id": "req-label-2"}))
+    assert [(c["id"], c["label"]) for c in choose["candidates"]] == [("cal-child", "#1a")]
+    assert sched.label_for("Lessons", {"title": "1"}, 1) == "Lessons"
+
+
+# spec: ANYM-552
+def test_invalid_arguments_state_timezone_and_now_in_both_transports(store):
+    from starlette.testclient import TestClient
+
+    from family_calendar.service.api import create_app
+
+    key = setup(store)
+    store.family_settings("family", "Asia/Makassar")
+    arguments = {**CREATE, "duration": 0, "request_id": "req-bad-1"}
+    with TestClient(create_app(store, port=13232), base_url="http://127.0.0.1:13232") as c:
+        headers = {"Authorization": "Bearer " + key}
+        rest = c.post("/v1/schedule", json=arguments, headers=headers)
+        mcp = c.post(
+            "/mcp", headers={**headers, "Accept": "application/json, text/event-stream"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "family_schedule", "arguments": arguments}},
+        ).json()["result"]
+    assert rest.status_code == 422 and mcp["isError"] is True
+    for body in (rest.json(), mcp["structuredContent"]):
+        assert body["error"] == "invalid_request" and body["timezone"] == "Asia/Makassar"
+        assert body["now"].endswith("+08:00")
