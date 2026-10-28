@@ -701,7 +701,8 @@ def test_publication_from_a_staged_verifier_config_is_refused(operator,tmp_path,
 
 # spec: ANYM-589
 @pytest.mark.parametrize('alias',['identity','protected','receiver_config','credentials','verifier_config','workspace',
-                                  'beside_identity','double_slash','private_double_slash'])
+                                  'beside_identity','double_slash','private_double_slash','workspace_mount',
+                                  'workspace_mount_inside'])
 def test_publication_never_touches_a_private_verifier_input(operator,tmp_path,monkeypatch,alias):
     v,config,engine,state=published_operator(operator,tmp_path,monkeypatch)
     receiver=json.loads(Path(config['receiver_config_file']).read_text())
@@ -711,7 +712,8 @@ def test_publication_never_touches_a_private_verifier_input(operator,tmp_path,mo
              'verifier_config':str(state.config_path),'workspace':str(Path(config['directory'])/'status.json'),
              'beside_identity':str(Path(config['identity_file']).with_name('capabilities.json')),
              # `//x` walks to the same file as `/x` but compares unequal as a path.
-             'double_slash':'/'+config['identity_file'],'private_double_slash':config['identity_file']}
+             'double_slash':'/'+config['identity_file'],'private_double_slash':config['identity_file'],
+             'workspace_mount':str(tmp_path/'unused-a'),'workspace_mount_inside':str(tmp_path/'unused-b')}
     if alias=='private_double_slash':
         # The key alone in its directory, named `//...` by the verifier config: only spelling or identity can match it.
         keys=tmp_path/'keys';keys.mkdir(mode=0o700);key=keys/'identity';key.write_bytes(Path(config['identity_file']).read_bytes())
@@ -723,6 +725,14 @@ def test_publication_never_touches_a_private_verifier_input(operator,tmp_path,mo
                              receiver['credentials_file'],state.config_path,target)]
     state.write_json(Path(config['receiver_config_file']),{**receiver,'capabilities_file':str(target)})
     files=[p for p in files if p.exists()];kept={p:p.read_bytes() for p in files}
+    if alias.startswith('workspace_mount'):
+        # A bind mount of the workspace elsewhere: another spelling, the same directory identity.
+        mount=tmp_path/'work-alias';mount.mkdir(mode=0o755);inside=mount/'sub' if alias=='workspace_mount_inside' else mount
+        inside.mkdir(exist_ok=True);target=inside/'active.json';target.write_bytes(b'synthetic journal\n');files.append(target)
+        original=v.identity_of
+        monkeypatch.setattr(v,'identity_of',lambda p:original(config['directory']) if Path(p)==mount else original(p))
+        state.write_json(Path(config['receiver_config_file']),{**receiver,'capabilities_file':str(target)})
+        kept={p:p.read_bytes() for p in files}
     refusal='invalid_config_path' if alias=='double_slash' else 'separate_capabilities_file_required'
     with pytest.raises(ValueError,match=refusal):v.publish_capabilities(state.config_path,engine=engine)
     assert {p:p.read_bytes() for p in files}==kept and 'preflight' not in state.calls

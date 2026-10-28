@@ -519,7 +519,9 @@ def publish_capabilities(config_path,*,engine=None):
     directories={identity_of(item.parent) for item in private}-{None}
     if (any(spelled(path)==item or spelled(path).parent==item.parent for item in private) or
             spelled(path).is_relative_to(spelled(config['directory'])) or identity_of(path.parent) in directories or
-            (identity_of(path) or 0) in {identity_of(item) for item in private}):
+            (identity_of(path) or 0) in {identity_of(item) for item in private} or
+            # A bind-mounted alias of the workspace (or of one of its ancestors' children) has its identity.
+            identity_of(config['directory']) in {identity_of(item) for item in (path.parent,*path.parent.parents)}):
         raise ValueError('separate_capabilities_file_required')
     instance=hashlib.sha256(str(config_path).encode()).hexdigest()[:32]
     # The verifier lock serializes publishers and keeps a publication out of a running verification.
