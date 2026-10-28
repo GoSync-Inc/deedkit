@@ -8,13 +8,13 @@ import subprocess
 import pytest
 
 HELPER = Path(__file__).resolve().parents[1] / "tools" / "attest-verify"
-BUILD = {"GOTOOLCHAIN": "go1.26.9", "CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64", "GOFLAGS": ""}
+BUILD = {"GOTOOLCHAIN": "go1.26.10", "CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64", "GOFLAGS": ""}
 
 
 def go() -> str:
     found = shutil.which("go")
     if not found:
-        (pytest.fail if os.environ.get("CI") else pytest.skip)("go is not on PATH; CI installs Go 1.26.9 before pytest")
+        (pytest.fail if os.environ.get("CI") else pytest.skip)("go is not on PATH; CI installs Go 1.26.10 before pytest")
         raise AssertionError("unreachable")
     return found
 
