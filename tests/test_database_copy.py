@@ -467,6 +467,25 @@ def test_a_late_container_that_cannot_be_removed_keeps_its_copy_unreleased_and_p
 
 
 # spec: ANYM-588
+def test_an_unreadable_container_listing_keeps_every_released_copy_for_the_next_run(tmp_path, monkeypatch):
+    docker = FakeDocker(monkeypatch, containers=0)
+    old = unreleased(tmp_path, stamp(49))
+    p.write_record(old / "released.json", {"id": old.name})
+    def listing(argv, **kwargs):
+        if "--format" in argv:
+            raise p.Refused("docker failed (exit 1); production was not accepted")
+        return docker(argv, **kwargs)
+    monkeypatch.setattr(p, "run", listing)
+    with pytest.raises(p.CopyStuck, match=old.name):
+        p.settle_copies(tmp_path)
+    # Expired: the dump is gone, the owner record stays until a run confirms no container is left.
+    assert [path.name for path in old.iterdir()] == ["owner.json"]
+    monkeypatch.setattr(p, "run", docker)
+    p.settle_copies(tmp_path)
+    assert not old.exists()
+
+
+# spec: ANYM-588
 def test_free_space_read_while_the_restore_runs_cancels_it_below_the_reserve(source, monkeypatch):
     settings, _ = source
     reads = []

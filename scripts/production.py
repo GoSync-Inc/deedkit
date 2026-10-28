@@ -2167,11 +2167,17 @@ def reconcile_copies(state):
     try:
         late = set(run(["docker", "ps", "-a", "--filter", "label=deedkit-copy", "--format",
                         '{{.Label "deedkit-copy"}}'], timeout=60).split())
+        unconfirmed = sorted(late & (done | set(released)))
     except Exception:
-        late = set()  # Docker cannot list: the next run looks again, as long as the copy is kept.
-    for copy_id in sorted(late & (done | set(released))):
-        # The same confirmed release; unconfirmed, the copy counts as unreleased again, so expiry keeps its owner.json.
+        # Docker cannot list: no released copy is confirmed free of late containers.
+        unconfirmed = sorted(done | set(released))
+        late = set()
+    for copy_id in unconfirmed:
+        # The same confirmed release; unconfirmed, the copy counts as unreleased again, so expiry keeps its owner.json
+        # and the next run retries it.
         try:
+            if copy_id not in late:
+                raise Refused("the copy's containers could not be listed")
             release_copy(owned_copy(root / copy_id))
         except Exception:
             with suppress(FileNotFoundError):
