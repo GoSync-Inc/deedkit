@@ -473,7 +473,7 @@ production tag.
 Before applying, follow [backup/migration and rollback](platform-cutover.md).
 This tool does not run migrations, prove data compatibility, authorize external
 actions, or perform provider readback. A schema change needs the module's explicit
-migration procedure and a fresh compatible backup first. Confirm that the pinned
+migration procedure and the backup gate below first. Confirm that the pinned
 backup/restore runtimes support both the current database schema and the planned
 target. Resolve delivery failures, including receiver quota/capacity failures,
 before taking the pre-migration snapshot; use a reviewed retention/storage change
@@ -491,6 +491,41 @@ can establish this restore evidence on the receiver using a root-only recovery
 key and isolated helper/PostgreSQL containers. It requires its own reviewed
 enrollment and actual successful restore; an enabled timer, upload receipt or
 synthetic CI run does not establish the live backup gate.
+
+### Migration releases and the backup gate
+
+Owner 10-28: «давай, конечно, в один релиз»; «процесс с бэкапами что нужно менять давайте
+менять».
+
+1. One release. Every migration pending on `main` ships in one release: one prepared SHA, the
+   pinned backup and restore runtimes updated once to it, one backup gate, one `migrate` (one
+   transaction applies every pending migration in order), each migration's owner and role SQL
+   steps in their order around it, then the release. A migration gets a release of its own only
+   when its procedure below says so. A `migrate` retried after `LockNotAvailable` stays under
+   the same gate; item 3's age limits hold at each attempt.
+2. After the release, no backup is required unless the release deletes data: before such a step
+   (045 step 7, `purge-deleted --apply`) a fresh verified backup at the new schema. Otherwise the
+   next scheduled daily backup follows as usual.
+3. The pre-migration gate is met by a fresh backup, or by the latest scheduled daily backup when,
+   at `migrate` (each attempt), all of these hold; otherwise take a fresh one:
+   - it is the producer's `last_success_id` and its snapshot time (`last_snapshot_at`, never the
+     delivery time) is at most 12 hours old: the 18:00 UTC backup serves until about 06:00 UTC;
+   - its schema is the database's current schema (no migration since);
+   - the receiver's independent verifier restored it: `last-success.json` names it, its proof is
+     `verified` with all seven checks true at that schema, and it is the protected point;
+   - the evidence above is kept privately as for a fresh backup: snapshot ID, time and schema,
+     backup image revision, ciphertext size and SHA-256, receipt and the proof's run ID;
+   - it is held. A hold on a reused daily backup starts after its scheduled verification: stop
+     the producer's `personal-os-backup.timer` with no backup service running, then the
+     receiver's verifier timer with no verifier run in flight. A read-only check then confirms
+     both timers stay stopped, `last-success.json` still names that backup and run, and the
+     backup is in the protected file. That `held` line is at most 30 minutes old when `migrate`
+     starts and is read again before each retry, as for a fresh backup proven by the release
+     kit. Right after `migrate`, release the receiver's timer, then the producer's.
+
+   Accepted risk (owner 10-28, quoted above): a reused backup may be 12 hours old. If `migrate`
+   destroys or corrupts data, a restore returns the database to that snapshot, and everything
+   written after it (messages, receipts, keys, operator changes) is lost.
 
 ## Apply and verify
 
@@ -637,8 +672,8 @@ API, the matcher and the dispatcher (package version, schema), each role limited
 row-level security. Additive; older runtimes write nothing there. With it the matcher and the
 delivery dispatcher run in production. Nothing here runs during an active call (check read-only
 first).
-1. Fresh verified backup (the backup gate), then `migrate`; the pinned backup and restore runtimes
-   move to the schema-50 release.
+1. The backup gate (fresh or a qualifying daily backup, above), then `migrate`; the pinned backup
+   and restore runtimes move to the schema-50 release.
 2. Role SQL (reviewed with the release): `gateway_role.sql`, `subscription_role.sql` and
    `delivery_role.sql`. Logins as in step 4 of 045: `messaging_subscriptions_runtime` (`LOGIN IN
    ROLE messaging_subscriptions`) and `messaging_event_delivery_runtime` (`LOGIN IN ROLE
@@ -743,9 +778,9 @@ order, outside an active call:
    without one it builds in place only on a table of at most 10k events and 8 MB, so a production
    build never runs inside the migration transaction.
 1. Update the pinned backup and restore runtimes to the schema-45 release.
-2. Fresh verified backup (the backup gate), then `migrate`. 045 takes all its table locks in one
-   attempt that never queues, retried for 2 s; `LockNotAvailable` (busy tables) rolls everything
-   back: run `migrate` again. Then, as the owner, `CREATE INDEX CONCURRENTLY IF NOT EXISTS
+2. The backup gate (fresh or a qualifying daily backup, above), then `migrate`. 045 takes all its
+   table locks in one attempt that never queues, retried for 2 s; `LockNotAvailable` (busy tables)
+   rolls everything back: run `migrate` again. Then, as the owner, `CREATE INDEX CONCURRENTLY IF NOT EXISTS
    messages_unpurged ON messages(account,chat) WHERE NOT purged;` (needs the new column; no lock on
    message writes) and check `\d messages` lists it without `INVALID`. The chat visibility probe reads
    it; without it a long chat's probe may run out of time and is retried each pass (`hide_pending` in
