@@ -167,6 +167,8 @@ class Schedule(Strict):
     guests: list[Annotated[str, Field(min_length=3, max_length=254)]] | None = Field(default=None, min_length=1,
                                                                                     max_length=20)
     notify: Literal["none", "all"] | None = None
+    # move and cancel of a recurring occurrence (ANYM-556): this occurrence (default), it and the following, or all.
+    series: Literal["this", "following", "all"] | None = None
     dry_run: bool = False
     confirm_token: str | None = Field(default=None, max_length=256)
     # A calendar candidate's preview: the stored request, so its `next` never repeats the caller's title.
@@ -238,6 +240,14 @@ DESCRIPTIONS = {
     "without guests. Events that already have guests are not moved or cancelled. move "
     "(start, optional duration) and cancel act only on event (an event_ref from agenda); event {title, date} "
     "lists the matching events as selection_required candidates, each previewing its change by event_ref. "
+    "For an occurrence of a recurring event, series: this (default, the occurrence alone), following (it and every "
+    "later one) or all (the whole series); the occurrence is named by its original start, and a series moves by "
+    "its wall-clock shift, so local times hold across DST. following and all work on Google calendars; elsewhere "
+    "capability_unsupported, with next: the same change for this occurrence. A following move first creates a "
+    "replacement series, then ends the original; if ending it fails, the result is failed with partial: true, both "
+    "series in handles, next to inspect them and undo previewing the replacement's removal. An occurrence changed "
+    "on its own in the edited range refuses the edit before any write (series_exceptions). A series result names "
+    "series_ref (and replacement.series_ref) instead of event_ref. "
     "start: ISO 8601; without an offset it is read in the family timezone; YYYY-MM-DD makes an all-day event. "
     "dry_run=true returns state previewed, the exact plan and a confirm_token valid 600 s; apply it with "
     "{confirm_token} alone: the token runs exactly that plan, once; a repeat returns the same operation. A plan "

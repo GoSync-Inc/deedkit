@@ -14,8 +14,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
-from .core import DATE_VALUE, GUEST_WRITE, wall_time
-from .providers import created_event_ref
+from .core import DATE_VALUE, GUEST_WRITE, SERIES_SCOPES, SERIES_WRITE, wall_time
+from .providers import created_event_ref, series_ref
 from .store import instant, ref
 
 TOOL = "schedule"
@@ -43,6 +43,21 @@ MAX_GUESTS = 20
 EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
                    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+")
 INVITE_FIELDS = ("guests", "notify")
+# What a series scope of a move or cancel does (ANYM-556), as the preview states it.
+SERIES_EFFECTS = {
+    ("all", "move"): "Every occurrence of the series moves by this occurrence's shift from its original start, in "
+                     "the wall-clock time of the series' own timezone, so local times hold across a DST change. If "
+                     "any occurrence was changed or cancelled on its own, nothing is written: series_exceptions.",
+    ("all", "cancel"): "The whole series is deleted: every occurrence, also those changed on their own.",
+    ("following", "move"): "First a new series from this occurrence on is created at the new time, with the same "
+                           "rule and fields; then the original series ends just before this occurrence's original "
+                           "start. Earlier occurrences, also those changed on their own, stay as they are. If an "
+                           "occurrence from here on was changed or cancelled on its own, nothing is written: "
+                           "series_exceptions.",
+    ("following", "cancel"): "The series ends just before this occurrence's original start; earlier occurrences, "
+                             "also those changed on their own, stay as they are. If an occurrence from here on was "
+                             "changed on its own, nothing is written: series_exceptions.",
+}
 
 
 def token_hash(token):
@@ -103,6 +118,15 @@ class Unsupported(CalendarError):
 
     def __init__(self, calendar, request, code="capability_unsupported"):
         super().__init__(code)
+        self.calendar, self.request = calendar, request
+
+
+class SeriesUnsupported(CalendarError):
+    """A series scope asked of a calendar whose provider does not write it (ANYM-556). The tool turns it into
+    `capability_unsupported` outside every transaction, with a stored selection for this occurrence only."""
+
+    def __init__(self, calendar, request):
+        super().__init__("capability_unsupported")
         self.calendar, self.request = calendar, request
 
 
@@ -235,6 +259,21 @@ class Scheduler:
             details["owner_step"] = "service allow-invitations --calendar " + cal["calendar_ref"]
         return CalendarError(refusal.code, details=details)
 
+    def series_unsupported(self, p, refusal):
+        """`capability_unsupported` for a series scope: `next` previews the same change for this occurrence only."""
+        cal, token = refusal.calendar, secrets.token_urlsafe(24)
+        self.store.query(
+            "INSERT INTO schedule_selections(token_hash,principal_id,request,expires_at) "
+            "VALUES (%s,%s,%s,now()+make_interval(secs=>%s))",
+            (token_hash(token), p["id"], Jsonb(dict(refusal.request, series="this")), SELECTION_TTL_S),
+        )
+        return CalendarError("capability_unsupported", details={
+            "capability": "series", "provider": cal["provider"],
+            "calendar": {"calendar_ref": cal["calendar_ref"], "label": cal["label"]},
+            "scopes": SERIES_WRITE[cal["provider"]]["scopes"],
+            "next": {"tool": TOOL_NAME, "arguments": {"selection_token": token, "dry_run": True}},
+        })
+
     def selected(self, p, token):
         """The request a selection stored; the caller's own arguments then add the chosen calendar."""
         if not isinstance(token, str) or not 8 <= len(token) <= 256:
@@ -265,6 +304,11 @@ class Scheduler:
             for field in INVITE_FIELDS:
                 if field in request:
                     raise missing(field, "unknown_field")
+        elif "series" in request:
+            raise missing("series", "unknown_field")
+        scope = request.get("series", "this")
+        if scope not in SERIES_SCOPES:
+            raise missing("series", "enum")
         if kind == "create":
             guests = invite(request)
             if not request.get("title"):
@@ -304,6 +348,17 @@ class Scheduler:
         target = request["event"]
         if isinstance(target, dict):
             self.choose(request, target, calendars, zone)
+        if isinstance(target, str) and target.startswith("series-"):
+            # A series handle (a partial following move's replacement) names the whole series only.
+            if scope != "all":
+                raise missing("series", "enum")
+            row = self.store.one(
+                "SELECT ref FROM occurrences WHERE details->>'series_ref'=%s AND calendar_ref=ANY(%s) "
+                "ORDER BY start_at,ref LIMIT 1", (target, [c["calendar_ref"] for c in calendars]),
+            )
+            if not row:
+                raise CalendarError("event_not_found")
+            target = row["ref"]
         occurrence = self.store.one(
             "SELECT ref,calendar_ref,start_at,end_at,details FROM occurrences WHERE ref=%s AND calendar_ref=ANY(%s)",
             (target, [c["calendar_ref"] for c in calendars]),
@@ -312,6 +367,12 @@ class Scheduler:
             raise CalendarError("not_found_or_forbidden")
         cal = next(c for c in calendars if c["calendar_ref"] == occurrence["calendar_ref"])
         action = {"action": KINDS[kind], "calendar_ref": cal["calendar_ref"], "event_ref": target}
+        if scope != "this":
+            if not occurrence["details"].get("recurring"):
+                raise missing("series", "not_recurring")
+            if scope not in SERIES_WRITE.get(cal["provider"], {}).get("scopes", ()):
+                raise SeriesUnsupported(cal, request)
+            action["series"] = scope
         if kind == "move":
             if occurrence["details"].get("all_day"):
                 if not (isinstance(request["start"], str) and DATE_VALUE.fullmatch(request["start"])):
@@ -369,7 +430,7 @@ class Scheduler:
     def preview(self, key, p, request, family):
         """Resolve `request` into a fresh plan with a token. Returns the plan row and the token."""
         action, cal = self.action(key, p, request, family)
-        plan = self.service.plan(key, [action], invitations=True)
+        plan = self.service.plan(key, [action], invitations=True, series=True)
         token = secrets.token_urlsafe(24)
         row = self.store.one(
             "UPDATE plans SET token_hash=%s,tool=%s,request=%s WHERE id=%s AND principal_id=%s RETURNING *",
@@ -378,11 +439,18 @@ class Scheduler:
         return row, token, dict(plan, calendar=cal)
 
     @staticmethod
+    def primary(steps):
+        """The step a preview and its result describe: a following move's truncation, not its replacement."""
+        return next((s for s in steps if s["action"] != "create"), steps[0])
+
+    @staticmethod
     def view(plan, family):
         """The exact plan, times in the family timezone."""
         zone = family["zone"]
-        step = plan["steps"][0]
-        event = step.get("event", {})
+        steps = plan["steps"]
+        step = Scheduler.primary(steps)
+        # A following move's new times are its replacement's.
+        event = next((s["event"] for s in steps if s.get("event")), {})
         shown = {"action": {"create": "create", "update": "move", "delete": "cancel"}[step["action"]],
                  "calendar": {"calendar_ref": plan["calendar"]["calendar_ref"], "label": plan["calendar"]["label"]}}
         if "title" in event:
@@ -402,6 +470,15 @@ class Scheduler:
             shown["event_ref"] = plan["event_ref"]
             shown["before"] = {k: before[k] if before.get("all_day") else instant(before[k]).astimezone(zone).isoformat()
                                for k in ("start", "end")}
+        scope = (step.get("series") or {}).get("scope")
+        if scope:
+            original = step["occurrence"]["original_start"]
+            shown.update(series=scope, effect=SERIES_EFFECTS[(scope, shown["action"])],
+                         original_start=original if "T" not in original else (
+                             instant(original).astimezone(zone).isoformat()),
+                         overlap_scope="this occurrence only")
+            if len(steps) > 1:
+                shown["steps"] = ["create_replacement", "end_original"]
         shown["overlap_check"] = plan["overlap_check"]
         shown["expires_at"] = plan["expires_at"]
         return shown
@@ -417,23 +494,36 @@ class Scheduler:
     @staticmethod
     def fingerprint(row):
         """What a preview resolved, without the random IDs a create mints anew on every plan."""
-        step = row["payload"]["steps"][0]
+        steps = row["payload"]["steps"]
+        step = Scheduler.primary(steps)
+        timed = next((s for s in steps if s.get("span") or s.get("event")), step)
         return {
             "calendar": step["calendar_ref"],
             "scope": row["scope_hash"],
             "event": [step.get(k) for k in ("target_id", "expected_etag", "before")] if step["action"] != "create" else None,
-            "times": step.get("span") or step.get("event"),
+            "times": timed.get("span") or timed.get("event"),
         }
 
     # --- operations ----------------------------------------------------------------------------------------
 
     def outcome(self, op, plan, family):
-        state = STATES[op["state"]]
+        steps = plan["payload"]["steps"]
+        step = self.primary(steps)
+        series = step.get("series")
+        replaced = bool(series) and len(steps) > 1
+        # A following move whose replacement exists and whose truncation was definitely refused (ANYM-556): a
+        # definite failure with both series named, never an operation to reconcile.
+        partial = replaced and op["state"] == "partial"
+        state = "failed" if partial else STATES[op["state"]]
         result = {"state": state, "detail_state": op["state"], "operation": {"module": "calendar", "id": op["id"]}}
         if not op["request_id"].startswith(TOKEN_KEY):
             result["request_id"] = op["request_id"]
-        step = plan["payload"]["steps"][0]
-        if state == "succeeded" and step["action"] == "create":
+        if state == "succeeded" and series:
+            # An occurrence's event_ref names its original start, which an all move changes: the series is the handle.
+            result["series_ref"] = step["occurrence"]["series_ref"]
+            if replaced:
+                result["replacement"] = {"series_ref": series_ref(step["calendar_ref"], steps[0]["target_id"])}
+        elif state == "succeeded" and step["action"] == "create":
             receipt = self.store.one(
                 "SELECT receipt FROM operation_steps WHERE operation_id=%s AND ordinal=0", (op["id"],)
             )["receipt"] or {}
@@ -449,7 +539,38 @@ class Scheduler:
         )
         if state == "unknown":
             result["next_action"] = "reconcile; do not create again"
+        if partial:
+            result.update(self.partial(step, steps, family))
+        elif state == "failed" and op["error"] == "series_exceptions":
+            request = plan["request"] or {}
+            # Nothing was written; the same change for this occurrence alone is the closest call.
+            result["next"] = {"tool": TOOL_NAME, "arguments": {
+                **{k: request[k] for k in ("action", "event", "start", "duration") if k in request},
+                "series": "this", "dry_run": True}}
         return result
+
+    @staticmethod
+    def partial(step, steps, family):
+        """Both series of a following move whose truncation failed: a read-only look at them, and the preview that
+        removes the replacement. Nothing is retried, deleted or overwritten on its own."""
+        calendar = step["calendar_ref"]
+        original = step["occurrence"]["series_ref"]
+        replacement = series_ref(calendar, steps[0]["target_id"])
+        at = step["occurrence"]["original_start"]
+        start = (datetime.combine(date.fromisoformat(at), datetime.min.time(), family["zone"]) if "T" not in at
+                 else instant(at).astimezone(family["zone"]))
+        return {
+            "partial": True,
+            "handles": {"original": {"calendar_ref": calendar, "series_ref": original},
+                        "replacement": {"calendar_ref": calendar, "series_ref": replacement}},
+            "next": {"tool": "calendar_agenda", "arguments": {
+                "calendar_refs": [calendar], "start": (start - timedelta(days=7)).isoformat(),
+                "end": (start + timedelta(days=21)).isoformat()}},
+            "undo": {"tool": TOOL_NAME, "arguments": {"action": "cancel", "event": replacement, "series": "all",
+                                                      "dry_run": True}},
+            "next_action": "inspect both series; the original was not ended, so occurrences from here on show twice; "
+                           "undo previews removing the replacement",
+        }
 
     def replay(self, operation_id, family):
         op = self.store.one("SELECT * FROM operations WHERE id=%s", (operation_id,))
@@ -499,6 +620,8 @@ class Scheduler:
                 raise self.chosen(p, choice) from None
             except Unsupported as refusal:
                 raise self.unsupported(p, refusal) from None
+            except SeriesUnsupported as refusal:
+                raise self.series_unsupported(p, refusal) from None
         except CalendarError as e:
             e.details = {**e.details, **self.context(family)}
             raise
@@ -570,7 +693,7 @@ class Scheduler:
                     raise CalendarError("idempotency_conflict")
                 operation_id = plan["operation_id"]
             else:
-                step = plan["payload"]["steps"][0]
+                step = self.primary(plan["payload"]["steps"])
                 # The calendar the preview resolved its name to, by calendar_ref: a rename since then is a changed
                 # calendar with a fresh plan, never a new choice.
                 again = dict(plan["request"], calendar=step["calendar_ref"]) if "calendar" in plan["request"] else (
