@@ -121,7 +121,9 @@ DESCRIPTIONS = {
     "raises, daily_calls_remaining, brief/call limits, and voice_engines: each "
     "engine (gemini_live, grok_live) with available (key configured), model, voices, "
     "languages, tool_calls, success_fields and which engine an omitted voice_engine "
-    "uses. Contacts no provider; preflight_call checks one external brief.",
+    "uses. calling_readiness per channel: configuration_ready and blockers judge an "
+    "omitted voice_engine; voice_engines, ready_engines and auto say which explicit "
+    "choice works now. Contacts no provider; preflight_call checks one external brief.",
     "prepare_call": "Local write; places no call. Saves a new browser-rehearsal brief "
     "(goal, counterparty, success_fields) owned by this principal and returns "
     "its id as brief_id. Optional source_message_ids (max 8) are read from this "

@@ -513,8 +513,11 @@ def _input(account,operation,chat_id,message_id,expected_revision,parameters,pre
 
 
 def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revision=0,parameters=None,
-            request_id='',preview_digest='',internal=None):
-    if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id):
+            request_id='',preview_digest='',internal=None,child=False):
+    from .outgoing import CHILD_KEY_PREFIX
+    # ANYM-546: the child prefix is reserved for messages_send steps (child=True), never a caller's key.
+    if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id) or (
+            request_id.startswith(CHILD_KEY_PREFIX)!=child):
         raise APIError('invalid_request_id')
     if not isinstance(preview_digest,str) or (preview_digest and not re.fullmatch(r'[a-f0-9]{64}',preview_digest)):
         raise APIError('preview_mismatch',409)

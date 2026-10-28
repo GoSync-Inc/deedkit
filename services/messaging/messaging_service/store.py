@@ -18,7 +18,8 @@ import threading
 from collections import OrderedDict
 from uuid import UUID
 
-from psycopg.errors import LockNotAvailable, TransactionTimeout
+import psycopg
+from psycopg.errors import LockNotAvailable, QueryCanceled, TransactionTimeout
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from . import __version__
@@ -26,6 +27,16 @@ from .policy import (DEFAULT_PERMISSIONS, OPERATION_PERMISSIONS, UNSET, audit,
                      key_id, lock_principal, normalize_policy, principal_id,
                      scope_filter, targets, effective_permissions, PERMISSIONS, normalize_list,
                      LEGACY_PERMISSIONS)
+from .telemetry import source_sha
+
+
+# When this messaging server process started (ANYM-592): with the source commit, "commit X running since T".
+STARTED_AT=datetime.now(timezone.utc)
+
+
+def build():
+    """The commit this server was built from (telemetry's rule) and its start time, read anew on every call."""
+    return {'source_sha':source_sha(),'started_at':STARTED_AT.strftime('%Y-%m-%dT%H:%M:%S.%fZ')}
 
 
 class APIError(Exception):
@@ -36,6 +47,136 @@ class APIError(Exception):
 
 # Under the 5 s request budget, so a writer queued behind a migrate lock request still finishes.
 MIGRATE_LOCK_TIMEOUT="SET LOCAL lock_timeout='2s'"
+
+
+# migrate-expand (ANYM-596): the session budgets as SHOW prints them; all three below a request's 5 s.
+EXPAND_SETTINGS={'lock_timeout':'2s','statement_timeout':'4s','transaction_timeout':'4s','search_path':'public'}
+
+
+class ExpandError(Exception):
+    """A fixed migrate-expand code; never PostgreSQL's message."""
+    def __init__(self, code):
+        self.code=code
+        super().__init__(code)
+
+
+def expand_connection(dsn):
+    """The only connection of migrate-expand (ANYM-596): its budgets, `public` only and no notices, read back."""
+    c=psycopg.connect(dsn,row_factory=dict_row,prepare_threshold=None,connect_timeout=5,
+        options='-c lock_timeout=2000 -c statement_timeout=4000 -c transaction_timeout=4000 -c search_path=public '
+                '-c client_min_messages=error -c timezone=UTC')
+    try:
+        if [c.execute(f'SHOW {name}').fetchone()[name] for name in EXPAND_SETTINGS]!=list(EXPAND_SETTINGS.values()):
+            raise ExpandError('settings_refused')
+    except BaseException:
+        c.close(); raise
+    return c
+
+
+def expand_code(run):
+    """`run()` with every failure as a fixed code. The connection is closed, never rolled back by psycopg's
+    context manager, whose rollback failure logs PostgreSQL's message (Astra r1 F4); the server discards the
+    open transaction when the session ends."""
+    try:
+        return run()
+    except ExpandError:
+        raise
+    except LockNotAvailable:
+        raise ExpandError('lock_timeout') from None
+    except TransactionTimeout:
+        raise ExpandError('transaction_timeout') from None
+    except QueryCanceled:
+        raise ExpandError('statement_timeout') from None
+    except Exception:
+        raise ExpandError('failed') from None
+
+
+def expand_status(dsn):
+    def run():
+        c=expand_connection(dsn)
+        try: return {'schema_version':ledger_version(c)}
+        finally: c.close()
+    return expand_code(run)
+
+
+def migrate_expand(dsn, plan, *, root=None, before_commit=None):
+    """Applies only DROP-free expand migrations and appended role grants in one bounded transaction on one
+    connection, or nothing (ANYM-596). Never schema.sql, lock_replay_tables or the ACL repair of migrate().
+    Raises ExpandError with a fixed code; `before_commit(c)` is a test hook."""
+    from . import migration_rollout as rollout
+    root=Path(root) if root else Path(__file__).parent
+    files={int(p.name[:3]):p for p in root.joinpath('migrations').glob('[0-9][0-9][0-9]_*.sql')}
+    roles={p.name:p.read_bytes() for p in root.glob('*_role.sql')}
+    try:
+        base,target,prefixes=plan['base'],plan['target'],plan['roles']
+        valid=(all(type(v) is int for v in (base,target)) and base<=target==max(files) and type(prefixes) is dict
+            and set(prefixes)==set(roles) and all(type(p) is dict and type(p.get('bytes')) is int
+            and 0<=p['bytes']<=len(roles[n]) and type(p.get('sha256')) is str for n,p in prefixes.items()))
+    except (KeyError,TypeError,ValueError):
+        valid=False
+    if not valid: raise ExpandError('plan_invalid')
+    try:
+        appended={}
+        for name,prefix in sorted(prefixes.items()):
+            data=roles[name]
+            if hashlib.sha256(data[:prefix['bytes']]).hexdigest()!=prefix['sha256']: raise ExpandError('prefix_mismatch')
+            appended[name]=(data[:prefix['bytes']].decode(),data.decode())
+    except UnicodeDecodeError:
+        raise ExpandError('prefix_mismatch') from None
+    pending=[(v,files[v].read_bytes()) for v in sorted(files) if base<v<=target]
+
+    def run():
+        c=expand_connection(dsn)
+        try:
+            if not c.execute('SELECT pg_try_advisory_xact_lock(74509137) AS locked').fetchone()['locked']:
+                raise ExpandError('busy')
+            if ledger_version(c)!=base: raise ExpandError('ledger_mismatch')
+            applied={r['version']:r['sha256'] for r in c.execute('SELECT version,sha256 FROM archive_migrations')}
+            if applied!={v:hashlib.sha256(p.read_bytes()).hexdigest() for v,p in files.items() if 1<v<=base}:
+                raise ExpandError('ledger_mismatch')
+            # An unqualified name resolves in pg_catalog before public (search_path=public), so a catalog name is
+            # never a table here. A GRANT target is an ordinary or partitioned table of `public`; a new table may
+            # not reuse the name of any relation (a sequence or view included), or IF NOT EXISTS would skip it.
+            relations={(r['nspname'],r['relname'],r['relkind']) for r in c.execute(
+                "SELECT n.nspname,c.relname,c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname IN ('public','pg_catalog')")}
+            taken={name for _,name,_ in relations}
+            inventory={name for space,name,kind in relations if space=='public' and kind in ('r','p')}-{
+                name for space,name,_ in relations if space=='pg_catalog'}
+            created={}
+            for _,data in pending:
+                text=data.decode()
+                if rollout.unattended_class(text,inventory|set(created))!='expand': raise ExpandError('not_unattended')
+                following=rollout.new_tables(text,created)
+                if (set(following)-set(created))&taken: raise ExpandError('not_unattended')
+                created=following
+            for old,new in appended.values():
+                if rollout.role_class(old,new,created,tables=inventory)!='additive': raise ExpandError('role_not_additive')
+            for version,data in pending:
+                c.execute(data.decode())
+                c.execute('INSERT INTO archive_migrations(version,sha256) VALUES(%s,%s)',(version,hashlib.sha256(data).hexdigest()))
+                c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'",(str(version),))
+            # Each claimed new table must now be an ordinary or partitioned table of `public`: a relation the batch
+            # made under that name some other way (a sequence, an index) made IF NOT EXISTS skip it (Sol r3).
+            if created and c.execute("SELECT count(*) AS n FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname=ANY(%s)",(sorted(created),)
+                    ).fetchone()['n']!=len(created):
+                raise ExpandError('not_unattended')
+            for old,new in appended.values():
+                if rollout.statements(new[len(old):]): c.execute(new[len(old):])
+            if before_commit: before_commit(c)
+            c.commit()
+        finally: c.close()
+        return {'schema_version':target}
+    return expand_code(run)
+
+
+def ledger_version(c):
+    if not c.execute("SELECT to_regclass('public.probe_metadata') IS NOT NULL AS present").fetchone()['present']:
+        raise ExpandError('ledger_mismatch')
+    row=c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()
+    if not row: raise ExpandError('ledger_mismatch')
+    return int(row['value'])
 
 
 REPLAY_LOCK_TABLES=('messages','deliveries','download_grants')
@@ -64,7 +205,7 @@ def lock_replay_tables(c, seconds=2):
 # capabilities sections (ANYM-270): each key of the full payload sits in exactly one
 # named block, with today's shape; summary is the short index an agent reads first.
 CAPABILITY_SECTIONS={
-    'identity':('service','version','principal','scope_version','credential_id','permissions','expires_at','key_permission_ceiling',
+    'identity':('service','version','build','principal','scope_version','credential_id','permissions','expires_at','key_permission_ceiling',
                 'key_permission_version','chat_scope','auth_mode'),
     'accounts':('accounts',),'coverage':('synthetic','sources','coverage'),
     'tool_manifest':('tool_manifest','available'),'search_options':('search_options',),'sending':('sending',),
@@ -91,7 +232,7 @@ def capability_view(full, detail='full', sections=None, permitted=None):
     if detail=='full':return full
     if detail!='summary':raise APIError('invalid_filter')
     scope=full['chat_scope']
-    return {'service':full['service'],'version':full['version'],'principal':full['principal'],
+    return {'service':full['service'],'version':full['version'],'build':full['build'],'principal':full['principal'],
         'credential_id':full['credential_id'],'permissions':full['permissions'],'expires_at':full['expires_at'],
         # ANYM-470: the key's expiry and each owner's ID stay in the default view.
         'accounts':[{k:a[k] for k in ('id','platform','label','self_provider_id')} for a in full['accounts']],
@@ -107,7 +248,7 @@ def digest(value: str) -> str:
 
 
 KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
-RUNTIME_SCHEMA=50  # the newest schema this runtime knows; migrate() refuses a newer database
+RUNTIME_SCHEMA=51  # the newest schema this runtime knows; migrate() refuses a newer database
 
 
 def revocable_token(value):
@@ -367,7 +508,7 @@ class Store:
                 permitted[account['id']]=[row['operation'] for row in listed['items'] if row['key_permitted']]
                 supported_by_account[account['id']]={'provider':listed['provider'],'count':len(supported),
                     'operations':supported,'available_operations':[row['operation'] for row in listed['items'] if row['available']]}
-            features={'read':['search','history','context','updates','reviews','search_people','search_files','get_file_text','get_file_occurrences','get_sync_status','get_file_segments','resolve_reference','resolve_target','preview_message'], 'download':['attachment','request_file_download'], 'cursor-write':['ack'], 'send':['send_message','get_send_status']}
+            features={'read':['search','history','context','updates','reviews','search_people','search_files','get_file_text','get_file_occurrences','get_sync_status','get_file_segments','resolve_reference','resolve_target','preview_message'], 'download':['attachment','request_file_download'], 'cursor-write':['ack'], 'send':['send_message','messages_send','get_send_status']}
             if 'read' in p['permissions']:
                 features['review-write']=['record_review']
                 features['cursor-write'].append('dismiss_reply')
@@ -387,7 +528,7 @@ class Store:
             if any(spec['permission'] in p['permissions'] for spec in OPERATIONS.values()):
                 available.extend(operation_tools)
             else:available.append('list_messenger_operations')
-            return capability_view({'service': 'anymsg', 'version': __version__, **dataset,
+            return capability_view({'service': 'anymsg', 'version': __version__, 'build': build(), **dataset,
                 'tool_manifest':{'version':__version__,'names':sorted(OPERATION_PERMISSIONS.keys()-{'download'}),
                     'discovery_action':'refresh_connection_if_tools_list_differs',
                     'rest_fallback':'POST /v1/{tool_name} with the same bearer and JSON parameters'},
@@ -547,6 +688,36 @@ class Store:
         with self.authorized(token,'send_message') as (c,p):
             return send_finish(self,c,p,account,phone,operation_id,text,request_id,reply_to,format,
                 preview_digest,link_preview,allow_lossy)
+
+    # ANYM-546: messages_send; send_intent.send waits between these short transactions.
+    def messages_send_preview(self,token,arguments,draft=None):
+        from .send_intent import _text, payload, resolve, save_preview
+        from .resolve_target import resolve_target
+        with self.authorized(token,'preview_message') as (c,p):
+            value=payload(arguments)
+            resolution=resolve(self,c,p,value,phone_text=_text(draft) if draft else None,
+                               open_chat=arguments.get('allow_open_chat') is not False,
+                               files=arguments.get('allow_files') is not False)
+            if resolution is not None:return save_preview(c,p,value,resolution)
+            target=resolve_target(self,c,p,value['to'],'message',value['account'])['target']
+            return {'phone':{'account':target['account'],'phone':target['phone'][1:],'text':value['text'],
+                             'reply_to':'','format':value['format']}}
+
+    def messages_send_execute(self,token,arguments):
+        from .send_intent import admit, advance
+        with self.authorized(token,'send_message') as (c,p):
+            intent=admit(self,c,p,arguments)
+            # preview_stale: its fresh preview commits with this transaction, then the caller raises.
+            if isinstance(intent,APIError):return {'raise':intent}
+            return advance(self,c,p,intent,resume=arguments.get('resume',False),first=True,
+                           open_chat=arguments.get('allow_open_chat') is not False,
+                           files=arguments.get('allow_files') is not False)
+
+    def messages_send_advance(self,token,intent_id,arguments):
+        from .send_intent import advance
+        with self.authorized(token,'send_message') as (c,p):
+            return advance(self,c,p,intent_id,open_chat=arguments.get('allow_open_chat') is not False,
+                           files=arguments.get('allow_files') is not False)
 
     def get_send_status(self,token,send_id):
         from .outgoing import status
@@ -1260,7 +1431,7 @@ class Store:
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version>RUNTIME_SCHEMA: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql')]:
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
@@ -1288,6 +1459,12 @@ class Store:
                  REVOKE ALL ON FUNCTION public.subscription_hint_references(uuid,bigint,bigint,text[],text[]) FROM PUBLIC;
                 END IF;
             END $$''')
+
+    def expand_status(self):
+        return expand_status(self.pool.conninfo)
+
+    def migrate_expand(self, plan, *, root=None, before_commit=None):
+        return migrate_expand(self.pool.conninfo,plan,root=root,before_commit=before_commit)
 
     def issue_key(self, principal, accounts, days=7, *, chats=UNSET, permissions=UNSET,
                   key_permissions=UNSET, token=None, operation_id=None, check=False, new_principal=False,

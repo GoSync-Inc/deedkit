@@ -19,7 +19,7 @@ from family_calendar.errors import CalendarError
 
 HERE = Path(__file__).parent
 MIGRATIONS = ((1, HERE / "schema.sql"), (2, HERE / "schema_v2.sql"), (3, HERE / "schema_v3.sql"),
-              (4, HERE / "schema_v4.sql"))
+              (4, HERE / "schema_v4.sql"), (5, HERE / "schema_v5.sql"))
 
 
 def caller_key(value):
@@ -252,6 +252,15 @@ class Store:
         self.query(
             "UPDATE calendars SET write_enabled=%s,version=version+1 WHERE ref=%s", (enabled, calendar_ref)
         )
+
+    def invitations_opt_in(self, calendar_ref, enabled):
+        """The owner's invitation opt-in (ANYM-555); the version bump makes every open preview of it stale."""
+        with self.transaction() as c:
+            c.execute(
+                "INSERT INTO invitation_opt_ins(calendar_ref,enabled) VALUES (%s,%s) ON CONFLICT(calendar_ref) "
+                "DO UPDATE SET enabled=excluded.enabled,changed_at=now()", (calendar_ref, enabled),
+            )
+            c.execute("UPDATE calendars SET version=version+1 WHERE ref=%s", (calendar_ref,))
 
     def grant(self, group_id, person_id, calendar_ref, scopes, visibility="details"):
         self.query(

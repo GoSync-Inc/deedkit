@@ -72,6 +72,7 @@ export type ToolName =
   | 'messages_search'
   | 'messages_search_files'
   | 'messages_search_people'
+  | 'messages_send'
   | 'messages_send_message'
   | 'messages_snooze_reply'
   | 'messages_submit_feedback'

@@ -4918,3 +4918,30 @@ def test_config_promotes_the_matcher_and_dispatcher_overlays(tmp_path, monkeypat
     docs = (Path(__file__).resolve().parents[1] / "docs/operations/production.md").read_text()
     assert "compose.subscriptions.yaml" in docs and "compose.delivery.yaml" in docs
     assert '"subscriptions": "runtime"' in docs and '"delivery": "runtime"' in docs
+
+
+# spec: ANYM-588
+def test_the_migration_section_is_outside_the_configuration_digest(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    before = p.settings_digest(host.settings)
+    assert before == p.digest(host.settings)  # receipts prepared before the section still match
+    host.settings["migration"] = {"databases": {"main": {"container": "db", "owner": "probe", "database": "probe"}}}
+    assert p.settings_digest(host.settings) == before
+    assert host.deploy()["status"] == "deployed" and host.paused() is None
+
+
+# spec: ANYM-588
+def test_deploy_pauses_before_any_step_when_a_database_copy_cannot_be_confirmed_stopped(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    copy_id = "c" * 12 + "-main-20261028T120000Z"
+    directory = p.copies_root(host.state, create=True) / copy_id
+    directory.mkdir(mode=0o700)
+    p.write_record(directory / "owner.json", {
+        "id": copy_id, "container": "deedkit-copy-" + copy_id, "application_name": "deedkit-copy-" + copy_id,
+        "source": {"container": "db", "owner": "probe", "database": "probe"}, "resources": []})
+    def stuck(copy):
+        raise p.CopyStuck(copy["id"])
+    monkeypatch.setattr(p, "release_copy", stuck)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and outcome["reason"] == "a database copy could not be stopped: " + copy_id
+    assert host.paused() == outcome["reason"] and host.steps == [] and host.git == []

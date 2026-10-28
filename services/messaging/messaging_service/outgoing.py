@@ -24,6 +24,8 @@ class DispatchNotStarted(Exception):
 
 
 PROVIDER_PHASES=frozenset({'waiting','started','refused'})
+# ANYM-546: request IDs of composite steps (messages_send child keys); a caller route refuses them.
+CHILD_KEY_PREFIX='agent-child:'
 
 
 async def dispatch(job,call,timeout,*,passthrough=()):
@@ -349,8 +351,9 @@ def result(row,c=None,p=None):
 
 
 def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
-            preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None):
-    """phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash."""
+            preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None,child=False):
+    """phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash.
+    child: a messages_send step (ANYM-546) under its child key; only such a call may use the child prefix."""
     format_options(format,link_preview,allow_lossy,preview_digest)
     # Source length is bounded by the renderer; the actual provider wire payload
     # must satisfy the conservative 4000 UTF-16-unit limit.
@@ -358,7 +361,8 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             ord(v)<32 and v not in '\n\r\t' or 0xD800<=ord(v)<=0xDFFF for v in text):
         raise APIError('invalid_message_text')
     if format=='plain':valid_text(text)
-    if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id):
+    if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id) or (
+            request_id.startswith(CHILD_KEY_PREFIX)!=child):
         raise APIError('invalid_request_id')
     chat,reply_id=target(c,p,account,chat_id,reply_to)
     default_policy=format=='plain' and not link_preview and not allow_lossy

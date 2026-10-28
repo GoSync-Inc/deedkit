@@ -5,7 +5,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter.",
+    "description": "Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter. version is the package version and does not change per release; build.source_sha is the commit this messaging server was built from and build.started_at when it started (the gateway, calls and calendar services deploy separately and are not reported here). A null build.source_sha means the image was built without its commit: on production, report it as a deploy defect. A restart without a deploy also moves started_at, so compare SHAs when the expected one is known.",
     "inputSchema": {
       "properties": {
         "detail": {
@@ -2372,6 +2372,202 @@
   },
   {
     "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Send text and files to anyone in one call: preview, confirm, send, wait, resume.\n\nConfirm with the owner before any send: call with dry_run true, show the owner the\npreview (recipient, visible text, warnings, links, reply target, files, caption\nhandling) and get their exact confirmation; then call again with its confirm_token.\nThe token binds that preview; it is not the owner's confirmation, and the server\ndoes not verify approval. A live send needs confirm_token or request_id (8-128\ncharacters, one key per approved action; repeat it after a network failure with the\nSAME payload). Rich format always needs a preview (preview_required).\nto: anything platform_resolve_target resolves exactly (person, chat_ or msg_ ID,\nphone, @username, JID); reply_to (a msg_ ID) alone sends into its chat. files: up to\n10 of {upload_id} (messages_prepare_file_upload) or {attachment_id} (forward an\narchived file), each with optional mode; they go in order. A plain caption up to\n1024 characters rides on the first file, other text is sent after the files.\nStates: previewed, running (repeat with next), succeeded, failed with resumable\ntrue (repeat with resume true: only failed and unsent steps go; account_offline\nwhen the account was not connected), unknown (a step may have been delivered:\ncheck history, never resend). preview_stale returns changed, a fresh preview and\na new confirm_token. wait_s (0-25) waits for the receipts here. allow_open_chat is\nset by the gateway from its open_chat_by_phone grant; false refuses a phone with no chat.\nallow_files is set by the gateway from its send_file grant; false refuses any file step.\n",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "account": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Account"
+        },
+        "allow_files": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allow Files"
+        },
+        "allow_open_chat": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allow Open Chat"
+        },
+        "confirm_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confirm Token"
+        },
+        "dry_run": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dry Run"
+        },
+        "files": {
+          "anyOf": [
+            {
+              "items": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Files"
+        },
+        "format": {
+          "anyOf": [
+            {
+              "enum": [
+                "plain",
+                "markdown",
+                "html"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format"
+        },
+        "reply_to": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reply To"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        },
+        "resume": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resume"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text"
+        },
+        "to": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "To"
+        },
+        "wait_s": {
+          "anyOf": [
+            {
+              "maximum": 25,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Wait S"
+        }
+      },
+      "title": "messages_sendArguments",
+      "type": "object"
+    },
+    "name": "messages_send",
+    "outputSchema": {
+      "additionalProperties": true,
+      "title": "messages_sendDictOutput",
+      "type": "object"
+    },
+    "module": "messaging",
+    "operation": "messages_send",
+    "scopes": [
+      "send"
+    ]
+  },
+  {
+    "annotations": {
       "destructiveHint": false,
       "openWorldHint": false,
       "readOnlyHint": true
@@ -4193,7 +4389,7 @@
   },
   {
     "name": "calendar_schedule",
-    "description": "Create, move or cancel one guest-free event in one call. create: title, start, duration in minutes (default 30), calendar (full name or calendar_ref; default: the family's default calendar). move (start, optional duration) and cancel act only on event (an event_ref from agenda); event {title, date} lists the matching events as selection_required candidates, each previewing its change by event_ref. start: ISO 8601; without an offset it is read in the family timezone; YYYY-MM-DD makes an all-day event. dry_run=true returns state previewed, the exact plan and a confirm_token valid 600 s; apply it with {confirm_token} alone: the token runs exactly that plan, once; a repeat returns the same operation. A plan that expired or whose calendar or scope changed returns preview_stale with a fresh preview and token. A live call without a token needs a request_id (one per intent; keep it on retries). Waits up to wait_s (default 10, max 25) for the result: succeeded with event_ref, else the operation and next calendar_operation; unknown means reconcile, never create again. Every result states timezone and now.",
+    "description": "Create, move or cancel one event in one call. create: title, start, duration in minutes (default 30), calendar (full name or calendar_ref; default: the family's default calendar), optional guests (1-20 email addresses) with notify: none (no invitation email) or all (Google emails each guest); the preview names every recipient and what each receives. Guests work only where calendar_capabilities shows guests.supported; elsewhere capability_unsupported names the calendar and provider, with next: the same event without guests. Events that already have guests are not moved or cancelled. move (start, optional duration) and cancel act only on event (an event_ref from agenda); event {title, date} lists the matching events as selection_required candidates, each previewing its change by event_ref. start: ISO 8601; without an offset it is read in the family timezone; YYYY-MM-DD makes an all-day event. dry_run=true returns state previewed, the exact plan and a confirm_token valid 600 s; apply it with {confirm_token} alone: the token runs exactly that plan, once; a repeat returns the same operation. A plan that expired or whose calendar or scope changed returns preview_stale with a fresh preview and token. A live call without a token needs a request_id (one per intent; keep it on retries). Waits up to wait_s (default 10, max 25) for the result: succeeded with event_ref, else the operation and next calendar_operation; unknown means reconcile, never create again. Every result states timezone and now.",
     "inputSchema": {
       "$defs": {
         "EventQuery": {
@@ -4306,6 +4502,41 @@
           "default": null,
           "title": "Event"
         },
+        "guests": {
+          "anyOf": [
+            {
+              "items": {
+                "maxLength": 254,
+                "minLength": 3,
+                "type": "string"
+              },
+              "maxItems": 20,
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Guests"
+        },
+        "notify": {
+          "anyOf": [
+            {
+              "enum": [
+                "none",
+                "all"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Notify"
+        },
         "dry_run": {
           "default": false,
           "title": "Dry Run",
@@ -4384,7 +4615,7 @@
     "module": "calls",
     "operation": "capabilities",
     "scopes": [],
-    "description": "Read-only; places no call. Shows this principal's calls scopes, each granted channel's configured state and recipient policy (any valid destination; SIP: exact allowlist), the daily call cap with the owner's active raises, daily_calls_remaining, brief/call limits, and voice_engines: each engine (gemini_live, grok_live) with available (key configured), model, voices, languages, tool_calls, success_fields and which engine an omitted voice_engine uses. Contacts no provider; preflight_call checks one external brief.",
+    "description": "Read-only; places no call. Shows this principal's calls scopes, each granted channel's configured state and recipient policy (any valid destination; SIP: exact allowlist), the daily call cap with the owner's active raises, daily_calls_remaining, brief/call limits, and voice_engines: each engine (gemini_live, grok_live) with available (key configured), model, voices, languages, tool_calls, success_fields and which engine an omitted voice_engine uses. calling_readiness per channel: configuration_ready and blockers judge an omitted voice_engine; voice_engines, ready_engines and auto say which explicit choice works now. Contacts no provider; preflight_call checks one external brief.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},

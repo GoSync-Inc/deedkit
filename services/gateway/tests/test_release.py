@@ -9,6 +9,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from test_files import issue, setup
+from test_policy import config
 from agent_gateway.app import create_app
 
 
@@ -130,3 +131,18 @@ def test_release_messaging_dial_requires_release_mode(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEDKIT_RELEASE_MESSAGING_URL", "http://http-api-012345abcdef:8080")
     with pytest.raises(ValueError, match="invalid_release_messaging_url"):
         setup(tmp_path)
+
+
+# spec: ANYM-394
+def test_release_messaging_dial_accepts_the_generation_target_of_deployed_messaging(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEDKIT_RELEASE_ID", "012345abcdef")
+    monkeypatch.setenv("DEEDKIT_RELEASE_SHA", "a" * 40)
+    monkeypatch.setenv("DEEDKIT_RELEASE_SOCKET", str(tmp_path / "control.sock"))
+    monkeypatch.setenv("DEEDKIT_RELEASE_MESSAGING_URL", "http://http-api-012345abcdef:8080")
+    app, path, _, _ = setup(tmp_path)
+    assert app.state.release.generation == "012345abcdef"
+    assert app.state.clients.messaging_url == "http://http-api-012345abcdef:8080"
+    # The same matching URL is refused when messaging is not a deployed module.
+    path.write_text(json.dumps(config()))
+    with pytest.raises(ValueError, match="invalid_release_messaging_url"):
+        create_app(path, "http://testserver")

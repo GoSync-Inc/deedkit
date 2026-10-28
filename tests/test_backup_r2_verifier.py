@@ -34,7 +34,7 @@ def test_server_verifier_proof_requires_exact_helper_facts_and_cloud_identity():
 
 
 # spec: ANYM-511
-@pytest.mark.parametrize('version,accepted',[(49,True),(50,True),(51,False)],ids=['n-1','current','next'])
+@pytest.mark.parametrize('version,accepted',[(50,True),(51,True),(52,False)],ids=['n-1','current','next'])
 def test_server_verifier_proof_accepts_current_schema_and_rejects_the_next(version,accepted):
     v=module();receipt={'wire':{'id':'20261016T091703Z-fedcba9876543210','bytes':100,'sha256':'a'*64,'snapshot_sha256':'b'*64}}
     facts={'v':1,'status':'verified','schema_version':version,'manifest_sha256':'b'*64,'checks':{k:True for k in r2.CHECKS}}
@@ -591,3 +591,52 @@ def test_server_verifier_proof_range_is_the_published_verifier_schemas():
         if accepted:assert v.make_proof(receipt,facts,'c'*32)['verification']['schema_version']==version
         else:
             with pytest.raises(ValueError,match='invalid_helper_result'):v.make_proof(receipt,facts,'c'*32)
+
+
+class PipeStdin:
+    """The helper's stdin after the helper exited: every write breaks the pipe."""
+    def __init__(self):self.closed=False;self.writes=0
+    def write(self,data):self.writes+=1;raise BrokenPipeError('helper exited')
+    def close(self):self.closed=True
+
+
+class ExitedHelper:
+    """Synthetic helper that stops reading mid-stream, optionally leaving failure.json or hanging."""
+    def __init__(self,payload,fact,hangs):
+        self.stdin=PipeStdin();self.hangs=hangs;self.terminated=False
+        if fact is not None:
+            path=payload/'failure.json';path.write_bytes(fact);path.chmod(0o600)
+    def poll(self):return None if self.hangs and not self.terminated else 1
+    def wait(self,timeout):
+        import subprocess,time
+        if self.hangs and not self.terminated:
+            time.sleep(min(timeout,0.05));raise subprocess.TimeoutExpired('helper',timeout)
+        return 1
+    def terminate(self):self.terminated=True
+    def kill(self):self.terminated=True
+
+
+# spec: ANYM-603
+@pytest.mark.parametrize('fact,hangs,code',[
+    (r2.encoded({'v':1,'status':'failed','error':'restore_database_failed'}),False,'restore_database_failed'),
+    (None,False,'isolated_restore_failed'),
+    (r2.encoded({'v':1,'status':'failed','error':'storage_unavailable'}),False,'isolated_restore_failed'),
+    (r2.encoded({'v':1,'status':'failed','error':[]}),False,'isolated_restore_failed'),
+    (r2.encoded({'v':1,'status':'failed','error':{}}),False,'isolated_restore_failed'),
+    (None,True,'restore_deadline')],ids=['named','missing','invalid','array-error','object-error','hang'])
+def test_helper_exit_mid_stream_reports_its_failure_fact_not_a_generic_code(operator,monkeypatch,fact,hangs,code):
+    v,config,receiver,cloud,engine,_=operator
+    docker=v.Docker(0.3 if hangs else 60);helpers=[]
+    monkeypatch.setattr(docker,'setup',lambda *a:None)
+    monkeypatch.setattr(docker,'inspect_owned',lambda *a:{})
+    monkeypatch.setattr(v,'validate_helper_layout',lambda *a:None)
+    monkeypatch.setattr(r2,'verify_object',lambda receiver,client,receipt,out:out.write(b'synthetic-ciphertext'))
+    def popen(*args,**kwargs):
+        helpers.append(ExitedHelper(next(Path(config['directory']).glob('payload-*')),fact,hangs));return helpers[-1]
+    monkeypatch.setattr(v.subprocess,'Popen',popen)
+    engine.restore=docker.restore
+    with pytest.raises((RuntimeError,TimeoutError)):v.run(config,client=cloud,engine=engine)
+    directory=Path(config['directory'])
+    for name in ('status.json','last-failure.json'):assert json.loads((directory/name).read_text())['error']==code
+    assert len(helpers)==1 and helpers[0].stdin.writes==1 and helpers[0].stdin.closed
+    assert helpers[0].terminated==hangs and not Path(config['protected_file']).exists()

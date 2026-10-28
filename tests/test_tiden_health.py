@@ -980,7 +980,9 @@ FAKE_GH = textwrap.dedent(f"""\
     page = int(next(arg for arg in args if arg.startswith("page=")).split("=")[1])
     cutoff = next(arg for arg in args if arg.startswith("created=>=")).split(">=")[1]
     workflow = args[3].split("/")[-2]
-    rows = [row for row in state.get("by_workflow", {{}}).get(workflow, state["rows"]) if row.get("created_at", "z") >= cutoff]
+    # VERSIONS: the run list as each call sees it, the last one repeating (runs created or deleted between pages).
+    listed = state["versions"][min(len(state["calls"]), len(state["versions"])) - 1] if "versions" in state else state["rows"]
+    rows = [row for row in state.get("by_workflow", {{}}).get(workflow, listed) if row.get("created_at", "z") >= cutoff]
     chunk = rows[(page - 1) * 100:page * 100]
     body = {{"total_count": state.get("total", len(rows)), "workflow_runs": chunk}}
     if mode == "no-total":
@@ -1371,6 +1373,37 @@ def test_a_lookup_that_is_not_a_complete_valid_run_list_is_a_named_error_without
     with pytest.raises(health.Unknown) as raised:
         health.Actions("o/r", gh.cli).runs(SINCE)
     assert str(raised.value) == reason and SECRET not in str(raised.value)
+
+
+def newest_first(numbers):
+    return [sync_row(number, "a" * 40) for number in sorted(numbers, reverse=True)]
+
+
+# spec: ANYM-438
+def test_a_run_created_between_pages_reads_the_list_again_instead_of_calling_the_repeated_row_malformed(gh):
+    # Run 40669350189 (2026-10-28): sync run 40669641138 started during the read, page 2 repeated page 1's last row.
+    gh.set(versions=[newest_first(range(1, 151)), newest_first(range(1, 152))])
+    rows = health.Actions("o/r", gh.cli).runs(SINCE)
+    assert [row["id"] for row in rows] == list(range(151, 0, -1))
+    assert [next(arg for arg in call if arg.startswith("page=")) for call in gh.calls()] == \
+        ["page=1", "page=2", "page=1", "page=2"]
+
+
+# spec: ANYM-438
+def test_a_run_deleted_between_pages_reads_the_list_again_instead_of_skipping_a_row(gh):
+    gh.set(versions=[newest_first(range(1, 151)), newest_first(set(range(1, 151)) - {120})])
+    rows = health.Actions("o/r", gh.cli).runs(SINCE)
+    assert [row["id"] for row in rows] == [number for number in range(150, 0, -1) if number != 120]
+    assert len(gh.calls()) == 4
+
+
+# spec: ANYM-438
+def test_a_run_list_that_changes_on_every_read_is_a_named_error_after_a_bounded_number_of_reads(gh):
+    gh.set(versions=[newest_first(range(1, 151 + number)) for number in range(20)])
+    with pytest.raises(health.Unknown) as raised:
+        health.Actions("o/r", gh.cli).runs(SINCE)
+    assert str(raised.value) == "the run list changed on every read"
+    assert len(gh.calls()) == 2 * health.SYNC_READS
 
 
 # spec: ANYM-438

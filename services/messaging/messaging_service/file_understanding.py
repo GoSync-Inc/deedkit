@@ -35,9 +35,13 @@ SOURCE_COLUMNS='''a.id AS attachment,a.digest AS source_digest,m.revision AS sou
 SOURCE_JOIN='''FROM attachment_understanding u JOIN attachments a ON a.id=u.attachment
  JOIN messages m ON m.id=a.message LEFT JOIN attachment_text f ON f.attachment=a.id
  LEFT JOIN attachment_enrichment e ON e.attachment=a.id'''
+# Exactly the characters str.strip() removes: a source _source() finds blank must also fail
+# SQL eligibility, or blank rows fill the claim window and starve ready ones.
+WHITESPACE='\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0                　'
+BLANK="E'"+''.join('\\u%04x'%ord(c) for c in WHITESPACE)+"'"
 SOURCE_ELIGIBLE={
-    'audio':"(e.state='ready' OR e.indexed_at IS NOT NULL) AND e.kind='audio' AND e.source_digest=a.digest AND e.source_revision=m.revision AND length(btrim(e.text_content))>0",
-    'document':"(f.state='ready' OR f.indexed_at IS NOT NULL) AND f.source_digest=a.digest AND f.source_revision=m.revision AND length(btrim(f.text_content))>0",
+    'audio':"(e.state='ready' OR e.indexed_at IS NOT NULL) AND e.kind='audio' AND e.source_digest=a.digest AND e.source_revision=m.revision AND length(btrim(e.text_content,"+BLANK+"))>0",
+    'document':"(f.state='ready' OR f.indexed_at IS NOT NULL) AND f.source_digest=a.digest AND f.source_revision=m.revision AND length(btrim(f.text_content,"+BLANK+"))>0",
     'image':"(r.state='resident' OR ((e.state='ready' OR e.indexed_at IS NOT NULL) AND e.source_digest=a.digest AND e.source_revision=m.revision AND length(btrim(e.title))>0 AND length(btrim(e.summary))>0))",
     'video':"r.state='resident'"}
 

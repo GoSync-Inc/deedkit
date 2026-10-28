@@ -72,6 +72,7 @@
   {"name": "messages_search", "read_only": true},
   {"name": "messages_search_files", "read_only": true},
   {"name": "messages_search_people", "read_only": true},
+  {"name": "messages_send", "read_only": false},
   {"name": "messages_send_message", "read_only": false},
   {"name": "messages_snooze_reply", "read_only": false},
   {"name": "messages_submit_feedback", "read_only": false},

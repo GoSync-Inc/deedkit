@@ -24,6 +24,11 @@ the owner has decided parts (below), not this inventory as a whole.
   cold archive «yes»; owner 10-18 BL-33 disk vs retention «давай оставим как есть если так работает»).
   Backup copies age out by the backup rotation (BACKUP.md). Messages and other kinds: proposal (no
   owner decision on a limit).
+- Pre-migration database copies (ANYM-588, docs/operations/production.md "Database copies"): the
+  deployer copies a database before a migration (owner 10-28 «добавление миграции автоматически с
+  копией»). The copy is plaintext, root-only, on the production host's disk, never leaves the host and is
+  deleted after 48 h, whatever its state (the orchestrator's reading of 2026-10-28; a later owner line may
+  tighten it). Its receipts hold table names, row counts, sizes, hashes, times and failure codes only.
 - Deletion: a message deleted in the messenger (for everyone, the owner's own delete-for-me when
   reported, a cleared chat after 24 h) has its content purged, keeping a content-free tombstone (owner
   10-25 «1) да 2) да 3) да»). Requested, not yet current behaviour: deleted content should not stay even

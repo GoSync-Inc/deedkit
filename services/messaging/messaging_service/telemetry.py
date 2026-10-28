@@ -35,11 +35,17 @@ _reporter = None
 log = logging.getLogger('anymsg.telemetry')
 
 
+def source_sha():
+    """The exact DeedKit source revision built into the image (40 lowercase hex), else None."""
+    sha = os.environ.get('DEEDKIT_SOURCE_SHA', '')
+    # An invalid value is never sent; it reads like an absent one.
+    return sha if re.fullmatch('[0-9a-f]{40}', sha) else None
+
+
 def release():
     """The exact DeedKit source revision built into the image, else the historical package version."""
-    sha = os.environ.get('DEEDKIT_SOURCE_SHA', '')
-    # An invalid value is never sent; it falls back like an absent one.
-    return 'deedkit@' + sha if re.fullmatch('[0-9a-f]{40}', sha) else 'anymsg@' + __version__
+    sha = source_sha()
+    return 'deedkit@' + sha if sha else 'anymsg@' + __version__
 
 
 def safe_event(error, component, code):

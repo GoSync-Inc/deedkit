@@ -80,7 +80,7 @@ Since ANYM-270, `capabilities` takes `detail` (`summary` or `full`) and `section
   when `detail` is omitted: service, version, principal, `credential_id`, permissions,
   `expires_at`, accounts (`id`, `platform`, `label`, `self_provider_id`; ANYM-470), `chat_scope`
   as `all_in_permitted_accounts` plus `chat_count`,
-  `tool_manifest.version`, the section names and a `next_action`. Through the gateway the summary
+  `tool_manifest.version`, `build`, the section names and a `next_action`. Through the gateway the summary
   names `gateway_principal`, `backend_principal` and `gateway_tool_count` and leaves out backend
   permissions, as `full` does. Callers that need everything pass `detail=full`, as the in-repo
   consumers do; the gateway's own capability check and the calls service ask once more with no
@@ -96,6 +96,17 @@ Since ANYM-270, `capabilities` takes `detail` (`summary` or `full`) and `section
 - `detail=full` is the previous payload unchanged, including its full per-account operation
   list. Every view is cut from the same scoped payload, so no view shows an account or chat
   outside the key's scope.
+- Since ANYM-592 the summary, `full` and the `identity` section carry
+  `build: {"source_sha", "started_at"}` next to `version`. `version` (and
+  `tool_manifest.version`) is the package version and does not change per release.
+  `build.source_sha` is the commit this messaging server was built from (`DEEDKIT_SOURCE_SHA`
+  in the image, 40 lowercase hex, the rule Tiden telemetry's release uses); the gateway, calls
+  and calendar services are deployed separately and do not report theirs here. Null means the
+  image was built without its commit, which on production is a deploy defect to report.
+  `build.started_at` is when the messaging server process started (UTC); a restart without a
+  deploy also moves it, so when the expected SHA is known, compare SHAs. The block is read anew
+  on every call; the gateway passes it through unchanged and adds none when an older messaging
+  server sends no `build`.
 
 ## Operator commands
 

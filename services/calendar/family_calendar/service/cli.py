@@ -100,6 +100,11 @@ def parser():
     )
     disable = sub.add_parser("disable-write")
     disable.add_argument("--calendar", required=True)
+    # Calendar invitations (ANYM-555): the owner's own opt-in, since Google may email the guests.
+    invitations = sub.add_parser("allow-invitations")
+    invitations.add_argument("--calendar", required=True)
+    no_invitations = sub.add_parser("disable-invitations")
+    no_invitations.add_argument("--calendar", required=True)
     # One-call scheduling (ANYM-552): the zone offset-free times are read in and the calendar used by default.
     settings = sub.add_parser("family-settings")
     settings.add_argument("--group", default="family")
@@ -294,6 +299,9 @@ def dispatch(args, home, root, config, store):
     if args.action in ("allow-write", "disable-write"):
         store.write_opt_in(args.calendar, args.action == "allow-write")
         return {"write_enabled": args.action == "allow-write"}
+    if args.action in ("allow-invitations", "disable-invitations"):
+        store.invitations_opt_in(args.calendar, args.action == "allow-invitations")
+        return {"invitations_enabled": args.action == "allow-invitations"}
     if args.action == "agent-key":
         scopes = args.scopes.split(",")
         if set(scopes) - set(READ + WRITE):

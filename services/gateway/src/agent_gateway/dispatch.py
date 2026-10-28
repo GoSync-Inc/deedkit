@@ -17,6 +17,7 @@ PLAIN_PATH = "/mcp"
 MODULE_PATH = "/mcp/modules/"
 LIVE_SEARCH = "search_messages_live"
 OPEN_CHAT_BY_PHONE = "open_chat_by_phone"
+SEND_FILE = "send_file"
 # One line each for an agent choosing what to load (ANYM-271); the ids are the deployable modules.
 # No ", " or ": ": the MCP text block is compact JSON (ANYM-408).
 MODULE_PURPOSES = {
@@ -568,6 +569,10 @@ class Dispatch:
                      or OPEN_CHAT_BY_PHONE not in self.actions(snapshot, agent, caps, args.get("account")))):
             # ANYM-532: a phone recipient needs the same action grant as the separate operation.
             raise Denied()
+        if (module == "messaging" and tool["operation"] == "messages_send" and args.get("files")
+                and SEND_FILE not in self.actions(snapshot, agent, caps, args.get("account") or None)):
+            # ANYM-546: files go as send_file operations, under the same action grant.
+            raise Denied()
         return allowed_actions
 
     @staticmethod
@@ -688,6 +693,12 @@ class Dispatch:
         if module == "messaging" and tool["operation"] in ("preview_message", "send_message"):
             # An empty recipient field is not sent, so a backend from before ANYM-532 keeps taking chat_id calls.
             args = {k: v for k, v in args.items() if k not in ("chat_id", "phone") or v != ""}
+        if module == "messaging" and tool["operation"] == "messages_send":
+            # ANYM-546: whether a phone with no chat may be opened, and whether files may go, is this gateway's
+            # grant on every call (a token-only or resume call carries no files), never the agent's word.
+            actions = self.actions(snapshot, agent, caps, args.get("account") or None)
+            args = {**args, "allow_open_chat": "send" in caps["permissions"] and OPEN_CHAT_BY_PHONE in actions,
+                    "allow_files": "send" in caps["permissions"] and SEND_FILE in actions}
         if module == "calendar" and tool["operation"] == "plan":
             # Carried drives (and create with activity) are asked for only under this gateway's own rule-read
             # ceiling, and only from a backend that declares the field; an agent never sets it itself.

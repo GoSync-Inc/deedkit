@@ -51,12 +51,21 @@ DRIFT_SKIP = {
 EVENT_WRITE = (
     "guest-free single event, all-day event (date range, exclusive end), or one occurrence of a "
     "recurring series (update or cancel, chosen by its event_ref); series, this-and-following and "
-    "invitations are not written"
+    "invitations are not written; calendar_schedule create invites guests where a calendar's guests.supported is true"
 )
 # Per provider, exactly what the write path implements; both rest on synthetic evidence until the owner's live run.
 PROVIDER_WRITE = {
     provider: {"occurrence_write": True, "all_day_write": True} for provider in ("google", "icloud")
 }
+# Guests of a new event, per provider (ANYM-555): only calendar_schedule create sends them, and only Google invites;
+# each calendar also needs the owner's invitation opt-in (schema 5, `service allow-invitations`).
+GUEST_WRITE = {
+    "google": {"supported": True, "tool": "calendar_schedule", "actions": ["create"], "notify": ["none", "all"]},
+    "icloud": {"supported": False, "error": "capability_unsupported"},
+}
+# Mixed into the scope hash of a plan with guests: a worker that predates guests computes another hash and refuses
+# the plan (scope_changed) instead of creating the event without them.
+INVITE_SCOPE = "invitations-v1"
 LIMITS = [("title", 256), ("location", 512), ("description", 4000)]
 DATE_VALUE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
@@ -185,7 +194,7 @@ class FamilyService:
                 raise CalendarError("write_not_enabled")
         return p, c
 
-    def _scope_hash(self, p, calendars):
+    def _scope_hash(self, p, calendars, invitations=False):
         return digest(
             [
                 p["id"],
@@ -198,7 +207,27 @@ class FamilyService:
                     for c in calendars
                 ],
             ]
+            + ([INVITE_SCOPE] if invitations else [])
         )
+
+    def invitations_enabled(self, calendar_ref):
+        """The owner's invitation opt-in of a calendar; false before schema 5 and its db-roles grant."""
+        if not self.store.one(
+            "SELECT coalesce(has_table_privilege(to_regclass('invitation_opt_ins'),'SELECT'),false) AS ok"
+        )["ok"]:
+            return False
+        row = self.store.one("SELECT enabled FROM invitation_opt_ins WHERE calendar_ref=%s", (calendar_ref,))
+        return bool(row and row["enabled"])
+
+    def guests(self, calendar):
+        """What calendar_capabilities says about guests on this calendar."""
+        support = GUEST_WRITE[calendar["provider"]]
+        if not support["supported"]:
+            return support
+        if self.invitations_enabled(calendar["calendar_ref"]):
+            return dict(support, enabled=True)
+        return dict(support, enabled=False, error="invitations_not_enabled",
+                    owner_step="service allow-invitations --calendar " + calendar["calendar_ref"])
 
     def calendars(self, key):
         p = self.principal(key)
@@ -329,6 +358,7 @@ class FamilyService:
 
     def capabilities(self, key):
         calendars = self.calendars(key)
+        calendars["calendars"] = [dict(c, guests=self.guests(c)) for c in calendars["calendars"]]
         return dict(
             calendars,
             permissions=sorted(self.principal(key)["scopes"]),
@@ -541,7 +571,7 @@ class FamilyService:
         result["configured_bindings_availability"] = "verified"
         return result
 
-    def plan(self, key, actions, carry_projections=False):
+    def plan(self, key, actions, carry_projections=False, invitations=False):
         p = self.principal(key)
         if not isinstance(actions, list) or not 1 <= len(actions) <= 8:
             raise CalendarError("invalid_actions")
@@ -553,6 +583,9 @@ class FamilyService:
         # Remote events this plan changes: one action per drive, whether by unproject or an ordinary write.
         targets, unprojected, carried = set(), False, False
         allowed = {"action", "calendar_ref", "event_ref", "event", "activity", "operation_id"}
+        if invitations:
+            # calendar_schedule only (ANYM-555): calendar_plan never takes guests.
+            allowed.add("invite")
         for action in actions:
             if not isinstance(action, dict) or set(action) - allowed:
                 raise CalendarError("invalid_action")
@@ -616,6 +649,15 @@ class FamilyService:
                 "provider": cal["provider"],
                 "ordinal": len(prepared),
             }
+            if "invite" in action:
+                guests = action["invite"]
+                if (kind != "create" or not GUEST_WRITE[cal["provider"]]["supported"] or not isinstance(guests, dict)
+                        or guests.get("notify") not in ("none", "all") or not isinstance(guests.get("guests"), list)
+                        or not 1 <= len(guests["guests"]) <= 20):
+                    raise CalendarError("capability_unsupported")
+                if not self.invitations_enabled(cal["ref"]):
+                    raise CalendarError("invitations_not_enabled")
+                step["invite"] = {"guests": list(guests["guests"]), "notify": guests["notify"]}
             if kind != "delete":
                 step["event"] = validate_event(action.get("event"), f"actions/{len(prepared)}/event")
                 a, b = event_span(step["event"], cal["timezone"])
@@ -720,13 +762,17 @@ class FamilyService:
         payload = {"steps": prepared, **({"sources": sources} if sources else {})}
         self.store.query(
             "INSERT INTO plans(id,principal_id,payload,scope_hash,expires_at) VALUES (%s,%s,%s,%s,%s)",
-            (plan_id, p["id"], Jsonb(payload), self._scope_hash(p, calendars + source_calendars), expires),
+            (plan_id, p["id"], Jsonb(payload),
+             self._scope_hash(p, calendars + source_calendars, any("invite" in s for s in prepared)), expires),
         )
         return {
             "plan_id": plan_id,
             "expires_at": expires.isoformat(),
             "steps": [self._preview(s) for s in prepared],
-            "notifications": "none; events with guests are blocked",
+            "notifications": (
+                "per step invite: guests of a create, emailed only with notify all; edits of events with guests are "
+                "blocked" if any("invite" in s for s in prepared) else "none; events with guests are blocked"
+            ),
             "atomic": False,
             "overlap_check": overlap_check,
             **({"projections_skipped": skipped} if projected or unprojected or carried else {}),
@@ -1286,8 +1332,11 @@ class FamilyService:
             if cal["visibility"] != "details":
                 raise CalendarError("scope_changed")
             calendars.append(cal)
-        if self._scope_hash(p, calendars) != plan["scope_hash"]:
+        invites = [s for s in plan["payload"]["steps"] if "invite" in s]
+        if self._scope_hash(p, calendars, bool(invites)) != plan["scope_hash"]:
             raise CalendarError("scope_changed")
+        if any(not self.invitations_enabled(s["calendar_ref"]) for s in invites):
+            raise CalendarError("invitations_not_enabled")
 
     def apply(self, key, plan_id, request_id):
         p = self.principal(key)

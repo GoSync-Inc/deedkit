@@ -47,6 +47,7 @@
   "mute_reply_source",
   "unmute_reply_source",
   "send_message",
+  "messages_send",
   "get_send_status",
   "record_review",
   "ack_subscription_events",
@@ -68,6 +69,10 @@
   "execute_messenger_operation",
   "get_messenger_operation"
  ],
+ "build": {
+  "source_sha": null,
+  "started_at": "<volatile>"
+ },
  "chat_scope": {
   "all_in_permitted_accounts": true,
   "chat_ids": null
@@ -724,6 +729,7 @@
    "list_messenger_operations",
    "list_reply_dismissals",
    "list_subscriptions",
+   "messages_send",
    "mute_reply_source",
    "prepare_file_upload",
    "preview_message",

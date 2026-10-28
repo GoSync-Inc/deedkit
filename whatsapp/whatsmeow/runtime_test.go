@@ -1301,3 +1301,133 @@ func TestGroupReceiptsMatchCapturesWithTheSenderSuffix(t *testing.T) {
 		t.Fatal("group delivery evidence", obs, err)
 	}
 }
+
+// spec: ANYM-387
+func TestHistoryProductionCompressedAndDecodedBounds(t *testing.T) {
+	if maxCompressedHistory != 32<<20 || maxDecodedHistory != 64<<20 {
+		t.Fatal("production history bounds changed", maxCompressedHistory, maxDecodedHistory)
+	}
+	// The production download path applies both bounds before any client call;
+	// this provider has no client, so passing a bound would panic.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatal("history bound not applied before the client call", r)
+		}
+	}()
+	p := &Provider{}
+	if _, err := p.downloadHistory(context.Background(), &waE2E.HistorySyncNotification{FileLength: proto.Uint64(32<<20 + 1)}); err == nil || err.Error() != "history_size_limit" {
+		t.Fatal("declared compressed size over 32 MiB accepted", err)
+	}
+	if _, err := p.downloadHistory(context.Background(), &waE2E.HistorySyncNotification{InitialHistBootstrapInlinePayload: make([]byte, 32<<20+1)}); err == nil || err.Error() != "history_size_limit" {
+		t.Fatal("compressed payload over 32 MiB accepted", err)
+	}
+	compress := func(size int) []byte {
+		var out bytes.Buffer
+		writer, _ := zlib.NewWriterLevel(&out, zlib.BestSpeed)
+		chunk := make([]byte, 1<<20)
+		for left := size; left > 0; left -= len(chunk) {
+			if _, err := writer.Write(chunk[:min(left, len(chunk))]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		writer.Close()
+		return out.Bytes()
+	}
+	if _, err := p.downloadHistory(context.Background(), &waE2E.HistorySyncNotification{InitialHistBootstrapInlinePayload: compress(64<<20 + 1)}); err == nil || err.Error() != "history_size_limit" {
+		t.Fatal("payload decoding to more than 64 MiB accepted", err)
+	}
+	if err := validateCompressedHistory(compress(64<<20), maxDecodedHistory); err != nil {
+		t.Fatal("payload decoding to exactly 64 MiB rejected", err)
+	}
+}
+
+// spec: ANYM-388
+func TestSymlinkedPolicyIsRefusedAsInvalidPolicy(t *testing.T) {
+	p := &Provider{Config: testConfig(t)}
+	// A valid, private policy: only the symlink makes it unusable.
+	savePolicy(t, p, time.Now().Add(time.Minute), Policy{Enabled: true, DiscoverChats: true, IncludeChats: []string{}, ExcludeChats: []string{}})
+	target := filepath.Join(p.Config.SessionDirectory, "target")
+	if err := os.Rename(filepath.Join(p.Config.EventsDirectory, ".policy"), target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(p.Config.EventsDirectory, ".policy")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.policy(); err == nil || err.Error() != "invalid_policy" {
+		t.Fatal("symlinked policy not refused with invalid_policy", err)
+	}
+	p.ready.Store(true)
+	if _, err := p.handle(context.Background(), request{ID: 1, Method: "dialogs", Params: json.RawMessage(`{"limit":5}`)}, func(any) error { return nil }); err == nil || err.Error() != "invalid_policy" {
+		t.Fatal("request proceeded on a symlinked policy", err)
+	}
+}
+
+// spec: ANYM-390
+func TestLocalPageHasLatestRevisionOnceOldestFirst(t *testing.T) {
+	s := openTestStore(t)
+	for _, m := range []*events.Message{fixtureMessage("c", 1700000300), fixtureMessage("a", 1700000100), fixtureMessage("b", 1700000200)} {
+		if err := s.Put(m, "live"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	edit := fixtureMessage("edit-of-a", 1700000400)
+	edit.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: &waCommon.MessageKey{ID: proto.String("a"), FromMe: proto.Bool(false)}, EditedMessage: &waE2E.Message{Conversation: proto.String("edited")}, TimestampMS: proto.Int64(1700000400000)}}
+	if err := s.Put(edit, "live"); err != nil {
+		t.Fatal(err)
+	}
+	var revisions int
+	s.db.QueryRow("SELECT COUNT(*) FROM capture WHERE message_id='false_111111@c.us_a'").Scan(&revisions)
+	if revisions != 2 {
+		t.Fatal("fixture has no second revision", revisions)
+	}
+	page, err := s.Page("111111@c.us", 10, nil)
+	if err != nil || len(page) != 3 {
+		t.Fatal("each message not on the page exactly once", len(page), err)
+	}
+	for i, id := range []string{"a", "b", "c"} {
+		if page[i].Info.ID != id {
+			t.Fatal("page not oldest first", i, page[i].Info.ID)
+		}
+	}
+	if page[0].Message.GetConversation() != "edited" {
+		t.Fatal("page does not hold the latest retained revision", page[0].Message)
+	}
+}
+
+// spec: ANYM-390
+func TestRevokeIsExportedAsDeleteOfOriginalMessageID(t *testing.T) {
+	s := openTestStore(t)
+	m := fixtureMessage("original", 1700000000)
+	if err := s.Put(m, "live"); err != nil {
+		t.Fatal(err)
+	}
+	revoke := fixtureMessage("revokeid", 1700000001)
+	revoke.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_REVOKE.Enum(), Key: &waCommon.MessageKey{ID: proto.String("original"), FromMe: proto.Bool(false)}}}
+	if err := s.Put(revoke, "live"); err != nil {
+		t.Fatal(err)
+	}
+	files, err := filepath.Glob(filepath.Join(s.Config.EventsDirectory, "*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deletes []map[string]any
+	for _, file := range files {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envelope map[string]any
+		if err = json.Unmarshal(raw, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope["kind"] == "whatsapp_delete" {
+			deletes = append(deletes, envelope)
+		}
+	}
+	if len(files) != 2 || len(deletes) != 1 {
+		t.Fatal("revoke not exported as exactly one delete", len(files), len(deletes))
+	}
+	if ids, _ := deletes[0]["ids"].([]any); len(ids) != 1 || ids[0] != LegacyMessageID(m) || deletes[0]["chat"] != "111111@c.us" {
+		t.Fatal("delete does not name the original message ID", deletes[0])
+	}
+}

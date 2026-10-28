@@ -15,7 +15,7 @@ from test_client_contract import rpc
 ROOT=Path(__file__).resolve().parents[1]
 SNAPSHOT=ROOT/'tests/fixtures/capabilities-full-snapshot.json'
 # Values that follow the clock, the issued key or the release, not the payload's shape.
-VOLATILE={'credential_id','expires_at','scope_version','key_permission_version','last_ingest_at',
+VOLATILE={'credential_id','expires_at','scope_version','key_permission_version','last_ingest_at','started_at',
           'updated_at','observed_at','checked_at','captured_at','created_at'}
 
 
@@ -64,8 +64,10 @@ def test_capabilities_summary_within_1500_chars(seeded):
 
 
 # spec: ANYM-270
-def test_capabilities_full_matches_previous_payload(seeded):
+def test_capabilities_full_matches_previous_payload(seeded,monkeypatch):
     s,_,_=seeded
+    # The snapshot's build.source_sha is null; an image's test stage may carry a real commit (ANYM-592).
+    monkeypatch.delenv('DEEDKIT_SOURCE_SHA',raising=False)
     key=all_permissions_key(s)
     full=s.capabilities(key,detail='full')
     assert masked(full)==json.loads(SNAPSHOT.read_text())

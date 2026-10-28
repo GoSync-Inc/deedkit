@@ -2,12 +2,14 @@ import base64
 import json
 import hashlib
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from starlette.testclient import TestClient
 
 from agent_gateway.app import create_app
+from agent_gateway import http_clients
 from agent_gateway.http_clients import Clients
 from agent_gateway.policy import Denied
 from test_policy import config
@@ -348,5 +350,36 @@ def test_upload_timeout_is_bounded_and_not_retried(monkeypatch):
                 await clients.call("messaging", "upload_file_chunk", "synthetic", {})
             assert attempts == ["/v1/upload_file_chunk"]
             assert clients.upload_budgets["messaging"].pending == 0
+
+    asyncio.run(run())
+
+
+# spec: ANYM-393
+def test_upload_rate_state_tracks_at_most_1024_credentials(monkeypatch):
+    now = [100.0]
+    # Freeze only the upload-rate clock, so all 1024 credentials stay active in the last second.
+    monkeypatch.setattr(http_clients, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    async def run():
+        seen = []
+
+        async def backend(request):
+            seen.append(request.url.path)
+            return httpx.Response(200, json={"state": "ready"})
+
+        deployment = {"modules": ["messaging"], "backends": {"messaging": {"url": "http://messaging"}}}
+        async with Clients(deployment, {"messaging": httpx.MockTransport(backend)}) as clients:
+            for index in range(1024):
+                clients.upload_rate.admit(f"synthetic-{index}")
+            assert len(clients.upload_rate.observations) == 1024
+            with pytest.raises(Denied, match="backend_busy") as refused:
+                await clients.call("messaging", "upload_file_chunk", "synthetic-new", {})
+            assert refused.value.status == 503 and seen == []
+            assert len(clients.upload_rate.observations) == 1024
+            await clients.call("messaging", "upload_file_chunk", "synthetic-0", {})
+            now[0] += 1
+            await clients.call("messaging", "upload_file_chunk", "synthetic-new", {})
+            assert len(clients.upload_rate.observations) == 1
+            assert seen == ["/v1/upload_file_chunk"] * 2
 
     asyncio.run(run())
