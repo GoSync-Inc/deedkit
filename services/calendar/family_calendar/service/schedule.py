@@ -49,6 +49,25 @@ def request_of(arguments):
     return {k: v for k, v in sorted(arguments.items()) if k not in CONTROL}
 
 
+def texts(value, key=None):
+    """The caller's own words in a request: every string outside the fields the gateway reads as references or
+    fixed values (action, start, date, IDs), with its words of 6 or more characters."""
+    if isinstance(value, dict):
+        return {t for k, v in value.items() for t in texts(v, k)}
+    if isinstance(value, str) and value.strip() and key not in ("action", "start", "date", "request_id"):
+        return {value} | {word for word in value.split() if len(word) >= 6}
+    return set()
+
+
+def label_for(label, request, n):
+    """A candidate label the gateway relays: one that repeats the caller's title or query would drop the candidate
+    (ANYM-544 payload filter), so that label falls back to the candidate's position."""
+    def found(piece, text):
+        return piece in text if len(piece) >= 4 else re.search(rf"(?<!\w){re.escape(piece)}(?!\w)", text) is not None
+    label = label[:200]
+    return f"#{n}" if any(found(t, label) for t in texts(request)) else label
+
+
 def selection(candidates, more_next=None):
     details = {"candidates": candidates[:MAX_CANDIDATES]}
     if len(candidates) > MAX_CANDIDATES and more_next:
@@ -136,10 +155,10 @@ class Scheduler:
              SELECTION_TTL_S),
         )
         return selection([
-            {"id": c["calendar_ref"], "label": c["label"][:200], "kind": "calendar",
+            {"id": c["calendar_ref"], "label": label_for(c["label"], choice.request, n), "kind": "calendar",
              "next": {"tool": TOOL_NAME, "arguments": {"selection_token": token, "calendar": c["calendar_ref"],
                                                        "dry_run": True}}}
-            for c in choice.calendars
+            for n, c in enumerate(choice.calendars, 1)
         ])
 
     def selected(self, p, token):

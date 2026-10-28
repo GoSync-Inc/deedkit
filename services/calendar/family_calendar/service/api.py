@@ -255,6 +255,8 @@ def failure(code, field_errors=None, details=None):
         **({"hint": HINTS[code]} if code in HINTS else {}),
         **({"field_errors": field_errors} if field_errors else {}),
         **(details if details and code in PUBLIC_DETAILS else {}),
+        # calendar_schedule states the family timezone and the current time in every answer (ANYM-552).
+        **{k: details[k] for k in ("timezone", "now") if details and k in details},
     }
 
 

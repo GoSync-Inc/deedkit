@@ -502,3 +502,31 @@ def test_errors_state_timezone_and_now(store):
         asyncio.run(gateway.call(key, "schedule", {"confirm_token": token}))
     stale = failure(caught.value.code, caught.value.field_errors, caught.value.details)
     assert stale["error"] == "preview_stale" and stale["timezone"] == "Asia/Makassar" and "now" in stale
+
+
+# spec: ANYM-552
+def test_a_calendar_label_that_repeats_the_title_falls_back_to_its_position(store):
+    key = setup(store, second=True)
+    store.family_settings("family", "Asia/Makassar")
+    choose = rulebook.validate_error(call(store, key, {**CREATE, "title": "Lessons", "calendar": "Less",
+                                                       "request_id": "req-label-1"}))
+    labels = {c["id"]: c["label"] for c in choose["candidates"]}
+    # The gateway drops a candidate whose label carries the caller's title; "#n" keeps it relayable.
+    assert labels == {"cal-child": "#1"}
+    preview = call(store, key, choose["candidates"][0]["next"]["arguments"])
+    assert preview["state"] == "previewed" and preview["preview"]["title"] == "Lessons"
+
+
+# spec: ANYM-552
+def test_token_errors_state_timezone_and_now(store):
+    key = setup(store, second=True)
+    store.family_settings("family", "Asia/Makassar")
+    gateway = Gateway(store)
+    for arguments, code in (({"confirm_token": "x" * 32}, "invalid_confirm_token"),
+                            ({"selection_token": "x" * 32, "calendar": "cal-a", "dry_run": True},
+                             "invalid_selection_token")):
+        with pytest.raises(CalendarError) as caught:
+            asyncio.run(gateway.call(key, "schedule", arguments))
+        relayed = failure(caught.value.code, caught.value.field_errors, caught.value.details)
+        assert relayed["error"] == code and relayed["timezone"] == "Asia/Makassar"
+        assert relayed["now"].endswith("+08:00")
