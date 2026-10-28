@@ -169,10 +169,11 @@ capability `DAC_OVERRIDE` is needed to read the collector UID's private files th
 mounts. The PG password is passed through a 0600 PGPASSFILE in tmpfs, with no password in argv.
 After successful encryption the plaintext staging is deleted before sending.
 
-The worker's `pg_dump` writes the custom format with `--compress=zstd:1`. Restoring a dump made since then
-needs `pg_restore` from PostgreSQL 16 or newer; the backup image and the receiver's verifier run PostgreSQL 18,
-but a restore by hand on the owner's own machine with older client tools fails on the archive header. Older
-dumps (gzip) restore as before. The dump has its own limit inside the capture: `dump_timeout_seconds` in
+The worker's `pg_dump` writes the custom format with `--compress=zstd:1`. Restore it with `pg_restore` from
+PostgreSQL 18 built with zstd, as the backup image and the receiver's verifier are (or run `pg_restore` in a
+`postgres:18` container). zstd in custom format needs PostgreSQL 16 or newer, but PostgreSQL 18 writes archive
+version 1.16, which `pg_restore` 16 already refused for the gzip dumps before (`unsupported version (1.16) in
+file header`), so on the owner's own machine install the 18 client tools. The dump has its own limit inside the capture: `dump_timeout_seconds` in
 `runner.json` (optional, a whole number 300–7200, at most the capture `timeout_seconds`; anything else is
 refused as `invalid_backup_timeout`). Without it the limit is 1800 s, or `timeout_seconds` if that is lower,
 so every `runner.json` valid before stays valid. A dump past the limit fails the capture as before (the worker
@@ -181,13 +182,16 @@ the messenger collectors paused for up to 30 minutes instead of failing the back
 minutes. The paused collectors catch up on resume, as after the usual daily pause; a verified daily point is
 worth more than a failed run.
 
-Upgrade order: the image first, the runner second. The runner now always writes the limit into `worker.json`,
-and an older worker refuses keys it does not know, so a newer runner with an older backup image fails every
-capture; a newer worker accepts `worker.json` with or without the key (without it, `pg_dump` keeps 600 s).
-So the release's image is built (autodeploy) and the `runner.json` `image` pin names it no later than the
-runner install ([production.md, Backup runner](docs/operations/production.md#backup-runner)). Undo in
-reverse: remove `dump_timeout_seconds` from `runner.json` (an older runner refuses unknown keys), install the
-`.before-<sha>` runner, then put back the image pin it ran with.
+Upgrade order: the runner now always writes the limit into `worker.json`, and an older worker refuses keys it
+does not know, so a newer runner with an older backup image fails every capture; a newer worker accepts
+`worker.json` with or without the key (without it, `pg_dump` keeps 600 s), so an older runner with the newer
+image works. The install is the one step of [production.md, Backup runner](docs/operations/production.md#backup-runner),
+with the timer and the backup service idle and no capture started until it ends: first set the `runner.json`
+`image` pin to the release's backup image and read it back, then install the runner, then add
+`dump_timeout_seconds` if wanted. Undo, in the same kind of idle step: remove `dump_timeout_seconds` from
+`runner.json` (an older runner refuses unknown keys), install the `.before-<sha>` runner, then put back the
+image pin it ran with (production.md's undo puts the pin back first; with this release, keep the runner first,
+since the new runner with the old image is the pair that fails).
 
 Delivery uses a separate SSH key created on the source VM. The key does not give
 shell/SFTP/forwarding/read/delete: the target VM runs only

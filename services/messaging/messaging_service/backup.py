@@ -185,7 +185,7 @@ def create_snapshot(store,destination,dump_command,recovery_config=None,*,captur
                 blobs,absent=blob_inventory(c,schema_version)
                 with (temporary/'database.dump').open('xb') as output:
                     # Command is configured by the operator, not accepted by MCP/REST. No shell.
-                    # zstd:1 in custom format needs pg_restore from PostgreSQL 16 or newer (BACKUP.md).
+                    # Restoring needs pg_restore from PostgreSQL 18 built with zstd, as the image (BACKUP.md).
                     process=subprocess.run([*dump_command,'--format=custom','--compress=zstd:1','--no-owner','--no-acl',
                         '--snapshot='+snapshot],stdout=output,stderr=subprocess.PIPE,timeout=dump_timeout)
                     if process.returncode: raise RuntimeError('pg_dump_failed')
