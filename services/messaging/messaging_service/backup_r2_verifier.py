@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import time
+import traceback
 
 from . import backup_r2_receiver as r2
 from . import backup_receiver as local
@@ -445,8 +446,12 @@ def run(config,*,client=None,engine=None):
             if journal is not None:
                 try:cleanup_resources(engine,journal['run']);remove_payload(config['directory'],journal['run'])
                 except Exception:cleanup_ok=False
-            local.write_maintenance_json('status.json',{'v':1,'status':'failed','error':failure_code(error),
-                'failed_at':now(),'cleanup_complete':cleanup_ok},dir_fd=fd)
+            failure={'v':1,'status':'failed','error':failure_code(error),'failed_at':now(),
+                     'cleanup_complete':cleanup_ok,'diagnostic':describe(error)}
+            local.write_maintenance_json('status.json',failure,dir_fd=fd)
+            # A later busy/idle/verified run overwrites status.json; keep the last failure's cause.
+            try:local.write_maintenance_json('last-failure.json',failure,dir_fd=fd)
+            except Exception:pass
             raise error
 
 
@@ -460,16 +465,37 @@ def failure_code(error):
           'unreviewed_restore_image','unreviewed_postgres_image','unowned_restore_resource','invalid_helper_result',
           'uploader_lock_initialization_required','uncommitted_cloud_object','receiver_quota','protected_backup_missing',
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
-          'isolated_restore_failed','stored_backup_corrupt','unexpected_restore_image_volume','unexpected_restore_helper_layout'}
+          'isolated_restore_failed','stored_backup_corrupt','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout'}
     return str(error) if str(error) in safe else 'independent_restore_failed'
+
+
+def code_location(filename):
+    parts=Path(filename).parts
+    if 'site-packages' in parts:return '/'.join(parts[len(parts)-parts[::-1].index('site-packages'):])
+    return '/'.join(parts[-2:]) if 'messaging_service' in parts[-2:-1] else Path(filename).name
+
+
+def describe(error):
+    """Exception classes and code frames only. Messages, args and locals can hold
+    signed URLs, DSNs or archive data and never enter status or logs."""
+    try:
+        chain=[];seen=set()
+        while error is not None and id(error) not in seen and len(chain)<4:
+            seen.add(id(error))
+            frames=[[code_location(frame.f_code.co_filename),line,frame.f_code.co_name]
+                    for frame,line in traceback.walk_tb(error.__traceback__)]
+            chain.append({'type':type(error).__module__+'.'+type(error).__qualname__,'frames':frames[-16:]})
+            error=error.__cause__ or error.__context__
+        return chain
+    except Exception:return [{'type':'diagnostic_unavailable','frames':[]}]
 
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--config',required=True)
     args=parser.parse_args(argv)
     try:run(load_config(args.config))
-    except Exception:
-        print('independent_restore_failed',file=sys.stderr);return 1
+    except Exception as error:
+        print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
     return 0
 
 

@@ -5,7 +5,7 @@ The producer still speaks stream_v2 and never receives object-store credentials.
 No boto3 import, ambient AWS credential lookup or network call occurs on import.
 """
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone, timedelta
 import hashlib
 import fcntl
@@ -18,11 +18,17 @@ import signal
 import stat
 import struct
 import sys
+import time
 
 from . import backup_receiver as local
 
 AGE_HEADER = local.AGE_HEADER
 MIB = 1024 ** 2
+# A ranged GET resumes a body read that broke mid-stream (R2 resets, read
+# timeouts) at most this many times per object, with bounded backoff.
+STREAM_RESUMES = 5
+# Codes our own SIGALRM/SIGTERM handlers raise; an SDK may wrap them.
+SIGNAL_CODES = {'receiver_timeout', 'restore_deadline', 'restore_stopped'}
 CHECKS = {'decryption', 'bundle_integrity', 'database_restore', 'table_inventory',
           'original_hashes', 'recovery_objects', 'collectors_quarantined'}
 
@@ -216,17 +222,71 @@ def get_receipt(config, client, bid):
     return validate_receipt(config, value, bid)
 
 
+def signalled(exc):
+    """Our deadline/stop error, even when urllib3/botocore wrapped it in a read error."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (TimeoutError, InterruptedError)) and exc.args[:1] and exc.args[0] in SIGNAL_CODES:
+            return exc
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def stream_pause(attempt):
+    time.sleep(min(30, 2 ** attempt))
+
+
+def resume_body(config, client, receipt, offset, etag):
+    total = receipt['wire']['bytes']
+    request = {'Bucket': config['bucket'], 'Key': receipt['object_key'], 'Range': 'bytes=%d-%d' % (offset, total - 1)}
+    if etag:
+        request['IfMatch'] = etag
+    response = cloud_call(client.get_object, **request)
+    if (response.get('ContentLength') != total - offset or
+            response.get('ContentRange', 'bytes %d-%d/%d' % (offset, total - 1, total)) != 'bytes %d-%d/%d' % (offset, total - 1, total)):
+        response['Body'].close()
+        raise ValueError('stored_backup_corrupt')
+    return response['Body']
+
+
 def verify_object(config, client, receipt, output=None):
-    """Hash actual downloaded bytes; multipart ETags are never integrity proof."""
+    """Hash actual downloaded bytes; multipart ETags are never integrity proof.
+
+    A body read that fails mid-stream resumes at the next byte with a ranged GET
+    of the same ETag (STREAM_RESUMES, bounded backoff); the full SHA256 still
+    covers every delivered byte. A failed write to `output` is never retried.
+    """
     wire = receipt['wire']
     response = cloud_call(client.get_object, Bucket=config['bucket'], Key=receipt['object_key'])
-    body = response['Body']
-    digest = hashlib.sha256(); size = 0; prefix = b''
+    body = response['Body']; etag = response.get('ETag')
+    digest = hashlib.sha256(); size = 0; prefix = b''; resumes = 0
     try:
         if response.get('ContentLength') != wire['bytes']:
             raise ValueError('stored_backup_corrupt')
         while True:
-            data = body.read(MIB)
+            try:
+                data = body.read(MIB)
+            except Exception as exc:
+                if (stop := signalled(exc)) is not None:
+                    raise stop
+                if size == wire['bytes']:
+                    break
+                with suppress(Exception):
+                    body.close()
+                while True:
+                    resumes += 1
+                    if resumes > STREAM_RESUMES:
+                        # SDK errors can hold signed URLs; only their class reaches diagnostics.
+                        raise RuntimeError('storage_unavailable') from None
+                    stream_pause(resumes)
+                    try:
+                        body = resume_body(config, client, receipt, size, etag)
+                        break
+                    except RuntimeError as again:
+                        if (stop := signalled(again)) is not None:
+                            raise stop
+                continue
             if not data:
                 break
             size += len(data)
