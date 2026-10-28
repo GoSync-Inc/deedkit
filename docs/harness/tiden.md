@@ -91,9 +91,12 @@ stays: no relocation preserves identity (none through CLI 0.41.0, checked 10-24)
 card or a review branch changes it.
 
 Main's Quality Gate counts a `Backlog` spec without tests as `no_test` (no status filter: open
-Tiden limitation, feedback 10-21), so ready cards keep it `BLOCKED`. Read it per spec: `no_test` on
-`Backlog` is planned work, any other failing row a finding. Never link tests or move a card to turn
-it green; a job that fails on main's verdict filters those rows first.
+Tiden limitation, feedback 10-21; still none in CLI 0.43.0), so ready cards keep it `BLOCKED`. Read
+it per spec with `bin/tiden-gate.sh`: a red row on a `Backlog` spec without code (no pull request,
+no non-.md repo file) is planned work (one `not built` line); any other failing row, a `Backlog`
+spec with code included, is a finding (exit 1); a failed read is exit 2, never a pass. Never link
+tests or move a card to turn it green; a job that fails on main's verdict fails on this read's exit
+code (1 or 2) instead of the raw verdict.
 
 ## Card intake
 
