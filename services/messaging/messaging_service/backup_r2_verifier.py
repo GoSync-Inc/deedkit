@@ -108,13 +108,14 @@ def verifier_lock(directory):
 @contextmanager
 def deadline(seconds):
     previous=signal.getsignal(signal.SIGALRM);previous_term=signal.getsignal(signal.SIGTERM)
-    def expired(*_):raise TimeoutError('restore_deadline')
-    def stopped(*_):raise InterruptedError('restore_stopped')
-    signal.signal(signal.SIGALRM,expired);signal.signal(signal.SIGTERM,stopped)
+    def expired(*_):r2.cancel(TimeoutError('restore_deadline'))
+    def stopped(*_):r2.cancel(InterruptedError('restore_stopped'))
+    r2.CANCELLED.clear();signal.signal(signal.SIGALRM,expired);signal.signal(signal.SIGTERM,stopped)
     signal.setitimer(signal.ITIMER_REAL,seconds)
     try:yield
     finally:
         signal.setitimer(signal.ITIMER_REAL,0);signal.signal(signal.SIGALRM,previous);signal.signal(signal.SIGTERM,previous_term)
+        r2.CANCELLED.clear()
 
 
 def names(run):

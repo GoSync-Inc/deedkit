@@ -524,3 +524,46 @@ def test_service_stderr_names_the_safe_code_and_exception_types_only(monkeypatch
     err=capsys.readouterr().err;line=json.loads(err)
     assert line['error']=='storage_unavailable' and 'SECRET' not in err
     assert [item['type'] for item in line['diagnostic']]==['builtins.RuntimeError','test_backup_r2_verifier.StreamingError']
+
+
+class SwallowingCloud(FlakyCloud):
+    """A ranged GET whose transport catches our deadline/stop and retries to success, as botocore's retry loop does."""
+    def __init__(self,data,failures,signum):super().__init__(data,failures);self.signum=signum
+    def get_object(self,**kw):
+        if 'Range' in kw:
+            import signal
+            try:signal.raise_signal(self.signum)
+            except Exception:pass
+        return super().get_object(**kw)
+
+
+# spec: ANYM-285
+@pytest.mark.parametrize('signum,code',[('SIGALRM','restore_deadline'),('SIGTERM','restore_stopped')],ids=['deadline','service-stop'])
+def test_stream_deadline_or_stop_swallowed_by_an_sdk_retry_still_stops_the_run(monkeypatch,signum,code):
+    import signal
+    v=module();data=r2.AGE_HEADER+os.urandom(r2.MIB);pauses=[]
+    monkeypatch.setattr(r2,'stream_pause',pauses.append)
+    cloud=SwallowingCloud(data,[100],getattr(signal,signum));out=io.BytesIO()
+    with pytest.raises((TimeoutError,InterruptedError),match=code):
+        with v.deadline(60):r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),out)
+    assert len(cloud.calls)==2 and len(pauses)==1 and len(out.getvalue())==100 and not r2.CANCELLED
+
+
+# spec: ANYM-285
+def test_sdk_retry_hook_reraises_a_recorded_deadline_before_the_next_attempt(monkeypatch):
+    import sys
+    registered=[]
+    class Events:
+        def register_first(self,event,handler):registered.append((event,handler))
+    client=SimpleNamespace(meta=SimpleNamespace(events=Events()))
+    session=SimpleNamespace(client=lambda *a,**kw:client)
+    monkeypatch.setitem(sys.modules,'boto3',SimpleNamespace(session=SimpleNamespace(Session=lambda **kw:session)))
+    monkeypatch.setitem(sys.modules,'botocore',SimpleNamespace())
+    monkeypatch.setitem(sys.modules,'botocore.config',SimpleNamespace(Config=lambda **kw:kw))
+    monkeypatch.setattr(r2,'credentials',lambda config:{'access_key_id':'a','secret_access_key':'s'})
+    monkeypatch.setattr(r2,'CANCELLED',[])
+    assert r2.make_client({'endpoint':'https://synthetic.invalid'}) is client
+    assert registered==[('needs-retry.s3',r2.cancelled)]
+    assert r2.cancelled(caught_exception=OSError()) is None
+    with pytest.raises(TimeoutError,match='restore_deadline'):r2.cancel(TimeoutError('restore_deadline'))
+    with pytest.raises(TimeoutError,match='restore_deadline'):r2.cancelled(caught_exception=OSError())

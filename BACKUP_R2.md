@@ -271,7 +271,10 @@ A body read that breaks mid-stream (a connection reset or read timeout on a
 multi-gigabyte object) resumes at the next byte with a ranged GET of the same
 ETag, at most five times per object with 2-30 s backoff; the full SHA256 still
 covers every byte. After that the run fails with `storage_unavailable`. A
-deadline, a service stop or a failed write to the helper is never retried.
+deadline, a service stop or a failed write to the helper is never retried:
+the signal handlers record the deadline or stop, and a first-priority botocore
+`needs-retry` hook and a check after every cloud call re-raise it, so an SDK
+request retry cannot swallow it and continue the run.
 
 The helper receives the recovery key read-only and plaintext workspace access,
 with no R2 credentials, producer DSN, delivery key, shared application volumes or

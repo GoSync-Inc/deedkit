@@ -29,6 +29,9 @@ MIB = 1024 ** 2
 STREAM_RESUMES = 5
 # Codes our own SIGALRM/SIGTERM handlers raise; an SDK may wrap them.
 SIGNAL_CODES = {'receiver_timeout', 'restore_deadline', 'restore_stopped'}
+# The deadline/stop our signal handlers raised. botocore's retry loop can swallow it and
+# return a later attempt's success, so its retry hook and every cloud call re-raise it.
+CANCELLED = []
 CHECKS = {'decryption', 'bundle_integrity', 'database_restore', 'table_inventory',
           'original_hashes', 'recovery_objects', 'collectors_quarantined'}
 
@@ -141,11 +144,25 @@ def make_client(config):
     secret = credentials(config)
     session = boto3.session.Session(aws_access_key_id=secret['access_key_id'],
                                    aws_secret_access_key=secret['secret_access_key'], region_name='auto')
-    return session.client('s3', endpoint_url=config['endpoint'], config=Config(
+    client = session.client('s3', endpoint_url=config['endpoint'], config=Config(
         signature_version='s3v4', connect_timeout=10, read_timeout=120,
         retries={'mode': 'standard', 'total_max_attempts': 3},
         request_checksum_calculation='when_required', response_checksum_validation='when_required',
         s3={'addressing_style': 'path'}))
+    client.meta.events.register_first('needs-retry.s3', cancelled)
+    return client
+
+
+def cancel(error):
+    """Signal handlers raise through here, so a deadline/stop the SDK swallowed is still seen."""
+    CANCELLED[:] = [error]
+    raise error
+
+
+def cancelled(**_):
+    """botocore `needs-retry` hook (first) and post-call check: never retry past a deadline/stop."""
+    if CANCELLED:
+        raise CANCELLED[0]
 
 
 def destination(config):
@@ -165,10 +182,13 @@ def absent(exc):
 
 def cloud_call(method, **kwargs):
     try:
-        return method(**kwargs)
+        response = method(**kwargs)
     except Exception:
+        cancelled()
         # SDK exceptions can contain signed URLs, request headers and diagnostics.
         raise RuntimeError('storage_unavailable') from None
+    cancelled()
+    return response
 
 
 def receipt_key(config, bid):
@@ -224,6 +244,8 @@ def get_receipt(config, client, bid):
 
 def signalled(exc):
     """Our deadline/stop error, even when urllib3/botocore wrapped it in a read error."""
+    if CANCELLED:
+        return CANCELLED[0]
     seen = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
@@ -1099,7 +1121,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     os.umask(0o077)
     def timed_out(*_):
-        raise TimeoutError('receiver_timeout')
+        cancel(TimeoutError('receiver_timeout'))
+    CANCELLED.clear()
     signal.signal(signal.SIGALRM, timed_out)
     try:
         config = load_config(args.config)
