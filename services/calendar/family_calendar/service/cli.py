@@ -55,6 +55,10 @@ def parser():
         sub.add_parser(name)
     roles = sub.add_parser("db-roles")
     roles.add_argument("--check", action="store_true", help="read-only: compare the grants with roles_expected.json")
+    expand = sub.add_parser("migrate-expand", help="autodeploy's bounded additive migration (ANYM-586)")
+    mode = expand.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--plan", type=Path, help="the plan JSON migration_rollout.plan made")
+    mode.add_argument("--status", action="store_true", help="read-only: the ledger's schema version")
     init = sub.add_parser("init-family")
     init.add_argument("--group", default="family")
     init.add_argument("--owner", default="egor")
@@ -371,6 +375,14 @@ def dispatch(args, home, root, config, store):
         return {"migrations": store.query("SELECT version,checksum FROM migrations ORDER BY version")}
     if args.action == "db-roles":
         return db_roles_check(store) if args.check else db_roles(store, root, config)
+    if args.action == "migrate-expand":
+        if args.status:
+            return store.expand_status()
+        try:
+            plan = json.loads(args.plan.read_bytes())
+        except (OSError, ValueError):
+            raise CalendarError("plan_invalid") from None
+        return store.migrate_expand(plan)
     if args.action == "init-family":
         store.person(args.owner, args.label)
         store.group(args.group, "Семья")
