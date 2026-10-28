@@ -17,7 +17,7 @@ REQUIREMENTS_LOCKS = ('services/messaging/requirements.lock', 'services/messagin
     'services/messaging/requirements-enrichment.lock', 'services/messaging/requirements-telemetry.lock',
     'services/messaging/requirements-backup-r2.lock')
 # package -> (first fixed version, advisory)
-FIXED = {'certifi': ('2026.10.19', 'PYSEC-2026-4320')}
+FIXED = {'certifi': ('2026.10.19', 'PYSEC-2026-4320'), 'filelock': ('4.2.1', 'GHSA-v4x8-3wr5-3wq8')}
 COMMENT = re.compile(r'(^|\s+)#.*$')  # pip's req_file.COMMENT_RE
 PIN = re.compile(r'([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([^\s=<>!~,;]+)')
 
