@@ -17,6 +17,7 @@ from anymsg import AnyMsg
 from core import AgentBrief, ServiceError
 from outbound import AgentExternalBrief
 import destination_policy as policy
+import voice_engines
 
 
 class Strict(BaseModel):
@@ -112,13 +113,16 @@ DESCRIPTIONS = {
     "capabilities": "Read-only; places no call. Shows this principal's calls scopes, "
     "each granted channel's configured state and recipient policy (any valid "
     "destination; SIP: exact allowlist), the daily call cap with the owner's active "
-    "raises, daily_calls_remaining and brief/call limits. Contacts no provider; "
-    "preflight_call checks one external brief.",
+    "raises, daily_calls_remaining, brief/call limits, and voice_engines: each "
+    "engine (gemini_live, grok_live) with available (key configured), model, voices, "
+    "languages, tool_calls, success_fields and which engine an omitted voice_engine "
+    "uses. Contacts no provider; preflight_call checks one external brief.",
     "prepare_call": "Local write; places no call. Saves a new browser-rehearsal brief "
     "(goal, counterparty, success_fields) owned by this principal and returns "
     "its id as brief_id. Optional source_message_ids (max 8) are read from this "
     "principal's own message archive. The owner sets the voice for all calls "
-    "(capabilities call_voice). Every request creates a new brief. "
+    "(capabilities call_voice); optional voice_engine (auto, gemini_live, grok_live) "
+    "picks the engine of this call, omitted: the owner's. Every request creates a new brief. "
     "Next: start_call.",
     "prepare_external_call": "Local write; places no call. Saves a new outbound brief "
     "for one exact channel (phone, sip, whatsapp or telegram), account and "
@@ -128,7 +132,11 @@ DESCRIPTIONS = {
     "to call them directly. Set timezone (IANA, e.g. Asia/Makassar) when you know "
     "where the counterparty is: the call then greets by their local time, otherwise "
     "neutrally. The owner sets the voice for all calls (capabilities call_voice). "
-    "Next: preflight_call, then dial_call.",
+    "Optional voice_engine: gemini_live (audio to Google) or grok_live (audio to xAI) "
+    "for this call, or auto (the owner's engine if it fits, else the first available "
+    "one); omitted: the owner's engine. The brief returns voice_engine {requested, "
+    "selected, reason, skipped}; no fitting engine is refused, never switched to "
+    "another vendor. Next: preflight_call, then dial_call.",
     "start_call": "Local write; places no phone call. Opens a browser rehearsal for a "
     "prepared browser brief: the call waits as waiting_for_browser until a human opens "
     "the local voice UI and joins with a microphone. Repeating with the same brief_id "
@@ -173,7 +181,8 @@ DESCRIPTIONS = {
     "{keys, dtmf_path in_band or out_of_band, at, note} shows the latest menu key "
     "press; handover_failure explains in plain words a call that ended because it "
     "did not reconnect after an out-of-band key, and end_note after_out_of_band_press "
-    "marks a remote hangup right after one. Use it to follow a running call or an "
+    "marks a remote hangup right after one. voice_engine {requested, selected, "
+    "reason} names the engine that speaks. Use it to follow a running call or an "
     "uncertain dial.",
     "get_call_result": "Read-only. Full saved record of one owned call: brief "
     "snapshot, transcript and tool events, answers, decisions, timings and owner "
@@ -253,6 +262,12 @@ def call_origin(call):
     if call["channel"] != "browser":
         origin["destination"] = call["brief"]["destination"]
     return origin
+
+
+def voice_engine(call):
+    """The engine choice frozen in the call's brief (ANYM-584); older briefs have none."""
+    choice = call["brief"].get("voice_engine")
+    return {"voice_engine": choice} if choice else {}
 
 
 def excerpt(text, size=120):
@@ -426,6 +441,14 @@ class AgentAPI:
         except ServiceError as error:
             return {"error": error.code}
 
+    def voice_engines(self):
+        """Read-only: engines with key presence (ANYM-584); never a key."""
+        try:
+            provider = self.service.call_voice().provider
+        except ServiceError:
+            provider = None
+        return voice_engines.capabilities(self.service.engine_credentials(), provider)
+
     @staticmethod
     def route(principal, brief):
         if brief["channel"] not in principal.channels:
@@ -506,6 +529,7 @@ class AgentAPI:
                 "owner_decision_write": False,
                 "live_call_verification": "not_claimed",
                 "call_voice": self.call_voice_summary(),
+                "voice_engines": self.voice_engines(),
                 **({'calling_readiness':self.readiness(principal)} if self.readiness else {}),
                 **({'call_cap':cap} if cap else {}),
             }
@@ -617,7 +641,7 @@ class AgentAPI:
                     "end_note",
                 )
                 if key in call
-            } | call_origin(call)
+            } | call_origin(call) | voice_engine(call)
         return call
 
     async def endpoint(self, operation, request):

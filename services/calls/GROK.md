@@ -9,7 +9,8 @@ and comes back as audio, without a separate STT/TTS pipeline.
 ## One voice for all calls (ANYM-359)
 
 The owner sets one `call_voice` for every agent-prepared call; agents can
-neither choose nor change it. It is a private server file,
+neither choose nor change the voice. Since ANYM-584 an agent may pick the engine of
+one call (`voice_engine`, below); the voice inside each engine stays the owner's. It is a private server file,
 `VOICE_DATA_DIR/call-voice.json` (0600), read and written only through the
 owner API `GET`/`POST /api/call-voice`, with no panel UI. After a deploy every
 call stays on Gemini `Puck` until it is set. On the server, the owner (or a
@@ -54,6 +55,29 @@ ask for a new call: a followup or a brief prepared before the switch keeps the
 old voice. To audition voices first, use the owner's browser rehearsal, whose
 engine and voice pickers are independent of `call_voice`. Synthetic tests
 are not live acceptance (ANYM-239 stage B).
+
+## Engine per call (ANYM-584)
+
+Owner, 2026-10-28: «да, делай выбор движка Gemini и Grok». Agent briefs take an
+optional `voice_engine`: `gemini_live` (audio to Google), `grok_live` (audio to
+xAI; the brief's `dialog_engine` is `grok_realtime`) or `auto`. Omitted keeps
+the owner's `call_voice` engine exactly as before. `auto` takes, among engines
+whose key is configured and which support the brief's language, task tools and
+success_fields, the owner's engine first, then `gemini_live`, then `grok_live`.
+The table and selector are `voice_engines.py`; `calls_capabilities.voice_engines`
+lists each engine with key presence. The prepared brief, `get_call_status` and
+`get_call_result` carry `voice_engine {requested, selected, reason, skipped}`
+with reasons `owner_call_voice`, `requested`, `auto_owner_engine`,
+`auto_first_fitting` and skipped reasons `key_not_configured`,
+`language_unsupported`, `tool_calls_unsupported`, `success_fields_unsupported`.
+No fitting engine refuses before saving (503 `voice_engine_unavailable` or
+`no_voice_engine_available`). After prepare the frozen engine alone picks the
+key: a missing key is `model_key_required` at preflight, never another vendor.
+A followup keeps its parent's engine and choice. Grok gets the owner's
+`grok_voice`; a replicated Gemini voice is not used with it. Whatever engine
+speaks, the supervisor and the after-call analysis read transcript text with
+Gemini (`transcript_analysis_vendor: google`). `dialog_engine` stays refused for
+agents: it also names the owner-only `gemini_live_flows` rehearsal.
 
 ## Input audio format
 
