@@ -9,9 +9,13 @@ Docker network whose only way out is the allowlist proxy, and starts one contain
 no mount of ~/.ssh, an SSH agent socket, ~/.deedkit or the orchestrator directory. The existing logins go in as
 environment values only: the gh token, the Claude subscription's current access token (never its refresh token) and
 the Tiden token; no new key is made. Their values never appear on a command line: `docker run -e NAME` reads them
-from the launcher's own environment. Two mounts: a read-only control directory (the two brief files and the gate
-file, rewritten from the host state every 30 s; a stop there or a closed terminal stops the container) and an outbox
-whose `finish`, `decline` and `large` requests for this intent only are applied on the host after the container ends.
+from the launcher's own environment. One mount: a read-only control directory (the two brief files and the gate
+file, rewritten from the host state every 30 s; a stop there, the build time limit or a closed terminal stops the
+container). The outbox stays inside the container: after it ends the launcher copies out at most one small regular
+file, keeps its `finish`, `decline` and `large` requests for this intent in a pending file, removes the container and
+applies them on the host, retrying while the tick holds the lock. What it cannot apply stays pending:
+
+    launch.py apply INTENT        # apply what a build left pending (or collect it from a stopped container first)
 """
 import argparse
 from datetime import datetime, timezone
@@ -22,6 +26,8 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import io
+import tarfile
 import subprocess
 import sys
 import threading
@@ -49,6 +55,9 @@ ENV = (*SECRETS, 'TIDEN_BASE_URL', 'TIDEN_WORKSPACE_ID', 'GIT_AUTHOR_NAME', 'GIT
 MOUNT = '/run/autoloop'
 POLL, STOP_SECONDS, CALL = 30, 20, 120
 MAX_REQUESTS, MAX_LINE = 10, 512
+MAX_OUTBOX = MAX_REQUESTS * (MAX_LINE + 1)  # bytes of the outbox file the host reads
+OUTBOX = f'{MOUNT}/outbox/requests.jsonl'
+ATTEMPTS, RETRY = 40, 30  # applying a request while a tick holds the lock: up to 20 minutes
 BUILD = re.compile(r'autoloop-build-[a-z0-9][a-z0-9-]{2,60}')
 CARD = re.compile(r'ANYM-[1-9][0-9]*')
 
@@ -170,18 +179,18 @@ def logins(now, minimum, run=call):
 
 def prompt(intent, card):
     return (f'Read and follow {MOUNT}/control/common.md and {MOUNT}/control/autoloop-build.md. '
-            f'Intent: {intent}. Card: {card}.')
+            f'Intent: {intent}. Card: {card}. In this container there is no Codex: run each review round as an Opus '
+            'subagent; the controller\'s Astra review on the host is the review of record.')
 
 
-def run_argv(name, image_name, env_names, control=None, outbox=None, tty=False):
-    """`docker run` for one runner container: the internal network, no capabilities, two mounts at most."""
-    argv = ['docker', 'run', '--rm', '--interactive', *(['--tty'] if tty else []), '--name', name,
+def run_argv(name, image_name, env_names, control=None, tty=False, remove=True):
+    """`docker run` for one runner container: the internal network, no capabilities, one read-only mount at most. A
+    build keeps its container after it ends (`remove=False`) until the launcher has copied the outbox out."""
+    argv = ['docker', 'run', *(['--rm'] if remove else []), '--interactive', *(['--tty'] if tty else []), '--name', name,
             '--network', NETWORK, '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--init',
             '--memory', '8g', '--pids-limit', '4096', '--label', 'deedkit.autoloop=runner']
     if control:
         argv += ['--mount', f'type=bind,source={control},target={MOUNT}/control,readonly']
-    if outbox:
-        argv += ['--mount', f'type=bind,source={outbox},target={MOUNT}/outbox']
     for env_name in env_names:
         argv += ['--env', env_name]
     return [*argv, image_name]
@@ -205,15 +214,14 @@ def client_env(values):
 
 
 def prepare(intent, runs=RUNS, briefs=autoloop.BRIEFS):
-    """The run directory: control/ (the two briefs and the gate file, read-only in the container) and outbox/."""
+    """The run directory: control/ (the two briefs and the gate file, read-only in the container)."""
     run = runs / intent
-    control, outbox = run / 'control', run / 'outbox'
-    for path in (runs, run, control, outbox):
+    control = run / 'control'
+    for path in (runs, run, control):
         path.mkdir(mode=0o700, exist_ok=True)
     for name in ('common.md', 'autoloop-build.md'):
         shutil.copyfile(briefs / name, control / name)
-    (outbox / 'requests.jsonl').unlink(missing_ok=True)
-    return control, outbox
+    return control
 
 
 def write_gate(control, why):
@@ -222,53 +230,140 @@ def write_gate(control, why):
     temp.replace(control / 'gate')
 
 
-def requests(outbox, intent):
-    """The outbox requests the host applies: this intent only, known actions and reasons, at most ten lines."""
+def outbox_text(archive):
+    """The outbox file out of `docker cp`'s tar stream: one regular file of at most MAX_OUTBOX bytes, else nothing
+    (a link, a FIFO, a directory or an oversized file is the container's, never followed or read whole)."""
     try:
-        lines = (outbox / 'requests.jsonl').read_text(errors='replace').splitlines()[:MAX_REQUESTS]
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            members = tar.getmembers()
+            if len(members) != 1 or not members[0].isreg() or members[0].size > MAX_OUTBOX:
+                return ''
+            data = tar.extractfile(members[0])
+            return data.read(MAX_OUTBOX).decode('utf-8', 'replace') if data else ''
+    except (tarfile.TarError, OSError, EOFError):
+        return ''
+
+
+def collect(name, popen=subprocess.Popen):
+    """The outbox of a stopped container, read through `docker cp` with a byte bound before any parsing."""
+    try:
+        with popen(['docker', 'cp', f'{name}:{OUTBOX}', '-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                   stdin=subprocess.DEVNULL) as copy:
+            archive = copy.stdout.read(MAX_OUTBOX + 4096) if copy.stdout else b''
+            copy.kill()
     except OSError:
-        return []
+        return ''
+    return outbox_text(archive)
+
+
+def requests(text, intent):
+    """The outbox requests the host applies: this intent only, known actions and reasons, at most ten lines."""
     out = []
-    for line in lines:
+    for line in text.splitlines()[:MAX_REQUESTS]:
         try:
             item = json.loads(line[:MAX_LINE])
         except ValueError:
             continue
         if not isinstance(item, dict) or item.get('intent') != intent or item.get('action') not in autoloop.RUNNER_ACTIONS:
             continue
-        if (item['action'] == 'decline') != (item.get('reason') in autoloop.DECLINED):
+        reason = item.get('reason')
+        if not (reason is None or isinstance(reason, str)) or (item['action'] == 'decline') != (reason in autoloop.DECLINED):
             continue
-        step = [item['action'], intent, *(['--reason', item['reason']] if item['action'] == 'decline' else [])]
+        step = [item['action'], intent, *(['--reason', reason] if item['action'] == 'decline' else [])]
         if step not in out:
             out.append(step)
     # An end (`decline` or `large`) before `finish`, as the brief orders them.
     return sorted(out, key=lambda step: step[0] == 'finish')
 
 
-def apply(outbox, intent, main=autoloop.main):
+def apply(pending, main=autoloop.main, sleep=time.sleep):
+    """Apply the pending steps in order, each retried while it fails (a tick holding the lock answers BUSY and writes
+    nothing); a step still failing and the ones after it stay in the pending file."""
+    steps = json.loads(pending.read_text()) if pending.exists() else []
     codes = []
-    for step in requests(outbox, intent):
-        codes.append((step[0], main(step)))
+    while steps:
+        code = 1
+        for attempt in range(ATTEMPTS):
+            code = main(steps[0])
+            if code == 0:
+                break
+            if attempt + 1 < ATTEMPTS:
+                sleep(RETRY)
+        codes.append((steps[0][0], code))
+        if code:
+            break
+        steps = steps[1:]
+        temp = pending.with_suffix('.tmp')
+        temp.write_text(json.dumps(steps))
+        temp.replace(pending)
+    if not steps:
+        pending.unlink(missing_ok=True)
     return codes
 
 
-def watch(state, intent, control, name, done, docker=call):
+def exists(name, docker=call):
+    try:
+        docker(['docker', 'inspect', '--format', '{{.State.Running}}', name])
+        return True
+    except Refused:
+        return False
+
+
+def gather(intent, runs=RUNS, docker=call, copy=collect):
+    """A stopped build container's requests into the run's pending file, then the container removed."""
+    pending = runs / intent / 'pending.json'
+    if exists(intent, docker):
+        steps = requests(copy(intent), intent)
+        known = json.loads(pending.read_text()) if pending.exists() else []
+        temp = pending.with_suffix('.tmp')
+        temp.write_text(json.dumps(known + [s for s in steps if s not in known]))
+        temp.replace(pending)
+        docker(['docker', 'rm', intent])
+    return pending
+
+
+def report(codes, pending):
+    for action, result in codes:
+        print(f'runner: {action} applied on the host: exit {result}', file=sys.stderr)
+    if pending.exists():
+        print(f'runner: PENDING {pending.read_text()}: not applied; run `launch.py apply {pending.parent.name}`',
+              file=sys.stderr, flush=True)
+        return 1
+    return 0
+
+
+def watch(state, intent, control, name, done, deadline, docker=call, clock=time.monotonic):
     """Every POLL seconds: the host gate into the gate file; a stop (PAUSE, a held card, a dropped item, an ended
-    intent) also stops the container."""
-    while not done.wait(POLL):
-        why = autoloop.gate(state, intent)
-        write_gate(control, why)
-        if why:
-            print(f'runner: STOP {why}; stopping the container', file=sys.stderr, flush=True)
-            stop(name, docker)
-            return
+    intent), the time limit or any failure of this check stops the container."""
+    try:
+        while not done.wait(POLL):
+            why = autoloop.gate(state, intent) or ('time limit' if clock() > deadline else None)
+            write_gate(control, why)
+            if why:
+                print(f'runner: STOP {why}; stopping the container', file=sys.stderr, flush=True)
+                stop(name, docker)
+                return
+    except Exception as error:  # a gate that cannot be checked is a stop
+        print(f'runner: STOP gate check failed ({type(error).__name__}); stopping the container', file=sys.stderr,
+              flush=True)
+        stop(name, docker)
 
 
 def stop(name, docker=call):
-    try:
-        docker(['docker', 'stop', '--time', str(STOP_SECONDS), name], timeout=STOP_SECONDS + 30)
-    except Refused:
-        pass  # already gone
+    """Stop the container, then kill it if it still runs; a container still running after both is said loudly."""
+    for argv in (['docker', 'stop', '--time', str(STOP_SECONDS), name], ['docker', 'kill', name]):
+        try:
+            docker(argv, timeout=STOP_SECONDS + 30)
+        except Refused:
+            pass  # already stopped or gone: the inspect below decides
+        try:
+            if docker(['docker', 'inspect', '--format', '{{.State.Running}}', name]).strip() != 'true':
+                return True
+        except Refused:
+            return True
+    print(f'runner: FAILED to stop container {name}; stop it by hand: docker kill {name}', file=sys.stderr,
+          flush=True)
+    return False
 
 
 def build(intent, card, state=autoloop.STATE, now=None):
@@ -277,25 +372,36 @@ def build(intent, card, state=autoloop.STATE, now=None):
     why = autoloop.gate(state, intent)
     if why:
         raise Refused(f'STOP {why}')
+    if exists(intent) or (RUNS / intent / 'pending.json').exists():
+        raise Refused(f'a container or pending requests of {intent} exist: run `launch.py apply {intent}` first')
     now = now or datetime.now(timezone.utc)
-    control, outbox = prepare(intent)
+    control = prepare(intent)
     write_gate(control, None)
     name_ = image()
     network(name_)
     values = {**logins(now, autoloop.LIMITS['build']), **settings(intent, card, production_host())}
-    argv = run_argv(intent, name_, sorted(values), control, outbox, sys.stdin.isatty())
+    argv = run_argv(intent, name_, sorted(values), control, sys.stdin.isatty(), remove=False)
     done = threading.Event()
     for number in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):  # a closed terminal (fence, hold) stops it too
         signal.signal(number, lambda *_: (done.set(), stop(intent)))
-    watcher = threading.Thread(target=watch, args=(state, intent, control, intent, done), daemon=True)
+    deadline = time.monotonic() + autoloop.LIMITS['build']
+    watcher = threading.Thread(target=watch, args=(state, intent, control, intent, done, deadline), daemon=True)
     watcher.start()
     try:
         code = subprocess.run(argv, env=client_env(values)).returncode
     finally:
         done.set()
-    for action, result in apply(outbox, intent):
-        print(f'runner: {action} applied on the host: exit {result}', file=sys.stderr)
-    return code
+    pending = gather(intent)
+    return report(apply(pending), pending) or code
+
+
+def resume(intent):
+    if not BUILD.fullmatch(intent):
+        raise Refused('usage: launch.py apply autoloop-build-<slug>')
+    if exists(intent) and not stop(intent):
+        raise Refused(f'container {intent} still runs')
+    pending = gather(intent)
+    return report(apply(pending), pending)
 
 
 def check(now=None):
@@ -314,13 +420,16 @@ def check(now=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='autoloop container runner launcher (ANYM-574)')
-    parser.add_argument('action', choices=['build', 'check'])
+    parser.add_argument('action', choices=['build', 'check', 'apply'])
     parser.add_argument('intent', nargs='?')
     parser.add_argument('card', nargs='?')
     args = parser.parse_args(argv)
-    if (args.action == 'build') != bool(args.intent and args.card):
-        parser.error('build takes INTENT CARD; check takes nothing')
+    if [bool(args.intent), bool(args.card)] != {'build': [True, True], 'apply': [True, False],
+                                                'check': [False, False]}[args.action]:
+        parser.error('build takes INTENT CARD; apply takes INTENT; check takes nothing')
     try:
+        if args.action == 'apply':
+            return resume(args.intent)
         return build(args.intent, args.card) if args.action == 'build' else check()
     except (Refused, autoloop.Refused) as error:
         print(f'runner: REFUSED {error}', file=sys.stderr)

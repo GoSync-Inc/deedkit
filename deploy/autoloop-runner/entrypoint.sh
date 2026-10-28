@@ -12,4 +12,5 @@ gh auth setup-git
 git clone --quiet --branch main "https://github.com/$AUTOLOOP_REPO.git" "$HOME/deedkit"
 cd "$HOME/deedkit"
 git switch --quiet --create "$AUTOLOOP_INTENT"
-exec claude --dangerously-skip-permissions --model "$AUTOLOOP_MODEL" --effort "$AUTOLOOP_EFFORT" "$AUTOLOOP_PROMPT"
+# Non-interactive: the agent ends after its last answer, so the launcher can apply the outbox.
+exec claude -p "$AUTOLOOP_PROMPT" --dangerously-skip-permissions --model "$AUTOLOOP_MODEL" --effort "$AUTOLOOP_EFFORT"
