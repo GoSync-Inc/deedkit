@@ -145,6 +145,7 @@ def with_example(tool, operations):
     chosen = next((op for op in operations if op in examples), None)
     if chosen is None or "Example: " not in description:
         return description
-    call = {"account": "telegram-synthetic", "operation": chosen, **examples[chosen]}
+    example = examples[chosen]
+    call = {"account": example["account"], "operation": chosen, **{k: v for k, v in example.items() if k != "account"}}
     return description[:description.index("Example: ")] + "Example: " + json.dumps(
         call, ensure_ascii=False, separators=(",", ":"))

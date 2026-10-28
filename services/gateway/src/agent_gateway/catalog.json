@@ -2900,12 +2900,14 @@
     ],
     "examples": {
       "delete_message": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "message_id": "msg_0123456789abcdef0123456789abcdef",
         "expected_revision": 3,
         "dry_run": true
       },
       "edit_message": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "message_id": "msg_0123456789abcdef0123456789abcdef",
         "expected_revision": 3,
@@ -2915,15 +2917,14 @@
         "dry_run": true
       },
       "pin_message": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "message_id": "msg_0123456789abcdef0123456789abcdef",
         "expected_revision": 3,
-        "parameters": {
-          "seconds": 86400
-        },
         "dry_run": true
       },
       "send_reaction": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "message_id": "msg_0123456789abcdef0123456789abcdef",
         "expected_revision": 3,
@@ -2933,24 +2934,28 @@
         "dry_run": true
       },
       "star_message": {
+        "account": "whatsapp-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "message_id": "msg_0123456789abcdef0123456789abcdef",
         "expected_revision": 3,
         "dry_run": true
       },
       "unpin_message": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "message_id": "msg_0123456789abcdef0123456789abcdef",
         "expected_revision": 3,
         "dry_run": true
       },
       "unstar_message": {
+        "account": "whatsapp-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "message_id": "msg_0123456789abcdef0123456789abcdef",
         "expected_revision": 3,
         "dry_run": true
       },
       "vote_poll": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "message_id": "msg_0123456789abcdef0123456789abcdef",
         "expected_revision": 3,
@@ -3097,66 +3102,77 @@
     ],
     "examples": {
       "add_participant": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
-          "user_id": "contact-synthetic"
+          "user_id": "123456789"
         },
         "dry_run": true
       },
       "approve_join_requests": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
           "user_ids": [
-            "contact-synthetic"
+            "123456789"
           ]
         },
         "dry_run": true
       },
       "archive_chat": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "dry_run": true
       },
       "create_group": {
+        "account": "telegram-synthetic",
         "parameters": {
           "title": "Team",
           "user_ids": [
-            "contact-synthetic"
+            "123456789"
           ]
         },
         "dry_run": true
       },
       "demote_participant": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
-          "user_id": "contact-synthetic"
+          "user_id": "123456789"
         },
         "dry_run": true
       },
       "get_invite_link": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "dry_run": true
       },
       "join_chat": {
+        "account": "telegram-synthetic",
         "parameters": {
           "link": "https://t.me/+synthetic"
         },
         "dry_run": true
       },
       "leave_group": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "dry_run": true
       },
       "mark_read": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "message_id": "msg_0123456789abcdef0123456789abcdef",
         "expected_revision": 3,
         "dry_run": true
       },
       "mark_unread": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "dry_run": true
       },
       "mute_chat": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
           "seconds": 3600
@@ -3164,6 +3180,7 @@
         "dry_run": true
       },
       "open_chat_by_phone": {
+        "account": "whatsapp-synthetic",
         "parameters": {
           "phone": "+12025550199",
           "create": false
@@ -3171,33 +3188,38 @@
         "dry_run": true
       },
       "pin_chat": {
+        "account": "whatsapp-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "dry_run": true
       },
       "promote_participant": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
-          "user_id": "contact-synthetic"
+          "user_id": "123456789"
         },
         "dry_run": true
       },
       "reject_join_requests": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
           "user_ids": [
-            "contact-synthetic"
+            "123456789"
           ]
         },
         "dry_run": true
       },
       "remove_participant": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
-          "user_id": "contact-synthetic"
+          "user_id": "123456789"
         },
         "dry_run": true
       },
       "rename_group": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
           "title": "Team"
@@ -3205,10 +3227,12 @@
         "dry_run": true
       },
       "revoke_invite_link": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "dry_run": true
       },
       "set_chat_labels": {
+        "account": "whatsapp-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
           "label_ids": [
@@ -3218,6 +3242,7 @@
         "dry_run": true
       },
       "set_group_description": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
           "description": "Weekly plans"
@@ -3225,6 +3250,7 @@
         "dry_run": true
       },
       "set_group_info_admins_only": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
           "enabled": true
@@ -3232,6 +3258,7 @@
         "dry_run": true
       },
       "set_group_messages_admins_only": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
           "enabled": true
@@ -3239,6 +3266,7 @@
         "dry_run": true
       },
       "set_join_approval": {
+        "account": "whatsapp-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
           "enabled": true
@@ -3246,6 +3274,7 @@
         "dry_run": true
       },
       "set_slow_mode": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "parameters": {
           "seconds": 60
@@ -3253,14 +3282,17 @@
         "dry_run": true
       },
       "unarchive_chat": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "dry_run": true
       },
       "unmute_chat": {
+        "account": "telegram-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "dry_run": true
       },
       "unpin_chat": {
+        "account": "whatsapp-synthetic",
         "chat_id": "chat_0123456789abcdef0123456789abcdef",
         "dry_run": true
       }
@@ -3354,6 +3386,7 @@
     ],
     "examples": {
       "add_contact": {
+        "account": "telegram-synthetic",
         "parameters": {
           "phone": "+12025550199",
           "first_name": "Alex"
@@ -3361,20 +3394,23 @@
         "dry_run": true
       },
       "block_contact": {
+        "account": "telegram-synthetic",
         "parameters": {
-          "user_id": "contact-synthetic"
+          "user_id": "123456789"
         },
         "dry_run": true
       },
       "delete_contact": {
+        "account": "telegram-synthetic",
         "parameters": {
-          "user_id": "contact-synthetic"
+          "user_id": "123456789"
         },
         "dry_run": true
       },
       "unblock_contact": {
+        "account": "telegram-synthetic",
         "parameters": {
-          "user_id": "contact-synthetic"
+          "user_id": "123456789"
         },
         "dry_run": true
       }
@@ -3467,21 +3503,25 @@
     ],
     "examples": {
       "get_contact": {
+        "account": "telegram-synthetic",
         "parameters": {
-          "user_id": "contact-synthetic"
+          "user_id": "123456789"
         },
         "request_id": "contacts-read-0001"
       },
       "get_labels": {
+        "account": "whatsapp-synthetic",
         "request_id": "contacts-read-0001"
       },
       "list_blocked": {
+        "account": "telegram-synthetic",
         "parameters": {
           "limit": 50
         },
         "request_id": "contacts-read-0001"
       },
       "list_contacts": {
+        "account": "telegram-synthetic",
         "parameters": {
           "limit": 50,
           "offset": 0
