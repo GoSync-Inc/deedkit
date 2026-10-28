@@ -97,11 +97,12 @@ class Choice(CalendarError):
 
 
 class Unsupported(CalendarError):
-    """Guests asked of a calendar whose provider cannot invite. The tool turns it into `capability_unsupported`
-    outside every transaction, with a stored selection for the same event without guests."""
+    """Guests asked of a calendar whose provider cannot invite (`capability_unsupported`) or whose owner has not
+    opted in to invitations (`invitations_not_enabled`). The tool turns it into that error outside every
+    transaction, with a stored selection for the same event without guests."""
 
-    def __init__(self, calendar, request):
-        super().__init__("capability_unsupported")
+    def __init__(self, calendar, request, code="capability_unsupported"):
+        super().__init__(code)
         self.calendar, self.request = calendar, request
 
 
@@ -129,9 +130,11 @@ def invite(request):
 def notifications(event, guests, notify):
     """Who is told what (ANYM-555): with notify all, each guest's invitation email and its fields."""
     if notify == "none":
-        return {"notify": "none", "recipients": [],
-                "summary": "Nobody is notified: no invitation email is sent. Google can still show the event, with "
-                           "these fields, in a guest's own Google Calendar."}
+        # Google's sendUpdates=none asks for no email but does not promise it (events.insert reference).
+        return {"notify": "none", "recipients": [], "emails_requested": False,
+                "summary": "Nobody is notified by DeedKit: Google is asked to send no invitation email "
+                           "(sendUpdates=none). Google does not guarantee that for every guest, and it can still "
+                           "show the event, with these fields, in a guest's own calendar."}
     # Google's default guest list visibility: each guest sees the others.
     receives = {**{k: event.get(k) for k in ("title", "start", "end", "timezone", "description", "location")},
                 "guests": guests}
@@ -222,12 +225,15 @@ class Scheduler:
             (token_hash(token), p["id"], Jsonb({k: v for k, v in refusal.request.items()
                                                  if k not in ("calendar", *INVITE_FIELDS)}), SELECTION_TTL_S),
         )
-        return CalendarError("capability_unsupported", details={
+        details = {
             "capability": "guests", "provider": cal["provider"],
             "calendar": {"calendar_ref": cal["calendar_ref"], "label": cal["label"]},
             "next": {"tool": TOOL_NAME, "arguments": {"selection_token": token, "calendar": cal["calendar_ref"],
                                                       "dry_run": True}},
-        })
+        }
+        if refusal.code == "invitations_not_enabled":
+            details["owner_step"] = "service allow-invitations --calendar " + cal["calendar_ref"]
+        return CalendarError(refusal.code, details=details)
 
     def selected(self, p, token):
         """The request a selection stored; the caller's own arguments then add the chosen calendar."""
@@ -284,6 +290,8 @@ class Scheduler:
                          "end": b.astimezone(zone).isoformat(), "timezone": family["timezone"]}
             if guests and not GUEST_WRITE[cal["provider"]]["supported"]:
                 raise Unsupported(cal, request)
+            if guests and not self.service.invitations_enabled(cal["calendar_ref"]):
+                raise Unsupported(cal, request, "invitations_not_enabled")
             return {"action": "create", "calendar_ref": cal["calendar_ref"], "event": event,
                     **({"invite": guests} if guests else {})}, cal
         if "event" not in request:
