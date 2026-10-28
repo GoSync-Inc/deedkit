@@ -56,6 +56,7 @@ ROUTER_SIGNATURE = "s:github.com/GoSync-Inc/deedkit/services/release-router::"
 SHA = re.compile(r"[0-9a-f]{40}")
 REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SYNC_WORKFLOW, SYNC_PAGE_SIZE, SYNC_MAX_PAGES = "tiden-sync.yml", 100, 10
+SYNC_READS = 3  # reads of a run list that changes while its pages are read, the first included
 SYNC_SLACK = timedelta(days=1)  # a run that processes TARGET is created after TARGET exists; the slack covers clock skew
 # The sync backlog (ANYM-503). The rollout commit, the base of the pull request that added the check: it and older
 # commits are not checked (sync runs before 1a4b78d carry no `Tiden sync <sha>` title).
@@ -343,20 +344,33 @@ class Actions:
 
     def listing(self, since: datetime, end: float, workflow: str = SYNC_WORKFLOW,
                 filters: tuple[str, ...] = ()) -> list[dict]:
-        """The runs of WORKFLOW on main created at or after SINCE, every page before END (monotonic)."""
+        """The runs of WORKFLOW on main created at or after SINCE, every page before END (monotonic). The pages list
+        the newest run first, so a run created or deleted while they are read shifts the later ones (run 40669350189):
+        a row repeated from an earlier page or a changed `total_count` reads every page again, SYNC_READS reads in
+        all within the same END."""
         created = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for _ in range(SYNC_READS):
+            rows = self.read(created, end, workflow, filters)
+            if rows is not None:
+                return rows
+        raise Unknown("the run list changed on every read")
+
+    def read(self, created: str, end: float, workflow: str, filters: tuple[str, ...]) -> list[dict] | None:
+        """One read of every page; None when the list changed between its pages."""
         rows: list[dict] = []
+        first: int | None = None
         for number in range(1, SYNC_MAX_PAGES + 1):
             page = self.page(number, created, end, workflow, filters)
             batch, total = page.get("workflow_runs") if isinstance(page, dict) else None, \
                 page.get("total_count") if isinstance(page, dict) else None
             if not isinstance(batch, list) or type(total) is not int or total < 0:
                 raise Unknown("gh api returned no run page")
-            if not all(valid_run(row) for row in batch):
+            if not all(valid_run(row) for row in batch) or len({row["id"] for row in batch}) != len(batch):
                 raise Unknown("gh api returned a malformed or duplicate run")
+            first = total if first is None else first
+            if total != first or {row["id"] for row in rows} & {row["id"] for row in batch}:
+                return None
             rows += batch
-            if len({row["id"] for row in rows}) != len(rows):
-                raise Unknown("gh api returned a malformed or duplicate run")
             if len(rows) == total:
                 return rows
             if len(rows) > total or len(batch) < SYNC_PAGE_SIZE:

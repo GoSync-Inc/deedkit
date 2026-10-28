@@ -676,7 +676,10 @@ have no `Tiden sync <sha>` title); the metric's reason names them as
 `tiden-sync.yml` runs and the `ci.yml` runs with event `push` of `main`, created
 since one day before the oldest commit in scope, every page (at most 10 of 100),
 all within one budget of 120 seconds. Each listed run carries its latest
-attempt. Per commit, `skipped` sync runs ignored:
+attempt. The pages list the newest run first, so a run created or deleted
+while they are read shifts the later pages: a row repeated from an earlier page
+or a changed total reads every page again, three reads in all within the same
+budget, then `the run list changed on every read`. Per commit, `skipped` sync runs ignored:
 
 | Evidence (first match decides) | State |
 | --- | --- |
