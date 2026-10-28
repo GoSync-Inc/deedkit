@@ -48,6 +48,15 @@ _REQUEST = re.compile(r'[a-zA-Z0-9_.:-]{8,128}')
 _SECRET = re.compile(r'whsec_[A-Za-z0-9+/]+={0,2}')
 _NON_PUBLIC_SUFFIXES = ('localhost', 'local', 'internal', 'lan', 'home.arpa', 'ts.net', 'intranet', 'corp', 'private')
 _CGNAT = ipaddress.ip_network('100.64.0.0/10')
+# ANYM-582: vendor hosts the operator names in the policy. Grok Bot routine webhooks take a Bearer key, start a run
+# on 200 and document every other status as "no run started"; they do not deduplicate a repeated request.
+VENDORS = frozenset(('grok-bot-routine',))
+_BEARER = re.compile(r'Bearer [\x21-\x7e]+')
+try:
+    from .egress import EgressNotSent
+except ImportError:  # Before the egress transport (ANYM-534): no failure is known to be unsent.
+    class EgressNotSent(OSError):
+        pass
 
 
 def _error(code, status, **extra):
@@ -113,24 +122,61 @@ def load_policy():
         return None
     finally:
         os.close(fd)
-    if not isinstance(data, dict) or set(data) - {'allow_hosts', 'deny_hosts', 'allow_any_public'}:
+    if not isinstance(data, dict) or set(data) - {'allow_hosts', 'deny_hosts', 'allow_any_public', 'vendors'}:
         return None
     allow, deny, public = data.get('allow_hosts', []), data.get('deny_hosts', []), data.get('allow_any_public', False)
+    vendors = data.get('vendors', {})
     if type(public) is not bool or any(not isinstance(v, list) or len(v) > 1000 for v in (allow, deny)):
+        return None
+    if not isinstance(vendors, dict) or set(vendors) - VENDORS or any(
+            not isinstance(v, list) or len(v) > 1000 for v in vendors.values()):
         return None
     try:
         allow, deny = [canonical_host(h) for h in allow], [canonical_host(h) for h in deny]
+        vendors = {name: [canonical_host(h) for h in hosts] for name, hosts in vendors.items()}
     except ValueError:
         return None
     if not allow and not public:
         return None
-    return {'allow': allow, 'deny': deny, 'allow_any_public': public}
+    return {'allow': allow, 'deny': deny, 'allow_any_public': public, 'vendors': vendors}
 
 
 def host_allowed(policy, host):
     if policy is None or any(_matches(host, suffix) for suffix in policy['deny']):
         return False
     return policy['allow_any_public'] or any(_matches(host, suffix) for suffix in policy['allow'])
+
+
+def vendor_of(policy, host):
+    """The vendor whose outcome table a host's endpoints use (ANYM-582), or None. Never widens host_allowed."""
+    if not host_allowed(policy, host):
+        return None
+    return next((name for name, hosts in sorted(policy.get('vendors', {}).items())
+        if any(_matches(host, suffix) for suffix in hosts)), None)
+
+
+def _vendor_headers(policy, host, names, values):
+    """A vendor host needs its key as `Authorization: Bearer <key>`; the value never appears in the error."""
+    if vendor_of(policy, host) and not any(name.lower() == 'authorization' and _BEARER.fullmatch(value)
+            for name, value in zip(names, values)):
+        raise _error('invalid_header', 400, header='Authorization')
+
+
+def vendor_result(status=None, failure=None):
+    """A vendor host's attempt (ANYM-582): ('delivered' | 'retry' | 'final', error code).
+
+    Only a documented "no run started" answer or a failure before the first request byte is retried; anything
+    after the request was written may have started a run and is never sent again.
+    """
+    if failure is not None:
+        return ('retry', 'receiver_unavailable') if isinstance(failure, EgressNotSent) else ('final', 'outcome_unknown')
+    if type(status) is not int or not 100 <= status <= 599:
+        return 'final', 'outcome_unknown'
+    if 200 <= status < 300:
+        return 'delivered', None
+    if 300 <= status < 400:
+        return 'final', 'redirect_rejected'
+    return ('final', 'vendor_refused') if status in (401, 403) else ('retry', 'receiver_status')
 
 
 def _private_answer(address):
@@ -311,7 +357,7 @@ def _view(c, row):
         'headers_fingerprint': row['headers_fingerprint'], 'secret_fingerprint': row['secret_fingerprint'],
         'rotation': rotation, 'created_at': row['created_at'], 'updated_at': row['updated_at'],
         'health': {'delivered': 'ok', 'failed': 'failing'}[finished['state']] if finished else 'unknown',
-        'last_test': _test_view(last), 'signature_scheme': SCHEME})
+        'last_test': _test_view(last), 'signature_scheme': SCHEME, 'vendor': vendor_of(load_policy(), row['host'])})
 
 
 def _day():
@@ -397,6 +443,7 @@ def register_delivery_endpoint(store, c, p, request_id, url, signing_secret, lab
     except OSError:
         # DNS that does not answer is not proof of a public host.
         raise _unsafe('unsafe_endpoint') from None
+    _vendor_headers(policy, resolved[0], names, values)
     count = c.execute('''SELECT count(*) AS n FROM delivery_endpoints WHERE principal=%s AND key_id=%s
         AND state<>'deleted' ''', (p['id'], p['key_id'])).fetchone()['n']
     if count >= max_endpoints():
@@ -457,6 +504,7 @@ def update_delivery_endpoint(store, c, p, endpoint_id, version, action, new_secr
         values = [new_secret, _fingerprint(key)]
     elif action == 'set_headers':
         names, header_values = normalize_headers(headers)
+        _vendor_headers(load_policy(), row['host'], names, header_values)
         changes += ',header_names=%s,header_values=%s,headers_fingerprint=%s'
         values = [names, header_values or None, headers_fingerprint(names, header_values)]
     elif action == 'pause':
@@ -652,9 +700,10 @@ def fenced(c, p, endpoint_id, url):
     if (row is None or row['state'] != 'enabled' or row['principal'] != p['id'] or row['key_id'] != p['key_id'] or
             url is not None and row['url'] != url or not row['signing_secret']):
         return None, 'access_or_configuration_changed'
-    if not host_allowed(load_policy(), row['host']):
+    policy = load_policy()
+    if not host_allowed(policy, row['host']):
         return None, 'endpoint_policy_refused'
-    return row, None
+    return {**row, 'vendor': vendor_of(policy, row['host'])}, None
 
 
 def caller_headers(row):
@@ -744,7 +793,10 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
                 AND lease_until>clock_timestamp() FOR UPDATE""", (test['id'], lease)).fetchone()
             if not live:
                 continue
-            if row is not None and target is not None:
+            if row is not None and target is not None and row['vendor'] and test['state'] == 'leased':
+                # ANYM-582: a lease that ran out mid-attempt may have reached the vendor; never send it again.
+                state, error = 'failed', 'outcome_unknown'
+            elif row is not None and target is not None:
                 body = test_body(test)
                 headers = signed_headers((row['signing_secret'], row['pending_secret']), test['id'], body, caller_headers(row))
                 started = time.monotonic()
@@ -752,10 +804,13 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
                     status = transport(row['url'], body, headers, resolved=target[1], timeout=5)
                     state, error = ('delivered', None) if type(status) is int and 200 <= status < 300 else (
                         'failed', 'redirect_rejected' if type(status) is int and 300 <= status < 400 else 'receiver_status')
-                except (OSError, TimeoutError):
-                    state, error = 'failed', 'receiver_unavailable'
-                except ValueError:
-                    state, error = 'failed', 'receiver_status'
+                    if row['vendor']:
+                        result, error = vendor_result(status)
+                        state = 'delivered' if result == 'delivered' else 'failed'
+                except (OSError, TimeoutError) as failure:
+                    state, error = 'failed', vendor_result(failure=failure)[1] if row['vendor'] else 'receiver_unavailable'
+                except ValueError as failure:
+                    state, error = 'failed', vendor_result(failure=failure)[1] if row['vendor'] else 'receiver_status'
                 latency = round((time.monotonic() - started) * 1000)
                 status = status if type(status) is int and 100 <= status <= 599 else None
             c.execute('''UPDATE delivery_endpoint_tests SET state=%s,error_code=%s,http_status=%s,latency_ms=%s,

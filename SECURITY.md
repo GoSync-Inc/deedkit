@@ -32,3 +32,8 @@ public port 443 (no host, tailnet, private, link-local, metadata or IPv6 address
 write-only for the API role and never returned, logged or audited. This is privilege
 separation, not encryption: database owners and anyone who can decrypt a backup can
 read them. Details: [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#self-service-webhook-endpoints-schema-49).
+
+A vendor host the operator names in that policy (ANYM-582, Grok Bot routine webhooks) receives the
+same content-free bodies plus the agent's own routine key as `Authorization: Bearer`, stored and
+hidden like any other header value. A request that may have reached the vendor is never sent again
+(SUBSCRIPTIONS.md, Vendor hosts).

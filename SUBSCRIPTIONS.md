@@ -588,6 +588,49 @@ its own secret. Binding a paused or disabled endpoint answers its state
 Endpoints and subscriptions do not carry over to a reissued key (ANYM-495): the
 new key registers its own.
 
+### Vendor hosts (Grok Bot routines, ANYM-582)
+
+An agent whose assistant has its own webhook trigger registers that trigger
+itself, with no host relay. A Grok Bot routine's Webhook section gives a "POST to"
+URL and a key; the vendor documents `Authorization: Bearer <key>`, a `200` when a
+run started and every other status as "no run started", and no deduplication
+(docs.x.ai/grok-bot/skills-routines-and-automations, cursor.com/help/grok-bot/routines,
+2026-10-28). The operator names the vendor's host in the policy file once:
+
+```json
+{"allow_hosts": ["<vendor host>"], "vendors": {"grok-bot-routine": ["<vendor host>"]}}
+```
+
+`vendors` takes only known names (`grok-bot-routine`), at most 1000 suffixes each,
+canonicalized and matched like `allow_hosts`. It never widens the policy: the host
+must also pass `allow_hosts` and `deny_hosts`, and a malformed value or an unknown
+name leaves the policy unset. Take the host from the routine's own URL; the vendor
+publishes none.
+
+The agent then calls `register_delivery_endpoint` with the URL,
+`headers: {"Authorization": "Bearer <key>"}` and a `signing_secret` of its own
+(still required; the vendor ignores the `webhook-*` headers). Without that header,
+registration and `set_headers` answer `invalid_header` with `header:
+"Authorization"`. Endpoint views show `vendor` (`grok-bot-routine` or null) under
+the current policy. The registration's signed test starts one run.
+
+A vendor host's endpoints deliver at most once after the request is written:
+
+| Outcome | Hint | Endpoint test |
+|---|---|---|
+| 2xx | `delivered` | `delivered` |
+| 3xx | dead letter `redirect_rejected` | `failed` `redirect_rejected` |
+| 401, 403 | dead letter `vendor_refused` | `failed` `vendor_refused` |
+| other status (no run started) | bounded retry, `receiver_status` | `failed` `receiver_status` |
+| not sent (`egress.EgressNotSent`: refusal, connect, TLS, deadline before the first byte) | bounded retry, `receiver_unavailable` | `failed` `receiver_unavailable` |
+| timeout, reset or malformed response after the write | dead letter `outcome_unknown`, never re-sent | `failed` `outcome_unknown` |
+| lease ran out during an attempt (dispatcher crash) | dead letter `outcome_unknown`, no POST | `failed` `outcome_unknown`, no POST |
+
+Before the dispatcher's transport raises `EgressNotSent`, no failure counts as
+unsent, so a vendor hint is still never sent twice. A lost wake loses no event: the
+routine also keeps a schedule trigger that fetches and ACKs. Other endpoints and
+operator receivers keep at-least-once delivery.
+
 ## Host receivers (wake relay)
 
 `packages/wake-relay/` (Node 24, `node:crypto` and `node:sqlite` only) is a host
@@ -654,9 +697,11 @@ which revokes its pending rows.
 **Vendor limits** (vendor documentation, 2026-10-19). Claude routine `/fire`: 30
 fires per hour per routine, 100 API fires per hour per account, `Retry-After` on
 `429`, no idempotency key, `text` up to 65,536 characters wrapped as untrusted
-`<routine-fire-payload>`. Grok Automations webhook: Standard Webhooks signature,
-timestamps within five minutes, body up to 1 MiB, no published rate limit or
-`webhook-id` deduplication.
+`<routine-fire-payload>`. Grok Automations webhook (the relay's `grok-automation`
+adapter, as researched 2026-10-19): Standard Webhooks signature, timestamps within
+five minutes, body up to 1 MiB, no published rate limit or `webhook-id`
+deduplication. Grok Bot routine webhooks as documented on 2026-10-28 take a Bearer
+key instead and need no relay ([Vendor hosts](#vendor-hosts-grok-bot-routines-anym-582)).
 
 `host_turn_verified` stays `false` on every hint: the dispatcher cannot see a host
 turn. A relay `accepted` row plus the run's own `fetch_subscription_events` and
