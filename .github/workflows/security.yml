@@ -1,12 +1,15 @@
 name: Security report
 # Report-only, except osv-scanner: every other step continues on error. osv-scanner fails the run on any
 # advisory that osv-scanner.toml does not list with a reason, a card and an expiry. The workflow is not a
-# required check, but a red main push run stops wait-merge.sh --main.
+# required check, but a red main push run stops wait-merge.sh --main. The daily scheduled run of main fails the same
+# way on an advisory published since the last push, so the next merge is not the first to notice.
 # Tools are pinned to exact releases and verified by SHA-256 before use.
 on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '23 5 * * *'
 permissions:
   contents: read
 concurrency:
