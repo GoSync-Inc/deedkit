@@ -509,11 +509,12 @@ def publish_capabilities(config_path,*,engine=None):
     config_path=Path(config_path).absolute();identity=r2.config_identity(config_path)
     config=load_config(config_path)
     receiver=r2.load_config(config['receiver_config_file'])
-    if 'capabilities_file' not in receiver:raise ValueError('capabilities_file_required')
+    if 'verifier_config_file' not in receiver:raise ValueError('capabilities_file_required')
     if Path(receiver['verifier_config_file'])!=config_path:raise ValueError('verifier_config_not_canonical')
-    path=Path(receiver['capabilities_file'])
-    # It unlinks and writes this one path: never a private input, nor in their directories
-    # or the verifier's workspace. Checked before any change, by spelling and by identity.
+    path=r2.CAPABILITIES_FILE
+    # It unlinks and writes this one fixed path. Belt and braces for a host that put a private
+    # input there: never a private input, their directories or the verifier's workspace,
+    # by spelling and by identity, checked before any change.
     private=[spelled(p) for p in (config_path,config['receiver_config_file'],receiver['credentials_file'],
                                   config['identity_file'],config['protected_file'])]
     directories={identity_of(item.parent) for item in private}-{None}

@@ -589,8 +589,8 @@ def published_operator(operator,tmp_path,monkeypatch):
     v,config,receiver,cloud,_,write_json=operator
     published=tmp_path/'published';published.mkdir();published.chmod(0o755)
     config_path=Path(config['receiver_config_file']).with_name('verifier.json');write_json(config_path,config)
-    write_json(Path(config['receiver_config_file']),{**receiver,'capabilities_file':str(published/'capabilities.json'),
-                                                    'verifier_config_file':str(config_path)})
+    monkeypatch.setattr(r2,'CAPABILITIES_FILE',published/'capabilities.json')
+    write_json(Path(config['receiver_config_file']),{**receiver,'verifier_config_file':str(config_path)})
     state=SimpleNamespace(calls=[],answer=b'{"start":2,"stop":52,"step":1}\n',leftover=b'',run=None,
                           config_path=config_path,path=published/'capabilities.json',write_json=write_json)
     def command(self,*args):
@@ -723,7 +723,7 @@ def test_publication_never_touches_a_private_verifier_input(operator,tmp_path,mo
     if not target.exists():target.write_bytes(b'synthetic sentinel\n')
     files=[Path(p) for p in (config['identity_file'],config['protected_file'],config['receiver_config_file'],
                              receiver['credentials_file'],state.config_path,target)]
-    state.write_json(Path(config['receiver_config_file']),{**receiver,'capabilities_file':str(target)})
+    monkeypatch.setattr(r2,'CAPABILITIES_FILE',target)
     files=[p for p in files if p.exists()];kept={p:p.read_bytes() for p in files}
     if alias.startswith('workspace_mount'):
         # A bind mount of the workspace elsewhere: another spelling, the same directory identity.
@@ -731,10 +731,9 @@ def test_publication_never_touches_a_private_verifier_input(operator,tmp_path,mo
         inside.mkdir(exist_ok=True);target=inside/'active.json';target.write_bytes(b'synthetic journal\n');files.append(target)
         original=v.identity_of
         monkeypatch.setattr(v,'identity_of',lambda p:original(config['directory']) if Path(p)==mount else original(p))
-        state.write_json(Path(config['receiver_config_file']),{**receiver,'capabilities_file':str(target)})
+        monkeypatch.setattr(r2,'CAPABILITIES_FILE',target)
         kept={p:p.read_bytes() for p in files}
-    refusal='invalid_config_path' if alias=='double_slash' else 'separate_capabilities_file_required'
-    with pytest.raises(ValueError,match=refusal):v.publish_capabilities(state.config_path,engine=engine)
+    with pytest.raises(ValueError,match='separate_capabilities_file_required'):v.publish_capabilities(state.config_path,engine=engine)
     assert {p:p.read_bytes() for p in files}==kept and 'preflight' not in state.calls
 
 

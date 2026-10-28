@@ -738,8 +738,8 @@ def published(config,tmp_path,monkeypatch):
         path.chmod(mode)
         if not root:upload_owned.add((path.stat().st_dev,path.stat().st_ino))
     config_path=tmp_path/'config.json'
-    write_json(config_path,{**json.loads(config_path.read_text()),'capabilities_file':str(path),
-                            'verifier_config_file':str(verifier_config)})
+    monkeypatch.setattr(r2,'CAPABILITIES_FILE',path)
+    write_json(config_path,{**json.loads(config_path.read_text()),'verifier_config_file':str(verifier_config)})
     return SimpleNamespace(publish=publish,config=str(config_path),path=path,verifier_config=verifier_config,good=good)
 
 
@@ -801,7 +801,7 @@ def test_capabilities_without_a_trusted_helper_publication_is_unavailable(publis
         published.verifier_config.symlink_to(real)
     elif case=='unconfigured':
         write_json(Path(published.config),{k:v for k,v in json.loads(Path(published.config).read_text()).items()
-                                           if k not in {'capabilities_file','verifier_config_file'}})
+                                           if k!='verifier_config_file'})
     elif case=='missing':published.path.unlink()
     elif case=='symlink':
         target=published.path.with_name('real.json');published.path.rename(target);published.path.symlink_to(target)
@@ -812,17 +812,21 @@ def test_capabilities_without_a_trusted_helper_publication_is_unavailable(publis
 
 
 # spec: ANYM-589
-def test_capabilities_file_stays_outside_upload_state_and_leaves_receive_unchanged(config,tmp_path):
-    path=tmp_path/'config.json';value=json.loads(path.read_text())
-    good={'capabilities_file':str(tmp_path/'published/capabilities.json'),'verifier_config_file':str(tmp_path/'verifier.json')}
-    for key in good:
-        for bad in ('relative/capabilities.json',str(Path(config['state_directory'])/'capabilities.json'),'/etc/../tmp/c.json',7,
-                    '/'+str(tmp_path/'published/capabilities.json')):
-            write_json(path,{**value,**good,key:bad})
-            with pytest.raises(ValueError,match='invalid_config_path'):r2.load_config(path)
-        # One without the other is no configuration.
-        write_json(path,{**value,key:good[key]})
-        with pytest.raises(ValueError,match='invalid_config'):r2.load_config(path)
+def test_capabilities_file_stays_outside_upload_state_and_leaves_receive_unchanged(config,tmp_path,monkeypatch):
+    path=tmp_path/'config.json';value=json.loads(path.read_text());good={'verifier_config_file':str(tmp_path/'verifier.json')}
+    # The publication path is fixed: the configuration cannot name one.
+    assert r2.CAPABILITIES_FILE==Path('/var/lib/deedkit-backup-r2/published/capabilities.json')
+    write_json(path,{**value,**good,'capabilities_file':str(tmp_path/'elsewhere.json')})
+    with pytest.raises(ValueError,match='invalid_config'):r2.load_config(path)
+    for bad in ('relative/verifier.json',str(Path(config['state_directory'])/'verifier.json'),'/etc/../tmp/v.json',7,
+                '/'+str(tmp_path/'verifier.json')):
+        write_json(path,{**value,'verifier_config_file':bad})
+        with pytest.raises(ValueError,match='invalid_config_path'):r2.load_config(path)
+    # A state directory holding the fixed publication path cannot enable the mode.
+    monkeypatch.setattr(r2,'CAPABILITIES_FILE',Path(config['state_directory'])/'published/capabilities.json')
+    write_json(path,{**value,**good})
+    with pytest.raises(ValueError,match='invalid_config_path'):r2.load_config(path)
+    monkeypatch.undo()
     write_json(path,{**value,**good})
     loaded=r2.load_config(path);cloud=Cloud()
     assert receive(loaded,cloud)['status']=='stored'

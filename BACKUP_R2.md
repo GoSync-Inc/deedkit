@@ -477,18 +477,20 @@ line:
 `verifier_schemas` is the range the installed verifier accepts from its helper
 (`backup_r2_verifier.SCHEMAS`). `helper_schemas` and `helper_revision` come from
 the pinned helper image, which only root may inspect, so the root verifier
-publishes them in a file the upload account can read: `capabilities_file` in the
-receiver configuration, set together with `verifier_config_file`, the path of the
-installed service's verifier configuration (both absolute and outside
-`state_directory`; set the same values in the root operator copy). The
-publication path must not be, or share a directory with, the verifier
-configuration, the operator configuration, its credentials, the recovery key or
-the protected marker, nor lie in the verifier `directory`
-(`separate_capabilities_file_required`, checked before anything changes). The file must be root-owned, single-link,
-world-readable and not group/other-writable, under root-owned ancestors that are
-not group/other writable, for example
-`/var/lib/deedkit-backup-r2/published/capabilities.json` in a root-owned `0755`
-directory. Anything else, a missing file or a malformed one answers
+publishes them in a file the upload account can read. Its path is fixed in code,
+never configured: `/var/lib/deedkit-backup-r2/published/capabilities.json`.
+Create `/var/lib/deedkit-backup-r2/published/` as a root-owned `0755` directory
+that holds nothing else. The mode is enabled by `verifier_config_file` in the
+receiver configuration: the absolute path of the installed service's verifier
+configuration, outside `state_directory`. Set the same value in the root
+operator copy. As a second guard, the publisher refuses to touch that fixed path
+if a host put a private input there: the verifier configuration, the operator
+configuration, its credentials, the recovery key, the protected marker or the
+verifier `directory`, compared by spelling and by device and inode, including a
+bind-mounted alias (`separate_capabilities_file_required`, checked before
+anything changes). The file must be root-owned, single-link, world-readable and
+not group/other-writable, under root-owned ancestors that are not group/other
+writable. Anything else, a missing file or a malformed one answers
 `capabilities_unavailable`: the deployer then waits.
 
 The file also names the verifier configuration it was made from, which must be

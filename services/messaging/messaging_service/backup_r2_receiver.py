@@ -30,6 +30,9 @@ MIB = 1024 ** 2
 STREAM_RESUMES = 5
 # Codes our own SIGALRM/SIGTERM handlers raise; an SDK may wrap them.
 SIGNAL_CODES = {'receiver_timeout', 'restore_deadline', 'restore_stopped'}
+# The root verifier's helper publication for `capabilities`. A fixed path, never
+# configured, so no configuration can point the publisher at another file.
+CAPABILITIES_FILE = Path('/var/lib/deedkit-backup-r2/published/capabilities.json')
 # The deadline/stop our signal handlers raised. botocore's retry loop can swallow it and
 # return a later attempt's success, so its retry hook and every cloud call re-raise it.
 CANCELLED = []
@@ -110,11 +113,10 @@ def load_config(path):
     defaults = {'max_bytes': 64 * 1024 ** 3, 'quota_bytes': 128 * 1024 ** 3,
                 'max_objects': 2, 'part_bytes': 64 * MIB, 'timeout_seconds': 7200,
                 'cold_max_bytes': 5 * 1024 ** 3}
-    # Optional pair: the root verifier's helper publication and the one verifier
-    # config (the installed service's) whose publication `capabilities` accepts.
-    published = {'capabilities_file', 'verifier_config_file'}
+    # Optional `verifier_config_file`: the installed service's verifier config, the one
+    # whose publication (CAPABILITIES_FILE) `capabilities` accepts; it enables the mode.
     if (not isinstance(value, dict) or not required <= set(value) or
-            set(value) - required - set(defaults) - published or len(published & set(value)) == 1 or
+            set(value) - required - set(defaults) - {'verifier_config_file'} or
             type(value['v']) is not int or value['v'] != 1):
         raise ValueError('invalid_config')
     value = {**defaults, **value}
@@ -131,14 +133,16 @@ def load_config(path):
             not 60 <= value['timeout_seconds'] <= 21600 or
             not 64 <= value['cold_max_bytes'] <= min(5 * 1024 ** 4, value['part_bytes'] * 10000)):
         raise ValueError('invalid_limits')
-    for key in ('state_directory', 'credentials_file', *published):
+    for key in ('state_directory', 'credentials_file', 'verifier_config_file'):
         if key in value and (not isinstance(value[key], str) or not Path(value[key]).is_absolute() or
                              '..' in Path(value[key]).parts):
             raise ValueError('invalid_config_path')
     state = Path(value['state_directory'])
     # The upload UID owns its state; a publication it could write is no root answer.
     # `//x` is another spelling of `/x` that path comparisons would miss.
-    if any(key in value and (value[key].startswith('//') or Path(value[key]).is_relative_to(state)) for key in published):
+    if 'verifier_config_file' in value and (value['verifier_config_file'].startswith('//') or
+                                            Path(value['verifier_config_file']).is_relative_to(state) or
+                                            CAPABILITIES_FILE.is_relative_to(state)):
         raise ValueError('invalid_config_path')
     if any(p.is_symlink() for p in (state, *state.parents)) or not state.is_dir() or state.stat().st_mode & 0o077:
         raise ValueError('private_receiver_directory_required')
@@ -1130,9 +1134,9 @@ def published_helper(config):
 
     It names the verifier config it was made from; once that config changed, it is stale.
     """
-    if 'capabilities_file' not in config:
+    if 'verifier_config_file' not in config:
         raise ValueError('capabilities_unavailable')
-    path = Path(config['capabilities_file'])
+    path = CAPABILITIES_FILE
     try:
         with local.trusted_directory(path.parent) as parent_fd:
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
