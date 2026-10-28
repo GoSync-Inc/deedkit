@@ -1,13 +1,11 @@
-# Include only the shared runtime module; the exclusions below still apply.
+# Include only the shared runtime package, every module of it (the runtime imports agent and release, and agent
+# imports field_errors); the exclusions below still apply.
 packages/*
 !packages/platform-contracts/
 packages/platform-contracts/*
 !packages/platform-contracts/src/
 packages/platform-contracts/src/*
 !packages/platform-contracts/src/platform_contracts/
-packages/platform-contracts/src/platform_contracts/*
-!packages/platform-contracts/src/platform_contracts/__init__.py
-!packages/platform-contracts/src/platform_contracts/release.py
 
 .venv
 __pycache__

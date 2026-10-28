@@ -853,6 +853,32 @@ def test_the_root_build_context_leaves_out_env_files_at_every_depth_but_keeps_th
     assert rules.index("!**/.env.example") > rules.index("**/.env.*")
 
 
+# spec: ANYM-546
+def test_the_root_build_context_keeps_every_platform_contracts_module_the_runtime_image_copies():
+    import re
+    root = Path(__file__).resolve().parents[1]
+    lines = [line.strip() for line in (root / ".dockerignore").read_text().splitlines()]
+    rules = [line for line in lines if line and not line.startswith("#")]
+    wildcards = {"**/": "(?:.*/)?", "**": ".*", "*": "[^/]*", "?": "[^/]"}
+    def regex(rule):
+        parts = re.split(r"(\*\*/|\*\*|\*|\?)", rule)
+        return re.compile("".join(wildcards.get(part, re.escape(part)) for part in parts))
+    # Docker's rule: the last pattern that matches the path or one of its parent directories decides.
+    def ignored(path):
+        parts, result = path.split("/"), False
+        for rule in rules:
+            pattern = regex(rule.removeprefix("!").rstrip("/"))
+            if any(pattern.fullmatch("/".join(parts[:n])) for n in range(1, len(parts) + 1)):
+                result = not rule.startswith("!")
+        return result
+    package = root / "packages/platform-contracts/src/platform_contracts"
+    modules = sorted(path.relative_to(root).as_posix() for path in package.glob("*.py"))
+    assert "packages/platform-contracts/src/platform_contracts/agent.py" in modules
+    assert [module for module in modules if ignored(module)] == []
+    assert ignored("packages/npm/package.json") and ignored("packages/platform-contracts/tests/test_agent.py")
+    assert ignored("deploy/private/x.json") and not ignored("services/messaging/messaging_service/app.py")
+
+
 
 TRIAGE_FIXTURE = json.loads((Path(__file__).parent / "fixtures/tiden-run-triage-041.json").read_text())
 TRIAGE_SENTINELS = ("SENTINEL-OUTPUT-542", "SENTINEL-ERROR-542")
