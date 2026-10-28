@@ -2,12 +2,17 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync} from 'node:fs';
+import {chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync} from 'node:fs';
 import {createServer} from 'node:http';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {tools} from '../lib/index.js';
 
 const bin = new URL('../bin/deedkit.js', import.meta.url).pathname;
+// The gateway catalog plus platform_capabilities, so a new gateway tool needs no edit here (catalog.test.js
+// checks the names); outside a repository checkout, the packaged list.
+const catalogUrl = new URL('../../../services/gateway/src/agent_gateway/catalog.json', import.meta.url);
+const toolCount = existsSync(catalogUrl) ? JSON.parse(readFileSync(catalogUrl, 'utf8')).length + 1 : tools.length;
 const key = 'synthetic-gateway-key';
 
 function run(args, env = {}) {
@@ -150,7 +155,7 @@ test('usage errors exit 2 before any request', async () => {
 
 test('tools, help and version need no network or token', async () => {
   const listed = JSON.parse((await run(['tools'])).stdout);
-  assert.equal(listed.length, 67);
+  assert.equal(listed.length, toolCount);
   assert.deepEqual(listed.find(row => row.name === 'messages_send_message'), {name: 'messages_send_message', read_only: false});
   assert.match((await run(['--help'])).stdout, /outcome unknown/);
   const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
