@@ -2196,7 +2196,9 @@ def test_the_proxy_tunnels_only_a_tls_session_whose_server_name_is_the_connect_n
             return ['140.82.121.4']
 
         async def opener(host, port):
-            return asyncio.StreamReader(), Up()
+            ended = asyncio.StreamReader()
+            ended.feed_eof()  # the upstream closes at once, so both pipes end
+            return ended, Up()
         reader, out = asyncio.StreamReader(), []
         reader.feed_data(b'CONNECT pypi.org:443 HTTP/1.1\r\n\r\n' + client_hello(name))
         reader.feed_eof()
@@ -2207,9 +2209,68 @@ def test_the_proxy_tunnels_only_a_tls_session_whose_server_name_is_the_connect_n
         original = asyncio.open_connection
         asyncio.open_connection = opener
         try:
-            await egress.handle(reader, Down(), resolver)
+            await asyncio.wait_for(egress.handle(reader, Down(), resolver), 10)
         finally:
             asyncio.open_connection = original
         return upstream
     assert asyncio.run(tunnel('outside.example')) == []
     assert asyncio.run(tunnel('pypi.org')) == [client_hello('pypi.org')]
+
+
+class FakeCopy:
+    def __init__(self, data, code=0, hang=False):
+        self.stdout, self.code, self.hang, self.killed = io.BytesIO(data), code, hang, False
+        if hang:
+            self.stdout.read = lambda size: threading.Event().wait(5) and b''
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return self.code
+
+
+# spec: ANYM-574
+def test_a_failed_or_unanswered_outbox_copy_keeps_the_container_and_applies_nothing(tmp_path):
+    line = json.dumps({'action': 'finish', 'intent': BUILD}).encode()
+    good = tar_of('requests.jsonl', line)
+    assert launcher.collect(BUILD, lambda *a, **k: FakeCopy(good)) == line.decode()
+    assert launcher.collect(BUILD, lambda *a, **k: FakeCopy(b'', code=1)) is None  # docker cp failed
+    assert launcher.collect(BUILD, lambda *a, **k: FakeCopy(b'', hang=True), timeout=0.1) is None  # no answer
+    assert launcher.collect(BUILD, lambda *a, **k: FakeCopy(b'x' * (launcher.MAX_OUTBOX + 20000))) == ''  # too big
+    (tmp_path / BUILD).mkdir()
+    calls = []
+
+    def docker(argv, timeout=None):
+        calls.append(argv[:2])
+        return 'false\n'
+    with pytest.raises(launcher.Refused, match='container is kept'):
+        launcher.gather(BUILD, tmp_path, docker, lambda name: None)
+    assert ['docker', 'rm'] not in calls and not (tmp_path / BUILD / 'pending.json').exists()
+    launcher.gather(BUILD, tmp_path, docker, lambda name: line.decode())
+    assert ['docker', 'rm'] in calls
+    assert json.loads((tmp_path / BUILD / 'pending.json').read_text()) == [['finish', BUILD]]
+
+
+# spec: ANYM-574
+def test_a_stop_counts_only_when_docker_confirms_the_container_stopped_or_gone():
+    tried = []
+
+    def down(argv, timeout=None):  # the Docker daemon does not answer
+        tried.append(argv[1])
+        raise launcher.Refused('docker inspect: exit 1: Cannot connect to the Docker daemon')
+    assert launcher.stop(BUILD, down) is False and tried.count('kill') == 1
+
+    def gone(argv, timeout=None):
+        if argv[1] == 'inspect':
+            raise launcher.Refused('docker inspect: exit 1: Error: No such object: x')
+        return ''
+    assert launcher.stop(BUILD, gone) is True
+    with pytest.raises(launcher.Refused):
+        launcher.exists(BUILD, down)

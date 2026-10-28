@@ -96,6 +96,7 @@ def image(docker=call):
 def proxy_argv(name):
     return ['docker', 'run', '--detach', '--rm', '--name', PROXY, '--network', 'bridge', '--cap-drop', 'ALL',
             '--security-opt', 'no-new-privileges', '--read-only', '--memory', '256m', '--pids-limit', '256',
+            '--log-opt', 'max-size=1m', '--log-opt', 'max-file=1',
             '--entrypoint', 'python3', name, '/opt/runner/proxy.py']
 
 
@@ -188,7 +189,7 @@ def run_argv(name, image_name, env_names, control=None, tty=False, remove=True):
     build keeps its container after it ends (`remove=False`) until the launcher has copied the outbox out."""
     argv = ['docker', 'run', *(['--rm'] if remove else []), '--interactive', *(['--tty'] if tty else []), '--name', name,
             '--network', NETWORK, '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--init',
-            '--memory', '8g', '--pids-limit', '4096', '--label', 'deedkit.autoloop=runner']
+            '--memory', '8g', '--pids-limit', '4096', '--label', 'deedkit.autoloop=runner', '--log-driver', 'none']
     if control:
         argv += ['--mount', f'type=bind,source={control},target={MOUNT}/control,readonly']
     for env_name in env_names:
@@ -244,16 +245,29 @@ def outbox_text(archive):
         return ''
 
 
-def collect(name, popen=subprocess.Popen):
-    """The outbox of a stopped container, read through `docker cp` with a byte bound before any parsing."""
+def collect(name, popen=subprocess.Popen, timeout=CALL):
+    """The outbox of a stopped container, read through `docker cp` with a byte and a time bound before any parsing.
+    The entrypoint makes the file, so a failed or unfinished copy is None (the container is kept), while an
+    oversized or malformed one is rejected content ('')."""
+    limit = MAX_OUTBOX + 16384  # the tar headers and padding around one small file
+    got = []
     try:
         with popen(['docker', 'cp', f'{name}:{OUTBOX}', '-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                    stdin=subprocess.DEVNULL) as copy:
-            archive = copy.stdout.read(MAX_OUTBOX + 4096) if copy.stdout else b''
-            copy.kill()
-    except OSError:
-        return ''
-    return outbox_text(archive)
+            reader = threading.Thread(target=lambda: got.append(copy.stdout.read(limit) if copy.stdout else b''),
+                                      daemon=True)
+            reader.start()
+            reader.join(timeout)
+            if not got:
+                copy.kill()
+                return None  # no answer in time
+            if len(got[0]) >= limit:
+                copy.kill()
+                return ''  # more than an outbox may hold: rejected
+            code = copy.wait(timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return outbox_text(got[0]) if code == 0 else None
 
 
 def requests(text, intent):
@@ -301,19 +315,30 @@ def apply(pending, main=autoloop.main, sleep=time.sleep):
     return codes
 
 
-def exists(name, docker=call):
+def running(name, docker=call):
+    """True or False for a container that exists, None for one that does not; any other inspect failure (the Docker
+    daemon down, a time-out) is not an answer and is refused."""
     try:
-        docker(['docker', 'inspect', '--format', '{{.State.Running}}', name])
-        return True
-    except Refused:
-        return False
+        return docker(['docker', 'inspect', '--format', '{{.State.Running}}', name]).strip() == 'true'
+    except Refused as error:
+        if 'No such' in str(error):
+            return None
+        raise
+
+
+def exists(name, docker=call):
+    return running(name, docker) is not None
 
 
 def gather(intent, runs=RUNS, docker=call, copy=collect):
     """A stopped build container's requests into the run's pending file, then the container removed."""
     pending = runs / intent / 'pending.json'
     if exists(intent, docker):
-        steps = requests(copy(intent), intent)
+        text = copy(intent)
+        if text is None:
+            raise Refused(f'the outbox of {intent} could not be copied; the container is kept: run '
+                          f'`launch.py apply {intent}` again')
+        steps = requests(text, intent)
         known = json.loads(pending.read_text()) if pending.exists() else []
         temp = pending.with_suffix('.tmp')
         temp.write_text(json.dumps(known + [s for s in steps if s not in known]))
@@ -341,12 +366,14 @@ def watch(state, intent, control, name, done, deadline, docker=call, clock=time.
             write_gate(control, why)
             if why:
                 print(f'runner: STOP {why}; stopping the container', file=sys.stderr, flush=True)
-                stop(name, docker)
-                return
+                break
+        else:
+            return
     except Exception as error:  # a gate that cannot be checked is a stop
         print(f'runner: STOP gate check failed ({type(error).__name__}); stopping the container', file=sys.stderr,
               flush=True)
-        stop(name, docker)
+    while not stop(name, docker) and not done.wait(POLL):
+        pass  # keep trying until the container is confirmed stopped or the run has ended
 
 
 def stop(name, docker=call):
@@ -357,10 +384,10 @@ def stop(name, docker=call):
         except Refused:
             pass  # already stopped or gone: the inspect below decides
         try:
-            if docker(['docker', 'inspect', '--format', '{{.State.Running}}', name]).strip() != 'true':
-                return True
+            if running(name, docker) is not True:
+                return True  # confirmed stopped, or gone
         except Refused:
-            return True
+            pass  # no answer: not confirmed
     print(f'runner: FAILED to stop container {name}; stop it by hand: docker kill {name}', file=sys.stderr,
           flush=True)
     return False
@@ -398,7 +425,7 @@ def build(intent, card, state=autoloop.STATE, now=None):
 def resume(intent):
     if not BUILD.fullmatch(intent):
         raise Refused('usage: launch.py apply autoloop-build-<slug>')
-    if exists(intent) and not stop(intent):
+    if running(intent) and not stop(intent):
         raise Refused(f'container {intent} still runs')
     pending = gather(intent)
     return report(apply(pending), pending)

@@ -12,5 +12,6 @@ gh auth setup-git
 git clone --quiet --branch main "https://github.com/$AUTOLOOP_REPO.git" "$HOME/deedkit"
 cd "$HOME/deedkit"
 git switch --quiet --create "$AUTOLOOP_INTENT"
+: > /run/autoloop/outbox/requests.jsonl  # the launcher copies it out; a missing file reads as a failed copy
 # Non-interactive: the agent ends after its last answer, so the launcher can apply the outbox.
 exec claude -p "$AUTOLOOP_PROMPT" --dangerously-skip-permissions --model "$AUTOLOOP_MODEL" --effort "$AUTOLOOP_EFFORT"
