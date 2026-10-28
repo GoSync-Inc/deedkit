@@ -6,6 +6,7 @@ observed resolution, and neither hash IDs nor ingest order resolve WhatsApp ties
 import math
 from datetime import datetime, timedelta, timezone
 
+from .conflict_classes import known_conflict
 from .policy import scope_filter
 
 
@@ -14,13 +15,14 @@ HEAD_LIMIT = 64
 CATCHUP_WINDOW = timedelta(minutes=30)
 CLOCK_SKEW = timedelta(minutes=5)  # as_of is the read transaction's start; a marker may be a moment newer
 # ANYM-454: what an agent does next for each reason a conversation block is unclear. Reading a chat
-# cannot refresh a stale head (the collector does), hence answer_with_caveat rather than a retry.
+# cannot refresh a stale head (the collector does), hence answer_with_caveat rather than a retry; nor does it
+# change a stored version conflict (ANYM-616), so only a revision that changed during this read is reread_now.
 # CONVERSATION.md and the list_chats description list exactly these pairs (tests pin all three).
 NEXT_STEP = {
     'provider_head_stale':'answer_with_caveat', 'provider_head_not_verified':'answer_with_caveat',
     'history_has_gaps':'answer_with_caveat', 'ambiguous_message_order':'answer_with_caveat',
     'ambiguous_attention_reply_order':'answer_with_caveat', 'head_candidates_truncated':'answer_with_caveat',
-    'message_revision_changed_during_read':'reread_now', 'message_version_conflict':'reread_now',
+    'message_version_conflict':'answer_with_caveat', 'message_revision_changed_during_read':'reread_now',
     'rate_limited':'wait_for_provider_cooldown', 'provider_temporarily_unavailable':'wait_for_provider_cooldown',
     'provider_unavailable':'check_provider_access', 'provider_chat_error':'check_provider_access',
     'unclassified_latest_message':'get_context', 'chat_type_unknown':'get_context',
@@ -34,7 +36,14 @@ def _instant(value):
 
 
 def _evidence(messages):
-    return [{'message_id':m['id'], 'revision':m['revision']} for m in messages]
+    result=[]
+    for m in messages:
+        item={'message_id':m['id'], 'revision':m['revision']}
+        known=known_conflict(m.get('evidence'))
+        if known:
+            item['conflict']=known
+        result.append(item)
+    return result
 
 
 def _snapshot(message):
@@ -65,7 +74,10 @@ def _meaningful(message):
 def _unstable(messages):
     if any((m.get('evidence') or {}).get('revision_changed_during_read') for m in messages):
         return 'message_revision_changed_during_read'
-    if any((m.get('evidence') or {}).get('active_conflicts',0) for m in messages):
+    # A reviewed known class stands until a later provider edit (ANYM-616): no reread changes it, and the
+    # block's evidence carries its meaning instead. Any other open conflict, a NULL class included, stays unstable.
+    if any((m.get('evidence') or {}).get('active_conflicts',0) and not known_conflict(m.get('evidence'))
+            for m in messages):
         return 'message_version_conflict'
     return None
 

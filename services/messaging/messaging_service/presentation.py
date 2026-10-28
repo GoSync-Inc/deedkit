@@ -172,6 +172,9 @@ def lean_conversation(state, *, shown=()):
     if state.get('order_status')=='ambiguous':
         result['order_status']='ambiguous'
         result['candidate_message_ids']=[m['message_id'] for m in state['basis'].get('evidence',[])]
+    # A known version conflict leaves the block stable; its meaning is the agent's quote caveat (ANYM-616).
+    known=[{'message_id':m['message_id'],**m['conflict']} for m in state['basis'].get('evidence',[]) if m.get('conflict')]
+    if known:result['known_conflicts']=known
     latest=state.get('latest_known_meaningful_message')
     if latest:
         result['latest_message_id']=latest['id']
