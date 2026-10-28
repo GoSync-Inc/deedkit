@@ -489,6 +489,43 @@ def test_a_recipient_remapped_between_steps_sends_nothing_to_the_new_chat(world)
 
 
 # spec: ANYM-546
+def test_a_remap_committed_just_before_the_enqueue_read_sends_nothing(world, monkeypatch):
+    import sys
+    import messaging_service.commands as commands
+    import messaging_service.outgoing as outgoing
+    upload = world.upload(b'Synthetic raced file', 'synthetic-upload-0001')
+    chat_remap = ("UPDATE chats SET provider_chat=%s WHERE id=%s", ('999', CHAT), ('100', CHAT))
+    reply_remap = ("UPDATE messages SET provider_id=%s WHERE id=%s", ('2', MESSAGE), ('1', MESSAGE))
+    remap = []
+
+    def racing(module, name):
+        real = getattr(module, name)
+
+        def read(*args, **kwargs):
+            # Another transaction remaps and commits between the step's checks and enqueue's own read.
+            if 'enqueue' in (sys._getframe(1).f_code.co_name, sys._getframe(2).f_code.co_name):
+                with world.s.pool.connection() as other:
+                    other.execute(remap[0][0], remap[0][1])
+            return real(*args, **kwargs)
+        monkeypatch.setattr(module, name, read)
+    racing(outgoing, 'target')
+    racing(commands, '_chat')
+    # A file step's send_file digest already binds the provider chat inside commands.enqueue (preview_mismatch).
+    cases = [({'to': CHAT, 'text': 'Synthetic raced text'}, chat_remap, 'identity_changed'),
+             ({'to': CHAT, 'files': [{'upload_id': upload}]}, chat_remap, 'preview_mismatch'),
+             ({'reply_to': MESSAGE, 'text': 'Synthetic raced reply'}, reply_remap, 'identity_changed')]
+    for n, (arguments, change, code) in enumerate(cases):
+        remap[:] = [change]
+        assert refused(world.call, **arguments, request_id=f'synthetic-race-000{n}').code == code
+        with world.s.pool.connection() as c:
+            c.execute(change[0], change[2])
+    world.work()
+    assert not world.texts and not world.files and intents(world) == 0
+    with world.s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM outgoing_messages').fetchone()['n'] == 0
+
+
+# spec: ANYM-546
 def test_a_payload_sent_with_a_token_must_equal_the_preview(world):
     token = world.call(to=CHAT, text='Synthetic approved', dry_run=True)['confirm_token']
     for changed in ({'to': CHAT, 'text': 'Synthetic other'}, {'to': OTHER_CHAT, 'text': 'Synthetic approved'}):

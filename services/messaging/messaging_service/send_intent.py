@@ -295,16 +295,31 @@ def _key(p, row, step):
 
 
 def _start(store, c, p, row, step):
+    """The step's handle. The previewed recipient binds it: the row the low-level route wrote must name the bound
+    provider chat (and reply), else `identity_changed` and a savepoint undoes the row. Checking the written row,
+    not a read before it, also holds when a remap commits between two statements (READ COMMITTED)."""
+    with c.transaction():
+        handle = _enqueue(store, c, p, row, step)
+        if step['kind'] == 'phone': return handle
+        resolution = row['plan']['resolution']
+        if 'send_id' in handle:
+            written = c.execute('SELECT provider_chat,reply_provider_id FROM outgoing_messages WHERE id=%s',
+                                (handle['send_id'],)).fetchone()
+            same = written['reply_provider_id'] == (resolution['reply_to'] or {}).get('provider_id')
+        else:
+            written = c.execute("SELECT payload->>'provider_chat' AS provider_chat FROM messenger_commands WHERE id=%s",
+                                (handle['operation_id'],)).fetchone()
+            same = True
+        if not same or written['provider_chat'] != resolution['target']['provider_chat']:
+            raise _error('identity_changed', 409)
+    return handle
+
+
+def _enqueue(store, c, p, row, step):
     from .commands import enqueue as operation
     from .outgoing import enqueue as send
     resolution, value = row['plan']['resolution'], row['plan']['value']
     target, key = resolution['target'], _key(p, row, step)
-    if step['kind'] != 'phone':
-        # The previewed recipient binds every step: a chat or reply that maps elsewhere now sends nothing.
-        from .outgoing import target as chat_target
-        chat, reply_id = chat_target(c, p, target['account'], target['chat_id'], value['reply_to'])
-        if chat['provider_chat'] != target['provider_chat'] or reply_id != (resolution['reply_to'] or {}).get('provider_id'):
-            raise _error('identity_changed', 409)
     if step['kind'] == 'text':
         rich = value['format'] != 'plain'
         return {'send_id': send(c, p, target['account'], target['chat_id'], value['text'], key, value['reply_to'],
