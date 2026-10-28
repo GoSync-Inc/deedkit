@@ -57,7 +57,11 @@ def test_notify_none_preview_says_nobody_is_notified(store):
     shown = call(store, key, {**CREATE, "guests": GUESTS, "notify": "none", "dry_run": True})["preview"]
     assert shown["guests"] == GUESTS
     assert shown["notifications"]["notify"] == "none" and shown["notifications"]["recipients"] == []
-    assert shown["notifications"]["summary"].startswith("Nobody is notified")
+    summary = shown["notifications"]["summary"]
+    # Google asks for no email but does not promise it: the preview says both, and where the event still shows.
+    assert shown["notifications"]["emails_requested"] is False
+    assert summary.startswith("Nobody is notified by DeedKit") and "sendUpdates=none" in summary
+    assert "does not guarantee" in summary and "own calendar" in summary
     # Without guests the preview keeps its ANYM-552 shape.
     assert "notifications" not in call(store, key, {**CREATE, "dry_run": True})["preview"]
 
