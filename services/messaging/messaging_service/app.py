@@ -355,13 +355,13 @@ class Boundary:
                 async def may_upload():
                     return principal is not None and await run_in_threadpool(self.store.permits,
                         bearer(request.headers),'upload_file_chunk')
-                # Past 16 KiB only for a large tool of a key that may upload: its REST path at once; on MCP the
-                # tool its first 16 KiB claim (claimed_tool), and the parsed envelope must then be that tool.
-                large=rest_tool if rest_tool in LARGE_BODIES and await may_upload() else None
-                body_limit=LARGE_BODIES[large] if large else NORMAL_BODY_BYTES
+                # Past 16 KiB only for a large tool of a key that may upload, asked once a body passes 16 KiB: its
+                # REST path's tool, or on MCP the one its first 16 KiB claim (claimed_tool); the parsed envelope
+                # must then be that tool.
+                large,body_limit=None,NORMAL_BODY_BYTES
                 try: size=int(request.headers.get('content-length','0'))
                 except ValueError: raise APIError('invalid_body') from None
-                if size<0 or size>(max(LARGE_BODIES.values()) if mcp_route else body_limit):
+                if size<0 or size>(max(LARGE_BODIES.values()) if mcp_route else LARGE_BODIES.get(rest_tool,body_limit)):
                     raise APIError('body_too_large',413)
                 async def read_body():
                     nonlocal large,body_limit
@@ -370,8 +370,8 @@ class Boundary:
                         event=await receive()
                         if event['type']=='http.disconnect': raise APIError('disconnected',400)
                         data.extend(event.get('body',b''))
-                        if len(data)>body_limit and mcp_route and large is None:
-                            claim=claimed_tool(bytes(data[:NORMAL_BODY_BYTES]))
+                        if len(data)>body_limit and large is None:
+                            claim=claimed_tool(bytes(data[:NORMAL_BODY_BYTES])) if mcp_route else rest_tool
                             if claim in LARGE_BODIES and await may_upload(): large,body_limit=claim,LARGE_BODIES[claim]
                         if len(data)>body_limit: raise APIError('body_too_large',413)
                         if not event.get('more_body'): return bytes(data)
