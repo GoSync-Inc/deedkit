@@ -13,6 +13,7 @@ from psycopg.types.json import Jsonb
 from .envelope import canonical, stable_id
 from .policy import audit, effective_permissions, lock_principal, targets
 from .store import APIError, serial
+from .subscriptions import journal_send_failures
 
 
 class SendRejected(RuntimeError):
@@ -443,9 +444,11 @@ class OutgoingWorker:
         st=self.state
         with st.archive.store.pool.connection() as c:
             st.archive.fence(c,st.account,st.lease)
-            c.execute("""UPDATE outgoing_messages SET status='unknown',error_code='sender_interrupted',finished_at=clock_timestamp()
-                WHERE account=%s AND status='dispatching' AND lease_epoch IS DISTINCT FROM %s""",
-                (st.account,st.lease[1]))
+            interrupted=c.execute("""UPDATE outgoing_messages SET status='unknown',error_code='sender_interrupted',finished_at=clock_timestamp()
+                WHERE account=%s AND status='dispatching' AND lease_epoch IS DISTINCT FROM %s
+                RETURNING id,account,chat,principal,key_id,status,error_code""",
+                (st.account,st.lease[1])).fetchall()
+            journal_send_failures(c,interrupted)
             row=c.execute("""SELECT * FROM outgoing_messages WHERE account=%s AND status='queued'
                 ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED""",(st.account,)).fetchone()
             if not row:return None
@@ -514,10 +517,13 @@ class OutgoingWorker:
         st=self.state
         with st.archive.store.pool.connection() as c:
             st.archive.fence(c,st.account,st.lease)
-            c.execute('''UPDATE outgoing_messages SET status=%s,provider_message_id=%s,error_code=%s,archive_reference=%s,
-                finished_at=clock_timestamp() WHERE id=%s AND status='dispatching' AND lease_epoch=%s''',
+            finished=c.execute('''UPDATE outgoing_messages SET status=%s,provider_message_id=%s,error_code=%s,archive_reference=%s,
+                finished_at=clock_timestamp() WHERE id=%s AND status='dispatching' AND lease_epoch=%s
+                RETURNING id,account,chat,principal,key_id,status,error_code''',
                 (status,provider_id,code,Jsonb(job['_archive_reference']) if job.get('_archive_reference') else None,
-                 job['id'],st.lease[1]))
+                 job['id'],st.lease[1])).fetchall()
+            # ANYM-535: a failed or uncertain send wakes its key's subscriptions; never blocks this status.
+            journal_send_failures(c,finished)
 
     async def once(self):
         if await asyncio.to_thread(self.state.cooldown_remaining)>0:return False

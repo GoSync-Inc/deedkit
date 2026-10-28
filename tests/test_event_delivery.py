@@ -834,6 +834,50 @@ def test_endpoint_hint_body_pins_the_reference_fields_and_the_cap(seeded, tmp_pa
     assert not any(name.lower().startswith('x-deedkit') for name in headers) and b'host_turn_verified' not in body
 
 
+# spec: ANYM-535
+def test_failure_kind_hints_carry_only_reference_fields(seeded, tmp_path, monkeypatch):
+    from messaging_service.archive import Archive
+    from messaging_service.collector_state import CollectorState
+    from messaging_service.event_delivery import dispatch_hints
+    from messaging_service.subscriptions import journal_send_failures, journal_source_health
+    store, _, _ = seeded
+    try:
+        token, endpoint, _, _ = endpoint_setup(store, tmp_path, monkeypatch, events=0)
+        sid = store.create_subscription(token, ['telegram-demo-chat'], kinds=['send.failed', 'source.health'],
+            label='Synthetic failures', delivery={'endpoint_id': endpoint['endpoint_id']})['subscription_id']
+        archive = Archive(store)
+        epoch = archive.acquire('telegram-demo', 'synthetic-health')
+        state = CollectorState(archive, 'telegram-demo', ('synthetic-health', epoch))
+        state.phase('connection', 'connected', 'provider_ready')
+        state.capture_progress(None, 0, 0)
+        assert journal_source_health(store) == 0
+        with store.pool.connection() as c:
+            owner = c.execute("SELECT id FROM api_keys WHERE principal='endpoint-reader'").fetchone()['id']
+            journal_send_failures(c, [{'id': 'synthetic-send-1', 'account': 'telegram-demo', 'chat': 'telegram-demo-chat',
+                'principal': 'endpoint-reader', 'key_id': owner, 'status': 'failed', 'error_code': 'send_not_started'}])
+        state.connection_failed('provider_disconnected')
+        assert journal_source_health(store) == 1
+        archive.release('telegram-demo', 'synthetic-health', epoch)
+        match_subscriptions(store)
+        sent = []
+        assert dispatch_hints(store, transport=lambda url, body, headers, **k: sent.append(body) or 204,
+            resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    finally:
+        store.set_delivery_features(False)
+    payload = json.loads(sent[0])
+    assert payload['subscription_id'] == sid and payload['references_omitted'] == 0
+    common = {'event_id', 'kind', 'occurred_at', 'wake_reason', 'account_id', 'chat_id', 'message_id', 'sender_id'}
+    failed, health = payload['references']
+    assert set(failed) == common | {'send_id', 'status'} and set(health) == common | {'status'}
+    assert (failed['kind'], failed['account_id'], failed['chat_id'], failed['send_id'], failed['status']) == (
+        'send.failed', 'telegram-demo', 'telegram-demo-chat', 'synthetic-send-1', 'failed')
+    assert failed['message_id'] is None and failed['sender_id'] is None
+    assert (health['kind'], health['account_id'], health['chat_id'], health['status']) == (
+        'source.health', 'telegram-demo', None, 'disconnected')
+    # The error code, the sending key and the collector reason stay out of the push body.
+    assert not any(value in sent[0] for value in (b'send_not_started', str(owner).encode(), b'provider_disconnected'))
+
+
 # spec: ANYM-519
 @pytest.mark.parametrize('change', ['operator_disable', 'delivery_write_lost', 'feature_disable', 'policy_reload'])
 def test_endpoint_change_waits_for_the_inflight_post_and_no_post_after(seeded, tmp_path, monkeypatch, change):
