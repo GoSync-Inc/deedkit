@@ -224,17 +224,25 @@ def create_snapshot(store,destination,dump_command,recovery_config=None,*,captur
             with store.pool.connection() as c:end_backup_fence(c,fence)
 
 
-def verify_bundle(directory,*,blob_root=None):
+def verify_bundle(directory,*,blob_root=None,extracted=None,read_dump=True):
+    """`extracted` ({member: (sha256, bytes)} hashed while this process extracted the bundle) replaces the
+    read of each original; `read_dump=False` also takes the dump's digest from it. Restore read-backs: ANYM-630."""
     from .recovery_state import read_manifest,verify_recovery
     directory=Path(directory); manifest=read_manifest(directory)
     if manifest.get('format') not in (1,2) or manifest.get('schema_version') not in SCHEMAS: raise ValueError('unsupported_backup')
+    if (extracted is None and not read_dump) or (extracted is not None and blob_root is not None):
+        raise ValueError('invalid_backup_verification')
     verify_recovery(directory,manifest)
     if (directory/'database.dump').is_symlink(): raise ValueError('invalid_backup_file')
-    fd=os.open(directory/'database.dump',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
-    with os.fdopen(fd,'rb') as dump:
-        if not stat.S_ISREG(os.fstat(dump.fileno()).st_mode):
-            raise ValueError('invalid_backup_file')
-        if hashlib.file_digest(dump,'sha256').hexdigest()!=manifest['dump_sha256']: raise RuntimeError('dump_corrupt')
+    if read_dump:
+        fd=os.open(directory/'database.dump',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as dump:
+            if not stat.S_ISREG(os.fstat(dump.fileno()).st_mode):
+                raise ValueError('invalid_backup_file')
+            if hashlib.file_digest(dump,'sha256').hexdigest()!=manifest['dump_sha256']: raise RuntimeError('dump_corrupt')
+    else:
+        if not stat.S_ISREG(os.lstat(directory/'database.dump').st_mode): raise ValueError('invalid_backup_file')
+        if extracted.get('database.dump',(None,))[0]!=manifest['dump_sha256']: raise RuntimeError('dump_corrupt')
     if (directory/'files').is_symlink(): raise ValueError('invalid_backup_file')
     writer=BlobWriter(blob_root if blob_root is not None else directory/'files',reserve_bytes=0); seen=set()
     if not isinstance(manifest['blobs'],list) or len(manifest['blobs'])>1000000:raise ValueError('invalid_backup_manifest')
@@ -267,7 +275,13 @@ def verify_bundle(directory,*,blob_root=None):
             not isinstance(item['digest'],str) or not re.fullmatch(r'[a-f0-9]{64}',item['digest']) or
             item['digest'] in seen or item['digest'] in absent_seen):
             raise ValueError('invalid_backup_manifest')
-        writer.verify(Blob(item['digest'],item['bytes'])); seen.add(item['digest'])
+        if extracted is None:writer.verify(Blob(item['digest'],item['bytes']))
+        else:
+            path=writer.root/item['digest']
+            if (extracted.get('files/'+item['digest'])!=(item['digest'],item['bytes']) or path.is_symlink() or
+                not path.is_file() or path.stat().st_size!=item['bytes']):
+                raise RuntimeError('blob_corrupt')
+        seen.add(item['digest'])
     # Reference capture is an operator workspace, not a self-contained backup.
     # Restore accepts only a bundle containing its exact complete original set.
     expected=set() if blob_root is not None else seen
@@ -275,8 +289,9 @@ def verify_bundle(directory,*,blob_root=None):
     return manifest
 
 
-def verify_snapshot(store,directory):
-    directory=Path(directory); manifest=verify_bundle(directory)
+def verify_snapshot(store,directory,*,extracted=None):
+    # With extraction digests the bundle check reads only the dump; the original_hashes read-back below stays.
+    directory=Path(directory); manifest=verify_bundle(directory,extracted=extracted)
     with store.pool.connection() as c:
         c.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
         tables=database_manifest(c)
