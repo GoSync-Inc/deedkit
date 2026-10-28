@@ -1,7 +1,11 @@
 """Calendar members linked to messaging people (ANYM-554): the owner's link, and person UUIDs in calendar_find_time."""
 import os
+import threading
+import time
 from uuid import uuid4
 
+import psycopg
+from psycopg import sql
 import pytest
 
 from family_calendar.errors import CalendarError
@@ -78,6 +82,84 @@ def test_the_calendar_keeps_only_the_person_uuid_and_reads_nothing_from_messagin
     # The answer names the calendar member only: no messaging name, handle or channel is fetched or returned.
     found = find(store, key, people=[MASHA], window=DAY, exclude_me=True)
     assert found["people"] == [{"member_id": "child", "label": "Masha", "role": "dependent"}]
+
+
+# spec: ANYM-554
+def test_a_person_whose_calendar_the_caller_cannot_read_is_not_found_like_an_unlinked_one(store, tmp_path):
+    key = setup(store)
+    # adult-b ("Anna") is bound to cal-b and cal-ib, which adult-a's agent cannot read.
+    link(store, tmp_path, "--member", "adult-b", "--person", ZOE)
+    unlinked = "11111111-2222-4333-8444-555555555555"
+    for people in ([ZOE], [ZOE, "Ann"], ["Ann", ZOE]):
+        # Same answer as an unlinked person, before a selection could name the member.
+        assert find(store, key, people=people, window=DAY) == find(
+            store, key, people=[unlinked if p == ZOE else p for p in people], window=DAY)
+        assert find(store, key, people=people, window=DAY)["error"] == "not_found"
+    # A principal of the same family who can read both calendars gets the member.
+    for cal in ("cal-b", "cal-ib"):
+        store.grant("family", "adult-b", cal, READ, "details")
+    anna = store.agent("agent-b", "family", "adult-b", READ, ["cal-b", "cal-ib"])
+    assert [m["member_id"] for m in find(store, anna, people=[ZOE], window=DAY, exclude_me=True)["people"]] == [
+        "adult-b"]
+
+
+# spec: ANYM-554
+def test_two_concurrent_links_of_one_person_end_with_one_link_and_person_already_linked(store, tmp_path):
+    setup(store)
+    dsn = os.environ["FCS_TEST_DSN"]
+    with psycopg.connect(dsn) as other, psycopg.connect(dsn, autocommit=True) as watch:
+        other.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(store.schema)))
+        other.execute("INSERT INTO member_people(group_id,member_id,person_uuid) VALUES ('family','adult-b',%s)",
+                      (MASHA,))
+        outcome = {}
+
+        def second():
+            try:
+                outcome["result"] = link(store, tmp_path, "--member", "child", "--person", MASHA)
+            except CalendarError as e:
+                outcome["error"] = e.code
+
+        thread = threading.Thread(target=second)
+        thread.start()
+        # The second link passed its check and waits on the uncommitted row's unique key.
+        deadline = time.monotonic() + 10
+        while not watch.execute("SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE "
+                                "'INSERT INTO member_people%'").fetchone():
+            assert time.monotonic() < deadline and thread.is_alive()
+            time.sleep(0.05)
+        other.commit()
+        thread.join(10)
+    assert outcome == {"error": "person_already_linked"}
+    assert [r["member_id"] for r in store.query("SELECT member_id FROM member_people")] == ["adult-b"]
+
+
+# spec: ANYM-554
+def test_migration_6_leaves_every_existing_table_as_version_5_code_reads_it():
+    s = Store(os.environ["FCS_TEST_DSN"], schema="test_" + uuid4().hex)
+
+    def shape():
+        return (
+            s.query("SELECT table_name,column_name,data_type,is_nullable,column_default FROM "
+                    "information_schema.columns WHERE table_schema=%s AND table_name<>'member_people' "
+                    "ORDER BY 1,2", (s.schema,)),
+            s.query("SELECT c.conrelid::regclass::text AS t,c.conname,pg_get_constraintdef(c.oid) AS d FROM "
+                    "pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname=%s AND "
+                    "c.conrelid::regclass::text<>'member_people' ORDER BY 1,2", (s.schema,)),
+            s.query("SELECT tablename,indexname,indexdef FROM pg_indexes WHERE schemaname=%s AND "
+                    "tablename<>'member_people' ORDER BY 1,2", (s.schema,)),
+        )
+
+    try:
+        s.migrate(through=5)
+        before = shape()
+        s.migrate()
+        assert shape() == before
+        assert s.one("SELECT max(version) AS v FROM migrations")["v"] == 6
+    finally:
+        try:
+            s.drop_test_schema()
+        finally:
+            s.close()
 
 
 # spec: ANYM-554

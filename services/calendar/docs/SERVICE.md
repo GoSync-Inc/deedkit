@@ -259,8 +259,9 @@ People (ANYM-554): the owner links a member to a messaging person UUID with `ser
 --person UUID` (`--group`, default `family`; one person is one member of a family, else `person_already_linked`; the
 answer names the `previous` person). Undo: `service member-person --member M --unlink` deletes that link row, or a
 relink to `previous`. A `people` entry in the UUID form that is not a member ID resolves only through that link, to an
-enabled member of the caller's family: an unlinked person, one linked in another family or a disabled member is
-`not_found` with `next` `calendar_members`; a UUID is never matched against names. Schema 6 adds the table
+enabled member of the caller's family whose bound calendars the caller can read for availability: an unlinked
+person, one linked in another family, a disabled member or one with a calendar the caller cannot read is the same
+`not_found` with `next` `calendar_members`, before any selection; a UUID is never matched against names. Schema 6 adds the table
 `member_people` (group_id, member_id, person_uuid, linked_at; additive, no foreign key): the calendar keeps the UUID
 only and reads nothing from messaging. Only `fcs_gateway` may read it (`db-roles` after `migrate`); before that every
 person UUID is `not_found` and names and member IDs work as before. `calendar_schedule` takes no member argument.
