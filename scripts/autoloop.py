@@ -644,6 +644,17 @@ def finish(state, name, now):
     return returned
 
 
+def end(state, name, now):
+    """The container runner's last step for a build (ANYM-574): a run still `unknown` or `started` ended without
+    `finish` (a failed start, a stop, the time limit), so it is interrupted with its whole reservation kept, and its
+    slot, lane and paths are free; any other intent, or none, is left as it is."""
+    intent = stored(state, name)
+    if not intent or intent['kind'] != 'build' or intent['status'] not in ('unknown', 'started'):
+        return intent['status'] if intent else 'no intent'
+    put(state, dict(intent, status='interrupted', ended_at=triage.stamp(now)))
+    return 'interrupted'
+
+
 def gate(state, name, running=('unknown', 'started')):
     """None when a worker may go on, else why not: PAUSE, a held card, a dropped item or no live intent."""
     if (state / 'PAUSE').exists():
@@ -2091,9 +2102,9 @@ def status(state, now):
 def main(argv_=None):
     parser = argparse.ArgumentParser(description='Feedback autoloop driver (docs/operations/feedback-autoloop.md).')
     parser.add_argument('action', choices=['tick', 'fence', 'resume', 'status', 'gate', 'finish', 'hold', 'release', 'read',
-                                           'decline', 'large', 'bind', 'report', 'review-run'])
+                                           'decline', 'large', 'bind', 'report', 'review-run', 'end'])
     parser.add_argument('name', nargs='?',
-                        help='the intent (gate, finish, decline, large, bind, review-run) or the card (hold, release)')
+                        help='the intent (gate, finish, decline, large, bind, review-run, end) or the card (hold, release)')
     parser.add_argument('--reason', choices=sorted(DECLINED), help='decline: the reason code of the review reject')
     parser.add_argument('--card', help='bind: the card ANYM-n the worker created')
     parser.add_argument('--head', help='review-run: the exact commit the controller reviews')
@@ -2155,6 +2166,8 @@ def main(argv_=None):
         with own_lock(args.state):
             if args.action == 'finish':
                 print(f'finished; {finish(args.state, args.name, now)} s returned')
+            elif args.action == 'end':
+                print(f'end: {args.name} {end(args.state, args.name, now)}')
             elif args.action == 'bind':
                 bind(args.state, args.name, args.card)
                 print(f'bound: {args.name} {args.card}')

@@ -4,9 +4,9 @@
 The runner container sits on an internal Docker network with no route out; this proxy is its only way out. It
 accepts `CONNECT <name>:443` for the names in ALLOWED (GitHub, the Anthropic API, Tiden and the package registries)
 and nothing else: no plain HTTP, no other port, no IP literal, and no name that resolves to a private, loopback,
-link-local, carrier-grade NAT (the tailnet) or otherwise non-global address. The tunnel's first TLS record must
-be a ClientHello whose server name equals the CONNECT name, so an allowed name cannot carry a TLS session to another
-name on a shared address.
+link-local, carrier-grade NAT (the tailnet), IPv4-in-IPv6 (NAT64, 6to4, Teredo) or otherwise non-global address.
+The tunnel's first TLS record must be a ClientHello whose server name equals the CONNECT name, so an allowed name
+cannot carry a TLS session to another name on a shared address.
 
     proxy.py [--port 3128]
 """
@@ -36,10 +36,18 @@ def allowed(host, port):
     return port == PORT and isinstance(host, str) and bool(NAME.fullmatch(host)) and host in ALLOWED
 
 
+# IPv6 ranges that carry an IPv4 address (NAT64, 6to4, Teredo, IPv4-mapped and -compatible, SIIT): through a
+# translator they can reach a private or tailnet IPv4 address, so they never pass, whatever `is_global` says.
+TRANSLATED = tuple(ipaddress.ip_network(n) for n in (
+    '64:ff9b::/96', '64:ff9b:1::/48', '2002::/16', '2001::/32', '::ffff:0:0/96', '::/96', '::ffff:0:0:0/96'))
+
+
 def public(addresses):
     """The addresses that are global unicast; a name with any other address is refused whole (rebinding)."""
     found = [ipaddress.ip_address(a) for a in addresses]
-    return [str(a) for a in found] if found and all(a.is_global and not a.is_multicast for a in found) else []
+    return [str(a) for a in found] if found and all(
+        a.is_global and not a.is_multicast and not any(a in n for n in TRANSLATED if n.version == a.version)
+        for a in found) else []
 
 
 async def resolve(host):

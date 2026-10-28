@@ -13,7 +13,9 @@ from the launcher's own environment. One mount: a read-only control directory (t
 file, rewritten from the host state every 30 s; a stop there, the build time limit or a closed terminal stops the
 container). The outbox stays inside the container: after it ends the launcher copies out at most one small regular
 file, keeps its `finish`, `decline` and `large` requests for this intent in a pending file, removes the container and
-applies them on the host, retrying while the tick holds the lock. What it cannot apply stays pending:
+applies them on the host, retrying while the tick holds the lock, then ends the intent there (`autoloop.py end`: a
+build that did not finish is interrupted and no longer holds a slot, a lane or paths). Every wait on a child process
+has a bound. What it cannot apply stays pending:
 
     launch.py apply INTENT        # apply what a build left pending (or collect it from a stopped container first)
 """
@@ -27,6 +29,7 @@ import re
 import shutil
 import signal
 import io
+import select
 import tarfile
 import subprocess
 import sys
@@ -41,7 +44,7 @@ import autoloop  # noqa: E402
 FILES = ('Dockerfile', 'entrypoint.sh', 'proxy.py', 'selfcheck.py')
 IMAGE = 'deedkit-autoloop-runner'
 NETWORK, PROXY = 'deedkit_autoloop', 'deedkit_autoloop_proxy'
-PROXY_URL = f'http://{PROXY}:3128'
+PROXY_URL = f'http://{PROXY}:3128'  # the names' prefix: each image has its own proxy (proxy_name)
 RUNS = Path.home() / '.cache' / 'deedkit-autoloop-runner'
 REPO = 'GoSync-Inc/deedkit'
 KEYCHAIN = 'Claude Code-credentials'
@@ -54,6 +57,9 @@ ENV = (*SECRETS, 'TIDEN_BASE_URL', 'TIDEN_WORKSPACE_ID', 'GIT_AUTHOR_NAME', 'GIT
        'AUTOLOOP_PROD_HOST', 'AUTOLOOP_REPO', 'AUTOLOOP_MODE')
 MOUNT = '/run/autoloop'
 POLL, STOP_SECONDS, CALL = 30, 20, 120
+REAP = 5  # seconds a killed child gets to be reaped; past them it is left to the OS
+IDLE = 3600  # another image's proxy, unused this long by a launcher and serving no container, is stopped
+CHECK = 'deedkit_autoloop_check'
 MAX_REQUESTS, MAX_LINE = 10, 512
 MAX_OUTBOX = MAX_REQUESTS * (MAX_LINE + 1)  # bytes of the outbox file the host reads
 OUTBOX = f'{MOUNT}/outbox/requests.jsonl'
@@ -73,15 +79,50 @@ def tag():
     return f'{IMAGE}:{digest.hexdigest()[:16]}'
 
 
+def supervise(argv, env=None, timeout=CALL, capture=True):
+    """(exit code, stdout, stderr) of one child, every wait on it bounded. `subprocess.run` and Popen's `with` wait
+    on a killed child without a bound, so a child past its time is killed here and reaped for at most REAP seconds;
+    the time-out is raised. capture=False: the child keeps the terminal (the attached build client)."""
+    pipe = subprocess.PIPE if capture else None
+    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL if capture else None, stdout=pipe, stderr=pipe, text=True,
+                             env=env)
+    try:
+        out, err = child.communicate(timeout=timeout)
+        return child.returncode, out or '', err or ''
+    except subprocess.TimeoutExpired:
+        child.kill()
+        try:
+            child.communicate(timeout=REAP)
+        except subprocess.TimeoutExpired:
+            pass  # a grandchild holds the pipes: closed below, never waited on
+        raise
+    finally:
+        reap(child)
+
+
+def reap(child):
+    """A child still running is killed and waited on for REAP seconds at most; its pipes are closed (no other thread
+    reads them, so a close never waits on a lock)."""
+    if child.poll() is None:
+        child.kill()
+        try:
+            child.wait(REAP)
+        except subprocess.TimeoutExpired:
+            pass  # a child that outlives SIGKILL is left to the OS
+    for stream in (child.stdout, child.stderr):
+        if stream:
+            stream.close()
+
+
 def call(argv, env=None, timeout=CALL):
     """One command whose stdout is returned; a failure is refused with its first stderr line, never a secret."""
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+        code, out, err = supervise(argv, env, timeout)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise Refused(f'{argv[0]} {argv[1] if len(argv) > 1 else ""}: {type(error).__name__}') from None
-    if done.returncode:
-        raise Refused(f'{" ".join(argv[:2])}: exit {done.returncode}: {done.stderr.strip()[:200]}')
-    return done.stdout
+    if code:
+        raise Refused(f'{" ".join(argv[:2])}: exit {code}: {err.strip()[:200]}')
+    return out
 
 
 def image(docker=call):
@@ -93,15 +134,22 @@ def image(docker=call):
     return name
 
 
+def proxy_name(name):
+    """The proxy of one image: a build of another image never loses its proxy when the runner changes."""
+    return f"{PROXY}_{name.rpartition(':')[2]}"
+
+
 def proxy_argv(name):
-    return ['docker', 'run', '--detach', '--rm', '--name', PROXY, '--network', 'bridge', '--cap-drop', 'ALL',
+    return ['docker', 'run', '--detach', '--rm', '--name', proxy_name(name), '--network', 'bridge', '--cap-drop', 'ALL',
             '--security-opt', 'no-new-privileges', '--read-only', '--memory', '256m', '--pids-limit', '256',
-            '--log-opt', 'max-size=1m', '--log-opt', 'max-file=1',
+            '--log-opt', 'max-size=1m', '--log-opt', 'max-file=1', '--label', 'deedkit.autoloop=proxy',
             '--entrypoint', 'python3', name, '/opt/runner/proxy.py']
 
 
-def network(name, docker=call):
-    """The internal network (no route out) and the proxy, the one container on both it and the default bridge."""
+def network(name, docker=call, runs=RUNS, clock=time.time):
+    """The internal network (no route out) and this image's proxy, the one container on both it and the default
+    bridge; its name is returned. Another image's proxy is stopped only when no container uses it and no launcher
+    has named it for IDLE seconds (each launcher stamps its proxy's mark before its container starts)."""
     try:
         docker(['docker', 'network', 'inspect', NETWORK])
     except Refused:
@@ -111,25 +159,43 @@ def network(name, docker=call):
             pass  # a second launcher created it meanwhile: the inspect below decides
     if json.loads(docker(['docker', 'network', 'inspect', NETWORK]))[0].get('Internal') is not True:
         raise Refused(f'network {NETWORK} is not internal')
-    if proxy_image(docker) == name:
-        return
-    if proxy_image(docker):  # an older image's proxy: replaced, after `--rm` has removed it
-        docker(['docker', 'stop', PROXY])
-        for _ in range(30):
-            if not proxy_image(docker):
-                break
-            time.sleep(1)
+    proxy, marks = proxy_name(name), runs / 'proxies'
+    for path in (runs, marks):
+        path.mkdir(mode=0o700, exist_ok=True)
+    (marks / proxy).touch()
+    if proxy_image(docker, proxy) != name:
+        try:
+            docker(proxy_argv(name))
+            docker(['docker', 'network', 'connect', NETWORK, proxy])
+        except Refused:
+            if proxy_image(docker, proxy) != name:  # not a second launcher's start either
+                raise
+    retire(proxy, docker, marks, clock)
+    return proxy
+
+
+def retire(mine, docker, marks, clock):
+    """Stop the other images' idle proxies; one still in use, or one this cannot tell about, is kept."""
     try:
-        docker(proxy_argv(name))
-        docker(['docker', 'network', 'connect', NETWORK, PROXY])
+        others = docker(['docker', 'ps', '--all', '--filter', 'label=deedkit.autoloop=proxy', '--format',
+                         '{{.Names}}']).split()
     except Refused:
-        if proxy_image(docker) != name:  # not a second launcher's start either
-            raise
+        return
+    for other in others:
+        mark = marks / other
+        try:
+            if other == mine or (mark.exists() and clock() - mark.stat().st_mtime < IDLE) or docker(
+                    ['docker', 'ps', '--all', '--quiet', '--filter', f'label=deedkit.autoloop.proxy={other}']).strip():
+                continue
+            docker(['docker', 'stop', other], timeout=STOP_SECONDS + 30)
+            mark.unlink(missing_ok=True)
+        except (Refused, OSError):
+            continue
 
 
-def proxy_image(docker=call):
+def proxy_image(docker=call, proxy=PROXY):
     try:
-        return docker(['docker', 'inspect', '--format', '{{.Config.Image}}', PROXY]).strip() or None
+        return docker(['docker', 'inspect', '--format', '{{.Config.Image}}', proxy]).strip() or None
     except Refused:
         return None
 
@@ -184,12 +250,14 @@ def prompt(intent, card):
             'subagent; the controller\'s Astra review on the host is the review of record.')
 
 
-def run_argv(name, image_name, env_names, control=None, tty=False, remove=True):
+def run_argv(name, image_name, env_names, control=None, tty=False, remove=True, proxy=PROXY):
     """`docker run` for one runner container: the internal network, no capabilities, one read-only mount at most. A
-    build keeps its container after it ends (`remove=False`) until the launcher has copied the outbox out."""
+    build keeps its container after it ends (`remove=False`) until the launcher has copied the outbox out. Its proxy
+    label keeps that proxy running while the container exists."""
     argv = ['docker', 'run', *(['--rm'] if remove else []), '--interactive', *(['--tty'] if tty else []), '--name', name,
             '--network', NETWORK, '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--init',
-            '--memory', '8g', '--pids-limit', '4096', '--label', 'deedkit.autoloop=runner', '--log-driver', 'none']
+            '--memory', '8g', '--pids-limit', '4096', '--label', 'deedkit.autoloop=runner',
+            '--label', f'deedkit.autoloop.proxy={proxy}', '--log-driver', 'none']
     if control:
         argv += ['--mount', f'type=bind,source={control},target={MOUNT}/control,readonly']
     for env_name in env_names:
@@ -197,9 +265,9 @@ def run_argv(name, image_name, env_names, control=None, tty=False, remove=True):
     return [*argv, image_name]
 
 
-def settings(intent=None, card=None, host='', mode='build'):
-    out = {'HTTPS_PROXY': PROXY_URL, 'HTTP_PROXY': PROXY_URL, 'https_proxy': PROXY_URL, 'http_proxy': PROXY_URL,
-           'NO_PROXY': '', 'no_proxy': '', 'AUTOLOOP_MODEL': autoloop.MODEL, 'AUTOLOOP_PROD_HOST': host,
+def settings(intent=None, card=None, host='', mode='build', proxy=PROXY):
+    url = f'http://{proxy}:3128'
+    out = {'HTTPS_PROXY': url, 'HTTP_PROXY': url, 'https_proxy': url, 'http_proxy': url, 'NO_PROXY': '', 'no_proxy': '', 'AUTOLOOP_MODEL': autoloop.MODEL, 'AUTOLOOP_PROD_HOST': host,
            'AUTOLOOP_REPO': REPO, 'AUTOLOOP_MODE': mode}
     if mode == 'build':
         out.update(AUTOLOOP_RUNNER=MOUNT, AUTOLOOP_INTENT=intent, AUTOLOOP_CARD=card, AUTOLOOP_PROMPT=prompt(intent, card),
@@ -250,35 +318,46 @@ def collect(name, popen=subprocess.Popen, timeout=CALL):
     The entrypoint makes the file, so a failed or unfinished copy is None (the container is kept), while an
     oversized or malformed one is rejected content ('')."""
     limit = MAX_OUTBOX + 16384  # the tar headers and padding around one small file
-    got = []
     try:
         copy = popen(['docker', 'cp', f'{name}:{OUTBOX}', '-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                      stdin=subprocess.DEVNULL)
     except OSError:
         return None
     try:  # no `with`: its exit waits on the child without a bound; every wait here has one
-        reader = threading.Thread(target=lambda: got.append(copy.stdout.read(limit) if copy.stdout else b''),
-                                  daemon=True)
-        reader.start()
-        reader.join(timeout)
-        if not got:
+        got = bounded_read(copy.stdout, limit, time.monotonic() + timeout)
+        if got is None:
             return None  # no answer in time
-        if len(got[0]) >= limit:
+        if len(got) >= limit:
             return ''  # more than an outbox may hold: rejected
         try:
             code = copy.wait(timeout)
         except subprocess.TimeoutExpired:
             return None
     finally:
-        if copy.poll() is None:
-            copy.kill()
-            try:
-                copy.wait(timeout)
-            except subprocess.TimeoutExpired:
-                pass  # a child that outlives SIGKILL is left to the OS; the copy reads as failed
-        if copy.stdout:
-            copy.stdout.close()
-    return outbox_text(got[0]) if code == 0 else None
+        reap(copy)  # the pipe is read in this thread only, so its close never waits
+    return outbox_text(got) if code == 0 else None
+
+
+def bounded_read(stream, limit, deadline):
+    """Up to `limit` bytes of a pipe until its end, read without blocking; None when the deadline comes first (a
+    writer that keeps the pipe open never holds the reader)."""
+    fd, chunks, size = stream.fileno(), [], 0
+    os.set_blocking(fd, False)
+    while size < limit:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        if not select.select([fd], [], [], left)[0]:
+            continue
+        try:
+            chunk = os.read(fd, limit - size)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b''.join(chunks)
 
 
 def requests(text, intent):
@@ -368,12 +447,13 @@ def report(codes, pending):
     return 0
 
 
-def watch(state, intent, control, name, done, deadline, docker=call, clock=time.monotonic):
+def watch(state, intent, control, name, done, deadline, docker=call, clock=time.monotonic, cancelled=None):
     """Every POLL seconds: the host gate into the gate file; a stop (PAUSE, a held card, a dropped item, an ended
-    intent), the time limit or any failure of this check stops the container."""
+    intent), a cancel (a closed terminal), the time limit or any failure of this check stops the container."""
     try:
         while not done.wait(POLL):
-            why = autoloop.gate(state, intent) or ('time limit' if clock() > deadline else None)
+            why = ('cancelled' if cancelled is not None and cancelled.is_set() else None) \
+                or autoloop.gate(state, intent) or ('time limit' if clock() > deadline else None)
             write_gate(control, why)
             if why:
                 print(f'runner: STOP {why}; stopping the container', file=sys.stderr, flush=True)
@@ -404,33 +484,73 @@ def stop(name, docker=call):
     return False
 
 
+def ending(pending, intent):
+    """The host's last step for a build that is over: `end` (a run that did not finish is interrupted there and its
+    slot, lane and paths are released; a finished one is left as it is). It is pending until applied."""
+    steps = json.loads(pending.read_text()) if pending.exists() else []
+    if ['end', intent] not in steps:
+        for path in (pending.parent.parent, pending.parent):
+            path.mkdir(mode=0o700, exist_ok=True)
+        temp = pending.with_suffix('.tmp')
+        temp.write_text(json.dumps(steps + [['end', intent]]))
+        temp.replace(pending)
+    return pending
+
+
 def build(intent, card, state=autoloop.STATE, now=None):
+    """One build in its container. Any exit after the checks below (a refusal, a cancel, a failed or timed-out
+    client) stops the container with a confirmed stop before its outbox is read, then ends the intent on the host."""
     if not BUILD.fullmatch(intent) or not CARD.fullmatch(card):
         raise Refused('usage: launch.py build autoloop-build-<slug> ANYM-<n>')
+    if exists(intent) or (RUNS / intent / 'pending.json').exists():
+        raise Refused(f'a container or pending requests of {intent} exist: run `launch.py apply {intent}` first')
+    done, cancelled = threading.Event(), threading.Event()
+    numbers = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)  # a closed terminal (fence, hold) stops it too
+    before = {number: signal.signal(number, lambda *_: (cancelled.set(), stop(intent))) for number in numbers}
+    refused, code = None, 1
+    try:
+        code = contained(intent, card, state, now, done, cancelled)
+    except Refused as error:
+        refused = error
+    finally:
+        try:
+            if not stop(intent):  # supervision ends only after a confirmed stop
+                raise Refused(f'container {intent} still runs; once it stops run `launch.py apply {intent}`')
+        finally:
+            done.set()
+            for number, handler in before.items():
+                signal.signal(number, handler)
+    pending = ending(gather(intent), intent)
+    result = report(apply(pending), pending)
+    if refused:
+        raise refused
+    return result or code
+
+
+def contained(intent, card, state, now, done, cancelled):
+    """The gate, the image, the proxy and the logins, then the attached container under the watcher; a cancel latched
+    before the start never starts it, and the client is bounded by the build limit even if the watcher fails."""
     why = autoloop.gate(state, intent)
     if why:
         raise Refused(f'STOP {why}')
-    if exists(intent) or (RUNS / intent / 'pending.json').exists():
-        raise Refused(f'a container or pending requests of {intent} exist: run `launch.py apply {intent}` first')
     now = now or datetime.now(timezone.utc)
     control = prepare(intent)
     write_gate(control, None)
     name_ = image()
-    network(name_)
-    values = {**logins(now, autoloop.LIMITS['build']), **settings(intent, card, production_host())}
-    argv = run_argv(intent, name_, sorted(values), control, sys.stdin.isatty(), remove=False)
-    done = threading.Event()
-    for number in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):  # a closed terminal (fence, hold) stops it too
-        signal.signal(number, lambda *_: (done.set(), stop(intent)))
+    proxy = network(name_)
+    values = {**logins(now, autoloop.LIMITS['build']), **settings(intent, card, production_host(), proxy=proxy)}
+    argv = run_argv(intent, name_, sorted(values), control, sys.stdin.isatty(), remove=False, proxy=proxy)
     deadline = time.monotonic() + autoloop.LIMITS['build']
-    watcher = threading.Thread(target=watch, args=(state, intent, control, intent, done, deadline), daemon=True)
+    watcher = threading.Thread(target=watch, args=(state, intent, control, intent, done, deadline),
+                               kwargs={'cancelled': cancelled}, daemon=True)
+    if cancelled.is_set():
+        raise Refused('cancelled before the container started')
     watcher.start()
     try:
-        code = subprocess.run(argv, env=client_env(values)).returncode
-    finally:
-        done.set()
-    pending = gather(intent)
-    return report(apply(pending), pending) or code
+        return supervise(argv, client_env(values), autoloop.LIMITS['build'] + 2 * POLL + 2 * (STOP_SECONDS + 30),
+                         capture=False)[0]
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Refused(f'the build client: {type(error).__name__}') from None
 
 
 def resume(intent):
@@ -438,22 +558,27 @@ def resume(intent):
         raise Refused('usage: launch.py apply autoloop-build-<slug>')
     if running(intent) and not stop(intent):
         raise Refused(f'container {intent} still runs')
-    pending = gather(intent)
+    pending = ending(gather(intent), intent)
     return report(apply(pending), pending)
 
 
 def check(now=None):
-    """The card's first step: the isolation check and one model call in a container with the subscription login."""
+    """The card's first step: the isolation check and one model call in a container with the subscription login. The
+    container is stopped (and so removed) on every exit, also after a time-out."""
     now = now or datetime.now(timezone.utc)
     name_ = image()
-    network(name_)
-    values = {**logins(now, 300), **settings(host=production_host(), mode='check')}
-    done = subprocess.run(run_argv('deedkit_autoloop_check', name_, sorted(values)), env=client_env(values),
-                          capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
-    sys.stderr.write(done.stderr[-4000:])
-    answer = done.stdout.strip().lower()
-    print(f'check: exit {done.returncode}; model answer {answer[:40]!r}')
-    return 0 if done.returncode == 0 and 'ok' in answer else 1
+    proxy = network(name_)
+    values = {**logins(now, 300), **settings(host=production_host(), mode='check', proxy=proxy)}
+    try:
+        code, out, err = supervise(run_argv(CHECK, name_, sorted(values), proxy=proxy), client_env(values), 600)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        code, out, err = type(error).__name__, '', ''
+    finally:
+        stop(CHECK)
+    sys.stderr.write(err[-4000:])
+    answer = out.strip().lower()
+    print(f'check: exit {code}; model answer {answer[:40]!r}')
+    return 0 if code == 0 and 'ok' in answer else 1
 
 
 def main(argv=None):

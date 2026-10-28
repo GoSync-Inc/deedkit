@@ -239,11 +239,14 @@ directory, Docker socket or login directory); the one mount is a read-only contr
   token. No new key. They sit in the container's Docker metadata (`docker inspect`, readable by
   the owner's user only) until the launcher removes the container at the end.
 - **Egress.** The container sits on the internal Docker network `deedkit_autoloop` with no route
-  out. Its only way out is `proxy.py` (`deedkit_autoloop_proxy`, the one container on both that
-  network and the default bridge): `CONNECT` on port 443 to GitHub, the Anthropic API, Tiden, PyPI,
-  npm and the Go module proxy, and nothing else. No IP literal, no name that resolves to a
-  private, loopback, link-local or tailnet address, and the tunnel's TLS ClientHello must name
-  the same host. The check is on the CONNECT name and the TLS server name only: the proxy cannot
+  out. Its only way out is `proxy.py` (`deedkit_autoloop_proxy_<image hash>`, one per runner image,
+  the one container on both that network and the default bridge): `CONNECT` on port 443 to GitHub,
+  the Anthropic API, Tiden, PyPI, npm and the Go module proxy, and nothing else. No IP literal, no
+  name that resolves to a private, loopback, link-local or tailnet address or to an IPv6 address
+  that carries an IPv4 one (NAT64, 6to4, Teredo, mapped), and the tunnel's TLS ClientHello must
+  name the same host. A new runner image starts its own proxy; another image's proxy is stopped
+  only when no container uses it and no launcher has named it for an hour, so a running build
+  keeps its proxy. The check is on the CONNECT name and the TLS server name only: the proxy cannot
   see the HTTP host inside TLS, so an upstream that serves several sites on one address and
   routes by that host (a CDN front) could carry a request to a site not on the list. What the
   proxy does stop is any route to the production host, the tailnet and private addresses; a
@@ -252,29 +255,36 @@ directory, Docker socket or login directory); the one mount is a read-only contr
   forbidden mount, or route to the production host (directly or through the proxy) stops the
   container. `launch.py check` runs the check and one model call: the subscription login works in
   a container.
-- **Agent.** The agent CLI runs non-interactively (`claude -p`) and ends after its last answer;
-  the launcher stops the container at the 4-hour build limit. There is no Codex in the image: the
+- **Agent.** The agent CLI runs non-interactively (`claude -p`, no saved session) and ends after
+  its last answer; the launcher stops the container at the 4-hour build limit. Every wait of the
+  launcher on a child process (docker, gh, the attached build client) has a time bound; a child
+  past it is killed and reaped for at most 5 s. There is no Codex in the image: the
   worker's own review rounds run as an Opus subagent (its prompt says so), and the controller's
   Astra review of the head on the host (above) stays the review of record.
 - **Gate and ends.** Inside the container `autoloop.py gate|finish|decline|large` work through the
   control directory and an outbox file inside the container: `gate` reads the gate file, which
   the launcher rewrites from the host state every 30 s; a stop there (`PAUSE`, a held card, a
   dropped item), a failed gate check or a closed terminal (fence, hold) stops the container
-  (`docker kill` if `stop` does not; a container still running then is said in the terminal).
+  (`docker kill` if `stop` does not; a container still running then is said in the terminal). A
+  terminal closed before the container starts cancels the start. Every exit of the launcher stops
+  the container (confirmed by Docker) before it reads the outbox.
   `finish`, `decline` and `large` for this intent go to the outbox. After the container ends the
   launcher copies out the outbox with `docker cp` (one regular file of at most 5 KiB, else
   nothing), keeps the valid requests in `~/.cache/deedkit-autoloop-runner/<intent>/pending.json`,
   removes the container and applies them on the host, retrying for 20 minutes while a tick holds
-  the lock. What it could not apply stays in that file, the terminal says so, and
-  `launch.py apply <intent>` applies it later; a new build of the intent waits until then.
+  the lock, then `autoloop.py end <intent>` (launcher only, refused inside): a run that did not
+  `finish` (a failed start, a stop, the time limit) is `interrupted`, keeps its whole reservation
+  and frees its slot, lane and paths; the controller parks it like a vanished worker. What it
+  could not apply stays in that file, the terminal says so, and `launch.py apply <intent>` applies
+  it later; a new build of the intent waits until then.
   Other commands are refused inside. A copy that fails or does not answer keeps the container
   and applies nothing; `launch.py apply <intent>` tries again.
 - **Logs.** The runner container has no Docker log (`--log-driver none`); the worker's output
   stays in the build terminal's scrollback only. The proxy keeps one Docker log of at most 1 MB
   (refused names, cut to 64 characters) until it is stopped (`docker stop
-  deedkit_autoloop_proxy`, which also removes it).
-- **Undo.** `docker stop <intent>`; `docker stop deedkit_autoloop_proxy`; to start builds with the
-  worker preset again, revert ANYM-574's `build_start`.
+  deedkit_autoloop_proxy_<image hash>`, which also removes it).
+- **Undo.** `docker stop <intent>`; `docker stop deedkit_autoloop_proxy_<image hash>`; to start
+  builds with the worker preset again, revert ANYM-574's `build_start`.
 
 ## The live switch
 
