@@ -234,6 +234,19 @@ def test_db_roles_check_names_each_drift_and_writes_nothing(fcs_home, change, li
 
 
 # spec: ANYM-601
+@pytest.mark.parametrize("missing", ["home", "service"])
+def test_db_roles_check_creates_no_missing_home_or_service_directory(tmp_path, missing):
+    home = tmp_path / "home"
+    if missing == "service":
+        home.mkdir()
+    before = sorted(str(p) for p in tmp_path.rglob("*"))
+    with pytest.raises(CalendarError) as caught:
+        run(["db-roles", "--check"], home)
+    assert caught.value.code == "existing_runtime_configuration_required"
+    assert sorted(str(p) for p in tmp_path.rglob("*")) == before
+
+
+# spec: ANYM-601
 def test_db_roles_check_reads_an_n_minus_one_schema_against_its_own_version(fcs_home):
     home, dsn = fcs_home
     store = Store(dsn)

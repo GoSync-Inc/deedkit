@@ -333,6 +333,10 @@ def run(argv, home):
             raise CalendarError("existing_runtime_configuration_required")
         if args.action == "worker" and not (home / "service/vault/key").is_file():
             raise CalendarError("existing_vault_required")
+    if getattr(args, "check", False):
+        # ANYM-601: the read-only check creates nothing, not even the service directory.
+        if (home / "service").is_symlink() or not (home / "service" / "runtime.json").is_file():
+            raise CalendarError("existing_runtime_configuration_required")
     root = private_dir(home / "service")
     profile = args.action if args.action in ("serve", "worker") else "runtime"
     if profile == "serve":
