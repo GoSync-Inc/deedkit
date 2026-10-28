@@ -250,12 +250,13 @@ def move_pins(host,paths,image,revision):
         for p in paths:write_pins(p,image,revision)
         # The pairs before this step, for the documented undo (a pin step back to them).
         local.write_maintenance_json(PINS_PREVIOUS,{'v':1,'pins':journal['from']},dir_fd=host)
-        unlink_entry(host,PINS_SWITCH)
     except BaseException:
         if not r2.CANCELLED:
             try:undo_pins(host,journal)
             except Exception:pass  # the journal stays: recover_pins finishes it
         raise
+    # The commit point: once the journal is gone every config holds the new pair and nothing rolls back.
+    os.unlink(PINS_SWITCH,dir_fd=host);local.fsync_dir(host)
 
 
 def undo_pins(host,journal):
@@ -282,16 +283,24 @@ def recover_pins(host,paths=None):
 
 
 def finish_pin_switch(config):
-    """Before this instance uses a pin: a stopped pin step's configs back on their old pairs. No pin step
-    or follow runs meanwhile (each holds every instance's lock, this one's too) and no other instance
-    passed this point since the journal was written. Returns this instance's config path when it did."""
+    """Before this instance uses a pin: a stopped pin step's configs back on their old pairs, when this
+    instance is one of them. Its writer held every listed instance's lock, this one's too, so it is gone,
+    and no listed instance passed this point since. A journal that does not list this instance may
+    belong to a live writer: it is left alone. Returns this instance's config path when it recovered."""
     with host_directory(config) as host:
-        try:paths=recover_pins(host)
+        try:
+            _,journal=r2.read_root(host,PINS_SWITCH,missing=True)
+            if journal is None:return None
+            olds=journal.get('from') if isinstance(journal,dict) else None
+            if not isinstance(olds,dict) or any(not isinstance(p,str) or not Path(p).is_absolute() for p in olds):
+                raise ValueError('pins_switch_unresolved')
+            own=next((Path(p) for p in olds if load_config(p)['directory']==config['directory']),None)
+            if own is None:return None
+            recover_pins(host)
         except Exception:
             if r2.CANCELLED:raise
             raise RuntimeError('verifier_pins_unfinished') from None
-    if paths is None:return None
-    return next((p for p in paths if load_config(p)['directory']==config['directory']),None)
+    return own
 
 
 @contextmanager

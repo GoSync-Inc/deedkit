@@ -1710,3 +1710,33 @@ def test_follow_self_test_restores_a_synthetic_calendar_bundle_with_the_calendar
     assert engine.scripts[-1]==f.CALENDAR_FIXTURE_SCRIPT and engine.workers[0]['profile']=='calendar'
     assert all('-calendar-' in name for name in engine.created) and engine.created
     assert list(directory.iterdir())==[] and not engine.resources
+
+
+# spec: ANYM-609
+def test_a_verifier_outside_a_running_pin_step_never_undoes_it(pins,monkeypatch):
+    s=pins;s.write_json(s.v.INSTANCES_FILE,{'v':1,'verifier_configs':[str(s.paths[0])]});original=os.replace;ran=[]
+    def replace(src,dst,**kw):
+        result=original(src,dst,**kw)
+        if dst=='verifier.json' and not ran:
+            # Between the writer's config writes, the calendar instance (not in its instances file) runs.
+            ran.append(s.v.run(s.calendar,client=s.calendar_cloud,engine=s.engine))
+        return result
+    monkeypatch.setattr(os,'replace',replace)
+    assert s.update()['status']=='pinned' and ran[0]['status']=='verified'
+    assert s.pairs()==[(NEW_IMAGE,HEAD),s.old] and not (s.host/'pins-switch.json').exists()
+
+
+# spec: ANYM-609
+def test_a_pin_step_failing_after_its_commit_point_never_rolls_back(pins,monkeypatch):
+    s=pins;original_unlink=os.unlink;original_replace=os.replace;committed=[];writes=[]
+    def unlink(name,*args,**kw):
+        original_unlink(name,*args,**kw)
+        if name=='pins-switch.json':committed.append(name);raise OSError('synthetic failure after the unlink')
+    def replace(src,dst,**kw):
+        if committed and dst=='verifier.json':
+            writes.append(dst)
+            if len(writes)==2:raise OSError('synthetic crash in a rollback')
+        return original_replace(src,dst,**kw)
+    monkeypatch.setattr(os,'unlink',unlink);monkeypatch.setattr(os,'replace',replace)
+    with pytest.raises(OSError):s.update()
+    assert committed and s.pairs()==[(NEW_IMAGE,HEAD)]*2 and not (s.host/'pins-switch.json').exists()

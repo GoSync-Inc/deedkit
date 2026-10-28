@@ -491,10 +491,12 @@ enabled connection, its token and a disabled one), made and encrypted by the
 image under test. Then it journals every config's old pair in
 `pins-switch.json`, replaces each config atomically with only its two pins
 changed, writes the old pairs to `pins-previous.json` and removes the journal.
-A failure before the journal is removed puts every config back. After a stop or
-crash between two writes the journal stays, and the first verifier, follow or
-pin step that runs puts every config back on its old pair before any instance
-uses a pin (a verifier that cannot fails `verifier_pins_unfinished`). It prints
+Removing the journal is the commit point: a failure before it puts every config
+back, nothing after it rolls back. After a stop or crash between two writes the
+journal stays, and the first follow, pin step or verifier of a listed instance
+that runs puts every config back on its old pair before any listed instance uses
+a pin (a verifier that cannot fails `verifier_pins_unfinished`). A verifier the
+journal does not list leaves it alone: its writer may still be running. It prints
 `{"v":1,"status":"pinned","helper_revision":...}`, or the safe code on stderr
 and exit 1.
 
