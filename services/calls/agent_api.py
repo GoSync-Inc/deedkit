@@ -96,6 +96,8 @@ METHODS = {
     "call": (CallArgs, "calls:dial"),
     "call_result": (CallResultArgs, "calls:read"),
 }
+# call prepares its brief too: the gateway catalog lists both scopes, and the backend checks both (ANYM-551).
+ALSO_REQUIRES = {"call": "calls:prepare"}
 SCOPES = {scope for _, scope in METHODS.values()} - {""}
 BODY_LIMIT = 16384
 
@@ -538,7 +540,7 @@ class AgentAPI:
             raise ServiceError("not_found_or_forbidden", 403)
         if name == "call":
             # Dialing on resolved or typed destinations: also the right to prepare a brief (ANYM-551).
-            if "calls:prepare" not in principal.scopes:
+            if ALSO_REQUIRES["call"] not in principal.scopes:
                 raise ServiceError("not_found_or_forbidden", 403)
             return await self.intents.call(
                 principal, lambda: self.admit(token, principal), self.route, "call", arguments

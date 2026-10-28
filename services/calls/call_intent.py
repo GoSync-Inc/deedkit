@@ -32,6 +32,8 @@ PREVIEW_TTL_S = 600
 MAX_WAIT_S = 25
 # A bound intent whose process died before its call row existed never reached a provider: it resumes this long.
 RESUME_S = 600
+# AGENT_API.md: records are kept 7 days for replay; after that only what stops a second dial stays.
+KEEP_S = 7 * 86400
 CHANNELS = ["phone", "whatsapp", "telegram", "sip"]
 ACCOUNT_CHANNEL = re.compile(r"(whatsapp|telegram)[-_][A-Za-z0-9_.-]{1,60}")
 CONTROL = frozenset(("dry_run", "confirm_token", "request_id", "wait_s"))
@@ -135,8 +137,12 @@ def sha(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def digest_of(payload):
+    return sha(json.dumps(payload, sort_keys=True))
+
+
 class CallIntents:
-    """Previews and bound intents of `call`, durable in the calls database; no row is ever deleted."""
+    """Previews and bound intents of `call`, durable in the calls database for KEEP_S."""
 
     def __init__(self, service, outbound, archive_factory, clock=time.time):
         self.service, self.outbound, self.archive_factory, self.clock = service, outbound, archive_factory, clock
@@ -248,6 +254,17 @@ class CallIntents:
 
     # Storage.
 
+    def _expire(self):
+        """Past KEEP_S an unbound preview goes; a bound preview keeps its token and intent, an intent its key, brief
+        and a payload digest, so a replay still returns the first call and never dials again. Caller holds the lock."""
+        old, db = self.clock() - KEEP_S, self.service.db
+        db.execute("DELETE FROM call_previews WHERE created_at<? AND intent IS NULL", (old,))
+        db.execute("UPDATE call_previews SET payload='{}', destination='{}' WHERE created_at<? AND payload!='{}'", (old,))
+        for intent_id, payload in db.execute("SELECT id,payload FROM call_intents WHERE created_at<? AND origin!='{}'",
+                                              (old,)).fetchall():
+            db.execute("UPDATE call_intents SET payload=?, origin='{}' WHERE id=?",
+                       (json.dumps({"sha256": digest_of(json.loads(payload))}), intent_id))
+
     def _preview_row(self, digest):
         row = self.service.db.execute("SELECT principal,tool,expires_at,payload,destination,brief_id,intent FROM "
                                       "call_previews WHERE token_sha256=?", (digest,)).fetchone()
@@ -282,8 +299,12 @@ class CallIntents:
                     return bound, False
             if request_id is not None:
                 bound = self._keyed(principal, tool, request_id)
+                if bound and digest is not None:
+                    # Another preview's intent holds this key (a concurrent execution won it): this token never runs.
+                    raise ServiceError("idempotency_conflict", 409, {"retryable": False})
                 if bound:
                     return bound, False
+            self._expire()
             intent_id = "intent-" + secrets.token_hex(12)
             self.service.db.execute("INSERT INTO call_intents VALUES (?,?,?,?,?,?,?,?,?,?)",
                                     (intent_id, principal, tool, request_id, json.dumps(payload), brief_id, digest,
@@ -310,8 +331,8 @@ class CallIntents:
         return await self.by_key(principal, admit, route, tool, args, payload, started)
 
     @staticmethod
-    def require(payload):
-        missing = [{"field": k, "reason": "required"} for k in ("to", "goal") if k not in payload]
+    def require(payload, fields=("to", "goal")):
+        missing = [{"field": k, "reason": "required"} for k in fields if k not in payload]
         if sum(k in payload for k in INSTRUCTION) != 1:
             missing.append({"field": "owner_instruction", "reason": "required"})
         if missing:
@@ -328,6 +349,7 @@ class CallIntents:
             preflight = {"ok": False, "error": error.code}
         token, at = secrets.token_urlsafe(24), self.clock()
         with self.service.lock:
+            self._expire()
             self.service.db.execute("INSERT INTO call_previews VALUES (?,?,?,?,?,?,?,?,?)",
                                     (sha(token), principal.id, tool, at, at + PREVIEW_TTL_S, json.dumps(payload),
                                      json.dumps({**plan["destination"], "origin": plan["origin"]}), brief["id"], None))
@@ -339,27 +361,27 @@ class CallIntents:
                 "confirm_token": token, "expires_in_s": PREVIEW_TTL_S, "next": None}
 
     async def by_token(self, principal, admit, route, tool, args, payload, started):
+        # The owner's words come with every execution, never from the stored preview.
+        self.require(payload, ())
         digest = sha(args.confirm_token)
         record = self._preview_row(digest)
         if record is None or record["principal"] != principal.id or record["tool"] != tool:
             raise ServiceError("invalid_confirm_token", 409, {"retryable": False})
         bound = self._keyed(principal.id, tool, args.request_id) if args.request_id else None
+        who = (principal, admit, route)
         if record["intent"]:
             if bound and bound != record["intent"]:
                 raise ServiceError("idempotency_conflict", 409, {"retryable": False})
-            return await self.saved(record["intent"], admit, started, args.wait_s)
+            return await self.saved(record["intent"], who, started, args.wait_s, instruction_of(payload))
         stored = record["payload"]
-        if record["expires_at"] <= self.clock():
-            raise ServiceError("preview_expired", 409, {"retryable": False, "next": {
-                "tool": "calls_call", "arguments": {**stored, "dry_run": True}}})
         given = {k: v for k, v in payload.items() if k not in INSTRUCTION}
         changed = sorted(k for k, v in given.items() if stored.get(k) != v)
-        if instruction_of(payload) is not None and instruction_of(payload) != instruction_of(stored):
+        if instruction_of(payload) != instruction_of(stored):
             changed.append("owner_instruction")
-        current = {**stored, **given}
-        if instruction_of(payload) is not None:
-            current = {**{k: v for k, v in current.items() if k not in INSTRUCTION},
-                       **{k: v for k, v in payload.items() if k in INSTRUCTION}}
+        # Like calendar_schedule (ANYM-552): an expired preview is stale, with a fresh preview and token.
+        if record["expires_at"] <= self.clock():
+            changed.append("expires_at")
+        current = {**{k: v for k, v in stored.items() if k not in INSTRUCTION}, **payload}
         plan = await self.plan(principal, current)
         if {**plan["destination"], "origin": plan["origin"]} != record["destination"]:
             changed.append("destination")
@@ -372,17 +394,18 @@ class CallIntents:
         intent_id, new = self._bind(principal.id, tool, args.request_id, stored, record["brief_id"], plan["origin"],
                                     digest)
         if not new:
-            return await self.saved(intent_id, admit, started, args.wait_s)
-        return await self.run(intent_id, admit, started, args.wait_s)
+            return await self.saved(intent_id, who, started, args.wait_s, instruction_of(payload))
+        return await self.run(intent_id, who, started, args.wait_s)
 
     async def by_key(self, principal, admit, route, tool, args, payload, started):
         if args.request_id is None:
             raise invalid([{"field": "request_id", "reason": "required"}],
                           hint="request_id is required for a live effect: choose one per intent and keep it on retries.",
                           next={"tool": "calls_call", "arguments": {**payload, "request_id": PLACEHOLDER_REQUEST_ID}})
+        who = (principal, admit, route)
         bound = self._keyed(principal.id, tool, args.request_id)
         if bound:
-            return await self.replay(bound, tool, payload, admit, started, args.wait_s)
+            return await self.replay(bound, tool, payload, who, started, args.wait_s)
         self.require(payload)
         plan = await self.plan(principal, payload)
         if plan["origin"]["destination_source"] != "owner_named":
@@ -393,19 +416,22 @@ class CallIntents:
         brief = self.prepare(principal, admit, route, plan)
         intent_id, new = self._bind(principal.id, tool, args.request_id, payload, brief["id"], plan["origin"])
         if not new:
-            return await self.replay(intent_id, tool, payload, admit, started, args.wait_s)
-        return await self.run(intent_id, admit, started, args.wait_s)
+            return await self.replay(intent_id, tool, payload, who, started, args.wait_s)
+        return await self.run(intent_id, who, started, args.wait_s)
 
-    async def replay(self, intent_id, tool, payload, admit, started, wait_s):
+    async def replay(self, intent_id, tool, payload, who, started, wait_s):
         # Same key: the binding's payload decides, never a fresh resolution, so drift never turns a replay into a conflict.
         intent = self._intent(intent_id)
-        if intent["payload"] != payload or intent["tool"] != tool:
+        if intent["payload"] not in (payload, {"sha256": digest_of(payload)}) or intent["tool"] != tool:
             raise ServiceError("idempotency_conflict", 409, {"retryable": False})
-        return await self.saved(intent_id, admit, started, wait_s)
+        return await self.saved(intent_id, who, started, wait_s)
 
-    async def run(self, intent_id, admit, started, wait_s):
+    async def run(self, intent_id, who, started, wait_s):
         """The one dial of a bound intent. A definite refusal before any call row is kept and replayed."""
+        principal, admit, route = who
         intent = self._intent(intent_id)
+        # The caller's current channel and SIP grants, before every provider attempt, as dial_call checks its brief.
+        route(principal, self.service.get_brief(intent["brief_id"]))
         self.running.add(intent_id)
         try:
             await self.outbound.dial(intent["brief_id"], instruction_of(intent["payload"]), admission=admit,
@@ -418,9 +444,17 @@ class CallIntents:
             raise
         finally:
             self.running.discard(intent_id)
-        return await self.saved(intent_id, admit, started, wait_s)
+        return await self.saved(intent_id, who, started, wait_s)
 
-    async def saved(self, intent_id, admit, started, wait_s):
+    def _refuse(self, intent_id, code, status, detail):
+        """A definite refusal of a bound intent: kept, so every replay returns it and none dials."""
+        with self.service.lock:
+            self.service.db.execute("UPDATE call_intents SET error=? WHERE id=?", (json.dumps(
+                {"code": code, "status": status, "detail": detail}), intent_id))
+            self.service.db.commit()
+        raise ServiceError(code, status, detail)
+
+    async def saved(self, intent_id, who, started, wait_s, instruction=None):
         intent = self._intent(intent_id)
         if intent["error"]:
             raise ServiceError(intent["error"]["code"], intent["error"]["status"], intent["error"]["detail"])
@@ -428,10 +462,18 @@ class CallIntents:
             raise ServiceError("in_progress", 409, {"retryable": True})
         row = self.service.db.execute("SELECT id FROM calls WHERE brief_id=?", (intent["brief_id"],)).fetchone()
         if row is None:
-            # The process died after binding and before the call row: no provider was contacted.
+            # The process died after binding and before the call row: no provider was contacted. It resumes only
+            # with the owner's same words and a destination that still resolves as it was bound.
             if self.clock() - intent["created_at"] > RESUME_S:
                 raise ServiceError("intent_expired", 409, {"retryable": False})
-            return await self.run(intent_id, admit, started, wait_s)
+            if instruction is not None and instruction != instruction_of(intent["payload"]):
+                raise ServiceError("idempotency_conflict", 409, {"retryable": False})
+            plan = await self.plan(who[0], intent["payload"])
+            brief = self.service.get_brief(intent["brief_id"])
+            if (plan["brief"]["channel"], plan["brief"]["destination"], plan["origin"]) != (
+                    brief["channel"], brief["destination"], intent["origin"]):
+                self._refuse(intent_id, "preview_stale", 409, {"changed": ["destination"], "retryable": False})
+            return await self.run(intent_id, who, started, wait_s)
         await self.wait(row[0], started, wait_s)
         return view(self.service.get_call(row[0]), intent["request_id"])
 

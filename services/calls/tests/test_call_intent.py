@@ -159,8 +159,8 @@ class Matrix:
             args["to"] = {"archive": CHAT, "typed": TYPED}[self.world.mode] if args.pop("target") == "alpha" else "x"
         if "text" in args:
             args["goal"] = args.pop("text")
-        if "confirm_token" not in args:
-            args["owner_instruction"] = ARCHIVE_WORDS if self.world.mode == "archive" else TYPED_WORDS
+        # The owner's words come with every call, also with a token: they are never read from the preview.
+        args["owner_instruction"] = ARCHIVE_WORDS if self.world.mode == "archive" else TYPED_WORDS
         if tool == "t_other":
             return self.world.other_tool(principal, args)
         return self.world.tool(principal, "call", args)
@@ -212,15 +212,21 @@ def error(result, code):
     return result
 
 
+def execute(w, token, **extra):
+    return w.tool("p1", "call", {"confirm_token": token, "owner_instruction": ARCHIVE_WORDS, **extra})
+
+
+# The matrix's case_expiry wants preview_expired; this card (criterion 2), like calendar_schedule, answers an expired
+# preview with preview_stale and changed: test_an_expired_preview_is_stale_with_changed_and_a_fresh_token.
 # spec: ANYM-551
 def test_archive_destination_meets_the_shared_token_and_key_matrix(world):
-    cases = sorted(set(CASES) - {"request_id_rules", "replay_after_drift"})
+    cases = sorted(set(CASES) - {"request_id_rules", "replay_after_drift", "expiry"})
     assert run_matrix(harness(world, "archive"), cases) == cases
 
 
 # spec: ANYM-551
 def test_owner_typed_number_meets_the_shared_token_and_key_matrix(world):
-    cases = sorted(set(CASES) - {"drift"})
+    cases = sorted(set(CASES) - {"drift", "expiry"})
     assert run_matrix(harness(world, "typed"), cases) == cases
 
 
@@ -244,7 +250,7 @@ def test_dry_run_shows_brief_destination_and_preflight_and_execution_dials_that_
     assert destination["destination_source"] == "agent_found"
     assert brief["success_fields"] == ["answer_1", "answer_2"] and "Who signs for it?" in brief["goal"]
     assert shown["preview"]["preflight"]["ok"] is True and shown["preview"]["preflight"]["dial_units"] == 1
-    done = agent.validate_result(w.tool("p1", "call", {"confirm_token": shown["confirm_token"]}))
+    done = agent.validate_result(execute(w, shown["confirm_token"]))
     call = w.service.get_call(done["call_id"])
     assert done["state"] == "succeeded" and w.effects == 1 and call["brief_id"] == brief["id"]
     # The destination's origin is derived from the archive source and is never owner_named.
@@ -257,11 +263,9 @@ def test_dry_run_shows_brief_destination_and_preflight_and_execution_dials_that_
 def test_changed_goal_questions_or_instruction_is_stale_and_never_dials(world):
     w = world()
     token = preview(w)["confirm_token"]
-    stale = error(w.tool("p1", "call", {"confirm_token": token, "goal": "Ask something else",
-                                        "questions": ["Is it paid?"]}), "preview_stale")
+    stale = error(execute(w, token, goal="Ask something else", questions=["Is it paid?"]), "preview_stale")
     assert stale["changed"] == ["goal", "questions"] and stale["confirm_token"] != token
-    stale = error(w.tool("p1", "call", {"confirm_token": token, "owner_instruction": "Call someone else instead"}),
-                  "preview_stale")
+    stale = error(execute(w, token, owner_instruction="Call someone else instead"), "preview_stale")
     assert stale["changed"] == ["owner_instruction"]
     assert w.effects == 0 and w.service.list_calls() == []
 
@@ -271,7 +275,7 @@ def test_source_drift_between_preview_and_dial_is_stale(world):
     w = world()
     token = preview(w)["confirm_token"]
     w.target["phone"] = OTHER_PHONE
-    stale = error(w.tool("p1", "call", {"confirm_token": token}), "preview_stale")
+    stale = error(execute(w, token), "preview_stale")
     assert stale["changed"] == ["destination"] and stale["preview"]["destination"]["destination"] == OTHER_PHONE
     assert w.effects == 0
 
@@ -410,3 +414,99 @@ def test_channels_and_messaging_account_names_map_or_name_the_allowed_values(wor
     w.target = {"account": "tg1", "chat_id": CHAT, "network": "telegram", "label": "Alpha", "how_resolved": "chat_id"}
     telegram = preview(w)["preview"]["destination"]
     assert (telegram["channel"], telegram["destination"]) == ("telegram", "123456789")
+
+
+# spec: ANYM-551
+def test_a_token_without_the_owners_words_never_dials(world):
+    w = world()
+    token = preview(w)["confirm_token"]
+    missing = error(w.tool("p1", "call", {"confirm_token": token}), "invalid_arguments")
+    assert {"field": "owner_instruction", "reason": "required"} in missing["field_errors"]
+    assert w.effects == 0 and w.service.list_calls() == []
+    assert agent.validate_result(execute(w, token))["state"] == "succeeded" and w.effects == 1
+
+
+# spec: ANYM-551
+def test_a_channel_revoked_between_preview_and_token_never_dials(world):
+    w = world()
+    token = preview(w)["confirm_token"]
+    w.doc["principals"][0]["channels"] = ["phone", "telegram", "sip"]
+    w.doc["revision"] += 1
+    w.save()
+    error(execute(w, token), "not_found_or_forbidden")
+    assert w.effects == 0 and w.service.list_calls() == []
+
+
+# spec: ANYM-551
+@pytest.mark.parametrize("drifted", [False, True])
+def test_a_crash_before_the_call_row_resumes_only_on_an_unchanged_destination(world, drifted):
+    w = world()
+    token = preview(w)["confirm_token"]
+
+    async def die(*args, **kwargs):
+        raise Died()
+    w.outbound.dial = die  # the process dies after binding, before any call row or provider contact
+    with pytest.raises(Crash):
+        execute(w, token)
+    if drifted:
+        w.target["phone"] = OTHER_PHONE
+        assert error(execute(w, token), "preview_stale")["changed"] == ["destination"]
+        assert error(execute(w, token), "preview_stale") and w.effects == 0 and w.service.list_calls() == []
+    else:
+        done = agent.validate_result(execute(w, token))
+        assert done["state"] == "succeeded" and w.effects == 1
+        assert w.service.get_call(done["call_id"])["brief"]["destination"] == PHONE
+
+
+# spec: ANYM-551
+def test_two_previews_racing_for_one_request_id_dial_once(world):
+    w = world()
+    first, second = preview(w)["confirm_token"], preview(w, goal="Ask who signs for the order")["confirm_token"]
+    plan = w.api.intents.plan
+
+    async def slow_plan(*args):
+        await asyncio.sleep(0.05)  # both executions pass the key check before either binds
+        return await plan(*args)
+    w.api.intents.plan = slow_plan
+
+    async def both():
+        return await asyncio.gather(*(w.api.call("p1", "call", {"confirm_token": t, "request_id": "req-race-1",
+                                                                 "owner_instruction": ARCHIVE_WORDS})
+                                      for t in (first, second)), return_exceptions=True)
+    results = w.run(both())
+    assert [r.code for r in results if isinstance(r, ServiceError)] == ["idempotency_conflict"]
+    assert sum(isinstance(r, dict) for r in results) == 1 and w.effects == 1
+    loser = (first, second)[[isinstance(r, ServiceError) for r in results].index(True)]
+    error(execute(w, loser, request_id="req-race-1"), "idempotency_conflict")
+    assert w.effects == 1 and len(w.service.list_calls()) == 1
+
+
+# spec: ANYM-551
+def test_an_expired_preview_is_stale_with_changed_and_a_fresh_token(world):
+    w = world()
+    token = preview(w)["confirm_token"]
+    w.offset += call_intent.PREVIEW_TTL_S + 1
+    stale = error(execute(w, token), "preview_stale")
+    assert stale["changed"] == ["expires_at"] and stale["confirm_token"] != token and w.effects == 0
+    assert agent.validate_result(execute(w, stale["confirm_token"]))["state"] == "succeeded" and w.effects == 1
+
+
+# spec: ANYM-551
+def test_records_past_seven_days_keep_only_what_stops_a_second_dial(world):
+    w = world()
+    used = preview(w)["confirm_token"]
+    by_token = agent.validate_result(execute(w, used))
+    args = {"to": TYPED, "goal": "Ask when it arrives", "request_id": "req-keep-1", "owner_instruction": TYPED_WORDS}
+    by_key = agent.validate_result(w.tool("p1", "call", args))
+    unused = preview(w)["confirm_token"]
+    w.offset += call_intent.KEEP_S + 1
+    preview(w)  # any new record expires the old ones
+    db = w.service.db
+    assert db.execute("SELECT 1 FROM call_previews WHERE token_sha256=?", (call_intent.sha(unused),)).fetchone() is None
+    assert db.execute("SELECT payload,destination FROM call_previews WHERE token_sha256=?",
+                      (call_intent.sha(used),)).fetchone() == ("{}", "{}")
+    kept = db.execute("SELECT payload,origin FROM call_intents").fetchall()
+    assert len(kept) == 2 and all(set(json.loads(p)) == {"sha256"} and o == "{}" for p, o in kept)
+    # Replays still return the first call and never dial again; another payload under the key is still a conflict.
+    assert w.tool("p1", "call", args) == by_key and execute(w, used) == by_token and w.effects == 2
+    error(w.tool("p1", "call", {**args, "goal": "Ask something else"}), "idempotency_conflict")

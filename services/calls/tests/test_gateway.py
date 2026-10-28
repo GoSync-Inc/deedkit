@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tests/platform"))
 from runtime_helpers import call, gateway, port, server
-from agent_api import ANNOTATIONS, DESCRIPTIONS, METHODS
+from agent_api import ALSO_REQUIRES, ANNOTATIONS, DESCRIPTIONS, METHODS
 from app import create_app
 from core import CallVoice
 from test_agent_api import registry
@@ -22,7 +22,8 @@ def test_gateway_catalog_mirrors_reviewed_calls_metadata():
     assert set(rows) == {"calls_" + name for name in METHODS}
     for name, (model, scope) in METHODS.items():
         row = rows["calls_" + name]
-        assert row["operation"] == name and row["scopes"] == ([scope] if scope else [])
+        also = [ALSO_REQUIRES[name]] if name in ALSO_REQUIRES else []
+        assert row["operation"] == name and row["scopes"] == ([scope] if scope else []) + also
         assert row["inputSchema"] == model.model_json_schema()
         assert row["description"] == DESCRIPTIONS[name]
         assert row["annotations"] == ANNOTATIONS[name]
