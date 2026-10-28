@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import psycopg
 import pytest
@@ -14,7 +15,26 @@ from psycopg import sql
 
 from family_calendar.errors import CalendarError
 from family_calendar.service import migration_rollout as rollout
-from family_calendar.service.store import MIGRATIONS, ROLES
+from family_calendar.service import store as store_module
+from family_calendar.service.store import ROLES, Store
+
+# These tests replay ranges from schema 5 with a synthetic version 6: the repository's own files and roles.sql text
+# through version 5, and a store migrated through 5 (the real migration 6 is ANYM-554's).
+MIGRATIONS = tuple(m for m in store_module.MIGRATIONS if m[0] <= 5)
+
+
+@pytest.fixture
+def store():
+    dsn = os.environ.get("FCS_TEST_DSN")
+    if not dsn:
+        pytest.fail("FCS_TEST_DSN is required; never fall back to a runtime database")
+    s = Store(dsn, schema="test_" + uuid4().hex)
+    s.migrate(through=5)
+    yield s
+    try:
+        s.drop_test_schema()
+    finally:
+        s.close()
 
 
 # spec: ANYM-586
@@ -52,7 +72,8 @@ def files(through=5):
 
 
 def roles_text():
-    return ROLES.read_text()
+    text = ROLES.read_text()
+    return text[:text.index("-- Migration 6")] if "-- Migration 6" in text else text
 
 
 # spec: ANYM-586

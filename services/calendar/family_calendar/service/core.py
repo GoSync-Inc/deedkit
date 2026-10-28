@@ -3,9 +3,10 @@ import hashlib
 import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import psycopg
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
-from .store import digest, instant, ref
+from .store import digest, instant, person_uuid, ref
 
 READ = ["agenda:read", "availability:read", "event:read", "assignment:read"]
 WRITE = ["plan:create", "plan:execute", "event:create", "event:update", "event:delete", "assignment:write"]
@@ -629,6 +630,26 @@ class FamilyService:
         result["configured_bindings_availability"] = "verified"
         return result
 
+    def linked_member(self, p, person_id):
+        """The member the owner linked to person_id in principal p's family (ANYM-554), or None. A member with a
+        bound calendar p cannot read for availability is hidden: None, the same answer as an unlinked person, so
+        a UUID never tells which member it names. Before migration 6 and its grant no person is linked, so names
+        and member IDs keep working."""
+        try:
+            row = self.store.one("SELECT member_id FROM member_people WHERE group_id=%s AND person_uuid=%s",
+                                 (p["group_id"], person_id))
+        except (psycopg.errors.UndefinedTable, psycopg.errors.InsufficientPrivilege):
+            return None
+        if not row:
+            return None
+        for b in self.store.query("SELECT calendar_ref FROM bindings WHERE group_id=%s AND person_id=%s",
+                                  (p["group_id"], row["member_id"])):
+            try:
+                self.authorize(None, b["calendar_ref"], "availability:read", principal_id=p["id"])
+            except CalendarError:
+                return None
+        return row["member_id"]
+
     def find_members(self, p, request):
         """calendar_find_time's people (ANYM-553) as enabled members of principal p (availability:read checked by
         the caller): a member ID, or a member name the calendar knows (case and spacing ignored). One exact name
@@ -649,7 +670,16 @@ class FamilyService:
         asked = []
         for name in request["people"]:
             wanted = norm(name)
-            exact = [m for m in members if m["member_id"] == name] or [m for m in members if norm(m["label"]) == wanted]
+            exact = [m for m in members if m["member_id"] == name]
+            if not exact and person_uuid(name):
+                # A messaging person (ANYM-554): only the owner's link to an enabled member of this calendar; no
+                # name match and no messaging read, so an unlinked or hidden person is not_found, before any
+                # selection can name a member.
+                linked = self.linked_member(p, person_uuid(name))
+                exact = [m for m in members if m["member_id"] == linked]
+                if not exact:
+                    raise CalendarError("not_found", details={"next": {"tool": "calendar_members", "arguments": {}}})
+            exact = exact or [m for m in members if norm(m["label"]) == wanted]
             matches = exact or [m for m in members if wanted and wanted in norm(m["label"])]
             if not matches:
                 raise CalendarError("not_found", details={"next": {"tool": "calendar_members", "arguments": {}}})

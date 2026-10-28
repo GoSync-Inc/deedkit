@@ -255,6 +255,17 @@ previews and never applies; a key without them gets slots without `next`. `avail
 verified` with no slot gives `next` this tool one step wider (the window's length in whole days, inside 31 days of elapsed time across DST);
 a pending refresh gives `next` the same request with `refresh: false`; other unknown availability gives no `next`.
 
+People (ANYM-554): the owner links a member to a messaging person UUID with `service member-person --member M
+--person UUID` (`--group`, default `family`; one person is one member of a family, else `person_already_linked`; the
+answer names the `previous` person). Undo: `service member-person --member M --unlink` deletes that link row, or a
+relink to `previous`. A `people` entry in the UUID form that is not a member ID resolves only through that link, to an
+enabled member of the caller's family whose bound calendars the caller can read for availability: an unlinked
+person, one linked in another family, a disabled member or one with a calendar the caller cannot read is the same
+`not_found` with `next` `calendar_members`, before any selection; a UUID is never matched against names. Schema 6 adds the table
+`member_people` (group_id, member_id, person_uuid, linked_at; additive, no foreign key): the calendar keeps the UUID
+only and reads nothing from messaging. Only `fcs_gateway` may read it (`db-roles` after `migrate`); before that every
+person UUID is `not_found` and names and member IDs work as before. `calendar_schedule` takes no member argument.
+
 ## Coverage and read errors
 
 iCloud recurrences are expanded lazily: at most 500 instances in one calendar window, the same as in agenda/slots responses (`event_limit`). Before expansion each RRULE is estimated from above without generating: dateutil walks all instances from DTSTART to the end of the window. More than 100 000 per resource or 1 000 000 per calendar give `coverage_incomplete`, for example `FREQ=MINUTELY`/`SECONDLY` or an hourly event running for more than 11 years. An hourly reminder gives 744 events in 31 days, so such a window stays `unknown`, while a window of up to 20 days is read in full. The limit of 500 is not raised: agenda and slots apply the same one, so a larger limit of one worker would not give coverage. On `coverage_incomplete` caused by a dense calendar, request a shorter window.

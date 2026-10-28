@@ -45,5 +45,8 @@
   "5": {
     "fcs_gateway": ["SELECT fcs.invitation_opt_ins"],
     "fcs_worker": ["SELECT fcs.invitation_opt_ins"]
+  },
+  "6": {
+    "fcs_gateway": ["SELECT fcs.member_people"]
   }
 }

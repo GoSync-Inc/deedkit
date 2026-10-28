@@ -70,6 +70,13 @@ def parser():
     member.add_argument(
         "--role", required=True, choices=["group_admin", "coordinator", "adult", "dependent", "helper"]
     )
+    # The owner's link of a calendar member to a messaging person (ANYM-554); --unlink is its undo.
+    linked = sub.add_parser("member-person")
+    linked.add_argument("--group", default="family")
+    linked.add_argument("--member", required=True)
+    target = linked.add_mutually_exclusive_group(required=True)
+    target.add_argument("--person", help="the messaging person UUID")
+    target.add_argument("--unlink", action="store_true")
     imported = sub.add_parser("import-icloud")
     imported.add_argument("--connection", required=True)
     imported.add_argument("--owner", default="egor")
@@ -401,6 +408,8 @@ def dispatch(args, home, root, config, store):
     if args.action == "bind":
         store.binding(args.group, args.member, args.calendar)
         return {"binding_saved": True}
+    if args.action == "member-person":
+        return store.member_person(args.group, args.member, None if args.unlink else args.person)
     if args.action == "family-settings":
         return store.family_settings(args.group, args.timezone, args.default_calendar)
     if args.action in ("allow-write", "disable-write"):
