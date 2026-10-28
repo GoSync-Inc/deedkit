@@ -25,6 +25,10 @@ LOCAL_STORAGE_ERRORS = {'storage_unavailable','media_storage_unavailable'}
 CAPTURE_STOP_DETAILS = {'spool_full','disk_reserve','spool_io_error','capture_error'}
 # Which bound a capture_overload stop tripped (ANYM-291); status and supervisor line only, not telemetry.
 OVERLOAD_STOP_DETAILS = {'waiters_limit','slot_wait_timeout'}
+# How the WhatsApp adapter child ended when it recorded no failure code (a bare provider_disconnected):
+# exit status 0, 1, 2 (whatsmeow: Go's unrecovered panic or fatal error; webjs: status 2 only), another
+# status, SIGKILL (OOM or forced) or another signal.
+CHILD_EXIT_DETAILS = {'exit_clean','exit_error','exit_panic','exit_other','exit_killed','exit_signal'}
 # Fixed codes each collector prints to its supervisor when it stops.
 SUPERVISOR_STOP_CODES = {
     'telegram':frozenset({'collector_disabled','session_handover_not_confirmed','telegram_pairing_required',
@@ -45,9 +49,10 @@ PHASE_REASONS = CONNECTION_ERRORS | {'provider_ready','capture_ready','capture_d
     'collector_shutdown','history_scan','history_scan_finished','provider_temporarily_unavailable',
     'collector_starting','operator_resumed'}
 # Stop codes a collector's telemetry event may carry (ANYM-292): never exception text.
-# Only Telegram records a fixed capture detail, so only it has qualified codes.
+# Qualified codes come only from a fixed detail: Telegram's capture detail, WhatsApp's child exit.
 TELEMETRY_STOP_CODES = {component:frozenset(codes|CONNECTION_ERRORS) for component,codes in SUPERVISOR_STOP_CODES.items()}
 TELEMETRY_STOP_CODES['telegram'] |= {'durable_capture_failed.'+detail for detail in CAPTURE_STOP_DETAILS}
+TELEMETRY_STOP_CODES['whatsapp'] |= {'provider_disconnected.'+detail for detail in CHILD_EXIT_DETAILS}
 
 
 def collector_stop(exc, component):
@@ -64,8 +69,12 @@ def collector_stop(exc, component):
         except Exception:detail=None
         allowed=CAPTURE_STOP_DETAILS if text=='durable_capture_failed' else OVERLOAD_STOP_DETAILS
         if type(detail) is not str or detail not in allowed:detail=None
+    elif component=='whatsapp' and text=='provider_disconnected':
+        try:detail=getattr(exc,'detail',None)
+        except Exception:detail=None
+        if type(detail) is not str or detail not in CHILD_EXIT_DETAILS:detail=None
     # A qualified code comes only from the fixed detail, never from exception text.
-    event=(text+'.'+detail if detail and text=='durable_capture_failed' else
+    event=(text+'.'+detail if detail and text in ('durable_capture_failed','provider_disconnected') else
         text if text in SUPERVISOR_STOP_CODES[component] or text in CONNECTION_ERRORS else 'collector_failed')
     return code,detail,event
 
