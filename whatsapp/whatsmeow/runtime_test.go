@@ -1309,6 +1309,11 @@ func TestHistoryProductionCompressedAndDecodedBounds(t *testing.T) {
 	}
 	// The production download path applies both bounds before any client call;
 	// this provider has no client, so passing a bound would panic.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatal("history bound not applied before the client call", r)
+		}
+	}()
 	p := &Provider{}
 	if _, err := p.downloadHistory(context.Background(), &waE2E.HistorySyncNotification{FileLength: proto.Uint64(32<<20 + 1)}); err == nil || err.Error() != "history_size_limit" {
 		t.Fatal("declared compressed size over 32 MiB accepted", err)
