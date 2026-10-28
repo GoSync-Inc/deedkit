@@ -652,7 +652,7 @@ END $$;
 ROLE_050 = {'gateway_role.sql': BEAT.format(role='messaging_gateway', component='api'),
             'subscription_role.sql': BEAT.format(role='messaging_subscriptions', component='matcher'),
             'delivery_role.sql': BEAT.format(role='messaging_event_delivery', component='dispatcher')}
-HEARTBEATS = {'component_heartbeats'}
+HEARTBEATS = rollout.new_tables(source(MIGRATIONS[50]))  # {component_heartbeats: its four columns}
 
 
 def role_base(name, block):
@@ -664,9 +664,9 @@ def role_base(name, block):
 
 # spec: ANYM-596
 @pytest.mark.parametrize(('name', 'block', 'new_tables', 'expected'), [
-    ('gateway_role.sql', ROLE_049['gateway_role.sql'], set(), 'additive'),
-    ('subscription_role.sql', ROLE_049['subscription_role.sql'], set(), 'additive'),
-    ('delivery_role.sql', ROLE_049['delivery_role.sql'], set(), 'manual'),  # GRANT EXECUTE ON FUNCTION
+    ('gateway_role.sql', ROLE_049['gateway_role.sql'], {}, 'additive'),
+    ('subscription_role.sql', ROLE_049['subscription_role.sql'], {}, 'additive'),
+    ('delivery_role.sql', ROLE_049['delivery_role.sql'], {}, 'manual'),  # GRANT EXECUTE ON FUNCTION
     ('gateway_role.sql', ROLE_050['gateway_role.sql'], HEARTBEATS, 'additive'),
     ('subscription_role.sql', ROLE_050['subscription_role.sql'], HEARTBEATS, 'additive'),
     ('delivery_role.sql', ROLE_050['delivery_role.sql'], HEARTBEATS, 'additive'),
@@ -675,7 +675,7 @@ def test_the_appended_role_text_of_049_and_050_classifies_as_merged(name, block,
     base = role_base(name, block)
     assert rollout.role_class(base, base + block, new_tables) == expected
     # The policy template is additive only on a table the same release creates.
-    if new_tables: assert rollout.role_class(base, base + block, set()) == 'manual'
+    if new_tables: assert rollout.role_class(base, base + block, {}) == 'manual'
 
 
 GATEWAY = 'gateway_role.sql'
@@ -693,6 +693,12 @@ ROLE_MANUAL = {
     'policy-for-all': GATEWAY_POLICY.replace(' TO messaging_gateway USING', ' FOR ALL TO messaging_gateway USING'),
     'policy-other-role': GATEWAY_POLICY.replace('TO messaging_gateway', 'TO messaging_synthetic'),
     'policy-expression': GATEWAY_POLICY.replace("USING (component='api')", 'USING (true)'),
+    # Astra r1 F1: value words in the column slots make an always-true policy.
+    'policy-value-word': GATEWAY_POLICY.replace("(component='api')", "(true='true')"),
+    'policy-current-user': GATEWAY_POLICY.replace("(component='api')", "(current_user='api')"),
+    'policy-undeclared-column': GATEWAY_POLICY.replace("(component='api')", "(beat='api')"),
+    # Astra r1 F3: PostgreSQL would truncate this name to an existing table's.
+    'policy-long-name': GATEWAY_POLICY.replace('messaging_gateway_beat', 'b' * 64),
     'other-do': "DO $$ BEGIN EXECUTE 'GRANT ALL ON messages TO messaging_gateway'; END $$;",
     'truncate': 'GRANT TRUNCATE ON messages TO messaging_gateway;',
     'truncate-statement': 'TRUNCATE messages;',
@@ -724,13 +730,34 @@ def test_role_text_outside_the_role_language_is_manual(example):
 def test_a_role_file_whose_base_text_changed_is_manual():
     candidate = GATEWAY_BASE + ROLE_050[GATEWAY]
     assert rollout.role_class(GATEWAY_BASE, candidate, HEARTBEATS) == 'additive'
-    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE, set()) == 'additive'  # nothing appended
+    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE, {}) == 'additive'  # nothing appended
     edited = candidate.replace('GRANT USAGE ON SCHEMA public', 'GRANT CREATE ON SCHEMA public', 1)
     assert edited != candidate and rollout.role_class(GATEWAY_BASE, edited, HEARTBEATS) == 'manual'
-    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE[:-1], set()) == 'manual'  # shortened
+    assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE[:-1], {}) == 'manual'  # shortened
     # The appended text starts a statement: a base ending inside a statement cannot be continued.
     open_base = GATEWAY_BASE + 'GRANT SELECT ON messages'
-    assert rollout.role_class(open_base, open_base + ' TO messaging_gateway;\n', set()) == 'manual'
+    assert rollout.role_class(open_base, open_base + ' TO messaging_gateway;\n', {}) == 'manual'
+
+
+# spec: ANYM-596
+def test_with_the_table_inventory_a_grant_on_anything_but_a_known_table_is_manual():
+    # Astra r1 F2: PostgreSQL takes `GRANT UPDATE ON <sequence>` without the SEQUENCE keyword.
+    implicit = GATEWAY_BASE + 'GRANT UPDATE ON synthetic_seq TO messaging_gateway;\n'
+    assert rollout.role_class(GATEWAY_BASE, implicit, {}, tables=EXISTING) == 'manual'
+    known = GATEWAY_BASE + 'GRANT SELECT ON messages, public.component_heartbeats TO messaging_gateway;\n'
+    assert rollout.role_class(GATEWAY_BASE, known, HEARTBEATS, tables=EXISTING) == 'additive'
+    assert rollout.role_class(GATEWAY_BASE, known, {}, tables=EXISTING) == 'manual'
+    long = GATEWAY_BASE + f'GRANT SELECT ON {"m" * 64} TO messaging_gateway;\n'
+    assert rollout.role_class(GATEWAY_BASE, long, {}, tables={'m' * 64}) == 'manual'
+
+
+# spec: ANYM-596
+def test_a_name_postgresql_would_truncate_is_never_unattended():
+    existing = 't' * 63
+    text = EXPAND + f'CREATE TABLE IF NOT EXISTS {existing}x (component text);\n'
+    assert rollout.rollout_class(text, {existing}) == 'expand'  # the CI class is unchanged
+    assert rollout.unattended_class(text, {existing}) == 'manual'
+    assert rollout.unattended_class(text.replace('x (', ' ('), set()) == 'expand'
 
 
 ADDITIVE_STATEMENTS = [ROLE_049['gateway_role.sql'], ROLE_050['gateway_role.sql'], GATEWAY_POLICY,

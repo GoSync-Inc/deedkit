@@ -30,25 +30,23 @@ def read_token(path):
 
 
 def migrate_expand(args, parser):
-    # ANYM-596: one JSON line, a fixed error code and exit 1 on refusal; never PostgreSQL's message.
-    from .store import ExpandError
+    # ANYM-596: one bounded connection and no application pool; one JSON line, a fixed error code and exit 1 on
+    # refusal. PostgreSQL's message is never printed: psycopg's own logger is off in this process.
+    import logging
+    from . import store
     if args.status not in (None,'ledger') or not (args.status or args.plan): parser.error('migrate-expand requires --plan or --status')
-    store=None
+    logging.getLogger('psycopg').disabled=True
     try:
-        store=Store(Path(os.environ['DATABASE_URL_FILE']).read_text().strip(),Path(os.environ.get('PROBE_FILES','./probe-files')),
-            os.environ.get('PROBE_PUBLIC_URL','http://127.0.0.1:18940'))
-        if args.status: result=store.expand_status()
+        dsn=Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
+        if args.status: result=store.expand_status(dsn)
         else:
             try: plan=json.loads(args.plan.read_text())
-            except (OSError,ValueError): raise ExpandError('plan_invalid') from None
-            result=store.migrate_expand(plan if isinstance(plan,dict) else {})
-    except ExpandError as error: result=error.code
+            except (OSError,ValueError): raise store.ExpandError('plan_invalid') from None
+            result=store.migrate_expand(dsn,plan if isinstance(plan,dict) else {})
+    except store.ExpandError as error: result=error.code
     except Exception: result='failed'
-    finally:
-        if store: store.close()
     print(json.dumps(result if isinstance(result,dict) else {'error':result}))
     return 0 if isinstance(result,dict) else 1
-
 
 def main():
     from .telemetry import configure

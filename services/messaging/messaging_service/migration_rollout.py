@@ -437,12 +437,26 @@ def unattended_class(text, inventory=None):
     """What `migrate-expand` may run without a person (ANYM-596): a `rollout_class` `expand` with no DROP of any
     kind, so the CHECK widening pair, which drops its constraint first, stays `manual` here."""
     if rollout_class(text, inventory) != 'expand': return 'manual'
-    return 'manual' if any(('word', 'drop') in statement for statement in statements(text)) else 'expand'
+    parsed = statements(text)
+    if any(long_name(statement) for statement in parsed): return 'manual'
+    return 'manual' if any(('word', 'drop') in statement for statement in parsed) else 'expand'
+
+
+# PostgreSQL truncates a longer name to NAMEDATALEN-1 bytes, so a "new" table could name an existing one.
+NAME_BYTES = 63
+
+
+def long_name(items):
+    return any(kind in ('word', 'ident') and len(value.encode()) > NAME_BYTES for kind, value in items)
 
 
 # Table privileges a role file may append; ALL, TRUNCATE, TRIGGER and MAINTAIN are manual.
 ROLE_PRIVILEGES = {'select', 'insert', 'update', 'delete', 'references'}
 NOT_ROLES = {'public', 'group', 'current_user', 'current_role', 'session_user', 'all'}
+# Unquoted words PostgreSQL reads as a value, never as a column: `USING (true='true')` would admit every row.
+VALUE_WORDS = {'true', 'false', 'null', 'default', 'user', 'current_user', 'current_role', 'session_user',
+               'system_user', 'current_date', 'current_time', 'current_timestamp', 'localtime', 'localtimestamp',
+               'current_catalog', 'current_schema'}
 # 050's policy: a permissive policy for one role on a new table, created once. $n a name, $s a string.
 POLICY = ('begin if not exists ( select from pg_policies where tablename = $s and policyname = $s ) then '
           'create policy $n on $n to $n using ( $n = $s ) with check ( $n = $s ) ; end if ; end').split()
@@ -464,8 +478,9 @@ def role_name(c, roles):
     return value
 
 
-def grant(c, roles):
-    """`GRANT <privilege>[(<columns>)][, …] ON [TABLE] <table>[, …] TO <role>` and nothing more."""
+def grant(c, roles, tables):
+    """`GRANT <privilege>[(<columns>)][, …] ON [TABLE] <table>[, …] TO <role>` and nothing more; with `tables`,
+    each target must be one of them (PostgreSQL takes a sequence or view after `ON` too)."""
     c.expect('grant')
     while True:
         c.expect(*ROLE_PRIVILEGES)
@@ -478,7 +493,8 @@ def grant(c, roles):
     while True:
         if c.peek()[0] == 'word' and c.peek()[1] in ('all', 'schema', 'database', 'function', 'sequence'):
             raise Manual('not a table')
-        c.name()
+        table = c.name()
+        if tables is not None and table not in tables: raise Manual('not a known table')
         if not c.take('punct', ','): break
     c.expect('to')
     role_name(c, roles)
@@ -486,7 +502,7 @@ def grant(c, roles):
 
 
 def policy(c, roles, new_tables):
-    """The 050 template: `DO $$ … CREATE POLICY … $$` for a table this release creates."""
+    """The 050 template: `DO $$ … CREATE POLICY … $$` for a table this release creates, on one of its columns."""
     c.expect('do')
     kind, body = c.next()
     c.end()
@@ -497,31 +513,36 @@ def policy(c, roles, new_tables):
     for (kind, value), expected in zip(items, POLICY):
         if expected in slots:
             if kind not in (('string',) if expected == '$s' else ('word', 'ident')): raise Manual('not the template')
+            if kind == 'word' and value in VALUE_WORDS: raise Manual('a value word in a name slot')
             slots[expected].append(value)
         elif not (kind in ('word', 'punct', 'op') and value == expected): raise Manual('not the template')
     (table_string, policy_string, using, check), (name, table, role, using_column, check_column) = (
         slots['$s'], slots['$n'])
     if (table_string, policy_string, check_column, check) != (table, name, using_column, using):
         raise Manual('the template slots disagree')
-    if table not in new_tables: raise Manual('a policy on a table this release does not create')
+    if long_name(items): raise Manual('a name PostgreSQL would truncate')
+    if table not in new_tables or using_column not in new_tables[table]:
+        raise Manual('a policy on a table this release does not create, or not on its column')
     role_name(Cursor([('word', role)]), roles)
 
 
-def role_class(base, candidate, new_tables):
+def role_class(base, candidate, new_tables, *, tables=None):
     """`additive` when `candidate` is `base` byte for byte plus appended statements that are comments, GRANTs of
-    table privileges to a role `base` already grants to, or the 050 policy template on one of `new_tables`; else
-    `manual` (ANYM-596). Standard library only, no I/O, like `classify`."""
+    table privileges to a role `base` already grants to, or the 050 policy template on a column of one of
+    `new_tables` ({table: columns}, as `new_tables()` returns); else `manual` (ANYM-596). With `tables` (the tables
+    that exist), a GRANT target must be one of them or a new table. Standard library only, no I/O, like `classify`."""
     if not candidate.startswith(base): return 'manual'
     appended = candidate[len(base):]
     try:
         # The file must scan as its two parts do: the base ends between statements, outside any comment or quote.
         before, added = tokens(base), tokens(appended)
         if tokens(candidate) != before + added or before and before[-1] != ('punct', ';'): return 'manual'
-        roles = granted_roles(base)
+        if long_name(added): return 'manual'
+        roles, known = granted_roles(base), None if tables is None else set(tables) | set(new_tables)
         for statement in statements(appended):
             c = Cursor(statement)
-            if c.peek() == ('word', 'grant'): grant(c, roles)
-            elif c.peek() == ('word', 'do'): policy(c, roles, set(new_tables))
+            if c.peek() == ('word', 'grant'): grant(c, roles, known)
+            elif c.peek() == ('word', 'do'): policy(c, roles, new_tables)
             else: return 'manual'
     except (Manual, Untokenizable):
         return 'manual'
@@ -529,14 +550,20 @@ def role_class(base, candidate, new_tables):
 
 
 def new_tables(text):
-    """The tables a migration's CREATE TABLE statements name; [] when it does not tokenize."""
-    found = []
+    """{table: its column names} for each CREATE TABLE of a migration; {} when it does not parse."""
+    found = {}
     try:
         for statement in statements(text):
             c = Cursor(statement)
             if c.word('create') and c.word('table'):
                 if c.word('if'): c.expect('not'), c.expect('exists')
-                found.append(c.name())
+                table, columns = c.name(), set()
+                for element in split(c.group()):
+                    kind, value = element[0] if element else (None, None)
+                    if kind == 'ident' or kind == 'word' and value not in (
+                            'constraint', 'primary', 'unique', 'check', 'foreign', 'exclude', 'like'):
+                        columns.add(value)
+                found[table] = columns
     except (Manual, Untokenizable):
-        return []
+        return {}
     return found

@@ -69,14 +69,19 @@ def plan_for(root, base, target, appended=None):
     return {'base': base, 'target': target, 'roles': roles}
 
 
-def image(tmp_path, migration=NOTE, roles=None):
-    """A copy of the package's migrations and role files plus migration NEXT and appended role text."""
-    root = tmp_path / 'image'
-    shutil.copytree(SOURCE / 'migrations', root / 'migrations')
-    for path in SOURCE.glob('*_role.sql'): shutil.copy(path, root / path.name)
+def package(tmp_path, migration=NOTE, roles=None, *, slow=False):
+    """A copy of the messaging package (the image) plus migration NEXT and appended role text; `slow` makes the
+    copy's migrate_expand sleep 5 s before its commit. The CLI runs it through PYTHONPATH."""
+    root = tmp_path / 'image' / 'messaging_service'
+    shutil.copytree(SOURCE, root, ignore=shutil.ignore_patterns('__pycache__'))
     root.joinpath('migrations', f'{NEXT:03d}_synthetic.sql').write_text(migration)
     for name, text in (roles or {}).items():
         with root.joinpath(name).open('a') as role: role.write(text)
+    if slow:
+        with root.joinpath('store.py').open('a') as store:
+            store.write('\n_synthetic_original = migrate_expand\n\n\n'
+                        'def migrate_expand(dsn, plan, *, root=None, before_commit=None):\n'
+                        "    return _synthetic_original(dsn, plan, root=root, before_commit=lambda c: c.execute('SELECT pg_sleep(5)'))\n")
     return root
 
 
@@ -89,14 +94,17 @@ def ledger(dsn):
         return int(version), rows['n'], column['n']
 
 
-def cli(dsn, tmp_path, *args):
+def cli(dsn, tmp_path, *args, root=None):
+    """The real entry point; returns (exit code, its one JSON line, seconds). PostgreSQL's text never reaches
+    stdout or stderr: stderr must stay empty."""
     tmp_path.joinpath('dsn').write_text(dsn)
     env = dict(os.environ, DATABASE_URL_FILE=str(tmp_path / 'dsn'), PROBE_FILES=str(tmp_path / 'files'))
+    if root: env['PYTHONPATH'] = str(root.parent)
     started = time.monotonic()
     done = subprocess.run([sys.executable, '-m', 'messaging_service', 'migrate-expand', *args], env=env,
                           capture_output=True, text=True, timeout=60)
     lines = done.stdout.splitlines()
-    assert len(lines) == 1, done.stdout + done.stderr
+    assert len(lines) == 1 and done.stderr == '', done.stdout + done.stderr
     return done.returncode, json.loads(lines[0]), time.monotonic() - started
 
 
@@ -112,6 +120,30 @@ def test_the_entry_point_reads_the_ledger_and_runs_an_empty_plan(db, tmp_path):
     assert cli(dsn, tmp_path, '--status')[:2] == (0, {'schema_version': RUNTIME_SCHEMA})
     plan = plan_for(SOURCE, RUNTIME_SCHEMA, RUNTIME_SCHEMA)
     assert cli(dsn, tmp_path, '--plan', write_plan(tmp_path, plan))[:2] == (0, {'schema_version': RUNTIME_SCHEMA})
+
+
+# spec: ANYM-596
+def test_the_entry_point_opens_one_connection_under_the_budgets_and_no_pool(db, tmp_path, monkeypatch):
+    # Astra r1 F5: no application pool beside the bounded connection.
+    from messaging_service import __main__ as cli_module
+    _, dsn = db
+    tmp_path.joinpath('dsn').write_text(dsn)
+    opened, connect = [], psycopg.connect
+
+    def counted(*args, **kwargs):
+        opened.append(kwargs.get('options', ''))
+        return connect(*args, **kwargs)
+
+    def no_store(*args, **kwargs): raise AssertionError('migrate-expand built the application Store')
+    monkeypatch.setattr(store_module.psycopg, 'connect', counted)
+    monkeypatch.setattr(cli_module, 'Store', no_store)
+    monkeypatch.setattr(store_module, 'ConnectionPool', no_store)
+    monkeypatch.setenv('DATABASE_URL_FILE', str(tmp_path / 'dsn'))
+    plan = write_plan(tmp_path, plan_for(SOURCE, RUNTIME_SCHEMA, RUNTIME_SCHEMA))
+    monkeypatch.setattr(sys, 'argv', ['messaging_service', 'migrate-expand', '--plan', plan])
+    assert cli_module.main() == 0
+    assert len(opened) == 1
+    assert all(f'-c {name}=' in opened[0] for name in ('lock_timeout', 'statement_timeout', 'transaction_timeout'))
 
 
 # spec: ANYM-596
@@ -150,16 +182,16 @@ def test_a_plan_whose_role_prefix_hash_differs_refuses(db, tmp_path):
 
 # spec: ANYM-596
 def test_an_expand_migration_and_its_role_grant_apply_together(db, tmp_path):
-    store, dsn = db
+    _, dsn = db
     role = 'synthetic_expand_' + uuid4().hex[:12]
     migration = '-- rollout: expand\nCREATE TABLE synthetic_marks (id text PRIMARY KEY);\n' + NOTE.split('\n', 1)[1]
     grant = f'-- synthetic\nGRANT SELECT(id) ON synthetic_marks TO {role};\n'
-    root = image(tmp_path, migration, {'synthetic_role.sql': ''})
+    root = package(tmp_path, migration)
     root.joinpath('synthetic_role.sql').write_text(f'GRANT SELECT ON messages TO {role};\n' + grant)
     with psycopg.connect(dsn, autocommit=True) as c: c.execute(sql.SQL('CREATE ROLE {}').format(sql.Identifier(role)))
     try:
-        result = store.migrate_expand(plan_for(root, RUNTIME_SCHEMA, NEXT, {'synthetic_role.sql': grant}), root=root)
-        assert result == {'schema_version': NEXT}
+        plan = write_plan(tmp_path, plan_for(root, RUNTIME_SCHEMA, NEXT, {'synthetic_role.sql': grant}))
+        assert cli(dsn, tmp_path, '--plan', plan, root=root)[:2] == (0, {'schema_version': NEXT})
         assert ledger(dsn) == (NEXT, 1, 1)
         with psycopg.connect(dsn) as c:
             assert c.execute('SELECT has_column_privilege(%s, %s, %s, %s)',
@@ -175,20 +207,21 @@ def test_an_expand_migration_and_its_role_grant_apply_together(db, tmp_path):
     ('-- rollout: expand\nALTER TABLE messages DROP COLUMN body;\n', {}, 'not_unattended'),
     ('-- rollout: manual\n' + NOTE.split('\n', 1)[1], {}, 'not_unattended'),
     (NOTE, {'gateway_role.sql': 'REVOKE SELECT ON messages FROM messaging_gateway;\n'}, 'role_not_additive'),
-], ids=['drop', 'declared-manual', 'revoke'])
+    (NOTE, {'gateway_role.sql': 'GRANT UPDATE ON synthetic_seq TO messaging_gateway;\n'}, 'role_not_additive'),
+], ids=['drop', 'declared-manual', 'revoke', 'not-a-table'])
 def test_anything_outside_the_unattended_language_applies_nothing(db, tmp_path, migration, roles, code):
-    store, dsn = db
-    root = image(tmp_path, migration, roles)
-    with pytest.raises(ExpandError) as refused:
-        store.migrate_expand(plan_for(root, RUNTIME_SCHEMA, NEXT, roles), root=root)
-    assert refused.value.code == code
+    _, dsn = db
+    root = package(tmp_path, migration, roles)
+    plan = write_plan(tmp_path, plan_for(root, RUNTIME_SCHEMA, NEXT, roles))
+    assert cli(dsn, tmp_path, '--plan', plan, root=root)[:2] == (1, {'error': code})
     assert ledger(dsn) == (RUNTIME_SCHEMA, 0, 0)
 
 
 # spec: ANYM-596
 def test_a_held_table_lock_fails_lock_timeout_while_an_old_runtime_insert_finishes(db, tmp_path):
-    store, dsn = db
-    root = image(tmp_path)
+    _, dsn = db
+    root = package(tmp_path)
+    plan = write_plan(tmp_path, plan_for(root, RUNTIME_SCHEMA, NEXT))
     with psycopg.connect(dsn) as c:
         c.execute("INSERT INTO accounts(id,platform,label) VALUES ('synthetic','telegram','synthetic')")
         c.execute("INSERT INTO chats(id,account,title) VALUES ('synthetic-chat','synthetic','synthetic')")
@@ -196,9 +229,7 @@ def test_a_held_table_lock_fails_lock_timeout_while_an_old_runtime_insert_finish
     holder.execute('SELECT count(*) FROM messages')  # an open reader holds ACCESS SHARE
     outcome, insert = {}, {}
 
-    def migrate():
-        try: store.migrate_expand(plan_for(root, RUNTIME_SCHEMA, NEXT), root=root)
-        except ExpandError as error: outcome['code'] = error.code
+    def migrate(): outcome['result'] = cli(dsn, tmp_path, '--plan', plan, root=root)[:2]
 
     def write():
         # The old runtime's insert queues behind the migration's ACCESS EXCLUSIVE request, under its 5 s budget.
@@ -210,40 +241,42 @@ def test_a_held_table_lock_fails_lock_timeout_while_an_old_runtime_insert_finish
     try:
         runner = threading.Thread(target=migrate)
         runner.start()
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 30
         with psycopg.connect(dsn, autocommit=True) as watch:
             while not watch.execute("SELECT count(*) FROM pg_locks WHERE NOT granted AND relation='messages'::regclass"
                                     ).fetchone()[0] and time.monotonic() < deadline: time.sleep(0.02)
         writer = threading.Thread(target=write)
         writer.start()
-        runner.join(10), writer.join(10)
+        runner.join(60), writer.join(10)
     finally: holder.close()
-    assert outcome == {'code': 'lock_timeout'}
+    assert outcome == {'result': (1, {'error': 'lock_timeout'})}
     assert insert['elapsed'] < 5
     assert ledger(dsn) == (RUNTIME_SCHEMA, 0, 0)
 
 
 # spec: ANYM-596
 def test_a_slow_statement_ends_at_the_transaction_budget_with_nothing_applied(db, tmp_path):
-    store, dsn = db
-    root = image(tmp_path)
-    started = time.monotonic()
-    with pytest.raises(ExpandError) as refused:
-        store.migrate_expand(plan_for(root, RUNTIME_SCHEMA, NEXT), root=root,
-                             before_commit=lambda c: c.execute('SELECT pg_sleep(5)'))
-    assert refused.value.code == 'transaction_timeout'
-    assert time.monotonic() - started < 5
+    _, dsn = db
+    root = package(tmp_path, slow=True)
+    plan = write_plan(tmp_path, plan_for(root, RUNTIME_SCHEMA, NEXT))
+    baseline = cli(dsn, tmp_path, '--status', root=root)[2]
+    code, out, elapsed = cli(dsn, tmp_path, '--plan', plan, root=root)
+    assert (code, out) == (1, {'error': 'transaction_timeout'})
+    assert elapsed < baseline + 5
     assert ledger(dsn) == (RUNTIME_SCHEMA, 0, 0)
 
 
 # spec: ANYM-596
 def test_a_failing_role_statement_after_a_good_file_leaves_neither(db, tmp_path):
-    store, dsn = db
-    grant = 'GRANT SELECT ON synthetic_missing TO messaging_gateway;\n'
-    root = image(tmp_path, NOTE, {'gateway_role.sql': grant})
-    with pytest.raises(ExpandError) as refused:
-        store.migrate_expand(plan_for(root, RUNTIME_SCHEMA, NEXT, {'gateway_role.sql': grant}), root=root)
-    assert refused.value.code == 'failed'
+    # The role exists in the base text but not in this cluster: PostgreSQL refuses the GRANT and names the role,
+    # and that name must not reach stdout or stderr.
+    _, dsn = db
+    absent = 'synthetic_absent_' + uuid4().hex[:12]
+    grant = f'GRANT SELECT ON messages TO {absent};\n'
+    root = package(tmp_path, NOTE)
+    root.joinpath('synthetic_role.sql').write_text(f'GRANT SELECT ON chats TO {absent};\n' + grant)
+    plan = write_plan(tmp_path, plan_for(root, RUNTIME_SCHEMA, NEXT, {'synthetic_role.sql': grant}))
+    assert cli(dsn, tmp_path, '--plan', plan, root=root)[:2] == (1, {'error': 'failed'})
     assert ledger(dsn) == (RUNTIME_SCHEMA, 0, 0)
 
 
